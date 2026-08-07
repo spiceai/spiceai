@@ -33,7 +33,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 use tokio::sync::RwLock;
 
-pub static EMBED_UDF_NAME: &str = "embed";
+pub use crate::EMBED_UDF_NAME;
+runtime_udfs_api::register_spice_function!(EMBED_SPICE_FUNCTION, EMBED_UDF_NAME);
 pub static DOCUMENTATION: LazyLock<Documentation> = LazyLock::new(|| Documentation {
     doc_section: DocSection::default(),
     description: "Generates embeddings for text using a specified embedding model".to_string(),

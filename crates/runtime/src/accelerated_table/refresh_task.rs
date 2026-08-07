@@ -48,9 +48,7 @@ use arrow_schema::SchemaRef;
 use arrow_tools::schema_evolution::{EvolutionContext, SchemaEvolution, WideningPlan, classify};
 use async_stream::stream;
 use data_components::poly::PolyTableProvider;
-use data_components::{
-    FieldMetadata, MetadataEnrichedTableProvider, metadata_enriched_table_provider,
-};
+use data_components::{FieldMetadata, metadata_enriched_table_provider};
 use datafusion::catalog::MemoryCatalogProvider;
 use datafusion::datasource::{DefaultTableSource, TableType};
 use datafusion::execution::SessionStateBuilder;
@@ -77,6 +75,7 @@ use runtime_datafusion::execution_plan::schema_cast::EnsureSchema;
 use runtime_datafusion::extension::ExtensionPlanQueryPlanner;
 use runtime_datafusion::extension::bytes_processed::BytesProcessedPhysicalOptimizer;
 use runtime_datafusion::optimizer_rule::avoid_vector_columns_on_index::AvoidDerivedVectorColumnOnIndexRule;
+use runtime_datafusion_index::rebuild_innermost_table_provider;
 use runtime_datafusion_index::{
     IndexedTableProvider,
     analyzer::{IndexTableScanExtensionPlanner, IndexTableScanOptimizerRule},
@@ -100,14 +99,15 @@ use tokio::{
 };
 use tracing::{Instrument, Span};
 use util::fibonacci_backoff::FibonacciBackoffBuilder;
+use util::timestamp_filter::is_day_granular;
 use util::{RetryError, retry};
 
 pub(crate) mod changes;
 mod deletion;
 
-// Reuse the single shared schema-evolution instrument (defined in `changes`) rather
-// than registering a same-named counter under a second meter.
-use changes::SCHEMA_EVOLUTION_FAILED;
+// Reuse the single shared schema-evolution instrument rather than registering a
+// same-named counter under a second meter.
+use crate::schema_evolution::SCHEMA_EVOLUTION_FAILED;
 
 const NANOS_TO_MILLIS: u128 = 1_000_000;
 
@@ -133,57 +133,37 @@ fn table_provider_with_existing_metadata(
         return provider;
     }
 
-    metadata_enriched_table_provider_preserving_indexes(provider, table_metadata, field_metadata)
+    metadata_enriched_table_provider_preserving_indexes(provider, &table_metadata, &field_metadata)
 }
 
+/// Pushes metadata enrichment to the base of the provider stack, rebuilding
+/// the index, stale-enrichment and federation layers around it so they stay
+/// discoverable by downcast. Restricted to the layers a refresh-path provider
+/// stack contains; see the layer table in [`crate::table_layers`].
 fn metadata_enriched_table_provider_preserving_indexes(
     provider: Arc<dyn TableProvider>,
-    table_metadata: HashMap<String, String>,
-    field_metadata: FieldMetadata,
+    table_metadata: &HashMap<String, String>,
+    field_metadata: &FieldMetadata,
 ) -> Arc<dyn TableProvider> {
     if table_metadata.is_empty() && field_metadata.is_empty() {
         return provider;
     }
 
-    if let Some(indexed) = provider.downcast_ref::<IndexedTableProvider>() {
-        let enriched_underlying = metadata_enriched_table_provider_preserving_indexes(
-            indexed.get_underlying(),
-            table_metadata,
-            field_metadata,
-        );
-
-        return Arc::new(IndexedTableProvider::with_indexes(
-            enriched_underlying,
-            indexed.get_all_indexes(),
-        ));
-    }
-
-    if let Some(metadata_enriched) = provider.downcast_ref::<MetadataEnrichedTableProvider>() {
-        return metadata_enriched_table_provider_preserving_indexes(
-            Arc::clone(metadata_enriched.get_inner_ref()),
-            table_metadata,
-            field_metadata,
-        );
-    }
-
-    if let Some(adaptor) = provider.downcast_ref::<FederatedTableProviderAdaptor>() {
-        let Some(table_provider) = &adaptor.table_provider else {
-            return Arc::clone(&provider);
-        };
-
-        let enriched_provider = metadata_enriched_table_provider_preserving_indexes(
-            Arc::clone(table_provider),
-            table_metadata,
-            field_metadata,
-        );
-
-        return Arc::new(FederatedTableProviderAdaptor::new_with_provider(
-            Arc::clone(&adaptor.source),
-            enriched_provider,
-        ));
-    }
-
-    metadata_enriched_table_provider(provider, table_metadata, field_metadata)
+    rebuild_innermost_table_provider(
+        provider,
+        &[
+            crate::table_layers::INDEXED_LAYER,
+            crate::table_layers::METADATA_ENRICHED_LAYER,
+            crate::table_layers::FEDERATED_ADAPTOR_LAYER,
+        ],
+        &|innermost| {
+            metadata_enriched_table_provider(
+                innermost,
+                table_metadata.clone(),
+                field_metadata.clone(),
+            )
+        },
+    )
 }
 
 #[derive(Debug, Clone, Default)]
@@ -193,57 +173,71 @@ struct RefreshStat {
 }
 
 /// Synchronous traversal: walks a provider chain and collects indexes from every
-/// [`IndexedTableProvider`] layer. Kept as a plain fn (not async) so that the
-/// `HashSet<*const ()>` used for dedup never appears inside an async fn and cannot
-/// make the enclosing future non-`Send`.
-fn collect_indexes_from_provider(
-    root: Arc<dyn datafusion::catalog::TableProvider>,
+/// [`IndexedTableProvider`] layer, stepping through every read-transparent layer
+/// (see [`crate::table_layers`]) so an index nested under a metadata-enrichment
+/// or vector-scan layer is not silently missed. Kept as a plain fn (not async)
+/// so that the `HashSet<*const ()>` used for dedup never appears inside an
+/// async fn and cannot make the enclosing future non-`Send`.
+pub(crate) fn collect_indexes_from_provider(
+    root: &Arc<dyn datafusion::catalog::TableProvider>,
 ) -> Vec<Arc<dyn runtime_datafusion_index::Index + Send + Sync>> {
-    use runtime_datafusion_index::IndexedTableProvider;
-    use runtime_search::embeddings::table::EmbeddingTable;
-
     let mut indexes: Vec<Arc<dyn runtime_datafusion_index::Index + Send + Sync>> = Vec::new();
     let mut seen = std::collections::HashSet::new();
-    let mut current = Some(root);
 
-    while let Some(provider) = current.take() {
-        if let Some(indexed) = provider.downcast_ref::<IndexedTableProvider>() {
-            for index in indexed.get_all_indexes() {
-                let ptr = Arc::as_ptr(&index).cast::<()>();
-                if seen.insert(ptr) {
-                    indexes.push(index);
+    runtime_datafusion_index::visit_provider_chain(
+        root,
+        crate::table_layers::TABLE_PROVIDER_LAYERS,
+        runtime_datafusion_index::LayerWalk::Read,
+        &mut |provider| {
+            if let Some(indexed) = provider.downcast_ref::<IndexedTableProvider>() {
+                for index in indexed.get_all_indexes() {
+                    let ptr = Arc::as_ptr(&index).cast::<()>();
+                    if seen.insert(ptr) {
+                        indexes.push(index);
+                    }
                 }
             }
-        }
-
-        current = if let Some(adaptor) = provider.downcast_ref::<FederatedTableProviderAdaptor>() {
-            adaptor.table_provider.as_ref().map(Arc::clone)
-        } else if let Some(embedding_table) = provider.downcast_ref::<EmbeddingTable>() {
-            Some(Arc::clone(embedding_table.get_underlying_ref()))
-        } else if let Some(indexed) = provider.downcast_ref::<IndexedTableProvider>() {
-            Some(indexed.get_underlying())
-        } else {
-            None
-        };
-    }
+        },
+    );
 
     indexes
 }
 
 /// Walks the federated provider chain and collects indexes from **every** [`IndexedTableProvider`]
-/// layer encountered. Known wrapper types (`FederatedTableProviderAdaptor`, `EmbeddingTable`) are
-/// unwrapped so that indexes nested inside them are not silently missed. These indexes receive
-/// write lifecycle hooks alongside accelerator refreshes.
+/// layer encountered, stepping through the read-transparent wrapper layers so that indexes nested
+/// inside them are not silently missed. These indexes receive write lifecycle hooks alongside
+/// accelerator refreshes.
 ///
 /// Uses `try_table_provider_sync` to avoid blocking when the federated provider is deferred
 /// (e.g. during schema evolution). If the provider is not yet available, returns an empty list.
-fn indexes_from_federated(
+pub(crate) fn indexes_from_federated(
     federated: &FederatedTable,
 ) -> Vec<Arc<dyn runtime_datafusion_index::Index + Send + Sync>> {
     let Some(root) = federated.try_table_provider_sync() else {
         return Vec::new();
     };
-    collect_indexes_from_provider(root)
+    collect_indexes_from_provider(&root)
+}
+
+/// Collects every index attached to this dataset, from both sides of the accelerated table.
+///
+/// An external-store vector/search index (e.g. S3 Vectors, Elasticsearch) is only ever attached
+/// via `IndexedTableProvider` on the *federated/read* side (`EmbeddingConnector::wrap_table` wraps
+/// the source connector, not the accelerator) — `collect_indexes_from_provider(accelerator)` alone
+/// finds nothing for these. The `DuckDB` vector engine is the opposite: it wraps the *accelerator*
+/// itself (`wrap_accelerator_with_duckdb_vector_indexes`), not the federated side. Both are checked
+/// here, deduplicating by pointer identity (mirroring `collect_indexes_from_provider`'s own dedup)
+/// in case an index is ever reachable through both paths.
+pub(crate) fn collect_all_indexes(
+    accelerator: &Arc<dyn datafusion::catalog::TableProvider>,
+    federated: &FederatedTable,
+) -> Vec<Arc<dyn runtime_datafusion_index::Index + Send + Sync>> {
+    let mut seen = std::collections::HashSet::new();
+    collect_indexes_from_provider(accelerator)
+        .into_iter()
+        .chain(indexes_from_federated(federated))
+        .filter(|index| seen.insert(Arc::as_ptr(index).cast::<()>()))
+        .collect()
 }
 
 pub struct RefreshTaskBuilder {
@@ -1036,6 +1030,7 @@ impl RefreshTask {
             retention::apply_retention_filters_once(
                 &self.dataset_name,
                 &self.accelerator,
+                &self.federated,
                 retention_sql_delete_expr,
                 &self.io_runtime,
             )
@@ -1116,7 +1111,11 @@ impl RefreshTask {
         let mut filters = vec![];
         if let Some(converter) = filter_converter.as_ref() {
             if let Some(timestamp) = overwrite_timestamp_in_nano {
-                filters.push(converter.convert(timestamp, Operator::Gt));
+                // A high-water mark read back out of the accelerator: compare
+                // inclusively on a day-granular time column, whose values all cast
+                // to midnight, and let `except_existing_records_from` drop the
+                // already-loaded rows it brings back (#12492).
+                filters.push(converter.convert_high_water_mark(timestamp));
             } else if let Some(period) = refresh.period {
                 filters.push(
                     converter.convert(get_timestamp(SystemTime::now() - period), Operator::Gt),
@@ -1159,7 +1158,12 @@ impl RefreshTask {
                     .get_full_or_incremental_append_update(refresh, timestamp)
                     .await
                 {
-                    Ok(data) => match self.except_existing_records_from(refresh, data).await {
+                    // Reuse `timestamp`: the dedupe must compare against the same mark the
+                    // source filter just used, not a freshly read one (#12492).
+                    Ok(data) => match self
+                        .except_existing_records_from(refresh, data, timestamp)
+                        .await
+                    {
                         Ok(data) => Ok(data),
                         Err(e) => Err(e),
                     },
@@ -1705,7 +1709,7 @@ impl RefreshTask {
 
     fn get_filter_converter(&self, refresh: &Refresh) -> Option<TimestampFilterConvert> {
         let schema = self.federated.schema();
-        Self::build_filter_converter(&schema, refresh)
+        self.build_high_water_converter(&schema, refresh)
     }
 
     fn get_accelerator_filter_converter(
@@ -1713,7 +1717,52 @@ impl RefreshTask {
         refresh: &Refresh,
     ) -> Option<TimestampFilterConvert> {
         let schema = self.accelerator.schema();
-        Self::build_filter_converter(&schema, refresh)
+        self.build_high_water_converter(&schema, refresh)
+    }
+
+    /// Build a converter for one side of the append high-water comparison.
+    ///
+    /// Both sides go through here so they cannot be given different day-granularity: the
+    /// flags come from [`Self::day_granular_high_water_columns`], which reads both schemas.
+    fn build_high_water_converter(
+        &self,
+        schema: &SchemaRef,
+        refresh: &Refresh,
+    ) -> Option<TimestampFilterConvert> {
+        let (time, partition) = self.day_granular_high_water_columns(refresh);
+        Self::build_filter_converter(schema, refresh)
+            .map(|converter| converter.with_day_granular_columns(time, partition))
+    }
+
+    /// Whether the time column and the partition column must be treated as day-granular
+    /// on the append high-water-mark path, as `(time_column, time_partition_column)`.
+    ///
+    /// Resolved across the federated *and* accelerator schemas together, and handed to
+    /// both converters, so the source filter and the dedupe filter cannot disagree about
+    /// the comparison. Deciding it from each converter's own schema is not safe: a
+    /// `refresh_sql` that casts the time column — say a `Date32` source projected to
+    /// `Timestamp` in the accelerator — would widen the source to `>=` while the dedupe
+    /// stayed on `>`. The already-loaded rows would then sit outside the dedupe's
+    /// comparison set and the re-fetched rows would be appended again on *every* refresh,
+    /// turning the stall this fixes into unbounded duplication (#12492).
+    ///
+    /// Either side being day-granular is enough. Widening the dedupe side only ever adds
+    /// rows to the comparison set, so it cannot cause duplication; leaving it narrow can.
+    fn day_granular_high_water_columns(&self, refresh: &Refresh) -> (bool, bool) {
+        let schemas = [self.federated.schema(), self.accelerator.schema()];
+        let any_day_granular = |column: Option<&str>| {
+            let Some(column) = column else { return false };
+            schemas.iter().any(|schema| {
+                schema
+                    .column_with_name(column)
+                    .is_some_and(|(_, field)| is_day_granular(field.data_type()))
+            })
+        };
+
+        (
+            any_day_granular(refresh.time_column.as_deref()),
+            any_day_granular(refresh.time_partition_column.as_deref()),
+        )
     }
 
     fn build_filter_converter(
@@ -1840,13 +1889,24 @@ impl RefreshTask {
         ctx
     }
 
+    /// `high_water_mark` is the mark the source filter was built from. Pass it whenever
+    /// the caller has it: recomputing it here reads `max(time_column)` a second time, and
+    /// a write that lands on the accelerator between the two reads gives this comparison a
+    /// *higher* mark than the source query used. The rows in between are then missing from
+    /// the comparison set and are appended again — the same duplication as widening one
+    /// side without the other (#12492). `None` falls back to deriving it.
     async fn except_existing_records_from(
         &self,
         refresh: &Refresh,
         mut update: StreamingDataUpdate,
+        high_water_mark: Option<u128>,
     ) -> Result<StreamingDataUpdate, RetryError<super::Error>> {
-        let Some(value) = self.timestamp_nanos_for_append_query(refresh).await? else {
-            return Ok(update);
+        let value = match high_water_mark {
+            Some(value) => value,
+            None => match self.timestamp_nanos_for_append_query(refresh).await? {
+                Some(value) => value,
+                None => return Ok(update),
+            },
         };
         let Some(filter_converter) = self.get_accelerator_filter_converter(refresh) else {
             return Ok(update);
@@ -1854,6 +1914,10 @@ impl RefreshTask {
 
         let federated_provider = self.federated.table_provider().await;
 
+        // The high-water filter below must widen in step with the source-side filter in
+        // `get_full_or_incremental_append_update`: on a day-granular time column, if the
+        // re-fetched same-day rows are not in this comparison set they pass the dedupe and
+        // get appended a second time, turning the skip into silent duplication (#12492).
         let mut existing_records = accelerator_df(
             &Arc::clone(&self.accelerator),
             &Self::create_refresh_df_context(
@@ -1867,7 +1931,7 @@ impl RefreshTask {
         )
         .map_err(find_datafusion_root)
         .context(super::UnableToScanTableProviderSnafu)?
-        .filter(filter_converter.convert(value, Operator::Gt))
+        .filter(filter_converter.convert_high_water_mark(value))
         .map_err(find_datafusion_root)
         .context(super::UnableToScanTableProviderSnafu)?
         .collect()
@@ -2758,11 +2822,12 @@ mod tests {
     use crate::dataupdate::{StreamingDataUpdate, UpdateType};
     use crate::federated_table::FederatedTable;
     use arrow::array::{
-        Float64Array, Int32Array, Int64Array, LargeStringArray, StringArray, StringViewArray,
-        TimestampNanosecondArray, UInt32Array, UInt64Array,
+        Date32Array, Float64Array, Int32Array, Int64Array, LargeStringArray, StringArray,
+        StringViewArray, TimestampNanosecondArray, UInt32Array, UInt64Array,
     };
     use arrow::datatypes::TimeUnit;
     use arrow_schema::{DataType, Field, Schema};
+    use data_components::MetadataEnrichedTableProvider;
     use data_components::arrow::write::MemTable;
     use datafusion::physical_plan::SendableRecordBatchStream;
     use datafusion::physical_plan::collect;
@@ -2838,6 +2903,60 @@ mod tests {
         assert_eq!(
             id_field.metadata().get("field_meta").map(String::as_str),
             Some("field_value")
+        );
+    }
+
+    fn indexed_mem_table() -> Arc<dyn TableProvider> {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![1_i64]))],
+        )
+        .expect("record batch should be created");
+        let mem_table: Arc<dyn TableProvider> = Arc::new(
+            MemTable::try_new(schema, vec![vec![batch]]).expect("mem table should be created"),
+        );
+        Arc::new(IndexedTableProvider::with_indexes(
+            mem_table,
+            vec![Arc::new(TestRefreshIndex)],
+        ))
+    }
+
+    /// An index nested under a metadata-enrichment layer must still receive
+    /// write lifecycle hooks: a walk that stops at the enrichment layer
+    /// silently drops the index writes for the whole refresh.
+    #[test]
+    fn collect_indexes_finds_indexes_under_metadata_enrichment() {
+        let enriched: Arc<dyn TableProvider> = data_components::metadata_enriched_table_provider(
+            indexed_mem_table(),
+            std::collections::HashMap::from([("table_meta".to_string(), "value".to_string())]),
+            data_components::FieldMetadata::new(),
+        );
+
+        assert_eq!(
+            collect_indexes_from_provider(&enriched).len(),
+            1,
+            "an index below a MetadataEnrichedTableProvider layer must be collected"
+        );
+    }
+
+    /// Same requirement for a vector-scan layer above the indexed provider.
+    #[test]
+    fn collect_indexes_finds_indexes_under_vector_scan() {
+        let plan = datafusion::logical_expr::LogicalPlanBuilder::empty(false)
+            .build()
+            .expect("empty logical plan should build");
+        let vector_scan: Arc<dyn TableProvider> =
+            Arc::new(search::index::VectorScanTableProvider {
+                table_provider: indexed_mem_table(),
+                vector_index_list: Arc::new(plan),
+                primary_key: vec![],
+            });
+
+        assert_eq!(
+            collect_indexes_from_provider(&vector_scan).len(),
+            1,
+            "an index below a VectorScanTableProvider layer must be collected"
         );
     }
 
@@ -3558,7 +3677,7 @@ mod tests {
         let update = StreamingDataUpdate::new(update_stream, UpdateType::Append);
 
         let result = task
-            .except_existing_records_from(&refresh, update)
+            .except_existing_records_from(&refresh, update, None)
             .await
             .expect("except_existing_records_from should succeed with column subset");
 
@@ -3679,7 +3798,7 @@ mod tests {
         let update = StreamingDataUpdate::new(update_stream, UpdateType::Append);
 
         let result = task
-            .except_existing_records_from(&refresh, update)
+            .except_existing_records_from(&refresh, update, None)
             .await
             .expect("except_existing_records_from should succeed with nullable time column");
 
@@ -3717,6 +3836,174 @@ mod tests {
             id_col.value(0),
             2,
             "remaining row after fix should be the new id=2 (NULL dup was filtered)"
+        );
+    }
+
+    /// Regression test for the schema-mismatch half of #12492.
+    ///
+    /// `refresh_sql` can project the time column to another type, so the federated and
+    /// accelerator schemas disagree about day-granularity. Resolving the comparison from
+    /// each schema separately would widen the source filter to `>=` while leaving the
+    /// dedupe on `>`: the already-loaded rows would sit outside the dedupe's comparison
+    /// set, and the re-fetched rows would be appended again on *every* refresh — the
+    /// stall turned into unbounded duplication. Both sides must come out the same.
+    #[tokio::test]
+    async fn test_high_water_comparison_agrees_across_mismatched_schemas() {
+        let src = Arc::new(Schema::new(vec![
+            Field::new("day", DataType::Date32, false),
+            Field::new("id", DataType::Int32, false),
+        ]));
+
+        // What `SELECT CAST(day AS TIMESTAMP) AS day, id FROM source` materialises.
+        let ts_type = DataType::Timestamp(TimeUnit::Nanosecond, None);
+        let acc = Arc::new(Schema::new(vec![
+            Field::new("day", ts_type, false),
+            Field::new("id", DataType::Int32, false),
+        ]));
+
+        let federated = MemTable::try_new(Arc::clone(&src), vec![vec![]]).expect("src table");
+        let accelerator = MemTable::try_new(Arc::clone(&acc), vec![vec![]]).expect("acc table");
+
+        let task = RefreshTaskBuilder::new(
+            crate::status::RuntimeStatus::new(),
+            TableReference::bare("test_mismatched_schemas"),
+            Arc::new(FederatedTable::new_unchecked(Arc::new(federated))),
+            None,
+            Arc::new(accelerator),
+            Handle::current(),
+            Arc::new(Mutex::new(())),
+        )
+        .build();
+
+        let refresh = Refresh::new(RefreshMode::Append).time_column("day".to_string());
+
+        assert_eq!(
+            task.day_granular_high_water_columns(&refresh),
+            (true, false),
+            "a Date32 on either side must make both converters day-granular"
+        );
+
+        let source = task
+            .get_filter_converter(&refresh)
+            .expect("source converter")
+            .convert_high_water_mark(1_620_000_000_000_000_000)
+            .to_string();
+        let dedupe = task
+            .get_accelerator_filter_converter(&refresh)
+            .expect("accelerator converter")
+            .convert_high_water_mark(1_620_000_000_000_000_000)
+            .to_string();
+
+        assert_eq!(
+            source, dedupe,
+            "the source filter and the dedupe filter must compare identically"
+        );
+        assert!(
+            source.contains(">="),
+            "both sides should be inclusive, got: {source}"
+        );
+    }
+
+    /// Regression test for #12492.
+    ///
+    /// With a `Date32` time column every value casts to midnight, so the append
+    /// high-water mark for a partly-loaded day *D* is *D*-midnight and the source
+    /// filter has to be inclusive to see the rest of that day. This dedupe has to
+    /// widen in step: with a strict `>` the already-loaded rows it exists to remove
+    /// are not in the comparison set at all, so the re-fetched rows pass through and
+    /// are appended a second time.
+    #[tokio::test]
+    async fn test_except_existing_records_from_date32_time_column_dedupes_same_day() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("day", DataType::Date32, false),
+            Field::new("id", DataType::Int32, false),
+        ]));
+
+        // Day 20_000 since the epoch. Both the loaded row and the incoming rows land on
+        // it, so the accelerator's max(day) is exactly this day's midnight.
+        let day: i32 = 20_000;
+
+        let existing_batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Date32Array::from(vec![day])),
+                Arc::new(Int32Array::from(vec![1])),
+            ],
+        )
+        .expect("existing batch");
+        let accelerator = Arc::new(
+            MemTable::try_new(Arc::clone(&schema), vec![vec![existing_batch]])
+                .expect("accelerator mem table"),
+        ) as Arc<dyn TableProvider>;
+
+        let federated_table = Arc::new(
+            MemTable::try_new(Arc::clone(&schema), vec![vec![]]).expect("federated mem table"),
+        ) as Arc<dyn TableProvider>;
+        let federated = Arc::new(FederatedTable::new_unchecked(Arc::clone(&federated_table)));
+
+        let task = RefreshTaskBuilder::new(
+            crate::status::RuntimeStatus::new(),
+            TableReference::bare("test_date32_append"),
+            federated,
+            None,
+            Arc::clone(&accelerator),
+            Handle::current(),
+            Arc::new(Mutex::new(())),
+        )
+        .build();
+
+        // No `append_overlap`: the overlap would push the high-water mark below midnight
+        // and mask the defect this test covers. `TimeFormat::Date` is what the runtime
+        // requires for a Date32 time column.
+        let refresh = Refresh::new(RefreshMode::Append)
+            .time_column("day".to_string())
+            .time_format(TimeFormat::Date);
+
+        // What the inclusive source filter returns for day D: the row already loaded
+        // into the accelerator, plus a genuinely new row for the same day.
+        let update_batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Date32Array::from(vec![day, day])),
+                Arc::new(Int32Array::from(vec![1, 2])),
+            ],
+        )
+        .expect("update batch");
+        let update_stream: SendableRecordBatchStream = Box::pin(
+            MemoryStream::try_new(vec![update_batch], Arc::clone(&schema), None)
+                .expect("update stream"),
+        );
+        let update = StreamingDataUpdate::new(update_stream, UpdateType::Append);
+
+        let collected = task
+            .except_existing_records_from(&refresh, update, None)
+            .await
+            .expect("except_existing_records_from should succeed for a Date32 time column")
+            .collect_data()
+            .await
+            .expect("collecting the deduped data should succeed");
+
+        let total_rows: usize = collected.data.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(
+            total_rows, 1,
+            "the already-loaded same-day row must be deduped, not appended again; \
+             a strict high-water comparison leaves the comparison set empty and lets both rows through"
+        );
+
+        let batch = collected
+            .data
+            .iter()
+            .find(|batch| batch.num_rows() > 0)
+            .expect("a non-empty batch should remain");
+        let id_col = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("id column should be Int32");
+        assert_eq!(
+            id_col.value(0),
+            2,
+            "the surviving row should be the new same-day row (id=2)"
         );
     }
 }

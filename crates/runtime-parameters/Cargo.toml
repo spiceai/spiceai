@@ -13,6 +13,7 @@ version.workspace = true
 itertools.workspace = true
 runtime-parameter-spec = { path = "../runtime-parameter-spec" }
 runtime-parameters-derive = { path = "../runtime-parameters-derive" }
+runtime-parameters-typed = { path = "../runtime-parameters-typed" }
 runtime-secrets = { path = "../runtime-secrets", default-features = false }
 secrecy.workspace = true
 snafu.workspace = true
@@ -22,7 +23,7 @@ util = { path = "../util" }
 
 [dev-dependencies]
 async-trait.workspace = true
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
 
 [lints]
 workspace = true

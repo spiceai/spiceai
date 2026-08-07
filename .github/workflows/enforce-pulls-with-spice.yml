@@ -6,9 +6,41 @@ on:
     types:
       [labeled, unlabeled, opened, edited, synchronize, assigned, unassigned]
 
+# Opening a PR applies several labels and an assignee, and each of those is its own
+# `labeled`/`assigned` event, so a single `gh pr create` routinely starts four to seven
+# runs of this workflow inside the same second. With nothing serialising them they race
+# on the same PR's labels — a PR was observed carrying `size/xl` and `size/l` at once —
+# and the verdict that sticks is whichever run happened to finish last rather than the
+# one that saw the final label set. Queue the burst instead, so the runs execute one at a
+# time and the last one — which is the only one that can see every label — is the verdict
+# that sticks. The trigger list stays as it is: `labeled` is also how a human clears a
+# failed verdict after adding the missing `kind/`/`area/` label, so dropping it would
+# leave the check red with no way to re-run it short of a push.
+#
+# `cancel-in-progress` stays `false` deliberately, and this is the whole reason #12377
+# asks for a group rather than the one `pr.yml` used to carry. This is a *required*
+# check, branch protection and the merge queue count a cancelled required check as
+# not-passing, and these triggers fire without a new commit SHA — so a cancelled run
+# writes a not-passing conclusion onto the same SHA the surviving run is reporting on,
+# and can strand the PR with no failing check and no push available to re-trigger it.
+# Cancelling would collapse the burst marginally faster; the job is one `node24` API
+# call, so serialising four to seven of them costs seconds and risks nothing.
+#
+# `pull_request_target` evaluates in the base-branch context, so `github.ref` is `trunk`
+# for every PR and would serialise unrelated PRs against each other; the PR number is
+# the correct key. A `merge_group` event carries no `pull_request`, and its `github.ref`
+# is the unique `gh-readonly-queue/...` branch, so it falls through to a group of its own.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: false
+
 jobs:
   enforce-pull-with-spice:
-    runs-on: spiceai-macos
+    # The only step is a `node24` JavaScript action that calls the GitHub API — it needs no
+    # checkout, no build, and no macOS. A GitHub-hosted runner keeps this required check off
+    # the self-hosted pool that the darwin build and benchmark matrices contend for, so PR
+    # hygiene does not queue behind hours of heavy work.
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       pull-requests: write
@@ -19,8 +51,18 @@ jobs:
           require_title_min_length: '10'
           required_label_prefixes: 'kind/,area/'
           banned_labels: 'invalid,wontfix,nomerge,duplicate'
-          require_assignee: 'true'
+          # GitHub's assignees API silently drops App accounts, so `auto_assign_author`
+          # below cannot satisfy `require_assignee` on a Dependabot PR — the required
+          # check is then red forever with nothing any author or reviewer can do about
+          # it. #12358 is the shape: every other gate green, blocked solely on
+          # `❌ At least one assignee is required`, until a maintainer hand-assigned
+          # themselves. `pr.yml` already fast-tracks Dependabot for the same reason.
+          # This exempts nothing else — the title-length, `kind/`/`area/` label and
+          # banned-label gates still apply to dependency bumps exactly as before.
+          require_assignee: ${{ github.event.pull_request.user.login == 'dependabot[bot]' && 'false' || 'true' }}
           auto_label: 'true'
-          auto_label_size: 'true'
+          # No auto_label_size: GitHub applies size labels natively now, and the
+          # action's input defaults to false, so leaving it out is the whole
+          # change — a second labeller would only fight the native one.
           auto_label_type: 'true'
           auto_assign_author: 'true'

@@ -102,10 +102,62 @@ endif
 # of the gate agreeing on which crates need system libraries, so a sign-off on
 # such a host fails only for reasons in the branch under test. The crate has no
 # unit tests of its own.
+#
+# One cargo invocation, not one per test group: under `resolver = "2"` the
+# resolved feature set of every crate is a function of which packages are
+# selected, so `--all`, `-p cayenne` and `-p runtime` each resolve a different
+# dependency graph and none of them can reuse another's artifacts
+# (spiceai/spiceai#12337). One selection resolves once, and a nextest filterset
+# decides which of the built tests actually run.
+#
+# `--tests` rather than `--lib` is what brings cayenne's integration tests and
+# the `metrics` binary into that one selection. It builds every test target
+# in the workspace, including ones the filterset never runs. Naming just the
+# wanted targets with `--test <glob>` would build fewer, but a new test file that
+# didn't match the glob would silently stop being covered — cayenne already has
+# a test target that doesn't follow the `*_test` convention its other 55 do.
+#
+# `metrics` is a `tests/` binary rather than a `--lib` test because it needs its
+# own process to control the OTel meter-provider install order. Every metrics
+# test lives in that one binary, so selecting it by name here covers all of them:
+# naming individual binaries is what left two of them built but never run.
+#
+# `kind(=proc-macro)` is the other half of what `--lib` used to select: nextest
+# labels a proc-macro crate's unit tests `proc-macro`, not `lib`, so leaving it
+# out would silently drop runtime-parameters-derive's tests from the gate.
+# `--tests` also builds the 14 bin targets as unit-test harnesses; `--lib` never
+# ran those, and nothing here selects `kind(=bin)`, so it still doesn't.
+#
+# Running cayenne's integration tests under the workspace resolve rather than
+# `-p cayenne` enables its `turso` feature, which brings 304 `*_turso` variants
+# into the gate for the first time. Four of them abort with a stack overflow —
+# they need more than the 2 MiB std gives a tokio worker thread. That is a
+# pre-existing defect in a configuration the gate never executed, not a
+# regression from merging the invocations, so it is tracked in #12436 and
+# excluded by name here; the other 300 run.
+# Shared so `nextest` and `verify-cli` cannot drift onto different selections:
+# a different selection resolves different features, which would make verify-cli
+# recompile instead of reading the build nextest just did.
+NEXTEST_SELECTION := --all --exclude libnfs
+NEXTEST_STACK_OVERFLOW_12436 := test(=prop_sequential_cold_impl_turso) + test(=prop_sequential_key_impl_turso) + test(=prop_sequential_position_impl_turso) + test(=test_cold_tier_promotion_racing_stage_b_finalize_impl_turso)
+NEXTEST_FILTER := (kind(=lib) + kind(=proc-macro) + (package(=cayenne) & kind(=test)) + binary(=metrics)) - ($(NEXTEST_STACK_OVERFLOW_12436))
+# Extra narrowing for callers that can't run everything (CI lacks credentials
+# for some tests). It has to *intersect* the expression above rather than sit
+# beside it: nextest unions repeated `-E` flags, so a second `-E 'not (…)'` would
+# match everything the first one excluded and widen the run instead.
+ifneq ($(strip $(NEXTEST_FILTER_EXTRA)),)
+_NEXTEST_FILTER := ($(NEXTEST_FILTER)) & ($(NEXTEST_FILTER_EXTRA))
+else
+_NEXTEST_FILTER := $(NEXTEST_FILTER)
+endif
+# A filterset smuggled in through NEXTEST_FLAG would silently widen the run for
+# the reason above, and a gate that runs more than it was asked to reads as green.
+ifneq (,$(findstring -E,$(NEXTEST_FLAG))$(findstring --filterset,$(NEXTEST_FLAG)))
+$(error NEXTEST_FLAG carries a nextest filterset — pass it as NEXTEST_FILTER_EXTRA instead, which intersects the gate's own filterset rather than being unioned with it)
+endif
 .PHONY: nextest
 nextest:
-	@cargo nextest run --all --exclude libnfs --lib $(NEXTEST_CARGO_PROFILE) $(NEXTEST_FLAG)
-	@cargo nextest run -p cayenne --tests $(NEXTEST_CARGO_PROFILE)
+	@cargo nextest run $(NEXTEST_SELECTION) --tests $(NEXTEST_CARGO_PROFILE) $(NEXTEST_FLAG) -E '$(_NEXTEST_FILTER)'
 
 # Unit tests for named packages — the fail-fast pre-check scripts/signoff runs on
 # the crates a branch touched, before the full workspace gate. Same lib-only
@@ -116,6 +168,27 @@ nextest:
 # unit tests (29 workspace libraries have none). nextest exits 4 on "no tests to
 # run" by default, which would abort the sign-off for a branch that only touched
 # one of them; the full `nextest` run still gates the workspace.
+# The gate does not build the `spice` CLI on its own, because `nextest`'s `--tests`
+# build already emits it: cargo builds a package's bins alongside that package's
+# integration tests, and `spice` has three. A CLI link error therefore fails
+# `nextest` itself, and a separate `cargo build -p spice` only re-resolved the
+# whole graph at a selection no other phase in the gate shares.
+#
+# That is an assumption about cargo's target selection, and it is the quiet kind
+# to lose: removing `spice`'s `tests/` targets would stop its bin from being built,
+# and the gate would drop CLI coverage without a single failure. So ask cargo
+# whether the bin is in that build graph, rather than looking for the file — a warm
+# `target/` would still hold a stale binary from an earlier build, so a file check
+# would pass at exactly the moment coverage was lost. Same selection as `nextest`,
+# so after it this is a fingerprint scan (measured ~2s), not a build.
+.PHONY: verify-cli
+verify-cli:
+	@out="$(TARGET_DIR)/verify-cli-artifacts.json"; \
+	mkdir -p "$(TARGET_DIR)"; \
+	cargo test --no-run --message-format json $(CARGO_PROFILE) --tests \
+	  $(NEXTEST_SELECTION) $(NEXTEST_FLAG) > "$$out" || exit $$?; \
+	python3 scripts/verify_cli_build.py "$$out" version.txt
+
 .PHONY: nextest-packages
 nextest-packages:
 	@test -n "$(strip $(PACKAGES))" || { echo 'nextest-packages requires PACKAGES="crate1 crate2"' >&2; exit 1; }
@@ -187,6 +260,8 @@ lint-rust:
 	cargo fmt $(_FMT_FLAGS) -- --check
 	## Crate-layering guard (fast, no compile): no crate may depend on a higher tier. See docs/dev/crate_layering.md
 	python3 scripts/check_crate_layers.py
+	## Rust-gate path-list guard (fast, no compile): the sign-off, Attestation, and merge-queue path lists must agree. See docs/dev/ci_signoff.md
+	python3 scripts/check_rust_gate_paths.py
 	## All except metal, cuda, nfs (nfs requires system libnfs library)
 	CLIPPY_CONF_DIR=".ci" cargo clippy $(CARGO_PROFILE) --keep-going $(_LINT_TARGET_FLAGS) $(_FEATURES_FLAGS) $(_LINT_WORKSPACE_FLAGS) -- \
 		-Dwarnings \

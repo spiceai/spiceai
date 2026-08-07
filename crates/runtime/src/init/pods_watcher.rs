@@ -49,40 +49,63 @@ impl Runtime {
     /// datasets, views, models, functions, and (without the `models` feature)
     /// workers against the currently-loaded app.
     ///
-    /// This is the same diff-based reconcile the pods watcher performs when a
-    /// spicepod file changes on disk, factored out so other drivers — e.g.
-    /// Spice Cloud Connect's `apply_spicepod` — can hot-apply a
-    /// control-plane-supplied configuration without restarting the process.
+    /// This is the diff-based reconcile the pods watcher performs when a
+    /// spicepod file changes on disk. It is the *local* configuration path: a
+    /// Spice Cloud deployment does not come through here, because it applies by
+    /// persisting the spicepod and restarting onto it (see
+    /// `spiced`'s `cloud_connect` module).
     ///
     /// Returns `true` if `new_app` differed from the current app and was
     /// applied, `false` if it was identical (a no-op). When there is no
     /// current app yet, `new_app` is installed and `true` is returned.
     ///
     /// Diffs are computed while holding only a read lock on the app; the write
-    /// lock is taken only for the final swap. This whole method is serialized by
-    /// [`Runtime::apply_app_lock`] because it now has two independent callers —
-    /// the on-disk pods watcher loop and Spice Cloud Connect's `apply_spicepod`
-    /// — which can invoke it concurrently. Without serialization two applies
-    /// could diff against the same old app, interleave their catalog/dataset/
-    /// view mutations, and overwrite `self.app` last-writer-wins. We hold the
-    /// dedicated mutex (rather than the app write lock) for the duration so the
-    /// diff phase can still read the app `RwLock` without deadlocking.
+    /// lock is taken only for the final swap. The whole method is serialized by
+    /// [`Runtime::apply_app_lock`] so two applies cannot diff against the same
+    /// old app, interleave their catalog/dataset/view mutations, and overwrite
+    /// `self.app` last-writer-wins. We hold the dedicated mutex (rather than the
+    /// app write lock) for the duration so the diff phase can still read the app
+    /// `RwLock` without deadlocking.
     pub async fn apply_app(self: Arc<Self>, new_app: Arc<App>) -> bool {
-        // Serialize the entire diff-and-swap so concurrent callers (pods watcher
-        // + Cloud Connect) apply one-at-a-time. Must be the first statement.
+        // Serialize the entire diff-and-swap so concurrent callers apply
+        // one-at-a-time. Must be the first statement.
         let _serialize = self.apply_app_lock.lock().await;
 
         // It is safe to operate by read lock until we actually need to update
         // the app state: with applies serialized by `_serialize`, no other path
         // mutates the app during the diff phase, so a write lock is not needed
         // until the final swap.
-        if let Some(ref current_app) = self.read_app().await {
+        let current_app = self.read_app().await;
+        Arc::clone(&self)
+            .apply_app_diff(current_app.as_ref(), new_app)
+            .await
+    }
+
+    /// Diff-and-apply behind [`Runtime::apply_app`].
+    ///
+    /// The caller holds `apply_app_lock`. `current_app` is what to reconcile
+    /// *from*, which is not necessarily the installed app; `new_app` is
+    /// installed either way.
+    async fn apply_app_diff(
+        self: Arc<Self>,
+        current_app: Option<&Arc<App>>,
+        new_app: Arc<App>,
+    ) -> bool {
+        if let Some(current_app) = current_app {
             if *current_app == new_app {
                 return false;
             }
 
             tracing::debug!("Updated pods information: {new_app:?}");
             tracing::debug!("Previous pods information: {current_app:?}");
+
+            // `runtime.cpu` sizes thread pools that are already running, so it
+            // is start-time only. Say so rather than silently ignoring the edit.
+            if current_app.runtime.cpu != new_app.runtime.cpu {
+                tracing::warn!(
+                    "`runtime.cpu` changed, but the CPU budget sizes thread pools that are already running: the previous value stays in effect. Restart spiced to apply it."
+                );
+            }
 
             Arc::clone(&self)
                 .apply_catalog_diff(current_app, &new_app)
@@ -101,16 +124,9 @@ impl Runtime {
                     .apply_worker_diff(current_app, &new_app)
                     .await;
             }
-
-            let mut app_write_lock = self.app.write().await;
-            let Some(current_app) = app_write_lock.as_mut() else {
-                unreachable!("current app must exist");
-            };
-            *current_app = new_app;
-        } else {
-            let mut app_write_lock = self.app.write().await;
-            *app_write_lock = Some(new_app);
         }
+
+        *self.app.write().await = Some(new_app);
 
         true
     }

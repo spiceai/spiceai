@@ -14,8 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::component::dataset::Dataset;
 use crate::component::dataset::acceleration::RefreshMode;
+use crate::component::dataset::{Dataset, DatasetSpec};
 use crate::component::{ComponentInitialization, DatasetHealthMonitor, StartupOptions};
 use crate::dataconnector::client_identity::{
     ClientIdentityConfig, ClientIdentityConfigError, TLS_CLIENT_CERTIFICATE,
@@ -104,7 +104,7 @@ impl Https {
     fn shared_rate_control_metrics_for_dataset(
         rate_control_registry: &http_rate_control::HttpRateControlRegistry,
         rate_control_registry_arc: &Arc<http_rate_control::HttpRateControlRegistry>,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
         structured_format: bool,
     ) -> (
         Arc<HttpRateControlMetrics>,
@@ -134,7 +134,7 @@ impl Https {
 
     /// Determines if the dataset uses a structured file format (parquet, csv, json, etc.)
     /// that would be handled by `ListingTableConnector` rather than `HttpTableProvider`.
-    fn is_structured_format(&self, dataset: &Dataset) -> bool {
+    fn is_structured_format(&self, dataset: &DatasetSpec) -> bool {
         let file_format = self
             .params
             .get("file_format")
@@ -143,19 +143,7 @@ impl Https {
             .map_or_else(|| "auto".to_string(), str::to_ascii_lowercase);
 
         // Check if explicitly configured as a structured format
-        if matches!(
-            file_format.as_str(),
-            "parquet"
-                | "csv"
-                | "tsv"
-                | "arrow"
-                | "avro"
-                | "jsonl"
-                | "ndjson"
-                | "ldjson"
-                | "soda"
-                | "socrata"
-        ) {
+        if STRUCTURED_FILE_FORMATS.contains(&file_format.as_str()) {
             return true;
         }
 
@@ -670,6 +658,49 @@ impl Https {
                 "mTLS client identity parameters are not supported for structured HTTP file datasets that use the listing connector. Remove {params}, or use a dynamic JSON HTTP API dataset."
             ),
         })
+    }
+
+    /// Reject `OAuth2` parameters on a dataset bound for the listing connector,
+    /// which builds a plain object-store HTTP client and cannot carry an access
+    /// token. These params exist only to authenticate, so a dataset that sets
+    /// them and then sends nothing is never what the user meant — and routing
+    /// there skips `resolve_oauth2_auth`'s validation as well.
+    fn ensure_auth_supported_for_structured_dataset(
+        &self,
+        dataset: &Dataset,
+    ) -> DataConnectorResult<()> {
+        if !any_oauth_param_set(&self.params) {
+            return Ok(());
+        }
+
+        let params = OAUTH_PARAM_KEYS
+            .iter()
+            .filter(|&&name| param_is_set(&self.params, name))
+            .map(|&name| format!("'{}'", self.params.user_param(name)))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        Err(DataConnectorError::InvalidConfigurationNoSource {
+            dataconnector: "https".to_string(),
+            connector_component: ConnectorComponent::from(dataset),
+            message: format!(
+                "OAuth2 authentication parameters are not supported for structured HTTP file datasets that use the listing connector; requests would be sent unauthenticated. Remove {params}, or use a dynamic JSON HTTP API dataset."
+            ),
+        })
+    }
+
+    /// The listing connector cannot carry `http_headers` either. Unlike the
+    /// `OAuth2` params this only warns: the header list is used for far more
+    /// than authentication, so rejecting it would fail datasets that load and
+    /// serve correctly today.
+    fn warn_ignored_http_headers(&self, dataset: &Dataset) {
+        if param_is_set(&self.params, "http_headers") {
+            tracing::warn!(
+                "Dataset {}: '{}' is not applied to structured HTTP file datasets, which are served by the listing connector. The headers are ignored; use a dynamic JSON HTTP API dataset if the endpoint requires them.",
+                dataset.name,
+                self.params.user_param("http_headers"),
+            );
+        }
     }
 
     fn resolve_client_identity_config(
@@ -1278,7 +1309,8 @@ impl Https {
 /// Returns true if the supplied connector parameters indicate a
 /// User-facing `OAuth2` parameter names (before the connector `http_` prefix).
 /// Setting any of these signals the user intends `OAuth2` on a dynamic JSON API
-/// endpoint. Kept as one list so the routing gate ([`params_indicate_dynamic_api`])
+/// endpoint. Kept as one list so the routing gate ([`params_indicate_dynamic_api`]),
+/// the structured-dataset guard ([`Https::ensure_auth_supported_for_structured_dataset`])
 /// and the resolver ([`Https::resolve_oauth2_auth`]) can't drift — if they did,
 /// an `OAuth2` param without `auth_token_url` would route to the listing connector
 /// and its config would be silently ignored instead of failing validation.
@@ -1293,15 +1325,27 @@ const OAUTH_PARAM_KEYS: &[&str] = &[
     "auth_header_name",
 ];
 
+/// File formats served by the listing connector rather than the dynamic JSON
+/// API provider. `vortex` is handled separately because it is only built on
+/// non-Windows targets, and `json` because it is structured only when no
+/// dynamic-API param is set.
+const STRUCTURED_FILE_FORMATS: &[&str] = &[
+    "parquet", "csv", "tsv", "arrow", "avro", "jsonl", "ndjson", "ldjson", "soda", "socrata",
+];
+
+/// Returns true if `name` is set to a non-empty value. Shared so the routing
+/// gate and the structured-dataset guard can't disagree about what "set" means.
+fn param_is_set(params: &Parameters, name: &str) -> bool {
+    params
+        .get(name)
+        .expose()
+        .ok()
+        .is_some_and(|v| !v.trim().is_empty())
+}
+
 /// Returns true if any `OAuth2` parameter is set to a non-empty value.
 fn any_oauth_param_set(params: &Parameters) -> bool {
-    OAUTH_PARAM_KEYS.iter().any(|key| {
-        params
-            .get(key)
-            .expose()
-            .ok()
-            .is_some_and(|v| !v.trim().is_empty())
-    })
+    OAUTH_PARAM_KEYS.iter().any(|key| param_is_set(params, key))
 }
 
 /// dynamic HTTP API endpoint (as opposed to a static file download).
@@ -1353,8 +1397,10 @@ fn params_indicate_dynamic_api(params: &Parameters) -> bool {
 
     // OAuth2 authentication is only wired into the dynamic JSON API provider
     // (the listing connector cannot apply it). Any OAuth2 param means the user
-    // intends the JSON API path — routing them to the listing connector instead
-    // would silently drop (and skip validating) their auth config.
+    // intends the JSON API path. This gate only covers the `json` file format;
+    // an explicitly structured format (csv, parquet, …) still routes to the
+    // listing connector, where `ensure_auth_supported_for_structured_dataset`
+    // rejects the config rather than dropping it silently.
     has_allowed_paths
         || has_query_filters
         || has_body_filters
@@ -1542,6 +1588,8 @@ impl DataConnector for Https {
         if self.is_structured_format(dataset) {
             self.ensure_rate_control_supported_for_structured_dataset(dataset)?;
             self.ensure_client_identity_supported_for_structured_dataset(dataset)?;
+            self.ensure_auth_supported_for_structured_dataset(dataset)?;
+            self.warn_ignored_http_headers(dataset);
             // Use ListingTableConnector for file-based structured formats (parquet, csv, etc.)
             // which properly handles file parsing with correct schemas
             let listing_connector =
@@ -1634,7 +1682,7 @@ static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
         ParameterSpec::component(TLS_CLIENT_KEY).secret()
             .description("Inline PEM private key (or ${ secrets:... } reference) matching 'tls_client_certificate'. Must be set together with 'tls_client_certificate'. Mutually exclusive with 'tls_client_certificate_file' and 'tls_client_key_file'. Applies to dynamic JSON API endpoints only; structured HTTP file datasets reject mTLS client identity params."),
         ParameterSpec::runtime("http_headers")
-            .description("Custom HTTP headers to include in requests. Format: 'Header1: Value1, Header2: Value2'. Headers are applied to all requests."),
+            .description("Custom HTTP headers to include in requests. Format: 'Header1: Value1, Header2: Value2'. Headers are applied to all requests. Applies to dynamic JSON API endpoints only; structured HTTP file datasets ignore these headers."),
         ParameterSpec::runtime("max_retries")
             .description("Maximum number of retries for HTTP requests. Default: 3"),
         ParameterSpec::runtime("retry_backoff_method")
@@ -1688,7 +1736,7 @@ static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
         ParameterSpec::runtime("pagination_page_size")
             .description("Number of items per page for query-parameter pagination. Must be a positive integer greater than 0. Used to expand {limit} in pagination_query_params and to detect the last page (fewer results than page_size = done)."),
         ParameterSpec::runtime("auth_token_url")
-            .description("OAuth2 token endpoint URL. Enables OAuth2: the connector acquires short-lived access tokens (refresh-token grant by default, or client_credentials via auth_grant_type) and attaches them to data requests ('Authorization: Bearer <token>' by default, or the bare token under a custom auth_header_name). Applies to JSON API endpoints only."),
+            .description("OAuth2 token endpoint URL. Enables OAuth2: the connector acquires short-lived access tokens (refresh-token grant by default, or client_credentials via auth_grant_type) and attaches them to data requests ('Authorization: Bearer <token>' by default, or the bare token under a custom auth_header_name). Applies to dynamic JSON API endpoints only; structured HTTP file datasets reject OAuth2 params."),
         ParameterSpec::runtime("auth_grant_type")
             .description("OAuth2 grant type: 'refresh_token' (default, RFC 6749 §6) or 'client_credentials' (RFC 6749 §4.4). client_credentials authenticates with client_id/client_secret and issues no refresh token, re-exchanging before expiry (e.g. Shopify Admin API).")
             .one_of(&["refresh_token", "client_credentials"]),
@@ -1724,11 +1772,9 @@ impl DataConnectorFactory for HttpsFactory {
         params: ConnectorParams,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
-            let runtime_rate_control_params =
-                params.app.as_ref().map(|app| app.runtime.params.clone());
+            let runtime_rate_control_params = params.app().map(|app| app.runtime.params.clone());
             let rate_control_registry = params
-                .runtime
-                .as_ref()
+                .runtime()
                 .map_or_else(http_rate_control::global_registry, |runtime| {
                     runtime.http_rate_control_registry()
                 });
@@ -2499,6 +2545,113 @@ uGgYIHbi/F+GaiUPzDyqe5p9
                 );
             }
             other => panic!("expected InvalidConfigurationNoSource, got: {other}"),
+        }
+    }
+
+    /// Regression test for #12315: a structured file format short-circuits
+    /// `is_structured_format` before the dynamic-API gate that
+    /// `any_oauth_param_set` feeds, so the dataset routed to the listing
+    /// connector and its `OAuth2` config was dropped without a word. Every
+    /// structured format takes that same short-circuit, so the guard is checked
+    /// against the whole list rather than one representative format.
+    #[tokio::test]
+    async fn test_http_structured_format_rejects_oauth_params() {
+        // `file_format` is explicit, so `is_structured_format` never inspects
+        // the URL and one dataset serves every format.
+        let dataset = test_dataset("https://example.com/data", RefreshMode::Full, None).await;
+
+        for file_format in STRUCTURED_FILE_FORMATS {
+            let connector = test_connector_with(&[
+                ("file_format", file_format),
+                ("auth_token_url", "https://example.com/oauth/token"),
+                ("auth_grant_type", "client_credentials"),
+            ])
+            .await;
+
+            let error = connector
+                .read_provider(&dataset)
+                .await
+                .expect_err("structured HTTP file datasets should reject OAuth2 params");
+
+            match error {
+                DataConnectorError::InvalidConfigurationNoSource { message, .. } => {
+                    assert!(
+                        message.contains("OAuth2 authentication parameters are not supported"),
+                        "file_format {file_format}: expected unsupported OAuth2 params error, got: {message}"
+                    );
+                    assert!(
+                        message.contains("'auth_token_url'")
+                            && message.contains("'auth_grant_type'"),
+                        "file_format {file_format}: expected the configured OAuth2 params in the error, got: {message}"
+                    );
+                    assert!(
+                        !message.contains("auth_client_secret"),
+                        "file_format {file_format}: error should not mention unset OAuth2 params, got: {message}"
+                    );
+                    assert!(
+                        message.contains("dynamic JSON HTTP API dataset"),
+                        "file_format {file_format}: expected dynamic JSON guidance in error, got: {message}"
+                    );
+                }
+                other => panic!(
+                    "file_format {file_format}: expected InvalidConfigurationNoSource, got: {other}"
+                ),
+            }
+        }
+    }
+
+    /// The `json` arm already consulted the dynamic-API gate, so `OAuth2` params
+    /// route it to the JSON API provider. The new guard must not intercept it.
+    #[tokio::test]
+    async fn test_http_json_format_with_oauth_params_stays_on_the_api_path() {
+        let connector = test_connector_with(&[
+            ("file_format", "json"),
+            ("auth_token_url", "https://example.com/oauth/token"),
+        ])
+        .await;
+        let dataset =
+            test_dataset("https://example.com/data.json", RefreshMode::Append, None).await;
+
+        assert!(
+            !connector.is_structured_format(&dataset),
+            "an OAuth2 param must route a JSON dataset to the dynamic API provider"
+        );
+
+        // Reaches `resolve_oauth2_auth`, which rejects the refresh-token grant
+        // without a refresh token — proof the auth config was validated rather
+        // than dropped.
+        let error = connector
+            .read_provider(&dataset)
+            .await
+            .expect_err("OAuth2 config without a refresh token should fail validation");
+        assert!(
+            matches!(
+                &error,
+                DataConnectorError::InvalidConfigurationNoSource { message, .. }
+                    if message.contains("http_auth_refresh_token")
+            ),
+            "expected OAuth2 refresh-token validation error, got: {error}"
+        );
+    }
+
+    /// A structured dataset keeps loading when no `OAuth2` param is set — with or
+    /// without `http_headers`, which only warns because it is used for far more
+    /// than authentication.
+    #[tokio::test]
+    async fn test_http_structured_format_does_not_reject_non_oauth_params() {
+        let dataset = test_dataset("https://example.com/data.csv", RefreshMode::Full, None).await;
+
+        for extra in [
+            &[][..],
+            &[("http_headers", "Authorization: Bearer token")][..],
+        ] {
+            let mut params = vec![("file_format", "csv")];
+            params.extend_from_slice(extra);
+            let connector = test_connector_with(&params).await;
+
+            connector
+                .ensure_auth_supported_for_structured_dataset(&dataset)
+                .expect("a structured dataset without OAuth2 params should pass the guard");
         }
     }
 

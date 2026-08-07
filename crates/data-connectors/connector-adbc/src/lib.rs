@@ -30,7 +30,7 @@ use datafusion_table_providers::sql::db_connection_pool::adbcpool::{
 };
 use datafusion_table_providers::sql::db_connection_pool::dbconnection::query_arrow;
 use futures::TryStreamExt;
-use runtime::component::dataset::Dataset;
+use runtime::component::dataset::{Dataset, DatasetSpec};
 #[cfg(test)]
 use sha2::{Digest, Sha256};
 use snafu::prelude::*;
@@ -952,7 +952,7 @@ fn infer_bigquery_namespace(component: &ConnectorComponent) -> ConnectionNamespa
     }
 }
 
-fn infer_bigquery_namespace_from_dataset(dataset: &Dataset) -> ConnectionNamespace {
+fn infer_bigquery_namespace_from_dataset(dataset: &DatasetSpec) -> ConnectionNamespace {
     let dialect = datafusion::sql::sqlparser::dialect::GenericDialect {};
     dataset.parse_path(true, Some(&dialect)).map_or_else(
         |_| infer_bigquery_namespace_from_path(dataset.path()),
@@ -1605,8 +1605,7 @@ mod tests {
                 parameters,
                 unsupported_type_action: None,
                 component: ConnectorComponent::from(dataset),
-                app: None,
-                runtime: None,
+                context: None,
                 io_runtime: tokio::runtime::Handle::current(),
             }
         };
@@ -1639,8 +1638,7 @@ mod tests {
                 parameters,
                 unsupported_type_action: None,
                 component: ConnectorComponent::from(&dataset),
-                app: None,
-                runtime: None,
+                context: None,
                 io_runtime: tokio::runtime::Handle::current(),
             }
         };
@@ -1769,8 +1767,7 @@ mod tests {
                 parameters,
                 unsupported_type_action: None,
                 component: ConnectorComponent::from(dataset),
-                app: None,
-                runtime: None,
+                context: None,
                 io_runtime: tokio::runtime::Handle::current(),
             }
         };

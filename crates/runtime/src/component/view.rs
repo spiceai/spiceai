@@ -232,6 +232,14 @@ impl AccelerationSource for View {
         &self.name
     }
 
+    fn connector_name(&self) -> Option<&str> {
+        // A view has no `from:` — its rows come from its SQL, not a connector — so
+        // there is no connector default to apply. `ViewBuilder::try_from` also
+        // rejects every refresh mode except `full`, which is the fallback a `None`
+        // resolves to.
+        None
+    }
+
     fn time_column(&self) -> Option<&str> {
         self.time_column.as_deref()
     }

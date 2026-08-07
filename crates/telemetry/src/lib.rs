@@ -295,6 +295,35 @@ pub fn track_spilled_bytes(value: u64, dimensions: &[KeyValue]) {
         .add(value, dimensions);
 }
 
+static PROCESS_RESIDENT_MEMORY_BYTES: OnceLock<Gauge<u64>> = OnceLock::new();
+
+/// Records the process's resident set size — the number the kernel's OOM
+/// decision is made on. Budgets and pool gauges describe intent; this describes
+/// fact, and the gap between them is the off-pool/unaccounted memory.
+///
+/// Resident memory is operator observability, not product-usage telemetry, so
+/// this binds to the OpenTelemetry **global** provider that `init_metrics`
+/// installs with the operator's Prometheus `/metrics` and OTLP readers — not to
+/// the anonymous-telemetry [`meter::METER`], which would never reach an
+/// operator's dashboard. The meter handle is fetched fresh rather than cached,
+/// for the reason `cayenne::operational_meter` documents: caching binds
+/// permanently to whatever provider is global at first access, so the `OnceLock`
+/// holds only the built gauge, whose construction is deferred to the first
+/// record — always after `init_metrics` on this 2s sampling path.
+pub fn track_process_resident_memory_bytes(bytes: u64, dimensions: &[KeyValue]) {
+    PROCESS_RESIDENT_MEMORY_BYTES
+        .get_or_init(|| {
+            global::meter("process")
+                .u64_gauge("process_resident_memory_bytes")
+                .with_description(
+                    "Resident set size of the spiced process. Budgets and pool gauges describe intent; this describes fact, and the gap between them is the off-pool/unaccounted memory.",
+                )
+                .with_unit("By")
+                .build()
+        })
+        .record(bytes, dimensions);
+}
+
 static QUERY_SPILLED_ROWS: OnceLock<Counter<u64>> = OnceLock::new();
 
 pub fn track_spilled_rows(value: u64, dimensions: &[KeyValue]) {
@@ -412,6 +441,71 @@ pub fn track_hash_index_lookup_rows(rows: u64, dimensions: &[KeyValue]) {
 /// just parked" signal — require the `tokio_unstable` cfg at build time
 /// (`RUSTFLAGS="--cfg tokio_unstable"`); without it only the stable gauges register, so
 /// default and CI builds are unaffected.
+/// Registers the CPU-sizing gauges, so a mis-sized deployment is greppable
+/// across a fleet rather than diagnosed pod-by-pod.
+///
+/// Three quantities, deliberately separate: `spiced_cpu_budget_*` is the value
+/// the runtime *uses*, while `spiced_cpu_limit_millicores` and
+/// `spiced_cpu_request_millicores` are the cgroup *inputs* it was chosen
+/// against. Comparing them is what distinguishes a pod sized for its request
+/// from one sized for its whole node. `source` is `CpuSource::as_str` — the rung
+/// of the detection ladder the budget came from.
+///
+/// `limit` and `request` are `None` when the cgroup expresses no such value; the
+/// gauge then reports nothing rather than `0`, which would be indistinguishable
+/// from a real zero.
+///
+/// Like [`register_tokio_runtime_metrics`], the binary MUST call this once
+/// AFTER `init_metrics` has installed the Prometheus meter.
+///
+/// Takes plain scalars rather than the budget itself: `telemetry` is a
+/// foundation crate and does not depend on `cpu-budget`.
+pub fn register_cpu_budget_metrics(
+    cores: u64,
+    millicores: u64,
+    source: &'static str,
+    limit_millicores: Option<u64>,
+    request_millicores: Option<u64>,
+) {
+    let meter = global::meter("cpu_budget");
+
+    let _ = meter
+        .u64_observable_gauge("spiced_cpu_budget_cores")
+        .with_description("CPU cores the runtime sizes itself for, and where that value came from.")
+        .with_unit("{cpu}")
+        .with_callback(move |obs| obs.observe(cores, &[KeyValue::new("source", source)]))
+        .build();
+
+    let _ = meter
+        .u64_observable_gauge("spiced_cpu_budget_millicores")
+        .with_description(
+            "CPU millicores the runtime sizes itself for, and where that value came from.",
+        )
+        .with_unit("{millicpu}")
+        .with_callback(move |obs| obs.observe(millicores, &[KeyValue::new("source", source)]))
+        .build();
+
+    if let Some(limit) = limit_millicores {
+        let _ = meter
+            .u64_observable_gauge("spiced_cpu_limit_millicores")
+            .with_description("CPU limit from the cgroup CPU quota (Kubernetes limits.cpu).")
+            .with_unit("{millicpu}")
+            .with_callback(move |obs| obs.observe(limit, &[]))
+            .build();
+    }
+
+    if let Some(request) = request_millicores {
+        let _ = meter
+            .u64_observable_gauge("spiced_cpu_request_millicores")
+            .with_description(
+                "CPU request inferred from the cgroup CPU share (Kubernetes requests.cpu). Reported only; never used for sizing.",
+            )
+            .with_unit("{millicpu}")
+            .with_callback(move |obs| obs.observe(request, &[]))
+            .build();
+    }
+}
+
 pub fn register_tokio_runtime_metrics(handles: Vec<(&'static str, tokio::runtime::Handle)>) {
     if handles.is_empty() {
         return;
@@ -957,6 +1051,46 @@ pub mod cayenne {
     /// the query memory limit. Published once via [`register_compaction_metrics`].
     pub fn track_compaction_memory_pool_bytes(bytes: u64, dimensions: &[KeyValue]) {
         compaction_memory_pool_bytes().record(bytes, dimensions);
+    }
+
+    static QUERY_MEMORY_POOL_USED_BYTES: OnceLock<Gauge<u64>> = OnceLock::new();
+
+    /// Build-once accessor for the live query-pool usage gauge.
+    fn query_memory_pool_used_bytes() -> &'static Gauge<u64> {
+        QUERY_MEMORY_POOL_USED_BYTES.get_or_init(|| {
+            operational_meter()
+                .u64_gauge("query_memory_pool_used_bytes")
+                .with_description(
+                    "Live bytes reserved in the query memory pool, excluding the in-memory CDC tier's mirror account.",
+                )
+                .with_unit("By")
+                .build()
+        })
+    }
+
+    /// Records live query-pool usage. Sampled by the mem-tier repartition loop,
+    /// which already reads the pool on an interval; without this gauge the value
+    /// is computed every two seconds and visible nowhere.
+    pub fn track_query_memory_pool_used_bytes(bytes: u64, dimensions: &[KeyValue]) {
+        query_memory_pool_used_bytes().record(bytes, dimensions);
+    }
+
+    static COMPACTION_MEMORY_POOL_USED_BYTES: OnceLock<Gauge<u64>> = OnceLock::new();
+
+    /// Build-once accessor for the live compaction-pool usage gauge.
+    fn compaction_memory_pool_used_bytes() -> &'static Gauge<u64> {
+        COMPACTION_MEMORY_POOL_USED_BYTES.get_or_init(|| {
+            operational_meter()
+                .u64_gauge("cayenne_compaction_memory_pool_used_bytes")
+                .with_description("Live bytes reserved in the dedicated compaction memory pool.")
+                .with_unit("By")
+                .build()
+        })
+    }
+
+    /// Records live compaction-pool usage, sampled alongside the query pool.
+    pub fn track_compaction_memory_pool_used_bytes(bytes: u64, dimensions: &[KeyValue]) {
+        compaction_memory_pool_used_bytes().record(bytes, dimensions);
     }
 
     static COMPACTION_MEMORY_EXHAUSTED: OnceLock<Counter<u64>> = OnceLock::new();
@@ -1738,6 +1872,40 @@ pub mod cayenne {
                     .build()
             })
             .record(duration.as_secs_f64() * 1000.0, dimensions);
+    }
+
+    static METASTORE_INCREMENTAL_VACUUM_MS: OnceLock<Histogram<f64>> = OnceLock::new();
+    static METASTORE_INCREMENTAL_VACUUM_PAGES: OnceLock<Counter<u64>> = OnceLock::new();
+
+    /// Records one off-hot-path incremental-vacuum pass over the metastore
+    /// freelist: wall-clock duration of the pass (caller-supplied), and how many
+    /// freelist pages it returned to the filesystem. Only emitted for a pass that
+    /// reclaimed something, so the histogram describes real reclamation rather
+    /// than being diluted by the no-op ticks of a database whose freelist is
+    /// already drained.
+    pub fn track_metastore_incremental_vacuum(duration: Duration, pages: u64) {
+        METASTORE_INCREMENTAL_VACUUM_MS
+            .get_or_init(|| {
+                operational_meter()
+                    .f64_histogram("cayenne_metastore_incremental_vacuum_ms")
+                    .with_description(
+                        "Wall-clock time of a Cayenne metastore incremental-vacuum pass.",
+                    )
+                    .with_unit("ms")
+                    .with_boundaries(CONTENTION_MS_HISTOGRAM_BUCKETS.to_vec())
+                    .build()
+            })
+            .record(duration.as_secs_f64() * 1000.0, &[]);
+        METASTORE_INCREMENTAL_VACUUM_PAGES
+            .get_or_init(|| {
+                operational_meter()
+                    .u64_counter("cayenne_metastore_incremental_vacuum_pages_total")
+                    .with_description(
+                        "Freelist pages reclaimed by Cayenne metastore incremental vacuum.",
+                    )
+                    .build()
+            })
+            .add(pages, &[]);
     }
 
     // METRIC 3 — inline admission flips. One increment each time a CDC batch that

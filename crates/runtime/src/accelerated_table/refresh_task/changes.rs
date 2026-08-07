@@ -15,18 +15,24 @@ limitations under the License.
 */
 use super::DatasetMetricLabels;
 use super::RefreshTask;
+use super::{collect_all_indexes, indexes_from_federated};
 use crate::accelerated_table::refresh::Refresh;
-use crate::accelerated_table::refresh_task::deletion::build_batch_delete_expr_from_change_batch;
+use crate::accelerated_table::refresh_task::deletion::{
+    build_batch_delete_expr_from_change_batch, build_pk_only_batch_from_change_batch,
+};
 use crate::component::dataset::OnSchemaChange;
 use crate::datafusion::error::{find_datafusion_root, format_datafusion_error};
-use crate::schema_evolution::{emit_schema_evolution_event, evolution_allowed};
+use crate::schema_evolution::{
+    SCHEMA_EVOLUTION_APPLIED, SCHEMA_EVOLUTION_DETECTED, SCHEMA_EVOLUTION_FAILED,
+    emit_schema_evolution_event, evolution_allowed, schema_evolution_labels, widening_plan_kind,
+};
 use crate::{dataupdate::StreamingDataUpdateExecutionPlan, status};
 use arrow::array::{
     Array, ArrayRef, Int32Array, Int64Array, RecordBatch, StringArray, UInt32Array,
 };
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow_tools::record_batch::try_cast_to;
-use arrow_tools::schema_evolution::{self, EvolutionContext, SchemaEvolution, WideningPlan};
+use arrow_tools::schema_evolution::{self, EvolutionContext, SchemaEvolution};
 use cache::Caching;
 #[cfg(not(windows))]
 use cayenne::{CayenneCdcWrite, CayenneTableProvider};
@@ -50,11 +56,8 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::sql::TableReference;
 use datafusion::{execution::context::SessionContext, physical_plan::collect};
 use futures::{StreamExt, stream};
-use opentelemetry::KeyValue;
 use runtime_datafusion::execution_plan::schema_cast::SchemaCastScanExec;
-use runtime_datafusion_index::{
-    INDEXED_INNER, IndexedTableProvider, InnerProviderFn, find_concrete_table_provider_with,
-};
+use runtime_datafusion_index::{IndexedTableProvider, LayerWalk, find_concrete_table_provider_in};
 use runtime_metrics::acceleration as metrics;
 use runtime_search::embeddings::table::EmbeddingTable;
 use runtime_table_partition::provider::PartitionTableProvider;
@@ -614,64 +617,6 @@ fn schema_evolution_first_warn(key: String) -> bool {
     SCHEMA_EVOLUTION_WARNING_KEYS
         .lock()
         .insert_new(key, SCHEMA_EVOLUTION_WARNING_KEY_LIMIT)
-}
-
-static SCHEMA_EVOLUTION_METER: std::sync::LazyLock<opentelemetry::metrics::Meter> =
-    std::sync::LazyLock::new(|| opentelemetry::global::meter("schema_evolution"));
-
-pub(crate) static SCHEMA_EVOLUTION_DETECTED: std::sync::LazyLock<
-    opentelemetry::metrics::Counter<u64>,
-> = std::sync::LazyLock::new(|| {
-    SCHEMA_EVOLUTION_METER
-        .u64_counter("schema_evolution_detected")
-        .with_description(
-            "Schema changes detected between an incoming source schema and the stored/accelerator schema.",
-        )
-        .build()
-});
-
-pub(crate) static SCHEMA_EVOLUTION_APPLIED: std::sync::LazyLock<
-    opentelemetry::metrics::Counter<u64>,
-> = std::sync::LazyLock::new(|| {
-    SCHEMA_EVOLUTION_METER
-        .u64_counter("schema_evolution_applied")
-        .with_description("Schema evolutions applied to the accelerator or cached source schema.")
-        .build()
-});
-
-pub(crate) static SCHEMA_EVOLUTION_FAILED: std::sync::LazyLock<
-    opentelemetry::metrics::Counter<u64>,
-> = std::sync::LazyLock::new(|| {
-    SCHEMA_EVOLUTION_METER
-        .u64_counter("schema_evolution_failed")
-        .with_description(
-            "Schema changes that were not applied: incompatible, blocked by policy, or requiring a restart.",
-        )
-        .build()
-});
-
-pub(crate) fn schema_evolution_labels(
-    dataset: &str,
-    kind: &'static str,
-    action: &'static str,
-) -> [KeyValue; 3] {
-    [
-        KeyValue::new("dataset", dataset.to_string()),
-        KeyValue::new("kind", kind),
-        KeyValue::new("action", action),
-    ]
-}
-
-/// Dominant change kind of a widening plan for the `kind` metric label.
-#[must_use]
-pub(crate) fn widening_plan_kind(plan: &WideningPlan) -> &'static str {
-    if !plan.widened_columns.is_empty() {
-        "widened_types"
-    } else if !plan.relaxed_nullability.is_empty() {
-        "nullability"
-    } else {
-        "added_columns"
-    }
 }
 
 /// Per-dataset CDC schema-evolution settings, installed at dataset
@@ -1912,42 +1857,44 @@ impl RefreshTask {
             }
             return true;
         }
-        let mut committers: Vec<Box<dyn cdc::CommitChange + Send + Sync>> =
-            Vec::with_capacity(envelopes.len());
-        let mut batches: Vec<ChangeBatch> = Vec::with_capacity(envelopes.len());
-        // Time the deferred-batch build loop: for sources that defer the decode
-        // (MySQL binlog rows), each envelope pays a `spawn_blocking` round-trip
-        // here — a per-envelope cost otherwise invisible between the recv_wait
-        // and coalesce stage timers.
+        // Time the deferred-batch build: sources that defer the decode (MySQL
+        // binlog and Postgres logical-replication rows) pay one `spawn_blocking`
+        // round trip per burst here — a cost otherwise invisible between the
+        // recv_wait and coalesce stage timers.
         let decode_start = Instant::now();
-        for env in envelopes {
-            // Build the (possibly deferred) batch here, on the per-dataset apply
-            // task — off the source's shared read/route path. A deferred build
-            // can fail on per-row value typing that only surfaces at build time
-            // (e.g. an unmergeable unchanged-TOAST column under REPLICA IDENTITY
-            // DEFAULT); treat it as a terminal error for this dataset, mirroring
-            // the eager path's pump-side fatal. Committers collected so far are
-            // dropped without acking, so the source re-streams on reconnect.
-            let (committer, batch, _is_ready) = match env.into_parts_offloaded().await {
-                Ok(parts) => parts,
-                Err(e) => {
-                    let error_message = format!(
-                        "Failed to build CDC change batch for {}: {e}",
-                        context.dataset_name,
-                    );
-                    tracing::error!("{error_message}");
-                    self.set_refresh_status(
-                        context.refresh_sql,
-                        status::ComponentStatus::error_with_message(error_message),
-                    )
-                    .await;
-                    return false;
-                }
-            };
-            committers.push(committer);
-            batches.push(batch);
-        }
+        // Build on the per-dataset apply task, off the source's shared
+        // read/route path. A deferred build can fail on per-row value typing that
+        // only surfaces at build time (e.g. an unmergeable unchanged-TOAST column
+        // under REPLICA IDENTITY DEFAULT); treat it as terminal for this dataset,
+        // mirroring the eager path's pump-side fatal. The burst's committers are
+        // dropped unacked, so the source re-streams on reconnect.
+        let parts = match cdc::into_parts_offloaded_burst(envelopes).await {
+            Ok(parts) => parts,
+            Err(e) => {
+                let error_message = format!(
+                    "Failed to build CDC change batch for {}: {e}",
+                    context.dataset_name,
+                );
+                tracing::error!("{error_message}");
+                self.set_refresh_status(
+                    context.refresh_sql,
+                    status::ComponentStatus::error_with_message(error_message),
+                )
+                .await;
+                return false;
+            }
+        };
         record_cdc_fixed_cost(context.metric_labels, "decode", decode_start);
+
+        // Readiness was already folded into `any_ready` before the heartbeat
+        // retain, so the per-envelope flag is spent here.
+        let (committers, batches): (
+            Vec<Box<dyn cdc::CommitChange + Send + Sync>>,
+            Vec<ChangeBatch>,
+        ) = parts
+            .into_iter()
+            .map(|(committer, batch, _is_ready)| (committer, batch))
+            .unzip();
 
         // Mixed-schema runs (mid-stream schema evolution): `concat_change_batches`
         // requires equal schemas. When the dataset's policy allows evolution,
@@ -2652,12 +2599,12 @@ impl RefreshTask {
     /// loses pipelined finalization (backgrounded publish, no blocking
     /// `apply_on_conflict_deletions`).
     ///
-    /// Uses [`find_concrete_table_provider_with`] with a *write-transparent* set
-    /// of accessors rather than the runtime-wide `DEFAULT_INNER_FNS`: only
-    /// wrappers whose `insert_into` is a pass-through may be peeled here.
+    /// Uses [`LayerWalk::Write`], which steps only through wrappers whose
+    /// `insert_into` is a pass-through (`PolyTableProvider` to its writer side,
+    /// `IndexedTableProvider`) — see the layer table in [`crate::table_layers`].
     ///
-    /// NOTE: `UpsertDedupTableProvider` is intentionally absent from the set.
-    /// Unlike `PolyTableProvider` (delegates writes) and `IndexedTableProvider`
+    /// NOTE: `UpsertDedupTableProvider` is opaque to the write walk. Unlike
+    /// `PolyTableProvider` (delegates writes) and `IndexedTableProvider`
     /// (`insert_into` is a pass-through), it *rewrites* the write on insert
     /// (dedup / last-write-wins via `UpsertDedupExec`). Routing CDC past it to the
     /// inner provider would bypass that transform, so a dedup-configured table
@@ -2665,15 +2612,10 @@ impl RefreshTask {
     /// semantics) and emits the fallback warning below.
     #[cfg(not(windows))]
     fn cayenne_accelerator(&self) -> Option<&CayenneTableProvider> {
-        /// Peels [`PolyTableProvider`] to its writer side (write-transparent).
-        const POLY_WRITER_INNER: InnerProviderFn = |tbl| {
-            tbl.downcast_ref::<data_components::poly::PolyTableProvider>()
-                .map(data_components::poly::PolyTableProvider::writer_ref)
-        };
-
-        find_concrete_table_provider_with::<CayenneTableProvider>(
+        find_concrete_table_provider_in::<CayenneTableProvider>(
             &self.accelerator,
-            &[POLY_WRITER_INNER, INDEXED_INNER],
+            crate::table_layers::TABLE_PROVIDER_LAYERS,
+            LayerWalk::Write,
         )
     }
 
@@ -2933,7 +2875,27 @@ impl RefreshTask {
                     }
                 };
 
-                if !handled_by_cayenne_cdc_path {
+                if handled_by_cayenne_cdc_path {
+                    // Cayenne's fast CDC-delete path bypasses `TableProvider::delete_from`
+                    // entirely, so it never reaches `IndexedTableProvider::delete_from`'s
+                    // index-aware handling on either side — drive index deletion explicitly
+                    // here instead, across both the accelerator and federated sides (an
+                    // external-store vector/search index, e.g. S3 Vectors, is attached only
+                    // on the federated side; see `collect_all_indexes`). Best-effort: an index
+                    // failure is logged, not propagated, so it can't block the (already-applied)
+                    // accelerator-side delete above.
+                    if let Some(keys) = build_pk_only_batch_from_change_batch(change_batch, chunk)?
+                    {
+                        for index in collect_all_indexes(&self.accelerator, &self.federated) {
+                            if let Err(e) = index.delete_by_keys(keys.clone()).await {
+                                tracing::error!(
+                                    "Index '{}' failed to delete entries for a CDC delete via the Cayenne fast path (best-effort, continuing): {e}",
+                                    index.name()
+                                );
+                            }
+                        }
+                    }
+                } else {
                     let delete_plan = self
                         .accelerator
                         .delete_from(session_state, vec![combined])
@@ -2944,6 +2906,24 @@ impl RefreshTask {
                         .await
                         .map_err(find_datafusion_root)
                         .context(crate::accelerated_table::FailedToWriteDataSnafu)?;
+
+                    // `self.accelerator.delete_from` above already drives any
+                    // `IndexedTableProvider` wrapping the accelerator itself (e.g. the DuckDB
+                    // vector engine) through its own index-aware handling. It cannot reach an
+                    // index attached only on the federated side (e.g. S3 Vectors, Elasticsearch)
+                    // — that's a distinct `TableProvider` chain — so drive those explicitly here.
+                    // Best-effort: logged, not propagated.
+                    if let Some(keys) = build_pk_only_batch_from_change_batch(change_batch, chunk)?
+                    {
+                        for index in indexes_from_federated(&self.federated) {
+                            if let Err(e) = index.delete_by_keys(keys.clone()).await {
+                                tracing::error!(
+                                    "Index '{}' failed to delete entries for a CDC delete (best-effort, continuing): {e}",
+                                    index.name()
+                                );
+                            }
+                        }
+                    }
                 }
                 wrote = true;
             }
@@ -3045,7 +3025,7 @@ fn cdc_item_budget_bytes(item: &Result<cdc::ChangeEnvelope, cdc::StreamError>) -
     // envelope from a schema-aware estimate of its buffered wire size, a built
     // one from its actual Arrow size. Used only to bound how much a single burst
     // accumulates before applying; the real Arrow build is deferred to apply
-    // time (`into_parts_offloaded`), off the source's shared read path.
+    // time (`into_parts_offloaded_burst`), off the source's shared read path.
     item.as_ref().map_or(0, cdc::ChangeEnvelope::encoded_len)
 }
 
@@ -4097,6 +4077,64 @@ mod tests {
         let result = group_into_sub_batches(&change_batch);
 
         assert!(result.is_empty(), "Empty batch should return empty vector");
+    }
+
+    #[test]
+    fn build_pk_only_batch_projects_just_the_key_columns() {
+        let change_batch = create_test_change_batch(
+            vec!["d", "d"],
+            &[vec!["id"], vec!["id"]],
+            vec![1, 2],
+            vec![Some("Alice"), Some("Bob")],
+        );
+
+        let keys = build_pk_only_batch_from_change_batch(&change_batch, &[0, 1])
+            .expect("should not error")
+            .expect("keyed rows produce a batch");
+
+        assert_eq!(
+            keys.num_columns(),
+            1,
+            "only the 'id' key column, not 'name'"
+        );
+        assert_eq!(keys.schema().field(0).name(), "id");
+        let id_col = keys
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("id column is Int32");
+        assert_eq!(id_col.values(), &[1, 2]);
+    }
+
+    #[test]
+    fn build_pk_only_batch_selects_requested_rows_only() {
+        let change_batch = create_test_change_batch(
+            vec!["d", "d", "d"],
+            &[vec!["id"], vec!["id"], vec!["id"]],
+            vec![10, 20, 30],
+            vec![Some("A"), Some("B"), Some("C")],
+        );
+
+        let keys = build_pk_only_batch_from_change_batch(&change_batch, &[0, 2])
+            .expect("should not error")
+            .expect("keyed rows produce a batch");
+
+        let id_col = keys
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("id column is Int32");
+        assert_eq!(id_col.values(), &[10, 30]);
+    }
+
+    #[test]
+    fn build_pk_only_batch_empty_row_indices_returns_none() {
+        let change_batch =
+            create_test_change_batch(vec!["d"], &[vec!["id"]], vec![1], vec![Some("Alice")]);
+
+        let result =
+            build_pk_only_batch_from_change_batch(&change_batch, &[]).expect("should not error");
+        assert!(result.is_none());
     }
 
     #[test]

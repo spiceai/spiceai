@@ -320,3 +320,12 @@ mod tests {
             .expect_err("should error parsing identifier");
     }
 }
+pub mod schema_evolution;
+
+/// Which role this runtime plays in a cluster deployment. Parsed from the CLI, so
+/// it carries clap's `ValueEnum`.
+#[derive(Debug, Clone, PartialEq, Eq, clap::ValueEnum)]
+pub enum ClusterRole {
+    Scheduler,
+    Executor,
+}

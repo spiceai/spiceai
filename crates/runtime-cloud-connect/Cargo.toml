@@ -18,14 +18,24 @@ async-trait = { workspace = true }
 # the same crypto backend rcgen generates the keypair with (see the rcgen
 # entry below), so the PKCS#8 we persist always round-trips.
 aws-lc-rs = "1"
+cloud-connect-crypto = { workspace = true }
 base64 = { workspace = true }
+# AEAD for the at-rest delivered-secrets cache (`secret_cache.rs`). The wire
+# format's crypto lives in `cloud-connect-crypto`; this is a local file format
+# with a local, non-rotating key, so it is deliberately not that path.
+chacha20poly1305 = { workspace = true }
 chrono = { workspace = true }
+# OS randomness for the cache key and its nonces, matching how
+# `cloud-connect-crypto` draws key material.
+getrandom = { version = "0.3", features = ["std"] }
 dirs = "6"
 gethostname = { workspace = true }
 # PEM → DER decoding for the renewal proof-of-possession signature (the
 # private key and CSR are held as PEM; the signer takes raw DER bytes).
 pem = { workspace = true }
 prost = { workspace = true }
+# `google.protobuf.Timestamp`, which every time-valued field on the wire uses.
+prost-types = "0.14"
 rand = { workspace = true }
 # Client-side keypair + PKCS#10 CSR generation for the enrollment flow.
 # Pin the aws_lc_rs backend (matching `crates/runtime`, which forces it via
@@ -44,6 +54,9 @@ tokio-stream = { workspace = true }
 tonic = { workspace = true }
 tonic-prost = "0.14"
 tracing = { workspace = true }
+# Key material and decrypted secret values are held in `Zeroizing` so a freed
+# buffer never leaves plaintext in the heap.
+zeroize = "1.8"
 
 [build-dependencies]
 tonic-prost-build = "0.14"

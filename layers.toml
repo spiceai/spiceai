@@ -120,11 +120,11 @@ tier = "foundation"
 runtime = "runtime"
 # Config-only component specs (DatasetSpec/CatalogSpec/ViewSpec + their config
 # submodules) carved out of the `runtime` crate body. It names nothing from
-# `runtime` (no Arc<Runtime>/App/secrets/datafusion), so it compiles in parallel
-# with `runtime` rather than inside it. Kept in the `runtime` tier alongside the
-# other runtime-* crates; its own deps are all shared-utility/foundation, so it
-# could equally sit in shared-utility.
-runtime-component = "runtime"
+# `runtime` (no Arc<Runtime>/App/secrets/datafusion) and its own deps are all
+# shared-utility/foundation, so it sits below `runtime` — which is what lets the
+# interface crates a connector needs (data-connector-api) name a component's
+# configuration without pulling in the orchestrator.
+runtime-component = "shared-utility"
 # Extensions that sit above the runtime crate (depend on `runtime`).
 spice-cloud = "extension"
 tpc-extension = "extension"
@@ -154,6 +154,7 @@ chunking = "foundation"
 # Shared by implementations outside this repo via a git dependency, so its
 # dependency closure has to stay small — foundation is also a budget here.
 cloud-connect-crypto = "foundation"
+cpu-budget = "foundation"
 dataformat-json = "foundation"
 datafusion-dml = "foundation"
 datafusion-flightsql = "foundation"
@@ -182,9 +183,15 @@ runtime-datafusion-index = "foundation"
 runtime-metrics = "foundation"
 runtime-object-store = "foundation"
 runtime-parameter-spec = "foundation"
+runtime-parameters-typed = "foundation"
 runtime-proto = "foundation"
 runtime-query-engine = "foundation"
 runtime-rate-control = "foundation"
+# Host/container resource introspection (cgroup-aware memory totals, process usage
+# monitoring). A leaf utility whose only workspace dep is `util`, so it belongs at
+# foundation — stated explicitly rather than left to `default_tier`, which would
+# silently place it in shared-utility.
+runtime-resources = "foundation"
 runtime-status = "foundation"
 s3_vectors = "foundation"
 s3_vectors_metadata_filter = "foundation"

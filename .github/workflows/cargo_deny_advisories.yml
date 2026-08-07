@@ -20,7 +20,7 @@ jobs:
       issues: write
 
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -64,7 +64,7 @@ jobs:
             const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
             const body = [
               marker,
-'`cargo deny check advisories` found Rust dependency advisory violations.',
+              '`cargo deny check advisories` found Rust dependency advisory violations.',
               '',
               `Run: ${runUrl}`,
               `Commit: ${context.sha}`,
@@ -74,7 +74,9 @@ jobs:
               '~~~',
             ].join('\n');
 
-            const { data: issues } = await github.rest.issues.listForRepo({
+            // Paginate: the marker issue falls off the first page of open issues
+            // within days, and missing it opens a duplicate on every run.
+            const issues = await github.paginate(github.rest.issues.listForRepo, {
               owner: context.repo.owner,
               repo: context.repo.repo,
               state: 'open',

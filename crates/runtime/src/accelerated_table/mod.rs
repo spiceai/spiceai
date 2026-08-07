@@ -1008,6 +1008,7 @@ impl Builder {
             let retention_check_handle = tokio::spawn(AcceleratedTable::start_retention_check(
                 self.dataset_name.clone(),
                 Arc::clone(&self.accelerator),
+                Arc::clone(&self.federated),
                 retention,
                 self.caching.clone(),
                 self.io_runtime.clone(),

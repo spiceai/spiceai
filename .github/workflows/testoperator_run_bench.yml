@@ -139,7 +139,7 @@ jobs:
           --health-retries 10
           --shm-size=1g
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Rust toolchain
         uses: ./.github/actions/setup-rust
@@ -253,7 +253,13 @@ jobs:
           DB_NAME="${QUERY_SET}_sf${SCALE_FACTOR}"
 
           sudo apt-get update -y
-          sudo apt-get install -y postgresql-client
+          # make is needed before the "already seeded" check below, not just by the
+          # seeding path further down: a database that already has data still runs
+          # `make pg-create-index`, and on a runner without make preinstalled that
+          # exits 127 before the later install line is ever reached. Only a
+          # pre-provisioned target takes that branch, so it surfaced solely on
+          # SF100 while the always-empty SF1/SF10 containers stayed green.
+          sudo apt-get install -y postgresql-client make
 
           echo "Checking whether $DB_NAME already has data on $PGHOST..."
           set +e
@@ -296,21 +302,23 @@ jobs:
           # Require those scale factors to be pre-provisioned instead.
           if [ "$PGHOST" != "127.0.0.1" ]; then
             echo "::error::$DB_NAME is missing or empty on the hosted $PGHOST cluster. Scale factor $SCALE_FACTOR is too large to safely generate and load inline from a CI runner. Pre-provision it first, e.g.:"
-            echo "  cd test/tpc-bench && DB_HOST=$PGHOST DB_PORT=5432 DB_USER=postgres DB_NAME=$DB_NAME DBGEN_SCALE=$SCALE_FACTOR make tpch-init tpch-gen pg-init pg-load pg-create-index"
+            echo "  cd test/tpc-bench && DB_HOST=$PGHOST DB_PORT=5432 DB_USER=postgres DB_NAME=$DB_NAME DBGEN_SCALE=$SCALE_FACTOR make tpch-clone tpch-fleet-gen pg-init && DB_HOST=$PGHOST DB_PORT=5432 DB_USER=postgres DB_NAME=$DB_NAME TPCH_DATA_DIR=./tmp/fleet make pg-load && DB_HOST=$PGHOST DB_PORT=5432 DB_USER=postgres DB_NAME=$DB_NAME make pg-create-index"
             echo "(substitute the tpcds-* targets for a tpcds run)"
             exit 1
           fi
 
           echo "$DB_NAME is missing or empty on $PGHOST - seeding it now."
-          sudo apt-get install -y git make flex bison byacc
+          sudo apt-get install -y git
           if [ "$QUERY_SET" = "tpcds" ]; then
             # tpcds-kit's tools/Makefile hardcodes CC=gcc-9 on Linux; ubuntu-24.04's
             # default gcc isn't named gcc-9, so install it explicitly via the PPA.
             sudo add-apt-repository ppa:ubuntu-toolchain-r/ppa -y
             sudo apt-get update -y
-            sudo apt-get install -y gcc-9 g++-9
+            sudo apt-get install -y flex bison byacc gcc-9 g++-9
           else
-            sudo apt-get install -y gcc g++
+            # TPC-H data comes from the pinned DuckDB CLI (see tpch-fleet-gen), so
+            # nothing is compiled here - tpch-kit is only cloned for dss.ddl.
+            sudo apt-get install -y unzip
           fi
 
           if [ "$QUERY_SET" = "tpcds" ]; then
@@ -320,10 +328,10 @@ jobs:
             DB_HOST=$PGHOST DB_PORT=5432 DB_USER=postgres DB_NAME=$DB_NAME make pg-tpcds-load
             DB_HOST=$PGHOST DB_PORT=5432 DB_USER=postgres DB_NAME=$DB_NAME make pg-tpcds-create-index
           else
-            make tpch-init
-            DBGEN_SCALE=$SCALE_FACTOR make tpch-gen
+            make tpch-clone
+            DBGEN_SCALE=$SCALE_FACTOR make tpch-fleet-gen
             DB_HOST=$PGHOST DB_PORT=5432 DB_USER=postgres DB_NAME=$DB_NAME make pg-init
-            DB_HOST=$PGHOST DB_PORT=5432 DB_USER=postgres DB_NAME=$DB_NAME make pg-load
+            DB_HOST=$PGHOST DB_PORT=5432 DB_USER=postgres DB_NAME=$DB_NAME TPCH_DATA_DIR=./tmp/fleet make pg-load
             DB_HOST=$PGHOST DB_PORT=5432 DB_USER=postgres DB_NAME=$DB_NAME make pg-create-index
           fi
           echo "Seed complete: $DB_NAME on $PGHOST."
@@ -342,7 +350,7 @@ jobs:
 
       - name: Set up Python
         if: ${{ contains(github.event.inputs.spicepod_path, 'scylladb') || contains(github.event.inputs.spicepod_path, 'ducklake') }}
-        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.12'
 

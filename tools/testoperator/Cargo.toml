@@ -13,6 +13,9 @@ arrow.workspace = true
 arrow-json.workspace = true
 arrow_tools = { path = "../../crates/arrow_tools" }
 async-trait.workspace = true
+# Serves testoperator's own /health and /v1/ready (see `src/probe.rs`) — the same
+# router the runtime uses for the same two paths.
+axum.workspace = true
 aws-config.workspace = true
 aws-credential-types.workspace = true
 aws-sdk-dynamodb.workspace = true
@@ -26,6 +29,7 @@ futures.workspace = true
 itertools.workspace = true
 hf-hub = { workspace = true }
 insta.workspace = true
+parking_lot.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -35,7 +39,9 @@ spicepod = { path = "../../crates/spicepod" }
 system-adapter-protocol.workspace = true
 test-framework = { path = "../../crates/test-framework" }
 rand.workspace = true
-tokio.workspace = true
+# `net`: the TcpListener the liveness endpoints bind (the workspace default set
+# has no networking).
+tokio = { workspace = true, features = ["fs", "net"] }
 tokio-postgres = { workspace = true }
 tokio-util.workspace = true
 url.workspace = true

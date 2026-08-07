@@ -20,6 +20,7 @@ use crate::cluster::partition::get_partition_filter_exprs;
 use crate::dataaccelerator::BootstrapStatus;
 use crate::dataaccelerator::spice_sys::OpenOption;
 use crate::dataaccelerator::spice_sys::caching_engine::CachingEngineSys;
+use crate::dataaccelerator::spice_sys::is_shutdown_cancellation;
 use crate::init::dataset_initialization::DatasetInitialization;
 use crate::{
     AcceleratedTableInvalidChangesSnafu, AcceleratorEngineNotAvailableSnafu,
@@ -354,6 +355,12 @@ impl Runtime {
             .await
         {
             Ok(data_connector) => data_connector,
+            // This is the only failure this function raises, and reporting it is
+            // owned here: the component status, the `LOAD_ERROR` count, and one log
+            // line at the level the failure's permanence warrants. Callers -- both
+            // `try_load_dataset_once` and the hot-reload path in `update_dataset` --
+            // propagate it without reporting it again, so one failure is counted
+            // once and writes one status. See #12365.
             Err(err) => {
                 let ds_name = &ds.name;
                 self.status.update_dataset(
@@ -361,6 +368,18 @@ impl Runtime {
                     status::ComponentStatus::error_with_message(err.to_string()),
                 );
                 metrics::datasets::LOAD_ERROR.add(1, &[]);
+                if is_permanent_dataset_failure(&err) {
+                    error_spaced!(
+                        spaced_tracer,
+                        "Error initializing dataset {}. {err}",
+                        ds_name.table()
+                    );
+                    return PermanentDatasetFailureSnafu {
+                        dataset: ds_name.clone(),
+                        reason: err.to_string(),
+                    }
+                    .fail();
+                }
                 warn_spaced!(
                     spaced_tracer,
                     "Error initializing dataset {}. {err}",
@@ -424,6 +443,13 @@ impl Runtime {
                 ds_name,
                 status::ComponentStatus::error_with_message(err.to_string()),
             );
+            if is_permanent_dataset_failure(&err) {
+                return PermanentDatasetFailureSnafu {
+                    dataset: ds_name.clone(),
+                    reason: err.to_string(),
+                }
+                .fail();
+            }
             return Err(err);
         }
 
@@ -485,18 +511,13 @@ impl Runtime {
                 tracing::debug!(dataset = %ds.name, duration_ms = connector_start.elapsed().as_millis(), "Dataset connector created");
                 connector
             }
-            Err(err) => {
-                if !self.status.is_shutdown() {
-                    let ds_name = &ds.name;
-                    self.status.update_dataset(
-                        ds_name,
-                        status::ComponentStatus::error_with_message(err.to_string()),
-                    );
-                    metrics::datasets::LOAD_ERROR.add(1, &[]);
-                    warn_spaced!(spaced_tracer, "{} {err}", ds_name.table());
-                }
-                return Err(err);
-            }
+            // `load_dataset_connector` owns reporting for this failure -- the
+            // status, the `LOAD_ERROR` count, and a log line at the level its
+            // permanence warrants -- and raises no other error, so propagating it
+            // unreported leaves nothing unreported (#12365). Its reporting is
+            // unconditional, including during teardown, so this arm needs no
+            // `is_shutdown()` guard of its own to keep the count at one.
+            Err(err) => return Err(err),
         };
 
         // Check shutdown between connector load and registration.
@@ -960,16 +981,15 @@ impl Runtime {
                     status::ComponentStatus::error_with_message(err.to_string()),
                 );
                 metrics::datasets::LOAD_ERROR.add(1, &[]);
-                if let Error::UnableToAttachDataConnector {
-                    source: crate::datafusion::Error::RefreshSql { .. },
-                    connector_component: _,
-                    data_connector: _,
-                } = &err
-                {
+                if is_permanent_dataset_failure(&err) {
                     error_spaced!(spaced_tracer, "{}{err}", "");
-                } else {
-                    warn_spaced!(spaced_tracer, "{}{err}", "");
+                    return PermanentDatasetFailureSnafu {
+                        dataset: ds.name.clone(),
+                        reason: err.to_string(),
+                    }
+                    .fail();
                 }
+                warn_spaced!(spaced_tracer, "{}{err}", "");
 
                 Err(err)
             }
@@ -1076,11 +1096,9 @@ impl Runtime {
                 }
             }
             Err(e) => {
+                // `load_dataset_connector` set the error status for this failure.
+                // Only the hot-reload context it cannot know is added here (#12365).
                 tracing::error!("Unable to update dataset {}: {e}", ds.name);
-                self.status.update_dataset(
-                    &ds.name,
-                    status::ComponentStatus::error_with_message(e.to_string()),
-                );
             }
         }
     }
@@ -1265,7 +1283,7 @@ impl Runtime {
         let source = ds.source();
         let factory = dataconnector::get_connector_factory(source).await?;
 
-        let params = ConnectorParamsBuilder::new(source.into(), ds.into())
+        let params = ConnectorParamsBuilder::for_dataset(source.into(), ds)
             .build(self.secrets(), self.tokio_io_runtime())
             .await
             .ok()?;
@@ -1296,7 +1314,15 @@ impl Runtime {
     ) -> Result<Arc<dyn DataConnector>> {
         let source = ds.source();
 
-        let params = ConnectorParamsBuilder::new(source.into(), (&ds).into())
+        // Resolve the connector before building parameters. The builder resolves it too — it
+        // reads the factory's prefix and parameter list — and fails with
+        // `InvalidConnectorType`, which names no alternative, so it used to answer every
+        // typo'd `from:` before `UnknownDataConnector` could. See #12415.
+        if dataconnector::get_connector_factory(source).await.is_none() {
+            return Err(unknown_data_connector(source).await);
+        }
+
+        let params = ConnectorParamsBuilder::for_dataset(source.into(), &ds)
             .build(self.secrets(), self.tokio_io_runtime())
             .await
             .context(UnableToInitializeDataConnectorSnafu)?;
@@ -1310,18 +1336,9 @@ impl Runtime {
             if let Some(dc) = dataconnector::create_new_connector(source, params).await {
                 dc.context(UnableToInitializeDataConnectorSnafu {})?
             } else {
-                if source == ODBC_DATACONNECTOR {
-                    return Err(OdbcNotInstalledSnafu.build());
-                }
-
-                let suggestion = dataconnector::suggest_connector(source).await;
-                let available = dataconnector::registered_connector_names().await;
-                return Err(UnknownDataConnectorSnafu {
-                    data_connector: source,
-                    suggestion,
-                    available,
-                }
-                .build());
+                // Only reachable if the connector is deregistered between the check above and
+                // this lookup; report the same error rather than a second, blunter one.
+                return Err(unknown_data_connector(source).await);
             };
 
         if ds.has_embeddings() {
@@ -1395,7 +1412,7 @@ impl Runtime {
                 .await
                 .context(UnableToAttachDataConnectorSnafu {
                     data_connector: source.clone(),
-                    connector_component: ConnectorComponent::from(&ds),
+                    connector_component: ConnectorComponent::from(ds.as_ref()),
                 })?;
 
             self.status
@@ -1486,7 +1503,7 @@ impl Runtime {
             .await
             .context(UnableToAttachDataConnectorSnafu {
                 data_connector: source.clone(),
-                connector_component: ConnectorComponent::from(&ds),
+                connector_component: ConnectorComponent::from(ds.as_ref()),
             })?;
 
         if notifier.is_some() {
@@ -1506,9 +1523,15 @@ impl Runtime {
                 // relying on the `Notify`-based completion handle (which is
                 // edge-triggered and can race with this spawn for fast
                 // initial refreshes).
-                runtime_status
+                // A shutdown before the dataset became ready means the initial
+                // load never finished: there is no partition state worth acking.
+                if runtime_status
                     .wait_for_dataset_ready(&dataset_table_ref)
-                    .await;
+                    .await
+                    == crate::status::WaitOutcome::ShuttingDown
+                {
+                    return;
+                }
                 // After the executor's initial load for this dataset finishes,
                 // ack the scheduler with the partition expressions we currently
                 // hold. This is the executor → scheduler readiness signal that
@@ -1765,6 +1788,62 @@ pub struct RegisterDatasetContext {
     bootstrap_status: BootstrapStatus,
 }
 
+/// Returns `true` when a dataset load failure cannot be cleared by retrying it.
+///
+/// `load_dataset` retries with unbounded backoff and only short-circuits on
+/// [`Error::PermanentDatasetFailure`], so a failure that is a pure function of
+/// the Spicepod configuration would otherwise be retried for the life of the
+/// process — rebuilding the table provider, and re-running its side effects,
+/// on every attempt. Reading the source already classifies its failures this
+/// way through `DataConnectorError::is_retriable`; this covers the
+/// configuration errors raised on the rest of the load path.
+///
+/// Everything else stays retriable, so a source that is merely unreachable or
+/// an accelerator that is momentarily unavailable still recovers on its own.
+fn is_permanent_dataset_failure(err: &Error) -> bool {
+    match err {
+        // The Spicepod names a connector this build cannot provide.
+        Error::UnknownDataConnector { .. }
+        | Error::OdbcNotInstalled
+        // Dataset-level settings that contradict each other.
+        | Error::FullTextSearchRequiresAcceleration { .. }
+        | Error::AcceleratedWriteBackWithOnConflict { .. }
+        | Error::AcceleratedWriteBackWithoutReplication { .. } => true,
+        // Connector creation boxes its error, so recover the type the way the
+        // catalog load path does before asking it to classify itself.
+        Error::UnableToInitializeDataConnector { source } => {
+            is_permanent_dataset_source(source.as_ref())
+        }
+        // Registration carries the accelerated-table configuration errors.
+        Error::UnableToAttachDataConnector { source, .. } => !source.is_retriable(),
+        _ => false,
+    }
+}
+
+/// Returns `true` when a boxed connector-construction error is a configuration
+/// error that no retry can clear.
+///
+/// Construction has two failure sources that box into the same variant, and
+/// only one of them is a [`dataconnector::DataConnectorError`]. Parameter
+/// validation runs *before* the connector is created — `ConnectorParamsBuilder`
+/// rejects an out-of-vocabulary `one_of` value or a missing required parameter
+/// — so it raises [`runtime_parameters::Error`] instead. Classifying on the
+/// `DataConnectorError` downcast alone therefore reads a plain Spicepod typo as
+/// transient and retries it for the life of the process. See #12416.
+///
+/// The `runtime_parameters` variant is matched by name rather than accepting
+/// any error of that type, so a future retriable variant does not silently
+/// inherit "permanent" from this arm.
+fn is_permanent_dataset_source(source: &(dyn std::error::Error + Send + Sync + 'static)) -> bool {
+    if let Some(err) = source.downcast_ref::<dataconnector::DataConnectorError>() {
+        return !err.is_retriable();
+    }
+    matches!(
+        source.downcast_ref::<runtime_parameters::Error>(),
+        Some(runtime_parameters::Error::InvalidConfigurationNoSource { .. })
+    )
+}
+
 #[expect(clippy::result_large_err)]
 fn validate_dataset(ds: &Arc<Dataset>) -> Result<()> {
     if ds.has_full_text_column() && !ds.is_accelerated() {
@@ -1774,6 +1853,25 @@ fn validate_dataset(ds: &Arc<Dataset>) -> Result<()> {
         .build());
     }
     Ok(())
+}
+
+/// The error for a `from:` naming a connector this build does not register: the closest
+/// registered name plus the full list, so the message names a fix.
+///
+/// ODBC is the exception. It is a real connector that this build may simply not have been
+/// compiled with, so it gets the build-with-`odbc` instruction instead of a "did you mean"
+/// over the connectors that happen to be present.
+async fn unknown_data_connector(source: &str) -> Error {
+    if source == ODBC_DATACONNECTOR {
+        return OdbcNotInstalledSnafu.build();
+    }
+
+    UnknownDataConnectorSnafu {
+        data_connector: source,
+        suggestion: dataconnector::suggest_connector(source).await,
+        available: dataconnector::registered_connector_names().await,
+    }
+    .build()
 }
 
 /// Updates the `fetched_at` column for all records in a cached dataset that was bootstrapped.
@@ -1800,11 +1898,18 @@ async fn update_cached_dataset_timestamps(dataset: &Dataset) {
 
     match CachingEngineSys::try_new(dataset, OpenOption::OpenExisting).await {
         Ok(caching_sys) => {
-            if let Err(e) = caching_sys.update_fetched_at() {
-                tracing::warn!(
-                    "Failed to update _fetched_at for cached dataset {}: {e}",
-                    dataset.name
-                );
+            if let Err(e) = caching_sys.update_fetched_at().await {
+                if is_shutdown_cancellation(&e) {
+                    tracing::debug!(
+                        "Did not update _fetched_at for cached dataset {}: the runtime is shutting down ({e})",
+                        dataset.name
+                    );
+                } else {
+                    tracing::warn!(
+                        "Failed to update _fetched_at for cached dataset {}: {e}",
+                        dataset.name
+                    );
+                }
             } else {
                 tracing::info!(
                     "Updated _fetched_at for all records in cached dataset {}",
@@ -1957,6 +2062,338 @@ mod tests {
             err.to_string()
                 .contains("acceleration is required for full text search"),
             "unexpected error: {err}"
+        );
+    }
+
+    /// The #12415 regression: `ConnectorParamsBuilder::build` resolves the factory first and
+    /// fails with `InvalidConnectorType`, which names no alternative, so the
+    /// suggestion-bearing `UnknownDataConnector` written for this case was unreachable.
+    #[tokio::test]
+    async fn a_misspelled_dataset_connector_suggests_the_closest_connector() {
+        register_connector_factory("schema_only", Arc::new(SchemaOnlyConnectorFactory)).await;
+
+        let app = Arc::new(app::AppBuilder::new("connector_typo").build());
+        let runtime = Arc::new(crate::Runtime::builder().build().await);
+        let spec = spicepod::component::dataset::Dataset::new("schema_onl:any", "typo_dataset");
+        let dataset = DatasetBuilder::try_from(spec)
+            .expect("valid dataset builder")
+            .with_app(app)
+            .with_runtime(Arc::clone(&runtime))
+            .build()
+            .expect("valid runtime dataset");
+
+        let err = runtime
+            .get_dataconnector_from_dataset(Arc::new(dataset))
+            .await
+            .expect_err("a `from:` naming an unregistered connector must fail");
+
+        assert!(
+            matches!(err, Error::UnknownDataConnector { .. }),
+            "expected UnknownDataConnector, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("Did you mean 'schema_only'?"),
+            "the error should name the closest registered connector: {err}"
+        );
+    }
+
+    /// ODBC is the one unregistered name that is not a typo: it is a real connector this build
+    /// may simply lack, so it gets the build instruction instead of a lookalike suggestion.
+    #[tokio::test]
+    async fn an_unregistered_odbc_connector_reports_the_missing_build() {
+        let err = unknown_data_connector(ODBC_DATACONNECTOR).await;
+
+        assert!(
+            matches!(err, Error::OdbcNotInstalled),
+            "expected OdbcNotInstalled, got: {err}"
+        );
+    }
+
+    struct SchemaOnlyConnectorFactory;
+
+    impl DataConnectorFactory for SchemaOnlyConnectorFactory {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn create(
+            &self,
+            _params: ConnectorParams,
+        ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>> {
+            Box::pin(async { Ok(Arc::new(SchemaOnlyConnector) as Arc<dyn DataConnector>) })
+        }
+
+        fn prefix(&self) -> &'static str {
+            "schema_only"
+        }
+
+        fn parameters(&self) -> &'static [ParameterSpec] {
+            &[]
+        }
+    }
+
+    #[derive(Debug)]
+    struct SchemaOnlyConnector;
+
+    #[async_trait]
+    impl DataConnector for SchemaOnlyConnector {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        async fn read_provider(
+            &self,
+            _dataset: &Dataset,
+        ) -> DataConnectorResult<Arc<dyn TableProvider>> {
+            let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+                "id",
+                arrow_schema::DataType::Int64,
+                false,
+            )]));
+            let table = datafusion::datasource::MemTable::try_new(schema, vec![vec![]])
+                .expect("empty MemTable with a single column");
+            Ok(Arc::new(table) as Arc<dyn TableProvider>)
+        }
+    }
+
+    /// Regression test for #12339: a `time_column` the source schema does not
+    /// have is a configuration error no retry can clear, so registration must
+    /// report it as a permanent failure rather than letting `load_dataset`
+    /// retry it for the life of the process.
+    #[tokio::test]
+    async fn a_dataset_configuration_error_fails_permanently() {
+        register_connector_factory("schema_only", Arc::new(SchemaOnlyConnectorFactory)).await;
+
+        let mut dataset =
+            spicepod::component::dataset::Dataset::new("schema_only:any", "missing_time_column");
+        dataset.acceleration = Some(spicepod::acceleration::Acceleration {
+            enabled: true,
+            ..spicepod::acceleration::Acceleration::default()
+        });
+        dataset.time_column = Some("not_in_the_source_schema".to_string());
+
+        let app = app::AppBuilder::new("permanent_configuration_failure")
+            .with_dataset(dataset.clone())
+            .build();
+        let runtime = Arc::new(crate::Runtime::builder().build().await);
+        let ds = DatasetBuilder::try_from(dataset)
+            .expect("valid dataset builder")
+            .with_app(Arc::new(app))
+            .with_runtime(Arc::clone(&runtime))
+            .build()
+            .expect("valid runtime dataset");
+
+        let err = runtime
+            .try_load_dataset_once(Arc::new(ds), BootstrapStatus::None, None)
+            .await
+            .expect_err("a missing time column should fail the load");
+
+        assert!(
+            matches!(err, Error::PermanentDatasetFailure { .. }),
+            "expected a permanent failure, got: {err}"
+        );
+    }
+
+    /// A `from:` no build of the runtime can resolve is settled at parse time,
+    /// so it must not be retried either.
+    #[tokio::test]
+    async fn an_unknown_connector_fails_permanently() {
+        let dataset = spicepod::component::dataset::Dataset::new(
+            "not_a_real_connector:any",
+            "unknown_connector",
+        );
+
+        let app = app::AppBuilder::new("unknown_connector")
+            .with_dataset(dataset.clone())
+            .build();
+        let runtime = Arc::new(crate::Runtime::builder().build().await);
+        let ds = DatasetBuilder::try_from(dataset)
+            .expect("valid dataset builder")
+            .with_app(Arc::new(app))
+            .with_runtime(Arc::clone(&runtime))
+            .build()
+            .expect("valid runtime dataset");
+
+        let err = runtime
+            .try_load_dataset_once(Arc::new(ds), BootstrapStatus::None, None)
+            .await
+            .expect_err("an unknown connector should fail the load");
+
+        assert!(
+            matches!(err, Error::PermanentDatasetFailure { .. }),
+            "expected a permanent failure, got: {err}"
+        );
+    }
+
+    #[test]
+    fn a_contradictory_dataset_configuration_is_permanent() {
+        let err = FullTextSearchRequiresAccelerationSnafu {
+            dataset_name: "docs".to_string(),
+        }
+        .build();
+        assert!(
+            is_permanent_dataset_failure(&err),
+            "full-text search without acceleration cannot resolve itself"
+        );
+    }
+
+    /// The #12416 regression: `ConnectorParamsBuilder` validates parameters
+    /// before the connector is built, so it raises `runtime_parameters::Error`
+    /// rather than a `DataConnectorError`. The original downcast recognised only
+    /// the latter, so a typo'd `one_of` value or a missing required parameter was
+    /// classified transient and retried for the life of the process.
+    #[test]
+    fn a_dataset_parameter_validation_failure_is_permanent() {
+        let source = runtime_parameters::Error::InvalidConfigurationNoSource {
+            component: "dataset taxi_trips".to_string(),
+            message: "'s3_auth' must be one of: public, key, iam_role. Found 'keys'.".to_string(),
+        };
+        let err = Error::UnableToInitializeDataConnector {
+            source: Box::new(source),
+        };
+        assert!(
+            is_permanent_dataset_failure(&err),
+            "an out-of-vocabulary parameter value is a pure function of the Spicepod"
+        );
+    }
+
+    /// An error type neither downcast recognises must not be assumed permanent —
+    /// failing open here would strand a dataset that would have recovered.
+    #[test]
+    fn an_unclassified_boxed_connector_error_stays_retriable() {
+        let err = Error::UnableToInitializeDataConnector {
+            source: "connection reset by peer".into(),
+        };
+        assert!(
+            !is_permanent_dataset_failure(&err),
+            "an unrecognised error is not evidence the configuration is wrong"
+        );
+    }
+
+    #[test]
+    fn only_configuration_errors_are_classified_permanent() {
+        use crate::datafusion::Error as DfError;
+
+        assert!(
+            !DfError::UnsupportedRefreshCompleteForStream.is_retriable(),
+            "a refresh setting the source cannot serve needs an operator to change it"
+        );
+        assert!(
+            !DfError::SnapshotCreationBatchesShouldBePositive.is_retriable(),
+            "an out-of-range Spicepod value needs an operator to change it"
+        );
+        assert!(
+            DfError::TableAlreadyExists {}.is_retriable(),
+            "an unclassified registration failure must keep retrying"
+        );
+        assert!(
+            DfError::UnableToLockDataWriters {}.is_retriable(),
+            "contention on an internal lock is transient"
+        );
+    }
+
+    /// Installs a `MeterProvider` backed by a scrapable Prometheus registry, so the
+    /// `datasets::LOAD_ERROR` counter this module writes can be read back.
+    ///
+    /// The metric statics are `LazyLock`s that bind to whichever provider is global
+    /// when they are first touched, and that binding survives a later
+    /// `set_meter_provider`. So this rewires the meter for the whole process and only
+    /// the first caller in it wins -- keep it to a single test, as
+    /// `tests/query_failure_err_code.rs` does.
+    fn install_prometheus_meter_provider() -> prometheus::Registry {
+        let registry = prometheus::Registry::new();
+
+        let exporter = opentelemetry_prometheus::exporter()
+            .with_registry(registry.clone())
+            .without_scope_info()
+            .without_units()
+            .without_counter_suffixes()
+            .without_target_info()
+            .build()
+            .expect("to build the prometheus exporter");
+
+        let provider = opentelemetry_sdk::metrics::SdkMeterProvider::builder()
+            .with_resource(opentelemetry_sdk::Resource::builder().build())
+            .with_reader(exporter)
+            .build();
+        opentelemetry::global::set_meter_provider(provider);
+
+        registry
+    }
+
+    /// Reads a counter's current value, treating "never incremented" as zero -- a
+    /// counter that was never written does not appear among the gathered families.
+    fn counter_value(registry: &prometheus::Registry, name: &str) -> f64 {
+        registry
+            .gather()
+            .iter()
+            .find(|family| {
+                family.name() == name
+                    && family.get_field_type() == prometheus::proto::MetricType::COUNTER
+            })
+            .and_then(|family| family.get_metric().first())
+            .map_or(0.0, |metric| metric.get_counter().value())
+    }
+
+    /// A dataset whose `from:` names no registered connector, so building its
+    /// connector always fails.
+    fn unloadable_dataset(runtime: &Arc<crate::Runtime>) -> Arc<Dataset> {
+        let spec =
+            spicepod::component::dataset::Dataset::new("not_a_real_connector:any", "reported_once");
+        let app = app::AppBuilder::new("single_load_error_report")
+            .with_dataset(spec.clone())
+            .build();
+
+        Arc::new(
+            DatasetBuilder::try_from(spec)
+                .expect("valid dataset builder")
+                .with_app(Arc::new(app))
+                .with_runtime(Arc::clone(runtime))
+                .build()
+                .expect("valid runtime dataset"),
+        )
+    }
+
+    /// Regression test for #12365: `load_dataset_connector` reports a connector
+    /// failure -- component status, `LOAD_ERROR`, and a log line -- and its caller
+    /// then reported the very same error again, so one unloadable dataset advanced
+    /// `dataset_load_errors` by 2 per attempt instead of 1.
+    ///
+    /// The teardown half is asserted in the same test on purpose: installing the
+    /// meter provider rewires the process, so only one test per binary can do it.
+    /// Deleting the caller's block also deleted the `is_shutdown()` guard around it,
+    /// and that guard only ever suppressed the duplicate -- the callee counted
+    /// regardless -- so a failure during teardown counted exactly one before this
+    /// change and must still count exactly one.
+    #[tokio::test]
+    async fn a_dataset_connector_failure_counts_one_load_error() {
+        let registry = install_prometheus_meter_provider();
+        let runtime = Arc::new(crate::Runtime::builder().build().await);
+
+        let before = counter_value(&registry, "dataset_load_errors");
+        runtime
+            .try_load_dataset_once(unloadable_dataset(&runtime), BootstrapStatus::None, None)
+            .await
+            .expect_err("a connector that cannot be created must fail the load");
+        let counted = counter_value(&registry, "dataset_load_errors") - before;
+
+        assert!(
+            (counted - 1.0).abs() < f64::EPSILON,
+            "one failure must be counted once, not once per reporting site; counted {counted}"
+        );
+
+        runtime.status.mark_shutdown();
+
+        let before = counter_value(&registry, "dataset_load_errors");
+        runtime
+            .try_load_dataset_once(unloadable_dataset(&runtime), BootstrapStatus::None, None)
+            .await
+            .expect_err("a connector that cannot be created must fail the load");
+        let counted = counter_value(&registry, "dataset_load_errors") - before;
+
+        assert!(
+            (counted - 1.0).abs() < f64::EPSILON,
+            "teardown counted one load error before this change; counted {counted}"
         );
     }
 }

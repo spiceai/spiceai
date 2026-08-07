@@ -1032,6 +1032,20 @@ struct RawScanInput {
     /// Current snapshot id captured under the read fence — the file set the scan
     /// reads. Pinned against GC by [`Self::scan_guard`].
     current_snapshot_id: String,
+    /// Cold-tier manifest belonging to [`Self::current_snapshot_id`], resolved under
+    /// the SAME held read fence (see
+    /// [`CayenneTableProvider::cold_manifest_under_held_fence`]). `None` when the
+    /// cold tier is disabled.
+    ///
+    /// A promotion publishes the cold manifest and the warm snapshot flip together
+    /// under `listing_fence.write()`, so both halves of a cross-tier read must be
+    /// captured in one fenced instant: a scan that pairs a warm snapshot captured
+    /// before that publish with a cold manifest read after it counts every promoted
+    /// row TWICE. Carrying the file set on the capture is what makes the pair
+    /// atomic — every plan branch descends from this one instant. Needs no separate
+    /// [`ScanViewKey`] component: a cold-manifest change always mints a new snapshot
+    /// id, which the key already carries.
+    cold_files: Option<Arc<Vec<crate::metadata::ColdTierFile>>>,
     /// Inline-memtable structural epoch (`inlined_structural_epoch`) observed at
     /// capture. Part of the [`Self::changed`] key — the same key the retired memos
     /// used, so a build is skipped iff no scan-visible state moved.
@@ -1076,6 +1090,49 @@ impl RawScanInput {
             inlined_view_ptr: Arc::as_ptr(&self.inlined_view).addr(),
         }
     }
+}
+
+/// The cold-tier manifest as published alongside ONE warm snapshot id.
+///
+/// Every mutation of `cayenne_cold_tier_file` mints a new warm snapshot id in the
+/// same metastore transaction: a promotion commits through
+/// [`MetadataCatalog::commit_overwrite_to_cold`], and that runs the same
+/// `commit_overwrite_in_txn` an overwrite / truncate clear does — which deletes the
+/// table's cold rows. A snapshot id therefore names exactly one cold manifest
+/// state, which is what makes it a sound cache key: an entry whose `snapshot_id`
+/// still equals the live one cannot be stale, and one that does not is simply a
+/// miss that re-reads. No path can leave a mismatched pair servable, so the cache
+/// needs no invalidation hook on the paths that clear the manifest.
+///
+/// The key is a snapshot id THIS process published: `current_snapshot_id` is in-memory
+/// state advanced by its own publishes (shared across writer clones by `Arc`), so the
+/// pairing is sound for the single-writer-per-table deployment Cayenne targets. It does
+/// not extend to two processes promoting the same table: on a cache miss the metastore
+/// SELECT returns whatever is committed, including a foreign promotion this provider's
+/// warm snapshot id predates, and the entry is then tagged with that local id. Reading
+/// the manifest live would pair a local warm snapshot with the freshest foreign cold on
+/// EVERY scan, so tagging by snapshot id is strictly narrower exposure — but it is not a
+/// cross-process guarantee.
+struct ColdManifestForSnapshot {
+    /// Warm snapshot id this manifest was published with.
+    snapshot_id: String,
+    /// Every live cold file for the table at that snapshot.
+    files: Arc<Vec<crate::metadata::ColdTierFile>>,
+}
+
+/// Inputs for [`CayenneTableProvider::build_cold_tier_scan_plan`], grouped the way
+/// [`ProtectedSnapshotScan`] groups the protected-snapshot branch's.
+struct ColdTierScan<'a> {
+    state: &'a dyn Session,
+    projection: Option<&'a Vec<usize>>,
+    filters: &'a [Expr],
+    limit: Option<usize>,
+    scan_config: &'a SessionConfig,
+    read_schema_override: Option<SchemaRef>,
+    /// The manifest the CALLER captured, in the same fenced instant as the warm
+    /// snapshot the rest of its scan reads. Never re-read inside the branch — see
+    /// [`RawScanInput::cold_files`].
+    cold_files: &'a [crate::metadata::ColdTierFile],
 }
 
 /// Identity of a [`RawScanInput`] capture — the cache key for its built [`ScanView`].
@@ -1474,6 +1531,15 @@ pub struct CayenneTableProvider {
     /// Uses `RwLock` for concurrent reads during normal operations with occasional
     /// writes on compaction. The lock is held briefly for string operations.
     current_snapshot_id: Arc<RwLock<String>>,
+    /// Cold-tier manifest paired with the warm snapshot id it was published with,
+    /// so a cross-tier read captures BOTH tiers' file sets in one fenced instant
+    /// ([`Self::cold_manifest_under_held_fence`]). `None` until the first resolve.
+    ///
+    /// Published by [`Self::promote_warm_to_cold`] inside the same
+    /// `listing_fence.write()` that commits the manifest and flips the snapshot, so
+    /// the capture that follows a promotion pays no metastore read. Shared across
+    /// writer clones of the same table.
+    cold_manifest: Arc<ArcSwap<Option<ColdManifestForSnapshot>>>,
     /// Test-only seam fired between the catalog CAS commit and the fenced
     /// in-memory publish of the subset-merge/seq-prefix-bake passes, so a test
     /// can commit a snapshot replacement (overwrite/promotion) inside the exact
@@ -1508,6 +1574,17 @@ pub struct CayenneTableProvider {
     /// `build_sharded_pk_index` / the sharded validate path; routed by
     /// `shard_of_pk` so a key co-locates with its tier segments + tombstones.
     sharded_pk_keyset_cache: Arc<ParkingMutex<Option<ShardedPkIndex>>>,
+    /// One-shot latch for the write-path warm-cache probe
+    /// (`maybe_install_warm_pk_caches`): probe once per cache lifetime,
+    /// re-armed by `clear_cached_pk_keyset`. Shared across clones so every
+    /// writer observes the same probe state.
+    pk_warm_probe_done: Arc<AtomicBool>,
+    /// Resident-byte components of the two PK caches, published as their SUM
+    /// through `table_memory.set_keyset_bytes` (a single slot — writing one
+    /// cache's size alone would under-account the other by up to a full budget
+    /// when both hold exact keysets). Shared across clones like the caches.
+    pk_keyset_bytes_single: Arc<AtomicUsize>,
+    pk_keyset_bytes_sharded: Arc<AtomicUsize>,
     /// Per-key transaction OCC (`transaction_has_conflict`) trusts the Exact
     /// keyset's per-key `sequence` stamps ONLY when this is `false`. Set `true`
     /// whenever an event leaves the shared Exact keyset with a stale or missing
@@ -2175,6 +2252,25 @@ enum ColdKeysetSource {
     /// incomplete; the rebuild folds cold via the exact scan for the whole
     /// table.
     Scan,
+}
+
+/// A [`ColdKeysetSource`] plus the warm snapshot id it was decided against.
+///
+/// The keyset rebuild runs OFF `write_lock` (`prepare_stream_for_insert` precedes
+/// the Stage-A guard), so a cold promotion can commit between this decision and the
+/// rebuild's own fenced capture. That is only dangerous in the [`ColdKeysetSource::Bloom`]
+/// direction, and it is dangerous in a way the tier accounting cannot detect later:
+/// the promoted keys would be absent from the pre-promotion bloom AND from the
+/// post-promotion warm snapshot, so an upsert of one would find no existing key,
+/// record no supersede tombstone, and leak the prior cold copy — a durable
+/// over-count. Carrying the snapshot id lets the rebuild notice the move and fold
+/// the cold tier exactly instead (see [`CayenneTableProvider::load_existing_pk_index`]).
+struct ColdKeysetPlan {
+    source: ColdKeysetSource,
+    /// Warm snapshot id the cold manifest — and any bloom published from it — was
+    /// resolved under the listing fence with. `None` when the cold tier contributes
+    /// nothing (disabled, or a non-upsert table), where there is nothing to pair.
+    resolved_at_snapshot: Option<String>,
 }
 
 struct CayenneTableProviderOpenOptions {
@@ -4334,7 +4430,10 @@ impl CayenneTableProvider {
     pub(crate) async fn ensure_snapshot_dir_exists(
         snapshot_dir: &std::path::Path,
     ) -> std::io::Result<()> {
-        if !snapshot_dir.exists() {
+        // `tokio::fs::try_exists`, not `Path::exists`: this runs on every write
+        // (see `write_to_snapshot`), and on the network-attached storage tier a
+        // cold `stat` can take milliseconds — long enough to stall a Tokio worker.
+        if !tokio::fs::try_exists(snapshot_dir).await? {
             // Capture the parent before creation so we can sync it afterwards.
             let parent = snapshot_dir.parent().map(std::path::Path::to_path_buf);
             tokio::fs::create_dir_all(snapshot_dir).await?;
@@ -5598,6 +5697,9 @@ impl CayenneTableProvider {
             )),
             pk_keyset_cache: Arc::new(ParkingMutex::new(None)),
             sharded_pk_keyset_cache: Arc::new(ParkingMutex::new(None)),
+            pk_warm_probe_done: Arc::new(AtomicBool::new(false)),
+            pk_keyset_bytes_single: Arc::new(AtomicUsize::new(0)),
+            pk_keyset_bytes_sharded: Arc::new(AtomicUsize::new(0)),
             pk_keyset_occ_degraded: Arc::new(AtomicBool::new(false)),
             cold_pk_existence: Arc::new(ParkingMutex::new(None)),
             table_memory,
@@ -5641,6 +5743,7 @@ impl CayenneTableProvider {
             // scan does not advertise ordering until the sorted compactor attests
             // a snapshot.
             current_sorted_snapshot: Arc::new(ArcSwap::from_pointee(None)),
+            cold_manifest: Arc::new(ArcSwap::from_pointee(None)),
             mem_checkpoint_lock: Arc::new(tokio::sync::Mutex::new(())),
             mem_tier_publish_locks: (0..mem_tier_shards)
                 .map(|_| tokio::sync::Mutex::new(()))
@@ -6021,11 +6124,7 @@ impl CayenneTableProvider {
         snapshot_id: &str,
         sequence_number: i64,
     ) -> CatalogResult<()> {
-        let is_s3 = self.table_metadata.path.starts_with("s3://");
-        if !is_s3 {
-            let snapshot_dir = self.snapshot_dir_path_for(snapshot_id);
-            Self::sync_snapshot_dir(&snapshot_dir).await?;
-        }
+        self.sync_local_snapshot_dir(snapshot_id).await?;
 
         self.catalog
             .set_snapshot_sequence(&self.table_metadata.table_id, snapshot_id, sequence_number)
@@ -6036,6 +6135,40 @@ impl CayenneTableProvider {
 
     fn pk_deletion_snapshot(&self) -> PkDeletionSnapshot {
         pk_deletion_snapshot_for_strategy(&self.pk_deletion_strategy)
+    }
+
+    /// Materialize this table's snapshot directory, if the table lives on a
+    /// local filesystem.
+    ///
+    /// A no-op on an object store: there are no directories, and the prefix
+    /// springs into existence with its first object.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the directory cannot be created.
+    pub(crate) async fn ensure_local_snapshot_dir(&self, snapshot_id: &str) -> Result<()> {
+        if self.table_metadata.path.starts_with("s3://") {
+            return Ok(());
+        }
+        Self::ensure_snapshot_dir_exists(&self.snapshot_dir_path_for(snapshot_id)).await?;
+        Ok(())
+    }
+
+    /// Take the durability barrier on this table's snapshot directory, if the
+    /// table lives on a local filesystem — the fsync that must precede any
+    /// catalog write making the snapshot visible.
+    ///
+    /// A no-op on an object store: there are no directories, and an object is
+    /// durable on PUT ack.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the directory cannot be synced.
+    pub(crate) async fn sync_local_snapshot_dir(&self, snapshot_id: &str) -> CatalogResult<()> {
+        if self.table_metadata.path.starts_with("s3://") {
+            return Ok(());
+        }
+        Self::sync_snapshot_dir(&self.snapshot_dir_path_for(snapshot_id)).await
     }
 
     /// Write a stream of record batches to a specific snapshot directory.
@@ -6074,6 +6207,26 @@ impl CayenneTableProvider {
     ) -> Result<(u64, usize, Arc<ColumnStatsAccumulator>)> {
         use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
         use std::time::Instant;
+
+        // Materialize the snapshot directory before the write, unconditionally.
+        // The Vortex sink creates it lazily when it writes its first file, so a
+        // write that carries no rows produces no files and no directory — and
+        // any caller that afterwards fsyncs the snapshot
+        // (`record_written_snapshot_sequence` → `sync_local_snapshot_dir`) then
+        // fails with `NotFound`, or records a catalog entry for a snapshot that
+        // has nothing on disk. Creating it here makes "a snapshot the catalog can
+        // reference always has a directory" a property of the write itself rather
+        // than a `rows == 0` guard repeated at each call site, and does not
+        // depend on the sink's lazy-creation behavior holding. It also makes the
+        // new directory's own dirent durable (`ensure_snapshot_dir_exists` syncs
+        // the parent), which the sink-created path never did. Callers that
+        // pre-create the directory pay only a `stat` — the helper short-circuits
+        // when it already exists.
+        //
+        // Ahead of the encode-permit acquisition below: this is pure metadata I/O
+        // that needs no permit, and holding the process-global budget across it
+        // would stall other tables' encodes for the duration.
+        self.ensure_local_snapshot_dir(snapshot_id).await?;
 
         // Bound aggregate encode concurrency across all tables. Per-table
         // `cayenne_write_concurrency` is sized in isolation (a conservative unset
@@ -6336,7 +6489,19 @@ impl CayenneTableProvider {
         // the cheap early-out in the compaction trigger. Only count files
         // landed in the live snapshot; staging writes are tracked separately
         // via the staging_may_have_files flag.
-        if !Self::is_staging_snapshot_id(snapshot_id) && writer_ops > 0 {
+        //
+        // The snapshot must be the CURRENT one, not merely non-staging. An
+        // overwrite writes into a fresh, not-yet-published snapshot id while the
+        // old snapshot is still live, so counting those files here attributes
+        // them to the snapshot they are about to REPLACE — and a background tick
+        // could then pick that doomed snapshot for compaction. The counter is
+        // reset when the overwrite publishes, so the net value is unchanged for
+        // every path that already published; this only stops the transient
+        // mis-attribution during the write.
+        if writer_ops > 0
+            && !Self::is_staging_snapshot_id(snapshot_id)
+            && self.get_current_snapshot_id() == snapshot_id
+        {
             self.record_current_snapshot_files_added(writer_ops);
         }
 
@@ -6379,6 +6544,12 @@ impl CayenneTableProvider {
         target_size_bytes: usize,
         schema: &SchemaRef,
     ) -> Result<(usize, Arc<ColumnStatsAccumulator>)> {
+        // Materialize the shared snapshot directory once, before fanning out.
+        // Every `write_to_snapshot` below targets the SAME directory, so without
+        // this each would race to create it and each would fsync the parent — N
+        // redundant syncs per checkpoint drain. This leaves them a `stat` each.
+        self.ensure_local_snapshot_dir(snapshot_id).await?;
+
         let mut handles = Vec::with_capacity(units.len());
         for unit in units {
             // A shallow writer clone (all Arc fields) so the encode can run on its
@@ -6643,10 +6814,10 @@ impl CayenneTableProvider {
 
     /// Requested number of intra-write shards (parallel encoders) for a snapshot
     /// write: the per-table `cayenne_write_concurrency` override if set, else a
-    /// conservative default of [`DEFAULT_WRITE_CONCURRENCY`] (capped at the host
-    /// core count so tiny hosts don't over-shard).
+    /// conservative default of [`DEFAULT_WRITE_CONCURRENCY`] (capped at the CPU
+    /// budget's core count so tiny hosts don't over-shard).
     ///
-    /// The default is deliberately NOT the host core count. `write_concurrency` is
+    /// The default is deliberately NOT the core count. `write_concurrency` is
     /// sized per table in isolation, so a default of "all cores" makes independent
     /// tables oversubscribe the box under concurrent CDC — the aggregate is the
     /// sum across every writing table, not the per-table value. A small default
@@ -6655,8 +6826,8 @@ impl CayenneTableProvider {
     /// encode budget still bounds the aggregate — see `provider::write_budget`).
     ///
     /// This is the *requested* count. `VortexFormat::build_shard_spec` then clamps
-    /// it to the write session's `target_partitions` — the host's logical-core
-    /// count (see [`Self::create_session_context`]) — so a configured value above
+    /// it to the write session's `target_partitions` — the CPU budget's core count
+    /// (see [`Self::create_session_context`]) — so a configured value above
     /// the core count is capped, not honored. That ceiling is intentional:
     /// parallel encode is CPU-bound, so extra shards would only add files (read
     /// amplification) without speeding the write.
@@ -6717,6 +6888,9 @@ impl CayenneTableProvider {
             ),
             pk_keyset_cache: Arc::clone(&self.pk_keyset_cache),
             sharded_pk_keyset_cache: Arc::clone(&self.sharded_pk_keyset_cache),
+            pk_warm_probe_done: Arc::clone(&self.pk_warm_probe_done),
+            pk_keyset_bytes_single: Arc::clone(&self.pk_keyset_bytes_single),
+            pk_keyset_bytes_sharded: Arc::clone(&self.pk_keyset_bytes_sharded),
             pk_keyset_occ_degraded: Arc::clone(&self.pk_keyset_occ_degraded),
             cold_pk_existence: Arc::clone(&self.cold_pk_existence),
             table_memory: Arc::clone(&self.table_memory),
@@ -6745,6 +6919,9 @@ impl CayenneTableProvider {
             // Shared so the sorted-rewrite attestation set by any (compaction)
             // clone is observed by scanning clones, and cleared for all on a write.
             current_sorted_snapshot: Arc::clone(&self.current_sorted_snapshot),
+            // Shared so a writer clone's promotion publishes the manifest every
+            // clone's scans resolve against.
+            cold_manifest: Arc::clone(&self.cold_manifest),
             mem_checkpoint_lock: Arc::clone(&self.mem_checkpoint_lock),
             // Shared across clones so EVERY writer serializes on the one publish
             // lock (the seq-ordering invariant requires a single lock per table).
@@ -7114,6 +7291,39 @@ impl CayenneTableProvider {
         matches!(self.table_metadata.on_conflict, Some(OnConflict::Upsert(_)))
     }
 
+    /// Effective byte budget for ONE PK cache. Sharded (N>1) tables maintain
+    /// two live caches — the table-wide keyset and the per-shard index — so
+    /// each gets half the configured budget, keeping their combined resident
+    /// size within it.
+    fn effective_pk_keyset_budget(&self) -> usize {
+        let max_bytes = self.context.pk_keyset_cache_max_bytes();
+        if self.mem_tier_shard_count() > 1 {
+            max_bytes / 2
+        } else {
+            max_bytes
+        }
+    }
+
+    /// Publish the table-wide PK cache's resident bytes and refresh the sum.
+    fn publish_single_keyset_bytes(&self, bytes: usize) {
+        self.pk_keyset_bytes_single.store(bytes, Ordering::Relaxed);
+        self.publish_keyset_bytes_total();
+    }
+
+    /// Publish the sharded PK cache's resident bytes and refresh the sum.
+    fn publish_sharded_keyset_bytes(&self, bytes: usize) {
+        self.pk_keyset_bytes_sharded.store(bytes, Ordering::Relaxed);
+        self.publish_keyset_bytes_total();
+    }
+
+    fn publish_keyset_bytes_total(&self) {
+        let total = self
+            .pk_keyset_bytes_single
+            .load(Ordering::Relaxed)
+            .saturating_add(self.pk_keyset_bytes_sharded.load(Ordering::Relaxed));
+        self.table_memory.set_keyset_bytes(total);
+    }
+
     /// Deferred cross-partition appends carry their on-conflict metadata and
     /// publish state in the prepared receipt.
     #[must_use]
@@ -7121,9 +7331,14 @@ impl CayenneTableProvider {
         true
     }
 
-    /// Build a bloom existence filter over `keyset`'s keys, sized to `max_bytes`.
+    /// Build a bloom existence filter over `keyset`'s keys.
+    ///
+    /// Sized for the conversion-time key count with 4× growth headroom
+    /// (~10 bits/key at 4×), capped at `max_bytes`. The bloom cannot grow, so
+    /// later inserts degrade the false-positive rate gradually; a false
+    /// positive is only a redundant tombstone under upsert.
     fn bloom_from_keyset(keyset: &CachedPkKeyset, max_bytes: usize) -> PkBloom {
-        let mut bloom = PkBloom::with_byte_budget(max_bytes);
+        let mut bloom = PkBloom::with_expected_keys(keyset.len().saturating_mul(4), max_bytes);
         for key in keyset.rows() {
             bloom.insert(key.as_ref());
         }
@@ -7131,7 +7346,7 @@ impl CayenneTableProvider {
     }
 
     pub(crate) fn store_cached_pk_index(&self, index: CachedPkIndex) {
-        let max_bytes = self.context.pk_keyset_cache_max_bytes();
+        let max_bytes = self.effective_pk_keyset_budget();
         let to_store = match index {
             CachedPkIndex::Exact(keyset) if keyset.approx_bytes > max_bytes => {
                 if self.upsert_bloom_eligible() {
@@ -7162,7 +7377,7 @@ impl CayenneTableProvider {
                     // `true` and force per-table OCC forever (over-abort). Same
                     // reasoning as `clear_cached_pk_keyset`.
                     self.pk_keyset_occ_degraded.store(false, Ordering::Release);
-                    self.table_memory.set_keyset_bytes(0);
+                    self.publish_single_keyset_bytes(0);
                     return;
                 }
             }
@@ -7171,7 +7386,7 @@ impl CayenneTableProvider {
 
         let bytes = to_store.approx_bytes();
         *self.pk_keyset_cache.lock() = Some(to_store);
-        self.table_memory.set_keyset_bytes(bytes);
+        self.publish_single_keyset_bytes(bytes);
     }
 
     /// Degrade per-key transaction OCC to the conservative per-table high-water
@@ -7189,6 +7404,87 @@ impl CayenneTableProvider {
     /// ordering rather than relying on a lock being co-held in every case.
     pub(crate) fn mark_pk_keyset_occ_degraded(&self) {
         self.pk_keyset_occ_degraded.store(true, Ordering::Release);
+    }
+
+    /// Write-path probe: when no PK cache is live and the table is provably
+    /// empty (no mem-tier, inlined, durable, or cold rows), install empty
+    /// exact caches. Every later write maintains them
+    /// (`record_pk_keys_with_location`, `append_to_shard`), so the first
+    /// conflict-validated batch skips the O(live-rows)
+    /// `load_existing_pk_index` scan — which otherwise runs inside the CDC
+    /// apply loop at the first post-snapshot upsert (~475 s at 300M rows)
+    /// and stalls the whole replication group behind it.
+    ///
+    /// Probing at the write — not at table creation — keeps reuse paths
+    /// safe: `create_table` is create-or-reuse, and an empty install over
+    /// existing rows would turn conflict validation into duplicates. The
+    /// emptiness proof therefore covers every place a live row can sit:
+    /// mem-tier, inlined, any snapshot's manifest, and the cold tier. Any
+    /// doubt (unreadable listing) keeps the lazy rebuild. Probes once per
+    /// cache lifetime; `clear_cached_pk_keyset` re-arms it, so a delete-all's
+    /// next write re-installs. Both call sites hold the per-table write
+    /// lock; the re-check after the awaits is belt-and-braces against a
+    /// concurrently populated cache.
+    pub(crate) async fn maybe_install_warm_pk_caches(&self) {
+        if self.table_metadata.on_conflict.is_none() {
+            return;
+        }
+        if self.pk_warm_probe_done.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        if !self.pk_caches_absent_and_memory_empty() {
+            return;
+        }
+        let table_id = &self.table_metadata.table_id;
+        // Every snapshot's manifest, not just the current one:
+        // `checkpoint_mem_tier` registers its snapshot as protected without
+        // repointing `current_snapshot_id`, so a fully checkpointed table has
+        // an empty current manifest while holding all its rows.
+        match self.catalog.get_all_snapshot_files(table_id).await {
+            Ok(files) if files.is_empty() => {}
+            _ => return,
+        }
+        match self.catalog.list_cold_tier_files(table_id).await {
+            Ok(files) if files.is_empty() => {}
+            _ => return,
+        }
+        // Re-check: this future may have suspended across the listings above.
+        if !self.pk_caches_absent_and_memory_empty() {
+            return;
+        }
+
+        *self.pk_keyset_cache.lock() = Some(CachedPkIndex::Exact(CachedPkKeyset::with_capacity(0)));
+        let shards = self.mem_tier_shard_count();
+        if shards > 1 {
+            let keysets: Vec<CachedPkKeyset> = (0..shards)
+                .map(|_| CachedPkKeyset::with_capacity(0))
+                .collect();
+            *self.sharded_pk_keyset_cache.lock() =
+                Some(ShardedPkIndex::Exact(keysets.into_boxed_slice()));
+        }
+        // A fresh empty exact keyset has no stale stamps to distrust.
+        self.pk_keyset_occ_degraded.store(false, Ordering::Release);
+        tracing::debug!(
+            table = %self.table_metadata.table_name,
+            shards,
+            "installed warm empty PK existence caches (empty table probe)"
+        );
+    }
+
+    /// One lock at a time: `record_pk_keys_with_location` takes
+    /// sharded-then-single, so holding both here would invert the order.
+    fn pk_caches_absent_and_memory_empty(&self) -> bool {
+        if self.pk_keyset_cache.lock().is_some() {
+            return false;
+        }
+        if self.sharded_pk_keyset_cache.lock().is_some() {
+            return false;
+        }
+        // A registered protected snapshot means rows outside the current manifest.
+        if !self.protected_snapshots.load().is_empty() {
+            return false;
+        }
+        self.mem_tier.is_empty() && self.inlined_row_count.load(Ordering::Acquire) == 0
     }
 
     pub(crate) fn clear_cached_pk_keyset(&self) {
@@ -7210,7 +7506,12 @@ impl CayenneTableProvider {
         // drop it too; the next apply's cache miss rebuilds it from the current
         // manifest via `resolve_cold_keyset_source`.
         self.store_cold_pk_existence(None);
-        self.table_memory.set_keyset_bytes(0);
+        self.publish_single_keyset_bytes(0);
+        self.publish_sharded_keyset_bytes(0);
+        // Re-arm the write-path warm-cache probe: if the event that cleared
+        // the caches also emptied the table (delete-all/TRUNCATE), the next
+        // write re-installs warm empty caches instead of paying a rebuild.
+        self.pk_warm_probe_done.store(false, Ordering::Release);
     }
 
     /// Single funnel for (re)setting `cold_pk_existence`: keeps the view's
@@ -7262,7 +7563,39 @@ impl CayenneTableProvider {
             return;
         }
 
-        let max_bytes = self.context.pk_keyset_cache_max_bytes();
+        // Mirror into the sharded (N>1) cache first, unconditionally: the
+        // per-shard record in `append_to_shard` covers only mem-tier appends,
+        // so inline/file/staging commits would otherwise leave holes in a
+        // long-lived sharded exact keyset and upserts of those keys would
+        // duplicate instead of superseding. Runs before the single keyset's
+        // checked-out early-return; the two locks are never held together.
+        {
+            let mut sharded = self.sharded_pk_keyset_cache.lock();
+            let mut drop_index = false;
+            if let Some(index) = sharded.as_mut() {
+                index.record_keys(keys, location);
+                // Byte budget: upsert degrades to per-shard blooms (a false
+                // positive is only a redundant delete); `DoNothing` needs
+                // exactness, so drop and let the next validation lazy-rebuild.
+                let max_bytes = self.effective_pk_keyset_budget();
+                if index.approx_bytes() > max_bytes {
+                    if self.upsert_bloom_eligible() {
+                        let per_shard = max_bytes / index.shard_count().max(1);
+                        index.degrade_to_blooms(per_shard);
+                    } else {
+                        drop_index = true;
+                    }
+                }
+            }
+            if drop_index {
+                *sharded = None;
+                self.publish_sharded_keyset_bytes(0);
+            } else if let Some(index) = sharded.as_ref() {
+                self.publish_sharded_keyset_bytes(index.approx_bytes());
+            }
+        }
+
+        let max_bytes = self.effective_pk_keyset_budget();
         let mut guard = self.pk_keyset_cache.lock();
         // Take ownership so an over-budget Exact keyset can be replaced by a
         // bloom without a borrow conflict; the index is restored before return.
@@ -7336,14 +7669,14 @@ impl CayenneTableProvider {
                 // Bloom), so clear any degraded flag rather than leave it stuck
                 // `true` across the rebuild (see `clear_cached_pk_keyset`).
                 self.pk_keyset_occ_degraded.store(false, Ordering::Release);
-                self.table_memory.set_keyset_bytes(0);
+                self.publish_single_keyset_bytes(0);
                 return;
             }
         }
 
         let bytes = index.approx_bytes();
         *guard = Some(index);
-        self.table_memory.set_keyset_bytes(bytes);
+        self.publish_single_keyset_bytes(bytes);
     }
 
     pub(crate) fn record_inlined_pk_keys(&self, keys: &PkDigestSet, sequence: i64) {
@@ -7352,15 +7685,16 @@ impl CayenneTableProvider {
 
     /// Store the per-shard PK index back into the sharded cache after validation
     /// (the §2.3c analog of `store_cached_pk_index`). Does NOT apply the
-    /// exact->bloom byte-budget conversion: the index was already built within
-    /// budget by `build_sharded_pk_index`, and a per-apply re-check would diverge
-    /// the two cache paths. Restored BEFORE the per-shard appends so each
+    /// exact->bloom byte-budget conversion: the index was just built within budget
+    /// by `build_sharded_pk_index`, so there is nothing to convert here — the
+    /// budget is re-checked once per apply AFTER the per-shard appends have grown
+    /// it (step 6 of `validate_and_append_sharded`). Restored BEFORE the appends so each
     /// `append_to_shard` can grow its shard's existence view UNDER `locks[s]` for
     /// the just-validated/MISS keys (§5 Phase 6).
     fn store_sharded_pk_index(&self, index: ShardedPkIndex) {
         let bytes = index.approx_bytes();
         *self.sharded_pk_keyset_cache.lock() = Some(index);
-        self.table_memory.set_keyset_bytes(bytes);
+        self.publish_sharded_keyset_bytes(bytes);
     }
 
     pub(crate) fn record_file_pk_keys(&self, keys: &PkDigestSet, sequence: i64) {
@@ -7617,7 +7951,7 @@ impl CayenneTableProvider {
             .lock()
             .as_ref()
             .map_or(0, CachedPkIndex::approx_bytes);
-        self.table_memory.set_keyset_bytes(keyset_bytes);
+        self.publish_single_keyset_bytes(keyset_bytes);
 
         Ok(())
     }
@@ -7720,34 +8054,39 @@ impl CayenneTableProvider {
     /// would run its cold scan), so the two stay coupled: NO object-store I/O —
     /// the per-file blooms come straight from the manifest rows.
     ///
-    /// See [`ColdKeysetSource`] for the three outcomes; `cold_pk_existence` is
-    /// populated only for [`ColdKeysetSource::Bloom`] and cleared otherwise.
-    async fn resolve_cold_keyset_source(&self) -> Result<ColdKeysetSource> {
+    /// See [`ColdKeysetSource`] for the three outcomes. [`ColdKeysetSource::Bloom`]
+    /// always comes with the view published; the no-usable-bloom case clears it. A
+    /// resolve whose snapshot was superseded before it could publish leaves the slot
+    /// untouched — whatever is there belongs to a snapshot at least as new as its own
+    /// — and downgrades itself to [`ColdKeysetSource::Scan`].
+    async fn resolve_cold_keyset_source(&self) -> Result<ColdKeysetPlan> {
         if !self.table_metadata.vortex_config.cold_tier_enabled() || !self.upsert_bloom_eligible() {
             self.store_cold_pk_existence(None);
-            return Ok(ColdKeysetSource::None);
+            return Ok(ColdKeysetPlan {
+                source: ColdKeysetSource::None,
+                resolved_at_snapshot: None,
+            });
         }
 
-        let cold_files = self
-            .catalog
-            .list_cold_tier_files(&self.table_metadata.table_id)
-            .await?;
+        // Resolve the manifest and the warm snapshot id it belongs to together under
+        // the read fence, and report that snapshot id to the caller: a `Bloom`
+        // outcome tells the rebuild to skip the cold scan and let this bloom stand
+        // in for the cold-resident keys, which is only sound while the rebuild's own
+        // capture sees the SAME snapshot. See `ColdKeysetPlan::resolved_at_snapshot`.
+        let (snapshot_id, cold_files) = {
+            let _fence = self.listing_fence.read().await;
+            let snapshot_id = self.get_current_snapshot_id();
+            let cold_files = self.cold_manifest_under_held_fence(&snapshot_id).await?;
+            (snapshot_id, cold_files)
+        };
         // Liveness is size-based, NOT row_count-based: promotion commits files
         // with `row_count = 0` when footer stats inference fails. Such files
         // carry no bloom, so keeping them live routes to the exact-scan fallback
         // instead of silently dropping their keys.
         let live: Vec<_> = cold_files
-            .into_iter()
+            .iter()
             .filter(|f| f.file_size_bytes > 0)
             .collect();
-        if live.is_empty() {
-            // No cold-resident keys: an EMPTY existence view (never probes true)
-            // is complete and correct, so skip the scan. Stored (not cleared) to
-            // keep the invariant "`Bloom` ⇒ view present".
-            self.store_cold_pk_existence(Some(Arc::new(ColdPkExistence::new(Vec::new()))));
-            return Ok(ColdKeysetSource::Bloom);
-        }
-
         let mut blooms = Vec::with_capacity(live.len());
         for f in &live {
             if let Some(bloom) = f.pk_bloom.as_deref().and_then(PkBloom::from_bytes) {
@@ -7757,7 +8096,9 @@ impl CayenneTableProvider {
                 // the per-file cap, or corrupt) means the union would omit
                 // that file's keys. Missing a cold key would let an upsert
                 // false-negative and double-count, so fall back to the exact
-                // cold scan for the whole table.
+                // cold scan for the whole table. Nothing to publish and nothing
+                // to pair: the exact fold reads the manifest under the rebuild's
+                // own fence.
                 tracing::debug!(
                     target: "cayenne::compaction",
                     table = self.table_metadata.table_name.as_str(),
@@ -7765,20 +8106,57 @@ impl CayenneTableProvider {
                     "Cold-tier file has no PK bloom; keyset rebuild falls back to the exact cold scan"
                 );
                 self.store_cold_pk_existence(None);
-                return Ok(ColdKeysetSource::Scan);
+                return Ok(ColdKeysetPlan {
+                    source: ColdKeysetSource::Scan,
+                    resolved_at_snapshot: Some(snapshot_id),
+                });
             }
         }
-
+        // An EMPTY view (no live cold files) never probes true, which is complete
+        // and correct — stored rather than cleared to keep the invariant
+        // "`Bloom` ⇒ view present".
         let existence = Arc::new(ColdPkExistence::new(blooms));
+
+        // `cold_pk_existence` is a SHARED slot that the on-conflict apply probes
+        // directly, with no snapshot id of its own, so publishing a bloom built for
+        // a superseded snapshot poisons every consumer that does not rebuild first.
+        // Two rebuilds running concurrently off `write_lock` are enough: the one that
+        // resolved before a promotion can store its pre-promotion bloom AFTER the one
+        // that resolved after it stored a post-promotion keyset, leaving the keys that
+        // promotion moved in neither half — an upsert of one then records no supersede
+        // tombstone and leaks its prior cold copy. Publish only while the snapshot the
+        // bloom was built for is still live, under the fence that makes a promotion's
+        // flip atomic; a losing resolve leaves the slot alone (whatever is there is at
+        // least as new) and folds the cold tier exactly instead.
+        let published = {
+            let _fence = self.listing_fence.read().await;
+            let still_live = self.get_current_snapshot_id() == snapshot_id;
+            if still_live {
+                self.store_cold_pk_existence(Some(existence));
+            }
+            still_live
+        };
+        if !published {
+            tracing::debug!(
+                target: "cayenne::compaction",
+                table = self.table_metadata.table_name.as_str(),
+                "Cold PK existence view was built against a snapshot that has since been superseded; folding the cold tier exactly instead of publishing it"
+            );
+            return Ok(ColdKeysetPlan {
+                source: ColdKeysetSource::Scan,
+                resolved_at_snapshot: Some(snapshot_id),
+            });
+        }
         tracing::debug!(
             target: "cayenne::compaction",
             table = self.table_metadata.table_name.as_str(),
             cold_files = live.len(),
-            approx_bytes = existence.approx_bytes(),
             "Built cold-tier PK existence view from manifest blooms; keyset rebuild skips the cold scan"
         );
-        self.store_cold_pk_existence(Some(existence));
-        Ok(ColdKeysetSource::Bloom)
+        Ok(ColdKeysetPlan {
+            source: ColdKeysetSource::Bloom,
+            resolved_at_snapshot: Some(snapshot_id),
+        })
     }
 
     /// Rebuild the PK existence index from durable state in ONE bounded
@@ -7797,11 +8175,21 @@ impl CayenneTableProvider {
     /// `false` skips that O(cold-rows) scan because the cold contribution is
     /// served by the [`ColdPkExistence`] bloom (`resolve_cold_keyset_source`).
     /// Immaterial when the cold tier is disabled (the pass is a no-op).
+    ///
+    /// `cold_bloom_snapshot` is [`ColdKeysetPlan::resolved_at_snapshot`] — the warm
+    /// snapshot a `fold_cold == false` decision was made against. If this capture
+    /// sees a different snapshot, a promotion landed in between and the bloom no
+    /// longer covers what warm no longer holds, so the skip is upgraded back to the
+    /// exact fold (which reads the manifest resolved in THIS fenced instant and is
+    /// therefore coherent by construction). `fold_cold == false` is therefore a
+    /// REQUEST to skip, not a guarantee: the fold runs whenever this capture ends up
+    /// resolving a manifest, and never for a table without the tier.
     async fn load_existing_pk_index(
         &self,
         pk_indices: &[usize],
         converter: &RowConverter,
         fold_cold: bool,
+        cold_bloom_snapshot: Option<&str>,
         shards: usize,
     ) -> Result<ShardedPkIndex> {
         // Capture the snapshot LIST — un-checkpointed mem-tier shards, the
@@ -7818,7 +8206,12 @@ impl CayenneTableProvider {
         // mem-tier snapshot stays inside the same fence so a concurrent
         // off-`write_lock` checkpoint cannot hide a live key either: it is in this
         // snapshot or already durable in the scan that follows.
-        let (mem_snapshots, protected_snapshots, current_snapshot_id) = {
+        // The cold manifest joins that same fenced instant when the cold fold runs:
+        // a promotion publishes its manifest commit and its warm snapshot flip
+        // together under the WRITE fence, so resolving cold after this block would
+        // let the rebuild fold the promoted rows from BOTH the pre-promotion warm
+        // snapshot and the post-promotion cold manifest.
+        let (mem_snapshots, protected_snapshots, current_snapshot_id, cold_files) = {
             let _fence = self.listing_fence.read().await;
             let mem_snapshots: Vec<Arc<crate::provider::mem_tier::MemTier>> = self
                 .mem_tier
@@ -7829,7 +8222,35 @@ impl CayenneTableProvider {
             // Wait-free Arc::clone — the inner HashMap is shared, not cloned.
             let protected_snapshots = self.protected_snapshots.load_full();
             let current_snapshot_id = self.get_current_snapshot_id();
-            (mem_snapshots, protected_snapshots, current_snapshot_id)
+            // A bloom resolved against a DIFFERENT snapshot cannot stand in for the
+            // cold tier here: the promotion that moved the snapshot on also moved
+            // the promoted keys out of this warm capture, so trusting it would drop
+            // them from the keyset entirely. Fold cold exactly instead.
+            let cold_bloom_is_stale =
+                cold_bloom_snapshot.is_some_and(|resolved_at| resolved_at != current_snapshot_id);
+            if cold_bloom_is_stale && !fold_cold {
+                tracing::debug!(
+                    target: "cayenne::compaction",
+                    table = self.table_metadata.table_name.as_str(),
+                    "Cold PK bloom was resolved against a superseded snapshot (a promotion raced the keyset rebuild); folding the cold tier exactly instead"
+                );
+            }
+            let cold_files = if self.table_metadata.vortex_config.cold_tier_enabled()
+                && (fold_cold || cold_bloom_is_stale)
+            {
+                Some(
+                    self.cold_manifest_under_held_fence(&current_snapshot_id)
+                        .await?,
+                )
+            } else {
+                None
+            };
+            (
+                mem_snapshots,
+                protected_snapshots,
+                current_snapshot_id,
+                cold_files,
+            )
         };
 
         let ctx = self.create_session_context();
@@ -7871,7 +8292,7 @@ impl CayenneTableProvider {
         // would wrongly drop a genuinely new row) and keeps the exact build.
         let budget = self
             .upsert_bloom_eligible()
-            .then(|| self.context.pk_keyset_cache_max_bytes());
+            .then(|| self.effective_pk_keyset_budget());
         let mut keyset = BoundedShardedPkIndexBuilder::new(shards, budget);
         let mut row_id_base: i64 = 0;
 
@@ -7944,16 +8365,17 @@ impl CayenneTableProvider {
         // Skipped when `fold_cold` is false: the cold contribution is then
         // served by the `ColdPkExistence` bloom, avoiding this O(cold-rows)
         // object-store scan entirely.
-        if fold_cold
+        if let Some(cold_files) = cold_files.as_ref()
             && let Some(cold_plan) = self
-                .build_cold_tier_scan_plan(
-                    &ctx.state(),
-                    Some(&pk_projection),
-                    &[],
-                    None,
-                    &ctx.copied_config(),
-                    None,
-                )
+                .build_cold_tier_scan_plan(ColdTierScan {
+                    state: &ctx.state(),
+                    projection: Some(&pk_projection),
+                    filters: &[],
+                    limit: None,
+                    scan_config: &ctx.copied_config(),
+                    read_schema_override: None,
+                    cold_files: cold_files.as_slice(),
+                })
                 .await?
         {
             let scan_start = Instant::now();
@@ -8273,10 +8695,18 @@ impl CayenneTableProvider {
     /// essential in `cdc_durability: memory`, where a key written after the
     /// checkpoint lives only in RAM — omitting it false-negatives that key's next
     /// update and leaks the prior copy, a durable over-count).
+    ///
+    /// `cold_bloom_snapshot` is [`ColdKeysetPlan::resolved_at_snapshot`]: this path
+    /// never scans the cold tier, so the cold-resident keys are served entirely by
+    /// the bloom published for that snapshot. A snapshot move since then means a
+    /// promotion landed, and the keys it moved are in neither that bloom nor this
+    /// checkpoint's warm coverage — so fail closed to the full rebuild, which folds
+    /// cold exactly.
     async fn try_load_persisted_pk_index(
         &self,
         pk_indices: &[usize],
         converter: &RowConverter,
+        cold_bloom_snapshot: Option<&str>,
     ) -> Result<Option<CachedPkIndex>> {
         if !self.upsert_bloom_eligible() {
             return Ok(None);
@@ -8327,7 +8757,10 @@ impl CayenneTableProvider {
 
         // Gate on the snapshot tag: the bloom covers the full current snapshot
         // only if nothing rewrote it since the checkpoint (compaction re-persists).
-        if checkpoint_snapshot != current_snapshot_id {
+        // The cold bloom is gated on the same id for the reason in the doc comment.
+        if checkpoint_snapshot != current_snapshot_id
+            || cold_bloom_snapshot.is_some_and(|resolved_at| resolved_at != current_snapshot_id)
+        {
             return Ok(None);
         }
         let Some((mut bloom, blob_snapshot)) = deserialize_pk_bloom_sidecar(&bytes) else {
@@ -8639,26 +9072,42 @@ impl CayenneTableProvider {
         // cold PK existence bloom from the manifest, no object-store I/O).
         // `Bloom` skips the cold scan; `Scan` forces a full rebuild (the
         // warm-only checkpoint can't cover the incomplete-bloom case).
-        let cold_source = self.resolve_cold_keyset_source().await?;
-        let fold_cold = !matches!(cold_source, ColdKeysetSource::Bloom);
-        let allow_checkpoint = !matches!(cold_source, ColdKeysetSource::Scan);
+        let cold_plan = self.resolve_cold_keyset_source().await?;
+        let fold_cold = !matches!(cold_plan.source, ColdKeysetSource::Bloom);
+        let allow_checkpoint = !matches!(cold_plan.source, ColdKeysetSource::Scan);
+        // Only a `Bloom` outcome makes the rebuild depend on the snapshot the bloom
+        // was resolved against; the exact fold reads the manifest under its own
+        // fence and needs no pairing check.
+        let cold_bloom_snapshot = matches!(cold_plan.source, ColdKeysetSource::Bloom)
+            .then_some(cold_plan.resolved_at_snapshot.as_deref())
+            .flatten();
         // Fast path: reconstruct the index from the persisted bloom checkpoint
         // (+ bounded post-checkpoint delta) and skip the full-table keyset
         // scan. Falls back to the full scan on any miss/mismatch/corruption.
         let existing_keys = if allow_checkpoint {
             match self
-                .try_load_persisted_pk_index(pk_indices, converter)
+                .try_load_persisted_pk_index(pk_indices, converter, cold_bloom_snapshot)
                 .await
             {
                 Ok(Some(index)) => index,
                 _ => {
-                    self.load_existing_pk_index_serial(pk_indices, converter, fold_cold)
-                        .await?
+                    self.load_existing_pk_index_serial(
+                        pk_indices,
+                        converter,
+                        fold_cold,
+                        cold_bloom_snapshot,
+                    )
+                    .await?
                 }
             }
         } else {
-            self.load_existing_pk_index_serial(pk_indices, converter, fold_cold)
-                .await?
+            self.load_existing_pk_index_serial(
+                pk_indices,
+                converter,
+                fold_cold,
+                cold_bloom_snapshot,
+            )
+            .await?
         };
         record_cayenne_write_phase(
             self.table_metadata.table_name.as_str(),
@@ -8683,9 +9132,10 @@ impl CayenneTableProvider {
         pk_indices: &[usize],
         converter: &RowConverter,
         fold_cold: bool,
+        cold_bloom_snapshot: Option<&str>,
     ) -> Result<CachedPkIndex> {
         let index = self
-            .load_existing_pk_index(pk_indices, converter, fold_cold, 1)
+            .load_existing_pk_index(pk_indices, converter, fold_cold, cold_bloom_snapshot, 1)
             .await?;
         Ok(match index {
             ShardedPkIndex::Exact(keysets) => CachedPkIndex::Exact(
@@ -8812,9 +9262,14 @@ impl CayenneTableProvider {
         // Resolve the datalake (cold) tier contribution first (rebuilds the cold
         // PK existence bloom from the manifest, no object-store I/O), coupled
         // with the sharded rebuild the same way the serial path couples it.
-        let cold_source = self.resolve_cold_keyset_source().await?;
-        let fold_cold = !matches!(cold_source, ColdKeysetSource::Bloom);
-        let allow_checkpoint = !matches!(cold_source, ColdKeysetSource::Scan);
+        let cold_plan = self.resolve_cold_keyset_source().await?;
+        let fold_cold = !matches!(cold_plan.source, ColdKeysetSource::Bloom);
+        let allow_checkpoint = !matches!(cold_plan.source, ColdKeysetSource::Scan);
+        // See the serial path: only a bloom-served cold tier has to be paired with
+        // the snapshot it was resolved against.
+        let cold_bloom_snapshot = matches!(cold_plan.source, ColdKeysetSource::Bloom)
+            .then_some(cold_plan.resolved_at_snapshot.as_deref())
+            .flatten();
 
         // Cold rebuild. Try the persisted single bloom only at n==1 (it can't be
         // split). All paths route through `load_existing_pk_index`, which folds
@@ -8835,7 +9290,7 @@ impl CayenneTableProvider {
         if n == 1 {
             let index = if allow_checkpoint {
                 match self
-                    .try_load_persisted_pk_index(pk_indices, converter)
+                    .try_load_persisted_pk_index(pk_indices, converter, cold_bloom_snapshot)
                     .await
                 {
                     Ok(Some(CachedPkIndex::Exact(keyset))) => {
@@ -8852,8 +9307,14 @@ impl CayenneTableProvider {
             let index = match index {
                 Some(index) => index,
                 None => {
-                    self.load_existing_pk_index(pk_indices, converter, fold_cold, 1)
-                        .await?
+                    self.load_existing_pk_index(
+                        pk_indices,
+                        converter,
+                        fold_cold,
+                        cold_bloom_snapshot,
+                        1,
+                    )
+                    .await?
                 }
             };
             record_cayenne_write_phase(
@@ -8865,7 +9326,7 @@ impl CayenneTableProvider {
         }
 
         let index = self
-            .load_existing_pk_index(pk_indices, converter, fold_cold, n)
+            .load_existing_pk_index(pk_indices, converter, fold_cold, cold_bloom_snapshot, n)
             .await?;
         record_cayenne_write_phase(
             self.table_metadata.table_name.as_str(),
@@ -9841,10 +10302,56 @@ impl CayenneTableProvider {
         //    so the memory budget reflects the post-apply index size. (Off-lock and
         //    serialized by `write_lock`, so no concurrent apply observes a stale
         //    figure.)
-        if !validated_keys.is_empty()
-            && let Some(index) = self.sharded_pk_keyset_cache.lock().as_ref()
-        {
-            self.table_memory.set_keyset_bytes(index.approx_bytes());
+        //
+        //    This recompute is also the byte budget's ENFORCEMENT point for the
+        //    keys that arrive here: the step-4 per-shard inserts run uncapped
+        //    (`record_keys_in_shard` passes no cap, so a single shard never
+        //    converts mid-insert while its siblings are still appending), so
+        //    without a degrade here the exact keysets grow with every distinct
+        //    key ever written — unbounded under a workload with monotonic keys,
+        //    even when the live row count is stable — and the configured budget
+        //    is only ever reported, never applied.
+        //
+        //    Enforcement covers UPSERT tables only, and deliberately leaves a
+        //    non-upsert index resident and over budget. A bloom is unsound for
+        //    `DoNothing` (see `upsert_bloom_eligible`), and dropping the cache —
+        //    what the commit-path mirror in `record_pk_keys_with_location` does —
+        //    is not an option on THIS path: the mem-tier CDC apply never reaches
+        //    that mirror (`write_cdc_in_memory` returns before
+        //    `record_inlined_pk_keys`), so a drop here would be newly reachable
+        //    per apply, and the `DoNothing` rebuild that follows is deliberately
+        //    uncapped (`build_sharded_pk_index` passes no budget) and comes back
+        //    over budget — a full O(live rows) keyset rebuild on every apply,
+        //    silently. Reporting the true resident bytes and letting the memory
+        //    account apply back-pressure is the lesser evil; bounding a
+        //    `DoNothing` keyset needs a sound exact eviction, not a bloom.
+        if !validated_keys.is_empty() {
+            let mut sharded = self.sharded_pk_keyset_cache.lock();
+            // Gate on the variant, not just the tally: only an `Exact` index grows
+            // per recorded key and only it can be degraded, so this fires on the
+            // one transition rather than repeating every apply for an
+            // already-bloomed index whose blooms sit above a very small budget.
+            let mut bytes = None;
+            if let Some(index @ ShardedPkIndex::Exact(_)) = sharded.as_mut() {
+                let max_bytes = self.effective_pk_keyset_budget();
+                let resident = index.approx_bytes();
+                if resident > max_bytes && self.upsert_bloom_eligible() {
+                    tracing::warn!(
+                        table = %self.table_name(),
+                        resident_bytes = resident,
+                        budget_bytes = max_bytes,
+                        "sharded PK keyset exceeded its byte budget; degrading to bounded per-shard blooms (existence stays sound - a false positive costs only a redundant delete and a false negative cannot occur; per-key sequences and captured positions are dropped until the next rebuild)"
+                    );
+                    index.degrade_to_blooms(max_bytes / index.shard_count().max(1));
+                } else {
+                    bytes = Some(resident);
+                }
+            }
+            // Recomputed after a degrade (the tally changed); reused otherwise.
+            let bytes = bytes.or_else(|| sharded.as_ref().map(ShardedPkIndex::approx_bytes));
+            if let Some(bytes) = bytes {
+                self.publish_sharded_keyset_bytes(bytes);
+            }
         }
 
         Ok(ShardedApplyResult {
@@ -13596,6 +14103,25 @@ impl CayenneTableProvider {
         // maintenance debounce, which fires whenever a write schedules
         // maintenance — i.e. continuously under CDC load — so the WAL drains
         // promptly even though the inline backstop is off.
+        // Reclaim a bounded slice of the metastore freelist, BEFORE the
+        // checkpoint below. A high-update upsert table frees pages as it
+        // supersedes rows; under the default auto-vacuum mode those stay on the
+        // freelist and are reused, so the file plateaus and this is a no-op. A
+        // deployment that opted into INCREMENTAL wants the space back instead,
+        // and this tick is the only safe place to take it: the pragma holds the
+        // write lock while it relocates pages, so it must never run on the hot
+        // path. Ordering is load-bearing — the relocation is written as WAL
+        // frames and the file only shrinks when a checkpoint copies them back,
+        // so vacuuming after the checkpoint would defer the truncation a whole
+        // tick. Best-effort, like the checkpoint: logged, never propagated to
+        // fail the originating write.
+        if let Err(e) = self.catalog.incremental_vacuum().await {
+            tracing::warn!(
+                table = self.table_metadata.table_name.as_str(),
+                "Background metastore incremental vacuum failed: {e}"
+            );
+        }
+
         if let Err(e) = self.catalog.checkpoint_wal().await {
             tracing::warn!(
                 table = self.table_metadata.table_name.as_str(),
@@ -16177,12 +16703,12 @@ impl CayenneTableProvider {
             Self::ensure_snapshot_dir_exists(&dir).await?;
         }
         // A cold promotion has TWO visibility publication points: the metastore
-        // commit (scans list cold files straight from `cayenne_cold_tier_file`)
-        // and the in-memory snapshot flip (scans read the warm snapshot id from
-        // memory). Publishing them at different times lets a concurrent fenced
-        // scan pair the OLD warm snapshot with the NEW cold manifest and count
-        // the promoted rows twice. Hold ONE `listing_fence` write across both so
-        // they flip atomically w.r.t. scans — the deliberate exception to
+        // commit (the cold manifest a scan's capture resolves) and the in-memory
+        // snapshot flip (the warm snapshot id it captures). Publishing them at
+        // different times lets a concurrent fenced scan pair the OLD warm snapshot
+        // with the NEW cold manifest and count the promoted rows twice. Hold ONE
+        // `listing_fence` write across both so they flip atomically w.r.t. scans —
+        // the deliberate exception to
         // "no `.await` under the fence": for cold, the metastore commit IS a
         // visibility flip. The hold is BOUNDED: the commit's write-conflict
         // retry loop is capped at DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS (4)
@@ -16196,6 +16722,7 @@ impl CayenneTableProvider {
             table = self.table_metadata.table_name.as_str(),
             "Committing the datalake manifest + snapshot flip under fence"
         );
+        let cold_files = Arc::new(cold_files);
         {
             let _fence = self.listing_fence.write().await;
             self.catalog
@@ -16206,6 +16733,11 @@ impl CayenneTableProvider {
                 )
                 .await?;
             self.publish_overwrite_snapshot_fenced(&new_snapshot_id, new_listing_table);
+            // The third publication step, under the same fence: hand the manifest
+            // this commit just wrote to the scan path as the cold half of the new
+            // snapshot. Every subsequent capture then resolves both halves with no
+            // metastore read, and no capture can observe one half without the other.
+            self.store_cold_manifest(&new_snapshot_id, &cold_files);
         }
         if let Err(error) = self.prune_snapshot_manifest_to(&new_snapshot_id).await {
             tracing::warn!(
@@ -20326,6 +20858,11 @@ impl CayenneTableProvider {
                 ))
             })?;
         }
+        // Same shape for the cold manifest: warm it OFF the fence so the resolve
+        // under the fence is an `Arc` clone. A snapshot flip landing after this
+        // read just makes that resolve miss and read again under the fence, which
+        // is correct, only slower.
+        self.warm_cold_manifest_cache().await;
 
         // Hold listing_fence.read() for the capture so the deletion snapshot, the
         // protected_snapshots set, and the current snapshot's file listing are all
@@ -20418,6 +20955,22 @@ impl CayenneTableProvider {
         let current_snapshot_id = self.get_current_snapshot_id();
         let structural_epoch = self.inlined_structural_epoch.load(Ordering::Relaxed);
 
+        // The cold half of the file set, resolved under the SAME held fence as the
+        // warm snapshot id above so the two are one instant. A promotion publishes
+        // the cold-manifest commit and the warm snapshot flip together under
+        // `listing_fence.write()`, so a cross-tier read has to capture both halves
+        // inside one fence: a manifest resolved any later can belong to a promotion
+        // this warm snapshot predates, and pairing the two counts every promoted row
+        // twice.
+        let cold_files = if self.table_metadata.vortex_config.cold_tier_enabled() {
+            Some(
+                self.cold_manifest_under_held_fence(&current_snapshot_id)
+                    .await?,
+            )
+        } else {
+            None
+        };
+
         // Capture the (gated) read schema under the SAME held fence + seqlock-validated
         // window, so it is consistent with the data captured above and every scan-plan
         // branch can build from this one schema instead of re-reading the live
@@ -20444,10 +20997,107 @@ impl CayenneTableProvider {
             protected_map,
             inlined_view,
             current_snapshot_id,
+            cold_files,
             structural_epoch,
             scan_guard,
             read_schema,
         })
+    }
+
+    /// Resolve the cold-tier manifest that belongs to `snapshot_id`, for a caller
+    /// that is holding `listing_fence.read()`.
+    ///
+    /// The cache entry is only usable when it names the live snapshot id, and a
+    /// cold-manifest change always mints a new one (see
+    /// [`ColdManifestForSnapshot`]) — so a hit is provably the manifest paired with
+    /// `snapshot_id`, and a miss reads the metastore. That read is a deliberate
+    /// `.await` under the held read fence, in the same spirit as the write side's
+    /// documented exception: for cold, listing the manifest IS reading a visibility
+    /// flip, so it has to happen inside the fence that makes the flip atomic. It is
+    /// bounded (one table-scoped indexed SELECT) and rare — [`Self::promote_warm_to_cold`]
+    /// publishes the manifest it just committed, `warm_cold_manifest_cache` warms
+    /// every other flip off the fence, and the capture already awaits metastore I/O
+    /// under this same fence for the inline corpus.
+    async fn cold_manifest_under_held_fence(
+        &self,
+        snapshot_id: &str,
+    ) -> datafusion_common::Result<Arc<Vec<crate::metadata::ColdTierFile>>> {
+        // A table without the tier has no manifest rows to pair with anything, and
+        // this runs on the CDC write path's keyset rebuild for EVERY table — so
+        // answering empty here, rather than at each call site, keeps a warm-only
+        // table's rebuild free of a `cayenne_cold_tier_file` round trip even if a
+        // future caller forgets to ask.
+        if !self.table_metadata.vortex_config.cold_tier_enabled() {
+            return Ok(Arc::new(Vec::new()));
+        }
+        let cached = self.cold_manifest.load_full();
+        if let Some(cached) = cached.as_ref()
+            && cached.snapshot_id == snapshot_id
+        {
+            return Ok(Arc::clone(&cached.files));
+        }
+        let files = self.fetch_cold_manifest().await?;
+        self.store_cold_manifest(snapshot_id, &files);
+        Ok(files)
+    }
+
+    /// Read the table's cold-tier manifest from the metastore.
+    ///
+    /// No directory-listing fallback exists for cold (unlike the warm manifest), so a
+    /// metastore error must fail the query rather than silently drop cold rows.
+    async fn fetch_cold_manifest(
+        &self,
+    ) -> datafusion_common::Result<Arc<Vec<crate::metadata::ColdTierFile>>> {
+        self.catalog
+            .list_cold_tier_files(&self.table_metadata.table_id)
+            .await
+            .map(Arc::new)
+            .map_err(|e| {
+                datafusion_common::DataFusionError::Execution(format!(
+                    "Failed to list cold-tier files for table {}: {e}",
+                    self.table_metadata.table_name
+                ))
+            })
+    }
+
+    /// Publish `files` as the cold manifest belonging to `snapshot_id`.
+    fn store_cold_manifest(
+        &self,
+        snapshot_id: &str,
+        files: &Arc<Vec<crate::metadata::ColdTierFile>>,
+    ) {
+        self.cold_manifest
+            .store(Arc::new(Some(ColdManifestForSnapshot {
+                snapshot_id: snapshot_id.to_string(),
+                files: Arc::clone(files),
+            })));
+    }
+
+    /// Populate the cold-manifest cache for the live snapshot id BEFORE a capture
+    /// takes the listing fence, so the fenced resolve is an `Arc` clone.
+    ///
+    /// Best-effort: a failure (or a flip that lands during the read) leaves the
+    /// cache as it was, and the fenced resolve reads again and reports the error.
+    /// The entry is only stored when the snapshot id is unchanged across the read,
+    /// so this can never publish a manifest under an id it does not belong to.
+    async fn warm_cold_manifest_cache(&self) {
+        if !self.table_metadata.vortex_config.cold_tier_enabled() {
+            return;
+        }
+        let snapshot_id = self.get_current_snapshot_id();
+        let cached = self.cold_manifest.load_full();
+        if cached
+            .as_ref()
+            .as_ref()
+            .is_some_and(|cached| cached.snapshot_id == snapshot_id)
+        {
+            return;
+        }
+        if let Ok(files) = self.fetch_cold_manifest().await
+            && self.get_current_snapshot_id() == snapshot_id
+        {
+            self.store_cold_manifest(&snapshot_id, &files);
+        }
     }
 
     /// Compute the scan-ready [`ScanView`] from a [`RawScanInput`] capture: the KDI
@@ -25016,21 +25666,28 @@ impl CayenneTableProvider {
     /// tier is disabled or empty (no added plan nodes — byte-identical to a
     /// warm-only scan).
     ///
-    /// Cold files come from the `cayenne_cold_tier_file` metastore manifest
-    /// (table-scoped, absolute object-store URLs), and each row carries its
-    /// serialized Vortex `FileStatistics` blob — so listing-time pruning runs
-    /// with NO object-store round-trip. The returned plan is a Vortex
-    /// `DataSourceExec`; the caller wraps it with the key-based (`Ignore`)
-    /// deletion filter and unions it into the scan tree.
+    /// `cold_files` is the caller's CAPTURED `cayenne_cold_tier_file` manifest
+    /// (table-scoped, absolute object-store URLs) — resolved in the same fenced
+    /// instant as the warm snapshot the rest of the scan reads, never re-read here:
+    /// a manifest read after the caller's capture can belong to a later promotion,
+    /// and pairing it with the captured warm snapshot double-counts every promoted
+    /// row. Each row carries its serialized Vortex `FileStatistics` blob, so
+    /// listing-time pruning runs with NO object-store round-trip. The returned plan
+    /// is a Vortex `DataSourceExec`; the caller wraps it with the key-based
+    /// (`Ignore`) deletion filter and unions it into the scan tree.
     async fn build_cold_tier_scan_plan(
         &self,
-        state: &dyn Session,
-        projection: Option<&Vec<usize>>,
-        filters: &[Expr],
-        limit: Option<usize>,
-        scan_config: &SessionConfig,
-        read_schema_override: Option<SchemaRef>,
+        scan: ColdTierScan<'_>,
     ) -> datafusion_common::Result<Option<Arc<dyn ExecutionPlan>>> {
+        let ColdTierScan {
+            state,
+            projection,
+            filters,
+            limit,
+            scan_config,
+            read_schema_override,
+            cold_files,
+        } = scan;
         // Cold tier disabled (no location) → no branch.
         if !self.table_metadata.vortex_config.cold_tier_enabled() {
             return Ok(None);
@@ -25046,31 +25703,18 @@ impl CayenneTableProvider {
             Self::register_object_store_if_needed(state.runtime_env(), cold_config);
         }
 
-        let cold_files = self
-            .catalog
-            .list_cold_tier_files(&self.table_metadata.table_id)
-            .await
-            .map_err(|e| {
-                // No directory-listing fallback exists for cold (unlike the warm
-                // manifest), so a metastore error must fail the query rather than
-                // silently drop cold rows.
-                datafusion_common::DataFusionError::Execution(format!(
-                    "Failed to list cold-tier files for table {}: {e}",
-                    self.table_metadata.table_name
-                ))
-            })?;
         // Carry-forward promotion: the promotion's PRIVATE session carries a
         // `ColdScanFileSubset` config extension restricting this branch to the
         // dirty files being rewritten (clean files are carried forward by
         // manifest reference, never re-read). User-query sessions never carry
-        // the extension, so queries always see the full manifest.
-        let cold_files =
+        // the extension, so queries always see the full captured manifest.
+        let cold_files: Vec<&crate::metadata::ColdTierFile> =
             match scan_config.get_extension::<super::cold_partition::ColdScanFileSubset>() {
                 Some(subset) => cold_files
-                    .into_iter()
+                    .iter()
                     .filter(|f| subset.0.contains(&f.file_url))
                     .collect(),
-                None => cold_files,
+                None => cold_files.iter().collect(),
             };
         // No early all-empty guard needed: the per-file loop skips zero-size
         // files and the `object_store_url is None` / `kept.is_empty()` checks
@@ -26368,6 +27012,9 @@ impl TableProvider for CayenneTableProvider {
         let protected_map = Arc::clone(&scan_view.raw.protected_map);
         let inlined_view = Arc::clone(&scan_view.raw.inlined_view);
         let current_snapshot_id = scan_view.raw.current_snapshot_id.clone();
+        // The cold file set captured in the SAME fenced instant as
+        // `current_snapshot_id`, so the cross-tier union cannot straddle a promotion.
+        let cold_files = scan_view.raw.cold_files.as_ref().map(Arc::clone);
         let scan_guard = Arc::clone(&scan_view.raw.scan_guard);
         let deletion_snapshot = scan_view.merged_deletions.clone();
         let visible_segments = Arc::clone(&scan_view.visible_segments);
@@ -26593,21 +27240,22 @@ impl TableProvider for CayenneTableProvider {
             })
             .await?;
 
-        // Build the COLD object-store tier branch (storage-cascade bottom tier).
-        // Cold files hold OLD, fully-superseded data, so they take the
-        // `Ignore`-re-inserts deletion treatment (`apply_deletion_filter`) — the
-        // same camp as protected snapshots. Using the `Apply` variant here would
+        // Build the COLD object-store tier branch (storage-cascade bottom tier) from
+        // the CAPTURED manifest. Cold files hold OLD, fully-superseded data, so they
+        // take the `Ignore`-re-inserts deletion treatment (`apply_deletion_filter`) —
+        // the same camp as protected snapshots. Using the `Apply` variant here would
         // resurrect a stale cold row for a key re-inserted after deletion.
         // `Ok(None)` (disabled / empty / all-pruned) adds zero plan nodes.
         let cold_plan: Option<Arc<dyn ExecutionPlan>> = self
-            .build_cold_tier_scan_plan(
+            .build_cold_tier_scan_plan(ColdTierScan {
                 state,
-                effective_projection.as_ref(),
-                scan_filters,
+                projection: effective_projection.as_ref(),
+                filters: scan_filters,
                 limit,
-                scan_listing_config,
-                Some(Arc::clone(&read_schema)),
-            )
+                scan_config: scan_listing_config,
+                read_schema_override: Some(Arc::clone(&read_schema)),
+                cold_files: cold_files.as_ref().map_or(&[], |files| files.as_slice()),
+            })
             .await?
             .map(|cold| {
                 self.apply_deletion_filter(cold, &pk_indices_in_projection, &deletion_snapshot)
@@ -27784,6 +28432,17 @@ impl CayenneTableProvider {
         // OnceLock::set fails only if already initialized — race here is fine,
         // the lost compactor drops and aborts its own task.
         self.background_compactor.set(compactor).is_ok()
+    }
+
+    /// Whether an interval background compactor was spawned for this provider.
+    ///
+    /// Reports only that the task was spawned, not that it is still running: a
+    /// spawned compactor exits on its own once the shared compaction semaphore
+    /// is closed. Post-write compaction is scheduled independently of it, so a
+    /// provider without one still compacts as it is written to.
+    #[must_use]
+    pub fn has_background_compactor(&self) -> bool {
+        self.background_compactor.get().is_some()
     }
 
     /// Spawn the periodic mem-tier checkpoint task for this provider, if memory
@@ -29486,6 +30145,57 @@ mod tests {
     /// data — the silent over-count behind the #11823 correctness-gate failure.
     /// The pass must detect the snapshot flip, discard its output, and return
     /// `false`.
+    /// A table with no cold tier must not pay a `cayenne_cold_tier_file` round trip
+    /// for its keyset rebuild. The rebuild's `fold_cold` is true for every table that
+    /// is not bloom-served — which includes every warm-only table — so the fenced
+    /// cold-manifest resolve has to opt OUT on the tier being disabled rather than in.
+    ///
+    /// `cold_manifest` is the observable: [`CayenneTableProvider::cold_manifest_under_held_fence`]
+    /// publishes into it on every read it performs, so a populated cache after an
+    /// upsert (which rebuilds the keyset) is exactly the SELECT this asserts did not
+    /// happen. Scoped to that resolve — the once-per-table `maybe_install_warm_pk_caches`
+    /// probe lists the manifest directly and is unaffected either way.
+    #[tokio::test]
+    async fn warm_only_table_never_reads_the_cold_manifest() {
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "warm_only_no_cold_read",
+            ctx.runtime_env(),
+            VortexConfig::default(),
+        )
+        .await;
+        assert!(
+            !provider.table_metadata.vortex_config.cold_tier_enabled(),
+            "fixture must have no cold tier, or this asserts nothing"
+        );
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+
+        // Two upserts of the same key: the first builds the keyset, the second
+        // exercises it, so the rebuild path has definitely run.
+        for value in [10, 20] {
+            insert_batch(
+                &provider,
+                id_value_batch(Arc::clone(&schema), &[1], &[value]),
+            )
+            .await;
+        }
+        assert_eq!(
+            query_count_star(&ctx, &provider, "warm_only_no_cold_read").await,
+            1,
+            "the upsert collapsed both writes onto one key (the keyset rebuild ran)"
+        );
+        assert!(
+            provider.cold_manifest.load().is_none(),
+            "a warm-only table's keyset rebuild must not resolve (and therefore must \
+             not read) the cold-tier manifest"
+        );
+    }
+
     #[tokio::test]
     async fn subset_compaction_discards_output_when_snapshot_replaced_mid_pass() {
         use arrow::datatypes::{DataType, Field, Schema};
@@ -30763,6 +31473,523 @@ mod tests {
         );
     }
 
+    /// The write-path probe installs warm (empty exact) PK existence caches
+    /// on a provably-empty table, and only then: creation itself installs
+    /// nothing (`create_table` is create-or-reuse, so creation is not proof
+    /// of emptiness), and a non-empty table keeps the lazy rebuild.
+    #[tokio::test]
+    async fn create_table_installs_warm_empty_pk_index_caches() {
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let ctx = SessionContext::new();
+        let temp_dir = tempfile::tempdir().expect("temp dir created");
+        let metadata_dir = format!(
+            "{}/metadata",
+            temp_dir.path().to_str().expect("should be str")
+        );
+        let data_dir = format!("{}/data", temp_dir.path().to_str().expect("should be str"));
+        std::fs::create_dir_all(&metadata_dir).expect("metadata dir created");
+        let connection_string = format!("sqlite://{metadata_dir}/cayenne.db");
+        let catalog = Arc::new(CayenneCatalog::new(connection_string).expect("catalog created"))
+            as Arc<dyn MetadataCatalog>;
+        catalog.init().await.expect("catalog initialized");
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let options = CreateTableOptions {
+            table_name: "warm_pk_index".to_string(),
+            schema,
+            primary_key: vec!["id".to_string()],
+            on_conflict: Some(OnConflict::Upsert(
+                datafusion_table_providers::util::column_reference::ColumnReference::new(vec![
+                    "id".to_string(),
+                ]),
+            )),
+            base_path: data_dir,
+            partition_column: None,
+            vortex_config: VortexConfig {
+                cdc_mem_tier_shards: 4,
+                ..VortexConfig::default()
+            },
+        };
+        let provider = CayenneTableProviderBuilder::new(catalog, ctx.runtime_env())
+            .create(options)
+            .await
+            .expect("table created");
+
+        // Creation installs nothing: create-or-reuse is not proof of emptiness.
+        assert!(provider.pk_keyset_cache.lock().is_none());
+        assert!(provider.sharded_pk_keyset_cache.lock().is_none());
+
+        // The write-path probe on the (verifiably empty) table installs both.
+        provider.maybe_install_warm_pk_caches().await;
+        match provider.pk_keyset_cache.lock().as_ref() {
+            Some(CachedPkIndex::Exact(keyset)) => {
+                assert_eq!(
+                    keyset.len(),
+                    0,
+                    "an empty table's keyset must be exactly empty"
+                );
+            }
+            Some(CachedPkIndex::Bloom(_)) => panic!("empty table must not start with a bloom"),
+            None => panic!("the probe must install the warm empty keyset"),
+        }
+        match provider.sharded_pk_keyset_cache.lock().as_ref() {
+            Some(ShardedPkIndex::Exact(keysets)) => {
+                assert_eq!(
+                    keysets.len(),
+                    provider.mem_tier_shard_count(),
+                    "one empty keyset per configured mem-tier shard"
+                );
+                assert!(keysets.iter().all(|keyset| keyset.len() == 0));
+            }
+            Some(ShardedPkIndex::Bloom(_)) => panic!("empty table must not start with blooms"),
+            None => panic!("the probe must install the warm empty sharded keysets"),
+        }
+
+        // Gate: a non-empty table must never get an empty install. Mark the
+        // table non-empty via the probe's own emptiness signal, clear the
+        // caches (re-arms the probe), re-probe.
+        provider.inlined_row_count.store(3, Ordering::Release);
+        provider.clear_cached_pk_keyset();
+        provider.maybe_install_warm_pk_caches().await;
+        assert!(
+            provider.pk_keyset_cache.lock().is_none(),
+            "probe must refuse to install over a non-empty table"
+        );
+        assert!(provider.sharded_pk_keyset_cache.lock().is_none());
+    }
+
+    /// A re-armed probe must refuse a table whose rows are durable in a
+    /// protected snapshot: `checkpoint_mem_tier` registers its snapshot as
+    /// protected without repointing `current_snapshot_id`, so the current
+    /// manifest is empty while the corpus is fully durable. An empty install
+    /// there false-negates the next upsert of an existing key, leaving two
+    /// live rows for one PK.
+    #[tokio::test]
+    async fn probe_refuses_a_table_whose_rows_live_in_a_protected_snapshot() {
+        let runtime_env = SessionContext::new().runtime_env();
+        let (provider, _catalog, _tmp) =
+            create_memory_mode_upsert_table("warm_probe_protected", Arc::clone(&runtime_env)).await;
+
+        // Seed rows through the tier and checkpoint them durable.
+        let no_deletions = OnConflictDeletions::default();
+        let seed = int64_id_batch(&[1, 2, 3]);
+        let seed_bytes = seed.get_array_memory_size() as u64;
+        provider
+            .append_to_mem_tier(vec![seed], &no_deletions, seed_bytes, 0)
+            .await
+            .expect("seed append");
+        provider
+            .checkpoint_mem_tier()
+            .await
+            .expect("seed checkpoint");
+
+        // The corpus is durable but NOT in the current snapshot's manifest.
+        assert!(provider.mem_tier.tier().load().is_empty(), "tier drained");
+        assert!(
+            !provider.protected_snapshot_ids().is_empty(),
+            "the checkpoint registers its snapshot as protected"
+        );
+        assert!(
+            provider
+                .catalog
+                .get_snapshot_files(
+                    &provider.table_metadata.table_id,
+                    &provider.current_snapshot_id()
+                )
+                .await
+                .expect("current manifest")
+                .is_empty(),
+            "the current snapshot's manifest is empty"
+        );
+        assert_eq!(scan_sorted_ids(&provider).await, vec![1, 2, 3]);
+
+        // Re-arm the probe the way the fold/refresh paths do.
+        provider.clear_cached_pk_keyset();
+        provider.maybe_install_warm_pk_caches().await;
+        assert!(
+            provider.pk_keyset_cache.lock().is_none(),
+            "probe must refuse: rows are durable in a protected snapshot"
+        );
+        assert!(provider.sharded_pk_keyset_cache.lock().is_none());
+    }
+
+    /// Keys committed through the inline/file/staging paths must be mirrored
+    /// into the live sharded existence cache: `append_to_shard`'s per-shard
+    /// record covers only mem-tier appends, so with warm caches live from the
+    /// first write, an unmirrored commit path leaves holes in an "exact"
+    /// keyset and upserts of those keys duplicate instead of superseding.
+    #[tokio::test]
+    async fn commit_path_keys_mirror_into_the_sharded_cache() {
+        use crate::provider::pk_index::pk_digest;
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let ctx = SessionContext::new();
+        let temp_dir = tempfile::tempdir().expect("temp dir created");
+        let metadata_dir = format!(
+            "{}/metadata",
+            temp_dir.path().to_str().expect("should be str")
+        );
+        let data_dir = format!("{}/data", temp_dir.path().to_str().expect("should be str"));
+        std::fs::create_dir_all(&metadata_dir).expect("metadata dir created");
+        let connection_string = format!("sqlite://{metadata_dir}/cayenne.db");
+        let catalog = Arc::new(CayenneCatalog::new(connection_string).expect("catalog created"))
+            as Arc<dyn MetadataCatalog>;
+        catalog.init().await.expect("catalog initialized");
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let options = CreateTableOptions {
+            table_name: "sharded_mirror".to_string(),
+            schema,
+            primary_key: vec!["id".to_string()],
+            on_conflict: Some(OnConflict::Upsert(
+                datafusion_table_providers::util::column_reference::ColumnReference::new(vec![
+                    "id".to_string(),
+                ]),
+            )),
+            base_path: data_dir,
+            partition_column: None,
+            vortex_config: VortexConfig {
+                cdc_mem_tier_shards: 4,
+                ..VortexConfig::default()
+            },
+        };
+        let provider = CayenneTableProviderBuilder::new(catalog, ctx.runtime_env())
+            .create(options)
+            .await
+            .expect("table created");
+        provider.maybe_install_warm_pk_caches().await;
+
+        let mut keys = PkDigestSet::with_capacity(8);
+        for i in 0..8u64 {
+            let key = crate::row_converter::Row::from_encoded(&i.to_be_bytes()).owned();
+            keys.insert_with_digest(pk_digest(&key), key);
+        }
+        provider.record_file_pk_keys(&keys, 1);
+
+        match provider.sharded_pk_keyset_cache.lock().as_ref() {
+            Some(ShardedPkIndex::Exact(keysets)) => {
+                let total: usize = keysets.iter().map(CachedPkKeyset::len).sum();
+                assert_eq!(
+                    total, 8,
+                    "file-committed keys must land in the sharded exact keyset"
+                );
+            }
+            other => panic!(
+                "expected exact sharded keysets, present={}",
+                other.is_some()
+            ),
+        }
+    }
+
+    /// The exact→bloom conversion must produce a bloom sized for the
+    /// conversion-time key count (with growth headroom), not the full byte
+    /// budget: a budget-sized bloom allocates gigabytes for large tables at
+    /// the moment the keyset first outgrows the budget — mid-ingest.
+    #[tokio::test]
+    async fn conversion_bloom_is_right_sized_for_conversion_time_keys() {
+        use crate::provider::pk_index::pk_digest;
+
+        let ctx = SessionContext::new();
+        let budget_bytes = 1024 * 1024;
+        let (provider, _temp_dir) =
+            create_budgeted_upsert_table("right_sized_bloom", 1, ctx.runtime_env()).await;
+        provider.maybe_install_warm_pk_caches().await;
+
+        // ~25k 8-byte keys ≈ 1.4 MiB accounted — crosses the 1 MiB budget.
+        let mut keys = PkDigestSet::with_capacity(25_000);
+        for i in 0..25_000u64 {
+            let key = crate::row_converter::Row::from_encoded(&i.to_be_bytes()).owned();
+            keys.insert_with_digest(pk_digest(&key), key);
+        }
+        provider.record_file_pk_keys(&keys, 1);
+
+        let guard = provider.pk_keyset_cache.lock();
+        match guard.as_ref() {
+            Some(CachedPkIndex::Bloom(bloom)) => {
+                let bloom_bytes = bloom.bits.len() * 8;
+                assert!(
+                    bloom_bytes <= budget_bytes / 4,
+                    "conversion bloom must be right-sized, got {bloom_bytes} bytes for a {budget_bytes}-byte budget"
+                );
+                for key in keys.iter() {
+                    assert!(
+                        bloom.maybe_contains(key.as_ref()),
+                        "right-sized bloom must have no false negatives"
+                    );
+                }
+            }
+            other => panic!(
+                "expected the over-budget keyset to convert to a bloom, present={}",
+                other.is_some()
+            ),
+        }
+    }
+
+    /// A sharded table maintains TWO live PK caches (table-wide + per-shard),
+    /// so each must run against half the configured budget: a key volume that
+    /// fits one budget but not half of it must convert both caches to blooms,
+    /// keeping their combined resident size within the configured budget.
+    #[tokio::test]
+    async fn sharded_table_splits_the_keyset_budget_between_the_two_caches() {
+        use crate::provider::pk_index::pk_digest;
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let ctx = SessionContext::new();
+        let temp_dir = tempfile::tempdir().expect("temp dir created");
+        let metadata_dir = format!(
+            "{}/metadata",
+            temp_dir.path().to_str().expect("should be str")
+        );
+        let data_dir = format!("{}/data", temp_dir.path().to_str().expect("should be str"));
+        std::fs::create_dir_all(&metadata_dir).expect("metadata dir created");
+        let connection_string = format!("sqlite://{metadata_dir}/cayenne.db");
+        let catalog = Arc::new(CayenneCatalog::new(connection_string).expect("catalog created"))
+            as Arc<dyn MetadataCatalog>;
+        catalog.init().await.expect("catalog initialized");
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let options = CreateTableOptions {
+            table_name: "split_budget".to_string(),
+            schema,
+            primary_key: vec!["id".to_string()],
+            on_conflict: Some(OnConflict::Upsert(
+                datafusion_table_providers::util::column_reference::ColumnReference::new(vec![
+                    "id".to_string(),
+                ]),
+            )),
+            base_path: data_dir,
+            partition_column: None,
+            vortex_config: VortexConfig {
+                cdc_mem_tier_shards: 4,
+                pk_keyset_cache_mb: Some(1),
+                ..VortexConfig::default()
+            },
+        };
+        let provider = CayenneTableProviderBuilder::new(catalog, ctx.runtime_env())
+            .create(options)
+            .await
+            .expect("table created");
+        provider.maybe_install_warm_pk_caches().await;
+
+        // 8k 8-byte keys ≈ 750 KiB accounted per cache (96 B/entry — see
+        // `approx_pk_keyset_entry_bytes`): under the 1 MiB budget, so neither
+        // cache would convert WITHOUT the split, but over the 512 KiB
+        // half-budget each cache must respect. The window is what gives this
+        // test its teeth, so keep the count inside it if the per-entry estimate
+        // changes.
+        let mut keys = PkDigestSet::with_capacity(8_000);
+        for i in 0..8_000u64 {
+            let key = crate::row_converter::Row::from_encoded(&i.to_be_bytes()).owned();
+            keys.insert_with_digest(pk_digest(&key), key);
+        }
+        provider.record_file_pk_keys(&keys, 1);
+
+        assert!(
+            matches!(
+                provider.pk_keyset_cache.lock().as_ref(),
+                Some(CachedPkIndex::Bloom(_))
+            ),
+            "table-wide cache must convert at the half-budget split"
+        );
+        assert!(
+            matches!(
+                provider.sharded_pk_keyset_cache.lock().as_ref(),
+                Some(ShardedPkIndex::Bloom(_))
+            ),
+            "sharded cache must degrade at the half-budget split"
+        );
+    }
+
+    /// `table_memory` keyset accounting must reflect BOTH caches: publishing
+    /// either cache's size alone into the single slot under-accounts the other
+    /// by up to a full budget when both hold exact keysets.
+    #[tokio::test]
+    async fn keyset_accounting_sums_both_caches() {
+        use crate::provider::pk_index::pk_digest;
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let ctx = SessionContext::new();
+        let temp_dir = tempfile::tempdir().expect("temp dir created");
+        let metadata_dir = format!(
+            "{}/metadata",
+            temp_dir.path().to_str().expect("should be str")
+        );
+        let data_dir = format!("{}/data", temp_dir.path().to_str().expect("should be str"));
+        std::fs::create_dir_all(&metadata_dir).expect("metadata dir created");
+        let connection_string = format!("sqlite://{metadata_dir}/cayenne.db");
+        let catalog = Arc::new(CayenneCatalog::new(connection_string).expect("catalog created"))
+            as Arc<dyn MetadataCatalog>;
+        catalog.init().await.expect("catalog initialized");
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let options = CreateTableOptions {
+            table_name: "summed_accounting".to_string(),
+            schema,
+            primary_key: vec!["id".to_string()],
+            on_conflict: Some(OnConflict::Upsert(
+                datafusion_table_providers::util::column_reference::ColumnReference::new(vec![
+                    "id".to_string(),
+                ]),
+            )),
+            base_path: data_dir,
+            partition_column: None,
+            vortex_config: VortexConfig {
+                cdc_mem_tier_shards: 4,
+                ..VortexConfig::default()
+            },
+        };
+        let provider = CayenneTableProviderBuilder::new(catalog, ctx.runtime_env())
+            .create(options)
+            .await
+            .expect("table created");
+        provider.maybe_install_warm_pk_caches().await;
+
+        let mut keys = PkDigestSet::with_capacity(64);
+        for i in 0..64u64 {
+            let key = crate::row_converter::Row::from_encoded(&i.to_be_bytes()).owned();
+            keys.insert_with_digest(pk_digest(&key), key);
+        }
+        provider.record_file_pk_keys(&keys, 1);
+
+        let single_bytes = provider
+            .pk_keyset_cache
+            .lock()
+            .as_ref()
+            .map_or(0, CachedPkIndex::approx_bytes);
+        let sharded_bytes = provider
+            .sharded_pk_keyset_cache
+            .lock()
+            .as_ref()
+            .map_or(0, ShardedPkIndex::approx_bytes);
+        assert!(single_bytes > 0, "table-wide cache must hold the keys");
+        assert!(sharded_bytes > 0, "sharded cache must hold the keys");
+        assert_eq!(
+            provider.table_memory.reserved_bytes(),
+            single_bytes + sharded_bytes,
+            "accounted keyset bytes must be the sum of both caches"
+        );
+    }
+
+    /// Rows written past the sharded keyset's effective byte budget on an N>1
+    /// memory-CDC table, so the apply's step-6 resync sees an over-budget index.
+    ///
+    /// `ROWS` is sized against the 512 KiB half-budget at 96 accounted bytes per
+    /// 8-byte key (`entry_estimate_charges_the_digest_the_entry_struct_and_the_key`)
+    /// — ~1.5x over, so the crossing is unambiguous without processing rows the
+    /// assertions do not need. Asserts the warm install really seeded an EXACT
+    /// index, without which a "not exact any more" assertion would also pass on a
+    /// cache that was never installed.
+    async fn write_past_the_sharded_keyset_budget(
+        ctx: &SessionContext,
+        table_name: &str,
+        on_conflict: OnConflict,
+    ) -> (CayenneTableProvider, Arc<dyn MetadataCatalog>, TempDir) {
+        const ROWS: i64 = 8_000;
+
+        let (provider, catalog, tmp) = create_cdc_table_with_on_conflict(
+            table_name,
+            ctx.runtime_env(),
+            VortexConfig {
+                cdc_durability: crate::metadata::CdcDurability::Memory,
+                cdc_mem_tier_shards: 4,
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                inline_max_rows: 1024,
+                // Halved for the sharded cache on an N>1 table, so ~512 KiB.
+                pk_keyset_cache_mb: Some(1),
+                ..VortexConfig::default()
+            },
+            on_conflict,
+        )
+        .await;
+        provider.install_slot_advancer(Arc::new(NoopSlotAdvancer));
+        provider.maybe_install_warm_pk_caches().await;
+        assert!(
+            matches!(
+                provider.sharded_pk_keyset_cache.lock().as_ref(),
+                Some(ShardedPkIndex::Exact(_))
+            ),
+            "the warm install must seed an exact index for the budget to act on"
+        );
+
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        let _ = provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch_for_range(schema, 0, ROWS)),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("sharded CDC append");
+        assert_eq!(
+            query_count_star(ctx, &provider, table_name).await,
+            ROWS,
+            "crossing the keyset budget must not drop or duplicate rows"
+        );
+        (provider, catalog, tmp)
+    }
+
+    /// The sharded apply's step-6 resync is the byte budget's enforcement point
+    /// for the keys `record_keys_in_shard` records: those per-shard inserts run
+    /// uncapped under the publish locks, so an over-budget exact index must be
+    /// degraded to per-shard blooms there. Without it the keysets grow with every
+    /// distinct key ever written — unbounded under monotonic keys even at a stable
+    /// live row count — and the configured budget is only ever reported.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sharded_apply_resync_degrades_an_over_budget_upsert_keyset() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = write_past_the_sharded_keyset_budget(
+            &ctx,
+            "resync_degrades_over_budget_keyset",
+            OnConflict::Upsert(
+                datafusion_table_providers::util::column_reference::ColumnReference::new(vec![
+                    "id".to_string(),
+                ]),
+            ),
+        )
+        .await;
+
+        assert!(
+            matches!(
+                provider.sharded_pk_keyset_cache.lock().as_ref(),
+                Some(ShardedPkIndex::Bloom(_))
+            ),
+            "the resync must degrade an over-budget sharded keyset to blooms"
+        );
+    }
+
+    /// A non-upsert table must never be degraded to blooms: the bloom existence arm
+    /// keeps the incoming row and emits a key-based supersede for the prior one —
+    /// upsert semantics — which is why validation debug-asserts that a bloom index
+    /// implies `OnConflict::Upsert`. The resync leaves it exact and reports the true
+    /// resident bytes instead (see the step-6 comment for why it must not drop the
+    /// cache either).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sharded_apply_resync_leaves_an_over_budget_do_nothing_keyset_exact() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = write_past_the_sharded_keyset_budget(
+            &ctx,
+            "resync_keeps_over_budget_keyset_exact",
+            OnConflict::DoNothingAll,
+        )
+        .await;
+
+        let resident = match provider.sharded_pk_keyset_cache.lock().as_ref() {
+            Some(index @ ShardedPkIndex::Exact(_)) => index.approx_bytes(),
+            Some(ShardedPkIndex::Bloom(_)) => {
+                panic!("a DoNothing table must never degrade to blooms")
+            }
+            None => panic!("a DoNothing table must keep its exact cache, not drop it"),
+        };
+        assert!(
+            resident > provider.effective_pk_keyset_budget(),
+            "the index the resync left alone must be the over-budget one"
+        );
+        assert!(
+            provider.table_memory.reserved_bytes() >= resident,
+            "an index left over budget must still be reported to the memory account"
+        );
+    }
+
     /// A table with no primary key has `pk_deletion_strategy: PositionBased`, so
     /// every delete leaves `delete_from` through the deletion-vector arm and never
     /// reaches `InlineAwareDeletionSink`. Position deletes address
@@ -31062,6 +32289,148 @@ mod tests {
             "conflicting id=1 must reflect the staged value"
         );
         assert_eq!(got.get(&3).map(String::as_str), Some("carol"));
+    }
+
+    /// A stream carrying no batches, for the zero-row write paths.
+    fn empty_stream(schema: &SchemaRef) -> SendableRecordBatchStream {
+        Box::pin(datafusion::physical_plan::EmptyRecordBatchStream::new(
+            Arc::clone(schema),
+        ))
+    }
+
+    /// The snapshot directory names present on disk for this table, sorted.
+    fn snapshot_dir_names(provider: &CayenneTableProvider) -> Vec<String> {
+        let table_root = std::path::Path::new(provider.table_path()).join(provider.table_id());
+        let Ok(entries) = std::fs::read_dir(&table_root) else {
+            // No table root yet — no snapshot directories either.
+            return Vec::new();
+        };
+        let mut names: Vec<String> = entries
+            .map(|entry| entry.expect("table root entry"))
+            .filter(|entry| entry.file_type().expect("entry file type").is_dir())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// Regression test for spiceai/spiceai#12208: a staged upsert that carries
+    /// no rows must commit as a successful no-op.
+    ///
+    /// The Vortex sink creates the snapshot directory lazily on its first file,
+    /// so a zero-row write produced no directory at all, and `commit` →
+    /// `record_written_snapshot_sequence` fsync'd a path that did not exist —
+    /// failing with `NotFound`. Nothing upstream bounds this row count: the
+    /// stream is whatever the caller's `INSERT` produced.
+    #[tokio::test]
+    async fn zero_row_staged_upsert_commits_as_a_successful_noop() {
+        let ctx = SessionContext::new();
+        let (provider, _tmp, schema) = build_staged_upsert_provider(&ctx, "su_zero_row").await;
+
+        insert_batch(&provider, id_name_batch(&schema, &[1], &["alice"])).await;
+        assert_eq!(scan_sorted_ids(&provider).await, vec![1]);
+
+        let token = provider.transaction_write_token().await;
+        let staged = provider
+            .begin_staged_upsert_occ(token, empty_stream(&schema), 1)
+            .await
+            .expect("begin zero-row staged upsert");
+        assert_eq!(staged.row_count(), 0);
+
+        let rows = staged
+            .commit(std::collections::HashSet::new(), true)
+            .await
+            .expect("zero-row staged upsert must commit as a no-op");
+        assert_eq!(rows, 0);
+        assert_eq!(
+            scan_sorted_ids(&provider).await,
+            vec![1],
+            "a zero-row staged upsert must not change visible data"
+        );
+
+        // The table must remain fully writable afterwards.
+        let token = provider.transaction_write_token().await;
+        provider
+            .begin_staged_upsert_occ(
+                token,
+                single_batch_stream(id_name_batch(&schema, &[2], &["bob"])),
+                1,
+            )
+            .await
+            .expect("begin staged upsert after the no-op")
+            .commit(std::collections::HashSet::new(), true)
+            .await
+            .expect("commit staged upsert after the no-op");
+        assert_eq!(scan_sorted_ids(&provider).await, vec![1, 2]);
+    }
+
+    /// The invariant behind the fix, asserted directly: a write materializes its
+    /// snapshot directory whether or not it carries rows, so no later fsync or
+    /// publish can reference a directory the Vortex sink never created.
+    #[tokio::test]
+    async fn zero_row_write_still_materializes_its_snapshot_directory() {
+        let ctx = SessionContext::new();
+        let (provider, _tmp, schema) = build_staged_upsert_provider(&ctx, "su_zero_row_dir").await;
+
+        let before = snapshot_dir_names(&provider);
+        let token = provider.transaction_write_token().await;
+        let staged = provider
+            .begin_staged_upsert_occ(token, empty_stream(&schema), 1)
+            .await
+            .expect("begin zero-row staged upsert");
+        let after = snapshot_dir_names(&provider);
+
+        let added = after.iter().filter(|dir| !before.contains(dir)).count();
+        assert_eq!(
+            added, 1,
+            "a zero-row staged write must materialize exactly one snapshot directory (before: {before:?}, after: {after:?})"
+        );
+
+        // The fused (multi-table transaction) path takes the same directory
+        // barrier the non-transactional publish takes, so it must accept the
+        // zero-row staged snapshot too.
+        let prepared = staged
+            .prepare_commit()
+            .await
+            .expect("prepare_commit must accept a zero-row staged snapshot");
+        assert_eq!(prepared.row_count(), 0);
+    }
+
+    /// The checkpoint paths fsync their new snapshot directory unconditionally.
+    /// They are guarded from the zero-row shape only by a distant invariant
+    /// (`filter_inlined_batch_for_deletions` returns `None` for a zero-row
+    /// batch, so a non-empty `Vec<RecordBatch>` implies a non-zero row count) —
+    /// pin the *observable* contract here so a change to that coupling shows up
+    /// as a test failure rather than as an `IoError` in the field.
+    #[tokio::test]
+    async fn checkpointing_an_empty_table_registers_no_snapshot() {
+        let ctx = SessionContext::new();
+        let (provider, _tmp, _schema) =
+            build_staged_upsert_provider(&ctx, "su_empty_checkpoint").await;
+
+        let before = snapshot_dir_names(&provider);
+
+        let inlined = provider
+            .checkpoint_inlined_data()
+            .await
+            .expect("inline checkpoint of an empty table must succeed");
+        assert_eq!(inlined, 0);
+
+        let mem_tier = provider
+            .checkpoint_mem_tier()
+            .await
+            .expect("mem-tier checkpoint of an empty table must succeed");
+        assert_eq!(mem_tier, 0);
+
+        assert_eq!(
+            snapshot_dir_names(&provider),
+            before,
+            "checkpointing an empty table must register no new snapshot"
+        );
+        assert!(
+            scan_sorted_ids(&provider).await.is_empty(),
+            "checkpointing an empty table must leave it empty"
+        );
     }
 
     /// Crash-recovery exactly-once (correctness item #5, gates promotion past
@@ -37875,6 +39244,25 @@ mod tests {
         runtime_env: Arc<RuntimeEnv>,
         vortex_config: VortexConfig,
     ) -> (CayenneTableProvider, Arc<dyn MetadataCatalog>, TempDir) {
+        create_cdc_table_with_on_conflict(
+            table_name,
+            runtime_env,
+            vortex_config,
+            OnConflict::Upsert(
+                datafusion_table_providers::util::column_reference::ColumnReference::new(vec![
+                    "id".to_string(),
+                ]),
+            ),
+        )
+        .await
+    }
+
+    async fn create_cdc_table_with_on_conflict(
+        table_name: &str,
+        runtime_env: Arc<RuntimeEnv>,
+        vortex_config: VortexConfig,
+        on_conflict: OnConflict,
+    ) -> (CayenneTableProvider, Arc<dyn MetadataCatalog>, TempDir) {
         use arrow::datatypes::{DataType, Field, Schema};
 
         let temp_dir = tempfile::tempdir().expect("temp dir");
@@ -37896,11 +39284,7 @@ mod tests {
             table_name: table_name.to_string(),
             schema,
             primary_key: vec!["id".to_string()],
-            on_conflict: Some(OnConflict::Upsert(
-                datafusion_table_providers::util::column_reference::ColumnReference::new(vec![
-                    "id".to_string(),
-                ]),
-            )),
+            on_conflict: Some(on_conflict),
             base_path: data_dir,
             partition_column: None,
             vortex_config,
@@ -41906,7 +43290,7 @@ mod tests {
             .build_pk_converter(&pk_indices)
             .expect("build pk converter");
         let index = provider
-            .load_existing_pk_index_serial(&pk_indices, &pk_converter, true)
+            .load_existing_pk_index_serial(&pk_indices, &pk_converter, true, None)
             .await
             .expect("cold keyset rebuild");
         provider.store_cached_pk_index(index);
@@ -42661,7 +44045,7 @@ mod tests {
             .expect("table has a primary key");
         let converter = reopened.build_pk_converter(&pk_indices).expect("converter");
         let loaded = reopened
-            .try_load_persisted_pk_index(&pk_indices, &converter)
+            .try_load_persisted_pk_index(&pk_indices, &converter, None)
             .await
             .expect("load persisted index");
         assert!(
@@ -42755,7 +44139,7 @@ mod tests {
             .expect("table has a primary key");
         let converter = provider.build_pk_converter(&pk_indices).expect("converter");
         let loaded = provider
-            .try_load_persisted_pk_index(&pk_indices, &converter)
+            .try_load_persisted_pk_index(&pk_indices, &converter, None)
             .await
             .expect("load persisted index")
             .expect("persisted bloom present after compaction");

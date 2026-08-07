@@ -44,6 +44,21 @@ pub trait AccelerationSource: Send + Sync {
     /// Returns the name of this source
     fn name(&self) -> &TableReference;
 
+    /// The name of the connector this source's rows arrive from — the `from:`
+    /// prefix (`debezium`, `cdc`, `sink`, `postgres`, …) — or `None` for a source
+    /// with no connector.
+    ///
+    /// Load-bearing because `DataConnector::resolve_refresh_mode` fills in an unset
+    /// `refresh_mode` and its result is never written back into [`Acceleration`]:
+    /// `acceleration().refresh_mode` is still `None` for a genuine `debezium:`/`cdc:`
+    /// stream. A consumer that must know the mode the source will actually run with
+    /// maps this name through the connector-default table instead of reading the
+    /// field raw (see `runtime::builder::unset_refresh_mode_for_connector`).
+    ///
+    /// Deliberately has NO default implementation: every impl states its own answer,
+    /// so a new source cannot silently inherit a wrong `None` and misclassify itself.
+    fn connector_name(&self) -> Option<&str>;
+
     /// Returns the time column name if configured, None otherwise.
     /// Both datasets and views expose this so the warm-tier / acceleration
     /// data-window logic (e.g. retention) can derive time-based properties.

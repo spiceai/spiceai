@@ -24,8 +24,8 @@ limitations under the License.
 //! - Out-of-band enrollment: adoption code + CSR + host facts → HTTP
 //!   enroll → identity persisted (with the issued gateway address) → the
 //!   gRPC stream opens against the gateway with the assigned identifier
-//!   and an empty credential; a subsequent `Adopt` marker is acknowledged
-//!   with `AdoptAck` + a successful `CommandResult`.
+//!   and no credential of its own; a subsequent `Adopt` marker is
+//!   acknowledged with `AdoptAck` + an `OK` `CommandResult`.
 //! - Permanent enroll rejection (consumed/expired code): the driver
 //!   discards the staged code and exits without creating an identity.
 //! - `ApplySpicepod` round-trip: server sends ApplySpicepod → client
@@ -33,9 +33,9 @@ limitations under the License.
 
 #![expect(
     clippy::unwrap_used,
+    clippy::expect_used,
     clippy::doc_markdown,
     clippy::struct_field_names,
-    clippy::items_after_statements,
     reason = "integration-test harness — readability over lint strictness"
 )]
 
@@ -47,7 +47,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use axum::{Json, Router, extract::State, http::StatusCode, routing::post};
 use runtime_cloud_connect::config::CloudConnectConfig;
-use runtime_cloud_connect::handlers::RuntimeHandle;
+use runtime_cloud_connect::handlers::{
+    ApplyOutcome, Capability, CommandError, RuntimeHandle, SpicepodDeployment,
+};
 use runtime_cloud_connect::identity::IdentityStore;
 use runtime_cloud_connect::proto;
 use runtime_cloud_connect::proto::cloud_connect_server::{CloudConnect, CloudConnectServer};
@@ -139,16 +141,27 @@ struct CapturedRuntime {
 
 #[async_trait]
 impl RuntimeHandle for CapturedRuntime {
+    fn supports(&self, capability: Capability) -> bool {
+        capability == Capability::ApplySpicepod
+    }
+
     async fn apply_spicepod(
         &self,
-        config_dir: &std::path::Path,
-        spicepod_yaml: &str,
-    ) -> Result<serde_json::Value, String> {
-        let path = config_dir.join(runtime_cloud_connect::config::CLOUD_MANAGED_SPICEPOD_FILE);
-        std::fs::create_dir_all(config_dir).map_err(|e| e.to_string())?;
-        std::fs::write(&path, spicepod_yaml).map_err(|e| e.to_string())?;
-        *self.applied.lock().await = Some((path.clone(), spicepod_yaml.to_string()));
-        Ok(serde_json::json!({ "path": path.display().to_string() }))
+        deployment: SpicepodDeployment<'_>,
+    ) -> Result<ApplyOutcome, CommandError> {
+        let path = deployment
+            .config_dir
+            .join(runtime_cloud_connect::config::CLOUD_MANAGED_SPICEPOD_FILE);
+        std::fs::create_dir_all(deployment.config_dir)
+            .map_err(|e| CommandError::failed(e.to_string()))?;
+        std::fs::write(&path, deployment.spicepod_yaml)
+            .map_err(|e| CommandError::failed(e.to_string()))?;
+        *self.applied.lock().await = Some((path.clone(), deployment.spicepod_yaml.to_string()));
+        // `settled`, not `exit_to_apply`: this handle has no process to restart,
+        // and asking the client to exit would take the test process with it.
+        Ok(ApplyOutcome::settled(
+            serde_json::json!({ "path": path.display().to_string() }),
+        ))
     }
 }
 
@@ -251,6 +264,9 @@ fn enroll_config(
         config_dir: dir.to_path_buf(),
         adoption_code: Some(ADOPTION_CODE.to_string()),
         pending_adopt_code_path: pending_code_path,
+        adopt_app_name: None,
+        adopt_create_app: false,
+        instance_region: None,
         runtime_version: "v0.0.0-test".to_string(),
         heartbeat_interval: Duration::from_secs(30),
         telemetry_interval: Duration::from_mins(1),
@@ -268,12 +284,10 @@ async fn out_of_band_enroll_persists_identity_and_connects() {
     // Gateway mock: send an Adopt trust/marker after Hello (the portal
     // admin clicked Adopt). Post-DR-025 it carries no certificate.
     let adopt_cmd = proto::ControlMessage {
+        command_id: "cmd-adopt-1".to_string(),
+        target: None,
         body: Some(proto::control_message::Body::Adopt(proto::Adopt {
-            command_id: "cmd-adopt-1".to_string(),
-            assigned_identifier: ASSIGNED_ID.to_string(),
-            identity_cert_pem: String::new(),
-            not_after_unix: 0,
-            ca_bundle_pem: String::new(),
+            assigned_identifier: Some(ASSIGNED_ID.to_string()),
         })),
     };
     let mock = MockServer::new(vec![adopt_cmd]);
@@ -314,7 +328,10 @@ async fn out_of_band_enroll_persists_identity_and_connects() {
         identity.ca_bundle_pem.contains("UNIT-TEST-CA"),
         "enroll ca_bundle_pem should be persisted into identity.json"
     );
-    assert!(identity.not_after_unix > 0, "not_after must be parsed");
+    assert!(
+        identity.not_after_unix.is_some_and(|secs| secs > 0),
+        "not_after must be parsed"
+    );
 
     // The enroll request carried the contract shape: adoption_code +
     // csr_pem + host facts nested under `instance`.
@@ -362,17 +379,20 @@ async fn out_of_band_enroll_persists_identity_and_connects() {
 
     let s = mock_state.lock().await;
     let hello = s.last_hello.clone().expect("server saw Hello");
-    assert_eq!(hello.kind, proto::InstanceKind::Standalone as i32);
+    assert_eq!(hello.instance_kind, proto::InstanceKind::Standalone as i32);
     // Enroll-first contract: by the time the stream opens, the identity is
-    // held — the Hello names the instance and carries no credential/CSR
+    // held — the Hello names the instance and carries no credential at all
     // (the client certificate is the authN; certless contact is gone).
     assert_eq!(hello.identifier, ASSIGNED_ID);
-    assert!(
-        hello.credential.is_empty(),
-        "Hello must carry an empty credential (identity is the client cert)"
+    assert_eq!(
+        hello.protocol_version,
+        runtime_cloud_connect::PROTOCOL_VERSION,
+        "Hello must announce the protocol revision it implements"
     );
-    assert!(hello.csr_pem.is_empty(), "Hello carries no CSR");
-    assert!(hello.agent_pubkey_pem.is_empty(), "Hello carries no pubkey");
+    assert!(
+        hello.capabilities.is_empty(),
+        "the no-op handle supports nothing, so the Hello must advertise nothing"
+    );
 
     let ack = s.last_adopt_ack.clone().expect("server saw AdoptAck");
     assert_eq!(ack.identifier, ASSIGNED_ID);
@@ -380,7 +400,12 @@ async fn out_of_band_enroll_persists_identity_and_connects() {
 
     let result = s.last_result.clone().expect("server saw CommandResult");
     assert_eq!(result.command_id, "cmd-adopt-1");
-    assert!(result.success);
+    assert_eq!(
+        result.code,
+        proto::ResultCode::Ok as i32,
+        "{}",
+        result.message
+    );
     drop(s);
 
     handle.shutdown().await;
@@ -441,10 +466,12 @@ async fn apply_spicepod_writes_file_and_acks() {
 
     let yaml = "name: cloud-managed\n";
     let apply_cmd = proto::ControlMessage {
+        command_id: "cmd-apply-1".to_string(),
+        target: None,
         body: Some(proto::control_message::Body::ApplySpicepod(
             proto::ApplySpicepod {
-                command_id: "cmd-apply-1".to_string(),
                 spicepod_yaml: yaml.to_string(),
+                sealed_secret_payload: None,
             },
         )),
     };
@@ -463,7 +490,11 @@ async fn apply_spicepod_writes_file_and_acks() {
         public_key_pem: "PRE-ADOPTED-PUB".to_string(),
         ca_bundle_pem: String::new(),
         gateway_addr: addr.to_string(),
-        not_after_unix: 0,
+        not_after_unix: None,
+        enc_private_key_pem: String::new(),
+        enc_public_key_pem: String::new(),
+        enc_previous_private_key_pem: String::new(),
+        cache_key_b64: String::new(),
     };
     IdentityStore::store(&identity_path, &identity).unwrap();
 
@@ -482,6 +513,9 @@ async fn apply_spicepod_writes_file_and_acks() {
         config_dir: config_dir.clone(),
         adoption_code: None,
         pending_adopt_code_path: None,
+        adopt_app_name: None,
+        adopt_create_app: false,
+        instance_region: None,
         runtime_version: "v0.0.0-test".to_string(),
         heartbeat_interval: Duration::from_secs(30),
         telemetry_interval: Duration::from_mins(1),
@@ -526,19 +560,148 @@ async fn apply_spicepod_writes_file_and_acks() {
     let s = mock_state.lock().await;
     let hello = s.last_hello.clone().expect("server saw Hello");
     assert_eq!(hello.identifier, "inst_pre_adopted");
-    // Stream contract: identity is proven by the client cert, so the Hello
-    // carries the identifier with an EMPTY credential (and no CSR — CSRs
-    // only travel in the out-of-band enroll/renew HTTP requests).
-    assert!(
-        hello.credential.is_empty(),
-        "Hello must carry an empty credential (mTLS proves identity)"
+    assert_eq!(
+        hello.capabilities,
+        vec!["apply_spicepod".to_string()],
+        "Hello must announce exactly what the runtime handle supports"
     );
-    assert!(hello.csr_pem.is_empty(), "Hello carries no CSR");
 
     let result = s.last_result.clone().expect("server saw CommandResult");
     assert_eq!(result.command_id, "cmd-apply-1");
-    assert!(result.success);
+    assert_eq!(
+        result.code,
+        proto::ResultCode::Ok as i32,
+        "{}",
+        result.message
+    );
     drop(s);
+
+    handle.shutdown().await;
+}
+
+/// Field number of `ControlMessage.command_id`. Taken from the generated
+/// descriptor rather than written out, so a renumbering of the contract cannot
+/// leave this test encoding a different field than it means to.
+fn command_id_field_number() -> u32 {
+    let probe = proto::ControlMessage {
+        command_id: "x".to_string(),
+        target: None,
+        body: None,
+    };
+    let mut encoded = Vec::new();
+    prost::Message::encode(&probe, &mut encoded).expect("encode probe");
+    let (key, _) = prost::encoding::decode_key(&mut encoded.as_slice()).expect("decode key");
+    key
+}
+
+/// Hand-encode a `ControlMessage` carrying a command this build has no oneof
+/// arm for: the `command_id` field, then an unknown length-delimited field 99
+/// standing in for the command a newer control plane would send.
+///
+/// This is the wire shape of "newer control plane, older client" — the point
+/// of the test is that prost drops the unrecognized arm to `body: None` while
+/// the envelope keeps the `command_id`, which is what makes the command
+/// answerable at all.
+fn encode_unknown_command(command_id: &str) -> Vec<u8> {
+    let mut buf = Vec::new();
+    prost::encoding::encode_key(
+        command_id_field_number(),
+        prost::encoding::WireType::LengthDelimited,
+        &mut buf,
+    );
+    prost::encoding::encode_varint(command_id.len() as u64, &mut buf);
+    buf.extend_from_slice(command_id.as_bytes());
+    // Field 99, wire type 2 — the unknown command.
+    prost::encoding::encode_key(99, prost::encoding::WireType::LengthDelimited, &mut buf);
+    prost::encoding::encode_varint(0, &mut buf);
+    buf
+}
+
+#[tokio::test]
+async fn unknown_command_is_nacked_rather_than_dropped() {
+    let dir = tempfile::tempdir().unwrap();
+    let identity_path = dir.path().join("identity.json");
+
+    let encoded = encode_unknown_command("cmd-from-the-future");
+    let unknown_cmd =
+        <proto::ControlMessage as prost::Message>::decode(encoded.as_slice()).expect("decode");
+    assert_eq!(unknown_cmd.command_id, "cmd-from-the-future");
+    assert!(
+        unknown_cmd.body.is_none(),
+        "an unrecognized command must decode to an absent body"
+    );
+
+    let mock = MockServer::new(vec![unknown_cmd]);
+    let mock_state = Arc::clone(&mock.state);
+    let addr = spawn_server(mock).await;
+
+    let identity = runtime_cloud_connect::identity::Identity {
+        identifier: "inst_pre_adopted".to_string(),
+        identity_cert_pem: "PRE-ADOPTED-CERT".to_string(),
+        private_key_pem: "PRE-ADOPTED-KEY".to_string(),
+        public_key_pem: "PRE-ADOPTED-PUB".to_string(),
+        ca_bundle_pem: String::new(),
+        gateway_addr: addr.to_string(),
+        not_after_unix: None,
+        enc_private_key_pem: String::new(),
+        enc_public_key_pem: String::new(),
+        enc_previous_private_key_pem: String::new(),
+        cache_key_b64: String::new(),
+    };
+    IdentityStore::store(&identity_path, &identity).unwrap();
+
+    let config = CloudConnectConfig {
+        enroll_endpoint: "http://127.0.0.1:9".to_string(),
+        gateway_endpoint: None,
+        ca_cert_pem: None,
+        insecure: true,
+        identity_path: identity_path.clone(),
+        config_dir: dir.path().to_path_buf(),
+        adoption_code: None,
+        pending_adopt_code_path: None,
+        instance_region: None,
+        runtime_version: "v0.0.0-test".to_string(),
+        heartbeat_interval: Duration::from_secs(30),
+        telemetry_interval: Duration::from_mins(1),
+        renewal_lead: Duration::from_hours(12),
+        adopt_app_name: None,
+        adopt_create_app: false,
+    };
+
+    let runtime: Arc<dyn RuntimeHandle> =
+        Arc::new(runtime_cloud_connect::handlers::NoopRuntimeHandle);
+    let handle = runtime_cloud_connect::CloudConnect::start(config, runtime)
+        .await
+        .expect("start")
+        .expect("started");
+
+    let mut result_seen = false;
+    for _ in 0..60 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        if mock_state.lock().await.last_result.is_some() {
+            result_seen = true;
+            break;
+        }
+    }
+    assert!(
+        result_seen,
+        "an unrecognized command must be answered, not silently dropped"
+    );
+
+    let result = mock_state
+        .lock()
+        .await
+        .last_result
+        .clone()
+        .expect("server saw CommandResult");
+    assert_eq!(result.command_id, "cmd-from-the-future");
+    assert_eq!(
+        result.code,
+        proto::ResultCode::Unsupported as i32,
+        "the NACK must say UNSUPPORTED, not a generic failure: {}",
+        result.message
+    );
+    assert!(!result.message.is_empty(), "the NACK must explain itself");
 
     handle.shutdown().await;
 }
