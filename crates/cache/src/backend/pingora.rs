@@ -247,10 +247,17 @@ where
     }
 
     async fn remove(&self, key: &u64) -> Option<V> {
-        // Remove from metadata tracking (this also updates total_weight)
-        self.remove_metadata(*key);
+        let shard_idx = Self::get_shard_index(*key);
 
-        // Remove from pingora-lru and return the value
+        // Drop the metadata and the value under one hold of the shard, for the same reason
+        // `insert` publishes them under one hold: a concurrent `insert` of this key that
+        // landed between the two would leave its metadata behind while this call removed
+        // the value it names — a key `len()`/`iter_keys()` still report but `get()` can
+        // never serve. `remove_metadata` is not reused here because the lock is not
+        // reentrant.
+        let mut shard = self.metadata_shards[shard_idx].write();
+        shard.remove(key);
+
         self.cache.remove(*key).map(|(entry, _)| entry.value)
     }
 
