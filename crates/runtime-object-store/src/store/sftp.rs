@@ -548,8 +548,12 @@ mod tests {
 
         // A remainder under a millisecond still has time left, so it is armed as the
         // shortest deadline ssh2 accepts instead of `0`, which it reads as no deadline.
+        let nearly_spent = bound
+            .checked_sub(Duration::from_micros(500))
+            .expect("the bound is longer than the amount taken off it");
+
         assert_eq!(
-            remaining_session_timeout_ms(bound, bound - Duration::from_micros(500))
+            remaining_session_timeout_ms(bound, nearly_spent)
                 .expect("a sub-millisecond remainder is still a remainder"),
             1
         );
