@@ -1075,6 +1075,8 @@ mod tests {
     /// many accelerated refreshes ran in the meantime.
     #[tokio::test]
     async fn test_swr_revalidation_preserves_input_tables() {
+        const SQL: &str = "SELECT count(*) FROM swr_table";
+
         let df = prepare_runtime(Some(SQLResultsCacheConfig {
             item_ttl: Some("1s".to_string()),
             cache_key_type: spicepod::component::caching::CacheKeyType::Sql,
@@ -1096,7 +1098,6 @@ mod tests {
             .register_table(TableReference::bare("swr_table"), Arc::new(table))
             .expect("should register table");
 
-        const SQL: &str = "SELECT count(*) FROM swr_table";
         let request_context =
             create_test_request_context(CacheControl::Cache(CacheKeyType::Raw), None);
 
