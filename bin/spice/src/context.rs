@@ -1047,6 +1047,8 @@ mod tests {
             user_agent: "spice/test (test; test)".to_string(),
             extra_headers: HashMap::new(),
             http_client: reqwest::Client::new(),
+            inference_http_client: reqwest::Client::new(),
+            inference_deadline: INFERENCE_DEADLINE,
             tls_root_certificate_file: None,
         };
         assert!(!ctx.spiced_path().exists());
