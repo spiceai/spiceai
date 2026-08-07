@@ -28,19 +28,26 @@ use crate::index::chunking::ChunkedSearchIndex;
 #[derive(Snafu, Debug)]
 pub enum Error {
     #[snafu(display(
-        "Failed to delete rows from the search index '{index}' (elasticsearch): Elasticsearch applied the delete only partially — {failures} document failure(s) and {version_conflicts} version conflict(s). First failure: {first}. The index still holds documents for rows the dataset no longer has, so a search can return them. A version conflict means those rows were written concurrently and the delete can simply be re-run; any other failure needs its reported error class resolved on the Elasticsearch index first. See: https://spiceai.org/docs/features/search"
+        "Failed to delete rows from the search index '{index}' (elasticsearch): Elasticsearch applied the delete only partially — {failures} document failure(s), {version_conflicts} version conflict(s), {undeleted} of {total} matched document(s) left in place, timed out: {timed_out}. First failure: {first}. The index still holds documents for rows the dataset no longer has, so a search can return them. Reconcile the index against the source before re-running this delete: a version conflict means the row was written concurrently, so re-issuing the delete can remove the document that write just produced. Any other failure needs its reported error class resolved on the Elasticsearch index first. See: https://spiceai.org/docs/features/search"
     ))]
     DeleteByQueryPartiallyApplied {
         index: String,
         failures: usize,
         version_conflicts: u64,
+        undeleted: u64,
+        total: u64,
+        timed_out: bool,
         first: String,
     },
 
     #[snafu(display(
-        "Failed to delete rows from the search index '{index}' (elasticsearch): the _delete_by_query response carried no `failures` array, so it cannot be confirmed that every matching document was deleted; got {shape}. Check whether a proxy sits in front of Elasticsearch and is rewriting the response. See: https://spiceai.org/docs/features/search"
+        "Failed to delete rows from the search index '{index}' (elasticsearch): the _delete_by_query response carries no usable `{field}`, so it cannot be confirmed that every matching document was deleted; got {shape}. Check whether a proxy sits in front of Elasticsearch and is rewriting the response. See: https://spiceai.org/docs/features/search"
     ))]
-    UnexpectedDeleteResponse { index: String, shape: String },
+    UnexpectedDeleteResponse {
+        index: String,
+        field: &'static str,
+        shape: String,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -153,41 +160,77 @@ pub async fn delete_by_keys(
 /// delete the document that write just produced. Every caller drives this from a delete it has
 /// already applied to the accelerator and logs the error rather than propagating it, so surfacing
 /// it makes the divergence visible where the retry decision can be made with the source in hand.
+///
+/// Success is positively confirmed, never assumed from the absence of a complaint. `failures` and
+/// `version_conflicts` name only the outcomes Elasticsearch chose to itemise; a request can also
+/// leave documents behind by running out of time (`timed_out`), which it reports as a flag rather
+/// than as a failure entry. So the counts have to agree as well: `deleted` must reach `total`, the
+/// number of documents the initial search matched. A body reporting `timed_out: true, total: 2,
+/// deleted: 1` with no conflicts and an empty `failures` array is a partial delete that every
+/// itemised signal calls clean.
 fn inspect_delete_response(resp: &Value, es_index: &str) -> Result<()> {
-    // Elasticsearch and OpenSearch both always include `failures` in a synchronous
-    // `_delete_by_query` response. Its absence means the body is not one — a `wait_for_completion`
-    // task handle, or a proxy's envelope — and neither confirms the delete applied.
-    let Some(failures) = resp.get("failures").and_then(Value::as_array) else {
-        return UnexpectedDeleteResponseSnafu {
+    // Elasticsearch and OpenSearch both always include these in a synchronous `_delete_by_query`
+    // response. A missing one means the body is not one — a `wait_for_completion` task handle, or
+    // a proxy's envelope — and neither confirms the delete applied. `total` and `deleted` are
+    // required for the same reason `failures` is: without them the delete cannot be confirmed,
+    // and coercing an absent count to a convenient default would manufacture that confirmation.
+    let unexpected = |field: &'static str| -> Result<()> {
+        UnexpectedDeleteResponseSnafu {
             index: es_index.to_string(),
+            field,
             // The body can carry document ids (its `failures` entries do), so it is never
             // reported — only the shape, which is what distinguishes an async task handle from a
             // proxy's error envelope.
             shape: write::describe_unexpected_response(resp),
         }
-        .fail();
+        .fail()
     };
 
-    let version_conflicts = resp
-        .get("version_conflicts")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
+    let Some(failures) = resp.get("failures").and_then(Value::as_array) else {
+        return unexpected("failures");
+    };
+    let Some(total) = resp.get("total").and_then(Value::as_u64) else {
+        return unexpected("total");
+    };
+    let Some(deleted) = resp.get("deleted").and_then(Value::as_u64) else {
+        return unexpected("deleted");
+    };
+    // Present but not a number is a rewritten body, not a zero — reading it as one would report a
+    // conflicted delete as clean.
+    let version_conflicts = match resp.get("version_conflicts").map(Value::as_u64) {
+        None => 0,
+        Some(Some(count)) => count,
+        Some(None) => return unexpected("version_conflicts"),
+    };
+    // Absent means the request did not report a timeout, which is the claim being tested — unlike
+    // the counts above, reading it as `false` asserts nothing that the body denies.
+    let timed_out = resp
+        .get("timed_out")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
 
-    if failures.is_empty() && version_conflicts == 0 {
+    let undeleted = total.saturating_sub(deleted);
+
+    if failures.is_empty() && version_conflicts == 0 && undeleted == 0 && !timed_out {
         return Ok(());
     }
 
     let first = match failures.first() {
         Some(failure) => describe_delete_failure(failure),
         // Conflicts alone: `conflicts=abort` (the default) stops the request and reports the
-        // count, and older versions report it without a matching `failures` entry.
-        None => "no failure entry; the delete was stopped by a version conflict".to_string(),
+        // count, and older versions report it without a matching `failures` entry. A timeout or a
+        // short `deleted` count has no failure entry to describe either.
+        None => "no failure entry; the delete stopped before every matching document was deleted"
+            .to_string(),
     };
 
     DeleteByQueryPartiallyAppliedSnafu {
         index: es_index.to_string(),
         failures: failures.len(),
         version_conflicts,
+        undeleted,
+        total,
+        timed_out,
         first,
     }
     .fail()
@@ -936,9 +979,130 @@ mod tests {
 
         let message = err.to_string();
         assert!(
-            message.contains("carried no `failures` array")
+            message.contains("no usable `failures`")
                 && message.contains("a JSON object with keys: task"),
             "the error should describe the response by its shape alone: {message}"
+        );
+    }
+
+    /// `timed_out` is the one partial-delete signal Elasticsearch reports as a flag rather than
+    /// as a failure entry: the request stopped early, so documents the query matched are still
+    /// indexed even though every itemised count reads clean.
+    #[tokio::test]
+    async fn a_timed_out_delete_is_not_reported_as_a_successful_delete() {
+        let client = RecordingClient::answering(json!({
+            "timed_out": true,
+            "total": 2,
+            "deleted": 1,
+            "version_conflicts": 0,
+            "failures": [],
+        }));
+
+        let err = delete_by_keys(
+            &client,
+            "idx",
+            &[pk("id", DataType::Utf8)],
+            &["id".to_string()],
+            &string_key_batch(vec![Some("ORDER-1024"), Some("ORDER-1025")]),
+        )
+        .await
+        .expect_err("a delete that timed out must not report success");
+
+        let message = err.to_string();
+        assert!(
+            message.contains("timed out: true"),
+            "the error should report the timeout: {message}"
+        );
+        assert!(
+            message.contains("1 of 2 matched document(s) left in place"),
+            "the error should count the documents left behind: {message}"
+        );
+    }
+
+    /// `deleted` falling short of `total` means documents the query matched were not removed,
+    /// whatever the itemised signals say. Nothing else in the body reports this shape.
+    #[tokio::test]
+    async fn a_short_deleted_count_is_not_reported_as_a_successful_delete() {
+        let client = RecordingClient::answering(json!({
+            "timed_out": false,
+            "total": 5,
+            "deleted": 3,
+            "version_conflicts": 0,
+            "failures": [],
+        }));
+
+        let err = delete_by_keys(
+            &client,
+            "idx",
+            &[pk("id", DataType::Utf8)],
+            &["id".to_string()],
+            &string_key_batch(vec![Some("ORDER-1024")]),
+        )
+        .await
+        .expect_err("a delete that left documents behind must not report success");
+
+        assert!(
+            err.to_string()
+                .contains("2 of 5 matched document(s) left in place"),
+            "the error should count the documents left behind: {err}"
+        );
+    }
+
+    /// The counts are required, not defaulted: a body without them cannot confirm the delete, and
+    /// reading an absent `deleted` as zero — or as "as many as matched" — would invent a verdict
+    /// the response never gave.
+    #[tokio::test]
+    async fn a_response_without_the_document_counts_is_not_reported_as_a_successful_delete() {
+        for missing in ["total", "deleted"] {
+            // The same fully-applied body, minus the one count under test.
+            let body = match missing {
+                "total" => json!({"deleted": 1, "version_conflicts": 0, "failures": []}),
+                _ => json!({"total": 1, "version_conflicts": 0, "failures": []}),
+            };
+            let client = RecordingClient::answering(body);
+
+            let err = delete_by_keys(
+                &client,
+                "idx",
+                &[pk("id", DataType::Utf8)],
+                &["id".to_string()],
+                &string_key_batch(vec![Some("ORDER-1024")]),
+            )
+            .await
+            .expect_err("an unconfirmable delete must not report success");
+
+            assert!(
+                err.to_string().contains(&format!("no usable `{missing}`")),
+                "the error should name the missing field: {err}"
+            );
+        }
+    }
+
+    /// A `version_conflicts` that is present but not a number is a rewritten body. Coercing it to
+    /// zero would report a conflicted delete as clean — the exact failure this check exists to
+    /// catch.
+    #[tokio::test]
+    async fn a_non_numeric_version_conflicts_is_not_read_as_zero() {
+        let client = RecordingClient::answering(json!({
+            "total": 1,
+            "deleted": 1,
+            "version_conflicts": "0",
+            "failures": [],
+        }));
+
+        let err = delete_by_keys(
+            &client,
+            "idx",
+            &[pk("id", DataType::Utf8)],
+            &["id".to_string()],
+            &string_key_batch(vec![Some("ORDER-1024")]),
+        )
+        .await
+        .expect_err("an unconfirmable delete must not report success");
+
+        assert!(
+            err.to_string().contains("no usable `version_conflicts`"),
+            "the error should name the unusable field: {err}"
         );
     }
 
