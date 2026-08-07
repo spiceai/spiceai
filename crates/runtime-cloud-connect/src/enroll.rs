@@ -924,6 +924,7 @@ mod tests {
             telemetry_interval: Duration::from_mins(1),
             metrics_interval: Duration::from_secs(30),
             renewal_lead: Duration::from_hours(12),
+            query_deadline: Duration::from_mins(1),
         }
     }
 

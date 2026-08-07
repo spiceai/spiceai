@@ -42,6 +42,19 @@ pub const DEFAULT_TELEMETRY_INTERVAL: Duration = Duration::from_mins(1);
 /// interval sets chart resolution rather than what is or is not recorded.
 pub const DEFAULT_METRICS_INTERVAL: Duration = Duration::from_secs(30);
 
+/// Default ceiling on a single `ExecuteQuery`.
+///
+/// There is no cancellation command on this contract, and one query runs at a
+/// time, so a query that never finishes would hold the only slot for the life
+/// of the process and answer every later query as busy. The deadline is what
+/// bounds that: it releases the slot and abandons the work.
+///
+/// It sits below the control plane's own command budget so the instance is the
+/// layer that gives up first. The slot is then free by the time the caller is
+/// told the query failed, and the retry it prompts is not answered busy by the
+/// query it is replacing.
+pub const DEFAULT_QUERY_DEADLINE: Duration = Duration::from_secs(25);
+
 /// File name (relative to `$SPICE_CONFIG_DIR`) where the cloud-managed
 /// spicepod is written when an `ApplySpicepod` command arrives.
 pub const CLOUD_MANAGED_SPICEPOD_FILE: &str = "spicepod-cloud-managed.yml";
@@ -173,6 +186,11 @@ pub struct CloudConnectConfig {
     /// [`DEFAULT_RENEWAL_LEAD`]; overridable so tests can exercise the
     /// renewal loop without waiting hours.
     pub renewal_lead: Duration,
+
+    /// How long an `ExecuteQuery` may run before the instance abandons it and frees
+    /// the query slot. Defaults to [`DEFAULT_QUERY_DEADLINE`]; overridable so
+    /// tests can exercise the deadline without waiting it out.
+    pub query_deadline: Duration,
 }
 
 impl CloudConnectConfig {
@@ -351,6 +369,7 @@ impl CloudConnectConfig {
             telemetry_interval: DEFAULT_TELEMETRY_INTERVAL,
             metrics_interval: DEFAULT_METRICS_INTERVAL,
             renewal_lead: DEFAULT_RENEWAL_LEAD,
+            query_deadline: DEFAULT_QUERY_DEADLINE,
         }
     }
 }
@@ -361,6 +380,31 @@ mod tests {
     use std::sync::Mutex;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// The instance must be the layer that gives up first, because it is the
+    /// only one holding the query slot. If the control plane answers the caller
+    /// while the query runs on, the retry that answer invites is refused as busy
+    /// by the query it is replacing, and the deadline's own result code never
+    /// reaches anyone.
+    ///
+    /// Serializing the result is inside the deadline, not inside the margin:
+    /// the encode runs within the future the deadline wraps. The margin is what
+    /// putting the finished payload on the control stream costs, so the answer
+    /// lands inside the budget rather than exactly on it.
+    #[test]
+    fn the_query_deadline_expires_inside_the_control_plane_command_budget() {
+        /// The control plane's shared `DEFAULT_COMMAND_TIMEOUT`, which bounds
+        /// every command it dispatches rather than queries alone. Mirrored here
+        /// because it is the number this deadline has to fit inside; if it moves
+        /// there, it moves here, and this test is what notices.
+        const CONTROL_PLANE_COMMAND_BUDGET: Duration = Duration::from_secs(30);
+        const MARGIN: Duration = Duration::from_secs(5);
+
+        assert!(
+            DEFAULT_QUERY_DEADLINE.saturating_add(MARGIN) <= CONTROL_PLANE_COMMAND_BUDGET,
+            "the {DEFAULT_QUERY_DEADLINE:?} query deadline leaves under {MARGIN:?} of the {CONTROL_PLANE_COMMAND_BUDGET:?} command budget to return the result; lower it, or raise the budget first"
+        );
+    }
 
     #[test]
     fn default_config_dir_respects_env_var() {
