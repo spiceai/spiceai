@@ -154,8 +154,8 @@ pub struct Identity {
     /// cache key yet and the cache is simply unavailable until one is minted.
     #[serde(default)]
     pub cache_key_b64: String,
-    /// The app this instance's telemetry is attributed to, as delivered by
-    /// `ApplySpicepod` and stamped on exported metrics as `scp_app_id`.
+    /// The app this instance's telemetry is attributed to, as delivered by the
+    /// control plane and stamped on exported metrics as `scp_app_id`.
     ///
     /// The one field here that is not credential material. It lives alongside
     /// the credential because it shares the credential's lifetime — both are
@@ -163,11 +163,10 @@ pub struct Identity {
     /// together when the instance is released.
     ///
     /// Persisted rather than held only in memory so a restart does not silence
-    /// the export until the next deploy: the runtime cannot derive the value,
-    /// nothing re-sends it on reconnect, and a deploy may be days away.
+    /// the export before the next control-stream reconciliation.
     ///
-    /// `None` means no deploy has ever named an app for this instance, which is
-    /// the state a freshly enrolled instance starts in.
+    /// `None` means the instance is detached, which is also the state a freshly
+    /// enrolled instance starts in.
     #[serde(default)]
     pub app_id: Option<String>,
 }
@@ -362,8 +361,8 @@ pub struct IdentityStore;
 ///
 /// [`atomic_write`] already makes any single write all-or-nothing, so no reader
 /// ever sees a half-file. What this adds is protection against a LOST UPDATE:
-/// [`IdentityStore::store_app_id`] reads the file, edits one field, and writes it
-/// back, while the renewal path writes the whole file from the identity it holds.
+/// [`IdentityStore::set_app_id`] reads the file, edits one field, and writes it
+/// back, while the renewal path replaces the credential fields.
 /// Interleave those and the rotated credential is silently replaced by the copy
 /// the app-id update read a moment earlier — leaving on disk a key the cloud has
 /// already stopped accepting, which surfaces much later as a renewal that cannot
@@ -420,11 +419,10 @@ impl IdentityStore {
     /// Record the app this instance's telemetry belongs to, leaving every other
     /// field as it is on disk.
     ///
-    /// A read-modify-write, which is why it runs under [`write_lock`]: the
-    /// renewal path rewrites the whole file from the identity it holds in
-    /// memory, so an unsynchronized update here could be read before a renewal
-    /// and written after it, silently reverting the rotated credential. The
-    /// lock makes the two orderings the only possible ones.
+    /// A read-modify-write, which is why it runs under [`write_lock`]. Complete
+    /// credential updates use [`IdentityStore::store_credential_update`] under
+    /// the same lock and merge this field from disk, preventing either update
+    /// from reverting the other.
     ///
     /// `Ok(())` with nothing written when the file does not exist. The app id
     /// arrives over an established stream, which requires an identity, so this
@@ -437,15 +435,60 @@ impl IdentityStore {
     /// Returns an error if the existing file cannot be read or parsed, or if the
     /// updated identity cannot be written.
     pub fn store_app_id(path: &Path, app_id: &str) -> Result<()> {
+        Self::set_app_id(path, Some(app_id)).map(|_| ())
+    }
+
+    /// Set or clear the app this instance's telemetry belongs to, leaving every
+    /// credential field as it is on disk.
+    ///
+    /// Returns `Ok(false)` when the identity file no longer exists. Callers
+    /// handling a control command must not acknowledge a durable update in that
+    /// case; the identity may have been removed concurrently.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the existing file cannot be read or parsed, or if the
+    /// updated identity cannot be written.
+    pub fn set_app_id(path: &Path, app_id: Option<&str>) -> Result<bool> {
         let _guard = write_lock();
         let Some(mut identity) = Self::load_optional(path)? else {
-            return Ok(());
+            return Ok(false);
         };
-        if identity.app_id.as_deref() == Some(app_id) {
-            return Ok(());
+        if identity.app_id.as_deref() == app_id {
+            return Ok(true);
         }
-        identity.app_id = Some(app_id.to_string());
-        Self::store_locked(path, &identity)
+        identity.app_id = app_id.map(str::to_string);
+        Self::store_locked(path, &identity)?;
+        Ok(true)
+    }
+
+    /// Persist a complete identity update without overwriting an attachment
+    /// change made after the caller cloned its in-memory identity.
+    ///
+    /// Certificate renewal and encryption-key retirement both replace
+    /// credential material from the client's in-memory clone. The attachment
+    /// is owned by control commands and can be newer on disk, so every such
+    /// full identity update must merge it while holding [`write_lock`].
+    ///
+    /// Returns `Ok(None)` when the identity was removed before the write and
+    /// does not recreate it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the existing file cannot be read or parsed, or if the
+    /// merged identity cannot be written.
+    pub fn store_credential_update(
+        path: &Path,
+        credential_update: &Identity,
+    ) -> Result<Option<Identity>> {
+        let _guard = write_lock();
+        let Some(current) = Self::load_optional(path)? else {
+            return Ok(None);
+        };
+        let mut merged = credential_update.clone();
+        merged.app_id = current.app_id;
+        Self::store_locked(path, &merged)?;
+        Ok(Some(merged))
     }
 
     /// The write itself, with the caller already holding [`write_lock`].
@@ -461,7 +504,7 @@ impl IdentityStore {
 
     /// Remove the identity file. No-op if it doesn't exist.
     ///
-    /// Takes [`write_lock`] for the same reason [`IdentityStore::store_app_id`]
+    /// Takes [`write_lock`] for the same reason [`IdentityStore::set_app_id`]
     /// does, and it is what makes a release final: an update that read the file
     /// a moment before the removal would otherwise write it back afterwards,
     /// resurrecting an instance the control plane just released. Under the lock
@@ -812,6 +855,26 @@ mod tests {
         assert_eq!(loaded.app_id.as_deref(), Some("3387"));
     }
 
+    #[test]
+    fn set_app_id_clears_only_the_attachment() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join("identity.json");
+        let identity = sample_identity();
+        IdentityStore::store(&path, &identity).expect("store");
+        IdentityStore::set_app_id(&path, Some("4002")).expect("attach");
+
+        let present = IdentityStore::set_app_id(&path, None).expect("detach");
+
+        assert!(present, "the identity still exists");
+        let loaded = IdentityStore::load_optional(&path)
+            .expect("load")
+            .expect("present");
+        assert_eq!(loaded.app_id, None);
+        assert_eq!(loaded.identity_cert_pem, identity.identity_cert_pem);
+        assert_eq!(loaded.private_key_pem, identity.private_key_pem);
+        assert_eq!(loaded.enc_private_key_pem, identity.enc_private_key_pem);
+    }
+
     /// The app id arrives over an established stream, which requires an
     /// identity — so a missing file means one was cleared concurrently by a
     /// `Remove`. Writing a fresh file here would resurrect an instance the
@@ -858,28 +921,51 @@ mod tests {
         );
     }
 
-    /// A renewal rewrites the whole file from the identity it holds in memory,
-    /// so the app id must ride across the rotation — otherwise every renewal
-    /// silently un-attributes the instance until its next deploy.
     #[test]
-    fn a_rotation_carries_the_app_id_forward() {
+    fn credential_update_merges_an_attachment_newer_than_its_identity_clone() {
         let dir = tempfile::tempdir().expect("create tempdir");
         let path = dir.path().join("identity.json");
-        IdentityStore::store(&path, &sample_identity()).expect("store");
+        let mut identity = sample_identity();
+        identity.enc_previous_private_key_pem = "PREVIOUS-ENCRYPTION-KEY".to_string();
+        IdentityStore::store(&path, &identity).expect("store");
+        let mut rotated = IdentityStore::load_optional(&path)
+            .expect("load stale clone")
+            .expect("present");
         IdentityStore::store_app_id(&path, "4002").expect("store app id");
 
-        let mut rotated = IdentityStore::load_optional(&path)
-            .expect("load")
-            .expect("present");
         rotated.private_key_pem = "ROTATED-KEY".to_string();
         rotated.identity_cert_pem = "ROTATED-CERT".to_string();
-        IdentityStore::store(&path, &rotated).expect("store rotated");
+        rotated.enc_previous_private_key_pem.clear();
+        assert_eq!(
+            rotated.app_id, None,
+            "the renewal clone is stale by construction"
+        );
+        let merged = IdentityStore::store_credential_update(&path, &rotated)
+            .expect("store rotated")
+            .expect("identity still present");
 
         let loaded = IdentityStore::load_optional(&path)
             .expect("load")
             .expect("present");
         assert_eq!(loaded.private_key_pem, "ROTATED-KEY");
+        assert!(loaded.enc_previous_private_key_pem.is_empty());
         assert_eq!(loaded.app_id.as_deref(), Some("4002"));
+        assert_eq!(merged.app_id.as_deref(), Some("4002"));
+    }
+
+    #[test]
+    fn credential_update_does_not_recreate_a_removed_identity() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join("identity.json");
+        let identity = sample_identity();
+        IdentityStore::store(&path, &identity).expect("store");
+        IdentityStore::clear(&path).expect("remove");
+
+        let stored = IdentityStore::store_credential_update(&path, &identity)
+            .expect("credential update is a no-op");
+
+        assert!(stored.is_none());
+        assert!(IdentityStore::load_optional(&path).expect("load").is_none());
     }
 
     #[test]
