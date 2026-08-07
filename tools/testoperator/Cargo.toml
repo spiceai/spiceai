@@ -41,7 +41,7 @@ test-framework = { path = "../../crates/test-framework" }
 rand.workspace = true
 # `net`: the TcpListener the liveness endpoints bind (the workspace default set
 # has no networking).
-tokio = { workspace = true, features = ["net"] }
+tokio = { workspace = true, features = ["fs", "net"] }
 tokio-postgres = { workspace = true }
 tokio-util.workspace = true
 url.workspace = true

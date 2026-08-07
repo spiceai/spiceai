@@ -11,6 +11,9 @@ version.workspace = true
 
 [dependencies]
 arrow.workspace = true
+clap.workspace = true
+arrow_tools = { path = "../arrow_tools" }
+opentelemetry.workspace = true
 arrow-schema = { workspace = true, features = ["serde"] }
 data_components = { path = "../data_components", features = ["flightsql"] }
 datafusion.workspace = true
