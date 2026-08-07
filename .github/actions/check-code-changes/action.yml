@@ -58,6 +58,9 @@ inputs:
         - 'scripts/check_crate_layers.py'
         - 'scripts/check_rust_gate_paths.py'
         - 'scripts/check_module_reachability.py'
+        # The reachability guard's own regression harness runs in `lint-rust`,
+        # so a change to it changes what the Rust gate enforces.
+        - 'scripts/test_check_module_reachability.py'
         - 'rust-toolchain'
         - 'rust-toolchain.toml'
 

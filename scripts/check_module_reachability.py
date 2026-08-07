@@ -185,16 +185,18 @@ def _marker(index: int, width: int) -> str:
     return marker
 
 
-def parse_mods(path: Path) -> list[tuple[str, str, str | None, tuple[str, ...]]]:
+def parse_mods(path: Path) -> list[tuple[str, str, tuple[str, ...], tuple[str, ...]]]:
     """Every `mod` declaration in `path`, in source order.
 
-    Each entry is `(name, kind, path_override, inline_parents)`, where `kind` is
-    `;` for a file module or `{` for an inline one, and `inline_parents` names the
-    inline `mod` blocks the declaration sits inside — which is what decides the
-    directory it resolves against.
+    Each entry is `(name, kind, path_overrides, inline_parents)`, where `kind` is
+    `;` for a file module or `{` for an inline one, `path_overrides` holds every
+    `#[path = "…"]` candidate on the declaration (empty when it has none), and
+    `inline_parents` names the inline `mod` blocks the declaration sits inside —
+    which is what decides the directory it resolves against.
 
     `#[cfg(...)]` is never evaluated: a module declared only under a non-default
     feature is still declared, so gating it must not make its file look dead.
+    The same reasoning is why *every* `path` candidate is kept rather than one.
     """
     try:
         text = path.read_text(encoding="utf-8", errors="replace")
@@ -236,21 +238,26 @@ def parse_mods(path: Path) -> list[tuple[str, str, str | None, tuple[str, ...]]]
             pending = item.group("name")
             continue
 
-        # The nearest `path = "…"` in the attributes immediately preceding this
+        # Every `path = "…"` in the attributes immediately preceding this
         # declaration. Bounded by the previous `;`/`{`/`}` so an attribute
         # belonging to an earlier item cannot be picked up by this one.
+        #
+        # All of them are kept, not just the last. A module routed per platform
+        # carries one `#[cfg_attr(…, path = "…")]` per configuration, and since
+        # `cfg` is never evaluated every candidate is reachable under some build
+        # — keeping only the last would report the others' files as dead.
         start = max(
             blanked.rfind(";", 0, item.start()),
             blanked.rfind("}", 0, item.start()),
             blanked.rfind("{", 0, item.start()),
         )
-        override = None
+        overrides = []
         for pm in PATH_ATTR_RE.finditer(blanked[start + 1 : item.start()]):
             idx = int(pm.group("idx"))
-            if idx < len(literals):
-                override = literals[idx]
+            if idx < len(literals) and literals[idx] not in overrides:
+                overrides.append(literals[idx])
         mods.append(
-            (item.group("name"), ";", override, tuple(n for _, n in stack))
+            (item.group("name"), ";", tuple(overrides), tuple(n for _, n in stack))
         )
 
     return mods
@@ -301,14 +308,18 @@ def walk_from_root(root: Path, reached: set[Path]) -> None:
         file_dir = current.parent
         module_dir = file_dir if current.name in MOD_RS_NAMES else file_dir / current.stem
 
-        for name, _, override, inline in parse_mods(current):
-            if override is not None:
+        for name, _, overrides, inline in parse_mods(current):
+            if overrides:
                 base = module_dir.joinpath(*inline) if inline else file_dir
             else:
                 base = module_dir.joinpath(*inline)
-            child = resolve_child(base, name, override)
-            if child is not None:
-                stack.append(child)
+            # Every candidate is followed: a per-platform module reaches a
+            # different file under each configuration, and all of them compile
+            # somewhere.
+            for override in overrides or (None,):
+                child = resolve_child(base, name, override)
+                if child is not None:
+                    stack.append(child)
 
 
 def collect_sources(src_dir: Path) -> set[Path]:

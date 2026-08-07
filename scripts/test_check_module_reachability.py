@@ -39,7 +39,7 @@ def check(name: str, got, want) -> None:
         print(f"  FAIL: {name}\n    got:  {got!r}\n    want: {want!r}")
 
 
-def mods_of(source: str) -> list[tuple[str, str, str | None, tuple[str, ...]]]:
+def mods_of(source: str) -> list[tuple[str, str, tuple[str, ...], tuple[str, ...]]]:
     """Every file-module declaration in `source`, as parse_mods returns them."""
     with tempfile.TemporaryDirectory() as d:
         f = Path(d) / "lib.rs"
@@ -74,44 +74,76 @@ check(
 check(
     "a lifetime does not swallow the rest of the file",
     mods_of("struct S<'a>(&'a str);\nmod real;\n"),
-    [("real", ";", None, ())],
+    [("real", ";", (), ())],
 )
 check(
     "a char literal does not swallow the rest of the file",
     mods_of("const C: char = '\\'';\nmod real;\n"),
-    [("real", ";", None, ())],
+    [("real", ";", (), ())],
 )
 
 print()
 print("parse_mods")
 
-check("a plain declaration", mods_of("mod alpha;"), [("alpha", ";", None, ())])
-check("a pub declaration", mods_of("pub mod alpha;"), [("alpha", ";", None, ())])
+check("a plain declaration", mods_of("mod alpha;"), [("alpha", ";", (), ())])
+check("a pub declaration", mods_of("pub mod alpha;"), [("alpha", ";", (), ())])
 check(
     "a pub(crate) declaration",
     mods_of("pub(crate) mod alpha;"),
-    [("alpha", ";", None, ())],
+    [("alpha", ";", (), ())],
 )
 check("an inline module declares no file of its own", mods_of("mod alpha { }"), [])
 check(
     "a cfg-gated declaration is still a declaration",
     mods_of('#[cfg(feature = "x")]\nmod alpha;'),
-    [("alpha", ";", None, ())],
+    [("alpha", ";", (), ())],
 )
 check(
     "a path attribute is captured",
     mods_of('#[path = "shared/helper.rs"]\nmod alpha;'),
-    [("alpha", ";", "shared/helper.rs", ())],
+    [("alpha", ";", ("shared/helper.rs",), ())],
 )
 check(
     "a path attribute does not leak to the next declaration",
     mods_of('#[path = "shared/helper.rs"]\nmod alpha;\nmod beta;'),
-    [("alpha", ";", "shared/helper.rs", ()), ("beta", ";", None, ())],
+    [("alpha", ";", ("shared/helper.rs",), ()), ("beta", ";", (), ())],
 )
 check(
     "a cfg attribute alongside a path attribute",
     mods_of('#[cfg(test)]\n#[path = "t.rs"]\nmod alpha;'),
-    [("alpha", ";", "t.rs", ())],
+    [("alpha", ";", ("t.rs",), ())],
+)
+
+# A module routed per platform carries one `cfg_attr` per configuration. `cfg`
+# is never evaluated, so every candidate compiles under some build — keeping
+# only the last would report the other platforms' files as dead and fail the
+# lint gate on live source.
+check(
+    "every cfg_attr path candidate is kept",
+    mods_of(
+        '#[cfg_attr(unix, path = "unix.rs")]\n'
+        '#[cfg_attr(windows, path = "windows.rs")]\n'
+        "mod platform;"
+    ),
+    [("platform", ";", ("unix.rs", "windows.rs"), ())],
+)
+check(
+    "repeated identical path candidates collapse",
+    mods_of(
+        '#[cfg_attr(unix, path = "shared.rs")]\n'
+        '#[cfg_attr(windows, path = "shared.rs")]\n'
+        "mod platform;"
+    ),
+    [("platform", ";", ("shared.rs",), ())],
+)
+check(
+    "multiple candidates do not leak to the next declaration",
+    mods_of(
+        '#[cfg_attr(unix, path = "unix.rs")]\n'
+        '#[cfg_attr(windows, path = "windows.rs")]\n'
+        "mod platform;\nmod beta;"
+    ),
+    [("platform", ";", ("unix.rs", "windows.rs"), ()), ("beta", ";", (), ())],
 )
 
 # Inline nesting decides which directory a declaration resolves against, so the
@@ -120,22 +152,22 @@ check(
 check(
     "a declaration inside an inline module records its parent",
     mods_of("mod alpha { mod beta; }"),
-    [("beta", ";", None, ("alpha",))],
+    [("beta", ";", (), ("alpha",))],
 )
 check(
     "the inline stack pops at the closing brace",
     mods_of("mod alpha { mod beta; }\nmod gamma;"),
-    [("beta", ";", None, ("alpha",)), ("gamma", ";", None, ())],
+    [("beta", ";", (), ("alpha",)), ("gamma", ";", (), ())],
 )
 check(
     "a nested inline module records the whole chain",
     mods_of("mod alpha { mod beta { mod delta; } }"),
-    [("delta", ";", None, ("alpha", "beta"))],
+    [("delta", ";", (), ("alpha", "beta"))],
 )
 check(
     "a function body's braces do not disturb the stack",
     mods_of("fn f() { if true { } }\nmod alpha;"),
-    [("alpha", ";", None, ())],
+    [("alpha", ";", (), ())],
 )
 
 print()
@@ -209,6 +241,38 @@ with tempfile.TemporaryDirectory() as d:
         "a non-mod-rs file's #[path] resolves beside the file, not under its module dir",
         sorted(p.relative_to(src).as_posix() for p in reached),
         ["main.rs", "server.rs", "sources/backend.rs", "sources/mod.rs"],
+    )
+
+# The end-to-end shape of the multi-candidate case: a platform-routed module
+# reaches a different file under each configuration, and every one of them is
+# live source. Following only the last candidate fails the gate on the rest.
+with tempfile.TemporaryDirectory() as d:
+    src = Path(d) / "src"
+    (src / "platform" / "unix").mkdir(parents=True)
+    (src / "lib.rs").write_text(
+        '#[cfg_attr(unix, path = "platform/unix.rs")]\n'
+        '#[cfg_attr(windows, path = "platform/windows.rs")]\n'
+        "mod platform;\n",
+        encoding="utf-8",
+    )
+    # `platform/unix.rs` is not a mod-rs file, so its own children live in the
+    # sibling directory named after it — the walk has to keep descending from
+    # each candidate, not merely mark the candidate itself.
+    (src / "platform" / "unix.rs").write_text("mod unix_leaf;\n", encoding="utf-8")
+    (src / "platform" / "unix" / "unix_leaf.rs").write_text("", encoding="utf-8")
+    (src / "platform" / "windows.rs").write_text("", encoding="utf-8")
+
+    reached = set()
+    walk_from_root(src / "lib.rs", reached)
+    check(
+        "every platform's file is reached, and so is what it declares",
+        sorted(p.relative_to(src).as_posix() for p in reached),
+        [
+            "lib.rs",
+            "platform/unix.rs",
+            "platform/unix/unix_leaf.rs",
+            "platform/windows.rs",
+        ],
     )
 
 print()
