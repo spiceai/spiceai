@@ -728,6 +728,19 @@ mod tests {
 
         let hostile = ["abcdef#123", "a/b", "..", "x=y", "with space"];
         for value in hostile {
+            // The path the creator computes, before the filesystem sees it: a
+            // value that kept a separator would nest below the table directory
+            // rather than sit directly in it, and `read_dir` below could not
+            // tell the difference — it only ever reports the first component.
+            let partition_dir = creator
+                .partition_dir(&[bucket(value)])
+                .unwrap_or_else(|e| panic!("'{value}' must map to a partition directory: {e}"));
+            assert_eq!(
+                partition_dir.parent(),
+                Some(fixture.base_path.as_path()),
+                "'{value}' must name a direct child of the table directory, got {partition_dir:?}"
+            );
+
             creator
                 .create_partition(vec![bucket(value)])
                 .await
