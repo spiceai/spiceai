@@ -28,8 +28,8 @@ pub use spice_cloud_client::CloudClient as InnerCloudClient;
 use spice_cloud_client::types::{
     ApiKeysResponse, App, AppExecutor, AppKind, AppResourceLimits, AppResources, AuthContext,
     AuthExchangeResponse, ContainerImagesResponse, CreateAppRequest, CreateDeploymentRequest,
-    Deployment, LogsResponse, MetricsResponse, RegenerateApiKeyResponse, RegionsResponse, Secret,
-    UpdateAppRequest, UpdateChannel,
+    Deployment, LogsResponse, MetricsResponse, MintAdoptionCodeRequest, MintAdoptionCodeResponse,
+    RegenerateApiKeyResponse, RegionsResponse, Secret, UpdateAppRequest, UpdateChannel,
 };
 
 const DEV_CLOUD_API_BASE_URL: &str = "https://dev-api.spice.ai";
@@ -116,6 +116,28 @@ impl CloudClient {
             }
             .fail()
         }
+    }
+
+    /// Mint a single-use standalone-instance adoption code for
+    /// `spice connect`'s codeless path.
+    pub async fn mint_instance_adoption_code(
+        &self,
+        request: &MintAdoptionCodeRequest,
+    ) -> Result<MintAdoptionCodeResponse> {
+        self.inner
+            .mint_instance_adoption_code(request)
+            .await
+            .map_err(into_cli)
+    }
+
+    /// `true` when a `spice login` credential is available in this environment.
+    ///
+    /// Lets `spice connect` tell "no code and no login" (which must name both
+    /// fixes) apart from "logged in, so mint a code" — without making a
+    /// network request to find out.
+    #[must_use]
+    pub fn is_authenticated() -> bool {
+        get_auth_token().is_ok()
     }
 
     /// Get the auth context for the current user.

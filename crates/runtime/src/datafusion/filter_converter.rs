@@ -47,6 +47,12 @@ pub(crate) fn create_timestamp_filter_convert(
         data_type_to_timestamp_format(f.data_type(), partition_scale)
     });
 
+    // Day-granularity is deliberately NOT resolved here. It governs the append
+    // high-water comparison, whose two sides are filtered through two different
+    // converters (source schema and accelerator schema); deciding it from one schema
+    // at a time lets those two disagree and re-append the same rows every refresh.
+    // The caller resolves it across both schemas and applies
+    // `with_day_granular_columns` — see `RefreshTask::day_granular_high_water_columns`.
     Some(TimestampFilterConvert::new(
         time_column,
         format,
@@ -196,6 +202,33 @@ mod test {
         assert_eq!(
             result.to_string(),
             r#"CAST(timestamp AS Timestamp(ns, "UTC")) > TimestampNanosecond(1620000000000000000, Some("UTC"))"#
+        );
+    }
+
+    /// This factory deliberately does not resolve day-granularity: the append
+    /// high-water comparison is filtered through two converters (source schema and
+    /// accelerator schema) that must agree, so the caller resolves it across both and
+    /// applies `with_day_granular_columns`. A converter straight out of here must
+    /// therefore compare strictly, even for a `Date32` column — otherwise a caller that
+    /// forgot to resolve it would silently get half of the #12492 fix, which is the
+    /// duplication case rather than the stall.
+    #[test]
+    fn test_factory_leaves_the_high_water_comparison_strict() {
+        let converter = create_timestamp_filter_convert(
+            Some(Field::new("ts", DataType::Date32, false)),
+            Some("ts".to_string()),
+            Some(TimeFormat::Date),
+            None,
+            None,
+            None,
+        )
+        .expect("converter should be created");
+
+        assert_eq!(
+            converter
+                .convert_high_water_mark(1_620_000_000_000_000_000)
+                .to_string(),
+            "CAST(ts AS Timestamp(ns)) > TimestampNanosecond(1620000000000000000, None)",
         );
     }
 

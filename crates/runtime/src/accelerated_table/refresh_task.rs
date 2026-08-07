@@ -99,6 +99,7 @@ use tokio::{
 };
 use tracing::{Instrument, Span};
 use util::fibonacci_backoff::FibonacciBackoffBuilder;
+use util::timestamp_filter::is_day_granular;
 use util::{RetryError, retry};
 
 pub(crate) mod changes;
@@ -1110,7 +1111,11 @@ impl RefreshTask {
         let mut filters = vec![];
         if let Some(converter) = filter_converter.as_ref() {
             if let Some(timestamp) = overwrite_timestamp_in_nano {
-                filters.push(converter.convert(timestamp, Operator::Gt));
+                // A high-water mark read back out of the accelerator: compare
+                // inclusively on a day-granular time column, whose values all cast
+                // to midnight, and let `except_existing_records_from` drop the
+                // already-loaded rows it brings back (#12492).
+                filters.push(converter.convert_high_water_mark(timestamp));
             } else if let Some(period) = refresh.period {
                 filters.push(
                     converter.convert(get_timestamp(SystemTime::now() - period), Operator::Gt),
@@ -1153,7 +1158,12 @@ impl RefreshTask {
                     .get_full_or_incremental_append_update(refresh, timestamp)
                     .await
                 {
-                    Ok(data) => match self.except_existing_records_from(refresh, data).await {
+                    // Reuse `timestamp`: the dedupe must compare against the same mark the
+                    // source filter just used, not a freshly read one (#12492).
+                    Ok(data) => match self
+                        .except_existing_records_from(refresh, data, timestamp)
+                        .await
+                    {
                         Ok(data) => Ok(data),
                         Err(e) => Err(e),
                     },
@@ -1699,7 +1709,7 @@ impl RefreshTask {
 
     fn get_filter_converter(&self, refresh: &Refresh) -> Option<TimestampFilterConvert> {
         let schema = self.federated.schema();
-        Self::build_filter_converter(&schema, refresh)
+        self.build_high_water_converter(&schema, refresh)
     }
 
     fn get_accelerator_filter_converter(
@@ -1707,7 +1717,52 @@ impl RefreshTask {
         refresh: &Refresh,
     ) -> Option<TimestampFilterConvert> {
         let schema = self.accelerator.schema();
-        Self::build_filter_converter(&schema, refresh)
+        self.build_high_water_converter(&schema, refresh)
+    }
+
+    /// Build a converter for one side of the append high-water comparison.
+    ///
+    /// Both sides go through here so they cannot be given different day-granularity: the
+    /// flags come from [`Self::day_granular_high_water_columns`], which reads both schemas.
+    fn build_high_water_converter(
+        &self,
+        schema: &SchemaRef,
+        refresh: &Refresh,
+    ) -> Option<TimestampFilterConvert> {
+        let (time, partition) = self.day_granular_high_water_columns(refresh);
+        Self::build_filter_converter(schema, refresh)
+            .map(|converter| converter.with_day_granular_columns(time, partition))
+    }
+
+    /// Whether the time column and the partition column must be treated as day-granular
+    /// on the append high-water-mark path, as `(time_column, time_partition_column)`.
+    ///
+    /// Resolved across the federated *and* accelerator schemas together, and handed to
+    /// both converters, so the source filter and the dedupe filter cannot disagree about
+    /// the comparison. Deciding it from each converter's own schema is not safe: a
+    /// `refresh_sql` that casts the time column — say a `Date32` source projected to
+    /// `Timestamp` in the accelerator — would widen the source to `>=` while the dedupe
+    /// stayed on `>`. The already-loaded rows would then sit outside the dedupe's
+    /// comparison set and the re-fetched rows would be appended again on *every* refresh,
+    /// turning the stall this fixes into unbounded duplication (#12492).
+    ///
+    /// Either side being day-granular is enough. Widening the dedupe side only ever adds
+    /// rows to the comparison set, so it cannot cause duplication; leaving it narrow can.
+    fn day_granular_high_water_columns(&self, refresh: &Refresh) -> (bool, bool) {
+        let schemas = [self.federated.schema(), self.accelerator.schema()];
+        let any_day_granular = |column: Option<&str>| {
+            let Some(column) = column else { return false };
+            schemas.iter().any(|schema| {
+                schema
+                    .column_with_name(column)
+                    .is_some_and(|(_, field)| is_day_granular(field.data_type()))
+            })
+        };
+
+        (
+            any_day_granular(refresh.time_column.as_deref()),
+            any_day_granular(refresh.time_partition_column.as_deref()),
+        )
     }
 
     fn build_filter_converter(
@@ -1834,13 +1889,24 @@ impl RefreshTask {
         ctx
     }
 
+    /// `high_water_mark` is the mark the source filter was built from. Pass it whenever
+    /// the caller has it: recomputing it here reads `max(time_column)` a second time, and
+    /// a write that lands on the accelerator between the two reads gives this comparison a
+    /// *higher* mark than the source query used. The rows in between are then missing from
+    /// the comparison set and are appended again — the same duplication as widening one
+    /// side without the other (#12492). `None` falls back to deriving it.
     async fn except_existing_records_from(
         &self,
         refresh: &Refresh,
         mut update: StreamingDataUpdate,
+        high_water_mark: Option<u128>,
     ) -> Result<StreamingDataUpdate, RetryError<super::Error>> {
-        let Some(value) = self.timestamp_nanos_for_append_query(refresh).await? else {
-            return Ok(update);
+        let value = match high_water_mark {
+            Some(value) => value,
+            None => match self.timestamp_nanos_for_append_query(refresh).await? {
+                Some(value) => value,
+                None => return Ok(update),
+            },
         };
         let Some(filter_converter) = self.get_accelerator_filter_converter(refresh) else {
             return Ok(update);
@@ -1848,6 +1914,10 @@ impl RefreshTask {
 
         let federated_provider = self.federated.table_provider().await;
 
+        // The high-water filter below must widen in step with the source-side filter in
+        // `get_full_or_incremental_append_update`: on a day-granular time column, if the
+        // re-fetched same-day rows are not in this comparison set they pass the dedupe and
+        // get appended a second time, turning the skip into silent duplication (#12492).
         let mut existing_records = accelerator_df(
             &Arc::clone(&self.accelerator),
             &Self::create_refresh_df_context(
@@ -1861,7 +1931,7 @@ impl RefreshTask {
         )
         .map_err(find_datafusion_root)
         .context(super::UnableToScanTableProviderSnafu)?
-        .filter(filter_converter.convert(value, Operator::Gt))
+        .filter(filter_converter.convert_high_water_mark(value))
         .map_err(find_datafusion_root)
         .context(super::UnableToScanTableProviderSnafu)?
         .collect()
@@ -2752,8 +2822,8 @@ mod tests {
     use crate::dataupdate::{StreamingDataUpdate, UpdateType};
     use crate::federated_table::FederatedTable;
     use arrow::array::{
-        Float64Array, Int32Array, Int64Array, LargeStringArray, StringArray, StringViewArray,
-        TimestampNanosecondArray, UInt32Array, UInt64Array,
+        Date32Array, Float64Array, Int32Array, Int64Array, LargeStringArray, StringArray,
+        StringViewArray, TimestampNanosecondArray, UInt32Array, UInt64Array,
     };
     use arrow::datatypes::TimeUnit;
     use arrow_schema::{DataType, Field, Schema};
@@ -3607,7 +3677,7 @@ mod tests {
         let update = StreamingDataUpdate::new(update_stream, UpdateType::Append);
 
         let result = task
-            .except_existing_records_from(&refresh, update)
+            .except_existing_records_from(&refresh, update, None)
             .await
             .expect("except_existing_records_from should succeed with column subset");
 
@@ -3728,7 +3798,7 @@ mod tests {
         let update = StreamingDataUpdate::new(update_stream, UpdateType::Append);
 
         let result = task
-            .except_existing_records_from(&refresh, update)
+            .except_existing_records_from(&refresh, update, None)
             .await
             .expect("except_existing_records_from should succeed with nullable time column");
 
@@ -3766,6 +3836,174 @@ mod tests {
             id_col.value(0),
             2,
             "remaining row after fix should be the new id=2 (NULL dup was filtered)"
+        );
+    }
+
+    /// Regression test for the schema-mismatch half of #12492.
+    ///
+    /// `refresh_sql` can project the time column to another type, so the federated and
+    /// accelerator schemas disagree about day-granularity. Resolving the comparison from
+    /// each schema separately would widen the source filter to `>=` while leaving the
+    /// dedupe on `>`: the already-loaded rows would sit outside the dedupe's comparison
+    /// set, and the re-fetched rows would be appended again on *every* refresh — the
+    /// stall turned into unbounded duplication. Both sides must come out the same.
+    #[tokio::test]
+    async fn test_high_water_comparison_agrees_across_mismatched_schemas() {
+        let src = Arc::new(Schema::new(vec![
+            Field::new("day", DataType::Date32, false),
+            Field::new("id", DataType::Int32, false),
+        ]));
+
+        // What `SELECT CAST(day AS TIMESTAMP) AS day, id FROM source` materialises.
+        let ts_type = DataType::Timestamp(TimeUnit::Nanosecond, None);
+        let acc = Arc::new(Schema::new(vec![
+            Field::new("day", ts_type, false),
+            Field::new("id", DataType::Int32, false),
+        ]));
+
+        let federated = MemTable::try_new(Arc::clone(&src), vec![vec![]]).expect("src table");
+        let accelerator = MemTable::try_new(Arc::clone(&acc), vec![vec![]]).expect("acc table");
+
+        let task = RefreshTaskBuilder::new(
+            crate::status::RuntimeStatus::new(),
+            TableReference::bare("test_mismatched_schemas"),
+            Arc::new(FederatedTable::new_unchecked(Arc::new(federated))),
+            None,
+            Arc::new(accelerator),
+            Handle::current(),
+            Arc::new(Mutex::new(())),
+        )
+        .build();
+
+        let refresh = Refresh::new(RefreshMode::Append).time_column("day".to_string());
+
+        assert_eq!(
+            task.day_granular_high_water_columns(&refresh),
+            (true, false),
+            "a Date32 on either side must make both converters day-granular"
+        );
+
+        let source = task
+            .get_filter_converter(&refresh)
+            .expect("source converter")
+            .convert_high_water_mark(1_620_000_000_000_000_000)
+            .to_string();
+        let dedupe = task
+            .get_accelerator_filter_converter(&refresh)
+            .expect("accelerator converter")
+            .convert_high_water_mark(1_620_000_000_000_000_000)
+            .to_string();
+
+        assert_eq!(
+            source, dedupe,
+            "the source filter and the dedupe filter must compare identically"
+        );
+        assert!(
+            source.contains(">="),
+            "both sides should be inclusive, got: {source}"
+        );
+    }
+
+    /// Regression test for #12492.
+    ///
+    /// With a `Date32` time column every value casts to midnight, so the append
+    /// high-water mark for a partly-loaded day *D* is *D*-midnight and the source
+    /// filter has to be inclusive to see the rest of that day. This dedupe has to
+    /// widen in step: with a strict `>` the already-loaded rows it exists to remove
+    /// are not in the comparison set at all, so the re-fetched rows pass through and
+    /// are appended a second time.
+    #[tokio::test]
+    async fn test_except_existing_records_from_date32_time_column_dedupes_same_day() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("day", DataType::Date32, false),
+            Field::new("id", DataType::Int32, false),
+        ]));
+
+        // Day 20_000 since the epoch. Both the loaded row and the incoming rows land on
+        // it, so the accelerator's max(day) is exactly this day's midnight.
+        let day: i32 = 20_000;
+
+        let existing_batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Date32Array::from(vec![day])),
+                Arc::new(Int32Array::from(vec![1])),
+            ],
+        )
+        .expect("existing batch");
+        let accelerator = Arc::new(
+            MemTable::try_new(Arc::clone(&schema), vec![vec![existing_batch]])
+                .expect("accelerator mem table"),
+        ) as Arc<dyn TableProvider>;
+
+        let federated_table = Arc::new(
+            MemTable::try_new(Arc::clone(&schema), vec![vec![]]).expect("federated mem table"),
+        ) as Arc<dyn TableProvider>;
+        let federated = Arc::new(FederatedTable::new_unchecked(Arc::clone(&federated_table)));
+
+        let task = RefreshTaskBuilder::new(
+            crate::status::RuntimeStatus::new(),
+            TableReference::bare("test_date32_append"),
+            federated,
+            None,
+            Arc::clone(&accelerator),
+            Handle::current(),
+            Arc::new(Mutex::new(())),
+        )
+        .build();
+
+        // No `append_overlap`: the overlap would push the high-water mark below midnight
+        // and mask the defect this test covers. `TimeFormat::Date` is what the runtime
+        // requires for a Date32 time column.
+        let refresh = Refresh::new(RefreshMode::Append)
+            .time_column("day".to_string())
+            .time_format(TimeFormat::Date);
+
+        // What the inclusive source filter returns for day D: the row already loaded
+        // into the accelerator, plus a genuinely new row for the same day.
+        let update_batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Date32Array::from(vec![day, day])),
+                Arc::new(Int32Array::from(vec![1, 2])),
+            ],
+        )
+        .expect("update batch");
+        let update_stream: SendableRecordBatchStream = Box::pin(
+            MemoryStream::try_new(vec![update_batch], Arc::clone(&schema), None)
+                .expect("update stream"),
+        );
+        let update = StreamingDataUpdate::new(update_stream, UpdateType::Append);
+
+        let collected = task
+            .except_existing_records_from(&refresh, update, None)
+            .await
+            .expect("except_existing_records_from should succeed for a Date32 time column")
+            .collect_data()
+            .await
+            .expect("collecting the deduped data should succeed");
+
+        let total_rows: usize = collected.data.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(
+            total_rows, 1,
+            "the already-loaded same-day row must be deduped, not appended again; \
+             a strict high-water comparison leaves the comparison set empty and lets both rows through"
+        );
+
+        let batch = collected
+            .data
+            .iter()
+            .find(|batch| batch.num_rows() > 0)
+            .expect("a non-empty batch should remain");
+        let id_col = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("id column should be Int32");
+        assert_eq!(
+            id_col.value(0),
+            2,
+            "the surviving row should be the new same-day row (id=2)"
         );
     }
 }

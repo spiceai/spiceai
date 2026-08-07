@@ -51,10 +51,15 @@ limitations under the License.
 //! handle whose tokio task crashes/disconnects are isolated from the rest
 //! of the process; the runtime stays up.
 
+pub mod clock_skew;
 pub mod config;
 pub mod enroll;
 pub mod handlers;
 pub mod identity;
+pub mod release;
+pub mod sealed_secrets;
+pub mod secret_cache;
+pub mod supervisor;
 
 mod client;
 mod fingerprint;
@@ -85,9 +90,11 @@ use tokio::task::JoinHandle;
 
 pub use config::CloudConnectConfig;
 pub use handlers::{
-    Capability, CommandError, RestartMode, RuntimeHandle, RuntimePhase, StatusReport,
+    ApplyOutcome, Capability, CommandError, PostApply, RestartMode, RuntimeHandle, RuntimePhase,
+    SpicepodDeployment, StatusReport,
 };
 pub use identity::{Identity, IdentityStore};
+pub use supervisor::Supervisor;
 
 /// Revision of the `spice.cloud.v1` contract this client implements,
 /// announced in `Hello.protocol_version`.
@@ -272,9 +279,70 @@ pub fn is_valid_adoption_code(code: &str) -> bool {
     (2..=5).contains(&segments)
 }
 
+/// Validate an instance region label (`spice connect --region` /
+/// `SPICE_CONNECT_ADOPT_REGION`).
+///
+/// This is a **charset and length check only** — deliberately not a lookup
+/// against the AWS region catalog. A standalone host may sit in a region newer
+/// than any catalog the CLI shipped with, or in no cloud region at all
+/// (`on-prem-syd`), and both must enroll. The catalog is used cloud-side for
+/// display and gateway-stamp selection, which fall back to the home stamp for
+/// a label it does not recognise.
+///
+/// The rule mirrors the cloud's own enroll validation (2–64 lowercase letters,
+/// digits, and hyphens, starting and ending alphanumeric) so the CLI never
+/// accepts a label the cloud would reject — and never rejects one it would
+/// accept.
+#[must_use]
+pub fn is_valid_instance_region(region: &str) -> bool {
+    if !(2..=64).contains(&region.len()) {
+        return false;
+    }
+    let alnum = |c: char| c.is_ascii_lowercase() || c.is_ascii_digit();
+    region.chars().all(|c| alnum(c) || c == '-')
+        && region.chars().next().is_some_and(alnum)
+        && region.chars().last().is_some_and(alnum)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn accepts_catalog_and_non_catalog_regions() {
+        // A region the CLI's catalog knows nothing about must still enroll:
+        // an on-prem label, and an AWS region newer than this build.
+        for region in [
+            "us-west-2",
+            "eu-central-1",
+            "on-prem-syd",
+            "ap-southeast-7",
+            "xx",
+            "rack42",
+        ] {
+            assert!(is_valid_instance_region(region), "{region} must be valid");
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_regions() {
+        for region in [
+            "",              // empty
+            "u",             // shorter than the cloud's 2-char minimum
+            "US-WEST-2",     // uppercase
+            "us_west_2",     // underscore
+            "-us-west-2",    // leading hyphen
+            "us-west-2-",    // trailing hyphen
+            "us west 2",     // whitespace
+            "us-west-2\n",   // trailing newline (an unnoticed shell artifact)
+            &"a".repeat(65), // past the cloud's 64-char ceiling
+        ] {
+            assert!(
+                !is_valid_instance_region(region),
+                "{region:?} must be rejected"
+            );
+        }
+    }
 
     #[test]
     fn rejects_codes_with_wrong_prefix() {
