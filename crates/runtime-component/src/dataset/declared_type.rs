@@ -463,17 +463,16 @@ impl<'a> TokenParser<'a> {
         let span_end = self.tokens[self.pos - 1].span.end;
         let leaf = &self.original[span_start..span_end];
 
-        match leaf_lookup(leaf) {
-            Ok(dt) => Ok(dt),
-            // `leaf_lookup` reports against the leaf it was handed; an
-            // unrecognized leaf reads better reported against the whole
-            // declaration, which is what the user wrote. A precise error
-            // (an out-of-range width) already names the offending part.
-            Err(ParseTypeError::Unrecognized { .. }) => Err(ParseTypeError::Unrecognized {
+        // `leaf_lookup` reports against the leaf it was handed; an unrecognized
+        // leaf reads better reported against the whole declaration, which is
+        // what the user wrote. A precise error — an out-of-range width —
+        // already names the offending part, so it passes through unchanged.
+        leaf_lookup(leaf).map_err(|e| match e {
+            ParseTypeError::Unrecognized { .. } => ParseTypeError::Unrecognized {
                 input: self.original.to_string(),
-            }),
-            Err(precise) => Err(precise),
-        }
+            },
+            precise => precise,
+        })
     }
 }
 
