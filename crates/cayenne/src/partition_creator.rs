@@ -18,7 +18,7 @@ limitations under the License.
 //! partitioned tables, creating and opening per-partition [`CayenneTableProvider`]s.
 
 use std::path::PathBuf;
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use datafusion::common::DFSchema;
@@ -29,7 +29,6 @@ use datafusion::logical_expr::TableProviderFilterPushDown;
 use datafusion::prelude::Expr;
 use datafusion::scalar::ScalarValue;
 use datafusion_table_providers::UnsupportedTypeAction;
-use regex::Regex;
 use runtime_table_partition::Partition;
 use runtime_table_partition::creator::filename::{
     encode_composite_key, encode_key, parse_partition_value, to_hive_partition_dir,
@@ -42,14 +41,6 @@ use crate::{
     CayenneContext, CayenneTableProviderBuilder, MetadataCatalog, PartitionMetadata,
     TimeRetentionFilterBuilder, metadata,
 };
-
-/// Partition values matching `.*#\d+` (e.g. `"abcdef#123"`) are only supported
-/// on S3 Express One Zone locations, not on local filesystem paths.
-static UNSUPPORTED_LOCAL_PARTITION_PATTERN: LazyLock<Regex> =
-    LazyLock::new(|| match Regex::new(r".*#\d+$") {
-        Ok(compiled) => compiled,
-        Err(e) => unreachable!("Unable to compile regexp: {e}"),
-    });
 
 /// Implements [`PartitionCreator`] for Cayenne-backed partitioned tables.
 ///
@@ -268,21 +259,6 @@ impl PartitionCreator for CayennePartitionCreator {
             .collect::<Result<Vec<_>, _>>()
             .boxed()
             .context(creator::CreatePartitionSnafu)?;
-
-        if self.object_store_config.is_none() {
-            for value in &partition_value_strings {
-                if UNSUPPORTED_LOCAL_PARTITION_PATTERN.is_match(value) {
-                    return Err(creator::Error::CreatePartition {
-                        source: format!(
-                            "Partition value '{value}' is not supported for local filesystem locations. \
-                             Values matching the pattern '*#<digits>' (e.g., 'abcdef#123') are only \
-                             supported for S3 Express One Zone locations."
-                        )
-                        .into(),
-                    });
-                }
-            }
-        }
 
         tracing::debug!("creating Cayenne partition at {partition_path}");
         tokio::fs::create_dir_all(&partition_dir)
@@ -740,31 +716,68 @@ mod tests {
         );
     }
 
-    /// The pattern gates on a `#` followed only by digits at the end of the
-    /// value; everything else is a legal local partition value.
-    #[test]
-    fn unsupported_local_partition_pattern_matches_only_a_trailing_hash_digits() {
-        for unsupported in ["abcdef#123", "test#1", "some_value#999999", "#0", "a#1"] {
+    /// A partition value is hex-encoded into a single path component before it
+    /// reaches the filesystem, so no character a user can write — a `#`, a path
+    /// separator, a parent-directory reference — can escape or split the
+    /// directory name. This is what makes every value legal on a local
+    /// filesystem, and it is the property to keep if the encoding ever changes.
+    #[tokio::test]
+    async fn a_path_hostile_partition_value_becomes_one_safe_directory_component() {
+        let fixture = fixture().await;
+        let creator = creator_for(&fixture);
+
+        let hostile = ["abcdef#123", "a/b", "..", "x=y", "with space"];
+        for value in hostile {
+            creator
+                .create_partition(vec![bucket(value)])
+                .await
+                .unwrap_or_else(|e| panic!("'{value}' must be a legal partition value: {e}"));
+        }
+
+        let partition_dirs: Vec<String> = std::fs::read_dir(&fixture.base_path)
+            .expect("the table directory is readable")
+            .map(|entry| {
+                entry
+                    .expect("the directory entry is readable")
+                    .file_name()
+                    .to_string_lossy()
+                    .to_string()
+            })
+            .filter(|name| name.starts_with("bucket="))
+            .collect();
+        assert_eq!(
+            partition_dirs.len(),
+            hostile.len(),
+            "one directory per created partition, got {partition_dirs:?}"
+        );
+        for name in &partition_dirs {
+            let encoded = name
+                .strip_prefix("bucket=")
+                .expect("the directory name is Hive-style");
             assert!(
-                UNSUPPORTED_LOCAL_PARTITION_PATTERN.is_match(unsupported),
-                "'{unsupported}' must be treated as S3 Express One Zone only"
+                encoded
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'.' || byte == b'_'),
+                "'{name}' must be a single path-safe component"
             );
         }
-        for supported in [
-            "abcdef",
-            "test_123",
-            "2024-01-01",
-            "partition_value",
-            "123",
-            "abc#def",
-            "test#",
-            "test#abc",
-            "test#123abc",
-        ] {
-            assert!(
-                !UNSUPPORTED_LOCAL_PARTITION_PATTERN.is_match(supported),
-                "'{supported}' must be a legal local filesystem partition value"
-            );
-        }
+
+        let mut values: Vec<String> = creator
+            .infer_existing_partitions()
+            .await
+            .expect("partitions are inferred")
+            .iter()
+            .map(|partition| match partition.partition_values.as_slice() {
+                [ScalarValue::Utf8(Some(value))] => value.clone(),
+                other => panic!("expected one Utf8 partition value, got {other:?}"),
+            })
+            .collect();
+        values.sort();
+        let mut expected: Vec<String> = hostile.iter().map(ToString::to_string).collect();
+        expected.sort();
+        assert_eq!(
+            values, expected,
+            "every encoded value must read back exactly as written"
+        );
     }
 }
