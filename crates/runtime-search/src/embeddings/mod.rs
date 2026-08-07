@@ -26,7 +26,7 @@ use std::sync::Arc;
 
 use chunking::{Chunker, ChunkingConfig};
 use llms::embeddings::{Embed, Error as EmbedError};
-use runtime_acceleration::acceleration::{Acceleration, ZeroResultsAction};
+use runtime_acceleration::acceleration::{Acceleration, RefreshMode, ZeroResultsAction};
 use std::collections::HashMap;
 use tokio::sync::RwLock;
 
@@ -51,6 +51,10 @@ pub type EmbeddingModelStore = HashMap<String, Arc<dyn Embed>>;
 ///   read mode rescues it: `ReturnEmpty` never consults the engine index, and `UseSource`
 ///   falls back only when the tier returns *exactly zero* rows, which a partly-filled tier
 ///   does not.
+/// - The accelerator is a cache (`refresh_mode: caching`). It is filled one cache miss at a
+///   time, and with neither `refresh_on_startup: always` nor a `refresh_check_interval` it
+///   schedules no refresh at all, so the tier holds only the rows read so far — partial by
+///   design rather than by timing, which is why this applies to every accelerator mode.
 ///
 /// Declining the tier costs a dataset the in-memory read path, not any results: the vector
 /// engine index holds the whole dataset and serves the search directly. The warm tier is an
@@ -71,6 +75,13 @@ pub fn warm_index_on_zero_results(
     if acceleration.mode.retains_data_across_restarts() {
         tracing::debug!(
             "Not adding an in-memory warm vector index: the accelerator keeps its rows across a restart, so the warm tier would hold only the rows refreshed since startup. Searches will be served by the vector engine directly."
+        );
+        return None;
+    }
+
+    if matches!(acceleration.refresh_mode, Some(RefreshMode::Caching)) {
+        tracing::debug!(
+            "Not adding an in-memory warm vector index: a caching accelerator is populated per cache miss, so the warm tier would hold only the rows read so far. Searches will be served by the vector engine directly."
         );
         return None;
     }
@@ -170,6 +181,26 @@ mod tests {
                 warm_index_on_zero_results(Some(&accelerated(mode))),
                 Some(&ZeroResultsAction::UseSource),
                 "{mode:?} starts empty, so repopulating it carries every row past the warm tier"
+            );
+        }
+    }
+
+    /// A caching accelerator is filled one cache miss at a time, and with neither
+    /// `refresh_on_startup: always` nor a `refresh_check_interval` it schedules no refresh at all,
+    /// so the warm tier would answer as primary from whatever subset has been read so far. That
+    /// holds for every accelerator mode, including the ephemeral ones that are otherwise sound.
+    #[test]
+    fn on_zero_results_is_none_for_a_caching_accelerator() {
+        for mode in [Mode::Memory, Mode::FileCreate, Mode::File, Mode::FileUpdate] {
+            let caching = Acceleration {
+                refresh_mode: Some(RefreshMode::Caching),
+                ..accelerated(mode)
+            };
+            assert_eq!(
+                warm_index_on_zero_results(Some(&caching)),
+                None,
+                "{mode:?} with refresh_mode: caching is populated per cache miss, so the warm \
+                 tier would hold only the rows read so far"
             );
         }
     }
