@@ -697,7 +697,10 @@ fn oauth_host(host: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CloudClient, auth_exchange_result, auth_exchange_status_is_pending};
+    use super::{
+        CloudClient, DEFAULT_TIMEOUT, auth_exchange_result, auth_exchange_status_is_pending,
+        same_origin_redirect_policy,
+    };
     use crate::types::{AuthContext, AuthContextApp, AuthContextOrg, AuthContextRaw};
     use crate::{error, types::AuthExchangeResponse};
 
@@ -705,22 +708,60 @@ mod tests {
     /// and the auth code `exchange_code` puts in a request body — could follow a `Location`
     /// off origin.
     ///
-    /// `reqwest` exposes no getter for the policy, but its `Client` `Debug` prints a
-    /// `redirect_policy` field only when the policy is *not* the default, and renders a
-    /// custom one as `Custom`. So the absence of that word is exactly the regression.
+    /// `reqwest` exposes no getter for the policy, so its `Client` `Debug` rendering is the
+    /// only thing available. Rather than matching the word `reqwest` happens to print
+    /// today, each constructed client is compared against a reference built here *with* the
+    /// policy, and that reference is checked to still render differently from one left on
+    /// the default. A `reqwest` release that rewords or drops the field moves both sides
+    /// together and fails the second assertion loudly, instead of leaving the first one
+    /// quietly passing on a client that no longer has the policy.
+    ///
+    /// What the policy then *does* — refuse a cross-origin hop, follow a same-origin one,
+    /// bound the chain — is asserted against a live server in [`crate::redirect`]. Those
+    /// tests cannot run through these constructors: `build_http_client` sets
+    /// `https_only(true)`, so a plain-HTTP stub is rejected before any redirect is
+    /// considered.
     #[test]
     fn test_both_constructors_install_the_same_origin_redirect_policy() {
-        let client = CloudClient::new("https://api.spice.ai").expect("client should build");
-        assert!(
-            format!("{:?}", client.client).contains("Custom"),
-            "CloudClient::new must set a non-default redirect policy"
+        /// The settings `build_http_client` applies, minus the redirect policy, so the
+        /// comparison isolates it.
+        fn reference_builder(timeout: std::time::Duration) -> reqwest::ClientBuilder {
+            reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .timeout(timeout)
+                .https_only(true)
+        }
+
+        fn rendering(builder: reqwest::ClientBuilder) -> String {
+            format!(
+                "{:?}",
+                builder.build().expect("reference client should build")
+            )
+        }
+
+        let with_policy =
+            rendering(reference_builder(DEFAULT_TIMEOUT).redirect(same_origin_redirect_policy()));
+        assert_ne!(
+            with_policy,
+            rendering(reference_builder(DEFAULT_TIMEOUT)),
+            "reqwest's Debug output no longer distinguishes a custom redirect policy from \
+             the default, so this test can no longer detect the regression it exists for"
         );
 
+        let client = CloudClient::new("https://api.spice.ai").expect("client should build");
+        assert_eq!(
+            format!("{:?}", client.client),
+            with_policy,
+            "CloudClient::new must build its client through build_http_client"
+        );
+
+        let retimed_timeout = std::time::Duration::from_secs(5);
         let retimed = client
-            .with_timeout(std::time::Duration::from_secs(5))
+            .with_timeout(retimed_timeout)
             .expect("client should rebuild with a new timeout");
-        assert!(
-            format!("{:?}", retimed.client).contains("Custom"),
+        assert_eq!(
+            format!("{:?}", retimed.client),
+            rendering(reference_builder(retimed_timeout).redirect(same_origin_redirect_policy())),
             "CloudClient::with_timeout must preserve the redirect policy"
         );
     }
