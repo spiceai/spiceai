@@ -59,7 +59,14 @@ pub type EmbeddingModelStore = HashMap<String, Arc<dyn Embed>>;
 pub fn warm_index_on_zero_results(
     acceleration: Option<&Acceleration>,
 ) -> Option<&ZeroResultsAction> {
-    let acceleration = acceleration.filter(|acceleration| acceleration.enabled)?;
+    // Both declines log their own reason here, where it is known: the consumer only sees
+    // `None` and cannot tell the two apart.
+    let Some(acceleration) = acceleration.filter(|acceleration| acceleration.enabled) else {
+        tracing::debug!(
+            "Not adding an in-memory warm vector index: the table has no enabled acceleration, so nothing would populate the warm tier. Searches will be served by the vector engine directly."
+        );
+        return None;
+    };
 
     if acceleration.mode.retains_data_across_restarts() {
         tracing::debug!(
