@@ -1168,10 +1168,9 @@ mod tests {
             .results_cache_provider()
             .expect("results cache should be configured");
 
-        let schema: arrow::datatypes::SchemaRef =
-            Arc::new(arrow::datatypes::Schema::new(vec![
-                arrow::datatypes::Field::new("n", arrow::datatypes::DataType::Int64, false),
-            ]));
+        let schema: arrow::datatypes::SchemaRef = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("n", arrow::datatypes::DataType::Int64, false),
+        ]));
         let batch = arrow::array::RecordBatch::try_new(
             Arc::clone(&schema),
             vec![Arc::new(Int64Array::from(vec![1_i64]))],

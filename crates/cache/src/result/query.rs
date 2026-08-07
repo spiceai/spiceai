@@ -334,8 +334,13 @@ mod tests {
         let input_tables = Arc::new(HashSet::new());
         let cached_at = Instant::now();
 
-        let cached_result =
-            CachedQueryResult::new_raw(batches, Arc::clone(&schema), input_tables, cached_at, cached_at);
+        let cached_result = CachedQueryResult::new_raw(
+            batches,
+            Arc::clone(&schema),
+            input_tables,
+            cached_at,
+            cached_at,
+        );
 
         // Calculate expected size
         let expected_size = std::mem::size_of::<CachedQueryResult>() as u64
@@ -373,8 +378,14 @@ mod tests {
         let input_tables = Arc::new(HashSet::new());
         let cached_at = Instant::now();
 
-        let cached_result =
-            CachedQueryResult::new(encoded_data.clone(), schema, input_tables, cached_at, cached_at, None);
+        let cached_result = CachedQueryResult::new(
+            encoded_data.clone(),
+            schema,
+            input_tables,
+            cached_at,
+            cached_at,
+            None,
+        );
 
         let expected_size =
             std::mem::size_of::<CachedQueryResult>() as u64 + encoded_data.len() as u64;
@@ -393,7 +404,8 @@ mod tests {
         let input_tables = Arc::new(HashSet::new());
         let cached_at = Instant::now();
 
-        let cached_result = CachedQueryResult::new_raw(batches, schema, input_tables, cached_at, cached_at);
+        let cached_result =
+            CachedQueryResult::new_raw(batches, schema, input_tables, cached_at, cached_at);
 
         let expected_size = std::mem::size_of::<CachedQueryResult>() as u64;
         let actual_size = cached_result.memory_size();

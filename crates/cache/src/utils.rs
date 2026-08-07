@@ -504,8 +504,7 @@ pub(crate) mod tests {
 
         let table_names = get_logical_plan_input_tables(&logical_plan);
 
-        let expected: HashSet<TableReference> =
-            HashSet::from(["customer".into(), "state".into()]);
+        let expected: HashSet<TableReference> = HashSet::from(["customer".into(), "state".into()]);
         assert_eq!(
             table_names, expected,
             "a table read only through a subquery expression must still be recorded, \

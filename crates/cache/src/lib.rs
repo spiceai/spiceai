@@ -453,9 +453,9 @@ struct TableInvalidationClock {
     state: parking_lot::RwLock<TableInvalidationState>,
 }
 
-/// Upper bound on individually-tracked tables. Each entry is a
-/// `catalog.schema.table` string plus an `Instant`, so this caps the clock at
-/// well under a megabyte while being far above the table count of any ordinary
+/// Upper bound on individually-tracked tables. Each entry is a `u64` hash of
+/// the resolved table name plus an `Instant`, so the clock stays in the tens of
+/// kilobytes while the bound sits far above the table count of any ordinary
 /// deployment — a collapse should be reachable only under deliberate churn.
 const MAX_TRACKED_TABLES: usize = 4096;
 
@@ -711,7 +711,8 @@ impl QueryResultsCacheProvider {
         // the same gap one step earlier.
         self.table_invalidations
             .mark_invalidated(&table_name, std::time::Instant::now());
-        CachedQueryResult::record_invalidation();
+        // The invalidation itself is counted by the underlying cache, so that
+        // every cache type is counted the same way rather than only this one.
         self.cache.invalidate_for_table(table_name)
     }
 
@@ -994,8 +995,11 @@ mod tests {
         // A different physical table must not reject the write.
         let other: HashSet<TableReference> = HashSet::from([TableReference::bare("orders")]);
         assert!(!clock.invalidated_since(&other, base));
-        let other_schema: HashSet<TableReference> =
-            HashSet::from([TableReference::full(SPICE_DEFAULT_CATALOG, "other", "customer")]);
+        let other_schema: HashSet<TableReference> = HashSet::from([TableReference::full(
+            SPICE_DEFAULT_CATALOG,
+            "other",
+            "customer",
+        )]);
         assert!(!clock.invalidated_since(&other_schema, base));
     }
 
