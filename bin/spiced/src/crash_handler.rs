@@ -28,8 +28,12 @@ limitations under the License.
 //! Everything here runs in the signal handler on the crashing thread and must be
 //! async-signal-safe — no allocation, no locks, no `tracing` — since the fault may
 //! have interrupted that thread mid-allocation. Anything that would need to allocate,
-//! such as the build identity, is resolved at install time; the report itself is
-//! formatted into a fixed stack buffer and emitted with one `write(2)`.
+//! such as the build identity, is resolved at install time.
+//!
+//! The report is formatted into fixed stack buffers and emitted in a few bounded
+//! `write(2)` calls rather than one. Inspecting the stack can fault a second time —
+//! the stack pointer may be what was corrupted — so the fields are already out by the
+//! time that is attempted.
 
 use std::sync::OnceLock;
 
@@ -365,9 +369,10 @@ const _: () = assert!(SI_UID_OFFSET + size_of::<u32>() <= size_of::<libc::signal
 
 /// Who sent the signal, when it was sent rather than raised by a fault.
 ///
-/// A `SIGABRT` reaches this handler whether the process aborted itself, a liveness
-/// probe killed it, or the OOM killer did — and the report otherwise cannot tell those
-/// apart. A sender pid equal to our own means it was self-inflicted.
+/// A `SIGABRT` reaches this handler whether the process aborted itself or something
+/// outside sent it, and the report otherwise cannot tell those apart. A sender pid
+/// equal to our own means it was self-inflicted. (An OOM kill is not among the cases
+/// this separates: the kernel sends `SIGKILL`, which cannot be caught at all.)
 ///
 /// Read at the real offsets for the same reason as [`fault_address`]: the `siginfo`
 /// handed to the callback is `siginfo_t` bytes wearing another struct's type, so
@@ -690,14 +695,22 @@ fn report_stack(cc: &crash_handler::CrashContext) {
     use std::io::Write as _;
 
     let sp = stack_pointer(cc);
+    let ip = instruction_pointer(cc);
+    // A return address is only where a call left it if nothing has run since. That
+    // holds when the fault is the instruction fetch itself — the address executed is
+    // the address that faulted — because no code at the target got as far as its
+    // prologue. A fault *inside* a function, this binary's or a shared library's, has
+    // a frame of its own, and the word at the stack pointer is not a return address.
+    let immediate_call = fault_address(cc) == Some(ip);
+
     let mut buf = [0u8; STACK_BUF];
     let mut cur = std::io::Cursor::new(&mut buf[..]);
-    let _ = write!(cur, "stack: rsp=0x{sp:x}");
+    let _ = write!(cur, "stack: sp=0x{sp:x}");
 
     // aarch64 keeps the return address in a register, so it needs no stack read.
     let mut caller = link_register(cc).and_then(|lr| {
         let _ = write!(cur, " lr=0x{lr:x}");
-        text_offset(lr)
+        immediate_call.then(|| text_offset(lr)).flatten()
     });
 
     let mut candidates = 0;
@@ -716,10 +729,9 @@ fn report_stack(cc: &crash_handler::CrashContext) {
         let Some(offset) = text_offset(value) else {
             continue;
         };
-        // The first word is the return address a `call` just pushed, which is what
-        // names the caller after a jump to a wild address. Anything deeper is a
-        // candidate: it may be a live return address or a stale one.
-        if word == 0 && caller.is_none() {
+        // Only the first word of an interrupted call is a return address; everything
+        // else is a candidate, which may be live or long stale.
+        if word == 0 && immediate_call && caller.is_none() {
             let _ = write!(cur, " ret=0x{value:x} (+0x{offset:x})");
             caller = Some(offset);
         } else {
@@ -1030,7 +1042,7 @@ mod tests {
         // What the instruction pointer no longer says, the stack does: the call that
         // jumped to the wild address pushed the address it would have returned to.
         assert!(
-            stderr.contains("stack: rsp=0x"),
+            stderr.contains("stack: sp=0x"),
             "report should carry the stack pointer: {stderr}"
         );
         assert!(

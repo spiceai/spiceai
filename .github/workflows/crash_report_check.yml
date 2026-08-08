@@ -15,12 +15,6 @@ on:
         default: '["release", "release-lto"]'
         type: string
 
-  # Remove before merge. `workflow_dispatch` only lists workflows already on the
-  # default branch, so a branch-scoped push is the only way to exercise this first.
-  push:
-    branches:
-      - sgrebnov/12332-crash-report-followups
-
 # Each leg builds spiced from scratch on a shared runner pool, so a superseded run
 # should stop rather than compete with the one that replaced it.
 concurrency:
