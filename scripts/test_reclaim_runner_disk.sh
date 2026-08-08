@@ -168,6 +168,18 @@ result="$(env bash -c 'source "$1"; workspace_is_stale "$2" "$3"' _ "$subject" "
 pass_or_fail "one recent file keeps a workspace off the list" \
   "$([[ "$result" == *"rc=1" ]] && echo 1 || echo 0)" "got: $result"
 
+# A walk that errored prints nothing, which is byte-for-byte what "nothing here
+# is recent" looks like — and the caller deletes the whole workspace on that
+# answer. The unknown case has to land on the safe side.
+failing_find_dir="$(mktemp -d)"
+printf '#!/usr/bin/env bash\nexit 1\n' >"$failing_find_dir/find"
+chmod +x "$failing_find_dir/find"
+
+result="$(env "PATH=$failing_find_dir:$PATH" bash -c 'source "$1"; workspace_is_stale "$2" "$3"' _ "$subject" "$tmp/stale-ws" 7 2>&1; echo "rc=$?")"
+pass_or_fail "a workspace whose walk failed is not called stale" \
+  "$([[ "$result" == *"rc=1" ]] && echo 1 || echo 0)" \
+  "an unreadable directory was reported as safe to delete: $result"
+
 echo "reclaim_temp"
 
 root="$tmp/work"
@@ -330,6 +342,29 @@ pass_or_fail "rejects a work root that is not there" \
 result="$(bash "$subject" --root "$tmp" --unknown-flag 2>&1; echo "rc=$?")"
 pass_or_fail "rejects an unknown argument rather than sweeping with a default" \
   "$([[ "$result" == *"rc=64" ]] && echo 1 || echo 0)" "got: $result"
+
+# A value-taking flag typed last used to leave `shift 2` failing with the
+# argument still in place, so the parser spun on it until the job timeout —
+# a mistyped dispatch input hung the sweep instead of correcting it. Each case
+# is bounded so a regression fails the suite rather than hanging it.
+for flag in --root --max-age-days --free-gib; do
+  result="$(bash "$subject" "$flag" 2>&1 & pid=$!; ( sleep 10; kill -9 "$pid" 2>/dev/null ) & watchdog=$!; wait "$pid"; rc=$?; kill "$watchdog" 2>/dev/null; echo "rc=$rc")"
+  pass_or_fail "$flag with no value exits rather than looping" \
+    "$([[ "$result" == *"rc=64" ]] && echo 1 || echo 0)" "got: $result"
+done
+
+# Bash arithmetic reads a leading zero as octal, so an unnormalised `08` is an
+# arithmetic error and `0100` would quietly mean 64 — a wrong floor decides
+# whether a host keeps its build cache.
+octal="$tmp/octal"
+make_cargo_target "$octal/repo/target"
+touch "$octal/repo/target/old.rlib"
+age_tree "$octal" 30
+
+output="$(env bash -c 'source "$1"; reclaim_stale_build_output "$2" "$3" "$4"' _ "$subject" "$octal" 7 08 2>&1)"
+pass_or_fail "a zero-padded floor is read as decimal, not octal" \
+  "$([[ "$output" != *"error"* && "$output" != *"value too great"* && "$output" == *"GiB"* ]] && echo 1 || echo 0)" \
+  "got: $output"
 
 echo
 if [[ "$failed_assertions" -eq 0 ]]; then

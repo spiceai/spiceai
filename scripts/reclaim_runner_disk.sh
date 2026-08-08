@@ -140,9 +140,24 @@ live_workspace() {
 # and probing that far costs a directory read rather than a walk of a target
 # directory holding hundreds of thousands of files.
 workspace_is_stale() {
-  local dir="$1" days="$2" recent
+  local dir="$1" days="$2" recent rc
   [[ -d "$dir" ]] || return 1
-  recent=$(find "$dir" -maxdepth 3 -mtime "-${days}" -print 2>/dev/null | head -n 1)
+
+  # Not piped to `head`, deliberately. Cutting the walk short would be the
+  # obvious optimisation, but with `pipefail` set the SIGPIPE that closing the
+  # pipe sends `find` is indistinguishable from the walk having failed -- and
+  # the two must not be confused, per below. A depth-3 listing is a few
+  # thousand lines at worst.
+  recent=$(find "$dir" -maxdepth 3 -mtime "-${days}" -print 2>/dev/null)
+  rc=$?
+
+  # Fail closed: a walk that errored produces no output, which is byte-for-byte
+  # what "nothing here is recent" looks like, and the caller deletes the whole
+  # workspace on that answer. An unreadable directory must keep its workspace,
+  # not lose it -- the age rule is a safety rule, so its unknown case belongs on
+  # the safe side.
+  (( rc == 0 )) || return 1
+
   [[ -z "$recent" ]]
 }
 
@@ -230,7 +245,11 @@ reclaim_stale_build_output() {
   local root="$1" days="$2" floor="$3" tag target_dir accepted
   local free
   if free=$(free_gib "$root"); then
-    if (( free >= floor )); then
+    # `10#` forces base 10 on both operands. Bash arithmetic reads a leading
+    # zero as octal, so a floor of `08` is an arithmetic error rather than
+    # 8 GiB, and `0100` would silently mean 64 -- a wrong floor decides whether
+    # a host keeps its build cache.
+    if (( 10#$free >= 10#$floor )); then
       info "free space is ${free} GiB, at or above the ${floor} GiB floor — leaving build output alone"
       return 0
     fi
@@ -300,9 +319,24 @@ main() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --dry-run) DRY_RUN=1; shift ;;
-      --root) root="${2:-}"; shift 2 ;;
-      --max-age-days) days="${2:-}"; shift 2 ;;
-      --free-gib) floor="${2:-}"; shift 2 ;;
+      # The operand count is checked before consuming it. `shift 2` on a
+      # one-element list fails, and with no `errexit` that leaves the argument
+      # in place and the loop spinning on it until the job's timeout kills it --
+      # a flag typed last on a dispatch would hang the sweep rather than
+      # correct it.
+      --root|--max-age-days|--free-gib)
+        if [[ $# -lt 2 ]]; then
+          info "$1 needs a value"
+          usage
+          return "$EXIT_USAGE"
+        fi
+        case "$1" in
+          --root) root="$2" ;;
+          --max-age-days) days="$2" ;;
+          --free-gib) floor="$2" ;;
+        esac
+        shift 2
+        ;;
       -h|--help) usage; return 0 ;;
       *) info "unknown argument: $1"; usage; return "$EXIT_USAGE" ;;
     esac
