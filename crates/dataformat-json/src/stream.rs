@@ -1000,7 +1000,7 @@ impl ArrayToNdjsonPush {
     #[expect(clippy::cast_possible_truncation)]
     fn process_buffer(&mut self) -> io::Result<()> {
         if matches!(self.state, ParsingState::Complete) {
-            return self.ensure_only_trailing_whitespace();
+            return self.take_trailing_whitespace();
         }
 
         // Skip whitespace and consume opening bracket if not done yet
@@ -1038,7 +1038,7 @@ impl ArrayToNdjsonPush {
                             let consumed = cursor.position() as usize;
                             self.buffer.drain(..consumed);
                             self.state = ParsingState::Complete;
-                            return self.ensure_only_trailing_whitespace();
+                            return self.take_trailing_whitespace();
                         }
                         Ok(_) => {
                             // The next non-whitespace byte is not a closing bracket, so we're expecting an element
@@ -1120,7 +1120,7 @@ impl ArrayToNdjsonPush {
                             let consumed = cursor.position() as usize;
                             self.buffer.drain(..consumed);
                             self.state = ParsingState::Complete;
-                            return self.ensure_only_trailing_whitespace();
+                            return self.take_trailing_whitespace();
                         }
                         Ok(byte) => {
                             return Err(io::Error::new(
@@ -1150,6 +1150,25 @@ impl ArrayToNdjsonPush {
     /// concatenated array, or a larger document that merely starts with one —
     /// yields that first array's rows and reports success, which is the same
     /// silent short read as a truncated file.
+    /// [`Self::ensure_only_trailing_whitespace`], then drop what it verified.
+    ///
+    /// Bytes arriving once the array has closed are appended to the buffer but
+    /// never parsed, so without this the buffer holds the whole tail and each
+    /// push rescans all of it. Whitespace that has already been checked cannot
+    /// become anything else, so nothing is lost by discarding it.
+    fn take_trailing_whitespace(&mut self) -> io::Result<()> {
+        self.ensure_only_trailing_whitespace()?;
+        self.buffer.clear();
+        Ok(())
+    }
+
+    /// Bytes held but not yet parsed, so a test can show the tail is dropped
+    /// rather than accumulated.
+    #[cfg(test)]
+    fn buffered_len(&self) -> usize {
+        self.buffer.len()
+    }
+
     fn ensure_only_trailing_whitespace(&self) -> io::Result<()> {
         let Some(byte) = self
             .buffer
@@ -2258,6 +2277,39 @@ mod tests {
                     )
                 });
             }
+        }
+
+        /// Whitespace after the closing bracket is checked and then dropped,
+        /// so a long run of it arriving across many pushes is neither retained
+        /// nor rescanned. Trailing content still has to be caught once the
+        /// whitespace before it has been discarded.
+        #[test]
+        fn a_long_whitespace_tail_is_consumed_across_pushes() {
+            let mut adapter = ArrayToNdjsonPush::new();
+            adapter
+                .push_bytes(br#"[{"a":1}]"#)
+                .expect("a well-formed array must not error");
+            assert_eq!(read_all_push(&mut adapter), vec![r#"{"a":1}"#.to_string()]);
+
+            for _ in 0..512 {
+                adapter
+                    .push_bytes(b"    \n\t")
+                    .expect("whitespace after the array must stay acceptable");
+            }
+            adapter
+                .finish()
+                .expect("a whitespace tail must finish cleanly");
+            assert_eq!(
+                adapter.buffered_len(),
+                0,
+                "the whitespace tail must be dropped, not retained and rescanned on every push"
+            );
+
+            // The guard is still armed once the whitespace has been dropped.
+            let err = adapter
+                .push_bytes(b"x")
+                .expect_err("content after a whitespace tail must still be reported");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         }
 
         /// A UTF-8 BOM arrives a byte at a time like anything else, and a
