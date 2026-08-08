@@ -996,8 +996,8 @@ impl ShardedPkIndex {
     /// Insert with the byte budget enforced DURING the loop, returning whether
     /// the index stayed inside it.
     ///
-    /// [`Self::record_keys`] inserts every key with `usize::MAX` and leaves the
-    /// caller to reconcile afterwards, which makes the budget a trim rather than
+    /// The previous shape inserted every key with `usize::MAX` and left the
+    /// caller to reconcile afterwards, which made the budget a trim rather than
     /// an admission control: the peak is `batch_keys x entry_bytes` with no
     /// ceiling, and each entry retains a cloned `OwnedRow` alongside its digest,
     /// location and sequence. At SF-1000 a heap profile attributed ~14.5 GiB to
@@ -1251,9 +1251,14 @@ mod tests {
         );
     }
 
-    /// Degrading must not peak at exact + blooms for every shard at once. The
-    /// conversion only runs because the budget was already hit, which is the
-    /// worst moment to need extra memory.
+    /// Degrading leaves a bloom index smaller than the exact one it replaced.
+    ///
+    /// Note what this does NOT establish: it checks the post-state, not the
+    /// peak. The point of releasing each shard as it converts is that exact and
+    /// blooms are never both fully resident, and this assertion would pass
+    /// equally on an implementation that built every bloom first and dropped the
+    /// keysets at the end. Proving the peak needs an allocator hook or an
+    /// injected counter; this covers the observable result only.
     #[test]
     fn degrading_releases_each_shard_as_it_converts() {
         let keysets: Vec<CachedPkKeyset> =
