@@ -90,6 +90,14 @@ pub enum Error {
     FailedToInvalidateCacheGeneric { source: moka::PredicateError },
 
     #[snafu(display(
+        "Cache invalidation for dataset {table_name} did not finish: {source}\nCached results for {table_name} may be stale until the next invalidation; report this if it recurs."
+    ))]
+    InvalidationDidNotFinish {
+        source: tokio::task::JoinError,
+        table_name: Arc<str>,
+    },
+
+    #[snafu(display(
         "Invalid hashing algorithm. Please refer to the documentation for supported algorithms: https://spiceai.org/docs/features/caching#choosing-a-hashing_algorithm"
     ))]
     InvalidHashingAlgorithm,
@@ -178,15 +186,20 @@ pub trait CacheProvider<V: Clone + Send + Sync + 'static>:
 }
 
 /// A ``TabledCacheProvider`` represents a cache that can invalidate entries based on table references which their values reference.
+#[async_trait]
 pub trait TabledCacheProvider<V: AsTableRefs + Clone + Send + Sync + 'static>:
     CacheProvider<V>
 {
     /// Invalidates all cache entries for the specified table.
     ///
+    /// Awaiting this is what lets an implementation take its work off the calling runtime
+    /// worker; the entries are invalidated by the time it returns, so a caller that awaits it
+    /// before reporting a write complete keeps the ordering it had when this was synchronous.
+    ///
     /// # Errors
     ///
     /// If the cache invalidation fails.
-    fn invalidate_for_table(&self, table_ref: TableReference) -> Result<()>;
+    async fn invalidate_for_table(&self, table_ref: TableReference) -> Result<()>;
 }
 
 #[derive(Clone)]
@@ -367,15 +380,17 @@ impl Caching {
     /// # Errors
     ///
     /// If the cache invalidation fails for any of the caches.
-    pub fn invalidate_for_table(&self, table_ref: TableReference) -> Result<()> {
+    pub async fn invalidate_for_table(&self, table_ref: TableReference) -> Result<()> {
         if let Some(results_cache) = &self.results {
-            results_cache.invalidate_for_table(table_ref.clone())?;
+            results_cache
+                .invalidate_for_table(table_ref.clone())
+                .await?;
         }
         if let Some(plans_cache) = &self.plans {
-            plans_cache.invalidate_for_table(table_ref.clone())?;
+            plans_cache.invalidate_for_table(table_ref.clone()).await?;
         }
         if let Some(search_cache) = &self.search {
-            search_cache.invalidate_for_table(table_ref)?;
+            search_cache.invalidate_for_table(table_ref).await?;
         }
         Ok(())
     }
@@ -529,8 +544,8 @@ impl QueryResultsCacheProvider {
     /// # Errors
     ///
     /// Will return `Err` if method fails to invalidate cache for the table provided
-    pub fn invalidate_for_table(&self, table_name: TableReference) -> Result<()> {
-        self.cache.invalidate_for_table(table_name)
+    pub async fn invalidate_for_table(&self, table_name: TableReference) -> Result<()> {
+        self.cache.invalidate_for_table(table_name).await
     }
 
     #[must_use]
@@ -858,6 +873,7 @@ mod tests {
         for _ in 0..1_000 {
             caching
                 .invalidate_for_table(table.clone())
+                .await
                 .expect("invalidation should succeed");
         }
 
@@ -872,6 +888,7 @@ mod tests {
         // Another invalidate + maintenance cycle still works.
         caching
             .invalidate_for_table(table)
+            .await
             .expect("invalidation should succeed");
         caching.run_pending_maintenance().await;
     }

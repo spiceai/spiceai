@@ -18,6 +18,7 @@ use crate::AsTableRefs;
 use crate::FailedToInvalidateCacheSnafu;
 use crate::HashBuilder;
 use crate::HashProvider;
+use crate::InvalidationDidNotFinishSnafu;
 use crate::Result;
 use crate::Sizeable;
 use crate::TabledCacheProvider;
@@ -152,7 +153,10 @@ pub struct LruCache<
     H: Hasher + Send + Sync + 'static,
 > {
     /// The underlying cache backend (Moka or Pingora)
-    backend: CacheBackendEnum<V, T>,
+    ///
+    /// Held behind an `Arc` so the Pingora invalidation scan can be handed to a blocking task
+    /// that outlives the borrow of `&self`.
+    backend: Arc<CacheBackendEnum<V, T>>,
     /// Moka cache for table invalidation (only used when Moka engine or for `invalidate_entries_if`)
     moka_cache: Option<Cache<u64, V, PassthroughHashBuilder<T>>>,
     /// The selected cache engine
@@ -342,7 +346,7 @@ impl<
         };
 
         LruCache {
-            backend,
+            backend: Arc::new(backend),
             moka_cache,
             engine: effective_engine,
             hasher,
@@ -482,7 +486,7 @@ impl<
     H: Hasher + Send + Sync + 'static,
 > TabledCacheProvider<V> for LruCache<V, T, H>
 {
-    fn invalidate_for_table(&self, table_ref: TableReference) -> Result<()> {
+    async fn invalidate_for_table(&self, table_ref: TableReference) -> Result<()> {
         let table_name = match &table_ref {
             TableReference::Bare { table }
             | TableReference::Partial { table, .. }
@@ -508,24 +512,41 @@ impl<
                 table_name
             );
 
-            // Spawn a blocking task to handle the synchronous iteration
-            // Note: This is suboptimal but necessary for Pingora's API
-            let backend = &self.backend;
-            let keys_to_remove: Vec<u64> = futures::executor::block_on(async {
-                let mut keys_to_remove = Vec::new();
-                for key in backend.iter_keys().await {
-                    if let Some(value) = backend.get(&key).await
-                        && crate::resolved_table_match(value.as_table_refs().as_ref(), &table_ref)
-                    {
-                        keys_to_remove.push(key);
+            // The scan walks every key, reads each value and removes the matches, so its cost
+            // is proportional to the cache size. `PingoraBackend` is entirely in-memory —
+            // `pingora_lru` behind sharded `parking_lot` locks — so none of its `async fn`s
+            // ever return `Poll::Pending`, and awaiting them here would occupy this worker for
+            // the whole walk without ever yielding. Running it on the blocking pool is what
+            // actually releases the worker; the future is awaited, so the entries are gone
+            // before this returns and callers keep the ordering they had when the whole method
+            // was synchronous.
+            //
+            // `block_on` is sound inside the blocking task for the same reason it was sound
+            // before: the backend needs no reactor, so there is no I/O driver to starve.
+            let backend = Arc::clone(&self.backend);
+            tokio::task::spawn_blocking(move || {
+                futures::executor::block_on(async {
+                    let mut keys_to_remove = Vec::new();
+                    for key in backend.iter_keys().await {
+                        if let Some(value) = backend.get(&key).await
+                            && crate::resolved_table_match(
+                                value.as_table_refs().as_ref(),
+                                &table_ref,
+                            )
+                        {
+                            keys_to_remove.push(key);
+                        }
                     }
-                }
-                keys_to_remove
-            });
 
-            for key in keys_to_remove {
-                futures::executor::block_on(backend.remove(&key));
-            }
+                    for key in keys_to_remove {
+                        backend.remove(&key).await;
+                    }
+                });
+            })
+            .await
+            .context(InvalidationDidNotFinishSnafu {
+                table_name: table_name_arc,
+            })?;
         }
 
         Ok(())
@@ -704,6 +725,7 @@ mod tests {
         // Invalidate the cache for the table
         cache
             .invalidate_for_table(table_ref)
+            .await
             .expect("should invalidate cache");
 
         // Verify the value is no longer in the cache
@@ -776,6 +798,7 @@ mod tests {
 
         cache
             .invalidate_for_table(invalidate_with)
+            .await
             .expect("should invalidate cache");
 
         assert_eq!(
@@ -823,6 +846,7 @@ mod tests {
         // Invalidate the cache for the table
         cache
             .invalidate_for_table(table_ref)
+            .await
             .expect("should invalidate cache");
 
         // Verify the value is no longer in the cache
@@ -1068,6 +1092,7 @@ mod tests {
         // Invalidate the cache for the table
         cache
             .invalidate_for_table(table_ref)
+            .await
             .expect("should invalidate cache for pingora");
 
         // Force pending tasks
@@ -1138,6 +1163,7 @@ mod tests {
         };
         cache
             .invalidate_for_table(table_ref)
+            .await
             .expect("should invalidate cache");
         cache.checkpoint().await;
 
@@ -1151,6 +1177,105 @@ mod tests {
         assert!(
             cache.get_raw_key(&key2.as_u64()).await.is_some(),
             "key2 should still be in cache"
+        );
+    }
+
+    /// The Pingora invalidation scan must not occupy the runtime worker that called it.
+    ///
+    /// Driven from a single-worker runtime, which is what makes the assertion meaningful:
+    /// a concurrently spawned task can only be polled if awaiting the invalidation actually
+    /// hands the worker back. When the scan ran inline the worker was held for the whole walk
+    /// — `PingoraBackend` is in-memory, so none of its futures ever return `Poll::Pending` and
+    /// awaiting them yields at no point — and the spawned task could not run until the
+    /// invalidation had already returned.
+    #[cfg(feature = "pingora")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_pingora_invalidate_for_table_releases_the_calling_worker() {
+        use std::sync::atomic::AtomicBool;
+
+        let hasher = RandomState::default();
+        let cache: LruCache<CachedQueryResult, _, _> = LruCache::new(
+            1024 * 1024, // 1 MB
+            Duration::from_mins(1),
+            hasher,
+            CachingPolicy::Lru,
+            CacheEngine::Pingora,
+        );
+
+        // Enough entries that the scan is a walk rather than an instant, so the worker is
+        // measurably released rather than incidentally free. Every entry references
+        // "test_table", so the scan does a `get` and a `remove` for each of them.
+        let entry_labels: Vec<String> = (0..256).map(|i| format!("scan_entry_{i}")).collect();
+        for label in &entry_labels {
+            let key = CacheKey::Query(label.as_str(), None).as_raw_key(cache.hasher());
+            cache
+                .put_raw_key(&key.as_u64(), create_test_cached_result().await)
+                .await;
+        }
+        cache.checkpoint().await;
+
+        let ran_during_invalidation = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&ran_during_invalidation);
+        let concurrent = tokio::spawn(async move {
+            flag.store(true, Ordering::SeqCst);
+        });
+
+        cache
+            .invalidate_for_table(TableReference::Bare {
+                table: Arc::from("test_table"),
+            })
+            .await
+            .expect("should invalidate cache");
+
+        assert!(
+            ran_during_invalidation.load(Ordering::SeqCst),
+            "a task spawned on the same single-worker runtime never ran while invalidation was in \
+             flight, so the scan is still occupying the calling worker"
+        );
+
+        concurrent.await.expect("concurrent task should not panic");
+    }
+
+    /// Invalidating a table the cache holds nothing for still succeeds, and leaves the
+    /// unrelated entries alone — the scan's empty-match path is the one a refresh on an
+    /// uncached dataset takes on every interval.
+    #[cfg(feature = "pingora")]
+    #[tokio::test]
+    async fn test_pingora_invalidate_for_table_with_no_matches() {
+        let hasher = RandomState::default();
+        let cache: LruCache<CachedQueryResult, _, _> = LruCache::new(
+            1024 * 1024, // 1 MB
+            Duration::from_mins(1),
+            hasher,
+            CachingPolicy::Lru,
+            CacheEngine::Pingora,
+        );
+
+        // An empty cache first: there is not even a key to walk.
+        cache
+            .invalidate_for_table(TableReference::Bare {
+                table: Arc::from("never_cached"),
+            })
+            .await
+            .expect("invalidating an empty cache should succeed");
+
+        let key = CacheKey::Query("query_test_table", None).as_raw_key(cache.hasher());
+        cache
+            .put_raw_key(&key.as_u64(), create_test_cached_result().await)
+            .await;
+        cache.checkpoint().await;
+
+        cache
+            .invalidate_for_table(TableReference::Bare {
+                table: Arc::from("never_cached"),
+            })
+            .await
+            .expect("invalidating an unmatched table should succeed");
+        cache.checkpoint().await;
+
+        assert!(
+            cache.get_raw_key(&key.as_u64()).await.is_some(),
+            "an entry for an unrelated table should survive an unmatched invalidation"
         );
     }
 
@@ -1268,6 +1393,7 @@ mod tests {
         // Invalidate the cache for the table
         cache
             .invalidate_for_table(table_ref)
+            .await
             .expect("should invalidate search cache for pingora");
         cache.checkpoint().await;
 

@@ -1746,7 +1746,9 @@ impl RefreshTask {
 
         if let Some(cache_provider_ref) = context.caching
             && let Some(cache_provider) = cache_provider_ref.upgrade()
-            && let Err(e) = cache_provider.invalidate_for_table(context.dataset_name.clone())
+            && let Err(e) = cache_provider
+                .invalidate_for_table(context.dataset_name.clone())
+                .await
             && !self.runtime_status.is_shutdown()
         {
             tracing::error!(
@@ -2087,8 +2089,9 @@ impl RefreshTask {
                     && !current_finalize_pending
                     && let Some(cache_provider_ref) = context.caching
                     && let Some(cache_provider) = cache_provider_ref.upgrade()
-                    && let Err(e) =
-                        cache_provider.invalidate_for_table(context.dataset_name.clone())
+                    && let Err(e) = cache_provider
+                        .invalidate_for_table(context.dataset_name.clone())
+                        .await
                     && !self.runtime_status.is_shutdown()
                 {
                     tracing::error!(

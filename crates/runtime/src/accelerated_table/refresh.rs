@@ -1067,7 +1067,7 @@ impl Refresher {
                         if refresh_changed_accelerator && let Some(cache_provider_ref) = caching.as_ref() {
                             // No cache provider means runtime is shutting down and cache is already cleaned up
                             if let Some(cache_provider) = cache_provider_ref.upgrade()
-                                && let Err(e) = cache_provider.invalidate_for_table(dataset_name.clone()) {
+                                && let Err(e) = cache_provider.invalidate_for_table(dataset_name.clone()).await {
                                     tracing::warn!("Failed to invalidate cached results for dataset {dataset_name}: {e}");
                                 }
                         }
