@@ -14,8 +14,10 @@ jobs:
   # instead of running it for every merge-queue entry.
   changes:
     runs-on: ubuntu-latest
-    # A checkout and a path diff.
-    timeout-minutes: 15
+    # A full-history checkout (`fetch-depth: 0`) and a path diff. Sized for a
+    # cold runner having to clone from scratch, not the ~1 min a warm
+    # self-hosted workspace takes.
+    timeout-minutes: 45
     outputs:
       relevant: ${{ steps.check.outputs.relevant_changes }}
     steps:
