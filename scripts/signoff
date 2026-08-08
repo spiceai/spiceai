@@ -818,26 +818,25 @@ readonly DISK_FULL_PATTERN='No space left on device|errno=28'
 # Anchored on sccache's own `error:` channel, which rustc, clippy and nextest
 # have no way to produce while reporting on the branch.
 #
-# The alternatives enumerate how sccache itself reports an unusable cache to a
-# wrapper invocation, taken from its source rather than from the spellings we
-# happen to have seen. `connect_or_start_server` — the whole of the path a
-# `RUSTC_WRAPPER=sccache` call takes — has exactly four outcomes, and the two
-# that abort the compile are `ServerStartup::Err`, which bails with
-# `Server startup failed: {reason}`, and `ServerStartup::TimedOut`, which bails
-# with `Timed out waiting for server startup`. `Ok` compiles and `AddrInUse`
-# retries, so neither can reach this channel. `main()` prints the first line of
-# that error as `sccache: error: {}` and every later cause as
-# `sccache: caused by: {}`, so the anchor belongs on the first line only.
+# The alternatives are taken from sccache's source rather than from the spellings
+# we happen to have seen, so the set is an enumeration and not a running tally.
+# `connect_or_start_server` is the whole of the path a `RUSTC_WRAPPER=sccache`
+# call takes, and it has four outcomes: `Ok` compiles and `AddrInUse` retries,
+# while `ServerStartup::Err` bails with `Server startup failed: {reason}` and
+# `ServerStartup::TimedOut` bails with `Timed out waiting for server startup`.
+# So those two are the ways an unusable cache reaches this channel, and the third
+# alternative below is the storage self-check's own `cache storage failed to
+# read: {…}`, for an invocation that reaches a live server and then cannot read
+# through it. sccache prints the first line of the error as `sccache: error: {}`
+# and every later cause as `sccache: caused by: {}`, so the anchor belongs on the
+# first line only.
 #
-# Hence three alternatives:
-#   - the startup failure, as observed on the pool;
-#   - the storage failure without the startup prefix, for an invocation that
-#     reaches a live server and then cannot read through it (sccache bails with
-#     `cache storage failed to read: {…}` from its storage self-check);
-#   - the startup timeout, matched on the prefix the two `TimedOut` bails share.
-#     sccache words it `Timed out waiting for server startup. Maybe the remote
-#     service is unreachable?` from the wrapper path and bare from
-#     `--start-server`, so the prefix covers both without pinning either.
+# The timeout is matched on the prefix its two bails share — sccache words it
+# `Timed out waiting for server startup. Maybe the remote service is
+# unreachable?` from the wrapper path and bare from `--start-server`. Keep it a
+# prefix: this string is an awk ERE, so the `?` ending the longer wording is a
+# quantifier, and spelling that sentence out here would match `unreachabl` plus
+# an optional `e` while reading as though it were deliberate.
 readonly CACHE_UNUSABLE_PATTERN='sccache: error: Server startup failed|sccache: error: cache storage failed|sccache: error: Timed out waiting for server startup'
 
 # Set to 1 on remote runs, where run_make_step watches build output for the
