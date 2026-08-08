@@ -242,24 +242,31 @@ reclaim_stale_build_output() {
     info "could not measure free space — pruning stale build output anyway"
   fi
 
-  local -a swept=()
-  local -i pruned=0
-
+  # Collected in full before any of it is swept, rather than filtered as it
+  # arrives. `find` emits a directory's entries in the order the filesystem
+  # returns them, not sorted and not ancestors-first: a nested target directory
+  # is reported before its ancestor whenever `package/` happens to precede
+  # `CACHEDIR.TAG` in the parent's listing. Deciding nesting against a partial
+  # list therefore sweeps the same files twice and reports two directories where
+  # there is one.
+  local -a found=()
   while IFS= read -r tag; do
     [[ -n "$tag" ]] || continue
     target_dir=$(dirname "$tag")
     is_cargo_target_dir "$target_dir" || continue
+    found+=("$target_dir")
+  done < <(find "$root" -type f -name CACHEDIR.TAG 2>/dev/null)
 
-    # A target directory nested inside one already swept -- cargo puts one under
-    # `target/package/` for a packaged crate, and a vendored checkout can carry
-    # its own -- is already covered by the sweep of its ancestor. Skipping it
-    # keeps the count honest rather than reporting the same files twice.
+  local -i pruned=0
+  for target_dir in ${found[@]+"${found[@]}"}; do
+    # Nested inside another one found anywhere in the sweep -- cargo puts one
+    # under `target/package/` for a packaged crate, and a vendored checkout can
+    # carry its own -- so it is already covered by its ancestor.
     local nested=0
-    for accepted in ${swept[@]+"${swept[@]}"}; do
+    for accepted in ${found[@]+"${found[@]}"}; do
       [[ "$target_dir" == "$accepted"/* ]] && { nested=1; break; }
     done
     (( nested )) && continue
-    swept+=("$target_dir")
 
     if [[ "$DRY_RUN" == "1" ]]; then
       local count
@@ -275,10 +282,7 @@ reclaim_stale_build_output() {
     # and cargo recreates whatever it needs.
     find "$target_dir" -mindepth 1 -type d -empty -delete 2>/dev/null
     pruned+=1
-    # `find` walks a directory before its contents, so an ancestor target
-    # directory is always read before any nested one -- which is what the
-    # nesting check above relies on.
-  done < <(find "$root" -type f -name CACHEDIR.TAG 2>/dev/null)
+  done
 
   info "build output directories swept: ${pruned}"
 }
