@@ -822,6 +822,11 @@ jobs:
           AWS_REGION: ${{ vars.AWS_REGION }}
           AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
           INSTA_UPDATE: ${{ github.event.inputs.update_snapshots || 'no' }}
+          # Lighter Cayenne fuzz/race depth for the merge-queue gate (see
+          # crates/cayenne/tests/mutation_property_test.rs and common::env_scale);
+          # both knobs default to 1.0 (full depth) when unset.
+          CAYENNE_PROPTEST_SCALE: "0.25"
+          CAYENNE_PROPTEST_OPS_SCALE: "0.25"
 
       - name: Build testoperator
         if: needs.check_changes.outputs.relevant_changes == 'true'
