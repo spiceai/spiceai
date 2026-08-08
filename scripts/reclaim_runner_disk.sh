@@ -50,6 +50,15 @@
 #   RECLAIM_FREE_GIB     Free space (GiB) at or above which build output is left
 #                        alone entirely (default: 100), overridden by
 #                        --free-gib. See `reclaim_stale_build_output`.
+#
+# Exit status:
+#   0   the sweep completed; everything it selected came off
+#   1   the sweep ran to the end but at least one removal failed
+#   64  invoked wrongly -- no work root, a bad flag, a bad value
+#
+# 1 rather than stopping at the first failure: one unremovable entry says
+# nothing about the rest of the volume, so the run carries on and reports at the
+# end. See SWEEP_FAILURES.
 
 set -uo pipefail
 
@@ -96,6 +105,17 @@ info() { printf '%s\n' "$*" >&2; }
 # Report rather than remove. Set by --dry-run; defaulted here so the unit tests,
 # which source this file to reach one function at a time, never meet it unset.
 DRY_RUN="${DRY_RUN:-0}"
+
+# Removals that failed. Counted rather than fatal: a permission or I/O error on
+# one entry says nothing about the rest of the volume, and the run that stops at
+# the first one reclaims less than the run that carries on. But a sweep that
+# reclaimed nothing must not report success -- the whole point of the schedule
+# is that nobody watches it, so green has to mean the space was actually taken
+# back. `main` returns 1 when this is non-zero, which `EXIT_USAGE` already
+# distinguishes from "the script was invoked wrongly".
+#
+# Defaulted like DRY_RUN so a test sourcing one function never meets it unset.
+SWEEP_FAILURES="${SWEEP_FAILURES:-0}"
 
 # Free space in GiB on the volume holding "$1". Prints an integer; returns
 # non-zero when `df` is absent or unparseable, so a host whose df cannot be read
@@ -213,7 +233,14 @@ remove_path() {
     return 0
   fi
   info "removing (${reason}): ${path}"
-  rm -rf "$path"
+  # `rm -rf` is silent about a path that was never there, so a non-zero status
+  # here is a real failure to remove something that is: a permission denial, a
+  # busy file, an I/O error. Report it and keep going.
+  if ! rm -rf "$path"; then
+    info "failed to remove: ${path}"
+    SWEEP_FAILURES=$((SWEEP_FAILURES + 1))
+    return 1
+  fi
 }
 
 # Orphaned job scratch. Actions clears `_temp` between jobs on a healthy run, so
@@ -345,10 +372,18 @@ reclaim_stale_build_output() {
     fi
 
     info "pruning files older than ${days}d from: ${target_dir}"
-    find "$target_dir" -type f -mtime "+${days}" -delete 2>/dev/null
+    # stderr is dropped -- a walk this wide reports every unreadable entry and
+    # the log is for an operator, not a debugger -- so the exit status is the
+    # only signal that the prune did not do what the line above just announced.
+    if ! find "$target_dir" -type f -mtime "+${days}" -delete 2>/dev/null; then
+      info "failed to prune some files from: ${target_dir}"
+      SWEEP_FAILURES=$((SWEEP_FAILURES + 1))
+    fi
     # Directories the prune emptied. Left behind they cost nothing but noise,
-    # and cargo recreates whatever it needs.
-    find "$target_dir" -mindepth 1 -type d -empty -delete 2>/dev/null
+    # and cargo recreates whatever it needs. Not counted as a sweep failure:
+    # the space was already reclaimed by the prune above, and an empty directory
+    # that survives costs an inode.
+    find "$target_dir" -mindepth 1 -type d -empty -delete 2>/dev/null || true
     pruned+=1
   done
 
@@ -361,6 +396,7 @@ usage() {
 
 main() {
   DRY_RUN=0
+  SWEEP_FAILURES=0
   local root=""
   local days="${RECLAIM_MAX_AGE_DAYS:-$DEFAULT_MAX_AGE_DAYS}"
   local floor="${RECLAIM_FREE_GIB:-$DEFAULT_FREE_GIB}"
@@ -427,6 +463,13 @@ main() {
     info "free space after: ${after} GiB (reclaimed $((after - before)) GiB)"
   elif [[ -n "$after" ]]; then
     info "free space after: ${after} GiB"
+  fi
+
+  # After the report, not instead of it: an operator reading a failed run still
+  # needs to know how much the parts that did work reclaimed.
+  if (( SWEEP_FAILURES > 0 )); then
+    info "sweep incomplete: ${SWEEP_FAILURES} removal(s) failed"
+    return 1
   fi
 
   return 0

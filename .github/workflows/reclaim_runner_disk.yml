@@ -76,6 +76,14 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          # `clean` defaults to true, which runs `git clean -ffdx` in this
+          # workspace before the sweep starts -- and `-x` takes the ignored
+          # `target/` with it. That is the one directory the free-space gate
+          # below exists to protect: on a host above the floor the script keeps
+          # every cache, then the checkout deletes this workspace's anyway, and
+          # the before/after report never sees it because it happened first.
+          # The script decides what comes off this volume, and nothing else.
+          clean: false
 
       - name: Reclaim stale space
         shell: bash

@@ -352,6 +352,47 @@ pass_or_fail "still names what it would remove" \
   "$([[ "$output" == *"would remove"* && "$output" == *"would prune"* ]] && echo 1 || echo 0)" \
   "got: $output"
 
+echo "reporting a sweep that could not remove what it found"
+
+# Nobody watches a scheduled run, so its exit status is the whole signal. A
+# permission or I/O failure that leaves the job green reports a host as swept
+# while it is still filling up — which is the condition #12794 was.
+#
+# `rm` is stubbed rather than the tree made read-only: a runner executing this
+# as root would delete straight through a `chmod`, so the interesting case would
+# silently stop being tested on exactly the hosts it is written for.
+stub_bin="$tmp/stub-bin"
+mkdir -p "$stub_bin"
+printf '#!/usr/bin/env bash\nexit 1\n' >"$stub_bin/rm"
+chmod +x "$stub_bin/rm"
+
+undeletable="$tmp/undeletable"
+mkdir -p "$undeletable/_temp/orphan" "$undeletable/spiceai/spiceai"
+age_tree "$undeletable" 30
+
+result="$(env "RUNNER_WORKSPACE=$undeletable/spiceai" "PATH=$stub_bin:$PATH" \
+  bash "$subject" --root "$undeletable" --free-gib "$ALWAYS_PRUNE_FLOOR" 2>&1; echo "rc=$?")"
+
+pass_or_fail "fails the run when a removal did not happen" \
+  "$([[ "$result" == *"rc=1" ]] && echo 1 || echo 0)" "got: $result"
+pass_or_fail "names the path it could not remove" \
+  "$([[ "$result" == *"failed to remove: $undeletable/_temp/orphan"* ]] && echo 1 || echo 0)" \
+  "got: $result"
+pass_or_fail "still reports the disk before returning non-zero" \
+  "$([[ "$result" == *"free space after:"* ]] && echo 1 || echo 0)" "got: $result"
+
+# The other direction: an ordinary sweep must not start failing the schedule.
+clean_sweep="$tmp/clean-sweep"
+mkdir -p "$clean_sweep/_temp/orphan" "$clean_sweep/staleworkspace/repo" "$clean_sweep/spiceai/spiceai"
+make_cargo_target "$clean_sweep/spiceai/spiceai/target"
+touch "$clean_sweep/staleworkspace/repo/Cargo.toml" "$clean_sweep/spiceai/spiceai/target/old.rlib"
+age_tree "$clean_sweep" 30
+
+result="$(env "RUNNER_WORKSPACE=$clean_sweep/spiceai" \
+  bash "$subject" --root "$clean_sweep" --free-gib "$ALWAYS_PRUNE_FLOOR" 2>&1; echo "rc=$?")"
+pass_or_fail "succeeds when everything it found came off" \
+  "$([[ "$result" == *"rc=0" ]] && echo 1 || echo 0)" "got: $result"
+
 echo "argument handling"
 
 result="$(env "RUNNER_WORKSPACE=" bash "$subject" 2>&1; echo "rc=$?")"
