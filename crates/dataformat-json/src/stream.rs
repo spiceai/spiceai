@@ -977,7 +977,7 @@ impl ArrayToNdjsonPush {
     /// or never closed.
     pub fn finish(&self) -> io::Result<()> {
         let detail = match self.state {
-            ParsingState::Complete => return Ok(()),
+            ParsingState::Complete => return self.ensure_only_trailing_whitespace(),
             ParsingState::ExpectingArrayStart => {
                 "the input ended before the opening '[' — the body is empty or contains only whitespace"
             }
@@ -1000,7 +1000,7 @@ impl ArrayToNdjsonPush {
     #[expect(clippy::cast_possible_truncation)]
     fn process_buffer(&mut self) -> io::Result<()> {
         if matches!(self.state, ParsingState::Complete) {
-            return Ok(());
+            return self.ensure_only_trailing_whitespace();
         }
 
         // Skip whitespace and consume opening bracket if not done yet
@@ -1038,7 +1038,7 @@ impl ArrayToNdjsonPush {
                             let consumed = cursor.position() as usize;
                             self.buffer.drain(..consumed);
                             self.state = ParsingState::Complete;
-                            return Ok(());
+                            return self.ensure_only_trailing_whitespace();
                         }
                         Ok(_) => {
                             // The next non-whitespace byte is not a closing bracket, so we're expecting an element
@@ -1120,7 +1120,7 @@ impl ArrayToNdjsonPush {
                             let consumed = cursor.position() as usize;
                             self.buffer.drain(..consumed);
                             self.state = ParsingState::Complete;
-                            return Ok(());
+                            return self.ensure_only_trailing_whitespace();
                         }
                         Ok(byte) => {
                             return Err(io::Error::new(
@@ -1139,6 +1139,34 @@ impl ArrayToNdjsonPush {
         }
 
         Ok(())
+    }
+
+    /// Whether everything left after the closing `]` is whitespace.
+    ///
+    /// Reaching `]` ends the array but not necessarily the input: the closing
+    /// bracket is drained and whatever followed it stays in the buffer, and
+    /// every later push is accumulated but never parsed. Without this check a
+    /// body holding more than the one array it was read as — a second
+    /// concatenated array, or a larger document that merely starts with one —
+    /// yields that first array's rows and reports success, which is the same
+    /// silent short read as a truncated file.
+    fn ensure_only_trailing_whitespace(&self) -> io::Result<()> {
+        let Some(byte) = self
+            .buffer
+            .iter()
+            .find(|b| !b.is_ascii_whitespace())
+            .copied()
+        else {
+            return Ok(());
+        };
+
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "Failed to read JSON array: found '{byte}' after the closing ']'. The body holds more than the single JSON array it was read as, so the rows returned are only its first array. Check the file for concatenated or trailing content, or set the dataset's 'format' to match its contents.",
+                byte = byte.escape_ascii()
+            ),
+        ))
     }
 
     /// Whether the buffer ends part-way through a token, so that bytes still
@@ -2137,6 +2165,98 @@ mod tests {
 
                 assert_eq!(lines, expected, "split at {split} lost or changed rows");
                 assert!(adapter.is_complete(), "split at {split} did not complete");
+            }
+        }
+
+        /// Reaching `]` ends the array but not the input. Anything after the
+        /// closing bracket means the body is not the single array it was read
+        /// as, so returning that first array's rows and reporting success is
+        /// the same silent short read as a truncated file.
+        #[test]
+        fn trailing_content_after_the_closing_bracket_is_reported() {
+            for body in [
+                &b"[1]garbage"[..],
+                &b"[1][2]"[..],
+                &br#"[{"a":1}] {"b":2}"#[..],
+                &br#"[{"a":1}]garbage"#[..],
+                // A stray delimiter is trailing content too: the array is
+                // already closed, so neither can belong to it.
+                &b"[1]]"[..],
+                &b"[1],"[..],
+                &b"[]x"[..],
+            ] {
+                let mut adapter = ArrayToNdjsonPush::new();
+                let Err(err) = adapter.push_bytes(body) else {
+                    panic!(
+                        "{} must be reported, not silently truncated to its first array",
+                        String::from_utf8_lossy(body)
+                    )
+                };
+                assert_eq!(
+                    err.kind(),
+                    io::ErrorKind::InvalidData,
+                    "{} reported the wrong error kind",
+                    String::from_utf8_lossy(body)
+                );
+            }
+        }
+
+        /// The bytes after `]` need not arrive in the push that closed the
+        /// array. A later push is accumulated but never parsed, so without an
+        /// explicit check it is dropped in silence.
+        #[test]
+        fn trailing_content_arriving_after_completion_is_reported() {
+            let mut adapter = ArrayToNdjsonPush::new();
+            adapter
+                .push_bytes(br#"[{"a":1}]"#)
+                .expect("a well-formed array must not error");
+            assert!(adapter.is_complete());
+
+            let err = adapter
+                .push_bytes(br#"{"b":2}"#)
+                .expect_err("content pushed after the array closed must be reported");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+
+            // `finish` guards the same condition, so a consumer that only
+            // checks the end of the stream reaches the same verdict.
+            assert!(
+                adapter.finish().is_err(),
+                "finish must agree that the body held more than one array"
+            );
+        }
+
+        /// The guard above must reject only what cannot belong to the file. A
+        /// JSON array ending in a newline is the ordinary case, and rejecting
+        /// it would turn every well-formed file into a read failure.
+        #[test]
+        fn whitespace_after_the_closing_bracket_is_accepted() {
+            for (body, expected) in [
+                (&b"[1]\n"[..], vec!["1"]),
+                (&b"[1] "[..], vec!["1"]),
+                (&br#"[{"a":1}]  "#[..], vec![r#"{"a":1}"#]),
+                (&b"[{\"a\":1}]\r\n\t "[..], vec![r#"{"a":1}"#]),
+                (&b"[]\n"[..], vec![]),
+            ] {
+                let mut adapter = ArrayToNdjsonPush::new();
+                adapter.push_bytes(body).unwrap_or_else(|e| {
+                    panic!(
+                        "{} is well formed and must not error: {e}",
+                        String::from_utf8_lossy(body)
+                    )
+                });
+                assert_eq!(
+                    read_all_push(&mut adapter),
+                    expected,
+                    "{} produced the wrong rows",
+                    String::from_utf8_lossy(body)
+                );
+                assert!(adapter.is_complete());
+                adapter.finish().unwrap_or_else(|e| {
+                    panic!(
+                        "{} is well formed and must finish cleanly: {e}",
+                        String::from_utf8_lossy(body)
+                    )
+                });
             }
         }
 
