@@ -259,29 +259,54 @@ jobs:
 
       - name: Upload schema snapshots to branch
         run: |
-          BRANCH_ID=${{ github.run_id }}
-          BRANCH_NAME="testoperator-snapshot-update/${BRANCH_ID}"
+          # One branch per source branch and spicepod, so a connector whose
+          # snapshots drift keeps updating its own open PR, and a trunk run
+          # never shares a branch with a release run of the same connector. A
+          # run-scoped name would make the "is a PR already open" check below
+          # unreachable, opening a new PR on every run.
+          SLUG="$(printf '%s' '${{ github.ref_name }}/${{ github.event.inputs.spicepod_path }}' \
+            | sed -e 's/\.[Yy][Aa][Mm][Ll]$//' -e 's/[^A-Za-z0-9]\{1,\}/-/g' -e 's/^-//' -e 's/-$//' \
+            | tr '[:upper:]' '[:lower:]')"
+          BRANCH_NAME="testoperator-snapshot-update/${SLUG}"
 
           git config --global user.name 'Spice Benchmark Snapshot Update Bot'
           git config --global user.email 'spiceaibot@spice.ai'
-          git checkout -b ${BRANCH_NAME}
+          git checkout -b "${BRANCH_NAME}"
+
+          # Continue that branch when it already exists, so the push
+          # fast-forwards onto it. Re-parenting the index onto the remote tip
+          # keeps the commit to the snapshots alone instead of replaying every
+          # trunk commit made since the branch was opened.
+          if git ls-remote --exit-code --heads origin "${BRANCH_NAME}"; then
+            git fetch origin "${BRANCH_NAME}"
+            git reset --soft FETCH_HEAD
+            git reset --quiet FETCH_HEAD -- .
+          fi
+
           git add '*.snap'
           if git diff --cached --quiet; then
-            echo "No changes to commit"
-          else
-            git commit -m "fix: Update schema snapshots for: ${{ github.event.inputs.spicepod_path }}"
-            if git ls-remote --exit-code --heads origin ${BRANCH_NAME}; then
-              git pull --rebase origin ${BRANCH_NAME}
-            fi
-            git push origin ${BRANCH_NAME}
+            echo "Schema snapshots already up to date on ${BRANCH_NAME}"
+            exit 0
+          fi
 
-            PR_URL="$(gh pr list --head "${BRANCH_NAME}" --state open --json url --jq .[].url)"
-            if [[ -n "${PR_URL}" ]]; then
-              echo "PR already exists -> ${PR_URL}"
-              exit 0
-            else
-              gh pr create --title "fix: Update schema snapshots" --body "Updates schema snapshots" --base trunk --head ${BRANCH_NAME} --label kind/bug
-            fi
+          git commit -m "fix: Update schema snapshots for: ${{ github.event.inputs.spicepod_path }}"
+          # The checkout persists no credentials, so authenticate the push
+          # itself rather than leaving a token in the local git config for the
+          # rest of the job.
+          git push "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}" "HEAD:${BRANCH_NAME}"
+
+          PR_URL="$(gh pr list --head "${BRANCH_NAME}" --state open --json url --jq .[].url)"
+          if [[ -n "${PR_URL}" ]]; then
+            echo "Updated the open PR -> ${PR_URL}"
+          else
+            # Target the branch the run was dispatched on: a release branch's
+            # snapshots describe that branch, not trunk.
+            gh pr create \
+              --title "fix: Update schema snapshots for ${{ github.event.inputs.spicepod_path }}" \
+              --body "Updates the schema snapshots for \`${{ github.event.inputs.spicepod_path }}\` on \`${{ github.ref_name }}\`." \
+              --base "${{ github.ref_name }}" \
+              --head "${BRANCH_NAME}" \
+              --label kind/bug
           fi
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
