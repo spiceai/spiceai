@@ -1357,8 +1357,8 @@ mod tests {
             for body in [
                 &br#"[{"a":1},{"a":2}"#[..],
                 &br#"[{"a":1},"#[..],
-                &br#"[1,2,3"#[..],
-                &br#"["#[..],
+                &br"[1,2,3"[..],
+                &br"["[..],
             ] {
                 let schema = schema();
                 let mut dec = decoder(&schema);
@@ -1395,7 +1395,7 @@ mod tests {
 
         #[test]
         fn flush_accepts_a_closed_array() {
-            for body in [&br#"[{"a":1},{"a":2}]"#[..], &br#"[]"#[..], &b"  [ ]  "[..]] {
+            for body in [&br#"[{"a":1},{"a":2}]"#[..], &br"[]"[..], &b"  [ ]  "[..]] {
                 let schema = schema();
                 let mut dec = decoder(&schema);
                 dec.decode(body).expect("decode should accept the body");
