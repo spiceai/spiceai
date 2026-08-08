@@ -369,10 +369,12 @@ assert_failure_post "an in-flight Attestation is not re-run" \
 assert_failure_post "a commit with no Attestation run is not re-run" \
   "" failure
 
-# An out-of-disk run and a failing branch reach this helper by the same path and
-# are told apart only by the description, so it must not be rewritten en route.
+# A run the runner broke and a failing branch reach this helper by the same path
+# and are told apart only by the description, so it must not be rewritten en route.
 assert_failure_description "an out-of-disk verdict keeps its own wording" \
   "Runner out of disk after 42s — checks did not complete, re-dispatch (triggered by someone)"
+assert_failure_description "an unreachable-cache verdict keeps its own wording" \
+  "Compiler cache unreachable after 42s — checks did not complete, re-dispatch (triggered by someone)"
 assert_failure_description "an ordinary check failure keeps its own wording" \
   "Sign-off checks failed after 42s (triggered by someone)"
 
