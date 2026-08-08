@@ -19201,6 +19201,7 @@ dependencies = [
  "fundu",
  "futures",
  "gethostname",
+ "http 1.4.1",
  "humantime",
  "insta",
  "keyring",
