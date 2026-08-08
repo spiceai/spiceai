@@ -49,12 +49,15 @@ struct TursoConnectionPool {
 impl TursoConnectionPool {
     /// Acquire a connection using round-robin with try-first heuristic.
     ///
-    /// The connection is handed out in autocommit, so a caller never inherits a
-    /// transaction a previous holder left open — see [`Self::clear_open_transaction`].
-    async fn acquire(&self) -> OwnedMutexGuard<Connection> {
+    /// The connection is handed out only once it is confirmed to be in autocommit, so a
+    /// caller never inherits a transaction a previous holder left open — see
+    /// [`Self::clear_open_transaction`]. A slot that cannot be cleared is reported as an
+    /// error rather than handed over: the borrower's statement would otherwise read that
+    /// transaction's snapshot, which is the failure this pool guard exists to prevent.
+    async fn acquire(&self) -> CatalogResult<OwnedMutexGuard<Connection>> {
         let guard = self.lock_next_free().await;
-        Self::clear_open_transaction(&guard).await;
-        guard
+        Self::clear_open_transaction(&guard).await?;
+        Ok(guard)
     }
 
     /// Take the lock on the first free connection, else wait on the round-robin pick.
@@ -83,19 +86,47 @@ impl TursoConnectionPool {
     /// snapshot.
     ///
     /// Clearing on acquire covers every borrower, transactional or not, in one place.
-    async fn clear_open_transaction(conn: &Connection) {
+    async fn clear_open_transaction(conn: &Connection) -> CatalogResult<()> {
         // Connection-local state, so a clean connection — the overwhelmingly common case —
         // pays no round trip here. Only a definite autocommit skips the rollback: if the
         // state cannot be read, issuing one is the safe direction, and it is harmless on a
         // connection that has no transaction open.
         if matches!(conn.is_autocommit(), Ok(true)) {
-            return;
+            return Ok(());
         }
 
-        if let Err(err) = conn.execute("ROLLBACK", ()).await {
-            tracing::warn!(
-                "Failed to roll back a transaction left open on a pooled Turso connection: {err}"
-            );
+        conn.execute("ROLLBACK", ())
+            .await
+            .map_err(|err| CatalogError::Database {
+                message: format!(
+                    "Failed to roll back a transaction left open on a pooled Turso connection: {err}"
+                ),
+            })?;
+
+        Self::require_autocommit(conn.is_autocommit())
+    }
+
+    /// Decide whether a connection may be handed to a borrower from the autocommit state
+    /// read after [`Self::clear_open_transaction`] cleaned it up.
+    ///
+    /// The rollback reporting success is not on its own proof that the transaction ended,
+    /// and an unreadable state is a refusal rather than a pass. Both alternatives hand the
+    /// borrower the MVCC snapshot the cleanup exists to discard, and a stale read is the
+    /// worse half of the pair: a failed acquire propagates to a caller that can retry or
+    /// give up, whereas a silent stale read makes the cold-tier GC delete a live file.
+    fn require_autocommit(state: turso::Result<bool>) -> CatalogResult<()> {
+        match state {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(CatalogError::Database {
+                message:
+                    "A pooled Turso connection is still in a transaction after rolling it back"
+                        .to_string(),
+            }),
+            Err(err) => Err(CatalogError::Database {
+                message: format!(
+                    "Cannot confirm a pooled Turso connection is out of its transaction: {err}"
+                ),
+            }),
         }
     }
 }
@@ -622,7 +653,7 @@ fn convert_turso_error(e: turso::Error) -> CatalogError {
 #[async_trait]
 impl MetastoreBackend for TursoMetastore {
     async fn init_schema(&self) -> CatalogResult<()> {
-        let conn = self.pool().await?.acquire().await;
+        let conn = self.pool().await?.acquire().await?;
 
         // Refuse to open a catalog written by a newer, incompatible Spice build
         // BEFORE running any migration against it (a fresh/legacy DB reads 0).
@@ -971,7 +1002,7 @@ impl MetastoreBackend for TursoMetastore {
     }
 
     async fn execute(&self, params: ExecuteParams<'_>) -> CatalogResult<()> {
-        let conn = self.pool().await?.acquire().await;
+        let conn = self.pool().await?.acquire().await?;
 
         let turso_params: Vec<TursoValue> = params.params.into_iter().map(to_turso_value).collect();
 
@@ -987,7 +1018,7 @@ impl MetastoreBackend for TursoMetastore {
     }
 
     async fn execute_batch(&self, sql: &str) -> CatalogResult<()> {
-        let conn = self.pool().await?.acquire().await;
+        let conn = self.pool().await?.acquire().await?;
 
         conn.execute_batch(sql)
             .await
@@ -999,7 +1030,7 @@ impl MetastoreBackend for TursoMetastore {
     }
 
     async fn execute_transaction_batch(&self, sql: &str) -> CatalogResult<()> {
-        let conn = self.pool().await?.acquire().await;
+        let conn = self.pool().await?.acquire().await?;
         let batch_sql = format!("BEGIN CONCURRENT; {sql}; COMMIT;");
 
         if let Err(e) = conn.execute_batch(&batch_sql).await {
@@ -1017,7 +1048,7 @@ impl MetastoreBackend for TursoMetastore {
         F: FnOnce(&dyn MetastoreRow) -> CatalogResult<T> + Send + 'static,
         T: Send + 'static,
     {
-        let conn = self.pool().await?.acquire().await;
+        let conn = self.pool().await?.acquire().await?;
 
         let turso_params: Vec<TursoValue> = params.params.into_iter().map(to_turso_value).collect();
 
@@ -1051,7 +1082,7 @@ impl MetastoreBackend for TursoMetastore {
         F: Fn(&dyn MetastoreRow) -> CatalogResult<T> + Send + 'static,
         T: Send + 'static,
     {
-        let conn = self.pool().await?.acquire().await;
+        let conn = self.pool().await?.acquire().await?;
 
         let turso_params: Vec<TursoValue> = params.params.into_iter().map(to_turso_value).collect();
 
@@ -1091,7 +1122,7 @@ impl MetastoreBackend for TursoMetastore {
     async fn begin_transaction(&self) -> CatalogResult<Box<dyn MetastoreTransaction>> {
         // `acquire` hands out a connection in autocommit, so no leftover transaction
         // state can precede this `BEGIN`.
-        let guard = self.pool().await?.acquire().await;
+        let guard = self.pool().await?.acquire().await?;
 
         guard
             .execute("BEGIN CONCURRENT", ())
@@ -1328,7 +1359,9 @@ mod tests {
 
         // Slot 0, taken through the pool, must read the committed database.
         let guard = Arc::clone(&pool.conns[0]).lock_owned().await;
-        TursoConnectionPool::clear_open_transaction(&guard).await;
+        TursoConnectionPool::clear_open_transaction(&guard)
+            .await
+            .expect("clear the abandoned transaction");
 
         assert_eq!(
             count_rows(&guard).await,
@@ -1357,7 +1390,9 @@ mod tests {
             "the leak should have left slot 0 inside a transaction"
         );
 
-        TursoConnectionPool::clear_open_transaction(&guard).await;
+        TursoConnectionPool::clear_open_transaction(&guard)
+            .await
+            .expect("clear the abandoned transaction");
 
         assert!(
             guard.is_autocommit().expect("read autocommit state"),
@@ -1378,7 +1413,9 @@ mod tests {
         let pool = Arc::clone(metastore.pool().await.expect("pool"));
         let guard = Arc::clone(&pool.conns[0]).lock_owned().await;
 
-        TursoConnectionPool::clear_open_transaction(&guard).await;
+        TursoConnectionPool::clear_open_transaction(&guard)
+            .await
+            .expect("clearing a clean connection should succeed");
 
         assert!(
             guard.is_autocommit().expect("read autocommit state"),
@@ -1414,7 +1451,7 @@ mod tests {
         drop(writer);
 
         for _ in 0..pool.conns.len() {
-            let guard = pool.acquire().await;
+            let guard = pool.acquire().await.expect("acquire a pooled connection");
             assert!(
                 guard.is_autocommit().expect("read autocommit state"),
                 "acquire should hand out a connection in autocommit"
@@ -1425,5 +1462,33 @@ mod tests {
                 "every acquired connection should read the committed row"
             );
         }
+    }
+
+    /// The decision `acquire` makes once cleanup has run. Only a connection read as being
+    /// in autocommit may be handed over; a connection still in its transaction, or one whose
+    /// state cannot be read at all, is refused. Handing either one to a borrower would serve
+    /// the stale snapshot the cleanup exists to discard, so the guard has to fail closed.
+    #[test]
+    fn a_connection_not_confirmed_in_autocommit_is_refused() {
+        TursoConnectionPool::require_autocommit(Ok(true))
+            .expect("a connection confirmed in autocommit is fit to hand out");
+
+        let Err(still_open) = TursoConnectionPool::require_autocommit(Ok(false)) else {
+            panic!("a connection still inside a transaction must not be handed out")
+        };
+        assert!(
+            still_open.to_string().contains("still in a transaction"),
+            "the error should name the transaction that survived the rollback, got: {still_open}"
+        );
+
+        let Err(unreadable) = TursoConnectionPool::require_autocommit(Err(turso::Error::Error(
+            "connection is closed".to_string(),
+        ))) else {
+            panic!("a connection whose autocommit state cannot be read must not be handed out")
+        };
+        assert!(
+            unreadable.to_string().contains("Cannot confirm"),
+            "the error should say the state could not be confirmed, got: {unreadable}"
+        );
     }
 }
