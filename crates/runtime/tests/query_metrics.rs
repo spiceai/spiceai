@@ -14,16 +14,18 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Query metrics must not depend on `runtime.task_history.enabled`.
+//! Metrics must reach the operator's metrics pipeline, whatever the config says.
 //!
 //! This needs its own test binary: the metric handles are `LazyLock`s over
 //! `global::meter(..)`, so an instrument first touched before the
 //! `MeterProvider` is installed binds to the no-op meter for the whole process.
-//! Keep it to a single test so the install order holds under `cargo test` too.
+//! Every test here shares one provider, installed by [`PROMETHEUS`] before any
+//! instrument exists — see its comment for what that means for assertions.
 
-use std::collections::HashSet;
+use std::{collections::HashSet, sync::LazyLock};
 
 use app::AppBuilder;
+use cache::{metrics::CacheMetrics, result::query::CachedQueryResult};
 use futures::StreamExt;
 use opentelemetry::global;
 use opentelemetry_sdk::{Resource, metrics::SdkMeterProvider};
@@ -40,6 +42,38 @@ const EXPECTED_QUERY_METRICS: &[&str] = &[
     "query_returned_rows",
     "query_returned_bytes",
 ];
+
+/// Series the SQL results cache must export as soon as it is enabled, whether or
+/// not anything has been recorded on them yet.
+///
+/// Each instrument is a `LazyLock` that only registers with the meter when
+/// something first derefs it, so a counter that has not fired exports nothing at
+/// all — not a zero. On a healthy runtime `results_cache_evictions` and both
+/// stale-while-revalidate counters are exactly the ones that never fire, and an
+/// absent series reads as a broken exporter rather than as "nothing happened".
+const EXPECTED_RESULTS_CACHE_METRICS: &[&str] = &[
+    "results_cache_requests",
+    "results_cache_hits",
+    "results_cache_misses",
+    "results_cache_evictions",
+    "results_cache_stale_swr_count",
+    "results_cache_swr_background_query_count",
+    "results_cache_items_count",
+    "results_cache_size_bytes",
+    "results_cache_max_size_bytes",
+];
+
+/// The one `MeterProvider` for this binary, installed before any instrument is
+/// built. Forcing this is the first statement of every test that asserts on a
+/// metric, so the install wins the race however the harness schedules them:
+/// `cargo nextest` gives each test its own process, `cargo test` gives them
+/// threads, and `LazyLock` covers both.
+///
+/// Sharing the registry means an assertion must not depend on what siblings
+/// recorded. Presence assertions are safe, because each test records what it
+/// checks.
+static PROMETHEUS: LazyLock<prometheus::Registry> =
+    LazyLock::new(install_prometheus_meter_provider);
 
 /// Installs a `MeterProvider` backed by a scrapable Prometheus registry, as
 /// `spiced` does for the `--metrics` endpoint.
@@ -64,9 +98,25 @@ fn install_prometheus_meter_provider() -> prometheus::Registry {
     registry
 }
 
+/// Every metric family on the registry, by name.
+fn reported_metric_names(registry: &prometheus::Registry) -> HashSet<String> {
+    registry
+        .gather()
+        .iter()
+        .map(|family| family.name().to_string())
+        .collect()
+}
+
+/// The names in `reported`, sorted, for an assertion message.
+fn sorted(reported: &HashSet<String>) -> Vec<&String> {
+    let mut names: Vec<&String> = reported.iter().collect();
+    names.sort();
+    names
+}
+
 #[tokio::test]
 async fn query_metrics_are_reported_when_task_history_is_disabled() {
-    let registry = install_prometheus_meter_provider();
+    let registry = &*PROMETHEUS;
 
     let app = AppBuilder::new("query_metrics_without_task_history")
         .with_runtime(SpicepodRuntime {
@@ -100,14 +150,7 @@ async fn query_metrics_are_reported_when_task_history_is_disabled() {
         .await;
     assert!(failed.is_err(), "a query on a missing table must fail");
 
-    let reported: HashSet<String> = registry
-        .gather()
-        .iter()
-        .map(|family| family.name().to_string())
-        .collect();
-    let mut reported_names: Vec<&String> = reported.iter().collect();
-    reported_names.sort();
-
+    let reported = reported_metric_names(registry);
     let missing: Vec<&str> = EXPECTED_QUERY_METRICS
         .iter()
         .copied()
@@ -115,6 +158,33 @@ async fn query_metrics_are_reported_when_task_history_is_disabled() {
         .collect();
     assert!(
         missing.is_empty(),
-        "query metrics {missing:?} were not reported with task history disabled; reported: {reported_names:?}"
+        "query metrics {missing:?} were not reported with task history disabled; reported: {:?}",
+        sorted(&reported)
+    );
+}
+
+/// The runtime calls `init` for each configured cache at startup, and that is the
+/// only chance an instrument nothing has touched gets to appear on `/metrics`.
+#[test]
+fn cache_counters_are_exported_before_anything_is_recorded() {
+    let registry = &*PROMETHEUS;
+
+    // Exactly what `Runtime::init_cache_metrics` calls once `runtime.caching.sql_results`
+    // is configured. Nothing else in this test touches a cache instrument, so a series
+    // present afterwards was published by `init` rather than by a real cache event.
+    CachedQueryResult::init();
+
+    let reported = reported_metric_names(registry);
+    let missing: Vec<&str> = EXPECTED_RESULTS_CACHE_METRICS
+        .iter()
+        .copied()
+        .filter(|metric| !reported.contains(*metric))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "cache metrics {missing:?} were not exported after the cache was initialised, so an \
+         operator scraping a healthy runtime cannot tell them from a broken exporter; \
+         reported: {:?}",
+        sorted(&reported)
     );
 }

@@ -51,6 +51,7 @@ pub use backend::PingoraBackend;
 
 pub use lru_cache::LruCache;
 pub use metrics::CacheMetrics;
+pub use metrics::EvictionReason;
 pub use simple_cache::SimpleCache;
 use spicepod::component::caching::SQLResultsCacheConfig;
 pub use utils::RESPONSE_STATUS_COLUMN;
