@@ -1585,6 +1585,12 @@ pub struct CayenneTableProvider {
     /// when both hold exact keysets). Shared across clones like the caches.
     pk_keyset_bytes_single: Arc<AtomicUsize>,
     pk_keyset_bytes_sharded: Arc<AtomicUsize>,
+    /// This table's share of the process-global keyset ceiling, as last
+
+    /// reported. Held so `publish_keyset_bytes_total` can restate the share as a
+
+    /// delta instead of reserve/release pairs at every mutation site.
+    pk_keyset_global_reserved: Arc<AtomicUsize>,
     /// Per-key transaction OCC (`transaction_has_conflict`) trusts the Exact
     /// keyset's per-key `sequence` stamps ONLY when this is `false`. Set `true`
     /// whenever an event leaves the shared Exact keyset with a stale or missing
@@ -5700,6 +5706,7 @@ impl CayenneTableProvider {
             pk_warm_probe_done: Arc::new(AtomicBool::new(false)),
             pk_keyset_bytes_single: Arc::new(AtomicUsize::new(0)),
             pk_keyset_bytes_sharded: Arc::new(AtomicUsize::new(0)),
+            pk_keyset_global_reserved: Arc::new(AtomicUsize::new(0)),
             pk_keyset_occ_degraded: Arc::new(AtomicBool::new(false)),
             cold_pk_existence: Arc::new(ParkingMutex::new(None)),
             table_memory,
@@ -6891,6 +6898,7 @@ impl CayenneTableProvider {
             pk_warm_probe_done: Arc::clone(&self.pk_warm_probe_done),
             pk_keyset_bytes_single: Arc::clone(&self.pk_keyset_bytes_single),
             pk_keyset_bytes_sharded: Arc::clone(&self.pk_keyset_bytes_sharded),
+            pk_keyset_global_reserved: Arc::clone(&self.pk_keyset_global_reserved),
             pk_keyset_occ_degraded: Arc::clone(&self.pk_keyset_occ_degraded),
             cold_pk_existence: Arc::clone(&self.cold_pk_existence),
             table_memory: Arc::clone(&self.table_memory),
@@ -7297,11 +7305,38 @@ impl CayenneTableProvider {
     /// size within it.
     fn effective_pk_keyset_budget(&self) -> usize {
         let max_bytes = self.context.pk_keyset_cache_max_bytes();
-        if self.mem_tier_shard_count() > 1 {
+        let per_table = if self.mem_tier_shard_count() > 1 {
             max_bytes / 2
         } else {
             max_bytes
+        };
+        // Clamp to what the FLEET has left. `pk_keyset_cache_mb` derives each
+        // table's figure from total memory (~1/32, clamped 256 MiB–8 GiB) with
+        // no view of its siblings, so seven CDC tables on a 96 GiB host each
+        // believe they may hold 3 GiB — 21 GiB in aggregate, which no single
+        // table can ever exceed. A SF-1000 profile measured ~14.5 GiB resident
+        // in keysets with zero over-budget events for exactly that reason.
+        //
+        // Unset (embedders, tests) leaves the per-table figure untouched.
+        match super::pk_keyset_budget::global_pk_keyset_total() {
+            Some(total) => {
+                let used = super::pk_keyset_budget::global_pk_keyset_used().unwrap_or(0);
+                let remaining = usize::try_from(total.saturating_sub(used)).unwrap_or(usize::MAX);
+                // Never below this table's own current residency, or a table
+                // already at its limit would be told to shrink by degrading —
+                // the fleet ceiling bounds GROWTH, it does not evict.
+                per_table.min(remaining.max(self.current_pk_keyset_bytes()))
+            }
+            None => per_table,
         }
+    }
+
+    /// Bytes this table's keyset caches currently hold, as published to the
+    /// memory account.
+    fn current_pk_keyset_bytes(&self) -> usize {
+        self.pk_keyset_bytes_single
+            .load(Ordering::Relaxed)
+            .saturating_add(self.pk_keyset_bytes_sharded.load(Ordering::Relaxed))
     }
 
     /// Publish the table-wide PK cache's resident bytes and refresh the sum.
@@ -7322,6 +7357,24 @@ impl CayenneTableProvider {
             .load(Ordering::Relaxed)
             .saturating_add(self.pk_keyset_bytes_sharded.load(Ordering::Relaxed));
         self.table_memory.set_keyset_bytes(total);
+        // Restate this table's share of the fleet ceiling. A delta rather than
+        // reserve/release pairs at every mutation site: residency is already
+        // recomputed and republished here on every change, so one place can hold
+        // the global figure in step with it, and a missed path shows up as a
+        // stale share rather than a leak that never returns.
+        let previous = self.pk_keyset_global_reserved.swap(total, Ordering::AcqRel);
+        if total > previous {
+            let growth = (total - previous) as u64;
+            // Best-effort: the clamp in `effective_pk_keyset_budget` is what
+            // actually gates growth. Recording the excess anyway keeps `used`
+            // honest, so a table that grew past the ceiling makes its siblings
+            // see less headroom rather than hiding the overshoot.
+            if !super::pk_keyset_budget::try_reserve_keyset_bytes(growth) {
+                super::pk_keyset_budget::force_reserve_keyset_bytes(growth);
+            }
+        } else if previous > total {
+            super::pk_keyset_budget::release_keyset_bytes((previous - total) as u64);
+        }
     }
 
     /// Deferred cross-partition appends carry their on-conflict metadata and
