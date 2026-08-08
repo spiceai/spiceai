@@ -443,16 +443,24 @@ pub fn track_hash_index_lookup_rows(rows: u64, dimensions: &[KeyValue]) {
 /// Registers the CPU-sizing gauges, so a mis-sized deployment is greppable
 /// across a fleet rather than diagnosed pod-by-pod.
 ///
-/// Three quantities, deliberately separate: `spiced_cpu_budget_*` is the value
-/// the runtime *uses*, while `spiced_cpu_limit_millicores` and
-/// `spiced_cpu_request_millicores` are the cgroup *inputs* it was chosen
-/// against. Comparing them is what distinguishes a pod sized for its request
-/// from one sized for its whole node. `source` is `CpuSource::as_str` — the rung
-/// of the detection ladder the budget came from.
+/// `spiced_cpu_budget_*` is the value the runtime *uses*; the rest are the
+/// inputs it was chosen against. Comparing them is what distinguishes a pod
+/// sized for its request from one sized for its whole node. `source` is
+/// `CpuSource::as_str` — the rung of the detection ladder the budget came from,
+/// and the only authority on which input actually won: an exported input may
+/// have been outranked by an explicit setting or by a CPU limit.
 ///
-/// `limit` and `request` are `None` when the cgroup expresses no such value; the
-/// gauge then reports nothing rather than `0`, which would be indistinguishable
-/// from a real zero.
+/// `spiced_cpu_request_millicores` is the pod's own `requests.cpu`, exact, as
+/// declared by whatever wrote the pod spec. The cgroup CPU *share* is
+/// deliberately not exported: every cgroup has one whether or not a request was
+/// expressed — cgroup v2 defaults `cpu.weight: 100`, which inverts to ~2536m in
+/// a plain `docker run` — so a gauge for it would report a request-shaped number
+/// on hosts where nothing requested anything. It stays in the startup log, where
+/// it is read next to the source that was actually used.
+///
+/// Each optional input is `None` when no such value exists; the gauge then
+/// reports nothing rather than `0`, which would be indistinguishable from a real
+/// zero.
 ///
 /// Like [`register_tokio_runtime_metrics`], the binary MUST call this once
 /// AFTER `init_metrics` has installed the Prometheus meter.
@@ -464,7 +472,7 @@ pub fn register_cpu_budget_metrics(
     millicores: u64,
     source: &'static str,
     limit_millicores: Option<u64>,
-    request_millicores: Option<u64>,
+    declared_request_millicores: Option<u64>,
 ) {
     let meter = global::meter("cpu_budget");
 
@@ -493,14 +501,14 @@ pub fn register_cpu_budget_metrics(
             .build();
     }
 
-    if let Some(request) = request_millicores {
+    if let Some(declared) = declared_request_millicores {
         let _ = meter
             .u64_observable_gauge("spiced_cpu_request_millicores")
             .with_description(
-                "CPU request inferred from the cgroup CPU share (Kubernetes requests.cpu). Reported only; never used for sizing.",
+                "The pod's own CPU request (Kubernetes requests.cpu), as declared by the surface that wrote the pod spec. It drives sizing only when nothing outranks it: no CPU limit, and no explicit runtime.cpu.cores (a quantity or all). spiced_cpu_budget_cores{source} reports whether it did, as source=request_burst.",
             )
             .with_unit("{millicpu}")
-            .with_callback(move |obs| obs.observe(request, &[]))
+            .with_callback(move |obs| obs.observe(declared, &[]))
             .build();
     }
 }
