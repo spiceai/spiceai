@@ -68,6 +68,12 @@ readonly VERSION="1.5.0"
 readonly STATUS_CONTEXT="signoff"
 readonly TARGET_BRANCH="${SIGNOFF_BRANCH:-trunk}"
 readonly TARGET_REMOTE="${SIGNOFF_REMOTE:-origin}"
+# Seconds to wait between attempts at a commit-status POST; the number of
+# attempts is one more than the number of entries. A verdict can cost hours of
+# runner time and exists nowhere but that POST, so one transient response must
+# not discard it. Empty means post once. Overridable so the unit tests do not
+# pay for the waits.
+readonly STATUS_POST_BACKOFF="${SIGNOFF_STATUS_POST_BACKOFF-5 15 30 60}"
 DEBUG="${SIGNOFF_DEBUG:-}"
 VCS=""
 JJ_REMOTE_URL=""
@@ -605,16 +611,68 @@ append_step_summary() {
   printf '%s\n' "$text" >>"$GITHUB_STEP_SUMMARY" 2>/dev/null || true
 }
 
+# A status post that never lands leaves the commit carrying whatever it had.
+# For a remote run that is the `pending` posted on the way in, which the
+# Attestation check renders as a failure and which every reader — `signoff
+# mine`, the PR-sweep tooling — takes for a run still in flight, so nobody
+# re-dispatches. That state is indistinguishable from a live run, and a warning
+# in the log of a finished job does not reach anyone looking at the PR.
+warn_status_not_recorded() {
+  local sha="$1" state="$2" attempts="$3"
+  info "warning: could not post ${STATUS_CONTEXT}=${state} on ${sha:0:12} after ${attempts} attempt(s)"
+
+  # A `pending` that fails to post strands nothing: the commit keeps whatever it
+  # had, and this run still has its own verdict to post later. It is the verdict
+  # failing that leaves a reader holding a `pending` they cannot tell from a run
+  # still going, so that is what the summary is for.
+  if [[ "$state" != "pending" ]]; then
+    append_step_summary \
+      "### Sign-off"$'\n'"**Verdict not recorded** on \`${sha:0:12}\` — the \`${STATUS_CONTEXT}=${state}\` status did not post after ${attempts} attempt(s). Any \`pending\` left on this commit is stale, not a run in flight: sign off again."$'\n'
+  fi
+}
+
 # Post a commit status for STATUS_CONTEXT. Used for pending/failure on remote
 # runs and the final success attestation.
+#
+# Retried with backoff: this call is the only place a verdict exists, and a
+# transient response — a 5xx, a network blip, a 401 from a job that has outlived
+# its token — would otherwise discard hours of runner time for good.
 post_commit_status() {
   local repo="$1" sha="$2" state="$3" description="$4"
   description="${description:0:140}"
   debug "posting ${STATUS_CONTEXT}=${state} on ${repo}@${sha}: ${description}"
-  gh api --method POST "repos/${repo}/statuses/${sha}" \
-    -f state="$state" \
-    -f context="${STATUS_CONTEXT}" \
-    -f "description=${description}" >/dev/null
+
+  local -a backoff=()
+  read -r -a backoff <<<"$STATUS_POST_BACKOFF" || true
+  local attempts=$((${#backoff[@]} + 1))
+
+  local attempt=1 response
+  while true; do
+    if response=$(gh api --method POST "repos/${repo}/statuses/${sha}" \
+      -f state="$state" \
+      -f context="${STATUS_CONTEXT}" \
+      -f "description=${description}" 2>&1); then
+      if (( attempt > 1 )); then
+        info "posted ${STATUS_CONTEXT}=${state} on ${sha:0:12} on attempt ${attempt}"
+      fi
+      return 0
+    fi
+
+    # Report the response, not just that the call failed: "Bad credentials" on a
+    # job that has outlived its token reads differently from a 5xx, and only the
+    # second is something retrying can fix. Which one it was decides whether the
+    # answer here is more attempts or a fresh token.
+    info "warning: posting ${STATUS_CONTEXT}=${state} on ${sha:0:12} failed (attempt ${attempt}/${attempts}): $(printf '%s' "$response" | tr '\n' ' ')"
+
+    if (( attempt >= attempts )); then
+      warn_status_not_recorded "$sha" "$state" "$attempts"
+      return 1
+    fi
+    # Never fatal: a backoff this cannot honour must not abort the run before
+    # the attempt that would have recorded the verdict.
+    sleep "${backoff[attempt - 1]}" || true
+    attempt=$((attempt + 1))
+  done
 }
 
 # The STATUS_CONTEXT state currently on a commit: success/pending/failure/error,
