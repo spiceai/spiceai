@@ -7587,6 +7587,14 @@ impl CayenneTableProvider {
                     if self.upsert_bloom_eligible() {
                         let per_shard = max_bytes / index.shard_count().max(1);
                         index.degrade_to_blooms(per_shard);
+                        // The bounded insert stopped at the budget and the
+                        // degrade only converted what was already held, so the
+                        // rest of this batch is missing from the bloom. An
+                        // absent key is a false negative, which under upsert
+                        // reads as a new PK and writes a duplicate live row —
+                        // backfill the whole batch, as the single-keyset path
+                        // below has always done.
+                        index.record_keys_after_degrade(keys);
                     } else {
                         drop_index = true;
                     }

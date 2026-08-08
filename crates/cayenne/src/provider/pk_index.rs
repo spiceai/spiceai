@@ -1074,6 +1074,39 @@ impl ShardedPkIndex {
         }
     }
 
+    /// Record every key of a batch into an already-degraded bloom index.
+    ///
+    /// MUST be called after [`Self::degrade_to_blooms`] when the degrade was
+    /// triggered by [`Self::record_keys_bounded`] returning `false`. That stops
+    /// at the budget, so the keys after the stop were never inserted, and
+    /// `degrade_to_blooms` only converts what the keysets already hold — leaving
+    /// the rest of the batch absent from the bloom.
+    ///
+    /// An absent key is a FALSE NEGATIVE. Under upsert that reads as "this PK is
+    /// new" and writes a duplicate live row, which is the one failure the bloom
+    /// fallback is documented never to cause (a false POSITIVE is merely a
+    /// redundant delete). The single-keyset path has always re-inserted the full
+    /// batch after converting; this is the sharded equivalent.
+    ///
+    /// Cheap and unconditional: blooms are fixed-size, so re-inserting keys
+    /// already present costs a hash and a few bit sets, and no memory.
+    pub(crate) fn record_keys_after_degrade(&mut self, keys: &PkDigestSet) {
+        let n = self.shard_count();
+        match self {
+            Self::Bloom(blooms) => {
+                for key in keys.iter() {
+                    let shard = shard_of_pk(key.as_ref(), n);
+                    if let Some(bloom) = blooms.get_mut(shard) {
+                        bloom.insert(key.as_ref());
+                    }
+                }
+            }
+            // Not degraded, so `record_keys_bounded` admitted the whole batch
+            // and there is nothing to backfill.
+            Self::Exact(_) => {}
+        }
+    }
+
     /// Convert every exact shard keyset into a byte-budgeted bloom (no-op on
     /// an already-bloomed index). The budget backstop for the maintained
     /// index: exact keysets grow with every recorded key, and a caller whose
@@ -1124,6 +1157,59 @@ mod tests {
         ColdPkExistence, PkBloom, PkDigestSet, PkKeysetInsertOutcome, RowLocation, ShardedPkIndex,
         approx_pk_keyset_entry_bytes, pk_digest, shard_of_pk,
     };
+
+    /// Degrading after a mid-batch stop must not lose the rest of the batch.
+    ///
+    /// `record_keys_bounded` stops once the budget is reached, so the keys after
+    /// the stop were never inserted. `degrade_to_blooms` only converts what the
+    /// keysets already hold, so those keys would be absent from the bloom — and
+    /// an absent key is a FALSE NEGATIVE, which under upsert reads as "this PK
+    /// is new" and writes a duplicate live row. The single-keyset path has
+    /// always re-inserted the full batch after converting; the sharded path must
+    /// match that contract.
+    ///
+    /// A bloom may answer `true` for a key it never saw; it must never answer
+    /// `false` for one it did.
+    #[test]
+    fn degrading_after_a_mid_batch_stop_still_records_every_key() {
+        let keysets: Vec<CachedPkKeyset> =
+            (0..4).map(|_| CachedPkKeyset::with_capacity(0)).collect();
+        let mut index = ShardedPkIndex::Exact(keysets.into_boxed_slice());
+
+        let mut keys = PkDigestSet::with_capacity(8_000);
+        for i in 0..8_000u64 {
+            let k = owned_key(&key(i));
+            keys.insert_with_digest(pk_digest(&k), k);
+        }
+        // Tight enough that the insert stops long before the batch ends.
+        let one_entry = approx_pk_keyset_entry_bytes(&owned_key(&key(0)));
+        let max_bytes = one_entry.saturating_mul(500);
+
+        let within = index.record_keys_bounded(&keys, &RowLocation::FileUnlocated, max_bytes);
+        assert!(
+            !within,
+            "this batch must exceed the budget for the test to mean anything"
+        );
+
+        let per_shard = max_bytes / index.shard_count().max(1);
+        index.degrade_to_blooms(per_shard);
+        index.record_keys_after_degrade(&keys);
+
+        let n = index.shard_count();
+        match &index {
+            ShardedPkIndex::Bloom(blooms) => {
+                for k in keys.iter() {
+                    let shard = shard_of_pk(k.as_ref(), n);
+                    assert!(
+                        blooms[shard].maybe_contains(k.as_ref()),
+                        "every key in the batch must survive degradation; a false negative \
+                         here is a duplicate live row under upsert"
+                    );
+                }
+            }
+            ShardedPkIndex::Exact(_) => panic!("degrade_to_blooms must leave a bloom index"),
+        }
+    }
 
     /// The budget must stop growth DURING the insert, not after it.
     ///
