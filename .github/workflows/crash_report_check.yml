@@ -27,6 +27,10 @@ jobs:
     runs-on: spiceai-dev-runners
     # `release-lto` links the whole graph with fat LTO; it is far slower than release.
     timeout-minutes: 300
+    env:
+      # `build.rs` declares `rerun-if-env-changed` on this, so it has to be identical
+      # for every cargo invocation in the job or the crate rebuilds between them.
+      SPICED_BUILD_FLAVOR: crash-check
     strategy:
       fail-fast: false
       matrix:
@@ -123,6 +127,20 @@ jobs:
       # `siginfo` reaches the handler typed as a `signalfd_siginfo`, whose fields stop
       # lining up after `si_code`, so a report reading the wrong offset shows addr=0x0
       # for every fault. Assert the address the child actually faulted on.
+      # Several release flavors ship under one version, so a report that cannot name
+      # its own build cannot be symbolized against the right binary. `profile=` must
+      # be the profile this leg built, not cargo's `PROFILE`, which says "release"
+      # for both of them.
+      - name: Check the report identifies its artifact
+        run: |
+          set -euo pipefail
+          grep -q "profile=${{ matrix.profile }}" report.txt \
+            || { echo "report does not name the profile it was built with"; exit 1; }
+          grep -q 'flavor=crash-check' report.txt \
+            || { echo "flavor label did not reach the binary"; exit 1; }
+          grep -qE 'spiced=v[0-9]' report.txt \
+            || { echo "report carries no version"; exit 1; }
+
       - name: Check the reported fault address
         run: |
           set -euo pipefail

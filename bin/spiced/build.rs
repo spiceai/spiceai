@@ -26,4 +26,39 @@ fn main() {
         );
 
     println!("cargo:rustc-env=GIT_COMMIT_HASH={git_hash}");
+    println!("cargo:rustc-env=SPICED_BUILD_PROFILE={}", build_profile());
+    println!("cargo:rustc-env=SPICED_BUILD_FLAVOR={}", build_flavor());
+}
+
+/// The cargo profile the binary is being built with.
+///
+/// Cargo's own `PROFILE` collapses every profile that inherits `release` down to
+/// `release`, so it cannot tell `release` from `release-lto` — which are the two
+/// profiles that ship, and which differ in whether a crash report can be symbolized.
+/// The profile directory can: `OUT_DIR` is `<target>/<profile>/build/<pkg>-<hash>/out`.
+fn build_profile() -> String {
+    std::env::var("OUT_DIR")
+        .ok()
+        .and_then(|dir| {
+            let path = std::path::Path::new(&dir);
+            Some(
+                path.parent()?
+                    .parent()?
+                    .parent()?
+                    .file_name()?
+                    .to_str()?
+                    .to_owned(),
+            )
+        })
+        .unwrap_or_else(|| "unknown".to_owned())
+}
+
+/// Which release artifact this binary is, e.g. `default`, `models`, `nas`.
+///
+/// The feature set alone does not name it — several flavors differ only in features
+/// that nothing in the binary reports — so the release workflows pass the artifact
+/// suffix they are already packaging under.
+fn build_flavor() -> String {
+    println!("cargo:rerun-if-env-changed=SPICED_BUILD_FLAVOR");
+    std::env::var("SPICED_BUILD_FLAVOR").unwrap_or_else(|_| "local".to_owned())
 }

@@ -77,7 +77,9 @@ fn chosen_on_command_line(matches: &clap::ArgMatches, id: &str) -> bool {
 fn main() {
     // Before anything else, so a fault during startup is still reported. A native
     // crash is not a panic: without this the process dies silently with exit 139.
-    spiced::crash_handler::install();
+    // The version goes in so a report names the artifact that produced it — several
+    // release flavors ship under one version.
+    spiced::crash_handler::install(&get_version_string());
 
     let matches = spiced::Args::command().get_matches();
     let open_telemetry_deprecated =

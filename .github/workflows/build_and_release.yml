@@ -235,12 +235,16 @@ jobs:
       - name: Build spiced and spice CLI
         if: contains(matrix.target.tags, 'default') && matrix.target.target_os != 'windows' && !matrix.target.is_tagged_release
         working-directory: bin/spiced
+        env:
+          SPICED_BUILD_FLAVOR: default
         run: cargo build --profile ${{ env.RUST_PROFILE }} --features release,models,postgres-accel -p spiced -p spice --target-dir ../../target
 
       # Release builds exclude optional accelerators from the distributed binary
       - name: Build spiced and spice CLI (release)
         if: contains(matrix.target.tags, 'default') && matrix.target.target_os != 'windows' && matrix.target.is_tagged_release
         working-directory: bin/spiced
+        env:
+          SPICED_BUILD_FLAVOR: default
         run: cargo build --profile ${{ env.RUST_PROFILE }} --features release,models -p spiced -p spice --target-dir ../../target
 
       - name: tar binary
@@ -274,6 +278,8 @@ jobs:
       - name: Build spiced (odbc)
         if: matrix.target.target_os != 'windows' && contains(matrix.target.tags, 'odbc')
         working-directory: bin/spiced
+        env:
+          SPICED_BUILD_FLAVOR: odbc
         run: cargo build --release --features release,odbc,models --target-dir ../../target
 
       - name: tar binary (odbc)
@@ -307,6 +313,8 @@ jobs:
       - name: Build spiced (metal)
         if: matrix.target.target_os == 'darwin'
         working-directory: bin/spiced
+        env:
+          SPICED_BUILD_FLAVOR: metal
         run: cargo build --release --features release,models,metal --target-dir ../../target
 
       - name: tar binary (metal)

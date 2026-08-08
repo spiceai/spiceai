@@ -18,8 +18,8 @@ limitations under the License.
 //!
 //! A `SIGSEGV` is not a panic, so the panic hook and `RUST_BACKTRACE` never run and
 //! the log stops mid-stream: a process that exits 139 leaves no evidence of where it
-//! died. This prints one line first, carrying the instruction pointer and load base
-//! so the report is symbolizable from logs alone:
+//! died. This prints a short report first, naming which build crashed and carrying
+//! the instruction pointer and load base, so it is symbolizable from logs alone:
 //!
 //! ```text
 //! addr2line -e spiced -fCi <offset>
@@ -27,8 +27,9 @@ limitations under the License.
 //!
 //! Everything here runs in the signal handler on the crashing thread and must be
 //! async-signal-safe — no allocation, no locks, no `tracing` — since the fault may
-//! have interrupted that thread mid-allocation. The line is formatted into a fixed
-//! stack buffer and emitted with one `write(2)`.
+//! have interrupted that thread mid-allocation. Anything that would need to allocate,
+//! such as the build identity, is resolved at install time; the report itself is
+//! formatted into a fixed stack buffer and emitted with one `write(2)`.
 
 use std::sync::OnceLock;
 
@@ -43,14 +44,29 @@ static LOAD_BASE: OnceLock<usize> = OnceLock::new();
 /// very different from ones that need hours of load.
 static START: OnceLock<std::time::Instant> = OnceLock::new();
 
+/// Which binary this is, formatted once at install so the handler only has to write
+/// bytes: several release artifacts share a version, and a report that cannot name
+/// its own artifact cannot be symbolized against the right one.
+static IDENTITY: OnceLock<String> = OnceLock::new();
+
 /// Install fatal-signal reporting. Call once, as early in `main` as possible, so
 /// faults during startup are covered.
 ///
+/// `version` is passed in rather than rebuilt here: `main` already composes it, and
+/// the feature flags it encodes belong with the rest of the version logic.
+///
 /// A failure to attach is logged and ignored: refusing to start without crash
 /// reporting would be worse than starting without it.
-pub fn install() {
+pub fn install(version: &str) {
     let _ = START.set(std::time::Instant::now());
     let _ = LOAD_BASE.set(read_load_base().unwrap_or(0));
+    // Formatted now, not in the handler: allocating there is not signal-safe, and a
+    // pre-built line cannot crowd out the rest of the report's fixed buffer.
+    let _ = IDENTITY.set(format!(
+        "spiced={version} flavor={} profile={}\n",
+        env!("SPICED_BUILD_FLAVOR"),
+        env!("SPICED_BUILD_PROFILE"),
+    ));
 
     // SAFETY: the closure is async-signal-safe — see the module docs.
     let event = unsafe { crash_handler::make_crash_event(on_crash) };
@@ -283,13 +299,19 @@ fn report(cc: &crash_handler::CrashContext) {
     let offset = ip.saturating_sub(base);
     let uptime = START.get().map_or(0, |s| s.elapsed().as_secs());
 
-    // Formatting into a fixed slice cannot allocate.
-    let mut buf = [0u8; 512];
+    // Formatting into a fixed slice cannot allocate. Sized well past the longest
+    // report a `Cursor` write can produce: it stops at capacity silently, so the
+    // margin is what keeps a long version string from truncating the fields below it.
+    let mut buf = [0u8; 1024];
     let mut cur = std::io::Cursor::new(&mut buf[..]);
+    let _ = write!(cur, "\n=== native crash ===\n");
+    // Already a formatted line, ending in a newline; reading it is an atomic load.
+    if let Some(identity) = IDENTITY.get() {
+        let _ = cur.write_all(identity.as_bytes());
+    }
     let _ = write!(
         cur,
-        "\n=== native crash ===\n\
-         signal={} code={} ({}) ",
+        "signal={} code={} ({}) ",
         signal_name(cc.siginfo.ssi_signo),
         cc.siginfo.ssi_code,
         signal_code_name(cc.siginfo.ssi_signo, cc.siginfo.ssi_code),
@@ -310,14 +332,7 @@ fn report(cc: &crash_handler::CrashContext) {
          thread=\"{}\" pid={} tid={} uptime={}s\n\
          symbolize: addr2line -e spiced -fCi 0x{:x}\n\
          === end native crash ===\n",
-        ip,
-        base,
-        offset,
-        thread,
-        cc.pid,
-        cc.tid,
-        uptime,
-        offset,
+        ip, base, offset, thread, cc.pid, cc.tid, uptime, offset,
     );
     #[expect(
         clippy::cast_possible_truncation,
@@ -336,12 +351,15 @@ fn report(_cc: &crash_handler::CrashContext) {
     use std::io::Write as _;
 
     let uptime = START.get().map_or(0, |s| s.elapsed().as_secs());
-    let mut buf = [0u8; 256];
+    let mut buf = [0u8; 512];
     let mut cur = std::io::Cursor::new(&mut buf[..]);
+    let _ = write!(cur, "\n=== native crash ===\n");
+    if let Some(identity) = IDENTITY.get() {
+        let _ = cur.write_all(identity.as_bytes());
+    }
     let _ = write!(
         cur,
-        "\n=== native crash ===\n\
-         (reduced report: full detail is Linux-only)\n\
+        "(reduced report: full detail is Linux-only)\n\
          uptime={uptime}s\n\
          === end native crash ===\n",
     );
@@ -357,6 +375,10 @@ fn report(_cc: &crash_handler::CrashContext) {
 mod tests {
     /// Set in the child process to select the crashing role.
     const CHILD: &str = "SPICED_CRASH_HANDLER_TEST_CHILD";
+
+    /// Distinctive enough that finding it in the report proves the string reached it
+    /// from the caller, rather than matching something the report prints anyway.
+    const TEST_VERSION: &str = "v0.0.0-crash-handler-test";
 
     /// The address the child faults at.
     ///
@@ -395,7 +417,7 @@ mod tests {
         use std::os::unix::process::ExitStatusExt as _;
 
         if std::env::var_os(CHILD).is_some() {
-            super::install();
+            super::install(TEST_VERSION);
             spiced_crash_handler_test_fault();
             unreachable!("the fault must terminate the process");
         }
@@ -422,6 +444,17 @@ mod tests {
             "no crash report on stderr.\nstderr: {stderr}\nstdout: {}",
             String::from_utf8_lossy(&output.stdout)
         );
+
+        // Which artifact crashed. Several release flavors ship under one version, so
+        // a report that cannot name its own build cannot be symbolized against the
+        // right binary. Present on every platform, unlike the fields below.
+        let version_field = format!("spiced={TEST_VERSION}");
+        for field in [version_field.as_str(), "flavor=", "profile="] {
+            assert!(
+                stderr.contains(field),
+                "report is missing `{field}`: {stderr}"
+            );
+        }
 
         // The child must die from the signal. A clean exit would mean the handler
         // swallowed the fault and let execution resume.
