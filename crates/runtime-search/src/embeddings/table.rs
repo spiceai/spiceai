@@ -704,6 +704,19 @@ impl EmbeddingTable {
         match (cfg.input_mode, cfg.chunker.is_some()) {
             // Scalar + chunked: doubly nested embedding + offsets
             // (character offsets of each chunk into the source string).
+            //
+            // The outer list of both derived columns is nullable. When an
+            // external vector index (e.g. S3 Vectors) owns the vectors, the
+            // index-population scan drops these columns and re-adds them as
+            // all-null literals — `AvoidDerivedVectorColumnOnIndexRule` in
+            // `runtime-datafusion` nulls exactly `{col}_embedding` and
+            // `{col}_offset` (see `ChunkedVectorIndex::derived_columns`). A
+            // non-nullable outer list rejects that all-null column when the
+            // accelerator write schema reaches the Vortex sink (#12778). The
+            // unchunked scalar arm below is already nullable for the same
+            // reason. Only the outer list is relaxed: the inner types stay
+            // non-nullable so the Arrow `DataType` still matches the arrays
+            // produced by `execution_plan::get_embedding_columns`.
             (EmbeddingInputMode::Scalar, true) => vec![
                 Arc::new(Field::new_list(
                     embedding_col!(field.name()),
@@ -713,7 +726,7 @@ impl EmbeddingTable {
                         cfg.vector_size,
                         false,
                     ),
-                    false,
+                    true,
                 )),
                 Arc::new(Field::new_list(
                     offset_col!(field.name()),
@@ -723,7 +736,7 @@ impl EmbeddingTable {
                         2,
                         false,
                     ),
-                    false,
+                    true,
                 )),
             ],
             // Scalar + unchunked: one vector per row.
@@ -1415,5 +1428,99 @@ mod tests {
         let err = EmbeddingTable::resolve_input_mode("tags", SourceShape::ListOfString, &cfg)
             .expect_err("expected rejection");
         assert!(matches!(err, Error::MultiVectorChunkingNotSupported { .. }));
+    }
+
+    /// regression test for #12778.
+    ///
+    /// A chunked scalar embedding column paired with an external vector index
+    /// (e.g. S3 Vectors) is nulled out on the index-population scan by
+    /// `AvoidDerivedVectorColumnOnIndexRule`, which drops the derived columns
+    /// and re-adds them as all-null literals. `ChunkedVectorIndex::derived_columns`
+    /// reports both `{col}_embedding` and `{col}_offset`, so both must declare a
+    /// nullable outer list. A non-nullable outer list rejected the all-null column
+    /// when the accelerator write schema reached the Vortex sink.
+    #[test]
+    fn chunked_scalar_derived_columns_admit_nulls() {
+        use arrow::array::{RecordBatch, new_null_array};
+        use chunking::{Chunker, ChunkingConfig, RecursiveSplittingChunker};
+
+        let chunk_cfg = ChunkingConfig {
+            target_chunk_size: 128,
+            overlap_size: 0,
+            trim_whitespace: true,
+            file_format: None,
+        };
+        let chunker: Arc<dyn Chunker> = Arc::new(
+            RecursiveSplittingChunker::with_character_sizer(&chunk_cfg)
+                .expect("build character-sized chunker"),
+        );
+
+        let mut embedded_columns = HashMap::new();
+        embedded_columns.insert(
+            "content".to_string(),
+            EmbeddingColumnConfig {
+                model_name: "test_model".to_string(),
+                vector_size: 8,
+                in_base_table: false,
+                chunker: Some(chunker),
+                input_mode: EmbeddingInputMode::Scalar,
+            },
+        );
+
+        let base_schema = Arc::new(Schema::new(vec![field("content", DataType::Utf8)]));
+        let base_table: Arc<dyn TableProvider> = Arc::new(
+            datafusion::catalog::MemTable::try_new(base_schema, vec![vec![]])
+                .expect("create MemTable"),
+        );
+        let table = EmbeddingTable {
+            base_table,
+            embedded_columns,
+            embedding_models: Arc::new(RwLock::new(HashMap::new())),
+        };
+
+        let derived = table.embedding_fields(&Field::new("content", DataType::Utf8, false));
+        assert_eq!(derived.len(), 2, "expected embedding and offset columns");
+
+        let embedding = derived
+            .iter()
+            .find(|f| f.name() == "content_embedding")
+            .expect("embedding column present");
+        let offset = derived
+            .iter()
+            .find(|f| f.name() == "content_offset")
+            .expect("offset column present");
+
+        // The optimizer rule nulls both columns on the index-write path, so
+        // both outer lists must admit nulls.
+        assert!(
+            embedding.is_nullable(),
+            "embedding outer list must be nullable"
+        );
+        assert!(offset.is_nullable(), "offset outer list must be nullable");
+
+        // The inner element types stay non-nullable so the Arrow `DataType`
+        // still matches the arrays the execution plan produces.
+        let inner_non_nullable = |f: &FieldRef| match f.data_type() {
+            DataType::List(inner) => !inner.is_nullable(),
+            _ => false,
+        };
+        assert!(
+            inner_non_nullable(embedding),
+            "embedding inner item must stay non-nullable"
+        );
+        assert!(
+            inner_non_nullable(offset),
+            "offset inner item must stay non-nullable"
+        );
+
+        // An all-null column of each derived type must build into a
+        // `RecordBatch` against the derived schema — the shape the write path
+        // hits once the external index owns the vectors.
+        for f in &derived {
+            let schema = Arc::new(Schema::new(vec![Arc::clone(f)]));
+            let all_null = new_null_array(f.data_type(), 4);
+            RecordBatch::try_new(schema, vec![all_null])
+                .expect("all-null derived column must build against a nullable schema");
+        }
     }
 }
