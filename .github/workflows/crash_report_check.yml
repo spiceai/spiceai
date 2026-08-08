@@ -1,0 +1,161 @@
+---
+name: Crash Report Check
+
+# No other workflow runs `spiced`'s unit tests on Linux, so the Linux-only half of
+# `crash_handler.rs` is compiled but never executed. Run this by hand after touching
+# the handler: it takes a real SIGSEGV under each release profile, checks the report
+# names the address that was actually faulted on, and checks the `offset` it prints
+# symbolizes back to the faulting symbol.
+on:
+  workflow_dispatch:
+    inputs:
+      profiles:
+        description: 'JSON array of cargo profiles to verify'
+        required: false
+        default: '["release", "release-lto"]'
+        type: string
+
+  # Remove before merge. `workflow_dispatch` only lists workflows already on the
+  # default branch, so a branch-scoped push is the only way to exercise this first.
+  push:
+    branches:
+      - sgrebnov/12332-crash-report-followups
+
+jobs:
+  crash_report:
+    name: crash report (${{ matrix.profile }})
+    runs-on: spiceai-dev-runners
+    # `release-lto` links the whole graph with fat LTO; it is far slower than release.
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: ${{ fromJSON(inputs.profiles || '["release", "release-lto"]') }}
+
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Cache Cargo registry
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+
+      - name: Set up make
+        uses: ./.github/actions/setup-make
+
+      - name: Set up cc
+        uses: ./.github/actions/setup-cc
+
+      - name: Install protoc
+        uses: ./.github/actions/install-protoc
+
+      - name: Set up sccache
+        uses: ./.github/actions/setup-sccache
+        with:
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+
+      - name: Environment
+        run: |
+          uname -a
+          cat /proc/sys/kernel/randomize_va_space || true
+
+      # Built exactly as the profile ships — no debuginfo or strip overrides — so the
+      # symbolization check below reflects what a real report from that artifact gives.
+      - name: Build the test binary
+        env:
+          CARGO_INCREMENTAL: 0
+          AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+        run: |
+          set -euo pipefail
+          cargo test -p spiced --lib --profile '${{ matrix.profile }}' --no-run \
+            --message-format=json > cargo-build.json
+          # The single test executable for spiced's lib target.
+          TEST_BIN=$(jq -r 'select(.profile.test == true) | .executable' \
+            cargo-build.json | grep . | tail -1)
+          echo "TEST_BIN=$TEST_BIN" | tee -a "$GITHUB_ENV"
+          test -x "$TEST_BIN"
+
+      - name: Symbol tables present in the built binary
+        run: |
+          set -uo pipefail
+          echo "size: $(stat -c %s "$TEST_BIN") bytes"
+          readelf -S "$TEST_BIN" | grep -E 'symtab|debug_info|gnu\.build-id' || \
+            echo "(no symtab, no DWARF, no build-id)"
+          readelf -n "$TEST_BIN" | grep -i 'build id' || echo "(no build id)"
+
+      - name: Run the test
+        # Match the build step's env or cargo re-fingerprints and rebuilds.
+        env:
+          CARGO_INCREMENTAL: 0
+        run: |
+          cargo test -p spiced --lib --profile '${{ matrix.profile }}' \
+            crash_handler -- --nocapture
+
+      # Re-run the faulting child directly so the report itself lands in the log.
+      # The child is meant to die, so drop the shell's inherited `-e`.
+      - name: Show a real crash report
+        run: |
+          set +e
+          SPICED_CRASH_HANDLER_TEST_CHILD=1 "$TEST_BIN" \
+            --exact crash_handler::tests::reports_a_fatal_signal --nocapture \
+            > child.out 2> report.txt
+          STATUS=$?
+          set -e
+          echo "child exit: $STATUS (139 = SIGSEGV)"
+          test "$STATUS" -eq 139
+          echo "───────── report ─────────"
+          cat report.txt
+          echo "──────────────────────────"
+
+      # `siginfo` reaches the handler typed as a `signalfd_siginfo`, whose fields stop
+      # lining up after `si_code`, so a report reading the wrong offset shows addr=0x0
+      # for every fault. Assert the address the child actually faulted on.
+      - name: Check the reported fault address
+        run: |
+          set -euo pipefail
+          grep -q '=== native crash ===' report.txt
+          grep -q 'addr=0x5eeddead0000' report.txt \
+            || { echo "fault address is not the one faulted on"; exit 1; }
+          grep -q '(SEGV_MAPERR)' report.txt \
+            || { echo "si_code was not decoded"; exit 1; }
+          # A zero load base means /proc/self/maps parsing failed and the offset,
+          # and so the symbolize step below, is meaningless.
+          if grep -q 'base=0x0 ' report.txt; then
+            echo "load base was not resolved"; exit 1
+          fi
+
+      # The point of the report: does the printed offset actually symbolize? Function
+      # names resolve from `.symtab`, which both release profiles keep; line numbers
+      # and inline frames need debug info these artifacts do not yet ship.
+      - name: Symbolize the offset
+        run: |
+          set -euo pipefail
+          OFFSET=$(grep -oE 'offset=0x[0-9a-f]+' report.txt | head -1 | cut -d= -f2)
+          echo "offset: $OFFSET"
+          test "$OFFSET" != "0x0"
+          addr2line -e "$TEST_BIN" -fCi "$OFFSET" | tee sym.txt
+          grep -q 'spiced_crash_handler_test_fault' sym.txt \
+            || { echo "offset did not resolve to the faulting symbol"; exit 1; }
+
+      - name: Upload the report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: crash-report-${{ matrix.profile }}
+          path: |
+            report.txt
+            sym.txt
+          if-no-files-found: warn
