@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::catalog_filter::TableSelector;
 use async_trait::async_trait;
 use datafusion::{
     catalog::{CatalogProvider, SchemaProvider},
@@ -22,7 +23,6 @@ use datafusion::{
     sql::TableReference,
 };
 use futures::{StreamExt, TryStreamExt};
-use globset::GlobSet;
 use snafu::prelude::*;
 use std::{
     collections::HashMap,
@@ -99,7 +99,7 @@ impl UnityCatalogProvider {
         client: Arc<UnityCatalog>,
         catalog_id: CatalogId,
         table_creator: Arc<dyn UCTableProviderFactory>,
-        include: Option<GlobSet>,
+        selector: TableSelector,
     ) -> Result<Self> {
         let schemas =
             client
@@ -108,8 +108,6 @@ impl UnityCatalogProvider {
                 .context(super::CatalogDoesntExistSnafu {
                     catalog_id: catalog_id.0,
                 })?;
-
-        let include = include.map(Arc::new);
 
         let mut schemas_map = HashMap::new();
         for schema in schemas {
@@ -120,7 +118,7 @@ impl UnityCatalogProvider {
                 Arc::clone(&client),
                 &schema,
                 Arc::clone(&table_creator),
-                include.clone(),
+                selector.clone(),
             )
             .await?;
             schemas_map.insert(schema.name, Arc::new(schema_provider));
@@ -168,7 +166,7 @@ pub struct UnityCatalogSchemaProvider {
     tables: RwLock<HashMap<String, Arc<dyn TableProvider>>>,
     client: Arc<UnityCatalog>,
     schema: UCSchema,
-    include: Option<Arc<GlobSet>>,
+    selector: TableSelector,
     table_creator: Arc<dyn UCTableProviderFactory>,
 }
 
@@ -191,7 +189,7 @@ impl UnityCatalogSchemaProvider {
         client: Arc<UnityCatalog>,
         schema: &UCSchema,
         table_creator: Arc<dyn UCTableProviderFactory>,
-        include: Option<Arc<GlobSet>>,
+        selector: TableSelector,
     ) -> Result<Self> {
         let tables = client
             .list_tables(&schema.catalog_name, &schema.name)
@@ -217,12 +215,12 @@ impl UnityCatalogSchemaProvider {
                 continue;
             };
 
-            let schema_with_table = format!("{}.{}", schema.name, table.name);
-            tracing::debug!("Checking if table {} should be included", schema_with_table);
-            if let Some(include) = &include
-                && !include.is_match(&schema_with_table)
-            {
-                tracing::debug!("Table {} is not included", schema_with_table);
+            if !selector.selects_table(&schema.name, &table.name) {
+                tracing::debug!(
+                    "Table {}.{} is not selected by the catalog's include/exclude patterns, skipping",
+                    schema.name,
+                    table.name
+                );
                 continue;
             }
 
@@ -299,7 +297,7 @@ impl UnityCatalogSchemaProvider {
             tables: RwLock::new(tables_map),
             client,
             schema: schema.clone(),
-            include,
+            selector,
             table_creator,
         })
     }
@@ -336,7 +334,7 @@ impl UnityCatalogSchemaProvider {
                 &self.schema,
                 &table,
                 Arc::clone(&self.table_creator),
-                self.include.clone(),
+                self.selector.clone(),
                 Arc::clone(&self.client),
             )
             .await
@@ -389,7 +387,7 @@ impl UnityCatalogSchemaProvider {
         schema: &UCSchema,
         table: &UCTable,
         table_creator: Arc<dyn UCTableProviderFactory>,
-        include: Option<Arc<GlobSet>>,
+        selector: TableSelector,
         client: Arc<UnityCatalog>,
     ) -> Option<Arc<dyn TableProvider>> {
         if !table.is_queryable() {
@@ -404,12 +402,11 @@ impl UnityCatalogSchemaProvider {
         let table_name = table.name.clone();
         let table_reference = table_creator.table_reference(table)?;
 
-        let schema_with_table = format!("{}.{}", schema.name, table_name);
-        tracing::debug!("Checking if table {} should be included", schema_with_table);
-        if let Some(include) = &include
-            && !include.is_match(&schema_with_table)
-        {
-            tracing::debug!("Table {} is not included", schema_with_table);
+        if !selector.selects_table(&schema.name, &table_name) {
+            tracing::debug!(
+                "Table {}.{table_name} is not selected by the catalog's include/exclude patterns, skipping",
+                schema.name
+            );
             return None;
         }
 
