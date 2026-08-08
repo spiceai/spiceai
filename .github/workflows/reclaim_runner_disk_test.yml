@@ -42,10 +42,21 @@ permissions: {}
 
 jobs:
   test-reclaim-runner-disk:
-    name: Unit tests for the runner disk sweep
+    name: Unit tests for the runner disk sweep (${{ matrix.os }})
     # GitHub-hosted on purpose: a sub-second check must not queue behind the
     # self-hosted pool whose full disks it exists to keep from recurring.
-    runs-on: ubuntu-24.04
+    #
+    # Both families, because the sweep ships to both self-hosted pools and the
+    # subject leans on `find` predicates whose availability differs between GNU
+    # and BSD userlands. `spiceai-macos` is the pool #12794 names, so a BSD
+    # regression would land exactly where the sweep matters most and nowhere the
+    # suite could see it. macOS runners here are GitHub-hosted, so this reads
+    # the same `find` the self-hosted Macs ship without touching that pool.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    runs-on: ${{ matrix.os }}
     permissions:
       # A checkout and a local bash script against temporary directories.
       contents: read
