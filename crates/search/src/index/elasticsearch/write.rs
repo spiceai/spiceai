@@ -775,17 +775,55 @@ fn describe_bulk_failure(position: usize, op: &Value) -> String {
     )
 }
 
+/// Top-level keys an Elasticsearch write or delete response is allowed to name.
+///
+/// Covers the `_bulk` response (`took`, `errors`, `items`), the `_delete_by_query` response,
+/// and the `{"error": …, "status": …}` envelope both share on failure.
+const KNOWN_RESPONSE_KEYS: &[&str] = &[
+    "batches",
+    "deleted",
+    "error",
+    "errors",
+    "failures",
+    "items",
+    "noops",
+    "requests_per_second",
+    "retries",
+    "status",
+    "throttled_millis",
+    "throttled_until_millis",
+    "timed_out",
+    "took",
+    "total",
+    "version_conflicts",
+];
+
+/// Accept `key` only if it is one Elasticsearch itself puts at the top level of a response.
+///
+/// [`categorical_token`] is the wrong filter for a response key: it admits *any*
+/// `lower_snake_case` string, and a document identifier (`customer_123`) has exactly that
+/// shape, so it would be copied verbatim into the error and `runtime.task_history`. The set
+/// of top-level keys is fixed and small, so match it exactly instead of by shape.
+fn response_key_token(key: &str) -> &str {
+    if KNOWN_RESPONSE_KEYS.contains(&key) {
+        key
+    } else {
+        UNRECOGNIZED_CATEGORY
+    }
+}
+
 /// Describe an unexpected `_bulk` response body by its shape alone.
 ///
 /// A successful bulk response contains one item per document, each naming its `_id`, so the
 /// body itself can never be reported. Its top-level key names are what actually distinguish
 /// the interesting cases (an `{"error": …}` envelope from a proxy versus a truncated
-/// response), and each goes through [`categorical_token`] because an unexpected response is
-/// exactly the case where the keys are not Elasticsearch's own.
+/// response), and each goes through [`response_key_token`] — an unexpected response is
+/// exactly the case where the keys are *not* Elasticsearch's own, so a key is reported only
+/// when it is one Elasticsearch itself defines.
 pub(super) fn describe_unexpected_response(resp: &Value) -> String {
     match resp {
         Value::Object(map) => {
-            let mut keys: Vec<&str> = map.keys().map(|k| categorical_token(k)).collect();
+            let mut keys: Vec<&str> = map.keys().map(|k| response_key_token(k)).collect();
             keys.sort_unstable();
             // Several rejected keys collapse onto the same placeholder; report it once.
             keys.dedup();
@@ -1187,6 +1225,22 @@ mod tests {
             message.matches(UNRECOGNIZED_CATEGORY).count(),
             1,
             "the three rejected keys must collapse to one placeholder: {message}"
+        );
+        assert!(
+            message.contains("took"),
+            "a legitimate key must still be reported: {message}"
+        );
+    }
+
+    /// A document identifier is `lower_snake_case` too, so shape alone cannot reject it.
+    #[test]
+    fn an_identifier_shaped_response_key_is_replaced() {
+        let resp = json!({ "took": 3, "customer_123": 1, "order_2026_08_08": 2 });
+
+        let message = describe(&resp);
+        assert!(
+            !message.contains("customer_123") && !message.contains("order_2026_08_08"),
+            "an identifier-shaped response key reached the error: {message}"
         );
         assert!(
             message.contains("took"),
