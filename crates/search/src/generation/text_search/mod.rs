@@ -34,7 +34,7 @@ use datafusion::{
 };
 
 use ::util::format_datafusion_error;
-use futures::{Stream, StreamExt};
+use futures::Stream;
 use serde_json::{Number, Value};
 use snafu::{ResultExt, Snafu};
 use tantivy::{
@@ -47,8 +47,7 @@ use tantivy::{
 };
 
 use super::{
-    CandidateGeneration, Error as GenerationError, Result as GenerationResult,
-    TextSearchSnafu as GenerationTextSearchSnafu,
+    CandidateGeneration, Result as GenerationResult, TextSearchSnafu as GenerationTextSearchSnafu,
 };
 
 /// Maximum number of results in a single full-text search request, before any pagination.
@@ -217,7 +216,7 @@ pub struct FullTextSearchFieldIndex {
     stored_columns: HashSet<String>,
 
     /// Provide hints to the final Arrow datatype for a given column. Keys are column names.
-    /// Tantivy [`FieldType`]s are less specific than [`arrow::datatypes::DataType`]s and the Arrow type must be inferred from Tanitvy JSON results (via [`arrow_json::reader::infer_json_schema_from_iterator`]).
+    /// Tantivy [`FieldType`]s are less specific than [`arrow::datatypes::DataType`], so source-schema type hints preserve the original Arrow types.
     /// For columns present, use the associated [`arrow::datatypes::Field`].
     type_hints: HashMap<String, Arc<arrow::datatypes::Field>>,
 }
@@ -263,7 +262,7 @@ impl FullTextSearchFieldIndex {
         Ok(fts)
     }
 
-    ///  Schema is based on the [`tantivy::schema::Schema`] with `self.type_hints` applied.
+    /// Schema is based on the [`tantivy::schema::Schema`] with `self.type_hints` applied.
     /// Field order follows the underlying tantivy schema (not the `HashSet` cache).
     fn schema(&self) -> Arc<Schema> {
         let search_schema = self.reader.schema();
@@ -282,6 +281,32 @@ impl FullTextSearchFieldIndex {
                 Some(Field::new(field_name, data_type, nullable))
             })
             .collect::<Vec<_>>();
+
+        Arc::new(Schema::new(fields))
+    }
+
+    /// Schema for every result page produced by [`Self::search`].
+    ///
+    /// Tantivy omits absent stored values from a document's JSON. Supplying this
+    /// fixed schema to the JSON decoder makes those absent nullable values Arrow
+    /// nulls instead of removing their columns from a result page.
+    fn result_schema(&self) -> Arc<Schema> {
+        let schema = self.schema();
+        let mut fields = schema.fields().iter().cloned().collect::<Vec<_>>();
+
+        if let Some((_, value_field)) = schema.column_with_name(self.field.as_str()) {
+            fields.push(Arc::new(Field::new(
+                SEARCH_VALUE_COLUMN_NAME,
+                value_field.data_type().clone(),
+                value_field.is_nullable(),
+            )));
+        }
+
+        fields.push(Arc::new(Field::new(
+            SEARCH_SCORE_COLUMN_NAME,
+            arrow::datatypes::DataType::Float64,
+            false,
+        )));
 
         Arc::new(Schema::new(fields))
     }
@@ -324,7 +349,7 @@ impl FullTextSearchFieldIndex {
         )
     }
 
-    pub async fn search(
+    pub fn search(
         &self,
         query: String,
         opt_filters: &[&Expr],
@@ -334,16 +359,7 @@ impl FullTextSearchFieldIndex {
             return Err(Error::UnsupportedFiltersError).context(GenerationTextSearchSnafu)?;
         }
         let strm = make_stream(self.clone(), query, limit);
-        let mut strm = Box::pin(strm.peekable());
-        let schema = match strm.as_mut().peek().await {
-            None => Arc::new(Schema::empty()),
-            Some(Ok(rb)) => rb.schema(),
-            Some(Err(e)) => {
-                return Err(GenerationError::internal(
-                    format!("Failed to parse schema of full text search results: {e}").as_str(),
-                ));
-            }
-        };
+        let schema = self.result_schema();
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, strm)) as SendableRecordBatchStream)
     }
@@ -413,27 +429,7 @@ impl FullTextSearchFieldIndex {
         &self,
         hits: &[Value],
     ) -> std::result::Result<Decoder, ArrowError> {
-        let schema = Arc::new(arrow_json::reader::infer_json_schema_from_iterator(
-            hits.iter().map(Ok),
-        )?);
-
-        let schema = Arc::new(Schema::new(
-            schema
-                .fields()
-                .into_iter()
-                .map(|f| {
-                    // Use [`Self::type_hints`].
-                    if let Some(new_field) = self.type_hints.get(f.name()) {
-                        new_field
-                    } else {
-                        f
-                    }
-                })
-                .cloned()
-                .collect::<Vec<_>>(),
-        ));
-
-        let mut decoder = arrow_json::ReaderBuilder::new(Arc::clone(&schema)).build_decoder()?;
+        let mut decoder = arrow_json::ReaderBuilder::new(self.result_schema()).build_decoder()?;
 
         decoder.serialize(hits)?;
 
