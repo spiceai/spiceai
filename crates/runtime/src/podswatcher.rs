@@ -113,6 +113,7 @@ fn watch_root(watcher: &mut notify::RecommendedWatcher, root_path: &Path) -> not
         return Err(err);
     }
 
+    unwatch_partial_registration(watcher, root_path)?;
     watcher.watch(root_path, RecursiveMode::NonRecursive)?;
 
     tracing::warn!(
@@ -121,6 +122,34 @@ fn watch_root(watcher: &mut notify::RecommendedWatcher, root_path: &Path) -> not
     );
 
     Ok(())
+}
+
+/// Drop whatever the failed recursive registration left behind, so the fallback starts from
+/// nothing.
+///
+/// A recursive `watch` is not atomic. `notify`'s inotify backend walks the tree and registers a
+/// watch per directory as it goes, propagating the first failure without unwinding, so every
+/// directory it reached before the error is still registered — with the kernel as well as in the
+/// backend's own map. Re-watching `root_path` non-recursively would only rewrite the root's
+/// entry, leaving those descendants in place: the `MaxFilesWatch` fallback would sit at the
+/// watch limit it was supposed to retreat from, and the permission-denied fallback would be a
+/// partially recursive watcher whose coverage nobody can predict — while the warning below says
+/// the directories underneath are not watched.
+///
+/// Unwatching the root is enough to clear them, because the backend recorded that entry as
+/// recursive and so removes every watch beneath it too. `WatchNotFound` is the expected answer
+/// when the walk failed on `root_path` itself, and on the backends that register a subtree in
+/// one operation and so leave nothing partial behind; neither is an error here. Anything else is
+/// the watcher refusing to give a registration back, which the fallback cannot paper over.
+fn unwatch_partial_registration(
+    watcher: &mut notify::RecommendedWatcher,
+    root_path: &Path,
+) -> notify::Result<()> {
+    match watcher.unwatch(root_path) {
+        Ok(()) => Ok(()),
+        Err(err) if matches!(err.kind, notify::ErrorKind::WatchNotFound) => Ok(()),
+        Err(err) => Err(err),
+    }
 }
 
 /// Whether `err` reports that the subtree below the watched directory could not be walked,
@@ -464,6 +493,45 @@ mod tests {
             Some(root_path.clone()),
             "a spicepod edit must still be reported after an unreadable neighbour is skipped"
         );
+    }
+
+    /// The fallback narrows the watch to `root_path`, which only means anything if the
+    /// registrations the failed recursive walk left behind are gone first — otherwise
+    /// `MaxFilesWatch` retreats to the limit it just hit, and the warning's claim that the
+    /// directories below are unwatched is false.
+    ///
+    /// Asserted by removing a registration that is known to exist and then removing it again:
+    /// the second call can only be `WatchNotFound`, so a version of this that quietly skipped
+    /// the `unwatch` would leave the registration in place and fail here.
+    #[test]
+    fn clearing_a_partial_registration_removes_it_and_tolerates_its_absence() {
+        let root = tempfile::tempdir().expect("failed to create temp dir");
+        std::fs::create_dir(root.path().join("nested")).expect("failed to create nested directory");
+
+        let mut watcher = notify::recommended_watcher(|_: notify::Result<notify::Event>| {})
+            .expect("failed to construct a platform watcher");
+        watcher
+            .watch(root.path(), RecursiveMode::Recursive)
+            .expect("failed to register the watch this test then clears");
+
+        unwatch_partial_registration(&mut watcher, root.path())
+            .expect("clearing a registered watch must succeed");
+        unwatch_partial_registration(&mut watcher, root.path())
+            .expect("clearing an already-cleared watch must be tolerated, not an error");
+    }
+
+    /// A walk that failed on `root_path` itself registered nothing, and the backends that
+    /// register a subtree in one operation leave nothing partial behind either. Neither is a
+    /// reason to refuse the fallback.
+    #[test]
+    fn clearing_a_registration_that_was_never_made_is_not_an_error() {
+        let root = tempfile::tempdir().expect("failed to create temp dir");
+
+        let mut watcher = notify::recommended_watcher(|_: notify::Result<notify::Event>| {})
+            .expect("failed to construct a platform watcher");
+
+        unwatch_partial_registration(&mut watcher, root.path())
+            .expect("an unwatched path must not stop the fallback");
     }
 
     #[test]
