@@ -121,8 +121,8 @@ struct BackendOutput {
     format: OutputFormat,
     /// Extracted content.
     content: String,
-    /// Wall-clock parse duration in milliseconds.
-    duration_ms: u128,
+    /// Wall-clock parse duration in milliseconds (fractional, ~µs resolution).
+    duration_ms: f64,
     /// A note to surface to the user (e.g. a format fallback), if any.
     note: Option<String>,
 }
@@ -183,7 +183,7 @@ async fn run_liteparse(raw: &[u8], format: OutputFormat) -> Result<BackendOutput
     let start = Instant::now();
     let doc = parser.parse(&bytes).await.context(LiteparseSnafu)?;
     let content = doc.as_flat_utf8().context(LiteparseTextSnafu)?;
-    let duration_ms = start.elapsed().as_millis();
+    let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
 
     Ok(BackendOutput {
         label: "liteparse (PDFium)",
@@ -224,7 +224,7 @@ fn run_pdf_inspector(path: &Path, format: OutputFormat) -> Result<BackendOutput>
             }
         }
     };
-    let duration_ms = start.elapsed().as_millis();
+    let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
 
     Ok(BackendOutput {
         label: "pdf-inspector (pure Rust)",
@@ -243,7 +243,7 @@ fn report(output: &BackendOutput, out_dir: Option<&Path>) -> Result<()> {
 
     println!("===== {} [{}] =====", output.label, format_name(output.format));
     println!(
-        "summary: {chars} chars, {lines} lines, parsed in {} ms",
+        "summary: {chars} chars, {lines} lines, parsed in {:.3} ms",
         output.duration_ms
     );
     if let Some(note) = &output.note {
