@@ -7225,9 +7225,16 @@ impl CayenneTableProvider {
         // supersedes) hide rows the persisted counts still include, so they must
         // ALSO demote the stats to the inexact variant until the checkpoint
         // publishes them into the durable deletion index.
+        // Those first three terms are proxies for "rows exist that the
+        // persisted count does not describe yet", and a checkpoint clears all
+        // of them at once. It does not drain post-write maintenance, though, so
+        // a commit whose `live_rows_delta` is still queued survives every proxy
+        // and would be served `Exact`-and-short. The fourth term reads that
+        // queue directly, which no checkpoint can clear out from under it.
         let has_pending_visibility_changes = self.has_pending_deletions()
             || self.inlined_row_count.load(Ordering::Relaxed) > 0
-            || self.mem_tier.any_tombstones();
+            || self.mem_tier.any_tombstones()
+            || self.post_write_maintenance.has_unapplied_live_rows_delta();
 
         let cache = self.table_statistics.read();
         // Serve the Inexact view when either (a) uncheckpointed visibility changes
@@ -14038,6 +14045,14 @@ impl CayenneTableProvider {
             maintenance_state.live_rows_delta = maintenance_state
                 .live_rows_delta
                 .saturating_add(live_rows_delta);
+            if live_rows_delta != 0 {
+                // Take a ticket under the same lock as the delta it accounts
+                // for, so `has_unapplied_live_rows_delta` reports this write
+                // from the moment its rows become visible until the persist
+                // that folds them into `num_rows` lands.
+                maintenance_state.live_rows_delta_ticket =
+                    self.post_write_maintenance.next_live_rows_delta_ticket();
+            }
         }
 
         if self
@@ -14132,14 +14147,22 @@ impl CayenneTableProvider {
             // `COUNT(*)` as `Exact`.
             let delta_is_exact =
                 self.table_metadata.on_conflict.is_none() && !state.retention_requested;
-            self.persist_table_stats(
-                &stats,
-                RowCountUpdate::Delta {
-                    delta: state.live_rows_delta,
-                    exact: delta_is_exact,
-                },
-            )
-            .await;
+            let persisted = self
+                .persist_table_stats(
+                    &stats,
+                    RowCountUpdate::Delta {
+                        delta: state.live_rows_delta,
+                        exact: delta_is_exact,
+                    },
+                )
+                .await;
+            if persisted {
+                // Only now does the persisted count describe these rows. Until
+                // this point the exactness gate must serve `Inexact`, because
+                // the rows have been visible to scans since their commit.
+                self.post_write_maintenance
+                    .publish_applied_live_rows_delta(state.live_rows_delta_ticket);
+            }
         }
 
         let mut retention_deleted = 0_u64;
@@ -19945,14 +19968,18 @@ impl CayenneTableProvider {
     ///
     /// Best-effort: logs a warning and continues if stats persistence fails,
     /// since stats are an optimization and not critical for correctness.
+    /// Returns whether `num_rows_update` was actually folded into the persisted
+    /// aggregate. A `false` return means the count still describes the state
+    /// before this update, and any caller tracking count freshness must keep
+    /// treating the update as outstanding.
     pub(crate) async fn persist_table_stats(
         &self,
         accumulator: &ColumnStatsAccumulator,
         num_rows_update: RowCountUpdate,
-    ) {
+    ) -> bool {
         let _stats_persistence_guard = self.table_statistics_persistence_lock.lock().await;
         self.persist_table_stats_locked(accumulator, num_rows_update, false)
-            .await;
+            .await
     }
 
     /// Replace the aggregate entirely with the overwrite's accumulator and reset
@@ -19992,15 +20019,19 @@ impl CayenneTableProvider {
     /// merges this write into it. `num_rows_update` sets the live count relative
     /// to the previous aggregate (`Delta`), to an authoritative value (`Set`), or
     /// leaves it (`Unchanged`).
+    /// Returns whether the update reached the metastore and the cache. Both
+    /// bail-outs below abandon `num_rows_update` while leaving `count_exact`
+    /// as it was, so a caller that folds the failure into "the count is current"
+    /// would serve a drifted count as `Exact`.
     async fn persist_table_stats_locked(
         &self,
         accumulator: &ColumnStatsAccumulator,
         num_rows_update: RowCountUpdate,
         replace_aggregate: bool,
-    ) {
+    ) -> bool {
         let Some((new_blob, _new_rows)) = accumulator.to_file_statistics_blob_with_row_count()
         else {
-            return;
+            return false;
         };
         let new_ndv = accumulator.to_ndv_sketches();
 
@@ -20090,7 +20121,7 @@ impl CayenneTableProvider {
                 "Failed to persist table stats for {}: {e}",
                 self.table_metadata.table_name
             );
-            return;
+            return false;
         }
 
         let df_stats = Self::table_statistics_to_df(&self.table_schema(), &stats);
@@ -20103,6 +20134,7 @@ impl CayenneTableProvider {
         cache.count_exact = stats.num_rows_exact;
         // Keep the raw blob for the next persist to avoid a catalog read.
         cache.raw = Some(stats);
+        true
     }
 
     /// Write small batches directly to the metastore, optionally atomically
@@ -41341,6 +41373,113 @@ mod tests {
                  checkpoint `Delta` did not net durable supersedes",
             );
         }
+    }
+
+    /// The maintained count must never be served `Exact` while a live-row delta
+    /// is still queued: `optimizer_table_statistics()` is what
+    /// `local_executor_table_statistics` reports to the coordinator, and the
+    /// coordinator folds `COUNT(*)` on it precisely when it is `Exact`. A
+    /// commit publishes its rows at once but hands the matching `num_rows`
+    /// delta to the debounced maintenance task, so the two are apart for a
+    /// window.
+    ///
+    /// Exactness is decided from proxies for "rows the persisted count does not
+    /// describe yet" — pending deletions, resident inline rows, mem-tier
+    /// tombstones — and a checkpoint clears all of them at once without
+    /// draining that queue. The queue is therefore consulted directly; without
+    /// it a reader landing after such a checkpoint folds `COUNT(*)` on a count
+    /// short by the undrained delta, with nothing to mark it stale.
+    ///
+    /// Queueing a delta with no accumulator behind it keeps the window open for
+    /// the whole test rather than racing the 100 ms debounce: the drain has
+    /// nothing to persist, so the delta is never applied and the assertion
+    /// holds however the background task happens to be scheduled.
+    #[tokio::test]
+    async fn queued_live_rows_delta_is_never_served_exact() {
+        const ROWS: i64 = 9;
+        const QUEUED_DELTA: i64 = 2;
+
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) =
+            create_append_only_table("queued_delta_exactness", ctx.runtime_env()).await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        insert_batch(
+            &provider,
+            id_value_batch_for_range(Arc::clone(&schema), 0, ROWS),
+        )
+        .await;
+        provider
+            .flush_pending_maintenance()
+            .await
+            .expect("drain post-write maintenance");
+
+        // Baseline: an append-only table whose maintenance has drained has no
+        // pending visibility changes, so the count is served Exact and the
+        // distributed fold engages.
+        let stats = provider
+            .optimizer_table_statistics()
+            .expect("maintained stats present after append");
+        assert_eq!(
+            stats.num_rows,
+            DFPrecision::Exact(usize::try_from(ROWS).expect("row count fits usize")),
+            "a drained append-only table must serve its maintained count Exact",
+        );
+
+        // A commit makes two more rows live and queues their delta for a
+        // maintenance pass that does not apply it.
+        provider.schedule_post_write_maintenance(None, false, false, QUEUED_DELTA);
+
+        let stats = provider
+            .optimizer_table_statistics()
+            .expect("maintained stats present while a delta is queued");
+        assert!(
+            matches!(stats.num_rows, DFPrecision::Inexact(_)),
+            "a queued-but-unapplied live-row delta must demote the maintained count to \
+             Inexact so the distributed COUNT(*) fold declines and a real scan answers, \
+             got {:?}",
+            stats.num_rows,
+        );
+    }
+
+    /// The counterpart to `queued_live_rows_delta_is_never_served_exact`: once
+    /// maintenance applies the delta the signal has to clear, or every table
+    /// would be stranded on `Inexact` and the distributed `COUNT(*)` fold would
+    /// never engage again.
+    #[tokio::test]
+    async fn a_drained_live_rows_delta_restores_exact_statistics() {
+        const FIRST: i64 = 9;
+        const SECOND: i64 = 2;
+
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) =
+            create_append_only_table("drained_delta_exactness", ctx.runtime_env()).await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        insert_batch(
+            &provider,
+            id_value_batch_for_range(Arc::clone(&schema), 0, FIRST),
+        )
+        .await;
+        insert_batch(
+            &provider,
+            id_value_batch_for_range(Arc::clone(&schema), FIRST, SECOND),
+        )
+        .await;
+        provider
+            .flush_pending_maintenance()
+            .await
+            .expect("drain post-write maintenance");
+
+        let stats = provider
+            .optimizer_table_statistics()
+            .expect("maintained stats present after appends");
+        assert_eq!(
+            stats.num_rows,
+            DFPrecision::Exact(usize::try_from(FIRST + SECOND).expect("row count fits usize")),
+            "every queued delta has been applied, so the maintained count must be served \
+             Exact at the live row count",
+        );
     }
 
     /// A RAM-tier CDC append must NOT invalidate the inline-view cache: it
