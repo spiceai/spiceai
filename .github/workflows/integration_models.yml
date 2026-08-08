@@ -37,6 +37,11 @@ env:
   AI_INTEGRATION_TEST_ARCHIVE_S3_URI: s3://build/test_binaries/${{ github.run_id }}/ai-integration-test-archive/integration.tar.zst
   AI_INTEGRATION_EXTENDED_TEST_ARCHIVE_S3_URI: s3://build/test_binaries/${{ github.run_id }}/ai-integration-test-archive-extended/integration-extended.tar.zst
 
+# The spiceio setup action exports AWS_ENDPOINT_URL (alongside SCCACHE_ENDPOINT) so that sccache
+# and the AWS CLI reach the local cache. The build jobs need it. The test jobs must not hand it to
+# spiced: it honours AWS_ENDPOINT_URL for every s3:// dataset and for the S3 Vectors API, so the
+# public fixtures these tests load resolve to the build cache instead of AWS and never become
+# ready. Every step below that runs the test binary drops it first.
 jobs:
   build:
     name: Build Test Binary (macOS)
@@ -213,6 +218,7 @@ jobs:
           INSTA_UPDATE: ${{ github.event_name == 'schedule' && 'always' || github.event.inputs.update_snapshots }}
           SPICE_SECRET_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
         run: |
+          unset AWS_ENDPOINT_URL # spiced must not use the build cache's S3 endpoint
           if [ -z "${SPICE_SECRET_OPENAI_API_KEY:-}" ]; then
             echo "ERROR: SPICE_SECRET_OPENAI_API_KEY is required but not set"
             exit 1
@@ -225,6 +231,7 @@ jobs:
           INSTA_UPDATE: ${{ github.event_name == 'schedule' && 'always' || github.event.inputs.update_snapshots }}
           SPICE_SECRET_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
         run: |
+          unset AWS_ENDPOINT_URL # spiced must not use the build cache's S3 endpoint
           if [ -z "${SPICE_SECRET_OPENAI_API_KEY:-}" ]; then
             echo "ERROR: SPICE_SECRET_OPENAI_API_KEY is required but not set"
             exit 1
@@ -239,6 +246,7 @@ jobs:
           SPICE_SECRET_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
           SPICE_SECRET_ANTHROPIC_API_KEY: ${{ secrets.SPICE_SECRET_ANTHROPIC_API_KEY }}
         run: |
+          unset AWS_ENDPOINT_URL # spiced must not use the build cache's S3 endpoint
           if [ -z "${SPICE_SECRET_OPENAI_API_KEY:-}" ]; then
             echo "ERROR: SPICE_SECRET_OPENAI_API_KEY is required but not set"
             exit 1
@@ -257,6 +265,7 @@ jobs:
           SPICE_SECRET_ANTHROPIC_API_KEY: ${{ secrets.SPICE_SECRET_ANTHROPIC_API_KEY }}
           SPICE_SECRET_XAI_API_KEY: ${{ secrets.SPICE_SECRET_XAI_API_KEY }}
         run: |
+          unset AWS_ENDPOINT_URL # spiced must not use the build cache's S3 endpoint
           if [ -z "${SPICE_SECRET_OPENAI_API_KEY:-}" ]; then
             echo "ERROR: SPICE_SECRET_OPENAI_API_KEY is required but not set"
             exit 1
@@ -280,6 +289,7 @@ jobs:
           SPICE_SECRET_ANTHROPIC_API_KEY: ${{ secrets.SPICE_SECRET_ANTHROPIC_API_KEY }}
           SPICE_SECRET_XAI_API_KEY: ${{ secrets.SPICE_SECRET_XAI_API_KEY }}
         run: |
+          unset AWS_ENDPOINT_URL # spiced must not use the build cache's S3 endpoint
           if [ -z "${SPICE_SECRET_OPENAI_API_KEY:-}" ]; then
             echo "ERROR: SPICE_SECRET_OPENAI_API_KEY is required but not set"
             exit 1
@@ -291,6 +301,7 @@ jobs:
         env:
           INSTA_UPDATE: ${{ github.event_name == 'schedule' && 'always' || github.event.inputs.update_snapshots }}
         run: |
+          unset AWS_ENDPOINT_URL # spiced must not use the build cache's S3 endpoint
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- local_embeddings_beta_requirements
 
       - name: Run AI UDF with local model test
@@ -299,6 +310,7 @@ jobs:
           INSTA_UPDATE: ${{ github.event_name == 'schedule' && 'always' || github.event.inputs.update_snapshots }}
           SPICE_HF_TOKEN: ${{ secrets.SPICE_SECRET_HF_TOKEN }}
         run: |
+          unset AWS_ENDPOINT_URL # spiced must not use the build cache's S3 endpoint
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- test_ai_udf_with_local_model
 
       # Workers tests
@@ -308,6 +320,7 @@ jobs:
           INSTA_UPDATE: ${{ github.event_name == 'schedule' && 'always' || github.event.inputs.update_snapshots }}
           SPICE_SECRET_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
         run: |
+          unset AWS_ENDPOINT_URL # spiced must not use the build cache's S3 endpoint
           if [ -z "${SPICE_SECRET_OPENAI_API_KEY:-}" ]; then
             echo "ERROR: SPICE_SECRET_OPENAI_API_KEY is required but not set"
             exit 1
@@ -323,6 +336,7 @@ jobs:
           AWS_S3_VECTORS_KEY: ${{ secrets.AWS_S3_VECTORS_KEY }}
           AWS_S3_VECTORS_SECRET: ${{ secrets.AWS_S3_VECTORS_SECRET }}
         run: |
+          unset AWS_ENDPOINT_URL # spiced must not use the build cache's S3 endpoint
           if [ -z "${SPICE_SECRET_OPENAI_API_KEY:-}" ]; then
             echo "ERROR: SPICE_SECRET_OPENAI_API_KEY is required but not set"
             exit 1
@@ -393,6 +407,7 @@ jobs:
           INSTA_UPDATE: ${{ github.event_name == 'schedule' && 'always' || github.event.inputs.update_snapshots }}
           SPICE_HF_TOKEN: ${{ secrets.SPICE_SECRET_HF_TOKEN }}
         run: |
+          unset AWS_ENDPOINT_URL # spiced must not use the build cache's S3 endpoint
           if [ -z "${SPICE_HF_TOKEN:-}" ]; then
             echo "ERROR: SPICE_SECRET_HF_TOKEN is required but not set"
             exit 1
@@ -405,6 +420,7 @@ jobs:
           INSTA_UPDATE: ${{ github.event_name == 'schedule' && 'always' || github.event.inputs.update_snapshots }}
           SPICE_HF_TOKEN: ${{ secrets.SPICE_SECRET_HF_TOKEN }}
         run: |
+          unset AWS_ENDPOINT_URL # spiced must not use the build cache's S3 endpoint
           if [ -z "${SPICE_HF_TOKEN:-}" ]; then
             echo "ERROR: SPICE_SECRET_HF_TOKEN is required but not set"
             exit 1
@@ -474,6 +490,7 @@ jobs:
           AWS_BEDROCK_KEY: ${{ secrets.AWS_BEDROCK_KEY }}
           AWS_BEDROCK_SECRET: ${{ secrets.AWS_BEDROCK_SECRET }}
         run: |
+          unset AWS_ENDPOINT_URL # spiced must not use the build cache's S3 endpoint
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- bedrock_test
 
       - name: Push snapshots to branch
