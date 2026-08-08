@@ -148,6 +148,21 @@ result="$(env bash -c 'source "$1"; is_cargo_target_dir "$2"' _ "$subject" "$tmp
 pass_or_fail "rejects a CACHEDIR.TAG some other tool wrote" \
   "$([[ "$result" == *"rc=1" ]] && echo 1 || echo 0)" "got: $result"
 
+# The realistic collision, and the one the wrong-signature case above does not
+# reach: the signature is the Cache Directory Tagging Specification's, not
+# cargo's, so every tool implementing the spec writes that exact first line.
+# Discovery walks the whole work root, so accepting on the signature alone hands
+# a `restic` or `borg` cache to a prune justified by cargo's rebuild semantics.
+mkdir -p "$tmp/other-tool-cache"
+printf '%s\n' \
+  'Signature: 8a477f597d28d172789f06886806bc55' \
+  '# This file is a cache directory tag automatically created by restic.' \
+  >"$tmp/other-tool-cache/CACHEDIR.TAG"
+
+result="$(env bash -c 'source "$1"; is_cargo_target_dir "$2"' _ "$subject" "$tmp/other-tool-cache" 2>&1; echo "rc=$?")"
+pass_or_fail "rejects another tool's cache carrying the same spec signature" \
+  "$([[ "$result" == *"rc=1" ]] && echo 1 || echo 0)" "got: $result"
+
 echo "workspace_is_stale"
 
 mkdir -p "$tmp/stale-ws/repo/src"
@@ -207,6 +222,22 @@ env "RUNNER_TEMP=$root/_temp" bash -c 'source "$1"; reclaim_temp "$2" "$3"' _ "$
 pass_or_fail "still sweeps when RUNNER_TEMP names the whole _temp directory" \
   "$([[ ! -e "$root/_temp/from-a-dead-job" ]] && echo 1 || echo 0)" \
   "the sweep spared everything because RUNNER_TEMP is _temp itself"
+
+# A directory's own mtime moves when an entry is added to or removed from it,
+# not when a file already inside it is rewritten -- so scratch whose structure
+# last changed a month ago, holding a file this job just overwrote, matches the
+# `+days` walk and would be removed recursively. On the stock layout the name
+# check cannot fire, so nothing else stands in the way.
+mkdir -p "$root/_temp/old-dir-live-file"
+touch "$root/_temp/old-dir-live-file/in-use.sock"
+age_tree "$root/_temp/old-dir-live-file" 30
+touch "$root/_temp/old-dir-live-file/in-use.sock"   # rewritten by the running job
+age_path "$root/_temp/old-dir-live-file" 30         # the directory itself stays old
+
+env "RUNNER_TEMP=$root/_temp" bash -c 'source "$1"; reclaim_temp "$2" "$3"' _ "$subject" "$root" 7 >/dev/null 2>&1
+pass_or_fail "keeps old scratch holding a file the running job rewrote" \
+  "$([[ -e "$root/_temp/old-dir-live-file/in-use.sock" ]] && echo 1 || echo 0)" \
+  "an in-use file was deleted because only the directory's own mtime was checked"
 
 echo "reclaim_workspaces"
 

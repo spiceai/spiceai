@@ -79,6 +79,18 @@ readonly EXIT_USAGE=64
 # directory that merely happens to be called `target` -- does not arise.
 readonly CACHEDIR_SIGNATURE='Signature: 8a477f597d28d172789f06886806bc55'
 
+# The producer line cargo writes beneath the signature. Required as well,
+# because the signature alone is the *specification's* marker rather than
+# cargo's: it is a fixed string every tool implementing the spec writes, so
+# `restic`, `borg` and others tag their caches with the identical first line.
+# Discovery walks the whole work root, so matching the signature alone would
+# hand any of their caches to a prune whose safety argument -- that a rebuild
+# is the worst case -- is an argument about cargo and holds for nothing else.
+#
+# Failing this match is the safe direction: a cargo that reworded its tag would
+# leave build output unswept, which is the condition the host was already in.
+readonly CARGO_PRODUCER_LINE='# This file is a cache directory tag created by cargo.'
+
 info() { printf '%s\n' "$*" >&2; }
 
 # Report rather than remove. Set by --dry-run; defaulted here so the unit tests,
@@ -107,11 +119,14 @@ work_root_from_env() {
 }
 
 # True when the directory is a cargo target directory, by its own CACHEDIR.TAG.
+# Both lines are required: the signature says the directory is a cache, and the
+# producer line says whose. Only the second one narrows this to cargo.
 is_cargo_target_dir() {
   local dir="$1"
   local tag="$dir/CACHEDIR.TAG"
   [[ -d "$dir" && -f "$tag" ]] || return 1
-  grep -qF "$CACHEDIR_SIGNATURE" "$tag" 2>/dev/null
+  grep -qF "$CACHEDIR_SIGNATURE" "$tag" 2>/dev/null || return 1
+  grep -qF "$CARGO_PRODUCER_LINE" "$tag" 2>/dev/null
 }
 
 # The workspace this job is running out of, which must survive the sweep
@@ -161,6 +176,34 @@ workspace_is_stale() {
   [[ -z "$recent" ]]
 }
 
+# True when nothing anywhere beneath "$1" has been modified within "$2" days.
+#
+# `-mtime` on an entry answers for that entry alone, and a directory's own mtime
+# moves only when something is added to or removed from it -- not when a file
+# already inside it is rewritten. So scratch last restructured a fortnight ago,
+# holding a file the running job overwrote a minute ago, still presents as old.
+# `reclaim_temp` selects by the entry's own mtime and then deletes recursively,
+# so without this the live-scratch exclusion its comments promise does not hold
+# on the stock layout, where the name check cannot fire.
+#
+# Unbounded depth, unlike `workspace_is_stale`: that one can stop at the level a
+# checkout is guaranteed to rewrite, whereas job scratch has no such layer and
+# is small enough to walk whole.
+tree_is_stale() {
+  local dir="$1" days="$2" recent rc
+  [[ -e "$dir" ]] || return 1
+
+  recent=$(find "$dir" -mtime "-${days}" -print 2>/dev/null)
+  rc=$?
+
+  # Fail closed, for the reason `workspace_is_stale` does: a walk that errored
+  # prints nothing, which is byte-for-byte what "nothing here is recent" looks
+  # like, and the caller deletes on that answer.
+  (( rc == 0 )) || return 1
+
+  [[ -z "$recent" ]]
+}
+
 # Remove "$1", or report it under --dry-run. Prints one line either way so the
 # run log names everything the sweep touched.
 remove_path() {
@@ -190,14 +233,20 @@ reclaim_temp() {
   while IFS= read -r entry; do
     [[ -n "$entry" ]] || continue
     # Whatever this job is using, whatever its age. On stock Actions RUNNER_TEMP
-    # *is* `_temp`, so no entry beneath it can equal it and the age filter is
-    # what actually protects the running job -- its files were written minutes
-    # ago. The name check covers the other layout, where RUNNER_TEMP points at a
-    # per-job directory inside `_temp`: there an idle-then-resumed runner really
-    # can present the live scratch as old, and only this catches it.
+    # *is* `_temp`, so no entry beneath it can equal it and the age rule is what
+    # actually protects the running job. The name check covers the other layout,
+    # where RUNNER_TEMP points at a per-job directory inside `_temp`: there an
+    # idle-then-resumed runner really can present the live scratch as old, and
+    # only this catches it.
     if [[ -n "$live_temp" ]]; then
       [[ "${entry%/}" == "$live_temp" || "$live_temp" == "${entry%/}"/* ]] && continue
     fi
+    # The walk below matched this entry's own mtime, which says nothing about
+    # what is inside it -- and the removal is recursive. On the stock layout,
+    # where the name check above cannot fire, this is the only thing standing
+    # between a file the running job just rewrote and an `rm -rf` of the
+    # directory holding it.
+    tree_is_stale "$entry" "$days" || continue
     remove_path "$entry" "orphaned job scratch"
   done < <(find "$temp_dir" -mindepth 1 -maxdepth 1 -mtime "+${days}" 2>/dev/null)
 }
