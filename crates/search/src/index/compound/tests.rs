@@ -725,6 +725,31 @@ async fn on_write_start_continues_past_a_best_effort_primary_failure() {
     );
 }
 
+/// Both halves failing to start is the only path that reaches the rollback branch with the
+/// primary's window never opened. The write is still abandoned — the secondary declares its own
+/// start failure fatal — but the primary must not be rolled back: a start that failed partway
+/// owns its cleanup, so `on_write_failed` would "restore" settings it never overrode (#12826).
+#[tokio::test]
+async fn on_write_start_does_not_roll_back_a_primary_whose_own_start_failed() {
+    let events = Arc::new(Mutex::new(vec![]));
+    let mut primary = MockIndex::new("primary", &events);
+    primary.fail_on_write_start = true;
+    let mut secondary = MockIndex::new("secondary", &events);
+    secondary.fail_on_write_start = true;
+    secondary.write_start_fatal = true;
+
+    let idx = compound(primary, secondary, CompoundReadMode::PrimaryOnly);
+    idx.on_write_start(WriteWindow::ReplaceAll)
+        .await
+        .expect_err("a fatal secondary start failure must propagate");
+
+    let events = events.lock().expect("event log mutex").clone();
+    assert!(
+        !events.contains(&"primary:on_write_failed".to_string()),
+        "a primary whose own start failed must not be rolled back: {events:?}"
+    );
+}
+
 /// The finalize hook has the same shape as the start hook: a half that declares its own finalize
 /// failure best-effort must not fail the write just because the *other* half declares its own
 /// fatal. Elasticsearch's `_forcemerge` beside a tantivy primary is the live pairing (#12826).

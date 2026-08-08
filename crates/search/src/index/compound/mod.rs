@@ -266,7 +266,7 @@ fn compound_required_columns(
 /// best-effort is logged and the write continues; one that declares it fatal returns the error,
 /// which the compound's [`Index::write_start_failure_is_fatal`] reports as fatal unconditionally.
 ///
-/// Both errors a single combined answer can give are wrong for one of the halves:
+/// Either answer a single combined flag can give is wrong for one of the halves:
 ///
 ///  - Answering "fatal" (a fatal half paired with a best-effort one) abandons the whole write
 ///    when the *best-effort* half's start fails — an Elasticsearch `refresh_interval` override
