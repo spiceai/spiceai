@@ -85,11 +85,53 @@ impl PodsWatcher {
             },
         )?;
 
-        watcher.watch(&self.root_path, RecursiveMode::Recursive)?;
+        watch_root(&mut watcher, &self.root_path)?;
 
         self.watcher = Some(watcher);
 
         Ok(rx)
+    }
+}
+
+/// Watch `root_path` for Spicepod changes, covering the directory alone when its subtree
+/// cannot be walked.
+///
+/// A recursive watch registers every directory beneath `root_path`, which is the working
+/// directory the runtime was started in — not a Spice-owned tree. Anything unreadable under it
+/// (another user's files) or a tree large enough to exhaust the kernel's watch limit fails the
+/// whole registration, and the pods watcher runs as a runtime task whose failure stops the
+/// process. Serving a valid Spicepod must not depend on every unrelated neighbour of it being
+/// readable, so those two environmental failures fall back to watching `root_path` itself,
+/// which is where `spicepod.yaml` lives. Any other failure — including an unreadable
+/// `root_path` — still propagates, because then there is nothing left to watch.
+fn watch_root(watcher: &mut notify::RecommendedWatcher, root_path: &Path) -> notify::Result<()> {
+    let Err(err) = watcher.watch(root_path, RecursiveMode::Recursive) else {
+        return Ok(());
+    };
+
+    if !is_untraversable_subtree(&err) {
+        return Err(err);
+    }
+
+    watcher.watch(root_path, RecursiveMode::NonRecursive)?;
+
+    tracing::warn!(
+        "Watching {} for Spicepod changes, but not the directories below it: {err}. Edits to spicepod.yaml still reload; edits to files it references from subdirectories do not. Run Spice from a directory it can read in full, or raise the system's file-watch limit, to restore them.",
+        root_path.display()
+    );
+
+    Ok(())
+}
+
+/// Whether `err` reports that the subtree below the watched directory could not be walked,
+/// rather than that the directory itself cannot be watched.
+fn is_untraversable_subtree(err: &notify::Error) -> bool {
+    match &err.kind {
+        // A directory beneath the root that this process may not read.
+        notify::ErrorKind::Io(err) => err.kind() == std::io::ErrorKind::PermissionDenied,
+        // More directories beneath the root than the kernel will watch.
+        notify::ErrorKind::MaxFilesWatch => true,
+        _ => false,
     }
 }
 
@@ -308,6 +350,120 @@ mod tests {
 
         assert!(!updated);
         assert_eq!(*watch_paths.read(), current);
+    }
+
+    #[test]
+    fn an_unreadable_directory_in_the_subtree_is_untraversable() {
+        let err = notify::Error::new(notify::ErrorKind::Io(std::io::Error::from(
+            std::io::ErrorKind::PermissionDenied,
+        )));
+
+        assert!(is_untraversable_subtree(&err));
+    }
+
+    #[test]
+    fn exhausting_the_watch_limit_is_untraversable() {
+        let err = notify::Error::new(notify::ErrorKind::MaxFilesWatch);
+
+        assert!(is_untraversable_subtree(&err));
+    }
+
+    /// The fallback narrows what is watched, so it must not stand in for a root that cannot be
+    /// watched at all — there is nothing left to degrade to.
+    #[test]
+    fn a_missing_or_unreadable_root_is_not_untraversable() {
+        for kind in [
+            notify::ErrorKind::PathNotFound,
+            notify::ErrorKind::Io(std::io::Error::from(std::io::ErrorKind::NotFound)),
+            notify::ErrorKind::Generic("something else".to_string()),
+        ] {
+            let err = notify::Error::new(kind);
+
+            assert!(
+                !is_untraversable_subtree(&err),
+                "{err:?} must propagate rather than fall back"
+            );
+        }
+    }
+
+    /// A root that does not exist has to keep failing: the fallback watch is on the same path,
+    /// so swallowing this would leave a watcher that reports nothing, forever.
+    #[tokio::test]
+    async fn a_root_that_does_not_exist_still_fails() {
+        let root = tempfile::tempdir().expect("failed to create temp dir");
+        let missing = root.path().join("no-such-directory");
+
+        let err = PodsWatcher::new(&missing)
+            .watch()
+            .await
+            .expect_err("watching a non-existent directory must fail");
+
+        assert!(
+            !is_untraversable_subtree(&err),
+            "a missing root must not be treated as a walkable-subtree failure: {err:?}"
+        );
+    }
+
+    /// The reported bug: Spice started in a directory that merely *contains* something the
+    /// process cannot read (`~` with another application's files under it) exited, because the
+    /// recursive registration failed and the pods watcher is a runtime task.
+    ///
+    /// On Linux the recursive walk is what fails, so this exercises the fallback directly. On
+    /// macOS `FSEvents` does not walk the tree, so the recursive watch succeeds and this asserts
+    /// the same end state by the ordinary path — either way an unreadable neighbour must not
+    /// stop the watcher, and edits to `spicepod.yaml` must still arrive.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unreadable_neighbour_directory_does_not_stop_the_watcher() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().expect("failed to create temp dir");
+        // The watcher matches event paths against the paths it was given, and the platform
+        // backend reports resolved ones — on macOS the temp dir is `/var/…`, a symlink to
+        // `/private/var/…`, so an unresolved root would match nothing and time out below.
+        let root_path = root
+            .path()
+            .canonicalize()
+            .expect("failed to resolve temp dir");
+
+        let spicepod = root_path.join("spicepod.yaml");
+        std::fs::write(&spicepod, "version: v1\nkind: Spicepod\nname: test\n")
+            .expect("failed to write spicepod");
+
+        let locked = root_path.join("unreadable");
+        std::fs::create_dir(&locked).expect("failed to create directory");
+        std::fs::create_dir(locked.join("nested")).expect("failed to create nested directory");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000))
+            .expect("failed to drop permissions");
+
+        // Root ignores the mode bits, which would make the fixture a no-op and the assertions
+        // below vacuous.
+        if std::fs::read_dir(&locked).is_ok() {
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755))
+                .expect("failed to restore permissions");
+            return;
+        }
+
+        let mut watcher = PodsWatcher::new(&root_path);
+        let mut rx = watcher
+            .watch()
+            .await
+            .expect("an unreadable neighbour must not stop the pods watcher");
+
+        std::fs::write(&spicepod, "version: v1\nkind: Spicepod\nname: changed\n")
+            .expect("failed to modify spicepod");
+
+        let changed = tokio::time::timeout(std::time::Duration::from_secs(30), rx.recv()).await;
+
+        // Restore before asserting so a failure still leaves the tree removable.
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755))
+            .expect("failed to restore permissions");
+
+        assert_eq!(
+            changed.expect("timed out waiting for the spicepod change"),
+            Some(root_path.clone()),
+            "a spicepod edit must still be reported after an unreadable neighbour is skipped"
+        );
     }
 
     #[test]
