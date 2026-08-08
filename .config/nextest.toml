@@ -25,12 +25,12 @@ cayenne-property-tests = { max-threads = 2 }
 # never a silently-recovered flake.
 #
 # `slow-timeout` here raises only the WALL-CLOCK ceiling, from the global 360s
-# (120s x 3) to 960s (120s x 8). `retries = 0` is deliberately unchanged: an
+# (120s x 3) to 1440s (120s x 12). `retries = 0` is deliberately unchanged: an
 # assertion failure still fails hard on its first occurrence and is never retried
 # into a pass. The two are independent, and only the former carries no
 # correctness signal.
 #
-# Why 960s. The global 360s cap sits inside this family's noise band rather than
+# Why 1440s. The global 360s cap sits inside this family's noise band rather than
 # above it, so it measures pool load instead of the diff under test. The same
 # tests, on a quiet pool (run 30833882620) vs. a pool running six concurrent
 # sign-offs (run 30858006237):
@@ -43,23 +43,29 @@ cayenne-property-tests = { max-threads = 2 }
 #
 # In that contended run `prop_concurrent_mixed_key` PASSED at 356.1s while its
 # matched sibling `prop_concurrent_mixed_position` was killed at 360.015s — a
-# 1.1% margin deciding a merge gate. Merge-queue run 30723487049 is the far end:
-# `prop_concurrent_upsert_only_key` passed at 338.0s against a 92.0s quiet
-# baseline, a 3.7x contention factor, and five tests in this binary were killed
-# at the cap with no assertion failure or panic anywhere in the log.
+# 1.1% margin deciding a merge gate. Sign-off run 31239284344 is the far end:
+# `prop_concurrent_upsert_only_key` passed at 422.1s against a 92.0s quiet
+# baseline — a 4.6x contention factor — while `prop_concurrent_mixed_position`
+# was killed at the cap, with no assertion failure or panic anywhere in the log.
 #
 # So the slowest test here intrinsically needs ~240s and contention has been
-# measured multiplying that by up to 3.7x, while the cap allowed only 1.5x.
-# 960s clears 240s x 3.7 with headroom. A genuine hang is still caught, just at
-# 16 minutes instead of 6.
+# measured multiplying that by up to 4.6x. Sizing the cap to exactly 240s x 4.6
+# would be correct only until the pool got busier by any margin, and each such
+# miss costs a full sign-off cycle and reports a code failure against a diff that
+# cannot reach this crate (#12811) — so the cap carries a further 1.25x, which
+# 1440s clears. That is 6x the slowest baseline here. A genuine hang is still
+# caught, just at 24 minutes instead of 6, and only a hang ever pays for the
+# headroom.
 #
 # This is a ceiling, not a target: if these tests get slower on a QUIET pool,
-# that is a regression to investigate, not a reason to raise this again.
+# that is a regression to investigate, not a reason to raise this again. It is
+# `.github/scripts/check_nextest_config.py` that holds this to the measurements,
+# so re-derive it there — the numbers above are its inputs, not its record.
 [[profile.default.overrides]]
 filter = 'binary(=mutation_property_test) | binary(=cdc_compaction_delete_race_test) | binary(=maintained_aggregate_filter_test)'
 test-group = 'cayenne-property-tests'
 retries = 0
-slow-timeout = { period = "120s", terminate-after = 8 }
+slow-timeout = { period = "120s", terminate-after = 12 }
 
 # The same wall-clock margin, for the long-running cayenne binaries that are NOT
 # in the zero-retry group above. These keep the default retries, so a timeout is
@@ -69,17 +75,25 @@ slow-timeout = { period = "120s", terminate-after = 8 }
 # `partition_chunking_test …timestamp_partition_with_date_part` hit the cap on
 # tries 1-5 and then passed on try 6 at 305.5s.
 #
-# Quiet-pool baselines (run 30833882620) against the 3.7x contention factor
+# A cap that clears contention is what makes that retry budget cheap rather than
+# expensive: the retries are there to absorb a genuine flake, and every one spent
+# on wall clock alone is one the run pays for in full. Sizing this to match the
+# group above means these tests are expected to pass on the first try under the
+# contention measured so far, so the budget is not consumed re-running work that
+# was never going to finish inside a smaller cap.
+#
+# Quiet-pool baselines (run 30833882620) against the 4.6x contention factor
 # measured above: partition_chunking 247.9s, layout_pruning_ab 170.1s,
-# mutation_model 107.1s — all of which exceed 360s once multiplied, so all three
-# sit in the same band as the group above for the same reason.
+# mutation_model 107.1s — the first two of which exceed 960s once multiplied and
+# given the same headroom, so all three sit in the same band as the group above
+# for the same reason.
 #
 # Spelled out as its own block rather than folded into the filter above so that
 # `retries = 0` stays visibly scoped to the three convergence binaries that need
 # it. These binaries must NOT inherit it.
 [[profile.default.overrides]]
 filter = 'binary(=partition_chunking_test) | binary(=layout_pruning_ab_test) | binary(=mutation_model_test)'
-slow-timeout = { period = "120s", terminate-after = 8 }
+slow-timeout = { period = "120s", terminate-after = 12 }
 
 # Same reasoning for the MySQL CDC convergence tests: a retry that passes hides a lost update.
 [[profile.default.overrides]]
