@@ -172,9 +172,10 @@ impl<R: Read + Send> ArrayToNdjson<R> {
                         return Ok(());
                     }
                 }
-                // An I/O failure may still be transient, so only a genuine
-                // parse failure closes the reader for good.
-                self.malformed = e.classify() != Category::Io;
+                // The bytes serde read are gone from the inner reader and a
+                // second attempt would start mid-element, so no failure here
+                // is recoverable — including an I/O one.
+                self.malformed = true;
                 return Err(io::Error::new(io::ErrorKind::InvalidData, e));
             }
             None => {
@@ -194,6 +195,12 @@ impl<R: Read + Send> ArrayToNdjson<R> {
         let committed = committed.min(tee.buf.len());
         let slice = &tee.buf[..committed];
 
+        // The element is held back until its delimiter has been read, so that
+        // a row is only ever published as part of a well-formed `element,` or
+        // `element]`. Handing it to `pending` first would let a caller that
+        // reads on past the error collect it from there.
+        let mut element_out = VecDeque::new();
+
         // If the element is a JSON array (e.g. from SODA `/data`), convert it
         // to a JSON object with positional string keys ("0", "1", …) so that
         // Arrow's JSON reader can handle it (it requires objects, not arrays).
@@ -206,17 +213,17 @@ impl<R: Read + Send> ArrayToNdjson<R> {
                     .map(|(i, v)| (i.to_string(), v))
                     .collect();
                 if let Ok(serialized) = serde_json::to_string(&serde_json::Value::Object(obj)) {
-                    self.pending.extend(serialized.bytes());
-                    self.pending.push_back(b'\n');
+                    element_out.extend(serialized.bytes());
+                    element_out.push_back(b'\n');
                 } else {
-                    filter_element_bytes(slice, &mut self.pending);
+                    filter_element_bytes(slice, &mut element_out);
                 }
             } else {
-                filter_element_bytes(slice, &mut self.pending);
+                filter_element_bytes(slice, &mut element_out);
             }
         } else {
-            // Push the clean element (without internal newlines and carriage returns) plus newline to `pending`.
-            filter_element_bytes(slice, &mut self.pending);
+            // Push the clean element (without internal newlines and carriage returns) plus newline.
+            filter_element_bytes(slice, &mut element_out);
         }
 
         // Discard bytes we no longer need from tee.buf.
@@ -224,28 +231,35 @@ impl<R: Read + Send> ArrayToNdjson<R> {
 
         drop(tee);
 
+        // From here the element's bytes have left the inner reader, so nothing
+        // can be re-read and every failure is final.
+        let next = self.read_delimiter().inspect_err(|_| {
+            self.malformed = true;
+        })?;
+        if next == b']' {
+            self.eof = true;
+        }
+
+        self.pending.append(&mut element_out);
+        Ok(())
+    }
+
+    /// Consume the `,` or `]` that follows an element, and report which it was.
+    fn read_delimiter(&mut self) -> io::Result<u8> {
         let next = self.peek_next_non_ws_byte()?;
         match next {
-            b',' => {
-                self.consume_delimiter()?; // another element coming
-                // println!("Found comma, expecting another element")
-            }
-            b']' => {
+            b',' | b']' => {
                 self.consume_delimiter()?;
-                self.eof = true;
+                Ok(next)
             }
-            _ => {
-                self.malformed = true;
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "expected ',' or ']' but found '{char}'",
-                        char = next as char
-                    ),
-                ));
-            }
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "expected ',' or ']' but found '{char}'",
+                    char = next as char
+                ),
+            )),
         }
-        Ok(())
     }
 
     /// Read (and buffer) bytes until we find the first non-whitespace byte,
@@ -3682,32 +3696,67 @@ mod tests {
             }
         }
 
-        /// Reading an element assumes the tee buffer begins at that element. A
-        /// parse error breaks that, so a caller that keeps reading has to keep
-        /// getting errors rather than a row assembled from the leftovers.
-        #[test]
-        fn a_malformed_array_keeps_failing_instead_of_yielding_a_row() {
+        /// Read past the point where the reader reported a problem, the way a
+        /// consumer that logs an error and carries on would.
+        ///
+        /// Reading an element assumes the tee buffer begins at that element,
+        /// and any failure breaks that: the element's bytes have already left
+        /// the inner reader, so nothing can be re-read from the right place.
+        /// Every read from there on has to keep saying so.
+        fn assert_stays_failed(body: &[u8], reads_before_failure: usize) {
             let mut reader =
-                ArrayToNdjson::try_new(Cursor::new(br"[1,@ 2]".to_vec())).expect("array start");
-
+                ArrayToNdjson::try_new(Cursor::new(body.to_vec())).expect("array start");
             let mut buf = [0u8; 64];
-            let n = reader
-                .read(&mut buf)
-                .expect("the first element is well formed");
-            assert_eq!(&buf[..n], b"1\n");
 
-            // `@` is where the array stops making sense. Every read from here
-            // on has to say so; the ` 2` behind it is not an element.
+            for i in 0..reads_before_failure {
+                let n = reader.read(&mut buf).unwrap_or_else(|e| {
+                    panic!(
+                        "{}: read {i} should succeed: {e}",
+                        String::from_utf8_lossy(body)
+                    )
+                });
+                assert_ne!(
+                    n,
+                    0,
+                    "{}: read {i} ended early",
+                    String::from_utf8_lossy(body)
+                );
+            }
+
             for attempt in 0..3 {
                 match reader.read(&mut buf) {
                     Err(_) => {}
-                    Ok(0) => panic!("attempt {attempt} ended the array instead of reporting it"),
+                    Ok(0) => panic!(
+                        "{}: attempt {attempt} ended the array instead of reporting it",
+                        String::from_utf8_lossy(body)
+                    ),
                     Ok(n) => panic!(
-                        "attempt {attempt} yielded {:?}, which is not in the file",
+                        "{}: attempt {attempt} yielded {:?}, which is not in the file",
+                        String::from_utf8_lossy(body),
                         String::from_utf8_lossy(&buf[..n])
                     ),
                 }
             }
+        }
+
+        #[test]
+        fn a_malformed_array_keeps_failing_instead_of_yielding_a_row() {
+            // `[1,@ 2]` — `1` is a real element, then `@` is where the array
+            // stops making sense and ` 2` behind it is not an element.
+            assert_stays_failed(br"[1,@ 2]", 1);
+        }
+
+        /// An element whose delimiter never arrives is not a row: the reader
+        /// has no way to know it read the whole of it.
+        #[test]
+        fn an_element_with_no_delimiter_is_never_published() {
+            // `1` is followed by a byte that ends nothing, or by nothing at all.
+            for body in [&br"[1x]"[..], &br"[1"[..]] {
+                assert_stays_failed(body, 0);
+            }
+            // `1,` is a whole element, so it is published; `2` runs into the
+            // end of the input and is not.
+            assert_stays_failed(br"[1,2", 1);
         }
 
         /// A body larger than one read buffer drives `fill_pending` many times
