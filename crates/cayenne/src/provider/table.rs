@@ -14046,12 +14046,13 @@ impl CayenneTableProvider {
                 .live_rows_delta
                 .saturating_add(live_rows_delta);
             if live_rows_delta != 0 {
-                // Take a ticket under the same lock as the delta it accounts
-                // for, so `has_unapplied_live_rows_delta` reports this write
-                // from the moment its rows become visible until the persist
-                // that folds them into `num_rows` lands.
-                maintenance_state.live_rows_delta_ticket =
-                    self.post_write_maintenance.next_live_rows_delta_ticket();
+                // Count this delta under the same lock that folds it in, so
+                // `has_unapplied_live_rows_delta` reports this write from the
+                // moment its rows become visible until the persist that folds
+                // them into `num_rows` lands.
+                maintenance_state.live_rows_delta_count =
+                    maintenance_state.live_rows_delta_count.saturating_add(1);
+                self.post_write_maintenance.record_queued_live_rows_delta();
             }
         }
 
@@ -14160,8 +14161,13 @@ impl CayenneTableProvider {
                 // Only now does the persisted count describe these rows. Until
                 // this point the exactness gate must serve `Inexact`, because
                 // the rows have been visible to scans since their commit.
+                //
+                // Retire only what this drain persisted. A drain that lands
+                // here with `persisted == false` abandoned its delta, and
+                // leaving it outstanding is what stops the *next* drain's
+                // success from declaring the count exact over that gap.
                 self.post_write_maintenance
-                    .publish_applied_live_rows_delta(state.live_rows_delta_ticket);
+                    .retire_applied_live_rows_deltas(state.live_rows_delta_count);
             }
         }
 
