@@ -174,33 +174,47 @@ fn inspect_delete_response(resp: &Value, es_index: &str) -> Result<()> {
     // a proxy's envelope — and neither confirms the delete applied. `total` and `deleted` are
     // required for the same reason `failures` is: without them the delete cannot be confirmed,
     // and coercing an absent count to a convenient default would manufacture that confirmation.
-    let unexpected = |field: &'static str| -> Result<()> {
-        UnexpectedDeleteResponseSnafu {
+    //
+    // Each arm reports `shape` rather than the body itself: the body can carry document ids (its
+    // `failures` entries do), and the shape is what distinguishes an async task handle from a
+    // proxy's error envelope.
+    let Some(failures) = resp.get("failures").and_then(Value::as_array) else {
+        return UnexpectedDeleteResponseSnafu {
             index: es_index.to_string(),
-            field,
-            // The body can carry document ids (its `failures` entries do), so it is never
-            // reported — only the shape, which is what distinguishes an async task handle from a
-            // proxy's error envelope.
+            field: "failures",
             shape: write::describe_unexpected_response(resp),
         }
-        .fail()
-    };
-
-    let Some(failures) = resp.get("failures").and_then(Value::as_array) else {
-        return unexpected("failures");
+        .fail();
     };
     let Some(total) = resp.get("total").and_then(Value::as_u64) else {
-        return unexpected("total");
+        return UnexpectedDeleteResponseSnafu {
+            index: es_index.to_string(),
+            field: "total",
+            shape: write::describe_unexpected_response(resp),
+        }
+        .fail();
     };
     let Some(deleted) = resp.get("deleted").and_then(Value::as_u64) else {
-        return unexpected("deleted");
+        return UnexpectedDeleteResponseSnafu {
+            index: es_index.to_string(),
+            field: "deleted",
+            shape: write::describe_unexpected_response(resp),
+        }
+        .fail();
     };
     // Present but not a number is a rewritten body, not a zero — reading it as one would report a
     // conflicted delete as clean.
     let version_conflicts = match resp.get("version_conflicts").map(Value::as_u64) {
         None => 0,
         Some(Some(count)) => count,
-        Some(None) => return unexpected("version_conflicts"),
+        Some(None) => {
+            return UnexpectedDeleteResponseSnafu {
+                index: es_index.to_string(),
+                field: "version_conflicts",
+                shape: write::describe_unexpected_response(resp),
+            }
+            .fail();
+        }
     };
     // Absent means the request did not report a timeout, which is the claim being tested — unlike
     // the counts above, reading it as `false` asserts nothing that the body denies.
