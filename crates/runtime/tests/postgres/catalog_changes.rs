@@ -243,6 +243,31 @@ fn accelerated_pg_catalog(port: usize) -> Catalog {
     catalog
 }
 
+/// A catalog whose acceleration is durable (`mode: file`), so its replication
+/// slot genuinely has resume value across a restart and is kept at shutdown.
+/// The default `mode: memory` catalog re-snapshots on every start, so its slot
+/// is released instead -- see
+/// `test_catalog_acceleration_releases_the_slot_when_the_acceleration_is_not_durable`.
+///
+/// Restricted to one table: on a RESUMING shared slot, the member that joins
+/// second can be registered above changes it has not consumed and skip them
+/// (#12609). With a single member the resume position is the slot's own
+/// `confirmed_flush_lsn`, so what this fixture backs is deterministic.
+fn durable_accelerated_pg_catalog(port: usize, data_dir: &std::path::Path) -> Catalog {
+    let mut catalog = accelerated_pg_catalog(port);
+    catalog.include = vec!["public.orders".to_string()];
+    catalog.acceleration = Some(CatalogAcceleration {
+        engine: CatalogAccelerationEngine::Cayenne,
+        refresh_mode: CatalogRefreshMode::Changes,
+        mode: AccelerationMode::File,
+        params: Some(Params::from_string_map(HashMap::from([(
+            "cayenne_file_path".to_string(),
+            data_dir.to_string_lossy().to_string(),
+        )]))),
+    });
+    catalog
+}
+
 /// Same as [`accelerated_pg_catalog`], but excluding `items` -- validates
 /// what the catalog's startup summary counts as "excluded by include/exclude
 /// filters": the table is never synthesized into a dataset at all, so it's
@@ -1025,13 +1050,78 @@ async fn test_check_cdc_prerequisites_rejects_non_replication_role() -> Result<(
         .await
 }
 
-/// Restart/recovery: the catalog's replication slot name is derived
-/// deterministically from the catalog and is INDEPENDENT of the Spice instance,
-/// so a restart -- even one that would reschedule onto a different host --
-/// recomputes the same name and REUSES the existing slot rather than orphaning
-/// it and creating a second. The slot persists across the shutdown, and a change
-/// made to the source while Spice is down is reflected after it comes back
-/// (#11850; feeds slot-lifecycle #12018).
+/// The mirror of the durable restart case: a catalog left on the default
+/// `mode: memory` re-runs its initial snapshot on every start, so its slot has
+/// no resume value and is released at shutdown rather than left pinning WAL on
+/// the source. Regression for the slot-lifecycle work -- before it, the slot
+/// survived and retained WAL for the whole time Spice was down.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_catalog_acceleration_releases_the_slot_when_the_acceleration_is_not_durable()
+-> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some(
+        "integration=debug,info,runtime::catalogconnector=debug",
+    ));
+
+    test_request_context()
+        .scope(async {
+            let port = common::get_random_port()?;
+            let _container = common::start_postgres_docker_container_with_logical_wal(port).await?;
+            seed_tables(port).await?;
+
+            let expected_slot = catalog_slot_name(CATALOG_NAME);
+
+            let rt = start_runtime(accelerated_pg_catalog(port)).await?;
+            wait_for_table_ready(&rt, "orders").await?;
+            anyhow::ensure!(
+                replication_slot_names(port).await? == vec![expected_slot.clone()],
+                "the catalog should hold exactly one slot while running"
+            );
+
+            rt.shutdown().await;
+            drop(rt);
+
+            // Poll rather than assert once: the drop runs after the walsender
+            // exits, and the server clears that asynchronously.
+            let released = wait_until_true(Duration::from_secs(90), || {
+                let slot = expected_slot.clone();
+                async move {
+                    replication_slot_names(port)
+                        .await
+                        .is_ok_and(|slots| !slots.contains(&slot))
+                }
+            })
+            .await;
+            anyhow::ensure!(
+                released,
+                "a non-durable catalog acceleration must release its slot at shutdown; still present: {:?}",
+                replication_slot_names(port).await
+            );
+
+            Ok(())
+        })
+        .await
+}
+
+/// Restart/recovery for a DURABLE catalog acceleration (`mode: file`): the
+/// slot's name is derived deterministically from the catalog and is INDEPENDENT
+/// of the Spice instance, so a restart -- even one that would reschedule onto a
+/// different host -- recomputes the same name and REUSES the existing slot
+/// rather than orphaning it and creating a second. The slot persists across the
+/// shutdown, so a change made to the source while Spice is down is reflected
+/// after it comes back (#11850; feeds slot-lifecycle #12018).
+///
+/// Two constraints on how this test can be written, both about the replication
+/// stream surviving to deliver that change:
+///
+/// * It needs process isolation, which `cargo nextest` (what CI runs) gives it.
+///   `Runtime::shutdown` signals every CDC source in the *process*
+///   (`data_components::cdc::begin_shutdown`), so under a shared-process runner
+///   any other test shutting a runtime down stops this one's pump for good
+///   (#12608).
+/// * Its catalog covers a single table. A member joining a RESUMING shared slot
+///   second can be registered above changes it has not consumed and skip them
+///   (#12609) -- with two tables this assertion fails whenever the join order
+///   puts `orders` second.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_catalog_acceleration_reuses_slot_across_restart() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some(
@@ -1046,9 +1136,13 @@ async fn test_catalog_acceleration_reuses_slot_across_restart() -> Result<(), an
             seed_tables(port).await?;
 
             let expected_slot = catalog_slot_name(CATALOG_NAME);
+            // A durable acceleration: its slot carries real resume value, so it
+            // is kept across the restart. A `mode: memory` catalog re-snapshots
+            // on every start, so its slot is released at shutdown instead.
+            let data_dir = tempfile::tempdir()?;
 
             // First run: bootstrap + stream.
-            let rt = start_runtime(accelerated_pg_catalog(port)).await?;
+            let rt = start_runtime(durable_accelerated_pg_catalog(port, data_dir.path())).await?;
             wait_for_table_ready(&rt, "orders").await?;
 
             // Exactly one slot, named deterministically from the catalog (with no
@@ -1094,7 +1188,7 @@ async fn test_catalog_acceleration_reuses_slot_across_restart() -> Result<(), an
                 .await?;
 
             // Restart with the SAME catalog config -> same deterministic slot.
-            let rt = start_runtime(accelerated_pg_catalog(port)).await?;
+            let rt = start_runtime(durable_accelerated_pg_catalog(port, data_dir.path())).await?;
             wait_for_table_ready(&rt, "orders").await?;
 
             // Still exactly one slot, same name: the restart REUSED it. An
@@ -1109,11 +1203,9 @@ async fn test_catalog_acceleration_reuses_slot_across_restart() -> Result<(), an
             // The change made while Spice was down (id = 3) is delivered after
             // restart -- this is the reused slot's guarantee: it resumes from its
             // retained `restart_lsn`, so WAL accumulated during the downtime is
-            // replayed, nothing lost. (We assert the specific offline row rather
-            // than a total row count: whether the pre-restart rows reappear is a
-            // function of the accelerator's own persistence -- Cayenne persists
-            // externally and reloads them in production, but that is independent
-            // of the slot-reuse behavior this test covers.)
+            // replayed, nothing lost. A durable acceleration reaches this row
+            // only through that replay: unlike `mode: memory`, it does not
+            // re-snapshot the source on start.
             let offline_row_sql =
                 format!("SELECT customer FROM {CATALOG_NAME}.public.orders WHERE id = 3");
             let delivered = wait_until_true(Duration::from_mins(2), || {

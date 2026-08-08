@@ -592,9 +592,30 @@ jobs:
         if: ${{ github.event_name == 'pull_request' && steps.revert.outputs.fast_track == 'true' }}
         run: echo "Pure revert fast-tracked past sign-off; the full suite runs on the merged result in the merge queue."
 
+      # Named rather than negated. Entry into the queue is itself gated on a green
+      # Attestation, so by the time a merge_group run exists the sign-off has already
+      # been validated — that precondition is what makes passing here sound. Any other
+      # non-pull_request trigger reaching this step would be borrowing an assumption it
+      # does not satisfy.
       - name: Merge queue passthrough
-        if: ${{ github.event_name != 'pull_request' }}
+        if: ${{ github.event_name == 'merge_group' }}
         run: echo "Sign-off was validated at queue entry; the full suite runs in this merge_group run."
+
+      # A dispatch carries no pull_request payload, so every inspection above is
+      # unreachable: there is no head SHA to read a `signoff` status for, no base to
+      # walk the first-parent chain from, and no author or commit list for the
+      # fast-tracks. It has no queue-entry precondition either, so the passthrough
+      # above must not cover it. Since Attestation is the only gate a pull request has,
+      # a green one minted here would satisfy that gate having verified nothing, which
+      # makes failing the only honest verdict.
+      #
+      # This does not cost the dispatch its purpose: the heavy jobs below gate on
+      # `check_changes`, not on this job, so they still run.
+      - name: Reject an attestation asserted by dispatch
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        run: |
+          echo "::error title=Attestation cannot be established by dispatch::A workflow_dispatch of pr.yml has no pull request payload, so no sign-off can be read and no verdict asserted. Dispatch this workflow only to run the heavy jobs. To report Attestation on a pull request whose checks are absent, re-run the pull_request-triggered 'pr' run for that head commit, or push to the branch so the pull_request event fires again."
+          exit 1
 
   # The jobs below run ONLY in the merge queue (merge_group) and on manual
   # dispatch — never on a pull request. They stay required, so the full suite
@@ -779,14 +800,15 @@ jobs:
         if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: ./.github/actions/setup-cc
 
-      # build-cli-dev, not build-cli: the latter is hardcoded to --release, so
-      # this job compiled the CLI in release while running its tests under
-      # RUST_PROFILE (lint) — two profiles, sharing nothing, in one job. Nothing
-      # here consumes the release binary, and the required `Build (release
-      # profile)` job below does the real release installs.
-      - name: Build CLI and run nextest
+      # No separate CLI build: nextest's `--tests` build already emits the `spice`
+      # binary, since cargo builds a package's bins alongside that package's
+      # integration tests, so a CLI link error fails nextest itself. `verify-cli`
+      # asserts the binary is there and runs, so the gate reports it if cargo ever
+      # stops producing it. The required `Build (release profile)` job below does
+      # the real release installs.
+      - name: Run nextest and verify the CLI
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        run: make build-cli-dev nextest
+        run: make nextest verify-cli
         env:
           RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
           AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
