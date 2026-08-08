@@ -326,6 +326,52 @@ async fn compound_on_write_start(
 /// either combining rule — misclassifies one of them, as [`compound_on_write_start`] describes.
 pub(super) const COMPOUND_WRITE_START_FAILURE_IS_FATAL: bool = true;
 
+/// Finalize both indexes, applying each half's own [`Index::write_complete_failure_is_fatal`] to
+/// *that half's* failure.
+///
+/// Both completion callbacks always run — a failure on one half must not skip the other's
+/// finalize — and the primary's error is surfaced first. Fatality is then decided per half for the
+/// same reason [`compound_on_write_start`] decides it per half: one combined answer cannot say
+/// which half failed, so a fatal half turns the *other* half's best-effort finalize failure into a
+/// failed write. Elasticsearch's `_forcemerge` beside a tantivy primary is the live pairing —
+/// force-merge is a segment-count optimization the indexed rows do not depend on, but the tantivy
+/// half declares its own commit fatal, so the combined answer failed the write whenever
+/// force-merge did.
+async fn compound_on_write_complete(
+    primary: &dyn Index,
+    secondary: &dyn Index,
+) -> Result<(), DataFusionError> {
+    let (primary_result, secondary_result) =
+        futures::join!(primary.on_write_complete(), secondary.on_write_complete());
+    let primary_outcome = finalize_outcome("primary", primary, primary_result);
+    let secondary_outcome = finalize_outcome("secondary", secondary, secondary_result);
+    primary_outcome.and(secondary_outcome)
+}
+
+/// Keep `result` only if `index` declares its own finalize failure fatal; otherwise log it and
+/// report success — what the sink does with that same flag on a standalone index.
+fn finalize_outcome(
+    half: &str,
+    index: &dyn Index,
+    result: Result<(), DataFusionError>,
+) -> Result<(), DataFusionError> {
+    match result {
+        Err(err) if !index.write_complete_failure_is_fatal() => {
+            tracing::warn!(
+                "The {half} index of a compound search index failed to finalize a write: {err}. Reporting the write as successful, because that index's finalize is best-effort."
+            );
+            Ok(())
+        }
+        result => result,
+    }
+}
+
+/// What a compound index reports from [`Index::write_complete_failure_is_fatal`].
+///
+/// Always `true`, for the reason [`COMPOUND_WRITE_START_FAILURE_IS_FATAL`] is:
+/// [`compound_on_write_complete`] has already applied each half's own policy to its own failure.
+pub(super) const COMPOUND_WRITE_COMPLETE_FAILURE_IS_FATAL: bool = true;
+
 /// Delete `keys` from both indexes (full/both-scope, per [`Index::delete_by_keys`]'s contract).
 /// Both deletes run concurrently and both are driven to completion even if one fails, matching
 /// [`compound_on_write_start`]'s "neither index left inconsistent" approach.
