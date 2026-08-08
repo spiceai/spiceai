@@ -20,7 +20,11 @@ limitations under the License.
 //! via `INFORMATION_SCHEMA` queries.
 
 use super::{CatalogConnector, ConnectorComponent, ParameterSpec};
-use crate::{Runtime, component::catalog::Catalog, dataconnector::parameters::ConnectorParams};
+use crate::{
+    Runtime,
+    component::catalog::{Catalog, table_selector},
+    dataconnector::parameters::ConnectorParams,
+};
 use async_trait::async_trait;
 use data_components::RefreshableCatalogProvider;
 use data_components::snowflake::SnowflakeTableFactory;
@@ -155,14 +159,14 @@ impl CatalogConnector for SnowflakeCatalog {
                 api,
                 database,
                 table_factory,
-                catalog.include.clone(),
+                table_selector(catalog),
             ))
         } else {
             Arc::new(SnowflakeCatalogProvider::new(
                 api,
                 database,
                 table_factory,
-                catalog.include.clone(),
+                table_selector(catalog),
             ))
         };
 
