@@ -211,6 +211,39 @@ meaningless address. Pair it with a `code` name — `SEGV_MAPERR`/`SEGV_ACCERR`/
    `ssi_signo` and `ssi_code` are valid, so nobody later reaches for `ssi_pid`,
    `ssi_uid` or `ssi_ptr` and gets padding.
 
+#### Still open after 1a landed
+
+- The `addr=n/a` branch has no test. The unit test faults with `SIGSEGV` only, so the
+  non-fault path and the `SI_TKILL`/`SI_USER` code names compile and never run — the
+  same shape of gap that let the original bug ship. Fixed by the `abort` scenario in
+  3a, which needs no new machinery: one more child role that calls `raise(SIGABRT)`.
+- `signal_code_name` decodes `SEGV_*`, `BUS_*` and `TRAP_*` but not `ILL_*` or `FPE_*`,
+  so a `SIGILL` or `SIGFPE` report shows `(?)` where it advertises a name. Eight lines.
+
+### 1g. Say who sent the signal, when nobody faulted
+
+`SIGABRT` is hooked — `crash-handler`'s `EXCEPTION_SIGNALS` is
+`[Abort, Bus, Fpe, Illegal, Segv, Trap]` — so an `abort()`, an allocation failure, a
+double panic, and an external `kill -ABRT` all reach this handler. For those, 1a now
+correctly prints `addr=n/a`, and then throws away the one thing `siginfo` does carry.
+
+For `SI_USER`/`SI_TKILL` the live union member is `_kill`, whose `si_pid` and `si_uid`
+sit at offsets 16 and 20 — reachable with exactly the machinery 1a already built. Print
+them instead of `addr=n/a`:
+
+```text
+signal=SIGABRT code=-6 (SI_TKILL) sender_pid=1 sender_uid=0
+```
+
+`sender_pid` equal to our own pid means the process aborted itself; anything else means
+something outside did. That is the difference between a bug in `spiced` and a liveness
+probe or an OOM kill, and it is currently unanswerable from the report — which matters
+because the runtime is deployed under Kubernetes, where being killed from outside is a
+routine failure mode.
+
+Same guard as 1a: read the field only when `si_code` says `_kill` is the live member,
+never unconditionally.
+
 ### 1b. Recover the caller when `ip` is wild
 
 Crash #2 (`ip=0x91`) is unresolvable because the return address at `*(RSP)` was never
