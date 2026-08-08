@@ -20,7 +20,11 @@ limitations under the License.
 //! and provides schema/table discovery using the ADBC metadata API.
 
 use super::{CatalogConnector, ConnectorComponent, ParameterSpec};
-use crate::{Runtime, component::catalog::Catalog, dataconnector::parameters::ConnectorParams};
+use crate::{
+    Runtime,
+    component::catalog::{Catalog, table_selector},
+    dataconnector::parameters::ConnectorParams,
+};
 use adbc_core::options::AdbcVersion;
 use adbc_core::{Driver as _, LOAD_FLAG_DEFAULT};
 use adbc_driver_manager::{ManagedDatabase, ManagedDriver};
@@ -29,6 +33,7 @@ use data_components::RefreshableCatalogProvider;
 use data_components::adbc_helpers::{
     build_db_options, dialect_for_driver, enrich_with_bigquery_metadata,
 };
+use data_components::catalog_filter::TableSelector;
 use datafusion::catalog::{CatalogProvider, SchemaProvider};
 use datafusion::datasource::TableProvider;
 use datafusion::error::Result as DFResult;
@@ -38,7 +43,6 @@ use datafusion_table_providers::sql::db_connection_pool::adbcpool::{
     ADBCPool, AdbcConnectionPoolBuilder,
 };
 use futures::stream::{self, StreamExt};
-use globset::GlobSet;
 use snafu::prelude::*;
 use std::any::Any;
 use std::collections::HashMap;
@@ -173,7 +177,7 @@ impl CatalogConnector for AdbcCatalog {
         let provider = Arc::new(AdbcCatalogProvider::new(
             pool,
             table_factory,
-            catalog.include.clone(),
+            table_selector(catalog),
             driver_name,
         ));
 
@@ -293,7 +297,7 @@ struct AdbcCatalogProvider {
     pool: Arc<ADBCPool<ManagedDatabase>>,
     table_factory: AdbcTableFactory<ManagedDatabase>,
     schemas: RwLock<HashMap<String, Arc<AdbcSchemaProvider>>>,
-    include: Option<Arc<GlobSet>>,
+    selector: TableSelector,
     driver_name: String,
 }
 
@@ -308,14 +312,14 @@ impl AdbcCatalogProvider {
     fn new(
         pool: Arc<ADBCPool<ManagedDatabase>>,
         table_factory: AdbcTableFactory<ManagedDatabase>,
-        include: Option<GlobSet>,
+        selector: TableSelector,
         driver_name: String,
     ) -> Self {
         Self {
             pool,
             table_factory,
             schemas: RwLock::new(HashMap::new()),
-            include: include.map(Arc::new),
+            selector,
             driver_name,
         }
     }
@@ -410,7 +414,7 @@ impl AdbcCatalogProvider {
 
         let start = Instant::now();
         let dialect = dialect_for_driver(&self.driver_name);
-        let include = self.include.clone();
+        let selector = self.selector.clone();
         let schema_name_owned = schema_name.to_owned();
 
         let mut tables: HashMap<String, Arc<dyn TableProvider>> = HashMap::new();
@@ -419,10 +423,10 @@ impl AdbcCatalogProvider {
                 .into_iter()
                 .filter_map(|table_name| {
                     let schema_with_table = format!("{schema_name_owned}.{table_name}");
-                    if let Some(include) = &include
-                        && !include.is_match(&schema_with_table)
-                    {
-                        tracing::debug!("Table {schema_with_table} is not included, skipping");
+                    if let Some(reason) = selector.rejection_reason(&schema_with_table) {
+                        tracing::debug!(
+                            "Table {schema_with_table} is not selected ({reason}), skipping"
+                        );
                         return None;
                     }
                     Some(table_name)

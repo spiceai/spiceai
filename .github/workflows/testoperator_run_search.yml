@@ -26,6 +26,14 @@ on:
         type: choice
         options:
           - 'quora_retrieval'
+          - 'miracl_en_retrieval'
+          - 'fiqa_retrieval'
+          - 'trec_covid_retrieval'
+          - 'arguana_retrieval'
+          - 'scidocs_retrieval'
+          - 'scifact_retrieval'
+          - 'nfcorpus_retrieval'
+          - 'touche2020_retrieval'
       ready_wait:
         description: 'Seconds to wait for the spiced instance to become ready'
         required: false
