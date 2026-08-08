@@ -35,6 +35,7 @@ use std::{
 };
 
 use app::AppBuilder;
+use cache::{metrics::CacheMetrics, result::query::CachedQueryResult};
 use futures::StreamExt;
 use opentelemetry::global;
 use opentelemetry_sdk::{Resource, metrics::SdkMeterProvider};
@@ -58,6 +59,26 @@ const EXPECTED_MEMORY_METRICS: &[&str] = &[
     "process_resident_memory_bytes",
     "query_memory_pool_used_bytes",
     "cayenne_compaction_memory_pool_used_bytes",
+];
+
+/// Series the SQL results cache must export as soon as it is enabled, whether or
+/// not anything has been recorded on them yet.
+///
+/// Each instrument is a `LazyLock` that only registers with the meter when
+/// something first derefs it, so a counter that has not fired exports nothing at
+/// all — not a zero. On a healthy runtime `results_cache_evictions` and both
+/// stale-while-revalidate counters are exactly the ones that never fire, and an
+/// absent series reads as a broken exporter rather than as "nothing happened".
+const EXPECTED_RESULTS_CACHE_METRICS: &[&str] = &[
+    "results_cache_requests",
+    "results_cache_hits",
+    "results_cache_misses",
+    "results_cache_evictions",
+    "results_cache_stale_swr_count",
+    "results_cache_swr_background_query_count",
+    "results_cache_items_count",
+    "results_cache_size_bytes",
+    "results_cache_max_size_bytes",
 ];
 
 /// Small enough that the sort below cannot fit, large enough that the runtime
@@ -354,5 +375,31 @@ async fn a_mid_stream_pool_refusal_is_counted_as_resources_exhausted() {
         increment(&before, &after, "QueryExecutionError") < 1.0,
         "capacity must not also be counted as a generic execution failure; \
          counts went from {before:?} to {after:?}"
+    );
+}
+
+/// The runtime calls `init` for each configured cache at startup, and that is the
+/// only chance an instrument nothing has touched gets to appear on `/metrics`.
+#[test]
+fn cache_counters_are_exported_before_anything_is_recorded() {
+    let registry = &*PROMETHEUS;
+
+    // Exactly what `Runtime::init_cache_metrics` calls once `runtime.caching.sql_results`
+    // is configured. Nothing else in this test touches a cache instrument, so a series
+    // present afterwards was published by `init` rather than by a real cache event.
+    CachedQueryResult::init();
+
+    let reported = reported_metric_names(registry);
+    let missing: Vec<&str> = EXPECTED_RESULTS_CACHE_METRICS
+        .iter()
+        .copied()
+        .filter(|metric| !reported.contains(*metric))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "cache metrics {missing:?} were not exported after the cache was initialised, so an \
+         operator scraping a healthy runtime cannot tell them from a broken exporter; \
+         reported: {:?}",
+        sorted(&reported)
     );
 }
