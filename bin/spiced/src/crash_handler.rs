@@ -49,6 +49,28 @@ static START: OnceLock<std::time::Instant> = OnceLock::new();
 /// its own artifact cannot be symbolized against the right one.
 static IDENTITY: OnceLock<String> = OnceLock::new();
 
+/// The report buffer. Checked against [`MAX_REPORT`] rather than chosen by eye.
+const REPORT_BUF: usize = 1024;
+
+/// How much of the identity line is kept. The version is the only part of a report
+/// with no inherent length limit, so it is clipped here — at install, where clipping
+/// can be logged — to keep the rest of the report provably bounded.
+const MAX_IDENTITY: usize = 192;
+
+/// The longest report that can be produced, so a new field breaks the build rather
+/// than silently truncating the fields printed after it. Each term is the widest its
+/// part can format to; `u64` is 20 digits, `i32` 11, a hex `u64` 16.
+#[cfg(target_os = "linux")]
+const MAX_REPORT: usize = 47                 // banner and trailer
+    + MAX_IDENTITY
+    + 46                                     // signal=… code=… (…)
+    + 43                                     // sender_pid=… sender_uid=…, the wider arm
+    + 89                                     // ip= base= offset=
+    + 86                                     // thread= pid= tid= uptime=
+    + 55; // symbolize line
+#[cfg(target_os = "linux")]
+const _: () = assert!(MAX_REPORT <= REPORT_BUF);
+
 /// Install fatal-signal reporting. Call once, as early in `main` as possible, so
 /// faults during startup are covered.
 ///
@@ -62,11 +84,27 @@ pub fn install(version: &str) {
     let _ = LOAD_BASE.set(read_load_base().unwrap_or(0));
     // Formatted now, not in the handler: allocating there is not signal-safe, and a
     // pre-built line cannot crowd out the rest of the report's fixed buffer.
-    let _ = IDENTITY.set(format!(
-        "spiced={version} flavor={} profile={}\n",
+    let mut identity = format!(
+        "spiced={version} flavor={} profile={}",
         env!("SPICED_BUILD_FLAVOR"),
         env!("SPICED_BUILD_PROFILE"),
-    ));
+    );
+    // Clip here rather than let the handler truncate the fields after it: the version
+    // is the one unbounded input, and this is where losing bytes can be reported.
+    if identity.len() > MAX_IDENTITY - 1 {
+        // Back off to a char boundary so the truncation cannot split a code point.
+        let mut end = MAX_IDENTITY - 1;
+        while !identity.is_char_boundary(end) {
+            end -= 1;
+        }
+        tracing::warn!(
+            "Build identity is too long for a crash report and was clipped to {end} bytes; \
+             a native crash will name this build only partially"
+        );
+        identity.truncate(end);
+    }
+    identity.push('\n');
+    let _ = IDENTITY.set(identity);
 
     // SAFETY: the closure is async-signal-safe — see the module docs.
     let event = unsafe { crash_handler::make_crash_event(on_crash) };
@@ -134,9 +172,18 @@ fn signal_name(signo: u32) -> &'static str {
 /// The `si_code` name, so a report does not need a lookup table to be read.
 #[cfg(target_os = "linux")]
 fn signal_code_name(signo: u32, code: i32) -> &'static str {
-    // `libc` exports `SI_*`, `BUS_*` and `TRAP_*`, but not the `SIGSEGV` codes.
+    // `libc` exports `SI_*`, `BUS_*` and `TRAP_*` for Linux, but not the per-signal
+    // codes for `SIGSEGV`, `SIGILL` or `SIGFPE`. From `asm-generic/siginfo.h`.
     const SEGV_MAPERR: i32 = 1;
     const SEGV_ACCERR: i32 = 2;
+    const ILL_ILLOPC: i32 = 1;
+    const ILL_ILLOPN: i32 = 2;
+    const ILL_ILLADR: i32 = 3;
+    const ILL_PRVOPC: i32 = 5;
+    const FPE_INTDIV: i32 = 1;
+    const FPE_INTOVF: i32 = 2;
+    const FPE_FLTDIV: i32 = 3;
+    const FPE_FLTINV: i32 = 7;
 
     // The sender codes are signal-independent and are matched first; none of them
     // collide with a fault code.
@@ -152,6 +199,14 @@ fn signal_code_name(signo: u32, code: i32) -> &'static str {
         (libc::SIGBUS, libc::BUS_OBJERR) => "BUS_OBJERR",
         (libc::SIGTRAP, libc::TRAP_BRKPT) => "TRAP_BRKPT",
         (libc::SIGTRAP, libc::TRAP_TRACE) => "TRAP_TRACE",
+        (libc::SIGILL, ILL_ILLOPC) => "ILL_ILLOPC",
+        (libc::SIGILL, ILL_ILLOPN) => "ILL_ILLOPN",
+        (libc::SIGILL, ILL_ILLADR) => "ILL_ILLADR",
+        (libc::SIGILL, ILL_PRVOPC) => "ILL_PRVOPC",
+        (libc::SIGFPE, FPE_INTDIV) => "FPE_INTDIV",
+        (libc::SIGFPE, FPE_INTOVF) => "FPE_INTOVF",
+        (libc::SIGFPE, FPE_FLTDIV) => "FPE_FLTDIV",
+        (libc::SIGFPE, FPE_FLTINV) => "FPE_FLTINV",
         _ => "?",
     }
 }
@@ -203,6 +258,46 @@ fn fault_address(cc: &crash_handler::CrashContext) -> Option<u64> {
             .cast::<u64>()
             .read_unaligned()
     })
+}
+
+/// `si_pid` and `si_uid` within the kernel's `siginfo_t`: `_sifields._kill` occupies
+/// the same union the fault address does, so these share `SI_ADDR_OFFSET`'s start.
+#[cfg(target_os = "linux")]
+const SI_PID_OFFSET: usize = 16;
+#[cfg(target_os = "linux")]
+const SI_UID_OFFSET: usize = 20;
+
+#[cfg(target_os = "linux")]
+const _: () = assert!(SI_UID_OFFSET + size_of::<u32>() <= size_of::<libc::signalfd_siginfo>());
+
+/// Who sent the signal, when it was sent rather than raised by a fault.
+///
+/// A `SIGABRT` reaches this handler whether the process aborted itself, a liveness
+/// probe killed it, or the OOM killer did — and the report otherwise cannot tell those
+/// apart. A sender pid equal to our own means it was self-inflicted.
+///
+/// Read at the real offsets for the same reason as [`fault_address`]: the `siginfo`
+/// handed to the callback is `siginfo_t` bytes wearing another struct's type, so
+/// `ssi_pid`/`ssi_uid` read padding and the low half of `si_addr` respectively.
+#[cfg(target_os = "linux")]
+fn signal_sender(cc: &crash_handler::CrashContext) -> Option<(u32, u32)> {
+    // `_kill` (and `_rt`, for `sigqueue`) is the live union member only for these.
+    if !matches!(
+        cc.siginfo.ssi_code,
+        libc::SI_USER | libc::SI_TKILL | libc::SI_QUEUE
+    ) {
+        return None;
+    }
+
+    // SAFETY: as `fault_address` — `siginfo` holds `siginfo_t` bytes, both offsets are
+    // bounded by the assertion above, and both fields are plain data.
+    unsafe {
+        let base = std::ptr::from_ref(&cc.siginfo).cast::<u8>();
+        Some((
+            base.add(SI_PID_OFFSET).cast::<u32>().read_unaligned(),
+            base.add(SI_UID_OFFSET).cast::<u32>().read_unaligned(),
+        ))
+    }
 }
 
 /// RIP's index into `mcontext_t::gregs`. `crash-context` exposes the register file
@@ -299,47 +394,56 @@ fn report(cc: &crash_handler::CrashContext) {
     let offset = ip.saturating_sub(base);
     let uptime = START.get().map_or(0, |s| s.elapsed().as_secs());
 
-    // Formatting into a fixed slice cannot allocate. Sized well past the longest
-    // report a `Cursor` write can produce: it stops at capacity silently, so the
-    // margin is what keeps a long version string from truncating the fields below it.
-    let mut buf = [0u8; 1024];
+    // Formatting into a fixed slice cannot allocate. A `Cursor` stops at capacity and
+    // returns an error rather than panicking, so every write is checked: `MAX_REPORT`
+    // says this cannot happen, and `complete` is what catches it if the arithmetic
+    // behind that constant ever stops being true.
+    let mut buf = [0u8; REPORT_BUF];
     let mut cur = std::io::Cursor::new(&mut buf[..]);
-    let _ = write!(cur, "\n=== native crash ===\n");
+    let mut complete = true;
+    complete &= write!(cur, "\n=== native crash ===\n").is_ok();
     // Already a formatted line, ending in a newline; reading it is an atomic load.
     if let Some(identity) = IDENTITY.get() {
-        let _ = cur.write_all(identity.as_bytes());
+        complete &= cur.write_all(identity.as_bytes()).is_ok();
     }
-    let _ = write!(
+    complete &= write!(
         cur,
         "signal={} code={} ({}) ",
         signal_name(cc.siginfo.ssi_signo),
         cc.siginfo.ssi_code,
         signal_code_name(cc.siginfo.ssi_signo, cc.siginfo.ssi_code),
-    );
-    // `n/a` rather than a number when the signal carries no address, so a raised
-    // `SIGABRT` cannot be misread as a fault at some address.
-    match fault_address(cc) {
-        Some(addr) => {
-            let _ = write!(cur, "addr=0x{addr:x}");
+    )
+    .is_ok();
+    // A signal that was sent rather than faulted carries no address, but it does say
+    // who sent it — which is the difference between aborting ourselves and being
+    // killed from outside.
+    complete &= match (fault_address(cc), signal_sender(cc)) {
+        (Some(addr), _) => write!(cur, "addr=0x{addr:x}"),
+        (None, Some((sender_pid, sender_uid))) => {
+            write!(cur, "sender_pid={sender_pid} sender_uid={sender_uid}")
         }
-        None => {
-            let _ = write!(cur, "addr=n/a");
-        }
+        (None, None) => write!(cur, "addr=n/a"),
     }
-    let _ = write!(
+    .is_ok();
+    complete &= write!(
         cur,
         " ip=0x{:x} base=0x{:x} offset=0x{:x}\n\
          thread=\"{}\" pid={} tid={} uptime={}s\n\
          symbolize: addr2line -e spiced -fCi 0x{:x}\n\
          === end native crash ===\n",
         ip, base, offset, thread, cc.pid, cc.tid, uptime, offset,
-    );
+    )
+    .is_ok();
     #[expect(
         clippy::cast_possible_truncation,
         reason = "the cursor position is bounded by the buffer length"
     )]
     let written = cur.position() as usize;
     raw_write(&buf[..written]);
+    if !complete {
+        // Its own `write(2)`: by definition there was no room left in the buffer.
+        raw_write(b"=== crash report truncated ===\n");
+    }
 }
 
 /// A reduced report. `CrashContext` is platform-specific: on macOS it carries a Mach
@@ -351,24 +455,29 @@ fn report(_cc: &crash_handler::CrashContext) {
     use std::io::Write as _;
 
     let uptime = START.get().map_or(0, |s| s.elapsed().as_secs());
-    let mut buf = [0u8; 512];
+    let mut buf = [0u8; REPORT_BUF];
     let mut cur = std::io::Cursor::new(&mut buf[..]);
-    let _ = write!(cur, "\n=== native crash ===\n");
+    let mut complete = true;
+    complete &= write!(cur, "\n=== native crash ===\n").is_ok();
     if let Some(identity) = IDENTITY.get() {
-        let _ = cur.write_all(identity.as_bytes());
+        complete &= cur.write_all(identity.as_bytes()).is_ok();
     }
-    let _ = write!(
+    complete &= write!(
         cur,
         "(reduced report: full detail is Linux-only)\n\
          uptime={uptime}s\n\
          === end native crash ===\n",
-    );
+    )
+    .is_ok();
     #[expect(
         clippy::cast_possible_truncation,
         reason = "the cursor position is bounded by the buffer length"
     )]
     let written = cur.position() as usize;
     raw_write(&buf[..written]);
+    if !complete {
+        raw_write(b"=== crash report truncated ===\n");
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -412,16 +521,12 @@ mod tests {
     /// The process under test necessarily dies, so this re-executes its own binary
     /// with `CHILD` set and asserts on the child's output. A genuine fault exercises
     /// the `si_code > 0` path and populates `addr` and `ip`; a sent signal does not.
-    #[test]
-    fn reports_a_fatal_signal() {
-        use std::os::unix::process::ExitStatusExt as _;
-
-        if std::env::var_os(CHILD).is_some() {
-            super::install(TEST_VERSION);
-            spiced_crash_handler_test_fault();
-            unreachable!("the fault must terminate the process");
-        }
-
+    /// Run the crashing child and return what it printed.
+    ///
+    /// The process under test necessarily dies, so this re-executes its own binary
+    /// with `CHILD` set. The child always re-enters through `reports_a_fatal_signal`,
+    /// which dispatches on the role, so there is one entry point to keep in step.
+    fn crash_child(role: &str) -> std::process::Output {
         // `module_path!` is crate-qualified; libtest filters are not.
         let module = module_path!();
         let filter = module
@@ -431,12 +536,38 @@ mod tests {
             + "::reports_a_fatal_signal";
 
         let exe = std::env::current_exe().expect("locate the test binary");
-        let output = std::process::Command::new(exe)
+        std::process::Command::new(exe)
             .args(["--exact", &filter, "--nocapture"])
-            .env(CHILD, "1")
+            .env(CHILD, role)
             .output()
-            .expect("run the faulting child");
+            .expect("run the crashing child")
+    }
 
+    /// Read a `key=value` field back out of a report.
+    fn field<'a>(report: &'a str, key: &str) -> Option<&'a str> {
+        report
+            .split_whitespace()
+            .find_map(|token| token.strip_prefix(key))
+    }
+
+    #[test]
+    fn reports_a_fatal_signal() {
+        use std::os::unix::process::ExitStatusExt as _;
+
+        if let Some(role) = std::env::var_os(CHILD) {
+            super::install(TEST_VERSION);
+            if role == "abort" {
+                // SAFETY: raising a signal at ourselves is the behaviour under test.
+                unsafe {
+                    libc::raise(libc::SIGABRT);
+                }
+            } else {
+                spiced_crash_handler_test_fault();
+            }
+            unreachable!("the child must terminate");
+        }
+
+        let output = crash_child("fault");
         let stderr = String::from_utf8_lossy(&output.stderr);
 
         assert!(
@@ -494,5 +625,45 @@ mod tests {
                 "report is missing the decoded si_code name: {stderr}"
             );
         }
+    }
+
+    /// A raised `SIGABRT` reaches the same handler but carries no fault address, so it
+    /// exercises the branch a `SIGSEGV` never reaches. Worth its own case: `abort()`,
+    /// an allocation failure and an external kill all arrive this way, and the report
+    /// has to say who sent the signal rather than invent an address.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn reports_a_raised_abort() {
+        use std::os::unix::process::ExitStatusExt as _;
+
+        let output = crash_child("abort");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        assert_eq!(
+            output.status.signal(),
+            Some(libc::SIGABRT),
+            "child should die from SIGABRT, got {:?}",
+            output.status
+        );
+        assert!(
+            stderr.contains("signal=SIGABRT"),
+            "abort was not reported: {stderr}"
+        );
+
+        // No `_sigfault` union member, so no address to report — the field that used
+        // to be printed unconditionally from a struct that never held one.
+        assert!(
+            !stderr.contains("addr=0x"),
+            "a signal with no fault address reported one anyway: {stderr}"
+        );
+
+        // `raise` targets our own process, so the sender is the crashing process
+        // itself. Anything else in production means something outside killed us.
+        let sender = field(&stderr, "sender_pid=").expect("report should name the sender");
+        let reported = field(&stderr, "pid=").expect("report should carry its own pid");
+        assert_eq!(
+            sender, reported,
+            "a self-raised signal should name this process as the sender: {stderr}"
+        );
     }
 }
