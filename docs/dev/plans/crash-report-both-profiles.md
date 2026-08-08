@@ -238,25 +238,145 @@ channel and `%rax` the vtable; the register file shows the corrupted pointer dir
 ### 1d. Identify the artifact
 
 Nine distinct Linux `spiced` artifacts ship per version across the two repos
-(`default`/`odbc` OSS; `core`/`default`/`models`/`nas`/`cuda` Enterprise), all with the
-same version string. Eliminating flavors by comparing `.text` was a large part of the
-manual analysis. Add three install-time fields — nothing new runs in the handler:
+(`default`/`odbc` OSS; `core`/`default`/`models`/`nas`/`cuda` Enterprise). Eliminating
+flavors by comparing `.text` was a large part of the manual analysis. The report should
+name its own artifact.
 
-- `version=` — `get_version_string()` (`main.rs:173`), already carries
-  `GIT_COMMIT_HASH` from `bin/spiced/build.rs`.
-- `profile=` — cargo exposes no profile name to the crate, but `build.rs` can take the
-  profile directory out of `OUT_DIR` (`target/release-lto/build/spiced-*/out`) and emit
-  `cargo:rustc-env=SPICED_BUILD_PROFILE`. This is what tells OSS and Enterprise builds
-  apart in a log, and it is the field that makes a report self-describing about which
-  of the two symbol regimes below applies.
-- `build_id=` — the only field that pins the exact binary. Resolve once at install via
-  `dl_iterate_phdr` → `PT_NOTE` → `NT_GNU_BUILD_ID`, hex into a static buffer.
+#### What today's report can already tell you, and what it can't
+
+`get_version_string()` (`main.rs:173`) is better than "no identity at all": OSS
+`version.txt` is `2.2.0-unstable` and Enterprise's is `2.2.0-enterprise-beta`, so the
+version alone already separates the two repos. `build_metadata()` (`main.rs:192`)
+appends semver build metadata for three features:
+
+```rust
+match (cfg!(feature = "models"), cfg!(feature = "metal"), cfg!(feature = "cuda"))
+```
+
+But none of it reaches the crash report — it only goes to the startup log line, which
+in the real incident was long gone from the buffer. And even if it were printed, it
+does not separate the flavors that matter:
+
+| flavor | features | `build_metadata()` | distinguishable? |
+|---|---|---|---|
+| Ent `models` | `release,models,odbc` | `+models` | **no** — same as `nas` |
+| Ent `nas` | `release,models,odbc,nfs,smb` | `+models` | **no** |
+| Ent `default` | `release,odbc` | `""` | **no** — same as `core` |
+| Ent `core` | `alloc-jemalloc` | `""` | **no** |
+| OSS `default` | `release,models[,postgres-accel]` | `+models` | only by version |
+| OSS `odbc` | `release,odbc,models` | `+models` | **no** — same as OSS `default` |
+
+`odbc`, `nfs`/`smb`, `postgres-accel` and the allocator choice are all invisible, and
+the profile is invisible too. That is exactly the ambiguity the gist had to resolve by
+disassembly.
+
+#### Tier 1 — three fields that close it (cheap, no new unsafe)
+
+**`version=` — pass it at `install()`.** `main` already computes it, so the handler
+should not recompute or duplicate the `cfg!` logic:
+
+```rust
+// main.rs, first statement in main()
+spiced::crash_handler::install(&get_version_string());
+```
+
+**`flavor=` and `profile=` — `env!()` in `crash_handler.rs`**, populated by
+`bin/spiced/build.rs`, which is in the same crate:
+
+```rust
+// bin/spiced/build.rs
+// Cargo's own `PROFILE` collapses every release-inheriting profile to "release", so
+// it cannot tell `release` from `release-lto`. The profile directory can:
+// OUT_DIR is `<target>/<profile>/build/<pkg>-<hash>/out`.
+let profile = std::env::var("OUT_DIR")
+    .ok()
+    .and_then(|dir| {
+        let path = std::path::Path::new(&dir);
+        Some(path.parent()?.parent()?.parent()?.file_name()?.to_str()?.to_owned())
+    })
+    .unwrap_or_else(|| "unknown".to_owned());
+println!("cargo:rustc-env=SPICED_BUILD_PROFILE={profile}");
+
+// Set by the release workflows to the artifact suffix, so a report names the tarball
+// it came from. Unset for local builds.
+println!("cargo:rerun-if-env-changed=SPICED_BUILD_FLAVOR");
+let flavor = std::env::var("SPICED_BUILD_FLAVOR").unwrap_or_else(|_| "local".to_owned());
+println!("cargo:rustc-env=SPICED_BUILD_FLAVOR={flavor}");
+```
+
+Both mechanisms verified empirically rather than assumed: for a build of the `release-lto`
+profile with `--features release,models,odbc,nfs,smb`, cargo reports
+`PROFILE=release` (useless) while `OUT_DIR` ends in `target/release-lto/build/…/out`
+(exact). The workflows set the label next to where they already name the artifact:
+
+```yaml
+env:
+  SPICED_BUILD_FLAVOR: ${{ matrix.flavor.name }}   # ent_build_and_release.yml
+```
+
+**Format the whole identity line once, at install.** Not field-by-field in the handler:
+
+```rust
+static IDENTITY: OnceLock<String> = OnceLock::new();
+
+pub fn install(version: &str) {
+    let _ = IDENTITY.set(format!(
+        "spiced={version} flavor={} profile={}\n",
+        env!("SPICED_BUILD_FLAVOR"),
+        env!("SPICED_BUILD_PROFILE"),
+    ));
+    …
+}
+```
+
+The handler then emits those bytes with one `raw_write` — no formatting, no allocation,
+and no pressure on the 512-byte report buffer (1f). `OnceLock::get` is an atomic load,
+so this stays signal-safe.
+
+Resulting first line:
+
+```text
+spiced=v2.2.0-enterprise-beta+models flavor=nas profile=release-lto
+```
+
+which is unambiguous across all nine artifacts, and directly names the tarball to
+download.
+
+#### Tier 2 — `build_id=`, to prove it rather than trust it
+
+Tier 1 is self-reported: it says what the binary was *compiled* as. `build_id=` pins
+which binary is actually running, which matters when someone is running something other
+than what they believe. Resolve once at install via `dl_iterate_phdr` → `PT_NOTE` →
+`NT_GNU_BUILD_ID`, hex-encoded into a static — roughly 50 lines of `unsafe` ELF note
+walking, all of it at install time, none in the handler. (Reading the notes out of
+`/proc/self/exe` with `std::fs` is the safer-but-wordier alternative; `std::fs` is fine
+at install.)
 
 **Build-id is not guaranteed to exist.** GNU ld defaults to `--build-id=sha1` on most
 distros; `lld` does not, and `.cargo/config.toml:11` forces `-fuse-ld=lld` on aarch64.
 Add `-Clink-arg=-Wl,--build-id=sha1` for the release profiles on all Linux targets in
-both repos, and have Phase 3 assert it is present. Note `strip = true` does **not**
-remove the build-id note, so this works on Enterprise as-is.
+both repos, and have Phase 3 assert it is present. `strip = true` does **not** remove
+the build-id note, so this works on Enterprise as-is.
+
+Pair it with a **build-id manifest published as a release asset** — one line per
+artifact, `build-id → flavor, arch, profile, version` — produced by the same workflow
+step that packages each tarball. That is what makes a build-id in a customer log
+resolvable months later without downloading nine binaries to `readelf` them. It is also
+the natural place to record the `.debug` sidecar name from Phase 2.
+
+#### Also log it at startup
+
+`main.rs:160` already logs `Starting runtime {version}`; extend it with the same flavor
+and profile. Costs nothing, and means a crash-free support case can answer the same
+question.
+
+#### What this would have done for the real crash
+
+Tier 1 alone replaces the whole "Getting the right binary" section of the analysis —
+the flavor elimination, the byte-comparison of `.text` across `default`/`models`/`nas`/
+`cuda`, and the wrong turn where `nas` showed an unrelated instruction and `cuda`
+disassembled misaligned. Tier 2 would have removed the residual "the two agree at this
+offset, so it probably doesn't matter" caveat.
 
 ### 1e. Do not print a command that cannot work
 
