@@ -115,6 +115,80 @@ fn signal_name(signo: u32) -> &'static str {
     }
 }
 
+/// The `si_code` name, so a report does not need a lookup table to be read.
+#[cfg(target_os = "linux")]
+fn signal_code_name(signo: u32, code: i32) -> &'static str {
+    // `libc` exports `SI_*`, `BUS_*` and `TRAP_*`, but not the `SIGSEGV` codes.
+    const SEGV_MAPERR: i32 = 1;
+    const SEGV_ACCERR: i32 = 2;
+
+    // The sender codes are signal-independent and are matched first; none of them
+    // collide with a fault code.
+    match (signo.cast_signed(), code) {
+        (_, libc::SI_USER) => "SI_USER",
+        (_, libc::SI_KERNEL) => "SI_KERNEL",
+        (_, libc::SI_QUEUE) => "SI_QUEUE",
+        (_, libc::SI_TKILL) => "SI_TKILL",
+        (libc::SIGSEGV, SEGV_MAPERR) => "SEGV_MAPERR",
+        (libc::SIGSEGV, SEGV_ACCERR) => "SEGV_ACCERR",
+        (libc::SIGBUS, libc::BUS_ADRALN) => "BUS_ADRALN",
+        (libc::SIGBUS, libc::BUS_ADRERR) => "BUS_ADRERR",
+        (libc::SIGBUS, libc::BUS_OBJERR) => "BUS_OBJERR",
+        (libc::SIGTRAP, libc::TRAP_BRKPT) => "TRAP_BRKPT",
+        (libc::SIGTRAP, libc::TRAP_TRACE) => "TRAP_TRACE",
+        _ => "?",
+    }
+}
+
+/// `si_addr`'s offset within the kernel's `siginfo_t` on 64-bit Linux: the
+/// `si_signo`/`si_errno`/`si_code` header plus four bytes of alignment padding,
+/// then `_sifields._sigfault.si_addr` as the union's first member.
+#[cfg(target_os = "linux")]
+const SI_ADDR_OFFSET: usize = 16;
+
+// `crash-handler` copies `size_of::<signalfd_siginfo>()` bytes *out of* a `siginfo_t`
+// (`crash-handler-0.8.0/src/linux/state.rs:431`), so the destination type must not be
+// the larger of the two, and `si_addr` has to fall inside what was copied. Both hold
+// at 128 bytes today; assert rather than assume, so a libc change breaks the build
+// instead of the report.
+#[cfg(target_os = "linux")]
+const _: () = assert!(size_of::<libc::signalfd_siginfo>() <= size_of::<libc::siginfo_t>());
+#[cfg(target_os = "linux")]
+const _: () = assert!(SI_ADDR_OFFSET + size_of::<u64>() <= size_of::<libc::signalfd_siginfo>());
+
+/// The faulting address, or `None` when `siginfo` does not carry one.
+///
+/// `CrashContext::siginfo` is typed `libc::signalfd_siginfo` but holds the bytes of a
+/// `siginfo_t`: `crash-handler` reinterprets the kernel's pointer before copying it.
+/// The two layouts agree only on `si_signo`, `si_errno` and `si_code` — `ssi_addr`
+/// sits at offset 72, where a `siginfo_t` has trailing padding — so reading it reports
+/// `0x0` for every fault, and the address has to be read at its real offset instead.
+/// Upstream: `EmbarkStudios/crash-handling#49`. Do not "simplify" this to `ssi_addr`.
+#[cfg(target_os = "linux")]
+fn fault_address(cc: &crash_handler::CrashContext) -> Option<u64> {
+    // `_sigfault` is the live union member only for a kernel-raised fault. A signal
+    // delivered by `kill`/`raise`/`pthread_kill` (`SI_USER`, `SI_TKILL`, …) carries
+    // the sender's pid and uid in those same bytes.
+    if !matches!(
+        cc.siginfo.ssi_signo.cast_signed(),
+        libc::SIGSEGV | libc::SIGBUS | libc::SIGILL | libc::SIGFPE | libc::SIGTRAP
+    ) || cc.siginfo.ssi_code <= 0
+        || cc.siginfo.ssi_code == libc::SI_KERNEL
+    {
+        return None;
+    }
+
+    // SAFETY: `siginfo` holds `siginfo_t` bytes (see above). The offset and the read
+    // are bounded by the assertions above, and the field is plain data.
+    Some(unsafe {
+        std::ptr::from_ref(&cc.siginfo)
+            .cast::<u8>()
+            .add(SI_ADDR_OFFSET)
+            .cast::<u64>()
+            .read_unaligned()
+    })
+}
+
 /// RIP's index into `mcontext_t::gregs`. `crash-context` exposes the register file
 /// as a bare array with no named accessors, so the index has to be spelled out;
 /// the assertion pins it to libc's definition rather than trusting a literal.
@@ -215,13 +289,27 @@ fn report(cc: &crash_handler::CrashContext) {
     let _ = write!(
         cur,
         "\n=== native crash ===\n\
-         signal={} code={} addr=0x{:x} ip=0x{:x} base=0x{:x} offset=0x{:x}\n\
+         signal={} code={} ({}) ",
+        signal_name(cc.siginfo.ssi_signo),
+        cc.siginfo.ssi_code,
+        signal_code_name(cc.siginfo.ssi_signo, cc.siginfo.ssi_code),
+    );
+    // `n/a` rather than a number when the signal carries no address, so a raised
+    // `SIGABRT` cannot be misread as a fault at some address.
+    match fault_address(cc) {
+        Some(addr) => {
+            let _ = write!(cur, "addr=0x{addr:x}");
+        }
+        None => {
+            let _ = write!(cur, "addr=n/a");
+        }
+    }
+    let _ = write!(
+        cur,
+        " ip=0x{:x} base=0x{:x} offset=0x{:x}\n\
          thread=\"{}\" pid={} tid={} uptime={}s\n\
          symbolize: addr2line -e spiced -fCi 0x{:x}\n\
          === end native crash ===\n",
-        signal_name(cc.siginfo.ssi_signo),
-        cc.siginfo.ssi_code,
-        cc.siginfo.ssi_addr,
         ip,
         base,
         offset,
@@ -270,14 +358,30 @@ mod tests {
     /// Set in the child process to select the crashing role.
     const CHILD: &str = "SPICED_CRASH_HANDLER_TEST_CHILD";
 
+    /// The address the child faults at.
+    ///
+    /// Deliberately not null: a null write is reported as `addr=0x0`, which is also
+    /// what a mis-decoded `siginfo` produces, so it is the one address at which the
+    /// reported fault address cannot be checked. Wider than 32 bits so a truncating
+    /// format would be caught too, and below bit 47 so it stays canonical — on x86-64
+    /// a fault at a non-canonical address is delivered with `si_addr == 0` whatever
+    /// address was actually touched, which would look exactly like a decoding bug.
+    #[cfg(target_os = "linux")]
+    const FAULT_ADDR: usize = 0x5eed_dead_0000;
+
+    /// macOS reports no address, and an unmapped high address is not guaranteed to
+    /// raise `SIGSEGV` there, so the non-Linux child keeps the null write.
+    #[cfg(not(target_os = "linux"))]
+    const FAULT_ADDR: usize = 0;
+
     /// Where the child faults. `inline(never)` and `no_mangle` keep it a distinct,
     /// named symbol so a report can be resolved back to it.
     #[inline(never)]
     #[unsafe(no_mangle)]
     extern "C" fn spiced_crash_handler_test_fault() {
-        // SAFETY: a deliberate null write — the behaviour under test.
+        // SAFETY: a deliberate wild write — the behaviour under test.
         unsafe {
-            std::ptr::null_mut::<u8>().write(1);
+            std::ptr::with_exposed_provenance_mut::<u8>(FAULT_ADDR).write(1);
         }
     }
 
@@ -341,6 +445,20 @@ mod tests {
             assert!(
                 !stderr.contains("base=0x0 "),
                 "load base was not resolved; reports would not be symbolizable: {stderr}"
+            );
+
+            // The address the kernel reported must be the address the child touched.
+            // `siginfo` reaches us typed as a `signalfd_siginfo`, whose fields do not
+            // line up past `si_code`, so a report that reads the wrong offset lands
+            // here as `addr=0x0`.
+            assert!(
+                stderr.contains(&format!("addr=0x{FAULT_ADDR:x}")),
+                "reported fault address is not the one faulted on \
+                 (expected addr=0x{FAULT_ADDR:x}): {stderr}"
+            );
+            assert!(
+                stderr.contains("(SEGV_MAPERR)"),
+                "report is missing the decoded si_code name: {stderr}"
             );
         }
     }
