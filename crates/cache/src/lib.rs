@@ -89,8 +89,10 @@ pub enum Error {
     #[snafu(display("Cache invalidation failed with error: {source}."))]
     FailedToInvalidateCacheGeneric { source: moka::PredicateError },
 
+    // Single line on purpose: callers interpolate this into a one-line `tracing` event, so an
+    // embedded newline would split the event and break structured log ingestion.
     #[snafu(display(
-        "Cache invalidation for dataset {table_name} did not finish: {source}\nCached results for {table_name} may be stale until the next invalidation; report this if it recurs."
+        "Cache invalidation for dataset {table_name} did not finish: {source}. Cached results for it may be stale until the next invalidation."
     ))]
     InvalidationDidNotFinish {
         source: tokio::task::JoinError,

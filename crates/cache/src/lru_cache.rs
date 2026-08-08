@@ -1180,21 +1180,61 @@ mod tests {
         );
     }
 
-    /// The Pingora invalidation scan must not occupy the runtime worker that called it.
+    /// A cached value that records which thread read its table references.
     ///
-    /// Driven from a single-worker runtime, which is what makes the assertion meaningful:
-    /// a concurrently spawned task can only be polled if awaiting the invalidation actually
-    /// hands the worker back. When the scan ran inline the worker was held for the whole walk
-    /// — `PingoraBackend` is in-memory, so none of its futures ever return `Poll::Pending` and
-    /// awaiting them yields at no point — and the spawned task could not run until the
-    /// invalidation had already returned.
+    /// The scan calls [`AsTableRefs::as_table_refs`] on every entry it walks, so recording the
+    /// thread there observes where the scan actually ran — without depending on the scheduler
+    /// doing anything in particular.
+    #[cfg(feature = "pingora")]
+    #[derive(Clone)]
+    struct ThreadRecordingValue {
+        scanned_on: Arc<parking_lot::Mutex<Vec<std::thread::ThreadId>>>,
+    }
+
+    #[cfg(feature = "pingora")]
+    impl Sizeable for ThreadRecordingValue {
+        fn get_memory_size(&self) -> usize {
+            std::mem::size_of::<Self>()
+        }
+    }
+
+    #[cfg(feature = "pingora")]
+    impl CacheMetrics for ThreadRecordingValue {
+        fn record_hit() {}
+        fn record_miss() {}
+        fn record_request() {}
+        fn record_item_count(_count: u64) {}
+        fn record_size(_size: u64) {}
+        fn record_max_size(_size: u64) {}
+        fn record_eviction() {}
+        fn update_hit_ratio(_hits: u64, _total: u64) {}
+    }
+
+    #[cfg(feature = "pingora")]
+    impl AsTableRefs for ThreadRecordingValue {
+        fn as_table_refs(&self) -> Arc<HashSet<TableReference>> {
+            self.scanned_on.lock().push(std::thread::current().id());
+            let mut refs = HashSet::new();
+            refs.insert(TableReference::Bare {
+                table: Arc::from("test_table"),
+            });
+            Arc::new(refs)
+        }
+    }
+
+    /// The Pingora invalidation scan must not run on the runtime worker that called it.
+    ///
+    /// Asserted by observing the thread the scan reads values on rather than by racing a
+    /// concurrently spawned task against it, so the test does not depend on the scan still
+    /// being in flight at any particular moment. When the scan ran inline it read every value
+    /// on the caller's own thread — `PingoraBackend` is in-memory, so none of its futures ever
+    /// return `Poll::Pending` and awaiting them yields at no point, which is why making the
+    /// method `async` alone would not have moved this.
     #[cfg(feature = "pingora")]
     #[tokio::test(flavor = "current_thread")]
-    async fn test_pingora_invalidate_for_table_releases_the_calling_worker() {
-        use std::sync::atomic::AtomicBool;
-
+    async fn test_pingora_invalidate_for_table_scans_off_the_calling_thread() {
         let hasher = RandomState::default();
-        let cache: LruCache<CachedQueryResult, _, _> = LruCache::new(
+        let cache: LruCache<ThreadRecordingValue, _, _> = LruCache::new(
             1024 * 1024, // 1 MB
             Duration::from_mins(1),
             hasher,
@@ -1202,23 +1242,24 @@ mod tests {
             CacheEngine::Pingora,
         );
 
-        // Enough entries that the scan is a walk rather than an instant, so the worker is
-        // measurably released rather than incidentally free. Every entry references
-        // "test_table", so the scan does a `get` and a `remove` for each of them.
-        let entry_labels: Vec<String> = (0..256).map(|i| format!("scan_entry_{i}")).collect();
+        let scanned_on = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let entry_labels: Vec<String> = (0..16).map(|i| format!("scan_entry_{i}")).collect();
         for label in &entry_labels {
             let key = CacheKey::Query(label.as_str(), None).as_raw_key(cache.hasher());
             cache
-                .put_raw_key(&key.as_u64(), create_test_cached_result().await)
+                .put_raw_key(
+                    &key.as_u64(),
+                    ThreadRecordingValue {
+                        scanned_on: Arc::clone(&scanned_on),
+                    },
+                )
                 .await;
         }
         cache.checkpoint().await;
 
-        let ran_during_invalidation = Arc::new(AtomicBool::new(false));
-        let flag = Arc::clone(&ran_during_invalidation);
-        let concurrent = tokio::spawn(async move {
-            flag.store(true, Ordering::SeqCst);
-        });
+        // Anything recorded before the invalidation would be an insert-path read, not a scan.
+        scanned_on.lock().clear();
+        let caller_thread = std::thread::current().id();
 
         cache
             .invalidate_for_table(TableReference::Bare {
@@ -1227,13 +1268,17 @@ mod tests {
             .await
             .expect("should invalidate cache");
 
+        let threads = scanned_on.lock().clone();
         assert!(
-            ran_during_invalidation.load(Ordering::SeqCst),
-            "a task spawned on the same single-worker runtime never ran while invalidation was in \
-             flight, so the scan is still occupying the calling worker"
+            !threads.is_empty(),
+            "the scan read no values, so this test proves nothing about where it ran"
         );
-
-        concurrent.await.expect("concurrent task should not panic");
+        assert!(
+            !threads.contains(&caller_thread),
+            "the scan read {} value(s) on the calling thread, so it is still running on the \
+             runtime worker instead of the blocking pool",
+            threads.iter().filter(|id| **id == caller_thread).count()
+        );
     }
 
     /// Invalidating a table the cache holds nothing for still succeeds, and leaves the
