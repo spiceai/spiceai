@@ -171,6 +171,7 @@ async fn build_catalogs() -> Vec<(&'static str, HadoopCatalog)> {
 }
 
 mod tests {
+    use data_components::catalog_filter::TableSelector;
     use data_components::iceberg::provider::IcebergCatalogProvider;
     use datafusion::catalog::CatalogProvider;
     use globset::{Glob, GlobSet};
@@ -472,15 +473,20 @@ mod tests {
         let catalogs = build_catalogs().await;
 
         for (name, catalog) in catalogs {
-            let glob_set = GlobSet::builder()
-                .add(Glob::new("test.*").expect("Should create Glob"))
-                .build()
-                .expect("Should build GlobSet");
+            let selector = TableSelector::new(
+                Some(
+                    GlobSet::builder()
+                        .add(Glob::new("test.*").expect("Should create Glob"))
+                        .build()
+                        .expect("Should build GlobSet"),
+                ),
+                None,
+            );
 
             let catalog = Arc::new(catalog) as Arc<dyn Catalog>;
 
             let provider =
-                IcebergCatalogProvider::try_new(Arc::clone(&catalog), None, Some(&glob_set), None)
+                IcebergCatalogProvider::try_new(Arc::clone(&catalog), None, &selector, None)
                     .await
                     .expect("Should create provider");
 
@@ -527,9 +533,10 @@ mod tests {
             );
 
             // recreate provider with no includes
-            let provider = IcebergCatalogProvider::try_new(catalog, None, None, None)
-                .await
-                .expect("Should create provider without includes");
+            let provider =
+                IcebergCatalogProvider::try_new(catalog, None, &TableSelector::select_all(), None)
+                    .await
+                    .expect("Should create provider without includes");
 
             // there should be 2 namespaces now: "nested" and "test"
             assert!(

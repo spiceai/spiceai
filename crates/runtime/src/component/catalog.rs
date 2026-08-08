@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use app::App;
+use data_components::catalog_filter::TableSelector;
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use snafu::prelude::*;
 use spicepod::{component::catalog as spicepod_catalog, param::Params};
@@ -102,6 +103,20 @@ impl Catalog {
     pub fn runtime(&self) -> Arc<Runtime> {
         Arc::clone(&self.runtime)
     }
+}
+
+/// Which of the catalog's discovered tables it registers.
+///
+/// Every catalog connector resolves the configuration through here rather than
+/// reading `include` directly, so a connector cannot apply one half of it and
+/// silently drop the other -- which is what left `exclude` ignored by all but
+/// the `PostgreSQL` connectors (#12636).
+///
+/// Takes the spec so a `&Catalog` coerces, and so the compiled patterns can be
+/// tested without the `app`/`runtime` a built [`Catalog`] also carries.
+#[must_use]
+pub fn table_selector(catalog: &CatalogSpec) -> TableSelector {
+    TableSelector::new(catalog.include.clone(), catalog.exclude.clone())
 }
 
 pub struct CatalogBuilder {
@@ -257,36 +272,42 @@ impl CatalogBuilder {
         self
     }
 
-    pub fn build(self) -> Result<Catalog> {
-        let app = self.app.ok_or(Error::UnableToBuildCatalog {
+    pub fn build(mut self) -> Result<Catalog> {
+        let app = self.app.take().ok_or(Error::UnableToBuildCatalog {
             catalog: self.name.clone(),
             missing_component: "app".to_string(),
         })?;
-        let runtime = self.runtime.ok_or(Error::UnableToBuildCatalog {
+        let runtime = self.runtime.take().ok_or(Error::UnableToBuildCatalog {
             catalog: self.name.clone(),
             missing_component: "runtime".to_string(),
         })?;
 
         let catalog = Catalog {
-            spec: CatalogSpec {
-                provider: self.provider,
-                catalog_id: self.catalog_id,
-                from: self.from,
-                name: self.name,
-                access: self.access,
-                orig_include: self.orig_include,
-                include: self.include,
-                orig_exclude: self.orig_exclude,
-                exclude: self.exclude,
-                params: self.params,
-                dataset_params: self.dataset_params,
-                acceleration: self.acceleration,
-            },
+            spec: self.into_spec(),
             app,
             runtime,
         };
 
         Ok(catalog)
+    }
+
+    /// The configuration half of the catalog, without the `app`/`runtime` a
+    /// fully built [`Catalog`] also carries.
+    fn into_spec(self) -> CatalogSpec {
+        CatalogSpec {
+            provider: self.provider,
+            catalog_id: self.catalog_id,
+            from: self.from,
+            name: self.name,
+            access: self.access,
+            orig_include: self.orig_include,
+            include: self.include,
+            orig_exclude: self.orig_exclude,
+            exclude: self.exclude,
+            params: self.params,
+            dataset_params: self.dataset_params,
+            acceleration: self.acceleration,
+        }
     }
 }
 
@@ -337,6 +358,54 @@ mod tests {
         let exclude = builder.exclude.expect("exclude globset should be built");
         assert!(exclude.is_match("private.secrets"));
         assert!(!exclude.is_match("public.orders"));
+    }
+
+    /// The end of the chain the `exclude` field travels: a spicepod `exclude:`
+    /// is compiled into a `GlobSet` and must reach the selector every catalog
+    /// connector filters through. Before #12636 the compiled set was built and
+    /// then read by nobody but the `PostgreSQL` connectors, so an excluded
+    /// table was silently registered.
+    #[test]
+    fn test_table_selector_carries_both_include_and_exclude() {
+        let selector = table_selector(
+            &CatalogBuilder::try_from(spicepod_catalog(&["public.*"], &["public.audit_log"], None))
+                .expect("should build")
+                .into_spec(),
+        );
+
+        assert!(selector.selects_table("public", "orders"));
+        assert!(
+            !selector.selects_table("public", "audit_log"),
+            "an excluded table must not be selected"
+        );
+        assert!(!selector.selects_table("reporting", "orders"));
+    }
+
+    /// An `exclude` with no `include` still withholds: the connectors that only
+    /// ever consulted `include` treated this configuration as selecting
+    /// everything.
+    #[test]
+    fn test_table_selector_honors_exclude_without_include() {
+        let selector = table_selector(
+            &CatalogBuilder::try_from(spicepod_catalog(&[], &["private.*"], None))
+                .expect("should build")
+                .into_spec(),
+        );
+
+        assert!(selector.selects_table("public", "orders"));
+        assert!(!selector.selects_table("private", "secrets"));
+    }
+
+    #[test]
+    fn test_table_selector_selects_everything_when_unconfigured() {
+        let selector = table_selector(
+            &CatalogBuilder::try_from(spicepod_catalog(&[], &[], None))
+                .expect("should build")
+                .into_spec(),
+        );
+
+        assert!(selector.selects_table("public", "orders"));
+        assert!(selector.selects_table("private", "secrets"));
     }
 
     #[test]

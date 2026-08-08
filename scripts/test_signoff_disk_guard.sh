@@ -274,6 +274,32 @@ assert_recorder "records sccache failing to reach its storage" \
 assert_recorder "records a storage failure reported without the startup prefix" \
   'echo "sccache: error: cache storage failed to read: Unexpected (temporary)"; exit 101' \
   101 no "" yes
+# The third spelling (#12622). sccache reaches this one when the server it spawns
+# never comes up inside the startup timeout, which is how an endpoint that stops
+# answering during a run reads once the previous server has exited. Wording is
+# verbatim from sccache's `connect_or_start_server`; the second line is the same
+# bail's own continuation, unprefixed, and must not be what the guard matches.
+assert_recorder "records sccache timing out waiting for its server to start" \
+  'echo "sccache: error: Timed out waiting for server startup. Maybe the remote service is unreachable?"
+   echo "Run with SCCACHE_LOG=debug SCCACHE_NO_DAEMON=1 to get more information"
+   echo "error: process didn'"'"'t exit successfully: \`sccache /Users/runner/.rustup/toolchains/1.96.1-aarch64-apple-darwin/bin/rustc -vV\` (exit status: 2)"
+   exit 101' \
+  101 no "Timed out waiting for server startup" yes
+# `sccache --start-server` bails with the same sentence and no trailing advice,
+# so the guard anchors on the prefix the two share rather than on either whole
+# sentence — this case fails if the pattern ever pins the "Maybe the remote
+# service is unreachable?" suffix.
+assert_recorder "records the bare startup-timeout wording too" \
+  'echo "sccache: error: Timed out waiting for server startup"; exit 101' \
+  101 no "" yes
+# The other direction, as for the storage spellings: the sentence only counts on
+# sccache's own error channel. A build that merely prints it — a test asserting
+# on the wording, or a log echoed back — is still a failure about the branch.
+assert_recorder "leaves a failure unmarked when the timeout wording is only quoted" \
+  'echo "Timed out waiting for server startup"
+   echo "error[E0308]: mismatched types"
+   exit 101' \
+  101 no "E0308" no
 # The direction that matters: a genuine defect must not be excused because the
 # word sccache appeared. Only sccache's own `error:` channel counts.
 assert_recorder "leaves a compile failure unmarked when sccache merely ran" \
