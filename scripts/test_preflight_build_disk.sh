@@ -45,6 +45,11 @@ if [[ -n "${STUB_DF_GARBAGE:-}" ]]; then
   echo "df: something went sideways"
   exit 0
 fi
+if [[ -n "${STUB_DF_NONNUMERIC:-}" ]]; then
+  echo "Filesystem 1024-blocks      Used Available Capacity Mounted on"
+  echo "map:autofs            0         0         -       -  /net"
+  exit 0
+fi
 target="${*: -1}"
 device="/dev/disk1"
 free_kb="${STUB_DEFAULT:-104857600}"
@@ -147,6 +152,14 @@ result=$(STUB_DF_GARBAGE=1 RUNNER_ENVIRONMENT=self-hosted run_subject "$work_dir
 expect_rc "df garbage" 0 "$result"
 expect_contains "df garbage says so" "could not measure" "$result"
 
+echo "- a df whose Available column is not a number does not refuse the build"
+# The dangerous shape: awk coerces a non-numeric field to 0, and a 0 that came
+# from garbage is indistinguishable downstream from a volume genuinely at zero.
+result=$(STUB_DF_NONNUMERIC=1 RUNNER_ENVIRONMENT=self-hosted run_subject "$work_dir")
+expect_rc "df non-numeric" 0 "$result"
+expect_contains "df non-numeric says so" "could not measure" "$result"
+expect_not_contains "df non-numeric is not read as zero" "0 GiB free" "$result"
+
 echo "- no df at all does not refuse the build"
 tests_run=$((tests_run + 1))
 empty_path_dir="$(mktemp -d)"
@@ -187,6 +200,17 @@ result=$(STUB_MAP="${work_dir}|/dev/disk3s5|$(gib_to_kb 1)" RUNNER_ENVIRONMENT=s
   run_subject "$work_dir/not/created/yet")
 expect_rc "absent target dir" 70 "$result"
 expect_contains "absent target dir measured the parent" "1 GiB free" "$result"
+
+echo "- an absent bare relative path falls back to the working directory"
+# `target` strips to itself, so walking parents is a loop. Giving up there would
+# silently measure nothing, which is the check quietly disabling itself.
+result=$(cd "$work_dir" && STUB_MAP=".|/dev/disk3s5|$(gib_to_kb 1)" RUNNER_ENVIRONMENT=self-hosted \
+  PATH="$stub_dir:$PATH" bash "$subject" "no-such-target" 2>&1; printf '|%s' "$?")
+tests_run=$((tests_run + 1))
+case "$result" in
+  *"free space on .: 1 GiB"*) ;;
+  *) fail_test "bare relative path: expected a reading for '.', got: ${result}" ;;
+esac
 
 # --- The floor --------------------------------------------------------------
 

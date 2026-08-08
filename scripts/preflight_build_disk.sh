@@ -52,7 +52,14 @@ measure_volume() {
   # -P: POSIX one-line-per-filesystem output, so the fields are reliably placed
   # even when a long device name would otherwise wrap.
   # -k: 1024-byte blocks on macOS (whose df defaults to 512) as well as Linux.
-  reading=$(df -Pk "$path" 2>/dev/null | awk 'NR==2 { print $1, int($4 / 1048576) }') || return 1
+  #
+  # awk checks that Available is a number before dividing, because it would
+  # otherwise coerce a non-numeric field to 0 — and a 0 that came from garbage
+  # is indistinguishable, downstream, from a volume genuinely at zero. That is
+  # the "unknown is never full" rule failing in the one direction that refuses
+  # a build it should not.
+  reading=$(df -Pk "$path" 2>/dev/null |
+    awk 'NR==2 && $4 ~ /^[0-9]+$/ { print $1, int($4 / 1048576) }') || return 1
   free="${reading##* }"
   [[ "$free" =~ ^[0-9]+$ ]] || return 1
   printf '%s\n' "$reading"
@@ -98,7 +105,11 @@ main() {
     # the same volume the directory will be created on.
     while [[ ! -e "$path" && "$path" != "/" && "$path" != "." && "$path" != *: ]]; do
       local parent="${path%/*}"
-      [[ "$parent" != "$path" ]] || break
+      # A relative path with no slash left — `target` — strips to itself, so
+      # walking further is a loop. Its parent is the working directory, which
+      # is the volume it would be created on, so ask about that rather than
+      # giving up and silently measuring nothing.
+      [[ "$parent" != "$path" ]] || { path="."; break; }
       path="${parent:-/}"
     done
 
