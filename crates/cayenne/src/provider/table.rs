@@ -28434,6 +28434,17 @@ impl CayenneTableProvider {
         self.background_compactor.set(compactor).is_ok()
     }
 
+    /// Whether an interval background compactor was spawned for this provider.
+    ///
+    /// Reports only that the task was spawned, not that it is still running: a
+    /// spawned compactor exits on its own once the shared compaction semaphore
+    /// is closed. Post-write compaction is scheduled independently of it, so a
+    /// provider without one still compacts as it is written to.
+    #[must_use]
+    pub fn has_background_compactor(&self) -> bool {
+        self.background_compactor.get().is_some()
+    }
+
     /// Spawn the periodic mem-tier checkpoint task for this provider, if memory
     /// mode is active, the configured interval is non-zero, and no task is
     /// already spawned. Must be called after the provider is wrapped in an `Arc`

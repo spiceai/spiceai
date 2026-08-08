@@ -220,6 +220,12 @@ mode=$1
 exit_before=${SPICE_FAKE_EXIT_BEFORE_TURN:-0}
 exit_after=${SPICE_FAKE_EXIT_AFTER_TURN:-0}
 
+# Records how the script invoked us, so a test can check that the runtime
+# endpoint was passed through rather than left at the CLI default.
+if [ -n "${SPICE_FAKE_ARGV_FILE:-}" ]; then
+  printf '%s\n' "$*" >"$SPICE_FAKE_ARGV_FILE"
+fi
+
 prompt='chat> '
 if [ "$mode" = 'search' ]; then
   prompt='search> '
@@ -303,6 +309,48 @@ script_case 'chat_01.exp when the REPL exits while idle' chat_01.exp \
 assert_status 1
 assert_reports 'Checking the chat REPL is still running'
 assert_reports 'exited with status 44'
+
+# ---------------------------------------------------------------------------
+# The runtime endpoint the REPL is pointed at
+# ---------------------------------------------------------------------------
+#
+# In CI each job binds its runtime to its own port (#12419), so a REPL left on
+# the CLI default would talk to whatever else holds 8090 on a shared host — or
+# to nothing. These check the scripts forward the endpoint when it is set, and
+# leave the default alone when it is not.
+
+argv_file="$work_dir/spice_argv"
+
+assert_argv() {
+  local expected=$1 actual
+  actual=$(cat "$argv_file" 2>/dev/null)
+  if [ "$actual" = "$expected" ]; then
+    pass "invokes spice as \"$expected\""
+  else
+    fail "expected spice args \"$expected\", got \"$actual\""
+  fi
+}
+
+for script in chat_01.exp chat_01_simple.exp search_01.exp; do
+  subcommand=chat
+  case $script in
+  search_*) subcommand=search ;;
+  esac
+
+  : >"$argv_file"
+  script_case "$script forwards SPICE_HTTP_ENDPOINT" "$script" \
+    SPICE_FAKE_ARGV_FILE="$argv_file" \
+    SPICE_HTTP_ENDPOINT='http://127.0.0.1:21734'
+  assert_status 0
+  assert_argv "$subcommand --endpoint http://127.0.0.1:21734"
+
+  : >"$argv_file"
+  script_case "$script keeps the CLI default when SPICE_HTTP_ENDPOINT is unset" "$script" \
+    SPICE_FAKE_ARGV_FILE="$argv_file" \
+    SPICE_HTTP_ENDPOINT=''
+  assert_status 0
+  assert_argv "$subcommand"
+done
 
 if [ "$failures" -ne 0 ]; then
   printf '\n%s check(s) failed\n' "$failures"
