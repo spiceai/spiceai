@@ -41,7 +41,7 @@ use arrow::array::RecordBatch;
 use arrow_schema::{ArrowError, Field, FieldRef, Schema};
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use itertools::Itertools;
-use runtime_datafusion_index::Index;
+use runtime_datafusion_index::{Index, WriteWindow};
 use snafu::{ResultExt, Snafu, ensure};
 
 pub use search_index::CompoundSearchIndex;
@@ -263,9 +263,10 @@ fn compound_required_columns(
 async fn compound_on_write_start(
     primary: &dyn SearchIndex,
     secondary: &dyn SearchIndex,
+    window: WriteWindow,
 ) -> Result<(), DataFusionError> {
-    primary.on_write_start().await?;
-    if let Err(secondary_err) = secondary.on_write_start().await {
+    primary.on_write_start(window).await?;
+    if let Err(secondary_err) = secondary.on_write_start(window).await {
         // Roll back only the primary: the secondary's `on_write_start` is the call that
         // failed, and `on_write_failed` restores state set up by a *successful*
         // `on_write_start` — an implementation whose start fails partway owns its own
