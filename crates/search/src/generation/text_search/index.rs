@@ -146,7 +146,7 @@ fn addressing_shape(entry: &FieldEntry) -> (Type, bool, bool) {
 }
 
 /// The tokenizer a text field is analyzed with, or [`None`] for any other field type.
-fn text_tokenizer(field_type: &FieldType) -> Option<&str> {
+pub(super) fn text_tokenizer(field_type: &FieldType) -> Option<&str> {
     match field_type {
         FieldType::Str(options) => options
             .get_indexing_options()
@@ -157,7 +157,7 @@ fn text_tokenizer(field_type: &FieldType) -> Option<&str> {
 
 /// Whether a text field is analyzed into multiple terms, rather than indexed as the single term
 /// that [`tantivy::schema::STRING`] (and so a primary-key lookup) relies on.
-fn is_tokenized(field_type: &FieldType) -> bool {
+pub(super) fn is_tokenized(field_type: &FieldType) -> bool {
     // Compare against tantivy's own untokenized text options rather than naming its tokenizer,
     // which tantivy does not export.
     let untokenized = FieldType::Str(tantivy::schema::STRING);
@@ -1072,7 +1072,7 @@ mod tests {
 
     async fn search_and_format(idx: &FullTextSearchFieldIndex, query: impl Into<String>) -> String {
         let rb: Vec<RecordBatch> = idx
-            .search(query.into(), &[], 1000)
+            .search(query.into(), vec![], 1000)
             .await
             .expect("Failed to search")
             .map(|res| match res {
@@ -1085,6 +1085,96 @@ mod tests {
             .expect("Failed to collect search results");
 
         format!("{}", pretty_format_batches(&rb).expect("failed to format"))
+    }
+
+    /// End-to-end proof that an `Exact` SQL filter is applied *inside* the tantivy index rather
+    /// than above the candidate scan. Every row matches the full-text term, so a low-priority row
+    /// would never surface within a tiny top-K; pushing `id = <target>` into the index shrinks the
+    /// candidate set to exactly that row, and it is found even at `limit = 1`. Post-filtering a
+    /// `limit = 1` scan would instead return zero rows for the target — regression test for the
+    /// silent-truncation gap (#12231).
+    #[tokio::test]
+    async fn filter_pushdown_finds_row_beyond_candidate_cap() {
+        use arrow::array::Int32Array;
+        use datafusion::logical_expr::TableProviderFilterPushDown;
+        use datafusion::prelude::{col, lit};
+
+        let index = new_test_index();
+        let ids: Vec<i32> = (1..=50).collect();
+        let contents: Vec<String> = ids.iter().map(|id| format!("shared token{id}")).collect();
+        let content_refs: Vec<&str> = contents.iter().map(String::as_str).collect();
+        index
+            .compute_index(vec![batch(&ids, &content_refs)])
+            .await
+            .expect("failed to compute_index");
+
+        let fts = index
+            .full_text_search_field_index("content")
+            .expect("Failed to create FullTextSearchFieldIndex");
+
+        // The provider must advertise `id = 47` as an Exact pushdown (`id` is an indexed i64).
+        let target = 47_i64;
+        let filter = col("id").eq(lit(target));
+        let support = fts.classify_filters(&[&filter]);
+        assert!(
+            matches!(support.as_slice(), [TableProviderFilterPushDown::Exact]),
+            "expected Exact pushdown for `id = {target}`, got {support:?}"
+        );
+
+        // With the filter pushed into the index, a limit of 1 still finds the target row.
+        let queries = fts
+            .translate_filters(std::slice::from_ref(&filter))
+            .expect("failed to translate pushable filter");
+        let rows: Vec<RecordBatch> = fts
+            .search("shared".to_string(), queries, 1)
+            .await
+            .expect("failed to search")
+            .try_collect()
+            .await
+            .expect("failed to collect search results");
+
+        let total: usize = rows.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(total, 1, "the pushed filter must isolate exactly the target row");
+        let rb = &rows[0];
+        let id_idx = rb.schema().index_of("id").expect("id column present");
+        let ids_out = rb
+            .column(id_idx)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("id column is Int32");
+        assert_eq!(ids_out.value(0), 47, "the filtered row must be id=47");
+
+        // A range predicate `id BETWEEN 10 AND 12` is likewise Exact and returns exactly that set.
+        let range = col("id").between(lit(10_i64), lit(12_i64));
+        let range_support = fts.classify_filters(&[&range]);
+        assert!(
+            matches!(range_support.as_slice(), [TableProviderFilterPushDown::Exact]),
+            "expected Exact pushdown for BETWEEN, got {range_support:?}"
+        );
+        let range_queries = fts
+            .translate_filters(std::slice::from_ref(&range))
+            .expect("failed to translate range filter");
+        let range_rows: Vec<RecordBatch> = fts
+            .search("shared".to_string(), range_queries, 1000)
+            .await
+            .expect("failed to search")
+            .try_collect()
+            .await
+            .expect("failed to collect range results");
+        let mut got: Vec<i32> = range_rows
+            .iter()
+            .flat_map(|rb| {
+                let id_idx = rb.schema().index_of("id").expect("id column present");
+                let arr = rb
+                    .column(id_idx)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .expect("id column is Int32");
+                (0..arr.len()).map(|i| arr.value(i)).collect::<Vec<_>>()
+            })
+            .collect();
+        got.sort_unstable();
+        assert_eq!(got, vec![10, 11, 12], "BETWEEN must return exactly the in-range rows");
     }
 
     #[tokio::test]

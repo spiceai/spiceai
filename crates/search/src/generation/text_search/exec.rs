@@ -114,10 +114,22 @@ impl ExecutionPlan for FullTextSearchExec {
         let limit = self.limit;
         let query = self.query.clone();
 
+        // Translate the pushed-down SQL filters into tantivy queries up front (cheap, sync). Any
+        // filter that fails to translate was advertised as pushable by `supports_filters_pushdown`
+        // but cannot be built — a lockstep bug — so fail the scan rather than silently drop it.
+        let filter_queries = match idx.translate_filters(&self.filters) {
+            Ok(queries) => queries,
+            Err(e) => {
+                return Ok(Box::pin(RecordBatchStreamAdapter::new(
+                    self.schema(),
+                    futures::stream::once(async move { Err(e) }),
+                )));
+            }
+        };
+
         let s = stream! {
-          // TODO: Support filters.
             match idx
-                .search(query, &[], limit)
+                .search(query, filter_queries, limit)
                 .await
                 .map_err(|e| DataFusionError::Plan(format!("Failed to prepare full text search: {e}"))) {
                 Ok(mut stream) => {
