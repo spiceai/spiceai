@@ -76,6 +76,7 @@ fn shared_params(port: u16) -> ReplicationParams {
         publication_name: PUBLICATION.into(),
         initial_snapshot: true,
         snapshot_on_resume: false,
+        ephemeral_accelerator: false,
         status_interval: Duration::from_secs(1),
         bootstrap_batch_size: 8192,
         shared: true,
@@ -1096,6 +1097,20 @@ async fn slot_acked_past(
 #[tokio::test(flavor = "multi_thread")]
 async fn shared_slot_resume_delivers_gap_changes_to_the_second_joiner() -> Result<(), anyhow::Error>
 {
+/// `drop_slot_after_shutdown` is what stops a non-persistent accelerator's slot
+/// from pinning WAL on the source for the whole time Spice is down, so its
+/// observable effect -- the slot actually disappearing -- is asserted against a
+/// real server rather than inferred from unit-level logic.
+///
+/// Both halves of the contract are covered:
+///
+///   * while a walsender still holds the slot, `PostgreSQL` refuses the drop
+///     (SQLSTATE `55006`); the call must retry within its budget and then give
+///     up *leaving the slot intact*, never erroring or hanging; and
+///   * once the stream is gone it must actually drop, tolerating the window in
+///     which the server has not yet cleared the walsender.
+#[tokio::test(flavor = "multi_thread")]
+async fn drop_slot_after_shutdown_releases_an_inactive_slot() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("data_components::postgres_replication=debug,info"));
 
     let port = common::get_random_port()?;
@@ -1203,6 +1218,51 @@ async fn shared_slot_resume_delivers_gap_changes_to_the_second_joiner() -> Resul
     drop(first_rejoined);
     drop(second_rejoined);
     drop_replication_slot_when_inactive(&source, SLOT).await?;
+    create_table(&source, "drop_slot_tbl", &[(1, "a"), (2, "b")]).await?;
+
+    // Bring the slot into existence the same way production does -- via a live
+    // stream -- so the drop runs against a slot with a real walsender history.
+    let mut stream = start_replication_stream(input_for(port, "drop_slot_tbl"));
+    next_envelope(&mut stream, "bootstrap")
+        .await?
+        .commit()
+        .await?;
+    wait_for_ready(&mut stream, "readiness catch-up")
+        .await?
+        .commit()
+        .await?;
+    assert_eq!(slot_count(&source).await?, 1, "slot should exist");
+
+    // The slot is held by a live walsender: the drop must fail closed. It
+    // retries on 55006 for its budget, then returns without dropping -- and
+    // without propagating an error, since shutdown must never block or fail on
+    // the source.
+    let params = shared_params(port);
+    data_components::postgres_replication::slot::drop_slot_after_shutdown(&params).await;
+    assert_eq!(
+        slot_count(&source).await?,
+        1,
+        "an actively-held slot must survive the drop attempt"
+    );
+
+    // Release the stream and wait for the server to actually clear the
+    // walsender before dropping for real. The drop's own 55006 retry covers a
+    // brief overlap, but polling the observable condition here keeps the test
+    // from depending on the pump tearing down inside that budget under load.
+    drop(stream);
+    wait_for_walsender_count(&source, 0).await?;
+    data_components::postgres_replication::slot::drop_slot_after_shutdown(&params).await;
+    assert_eq!(
+        slot_count(&source).await?,
+        0,
+        "slot should be gone once no walsender holds it"
+    );
+
+    // Idempotent: a second call finds nothing (SQLSTATE 42704) and is a no-op
+    // rather than an error -- shutdown can race with an external cleanup.
+    data_components::postgres_replication::slot::drop_slot_after_shutdown(&params).await;
+    assert_eq!(slot_count(&source).await?, 0, "second drop is a no-op");
+
     source
         .simple_query(&format!("DROP PUBLICATION IF EXISTS {PUBLICATION}"))
         .await?;

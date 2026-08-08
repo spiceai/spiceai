@@ -20,6 +20,8 @@ import { fileURLToPath } from 'node:url';
 const WORKFLOW = fileURLToPath(new URL('../workflows/pr.yml', import.meta.url));
 const REJECT_STEP = 'Reject a failed sign-off on the head commit';
 const INSPECT_STEP = 'Inspect developer sign-off';
+const QUEUE_PASSTHROUGH_STEP = 'Merge queue passthrough';
+const DISPATCH_REJECT_STEP = 'Reject an attestation asserted by dispatch';
 
 const HEAD = 'a'.repeat(40);
 const BASE = 'b'.repeat(40);
@@ -73,6 +75,47 @@ function stepLines(jobLines, stepName) {
     }
   }
   return jobLines.slice(start, end);
+}
+
+/** Every step name in the job, in declaration order. */
+function jobStepNames(jobLines) {
+  return jobLines
+    .filter((line) => /^ {6}- name: /.test(line))
+    .map((line) => line.replace(/^ {6}- name: /, '').trimEnd());
+}
+
+/** The trigger names in the workflow's `on:` block. */
+function declaredTriggers(workflow) {
+  const lines = workflow.split('\n');
+  const start = lines.indexOf('on:');
+  assert.notEqual(start, -1, 'pr.yml no longer declares an `on:` block');
+
+  const triggers = [];
+  for (const line of lines.slice(start + 1)) {
+    // A key back at column 0 ends the block.
+    if (/^[A-Za-z_]/.test(line)) break;
+    const match = /^ {2}([a-z_]+):/.exec(line);
+    if (match) triggers.push(match[1]);
+  }
+  assert.ok(triggers.length > 0, 'pr.yml declares no triggers');
+  return triggers;
+}
+
+/**
+ * A step's `if:` expression, with the `${{ }}` wrapper and surrounding space removed.
+ *
+ * The gating is as load-bearing as the script bodies below: a step that runs on the
+ * wrong trigger decides Attestation without inspecting anything (#12679).
+ */
+function stepIf(jobLines, stepName) {
+  const lines = stepLines(jobLines, stepName);
+  const condition = lines.find((line) => /^ *if: /.test(line));
+  assert.notEqual(condition, undefined, `step "${stepName}" has no \`if:\``);
+  return condition
+    .replace(/^ *if: /, '')
+    .trim()
+    .replace(/^\$\{\{\s*/, '')
+    .replace(/\s*\}\}$/, '');
 }
 
 /** The dedented body of a step's `script: |` block. */
@@ -239,6 +282,67 @@ test('the rejection runs before, and independently of, every fast-track', () => 
     /continue-on-error/,
     'the rejection is the gate; it cannot be best-effort'
   );
+});
+
+// --- Which triggers can decide the job (#12679) -----------------------------
+
+// The job has no job-level `if:`, so it runs for every trigger in the `on:` block and
+// every step decides for itself. A step gated on the *absence* of a trigger therefore
+// picks up triggers nobody weighed: `!= 'pull_request'` was written for the merge queue
+// and silently covered `workflow_dispatch` too, so dispatching pr.yml posted a green
+// Attestation — the only gate a PR has — having read no sign-off at all.
+test('every step gates on a named event, never on the absence of one', () => {
+  for (const stepName of jobStepNames(job)) {
+    const condition = stepIf(job, stepName);
+    assert.doesNotMatch(
+      condition,
+      /github\.event_name\s*!=/,
+      `"${stepName}" gates on the absence of a trigger, so a trigger added to \`on:\` ` +
+        'later would take this path without anyone deciding it should'
+    );
+    assert.match(
+      condition,
+      /github\.event_name\s*==\s*'[a-z_]+'/,
+      `"${stepName}" does not gate on a named event`
+    );
+  }
+});
+
+// The passthrough asserts the sign-off was already validated. That is true of the merge
+// queue, because entry into it is itself gated on a green Attestation, and it is true of
+// nothing else.
+test('the queue passthrough is reachable only from the merge queue', () => {
+  assert.equal(stepIf(job, QUEUE_PASSTHROUGH_STEP), "github.event_name == 'merge_group'");
+});
+
+test('a dispatch is rejected rather than passed through', () => {
+  assert.equal(stepIf(job, DISPATCH_REJECT_STEP), "github.event_name == 'workflow_dispatch'");
+
+  const declaration = stepLines(job, DISPATCH_REJECT_STEP).join('\n');
+  assert.match(
+    declaration,
+    /exit 1/,
+    `"${DISPATCH_REJECT_STEP}" must fail the job; a message alone still leaves it green`
+  );
+  assert.doesNotMatch(
+    declaration,
+    /continue-on-error/,
+    'a rejection that cannot fail the job is not a rejection'
+  );
+});
+
+// The bug was not that `workflow_dispatch` was handled wrongly — it was that nothing
+// handled it, so it inherited a path meant for something else. Any trigger added to
+// `on:` without its own verdict lands in exactly that position again.
+test('every declared trigger has a step that decides the job', () => {
+  const conditions = jobStepNames(job).map((stepName) => stepIf(job, stepName));
+  for (const trigger of declaredTriggers(workflow)) {
+    assert.ok(
+      conditions.some((condition) => condition.includes(`github.event_name == '${trigger}'`)),
+      `pr.yml runs on "${trigger}" but no attestation step gates on it, so the job ` +
+        'reports success for that trigger without reaching a verdict'
+    );
+  }
 });
 
 // --- Inheritance still works (regression guards) ----------------------------
