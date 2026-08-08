@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use serde_json::error::Category;
-use serde_json::{Deserializer, StreamDeserializer, de::IoRead, value::RawValue};
+use serde_json::{Deserializer, value::RawValue};
 use std::collections::VecDeque;
 use std::io::{self, BufRead, Read};
 use std::sync::{Arc, Mutex};
@@ -73,11 +73,13 @@ ArrayToNdjson – implements `BufRead` so downstream can pull NDJSON
 ///   consumers choke on embedded new‑lines.
 pub struct ArrayToNdjson<R: Read + Send> {
     shared: Arc<Mutex<Tee<R>>>, // rolling buffer
-    stream: StreamDeserializer<'static, IoRead<TeeReader<R>>, Box<RawValue>>, // serde iterator
-    drained: usize,             // bytes already drained from tee.buf
-    prev_off: usize,            // byte_offset() after previous element
     pending: VecDeque<u8>,      // data ready for BufRead
     eof: bool,
+    /// Set when the array is known to be malformed. Reading an element
+    /// requires the tee buffer to begin at the element, and a parse error
+    /// leaves whatever serde had read sitting in front of it, so a caller that
+    /// keeps reading would be handed those bytes as the next element.
+    malformed: bool,
 }
 
 impl<R: Read + Send> ArrayToNdjson<R> {
@@ -92,19 +94,12 @@ impl<R: Read + Send> ArrayToNdjson<R> {
 
         // Shared tee so we can inspect bytes that serde has read.
         let shared = Arc::new(Mutex::new(Tee::new(inner)));
-        let reader = TeeReader {
-            shared: Arc::clone(&shared),
-        };
-        // `from_reader` takes ownership of `reader` and wraps it in IoRead.
-        let stream = Deserializer::from_reader(reader).into_iter::<Box<RawValue>>();
 
         Ok(Self {
             shared,
-            stream,
-            drained: 0,
-            prev_off: 0,
             pending: VecDeque::new(),
             eof: false,
+            malformed: false,
         })
     }
 
@@ -116,10 +111,8 @@ impl<R: Read + Send> ArrayToNdjson<R> {
     /// Returns an error if the adapter cannot be consumed due to multiple outstanding
     /// references to the shared buffer.
     pub fn finish(self) -> Result<R, io::Error> {
-        // Drop the stream to release its reference to the shared Tee
-        drop(self.stream);
-
-        // Try to unwrap the Arc - this should succeed since we dropped the stream
+        // Each element is read through a short-lived deserializer, so nothing
+        // else holds the shared Tee by the time the adapter is consumed.
         let tee = Arc::try_unwrap(self.shared)
             .map_err(|_| {
                 io::Error::other("Failed to recover inner reader - multiple references still exist")
@@ -139,9 +132,34 @@ impl<R: Read + Send> ArrayToNdjson<R> {
         if !self.pending.is_empty() || self.eof {
             return Ok(());
         }
+        if self.malformed {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Failed to read JSON array: the array is malformed and cannot be read further",
+            ));
+        }
 
-        // Pull the next element from serde.
-        match self.stream.next() {
+        // Pull the next element through a deserializer built for this element
+        // alone.
+        //
+        // A value with no closing delimiter — a number, `true`, `false` or
+        // `null` — is only known to have ended once the byte after it is read,
+        // and inside an array that byte is the array's own `,` or `]`. serde
+        // holds it as lookahead, so a deserializer reused for the next element
+        // would be handed a delimiter where it expects a value. Building a
+        // fresh one drops the lookahead on serde's side; the byte itself is
+        // still in the tee buffer, where the delimiter scan below consumes it.
+        let reader = TeeReader {
+            shared: Arc::clone(&self.shared),
+        };
+        let mut stream = Deserializer::from_reader(reader).into_iter::<Box<RawValue>>();
+        let element = stream.next();
+        // `byte_offset` counts what serde committed to the element, which
+        // excludes any lookahead byte. Read it before the stream is dropped.
+        let committed = stream.byte_offset();
+        drop(stream);
+
+        match element {
             Some(Ok(_)) => {}
             Some(Err(e)) => {
                 // Check if this is an empty array case
@@ -154,6 +172,9 @@ impl<R: Read + Send> ArrayToNdjson<R> {
                         return Ok(());
                     }
                 }
+                // An I/O failure may still be transient, so only a genuine
+                // parse failure closes the reader for good.
+                self.malformed = e.classify() != Category::Io;
                 return Err(io::Error::new(io::ErrorKind::InvalidData, e));
             }
             None => {
@@ -168,8 +189,10 @@ impl<R: Read + Send> ArrayToNdjson<R> {
             Err(e) => e.into_inner(),
         };
 
-        let slice = &tee.buf[..];
-        let tee_buf_len = tee.buf.len();
+        // Anything past `committed` is the lookahead: it belongs to the array,
+        // not to the element, so it is neither emitted nor drained here.
+        let committed = committed.min(tee.buf.len());
+        let slice = &tee.buf[..committed];
 
         // If the element is a JSON array (e.g. from SODA `/data`), convert it
         // to a JSON object with positional string keys ("0", "1", …) so that
@@ -197,7 +220,7 @@ impl<R: Read + Send> ArrayToNdjson<R> {
         }
 
         // Discard bytes we no longer need from tee.buf.
-        tee.drain_front(tee_buf_len);
+        tee.drain_front(committed);
 
         drop(tee);
 
@@ -212,6 +235,7 @@ impl<R: Read + Send> ArrayToNdjson<R> {
                 self.eof = true;
             }
             _ => {
+                self.malformed = true;
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!(
@@ -233,17 +257,11 @@ impl<R: Read + Send> ArrayToNdjson<R> {
         };
         loop {
             /* -------- 1. look in the bytes we already have -------- */
-            {
-                // Everything read so far (but not yet drained) lives in tee.buf.
-                // We start scanning from the point just after the last element.
-                let mut i = self.prev_off - self.drained;
-                while i < tee.buf.len() {
-                    let b = tee.buf[i];
-                    if !b.is_ascii_whitespace() {
-                        return Ok(b); // found it – return without consuming
-                    }
-                    i += 1;
-                }
+            // The element's own bytes have already been drained, so whatever
+            // is left in tee.buf starts just after it: serde's lookahead, plus
+            // anything read here on an earlier pass.
+            if let Some(&b) = tee.buf.iter().find(|b| !b.is_ascii_whitespace()) {
+                return Ok(b); // found it – return without consuming
             }
 
             /* -------- 2. need more data: read one byte from the source -------- */
@@ -264,8 +282,8 @@ impl<R: Read + Send> ArrayToNdjson<R> {
     }
 
     /// Remove the comma (`','`) **or** closing bracket (`']'`) that we just
-    /// peeked, together with any preceding whitespace, and update the
-    /// `drained` / `prev_off` counters so slicing the next element works.
+    /// peeked, together with any preceding whitespace, leaving tee.buf empty
+    /// so the next element starts at its front.
     fn consume_delimiter(&mut self) -> io::Result<()> {
         let mut tee = match self.shared.lock() {
             Ok(tee) => tee,
@@ -278,8 +296,6 @@ impl<R: Read + Send> ArrayToNdjson<R> {
                 break;
             }
             tee.drain_front(1);
-            self.drained += 1;
-            self.prev_off += 1;
         }
 
         // 2️⃣  Now the first byte must be the delimiter itself.
@@ -290,8 +306,6 @@ impl<R: Read + Send> ArrayToNdjson<R> {
             ));
         }
         tee.drain_front(1); // discard ',' or ']'
-        self.drained += 1;
-        self.prev_off += 1;
 
         Ok(())
     }
@@ -3534,30 +3548,203 @@ mod tests {
             assert_eq!(lines[0], "{}");
         }
 
-        /// Array with null elements — `ArrayToNdjson` doesn't handle bare scalars,
-        /// so this exercises the error path
+        /// Array whose elements are all bare `null`
         #[test]
         fn test_auto_array_null_elements() {
             let input = br"[null,null,null]";
-            // ArrayToNdjson uses RawValue which doesn't handle bare scalars
-            let result = auto_detect_and_read(input);
-            assert!(
-                result.is_err(),
-                "bare null elements should fail in ArrayToNdjson"
-            );
+            let lines = auto_detect_and_read(input).expect("should read");
+            assert_eq!(lines, vec!["null", "null", "null"]);
         }
 
-        /// Array with numeric elements — `ArrayToNdjson` doesn't handle bare scalars,
-        /// so this exercises the error path
+        /// Array whose elements are bare numbers
         #[test]
         fn test_auto_array_numeric_elements() {
             let input = br"[1,2,3,4,5]";
-            // ArrayToNdjson uses RawValue which doesn't handle bare scalars
-            let result = auto_detect_and_read(input);
-            assert!(
-                result.is_err(),
-                "bare numeric elements should fail in ArrayToNdjson"
+            let lines = auto_detect_and_read(input).expect("should read");
+            assert_eq!(lines, vec!["1", "2", "3", "4", "5"]);
+        }
+    }
+
+    /// A value with no closing delimiter — a number, `true`, `false`, `null` —
+    /// only ends when the byte after it is read, and inside an array that byte
+    /// is the array's own `,` or `]`. The pull reader has to hand that byte to
+    /// its own delimiter scan rather than lose it to serde's lookahead.
+    mod bare_scalar_elements {
+        use super::*;
+
+        /// Drive `ArrayToNdjson` over a whole body and split the NDJSON it
+        /// produces into lines.
+        fn ndjson_lines(body: &[u8]) -> io::Result<Vec<String>> {
+            let mut out = String::new();
+            ArrayToNdjson::try_new(Cursor::new(body.to_vec()))?.read_to_string(&mut out)?;
+            Ok(out.lines().map(ToOwned::to_owned).collect())
+        }
+
+        #[test]
+        fn each_scalar_kind_reads_as_one_element() {
+            for (body, want) in [
+                (&br"[1,2,3]"[..], vec!["1", "2", "3"]),
+                (&br"[1]"[..], vec!["1"]),
+                (&br"[true]"[..], vec!["true"]),
+                (&br"[false,true]"[..], vec!["false", "true"]),
+                (&br"[null]"[..], vec!["null"]),
+                (&br"[1.5]"[..], vec!["1.5"]),
+                (&br"[-2.5e10,0]"[..], vec!["-2.5e10", "0"]),
+            ] {
+                let got = ndjson_lines(body).unwrap_or_else(|e| {
+                    panic!("{} should read: {e}", String::from_utf8_lossy(body))
+                });
+                assert_eq!(got, want, "for {}", String::from_utf8_lossy(body));
+            }
+        }
+
+        /// Scalars mixed with self-delimiting elements, in both orders: the
+        /// reader has to cope with a lookahead byte appearing for some
+        /// elements of an array and not others.
+        #[test]
+        fn scalars_mix_with_objects_strings_and_arrays() {
+            for (body, want) in [
+                (&br#"[{"a":1},2]"#[..], vec![r#"{"a":1}"#, "2"]),
+                (&br#"[1,{"a":2}]"#[..], vec!["1", r#"{"a":2}"#]),
+                (&br#"[1,"s",true]"#[..], vec!["1", r#""s""#, "true"]),
+                (&br#"["s",1]"#[..], vec![r#""s""#, "1"]),
+                // A nested array element is rewritten with positional keys for
+                // Arrow's benefit; the scalar after it must still be read.
+                (&br"[[1,2],3]"[..], vec![r#"{"0":1,"1":2}"#, "3"]),
+            ] {
+                let got = ndjson_lines(body).unwrap_or_else(|e| {
+                    panic!("{} should read: {e}", String::from_utf8_lossy(body))
+                });
+                assert_eq!(got, want, "for {}", String::from_utf8_lossy(body));
+            }
+        }
+
+        /// Whitespace may sit either side of a scalar, and serde's lookahead
+        /// may land on it instead of on the delimiter.
+        #[test]
+        fn whitespace_around_scalars_is_trimmed() {
+            for body in [
+                &br"[ 1 , 2 ]"[..],
+                &b"[\n  1,\n  2\n]"[..],
+                &b"[\r\n1,\r\n2\r\n]"[..],
+                &b"  [1, 2]  "[..],
+            ] {
+                let got = ndjson_lines(body).unwrap_or_else(|e| {
+                    panic!("{} should read: {e}", String::from_utf8_lossy(body))
+                });
+                assert_eq!(got, vec!["1", "2"], "for {}", String::from_utf8_lossy(body));
+            }
+        }
+
+        /// The shapes that already worked have to keep working: the fix moves
+        /// where the element ends, which is shared with every element kind.
+        #[test]
+        fn self_delimiting_elements_are_unchanged() {
+            for (body, want) in [
+                (
+                    &br#"[{"a":1},{"b":2}]"#[..],
+                    vec![r#"{"a":1}"#, r#"{"b":2}"#],
+                ),
+                (&br#"["s"]"#[..], vec![r#""s""#]),
+                (&br"[]"[..], vec![]),
+                (&br"[{},{}]"[..], vec!["{}", "{}"]),
+            ] {
+                let got = ndjson_lines(body).unwrap_or_else(|e| {
+                    panic!("{} should read: {e}", String::from_utf8_lossy(body))
+                });
+                assert_eq!(got, want, "for {}", String::from_utf8_lossy(body));
+            }
+        }
+
+        /// An element is only ever the bytes serde committed to it. A body
+        /// with a stray byte after the array must still yield `1`, not `1]` —
+        /// a row that is not valid JSON and is not in the file.
+        #[test]
+        fn a_trailing_byte_is_never_folded_into_the_element() {
+            let got = ndjson_lines(br"[1]]").expect("should read the closed array");
+            assert_eq!(got, vec!["1"]);
+        }
+
+        /// An array cut short mid-scalar has no closing `]`, and must be
+        /// reported rather than read as a complete one.
+        ///
+        /// A body ending on the separator instead — `[1,` — is the separate
+        /// truncation gap tracked by #12755, which the reader shares with
+        /// object elements (`[{"a":1},`) and is not scalar-specific.
+        #[test]
+        fn a_truncated_array_is_still_reported() {
+            for body in [&br"[1,2"[..], &br"[1"[..], &br"[1.5"[..]] {
+                assert!(
+                    ndjson_lines(body).is_err(),
+                    "{} has no closing ']' and must not read clean",
+                    String::from_utf8_lossy(body)
+                );
+            }
+        }
+
+        /// Reading an element assumes the tee buffer begins at that element. A
+        /// parse error breaks that, so a caller that keeps reading has to keep
+        /// getting errors rather than a row assembled from the leftovers.
+        #[test]
+        fn a_malformed_array_keeps_failing_instead_of_yielding_a_row() {
+            let mut reader =
+                ArrayToNdjson::try_new(Cursor::new(br"[1,@ 2]".to_vec())).expect("array start");
+
+            let mut buf = [0u8; 64];
+            let n = reader
+                .read(&mut buf)
+                .expect("the first element is well formed");
+            assert_eq!(&buf[..n], b"1\n");
+
+            // `@` is where the array stops making sense. Every read from here
+            // on has to say so; the ` 2` behind it is not an element.
+            for attempt in 0..3 {
+                match reader.read(&mut buf) {
+                    Err(_) => {}
+                    Ok(0) => panic!("attempt {attempt} ended the array instead of reporting it"),
+                    Ok(n) => panic!(
+                        "attempt {attempt} yielded {:?}, which is not in the file",
+                        String::from_utf8_lossy(&buf[..n])
+                    ),
+                }
+            }
+        }
+
+        /// A body larger than one read buffer drives `fill_pending` many times
+        /// over, so any per-element bookkeeping drift shows up here.
+        #[test]
+        fn a_long_run_of_scalars_stays_aligned() {
+            let count = 5_000;
+            let body = format!(
+                "[{}]",
+                (0..count)
+                    .map(|i| i.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
             );
+
+            let got = ndjson_lines(body.as_bytes()).expect("should read");
+            assert_eq!(got.len(), count);
+            assert_eq!(got.first().map(String::as_str), Some("0"));
+            assert_eq!(got.last().map(String::as_str), Some("4999"));
+        }
+
+        /// The `BufRead` side is what production drives, and it hands out one
+        /// element at a time rather than the whole body.
+        #[test]
+        fn the_bufread_side_yields_the_same_elements() {
+            let mut reader =
+                ArrayToNdjson::try_new(Cursor::new(br"[1,2,3]".to_vec())).expect("array start");
+
+            let mut lines = Vec::new();
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).expect("read a line") == 0 {
+                    break;
+                }
+                lines.push(line.trim_end().to_owned());
+            }
+            assert_eq!(lines, vec!["1", "2", "3"]);
         }
     }
 
