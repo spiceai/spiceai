@@ -57,7 +57,6 @@ pub static DEFAULT_BATCH_SIZE: usize = 100;
 pub static DEFAULT_LIMIT_MAXIMUM: usize = 1000;
 
 pub mod exec;
-mod filter;
 pub mod index;
 pub mod query;
 mod util;
@@ -332,7 +331,7 @@ impl FullTextSearchFieldIndex {
         let schema = self.reader.schema();
         filters
             .iter()
-            .map(|f| filter::classify_filter(schema, f))
+            .map(|f| tantivy_datafusion_filter::classify_filter(schema, f))
             .collect()
     }
 
@@ -350,7 +349,7 @@ impl FullTextSearchFieldIndex {
         filters
             .iter()
             .map(|f| {
-                filter::translate_filter(schema, f).ok_or_else(|| {
+                tantivy_datafusion_filter::translate_filter(schema, f).ok_or_else(|| {
                     DataFusionError::Internal(format!(
                         "Full text search received a filter it advertised as pushable but cannot translate: {f}"
                     ))

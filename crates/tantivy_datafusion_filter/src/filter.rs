@@ -11,7 +11,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Translation of DataFusion [`Expr`] filters into tantivy queries, and the matching
+//! Translation of `DataFusion` [`Expr`] filters into tantivy queries, and the matching
 //! [`TableProviderFilterPushDown`] classification.
 //!
 //! Correctness invariant: [`classify_filter`] and [`translate_filter`] are two views over the
@@ -19,7 +19,7 @@ limitations under the License.
 //! executor can build a tantivy query for, and one reported `Unsupported` never is. A filter
 //! reported `Exact` produces a tantivy query whose match set equals the SQL predicate; a filter
 //! reported `Inexact` produces a query whose match set is a *superset* of the SQL predicate
-//! (DataFusion re-checks it above the scan). Neither ever produces a subset — that would drop
+//! (`DataFusion` re-checks it above the scan). Neither ever produces a subset — that would drop
 //! rows and return wrong results.
 
 use std::ops::Bound;
@@ -35,8 +35,8 @@ use tantivy::Term;
 use tantivy::query::{AllQuery, BooleanQuery, Occur, Query, RangeQuery, TermQuery};
 use tantivy::schema::{Field, FieldType, IndexRecordOption, Schema};
 
-use super::index::is_tokenized;
-use super::util::array_to_terms;
+use crate::schema::is_tokenized;
+use crate::terms::array_to_terms;
 
 /// `safe: false` makes an out-of-range or wrong-signedness literal cast *error* rather than
 /// silently saturate/null. A literal that does not fit the field's numeric type must not be
@@ -96,14 +96,15 @@ enum Translated {
     /// The tantivy query's match set equals the SQL predicate.
     Exact(Box<dyn Query>),
     /// The tantivy query's match set is a superset of the SQL predicate (re-checked above the
-    /// scan by DataFusion).
+    /// scan by `DataFusion`).
     Inexact(Box<dyn Query>),
     /// Cannot be pushed at all.
     Unsupported,
 }
 
 /// Classify each `filter` for [`datafusion::catalog::TableProvider::supports_filters_pushdown`].
-pub(super) fn classify_filter(schema: &Schema, filter: &Expr) -> TableProviderFilterPushDown {
+#[must_use]
+pub fn classify_filter(schema: &Schema, filter: &Expr) -> TableProviderFilterPushDown {
     match translate(schema, filter) {
         Translated::Exact(_) => TableProviderFilterPushDown::Exact,
         Translated::Inexact(_) => TableProviderFilterPushDown::Inexact,
@@ -111,12 +112,13 @@ pub(super) fn classify_filter(schema: &Schema, filter: &Expr) -> TableProviderFi
     }
 }
 
-/// Build the tantivy query for a filter DataFusion has pushed down, or [`None`] when the filter
+/// Build the tantivy query for a filter `DataFusion` has pushed down, or [`None`] when the filter
 /// cannot be translated. Because this shares [`translate`] with [`classify_filter`], `None` is
 /// only ever returned for a filter that would have been classified `Unsupported` — such a filter
 /// is never in the pushed set, so the executor treats `None` as an error rather than silently
 /// dropping it.
-pub(super) fn translate_filter(schema: &Schema, filter: &Expr) -> Option<Box<dyn Query>> {
+#[must_use]
+pub fn translate_filter(schema: &Schema, filter: &Expr) -> Option<Box<dyn Query>> {
     match translate(schema, filter) {
         Translated::Exact(q) | Translated::Inexact(q) => Some(q),
         Translated::Unsupported => None,
@@ -323,7 +325,7 @@ fn in_list(schema: &Schema, expr: &Expr, list: &[Expr], negated: bool) -> Transl
 
 /// Push a prefix `LIKE 'x%'` on an untokenized string column as a lexicographic
 /// [`RangeQuery`] `[prefix, prefix⁺)`. Reported `Inexact`: `LIKE` is case-sensitive over the raw
-/// term and the upper bound may fall back to unbounded (a superset), so DataFusion re-checks.
+/// term and the upper bound may fall back to unbounded (a superset), so `DataFusion` re-checks.
 fn like_prefix(schema: &Schema, like: &Like) -> Translated {
     if like.case_insensitive {
         return Translated::Unsupported;

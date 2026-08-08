@@ -18320,6 +18320,7 @@ dependencies = [
  "serde_json",
  "snafu",
  "tantivy",
+ "tantivy_datafusion_filter",
  "tempfile",
  "tokio",
  "tracing",
@@ -20291,6 +20292,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "eac258c2c6390673f2685813afeeafcb8c4e0ee7de8dd3fc46838dcc37263f98"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "tantivy_datafusion_filter"
+version = "2.2.0-unstable"
+dependencies = [
+ "arrow",
+ "datafusion",
+ "snafu",
+ "tantivy",
 ]
 
 [[package]]

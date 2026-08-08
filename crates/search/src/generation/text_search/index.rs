@@ -30,15 +30,16 @@ use runtime_datafusion_index::{Index, WriteWindow};
 use snafu::{ResultExt, ensure};
 use tantivy::merge_policy::LogMergePolicy;
 use tantivy::schema::{
-    DocParsingError, FieldEntry, FieldType, IndexRecordOption, Schema, SchemaBuilder,
+    DocParsingError, FieldEntry, IndexRecordOption, Schema, SchemaBuilder,
     TextFieldIndexing, TextOptions, Type,
 };
 use tantivy::{TantivyDocument, TantivyError};
+use tantivy_datafusion_filter::{array_to_terms, is_tokenized, text_tokenizer};
 use tokio::sync::Mutex;
 
 use crate::aggregation::write_to_json_string;
 use crate::generation::text_search::query::FullTextSearchQuery;
-use crate::generation::text_search::util::{array_to_terms, with_json_subset_column};
+use crate::generation::text_search::util::with_json_subset_column;
 use crate::generation::text_search::{
     FailedToInsertDataIntoIndexSnafu, FullTextSearchFieldIndex, IndexCreationSnafu,
     InvalidIndexingSnafu, PersistedIndexColumnChangedSnafu, PersistedIndexMissingColumnsSnafu,
@@ -143,28 +144,6 @@ fn addressing_shape(entry: &FieldEntry) -> (Type, bool, bool) {
         field_type.is_indexed(),
         is_tokenized(field_type),
     )
-}
-
-/// The tokenizer a text field is analyzed with, or [`None`] for any other field type.
-pub(super) fn text_tokenizer(field_type: &FieldType) -> Option<&str> {
-    match field_type {
-        FieldType::Str(options) => options
-            .get_indexing_options()
-            .map(TextFieldIndexing::tokenizer),
-        _ => None,
-    }
-}
-
-/// Whether a text field is analyzed into multiple terms, rather than indexed as the single term
-/// that [`tantivy::schema::STRING`] (and so a primary-key lookup) relies on.
-pub(super) fn is_tokenized(field_type: &FieldType) -> bool {
-    // Compare against tantivy's own untokenized text options rather than naming its tokenizer,
-    // which tantivy does not export.
-    let untokenized = FieldType::Str(tantivy::schema::STRING);
-    match (text_tokenizer(field_type), text_tokenizer(&untokenized)) {
-        (Some(tokenizer), Some(untokenized)) => tokenizer != untokenized,
-        _ => false,
-    }
 }
 
 /// Describes how a field is indexed, for the error naming a column whose indexing changed.

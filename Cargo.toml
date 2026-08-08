@@ -71,6 +71,7 @@ members = [
     "crates/s3_vectors",
     "crates/s3_vectors_metadata_filter",
     "crates/search",
+    "crates/tantivy_datafusion_filter",
     "crates/spice_cloud",
     "crates/spice-cloud-client",
     "crates/spicepod",
