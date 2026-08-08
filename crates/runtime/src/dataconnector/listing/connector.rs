@@ -44,6 +44,7 @@ use datafusion_datasource::file_groups::FileGroup;
 use datafusion_datasource::file_scan_config::FileScanConfigBuilder;
 use datafusion_datasource::{FileExtensions, PartitionedFile, TableSchema};
 use futures::TryStreamExt;
+use object_store::client::{HttpError, HttpErrorKind};
 use object_store::{ObjectMeta, ObjectStore, ObjectStoreExt, path::Path};
 use snafu::prelude::*;
 use url::Url;
@@ -1022,6 +1023,11 @@ pub trait ListingTableConnector: DataConnector {
         Ok(())
     }
 
+    /// Turn an `object_store` error into the error the user sees.
+    ///
+    /// An implementation that inspects [`object_store::Error::Generic`] must call
+    /// [`object_store_timeout_message`] before classifying it any other way — see that function
+    /// for why.
     fn handle_object_store_error(
         &self,
         dataset: &Dataset,
@@ -1435,6 +1441,56 @@ impl<T: ListingTableConnector + Display> DataConnector for T {
         ListingTableConnector::on_accelerated_table_registration(self, dataset, accelerated_table)
             .await
     }
+}
+
+/// Walks an `object_store` error's source chain for the typed `HttpError`.
+///
+/// `object_store` 0.13 classifies `reqwest`/`hyper`/I/O timeouts into `HttpErrorKind::Timeout`
+/// before flattening the error into `object_store::Error::Generic`, so a timeout is detectable by
+/// a typed downcast rather than by matching on the error message.
+fn object_store_http_error_kind(
+    source: &(dyn std::error::Error + 'static),
+) -> Option<HttpErrorKind> {
+    let mut next = Some(source);
+    while let Some(err) = next {
+        if let Some(http_error) = err.downcast_ref::<HttpError>() {
+            return Some(http_error.kind());
+        }
+        next = err.source();
+    }
+    None
+}
+
+/// The message for an object-store request that timed out, or `None` when `source` is not a
+/// transport timeout.
+///
+/// Every [`ListingTableConnector::handle_object_store_error`] that inspects
+/// [`object_store::Error::Generic`] must consult this **before** classifying the error any other
+/// way. `object_store` flattens a timeout into the same `Generic` variant an authentication
+/// failure arrives in, so a connector that classifies `Generic` by which credentials are
+/// configured reports a network timeout as bad credentials — sending the user to rotate a working
+/// secret while the parameter that actually resolves it goes unmentioned (#12793).
+///
+/// `client_timeout` is the connector's configured value. `None` reports `object_store`'s own
+/// default, which every connector inherits by forwarding the parameter unset.
+#[must_use]
+pub fn object_store_timeout_message(
+    source: &(dyn std::error::Error + 'static),
+    service: &str,
+    client_timeout: Option<&str>,
+    docs_url: &str,
+) -> Option<String> {
+    if object_store_http_error_kind(source) != Some(HttpErrorKind::Timeout) {
+        return None;
+    }
+
+    let client_timeout = client_timeout.unwrap_or("30s (default)");
+    Some(format!(
+        "{service} request timed out (client_timeout: {client_timeout}). This often happens when \
+         many datasets are loaded concurrently and saturate the network or I/O. Consider \
+         increasing the `client_timeout` parameter or reducing the number of concurrent dataset \
+         loads. See {docs_url}#params for details."
+    ))
 }
 
 fn refresh_skip_enabled(dataset: &Dataset) -> bool {
