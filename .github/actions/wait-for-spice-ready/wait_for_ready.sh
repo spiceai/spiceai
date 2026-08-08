@@ -36,6 +36,33 @@ port_from_url() {
   esac
 }
 
+# The runtime reports a port collision in two different wordings, and a guard
+# that knows only one of them does not fire on the other (#12642):
+#
+#   - the HTTP server surfaces the OS error as-is —
+#     "Unable to bind to address: Address already in use (os error 48)"
+#   - the Flight server formats its own, with the address in the middle —
+#     "Address 127.0.0.1:50051 is already in use by another process."
+#     (crates/runtime/src/flight/mod.rs)
+#
+# Flight is the one that actually shows up on the self-hosted macOS pool, since
+# it binds :50051 while the collision is usually with a sibling runner's runtime
+# on the same machine. The same formatted variant covers the cluster listener.
+#
+# Two exact alternatives rather than `Address .*already in use`: tracing puts a
+# line's fields and its message together, so a wildcard between the two halves
+# could pair an `address` field with an unrelated "already in use" message — and
+# the runtime has several of those (a Postgres replication slot, a view name, a
+# schedule name). Neither alternative below matches any of them.
+BIND_FAILURE_PATTERN='Address already in use|Address [^[:space:]]+ is already in use'
+
+# True when our own runtime recorded that it could not bind. Authoritative over
+# whatever answers the readiness socket: on a shared machine that answer can come
+# from another job's runtime.
+own_runtime_failed_to_bind() {
+  [ -f "$LOG_FILE" ] && grep -Eq "$BIND_FAILURE_PATTERN" "$LOG_FILE" 2>/dev/null
+}
+
 # Runs only on the failure path, and is deliberately not itself time-bounded:
 # `lsof` can block on a wedged mount, and the job-level `timeout-minutes` is the
 # backstop for that. A step-level timeout is not an option — the inner steps of
@@ -82,7 +109,7 @@ diagnose() {
     cat "$LOG_FILE"
     # The single highest-value line: a port already held means a previous job on
     # this runner leaked its runtime, not that this job is broken.
-    if grep -q "Address already in use" "$LOG_FILE" 2>/dev/null; then
+    if grep -Eq "$BIND_FAILURE_PATTERN" "$LOG_FILE" 2>/dev/null; then
       echo
       echo "NOTE: the runtime could not bind its port because something else already held it."
       echo "      Two causes, and the process list above tells them apart:"
@@ -121,7 +148,7 @@ while :; do
     # runtime — and every test step after this would then run against it.
     # Failing to bind always leaves this line in our own log, so treat it as
     # authoritative over whatever answered the socket.
-    if [ -f "$LOG_FILE" ] && grep -q "Address already in use" "$LOG_FILE" 2>/dev/null; then
+    if own_runtime_failed_to_bind; then
       echo "Something on ${URL} reports ready, but it is not this job's runtime:"
       echo "${LOG_FILE} shows our own spiced failed to bind its port."
       diagnose "$last_body"
