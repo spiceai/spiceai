@@ -44,6 +44,7 @@ use datafusion_datasource::file_groups::FileGroup;
 use datafusion_datasource::file_scan_config::FileScanConfigBuilder;
 use datafusion_datasource::{FileExtensions, PartitionedFile, TableSchema};
 use futures::TryStreamExt;
+use object_store::client::{HttpError, HttpErrorKind};
 use object_store::{ObjectMeta, ObjectStore, ObjectStoreExt, path::Path};
 use snafu::prelude::*;
 use url::Url;
@@ -1037,6 +1038,47 @@ pub trait ListingTableConnector: DataConnector {
         }
     }
 
+    /// Builds an actionable error when `source` — the payload of an
+    /// [`object_store::Error::Generic`] — carries a transport timeout, and returns
+    /// `None` for anything else.
+    ///
+    /// An implementation of [`Self::handle_object_store_error`] that chooses its
+    /// message from the configured credentials must consult this **first**. A timeout
+    /// says nothing about the credentials, so a credential-shaped branch reached with
+    /// one in hand reports an authentication failure for a working secret and never
+    /// names `client_timeout`, the one parameter that resolves it.
+    ///
+    /// `label` names the service in the message; the documentation link is derived
+    /// from the connector's own [`Display`], which is its URL scheme.
+    fn object_store_timeout_error(
+        &self,
+        dataset: &Dataset,
+        source: &(dyn std::error::Error + 'static),
+        client_timeout: Option<&str>,
+        label: &str,
+    ) -> Option<DataConnectorError>
+    where
+        Self: Display,
+    {
+        if object_store_http_error_kind(source) != Some(HttpErrorKind::Timeout) {
+            return None;
+        }
+
+        let client_timeout = client_timeout.unwrap_or("30s (default)");
+        Some(DataConnectorError::UnableToConnectInternal {
+            dataconnector: format!("{self}"),
+            connector_component: ConnectorComponent::from(dataset),
+            source: format!(
+                "{label} request timed out (client_timeout: {client_timeout}). This often \
+                 happens when many datasets are loaded concurrently and saturate the network \
+                 or I/O. Consider increasing the `client_timeout` parameter or reducing the \
+                 number of concurrent dataset loads. See \
+                 https://spiceai.org/docs/components/data-connectors/{self}#params for details."
+            )
+            .into(),
+        })
+    }
+
     async fn create_text_table(
         &self,
         dataset: &Dataset,
@@ -1341,6 +1383,26 @@ pub trait ListingTableConnector: DataConnector {
 
         Ok(Arc::new(new_schema))
     }
+}
+
+/// Walks an `object_store` error's source chain for the typed [`HttpError`].
+///
+/// `object_store` 0.13 classifies `reqwest`/`hyper`/I/O timeouts into
+/// [`HttpErrorKind::Timeout`] and then flattens the error into
+/// [`object_store::Error::Generic`], so the classification survives only as a typed
+/// error in the source chain and has to be recovered by downcast rather than by
+/// matching on the rendered message.
+fn object_store_http_error_kind(
+    source: &(dyn std::error::Error + 'static),
+) -> Option<HttpErrorKind> {
+    let mut next = Some(source);
+    while let Some(err) = next {
+        if let Some(http_error) = err.downcast_ref::<HttpError>() {
+            return Some(http_error.kind());
+        }
+        next = err.source();
+    }
+    None
 }
 
 #[async_trait]

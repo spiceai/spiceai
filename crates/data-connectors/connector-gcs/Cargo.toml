@@ -14,5 +14,11 @@ snafu.workspace = true
 tokio.workspace = true
 url.workspace = true
 
+[dev-dependencies]
+app = { path = "../../app" }
+runtime-secrets = { path = "../../runtime-secrets", default-features = false }
+secrecy.workspace = true
+tokio = { workspace = true, features = ["sync"] }
+
 [lints]
 workspace = true

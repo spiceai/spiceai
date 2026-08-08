@@ -242,6 +242,17 @@ impl ListingTableConnector for GoogleCloudStorage {
     ) -> DataConnectorError {
         match error {
             object_store::Error::Generic { source, .. } => {
+                // A timeout carries no information about the credentials, so it has to
+                // be recognised before the auth-shaped branches below.
+                if let Some(timeout) = self.object_store_timeout_error(
+                    dataset,
+                    source.as_ref(),
+                    self.params.get("client_timeout").expose().ok(),
+                    "GCS",
+                ) {
+                    return timeout;
+                }
+
                 let has_service_account_path = self
                     .params
                     .get("service_account_path")
@@ -312,3 +323,153 @@ runtime::register_data_connector!(
     CONNECTOR_NAME,
     GoogleCloudStorageFactory
 );
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use app::AppBuilder;
+    use object_store::client::{HttpError, HttpErrorKind};
+    use runtime::builder::RuntimeBuilder;
+    use runtime::component::dataset::builder::DatasetBuilder;
+    use runtime_secrets::Secrets;
+    use tokio::sync::RwLock;
+
+    fn create_test_connector(params: Parameters) -> GoogleCloudStorage {
+        GoogleCloudStorage {
+            params,
+            runtime: None,
+            tokio_io_runtime: Handle::current(),
+        }
+    }
+
+    async fn create_test_parameters(params: Vec<(String, secrecy::SecretString)>) -> Parameters {
+        Parameters::try_new(
+            "gcs_test",
+            params,
+            PREFIX,
+            Arc::new(RwLock::new(Secrets::new())),
+            PARAMETERS.as_ref(),
+        )
+        .await
+        .expect("valid GCS test parameters")
+    }
+
+    async fn create_test_dataset() -> Dataset {
+        DatasetBuilder::try_new("gs://test-bucket/data/".to_string(), "test")
+            .expect("dataset builder should be created")
+            .with_app(Arc::new(AppBuilder::new("test").build()))
+            .with_runtime(Arc::new(RuntimeBuilder::new().build().await))
+            .build()
+            .expect("dataset should be built")
+    }
+
+    /// A body-read timeout, as it reaches the connector: `object_store` classifies it
+    /// as [`HttpErrorKind::Timeout`] and then flattens it into `Error::Generic`.
+    fn timeout_error() -> object_store::Error {
+        object_store::Error::Generic {
+            store: "GoogleCloudStorage",
+            source: Box::new(HttpError::new(
+                HttpErrorKind::Timeout,
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "request timed out"),
+            )),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_timeout_with_service_account_is_not_an_auth_failure() {
+        let params = create_test_parameters(vec![(
+            "service_account_key".to_string(),
+            "{}".to_string().into(),
+        )])
+        .await;
+        let connector = create_test_connector(params);
+        let dataset = create_test_dataset().await;
+
+        let message = connector
+            .handle_object_store_error(&dataset, timeout_error())
+            .to_string();
+
+        assert!(
+            message.contains("timed out") && message.contains("client_timeout"),
+            "a timeout should be reported as one, and name client_timeout, got: {message}"
+        );
+        assert!(
+            !message.contains("authentication failed"),
+            "a timeout must not be attributed to the service account, got: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_timeout_with_application_default_credentials_is_not_an_auth_failure() {
+        let params = create_test_parameters(vec![(
+            "application_default_credentials".to_string(),
+            "true".to_string().into(),
+        )])
+        .await;
+        let connector = create_test_connector(params);
+        let dataset = create_test_dataset().await;
+
+        let message = connector
+            .handle_object_store_error(&dataset, timeout_error())
+            .to_string();
+
+        assert!(
+            !message.contains("authentication failed"),
+            "a timeout must not be attributed to application default credentials, got: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_timeout_surfaces_the_configured_client_timeout() {
+        let params = create_test_parameters(vec![
+            ("service_account_key".to_string(), "{}".to_string().into()),
+            ("client_timeout".to_string(), "120s".to_string().into()),
+        ])
+        .await;
+        let connector = create_test_connector(params);
+        let dataset = create_test_dataset().await;
+
+        let message = connector
+            .handle_object_store_error(&dataset, timeout_error())
+            .to_string();
+
+        assert!(
+            message.contains("120s"),
+            "the timeout error should surface the configured client_timeout, got: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_non_timeout_still_reports_the_authentication_failure() {
+        let params = create_test_parameters(vec![(
+            "service_account_key".to_string(),
+            "{}".to_string().into(),
+        )])
+        .await;
+        let connector = create_test_connector(params);
+        let dataset = create_test_dataset().await;
+
+        // A decode error is not a timeout: the credential-shaped diagnosis is the
+        // right one here, and must survive the timeout check placed ahead of it.
+        let error = object_store::Error::Generic {
+            store: "GoogleCloudStorage",
+            source: Box::new(HttpError::new(
+                HttpErrorKind::Decode,
+                std::io::Error::other("malformed response body"),
+            )),
+        };
+
+        let message = connector
+            .handle_object_store_error(&dataset, error)
+            .to_string();
+
+        assert!(
+            message.contains("service account authentication failed"),
+            "a non-timeout failure should keep its credential diagnosis, got: {message}"
+        );
+        assert!(
+            !message.contains("client_timeout"),
+            "a non-timeout failure must not be reported as a timeout, got: {message}"
+        );
+    }
+}

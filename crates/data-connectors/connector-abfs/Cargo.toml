@@ -16,5 +16,10 @@ tokio.workspace = true
 tracing.workspace = true
 url.workspace = true
 
+[dev-dependencies]
+app = { path = "../../app" }
+runtime-secrets = { path = "../../runtime-secrets", default-features = false }
+tokio = { workspace = true, features = ["sync"] }
+
 [lints]
 workspace = true
