@@ -14,6 +14,8 @@ jobs:
   # instead of running it for every merge-queue entry.
   changes:
     runs-on: ubuntu-latest
+    # A checkout and a path diff.
+    timeout-minutes: 15
     outputs:
       relevant: ${{ steps.check.outputs.relevant_changes }}
     steps:
@@ -31,6 +33,8 @@ jobs:
   lint-helm:
     name: Helm Lint
     needs: changes
+    # A helm template/lint over one chart.
+    timeout-minutes: 60
     if: ${{ needs.changes.outputs.relevant == 'true' || github.event_name == 'workflow_dispatch' }}
     runs-on: spiceai-macos
 

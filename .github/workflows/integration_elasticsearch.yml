@@ -36,6 +36,8 @@ jobs:
   # changed-files check instead of running Elasticsearch for every merge entry.
   changes:
     runs-on: ubuntu-latest
+    # A checkout and a path diff.
+    timeout-minutes: 15
     outputs:
       relevant: ${{ steps.check.outputs.relevant_changes }}
     steps:
@@ -57,6 +59,8 @@ jobs:
   test-elasticsearch:
     name: Elasticsearch Integration Tests
     needs: changes
+    # Slowest observed success in the 2026-07-25..08-08 window: 15 min.
+    timeout-minutes: 90
     if: ${{ needs.changes.outputs.relevant == 'true' || github.event_name == 'workflow_dispatch' }}
     runs-on: spiceai-dev-runners
 

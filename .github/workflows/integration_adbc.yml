@@ -38,6 +38,8 @@ jobs:
   # the real check runs against the merge-group commit.
   check_changes:
     runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || 'spiceai-dev-runners' }}
+    # A checkout and a path diff.
+    timeout-minutes: 15
     outputs:
       relevant_changes: ${{ steps.check.outputs.relevant_changes }}
     steps:
@@ -59,6 +61,8 @@ jobs:
   test:
     name: ADBC Integration Tests
     needs: check_changes
+    # Slowest observed success in the 2026-07-25..08-08 window: 50 min.
+    timeout-minutes: 150
     # On non-PR events, run the required check unconditionally and gate each
     # step so docs-only merge groups still report success.
     runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || 'spiceai-dev-runners' }}
