@@ -3594,6 +3594,7 @@ dependencies = [
  "duckdb",
  "flatbuffers",
  "futures",
+ "globset",
  "hash-index",
  "im",
  "insta",
