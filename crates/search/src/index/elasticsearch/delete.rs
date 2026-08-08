@@ -217,13 +217,33 @@ fn inspect_delete_response(resp: &Value, es_index: &str) -> Result<()> {
         }
     };
     // Absent means the request did not report a timeout, which is the claim being tested — unlike
-    // the counts above, reading it as `false` asserts nothing that the body denies.
-    let timed_out = resp
-        .get("timed_out")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+    // the counts above, reading it as `false` asserts nothing that the body denies. Present but not
+    // a boolean is a rewritten body rather than that silence, and reading it as `false` would
+    // assert the one thing this field exists to deny, so it is rejected like `version_conflicts`.
+    let timed_out = match resp.get("timed_out").map(Value::as_bool) {
+        None => false,
+        Some(Some(flag)) => flag,
+        Some(None) => {
+            return UnexpectedDeleteResponseSnafu {
+                index: es_index.to_string(),
+                field: "timed_out",
+                shape: write::describe_unexpected_response(resp),
+            }
+            .fail();
+        }
+    };
 
-    let undeleted = total.saturating_sub(deleted);
+    // `deleted` counts documents drawn from the `total` the initial search matched, so it cannot
+    // exceed it. A body where it does is not a response this function can read a verdict from;
+    // saturating the difference to zero would turn that contradiction into a clean delete.
+    let Some(undeleted) = total.checked_sub(deleted) else {
+        return UnexpectedDeleteResponseSnafu {
+            index: es_index.to_string(),
+            field: "deleted",
+            shape: write::describe_unexpected_response(resp),
+        }
+        .fail();
+    };
 
     if failures.is_empty() && version_conflicts == 0 && undeleted == 0 && !timed_out {
         return Ok(());
@@ -1117,6 +1137,64 @@ mod tests {
         assert!(
             err.to_string().contains("no usable `version_conflicts`"),
             "the error should name the unusable field: {err}"
+        );
+    }
+
+    /// An absent `timed_out` asserts nothing the body denies, so it reads as `false`. A present one
+    /// that is not a boolean is a rewritten body instead of that silence, and reading it as `false`
+    /// would assert the timeout did not happen — the one claim the field exists to make.
+    #[tokio::test]
+    async fn a_non_boolean_timed_out_is_not_read_as_absent() {
+        let client = RecordingClient::answering(json!({
+            "timed_out": "true",
+            "total": 1,
+            "deleted": 1,
+            "version_conflicts": 0,
+            "failures": [],
+        }));
+
+        let err = delete_by_keys(
+            &client,
+            "idx",
+            &[pk("id", DataType::Utf8)],
+            &["id".to_string()],
+            &string_key_batch(vec![Some("ORDER-1024")]),
+        )
+        .await
+        .expect_err("an unconfirmable delete must not report success");
+
+        assert!(
+            err.to_string().contains("no usable `timed_out`"),
+            "the error should name the unusable field: {err}"
+        );
+    }
+
+    /// `deleted` counts documents drawn from the `total` the initial search matched, so a body
+    /// reporting more deleted than matched is one no verdict can be read from. Saturating the
+    /// difference to zero would read that contradiction as a fully-applied delete.
+    #[tokio::test]
+    async fn a_deleted_count_above_the_total_is_not_reported_as_a_successful_delete() {
+        let client = RecordingClient::answering(json!({
+            "timed_out": false,
+            "total": 1,
+            "deleted": 2,
+            "version_conflicts": 0,
+            "failures": [],
+        }));
+
+        let err = delete_by_keys(
+            &client,
+            "idx",
+            &[pk("id", DataType::Utf8)],
+            &["id".to_string()],
+            &string_key_batch(vec![Some("ORDER-1024")]),
+        )
+        .await
+        .expect_err("a contradictory delete response must not report success");
+
+        assert!(
+            err.to_string().contains("no usable `deleted`"),
+            "the error should name the contradictory field: {err}"
         );
     }
 
