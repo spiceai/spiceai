@@ -78,7 +78,8 @@ pub enum Error {
     #[snafu(display("Cannot write to '{index}' index: {source}"))]
     CannotWriteIndex {
         index: String,
-        source: data_components::s3_vectors::Error,
+        #[snafu(source(from(data_components::s3_vectors::Error, Box::new)))]
+        source: Box<data_components::s3_vectors::Error>,
     },
 }
 
