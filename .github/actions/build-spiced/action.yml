@@ -56,6 +56,10 @@ inputs:
   spiceio_endpoint:
     description: 'Spiceio S3-compatible endpoint for sccache (macOS)'
     required: false
+  min_free_gib:
+    description: 'Free space (GiB) each volume the build writes to must have before it starts. Enforced only on self-hosted runners; GitHub-hosted images are reported and built anyway. Left empty, a caller-set BUILD_MIN_FREE_GIB applies, then the script default.'
+    required: false
+    default: ''
 
 outputs:
   spiced_path:
@@ -74,6 +78,56 @@ outputs:
 runs:
   using: 'composite'
   steps:
+    # Ask whether the runner can hold the build before starting one, because the
+    # only other place to find out is inside the compiler: a volume at zero
+    # surfaces minutes later as `os error 28` against whichever crate happened to
+    # be writing, often behind a `cc-rs`/sccache frame that reads as a
+    # compiler-cache fault rather than a full disk (#12794).
+    #
+    # First step in the action, and it has to be: every later step writes to one
+    # of the volumes this measures, so any of them can die on a raw ENOSPC before
+    # the diagnostic runs. `Detect OS`, `Detect architecture` and `Check if
+    # sccache can be set up` append to `$GITHUB_OUTPUT`, `setup-sccache` appends
+    # to `$GITHUB_ENV` and writes its own config file, and `Resolve build paths`
+    # runs `mkdir -p` on the target directory — on a self-hosted runner the
+    # command files live under `RUNNER_TEMP`, beside `target/` on the same work
+    # volume. Nothing here needs those steps: the target is resolved from the
+    # input, and the script walks an absent path up to its nearest existing
+    # ancestor, which is on the volume the directory would be created on.
+    - name: Preflight disk space
+      shell: bash
+      env:
+        # Named separately from BUILD_MIN_FREE_GIB so an omitted input does not
+        # overwrite a caller's own setting with an empty step-level value —
+        # a step env key wins over the job's even when it is empty.
+        MIN_FREE_GIB_INPUT: ${{ inputs.min_free_gib }}
+        # Through the environment rather than interpolated into the script body,
+        # so a target directory containing a quote stays one argument instead of
+        # becoming shell syntax.
+        TARGET_DIR_INPUT: ${{ inputs.target_dir }}
+      run: |
+        if [ -n "$MIN_FREE_GIB_INPUT" ]; then
+          export BUILD_MIN_FREE_GIB="$MIN_FREE_GIB_INPUT"
+        fi
+
+        # target_dir is relative to bin/spiced, which is where the build steps
+        # resolve it from; an absolute value is used as given.
+        case "$TARGET_DIR_INPUT" in
+          /*|[A-Za-z]:[/\\]*) target_probe="$TARGET_DIR_INPUT" ;;
+          *) target_probe="bin/spiced/$TARGET_DIR_INPUT" ;;
+        esac
+
+        # Every volume #12794 observed at zero. RUNNER_TEMP and TMPDIR are named
+        # separately because they are not the same place on a self-hosted macOS
+        # runner: RUNNER_TEMP sits under the work volume beside target/, while
+        # TMPDIR is the per-user system temp directory sccache and cc-rs write
+        # through. The script reports one reading per volume, so naming all
+        # three costs nothing where they coincide.
+        bash "$GITHUB_ACTION_PATH/../../../scripts/preflight_build_disk.sh" \
+          "$target_probe" \
+          "${RUNNER_TEMP:-}" \
+          "${TMPDIR:-}"
+
     - name: Detect OS
       id: detect-os
       shell: bash
