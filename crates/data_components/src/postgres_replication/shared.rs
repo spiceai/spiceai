@@ -1536,8 +1536,12 @@ impl SharedSource {
         if self.reservations_installed.swap(true, Ordering::AcqRel) {
             return;
         }
-        // Only a *resuming* slot is owed anything below a join point: on a slot
-        // this process created, every member snapshots. And a slot whose
+        // Only a *resuming* slot is owed anything below a join point.
+        // `created_fresh` covers both cases where nothing is: a slot this
+        // process created, and one fast-forwarded past its history for a
+        // re-bootstrap — that one only happens when every member re-snapshots
+        // (`slot_is_disposable`), which is what makes discarding the history
+        // safe there and holding a floor pointless. A slot whose
         // `confirmed_flush_lsn` the catalog has not published yet offers no
         // floor worth holding (0 would pin the ack forever).
         if setup.slot.created_fresh || setup.slot.consistent_lsn == 0 {
@@ -1777,6 +1781,29 @@ async fn attach_member(
         });
     }
 
+    // Slot lifetime is not a connection parameter, but it *is* a property of
+    // the slot rather than of one member: the slot is released on shutdown, and
+    // its history discarded when re-bootstrapping, exactly when
+    // `slot_is_disposable` holds. A member that needs the history retained --
+    // because it does not re-snapshot, whether its accelerator persists or its
+    // initial snapshot is disabled -- would resume from a `confirmed_flush_lsn`
+    // no longer backed by retained WAL, and silently serve a gap.
+    //
+    // Compare the same predicate the two action sites use (`drop_slot_if_ephemeral`
+    // and `slot::advance_slot_for_rebootstrap`) rather than `ephemeral_accelerator`
+    // alone. Both act on the params of whichever member opened the source, so a
+    // pair that agrees on ephemerality but disagrees on `snapshot_on_resume`
+    // would otherwise have its slot's fate decided by join order -- and in one
+    // order that discards history the non-snapshotting member depends on.
+    if params.slot_is_disposable() != source.params.slot_is_disposable() {
+        return Err(Error::SharedSlotDurabilityMismatch {
+            dataset: dataset_name,
+            slot: source.key.slot_name.clone(),
+            joining: slot_lifetime_description(params.slot_is_disposable()),
+            existing: slot_lifetime_description(source.params.slot_is_disposable()),
+        });
+    }
+
     if let Some(existing) = source.member(&member_key) {
         if existing.sender.is_closed() {
             // The previous subscription's receiver is gone (dataset reload,
@@ -1947,6 +1974,22 @@ async fn attach_member(
     Ok(Box::pin(head.chain(receiver)))
 }
 
+/// Render the slot lifetime a member needs for
+/// [`Error::SharedSlotDurabilityMismatch`], which describes both sides of the
+/// disagreement in one sentence. Keyed on `slot_is_disposable`, so a member is
+/// described by what it needs of the *slot*, not by its accelerator alone: a
+/// dataset with `pg_replication_initial_snapshot: disabled` needs the history
+/// retained even though its accelerator starts empty.
+fn slot_lifetime_description(disposable: bool) -> &'static str {
+    if disposable {
+        "can be discarded at shutdown (an acceleration `mode` that starts empty on every restart, \
+         and an initial snapshot that re-runs to rebuild it)"
+    } else {
+        "is retained across restarts so its history can be replayed (a file-backed acceleration \
+         `mode`, or `pg_replication_initial_snapshot: disabled`)"
+    }
+}
+
 /// Compare connection-level params of a joining member against the shared
 /// source's. Returns the name of the first mismatched parameter, never its
 /// value — passwords and certificate paths must not leak into error messages.
@@ -2007,6 +2050,22 @@ fn finish_pump(source: &Arc<SharedSource>) {
         && Arc::ptr_eq(current, source)
     {
         registry.remove(&source.key);
+    }
+}
+
+/// Drop the shared slot when the pump stops for runtime shutdown and no member
+/// needs it to survive.
+///
+/// Reading the source's own params is authoritative for every member: a member
+/// whose accelerator durability disagrees is rejected at join time with
+/// [`Error::SharedSlotDurabilityMismatch`], so all members of a live slot share
+/// this value.
+///
+/// Best-effort and time-bounded — shutdown never blocks on the source, and a
+/// surviving slot costs retained WAL, not correctness.
+async fn drop_slot_if_ephemeral(source: &Arc<SharedSource>) {
+    if source.params.slot_is_disposable() {
+        slot::drop_slot_after_shutdown(&source.params).await;
     }
 }
 
@@ -2121,6 +2180,7 @@ async fn run_pump(source: Arc<SharedSource>) {
                 "runtime shutdown; releasing shared replication connection and slot"
             );
             finish_pump(&source);
+            drop_slot_if_ephemeral(&source).await;
             return;
         }
         source.reap_closed_members();
@@ -2231,6 +2291,9 @@ async fn run_pump(source: Arc<SharedSource>) {
                 );
                 drop(client);
                 finish_pump(&source);
+                // After `drop(client)`: Postgres refuses to drop a slot its
+                // walsender still holds.
+                drop_slot_if_ephemeral(&source).await;
                 return;
             }
             if source.restart_requested.swap(false, Ordering::AcqRel) {
@@ -2996,10 +3059,29 @@ async fn push_eager_envelope(
     let limits = settings.limits;
     // Eager holding disabled, or this transaction alone already fills an
     // envelope: publish straight through rather than paying the hold.
+    //
+    // Whatever this member already holds absorbed earlier commits, so it is
+    // sealed and published FIRST. Changes are applied in delivery order and
+    // nothing downstream re-sorts by LSN, so letting this transaction overtake
+    // the hold would apply an older commit's rows over a newer one's; and
+    // because `SharedLsnCommitter` takes a monotonic max, the overtaking
+    // envelope acks the higher LSN, so the skipped WAL is recyclable and never
+    // replayed. This is the same invariant the idle-heartbeat path keeps, and
+    // the one `MergeOutcome::Limited` keeps below. The sealed hold carries its
+    // own member handle, so it stays correct across a detach + re-subscribe
+    // that installs a new handle under the same key.
     if limits.max_envelope_age.is_zero()
         || next.envelope.rows.num_rows_hint() >= limits.eager_max_rows
     {
-        return publish_eager_envelope(source, member_key, next, settings.shutdown_epoch).await;
+        let mut waited: u64 = 0;
+        if let Some(sealed) = hold.pending.remove(member_key) {
+            hold.refresh_deadline(limits.max_envelope_age);
+            waited =
+                publish_eager_envelope(source, member_key, sealed, settings.shutdown_epoch).await;
+        }
+        return waited.saturating_add(
+            publish_eager_envelope(source, member_key, next, settings.shutdown_epoch).await,
+        );
     }
 
     let Some(current) = hold.pending.get_mut(member_key) else {
@@ -3239,6 +3321,25 @@ mod tests {
         Arc::clone(&TINY_SCHEMA)
     }
 
+    /// A pending envelope buffering `rows` change messages, for a transaction big
+    /// enough to reach `eager_max_rows` on its own.
+    fn pending_change_rows(
+        slot: &Arc<AckSlot>,
+        flush_to: u64,
+        source_commit_ts_ms: i64,
+        rows: usize,
+    ) -> PendingPgEnvelope {
+        PendingPgEnvelope {
+            rows: PgChangeRows::new(
+                tiny_schema(),
+                Arc::clone(&TINY_RELATION),
+                vec![Bytes::from_static(b"I"); rows],
+                Some(source_commit_ts_ms),
+            ),
+            ..pending_change(slot, flush_to, source_commit_ts_ms, false)
+        }
+    }
+
     fn pending_change(
         slot: &Arc<AckSlot>,
         flush_to: u64,
@@ -3275,6 +3376,7 @@ mod tests {
             publication_name: "pub".to_string(),
             initial_snapshot: true,
             snapshot_on_resume: false,
+            ephemeral_accelerator: false,
             status_interval: std::time::Duration::from_secs(5),
             bootstrap_batch_size: 8192,
             shared: true,
@@ -3306,6 +3408,87 @@ mod tests {
         }
     }
 
+    /// The two slot lifetimes must render as distinguishable prose -- the
+    /// mismatch error states both sides in one sentence, and identical (or
+    /// vague) text would leave an operator unable to tell which dataset to move.
+    #[test]
+    fn slot_lifetime_descriptions_distinguish_the_two_cases() {
+        let disposable = slot_lifetime_description(true);
+        let retained = slot_lifetime_description(false);
+        assert_ne!(disposable, retained);
+        assert!(disposable.contains("discarded at shutdown"), "{disposable}");
+        assert!(retained.contains("retained across restarts"), "{retained}");
+        // Both name a setting an operator would actually change.
+        assert!(disposable.contains("`mode`"), "{disposable}");
+        assert!(retained.contains("`mode`"), "{retained}");
+        // The retained side must surface the non-obvious half of the predicate:
+        // a disabled initial snapshot needs the history even though the
+        // accelerator starts empty.
+        assert!(
+            retained.contains("pg_replication_initial_snapshot"),
+            "{retained}"
+        );
+    }
+
+    /// The mismatch error must name the slot and describe both lifetimes, so an
+    /// operator can tell which dataset to move without reading the source.
+    #[test]
+    fn durability_mismatch_error_is_actionable() {
+        let message = Error::SharedSlotDurabilityMismatch {
+            dataset: "orders".to_string(),
+            slot: "spice_shared".to_string(),
+            joining: slot_lifetime_description(false),
+            existing: slot_lifetime_description(true),
+        }
+        .to_string();
+
+        assert!(message.contains("orders"), "{message}");
+        assert!(message.contains("spice_shared"), "{message}");
+        assert!(message.contains("pg_replication_slot"), "{message}");
+        assert!(message.contains("acceleration `mode`"), "{message}");
+        assert!(message.contains("https://spiceai.org/docs"), "{message}");
+    }
+
+    /// The guard must key on the SAME predicate that releases the slot at
+    /// shutdown and fast-forwards it on re-bootstrap (`slot_is_disposable`), not
+    /// on `ephemeral_accelerator` alone.
+    ///
+    /// Two members can agree on ephemerality and still want opposite slot
+    /// lifetimes: `pg_replication_initial_snapshot: disabled` leaves an
+    /// empty-starting accelerator with no way to rebuild itself, so it needs the
+    /// slot's history replayed. Both action sites read the params of whichever
+    /// member opened the source, so admitting that pair would let join order
+    /// decide whether the history survives -- and one order silently drops the
+    /// non-snapshotting member's changes.
+    #[test]
+    fn slot_lifetime_conflicts_are_keyed_on_disposability_not_ephemerality() {
+        let member = |ephemeral, snapshot_on_resume| {
+            let mut p = test_params();
+            p.ephemeral_accelerator = ephemeral;
+            p.snapshot_on_resume = snapshot_on_resume;
+            p
+        };
+
+        // Same ephemerality, opposite disposability -- the case the old
+        // `ephemeral_accelerator` comparison waved through.
+        let re_snapshots = member(true, true);
+        let needs_history = member(true, false);
+        assert!(re_snapshots.slot_is_disposable());
+        assert!(!needs_history.slot_is_disposable());
+        assert_eq!(
+            re_snapshots.ephemeral_accelerator, needs_history.ephemeral_accelerator,
+            "the pair must be indistinguishable to the old comparison for this to be a regression test"
+        );
+
+        // Opposite ephemerality, same disposability: neither can discard the
+        // slot's history, so they can share it.
+        let durable = member(false, false);
+        assert_eq!(
+            durable.slot_is_disposable(),
+            needs_history.slot_is_disposable()
+        );
+    }
+
     type MemberProbe = (
         MemberKey,
         Arc<ReplicationMetricsCollector>,
@@ -3316,6 +3499,17 @@ mod tests {
     /// and (capacity-4) channels, returning a probe per member so tests can read
     /// its metrics and drive its channel.
     fn test_source_with_members(n: usize) -> (Arc<SharedSource>, Vec<MemberProbe>) {
+        test_source_with_member_limits(n, *COALESCING_LIMITS)
+    }
+
+    /// As [`test_source_with_members`], with the member mailboxes' coalescing
+    /// limits chosen by the caller. A `backpressure_max_rows` low enough to
+    /// refuse the fold keeps each delivery a distinct mailbox item, which is how
+    /// a test observes *delivery order* rather than a merged result.
+    fn test_source_with_member_limits(
+        n: usize,
+        limits: CoalescingLimits,
+    ) -> (Arc<SharedSource>, Vec<MemberProbe>) {
         let source_key = SourceKey::from_params(&test_params());
         let source = Arc::new(SharedSource::new(source_key, test_params()));
         let schema: SchemaRef = Arc::new(arrow::datatypes::Schema::empty());
@@ -3323,7 +3517,7 @@ mod tests {
         for i in 0..n {
             let member_key = key(&format!("t{i}"));
             let metrics = ReplicationMetricsCollector::new();
-            let (sender, receiver) = member_mailbox(4);
+            let (sender, receiver) = member_mailbox_with_limits(4, limits);
             lock(&source.members).insert(
                 member_key.clone(),
                 Arc::new(MemberHandle {
@@ -3847,6 +4041,199 @@ mod tests {
             .expect("eager envelope")
             .expect("valid envelope");
         assert_eq!(envelope.num_rows_hint(), 2);
+    }
+
+    /// Regression test for #12311. A transaction that fills an envelope on its own
+    /// publishes straight through, but it must not overtake what this member
+    /// already holds: changes are applied in delivery order, so the earlier
+    /// commit arriving second would apply its rows over the later commit's — and
+    /// since `SharedLsnCommitter` takes a monotonic max, the overtaking envelope
+    /// acks the higher LSN, so the skipped WAL is recyclable and never replayed.
+    #[tokio::test]
+    async fn eager_oversized_transaction_does_not_overtake_the_held_envelope() {
+        // `backpressure_max_rows` 1 stops the mailbox folding the two deliveries
+        // into one item, leaving the order directly observable.
+        let limits = test_limits(2, 1);
+        let settings = eager_settings(limits);
+        let (source, mut probes) = test_source_with_member_limits(1, limits);
+        let (member_key, _metrics, mut rx) = probes.remove(0);
+        let member = source.member(&member_key).expect("member");
+        let slot = Arc::new(AckSlot::new(0, false));
+        let mut hold = EagerHold::default();
+
+        // A small commit starts the hold.
+        let _ = push_eager_envelope(
+            &source,
+            &mut hold,
+            &member_key,
+            EagerPendingEnvelope {
+                member: Arc::clone(&member),
+                envelope: pending_change(&slot, 100, 100, false),
+            },
+            settings,
+        )
+        .await;
+        assert_eq!(hold.pending.len(), 1, "the small commit should be held");
+
+        // A bulk transaction reaching `eager_max_rows` on its own takes the
+        // straight-through path.
+        let _ = push_eager_envelope(
+            &source,
+            &mut hold,
+            &member_key,
+            EagerPendingEnvelope {
+                member: Arc::clone(&member),
+                envelope: pending_change_rows(&slot, 120, 120, 2),
+            },
+            settings,
+        )
+        .await;
+
+        assert!(
+            hold.pending.is_empty() && hold.next_deadline.is_none(),
+            "the hold should be sealed and its deadline cleared"
+        );
+        let first = rx
+            .next()
+            .await
+            .expect("first envelope")
+            .expect("valid first envelope");
+        let second = rx
+            .next()
+            .await
+            .expect("second envelope")
+            .expect("valid second envelope");
+        assert_eq!(
+            (first.source_commit_ts_ms(), second.source_commit_ts_ms()),
+            (Some(100), Some(120)),
+            "the held commit must be delivered before the bulk transaction"
+        );
+        assert_eq!(first.num_rows_hint(), 1);
+        assert_eq!(second.num_rows_hint(), 2);
+    }
+
+    /// Sealing the hold is scoped to the member being published to: a bulk
+    /// transaction on one table must not flush another table's coalescing
+    /// envelope, whose age deadline has to survive intact.
+    #[tokio::test]
+    async fn eager_oversized_transaction_leaves_other_members_held() {
+        let limits = test_limits(2, 1);
+        let settings = eager_settings(limits);
+        let (source, mut probes) = test_source_with_member_limits(2, limits);
+        let (first_key, _first_metrics, mut first_rx) = probes.remove(0);
+        let (second_key, _second_metrics, mut second_rx) = probes.remove(0);
+        let first_member = source.member(&first_key).expect("first member");
+        let second_member = source.member(&second_key).expect("second member");
+        let slot = Arc::new(AckSlot::new(0, false));
+        let mut hold = EagerHold::default();
+
+        let _ = push_eager_envelope(
+            &source,
+            &mut hold,
+            &first_key,
+            EagerPendingEnvelope {
+                member: Arc::clone(&first_member),
+                envelope: pending_change(&slot, 100, 100, false),
+            },
+            settings,
+        )
+        .await;
+        let first_deadline = hold.next_deadline.expect("the first member holds");
+
+        let _ = push_eager_envelope(
+            &source,
+            &mut hold,
+            &second_key,
+            EagerPendingEnvelope {
+                member: Arc::clone(&second_member),
+                envelope: pending_change_rows(&slot, 120, 120, 2),
+            },
+            settings,
+        )
+        .await;
+
+        assert_eq!(
+            hold.pending.len(),
+            1,
+            "only the published member's hold should be sealed"
+        );
+        assert!(hold.pending.contains_key(&first_key));
+        assert_eq!(
+            hold.next_deadline,
+            Some(first_deadline),
+            "the untouched member's age deadline must survive"
+        );
+        assert!(
+            futures::FutureExt::now_or_never(first_rx.next()).is_none(),
+            "the other member's envelope should still be held"
+        );
+        assert_eq!(
+            second_rx
+                .next()
+                .await
+                .expect("bulk envelope")
+                .expect("valid envelope")
+                .source_commit_ts_ms(),
+            Some(120)
+        );
+    }
+
+    /// The straight-through path drains the hold whichever condition selected it.
+    /// A zero `max_envelope_age` means no hold is ever started, so this guards the
+    /// shape of the drain rather than a state the pump reaches today: the two
+    /// conditions share one branch, and a future dynamic `max_envelope_age` would
+    /// make holding reachable after a hold already exists.
+    #[tokio::test]
+    async fn eager_disabled_hold_still_publishes_held_data_first() {
+        let enabled = test_limits(8, 1);
+        let (source, mut probes) = test_source_with_member_limits(1, enabled);
+        let (member_key, _metrics, mut rx) = probes.remove(0);
+        let member = source.member(&member_key).expect("member");
+        let slot = Arc::new(AckSlot::new(0, false));
+        let mut hold = EagerHold::default();
+        let mut disabled = enabled;
+        disabled.max_envelope_age = std::time::Duration::ZERO;
+
+        // Start the hold while holding is on, then publish with it off.
+        let _ = push_eager_envelope(
+            &source,
+            &mut hold,
+            &member_key,
+            EagerPendingEnvelope {
+                member: Arc::clone(&member),
+                envelope: pending_change(&slot, 100, 100, false),
+            },
+            eager_settings(enabled),
+        )
+        .await;
+        let _ = push_eager_envelope(
+            &source,
+            &mut hold,
+            &member_key,
+            EagerPendingEnvelope {
+                member: Arc::clone(&member),
+                envelope: pending_change(&slot, 120, 120, false),
+            },
+            eager_settings(disabled),
+        )
+        .await;
+
+        assert!(hold.pending.is_empty() && hold.next_deadline.is_none());
+        let first = rx
+            .next()
+            .await
+            .expect("first envelope")
+            .expect("valid first envelope");
+        let second = rx
+            .next()
+            .await
+            .expect("second envelope")
+            .expect("valid second envelope");
+        assert_eq!(
+            (first.source_commit_ts_ms(), second.source_commit_ts_ms()),
+            (Some(100), Some(120)),
+            "disabling the hold must not let the new commit overtake held data"
+        );
     }
 
     /// One hold per member, not one most-recently-used slot: a transaction
