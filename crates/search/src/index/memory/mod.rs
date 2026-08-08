@@ -347,8 +347,15 @@ impl Index for MemoryVectorIndex {
     /// [`Index::on_write_complete`] — a query during the refresh reads the previous
     /// contents, never a half-rebuilt index, and a refresh that fails leaves them in place.
     async fn on_write_start(&self, window: WriteWindow) -> Result<(), DataFusionError> {
-        if window == WriteWindow::ReplaceAll {
-            self.store.write().begin_replace_window();
+        let mut store = self.store.write();
+        match window {
+            WriteWindow::ReplaceAll => store.begin_replace_window(),
+            // An append has to land in the rows readers already see. A replace window whose
+            // terminators never ran leaves the store staging, so without this the append would
+            // be staged too and the `on_write_complete` that follows it would publish that
+            // staged set as the whole index — dropping every row the abandoned window had
+            // not re-sent. Discarding is a no-op in the usual case of no window open.
+            WriteWindow::Append => store.abandon_replace_window(),
         }
         Ok(())
     }
@@ -725,6 +732,35 @@ mod tests {
             indexed_ids(&index),
             vec![2],
             "row 7 belonged to a refresh that never completed"
+        );
+    }
+
+    /// The same abandoned window, followed by an append rather than another refresh. The
+    /// append has to land in the rows readers see: staged into the window the cancelled
+    /// refresh left open, its `on_write_complete` would publish that staged set as the
+    /// entire index and drop every row the abandoned refresh had not re-sent.
+    #[tokio::test]
+    async fn an_abandoned_window_does_not_capture_the_next_append() {
+        let index = memory_index();
+        write_window(&index, WriteWindow::Append, &[1, 2]).await;
+
+        index
+            .on_write_start(WriteWindow::ReplaceAll)
+            .await
+            .expect("the write window opens");
+        index
+            .compute_index(vec![batch(&[7])])
+            .await
+            .expect("the rows are indexed");
+
+        // No `on_write_complete` / `on_write_failed`; an append simply follows.
+        write_window(&index, WriteWindow::Append, &[3]).await;
+
+        assert_eq!(
+            indexed_ids(&index),
+            vec![1, 2, 3],
+            "row 7 belonged to a refresh that never completed, and an append must not \
+             replace the rows it did not carry"
         );
     }
 
