@@ -70,6 +70,21 @@ proc repl_send {text} {
     }
 }
 
+# The arguments that point a REPL at this job's runtime, or none at all.
+#
+# In CI each job binds its runtime to its own port, because the self-hosted
+# pools run several runner instances on one host and spiced's default 8090
+# cannot be shared (#12419). SPICE_HTTP_ENDPOINT carries that port. When it is
+# unset — running one of these scripts by hand against a local runtime — the
+# REPL keeps its own default, so nothing has to be set to reproduce a CI run.
+proc repl_endpoint_args {} {
+    if {[info exists ::env(SPICE_HTTP_ENDPOINT)] && $::env(SPICE_HTTP_ENDPOINT) ne ""} {
+        return [list --endpoint $::env(SPICE_HTTP_ENDPOINT)]
+    }
+
+    return [list]
+}
+
 # Fails the script if the spawned process has exited. Writing to the pty of an
 # exited process succeeds silently, so a REPL that crashes while sitting idle at
 # its prompt is invisible to `repl_send` alone; reading finds the eof. Output
