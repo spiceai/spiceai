@@ -8,6 +8,8 @@
 # Same fail-fast order as local sign-off:
 #   0. Skip Rust lint/build/tests when the branch has no Rust-affecting files
 #      vs trunk (.rs, Cargo.toml/lock, rust-toolchain*, .cargo/*)
+#   0b. Refuse a branch whose Makefile has no rule for a target the gate invokes
+#      (a branch based before the target was added would build for hours first)
 #   1. Targeted lint of crates touched by the branch vs trunk (off by default
 #      here — see the run_targeted_prechecks input)
 #   2. Targeted unit tests for those crates (runs only when step 1 does)
