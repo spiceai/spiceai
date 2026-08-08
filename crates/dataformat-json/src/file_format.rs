@@ -502,6 +502,14 @@ impl Decoder for SpiceJsonDecoder {
     }
 
     fn flush(&mut self) -> Result<Option<RecordBatch>, ArrowError> {
+        // `can_flush_early` is false, so the deserializer only flushes once the
+        // input stream is exhausted. That makes this the one place the adapter
+        // can be told the file has ended, and the only place a still-open array
+        // can be reported instead of silently returning the rows read so far.
+        if let Some(push) = &self.array_to_ndjson_push {
+            push.finish()?;
+        }
+
         let projected_schema = Arc::clone(&self.projected_schema);
         self.inner.flush().map(move |batch| {
             batch.map(|batch| {
@@ -1323,5 +1331,140 @@ mod tests {
         schema
             .field_with_name("val")
             .expect("field should exist in schema");
+    }
+
+    mod truncated_array {
+        use super::*;
+        use arrow::datatypes::{DataType, Field};
+        use datafusion_datasource::decoder::{DecoderDeserializer, deserialize_stream};
+        use futures::{StreamExt, executor::block_on};
+
+        fn schema() -> SchemaRef {
+            Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, true)]))
+        }
+
+        fn decoder(schema: &SchemaRef) -> SpiceJsonDecoder {
+            let inner = json::reader::ReaderBuilder::new(Arc::clone(schema))
+                .build_decoder()
+                .expect("build arrow json decoder");
+            SpiceJsonDecoder::new(inner, true, None, Arc::clone(schema))
+        }
+
+        /// Rows read before the input ran out must not be handed back as if
+        /// they were the whole file.
+        #[test]
+        fn flush_rejects_an_array_that_never_closed() {
+            for body in [
+                &br#"[{"a":1},{"a":2}"#[..],
+                &br#"[{"a":1},"#[..],
+                &br#"[1,2,3"#[..],
+                &br#"["#[..],
+            ] {
+                let schema = schema();
+                let mut dec = decoder(&schema);
+                dec.decode(body).expect("decode should accept the prefix");
+
+                let err = dec.flush().expect_err(
+                    "an array with no closing bracket must be reported, not silently truncated",
+                );
+                assert!(
+                    err.to_string().contains("closing ']'"),
+                    "unexpected error for {:?}: {err}",
+                    String::from_utf8_lossy(body)
+                );
+            }
+        }
+
+        #[test]
+        fn flush_rejects_a_body_that_is_not_an_array() {
+            for body in [&b""[..], &b"   \n\t "[..]] {
+                let schema = schema();
+                let mut dec = decoder(&schema);
+                dec.decode(body).expect("decode should accept the prefix");
+
+                let err = dec
+                    .flush()
+                    .expect_err("a body with no array at all must be reported");
+                assert!(
+                    err.to_string().contains("opening '['"),
+                    "unexpected error for {:?}: {err}",
+                    String::from_utf8_lossy(body)
+                );
+            }
+        }
+
+        #[test]
+        fn flush_accepts_a_closed_array() {
+            for body in [&br#"[{"a":1},{"a":2}]"#[..], &br#"[]"#[..], &b"  [ ]  "[..]] {
+                let schema = schema();
+                let mut dec = decoder(&schema);
+                dec.decode(body).expect("decode should accept the body");
+
+                // Flush is called repeatedly until it yields no more batches;
+                // a closed array must stay clean across every call.
+                for _ in 0..3 {
+                    dec.flush().unwrap_or_else(|e| {
+                        panic!(
+                            "closed array {:?} must flush clean: {e}",
+                            String::from_utf8_lossy(body)
+                        )
+                    });
+                }
+            }
+        }
+
+        /// The whole point of `finish` is that the deserializer reaches it, so
+        /// drive the real `deserialize_stream` wiring rather than `flush` alone.
+        #[test]
+        fn the_stream_fails_instead_of_returning_a_short_table() {
+            let schema = schema();
+            let chunks: Vec<Result<bytes::Bytes>> = vec![
+                Ok(bytes::Bytes::from_static(br#"[{"a":1},"#)),
+                Ok(bytes::Bytes::from_static(br#"{"a":2}"#)),
+            ];
+
+            // Bounded: `deserialize_stream` re-polls the exhausted input and so
+            // repeats any decoder error indefinitely. Consumers stop at the
+            // first error; the test only needs to see one arrive.
+            let batches: Vec<_> = block_on(
+                deserialize_stream(
+                    futures::stream::iter(chunks),
+                    DecoderDeserializer::new(decoder(&schema)),
+                )
+                .take(8)
+                .collect(),
+            );
+
+            let rows: usize = batches
+                .iter()
+                .filter_map(|b| b.as_ref().ok())
+                .map(RecordBatch::num_rows)
+                .sum();
+            assert!(
+                batches.iter().any(Result::is_err),
+                "a truncated array yielded {rows} rows and no error"
+            );
+        }
+
+        /// The buffered reader already rejects these bodies. The streaming
+        /// adapter reading the same file must not disagree with it.
+        #[test]
+        fn both_readers_reject_the_same_truncated_body() {
+            let body = br#"[{"a":1},{"a":2}"#;
+
+            let mut pulled = Vec::new();
+            let pull = ArrayToNdjson::try_new(std::io::Cursor::new(body.to_vec()))
+                .expect("array start is present")
+                .read_to_end(&mut pulled);
+            assert!(pull.is_err(), "buffered reader accepted a truncated array");
+
+            let schema = schema();
+            let mut dec = decoder(&schema);
+            dec.decode(body).expect("decode should accept the prefix");
+            assert!(
+                dec.flush().is_err(),
+                "streaming adapter accepted a truncated array the buffered reader rejects"
+            );
+        }
     }
 }

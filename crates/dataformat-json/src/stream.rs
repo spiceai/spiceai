@@ -962,6 +962,40 @@ impl ArrayToNdjsonPush {
         matches!(self.state, ParsingState::Complete)
     }
 
+    /// Signal that no more bytes will arrive.
+    ///
+    /// Every state other than [`ParsingState::Complete`] means the array was
+    /// still open when the input ran out, so the elements already emitted are
+    /// a prefix of the file rather than the whole of it. Without this call the
+    /// adapter has no end-of-input transition at all: a body cut short mid-way
+    /// simply stops producing rows, and the short result is indistinguishable
+    /// from a complete one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::UnexpectedEof`] if the array was never opened
+    /// or never closed.
+    pub fn finish(&self) -> io::Result<()> {
+        let detail = match self.state {
+            ParsingState::Complete => return Ok(()),
+            ParsingState::ExpectingArrayStart => {
+                "the input ended before the opening '[' — the body is empty or contains only whitespace"
+            }
+            ParsingState::ExpectingFirstElement
+            | ParsingState::ExpectingElement
+            | ParsingState::ExpectingCommaOrClosingBracket => {
+                "the input ended before the closing ']' — the file is truncated"
+            }
+        };
+
+        Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            format!(
+                "Failed to read JSON array: {detail}. Rows read so far are only part of the file. Re-fetch the complete file, or set the dataset's 'format' to match its contents."
+            ),
+        ))
+    }
+
     /// Process accumulated buffer data using `serde_json::StreamDeserializer`
     #[expect(clippy::cast_possible_truncation)]
     fn process_buffer(&mut self) -> io::Result<()> {
