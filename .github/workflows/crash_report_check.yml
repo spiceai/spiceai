@@ -21,6 +21,12 @@ on:
     branches:
       - sgrebnov/12332-crash-report-followups
 
+# Each leg builds spiced from scratch on a shared runner pool, so a superseded run
+# should stop rather than compete with the one that replaced it.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   crash_report:
     name: crash report (${{ matrix.profile }})
