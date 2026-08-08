@@ -877,6 +877,47 @@ SIGNOFF_CACHE_HIT="${SIGNOFF_CACHE_HIT:-}"
 readonly DISK_WATCH_HIT_STATUS=3
 readonly CACHE_WATCH_HIT_STATUS=4
 
+# The watcher itself, held in one place so the probe below runs exactly the
+# program that will read the build output — a probe of anything else predicts
+# nothing about the invocation that matters.
+#
+# awk rather than a captured log: it passes every line straight through and
+# keeps two bits of state, so watching costs nothing on a volume that is already
+# short of space. fflush keeps the output streaming to the Actions log line by
+# line, as it does unwatched.
+#
+# Disk wins when both signatures appear: a volume at zero can break sccache's
+# storage too, and reclaiming space is then the remedy that also fixes the
+# cache. One exit status rather than a bitmask keeps the "watcher never reached
+# a verdict" reading below unambiguous.
+readonly DISK_WATCH_PROGRAM='
+    $0 ~ pat { hit = 1 }
+    $0 ~ cache_pat { cache_hit = 1 }
+    { print; fflush() }
+    END {
+      if (hit) exit (hit_status + 0)
+      if (cache_hit) exit (cache_status + 0)
+    }
+  '
+
+# Run the watcher over no input at all. A usable watcher reads the empty stream,
+# matches nothing, and exits 0; one that cannot run — no awk on the runner, a
+# variant that rejects the program — reports its own non-zero status here,
+# while nothing is downstream of it.
+disk_watch_probe() {
+  awk -v pat="$DISK_FULL_PATTERN" -v hit_status="$DISK_WATCH_HIT_STATUS" \
+    -v cache_pat="$CACHE_UNUSABLE_PATTERN" -v cache_status="$CACHE_WATCH_HIT_STATUS" \
+    "$DISK_WATCH_PROGRAM" </dev/null >/dev/null 2>&1
+}
+
+# Give up the reading and say so. Called from both places a watcher can fail to
+# deliver one — before it runs, and part-way through — so the two cannot drift
+# into describing the same outcome differently.
+disarm_disk_watch() {
+  info "warning: the build-output watcher exited ${1} rather than reporting a verdict — falling back to free-space classification"
+  SIGNOFF_DISK_WATCH=""
+}
+
 # Run one `make` step, recording whether it died for want of disk or for want of
 # a reachable compiler cache. Returns make's own status, never the watcher's.
 # With the watch off — every local run — make is invoked exactly as before, so
@@ -886,7 +927,7 @@ run_make_step() {
     make "$@"
     return $?
   fi
-  local status watch_status
+  local status watch_status probe_status=0
   local -a pipe_status
   # Reset per step, so the verdict describes the step that actually failed. Left
   # to accumulate, a step that merely *mentioned* running out of disk and then
@@ -894,26 +935,24 @@ run_make_step() {
   # steps later.
   SIGNOFF_DISK_HIT=""
   SIGNOFF_CACHE_HIT=""
-  # awk rather than a captured log: it passes every line straight through and
-  # keeps two bits of state, so watching costs nothing on a volume that is
-  # already short of space. fflush keeps the output streaming to the Actions log
-  # line by line, as it does unwatched.
-  #
-  # Disk wins when both signatures appear: a volume at zero can break sccache's
-  # storage too, and reclaiming space is then the remedy that also fixes the
-  # cache. One exit status rather than a bitmask keeps the "watcher never reached
-  # a verdict" reading below unambiguous.
+  # Ask whether the watcher runs before make writes a byte to it, because the
+  # only other place to find out is downstream of make — where a watcher that
+  # exits at once closes the pipe under a still-writing make, make dies of
+  # SIGPIPE, and the step reports 128+13 instead of its own status. A genuine
+  # compile failure then reads as a run that was signalled rather than one that
+  # was judged. Probing first keeps make's status make's own: an unusable
+  # watcher costs the reading, which the free-space backstop already covers,
+  # and nothing else. Regression test for #12734.
+  disk_watch_probe || probe_status=$?
+  if [[ "$probe_status" -ne 0 ]]; then
+    disarm_disk_watch "$probe_status"
+    make "$@"
+    return $?
+  fi
   make "$@" 2>&1 | awk \
       -v pat="$DISK_FULL_PATTERN" -v hit_status="$DISK_WATCH_HIT_STATUS" \
-      -v cache_pat="$CACHE_UNUSABLE_PATTERN" -v cache_status="$CACHE_WATCH_HIT_STATUS" '
-    $0 ~ pat { hit = 1 }
-    $0 ~ cache_pat { cache_hit = 1 }
-    { print; fflush() }
-    END {
-      if (hit) exit (hit_status + 0)
-      if (cache_hit) exit (cache_status + 0)
-    }
-  '
+      -v cache_pat="$CACHE_UNUSABLE_PATTERN" -v cache_status="$CACHE_WATCH_HIT_STATUS" \
+      "$DISK_WATCH_PROGRAM"
   # Copy the whole array in one statement: reading PIPESTATUS is itself a command,
   # so a second `x="${PIPESTATUS[1]}"` would be reading the *assignment's* status
   # and, under `set -u`, abort on the now-absent index.
@@ -925,15 +964,21 @@ run_make_step() {
   elif [[ "$watch_status" -eq "$CACHE_WATCH_HIT_STATUS" ]]; then
     SIGNOFF_CACHE_HIT=1
   elif [[ "$watch_status" -ne 0 ]]; then
-    # The watcher died instead of reaching a verdict: no awk on the runner, a
-    # syntax error, a signal. Its silence is then not "no out-of-disk line went
-    # past" — nothing reliably read the output at all — so leaving the watch
-    # armed would let failure_kind assert "not disk" on the authority of a
-    # watcher that never ran, which is the same mislabelling in the other
+    # The watcher started, so the probe cleared it, and then died part-way
+    # through: killed for memory, or a signal that reached the whole group. Its
+    # silence is then neither "no out-of-disk line went past" nor "the cache was
+    # reachable" — nothing reliably read the output to the end — so leaving the
+    # watch armed would let failure_kind assert "not disk" on the authority of a
+    # reading nobody finished, which is the same mislabelling in the other
     # direction from #12427. Disarm it so classification falls back to the
     # free-space backstop, exactly as on an unwatched local run.
-    info "warning: the build-output watcher exited ${watch_status} rather than reporting a verdict — falling back to free-space classification"
-    SIGNOFF_DISK_WATCH=""
+    #
+    # make can still have taken SIGPIPE on its way out here, and the probe
+    # cannot prevent that: a watcher that dies mid-stream closes the pipe with
+    # make still writing. What the probe removes is the whole class where the
+    # watcher was never going to run at all, which is the one that costs
+    # make's status on every step rather than on the step that raced.
+    disarm_disk_watch "$watch_status"
   fi
   return "$status"
 }
