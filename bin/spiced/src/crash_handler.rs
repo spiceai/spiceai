@@ -36,9 +36,26 @@ use std::sync::OnceLock;
 /// Kept alive for the process lifetime; dropping a [`CrashHandler`] detaches it.
 static HANDLER: OnceLock<crash_handler::CrashHandler> = OnceLock::new();
 
-/// Resolved at install time: parsing `/proc/self/maps` is not signal-safe, and the
-/// value cannot change while the process runs.
-static LOAD_BASE: OnceLock<usize> = OnceLock::new();
+/// Where the running binary is mapped.
+///
+/// Resolved at install time: parsing `/proc/self/maps` is not signal-safe, and none
+/// of it changes while the process runs.
+#[cfg(target_os = "linux")]
+struct Image {
+    /// Start of the mapping at file offset 0 — what `ip - base` is an offset into.
+    base: usize,
+    /// The executable mapping. An instruction pointer outside it is not code from
+    /// this binary, so no file offset computed from it means anything.
+    text: core::ops::Range<usize>,
+}
+
+#[cfg(target_os = "linux")]
+static IMAGE: OnceLock<Image> = OnceLock::new();
+
+/// `addr2line` up to the offset, built at install so the handler writes bytes rather
+/// than formatting a path. Printed only when the offset is one `addr2line` can use.
+#[cfg(target_os = "linux")]
+static SYMBOLIZE_PREFIX: OnceLock<String> = OnceLock::new();
 
 /// For the `uptime` field: crashes clustered at a fixed point after startup look
 /// very different from ones that need hours of load.
@@ -57,6 +74,12 @@ const REPORT_BUF: usize = 1024;
 /// can be logged — to keep the rest of the report provably bounded.
 const MAX_IDENTITY: usize = 192;
 
+/// How long the `addr2line` prefix may be. The executable's path is the other input
+/// with no inherent limit — `PATH_MAX` is four times this whole buffer — so a path
+/// that will not fit falls back to a bare `spiced` at install.
+#[cfg(target_os = "linux")]
+const MAX_SYMBOLIZE_PREFIX: usize = 320;
+
 /// The longest report that can be produced, so a new field breaks the build rather
 /// than silently truncating the fields printed after it. Each term is the widest its
 /// part can format to; `u64` is 20 digits, `i32` 11, a hex `u64` 16.
@@ -65,9 +88,11 @@ const MAX_REPORT: usize = 47                 // banner and trailer
     + MAX_IDENTITY
     + 46                                     // signal=… code=… (…)
     + 43                                     // sender_pid=… sender_uid=…, the wider arm
-    + 89                                     // ip= base= offset=
+    + 46                                     // ip= base=
+    + 60                                     // offset=, or the widest reason it is absent
+    + 1
     + 86                                     // thread= pid= tid= uptime=
-    + 55; // symbolize line
+    + MAX_SYMBOLIZE_PREFIX + 17; // symbolize line
 #[cfg(target_os = "linux")]
 const _: () = assert!(MAX_REPORT <= REPORT_BUF);
 
@@ -81,7 +106,7 @@ const _: () = assert!(MAX_REPORT <= REPORT_BUF);
 /// reporting would be worse than starting without it.
 pub fn install(version: &str) {
     let _ = START.set(std::time::Instant::now());
-    let _ = LOAD_BASE.set(read_load_base().unwrap_or(0));
+    resolve_image();
     // Formatted now, not in the handler: allocating there is not signal-safe, and a
     // pre-built line cannot crowd out the rest of the report's fixed buffer.
     let mut identity = format!(
@@ -121,38 +146,103 @@ pub fn install(version: &str) {
     }
 }
 
-/// The executable's load base, needed to turn a runtime instruction pointer back into
-/// a file offset for `addr2line`. Read from `/proc/self/maps`: the first executable
-/// mapping backed by the running binary.
+/// Resolve everything the report needs about the running binary. Only the Linux
+/// report carries an instruction pointer, so only Linux has anything to resolve.
 #[cfg(target_os = "linux")]
-fn read_load_base() -> Option<usize> {
+fn resolve_image() {
+    if let Some(image) = read_image() {
+        let _ = IMAGE.set(image);
+    }
+    let _ = SYMBOLIZE_PREFIX.set(symbolize_prefix());
+}
+
+#[cfg(not(target_os = "linux"))]
+fn resolve_image() {}
+
+/// Where the running binary is mapped, from `/proc/self/maps`.
+#[cfg(target_os = "linux")]
+fn read_image() -> Option<Image> {
     let exe = std::fs::read_link("/proc/self/exe").ok()?;
     let exe = exe.to_str()?;
     let maps = std::fs::read_to_string("/proc/self/maps").ok()?;
+
+    let mut base = None;
+    let mut text_start = usize::MAX;
+    let mut text_end = 0;
+
     for line in maps.lines() {
-        // Take the mapping at file offset 0, not the first executable segment: the
-        // r-xp segment sits at a non-zero offset, so using it would make `ip - base`
-        // an offset into the text segment rather than into the file and every
-        // `addr2line` would resolve to the wrong place.
-        //
         // Fields: <start>-<end> <perms> <file-offset> <dev> <inode> <path>
         if !line.ends_with(exe) {
             continue;
         }
         let mut fields = line.split_whitespace();
-        let range = fields.next()?;
-        let _perms = fields.next()?;
-        let file_offset = fields.next()?;
-        if file_offset.trim_start_matches('0').is_empty() {
-            return usize::from_str_radix(range.split('-').next()?, 16).ok();
+        let (Some(range), Some(perms), Some(file_offset)) =
+            (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        let Some((start, end)) = range.split_once('-') else {
+            continue;
+        };
+        let (Ok(start), Ok(end)) = (
+            usize::from_str_radix(start, 16),
+            usize::from_str_radix(end, 16),
+        ) else {
+            continue;
+        };
+
+        // Take the mapping at file offset 0, not the first executable segment: the
+        // r-xp segment sits at a non-zero offset, so using it would make `ip - base`
+        // an offset into the text segment rather than into the file and every
+        // `addr2line` would resolve to the wrong place.
+        if base.is_none() && file_offset.trim_start_matches('0').is_empty() {
+            base = Some(start);
+        }
+        // `-z separate-code` can split the text segment, so take the whole span.
+        if perms.contains('x') {
+            text_start = text_start.min(start);
+            text_end = text_end.max(end);
         }
     }
-    None
+
+    if text_start >= text_end {
+        return None;
+    }
+    Some(Image {
+        base: base?,
+        text: text_start..text_end,
+    })
 }
 
-#[cfg(not(target_os = "linux"))]
-fn read_load_base() -> Option<usize> {
-    None
+/// The `addr2line` invocation, up to the offset.
+///
+/// Uses the real path so the command is runnable as printed. A path that would not fit
+/// the report's budget falls back to a bare `spiced` — a clipped path is worse than a
+/// generic one, because it looks runnable and is not.
+#[cfg(target_os = "linux")]
+fn symbolize_prefix() -> String {
+    let exe = std::fs::read_link("/proc/self/exe")
+        .ok()
+        .and_then(|path| path.to_str().map(str::to_owned));
+    match exe {
+        Some(exe) => {
+            let prefix = format!("symbolize: addr2line -e {exe} -fCi 0x");
+            if prefix.len() <= MAX_SYMBOLIZE_PREFIX {
+                return prefix;
+            }
+            tracing::warn!(
+                "Executable path is too long to print in a crash report; \
+                 the symbolize command will name the binary generically"
+            );
+        }
+        None => {
+            tracing::warn!(
+                "Could not resolve the executable's path; \
+                 the symbolize command in a crash report will name the binary generically"
+            );
+        }
+    }
+    "symbolize: addr2line -e spiced -fCi 0x".to_owned()
 }
 
 #[cfg(target_os = "linux")]
@@ -388,9 +478,15 @@ fn report(cc: &crash_handler::CrashContext) {
     let thread = core::str::from_utf8(&name[..name_len]).unwrap_or("?");
 
     let ip = instruction_pointer(cc);
-    let base = LOAD_BASE.get().copied().unwrap_or(0) as u64;
-    // The ASLR-removed offset is what `addr2line` wants; emitting it alongside the
-    // raw values keeps the printed command directly runnable.
+    let image = IMAGE.get();
+    let base = image.map_or(0, |image| image.base) as u64;
+    // An offset only means anything when `ip` is code from this binary. After a jump
+    // through a corrupted pointer it is not — it can be in a shared library, or not
+    // mapped at all — and `ip - base` is then a number `addr2line` will accept and
+    // resolve to the wrong place.
+    let in_text = image
+        .zip(usize::try_from(ip).ok())
+        .is_some_and(|(image, ip)| image.text.contains(&ip));
     let offset = ip.saturating_sub(base);
     let uptime = START.get().map_or(0, |s| s.elapsed().as_secs());
 
@@ -425,15 +521,35 @@ fn report(cc: &crash_handler::CrashContext) {
         (None, None) => write!(cur, "addr=n/a"),
     }
     .is_ok();
+    complete &= write!(cur, " ip=0x{ip:x} base=0x{base:x}").is_ok();
+    // Say why there is no offset rather than print one that cannot be used. The two
+    // reasons are worth telling apart: one is a bug in the crashing program, the other
+    // is a bug in this handler.
+    complete &= if in_text {
+        write!(cur, " offset=0x{offset:x}")
+    } else if image.is_none() {
+        write!(
+            cur,
+            " (load base unresolved - /proc/self/maps was not parsed)"
+        )
+    } else {
+        write!(cur, " (ip not in the spiced text mapping - wild jump)")
+    }
+    .is_ok();
     complete &= write!(
         cur,
-        " ip=0x{:x} base=0x{:x} offset=0x{:x}\n\
-         thread=\"{}\" pid={} tid={} uptime={}s\n\
-         symbolize: addr2line -e spiced -fCi 0x{:x}\n\
-         === end native crash ===\n",
-        ip, base, offset, thread, cc.pid, cc.tid, uptime, offset,
+        "\nthread=\"{}\" pid={} tid={} uptime={}s\n",
+        thread, cc.pid, cc.tid, uptime,
     )
     .is_ok();
+    // Only when the offset is one `addr2line` can actually use.
+    if in_text {
+        if let Some(prefix) = SYMBOLIZE_PREFIX.get() {
+            complete &= cur.write_all(prefix.as_bytes()).is_ok();
+            complete &= writeln!(cur, "{offset:x}").is_ok();
+        }
+    }
+    complete &= write!(cur, "=== end native crash ===\n").is_ok();
     #[expect(
         clippy::cast_possible_truncation,
         reason = "the cursor position is bounded by the buffer length"
@@ -516,6 +632,26 @@ mod tests {
         }
     }
 
+    /// The address the wild-call child jumps to: low enough to be below the load base
+    /// and never mapped, so the fault happens with `ip` already outside the image.
+    #[cfg(target_os = "linux")]
+    const WILD_CALL_ADDR: usize = 0x91;
+
+    /// Jump through a corrupted function pointer, the shape the report cannot
+    /// currently localize: `ip` ends up somewhere that is not code from this binary.
+    #[cfg(target_os = "linux")]
+    #[inline(never)]
+    #[unsafe(no_mangle)]
+    extern "C" fn spiced_crash_handler_test_wild_call() {
+        // SAFETY: a deliberate jump to an unmapped address — the behaviour under test.
+        let callee: extern "C" fn() =
+            unsafe { std::mem::transmute::<usize, extern "C" fn()>(WILD_CALL_ADDR) };
+        callee();
+        // Unreachable, but it stops the call above being turned into a tail jump,
+        // which would leave no return address behind for the report to recover.
+        std::hint::black_box(());
+    }
+
     /// Install the handler, take a real fault, and assert the report reached stderr.
     ///
     /// The process under test necessarily dies, so this re-executes its own binary
@@ -556,13 +692,16 @@ mod tests {
 
         if let Some(role) = std::env::var_os(CHILD) {
             super::install(TEST_VERSION);
-            if role == "abort" {
-                // SAFETY: raising a signal at ourselves is the behaviour under test.
-                unsafe {
-                    libc::raise(libc::SIGABRT);
+            match role.to_str() {
+                Some("abort") => {
+                    // SAFETY: raising a signal at ourselves is the behaviour under test.
+                    unsafe {
+                        libc::raise(libc::SIGABRT);
+                    }
                 }
-            } else {
-                spiced_crash_handler_test_fault();
+                #[cfg(target_os = "linux")]
+                Some("wild_call") => spiced_crash_handler_test_wild_call(),
+                _ => spiced_crash_handler_test_fault(),
             }
             unreachable!("the child must terminate");
         }
@@ -664,6 +803,44 @@ mod tests {
         assert_eq!(
             sender, reported,
             "a self-raised signal should name this process as the sender: {stderr}"
+        );
+    }
+
+    /// A jump through a corrupted pointer leaves `ip` outside this binary, where no
+    /// file offset computed from it is meaningful. The report has to say so rather
+    /// than print a command that resolves to whatever happens to sit at that offset.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn declines_to_symbolize_a_wild_jump() {
+        use std::os::unix::process::ExitStatusExt as _;
+
+        let output = crash_child("wild_call");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        assert_eq!(
+            output.status.signal(),
+            Some(libc::SIGSEGV),
+            "child should die from SIGSEGV, got {:?}",
+            output.status
+        );
+        assert!(
+            stderr.contains(&format!("ip=0x{WILD_CALL_ADDR:x}")),
+            "report should carry the wild instruction pointer: {stderr}"
+        );
+        assert!(
+            stderr.contains("wild jump"),
+            "report should say the ip is not in this binary: {stderr}"
+        );
+
+        // The two things that made the original report misleading: an offset clamped
+        // to zero, and a command built from it that resolves to something.
+        assert!(
+            !stderr.contains("offset="),
+            "no file offset should be reported for an ip outside the image: {stderr}"
+        );
+        assert!(
+            !stderr.contains("symbolize:"),
+            "a command that cannot work should not be printed: {stderr}"
         );
     }
 }

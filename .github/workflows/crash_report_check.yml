@@ -186,6 +186,27 @@ jobs:
       # The point of the report: does the printed offset actually symbolize? Function
       # names resolve from `.symtab`, which both release profiles keep; line numbers
       # and inline frames need debug info these artifacts do not yet ship.
+      # A jump through a corrupted pointer leaves `ip` outside this binary, where a
+      # file offset computed from it resolves to whatever happens to sit there.
+      - name: Show a wild-jump report
+        run: |
+          set +e
+          SPICED_CRASH_HANDLER_TEST_CHILD=wild_call "$TEST_BIN" \
+            --exact crash_handler::tests::reports_a_fatal_signal --nocapture \
+            > wild.out 2> wild.txt
+          STATUS=$?
+          set -e
+          echo "child exit: $STATUS (139 = SIGSEGV)"
+          test "$STATUS" -eq 139
+          echo "───────── report ─────────"
+          cat wild.txt
+          echo "──────────────────────────"
+          grep -q 'wild jump' wild.txt \
+            || { echo "report did not flag the ip as outside the image"; exit 1; }
+          if grep -qE 'offset=|symbolize:' wild.txt; then
+            echo "a command that cannot work was printed anyway"; exit 1
+          fi
+
       - name: Symbolize the offset
         run: |
           set -euo pipefail
@@ -204,5 +225,6 @@ jobs:
           path: |
             report.txt
             abort.txt
+            wild.txt
             sym.txt
           if-no-files-found: warn
