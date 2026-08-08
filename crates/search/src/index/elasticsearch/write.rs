@@ -778,7 +778,8 @@ fn describe_bulk_failure(position: usize, op: &Value) -> String {
 /// Top-level keys an Elasticsearch write or delete response is allowed to name.
 ///
 /// Covers the `_bulk` response (`took`, `errors`, `items`), the `_delete_by_query` response,
-/// and the `{"error": …, "status": …}` envelope both share on failure.
+/// the `{"task": …}` handle it returns instead when asked not to wait for completion, and
+/// the `{"error": …, "status": …}` envelope they share on failure.
 const KNOWN_RESPONSE_KEYS: &[&str] = &[
     "batches",
     "deleted",
@@ -790,6 +791,7 @@ const KNOWN_RESPONSE_KEYS: &[&str] = &[
     "requests_per_second",
     "retries",
     "status",
+    "task",
     "throttled_millis",
     "throttled_until_millis",
     "timed_out",
