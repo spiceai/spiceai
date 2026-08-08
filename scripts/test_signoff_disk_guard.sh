@@ -311,7 +311,26 @@ several_dir="$fixture_dir/predates-several"
 mkdir -p "$several_dir"
 write_makefile "$several_dir" lint-rust
 assert_preflight_targets "lists every missing target, not just the first" "$several_dir" 71 \
-  "nextest-packages nextest verify-cli"
+  "nextest verify-cli nextest-packages"
+
+# Requiring a target the run will not invoke refuses a branch that could have
+# completed every step selected for it. `nextest-packages` is reached only
+# through run_targeted_tests, and remote sign-off turns targeted work off by
+# default — so on that run the target is never invoked and must not be probed.
+targeted_off_dir="$fixture_dir/predates-nextest-packages"
+mkdir -p "$targeted_off_dir"
+write_makefile "$targeted_off_dir" lint-rust nextest verify-cli
+assert_preflight_targets "probes nextest-packages when targeted work is on" \
+  "$targeted_off_dir" 71 "nextest-packages"
+assert_preflight_targets "proceeds without nextest-packages when targeted work is off" \
+  "$targeted_off_dir" 0 "" SIGNOFF_SKIP_TARGETED_LINT=1 SIGNOFF_SKIP_TARGETED_TESTS=1
+# Either switch alone leaves the targeted path unreachable, so either alone is
+# enough to stop asking for the target.
+assert_preflight_targets "proceeds when only targeted tests are off" \
+  "$targeted_off_dir" 0 "" SIGNOFF_SKIP_TARGETED_TESTS=1
+# The unconditional targets stay required whatever the targeted switches say.
+assert_preflight_targets "still stops on an unconditional target with targeted work off" \
+  "$predates_dir" 71 "verify-cli" SIGNOFF_SKIP_TARGETED_LINT=1 SIGNOFF_SKIP_TARGETED_TESTS=1
 
 # A preflight run_checks never calls is a preflight that does nothing, and no
 # case above would notice — so assert the wiring, not just the function. Called
@@ -330,8 +349,9 @@ fi
 
 # The list is only worth anything if it matches the Makefile the gate actually
 # runs: rename a target in the root Makefile without updating
-# SIGNOFF_MAKE_TARGETS and every sign-off refuses to start.
-assert_preflight_targets "every SIGNOFF_MAKE_TARGETS entry resolves in the repo's own Makefile" \
+# SIGNOFF_MAKE_TARGETS and every sign-off refuses to start. Asserted with
+# targeted work on, so the conditional entry is covered here too.
+assert_preflight_targets "every sign-off make target resolves in the repo's own Makefile" \
   "$(cd "$script_dir/.." && pwd)" 0 ""
 
 echo

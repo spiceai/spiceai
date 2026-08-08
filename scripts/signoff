@@ -1100,10 +1100,34 @@ describe_check_failure() {
   esac
 }
 
-# The make targets run_checks invokes. Kept beside the preflight that reads it:
-# a target added to run_checks and not to this list reopens exactly the failure
-# the preflight exists to catch.
-readonly SIGNOFF_MAKE_TARGETS=(lint-rust nextest-packages nextest verify-cli)
+# The make targets run_checks invokes on every run that gets past the
+# Rust-changes skip. Kept beside the preflight that reads it: a target added to
+# run_checks and not to this list reopens exactly the failure the preflight
+# exists to catch.
+#
+# `nextest-packages` is deliberately absent — it is the one target run_checks
+# invokes conditionally, so it lives in signoff_make_targets below.
+readonly SIGNOFF_MAKE_TARGETS=(lint-rust nextest verify-cli)
+
+# The targets *this* invocation will actually reach.
+#
+# Requiring a target the run will not invoke refuses a branch that could have
+# completed every step selected for it. `nextest-packages` runs only inside
+# run_targeted_tests, which this invocation reaches only when targeted work is
+# enabled — and remote sign-off disables it by default
+# (SIGNOFF_SKIP_TARGETED_{LINT,TESTS} in .github/workflows/signoff.yml), so on
+# the default remote run that target is never invoked at all.
+#
+# Errs toward asking: targeted tests can still end up skipped after this point
+# when no changed workspace package is found, and the probe costs ten
+# milliseconds. Over-probing a target the branch has costs nothing; the
+# direction that matters is never *under*-probing one the run will invoke.
+signoff_make_targets() {
+  printf '%s\n' "${SIGNOFF_MAKE_TARGETS[@]}"
+  if [[ -z "${SIGNOFF_SKIP_TARGETED_LINT:-}" && -z "${SIGNOFF_SKIP_TARGETED_TESTS:-}" ]]; then
+    printf '%s\n' nextest-packages
+  fi
+}
 
 # True when `make` can resolve TARGET in this branch's Makefile.
 #
@@ -1144,7 +1168,8 @@ make_target_exists() {
 }
 
 # Stop before the Rust checks when this branch's Makefile has no rule for a
-# target the gate invokes.
+# target *this invocation* will invoke — see signoff_make_targets for why the
+# set is not fixed.
 #
 # `make lint-rust`/`nextest`/`verify-cli` run out of the *branch's* Makefile, so
 # a branch based before a target was added builds the entire workspace and then
@@ -1161,9 +1186,9 @@ preflight_make_targets() {
   local target
   local -a missing=()
 
-  for target in "${SIGNOFF_MAKE_TARGETS[@]}"; do
+  while IFS= read -r target; do
     make_target_exists "$target" || missing+=("$target")
-  done
+  done < <(signoff_make_targets)
 
   if (( ${#missing[@]} == 0 )); then
     debug "every sign-off make target resolves in this branch's Makefile"
