@@ -380,19 +380,171 @@ offset, so it probably doesn't matter" caveat.
 
 ### 1e. Do not print a command that cannot work
 
-`offset = ip.saturating_sub(base)` (`:209`) clamps to 0, so crash #2 printed
-`symbolize: addr2line -e spiced -fCi 0x0` — a command that resolves to something and
-misleads. Record the image end at install (last mapping of the exe in
-`/proc/self/maps`); when `ip` is outside `[base, end)`, print
-`ip=0x91 (outside the spiced image — wild jump)` and drop both `offset=` and the
-`symbolize:` line. Same when `base == 0`. Use the exe path `read_load_base` already
-resolves so the printed command is copy-pasteable.
+`offset = ip.saturating_sub(base)` (`crash_handler.rs:299`) clamps to `0` whenever
+`ip < base`, and the `symbolize:` line (`:333`) is printed unconditionally. Crash #2
+therefore ended with `offset=0x0` and `symbolize: addr2line -e spiced -fCi 0x0` — a
+command that resolves to *something*, at the very moment the report should have said
+the instruction pointer was not in this binary at all.
+
+#### Widen what install resolves
+
+`LOAD_BASE` records only the base. Record the executable mapping too, so the report can
+tell "in this binary" from "somewhere else":
+
+```rust
+/// Where the running binary is mapped. Resolved at install: parsing `/proc/self/maps`
+/// is not signal-safe, and none of it changes while the process runs.
+struct Image {
+    /// Start of the mapping at file offset 0 — what `ip - base` is an offset into.
+    base: usize,
+    /// The executable mapping. An `ip` outside it is not code from this binary, so no
+    /// file offset computed from it means anything.
+    text: core::ops::Range<usize>,
+}
+
+static IMAGE: OnceLock<Image> = OnceLock::new();
+```
+
+One pass over `/proc/self/maps` fills both: the exe-backed line at file offset `0` gives
+`base` (the existing rule, unchanged), and the exe-backed lines with `x` in their perms
+give `text` — take the lowest start and highest end across them, since `-z separate-code`
+can split the text segment in two.
+
+**Test against `text`, not against `[base, end_of_image)`.** The mapping set also covers
+the read-only and data segments, and an `ip` in those is just as much not-code; more
+importantly the common real case is an `ip` inside a *shared library* — libc, libcuda —
+where `ip - base` is a large bogus number that `addr2line` will happily accept.
+
+#### Branch the tail of the report
+
+```rust
+let image = IMAGE.get();
+let base = image.map_or(0, |i| i.base);
+let in_text = image.is_some_and(|i| i.text.contains(&(ip as usize)));
+```
+
+- `in_text` → `offset=0x…` and the `symbolize:` line, exactly as today.
+- `IMAGE` resolved but `ip` outside `text` → no `offset=`, no `symbolize:`, and say why:
+  `ip=0x91 (outside the spiced text mapping — wild jump)`.
+- `IMAGE` unresolved → also no offset, with the different reason:
+  `(load base unresolved — /proc/self/maps could not be parsed)`. Distinguishing the two
+  matters: one is a bug in the crashing program, the other is a bug in this handler.
+
+#### Pre-format the symbolize prefix at install
+
+`-e spiced` is not runnable as printed. `read_load_base` already resolves
+`/proc/self/exe`, so keep it — and, as with `IDENTITY`, build the whole prefix once at
+install rather than formatting a path inside the handler:
+
+```rust
+static SYMBOLIZE_PREFIX: OnceLock<String> = OnceLock::new();
+// "symbolize: addr2line -e /usr/local/bin/spiced -fCi 0x"
+```
+
+The handler then writes those bytes and appends `{offset:x}`. This also removes the one
+unbounded-length input from the report, which is what 1f needs to be able to bound it.
+
+#### Verify it
+
+The `wild_call` scenario in 3a is exactly this case: assert the report contains
+`outside the spiced text mapping`, contains no `symbolize:` line, and — once 1b lands —
+that the recovered return address *is* in `text` and does symbolize.
 
 ### 1f. Do not let the report truncate silently
 
-`write!` into the 512-byte cursor (`:213`) discards its `Err`. Registers, stack words
-and build-id all push on that budget. The split writes from 1b mostly solve it;
-otherwise size the buffer to the worst case with a `const` assertion.
+Every `write!` in `report()` is `let _ = write!(…)`, and a `Cursor` over a fixed slice
+stops at capacity and reports `WriteZero` rather than panicking. So the failure mode is
+a report that simply ends mid-field, with nothing saying it did. The buffer is 1 KiB
+against roughly 330 bytes of typical content, so there is margin today — but the margin
+is the only thing protecting it, and 1b (registers, stack words) is a large addition
+sitting behind an unchecked budget.
+
+Three layers, cheapest first.
+
+#### (a) Bound the variable-length inputs at install
+
+Two inputs have no inherent limit: the version string inside `IDENTITY`, and the exe
+path inside the `SYMBOLIZE_PREFIX` that 1e introduces (`PATH_MAX` is 4096, four times
+the whole buffer). Cap both where truncation is safe and observable:
+
+```rust
+const MAX_IDENTITY: usize = 192;
+const MAX_SYMBOLIZE_PREFIX: usize = 320;
+```
+
+Clip at install and `tracing::warn!` when clipping happens — install time is not a
+signal handler, so logging is fine there. Everything else in the report is then
+fixed-width.
+
+#### (b) A `const` assertion on the worst case
+
+With (a) in place the maximum is computable, so make the compiler check it:
+
+| part | max bytes |
+|---|---|
+| banner + trailer | 47 |
+| identity | `MAX_IDENTITY` |
+| `signal=` + `code=` + decoded name | 7 + 11 + 13 |
+| `addr=0x` + 16 hex | 23 |
+| `ip=` / `base=` / `offset=` | 3 × 26 |
+| `thread="…"` (`TASK_COMM_LEN`) | 24 |
+| `pid=` / `tid=` | 2 × 15 |
+| `uptime=` (u64) | 27 |
+| symbolize prefix + 16 hex | `MAX_SYMBOLIZE_PREFIX` + 17 |
+
+```rust
+const MAX_REPORT: usize = /* the sum above */;
+const _: () = assert!(MAX_REPORT <= REPORT_BUF);
+```
+
+Adding a field without adjusting the arithmetic then breaks the build rather than
+silently eating the `symbolize:` line.
+
+#### (c) A runtime backstop, because (b) is arithmetic a human maintains
+
+Thread the write results and, if any failed, emit a fixed marker in its own `write(2)`
+— by definition there is no room for it in the buffer:
+
+```rust
+let mut complete = true;
+complete &= write!(cur, …).is_ok();
+…
+raw_write(&buf[..written]);
+if !complete {
+    raw_write(b"=== crash report truncated ===\n");
+}
+```
+
+This is what survives someone adding a field and updating neither the constant nor the
+table.
+
+#### (d) Make the formatting testable off Linux
+
+(b) is only as good as the arithmetic, and nothing currently exercises it. The way to
+test it is to stop formatting straight out of a `CrashContext`:
+
+```rust
+struct ReportFields<'a> { identity: &'a str, signal: &'a str, thread: &'a str, … }
+
+fn format_report(fields: &ReportFields<'_>, out: &mut [u8]) -> (usize, bool)
+```
+
+`report()` becomes the part that extracts fields from the platform context, and a unit
+test can feed the worst case — `MAX_IDENTITY`-length identity, `u64::MAX` for every
+numeric field, a full 15-byte thread name — and assert it fits with `complete == true`.
+
+The real prize is that this test is **platform-independent**. Every field the handler
+prints today lives behind `#[cfg(target_os = "linux")]`, so the macOS dev loop compiles
+none of it and the only feedback is a CI run that takes an hour. A pure formatting
+function runs everywhere in milliseconds.
+
+#### Sequencing
+
+(a)+(b)+(c) are one small change and should land together. Do them **before** 1b, not
+after: 1b is the change that actually strains the budget, and it should land against a
+checked one. (d) is worth doing in the same PR if the refactor stays contained, since
+without it (b) is unverified arithmetic — but it is the one piece here that touches the
+shape of `report()` rather than adding to it.
 
 ---
 
