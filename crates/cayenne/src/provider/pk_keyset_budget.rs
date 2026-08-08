@@ -194,6 +194,54 @@ mod tests {
         set_global_pk_keyset_bytes(0);
     }
 
+    /// The clamp must let a grown table use free fleet headroom.
+    ///
+    /// `used` already includes the table's own share, so `remaining` is the
+    /// headroom BESIDE it. The ceiling is therefore `own + remaining`. Taking
+    /// the larger of the two instead freezes a grown table at its current size
+    /// while the fleet still has room — own 2 GiB with 1 GiB free reads as a
+    /// 2 GiB ceiling, admitting nothing. This models that arithmetic directly.
+    #[test]
+    fn a_grown_table_may_still_use_free_fleet_headroom() {
+        let per_table: usize = 4000;
+        let total: usize = 5000;
+        let own: usize = 2000;
+        // Two other tables hold 1500 between them, so `used` is own + 1500.
+        let used: usize = own + 1500;
+        let remaining = total - used;
+
+        let ceiling = per_table.min(own.saturating_add(remaining));
+        assert_eq!(
+            ceiling, 3500,
+            "the table may grow into the fleet's free headroom on top of what it holds"
+        );
+        assert!(
+            ceiling > own,
+            "a ceiling at or below current residency admits nothing and freezes the table"
+        );
+
+        // The rejected formula, kept as the contrast it exists to prevent.
+        let frozen = per_table.min(remaining.max(own));
+        assert_eq!(frozen, own, "max() collapses to own and freezes growth");
+    }
+
+    /// A fleet already at its ceiling must not push a table below what it holds:
+    /// the bound governs growth, it does not evict.
+    #[test]
+    fn a_full_fleet_holds_a_table_at_its_current_size_but_no_lower() {
+        let per_table: usize = 4000;
+        let total: usize = 5000;
+        let own: usize = 2000;
+        let used: usize = total; // fleet exactly full
+        let remaining = total.saturating_sub(used);
+
+        let ceiling = per_table.min(own.saturating_add(remaining));
+        assert_eq!(
+            ceiling, own,
+            "a full fleet pins the table at its residency rather than shrinking it"
+        );
+    }
+
     /// Unset must be transparent, so embedders and tests that never install a
     /// budget behave exactly as before.
     #[test]
