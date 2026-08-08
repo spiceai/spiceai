@@ -105,6 +105,14 @@ runs:
       if: (inputs.force_rebuild == 'true' || (steps.minio-download.outputs.found != 'true' && steps.cache-spidapter.outputs.cache-hit != 'true')) && steps.detect-os.outputs.os == 'linux'
       uses: ./.github/actions/setup-cc
 
+    # Reports only whether an sccache endpoint was configured, which decides
+    # whether `setup-sccache` runs. It deliberately does not export a
+    # `RUSTC_WRAPPER` for the build steps to consume: whether rustc is actually
+    # wrapped depends on the cache answering, which only `setup-sccache` learns.
+    # It writes the verdict to `$GITHUB_ENV`, so the build steps must inherit it
+    # rather than pin a step-level `env: RUSTC_WRAPPER:` -- a step-level value
+    # outranks `$GITHUB_ENV` and would wrap rustc in a cache known to be
+    # unreachable, which is the failure this action exists to prevent.
     - name: Check if sccache can be set up
       if: inputs.force_rebuild == 'true' || (steps.minio-download.outputs.found != 'true' && steps.cache-spidapter.outputs.cache-hit != 'true')
       id: check-sccache
@@ -112,10 +120,8 @@ runs:
       run: |
         if [ -z "${{ inputs.minio_endpoint }}" ]; then
           echo "SCCACHE_SETUP=false" >> $GITHUB_OUTPUT
-          echo "RUSTC_WRAPPER=" >> $GITHUB_OUTPUT
         else
           echo "SCCACHE_SETUP=true" >> $GITHUB_OUTPUT
-          echo "RUSTC_WRAPPER=sccache" >> $GITHUB_OUTPUT
         fi
 
     - name: Set up sccache
@@ -131,7 +137,6 @@ runs:
       run: |
         cargo build -p spidapter --release
       env:
-        RUSTC_WRAPPER: ${{ steps.check-sccache.outputs.RUSTC_WRAPPER }}
         AWS_ACCESS_KEY_ID: ${{ inputs.minio_access_key }}
         AWS_SECRET_ACCESS_KEY: ${{ inputs.minio_secret_key }}
         CARGO_INCREMENTAL: 0
