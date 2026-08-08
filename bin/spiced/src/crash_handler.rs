@@ -622,7 +622,7 @@ fn report(cc: &crash_handler::CrashContext) {
             " (load base unresolved - /proc/self/maps was not parsed)"
         )
     } else {
-        write!(cur, " (ip not in the spiced text mapping - wild jump)")
+        write!(cur, " (ip not in the spiced text mapping)")
     }
     .is_ok();
     complete &= write!(
@@ -1012,7 +1012,7 @@ mod tests {
             "report should carry the wild instruction pointer: {stderr}"
         );
         assert!(
-            stderr.contains("wild jump"),
+            stderr.contains("not in the spiced text mapping"),
             "report should say the ip is not in this binary: {stderr}"
         );
 

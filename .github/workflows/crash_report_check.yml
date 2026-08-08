@@ -201,7 +201,7 @@ jobs:
           echo "───────── report ─────────"
           cat wild.txt
           echo "──────────────────────────"
-          grep -q 'wild jump' wild.txt \
+          grep -q 'not in the spiced text mapping' wild.txt \
             || { echo "report did not flag the ip as outside the image"; exit 1; }
           if grep -qE 'offset=|symbolize: ' wild.txt; then
             echo "a command that cannot work was printed anyway"; exit 1
