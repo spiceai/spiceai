@@ -56,6 +56,10 @@ inputs:
   spiceio_endpoint:
     description: 'Spiceio S3-compatible endpoint for sccache (macOS)'
     required: false
+  min_free_gib:
+    description: 'Free space (GiB) each volume the build writes to must have before it starts. Enforced only on self-hosted runners; GitHub-hosted images are reported and built anyway.'
+    required: false
+    default: '10'
 
 outputs:
   spiced_path:
@@ -153,6 +157,33 @@ runs:
         echo "target_subdir=$target_subdir" >> $GITHUB_OUTPUT
         echo "target_dir=$target_dir" >> $GITHUB_OUTPUT
         echo "target_dir_relative=$target_dir_relative" >> $GITHUB_OUTPUT
+
+    # Ask whether the runner can hold the build before starting one, because the
+    # only other place to find out is inside the compiler: a volume at zero
+    # surfaces minutes later as `os error 28` against whichever crate happened to
+    # be writing, often behind a `cc-rs`/sccache frame that reads as a
+    # compiler-cache fault rather than a full disk (#12794). Placed after the
+    # paths are resolved so it measures the target directory the build will
+    # actually use, which CARGO_TARGET_DIR can put on another filesystem.
+    - name: Preflight disk space
+      shell: bash
+      env:
+        BUILD_MIN_FREE_GIB: ${{ inputs.min_free_gib }}
+        # Through the environment rather than interpolated into the script body,
+        # so a target directory containing a quote stays one argument instead of
+        # becoming shell syntax.
+        BUILD_TARGET_DIR: ${{ steps.resolve-build-paths.outputs.target_dir }}
+      run: |
+        # Every volume #12794 observed at zero. RUNNER_TEMP and TMPDIR are named
+        # separately because they are not the same place on a self-hosted macOS
+        # runner: RUNNER_TEMP sits under the work volume beside target/, while
+        # TMPDIR is the per-user system temp directory sccache and cc-rs write
+        # through. The script reports one reading per volume, so naming all
+        # three costs nothing where they coincide.
+        bash "$GITHUB_ACTION_PATH/../../../scripts/preflight_build_disk.sh" \
+          "${BUILD_TARGET_DIR:-}" \
+          "${RUNNER_TEMP:-}" \
+          "${TMPDIR:-}"
 
     - name: Build spiced (Makefile)
       if: inputs.use_makefile == 'true'
