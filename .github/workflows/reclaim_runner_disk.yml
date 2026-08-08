@@ -1,0 +1,105 @@
+---
+name: Reclaim Runner Disk
+
+# Takes stale build output and dead workspaces off the self-hosted runners.
+#
+# The pool's hosts are long-lived and nothing ever removed anything from them,
+# so free space only moved one way. #12794 is where that ends: two volumes below
+# the 25 GiB sign-off floor at the same time while two other hosts in the same
+# pool sat at 163 and 536 GiB, every merge-queue candidate failing its build,
+# and an operator deleting files by hand to get the queue moving again.
+#
+# The preflight checks added since (`scripts/preflight_build_disk.sh` for the
+# build path, `scripts/signoff` for the sign-off path) report a full volume at
+# the point it is detectable rather than minutes later from inside the compiler.
+# Neither reclaims anything. This is the other half.
+#
+# What it does not do is bound a single run — one host went 26 GiB to 1 GiB in
+# 6.2 hours of building, which no periodic sweep prevents. See #12800.
+
+on:
+  schedule:
+    # Off the hour, where scheduled runs are least likely to be delayed behind
+    # the on-the-hour crowd. Six-hourly rather than daily because each run
+    # sweeps whichever instances happen to be idle, so the pool is covered by
+    # repetition rather than by any one run (see `slot` below).
+    - cron: '41 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Report what would be removed without removing it'
+        type: boolean
+        default: false
+      max_age_days:
+        description: 'Leave anything modified within this many days'
+        type: string
+        default: '7'
+      free_gib:
+        description: 'Leave build output alone on a host with at least this many GiB free'
+        type: string
+        default: '100'
+
+concurrency:
+  group: ${{ github.workflow }}
+  # Queued rather than cancelled: a sweep interrupted mid-`rm` leaves a
+  # half-removed tree, and there is no hurry that would justify it.
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  reclaim:
+    name: Reclaim (${{ matrix.pool }} slot ${{ matrix.slot }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # Both self-hosted pools. `spiceai-macos` is the one #12794 names, but
+        # `spiceai-dev-runners` hosts are equally long-lived and accumulate the
+        # same way.
+        pool: [spiceai-macos, spiceai-dev-runners]
+        # A runner instance runs one job at a time, so N concurrent jobs on one
+        # label occupy N distinct instances — which is the only way to address
+        # individual instances behind a shared label. It is coverage by
+        # repetition, not a guarantee: a busier instance is idle less often and
+        # is swept on a later run instead.
+        slot: [1, 2, 3, 4]
+    runs-on: ${{ matrix.pool }}
+    # The sweep is a bounded directory walk and some deletes. Anything past this
+    # is wedged, and a wedged job on a self-hosted pool holds a slot until
+    # GitHub's 6-hour default expires it (#12717).
+    timeout-minutes: 30
+    permissions:
+      # Reads the repository to get the script, and nothing else.
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Reclaim stale space
+        shell: bash
+        env:
+          # Through the environment rather than interpolated into the script
+          # body, so a value carrying shell syntax cannot become shell syntax.
+          DRY_RUN_INPUT: ${{ inputs.dry_run }}
+          MAX_AGE_DAYS_INPUT: ${{ inputs.max_age_days }}
+          FREE_GIB_INPUT: ${{ inputs.free_gib }}
+        run: |
+          # On a scheduled run every input is empty, so each flag is omitted and
+          # the script's own defaults apply -- including "not a dry run", which
+          # is what a sweep that reclaims nothing would quietly become.
+          args=()
+          if [ "$DRY_RUN_INPUT" = "true" ]; then
+            args+=(--dry-run)
+          fi
+          if [ -n "$MAX_AGE_DAYS_INPUT" ]; then
+            args+=(--max-age-days "$MAX_AGE_DAYS_INPUT")
+          fi
+          if [ -n "$FREE_GIB_INPUT" ]; then
+            args+=(--free-gib "$FREE_GIB_INPUT")
+          fi
+
+          # Invoked through `bash` rather than as `./…` so the job does not
+          # depend on the executable bit surviving a checkout.
+          bash scripts/reclaim_runner_disk.sh ${args[@]+"${args[@]}"}
