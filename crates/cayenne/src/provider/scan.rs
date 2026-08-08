@@ -1045,9 +1045,10 @@ impl ExecutionPlan for CayenneAccelerationExec {
 struct MemoryAccountedScanStream<S> {
     inner: S,
     schema: SchemaRef,
-    /// `None` when the pool refused to register a consumer; accounting is then
-    /// skipped rather than failing the scan, because an unaccounted read is
-    /// strictly better than no read at all.
+    /// Always `Some` in practice — `MemoryConsumer::register` is infallible, so
+    /// there is no unaccounted path. `Option` only so the accounting can be
+    /// skipped wholesale in a future caller (or a test) without threading a
+    /// second flag through the poll loop.
     reservation: Option<MemoryReservation>,
     /// What to charge BEFORE a poll, since the batch's real size is unknowable
     /// until the decode that allocates it has already run. Adapted upward to the
@@ -1081,6 +1082,8 @@ const INITIAL_BATCH_ESTIMATE_BYTES: usize = 1024 * 1024;
 
 impl<S> MemoryAccountedScanStream<S> {
     fn new(inner: S, schema: SchemaRef, consumer_name: String, context: &Arc<TaskContext>) -> Self {
+        // Infallible: `register` hands back a zero-sized reservation and the
+        // pool only refuses later, at `try_grow`.
         let reservation = Some(MemoryConsumer::new(consumer_name).register(context.memory_pool()));
         Self {
             inner,
@@ -1136,6 +1139,15 @@ where
                 if let Some(reservation) = self.reservation.as_mut()
                     && let Err(e) = reservation.try_resize(actual)
                 {
+                    // Settling failed, so this batch is dropped with the error.
+                    // Release its charge and clear the flag: leaving the flag set
+                    // would make the next poll skip both the free and the
+                    // pre-charge, so a stream that is polled again after an error
+                    // would decode against a reservation held for a batch that no
+                    // longer exists. Most consumers abort on first error, but the
+                    // accounting must not depend on that.
+                    reservation.free();
+                    self.decode_charged = false;
                     return std::task::Poll::Ready(Some(Err(e)));
                 }
                 // The charge now covers the in-flight batch; the next poll
@@ -1215,6 +1227,69 @@ mod tests {
         assert!(
             err.to_string().contains("Resources exhausted"),
             "expected a pool refusal, got: {err}"
+        );
+    }
+
+    /// A failed settle must not leave the charge stuck.
+    ///
+    /// `try_resize` failing means the batch is dropped with the error. If the
+    /// `decode_charged` flag stayed set, the next poll would skip BOTH the free
+    /// and the pre-charge, so the following decode would run against a
+    /// reservation still held for a batch that no longer exists — accounting
+    /// drift in the direction that under-charges. Most consumers abort on the
+    /// first error, but the accounting must not rely on that.
+    #[tokio::test]
+    async fn a_failed_settle_releases_the_charge_and_recharges_next_poll() {
+        use datafusion_execution::memory_pool::GreedyMemoryPool;
+        use datafusion_execution::runtime_env::RuntimeEnvBuilder;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let wide = || {
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Int64Array::from(
+                    (0..262_144_i64).collect::<Vec<_>>(),
+                ))],
+            )
+            .expect("batch")
+        };
+        // Pool fits the 1 MiB pre-charge but not the settled size of this batch,
+        // so `try_grow` succeeds and `try_resize` is what fails.
+        let batch_bytes = wide().get_array_memory_size();
+        assert!(
+            batch_bytes > INITIAL_BATCH_ESTIMATE_BYTES,
+            "the batch must settle larger than the pre-charge for this to exercise try_resize"
+        );
+        let pool: Arc<dyn datafusion_execution::memory_pool::MemoryPool> = Arc::new(
+            GreedyMemoryPool::new(INITIAL_BATCH_ESTIMATE_BYTES + (batch_bytes / 2)),
+        );
+        let runtime = RuntimeEnvBuilder::new()
+            .with_memory_pool(Arc::clone(&pool))
+            .build_arc()
+            .expect("runtime env");
+        let context = Arc::new(TaskContext::default().with_runtime(runtime));
+
+        let inner = futures::stream::iter(vec![Ok(wide()), Ok(wide())]);
+        let mut stream = MemoryAccountedScanStream::new(
+            Box::pin(inner),
+            Arc::clone(&schema),
+            "cayenne_scan[test]".to_string(),
+            &context,
+        );
+
+        let first = stream.next().await.expect("one item");
+        assert!(
+            first.is_err(),
+            "a batch larger than the pool must fail to settle"
+        );
+        assert!(
+            !stream.decode_charged,
+            "a failed settle must clear the charge flag, or the next poll skips its pre-charge"
+        );
+        assert_eq!(
+            pool.reserved(),
+            0,
+            "a failed settle must release the charge for the batch it dropped"
         );
     }
 
