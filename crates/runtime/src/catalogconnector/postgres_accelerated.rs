@@ -76,6 +76,7 @@ use std::time::Duration;
 use app::App;
 use async_trait::async_trait;
 use data_components::RefreshableCatalogProvider;
+use data_components::catalog_filter::TableSelector;
 use data_components::postgres::provider::{
     ReplicaIdentityOutcome, check_cdc_prerequisites, classify_replica_identity,
     ensure_replication_slot_capacity, list_schemas, list_tables, list_views, replica_identity,
@@ -88,7 +89,6 @@ use datafusion::common::utils::quote_identifier;
 use datafusion::datasource::TableProvider;
 use datafusion::error::Result as DFResult;
 use datafusion_table_providers::sql::db_connection_pool::postgrespool::PostgresConnectionPool;
-use globset::GlobSet;
 use parking_lot::RwLock;
 use snafu::prelude::*;
 use spicepod::acceleration::{
@@ -99,7 +99,7 @@ use spicepod::component::dataset::Dataset as SpicepodDataset;
 use spicepod::param::Params;
 
 use crate::Runtime;
-use crate::component::catalog::Catalog;
+use crate::component::catalog::{Catalog, table_selector};
 use crate::component::dataset::builder::DatasetBuilder;
 
 /// Dataset param key carrying an explicit replication slot name (see
@@ -122,18 +122,6 @@ const CAYENNE_ENGINE: &str = "cayenne";
 /// docs link). The purely informational USING INDEX acceleration line is not a
 /// warning/error and omits it.
 const DOCS_URL: &str = "https://spiceai.org/docs/components/data-connectors/postgres";
-
-fn table_is_selected(
-    schema_name: &str,
-    table_name: &str,
-    include: Option<&GlobSet>,
-    exclude: Option<&GlobSet>,
-) -> bool {
-    let schema_with_table = format!("{schema_name}.{table_name}");
-    let included = include.is_none_or(|globset| globset.is_match(&schema_with_table));
-    let excluded = exclude.is_some_and(|globset| globset.is_match(&schema_with_table));
-    included && !excluded
-}
 
 /// Escapes one `PostgreSQL` identifier into a component of a synthesized dataset
 /// name, so the joined result is always a valid SQL identifier word and no two
@@ -477,8 +465,7 @@ pub struct AcceleratedCatalogProvider {
     /// Accelerator params written onto every synthesized dataset's acceleration
     /// block (the catalog's `acceleration.params`, e.g. `cayenne_file_path`).
     acceleration_params: HashMap<String, String>,
-    include: Option<Arc<GlobSet>>,
-    exclude: Option<Arc<GlobSet>>,
+    selector: TableSelector,
     schemas: RwLock<HashMap<String, Arc<AcceleratedSchemaProvider>>>,
     /// `(schema_name, table_name)` -> the dataset name it was already
     /// spawned under, tracked across refreshes so a periodic `refresh()`
@@ -555,8 +542,7 @@ impl AcceleratedCatalogProvider {
             slot_name,
             acceleration_mode,
             acceleration_params,
-            include: catalog.include.clone().map(Arc::new),
-            exclude: catalog.exclude.clone().map(Arc::new),
+            selector: table_selector(catalog),
             schemas: RwLock::new(HashMap::new()),
             spawned: RwLock::new(HashMap::new()),
         }
@@ -777,12 +763,7 @@ impl AcceleratedCatalogProvider {
         let mut summary = AccelerationSummary::default();
         let mut to_spawn = Vec::new();
         for table_name in table_names {
-            if !table_is_selected(
-                schema_name,
-                &table_name,
-                self.include.as_deref(),
-                self.exclude.as_deref(),
-            ) {
+            if !self.selector.selects_table(schema_name, &table_name) {
                 summary.excluded += 1;
                 continue;
             }
@@ -880,12 +861,7 @@ impl AcceleratedCatalogProvider {
             .await
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
         for view in views {
-            if !table_is_selected(
-                schema_name,
-                &view.name,
-                self.include.as_deref(),
-                self.exclude.as_deref(),
-            ) {
+            if !self.selector.selects_table(schema_name, &view.name) {
                 continue;
             }
             summary.views_not_replicated += 1;
@@ -1279,59 +1255,6 @@ mod tests {
                 panic!("{input:?} and {previous:?} both escape to {escaped:?}");
             }
         }
-    }
-
-    fn globset(patterns: &[&str]) -> GlobSet {
-        let mut builder = globset::GlobSetBuilder::new();
-        for pattern in patterns {
-            builder.add(globset::Glob::new(pattern).expect("valid glob"));
-        }
-        builder.build().expect("valid globset")
-    }
-
-    #[test]
-    fn table_is_selected_with_no_filters_selects_everything() {
-        assert!(table_is_selected("public", "orders", None, None));
-    }
-
-    #[test]
-    fn table_is_selected_honors_include() {
-        let include = globset(&["public.*"]);
-        assert!(table_is_selected("public", "orders", Some(&include), None));
-        // A table outside the include set is not selected.
-        assert!(!table_is_selected(
-            "reporting",
-            "orders",
-            Some(&include),
-            None
-        ));
-    }
-
-    #[test]
-    fn table_is_selected_honors_exclude() {
-        let exclude = globset(&["public.audit"]);
-        assert!(table_is_selected("public", "orders", None, Some(&exclude)));
-        assert!(!table_is_selected("public", "audit", None, Some(&exclude)));
-    }
-
-    #[test]
-    fn table_is_selected_exclude_wins_over_include() {
-        // A table matched by BOTH include and exclude is excluded -- exclude is
-        // the veto.
-        let include = globset(&["public.*"]);
-        let exclude = globset(&["public.audit"]);
-        assert!(table_is_selected(
-            "public",
-            "orders",
-            Some(&include),
-            Some(&exclude)
-        ));
-        assert!(!table_is_selected(
-            "public",
-            "audit",
-            Some(&include),
-            Some(&exclude)
-        ));
     }
 
     fn empty_provider() -> Arc<dyn TableProvider> {
