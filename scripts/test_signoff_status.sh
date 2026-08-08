@@ -11,6 +11,11 @@
 
 set -uo pipefail
 
+# Every assertion below that exercises a failing post wants one call and no
+# waiting; the retry is covered on its own by assert_post_retry, which sets the
+# backoff it needs.
+export SIGNOFF_STATUS_POST_BACKOFF=""
+
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 subject="$script_dir/signoff"
 
@@ -62,7 +67,22 @@ fi
 
 if [[ "$*" == *"--method POST"* ]]; then
   # A post that fails records nothing: the status never landed on the commit.
-  [[ "${STUB_POST_RC:-0}" == "0" ]] || exit "${STUB_POST_RC}"
+  # STUB_POST_FAILURES names a file holding how many of the next posts must
+  # fail; each failing attempt decrements it, so a caller that retries gets
+  # through once it reaches zero. The body is the one that stranded the verdict
+  # the retry exists for.
+  if [[ -n "${STUB_POST_FAILURES:-}" ]]; then
+    remaining="$(cat "$STUB_POST_FAILURES" 2>/dev/null)"
+    if (( "${remaining:-0}" > 0 )); then
+      printf '%s\n' "$(( remaining - 1 ))" >"$STUB_POST_FAILURES"
+      echo "gh: Bad credentials (HTTP 401)" >&2
+      exit 1
+    fi
+  fi
+  if [[ "${STUB_POST_RC:-0}" != "0" ]]; then
+    echo "gh: Bad credentials (HTTP 401)" >&2
+    exit "${STUB_POST_RC}"
+  fi
   state="" context="" description=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -300,6 +320,54 @@ assert_reruns() {
   echo "  ok: $name"
 }
 
+# Calls post_commit_status against an endpoint that fails its next $2 posts,
+# under a backoff of $3 (empty = one attempt). Checks the return code against
+# $4, that exactly $5 statuses landed on the commit, and that the output — the
+# log plus the job summary, which is where a reader who is not tailing the run
+# looks — carries $6.
+assert_post_retry() {
+  local name="$1" fail_times="$2" backoff="$3" want_rc="$4" want_posts="$5" want_output="${6:-}"
+  local state="${7:-failure}" unwanted_output="${8:-}"
+  tests_run=$((tests_run + 1))
+
+  # Not named `failures`: that is the suite's own counter, and shadowing it here
+  # makes fail_test's increment an arithmetic error, so a failing assertion
+  # reports nothing and the suite still claims every test passed.
+  local posts="$stub_dir/posts" failures_left="$stub_dir/failures" summary="$stub_dir/summary"
+  : >"$posts"
+  : >"$summary"
+  printf '%s\n' "$fail_times" >"$failures_left"
+
+  local output rc
+  output="$(PATH="$stub_dir:$PATH" STUB_POSTS="$posts" STUB_POST_FAILURES="$failures_left" \
+    SIGNOFF_STATUS_POST_BACKOFF="$backoff" GITHUB_STEP_SUMMARY="$summary" \
+    bash -c 'source "$1"; post_commit_status spiceai/spiceai "$2" "$3" "a canned verdict"' \
+    _ "$subject" "$fake_sha" "$state" 2>&1)"
+  rc=$?
+  output+=$'\n'"$(cat "$summary")"
+
+  if [[ "$rc" -ne "$want_rc" ]]; then
+    fail_test "$name: expected exit ${want_rc}, got ${rc} (output: ${output})"
+    return
+  fi
+
+  local landed
+  landed="$(grep -c . <"$posts")"
+  if [[ "$landed" -ne "$want_posts" ]]; then
+    fail_test "$name: expected ${want_posts} status(es) to land, got ${landed} (output: ${output})"
+    return
+  fi
+  if [[ -n "$want_output" && "$output" != *"$want_output"* ]]; then
+    fail_test "$name: expected the output to carry '${want_output}', got '${output}'"
+    return
+  fi
+  if [[ -n "$unwanted_output" && "$output" == *"$unwanted_output"* ]]; then
+    fail_test "$name: expected the output not to carry '${unwanted_output}', got '${output}'"
+    return
+  fi
+  echo "  ok: $name"
+}
+
 # The BASH_SOURCE guard that makes the subject sourceable must not stop it from
 # dispatching when it is executed — every other caller runs it that way.
 assert_dispatches_when_executed() {
@@ -369,10 +437,12 @@ assert_failure_post "an in-flight Attestation is not re-run" \
 assert_failure_post "a commit with no Attestation run is not re-run" \
   "" failure
 
-# An out-of-disk run and a failing branch reach this helper by the same path and
-# are told apart only by the description, so it must not be rewritten en route.
+# A run the runner broke and a failing branch reach this helper by the same path
+# and are told apart only by the description, so it must not be rewritten en route.
 assert_failure_description "an out-of-disk verdict keeps its own wording" \
   "Runner out of disk after 42s — checks did not complete, re-dispatch (triggered by someone)"
+assert_failure_description "an unreachable-cache verdict keeps its own wording" \
+  "Compiler cache unreachable after 42s — checks did not complete, re-dispatch (triggered by someone)"
 assert_failure_description "an ordinary check failure keeps its own wording" \
   "Sign-off checks failed after 42s (triggered by someone)"
 
@@ -400,12 +470,48 @@ assert_attestation_refresh "an in-flight Attestation is not flagged on the succe
   "4242 in_progress null" "" "" 0 "it will evaluate the sign-off once it finishes"
 
 echo
+echo "scripts/signoff — recording the verdict"
+
+# The bug: post_commit_status made one unretried call, so a single transient
+# response discarded a verdict that had cost hours of runner time, and the
+# `pending` posted on the way in stayed on the commit as the only thing there —
+# a state no reader can tell from a run still in flight.
+assert_post_retry "a verdict survives a transient failure" 2 "0 0 0" 0 1
+assert_post_retry "a verdict survives failures up to the last attempt" 3 "0 0 0" 0 1
+
+# An expired token is beyond what retrying can fix. What it must not do is fail
+# where only the log of a finished job can see it.
+assert_post_retry "a verdict that never lands says the pending is stale" 9 "0 0 0" 1 0 \
+  "Verdict not recorded"
+
+# Which failure it was decides whether the answer is more attempts or a fresh
+# token, and only the response body tells them apart.
+assert_post_retry "the response body is reported, not just the failure" 9 "0 0 0" 1 0 \
+  "Bad credentials"
+
+# An empty backoff is the single call the endpoint used to get, so a caller that
+# opts out is not silently retried.
+assert_post_retry "an empty backoff posts exactly once" 1 "" 1 0 "attempt 1/1"
+
+# A pending that never posts strands nothing — the commit keeps what it had and
+# the run still has its verdict to post — so it must not raise the alarm that
+# belongs to a lost verdict.
+assert_post_retry "a lost pending does not claim a stale status" 9 "0 0 0" 1 0 \
+  "" pending "Verdict not recorded"
+
+echo
 echo "scripts/signoff clear-pending"
 
-# The bug: a run terminated mid-check leaves the `pending` it posted on the
-# commit for good, so `status` and `mine` report a sign-off still in progress.
-assert_clear_pending "a pending status is replaced with a failure" \
-  pending failure "a canned reason"
+# A run terminated mid-check leaves the `pending` it posted on the commit with its
+# "in progress" wording, so the description is restated to say the run ended.
+#
+# The state stays `pending` and must not become `failure`: nothing judged the diff,
+# pr.yml reads `failure` as a code failure, Attestation rejects it on the head commit
+# (#12362), and a red `signoff` never self-clears, disqualifying the commit outright.
+# A budget expiry reaches this path as a failed step rather than a cancellation, so
+# `correct-cancelled` never fires to take such a verdict back (#12741).
+assert_clear_pending "an incomplete run is restated as pending, not failed" \
+  pending pending "a canned reason"
 
 # The run reached a verdict — that verdict is the one that counts.
 assert_clear_pending "a successful sign-off is left alone" success

@@ -37,10 +37,12 @@ pub const ROWS_RETURNED_HISTOGRAM_BUCKETS: [f64; 18] = [
     50000.0, 100_000.0, 250_000.0, 500_000.0,
 ];
 
-// Extended default buckets for duration histogram: 25000.0, 50000.0, 100000.0, 250000.0, 500000.0
-pub const DURATION_MS_HISTOGRAM_BUCKETS: [f64; 15] = [
-    0.0, 100.0, 250.0, 500.0, 750.0, 1000.0, 2500.0, 5000.0, 7500.0, 10000.0, 25000.0, 50000.0,
-    100_000.0, 250_000.0, 500_000.0,
+// Boundaries for every millisecond-scale duration histogram. The sub-100ms head resolves the band
+// most requests finish in: without it a 0.1ms lookup and a 99ms one share a bucket, and the
+// quantile interpolated inside it tracks the requested percentile rather than any latency.
+pub const DURATION_MS_HISTOGRAM_BUCKETS: [f64; 24] = [
+    0.0, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 750.0, 1000.0,
+    2500.0, 5000.0, 7500.0, 10000.0, 25000.0, 50000.0, 100_000.0, 250_000.0, 500_000.0,
 ];
 
 // Buckets for byte-sized payload histograms (Cayenne CDC burst / WAL telemetry).
@@ -66,12 +68,9 @@ pub const BYTES_HISTOGRAM_BUCKETS: [f64; 16] = [
     8_589_934_592.0,
 ];
 
-// Finer-grained millisecond buckets for sub-second contention timings (metastore
-// writer wait/hold, WAL checkpoint, CDC linger). The shared
-// `DURATION_MS_HISTOGRAM_BUCKETS` jumps straight from 0 to 100ms, which is too
-// coarse for lock/checkpoint latencies that live in the 0.1–50ms band; this set
-// resolves that band while still reaching into the multi-second tail that signals
-// a stall.
+// Finer-grained millisecond buckets for sub-second contention timings (metastore writer
+// wait/hold, WAL checkpoint, CDC linger). Shares its head with `DURATION_MS_HISTOGRAM_BUCKETS`
+// and stops at 30s: a lock or checkpoint wait that long is already a stall.
 pub const CONTENTION_MS_HISTOGRAM_BUCKETS: [f64; 17] = [
     0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0,
     10000.0, 30000.0,
@@ -1973,5 +1972,42 @@ pub mod cayenne {
                 .build()
         })
         .record(bytes, dimensions);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CONTENTION_MS_HISTOGRAM_BUCKETS, DURATION_MS_HISTOGRAM_BUCKETS};
+
+    /// The first boundary above zero is the floor of every quantile drawn from these buckets, and
+    /// requests answered in a fraction of a millisecond are ordinary.
+    ///
+    /// Regression test for #12693.
+    #[test]
+    fn the_duration_buckets_resolve_below_a_millisecond() {
+        let floor = DURATION_MS_HISTOGRAM_BUCKETS
+            .iter()
+            .copied()
+            .find(|&bound| bound > 0.0)
+            .expect("the duration buckets should have a boundary above zero");
+
+        assert!(
+            floor <= 1.0,
+            "the first duration boundary above zero is the floor of every quantile drawn from \
+             these buckets, and {floor}ms is above a millisecond"
+        );
+    }
+
+    #[test]
+    fn histogram_boundaries_are_strictly_increasing() {
+        for (name, bounds) in [
+            ("duration", DURATION_MS_HISTOGRAM_BUCKETS.as_slice()),
+            ("contention", CONTENTION_MS_HISTOGRAM_BUCKETS.as_slice()),
+        ] {
+            assert!(
+                bounds.windows(2).all(|pair| pair[0] < pair[1]),
+                "the {name} boundaries must be strictly increasing"
+            );
+        }
     }
 }

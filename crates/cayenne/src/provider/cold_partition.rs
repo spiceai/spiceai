@@ -44,7 +44,6 @@ limitations under the License.
 //! drains: every tombstone's potential host file is in the rewrite set, so
 //! every tombstone is physically applied.
 
-use std::collections::HashSet;
 use std::sync::Arc;
 
 use arrow::array::{ArrayRef, Int64Array};
@@ -57,12 +56,43 @@ use crate::metadata::ColdTierFile;
 use crate::row_converter::{Row, RowConverter};
 use crate::stats::statistics_from_persisted_blob;
 
-/// `SessionConfig` extension restricting the cold scan branch to a file
-/// subset. Attached ONLY by the promotion's private session so the
+/// `SessionConfig` extension supplying the exact cold files the scan branch
+/// must read. Attached ONLY by the promotion's private session so the
 /// carry-forward rewrite reads the dirty files and nothing else; user-query
-/// sessions never carry it, so queries always see the full manifest.
+/// sessions never carry it, so queries always see the full captured manifest.
+///
+/// Carries the classified manifest ROWS, not their URLs, so the rewrite stream
+/// is built from the listing the classification ran against. See
+/// [`cold_files_for_scan`] for why that has to replace the scan's own capture.
 #[derive(Debug)]
-pub(crate) struct ColdScanFileSubset(pub HashSet<String>);
+pub(crate) struct ColdScanFiles(pub Arc<Vec<ColdTierFile>>);
+
+/// Resolve which cold files a scan branch reads: the promotion's classified
+/// rows when its private session supplies them, else the caller's fenced
+/// manifest capture.
+///
+/// `promotion` REPLACES `captured` — it is deliberately not intersected with
+/// it. The two are independent reads of `cayenne_cold_tier_file` with no lock
+/// held across them, so they can disagree, and intersecting silently yields
+/// the smaller set: a file classified dirty but missing from `captured` would
+/// be dropped from the rewrite while the promotion's commit still retires it,
+/// carrying its rows forward by neither manifest reference nor rewrite. Every
+/// file the promotion classified is one it listed from the manifest, so
+/// reading them is always the correct rewrite input.
+///
+/// Should a retired file's object have since been GC'd, the scan fails with a
+/// `NotFound` rather than dropping rows — the same trade
+/// [`super::table::CayenneTableProvider::run_cold_tier_gc_tick`] already makes
+/// for a long-running query, and the right one for an accelerator.
+pub(crate) fn cold_files_for_scan<'a>(
+    captured: &'a [ColdTierFile],
+    promotion: Option<&'a ColdScanFiles>,
+) -> Vec<&'a ColdTierFile> {
+    match promotion {
+        Some(promotion) => promotion.0.iter().collect(),
+        None => captured.iter().collect(),
+    }
+}
 
 /// The cold manifest split for one promotion pass.
 pub(crate) struct ColdFilePartition {
@@ -710,6 +740,105 @@ mod composite_key_tests {
         assert!(
             !bloom.maybe_contains(&probes[1]),
             "absent key must bloom-miss through the re-encode"
+        );
+    }
+}
+
+#[cfg(test)]
+mod scan_file_selection_tests {
+    use super::*;
+
+    /// A manifest row carrying only what the selection reads (its identity);
+    /// statistics/bloom are irrelevant to which files are selected.
+    fn cold_file(url: &str) -> ColdTierFile {
+        ColdTierFile {
+            table_id: "t".to_string(),
+            file_url: url.to_string(),
+            row_count: 1000,
+            file_size_bytes: 1_000_000,
+            min_sequence: 0,
+            max_sequence: 100,
+            statistics_blob: Vec::new(),
+            pk_bloom: None,
+        }
+    }
+
+    fn urls(files: &[&ColdTierFile]) -> Vec<String> {
+        files.iter().map(|f| f.file_url.clone()).collect()
+    }
+
+    #[test]
+    fn a_user_query_reads_the_whole_captured_manifest() {
+        let captured = vec![cold_file("s3://c/a.vortex"), cold_file("s3://c/b.vortex")];
+        assert_eq!(
+            urls(&cold_files_for_scan(&captured, None)),
+            vec!["s3://c/a.vortex", "s3://c/b.vortex"],
+            "a session without the extension must see every captured file"
+        );
+    }
+
+    #[test]
+    fn a_promotion_reads_only_its_classified_files() {
+        // `b` is clean — carried forward by manifest reference, so it must stay
+        // out of the rewrite stream even though the capture lists it. Guards
+        // against "fixing" the intersection by ignoring the extension: that
+        // would re-read every clean file and double-write its rows.
+        let captured = vec![
+            cold_file("s3://c/a.vortex"),
+            cold_file("s3://c/b.vortex"),
+            cold_file("s3://c/c.vortex"),
+        ];
+        let dirty = ColdScanFiles(Arc::new(vec![
+            cold_file("s3://c/a.vortex"),
+            cold_file("s3://c/c.vortex"),
+        ]));
+        assert_eq!(
+            urls(&cold_files_for_scan(&captured, Some(&dirty))),
+            vec!["s3://c/a.vortex", "s3://c/c.vortex"],
+            "the rewrite must read the dirty files and nothing else"
+        );
+    }
+
+    /// Regression test for #12708.
+    ///
+    /// The promotion classified `b` dirty and its commit will retire it. The
+    /// scan's own manifest capture no longer lists it — the two reads are
+    /// independent, with no lock held across them. Selecting by URL out of the
+    /// capture intersects the two sets and drops `b` from the rewrite, so its
+    /// live rows are carried forward by neither reference nor rewrite: silent
+    /// row loss. The classified rows must win.
+    #[test]
+    fn a_classified_file_missing_from_the_capture_is_still_rewritten() {
+        let captured = vec![cold_file("s3://c/a.vortex")];
+        let dirty = ColdScanFiles(Arc::new(vec![
+            cold_file("s3://c/a.vortex"),
+            cold_file("s3://c/b.vortex"),
+        ]));
+        let selected = cold_files_for_scan(&captured, Some(&dirty));
+        assert_eq!(
+            urls(&selected),
+            vec!["s3://c/a.vortex", "s3://c/b.vortex"],
+            "a dirty file absent from the capture must still be rewritten, not dropped"
+        );
+    }
+
+    #[test]
+    fn a_promotion_with_no_dirty_files_reads_nothing() {
+        // Every cold file was provably untouched: the rewrite carries the warm
+        // tier alone, and the capture must not leak clean files back in.
+        let captured = vec![cold_file("s3://c/a.vortex")];
+        let dirty = ColdScanFiles(Arc::new(Vec::new()));
+        assert!(
+            cold_files_for_scan(&captured, Some(&dirty)).is_empty(),
+            "an empty dirty set must read no cold files"
+        );
+    }
+
+    #[test]
+    fn an_empty_capture_without_the_extension_reads_nothing() {
+        assert!(
+            cold_files_for_scan(&[], None).is_empty(),
+            "an empty cold manifest must select no files"
         );
     }
 }

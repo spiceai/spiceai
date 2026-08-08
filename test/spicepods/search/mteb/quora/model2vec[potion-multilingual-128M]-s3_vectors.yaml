@@ -1,6 +1,6 @@
 version: v1
 kind: Spicepod
-name: openai[text-embedding-3-small[chunking]]-duckdb[file]
+name: model2vec[potion-multilingual-128M]-s3_vectors
 datasets:
 
   # MTEB Quora Retrieval dataset files (*.parquet) are automatically downloaded by the test operator.
@@ -10,19 +10,21 @@ datasets:
     name: corpus
     acceleration:
       enabled: true
-      engine: duckdb
-      mode: file
+    vectors:
+      enabled: true
+      engine: s3_vectors
+      params:
+        s3_vectors_bucket: spice-ci-search-benchmarks-variant-001
+        s3_vectors_index: quora
+        s3_vectors_aws_region: us-east-2
+        s3_vectors_aws_access_key_id: ${env:AWS_S3_VECTORS_KEY}
+        s3_vectors_aws_secret_access_key: ${env:AWS_S3_VECTORS_SECRET}
     columns:
       - name: text
         embeddings:
-          - from: openai_embed
+          - from: potion
             row_id:
               - _id
-            chunking:
-              enabled: true
-              target_chunk_size: 512
-              overlap_size: 128
-              trim_whitespace: false
 
   - from: file:./queries.parquet
     name: test_queries
@@ -35,7 +37,5 @@ datasets:
       enabled: true
 
 embeddings:
-  - from: openai:text-embedding-3-small
-    name: openai_embed
-    params:
-      openai_api_key: ${ secrets:OPENAI_API_KEY }
+  - from: model2vec:minishlab/potion-multilingual-128M
+    name: potion

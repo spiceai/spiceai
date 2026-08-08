@@ -20,7 +20,7 @@ use super::ParameterSpec;
 use super::Parameters;
 use crate::Runtime;
 use crate::component::ComponentInitialization;
-use crate::component::catalog::Catalog;
+use crate::component::catalog::{Catalog, table_selector};
 use crate::dataconnector::http_rate_control;
 use crate::dataconnector::parameters::ConnectorParams;
 use crate::token_providers::databricks::{
@@ -471,7 +471,7 @@ impl CatalogConnector for Databricks {
             client,
             CatalogId(catalog_id),
             table_creator,
-            catalog.include.clone(),
+            table_selector(catalog),
         )
         .await
         {

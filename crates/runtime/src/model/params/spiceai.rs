@@ -14,29 +14,50 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use util::concat_arrays;
+use runtime_parameters::TypedParams;
+use secrecy::SecretString;
 
-use super::{COMMON_MODEL_PARAMETERS_WITH_DEPRECATED, PARAM_WITH_DEPRE_LEN};
-use crate::parameters::ParameterSpec;
+/// Parameters for `from: spiceai` chat models.
+#[derive(TypedParams)]
+#[params(
+    prefix = "spiceai",
+    passthrough = crate::model::params::common::PREFIXED_COMMON,
+    emit_specs
+)]
+pub struct SpiceAiModelParams {
+    /// The API key for the `Spice.ai` Cloud Platform, or for the Spice runtime serving the model. Required for the `Spice.ai` Cloud Platform.
+    #[param(autoload_secret)]
+    pub api_key: Option<SecretString>,
+    /// The endpoint serving the model: the `Spice.ai` Cloud Platform, or another Spice runtime.
+    // The default mirrors `llms::spiceai::DEFAULT_ENDPOINT`; `endpoint_default_matches_llms`
+    // guards against drift between the two.
+    #[param(default = "https://data.spiceai.io")]
+    pub endpoint: String,
+}
 
-pub const PARAMETERS: &[ParameterSpec] =
-    &concat_arrays::<
-        ParameterSpec,
-        SPICEAI_PARAM_LEN,
-        PARAM_WITH_DEPRE_LEN,
-        { SPICEAI_PARAM_LEN + PARAM_WITH_DEPRE_LEN },
-    >(SPICEAI_PARAMETERS, COMMON_MODEL_PARAMETERS_WITH_DEPRECATED);
+#[cfg(test)]
+mod tests {
+    use runtime_parameters_typed::TypedParams;
+    use secrecy::SecretString;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
 
-const SPICEAI_PARAM_LEN: usize = 2;
+    use super::SpiceAiModelParams;
 
-pub(crate) const SPICEAI_PARAMETERS: [ParameterSpec; SPICEAI_PARAM_LEN] = [
-    ParameterSpec::component("api_key")
-        .secret()
-        .description("The API key for the Spice.ai Cloud Platform, or for the Spice runtime serving the model. Required for the Spice.ai Cloud Platform."),
-    ParameterSpec::component("endpoint")
-        .description("The endpoint serving the model: the Spice.ai Cloud Platform, or another Spice runtime.")
-        // Sourced from `llms` so the documented default and the one the client actually dials
-        // cannot drift — `Parameters::try_new` substitutes this value when the param is unset.
-        .default(llms::spiceai::DEFAULT_ENDPOINT)
-        .examples(&[llms::spiceai::DEFAULT_ENDPOINT, "http://localhost:8090"]),
-];
+    fn empty_secrets() -> Arc<RwLock<runtime_secrets::Secrets>> {
+        Arc::new(RwLock::new(runtime_secrets::Secrets::new()))
+    }
+
+    #[tokio::test]
+    async fn endpoint_default_matches_llms() {
+        let typed = SpiceAiModelParams::try_from_params(
+            "model spiceai",
+            HashMap::<String, SecretString>::new(),
+            &empty_secrets(),
+        )
+        .await
+        .expect("spiceai params should deserialize with defaults");
+        assert_eq!(typed.endpoint, llms::spiceai::DEFAULT_ENDPOINT);
+    }
+}

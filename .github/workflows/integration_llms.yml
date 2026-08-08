@@ -200,6 +200,10 @@ jobs:
           SPICE_BEDROCK_ACCESS_KEY: ${{ secrets.AWS_BEDROCK_KEY }}
           SPICE_BEDROCK_SECRET_KEY: ${{ secrets.AWS_BEDROCK_SECRET }}
         run: |
+          # The spiceio setup action exports AWS_ENDPOINT_URL for sccache; the AWS SDK
+          # honours it for every service, so leaving it set sends this suite's Bedrock
+          # calls to the local build cache instead of AWS.
+          unset AWS_ENDPOINT_URL
           if [ "${{ matrix.target.needs_env }}" == "true" ]; then
             if [ -z "$SPICE_OPENAI_API_KEY" ]; then
               echo "Error: 'SPICE_OPENAI_API_KEY' is not defined."

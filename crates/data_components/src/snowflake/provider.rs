@@ -23,13 +23,13 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
+use crate::catalog_filter::TableSelector;
 use async_trait::async_trait;
 use datafusion::catalog::{CatalogProvider, SchemaProvider};
 use datafusion::datasource::TableProvider;
 use datafusion::error::Result as DFResult;
 use datafusion::sql::TableReference;
 use futures::stream::{self, StreamExt};
-use globset::GlobSet;
 use snafu::prelude::*;
 use snowflake_api::SnowflakeApi;
 
@@ -102,8 +102,8 @@ pub struct SnowflakeCatalogProvider {
     table_creator: SnowflakeTableCreator,
     /// Cached schemas (`schema_name` -> `SchemaProvider`)
     schemas: RwLock<HashMap<String, Arc<SnowflakeSchemaProvider>>>,
-    /// Optional glob filter for `schema.table` patterns
-    include: Option<Arc<GlobSet>>,
+    /// Which discovered tables the catalog registers
+    selector: TableSelector,
 }
 
 impl std::fmt::Debug for SnowflakeCatalogProvider {
@@ -120,13 +120,13 @@ impl SnowflakeCatalogProvider {
         api: Arc<SnowflakeApi>,
         database: String,
         table_creator: Arc<dyn Read>,
-        include: Option<GlobSet>,
+        selector: TableSelector,
     ) -> Self {
         Self::new_with_table_creator(
             api,
             database,
             SnowflakeTableCreator::Read(table_creator),
-            include,
+            selector,
         )
     }
 
@@ -135,13 +135,13 @@ impl SnowflakeCatalogProvider {
         api: Arc<SnowflakeApi>,
         database: String,
         table_creator: Arc<dyn ReadWrite>,
-        include: Option<GlobSet>,
+        selector: TableSelector,
     ) -> Self {
         Self::new_with_table_creator(
             api,
             database,
             SnowflakeTableCreator::ReadWrite(table_creator),
-            include,
+            selector,
         )
     }
 
@@ -149,14 +149,14 @@ impl SnowflakeCatalogProvider {
         api: Arc<SnowflakeApi>,
         database: String,
         table_creator: SnowflakeTableCreator,
-        include: Option<GlobSet>,
+        selector: TableSelector,
     ) -> Self {
         Self {
             api,
             database,
             table_creator,
             schemas: RwLock::new(HashMap::new()),
-            include: include.map(Arc::new),
+            selector,
         }
     }
 
@@ -175,14 +175,14 @@ impl SnowflakeCatalogProvider {
                 let api = Arc::clone(&self.api);
                 let database = self.database.clone();
                 let table_creator = self.table_creator.clone();
-                let include = self.include.clone();
+                let selector = self.selector.clone();
                 async move {
                     let provider = SnowflakeSchemaProvider::new(
                         api,
                         database,
                         schema_name.clone(),
                         table_creator,
-                        include,
+                        selector,
                     );
                     let result = provider.refresh_tables().await;
                     (schema_name, result.map(|()| Arc::new(provider)))
@@ -300,8 +300,8 @@ pub struct SnowflakeSchemaProvider {
     table_creator: SnowflakeTableCreator,
     /// Cached tables (`table_name` -> `TableProvider`)
     tables: RwLock<HashMap<String, Arc<dyn TableProvider>>>,
-    /// Optional glob filter for `schema.table` patterns
-    include: Option<Arc<GlobSet>>,
+    /// Which discovered tables the catalog registers
+    selector: TableSelector,
 }
 
 impl std::fmt::Debug for SnowflakeSchemaProvider {
@@ -319,7 +319,7 @@ impl SnowflakeSchemaProvider {
         database: String,
         schema_name: String,
         table_creator: SnowflakeTableCreator,
-        include: Option<Arc<GlobSet>>,
+        selector: TableSelector,
     ) -> Self {
         Self {
             api,
@@ -327,7 +327,7 @@ impl SnowflakeSchemaProvider {
             schema_name,
             table_creator,
             tables: RwLock::new(HashMap::new()),
-            include,
+            selector,
         }
     }
 
@@ -343,11 +343,11 @@ impl SnowflakeSchemaProvider {
         let filtered_tables: Vec<String> = table_names
             .into_iter()
             .filter(|table_name| {
-                let schema_with_table = format!("{}.{}", self.schema_name, table_name);
-                if let Some(include) = &self.include
-                    && !include.is_match(&schema_with_table)
-                {
-                    tracing::debug!("Table {schema_with_table} is not included, skipping");
+                if !self.selector.selects_table(&self.schema_name, table_name) {
+                    tracing::debug!(
+                        "Table {}.{table_name} is not selected by the catalog's include/exclude patterns, skipping",
+                        self.schema_name
+                    );
                     return false;
                 }
                 true
