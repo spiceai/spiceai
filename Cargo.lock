@@ -6008,6 +6008,7 @@ dependencies = [
  "document_parse",
  "duckdb",
  "elasticsearch",
+ "elasticsearch_datafusion_filter",
  "flate2",
  "flight_client",
  "futures",
@@ -7650,6 +7651,16 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
+]
+
+[[package]]
+name = "elasticsearch_datafusion_filter"
+version = "2.2.0-unstable"
+dependencies = [
+ "arrow",
+ "datafusion",
+ "serde_json",
+ "snafu",
 ]
 
 [[package]]
@@ -18306,6 +18317,7 @@ dependencies = [
  "datafusion-table-providers",
  "duckdb",
  "elasticsearch",
+ "elasticsearch_datafusion_filter",
  "futures",
  "insta",
  "itertools 0.14.0",

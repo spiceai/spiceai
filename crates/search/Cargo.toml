@@ -23,6 +23,7 @@ datafusion-functions-json = { workspace = true }
 datafusion-table-providers = { workspace = true, optional = true }
 duckdb = { workspace = true, optional = true }
 elasticsearch = { path = "../elasticsearch", optional = true }
+elasticsearch_datafusion_filter = { path = "../elasticsearch_datafusion_filter", optional = true }
 datafusion-optimizer-rules = {path = "../datafusion-optimizer-rules"}
 futures.workspace = true
 itertools.workspace = true
@@ -44,7 +45,12 @@ util = { path = "../util", features = ["datafusion"] }
 [features]
 default = ["text_search", "s3_vectors"]
 duckdb = ["datafusion-table-providers/duckdb", "dep:datafusion-table-providers", "dep:duckdb", "llms"]
-elasticsearch = ["data_components/elasticsearch", "dep:elasticsearch", "llms"]
+elasticsearch = [
+    "data_components/elasticsearch",
+    "dep:elasticsearch",
+    "dep:elasticsearch_datafusion_filter",
+    "llms",
+]
 llms = ["dep:llms", "dep:runtime-datafusion-udfs"]
 s3_vectors = ["data_components/s3_vectors", "dep:s3_vectors", "llms"]
 text_search = ["dep:tantivy"]

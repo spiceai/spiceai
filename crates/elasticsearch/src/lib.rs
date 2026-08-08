@@ -118,6 +118,11 @@ pub struct KnnQuery {
     pub query_vector: Vec<f32>,
     pub k: usize,
     pub num_candidates: usize,
+    /// Optional pre-filter applied by Elasticsearch *before* selecting the top-`k` nearest
+    /// neighbours, so a matching row ranked below `num_candidates` is not silently dropped.
+    /// Serialized as the native kNN `filter` and expected to be a `bool.filter`-context clause.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub filter: Option<serde_json::Value>,
 }
 
 /// Top-level search response.
@@ -710,7 +715,29 @@ pub fn knn_query(field: &str, vector: Vec<f32>, k: usize, num_candidates: usize)
         query_vector: vector,
         k,
         num_candidates,
+        filter: None,
     }
+}
+
+/// Wrap a query in a `bool.filter` context alongside the given non-scoring filter clauses.
+///
+/// When `filters` is empty the query is returned unchanged. Otherwise the query becomes the
+/// scoring `must` and the filter clauses are applied as non-scoring constraints — the optimal
+/// shape for combining a relevance query with metadata predicates.
+#[must_use]
+pub fn query_with_filters(
+    query: Option<serde_json::Value>,
+    filters: Vec<serde_json::Value>,
+) -> Option<serde_json::Value> {
+    if filters.is_empty() {
+        return query;
+    }
+    let mut bool_query = serde_json::Map::new();
+    if let Some(query) = query {
+        bool_query.insert("must".to_string(), serde_json::json!([query]));
+    }
+    bool_query.insert("filter".to_string(), serde_json::Value::Array(filters));
+    Some(serde_json::json!({ "bool": bool_query }))
 }
 
 /// Trait for pluggable Elasticsearch backends (useful for testing).

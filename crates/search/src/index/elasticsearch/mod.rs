@@ -49,6 +49,7 @@ use crate::metadata::MetadataColumns;
 use data_components::elasticsearch::search_table::{
     ElasticsearchKnnTable, ElasticsearchTextSearchTable, QueryEmbedder,
 };
+use elasticsearch_datafusion_filter::EsFilterSchema;
 
 /// Default kNN candidate-pool size used when a `LIMIT` cannot be pushed down to the
 /// Elasticsearch index scan. Matches the DuckDB vector backend's default
@@ -322,6 +323,12 @@ impl SearchIndex for ElasticsearchIndex {
 
     fn query_table_provider(&self, query: &str) -> Result<Arc<LogicalPlan>, DataFusionError> {
         let schema = self.query_result_schema();
+        // Only Elasticsearch-indexed columns (primary keys + user-declared `filterable` metadata)
+        // may be pre-filtered; everything else stays a DataFusion filter above the scan.
+        let mut filterable: Vec<String> =
+            self.primary_key.iter().map(|f| f.name().clone()).collect();
+        filterable.extend(self.metadata_columns.filterable_names());
+        let filter_schema = EsFilterSchema::from_spice_managed(&self.source_schema, &filterable);
         let table: Arc<dyn TableProvider> = Arc::new(ElasticsearchKnnTable {
             client: Arc::clone(&self.client),
             index: self.es_index.clone(),
@@ -332,6 +339,7 @@ impl SearchIndex for ElasticsearchIndex {
             source_schema: Arc::clone(&self.source_schema),
             query_text: Some(query.to_string()),
             embedder: Some(Arc::new(EmbedQueryAdapter(Arc::clone(&self.compute_query)))),
+            filter_schema,
         });
 
         Ok(
@@ -680,6 +688,12 @@ impl SearchIndex for ElasticsearchTextIndex {
         ));
         let schema = Arc::new(Schema::new(result_fields));
 
+        // The text index indexes the primary key and the analyzed search fields; only the
+        // primary-key columns are safe exact-value pre-filter targets.
+        let filterable: Vec<String> =
+            self.primary_key.iter().map(|f| f.name().clone()).collect();
+        let filter_schema = EsFilterSchema::from_spice_managed(&self.source_schema, &filterable);
+
         let table: Arc<dyn TableProvider> = Arc::new(ElasticsearchTextSearchTable {
             client: Arc::clone(&self.client),
             index: self.es_index.clone(),
@@ -688,6 +702,7 @@ impl SearchIndex for ElasticsearchTextIndex {
             limit: 10_000,
             schema: Arc::clone(&schema),
             source_schema: Arc::clone(&self.source_schema),
+            filter_schema,
         });
 
         Ok(

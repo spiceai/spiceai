@@ -45,6 +45,7 @@ use datafusion::physical_plan::{
 };
 use datafusion::prelude::Expr;
 use elasticsearch::{Elasticsearch, SearchRequest};
+use elasticsearch_datafusion_filter::{EsFilterSchema, classify_filter, translate_filter};
 
 const ELASTICSEARCH_PAGE_SIZE: usize = 10_000;
 const ELASTICSEARCH_PIT_KEEP_ALIVE: &str = "1m";
@@ -57,16 +58,45 @@ pub struct ElasticsearchQueryTable {
     client: Arc<dyn Elasticsearch>,
     index: String,
     schema: SchemaRef,
+    /// Which columns can be filtered inside Elasticsearch, derived from the Arrow schema.
+    filter_schema: EsFilterSchema,
 }
 
 impl ElasticsearchQueryTable {
     #[must_use]
     pub fn new(client: Arc<dyn Elasticsearch>, index: String, schema: SchemaRef) -> Self {
+        let filter_schema = EsFilterSchema::from_connector_schema(&schema);
         Self {
             client,
             index,
             schema,
+            filter_schema,
         }
+    }
+
+    /// Translate the filters DataFusion is pushing into a single non-scoring `bool.filter`
+    /// clause list. Every filter reaching this point was reported pushable by
+    /// `supports_filters_pushdown`, so a translation miss is an internal inconsistency and is
+    /// surfaced as an error rather than silently dropping the predicate (which would over-return
+    /// rows for an `Exact` filter DataFusion is no longer re-checking).
+    fn build_filter_clauses(
+        &self,
+        filters: &[Expr],
+    ) -> datafusion::error::Result<Vec<serde_json::Value>> {
+        let mut clauses = Vec::with_capacity(filters.len());
+        for filter in filters {
+            match translate_filter(&self.filter_schema, filter) {
+                Some(clause) => clauses.push(clause),
+                None => {
+                    return Err(DataFusionError::External(Box::new(
+                        elasticsearch_datafusion_filter::Error::PushableFilterNotTranslated {
+                            column: filter.to_string(),
+                        },
+                    )));
+                }
+            }
+        }
+        Ok(clauses)
     }
 }
 
@@ -84,18 +114,17 @@ impl TableProvider for ElasticsearchQueryTable {
         &self,
         filters: &[&Expr],
     ) -> datafusion::error::Result<Vec<TableProviderFilterPushDown>> {
-        // For now, we don't push filters down to ES; DataFusion handles filtering.
-        Ok(vec![
-            TableProviderFilterPushDown::Unsupported;
-            filters.len()
-        ])
+        Ok(filters
+            .iter()
+            .map(|filter| classify_filter(&self.filter_schema, filter))
+            .collect())
     }
 
     async fn scan(
         &self,
         _state: &dyn Session,
         projection: Option<&Vec<usize>>,
-        _filters: &[Expr],
+        filters: &[Expr],
         limit: Option<usize>,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
         let projected_schema = project_schema(&self.schema, projection)?;
@@ -105,12 +134,34 @@ impl TableProvider for ElasticsearchQueryTable {
             )));
         }
 
+        // Push the pushable filters into a non-scoring `bool.filter` query; unpushable and
+        // `Inexact` filters remain (re-)applied by DataFusion above this scan.
+        let filter_clauses = self.build_filter_clauses(filters)?;
+        let query = if filter_clauses.is_empty() {
+            elasticsearch::match_all_query()
+        } else {
+            serde_json::json!({ "bool": { "filter": filter_clauses } })
+        };
+
+        // Restrict `_source` to the projected columns so `SELECT id` does not fetch whole
+        // documents. The scan reads every column from `_source` before projecting, so a column
+        // absent from `_source` simply reads back NULL and is then dropped by the projection.
+        let source = projection.map(|proj| {
+            let names: Vec<&str> = proj
+                .iter()
+                .filter_map(|&i| self.schema.fields().get(i).map(|f| f.name().as_str()))
+                .collect();
+            serde_json::json!(names)
+        });
+
         Ok(Arc::new(ElasticsearchQueryExec {
             client: Arc::clone(&self.client),
             index: self.index.clone(),
             full_schema: Arc::clone(&self.schema),
             projected_schema,
             projection: projection.cloned(),
+            query,
+            source,
             limit,
             properties: Arc::new(PlanProperties::new(
                 EquivalenceProperties::new(project_schema(&self.schema, projection)?),
@@ -129,6 +180,10 @@ struct ElasticsearchQueryExec {
     full_schema: SchemaRef,
     projected_schema: SchemaRef,
     projection: Option<Vec<usize>>,
+    /// The Elasticsearch query body: `match_all` or a `bool.filter` of the pushed predicates.
+    query: serde_json::Value,
+    /// `_source` restriction (the projected column names), or `None` for the full document.
+    source: Option<serde_json::Value>,
     limit: Option<usize>,
     properties: Arc<PlanProperties>,
 }
@@ -173,10 +228,12 @@ impl ExecutionPlan for ElasticsearchQueryExec {
         let full_schema = Arc::clone(&self.full_schema);
         let projected_schema = Arc::clone(&self.projected_schema);
         let projection = self.projection.clone();
+        let query = self.query.clone();
+        let source = self.source.clone();
         let limit = self.limit;
 
         let stream = futures::stream::try_unfold(
-            ElasticsearchScanState::new(client, index, full_schema, projection, limit),
+            ElasticsearchScanState::new(client, index, full_schema, projection, query, source, limit),
             |mut state| async move {
                 state
                     .next_batch()
@@ -197,6 +254,8 @@ struct ElasticsearchScanState {
     index: String,
     full_schema: SchemaRef,
     projection: Option<Vec<usize>>,
+    query: serde_json::Value,
+    source: Option<serde_json::Value>,
     remaining: Option<usize>,
     pit_id: Option<String>,
     search_after: Option<Vec<serde_json::Value>>,
@@ -210,6 +269,8 @@ impl ElasticsearchScanState {
         index: String,
         full_schema: SchemaRef,
         projection: Option<Vec<usize>>,
+        query: serde_json::Value,
+        source: Option<serde_json::Value>,
         limit: Option<usize>,
     ) -> Self {
         Self {
@@ -217,6 +278,8 @@ impl ElasticsearchScanState {
             index,
             full_schema,
             projection,
+            query,
+            source,
             remaining: limit,
             pit_id: None,
             search_after: None,
@@ -246,8 +309,9 @@ impl ElasticsearchScanState {
     async fn fetch_single_batch(&mut self) -> Result<Option<RecordBatch>, DataFusionError> {
         let size = self.remaining.unwrap_or(ELASTICSEARCH_PAGE_SIZE);
         let req = SearchRequest {
-            query: Some(elasticsearch::match_all_query()),
+            query: Some(self.query.clone()),
             size: Some(size),
+            source: self.source.clone(),
             ..Default::default()
         };
 
@@ -284,7 +348,7 @@ impl ElasticsearchScanState {
 
         let pit_id = self.open_point_in_time().await?;
         let mut req = serde_json::json!({
-            "query": elasticsearch::match_all_query(),
+            "query": self.query.clone(),
             "pit": {
                 "id": pit_id,
                 "keep_alive": ELASTICSEARCH_PIT_KEEP_ALIVE,
@@ -293,6 +357,10 @@ impl ElasticsearchScanState {
             "sort": [{ "_shard_doc": "asc" }],
             "track_total_hits": false,
         });
+
+        if let Some(source) = &self.source {
+            req["_source"] = source.clone();
+        }
 
         if let Some(search_after) = &self.search_after {
             req["search_after"] = serde_json::Value::Array(search_after.clone());
