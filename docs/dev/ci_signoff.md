@@ -366,6 +366,19 @@ If you see `signoff=pending` with "Remote sign-off was cancelled", nothing is
 wrong with the branch: dispatch sign-off again. `scripts/test_signoff_cancelled_correction.sh`
 covers both directions.
 
+The correction runs through `.trusted-ci/signoff`, so it can only work if that copy
+understands the subcommand the workflow calls. Both trusted helpers are therefore read
+out of the object database at the workflow file's own commit (`github.sha`) rather than
+copied from the checked-out tree — the tree is the *branch under test*, which for a
+branch older than the helper is a script the workflow's own call sites have outrun. That
+is what left cancelled runs on older branches with a `signoff=failure` they could not
+withdraw (#12657). One consequence worth knowing: a branch that changes `scripts/signoff`
+or `.github/actions/**` is still signed off with the dispatch ref's version of them. To
+exercise a branch's own helper changes, dispatch on that branch —
+`gh workflow run signoff.yml --ref <branch> -f branch=<branch>` — which puts the workflow
+and the helpers on the same commit again. `scripts/test_signoff_trusted_helpers.sh` covers
+the extraction.
+
 ### Jujutsu workspaces
 
 `make signoff` also works in non-colocated JJ workspaces (where there is a
@@ -436,11 +449,12 @@ and hands classification back to the free-space backstop; treating its silence a
 "not disk" would blame the branch for the volume just as surely as the unwritable
 marker did.
 
-Classification has a third answer, ranked above both disk signals: a run that was
-*signalled* judged nothing at all, where the two disk cases both describe a `make`
-that returned. That ordering matters when a budget expires on a tight volume —
-calling it disk would send you to reclaim space that was never the problem. See
-the budget paragraph above for what a signalled run publishes.
+Classification's highest-ranked answer sits above every other signal: a run that
+was *signalled* judged nothing at all, where the disk and cache cases all describe
+a `make` that returned. That ordering matters when a budget expires on a tight
+volume — calling it disk would send you to reclaim space that was never the
+problem. See the budget paragraph above for what a signalled run publishes, and
+the cache section below for the fourth answer.
 
 The watch keeps its answer in a shell variable, not a file. Recording it on disk
 needed an allocation at the one moment allocation is failing — and on macOS
@@ -450,6 +464,33 @@ failure", which blamed the branch for the volume.
 
 Set `SIGNOFF_MIN_FREE_GIB` to change the floor. Locally both checks only warn and
 the output is not watched — your own disk is yours to manage.
+
+### "Compiler cache unreachable — checks did not complete"
+
+The pool's runners compile through `sccache` (`RUSTC_WRAPPER`, configured by
+`.github/actions/setup-sccache`) against an S3-compatible endpoint on the host.
+When that endpoint stops answering, sccache's server cannot start and *every*
+`rustc` invocation from that moment on dies before compiling anything:
+
+```
+sccache: error: Server startup failed: cache storage failed to read: …
+  error sending request for url (http://127.0.0.1:8333/sccache/…/.sccache_check):
+  tcp connect error: Connection refused (os error 61)
+error: process didn't exit successfully: `sccache …/rustc -vV` (exit status: 2)
+```
+
+**Re-dispatch it.** Your branch was never compiled, so nothing in that run is a
+statement about it. If it recurs on the same runner, that machine's sccache
+storage service is what needs attention.
+
+The same watcher that reads the out-of-disk signature reads this one, so the same
+rules apply: only sccache's own `error:` channel counts (a build that merely
+*mentions* sccache and then fails to compile is still a check failure), the
+verdict is only worth something on a run that armed the watch, and disk outranks
+cache when both appear — a volume at zero can break the cache endpoint too, and
+reclaiming space is then the remedy that fixes both. Unlike disk there is no
+after-the-fact backstop: the endpoint may well be answering again by the time the
+run ends, so the only evidence is what the build said while it was failing.
 
 ### External contributors (forks)
 
@@ -469,6 +510,14 @@ merge queue is still the real gate.
 | Remote | `make signoff-remote` | the same checks via the self-hosted `signoff.yml` workflow, without the targeted pre-checks (`run_targeted_prechecks=true` restores them); posts `signoff` |
 | Pull request | `pull_request` | **Attestation** (validates the sign-off, or auto-passes a branch with no Rust-affecting files, a pure revert, or a single-commit Dependabot bump) + PR hygiene; merge-queue check names report lightweight skipped/passthrough results |
 | Merge queue | `merge_group` | the full required suite (below) + advisory niche checks |
+| Manual dispatch of `pr.yml` | `workflow_dispatch` | the heavy jobs, and **`Attestation` fails on purpose** — a dispatch carries no pull request payload, so there is no sign-off to read and no verdict it can honestly reach |
+
+`Attestation` failing on a dispatch is deliberate: it is the only gate a pull
+request has, so a green one that inspected nothing would satisfy that gate
+outright. Do not dispatch `pr.yml` to report a missing `Attestation` on a PR —
+it cannot, and the failure it posts lands on that head commit. Push to the
+branch, or re-run the `pull_request`-triggered `pr` run, so the event fires with
+its payload. To re-run the *sign-off* itself, dispatch `signoff.yml` instead.
 
 Required checks in the merge queue (the `trunk` ruleset):
 

@@ -20,6 +20,7 @@ use std::{any::Any, fmt::Debug, sync::Arc};
 use datafusion::arrow::array::RecordBatch;
 use datafusion::catalog::{Session, TableProvider};
 use datafusion::error::Result;
+use datafusion::logical_expr::dml::InsertOp;
 use datafusion::prelude::Expr;
 use snafu::prelude::*;
 
@@ -46,6 +47,39 @@ pub enum Error {
     NoExpressions { expr_len: usize },
 }
 
+/// What a `TableSink` write window does to the rows already in the table.
+///
+/// A replacing write removes rows by simply not re-sending them: it announces no deletions, so
+/// neither [`Index::compute_index`] (which only ever sees the rows that *are* present) nor
+/// [`Index::delete_by_keys`] (which only ever sees keys someone knows about) can observe the
+/// removal. An index therefore has to be told the write's kind up front.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteWindow {
+    /// Rows are added to what the table already holds. Index entries for rows absent from
+    /// this write belong to rows that still exist, and must be preserved.
+    Append,
+    /// Every row in the table is replaced by this write's rows. An index whose entries do not
+    /// live inside the accelerated table row must clear itself for this window, or it keeps
+    /// entries for rows the source dropped.
+    ReplaceAll,
+}
+
+impl From<InsertOp> for WriteWindow {
+    fn from(op: InsertOp) -> Self {
+        match op {
+            // `UpdateType::Overwrite` — a `refresh_mode: full` refresh, which reproduces the
+            // table's entire contents.
+            InsertOp::Overwrite => WriteWindow::ReplaceAll,
+            // `Append` adds rows. `Replace` is an upsert: it rewrites only the rows whose keys
+            // collide and leaves every other row in place. Critically, `Replace` is also what
+            // `UpdateType::Changes` maps to (see `DataFusion::write_data`), so it carries CDC
+            // change batches — treating it as `ReplaceAll` would clear the whole index on
+            // every change batch.
+            InsertOp::Append | InsertOp::Replace => WriteWindow::Append,
+        }
+    }
+}
+
 #[async_trait]
 pub trait Index: Debug + Send + Sync + 'static {
     fn name(&self) -> &'static str;
@@ -59,11 +93,17 @@ pub trait Index: Debug + Send + Sync + 'static {
         Ok(batches)
     }
 
-    /// Called before data is written via the [`TableSink`] path (full refresh or append).
+    /// Called before data is written via the `TableSink` path (full refresh or append).
+    ///
+    /// `window` tells the index whether this write replaces the table's contents
+    /// ([`WriteWindow::ReplaceAll`]) or adds to them ([`WriteWindow::Append`]). An index whose
+    /// entries live outside the accelerated table row must clear itself on
+    /// [`WriteWindow::ReplaceAll`] — ideally staged so the clear and the repopulation become
+    /// visible together, so queries never observe a half-empty index.
     ///
     /// Default is a no-op. Implementations use this to prepare external index state for a
     /// bounded write window. Not called for CDC writes.
-    async fn on_write_start(&self) -> Result<()> {
+    async fn on_write_start(&self, _window: WriteWindow) -> Result<()> {
         Ok(())
     }
 
@@ -209,4 +249,23 @@ pub trait Index: Debug + Send + Sync + 'static {
     }
 
     fn as_any(&self) -> &dyn Any;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{InsertOp, WriteWindow};
+
+    /// The mapping decides whether an index clears itself, so each arm is spelled out. The
+    /// `Replace` arm is the load-bearing one: it is an upsert, and it is also what
+    /// `UpdateType::Changes` maps to, so mapping it to `ReplaceAll` would clear the entire
+    /// index on every CDC change batch.
+    #[test]
+    fn write_window_is_derived_from_the_insert_op() {
+        assert_eq!(
+            WriteWindow::from(InsertOp::Overwrite),
+            WriteWindow::ReplaceAll
+        );
+        assert_eq!(WriteWindow::from(InsertOp::Append), WriteWindow::Append);
+        assert_eq!(WriteWindow::from(InsertOp::Replace), WriteWindow::Append);
+    }
 }
