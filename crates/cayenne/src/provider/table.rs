@@ -7573,12 +7573,17 @@ impl CayenneTableProvider {
             let mut sharded = self.sharded_pk_keyset_cache.lock();
             let mut drop_index = false;
             if let Some(index) = sharded.as_mut() {
-                index.record_keys(keys, location);
-                // Byte budget: upsert degrades to per-shard blooms (a false
+                // Budget enforced DURING the insert, not after it. Recording the
+                // whole batch first and reconciling afterwards made the budget a
+                // trim rather than an admission control: the peak was
+                // `batch_keys x entry_bytes` with no ceiling, which at SF-1000
+                // reached ~14.5 GiB against a 256 MiB default.
+                let max_bytes = self.effective_pk_keyset_budget();
+                let within_budget = index.record_keys_bounded(keys, location, max_bytes);
+                // Over budget: upsert degrades to per-shard blooms (a false
                 // positive is only a redundant delete); `DoNothing` needs
                 // exactness, so drop and let the next validation lazy-rebuild.
-                let max_bytes = self.effective_pk_keyset_budget();
-                if index.approx_bytes() > max_bytes {
+                if !within_budget {
                     if self.upsert_bloom_eligible() {
                         let per_shard = max_bytes / index.shard_count().max(1);
                         index.degrade_to_blooms(per_shard);
