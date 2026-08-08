@@ -42,7 +42,9 @@ pub type EmbeddingModelStore = HashMap<String, Arc<dyn Embed>>;
 /// whenever that does not hold:
 ///
 /// - The table has no enabled acceleration, so nothing hydrates the tier at all (#12101).
-/// - The accelerator keeps its rows across a restart (#12102). The refresh that follows then
+/// - The accelerator keeps its rows across a restart (#12102) — which is a question for the
+///   engine and the mode together, not the mode alone, since `PostgreSQL` keeps them in a server
+///   that outlives the process whatever the mode says. The refresh that follows then
 ///   loads only what the accelerator is missing — for `append` and `changes` a delta, and for
 ///   `full` possibly nothing at all, since a checkpointed dataset with no
 ///   `refresh_check_interval` skips its startup refresh outright. The accelerator and the
@@ -72,7 +74,7 @@ pub fn warm_index_on_zero_results(
         return None;
     };
 
-    if acceleration.mode.retains_data_across_restarts() {
+    if acceleration.retains_data_across_restarts() {
         tracing::debug!(
             "Not adding an in-memory warm vector index: the accelerator keeps its rows across a restart, so the warm tier would hold only the rows refreshed since startup. Searches will be served by the vector engine directly."
         );
@@ -106,6 +108,7 @@ pub async fn construct_chunker(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use runtime_acceleration::Engine;
     use runtime_acceleration::acceleration::Mode;
 
     /// An enabled acceleration in `mode`, whose `on_zero_results` is distinguishable from the
@@ -185,6 +188,26 @@ mod tests {
         }
     }
 
+    /// `PostgreSQL` keeps its rows in a server that outlives the process, and its accelerator never
+    /// reads the mode when opening the table. So the two modes every other engine starts empty in
+    /// are, for `PostgreSQL`, still populated after a restart — reproducing #12102 through the
+    /// default `mode: memory` if the tier were decided by the mode alone.
+    #[test]
+    fn on_zero_results_is_none_for_postgres_in_an_otherwise_ephemeral_mode() {
+        for mode in [Mode::Memory, Mode::FileCreate] {
+            let postgres = Acceleration {
+                engine: Engine::PostgreSQL,
+                ..accelerated(mode)
+            };
+            assert_eq!(
+                warm_index_on_zero_results(Some(&postgres)),
+                None,
+                "postgres in {mode:?} keeps its rows in an external server across a restart, so \
+                 the warm tier would hold only the rows refreshed since startup"
+            );
+        }
+    }
+
     /// A caching accelerator is filled one cache miss at a time, and with neither
     /// `refresh_on_startup: always` nor a `refresh_check_interval` it schedules no refresh at all,
     /// so the warm tier would answer as primary from whatever subset has been read so far. That
@@ -212,5 +235,30 @@ mod tests {
         assert!(!Mode::FileCreate.retains_data_across_restarts());
         assert!(Mode::File.retains_data_across_restarts());
         assert!(Mode::FileUpdate.retains_data_across_restarts());
+    }
+
+    /// The engine decides it too: a file-backed engine follows its mode, while `PostgreSQL` keeps
+    /// its rows in an external server in every mode.
+    #[test]
+    fn postgres_retains_data_in_every_mode_unlike_a_file_backed_engine() {
+        for mode in [Mode::Memory, Mode::FileCreate, Mode::File, Mode::FileUpdate] {
+            let postgres = Acceleration {
+                engine: Engine::PostgreSQL,
+                ..accelerated(mode)
+            };
+            let duckdb = Acceleration {
+                engine: Engine::DuckDB,
+                ..accelerated(mode)
+            };
+            assert!(
+                postgres.retains_data_across_restarts(),
+                "postgres keeps its rows across a restart in {mode:?}"
+            );
+            assert_eq!(
+                duckdb.retains_data_across_restarts(),
+                mode.retains_data_across_restarts(),
+                "a file-backed engine follows its mode in {mode:?}"
+            );
+        }
     }
 }

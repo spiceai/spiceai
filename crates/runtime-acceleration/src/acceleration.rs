@@ -138,11 +138,13 @@ pub enum Mode {
 }
 
 impl Mode {
-    /// Whether an accelerator in this mode still holds the rows it held before a restart.
+    /// Whether a *file-backed* accelerator in this mode reopens the rows it held before a
+    /// restart.
     ///
-    /// This is what decides whether the refresh that follows a restart reloads the whole
-    /// dataset or only the part the accelerator is missing, so a caller reasoning about what
-    /// a fresh process observes should ask this rather than matching on the mode itself.
+    /// This answers for the mode alone, so it is only the whole answer for an engine that stores
+    /// its data in a file the mode governs. Unless the engine is already known to be one of
+    /// those, ask [`Acceleration::retains_data_across_restarts`] instead — an engine that keeps
+    /// its data somewhere the mode does not describe gets the wrong answer here.
     ///
     /// `Memory` is ephemeral, and so is Cayenne's memory mode — it is "fully in-RAM and
     /// ephemeral … the dataset reloads from its federated source on startup". `FileCreate`
@@ -463,6 +465,27 @@ pub struct Acceleration {
 }
 
 impl Acceleration {
+    /// Whether this acceleration still holds the rows it held before a restart.
+    ///
+    /// This is what decides whether the refresh that follows a restart reloads the whole
+    /// dataset or only the part the accelerator is missing, so a caller reasoning about what
+    /// a fresh process observes should ask this rather than matching on the mode itself.
+    ///
+    /// The mode alone does not answer it. `PostgreSQL` stores the rows in a server that outlives
+    /// the process, and `PostgresAccelerator` never reads the mode when opening its table — so
+    /// it keeps them even under the default `Mode::Memory`, which every other engine treats as
+    /// ephemeral. `DatasetSpec::is_file_accelerated` already carves it out the same way.
+    ///
+    /// Every other engine does start empty in the modes [`Mode::retains_data_across_restarts`]
+    /// reports as ephemeral, so for those the mode is the whole answer. An engine that ignores
+    /// the mode in the other direction — Arrow is in-memory whatever the mode asks for — is
+    /// only ever reported as *more* durable than it is, which costs a caller an optimization
+    /// rather than a correct answer.
+    #[must_use]
+    pub fn retains_data_across_restarts(&self) -> bool {
+        self.engine == Engine::PostgreSQL || self.mode.retains_data_across_restarts()
+    }
+
     #[must_use]
     pub fn with_primary_key(mut self, primary_key: ColumnReference) -> Self {
         self.primary_key = Some(primary_key);
