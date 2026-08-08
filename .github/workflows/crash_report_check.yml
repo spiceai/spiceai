@@ -203,9 +203,18 @@ jobs:
           echo "──────────────────────────"
           grep -q 'wild jump' wild.txt \
             || { echo "report did not flag the ip as outside the image"; exit 1; }
-          if grep -qE 'offset=|symbolize:' wild.txt; then
+          if grep -qE 'offset=|symbolize: ' wild.txt; then
             echo "a command that cannot work was printed anyway"; exit 1
           fi
+          # The payoff: with the ip useless, the caller has to come off the stack,
+          # and it has to resolve to the function that made the wild call.
+          CALLER=$(grep -oE 'symbolize caller: .* 0x[0-9a-f]+' wild.txt \
+            | grep -oE '0x[0-9a-f]+$')
+          test -n "$CALLER" || { echo "no caller recovered"; exit 1; }
+          echo "caller offset: $CALLER"
+          addr2line -e "$TEST_BIN" -fCi "$CALLER" | tee wild_sym.txt
+          grep -q 'spiced_crash_handler_test_wild_call' wild_sym.txt \
+            || { echo "recovered caller did not resolve to the calling function"; exit 1; }
 
       - name: Symbolize the offset
         run: |
@@ -226,5 +235,6 @@ jobs:
             report.txt
             abort.txt
             wild.txt
+            wild_sym.txt
             sym.txt
           if-no-files-found: warn

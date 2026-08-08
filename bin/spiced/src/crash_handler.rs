@@ -153,6 +153,9 @@ fn resolve_image() {
     if let Some(image) = read_image() {
         let _ = IMAGE.set(image);
     }
+    if let Some(fds) = open_probe() {
+        let _ = PROBE_FDS.set(fds);
+    }
     let _ = SYMBOLIZE_PREFIX.set(symbolize_prefix());
 }
 
@@ -226,7 +229,7 @@ fn symbolize_prefix() -> String {
         .and_then(|path| path.to_str().map(str::to_owned));
     match exe {
         Some(exe) => {
-            let prefix = format!("symbolize: addr2line -e {exe} -fCi 0x");
+            let prefix = format!("addr2line -e {exe} -fCi 0x");
             if prefix.len() <= MAX_SYMBOLIZE_PREFIX {
                 return prefix;
             }
@@ -242,7 +245,7 @@ fn symbolize_prefix() -> String {
             );
         }
     }
-    "symbolize: addr2line -e spiced -fCi 0x".to_owned()
+    "addr2line -e spiced -fCi 0x".to_owned()
 }
 
 #[cfg(target_os = "linux")]
@@ -388,6 +391,92 @@ fn signal_sender(cc: &crash_handler::CrashContext) -> Option<(u32, u32)> {
             base.add(SI_UID_OFFSET).cast::<u32>().read_unaligned(),
         ))
     }
+}
+
+/// The write end of a pipe, opened at install, used to test whether an address can be
+/// read without faulting: `write(2)` reports `EFAULT` for an unreadable buffer instead
+/// of raising a signal, and is async-signal-safe.
+///
+/// A pipe rather than `/dev/null`, which the kernel completes without ever reading the
+/// buffer — every probe against it would pass. The read end is deliberately held open
+/// too: closing it would make each probe raise `SIGPIPE`. A whole report probes far
+/// less than a pipe's capacity, and the handler only ever runs once, so the writes
+/// cannot accumulate enough to block.
+#[cfg(target_os = "linux")]
+static PROBE_FDS: OnceLock<[i32; 2]> = OnceLock::new();
+
+#[cfg(target_os = "linux")]
+fn open_probe() -> Option<[i32; 2]> {
+    let mut fds = [0i32; 2];
+    // SAFETY: `pipe2` fills the caller-owned array.
+    let rc = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) };
+    (rc == 0).then_some(fds)
+}
+
+/// Whether `len` bytes at `ptr` can be read without faulting.
+///
+/// Conservative: any error at all, not just `EFAULT`, is treated as unreadable. The
+/// cost of being wrong here is a second fault inside the handler, which kills the
+/// process before the rest of the report is written.
+#[cfg(target_os = "linux")]
+fn readable(ptr: *const u8, len: usize) -> bool {
+    let Some(fds) = PROBE_FDS.get() else {
+        return false;
+    };
+    // SAFETY: `write` reads at most `len` bytes from `ptr` and reports `EFAULT` rather
+    // than faulting if it cannot. The fd is a pipe this process holds both ends of.
+    unsafe { libc::write(fds[1], ptr.cast(), len) >= 0 }
+}
+
+/// `addr` as an offset into the executable file, if it points into this binary's code.
+#[cfg(target_os = "linux")]
+fn text_offset(addr: u64) -> Option<u64> {
+    let image = IMAGE.get()?;
+    let within = usize::try_from(addr).ok()?;
+    image
+        .text
+        .contains(&within)
+        .then(|| addr.saturating_sub(image.base as u64))
+}
+
+/// RSP's index into `mcontext_t::gregs`, as [`REG_RIP`].
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const REG_RSP: usize = 15;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const _: () = assert!(libc::REG_RSP == 15);
+
+/// The stack pointer at the point of the fault.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn stack_pointer(cc: &crash_handler::CrashContext) -> u64 {
+    cc.context.uc_mcontext.gregs[REG_RSP].cast_unsigned()
+}
+
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+fn stack_pointer(cc: &crash_handler::CrashContext) -> u64 {
+    cc.context.uc_mcontext.sp
+}
+
+#[cfg(all(
+    target_os = "linux",
+    not(any(target_arch = "x86_64", target_arch = "aarch64"))
+))]
+fn stack_pointer(_cc: &crash_handler::CrashContext) -> u64 {
+    0
+}
+
+/// The return address, where the architecture keeps one in a register.
+///
+/// On aarch64 a `blr` leaves it in `x30`, so a jump through a corrupted pointer names
+/// its caller without reading memory at all. x86-64 pushes it instead, and it is
+/// recovered from the stack below.
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+fn link_register(cc: &crash_handler::CrashContext) -> Option<u64> {
+    Some(cc.context.uc_mcontext.regs[30])
+}
+
+#[cfg(all(target_os = "linux", not(target_arch = "aarch64")))]
+fn link_register(_cc: &crash_handler::CrashContext) -> Option<u64> {
+    None
 }
 
 /// RIP's index into `mcontext_t::gregs`. `crash-context` exposes the register file
@@ -545,11 +634,16 @@ fn report(cc: &crash_handler::CrashContext) {
     // Only when the offset is one `addr2line` can actually use.
     if in_text {
         if let Some(prefix) = SYMBOLIZE_PREFIX.get() {
+            complete &= write!(cur, "symbolize: ").is_ok();
             complete &= cur.write_all(prefix.as_bytes()).is_ok();
             complete &= writeln!(cur, "{offset:x}").is_ok();
         }
     }
-    complete &= write!(cur, "=== end native crash ===\n").is_ok();
+    // Written before the stack section, not with it. Reading the stack is the one part
+    // of this report that can fault again — the stack pointer itself may be what was
+    // corrupted — and a second fault here kills the process outright, since the signal
+    // is blocked inside its own handler. Flushing first means that costs the stack
+    // section rather than the whole report.
     #[expect(
         clippy::cast_possible_truncation,
         reason = "the cursor position is bounded by the buffer length"
@@ -560,6 +654,96 @@ fn report(cc: &crash_handler::CrashContext) {
         // Its own `write(2)`: by definition there was no room left in the buffer.
         raw_write(b"=== crash report truncated ===\n");
     }
+
+    report_stack(cc);
+    raw_write(b"=== end native crash ===\n");
+}
+
+/// How many words above the stack pointer are examined for a return address.
+#[cfg(target_os = "linux")]
+const STACK_WORDS: usize = 16;
+
+/// Sized like [`MAX_REPORT`], for the second write.
+#[cfg(target_os = "linux")]
+const STACK_BUF: usize = 1024;
+#[cfg(target_os = "linux")]
+const _: () = assert!(
+    38 + 24                          // stack: rsp=… ret=…
+        + 22                         // (+0x…)
+        + 18                         // lr=…
+        + MAX_SYMBOLIZE_PREFIX + 17  // the caller's symbolize line
+        + 18 + STACK_WORDS * 21      // the candidate list
+        <= STACK_BUF
+);
+
+/// Where the crash came *from*, when the instruction pointer no longer says.
+///
+/// After a call through a corrupted pointer the faulting address names nothing — but
+/// the return address the call pushed is still on the stack, and on aarch64 still in
+/// `x30`. Words are reported only when they point into this binary's code, since a
+/// stack is full of data that looks like nothing in particular.
+///
+/// Every read is probed first: this runs with an unknown stack pointer, and faulting
+/// here would take the process down before the rest of the report is out.
+#[cfg(target_os = "linux")]
+fn report_stack(cc: &crash_handler::CrashContext) {
+    use std::io::Write as _;
+
+    let sp = stack_pointer(cc);
+    let mut buf = [0u8; STACK_BUF];
+    let mut cur = std::io::Cursor::new(&mut buf[..]);
+    let _ = write!(cur, "stack: rsp=0x{sp:x}");
+
+    // aarch64 keeps the return address in a register, so it needs no stack read.
+    let mut caller = link_register(cc).and_then(|lr| {
+        let _ = write!(cur, " lr=0x{lr:x}");
+        text_offset(lr)
+    });
+
+    let mut candidates = 0;
+    for word in 0..STACK_WORDS {
+        let Some(at) = sp.checked_add((word * size_of::<u64>()) as u64) else {
+            break;
+        };
+        let ptr =
+            std::ptr::with_exposed_provenance::<u8>(usize::try_from(at).unwrap_or(usize::MAX));
+        if !readable(ptr, size_of::<u64>()) {
+            break;
+        }
+        // SAFETY: the probe above established that these eight bytes are readable, and
+        // a stack word has no validity invariants.
+        let value = unsafe { ptr.cast::<u64>().read_unaligned() };
+        let Some(offset) = text_offset(value) else {
+            continue;
+        };
+        // The first word is the return address a `call` just pushed, which is what
+        // names the caller after a jump to a wild address. Anything deeper is a
+        // candidate: it may be a live return address or a stale one.
+        if word == 0 && caller.is_none() {
+            let _ = write!(cur, " ret=0x{value:x} (+0x{offset:x})");
+            caller = Some(offset);
+        } else {
+            if candidates == 0 {
+                let _ = write!(cur, "\nstack candidates:");
+            }
+            let _ = write!(cur, " +0x{offset:x}");
+            candidates += 1;
+        }
+    }
+    let _ = writeln!(cur);
+
+    if let Some((offset, prefix)) = caller.zip(SYMBOLIZE_PREFIX.get()) {
+        let _ = write!(cur, "symbolize caller: ");
+        let _ = cur.write_all(prefix.as_bytes());
+        let _ = writeln!(cur, "{offset:x}");
+    }
+
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "the cursor position is bounded by the buffer length"
+    )]
+    let written = cur.position() as usize;
+    raw_write(&buf[..written]);
 }
 
 /// A reduced report. `CrashContext` is platform-specific: on macOS it carries a Mach
@@ -841,6 +1025,17 @@ mod tests {
         assert!(
             !stderr.contains("symbolize:"),
             "a command that cannot work should not be printed: {stderr}"
+        );
+
+        // What the instruction pointer no longer says, the stack does: the call that
+        // jumped to the wild address pushed the address it would have returned to.
+        assert!(
+            stderr.contains("stack: rsp=0x"),
+            "report should carry the stack pointer: {stderr}"
+        );
+        assert!(
+            stderr.contains("symbolize caller: "),
+            "report should recover a caller for a wild jump: {stderr}"
         );
     }
 }
