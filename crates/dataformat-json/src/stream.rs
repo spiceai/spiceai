@@ -1020,14 +1020,26 @@ impl ArrayToNdjsonPush {
                     let mut stream = Deserializer::from_reader(cursor).into_iter::<Box<RawValue>>();
                     match stream.next() {
                         Some(Ok(element)) => {
+                            // Calculate how many bytes were consumed
+                            let consumed = stream.byte_offset();
+
+                            // A scalar has no closing delimiter, so serde ends
+                            // it at the end of the buffer and reports success:
+                            // `[123` yields `123` even though the next push
+                            // could make it `123456`. Emitting now would emit a
+                            // value the file never contained. Objects, arrays
+                            // and strings all end on a delimiter, so only a
+                            // scalar running to the buffer's end is ambiguous.
+                            if consumed == self.buffer.len() && self.may_be_truncated() {
+                                return Ok(());
+                            }
+
                             // Successfully parsed an element
                             let element_bytes = element.get().as_bytes();
 
                             // Filter and add to pending
                             filter_element_bytes(element_bytes, &mut self.pending);
 
-                            // Calculate how many bytes were consumed
-                            let consumed = stream.byte_offset();
                             self.buffer.drain(..consumed);
 
                             self.state = ParsingState::ExpectingCommaOrClosingBracket;
@@ -2033,6 +2045,65 @@ mod tests {
                 .push_bytes(b"}]")
                 .expect_err("the completed element is malformed and must be reported");
             assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        }
+
+        /// A scalar element split across two pushes must not be emitted as the
+        /// prefix that happened to arrive first. serde ends a number at the end
+        /// of the buffer and reports success, so `[123` + `456]` used to yield
+        /// the row `123` — a value the file never contained — and then fail on
+        /// the leftover `456`.
+        #[test]
+        fn a_scalar_split_across_pushes_is_not_emitted_as_its_prefix() {
+            for (head, tail, expected) in [
+                (&b"[123"[..], &b"456]"[..], vec!["123456"]),
+                (&b"[1"[..], &b"2.5e3]"[..], vec!["12.5e3"]),
+                (&b"[tru"[..], &b"e]"[..], vec!["true"]),
+                (&b"[1,2"[..], &b"3]"[..], vec!["1", "23"]),
+                // A scalar followed by a delimiter is unambiguous and still
+                // emits without waiting.
+                (&b"[123,"[..], &b"4]"[..], vec!["123", "4"]),
+            ] {
+                let mut adapter = ArrayToNdjsonPush::new();
+                adapter.push_bytes(head).expect("head must not error");
+                let mut lines = read_all_push(&mut adapter);
+                adapter.push_bytes(tail).expect("tail must not error");
+                lines.extend(read_all_push(&mut adapter));
+
+                assert_eq!(
+                    lines,
+                    expected,
+                    "{} + {} produced the wrong rows",
+                    String::from_utf8_lossy(head),
+                    String::from_utf8_lossy(tail)
+                );
+                assert!(adapter.is_complete());
+            }
+        }
+
+        /// Splitting an array of bare scalars at every byte offset must yield
+        /// the same rows, whichever byte the chunk boundary lands on.
+        #[test]
+        fn an_array_of_scalars_survives_every_split() {
+            let body = br#"[1,-2.5,3e4,true,false,null,"s"]"#;
+            let expected = vec!["1", "-2.5", "3e4", "true", "false", "null", r#""s""#];
+
+            for split in 1..body.len() {
+                let mut adapter = ArrayToNdjsonPush::new();
+                let (head, tail) = body.split_at(split);
+
+                adapter
+                    .push_bytes(head)
+                    .unwrap_or_else(|e| panic!("split at {split}: head must not error: {e}"));
+                let mut lines = read_all_push(&mut adapter);
+
+                adapter
+                    .push_bytes(tail)
+                    .unwrap_or_else(|e| panic!("split at {split}: tail must not error: {e}"));
+                lines.extend(read_all_push(&mut adapter));
+
+                assert_eq!(lines, expected, "split at {split} lost or changed rows");
+                assert!(adapter.is_complete(), "split at {split} did not complete");
+            }
         }
 
         /// A UTF-8 BOM arrives a byte at a time like anything else, and a
