@@ -25,17 +25,25 @@ retries = 0
 """
 
 # The fix: the same overrides, plus an explicit ceiling for the slow binaries.
+# `mutation_model_test` is split out at a lower ceiling, mirroring the real
+# config: its baseline is a third of the others', so 960s already clears the
+# required factor and the retries it keeps would pay for anything above that.
 FIXED_CONFIG = PRE_FIX_CONFIG + """\
 slow-timeout = { period = "120s", terminate-after = 12 }
 
 [[profile.default.overrides]]
-filter = 'binary(=partition_chunking_test) | binary(=layout_pruning_ab_test) | binary(=mutation_model_test)'
+filter = 'binary(=partition_chunking_test) | binary(=layout_pruning_ab_test)'
 slow-timeout = { period = "120s", terminate-after = 12 }
+
+[[profile.default.overrides]]
+filter = 'binary(=mutation_model_test)'
+slow-timeout = { period = "120s", terminate-after = 8 }
 """
 
 # The ceiling sized against the 3.7x contention factor measured for #12336: high
 # enough to clear every baseline at that factor, and still reached once the pool
-# got busier (#12811).
+# got busier (#12811). Only the 12s drop to 8 — `mutation_model_test` is already
+# there, which is the point of it being separate.
 UNDERSIZED_CONFIG = FIXED_CONFIG.replace("terminate-after = 12", "terminate-after = 8")
 
 
@@ -143,6 +151,39 @@ class CheckConfigTest(unittest.TestCase):
     def test_the_fixed_config_is_accepted(self):
         with tempfile.TemporaryDirectory() as tmp:
             self.assertEqual(check_nextest_config.check_config(write(tmp, FIXED_CONFIG)), [])
+
+    def test_a_binary_keeps_the_ceiling_its_own_baseline_asks_for(self):
+        """960s is enough for mutation_model_test, so the guard must not ask for more.
+
+        Its 107.1s baseline needs 616s at 4.6 x 1.25, which the 960s in
+        FIXED_CONFIG clears — while its two block-mates need 978s and 1425s and
+        so sit at 1440s. Without this, raising the whole block to match the
+        slowest member would read as required rather than as a choice, and this
+        binary keeps the default retries: every second above what it needs is
+        spent once per attempt when a genuine hang is caught.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            problems = check_nextest_config.check_config(write(tmp, FIXED_CONFIG))
+        self.assertNotIn("mutation_model_test", "\n".join(problems))
+
+    def test_rejects_the_lower_ceiling_for_a_binary_that_needs_more(self):
+        """The split is per-baseline, not a licence to move any binary down to 960s.
+
+        Demotes layout_pruning_ab_test into the lower block — it needs 978s, so
+        960s no longer clears it. Its name has to leave the 1440s filter as well
+        as join the 960s one: nextest takes the first override a binary matches,
+        which is what makes the earlier block win otherwise.
+        """
+        config = FIXED_CONFIG.replace(
+            "filter = 'binary(=partition_chunking_test) | binary(=layout_pruning_ab_test)'",
+            "filter = 'binary(=partition_chunking_test)'",
+        ).replace(
+            "filter = 'binary(=mutation_model_test)'",
+            "filter = 'binary(=mutation_model_test) | binary(=layout_pruning_ab_test)'",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            problems = check_nextest_config.check_config(write(tmp, config))
+        self.assertIn("layout_pruning_ab_test is killed after 960s", "\n".join(problems))
 
     def test_rejects_a_ceiling_that_clears_the_baseline_but_not_contention(self):
         """600s clears the 247.9s baseline but not 247.9 x 4.6 x 1.25."""

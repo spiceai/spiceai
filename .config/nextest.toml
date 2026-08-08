@@ -82,18 +82,36 @@ slow-timeout = { period = "120s", terminate-after = 12 }
 # contention measured so far, so the budget is not consumed re-running work that
 # was never going to finish inside a smaller cap.
 #
-# Quiet-pool baselines (run 30833882620) against the 4.6x contention factor
-# measured above: partition_chunking 247.9s, layout_pruning_ab 170.1s,
-# mutation_model 107.1s — the first two of which exceed 960s once multiplied and
-# given the same headroom, so all three sit in the same band as the group above
-# for the same reason.
+# Quiet-pool baselines (run 30833882620) against the 4.6x contention factor and
+# the 1.25x headroom, i.e. 5.75x: partition_chunking 247.9s needs 1425s and
+# layout_pruning_ab 170.1s needs 978s, so both land here.
 #
 # Spelled out as its own block rather than folded into the filter above so that
 # `retries = 0` stays visibly scoped to the three convergence binaries that need
 # it. These binaries must NOT inherit it.
 [[profile.default.overrides]]
-filter = 'binary(=partition_chunking_test) | binary(=layout_pruning_ab_test) | binary(=mutation_model_test)'
+filter = 'binary(=partition_chunking_test) | binary(=layout_pruning_ab_test)'
 slow-timeout = { period = "120s", terminate-after = 12 }
+
+# `mutation_model_test` is the same family but a third of the runtime: 107.1s
+# quiet, so 616s at 5.75x, which the existing 960s already clears with room to
+# spare. It stays at 8.
+#
+# Raising it with the others would buy nothing and cost something. Nothing,
+# because the ceiling is already above what the model predicts under the worst
+# contention measured plus headroom — the reason the other two moved. Something,
+# because this binary keeps the default retries: a genuine hang is killed once
+# per attempt, so every second added to the ceiling is spent six times over
+# (5 retries + the first try). Going to 12 would add 480s x 6 = 48 minutes to
+# the cost of catching one, on the binary least likely to need the room.
+#
+# The rule this follows is the one stated above: the ceiling is derived from the
+# measurement, not copied from a sibling. If a quiet-pool baseline here grows
+# past 167s (960 / 5.75), that is the signal to move it — and
+# `.github/scripts/check_nextest_config.py` is what will say so.
+[[profile.default.overrides]]
+filter = 'binary(=mutation_model_test)'
+slow-timeout = { period = "120s", terminate-after = 8 }
 
 # Same reasoning for the MySQL CDC convergence tests: a retry that passes hides a lost update.
 [[profile.default.overrides]]
