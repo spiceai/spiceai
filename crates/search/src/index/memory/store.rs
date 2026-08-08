@@ -50,6 +50,14 @@ pub(crate) struct MemoryVectorStore {
     /// output uses, as required by `VectorScanTableProvider`).
     pub(crate) stored_schema: SchemaRef,
     batches: Vec<StoredBatch>,
+    /// Rows written since a replace window opened, held aside from [`Self::batches`].
+    ///
+    /// `None` outside a replace window, which is every append and every CDC write. While it
+    /// is `Some`, writes land here and reads still see [`Self::batches`], so the wipe and the
+    /// repopulation of a full refresh become visible together at
+    /// [`Self::commit_replace_window`] rather than a searcher observing an empty index for
+    /// the length of the refresh.
+    replacement: Option<Vec<StoredBatch>>,
 }
 
 impl MemoryVectorStore {
@@ -57,7 +65,39 @@ impl MemoryVectorStore {
         Self {
             stored_schema,
             batches: Vec::new(),
+            replacement: None,
         }
+    }
+
+    /// Open a replace window: stage subsequent writes instead of adding them to the rows
+    /// readers see.
+    ///
+    /// A replacing write reproduces the table's whole contents, so every row this store
+    /// already holds is either re-sent inside the window or belongs to a row the source
+    /// dropped. Discards anything staged by a window that was abandoned without either
+    /// terminator running, so it cannot be swept into this one.
+    pub(crate) fn begin_replace_window(&mut self) {
+        self.replacement = Some(Vec::new());
+    }
+
+    /// Close a replace window by publishing what it staged, replacing the previous contents
+    /// in one step. A no-op when no window is open — the terminators run after an append too.
+    pub(crate) fn commit_replace_window(&mut self) {
+        if let Some(staged) = self.replacement.take() {
+            self.batches = staged;
+        }
+    }
+
+    /// Close a replace window by discarding what it staged, leaving the previous contents
+    /// readable. A no-op when no window is open.
+    pub(crate) fn abandon_replace_window(&mut self) {
+        self.replacement = None;
+    }
+
+    /// The batches a write acts on: the staged set inside a replace window, else the rows
+    /// readers see.
+    fn write_target(&mut self) -> &mut Vec<StoredBatch> {
+        self.replacement.as_mut().unwrap_or(&mut self.batches)
     }
 
     /// Replace-on-rewrite insert: drops any stored row whose formatted primary
@@ -72,7 +112,7 @@ impl MemoryVectorStore {
 
         self.delete_by_keys(&keys)?;
         if batch.num_rows() > 0 {
-            self.batches.push(StoredBatch { batch, keys });
+            self.write_target().push(StoredBatch { batch, keys });
         }
         Ok(())
     }
@@ -84,8 +124,9 @@ impl MemoryVectorStore {
         }
 
         let delete_keys: HashSet<&str> = keys.iter().map(String::as_str).collect();
-        let mut retained = Vec::with_capacity(self.batches.len() + 1);
-        for stored in self.batches.drain(..) {
+        let target = self.write_target();
+        let mut retained = Vec::with_capacity(target.len() + 1);
+        for stored in target.drain(..) {
             if !stored
                 .keys
                 .iter()
@@ -115,12 +156,16 @@ impl MemoryVectorStore {
                 keys: kept_keys,
             });
         }
-        self.batches = retained;
+        *self.write_target() = retained;
         Ok(())
     }
 
     /// Current contents as batches conforming to [`Self::stored_schema`].
     /// Cheap: Arrow buffers are shared, not copied.
+    ///
+    /// Always the published rows. Rows staged by an open replace window are deliberately
+    /// invisible here: a query during a full refresh reads the previous contents rather than
+    /// the partially rebuilt ones.
     pub(crate) fn batches(&self) -> Vec<RecordBatch> {
         self.batches.iter().map(|s| s.batch.clone()).collect()
     }
