@@ -64,7 +64,7 @@ jobs:
           cargo test -p spice --test cloud_integration -- --test-threads=1
 
       - name: Push snapshots to branch
-        if: github.event.inputs.update_snapshots == 'always' || github.event_name == 'schedule'
+        if: ${{ !cancelled() && (github.event.inputs.update_snapshots == 'always' || github.event_name == 'schedule') }}
         uses: ./.github/actions/push-snap-changes
         with:
           token: ${{ secrets.GITHUB_TOKEN }}

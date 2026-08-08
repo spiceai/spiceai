@@ -5,7 +5,7 @@ source [file join [file dirname [info script]] repl_helpers.exp]
 # spiced runtime response timeout
 set timeout 5
 
-spawn spice search
+spawn spice search {*}[repl_endpoint_args]
 
 proc perform_search {search_term expected_term} {
     global timeout

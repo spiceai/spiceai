@@ -25,7 +25,7 @@ use datafusion::{
 };
 use opentelemetry::KeyValue;
 use runtime_datafusion::execution_plan::schema_cast::SchemaCastScanExec;
-use runtime_datafusion_index::{Index, IndexedTableProvider};
+use runtime_datafusion_index::{Index, IndexedTableProvider, WriteWindow};
 use runtime_table_partition::provider::PartitionTableProvider;
 use util::RetryError;
 
@@ -200,11 +200,14 @@ impl TableSink {
             .flat_map(IndexedTableProvider::get_all_indexes)
             .collect();
 
+        // A replacing write drops source rows by not re-sending them, so an index backed by its
+        // own store has to be told to clear rather than upsert (#12066).
         prepare_indexes(
             "TableSink",
             provider_indexes_before
                 .iter()
                 .chain(self.sink_indexes.iter()),
+            WriteWindow::from(overwrite),
         )
         .await
         .map_err(retry_from_df_error)?;

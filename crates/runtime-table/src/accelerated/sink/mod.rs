@@ -19,7 +19,7 @@ use datafusion::{
     physical_plan::RecordBatchStream,
 };
 use multi::MultiSink;
-use runtime_datafusion_index::Index;
+use runtime_datafusion_index::{Index, WriteWindow};
 use std::{pin::Pin, sync::Arc};
 use table::TableSink;
 use util::RetryError;
@@ -100,15 +100,16 @@ impl AccelerationSink {
 pub(crate) async fn prepare_indexes<'a>(
     sink: &str,
     indexes: impl Iterator<Item = &'a Arc<dyn Index + Send + Sync>>,
+    write_window: WriteWindow,
 ) -> Result<(), DataFusionError> {
     let mut started: Vec<&Arc<dyn Index + Send + Sync>> = Vec::new();
 
     for index in indexes {
         tracing::debug!(
-            "{sink}: running on_write_start for index '{}'",
+            "{sink}: running on_write_start for index '{}' ({write_window:?})",
             index.name()
         );
-        let Err(e) = index.on_write_start().await else {
+        let Err(e) = index.on_write_start(write_window).await else {
             started.push(index);
             continue;
         };
@@ -216,7 +217,7 @@ mod tests {
     use datafusion::error::{DataFusionError, Result as DataFusionResult};
     use runtime_datafusion::error::find_datafusion_root;
 
-    use super::{Arc, Index, finalize_indexes, prepare_indexes};
+    use super::{Arc, Index, WriteWindow, finalize_indexes, prepare_indexes};
 
     /// An [`Index`] whose finalize outcome and fatality are configurable, recording how
     /// many times it was finalized.
@@ -444,7 +445,7 @@ mod tests {
             vec![]
         }
 
-        async fn on_write_start(&self) -> DataFusionResult<()> {
+        async fn on_write_start(&self, _window: WriteWindow) -> DataFusionResult<()> {
             self.start_calls.fetch_add(1, Ordering::SeqCst);
             if self.fails {
                 return Err(DataFusionError::Execution(format!(
@@ -477,7 +478,7 @@ mod tests {
         ];
         let erased = erase(&indexes);
 
-        prepare_indexes("TestSink", erased.iter())
+        prepare_indexes("TestSink", erased.iter(), WriteWindow::Append)
             .await
             .expect("no index failed to start");
 
@@ -497,7 +498,7 @@ mod tests {
         ];
         let erased = erase(&indexes);
 
-        prepare_indexes("TestSink", erased.iter())
+        prepare_indexes("TestSink", erased.iter(), WriteWindow::Append)
             .await
             .expect("a best-effort start failure must not fail the write");
 
@@ -514,7 +515,7 @@ mod tests {
         let indexes = vec![StartIndex::new("full_text", true, true)];
         let erased = erase(&indexes);
 
-        let err = prepare_indexes("TestSink", erased.iter())
+        let err = prepare_indexes("TestSink", erased.iter(), WriteWindow::Append)
             .await
             .expect_err("a fatal start failure must fail the write");
 
@@ -537,7 +538,7 @@ mod tests {
         let indexes = vec![StartIndex::new("full_text", true, true)];
         let erased = erase(&indexes);
 
-        let err = prepare_indexes("TestSink", erased.iter())
+        let err = prepare_indexes("TestSink", erased.iter(), WriteWindow::Append)
             .await
             .expect_err("a fatal start failure must fail the write");
 
@@ -560,7 +561,7 @@ mod tests {
         ];
         let erased = erase(&indexes);
 
-        prepare_indexes("TestSink", erased.iter())
+        prepare_indexes("TestSink", erased.iter(), WriteWindow::Append)
             .await
             .expect_err("a fatal start failure must fail the write");
 
@@ -596,7 +597,7 @@ mod tests {
     #[tokio::test]
     async fn no_indexes_is_a_successful_prepare() {
         let erased: Vec<Arc<dyn Index + Send + Sync>> = vec![];
-        prepare_indexes("TestSink", erased.iter())
+        prepare_indexes("TestSink", erased.iter(), WriteWindow::Append)
             .await
             .expect("an empty index set cannot fail");
     }

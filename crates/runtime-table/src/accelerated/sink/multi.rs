@@ -37,7 +37,7 @@ use tokio_stream::wrappers::BroadcastStream;
 use util::RetryError;
 
 use data_components::index_maintenance::perform_index_maintenance;
-use runtime_datafusion_index::Index;
+use runtime_datafusion_index::{Index, WriteWindow};
 
 use crate::accelerated::{
     refresh_task::retry_from_df_error,
@@ -153,9 +153,17 @@ impl MultiSink {
 
         // Run on_write_start for all sink_indexes before any write begins. A fatal start
         // failure returns here, before any task is spawned, so no data is written.
-        prepare_indexes("MultiSink", self.sink_indexes.iter())
-            .await
-            .map_err(retry_from_df_error)?;
+        //
+        // The window comes from `overwrite`: a replacing write drops source rows by not
+        // re-sending them, so an index backed by its own store has to be told to clear
+        // rather than upsert (#12066).
+        prepare_indexes(
+            "MultiSink",
+            self.sink_indexes.iter(),
+            WriteWindow::from(overwrite),
+        )
+        .await
+        .map_err(retry_from_df_error)?;
 
         // Spawn primary task
         let primary_provider = Arc::clone(&self.original_table_provider);
