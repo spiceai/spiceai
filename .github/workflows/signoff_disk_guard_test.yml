@@ -7,6 +7,11 @@ name: Sign-off Disk Guard Tests
 # else: a guard that under-reports leaves an out-of-disk run looking like a code
 # failure (the bug it was written for, #12412), and one that over-reports
 # excuses a genuinely broken branch as "infrastructure, just re-dispatch".
+#
+# The same classification also decides whether a run reached a verdict at all, so
+# these tests cover the signalled case too — a budget expiry publishing "checks
+# failed" about a suite that was still passing (#12518). The workflow keeps its
+# name: it is a required check, and renaming one costs a branch-protection edit.
 on:
   pull_request:
     branches:

@@ -27,9 +27,10 @@ use crate::error::{CloudErrorCode, Error, InvalidResponseSnafu, Result};
 pub use spice_cloud_client::CloudClient as InnerCloudClient;
 use spice_cloud_client::types::{
     ApiKeysResponse, AuthContext, AuthExchangeResponse, ContainerImagesResponse,
-    CreateDeploymentRequest, CreateProjectRequest, Deployment, LogsResponse, MetricsResponse, Org,
-    Project, ProjectExecutor, ProjectKind, ProjectResourceLimits, ProjectResources,
-    RegenerateApiKeyResponse, RegionsResponse, Secret, UpdateChannel, UpdateProjectRequest,
+    CreateDeploymentRequest, CreateProjectRequest, Deployment, LogsResponse, MetricsResponse,
+    MintAdoptionCodeRequest, MintAdoptionCodeResponse, Org, Project, ProjectExecutor, ProjectKind,
+    ProjectResourceLimits, ProjectResources, RegenerateApiKeyResponse, RegionsResponse, Secret,
+    UpdateChannel, UpdateProjectRequest,
 };
 
 use super::org;
@@ -220,6 +221,31 @@ impl CloudClient {
             }
             .fail()
         }
+    }
+
+    /// Mint a single-use standalone-instance adoption code for
+    /// `spice connect`'s codeless path.
+    pub async fn mint_instance_adoption_code(
+        &self,
+        request: &MintAdoptionCodeRequest,
+    ) -> Result<MintAdoptionCodeResponse> {
+        self.inner
+            .mint_instance_adoption_code(request)
+            .await
+            .map_err(|error| self.err(error))
+    }
+
+    /// `true` when a `spice login` credential [`Self::connect`] would accept for
+    /// `org` is available in this environment.
+    ///
+    /// Lets `spice connect` tell "no code and no login" (which must name both
+    /// fixes) apart from "logged in, so mint a code" — without making a
+    /// network request to find out. It resolves credentials the same way
+    /// [`Self::connect`] does, so an operator with a credential for the named
+    /// org alone is never told to log in again.
+    #[must_use]
+    pub fn is_authenticated(org: Option<&str>) -> bool {
+        org.is_some_and(org::has_org_token) || org::default_token().is_some()
     }
 
     /// Get the auth context for the current user.

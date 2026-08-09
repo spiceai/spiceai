@@ -59,7 +59,7 @@ by re-reading the scrollback, and a warning is invisible in `--machine` output.
 ([cli/cli#6777](https://github.com/cli/cli/discussions/6777)); the CLIs that
 silently pick instead have documented wrong-target incidents.
 
-Implemented in `resolve_app_target_with_source` and `ensure_orgs_agree` in
+Implemented in `resolve_project_target_with_source` and `ensure_orgs_agree` in
 `bin/spice/src/commands/cloud/mod.rs`, with tests covering each case.
 
 `spice cloud whoami` is the single source of truth for what a command will do:
@@ -286,18 +286,19 @@ without further CLI changes once the API lands.
 its own credential, which is how an operator can tell a fully-working org from
 one that is merely known by name.
 
-## Adding a command that acts on an app
+## Adding a command that acts on a project
 
 1. Take `flag_org: Option<&str>` and resolve with
-   `resolve_app_target(args.app.as_deref(), flag_org)` — never read `--app`
-   directly, or the command will ignore `--org`, the link file, and the active
-   org. If the command **mutates** anything, use
-   `resolve_app_target_with_source` and call `announce_target` first, so the
+   `resolve_project_target(args.project.as_deref(), flag_org)` — never read
+   `--project` directly, or the command will ignore `--org`, the link file, and
+   the active org. If the command **mutates** anything, use
+   `resolve_project_target_with_source` and call `announce_target` first, so the
    operator sees which org is about to be changed and why.
 2. Build the client with `connect_for_target(&target)` so the request carries
    the target's org and uses that org's credential.
-3. Pass `&AppTarget` to the client method. App-scoped `CloudClient` methods take
-   a target rather than a string precisely so a caller cannot skip resolution.
+3. Pass `&ProjectTarget` to the client method. Project-scoped `CloudClient`
+   methods take a target rather than a string precisely so a caller cannot skip
+   resolution.
 4. Add the command to `apply_machine_cloud_mode` and `is_json_output` in
    `bin/spice/src/main.rs`, or `--machine` will silently not apply to it.
 5. Report failures with `Error::cloud_with_hint` and a code from the table
@@ -307,6 +308,6 @@ one that is merely known by name.
 
 - [`bin/spice/src/commands/cloud/org.rs`](../../bin/spice/src/commands/cloud/org.rs) — active org, per-org credentials, org-name validation.
 - [`bin/spice/src/commands/cloud/mod.rs`](../../bin/spice/src/commands/cloud/mod.rs) — command surface, precedence, deploy waiting, runtime inspection.
-- [`bin/spice/src/commands/cloud/client.rs`](../../bin/spice/src/commands/cloud/client.rs) — `AppTarget`, app resolution, error-code mapping.
+- [`bin/spice/src/commands/cloud/client.rs`](../../bin/spice/src/commands/cloud/client.rs) — `ProjectTarget`, project resolution, error-code mapping.
 - [`crates/spice-cloud-client/src/client.rs`](../../crates/spice-cloud-client/src/client.rs) — `X-Org-Name`, `GET /v1/orgs`, org-scoped auth context.
 - [`bin/spice/src/error.rs`](../../bin/spice/src/error.rs) — `CloudErrorCode`.

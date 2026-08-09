@@ -453,6 +453,46 @@ pub struct RegenerateApiKeyRequest {
 }
 
 // ============================================================================
+// Standalone instance adoption codes
+// ============================================================================
+
+/// Request body for `POST /v1/instance-adoption-codes`, the management-API
+/// mint a logged-in `spice connect` uses instead of making the customer copy a
+/// code out of the portal.
+#[derive(Debug, Default, Serialize)]
+pub struct MintAdoptionCodeRequest {
+    /// Display label for the adoption-codes screen — who minted this and why.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// Lifetime in seconds. Omitted to take the endpoint's short default,
+    /// which is what a mint-and-redeem-immediately caller wants: a code that
+    /// outlives its own enroll is a live org credential nobody is holding.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ttl_seconds: Option<u32>,
+    /// The org the caller believes it is minting into. An **assertion, not a
+    /// selection** — the org always comes from the token, and a mismatch is a
+    /// not-found. Without it, a token bound to org A plus `--org B` would mint
+    /// quietly into A.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub org: Option<String>,
+}
+
+/// Response from `POST /v1/instance-adoption-codes`. The plaintext code is
+/// returned exactly once, at mint.
+#[derive(Debug, Deserialize)]
+pub struct MintAdoptionCodeResponse {
+    /// The plaintext adoption code. Never logged, never written to disk.
+    pub code: String,
+    /// The org the code is scoped to, as the cloud resolved it from the token.
+    #[serde(default)]
+    pub org: Option<String>,
+    /// RFC 3339 expiry, for an error message that can say how long the code
+    /// was good for.
+    #[serde(default)]
+    pub expires_at: Option<String>,
+}
+
+// ============================================================================
 // Metrics
 // ============================================================================
 

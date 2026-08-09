@@ -74,6 +74,16 @@ pub mod distributed;
 mod paged_attention;
 pub use crate::chat::paged_attention::PagedAttentionMode;
 
+// Whether pickle-format weights are trusted is plain config with no engine
+// dependency, so it stays ungated alongside `paged_attention` above.
+mod pickle_trust;
+pub use crate::chat::pickle_trust::PickleTrust;
+
+// The `distributed_backend` setting itself is plain config; kept ungated and
+// separate from the `local_llm`-gated `distributed` module above.
+mod distributed_backend_setting;
+pub use crate::chat::distributed_backend_setting::DistributedBackendSetting;
+
 static WEIGHTS_EXTENSIONS: [&str; 7] = [
     ".safetensors",
     ".pth",

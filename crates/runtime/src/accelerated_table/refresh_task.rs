@@ -99,14 +99,15 @@ use tokio::{
 };
 use tracing::{Instrument, Span};
 use util::fibonacci_backoff::FibonacciBackoffBuilder;
+use util::timestamp_filter::is_day_granular;
 use util::{RetryError, retry};
 
 pub(crate) mod changes;
 mod deletion;
 
-// Reuse the single shared schema-evolution instrument (defined in `changes`) rather
-// than registering a same-named counter under a second meter.
-use changes::SCHEMA_EVOLUTION_FAILED;
+// Reuse the single shared schema-evolution instrument rather than registering a
+// same-named counter under a second meter.
+use crate::schema_evolution::SCHEMA_EVOLUTION_FAILED;
 
 const NANOS_TO_MILLIS: u128 = 1_000_000;
 
@@ -1110,7 +1111,11 @@ impl RefreshTask {
         let mut filters = vec![];
         if let Some(converter) = filter_converter.as_ref() {
             if let Some(timestamp) = overwrite_timestamp_in_nano {
-                filters.push(converter.convert(timestamp, Operator::Gt));
+                // A high-water mark read back out of the accelerator: compare
+                // inclusively on a day-granular time column, whose values all cast
+                // to midnight, and let `except_existing_records_from` drop the
+                // already-loaded rows it brings back (#12492).
+                filters.push(converter.convert_high_water_mark(timestamp));
             } else if let Some(period) = refresh.period {
                 filters.push(
                     converter.convert(get_timestamp(SystemTime::now() - period), Operator::Gt),
@@ -1153,7 +1158,12 @@ impl RefreshTask {
                     .get_full_or_incremental_append_update(refresh, timestamp)
                     .await
                 {
-                    Ok(data) => match self.except_existing_records_from(refresh, data).await {
+                    // Reuse `timestamp`: the dedupe must compare against the same mark the
+                    // source filter just used, not a freshly read one (#12492).
+                    Ok(data) => match self
+                        .except_existing_records_from(refresh, data, timestamp)
+                        .await
+                    {
                         Ok(data) => Ok(data),
                         Err(e) => Err(e),
                     },
@@ -1699,7 +1709,7 @@ impl RefreshTask {
 
     fn get_filter_converter(&self, refresh: &Refresh) -> Option<TimestampFilterConvert> {
         let schema = self.federated.schema();
-        Self::build_filter_converter(&schema, refresh)
+        self.build_high_water_converter(&schema, refresh)
     }
 
     fn get_accelerator_filter_converter(
@@ -1707,7 +1717,52 @@ impl RefreshTask {
         refresh: &Refresh,
     ) -> Option<TimestampFilterConvert> {
         let schema = self.accelerator.schema();
-        Self::build_filter_converter(&schema, refresh)
+        self.build_high_water_converter(&schema, refresh)
+    }
+
+    /// Build a converter for one side of the append high-water comparison.
+    ///
+    /// Both sides go through here so they cannot be given different day-granularity: the
+    /// flags come from [`Self::day_granular_high_water_columns`], which reads both schemas.
+    fn build_high_water_converter(
+        &self,
+        schema: &SchemaRef,
+        refresh: &Refresh,
+    ) -> Option<TimestampFilterConvert> {
+        let (time, partition) = self.day_granular_high_water_columns(refresh);
+        Self::build_filter_converter(schema, refresh)
+            .map(|converter| converter.with_day_granular_columns(time, partition))
+    }
+
+    /// Whether the time column and the partition column must be treated as day-granular
+    /// on the append high-water-mark path, as `(time_column, time_partition_column)`.
+    ///
+    /// Resolved across the federated *and* accelerator schemas together, and handed to
+    /// both converters, so the source filter and the dedupe filter cannot disagree about
+    /// the comparison. Deciding it from each converter's own schema is not safe: a
+    /// `refresh_sql` that casts the time column — say a `Date32` source projected to
+    /// `Timestamp` in the accelerator — would widen the source to `>=` while the dedupe
+    /// stayed on `>`. The already-loaded rows would then sit outside the dedupe's
+    /// comparison set and the re-fetched rows would be appended again on *every* refresh,
+    /// turning the stall this fixes into unbounded duplication (#12492).
+    ///
+    /// Either side being day-granular is enough. Widening the dedupe side only ever adds
+    /// rows to the comparison set, so it cannot cause duplication; leaving it narrow can.
+    fn day_granular_high_water_columns(&self, refresh: &Refresh) -> (bool, bool) {
+        let schemas = [self.federated.schema(), self.accelerator.schema()];
+        let any_day_granular = |column: Option<&str>| {
+            let Some(column) = column else { return false };
+            schemas.iter().any(|schema| {
+                schema
+                    .column_with_name(column)
+                    .is_some_and(|(_, field)| is_day_granular(field.data_type()))
+            })
+        };
+
+        (
+            any_day_granular(refresh.time_column.as_deref()),
+            any_day_granular(refresh.time_partition_column.as_deref()),
+        )
     }
 
     fn build_filter_converter(
@@ -1834,13 +1889,24 @@ impl RefreshTask {
         ctx
     }
 
+    /// `high_water_mark` is the mark the source filter was built from. Pass it whenever
+    /// the caller has it: recomputing it here reads `max(time_column)` a second time, and
+    /// a write that lands on the accelerator between the two reads gives this comparison a
+    /// *higher* mark than the source query used. The rows in between are then missing from
+    /// the comparison set and are appended again — the same duplication as widening one
+    /// side without the other (#12492). `None` falls back to deriving it.
     async fn except_existing_records_from(
         &self,
         refresh: &Refresh,
         mut update: StreamingDataUpdate,
+        high_water_mark: Option<u128>,
     ) -> Result<StreamingDataUpdate, RetryError<super::Error>> {
-        let Some(value) = self.timestamp_nanos_for_append_query(refresh).await? else {
-            return Ok(update);
+        let value = match high_water_mark {
+            Some(value) => value,
+            None => match self.timestamp_nanos_for_append_query(refresh).await? {
+                Some(value) => value,
+                None => return Ok(update),
+            },
         };
         let Some(filter_converter) = self.get_accelerator_filter_converter(refresh) else {
             return Ok(update);
@@ -1848,6 +1914,10 @@ impl RefreshTask {
 
         let federated_provider = self.federated.table_provider().await;
 
+        // The high-water filter below must widen in step with the source-side filter in
+        // `get_full_or_incremental_append_update`: on a day-granular time column, if the
+        // re-fetched same-day rows are not in this comparison set they pass the dedupe and
+        // get appended a second time, turning the skip into silent duplication (#12492).
         let mut existing_records = accelerator_df(
             &Arc::clone(&self.accelerator),
             &Self::create_refresh_df_context(
@@ -1861,7 +1931,7 @@ impl RefreshTask {
         )
         .map_err(find_datafusion_root)
         .context(super::UnableToScanTableProviderSnafu)?
-        .filter(filter_converter.convert(value, Operator::Gt))
+        .filter(filter_converter.convert_high_water_mark(value))
         .map_err(find_datafusion_root)
         .context(super::UnableToScanTableProviderSnafu)?
         .collect()
@@ -1937,12 +2007,23 @@ impl RefreshTask {
         let filter_schema = update.data.schema();
         let update_type = update.update_type.clone();
 
+        // The dedup subtracts the accelerator's overlap window from the source's as a
+        // multiset, and this stream is one window split into arbitrary batches, so the
+        // record of which existing rows have already cancelled an incoming row has to span
+        // the whole stream. Keeping it per batch would let the same two identical source
+        // rows survive or not depending on where the batch boundary happened to fall.
+        let mut used: Vec<Vec<bool>> = existing_records
+            .iter()
+            .map(|existing| vec![false; existing.num_rows()])
+            .collect();
+
         let filtered_data = Box::pin(RecordBatchStreamAdapter::new(
             Arc::clone(&update.data.schema()),
             {
                 stream! {
                     while let Some(batch) = update.data.next().await {
-                        let batch = filter_records(&batch?, &existing_records, &filter_schema);
+                        let batch =
+                            filter_records(&batch?, &existing_records, &filter_schema, &mut used);
                         yield batch.map_err(|e| { DataFusionError::External(Box::new(e)) });
                     }
                 }
@@ -2620,14 +2701,28 @@ fn ensure_dedup_column_type(
     .context(super::FailedToFilterUpdatesSnafu)
 }
 
+/// Subtracts the rows already held by the accelerator from an incoming append batch.
+///
+/// The subtraction is a **multiset** (bag) subtraction, not a set subtraction: each existing
+/// row cancels at most one incoming row. An append-mode table has bag semantics unless a key
+/// says otherwise, so a source that legitimately grows to hold the same row twice while the
+/// accelerator holds it once must keep the second copy. Testing membership without consuming
+/// the match would instead impose cross-refresh `DISTINCT` and silently drop that copy.
+///
+/// `used` carries that consumption across calls - one flag per row of each batch in
+/// `existing_records`, in the same order. The caller owns it because a single overlap window
+/// arrives as many batches, and a window's existing row must not cancel one incoming row per
+/// batch. Callers that subtract a single batch pass a freshly zeroed set.
+///
 /// Post-evolution duplicate window: after a widening schema evolution adds a column,
 /// stored rows are NULL-backfilled while the source re-emits them with real values in
 /// the new column - those rows compare unequal here and are appended once more for
 /// the overlap window. This is a documented one-time effect, not a defect.
 fn filter_records(
     update_data: &RecordBatch,
-    existing_records: &Vec<RecordBatch>,
+    existing_records: &[RecordBatch],
     filter_schema: &SchemaRef,
+    used: &mut [Vec<bool>],
 ) -> super::Result<RecordBatch> {
     let mut predicates = vec![];
     let mut comparators = vec![];
@@ -2676,12 +2771,39 @@ fn filter_records(
         ));
     }
 
+    // The caller builds `used` from these same batches, so a mismatch is a bug here rather
+    // than bad input - but it must not be a silent one. Too few sets and the `zip` below
+    // would skip existing batches, under-subtracting; a set longer than its batch would
+    // hand the comparator a row index that batch does not have.
+    if used.len() != comparators.len()
+        || comparators
+            .iter()
+            .zip(used.iter())
+            .any(|((rows, _), used_rows)| *rows != used_rows.len())
+    {
+        return Err(ArrowError::ComputeError(format!(
+            "append de-duplication state does not describe the rows being compared: \
+             {} existing batches holding {} rows, against {} sets of {} claim flags",
+            comparators.len(),
+            comparators.iter().map(|(rows, _)| rows).sum::<usize>(),
+            used.len(),
+            used.iter().map(Vec::len).sum::<usize>(),
+        )))
+        .context(super::FailedToFilterUpdatesSnafu);
+    }
+
     for i in 0..update_data.num_rows() {
         let mut not_matched = true;
-        for (size, comparator) in &comparators {
-            if (0..*size).any(|j| comparator(i, j) == Ordering::Equal) {
-                not_matched = false;
-                break;
+        // An existing row cancels at most one incoming row: the first still-unused match
+        // claims it. Whole-row equality makes all matches interchangeable, so which one is
+        // claimed cannot change how many rows survive.
+        'existing: for ((_, compare), used_rows) in comparators.iter().zip(used.iter_mut()) {
+            for (j, used_row) in used_rows.iter_mut().enumerate() {
+                if !*used_row && compare(i, j) == Ordering::Equal {
+                    *used_row = true;
+                    not_matched = false;
+                    break 'existing;
+                }
             }
         }
 
@@ -2752,8 +2874,8 @@ mod tests {
     use crate::dataupdate::{StreamingDataUpdate, UpdateType};
     use crate::federated_table::FederatedTable;
     use arrow::array::{
-        Float64Array, Int32Array, Int64Array, LargeStringArray, StringArray, StringViewArray,
-        TimestampNanosecondArray, UInt32Array, UInt64Array,
+        Date32Array, Float64Array, Int32Array, Int64Array, LargeStringArray, StringArray,
+        StringViewArray, TimestampNanosecondArray, UInt32Array, UInt64Array,
     };
     use arrow::datatypes::TimeUnit;
     use arrow_schema::{DataType, Field, Schema};
@@ -3027,8 +3149,9 @@ mod tests {
         )
         .expect("existing batch should be created");
         let existing_records = vec![existing_batch];
+        let mut used = vec![vec![false; 1]];
 
-        let err = filter_records(&update_batch, &existing_records, &update_schema)
+        let err = filter_records(&update_batch, &existing_records, &update_schema, &mut used)
             .expect_err("dtype mismatch must be an error, not a panic");
         let message = err.to_string();
         assert!(message.contains("`id`"), "{message}");
@@ -3607,7 +3730,7 @@ mod tests {
         let update = StreamingDataUpdate::new(update_stream, UpdateType::Append);
 
         let result = task
-            .except_existing_records_from(&refresh, update)
+            .except_existing_records_from(&refresh, update, None)
             .await
             .expect("except_existing_records_from should succeed with column subset");
 
@@ -3728,7 +3851,7 @@ mod tests {
         let update = StreamingDataUpdate::new(update_stream, UpdateType::Append);
 
         let result = task
-            .except_existing_records_from(&refresh, update)
+            .except_existing_records_from(&refresh, update, None)
             .await
             .expect("except_existing_records_from should succeed with nullable time column");
 
@@ -3766,6 +3889,443 @@ mod tests {
             id_col.value(0),
             2,
             "remaining row after fix should be the new id=2 (NULL dup was filtered)"
+        );
+    }
+
+    fn dedup_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("day", DataType::Int32, false),
+            Field::new("id", DataType::Int32, false),
+        ]))
+    }
+
+    fn dedup_batch(schema: &SchemaRef, rows: &[(i32, i32)]) -> RecordBatch {
+        let days: Vec<i32> = rows.iter().map(|(day, _)| *day).collect();
+        let ids: Vec<i32> = rows.iter().map(|(_, id)| *id).collect();
+        RecordBatch::try_new(
+            Arc::clone(schema),
+            vec![
+                Arc::new(Int32Array::from(days)),
+                Arc::new(Int32Array::from(ids)),
+            ],
+        )
+        .expect("dedup batch")
+    }
+
+    fn dedup_ids(batch: &RecordBatch) -> Vec<i32> {
+        batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("id column should be Int32")
+            .values()
+            .to_vec()
+    }
+
+    /// Subtracts one existing batch per element of `existing` from the `update` rows,
+    /// returning the `id`s that survived. `update` arrives as a single batch, so this is the
+    /// per-batch view of the subtraction; `dedup_surviving_ids_streamed` covers the rest.
+    fn dedup_surviving_ids(update: &[(i32, i32)], existing: &[&[(i32, i32)]]) -> Vec<i32> {
+        dedup_surviving_ids_streamed(&[update], existing)
+    }
+
+    /// Subtracts `existing` from a sequence of `update` batches sharing one `used` set, the
+    /// way `except_existing_records_from` drives the whole overlap window.
+    fn dedup_surviving_ids_streamed(
+        updates: &[&[(i32, i32)]],
+        existing: &[&[(i32, i32)]],
+    ) -> Vec<i32> {
+        let schema = dedup_schema();
+        let mut existing_batches = vec![];
+        let mut used = vec![];
+        for rows in existing {
+            let batch = dedup_batch(&schema, rows);
+            used.push(vec![false; batch.num_rows()]);
+            existing_batches.push(batch);
+        }
+
+        let mut surviving = vec![];
+        for update in updates {
+            let update_batch = dedup_batch(&schema, update);
+            let filtered = filter_records(&update_batch, &existing_batches, &schema, &mut used)
+                .expect("filter_records should succeed");
+            surviving.extend(dedup_ids(&filtered));
+        }
+        surviving
+    }
+
+    /// Regression test for #12499: the dedup is a multiset subtraction, so a row the
+    /// accelerator holds once cancels exactly one incoming copy. Set subtraction dropped
+    /// every copy, silently losing the legitimately appended one.
+    #[test]
+    fn filter_records_keeps_the_second_copy_of_a_legitimately_duplicated_row() {
+        assert_eq!(
+            dedup_surviving_ids(&[(1, 1), (1, 1)], &[&[(1, 1)]]),
+            vec![1],
+            "the accelerator holds the row once, so only one incoming copy is already stored"
+        );
+    }
+
+    #[test]
+    fn filter_records_cancels_each_existing_row_at_most_once() {
+        assert_eq!(
+            dedup_surviving_ids(&[(1, 1), (1, 1), (1, 1)], &[&[(1, 1), (1, 1)]]),
+            vec![1],
+            "two stored copies cancel two of the three incoming copies"
+        );
+    }
+
+    #[test]
+    fn filter_records_consumes_matches_across_existing_batches() {
+        assert_eq!(
+            dedup_surviving_ids(&[(1, 1), (1, 1), (1, 1)], &[&[(1, 1)], &[(1, 1)]]),
+            vec![1],
+            "a copy stored in each of two batches cancels two incoming copies"
+        );
+    }
+
+    #[test]
+    fn filter_records_drops_every_incoming_row_the_accelerator_already_holds() {
+        assert!(
+            dedup_surviving_ids(&[(1, 1), (2, 2)], &[&[(1, 1), (2, 2)]]).is_empty(),
+            "an unchanged overlap window must not re-append anything"
+        );
+    }
+
+    #[test]
+    fn filter_records_keeps_rows_the_accelerator_does_not_hold() {
+        assert_eq!(
+            dedup_surviving_ids(&[(1, 1), (2, 2)], &[&[(1, 1)]]),
+            vec![2],
+            "only the row already stored is subtracted"
+        );
+    }
+
+    #[test]
+    fn filter_records_keeps_everything_when_the_overlap_window_is_empty() {
+        assert_eq!(
+            dedup_surviving_ids(&[(1, 1), (1, 1)], &[]),
+            vec![1, 1],
+            "with nothing stored in the window there is nothing to subtract"
+        );
+    }
+
+    /// One overlap window arrives as many batches, so a stored row must cancel one incoming
+    /// row across the whole stream - not one per batch. Sharing `used` is what makes the
+    /// result independent of where the batch boundaries fall.
+    #[test]
+    fn filter_records_cancels_once_across_the_whole_update_stream() {
+        assert_eq!(
+            dedup_surviving_ids_streamed(&[&[(1, 1)], &[(1, 1)]], &[&[(1, 1)]]),
+            vec![1],
+            "the single stored copy is cancelled by the first batch, not again by the second"
+        );
+    }
+
+    /// A row matched in a later batch must not strand an unused match in an earlier one: the
+    /// labelled break leaves the batch loop, and the next incoming row restarts at the first.
+    #[test]
+    fn filter_records_can_claim_an_earlier_batch_after_matching_a_later_one() {
+        assert!(
+            dedup_surviving_ids(&[(2, 2), (1, 1)], &[&[(1, 1)], &[(2, 2)]]).is_empty(),
+            "both stored rows are claimed whatever order the incoming rows arrive in"
+        );
+    }
+
+    /// `make_comparator` reports two NULLs in the same position as equal, so a NULL-bearing
+    /// row takes part in the subtraction like any other - cancelled once, not once per copy.
+    #[test]
+    fn filter_records_subtracts_a_null_bearing_row_once() {
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("day", DataType::Int32, true),
+            Field::new("id", DataType::Int32, false),
+        ]));
+        let null_days = |rows: usize| {
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int32Array::from(vec![None::<i32>; rows])),
+                    Arc::new(Int32Array::from(vec![7; rows])),
+                ],
+            )
+            .expect("null-bearing batch")
+        };
+
+        let existing = vec![null_days(1)];
+        let mut used = vec![vec![false; 1]];
+        let filtered = filter_records(&null_days(2), &existing, &schema, &mut used)
+            .expect("filter_records should succeed");
+
+        assert_eq!(
+            dedup_ids(&filtered),
+            vec![7],
+            "the one stored NULL-day row cancels one of the two incoming copies"
+        );
+    }
+
+    /// The same rows, batched two ways, must subtract to the same thing.
+    #[test]
+    fn filter_records_is_independent_of_the_update_batch_boundaries() {
+        let existing: &[&[(i32, i32)]] = &[&[(1, 1), (1, 1)]];
+        let one_batch = dedup_surviving_ids_streamed(&[&[(1, 1), (1, 1), (1, 1)]], existing);
+        let split = dedup_surviving_ids_streamed(&[&[(1, 1)], &[(1, 1), (1, 1)]], existing);
+        assert_eq!(one_batch, vec![1], "two stored copies cancel two of three");
+        assert_eq!(split, one_batch, "batching must not change the result");
+    }
+
+    /// End-to-end regression test for #12499 through the append dedup path: the accelerator
+    /// holds one copy of a row inside the overlap window while the source now holds two, so
+    /// exactly one copy must be appended.
+    #[tokio::test]
+    async fn test_except_existing_records_from_keeps_a_legitimate_duplicate_append() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("ts", DataType::Timestamp(TimeUnit::Nanosecond, None), false),
+            Field::new("id", DataType::Int32, false),
+        ]));
+
+        let existing_batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(TimestampNanosecondArray::from(vec![1_000])),
+                Arc::new(Int32Array::from(vec![1])),
+            ],
+        )
+        .expect("existing batch");
+        let accelerator = Arc::new(
+            MemTable::try_new(Arc::clone(&schema), vec![vec![existing_batch]])
+                .expect("accelerator mem table"),
+        ) as Arc<dyn TableProvider>;
+
+        let federated_table = Arc::new(
+            MemTable::try_new(Arc::clone(&schema), vec![vec![]]).expect("federated mem table"),
+        ) as Arc<dyn TableProvider>;
+        let federated = Arc::new(FederatedTable::new_unchecked(Arc::clone(&federated_table)));
+
+        let task = RefreshTaskBuilder::new(
+            crate::status::RuntimeStatus::new(),
+            TableReference::bare("test_multiset_append"),
+            federated,
+            None,
+            Arc::clone(&accelerator),
+            Handle::current(),
+            Arc::new(Mutex::new(())),
+        )
+        .build();
+
+        // append_overlap keeps the stored row at ts=1000 inside the comparison window.
+        let refresh = Refresh::new(RefreshMode::Append)
+            .time_column("ts".to_string())
+            .append_overlap(Duration::from_secs(1));
+
+        // The source legitimately holds the row twice now; one copy is already stored. The
+        // copies arrive in separate batches on purpose - that is where dedup state scoped to
+        // a single batch would cancel the one stored row twice and drop both.
+        let first = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(TimestampNanosecondArray::from(vec![1_000])),
+                Arc::new(Int32Array::from(vec![1])),
+            ],
+        )
+        .expect("first update batch");
+        let second = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(TimestampNanosecondArray::from(vec![1_000])),
+                Arc::new(Int32Array::from(vec![1])),
+            ],
+        )
+        .expect("second update batch");
+        let update_stream: SendableRecordBatchStream = Box::pin(
+            MemoryStream::try_new(vec![first, second], Arc::clone(&schema), None)
+                .expect("update stream"),
+        );
+        let update = StreamingDataUpdate::new(update_stream, UpdateType::Append);
+
+        // `None`: let the dedupe derive the mark, which is what an append refresh without a
+        // day-granular time column does.
+        let result = task
+            .except_existing_records_from(&refresh, update, None)
+            .await
+            .expect("except_existing_records_from should succeed");
+
+        let collected = result
+            .collect_data()
+            .await
+            .expect("collecting filtered data should succeed");
+
+        let total_rows: usize = collected.data.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(
+            total_rows, 1,
+            "one copy is already stored, so exactly one of the two must be appended"
+        );
+    }
+
+    /// Regression test for the schema-mismatch half of #12492.
+    ///
+    /// `refresh_sql` can project the time column to another type, so the federated and
+    /// accelerator schemas disagree about day-granularity. Resolving the comparison from
+    /// each schema separately would widen the source filter to `>=` while leaving the
+    /// dedupe on `>`: the already-loaded rows would sit outside the dedupe's comparison
+    /// set, and the re-fetched rows would be appended again on *every* refresh — the
+    /// stall turned into unbounded duplication. Both sides must come out the same.
+    #[tokio::test]
+    async fn test_high_water_comparison_agrees_across_mismatched_schemas() {
+        let src = Arc::new(Schema::new(vec![
+            Field::new("day", DataType::Date32, false),
+            Field::new("id", DataType::Int32, false),
+        ]));
+
+        // What `SELECT CAST(day AS TIMESTAMP) AS day, id FROM source` materialises.
+        let ts_type = DataType::Timestamp(TimeUnit::Nanosecond, None);
+        let acc = Arc::new(Schema::new(vec![
+            Field::new("day", ts_type, false),
+            Field::new("id", DataType::Int32, false),
+        ]));
+
+        let federated = MemTable::try_new(Arc::clone(&src), vec![vec![]]).expect("src table");
+        let accelerator = MemTable::try_new(Arc::clone(&acc), vec![vec![]]).expect("acc table");
+
+        let task = RefreshTaskBuilder::new(
+            crate::status::RuntimeStatus::new(),
+            TableReference::bare("test_mismatched_schemas"),
+            Arc::new(FederatedTable::new_unchecked(Arc::new(federated))),
+            None,
+            Arc::new(accelerator),
+            Handle::current(),
+            Arc::new(Mutex::new(())),
+        )
+        .build();
+
+        let refresh = Refresh::new(RefreshMode::Append).time_column("day".to_string());
+
+        assert_eq!(
+            task.day_granular_high_water_columns(&refresh),
+            (true, false),
+            "a Date32 on either side must make both converters day-granular"
+        );
+
+        let source = task
+            .get_filter_converter(&refresh)
+            .expect("source converter")
+            .convert_high_water_mark(1_620_000_000_000_000_000)
+            .to_string();
+        let dedupe = task
+            .get_accelerator_filter_converter(&refresh)
+            .expect("accelerator converter")
+            .convert_high_water_mark(1_620_000_000_000_000_000)
+            .to_string();
+
+        assert_eq!(
+            source, dedupe,
+            "the source filter and the dedupe filter must compare identically"
+        );
+        assert!(
+            source.contains(">="),
+            "both sides should be inclusive, got: {source}"
+        );
+    }
+
+    /// Regression test for #12492.
+    ///
+    /// With a `Date32` time column every value casts to midnight, so the append
+    /// high-water mark for a partly-loaded day *D* is *D*-midnight and the source
+    /// filter has to be inclusive to see the rest of that day. This dedupe has to
+    /// widen in step: with a strict `>` the already-loaded rows it exists to remove
+    /// are not in the comparison set at all, so the re-fetched rows pass through and
+    /// are appended a second time.
+    #[tokio::test]
+    async fn test_except_existing_records_from_date32_time_column_dedupes_same_day() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("day", DataType::Date32, false),
+            Field::new("id", DataType::Int32, false),
+        ]));
+
+        // Day 20_000 since the epoch. Both the loaded row and the incoming rows land on
+        // it, so the accelerator's max(day) is exactly this day's midnight.
+        let day: i32 = 20_000;
+
+        let existing_batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Date32Array::from(vec![day])),
+                Arc::new(Int32Array::from(vec![1])),
+            ],
+        )
+        .expect("existing batch");
+        let accelerator = Arc::new(
+            MemTable::try_new(Arc::clone(&schema), vec![vec![existing_batch]])
+                .expect("accelerator mem table"),
+        ) as Arc<dyn TableProvider>;
+
+        let federated_table = Arc::new(
+            MemTable::try_new(Arc::clone(&schema), vec![vec![]]).expect("federated mem table"),
+        ) as Arc<dyn TableProvider>;
+        let federated = Arc::new(FederatedTable::new_unchecked(Arc::clone(&federated_table)));
+
+        let task = RefreshTaskBuilder::new(
+            crate::status::RuntimeStatus::new(),
+            TableReference::bare("test_date32_append"),
+            federated,
+            None,
+            Arc::clone(&accelerator),
+            Handle::current(),
+            Arc::new(Mutex::new(())),
+        )
+        .build();
+
+        // No `append_overlap`: the overlap would push the high-water mark below midnight
+        // and mask the defect this test covers. `TimeFormat::Date` is what the runtime
+        // requires for a Date32 time column.
+        let refresh = Refresh::new(RefreshMode::Append)
+            .time_column("day".to_string())
+            .time_format(TimeFormat::Date);
+
+        // What the inclusive source filter returns for day D: the row already loaded
+        // into the accelerator, plus a genuinely new row for the same day.
+        let update_batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Date32Array::from(vec![day, day])),
+                Arc::new(Int32Array::from(vec![1, 2])),
+            ],
+        )
+        .expect("update batch");
+        let update_stream: SendableRecordBatchStream = Box::pin(
+            MemoryStream::try_new(vec![update_batch], Arc::clone(&schema), None)
+                .expect("update stream"),
+        );
+        let update = StreamingDataUpdate::new(update_stream, UpdateType::Append);
+
+        let collected = task
+            .except_existing_records_from(&refresh, update, None)
+            .await
+            .expect("except_existing_records_from should succeed for a Date32 time column")
+            .collect_data()
+            .await
+            .expect("collecting the deduped data should succeed");
+
+        let total_rows: usize = collected.data.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(
+            total_rows, 1,
+            "the already-loaded same-day row must be deduped, not appended again; \
+             a strict high-water comparison leaves the comparison set empty and lets both rows through"
+        );
+
+        let batch = collected
+            .data
+            .iter()
+            .find(|batch| batch.num_rows() > 0)
+            .expect("a non-empty batch should remain");
+        let id_col = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("id column should be Int32");
+        assert_eq!(
+            id_col.value(0),
+            2,
+            "the surviving row should be the new same-day row (id=2)"
         );
     }
 }

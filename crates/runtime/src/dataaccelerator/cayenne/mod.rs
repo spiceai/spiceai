@@ -28,25 +28,16 @@ use std::path::PathBuf;
 use std::sync::{Arc, LazyLock, RwLock, Weak};
 use std::time::Duration;
 
-use regex::Regex;
-
 use arrow_schema::{DataType, Schema};
 use async_trait::async_trait;
+use cayenne::CayennePartitionCreator;
 use data_components::poly::PolyTableProvider;
-use datafusion::common::DFSchema;
 use datafusion::common::arrow::datatypes::SchemaRef;
 use datafusion::datasource::TableProvider;
-use datafusion::error::DataFusionError;
 use datafusion::execution::runtime_env::RuntimeEnv;
-use datafusion::logical_expr::{CreateExternalTable, TableProviderFilterPushDown};
+use datafusion::logical_expr::CreateExternalTable;
 use datafusion::prelude::Expr;
-use datafusion::scalar::ScalarValue;
 use datafusion_table_providers::UnsupportedTypeAction;
-use runtime_table_partition::Partition;
-use runtime_table_partition::creator::filename::{
-    encode_composite_key, encode_key, parse_partition_value, to_hive_partition_dir,
-};
-use runtime_table_partition::creator::{self, PartitionCreator};
 use runtime_table_partition::expression::PartitionedBy;
 use runtime_table_partition::provider::PartitionTableProvider;
 use snafu::prelude::*;
@@ -111,15 +102,6 @@ pub enum Error {
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
-
-/// Regex pattern for partition values that are not supported on local filesystem.
-/// Partition values matching `.*#\d+` (e.g., "abcdef#123") are only supported on S3 Express
-/// One Zone locations, not on local filesystem paths.
-static UNSUPPORTED_LOCAL_PARTITION_PATTERN: LazyLock<Regex> =
-    LazyLock::new(|| match Regex::new(r".*#\d+$") {
-        Ok(compiled) => compiled,
-        Err(e) => unreachable!("Unable to compile regexp: {e}"),
-    });
 
 fn maintained_aggregate_specs_for_cayenne(
     acceleration: Option<&Acceleration>,
@@ -3457,23 +3439,29 @@ impl DataAccelerator for CayenneAccelerator {
                 );
             }
 
-            let creator = Arc::new(CayennePartitionCreator::new(
-                table_name.clone(),
-                PathBuf::from(&dir_path),
-                partition_by.clone(),
-                Arc::clone(&arrow_schema),
-                catalog,
-                table_metadata.table_id,
-                unsupported_type_action,
-                retention_filters,
-                time_retention_filter_builder,
-                vortex_config,
-                object_store_config,
-                primary_keys.clone(),
-                on_conflict,
-                runtime_env,
-                Arc::clone(&self.compaction_semaphore),
-            ));
+            let creator = Arc::new(
+                CayennePartitionCreator::new(
+                    table_name.clone(),
+                    PathBuf::from(&dir_path),
+                    partition_by.clone(),
+                    Arc::clone(&arrow_schema),
+                    catalog,
+                    table_metadata.table_id,
+                    unsupported_type_action,
+                    retention_filters,
+                    time_retention_filter_builder,
+                    vortex_config,
+                    object_store_config,
+                    primary_keys.clone(),
+                    on_conflict,
+                    runtime_env,
+                )
+                // Per-partition background compaction draws on the accelerator's
+                // one budget, and an accelerated partitioned table is a target for
+                // the dual-write path.
+                .with_background_compaction(Arc::clone(&self.compaction_semaphore))
+                .with_direct_partition_writes(),
+            );
 
             // Wrap the base table provider with partitioning logic, installing
             // the Cayenne-specific cross-partition insert strategy so that
@@ -3772,421 +3760,6 @@ fn serialize_partition_child_writes(
         );
     }
     config.write_concurrency = Some(1);
-}
-
-/// Partition creator for Cayenne accelerator.
-///
-/// Supports single and composite partition keys (e.g., `partition_by: [year, month, day]`).
-/// For composite partitions, data is stored in nested Hive-style directories.
-pub(crate) struct CayennePartitionCreator {
-    table_name: String,
-    base_path: PathBuf,
-    /// Partition expressions. For hierarchical partitions like `partition_by: [year, month]`,
-    /// this contains all expressions in order.
-    partition_by: Vec<PartitionedBy>,
-    schema: SchemaRef,
-    catalog: Arc<dyn cayenne::MetadataCatalog>,
-    table_id: String,
-    unsupported_type_action: UnsupportedTypeAction,
-    retention_filters: Vec<Expr>,
-    time_retention_filter_builder: Option<cayenne::TimeRetentionFilterBuilder>,
-    vortex_config: cayenne::metadata::VortexConfig,
-    object_store_config: Option<cayenne::metadata::ObjectStoreConfig>,
-    primary_key: Vec<String>,
-    on_conflict: Option<datafusion_table_providers::util::on_conflict::OnConflict>,
-    /// Shared Cayenne context with cache, created once and shared across all partitions.
-    context: Arc<cayenne::CayenneContext>,
-    /// Shared compaction semaphore inherited from the parent
-    /// [`CayenneAccelerator`]. Per-partition providers spawn their own
-    /// background compaction tasks through this semaphore so the whole accelerator
-    /// shares one concurrency budget.
-    compaction_semaphore: Arc<tokio::sync::Semaphore>,
-}
-
-impl std::fmt::Debug for CayennePartitionCreator {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CayennePartitionCreator")
-            .field("table_name", &self.table_name)
-            .field("base_path", &self.base_path)
-            .field("partition_by", &self.partition_by)
-            .field("schema", &self.schema)
-            .field("catalog", &"<dyn MetadataCatalog>")
-            .field("table_id", &self.table_id)
-            .field("unsupported_type_action", &self.unsupported_type_action)
-            .field("retention_filters", &self.retention_filters.len())
-            .field(
-                "time_retention_filter_builder",
-                &self.time_retention_filter_builder.is_some(),
-            )
-            .field("vortex_config", &"<VortexConfig>")
-            .field("object_store_config", &self.object_store_config.is_some())
-            .field("primary_key", &self.primary_key)
-            .field("on_conflict", &self.on_conflict.is_some())
-            .field("context", &"<CayenneContext>")
-            .finish_non_exhaustive()
-    }
-}
-
-impl CayennePartitionCreator {
-    #[expect(clippy::too_many_arguments)]
-    pub(crate) fn new(
-        table_name: String,
-        base_path: PathBuf,
-        partition_by: Vec<PartitionedBy>,
-        schema: SchemaRef,
-        catalog: Arc<dyn cayenne::MetadataCatalog>,
-        table_id: String,
-        unsupported_type_action: UnsupportedTypeAction,
-        retention_filters: Vec<Expr>,
-        time_retention_filter_builder: Option<cayenne::TimeRetentionFilterBuilder>,
-        vortex_config: cayenne::metadata::VortexConfig,
-        object_store_config: Option<cayenne::metadata::ObjectStoreConfig>,
-        primary_key: Vec<String>,
-        on_conflict: Option<datafusion_table_providers::util::on_conflict::OnConflict>,
-        runtime_env: Arc<RuntimeEnv>,
-        compaction_semaphore: Arc<tokio::sync::Semaphore>,
-    ) -> Self {
-        // Create shared Cayenne context with cache once, to be shared across all partitions.
-        // This ensures all partitions share the same footer/segment caches instead of
-        // each partition creating its own cache.
-        let context = cayenne::CayenneContext::new_for_partition_child(
-            &vortex_config,
-            runtime_env,
-            &table_name,
-        );
-
-        Self {
-            table_name,
-            base_path,
-            partition_by,
-            schema,
-            catalog,
-            table_id,
-            unsupported_type_action,
-            retention_filters,
-            time_retention_filter_builder,
-            vortex_config,
-            object_store_config,
-            primary_key,
-            on_conflict,
-            context,
-            compaction_semaphore,
-        }
-    }
-
-    /// Returns the partition column labels for all partition expressions.
-    fn partition_column_labels(&self) -> Vec<String> {
-        self.partition_by
-            .iter()
-            .map(|p| match &p.expression {
-                Expr::Column(col) => col.name.clone(),
-                _ => p.name.clone(),
-            })
-            .collect()
-    }
-
-    /// Generate a unique table name for this partition based on composite key.
-    fn partition_table_name(&self, partition_key: &str) -> String {
-        format!(
-            "{}_p{}",
-            self.table_name,
-            encode_identifier_hex(partition_key)
-        )
-    }
-
-    fn legacy_partition_table_name(&self, partition_values: &[String]) -> String {
-        format!("{}_{}", self.table_name, partition_values.join("_"))
-    }
-
-    /// Generate partition directory path from multiple partition values.
-    /// Creates nested Hive-style directories (e.g., `year=2025/month=10/day=15/`).
-    fn partition_dir(&self, partition_values: &[ScalarValue]) -> Result<PathBuf, creator::Error> {
-        let pairings: Vec<(PartitionedBy, ScalarValue)> = self
-            .partition_by
-            .iter()
-            .cloned()
-            .zip(partition_values.iter().cloned())
-            .collect();
-
-        let partition_dir = to_hive_partition_dir(&pairings)
-            .boxed()
-            .context(creator::CreatePartitionSnafu)?;
-
-        Ok(self.base_path.join(partition_dir))
-    }
-}
-
-#[async_trait]
-impl PartitionCreator for CayennePartitionCreator {
-    async fn create_partition(
-        &self,
-        partition_values: Vec<ScalarValue>,
-    ) -> Result<Partition, creator::Error> {
-        if partition_values.is_empty() {
-            return Err(creator::Error::CreatePartition {
-                source: "At least one partition value is required".into(),
-            });
-        }
-
-        if partition_values.len() != self.partition_by.len() {
-            return Err(creator::Error::CreatePartition {
-                source: format!(
-                    "Expected {} partition values but got {} (one per partition_by expression)",
-                    self.partition_by.len(),
-                    partition_values.len()
-                )
-                .into(),
-            });
-        }
-
-        let partition_dir = self.partition_dir(&partition_values)?;
-        let partition_path = partition_dir.to_string_lossy().to_string();
-
-        // Encode partition values as strings for metadata storage
-        let partition_value_strings: Vec<String> = partition_values
-            .iter()
-            .map(encode_key)
-            .collect::<Result<Vec<_>, _>>()
-            .boxed()
-            .context(creator::CreatePartitionSnafu)?;
-
-        // Validate partition values for local filesystem compatibility.
-        // Partition values matching the pattern `.*#\d+` (e.g., "abcdef#123") are not supported
-        // on local filesystem paths but are supported on remote Object Store locations.
-        if self.object_store_config.is_none() {
-            for value in &partition_value_strings {
-                if UNSUPPORTED_LOCAL_PARTITION_PATTERN.is_match(value) {
-                    return Err(creator::Error::CreatePartition {
-                        source: format!(
-                            "Partition value '{value}' is not supported for local filesystem locations. \
-                            Values matching the pattern '*#<digits>' (e.g., 'abcdef#123') are only supported \
-                            for S3 Express One Zone locations."
-                        )
-                        .into(),
-                    });
-                }
-            }
-        }
-
-        tracing::debug!("creating Cayenne partition at {partition_path}");
-
-        // Create the partition directory (including nested directories for composite partitions).
-        // Use tokio's async variant so partition creation does not block the runtime thread.
-        tokio::fs::create_dir_all(&partition_dir)
-            .await
-            .boxed()
-            .context(creator::CreatePartitionSnafu)?;
-        let partition_column_names = self.partition_column_labels();
-
-        let partition_key = encode_composite_key(&partition_values)
-            .boxed()
-            .context(creator::CreatePartitionSnafu)?;
-
-        // Create partition metadata with composite key support
-        let partition_metadata = cayenne::PartitionMetadata::new_composite(
-            self.table_id.clone(),
-            partition_column_names,
-            partition_value_strings.clone(),
-            partition_path.clone(),
-            false, // path_is_relative
-        );
-
-        self.catalog
-            .add_partition(partition_metadata)
-            .await
-            .boxed()
-            .context(creator::CreatePartitionSnafu)?;
-
-        // Create table options for this partition
-        let table_options = cayenne::metadata::CreateTableOptions {
-            table_name: self.partition_table_name(&partition_key),
-            schema: Arc::clone(&self.schema),
-            primary_key: self.primary_key.clone(),
-            on_conflict: self.on_conflict.clone(),
-            base_path: partition_path.clone(),
-            partition_column: None, // Partitions themselves are not partitioned
-            vortex_config: self.vortex_config.clone(),
-        };
-
-        // Create Cayenne table provider for this partition with S3 support.
-        // Use the shared context to share footer/segment caches across partitions.
-        let mut builder = cayenne::CayenneTableProviderBuilder::new(
-            Arc::clone(&self.catalog),
-            Arc::clone(self.context.runtime_env()),
-        )
-        .with_context(Arc::clone(&self.context))
-        .with_retention_filters(self.retention_filters.clone());
-        if let Some(ref retention_builder) = self.time_retention_filter_builder {
-            builder = builder.with_time_retention_filter_builder(retention_builder.clone());
-        }
-        if let Some(ref object_store) = self.object_store_config {
-            builder = builder.with_object_store(object_store.clone());
-        }
-        let cayenne_table = builder
-            .create(table_options)
-            .await
-            .boxed()
-            .context(creator::CreatePartitionSnafu)?;
-
-        let partition_provider = Arc::new(cayenne_table);
-        partition_provider.spawn_background_compaction(Arc::clone(&self.compaction_semaphore));
-        partition_provider.init_scan_view_cache();
-        Ok(Partition {
-            partition_values,
-            table_provider: partition_provider,
-        })
-    }
-
-    async fn infer_existing_partitions(&self) -> Result<Vec<Partition>, creator::Error> {
-        // Query catalog for existing partitions
-        let partitions = self
-            .catalog
-            .get_partitions(&self.table_id)
-            .await
-            .boxed()
-            .context(creator::InferringPartitionsSnafu)?;
-
-        let mut result = Vec::new();
-
-        let df_schema = DFSchema::try_from(Arc::clone(&self.schema))
-            .boxed()
-            .context(creator::InferringPartitionsSnafu)?;
-
-        let expected_partition_columns = self.partition_column_labels();
-
-        for partition_meta in partitions {
-            // Validate that stored partition metadata matches current partition_by expressions.
-            // Both the column names and their order must match exactly, otherwise the partition
-            // was created with different partition_by configuration and cannot be safely used.
-            // Silently skipping mismatched partitions would cause incomplete query results (data loss).
-            if partition_meta.partition_columns != expected_partition_columns {
-                return Err(creator::Error::PartitionByExpressionsChanged);
-            }
-
-            let mut partition_values = Vec::with_capacity(self.partition_by.len());
-            for (partition_expr, value_str) in self
-                .partition_by
-                .iter()
-                .zip(&partition_meta.partition_values)
-            {
-                let partition_value = parse_partition_value(&df_schema, partition_expr, value_str)
-                    .map_err(|e| creator::Error::InferringPartitions {
-                        source: Box::new(e),
-                    })?;
-                partition_values.push(partition_value);
-            }
-
-            let partition_key = partition_meta.composite_key();
-            let partition_table_name = self.partition_table_name(&partition_key);
-
-            // Use builder pattern to pass object store config for S3 support.
-            // Use the shared context to share footer/segment caches across partitions.
-            let mut builder = cayenne::CayenneTableProviderBuilder::new(
-                Arc::clone(&self.catalog),
-                Arc::clone(self.context.runtime_env()),
-            )
-            .with_context(Arc::clone(&self.context))
-            .with_retention_filters(self.retention_filters.clone());
-            if let Some(ref retention_builder) = self.time_retention_filter_builder {
-                builder = builder.with_time_retention_filter_builder(retention_builder.clone());
-            }
-            if let Some(ref object_store) = self.object_store_config {
-                builder = builder.with_object_store(object_store.clone());
-            }
-            let cayenne_table = match builder.open(&partition_table_name).await {
-                Ok(table) => table,
-                Err(cayenne::provider::Error::Catalog {
-                    source: cayenne::CatalogError::TableNotFound { .. },
-                }) => {
-                    let legacy_name =
-                        self.legacy_partition_table_name(&partition_meta.partition_values);
-                    let mut legacy_builder = cayenne::CayenneTableProviderBuilder::new(
-                        Arc::clone(&self.catalog),
-                        Arc::clone(self.context.runtime_env()),
-                    )
-                    .with_context(Arc::clone(&self.context))
-                    .with_retention_filters(self.retention_filters.clone());
-                    if let Some(ref retention_builder) = self.time_retention_filter_builder {
-                        legacy_builder = legacy_builder
-                            .with_time_retention_filter_builder(retention_builder.clone());
-                    }
-                    if let Some(ref object_store) = self.object_store_config {
-                        legacy_builder = legacy_builder.with_object_store(object_store.clone());
-                    }
-                    legacy_builder
-                        .open(&legacy_name)
-                        .await
-                        .boxed()
-                        .context(creator::InferringPartitionsSnafu)?
-                }
-                Err(error) => {
-                    return Err(creator::Error::InferringPartitions {
-                        source: Box::new(error),
-                    });
-                }
-            };
-
-            let partition_provider = Arc::new(cayenne_table);
-            partition_provider.spawn_background_compaction(Arc::clone(&self.compaction_semaphore));
-            partition_provider.init_scan_view_cache();
-            result.push(Partition {
-                partition_values,
-                table_provider: partition_provider,
-            });
-        }
-
-        Ok(result)
-    }
-
-    fn supports_filters_pushdown(
-        &self,
-        filters: &[&Expr],
-    ) -> Result<Vec<TableProviderFilterPushDown>, DataFusionError> {
-        // Partition pruning works for filters on partition columns, even though
-        // Cayenne doesn't have native filter pushdown to the storage layer
-        use datafusion::logical_expr::TableProviderFilterPushDown;
-
-        // Collect all partition columns from all partition expressions
-        let partition_columns: std::collections::HashSet<_> = self
-            .partition_by
-            .iter()
-            .flat_map(|p| p.expression.column_refs())
-            .collect();
-
-        Ok(filters
-            .iter()
-            .map(|filter| {
-                let filter_columns = filter.column_refs();
-
-                // Check if filter columns match partition columns (ignoring table qualifiers)
-                // Both `order_date` and `table.order_date` should match partition column `order_date`
-                let matches_partition_cols = filter_columns.is_empty()
-                    || filter_columns.iter().all(|filter_col| {
-                        partition_columns
-                            .iter()
-                            .any(|part_col| filter_col.name == part_col.name)
-                    });
-
-                // If filter references partition columns or contains the partition expression,
-                // it can be used for partition pruning
-                if matches_partition_cols {
-                    TableProviderFilterPushDown::Inexact
-                } else {
-                    TableProviderFilterPushDown::Unsupported
-                }
-            })
-            .collect())
-    }
-}
-
-fn encode_identifier_hex(value: &str) -> String {
-    use std::fmt::Write as _;
-
-    let mut encoded = String::with_capacity(value.len() * 2);
-    for byte in value.as_bytes() {
-        let _ = write!(encoded, "{byte:02X}");
-    }
-    encoded
 }
 
 data_accelerator_api::register_data_accelerator!(Engine::Cayenne, CayenneAccelerator);
@@ -6057,72 +5630,6 @@ mod tests {
         assert_eq!(
             CayenneAccelerator::resolve_metadata_dir(Some(&acceleration)),
             "/persistent/data/metadata"
-        );
-    }
-
-    #[test]
-    fn test_unsupported_local_partition_pattern() {
-        // Pattern should match values ending with `#<digits>` (e.g., "abcdef#123")
-        // These are only supported on S3 Express One Zone, not local filesystem.
-
-        // Values that should match (unsupported on local filesystem)
-        assert!(
-            UNSUPPORTED_LOCAL_PARTITION_PATTERN.is_match("abcdef#123"),
-            "Expected 'abcdef#123' to match unsupported pattern"
-        );
-        assert!(
-            UNSUPPORTED_LOCAL_PARTITION_PATTERN.is_match("test#1"),
-            "Expected 'test#1' to match unsupported pattern"
-        );
-        assert!(
-            UNSUPPORTED_LOCAL_PARTITION_PATTERN.is_match("some_value#999999"),
-            "Expected 'some_value#999999' to match unsupported pattern"
-        );
-        assert!(
-            UNSUPPORTED_LOCAL_PARTITION_PATTERN.is_match("#0"),
-            "Expected '#0' to match unsupported pattern"
-        );
-        assert!(
-            UNSUPPORTED_LOCAL_PARTITION_PATTERN.is_match("a#1"),
-            "Expected 'a#1' to match unsupported pattern"
-        );
-
-        // Values that should NOT match (supported on local filesystem)
-        assert!(
-            !UNSUPPORTED_LOCAL_PARTITION_PATTERN.is_match("abcdef"),
-            "Expected 'abcdef' to not match unsupported pattern"
-        );
-        assert!(
-            !UNSUPPORTED_LOCAL_PARTITION_PATTERN.is_match("test_123"),
-            "Expected 'test_123' to not match unsupported pattern"
-        );
-        assert!(
-            !UNSUPPORTED_LOCAL_PARTITION_PATTERN.is_match("2024-01-01"),
-            "Expected '2024-01-01' to not match unsupported pattern"
-        );
-        assert!(
-            !UNSUPPORTED_LOCAL_PARTITION_PATTERN.is_match("partition_value"),
-            "Expected 'partition_value' to not match unsupported pattern"
-        );
-        assert!(
-            !UNSUPPORTED_LOCAL_PARTITION_PATTERN.is_match("123"),
-            "Expected '123' (pure digits) to not match unsupported pattern"
-        );
-        assert!(
-            !UNSUPPORTED_LOCAL_PARTITION_PATTERN.is_match("abc#def"),
-            "Expected 'abc#def' (# not followed by only digits) to not match unsupported pattern"
-        );
-        assert!(
-            !UNSUPPORTED_LOCAL_PARTITION_PATTERN.is_match("test#"),
-            "Expected 'test#' (# with no digits) to not match unsupported pattern"
-        );
-        assert!(
-            !UNSUPPORTED_LOCAL_PARTITION_PATTERN.is_match("test#abc"),
-            "Expected 'test#abc' (# followed by non-digits) to not match unsupported pattern"
-        );
-        assert!(
-            !UNSUPPORTED_LOCAL_PARTITION_PATTERN.is_match("test#123abc"),
-            "Expected 'test#123abc' (digits followed by non-digits) to not match unsupported pattern"
         );
     }
 }

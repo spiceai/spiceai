@@ -144,7 +144,44 @@ pub struct ReplConfig {
     /// line per record (useful for wide tables). Toggle at runtime with `.expanded`.
     #[arg(long, short = 'x', help_heading = "SQL REPL")]
     pub expanded: bool,
+
+    /// Set when the Flight endpoint was chosen on the command line and `http_endpoint` was not,
+    /// so nothing pointed the HTTP endpoint at the runtime the SQL queries go to — whether it
+    /// then holds a built-in default or a value derived from something else, such as a cloud
+    /// region. `nql` — the one REPL feature that speaks HTTP rather than Flight — says so
+    /// instead of answering from whatever that endpoint reaches. See #11005.
+    ///
+    /// Not a flag: only the caller that resolved both endpoints knows where each came from.
+    #[arg(skip)]
+    pub http_endpoint_may_be_another_runtime: bool,
 }
+
+/// Whether the REPL's HTTP endpoint may address a runtime other than the one SQL queries go to,
+/// given whether each endpoint was chosen on the command line.
+///
+/// This is a question about provenance, not about hosts. The Flight endpoint can be moved on
+/// its own — by `spice sql --endpoint` or `spiced --repl-flight-endpoint` — leaving the HTTP
+/// endpoint at whatever it already held, and comparing the two cannot settle whether they
+/// agree: a host and port say nothing about which runtime answers there. Two runtimes can both
+/// be on loopback, and one runtime can be reached at unrelated addresses through a tunnel.
+///
+/// So only endpoints that were chosen, or defaulted as a pair, are trusted:
+///
+/// - neither chosen — the built-in defaults, or a pair derived from a cloud region: trusted;
+/// - both chosen — the caller paired them, even if the HTTP one repeats the default: trusted;
+/// - Flight chosen alone — nothing pointed the HTTP endpoint at that runtime: not trusted.
+///
+/// Callers pass the result to [`ReplConfig::http_endpoint_may_be_another_runtime`]. See #11005.
+#[must_use]
+pub fn http_endpoint_unpaired(flight_chosen: bool, http_chosen: bool) -> bool {
+    flight_chosen && !http_chosen
+}
+
+/// How long `nql` waits with nothing arriving before it gives up on the runtime.
+///
+/// This bounds silence rather than the whole request, so a translation that is merely slow is
+/// not cut off. `spice nsql` applies the same deadline to the same endpoint.
+const NSQL_SILENCE_DEADLINE: std::time::Duration = std::time::Duration::from_mins(5);
 
 const NQL_LINE_PREFIX: &str = "nql ";
 
@@ -629,6 +666,15 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
             }
             _ if lower.starts_with(NQL_LINE_PREFIX) => {
                 let _ = rl.add_history_entry(line);
+                if repl_config.http_endpoint_may_be_another_runtime {
+                    println!(
+                        "{} {}",
+                        Color::Red.paint("Error:"),
+                        nql_endpoint_mismatch_message(&repl_config)
+                    );
+                    let _ = std::io::stdout().flush();
+                    continue;
+                }
                 // `lower` and `line` have the same byte length, so slicing
                 // off the prefix on the original line yields the user's
                 // original-case question.
@@ -807,6 +853,40 @@ fn format_flight_sql_status(status: &Status) -> String {
     )
 }
 
+/// Why `nql` will not run when nothing pointed the HTTP endpoint at the SQL target.
+///
+/// `nql` is the one REPL feature that goes over the runtime's HTTP API; everything else uses
+/// Flight. Answering it from an endpoint nobody chose, while this session's SQL goes somewhere
+/// chosen, would silently mix results from two runtimes — so state both endpoints, and the flag
+/// that settles which runtime `nql` should ask, without claiming to know what answers where.
+fn nql_endpoint_mismatch_message(repl_config: &ReplConfig) -> String {
+    let http_endpoint = &repl_config.http_endpoint;
+    let flight_endpoint = &repl_config.repl_flight_endpoint;
+
+    format!(
+        "`nql` uses the runtime's HTTP API at '{http_endpoint}', which nothing pointed at \
+         the runtime this session's SQL queries go to ('{flight_endpoint}'). Pass \
+         `--http-endpoint` for the runtime `nql` should ask — repeating the endpoint above \
+         is accepted, and confirms that is the one you mean."
+    )
+}
+
+/// Why the REPL could not open its Flight connection.
+///
+/// The endpoint is the runtime's **Arrow Flight (gRPC)** address, not its HTTP API, and the
+/// scheme (`http://`) hides that: pointing the REPL at an HTTP ingress, or at the HTTP port,
+/// fails here with a bare transport error. Say what the endpoint has to serve. See #11005.
+fn flight_connection_failed(flight_endpoint: &str, cause: &str) -> Box<dyn Error> {
+    Box::<dyn Error>::from(format!(
+        "Connection failed to spiced at '{flight_endpoint}': {cause}. This endpoint must \
+         serve the runtime's Arrow Flight (gRPC) API — its flight port, 50051 by default, \
+         reached through a gRPC-capable route if it is behind a proxy or ingress; the \
+         runtime's HTTP port will not answer here. Check that the Spice runtime is running, \
+         that the endpoint including port is correct, and that the TLS config (if used) is \
+         valid."
+    ))
+}
+
 async fn connect_flight_client(
     repl_config: &ReplConfig,
     user_agent: &str,
@@ -855,11 +935,7 @@ async fn connect_flight_client(
 
     let channel = connect_channel(repl_flight_endpoint.clone(), user_agent, client_tls_config)
         .await
-        .map_err(|e| {
-        Box::<dyn Error>::from(format!(
-            "Connection failed to spiced at '{repl_flight_endpoint}': {e}. Check if the Spice runtime is running, endpoint including port is correct, and TLS config (if used) is valid."
-        ))
-    })?;
+        .map_err(|e| flight_connection_failed(&repl_flight_endpoint, &e.to_string()))?;
 
     Ok(FlightServiceClient::new(channel)
         .max_encoding_message_size(MAX_ENCODING_MESSAGE_SIZE)
@@ -1065,9 +1141,14 @@ async fn get_and_display_nql_records(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let start_time = Instant::now();
 
+    // `/v1/nsql` is a model round trip -- it builds context, invokes the model, and may retry
+    // generation before running the query it produced. A whole-request deadline therefore cuts
+    // off answers that are merely slow, so the deadline measures silence instead: this response
+    // is not streamed, so it bounds the wait for the answer without capping how long the model
+    // may take to produce one.
     let mut client = Client::builder()
         .connect_timeout(std::time::Duration::from_secs(10))
-        .timeout(std::time::Duration::from_secs(30));
+        .read_timeout(NSQL_SILENCE_DEADLINE);
 
     // A request carrying the session's key must not follow a redirect. `reqwest` follows up to
     // ten by default, and the sanitisation it applies when the origin changes drops
@@ -1401,6 +1482,62 @@ mod tests {
     fn test_cache_control_default() {
         let default = cache_control::CacheControl::default();
         assert_eq!(default, cache_control::CacheControl::Cache);
+    }
+
+    /// #11005: refusing `nql` is only useful if the message names both endpoints and the flag
+    /// that reconciles them — otherwise it reads as `nql` being broken.
+    #[test]
+    fn the_nql_mismatch_message_names_both_endpoints_and_the_flag() {
+        let config = ReplConfig::parse_from([
+            "repl",
+            "--http-endpoint",
+            "http://127.0.0.1:8090",
+            "--repl-flight-endpoint",
+            "http://remote:50051",
+        ]);
+
+        let message = nql_endpoint_mismatch_message(&config);
+
+        assert!(message.contains("http://127.0.0.1:8090"), "{message}");
+        assert!(message.contains("http://remote:50051"), "{message}");
+        assert!(message.contains("--http-endpoint"), "{message}");
+    }
+
+    /// #11005: the reporter pointed `--endpoint` at an HTTP ingress and got a bare transport
+    /// error, so the message has to say the endpoint serves Flight/gRPC on its own port.
+    #[test]
+    fn the_flight_connection_failure_says_the_endpoint_serves_grpc() {
+        let endpoint = "http://spice-test.127.0.0.1.nip.io";
+        let error = flight_connection_failed(endpoint, "transport error");
+        let message = error.to_string();
+
+        assert!(message.contains(endpoint), "{message}");
+        assert!(message.contains("transport error"), "{message}");
+        assert!(message.contains("gRPC"), "{message}");
+        assert!(message.contains("50051"), "{message}");
+    }
+
+    /// The guard is not a flag, and defaults off: a caller that does not resolve endpoint
+    /// provenance gets the previous behaviour rather than a REPL that refuses `nql`.
+    #[test]
+    fn the_nql_guard_defaults_off_when_parsed_from_flags() {
+        let config = ReplConfig::parse_from(["repl"]);
+
+        assert!(!config.http_endpoint_may_be_another_runtime);
+    }
+
+    /// #11005: moving the SQL target without saying where `nql` should go is the one case
+    /// nothing can vouch for. Defaulted pairs and chosen pairs both can.
+    #[test]
+    fn only_a_flight_endpoint_chosen_alone_is_unpaired() {
+        assert!(http_endpoint_unpaired(true, false));
+
+        // Both defaulted: the local pair, or a pair derived from a cloud region.
+        assert!(!http_endpoint_unpaired(false, false));
+        // Both chosen: the caller paired them, even if the HTTP one repeats its default.
+        assert!(!http_endpoint_unpaired(true, true));
+        // Only the HTTP endpoint moved, so SQL still goes to the default it belongs to.
+        assert!(!http_endpoint_unpaired(false, true));
     }
 
     #[test]
