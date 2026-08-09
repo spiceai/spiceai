@@ -61,6 +61,7 @@ members = [
     "crates/runtime-parameters-derive",
     "crates/runtime-parameters-typed",
     "crates/runtime-secrets",
+    "crates/runtime-table",
     "crates/runtime-resources",
     "crates/runtime-status",
     "crates/runtime-udfs-api",
@@ -256,7 +257,7 @@ datafusion-proto-common = "54.1.0"
 datafusion-pruning = "54.1.0"
 datafusion-spark = "54.1.0"
 datafusion-substrait = "54.1.0"
-datafusion-table-providers = { git = "https://github.com/spiceai/datafusion-table-providers.git", rev = "99e33a11fac58b89edca3ee522e41d777e39cabb" } # spiceai-54
+datafusion-table-providers = { git = "https://github.com/spiceai/datafusion-table-providers.git", rev = "894e2794ff285c0f0258e45bba693190cd84e0fb" } # spiceai-54
 delta_kernel = { version = "0.23.0", features = [
     "default-engine-rustls",
     "arrow-58",
