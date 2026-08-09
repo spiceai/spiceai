@@ -113,8 +113,7 @@ impl TableSelector {
 
         let container_prefix = format!("{container}.");
         self.include_literal_prefixes.iter().any(|literal| {
-            container_prefix.starts_with(literal.as_str())
-                || literal.starts_with(&container_prefix)
+            container_prefix.starts_with(literal.as_str()) || literal.starts_with(&container_prefix)
         })
     }
 
@@ -276,12 +275,31 @@ mod tests {
     #[test]
     fn may_select_within_never_contradicts_selects_table() {
         let pattern_sets: &[&[&str]] = &[
-            &["public.orders"], &["public.*"], &["*.orders"], &["*"], &["*.*"],
-            &["sales_*.orders"], &["sales_*.*"], &["{public,sales}.*"], &["[ps]ublic.*"],
-            &["?ublic.orders"], &["public.order?"], &["public.orders", "sales.*"],
-            &["public.*", "*.audit_log"], &["pg_*.*"],
+            &["public.orders"],
+            &["public.*"],
+            &["*.orders"],
+            &["*"],
+            &["*.*"],
+            &["sales_*.orders"],
+            &["sales_*.*"],
+            &["{public,sales}.*"],
+            &["[ps]ublic.*"],
+            &["?ublic.orders"],
+            &["public.order?"],
+            &["public.orders", "sales.*"],
+            &["public.*", "*.audit_log"],
+            &["pg_*.*"],
         ];
-        let containers = ["public", "sales", "sales_east", "sales_", "audit", "pg_toast", "s", ""];
+        let containers = [
+            "public",
+            "sales",
+            "sales_east",
+            "sales_",
+            "audit",
+            "pg_toast",
+            "s",
+            "",
+        ];
         let tables = ["orders", "order1", "audit_log", "lineitem", "x", ""];
 
         for patterns in pattern_sets {
