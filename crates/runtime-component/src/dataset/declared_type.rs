@@ -72,6 +72,15 @@ limitations under the License.
 //!   2. Arrow's `DataType::from_str`.
 //!   3. `sqlparser::Parser::parse_data_type` mapped to `arrow::DataType`.
 //!
+//! ## Widths
+//!
+//! A type's parenthesised arguments are honoured where they change the Arrow
+//! type: `FLOAT(p)` is a binary precision in bits, so `float(25..=53)` is
+//! `Float64` and `float(1..=24)` is `Float32`, and `NUMERIC(p, s)` picks
+//! `Decimal128` up to a precision of 38 and `Decimal256` beyond it. A width
+//! no Arrow type can represent is a parse error rather than a `DataType` that
+//! only fails later, inside a cast kernel.
+//!
 //! Tokenising before parsing means bracket and comma structure is always
 //! handled at the `logos` layer, keeping the recursive descent free of
 //! ad-hoc string scans and ensuring trailing-junk inputs (e.g.
@@ -81,6 +90,10 @@ limitations under the License.
 use std::str::FromStr;
 
 use arrow::datatypes::{DataType, Field, IntervalUnit, TimeUnit};
+use arrow_schema::{
+    DECIMAL32_MAX_PRECISION, DECIMAL32_MAX_SCALE, DECIMAL64_MAX_PRECISION, DECIMAL64_MAX_SCALE,
+    DECIMAL128_MAX_PRECISION, DECIMAL128_MAX_SCALE, DECIMAL256_MAX_PRECISION, DECIMAL256_MAX_SCALE,
+};
 use datafusion::sql::sqlparser::{
     ast::{DataType as SqlDataType, ExactNumberInfo, TimezoneInfo},
     dialect::PostgreSqlDialect,
@@ -113,6 +126,13 @@ pub enum ParseTypeError {
         #[snafu(source(from(ParseTypeError, Box::new)))]
         source: Box<ParseTypeError>,
     },
+
+    #[snafu(display(
+        "Column type `{input}` names a width Arrow cannot represent: {reason}. \
+         Update the `columns[].type` declaration. \
+         See: https://spiceai.org/docs/reference/spicepod/datasets"
+    ))]
+    OutOfRange { input: String, reason: String },
 }
 
 /// Parse a user-supplied type string into an Arrow `DataType`.
@@ -138,7 +158,114 @@ pub fn parse_declared_type(input: &str) -> Result<DataType, ParseTypeError> {
             input: input.to_string(),
         });
     }
+    ensure_representable(input, &ty)?;
     Ok(ty)
+}
+
+/// Reject a `DataType` whose decimal width Arrow cannot represent, at any
+/// nesting depth.
+///
+/// `Field::new` and `Schema::new` accept `Decimal128(50, 2)`, and Arrow's own
+/// `DataType::from_str` builds one, so an over-wide decimal is admitted into a
+/// dataset's declared schema and only fails once a kernel tries to put data in
+/// it — at refresh or query time, with a message that names neither the dataset
+/// nor the column. The width is fully decidable while parsing the declaration,
+/// so it is decided here.
+fn ensure_representable(input: &str, ty: &DataType) -> Result<(), ParseTypeError> {
+    match ty {
+        DataType::Decimal32(precision, scale) => ensure_decimal_in_range(
+            input,
+            "Decimal32",
+            *precision,
+            *scale,
+            DECIMAL32_MAX_PRECISION,
+            DECIMAL32_MAX_SCALE,
+        ),
+        DataType::Decimal64(precision, scale) => ensure_decimal_in_range(
+            input,
+            "Decimal64",
+            *precision,
+            *scale,
+            DECIMAL64_MAX_PRECISION,
+            DECIMAL64_MAX_SCALE,
+        ),
+        DataType::Decimal128(precision, scale) => ensure_decimal_in_range(
+            input,
+            "Decimal128",
+            *precision,
+            *scale,
+            DECIMAL128_MAX_PRECISION,
+            DECIMAL128_MAX_SCALE,
+        ),
+        DataType::Decimal256(precision, scale) => ensure_decimal_in_range(
+            input,
+            "Decimal256",
+            *precision,
+            *scale,
+            DECIMAL256_MAX_PRECISION,
+            DECIMAL256_MAX_SCALE,
+        ),
+        DataType::List(field)
+        | DataType::LargeList(field)
+        | DataType::FixedSizeList(field, _)
+        | DataType::Map(field, _) => ensure_representable(input, field.data_type()),
+        DataType::Struct(fields) => fields
+            .iter()
+            .try_for_each(|field| ensure_representable(input, field.data_type())),
+        _ => Ok(()),
+    }
+}
+
+/// Check one decimal's precision and scale against the limits of the Arrow
+/// decimal that carries it.
+///
+/// Only Arrow representability is enforced — but that includes Arrow's own
+/// `scale <= precision` rule, which its decimal validation applies at every
+/// width. A declaration that breaks it builds a `Field` without complaint and
+/// then fails the first cast with `scale N is greater than precision M`, so
+/// deciding it here turns a query-time error into a load-time one that names
+/// the declaration at fault.
+fn ensure_decimal_in_range(
+    input: &str,
+    arrow_type: &str,
+    precision: u8,
+    scale: i8,
+    max_precision: u8,
+    max_scale: i8,
+) -> Result<(), ParseTypeError> {
+    let reason = if precision == 0 {
+        format!("`{arrow_type}` needs a precision of at least 1")
+    } else if precision > max_precision {
+        // `reason` carries no terminal punctuation of its own — the `OutOfRange`
+        // display supplies the period that ends the sentence.
+        let wider = match precision {
+            p if p <= DECIMAL64_MAX_PRECISION => {
+                format!("; `Decimal64` represents a precision up to {DECIMAL64_MAX_PRECISION}")
+            }
+            p if p <= DECIMAL128_MAX_PRECISION => {
+                format!("; `Decimal128` represents a precision up to {DECIMAL128_MAX_PRECISION}")
+            }
+            p if p <= DECIMAL256_MAX_PRECISION => {
+                format!("; `Decimal256` represents a precision up to {DECIMAL256_MAX_PRECISION}")
+            }
+            _ => String::new(),
+        };
+        format!("precision {precision} exceeds `{arrow_type}`'s maximum of {max_precision}{wider}")
+    } else if scale > max_scale || scale < -max_scale {
+        format!("scale {scale} is outside `{arrow_type}`'s range of -{max_scale} to {max_scale}")
+    } else if scale > 0 && scale.unsigned_abs() > precision {
+        format!(
+            "scale {scale} is greater than precision {precision}, which Arrow rejects at every \
+             decimal width; declare a precision of at least {scale}"
+        )
+    } else {
+        return Ok(());
+    };
+
+    Err(ParseTypeError::OutOfRange {
+        input: input.to_string(),
+        reason,
+    })
 }
 
 #[derive(Logos, Debug, PartialEq, Clone)]
@@ -346,8 +473,15 @@ impl<'a> TokenParser<'a> {
         let span_end = self.tokens[self.pos - 1].span.end;
         let leaf = &self.original[span_start..span_end];
 
-        leaf_lookup(leaf).ok_or_else(|| ParseTypeError::Unrecognized {
-            input: self.original.to_string(),
+        // `leaf_lookup` reports against the leaf it was handed; an unrecognized
+        // leaf reads better reported against the whole declaration, which is
+        // what the user wrote. A precise error — an out-of-range width —
+        // already names the offending part, so it passes through unchanged.
+        leaf_lookup(leaf).map_err(|e| match e {
+            ParseTypeError::Unrecognized { .. } => ParseTypeError::Unrecognized {
+                input: self.original.to_string(),
+            },
+            precise => precise,
         })
     }
 }
@@ -377,17 +511,17 @@ fn map_of(key: DataType, value: DataType) -> DataType {
 ///   1. The Postgres / Arrow alias table (`parse_pg_alias`).
 ///   2. Arrow's `DataType::from_str`.
 ///   3. `sqlparser::Parser::parse_data_type` mapped to `arrow::DataType`.
-fn leaf_lookup(s: &str) -> Option<DataType> {
+fn leaf_lookup(s: &str) -> Result<DataType, ParseTypeError> {
     if let Some(dt) = parse_pg_alias(s) {
-        return Some(dt);
+        return Ok(dt);
     }
     if let Some(dt) = parse_arrow_timestamp_display(s) {
-        return Some(dt);
+        return Ok(dt);
     }
     if let Ok(dt) = DataType::from_str(s) {
-        return Some(dt);
+        return Ok(dt);
     }
-    parse_via_sqlparser(s).ok()
+    parse_via_sqlparser(s)
 }
 
 /// Parse Arrow's `Display` form for `Timestamp(<unit>[, <tz>])` and
@@ -528,13 +662,15 @@ fn parse_via_sqlparser(input: &str) -> Result<DataType, ParseTypeError> {
             input: input.to_string(),
         });
     }
-    sql_to_arrow_type(&sql_dt).ok_or_else(|| ParseTypeError::Unrecognized {
-        input: input.to_string(),
-    })
+    sql_to_arrow_type(&sql_dt, input)
 }
 
-fn sql_to_arrow_type(sql: &SqlDataType) -> Option<DataType> {
-    Some(match sql {
+fn sql_to_arrow_type(sql: &SqlDataType, input: &str) -> Result<DataType, ParseTypeError> {
+    let unrecognized = || ParseTypeError::Unrecognized {
+        input: input.to_string(),
+    };
+
+    Ok(match sql {
         // Integers
         SqlDataType::TinyInt(_) | SqlDataType::Int8(_) => DataType::Int8,
         SqlDataType::SmallInt(_) | SqlDataType::Int2(_) => DataType::Int16,
@@ -549,9 +685,32 @@ fn sql_to_arrow_type(sql: &SqlDataType) -> Option<DataType> {
         SqlDataType::Boolean | SqlDataType::Bool => DataType::Boolean,
 
         // Floats
-        SqlDataType::Float(_) | SqlDataType::Float4 | SqlDataType::Float32 | SqlDataType::Real => {
-            DataType::Float32
-        }
+        //
+        // `FLOAT(p)` states a binary precision in bits: 1..=24 selects `real`
+        // and 25..=53 selects `double precision`, in both the SQL standard and
+        // Postgres — the dialect this parser runs. Bare `FLOAT` keeps its
+        // long-standing `Float32` mapping; changing it would silently rewrite
+        // the schema of every dataset that already declares `type: float`.
+        SqlDataType::Float(info) => match info {
+            ExactNumberInfo::None => DataType::Float32,
+            ExactNumberInfo::Precision(bits) => match bits {
+                1..=24 => DataType::Float32,
+                25..=53 => DataType::Float64,
+                _ => {
+                    return Err(ParseTypeError::OutOfRange {
+                        input: input.to_string(),
+                        reason: format!(
+                            "`FLOAT(p)` takes a binary precision of 1 to 53 bits \
+                             (1 to 24 is `Float32`, 25 to 53 is `Float64`); got {bits}"
+                        ),
+                    });
+                }
+            },
+            // `FLOAT` takes a single precision argument; `FLOAT(p, s)` is not
+            // a float declaration in any dialect this parser accepts.
+            ExactNumberInfo::PrecisionAndScale(_, _) => return Err(unrecognized()),
+        },
+        SqlDataType::Float4 | SqlDataType::Float32 | SqlDataType::Real => DataType::Float32,
         SqlDataType::DoublePrecision
         | SqlDataType::Float8
         | SqlDataType::Float64
@@ -564,10 +723,8 @@ fn sql_to_arrow_type(sql: &SqlDataType) -> Option<DataType> {
         | SqlDataType::BigDecimal(info)
         | SqlDataType::BigNumeric(info) => match info {
             ExactNumberInfo::None => DataType::Decimal128(38, 10),
-            ExactNumberInfo::Precision(p) => DataType::Decimal128(u8::try_from(*p).ok()?, 0),
-            ExactNumberInfo::PrecisionAndScale(p, s) => {
-                DataType::Decimal128(u8::try_from(*p).ok()?, i8::try_from(*s).ok()?)
-            }
+            ExactNumberInfo::Precision(p) => sql_decimal(*p, 0, input)?,
+            ExactNumberInfo::PrecisionAndScale(p, s) => sql_decimal(*p, *s, input)?,
         },
 
         // Strings
@@ -610,14 +767,51 @@ fn sql_to_arrow_type(sql: &SqlDataType) -> Option<DataType> {
             let element = match spec {
                 ArrayElemTypeDef::AngleBracket(inner)
                 | ArrayElemTypeDef::SquareBracket(inner, _)
-                | ArrayElemTypeDef::Parenthesis(inner) => sql_to_arrow_type(inner)?,
-                ArrayElemTypeDef::None => return None,
+                | ArrayElemTypeDef::Parenthesis(inner) => sql_to_arrow_type(inner, input)?,
+                ArrayElemTypeDef::None => return Err(unrecognized()),
             };
             list_of(element)
         }
 
-        _ => return None,
+        _ => return Err(unrecognized()),
     })
+}
+
+/// Map a SQL `NUMERIC(p, s)` to the narrowest Arrow decimal wide enough for
+/// `p` digits: `Decimal128` up to a precision of 38, `Decimal256` beyond it.
+///
+/// The width follows precision alone. Scale cannot widen it, because a scale
+/// larger than the precision is not representable at any width — Arrow's
+/// decimal validation rejects `scale > precision` for `Decimal256` exactly as
+/// it does for `Decimal128` — so `ensure_representable` rejects it outright
+/// rather than reaching for a wider type that would fail the same way.
+///
+/// A precision past `Decimal256`'s 76 still maps to `Decimal256` so that
+/// `ensure_representable` reports the width that is actually out of range,
+/// rather than the declaration reading as an unrecognized type. Only a
+/// precision or scale too large to name at all — one that does not fit the
+/// `u8`/`i8` Arrow stores them in — is rejected here.
+fn sql_decimal(precision: u64, scale: i64, input: &str) -> Result<DataType, ParseTypeError> {
+    let precision = u8::try_from(precision).map_err(|_| ParseTypeError::OutOfRange {
+        input: input.to_string(),
+        reason: format!(
+            "precision {precision} exceeds the widest Arrow decimal precision, \
+             `Decimal256`'s {DECIMAL256_MAX_PRECISION}"
+        ),
+    })?;
+    let scale = i8::try_from(scale).map_err(|_| ParseTypeError::OutOfRange {
+        input: input.to_string(),
+        reason: format!(
+            "scale {scale} is outside the widest Arrow decimal scale range, \
+             `Decimal256`'s -{DECIMAL256_MAX_SCALE} to {DECIMAL256_MAX_SCALE}"
+        ),
+    })?;
+
+    if precision <= DECIMAL128_MAX_PRECISION {
+        Ok(DataType::Decimal128(precision, scale))
+    } else {
+        Ok(DataType::Decimal256(precision, scale))
+    }
 }
 
 #[cfg(test)]
@@ -862,5 +1056,263 @@ mod tests {
     #[test]
     fn rejects_invalid_array_element() {
         fail("not_a_type[]");
+    }
+
+    /// Assert a declaration is rejected as out of range (not merely
+    /// unrecognized) and hand back the reason for inspection.
+    fn fail_out_of_range(input: &str) -> String {
+        match parse_declared_type(input) {
+            Err(ParseTypeError::OutOfRange { reason, .. }) => reason,
+            Err(other) => {
+                panic!("expected `{input}` to be rejected as out of range, got: {other}")
+            }
+            Ok(dt) => panic!("expected `{input}` to be rejected, got {dt:?}"),
+        }
+    }
+
+    /// `FLOAT(p)` states a binary precision in bits — 25..=53 is
+    /// `double precision`. Regression test for #12756: every `FLOAT(p)`
+    /// used to map to `Float32`.
+    #[test]
+    fn float_precision_selects_the_width_it_names() {
+        assert_eq!(parse("float(1)"), DataType::Float32);
+        assert_eq!(parse("float(24)"), DataType::Float32);
+        assert_eq!(parse("float(25)"), DataType::Float64);
+        assert_eq!(parse("float(53)"), DataType::Float64);
+        assert_eq!(parse("FLOAT(53)"), DataType::Float64);
+        assert_eq!(parse("float (53)"), DataType::Float64);
+
+        // Bare `FLOAT` keeps its existing mapping — changing it would rewrite
+        // the schema of datasets that already declare `type: float`.
+        assert_eq!(parse("float"), DataType::Float32);
+        assert_eq!(parse("real"), DataType::Float32);
+        assert_eq!(parse("float4"), DataType::Float32);
+        assert_eq!(parse("float8"), DataType::Float64);
+        assert_eq!(parse("double precision"), DataType::Float64);
+    }
+
+    /// A precision outside 1..=53 is not a float width in any dialect, and
+    /// the error says what the accepted range is.
+    #[test]
+    fn float_precision_outside_the_binary_range_is_rejected() {
+        for input in ["float(0)", "float(54)", "float(64)", "float(1000)"] {
+            let reason = fail_out_of_range(input);
+            assert!(
+                reason.contains("1 to 53"),
+                "`{input}` should name the accepted range, got: {reason}"
+            );
+        }
+        // `FLOAT(p, s)` is not a float declaration at all.
+        fail("float(53, 2)");
+    }
+
+    /// The declared type is what the dataset's schema is built from, so a
+    /// narrowed float silently changes the values a query returns.
+    #[test]
+    fn float53_round_trips_an_f64_that_float32_would_narrow() {
+        use arrow::array::Float64Array;
+        use arrow::compute::kernels::cast::cast;
+
+        // `2^53 + 2` is the first integer above `2^53` that an `f64` still
+        // holds exactly. `2^53` itself is a power of two and survives `f32`
+        // untouched, so it would not witness any narrowing.
+        let source = Float64Array::from(vec![1.234_567_890_123_456_7_f64, 9_007_199_254_740_994.0]);
+
+        let declared = parse("float(53)");
+        let round_tripped = cast(
+            &cast(&source, &declared).expect("cast into the declared type"),
+            &DataType::Float64,
+        )
+        .expect("cast back to Float64");
+        assert_eq!(
+            round_tripped.as_ref(),
+            &source,
+            "float(53) must carry an f64 unchanged"
+        );
+
+        // The same values through `float(24)`, which really is `Float32`, do
+        // not survive — which is what made the old mapping silent rather than
+        // loud.
+        let narrowed = cast(
+            &cast(&source, &parse("float(24)")).expect("cast into Float32"),
+            &DataType::Float64,
+        )
+        .expect("cast back to Float64");
+        assert_ne!(narrowed.as_ref(), &source);
+    }
+
+    /// A `NUMERIC` past `Decimal128`'s precision is representable — as
+    /// `Decimal256`. Regression test for #12756: it used to build a
+    /// `Decimal128` no Arrow kernel accepts.
+    #[test]
+    fn numeric_past_decimal128_widens_to_decimal256() {
+        assert_eq!(parse("numeric(38,2)"), DataType::Decimal128(38, 2));
+        assert_eq!(parse("numeric(39,2)"), DataType::Decimal256(39, 2));
+        assert_eq!(parse("numeric(50,2)"), DataType::Decimal256(50, 2));
+        assert_eq!(parse("numeric(76,2)"), DataType::Decimal256(76, 2));
+        assert_eq!(parse("decimal(50)"), DataType::Decimal256(50, 0));
+
+        // Unchanged for everything that already fit.
+        assert_eq!(parse("numeric(18,4)"), DataType::Decimal128(18, 4));
+        assert_eq!(parse("decimal(5)"), DataType::Decimal128(5, 0));
+        assert_eq!(parse("numeric(38,38)"), DataType::Decimal128(38, 38));
+    }
+
+    /// Every decimal this parser accepts must be one a cast kernel accepts —
+    /// the property the old mapping broke.
+    #[test]
+    fn every_accepted_decimal_accepts_data() {
+        use arrow::array::Float64Array;
+        use arrow::compute::kernels::cast::cast;
+
+        let source = Float64Array::from(vec![1.5_f64]);
+        for input in [
+            "numeric(5)",
+            "numeric(18,4)",
+            "numeric(38,2)",
+            "numeric(38,38)",
+            "numeric(39,2)",
+            "numeric(50,2)",
+            "numeric(76,2)",
+            "numeric(76,76)",
+            "Decimal128(38, 2)",
+            "Decimal256(76, 2)",
+        ] {
+            let declared = parse(input);
+            cast(&source, &declared).unwrap_or_else(|e| {
+                panic!("`{input}` parsed to {declared:?}, which rejects data: {e}")
+            });
+        }
+    }
+
+    /// A width past `Decimal256` is decidable while parsing, so it is decided
+    /// there rather than inside a cast kernel at query time.
+    #[test]
+    fn decimal_width_arrow_cannot_represent_is_rejected() {
+        for input in ["numeric(77,2)", "numeric(100,2)", "numeric(1000,2)"] {
+            let reason = fail_out_of_range(input);
+            assert!(
+                reason.contains("76"),
+                "`{input}` should name Decimal256's limit, got: {reason}"
+            );
+        }
+        // A scale past the carrying type's maximum, and a precision of zero.
+        assert!(fail_out_of_range("numeric(38,50)").contains("scale"));
+        assert!(fail_out_of_range("numeric(38,100)").contains("scale"));
+        assert!(fail_out_of_range("numeric(0,0)").contains("at least 1"));
+    }
+
+    /// Arrow's decimal validation rejects `scale > precision` at every width,
+    /// so a declaration that breaks the rule can never carry data. It builds a
+    /// `Field` without complaint, so nothing catches it until the first cast
+    /// fails at query time — this decides it while loading the dataset, where
+    /// the message can name the declaration.
+    #[test]
+    fn decimal_scale_past_its_own_precision_is_rejected() {
+        use arrow::array::Float64Array;
+        use arrow::compute::kernels::cast::cast;
+
+        for input in ["numeric(10,20)", "decimal(1,2)", "Decimal256(38, 40)"] {
+            let reason = fail_out_of_range(input);
+            assert!(
+                reason.contains("greater than precision"),
+                "`{input}` should name the precision it outruns, got: {reason}"
+            );
+        }
+
+        // The rule is Arrow's, not ours: the width the old code would have
+        // built rejects data for exactly this reason.
+        let err = cast(
+            &Float64Array::from(vec![1.5_f64]),
+            &DataType::Decimal128(10, 20),
+        )
+        .expect_err("Arrow must reject a scale past its precision");
+        assert!(
+            err.to_string().contains("greater than precision"),
+            "unexpected Arrow error: {err}"
+        );
+
+        // Scale equal to precision stays legal, at both widths.
+        assert_eq!(parse("numeric(38,38)"), DataType::Decimal128(38, 38));
+        assert_eq!(parse("numeric(76,76)"), DataType::Decimal256(76, 76));
+    }
+
+    /// The `OutOfRange` display ends the sentence itself, so a `reason` that
+    /// also ends in one renders `..` at the user.
+    #[test]
+    fn out_of_range_message_punctuates_once() {
+        // Both shapes of `reason`: one that appends a wider-type suggestion,
+        // and one that has none to append.
+        for input in ["Decimal128(50, 2)", "numeric(77,2)", "numeric(0,0)"] {
+            let rendered = parse_declared_type(input)
+                .expect_err("expected the declaration to be rejected")
+                .to_string();
+            assert!(
+                !rendered.contains(".."),
+                "`{input}` renders doubled punctuation: {rendered}"
+            );
+        }
+    }
+
+    /// Arrow's own `DataType::from_str` builds `Decimal128(50, 2)` without
+    /// complaint, so the Arrow display form needs the same range check as the
+    /// SQL form.
+    #[test]
+    fn arrow_display_decimal_out_of_range_is_rejected() {
+        assert_eq!(parse("Decimal128(38, 2)"), DataType::Decimal128(38, 2));
+        assert_eq!(parse("Decimal256(76, 2)"), DataType::Decimal256(76, 2));
+
+        let reason = fail_out_of_range("Decimal128(50, 2)");
+        assert!(
+            reason.contains("Decimal256"),
+            "the error should point at the type that can represent it, got: {reason}"
+        );
+        fail_out_of_range("Decimal128(38, 50)");
+        fail_out_of_range("Decimal256(100, 2)");
+        fail_out_of_range("Decimal256(76, 100)");
+        fail_out_of_range("Decimal128(0, 0)");
+    }
+
+    /// `Decimal32` and `Decimal64` reach the same parser through the same
+    /// unbounded `u8`/`i8` conversion, at a much lower limit.
+    #[test]
+    fn narrow_arrow_decimals_are_range_checked_too() {
+        assert_eq!(parse("Decimal32(9, 2)"), DataType::Decimal32(9, 2));
+        assert_eq!(parse("Decimal64(18, 2)"), DataType::Decimal64(18, 2));
+
+        // The suggestion names the narrowest type that fits, which is not
+        // always the next one up.
+        let reason = fail_out_of_range("Decimal32(12, 2)");
+        assert!(
+            reason.contains("Decimal64"),
+            "the error should point at the type that can represent it, got: {reason}"
+        );
+        let reason = fail_out_of_range("Decimal32(20, 2)");
+        assert!(
+            reason.contains("Decimal128"),
+            "the error should point at the type that can represent it, got: {reason}"
+        );
+        fail_out_of_range("Decimal32(9, 20)");
+        fail_out_of_range("Decimal64(19, 2)");
+    }
+
+    /// The range check runs over the whole type, not just a bare leaf.
+    #[test]
+    fn nested_decimal_out_of_range_is_rejected() {
+        fail_out_of_range("Decimal128(50, 2)[]");
+        fail_out_of_range("List<Decimal128(50, 2)>");
+        fail_out_of_range("Map<Utf8, Decimal128(50, 2)>");
+        fail_out_of_range("Map<Decimal128(50, 2), Utf8>");
+        fail_out_of_range("numeric(77,2)[]");
+
+        // The representable ones still nest.
+        assert_eq!(
+            parse("List<numeric(50,2)>"),
+            DataType::List(std::sync::Arc::new(Field::new(
+                "item",
+                DataType::Decimal256(50, 2),
+                true,
+            )))
+        );
     }
 }
