@@ -3907,7 +3907,10 @@ mod tests {
         )
         .expect("a Float64 list should convert");
 
-        assert_eq!(value, TursoValue::Text("[1.5,-2.25]".to_string()));
+        assert_eq!(
+            stored_json(&value),
+            list_envelope(serde_json::json!([1.5, -2.25]))
+        );
     }
 
     /// `LargeList` and `FixedSizeList` are declared `TEXT` by the accelerator's DDL, so they have
@@ -3923,7 +3926,10 @@ mod tests {
             TimestampFormat::default(),
         )
         .expect("a LargeList should convert");
-        assert_eq!(large_value, TursoValue::Text("[7,8]".to_string()));
+        assert_eq!(
+            stored_json(&large_value),
+            list_envelope(serde_json::json!([7, 8]))
+        );
 
         let mut fixed = arrow::array::FixedSizeListBuilder::new(Int32Builder::new(), 2);
         fixed.values().append_value(9);
@@ -3934,7 +3940,10 @@ mod tests {
             TimestampFormat::default(),
         )
         .expect("a FixedSizeList should convert");
-        assert_eq!(fixed_value, TursoValue::Text("[9,10]".to_string()));
+        assert_eq!(
+            stored_json(&fixed_value),
+            list_envelope(serde_json::json!([9, 10]))
+        );
     }
 
     /// A non-finite float has no JSON form; `serde_json` encodes it as `null`, which would be
@@ -4171,11 +4180,15 @@ mod tests {
             stored.push(row.get_value(0).expect("tags should be present"));
         }
 
+        let [tags_row, null_row] = stored.as_slice() else {
+            panic!("both written rows should be stored, got {stored:?}");
+        };
         assert_eq!(
-            stored,
-            vec![TursoValue::Text("[10,20]".to_string()), TursoValue::Null],
-            "the list's elements should be stored, and a null list should stay NULL"
+            stored_json(tags_row),
+            list_envelope(serde_json::json!([10, 20])),
+            "the list's elements should be stored"
         );
+        assert_eq!(*null_row, TursoValue::Null, "a null list should stay NULL");
     }
     /// The read path pairs with the write path: a stored list whose element is null must come back
     /// as a list holding a null, not as a null list.
