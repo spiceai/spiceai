@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 #
-# Unit tests for the sign-off disk guard in `scripts/signoff`: the preflight
+# Unit tests for the sign-off runner guards in `scripts/signoff`: the preflight
 # that refuses to start a run the work volume cannot hold, and the failure
-# classification that tells "the runner is out of disk" apart from "the branch
-# is broken". Both exist because an out-of-disk sign-off otherwise reports as a
-# code failure — the suite passes, then the linker dies with errno=28 on a crate
-# the branch never touched — so getting the distinction wrong in either
-# direction is the bug. No network and no credentials: a stub `df` on PATH
-# reports whatever free space a case needs.
+# classification that tells "the runner broke" apart from "the branch is broken".
+# Both exist because a run the runner broke otherwise reports as a code failure —
+# the suite passes, then the linker dies with errno=28 on a crate the branch never
+# touched, or sccache loses its storage and nothing compiles at all — so getting
+# the distinction wrong in either direction is the bug. No network and no
+# credentials: a stub `df` on PATH reports whatever free space a case needs, and a
+# stub `make` prints whatever a case needs the watcher to read.
 #
 # `failure_kind` names a third cause with the same consequence — a run that was
 # signalled and so judged nothing at all — so its cases live here too, alongside
@@ -180,6 +181,10 @@ echo "run_make_step + build_hit_disk_full"
 # #12427, so there is nothing on disk for a later shell to inspect.
 assert_recorder() {
   local name="$1" make_body="$2" want_rc="$3" want_marked="$4" want_passthrough="${5:-}"
+  # The watcher reads two signatures off one stream, so every case asserts both
+  # verdicts. Defaulting this to "no" means the existing disk cases now also
+  # prove the cache signature does not cross-fire on them.
+  local want_cache_marked="${6:-no}"
   tests_run=$((tests_run + 1))
 
   local fake_make="$stub_dir/make"
@@ -193,6 +198,7 @@ assert_recorder() {
     bash -c 'source "$1"
       if run_make_step some-target; then step_rc=0; else step_rc=$?; fi
       echo "VERDICT=${SIGNOFF_DISK_HIT:+yes}"
+      echo "CACHEHIT=${SIGNOFF_CACHE_HIT:+yes}"
       exit "$step_rc"' _ "$subject" 2>&1)"
   rc=$?
 
@@ -216,6 +222,19 @@ assert_recorder() {
   fi
   if [[ "$marked" != "$want_marked" ]]; then
     fail_test "$name: expected marked=${want_marked}, got ${marked} (output: '${output}')"
+    rm -f "$fake_make"
+    return
+  fi
+
+  local cache_marked="no"
+  [[ "$output" == *"CACHEHIT=yes"* ]] && cache_marked="yes"
+  if [[ "$output" != *"CACHEHIT="* ]]; then
+    fail_test "$name: the step never reported a cache verdict — output: '${output}'"
+    rm -f "$fake_make"
+    return
+  fi
+  if [[ "$cache_marked" != "$want_cache_marked" ]]; then
+    fail_test "$name: expected cache_marked=${want_cache_marked}, got ${cache_marked} (output: '${output}')"
     rm -f "$fake_make"
     return
   fi
@@ -243,6 +262,56 @@ assert_recorder "leaves a passing step unmarked and keeps its status" \
 assert_recorder "reports make's failure, not the recorder's success" \
   'echo "some output"; exit 42' \
   42 no "some output"
+
+# Verbatim from run 30978407363, where sccache's storage endpoint stopped
+# answering 98 minutes into a sign-off and the run reported "Sign-off checks
+# failed" about a branch nothing had compiled.
+assert_recorder "records sccache failing to reach its storage" \
+  'echo "sccache: error: Server startup failed: cache storage failed to read: Unexpected (temporary) at read => send http request"
+   echo "error: process didn'"'"'t exit successfully: \`sccache /Users/runner/.rustup/toolchains/1.96.1-aarch64-apple-darwin/bin/rustc -vV\` (exit status: 2)"
+   exit 101' \
+  101 no "Server startup failed" yes
+assert_recorder "records a storage failure reported without the startup prefix" \
+  'echo "sccache: error: cache storage failed to read: Unexpected (temporary)"; exit 101' \
+  101 no "" yes
+# The third spelling (#12622). sccache reaches this one when the server it spawns
+# never comes up inside the startup timeout, which is how an endpoint that stops
+# answering during a run reads once the previous server has exited. Wording is
+# verbatim from sccache's `connect_or_start_server`; the second line is the same
+# bail's own continuation, unprefixed, and must not be what the guard matches.
+assert_recorder "records sccache timing out waiting for its server to start" \
+  'echo "sccache: error: Timed out waiting for server startup. Maybe the remote service is unreachable?"
+   echo "Run with SCCACHE_LOG=debug SCCACHE_NO_DAEMON=1 to get more information"
+   echo "error: process didn'"'"'t exit successfully: \`sccache /Users/runner/.rustup/toolchains/1.96.1-aarch64-apple-darwin/bin/rustc -vV\` (exit status: 2)"
+   exit 101' \
+  101 no "Timed out waiting for server startup" yes
+# `sccache --start-server` bails with the same sentence and no trailing advice,
+# so the guard anchors on the prefix the two share rather than on either whole
+# sentence — this case fails if the pattern ever pins the "Maybe the remote
+# service is unreachable?" suffix.
+assert_recorder "records the bare startup-timeout wording too" \
+  'echo "sccache: error: Timed out waiting for server startup"; exit 101' \
+  101 no "" yes
+# The other direction, as for the storage spellings: the sentence only counts on
+# sccache's own error channel. A build that merely prints it — a test asserting
+# on the wording, or a log echoed back — is still a failure about the branch.
+assert_recorder "leaves a failure unmarked when the timeout wording is only quoted" \
+  'echo "Timed out waiting for server startup"
+   echo "error[E0308]: mismatched types"
+   exit 101' \
+  101 no "E0308" no
+# The direction that matters: a genuine defect must not be excused because the
+# word sccache appeared. Only sccache's own `error:` channel counts.
+assert_recorder "leaves a compile failure unmarked when sccache merely ran" \
+  'echo "Compiling runtime v2.3.0"; echo "sccache: Starting the server..."; echo "error[E0308]: mismatched types"; exit 101' \
+  101 no "E0308" no
+# Disk wins when both appear: a volume at zero can break the cache endpoint too,
+# and reclaiming space is the remedy that fixes both.
+assert_recorder "reports disk, not cache, when the volume filled and took sccache with it" \
+  'echo "sccache: error: Server startup failed: cache storage failed to read"
+   echo "ld: write() failed, errno=28 (No space left on device)"
+   exit 101' \
+  101 yes "errno=28" no
 
 # Stickiness: a step that merely mentions running out of disk and then succeeds
 # must not leave the verdict blaming the volume for a later, genuine failure.
@@ -353,6 +422,23 @@ assert_failure_kind "calls a failure on a roomy volume a check failure" 101 "che
 assert_failure_kind "calls a failure with unknown free space a check failure" 101 "checks" \
   STUB_DF_RC=1
 
+# The cache verdict, same shape as the disk one: authoritative when the watch was
+# armed, and worth nothing without it.
+assert_failure_kind "calls an unreachable compiler cache an infrastructure failure" 101 "cache" \
+  SIGNOFF_DISK_WATCH=1 SIGNOFF_CACHE_HIT=1 STUB_FREE_KB="$(gib_to_kb 200)"
+# Disk outranks cache: an out-of-disk volume can break sccache's storage, and
+# "reclaim space" is then the remedy that fixes both.
+assert_failure_kind "prefers the disk verdict when the build reported both" 101 "disk" \
+  SIGNOFF_DISK_WATCH=1 SIGNOFF_DISK_HIT=1 SIGNOFF_CACHE_HIT=1 STUB_FREE_KB="$(gib_to_kb 200)"
+# A cache hit with no armed watch is not a reading, exactly as for disk — and
+# there is no after-the-fact backstop for the cache, so it falls through to the
+# free-space one and lands on the branch.
+assert_failure_kind "a cache hit without an armed watch does not classify" 101 "checks" \
+  SIGNOFF_CACHE_HIT=1 STUB_FREE_KB="$(gib_to_kb 200)"
+# The preflight's own refusal is about disk and must not be recoloured by an
+# inherited cache flag.
+assert_failure_kind "the preflight refusal stays a disk failure with a cache flag set" 70 "disk" \
+  SIGNOFF_DISK_WATCH=1 SIGNOFF_CACHE_HIT=1 STUB_FREE_KB="$(gib_to_kb 60)"
 # A signalled run reached no verdict at all, which is a different statement from
 # either disk kind: both of those describe a `make` that returned. The statuses
 # here are what bash reports for a killed foreground child — 128+N — which is how
@@ -370,6 +456,10 @@ assert_failure_kind "treats 128 itself as signalled" 128 "signalled" \
 # author it was disk sends them to reclaim space that was never the problem.
 assert_failure_kind "keeps a signalled run signalled on a near-empty volume" 143 "signalled" \
   STUB_FREE_KB="$(gib_to_kb 1)"
+# And over the cache verdict, for the same reason: a run that was killed judged
+# nothing, whatever the build had printed about sccache before it died.
+assert_failure_kind "keeps a signalled run signalled with a cache hit recorded" 143 "signalled" \
+  SIGNOFF_DISK_WATCH=1 SIGNOFF_CACHE_HIT=1 STUB_FREE_KB="$(gib_to_kb 200)"
 # The boundary in the other direction is the one that protects real verdicts: 2
 # is what make exits when a recipe fails, and 101 is cargo's own. Neither may be
 # excused as "nothing ran".
@@ -428,6 +518,10 @@ assert_describe "says the run was signalled rather than that checks failed" 143 
 assert_describe "still publishes the out-of-disk verdict" 101 \
   "Runner out of disk after 21195s — checks did not complete, re-dispatch (triggered by someone)" \
   "ran out of disk" SIGNOFF_DISK_WATCH=1 SIGNOFF_DISK_HIT=1 STUB_FREE_KB="$(gib_to_kb 200)"
+assert_describe "still publishes the unreachable-cache verdict" 101 \
+  "Compiler cache unreachable after 21195s — checks did not complete, re-dispatch (triggered by someone)" \
+  "sccache could not reach its storage" \
+  SIGNOFF_DISK_WATCH=1 SIGNOFF_CACHE_HIT=1 STUB_FREE_KB="$(gib_to_kb 200)"
 assert_describe "still publishes a genuine check failure" 101 \
   "Sign-off checks failed after 21195s (triggered by someone)" \
   "sign-off checks failed" STUB_FREE_KB="$(gib_to_kb 200)"
