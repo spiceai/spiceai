@@ -2069,8 +2069,12 @@ fn committed_datalake_file_count(metadata_dir: &std::path::Path) -> Result<i64, 
     if !db_path.exists() {
         return Ok(0);
     }
-    let conn = rusqlite::Connection::open(&db_path)
-        .map_err(|e| format!("failed to open the Cayenne metastore {}: {e}", db_path.display()))?;
+    let conn = rusqlite::Connection::open(&db_path).map_err(|e| {
+        format!(
+            "failed to open the Cayenne metastore {}: {e}",
+            db_path.display()
+        )
+    })?;
     // The runtime holds this database open; wait rather than fail on its writes.
     conn.busy_timeout(Duration::from_secs(10))
         .map_err(|e| format!("failed to set the metastore busy timeout: {e}"))?;
