@@ -8,10 +8,14 @@ on:
   workflow_dispatch:
     inputs:
       profiles:
-        description: 'JSON array of cargo profiles to verify'
+        description: 'Which cargo profiles to verify'
         required: false
-        default: '["release", "release-lto"]'
-        type: string
+        default: 'release,release-lto'
+        type: choice
+        options:
+          - 'release,release-lto'
+          - 'release'
+          - 'release-lto'
 
 # Each leg builds spiced from scratch on a shared runner pool.
 concurrency:
@@ -27,7 +31,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        profile: ${{ fromJSON(inputs.profiles || '["release", "release-lto"]') }}
+        profile: ${{ inputs.profiles == 'release' && fromJSON('["release"]')
+          || inputs.profiles == 'release-lto' && fromJSON('["release-lto"]')
+          || fromJSON('["release", "release-lto"]') }}
 
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -72,11 +78,12 @@ jobs:
       - name: Build the test binary
         env:
           CARGO_INCREMENTAL: 0
+          PROFILE: ${{ matrix.profile }}
           AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
         run: |
           set -euo pipefail
-          cargo test -p spiced --lib --profile '${{ matrix.profile }}' --no-run \
+          cargo test -p spiced --lib --profile "$PROFILE" --no-run \
             --message-format=json > cargo-build.json
           # The single test executable for spiced's lib target.
           TEST_BIN=$(jq -r 'select(.profile.test == true) | .executable' \
@@ -96,8 +103,9 @@ jobs:
         # Match the build step's env or cargo re-fingerprints and rebuilds.
         env:
           CARGO_INCREMENTAL: 0
+          PROFILE: ${{ matrix.profile }}
         run: |
-          cargo test -p spiced --lib --profile '${{ matrix.profile }}' \
+          cargo test -p spiced --lib --profile "$PROFILE" \
             crash_handler -- --nocapture
 
       # Re-run the faulting child directly so the report itself lands in the log.
@@ -140,9 +148,11 @@ jobs:
       # `profile=` must be the profile this leg built, not cargo's `PROFILE`, which
       # reports "release" for both.
       - name: Check the report identifies its artifact
+        env:
+          PROFILE: ${{ matrix.profile }}
         run: |
           set -euo pipefail
-          grep -q "profile=${{ matrix.profile }}" report.txt \
+          grep -q "profile=$PROFILE" report.txt \
             || { echo "report does not name the profile it was built with"; exit 1; }
           grep -qE 'features=[a-z,]+' report.txt \
             || { echo "report does not name the features it was built with"; exit 1; }
