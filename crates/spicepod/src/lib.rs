@@ -1443,22 +1443,22 @@ mod version_tests {
 
         let absent_in_dir = Spicepod::load_from(&reader::StdFileSystem, dir.path())
             .await
-            .err()
-            .expect("an empty directory has no spicepod.yaml");
+            .expect_err("an empty directory has no spicepod.yaml");
         assert!(absent_in_dir.is_spicepod_missing());
 
         let absent_file = Spicepod::load_from(&reader::StdFileSystem, dir.path().join("pod.yaml"))
             .await
-            .err()
-            .expect("a named file that does not exist cannot load");
+            .expect_err("a named file that does not exist cannot load");
         assert!(absent_file.is_spicepod_missing());
 
-        std::fs::write(dir.path().join("spicepod.yaml"), "version: v1\nkind: Spicepod\n")
-            .expect("write spicepod.yaml");
+        std::fs::write(
+            dir.path().join("spicepod.yaml"),
+            "version: v1\nkind: Spicepod\n",
+        )
+        .expect("write spicepod.yaml");
         let malformed = Spicepod::load_from(&reader::StdFileSystem, dir.path())
             .await
-            .err()
-            .expect("a spicepod.yaml with no name does not match the schema");
+            .expect_err("a spicepod.yaml with no name does not match the schema");
         assert!(!malformed.is_spicepod_missing());
     }
 
