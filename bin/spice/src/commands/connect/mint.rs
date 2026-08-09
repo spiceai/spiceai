@@ -31,7 +31,7 @@ limitations under the License.
 use spice_cloud_client::types::MintAdoptionCodeRequest;
 
 use crate::commands::cloud::CloudClient;
-use crate::error::{Error, Result};
+use crate::error::{CloudErrorCode, Error, Result};
 
 /// A minted, unredeemed adoption code plus the org it is scoped to.
 pub(crate) struct MintedCode {
@@ -106,60 +106,62 @@ fn mint_label() -> String {
 
 /// Turn a mint failure into an error that names the alternative path, since a
 /// denied mint is not something the caller can retry into success.
+///
+/// Branches on the cloud error code rather than the rendered message: the codes
+/// are the stable contract, while the wording is free to change and would take
+/// these fixes down with it silently.
 fn mint_error(err: &Error, org: Option<&str>) -> Error {
     let detail = err.to_string();
 
-    // A 403 means the login is valid but lacks org admin/owner. The fix is a
-    // different path, not a retry.
-    if detail.contains("Forbidden") {
-        return Error::InvalidArgument {
+    match err.cloud_code() {
+        // A 403 means the login is valid but lacks org admin/owner. The fix is a
+        // different path, not a retry.
+        Some(CloudErrorCode::Forbidden) => Error::InvalidArgument {
             message: format!(
                 "Failed to mint an adoption code for this host: {detail}. Minting requires org \
                  admin or owner. Ask an org admin to mint a code in the Spice Cloud portal and \
                  run `spice connect SPICE-ADOPT-XXXXX-XXXXX-XXXXX-XXXXX` on this host. \
                  See: https://spiceai.org/docs"
             ),
-        };
-    }
+        },
 
-    // A 404 is the org assertion failing: the token is not bound to the org the
-    // caller named (the response deliberately does not enumerate orgs).
-    if detail.contains("Not found") {
-        let message = match org {
-            Some(org) => format!(
-                "Failed to mint an adoption code for org {org}: {detail}. This login is not a \
-                 member of {org}, or no such org exists. Run `spice cloud whoami` to see which \
-                 org this login belongs to, pass the right `--org <name>`, or mint a code in the \
-                 Spice Cloud portal. See: https://spiceai.org/docs"
-            ),
-            None => format!(
-                "Failed to mint an adoption code for this host: {detail}. Run \
-                 `spice cloud whoami` to check which org this login belongs to, or mint a code in \
-                 the Spice Cloud portal and run `spice connect <code>`. \
-                 See: https://spiceai.org/docs"
-            ),
-        };
-        return Error::InvalidArgument { message };
-    }
+        // A 404 is the org assertion failing: the token cannot reach the org the
+        // caller named (the response deliberately does not enumerate orgs).
+        Some(CloudErrorCode::NotFound) => {
+            let message = match org {
+                Some(org) => format!(
+                    "Failed to mint an adoption code for org {org}: {detail}. This login is not a \
+                     member of {org}, or no such org exists. Run `spice cloud whoami` to see which \
+                     org this login belongs to, pass the right `--org <name>`, or mint a code in \
+                     the Spice Cloud portal. See: https://spiceai.org/docs"
+                ),
+                None => format!(
+                    "Failed to mint an adoption code for this host: {detail}. Run \
+                     `spice cloud whoami` to check which org this login belongs to, or mint a code \
+                     in the Spice Cloud portal and run `spice connect <code>`. \
+                     See: https://spiceai.org/docs"
+                ),
+            };
+            Error::InvalidArgument { message }
+        }
 
-    // An expired or revoked login.
-    if detail.contains("Unauthorized") {
-        return Error::InvalidArgument {
+        // An expired or revoked login.
+        Some(CloudErrorCode::TokenExpired) => Error::InvalidArgument {
             message: format!(
                 "Failed to mint an adoption code for this host: {detail}. Re-run `spice login` \
                  and try again, or mint a code in the Spice Cloud portal and run \
                  `spice connect SPICE-ADOPT-XXXXX-XXXXX-XXXXX-XXXXX`. \
                  See: https://spiceai.org/docs"
             ),
-        };
-    }
+        },
 
-    Error::CloudConnectEnroll {
-        message: format!(
-            "Failed to mint an adoption code for this host: {detail}. Nothing was enrolled — \
-             retry, or mint a code in the Spice Cloud portal and run `spice connect <code>`. \
-             See: https://spiceai.org/docs"
-        ),
+        _ => Error::CloudConnectEnroll {
+            message: format!(
+                "Failed to mint an adoption code for this host: {detail}. Nothing was enrolled — \
+                 retry, or mint a code in the Spice Cloud portal and run `spice connect <code>`. \
+                 See: https://spiceai.org/docs"
+            ),
+        },
     }
 }
 
@@ -180,9 +182,10 @@ mod tests {
     #[test]
     fn forbidden_points_at_the_portal_path() {
         let err = mint_error(
-            &Error::InvalidArgument {
-                message: "Forbidden: requires org admin".to_string(),
-            },
+            &Error::cloud(
+                CloudErrorCode::Forbidden,
+                "Not permitted: requires org admin",
+            ),
             None,
         );
         let message = err.to_string();
@@ -197,9 +200,7 @@ mod tests {
     #[test]
     fn not_found_names_the_asserted_org() {
         let err = mint_error(
-            &Error::InvalidArgument {
-                message: "Not found: org".to_string(),
-            },
+            &Error::cloud(CloudErrorCode::NotFound, "Not found: org"),
             Some("acme"),
         );
         let message = err.to_string();
@@ -213,9 +214,7 @@ mod tests {
     #[test]
     fn not_found_without_an_org_still_actionable() {
         let err = mint_error(
-            &Error::InvalidArgument {
-                message: "Not found: org".to_string(),
-            },
+            &Error::cloud(CloudErrorCode::NotFound, "Not found: org"),
             None,
         );
         let message = err.to_string();
@@ -225,9 +224,10 @@ mod tests {
     #[test]
     fn unauthorized_says_to_log_in_again() {
         let err = mint_error(
-            &Error::InvalidArgument {
-                message: "Unauthorized: token expired".to_string(),
-            },
+            &Error::cloud(
+                CloudErrorCode::TokenExpired,
+                "Spice Cloud rejected the credential: token expired",
+            ),
             None,
         );
         assert!(err.to_string().contains("spice login"), "{err}");
@@ -236,9 +236,10 @@ mod tests {
     #[test]
     fn other_failures_do_not_claim_anything_was_enrolled() {
         let err = mint_error(
-            &Error::InvalidArgument {
-                message: "API error (503): upstream".to_string(),
-            },
+            &Error::cloud(
+                CloudErrorCode::ApiError,
+                "Spice Cloud request failed with status 503: upstream",
+            ),
             None,
         );
         let message = err.to_string();
