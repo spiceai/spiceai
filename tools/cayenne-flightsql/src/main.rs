@@ -407,6 +407,7 @@ mod tests {
                     bake_deletion_index_trigger: None,
                 },
                 ctx.runtime_env(),
+                TableSelector::select_all(),
             )
             .await
             .expect("catalog provider should initialize"),
