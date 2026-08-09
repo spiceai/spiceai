@@ -10,9 +10,12 @@ inputs:
     required: false
     default: '.'
   ports:
-    description: 'Space-separated TCP ports to wait for release'
+    description: |
+      Space-separated TCP ports to wait for release. Empty lets the script use
+      the ports this job allocated (SPICE_HTTP_PORT / SPICE_FLIGHT_PORT), and
+      spiced's defaults when it allocated none.
     required: false
-    default: '8090 50051'
+    default: ''
   print-log:
     description: 'Print spice.log after stopping'
     required: false

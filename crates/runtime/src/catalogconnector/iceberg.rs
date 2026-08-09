@@ -17,7 +17,7 @@ limitations under the License.
 use super::{CatalogConnector, ConnectorComponent, ParameterSpec, Parameters};
 use crate::{
     Runtime,
-    component::catalog::Catalog,
+    component::catalog::{Catalog, table_selector},
     dataconnector::parameters::{ConnectorParams, aws::initiate_config_with_credentials},
     http::v1::iceberg::namespace::Namespace as HttpNamespace,
 };
@@ -186,7 +186,7 @@ impl IcebergCatalog {
         let catalog_provider = IcebergCatalogProvider::try_new(
             Arc::new(hadoop_catalog),
             None,
-            catalog.include.as_ref(),
+            &table_selector(catalog),
             table_wrapper,
         )
         .await
@@ -447,7 +447,7 @@ impl CatalogConnector for IcebergCatalog {
         let catalog_provider = IcebergCatalogProvider::try_new(
             Arc::new(catalog_client),
             namespace.map(|n| n.name().clone()),
-            catalog.include.as_ref(),
+            &table_selector(catalog),
             table_wrapper,
         )
         .await

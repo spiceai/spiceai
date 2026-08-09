@@ -25,7 +25,7 @@
 #   scripts/signoff --no-verify     Sign off without running the checks (honor system)
 #   scripts/signoff status          Show the sign-off status of HEAD
 #   scripts/signoff mine            Show attestation status for all your open PRs
-#   scripts/signoff clear-pending   Turn a left-behind pending status into a failure
+#   scripts/signoff clear-pending   Restate a left-behind pending status as incomplete
 #   scripts/signoff preflight-disk  Check the work volume's free space (CI: run
 #                                   before the toolchain setup steps)
 #   scripts/signoff check           Show whether trunk requires sign-off
@@ -68,6 +68,12 @@ readonly VERSION="1.5.0"
 readonly STATUS_CONTEXT="signoff"
 readonly TARGET_BRANCH="${SIGNOFF_BRANCH:-trunk}"
 readonly TARGET_REMOTE="${SIGNOFF_REMOTE:-origin}"
+# Seconds to wait between attempts at a commit-status POST; the number of
+# attempts is one more than the number of entries. A verdict can cost hours of
+# runner time and exists nowhere but that POST, so one transient response must
+# not discard it. Empty means post once. Overridable so the unit tests do not
+# pay for the waits.
+readonly STATUS_POST_BACKOFF="${SIGNOFF_STATUS_POST_BACKOFF-5 15 30 60}"
 DEBUG="${SIGNOFF_DEBUG:-}"
 VCS=""
 JJ_REMOTE_URL=""
@@ -605,16 +611,68 @@ append_step_summary() {
   printf '%s\n' "$text" >>"$GITHUB_STEP_SUMMARY" 2>/dev/null || true
 }
 
+# A status post that never lands leaves the commit carrying whatever it had.
+# For a remote run that is the `pending` posted on the way in, which the
+# Attestation check renders as a failure and which every reader — `signoff
+# mine`, the PR-sweep tooling — takes for a run still in flight, so nobody
+# re-dispatches. That state is indistinguishable from a live run, and a warning
+# in the log of a finished job does not reach anyone looking at the PR.
+warn_status_not_recorded() {
+  local sha="$1" state="$2" attempts="$3"
+  info "warning: could not post ${STATUS_CONTEXT}=${state} on ${sha:0:12} after ${attempts} attempt(s)"
+
+  # A `pending` that fails to post strands nothing: the commit keeps whatever it
+  # had, and this run still has its own verdict to post later. It is the verdict
+  # failing that leaves a reader holding a `pending` they cannot tell from a run
+  # still going, so that is what the summary is for.
+  if [[ "$state" != "pending" ]]; then
+    append_step_summary \
+      "### Sign-off"$'\n'"**Verdict not recorded** on \`${sha:0:12}\` — the \`${STATUS_CONTEXT}=${state}\` status did not post after ${attempts} attempt(s). Any \`pending\` left on this commit is stale, not a run in flight: sign off again."$'\n'
+  fi
+}
+
 # Post a commit status for STATUS_CONTEXT. Used for pending/failure on remote
 # runs and the final success attestation.
+#
+# Retried with backoff: this call is the only place a verdict exists, and a
+# transient response — a 5xx, a network blip, a 401 from a job that has outlived
+# its token — would otherwise discard hours of runner time for good.
 post_commit_status() {
   local repo="$1" sha="$2" state="$3" description="$4"
   description="${description:0:140}"
   debug "posting ${STATUS_CONTEXT}=${state} on ${repo}@${sha}: ${description}"
-  gh api --method POST "repos/${repo}/statuses/${sha}" \
-    -f state="$state" \
-    -f context="${STATUS_CONTEXT}" \
-    -f "description=${description}" >/dev/null
+
+  local -a backoff=()
+  read -r -a backoff <<<"$STATUS_POST_BACKOFF" || true
+  local attempts=$((${#backoff[@]} + 1))
+
+  local attempt=1 response
+  while true; do
+    if response=$(gh api --method POST "repos/${repo}/statuses/${sha}" \
+      -f state="$state" \
+      -f context="${STATUS_CONTEXT}" \
+      -f "description=${description}" 2>&1); then
+      if (( attempt > 1 )); then
+        info "posted ${STATUS_CONTEXT}=${state} on ${sha:0:12} on attempt ${attempt}"
+      fi
+      return 0
+    fi
+
+    # Report the response, not just that the call failed: "Bad credentials" on a
+    # job that has outlived its token reads differently from a 5xx, and only the
+    # second is something retrying can fix. Which one it was decides whether the
+    # answer here is more attempts or a fresh token.
+    info "warning: posting ${STATUS_CONTEXT}=${state} on ${sha:0:12} failed (attempt ${attempt}/${attempts}): $(printf '%s' "$response" | tr '\n' ' ')"
+
+    if (( attempt >= attempts )); then
+      warn_status_not_recorded "$sha" "$state" "$attempts"
+      return 1
+    fi
+    # Never fatal: a backoff this cannot honour must not abort the run before
+    # the attempt that would have recorded the verdict.
+    sleep "${backoff[attempt - 1]}" || true
+    attempt=$((attempt + 1))
+  done
 }
 
 # The STATUS_CONTEXT state currently on a commit: success/pending/failure/error,
@@ -727,6 +785,10 @@ readonly DEFAULT_MIN_FREE_GIB=25
 readonly DISK_CRITICAL_GIB=2
 # run_checks returns this when the preflight refuses to start.
 readonly EXIT_DISK_EXHAUSTED=70
+# run_checks returns this when the branch's Makefile has no rule for a target
+# the gate invokes, so the checks could not be run at all — see
+# preflight_make_targets.
+readonly EXIT_MAKE_TARGET_MISSING=71
 # Bash reports a foreground child killed by signal N as 128+N, and run_make_step
 # returns make's own status untouched. So a status at or above this means `make`
 # never reached a verdict of its own — the process tree was signalled. That is
@@ -738,9 +800,52 @@ readonly EXIT_SIGNAL_BASE=128
 # enough; matching both survives a toolchain that words one of them differently.
 readonly DISK_FULL_PATTERN='No space left on device|errno=28'
 
+# --- compiler-cache guard -----------------------------------------------------
+#
+# The pool's runners set RUSTC_WRAPPER=sccache (see .github/actions/setup-sccache)
+# against an S3-compatible endpoint on the host. When that endpoint stops
+# answering, sccache's server cannot start, and *every* rustc invocation from
+# that moment on dies before compiling anything:
+#
+#   sccache: error: Server startup failed: cache storage failed to read: …
+#     error sending request for url (http://127.0.0.1:8333/sccache/…/.sccache_check):
+#     tcp connect error: Connection refused (os error 61)
+#   error: process didn't exit successfully: `sccache …/rustc -vV` (exit status: 2)
+#
+# The branch is not evaluated — nothing is compiled — but the run reads as
+# `Sign-off checks failed after 5859s`, which is a statement about the diff. So
+# the author hunts a nonexistent bug in a branch that was never built, and the
+# commit carries a `signoff=failure` that disqualifies it outright. sccache is a
+# cache: its backend going away says nothing about the code. Recognise it and say
+# so, exactly as the disk guard above does for a volume that filled.
+#
+# Anchored on sccache's own `error:` channel, which rustc, clippy and nextest
+# have no way to produce while reporting on the branch.
+#
+# The alternatives are taken from sccache's source rather than from the spellings
+# we happen to have seen, so the set is an enumeration and not a running tally.
+# `connect_or_start_server` is the whole of the path a `RUSTC_WRAPPER=sccache`
+# call takes, and it has four outcomes: `Ok` compiles and `AddrInUse` retries,
+# while `ServerStartup::Err` bails with `Server startup failed: {reason}` and
+# `ServerStartup::TimedOut` bails with `Timed out waiting for server startup`.
+# So those two are the ways an unusable cache reaches this channel, and the third
+# alternative below is the storage self-check's own `cache storage failed to
+# read: {…}`, for an invocation that reaches a live server and then cannot read
+# through it. sccache prints the first line of the error as `sccache: error: {}`
+# and every later cause as `sccache: caused by: {}`, so the anchor belongs on the
+# first line only.
+#
+# The timeout is matched on the prefix its two bails share — sccache words it
+# `Timed out waiting for server startup. Maybe the remote service is
+# unreachable?` from the wrapper path and bare from `--start-server`. Keep it a
+# prefix: this string is an awk ERE, so the `?` ending the longer wording is a
+# quantifier, and spelling that sentence out here would match `unreachabl` plus
+# an optional `e` while reading as though it were deliberate.
+readonly CACHE_UNUSABLE_PATTERN='sccache: error: Server startup failed|sccache: error: cache storage failed|sccache: error: Timed out waiting for server startup'
+
 # Set to 1 on remote runs, where run_make_step watches build output for the
-# out-of-disk signature. Separates "watched, and it was not disk" from "nothing
-# watched at all", which failure_kind answers differently.
+# out-of-disk and unusable-cache signatures. Separates "watched, and it was
+# neither" from "nothing watched at all", which failure_kind answers differently.
 SIGNOFF_DISK_WATCH="${SIGNOFF_DISK_WATCH:-}"
 
 # Set to 1 by run_make_step when the step it ran reported running out of disk.
@@ -758,37 +863,96 @@ SIGNOFF_DISK_WATCH="${SIGNOFF_DISK_WATCH:-}"
 # value cannot outlive a run that watched anything.
 SIGNOFF_DISK_HIT="${SIGNOFF_DISK_HIT:-}"
 
-# The status the watcher exits with to report an out-of-disk line. Deliberately
+# Set to 1 by run_make_step when the step it ran reported an unusable compiler
+# cache. Same mechanism and the same reason for being a variable rather than a
+# file as SIGNOFF_DISK_HIT above, and likewise seeded from the environment so a
+# test can set up a classification without running a build.
+SIGNOFF_CACHE_HIT="${SIGNOFF_CACHE_HIT:-}"
+
+# The statuses the watcher exits with to report each signature. Deliberately
 # not 1 or 2: awk uses those for its own errors, and a watcher that itself died
-# must not be read as a volume that filled. Reserving a distinct status is also
+# must not be read as a volume that filled. Reserving distinct statuses is also
 # what lets run_make_step tell "ran, saw nothing" (0) from "never reached a
 # verdict" (anything else), which it must not conflate — see run_make_step.
 readonly DISK_WATCH_HIT_STATUS=3
+readonly CACHE_WATCH_HIT_STATUS=4
 
-# Run one `make` step, recording whether it died for want of disk. Returns
-# make's own status, never the watcher's. With the watch off — every local run —
-# make is invoked exactly as before, so local output is untouched.
+# The watcher itself, held in one place so the probe below runs exactly the
+# program that will read the build output — a probe of anything else predicts
+# nothing about the invocation that matters.
+#
+# awk rather than a captured log: it passes every line straight through and
+# keeps two bits of state, so watching costs nothing on a volume that is already
+# short of space. fflush keeps the output streaming to the Actions log line by
+# line, as it does unwatched.
+#
+# Disk wins when both signatures appear: a volume at zero can break sccache's
+# storage too, and reclaiming space is then the remedy that also fixes the
+# cache. One exit status rather than a bitmask keeps the "watcher never reached
+# a verdict" reading below unambiguous.
+readonly DISK_WATCH_PROGRAM='
+    $0 ~ pat { hit = 1 }
+    $0 ~ cache_pat { cache_hit = 1 }
+    { print; fflush() }
+    END {
+      if (hit) exit (hit_status + 0)
+      if (cache_hit) exit (cache_status + 0)
+    }
+  '
+
+# Run the watcher over no input at all. A usable watcher reads the empty stream,
+# matches nothing, and exits 0; one that cannot run — no awk on the runner, a
+# variant that rejects the program — reports its own non-zero status here,
+# while nothing is downstream of it.
+disk_watch_probe() {
+  awk -v pat="$DISK_FULL_PATTERN" -v hit_status="$DISK_WATCH_HIT_STATUS" \
+    -v cache_pat="$CACHE_UNUSABLE_PATTERN" -v cache_status="$CACHE_WATCH_HIT_STATUS" \
+    "$DISK_WATCH_PROGRAM" </dev/null >/dev/null 2>&1
+}
+
+# Give up the reading and say so. Called from both places a watcher can fail to
+# deliver one — before it runs, and part-way through — so the two cannot drift
+# into describing the same outcome differently.
+disarm_disk_watch() {
+  info "warning: the build-output watcher exited ${1} rather than reporting a verdict — falling back to free-space classification"
+  SIGNOFF_DISK_WATCH=""
+}
+
+# Run one `make` step, recording whether it died for want of disk or for want of
+# a reachable compiler cache. Returns make's own status, never the watcher's.
+# With the watch off — every local run — make is invoked exactly as before, so
+# local output is untouched.
 run_make_step() {
   if [[ -z "$SIGNOFF_DISK_WATCH" ]]; then
     make "$@"
     return $?
   fi
-  local status watch_status
+  local status watch_status probe_status=0
   local -a pipe_status
   # Reset per step, so the verdict describes the step that actually failed. Left
   # to accumulate, a step that merely *mentioned* running out of disk and then
   # succeeded would still be blaming the volume for a genuine test failure two
   # steps later.
   SIGNOFF_DISK_HIT=""
-  # awk rather than a captured log: it passes every line straight through and
-  # keeps one bit of state, so watching costs nothing on a volume that is
-  # already short of space. fflush keeps the output streaming to the Actions log
-  # line by line, as it does unwatched.
-  make "$@" 2>&1 | awk -v pat="$DISK_FULL_PATTERN" -v hit_status="$DISK_WATCH_HIT_STATUS" '
-    $0 ~ pat { hit = 1 }
-    { print; fflush() }
-    END { if (hit) exit (hit_status + 0) }
-  '
+  SIGNOFF_CACHE_HIT=""
+  # Ask whether the watcher runs before make writes a byte to it, because the
+  # only other place to find out is downstream of make — where a watcher that
+  # exits at once closes the pipe under a still-writing make, make dies of
+  # SIGPIPE, and the step reports 128+13 instead of its own status. A genuine
+  # compile failure then reads as a run that was signalled rather than one that
+  # was judged. Probing first keeps make's status make's own: an unusable
+  # watcher costs the reading, which the free-space backstop already covers,
+  # and nothing else. Regression test for #12734.
+  disk_watch_probe || probe_status=$?
+  if [[ "$probe_status" -ne 0 ]]; then
+    disarm_disk_watch "$probe_status"
+    make "$@"
+    return $?
+  fi
+  make "$@" 2>&1 | awk \
+      -v pat="$DISK_FULL_PATTERN" -v hit_status="$DISK_WATCH_HIT_STATUS" \
+      -v cache_pat="$CACHE_UNUSABLE_PATTERN" -v cache_status="$CACHE_WATCH_HIT_STATUS" \
+      "$DISK_WATCH_PROGRAM"
   # Copy the whole array in one statement: reading PIPESTATUS is itself a command,
   # so a second `x="${PIPESTATUS[1]}"` would be reading the *assignment's* status
   # and, under `set -u`, abort on the now-absent index.
@@ -797,16 +961,24 @@ run_make_step() {
   watch_status="${pipe_status[1]:-0}"
   if [[ "$watch_status" -eq "$DISK_WATCH_HIT_STATUS" ]]; then
     SIGNOFF_DISK_HIT=1
+  elif [[ "$watch_status" -eq "$CACHE_WATCH_HIT_STATUS" ]]; then
+    SIGNOFF_CACHE_HIT=1
   elif [[ "$watch_status" -ne 0 ]]; then
-    # The watcher died instead of reaching a verdict: no awk on the runner, a
-    # syntax error, a signal. Its silence is then not "no out-of-disk line went
-    # past" — nothing reliably read the output at all — so leaving the watch
-    # armed would let failure_kind assert "not disk" on the authority of a
-    # watcher that never ran, which is the same mislabelling in the other
+    # The watcher started, so the probe cleared it, and then died part-way
+    # through: killed for memory, or a signal that reached the whole group. Its
+    # silence is then neither "no out-of-disk line went past" nor "the cache was
+    # reachable" — nothing reliably read the output to the end — so leaving the
+    # watch armed would let failure_kind assert "not disk" on the authority of a
+    # reading nobody finished, which is the same mislabelling in the other
     # direction from #12427. Disarm it so classification falls back to the
     # free-space backstop, exactly as on an unwatched local run.
-    info "warning: the out-of-disk watcher exited ${watch_status} rather than reporting a verdict — falling back to free-space classification"
-    SIGNOFF_DISK_WATCH=""
+    #
+    # make can still have taken SIGPIPE on its way out here, and the probe
+    # cannot prevent that: a watcher that dies mid-stream closes the pipe with
+    # make still writing. What the probe removes is the whole class where the
+    # watcher was never going to run at all, which is the one that costs
+    # make's status on every step rather than on the step that raced.
+    disarm_disk_watch "$watch_status"
   fi
   return "$status"
 }
@@ -826,6 +998,16 @@ disk_watch_armed() {
 # what is failing.
 build_hit_disk_full() {
   [[ -n "$SIGNOFF_DISK_HIT" ]]
+}
+
+# True when this run's build reported that sccache could not reach its storage.
+# Unlike disk there is no after-the-fact backstop for this: the endpoint is on
+# the runner and may well be answering again by the time the run ends, so the
+# only evidence is what the build said while it was failing. Without the watch
+# there is no reading at all, and claiming infrastructure without one is the
+# mislabelling that matters most to avoid.
+build_hit_cache_unusable() {
+  [[ -n "$SIGNOFF_CACHE_HIT" ]]
 }
 
 # Free space in GiB on the volume holding "$1" (default: the working tree).
@@ -856,7 +1038,8 @@ disk_is_critical() {
 
 # Names what broke in a check run that did not pass, given run_checks' exit
 # status: "signalled" when nothing judged the branch at all, "disk" when the work
-# volume is the cause, "checks" for everything else, which is the branch. Three
+# volume is the cause, "cache" when sccache could not reach its storage and so
+# nothing was compiled, "checks" for everything else, which is the branch. Three
 # ways to reach "disk", in falling order of authority: the preflight refused to
 # start, the build said so itself, or the volume is at ~0 now. The last is a
 # backstop for a build whose output we did not record — a local run, or a remote
@@ -881,6 +1064,14 @@ failure_kind() {
     return
   fi
 
+  # Same authority, and for the same reason: this run stopped before it compiled
+  # anything, so no later reading — a watched build's, a free-space sample's —
+  # can describe it better than the preflight that refused to start.
+  if [[ "$check_status" -eq "$EXIT_MAKE_TARGET_MISSING" ]]; then
+    echo "missing-target"
+    return
+  fi
+
   # If we watched the build, the watch decides — both ways. No ENOSPC line means
   # the build ran out of many things but not disk, and a free-space reading must
   # not overrule that: on a shared pool another run can drag the volume under any
@@ -888,7 +1079,13 @@ failure_kind() {
   # "infrastructure" tells the author to re-dispatch a branch that will fail
   # again. Free space is consulted only when nothing watched.
   if disk_watch_armed; then
-    if build_hit_disk_full; then echo "disk"; else echo "checks"; fi
+    if build_hit_disk_full; then
+      echo "disk"
+    elif build_hit_cache_unusable; then
+      echo "cache"
+    else
+      echo "checks"
+    fi
     return
   fi
 
@@ -940,12 +1137,140 @@ describe_check_failure() {
       SIGNOFF_FAILURE_SUMMARY="### Sign-off"$'\n'"**Infrastructure failure** after ${elapsed}s — the build ran out of disk on the runner work volume, so **the checks did not complete**. Re-dispatch once the runner has space. Only if this recurs for one branch alone is the diff worth suspecting: a build script or dependency change can consume the volume by itself."$'\n'
       SIGNOFF_FAILURE_MESSAGE="sign-off aborted: the runner ran out of disk (the checks did not complete)"
       ;;
+    cache)
+      # Same reasoning as disk: the reader sees the commit status, not the log,
+      # so the status itself has to say the branch was never evaluated.
+      SIGNOFF_FAILURE_STATUS_DESC="Compiler cache unreachable after ${elapsed}s — checks did not complete, re-dispatch (triggered by ${user})"
+      SIGNOFF_FAILURE_SUMMARY="### Sign-off"$'\n'"**Infrastructure failure** after ${elapsed}s — \`sccache\` could not reach its storage endpoint on this runner, so every \`rustc\` invocation failed before compiling anything and **the checks did not complete**. Nothing here is a statement about the branch. Re-dispatch once the runner's cache endpoint is answering; if it stays down, the pool's \`sccache\` service is what needs attention (see \`.github/actions/setup-sccache\`)."$'\n'
+      SIGNOFF_FAILURE_MESSAGE="sign-off aborted: sccache could not reach its storage (the checks did not complete)"
+      ;;
+    missing-target)
+      # Neither of the two readings above: the runner is fine and the code was
+      # never judged. Distinguishing that here is the point — a verdict worded
+      # like a lint denial sends the author to read a 14k-line log to discover
+      # that nothing was wrong with the diff (#12813). The remedy belongs in the
+      # description itself, which is all most readers see.
+      SIGNOFF_FAILURE_STATUS_DESC="Sign-off could not run after ${elapsed}s — branch predates a make target the gate needs; merge ${LINT_BASE_BRANCH} in (triggered by ${user})"
+      SIGNOFF_FAILURE_SUMMARY="### Sign-off"$'\n'"**Could not run** after ${elapsed}s — this branch's \`Makefile\` has no rule for a target the gate invokes, so **the checks did not run and the branch was not evaluated**. Nothing here is a statement about the code. Merge \`${LINT_BASE_BRANCH}\` into the branch and sign off again."$'\n'
+      SIGNOFF_FAILURE_MESSAGE="sign-off could not run: this branch's Makefile has no rule for a target the gate invokes (the checks did not run) — merge ${LINT_BASE_BRANCH} in and sign off again"
+      ;;
     *)
       SIGNOFF_FAILURE_STATUS_DESC="Sign-off checks failed after ${elapsed}s (triggered by ${user})"
       SIGNOFF_FAILURE_SUMMARY="### Sign-off"$'\n'"**Failed** after ${elapsed}s."$'\n'
       SIGNOFF_FAILURE_MESSAGE="sign-off checks failed"
       ;;
   esac
+}
+
+# The make targets run_checks invokes on every run that gets past the
+# Rust-changes skip. Kept beside the preflight that reads it: a target added to
+# run_checks and not to this list reopens exactly the failure the preflight
+# exists to catch.
+#
+# `nextest-packages` is deliberately absent — it is the one target run_checks
+# invokes conditionally, so it lives in signoff_make_targets below.
+readonly SIGNOFF_MAKE_TARGETS=(lint-rust nextest verify-cli)
+
+# The targets *this* invocation will actually reach.
+#
+# Requiring a target the run will not invoke refuses a branch that could have
+# completed every step selected for it. `nextest-packages` runs only inside
+# run_targeted_tests, which this invocation reaches only when targeted work is
+# enabled — and remote sign-off disables it by default
+# (SIGNOFF_SKIP_TARGETED_{LINT,TESTS} in .github/workflows/signoff.yml), so on
+# the default remote run that target is never invoked at all.
+#
+# Errs toward asking: targeted tests can still end up skipped after this point
+# when no changed workspace package is found, and the probe costs ten
+# milliseconds. Over-probing a target the branch has costs nothing; the
+# direction that matters is never *under*-probing one the run will invoke.
+signoff_make_targets() {
+  printf '%s\n' "${SIGNOFF_MAKE_TARGETS[@]}"
+  if [[ -z "${SIGNOFF_SKIP_TARGETED_LINT:-}" && -z "${SIGNOFF_SKIP_TARGETED_TESTS:-}" ]]; then
+    printf '%s\n' nextest-packages
+  fi
+}
+
+# True when `make` can resolve TARGET in this branch's Makefile.
+#
+# `make -n` rather than a grep for `^target:`: a target can arrive through the
+# `-include Makefile.local` the root Makefile already has, and make's own answer
+# covers that. `-n` prints recipes instead of running them, and nothing in this
+# Makefile is `+`-prefixed or recursive, so the probe executes no build work —
+# it costs about ten milliseconds per target.
+#
+# Answers only what it can answer honestly. The one positive signal is make's
+# own "No rule to make target" for the single goal we asked for — which a
+# checkout with no Makefile at all also produces, and rightly so, since the gate
+# cannot run a single target there either.
+#
+# Anything else reports "present", so a reading we cannot trust never blocks a
+# sign-off: a Makefile make cannot parse says `missing separator`, and a runner
+# with no make at all says `command not found`. Both are real problems, but
+# neither is this one, and the step that hits them reports them in its own
+# words. That is the same direction free_disk_gib errs in, and for the same
+# reason: refusing to evaluate a branch on the strength of a broken probe is
+# worse than running checks that will report the problem themselves.
+make_target_exists() {
+  local target="$1" output
+  # LC_ALL=C so a localized make cannot word the message out of recognition and
+  # read as a target that is present.
+  output=$(LC_ALL=C make -n "$target" 2>&1) && return 0
+
+  # A missing *prerequisite* reports the same phrase, with a "needed by" clause
+  # naming who wanted it — a different condition, since the target itself does
+  # exist. Fall through to "present" there and let the real run report it in its
+  # own words. With a single goal on the command line, a miss without that
+  # clause can only be the goal we named.
+  if [[ "$output" == *"No rule to make target"* && "$output" != *"needed by"* ]]; then
+    return 1
+  fi
+  debug "make -n ${target} failed without naming a missing target — treating it as present"
+  return 0
+}
+
+# Stop before the Rust checks when this branch's Makefile has no rule for a
+# target *this invocation* will invoke — see signoff_make_targets for why the
+# set is not fixed.
+#
+# `make lint-rust`/`nextest`/`verify-cli` run out of the *branch's* Makefile, so
+# a branch based before a target was added builds the entire workspace and then
+# dies on the last line — every test green, then `No rule to make target
+# 'verify-cli'` and a `signoff=failure` that reddens Attestation (#12813). That
+# cost a full pool slot, ~2.6h, to learn something a probe answers in
+# milliseconds before anything is compiled.
+#
+# Fatal on local runs too, unlike the disk floor: a missing target is not a
+# threshold someone may reasonably run under, it is a step that is certain to
+# fail. Saying so now, naming the remedy, is strictly better than saying it
+# after the build.
+preflight_make_targets() {
+  local target
+  local -a missing=()
+
+  while IFS= read -r target; do
+    make_target_exists "$target" || missing+=("$target")
+  done < <(signoff_make_targets)
+
+  if (( ${#missing[@]} == 0 )); then
+    debug "every sign-off make target resolves in this branch's Makefile"
+    return 0
+  fi
+
+  local list="${missing[*]}"
+  local remedy="Merge ${LINT_BASE_BRANCH} into the branch to pick the target up, then sign off again."
+  info "${NO} This branch's Makefile has no rule for: ${list}"
+  info "  The sign-off gate runs these targets out of the branch's own Makefile, so the run would"
+  info "  build for hours and then die on the first missing one. The branch was not evaluated."
+  info "  ${remedy}"
+  if is_remote_run; then
+    # The step summary is not shown on the run page when the step itself failed,
+    # so the annotation is what an operator actually reads — same reasoning as
+    # the disk preflight's.
+    echo "::error title=Sign-off cannot run on this branch::This branch's Makefile has no rule for: ${list}. The branch was not evaluated. ${remedy}"
+  fi
+  append_step_summary "### Preflight: the branch cannot run the gate"$'\n'"This branch's \`Makefile\` has no rule for: \`${list}\`. The sign-off gate invokes these targets out of the branch's own \`Makefile\`, so **the checks did not run and the branch was not evaluated** — this is not a statement about the code. ${remedy}"$'\n'
+  return "$EXIT_MAKE_TARGET_MISSING"
 }
 
 # Stop before the Rust checks when the work volume cannot hold them. Fatal only
@@ -1034,6 +1359,7 @@ run_targeted_tests() {
 #
 # Fail-fast order:
 #   0. Skip all Rust work when the branch has no Rust-affecting files vs trunk
+#   0b. Refuse a branch whose Makefile has no rule for a target the gate invokes
 #   1. Targeted lint on packages touched by the branch (fast feedback)
 #   2. Targeted unit tests for those packages (fast feedback)
 #   3. Full workspace lint (the real gate)
@@ -1064,8 +1390,13 @@ run_checks() {
     return 0
   fi
 
-  # Deliberately after the Rust-changes skip: a docs-only sign-off compiles
-  # nothing, so a full volume is no reason to refuse it.
+  # Both preflights sit after the Rust-changes skip for the same reason: a
+  # docs-only sign-off invokes no make target and compiles nothing, so neither a
+  # full volume nor a Makefile predating one of them is a reason to refuse it.
+  #
+  # Targets first. It needs no disk, costs milliseconds, and answers a question
+  # the disk floor cannot: whether this branch can run the gate at all.
+  preflight_make_targets || return $?
   preflight_disk || return $?
 
   if [[ -z "${SIGNOFF_SKIP_TARGETED_LINT:-}" && -n "$revision" ]]; then
@@ -1298,10 +1629,12 @@ cmd_signoff() {
     start=$(date +%s)
     if is_remote_run; then
       post_pending_status "$repo" "$sha" "$user"
-      # Watch for out-of-disk lines from here on, so a failure can say whether
-      # the volume or the branch was at fault. Remote only: a local run's output
-      # then stays byte-for-byte what it is today. Arming cannot fail — there is
-      # no file to create and so nothing to clean up on exit.
+      # Watch for out-of-disk and unusable-cache lines from here on, so a failure
+      # can say whether the runner or the branch was at fault. Remote only: a
+      # local run's output then stays byte-for-byte what it is today, and neither
+      # signature belongs to a developer's own machine — the shared `target/` and
+      # the pool's sccache endpoint are both pool-only. Arming cannot fail —
+      # there is no file to create and so nothing to clean up on exit.
       SIGNOFF_DISK_WATCH=1
     fi
     # Capture status without wrapping in `if`/`||` (those also disable set -e
@@ -1463,14 +1796,33 @@ cmd_correct_cancelled() {
   return 0
 }
 
-# Replace a `pending` sign-off status with a failure.
+# Restate a left-behind `pending` sign-off status as a run that reached no verdict.
 #
 # A remote run posts `pending` before it starts the checks, so a run that never
 # reaches a verdict — the job is terminated at its budget, the runner goes away —
-# leaves that `pending` on the commit for good. `status` and `mine` then render
-# the branch as a sign-off still in progress, which is the one thing it is not.
+# leaves that `pending` on the commit carrying its "in progress" wording, which
+# is the one thing the run is not.
 #
-# Only `pending` is replaced. A run that finished has already posted its own
+# The state stays `pending`; only the description changes. Nothing judged the diff,
+# so `failure` would assert what no check established — pr.yml reads it as a code
+# failure, Attestation rejects it on the head commit (#12362), and a red `signoff`
+# never self-clears, leaving the commit disqualified until someone re-dispatches by
+# hand. `pending` is what this run's own signalled path already leaves standing (see
+# `describe_check_failure`), and pr.yml does not reject it: a pending is not a
+# verdict. Attestation then decides on its own terms — red for an ordinary head,
+# which really is not signed off, and pointing at re-running sign-off rather than at
+# a phantom defect; green only where pr.yml already allows it, on a fast-tracked head
+# or a verified inheritance chain, which a dead run is no reason to block.
+#
+# `correct-cancelled` reaches the same end state from the other direction: it repairs
+# a `failure`/`error` into `pending` and leaves an existing `pending` alone. Neither
+# handler ever writes a verdict, because neither ending is evidence about the diff.
+#
+# A dormant `pending` stays distinguishable from a live one: `mine` takes its ⟳ from
+# the in-flight run list, not from this status, and `status` reports any non-success
+# as "not signed off". The description carries the rest.
+#
+# Only `pending` is rewritten. A run that finished has already posted its own
 # success or failure, and overwriting that would discard the real verdict; the
 # same guard makes this safe to run unconditionally at the end of a job.
 #
@@ -1495,7 +1847,7 @@ cmd_clear_pending() {
     return 0
   fi
 
-  post_commit_status "$repo" "$sha" failure "$reason" \
+  post_commit_status "$repo" "$sha" pending "$reason" \
     || fail "failed to post the sign-off status (do you have write access to ${repo}?)"
   append_step_summary "### Sign-off"$'\n'"**Incomplete** on \`${sha:0:12}\` — ${reason}"$'\n'
   echo "${NO} ${sha:0:12} — ${reason}"
@@ -1838,8 +2190,10 @@ Developers:
   scripts/signoff status       Show the sign-off status of HEAD
   scripts/signoff mine         Show attestation status for all your open PRs
   scripts/signoff clear-pending [reason]
-                               Replace a left-behind '${STATUS_CONTEXT}' pending status
-                               on HEAD with a failure (no-op for any other state)
+                               Restate a left-behind '${STATUS_CONTEXT}' pending status
+                               on HEAD as a run that reached no verdict: it stays
+                               pending, with [reason] as its description (no-op for
+                               any other state)
 
 CI (.github/workflows/signoff.yml):
   scripts/signoff correct-cancelled [<sha>] [<owner/repo>]
@@ -1862,6 +2216,9 @@ Checks (when verify is on):
      rust-toolchain*, .cargo/*, clippy/rustfmt/nextest/layers config, the lint
      guards, the root Makefile) → skip Rust lint/build/tests (still posts
      status)
+  0b. Refuse the run when this branch's Makefile has no rule for a target the
+     gate invokes — a branch based before the target was added would otherwise
+     build for hours and then die on it
   1. Targeted lint of crates touched by this branch vs trunk
      (make lint-rust PACKAGES="…") — fail-fast feedback
   2. Targeted unit tests for those crates (make nextest-packages PACKAGES="…")

@@ -8,6 +8,8 @@
 # Same fail-fast order as local sign-off:
 #   0. Skip Rust lint/build/tests when the branch has no Rust-affecting files
 #      vs trunk (.rs, Cargo.toml/lock, rust-toolchain*, .cargo/*)
+#   0b. Refuse a branch whose Makefile has no rule for a target the gate invokes
+#      (a branch based before the target was added would build for hours first)
 #   1. Targeted lint of crates touched by the branch vs trunk (off by default
 #      here — see the run_targeted_prechecks input)
 #   2. Targeted unit tests for those crates (runs only when step 1 does)
@@ -41,9 +43,10 @@
 # PR/run lookups) at the fork instead of this repo.
 #
 # scripts/signoff and the setup-* composite actions below are also saved to
-# .trusted-ci/ from this repo *before* any fork commit is checked out, and
-# every later step references those copies (literal `.trusted-ci/...` paths)
-# rather than the working tree. This runs unconditionally, not just for fork
+# .trusted-ci/, read out of the object database at this workflow file's own
+# commit (github.sha) *before* any fork commit is checked out, and every later
+# step references those copies (literal `.trusted-ci/...` paths) rather than
+# the working tree. This runs unconditionally, not just for fork
 # PRs, so every step downstream has one fixed path to depend on instead of
 # branching on is_fork — `uses:` can't read a step output (the `steps`
 # context isn't available there), so a per-case path chosen at runtime
@@ -326,21 +329,59 @@ jobs:
         # would otherwise resolve to whatever the fork shipped — e.g. a fork
         # could ship a scripts/signoff that unconditionally posts "success"
         # regardless of whether checks passed, or a setup-rust action that
-        # exfiltrates secrets. Copying them out now, from this repo's
-        # checkout, and pointing every later step at these copies keeps the
-        # checks/decision/status-post logic trusted even though the code
-        # being built/linted/tested may be the fork's. Unconditional (not
-        # just for forks) so every later step has one fixed path regardless
-        # of is_fork — see the top-of-file comment. This directory is
-        # untracked, so the fork checkout below (which only touches tracked
-        # paths) leaves it alone.
+        # exfiltrates secrets. Materialising them now, and pointing every
+        # later step at these copies, keeps the checks/decision/status-post
+        # logic trusted even though the code being built/linted/tested may be
+        # the fork's. Unconditional (not just for forks) so every later step
+        # has one fixed path regardless of is_fork — see the top-of-file
+        # comment. This directory is untracked, so the fork checkout below
+        # (which only touches tracked paths) leaves it alone.
+        #
+        # Read out of the object database at ${{ github.sha }} rather than
+        # copied from the working tree. The call sites for these helpers are
+        # in this workflow file, which always comes from github.sha, while the
+        # same-repo checkout above is at the *branch under test* — so copying
+        # from the tree let a branch present an older helper to newer call
+        # sites. A branch predating `scripts/signoff correct-cancelled`
+        # (#12432) supplied a script without it, so the `if: cancelled()` step
+        # below died on "unknown command" and the cancelled run kept the
+        # `signoff=failure` it had already posted — a red Attestation on code
+        # that was never judged (#12657). Taking both helpers from one commit
+        # makes that skew unrepresentable.
+        #
+        # It also closes the same-repo half of the trust boundary the fork
+        # case already had: the branch under test no longer supplies the
+        # script that decides its own sign-off. github.sha is always a commit
+        # in this repo (workflow_dispatch can only target this repo's refs),
+        # and reading the object database rather than the tree means the fork
+        # overlay below cannot reach these files even in principle.
+        #
+        # To exercise a branch's *own* helper changes, dispatch on that branch
+        # (`gh workflow run signoff.yml --ref <branch> …`): github.sha is then
+        # the branch, so workflow and helpers agree there instead.
+        env:
+          TRUSTED_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
+          # actions/checkout fetches only the ref it checks out, even at
+          # fetch-depth: 0, so github.sha is usually absent in the same-repo
+          # case and already present in the fork case (where it is the ref
+          # checked out). No fallback to the working tree if this fails: the
+          # silent version skew is the bug, so an unresolvable trusted commit
+          # has to stop the run.
+          if ! git cat-file -e "${TRUSTED_SHA}^{commit}" 2>/dev/null; then
+            echo "Fetching this workflow's own commit ${TRUSTED_SHA} for the trusted helpers…"
+            git fetch --no-tags origin "$TRUSTED_SHA"
+          fi
+          rm -rf .trusted-ci
           mkdir -p .trusted-ci
-          cp -R .github/actions .trusted-ci/actions
-          cp scripts/signoff .trusted-ci/signoff
+          # --strip-components=1 drops the leading `.github/`, so the tree
+          # lands at .trusted-ci/actions/… — the path every `uses:` below
+          # names.
+          git archive "$TRUSTED_SHA" .github/actions | tar -x -C .trusted-ci --strip-components=1
+          git show "${TRUSTED_SHA}:scripts/signoff" > .trusted-ci/signoff
           chmod +x .trusted-ci/signoff
-          echo "Saved trusted CI helpers from $(git rev-parse --short HEAD) to .trusted-ci/"
+          echo "Saved trusted CI helpers from ${TRUSTED_SHA} (this workflow file's own commit) to .trusted-ci/"
 
       - name: Fetch and check out fork head commit
         if: needs.resolve.outputs.is_fork == 'true'
@@ -470,13 +511,18 @@ jobs:
       # it. A run that evicted this one re-posts its own `pending` after checkout and
       # setup (~25s), well after this step has run.
       #
-      # `!cancelled()` partitions this against the cancellation handler above, which
-      # would otherwise fight it: on a cancelled run that handler writes `pending` and
-      # this one would immediately rewrite that to `failure`, re-asserting the very
-      # verdict #12424 is about. The split is along the grain of #12343's own design —
-      # `timeout-minutes: 353` exists so budget expiry lands here as a *failed step*
-      # rather than a cancellation, leaving this step the incomplete-run cases and the
-      # handler above the externally-cancelled ones.
+      # `!cancelled()` partitions this against the cancellation handler above, along the
+      # grain of #12343's own design: `timeout-minutes: 353` makes budget expiry land here
+      # as a *failed step* rather than a cancellation, leaving this step the incomplete-run
+      # cases and the handler above the externally-cancelled ones.
+      #
+      # Neither handler writes a verdict, so the two agree on the end state rather than
+      # racing to opposite ones: budget expiry and external cancellation are the same
+      # epistemic state — nothing judged the diff — and `failure` is the one state that
+      # reads as a defect in it instead (#12741). They act on different starting states.
+      # `correct-cancelled` above repairs a `failure`/`error` into `pending`, and leaves
+      # an already-`pending` status untouched; this step restates a `pending` with why
+      # the run ended. A `success` already on the commit is left alone by both.
       - name: Resolve an incomplete sign-off
         if: always() && !cancelled() && steps.sign_off.conclusion != 'success'
         run: |

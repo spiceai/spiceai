@@ -2486,6 +2486,57 @@ const PROTECTED_TIER_GROWTH: u64 = 8;
 /// same-tier runs have accumulated.
 const PROTECTED_MERGE_MAX_WIDTH: usize = 32;
 
+/// Bytes of merge input one protected-snapshot pass may select, per byte of the
+/// memory pool it accounts against.
+///
+/// This pass is meant to be the *fast* consolidation path, and the work it was
+/// doing without this bound was both heavy and poor value. Heavy:
+/// [`PROTECTED_MERGE_MAX_WIDTH`] bounds the run count but not the run size, and
+/// the size tiers are relative — they grow geometrically and saturate on
+/// overflow, so arbitrarily large runs collapse into one top tier and merge as
+/// same-size peers. The pass streams, but its footprint is not size-independent:
+/// every selected input is scanned concurrently, and the Vortex encode cascade
+/// holds decompressed Arrow chunks the memory pool does not account. Unbounded,
+/// that combination OOM-killed the process on a small-RAM host (issue #12013).
+///
+/// Poor value: a merge buys exactly one fewer scan branch (`scan_protected_snapshots`
+/// unions one branch per protected snapshot), which is the same whether the runs
+/// are 8 MiB or 8 GiB, while its cost is the bytes it rewrites. Benefit is per
+/// run, cost is per byte — so the largest runs are the worst merges available,
+/// and bounding by bytes drops the least valuable work first rather than
+/// sacrificing something worth having.
+///
+/// 4× keeps a pass proportional to the budget the operator gave compaction while
+/// still letting a moderately large tier consolidate.
+///
+/// This bounds the work; it does not make it unnecessary. The rewrite exists only
+/// to apply each input's own deletions (`delete_seq > threshold_at_creation`), so
+/// a run needing none could be referenced in place instead of re-encoded — and
+/// cross-snapshot manifest references already exist and are honored by physical-file
+/// GC (see [`Self::manifest_file_relative_path`]). That is the change that would
+/// make this path fast rather than merely bounded; it is out of scope here.
+const PROTECTED_MERGE_INPUT_BYTES_PER_POOL_BYTE: u64 = 4;
+
+/// Per-pass merge-input budget for a pool of `pool_limit` (extracted for unit
+/// testing).
+///
+/// `None` for an unbounded/unknown pool: no host ceiling to derive a budget from,
+/// so selection stays unbounded — the same treatment
+/// [`deletion_bytes_over_ceiling`] gives an infinite pool.
+fn protected_merge_input_budget_for_pool(
+    pool_limit: &datafusion::execution::memory_pool::MemoryLimit,
+) -> Option<u64> {
+    use datafusion::execution::memory_pool::MemoryLimit;
+    let MemoryLimit::Finite(limit) = pool_limit else {
+        return None;
+    };
+    Some(
+        u64::try_from(*limit)
+            .unwrap_or(u64::MAX)
+            .saturating_mul(PROTECTED_MERGE_INPUT_BYTES_PER_POOL_BYTE),
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Seq-prefix BAKE (Stage 2): shrink the merge-on-read deletion index.
 //
@@ -2663,20 +2714,24 @@ fn protected_snapshot_size_tier(bytes: u64, base_bytes: u64, growth: u64) -> u32
 /// carried-forward run sits alone in a high tier and is rewritten rarely
 /// instead of on every pass.
 ///
-/// `inputs` is `(snapshot_id, deletion_threshold, bytes)`. Returns the selected
-/// `(snapshot_id, deletion_threshold)` pairs oldest-first (input order is
-/// assumed oldest-first, i.e. `UUIDv7` lexical order), or empty if no tier has
-/// `>= min_runs` runs.
+/// `max_pass_bytes` caps the selected runs' total on-disk bytes (see
+/// [`PROTECTED_MERGE_INPUT_BYTES_PER_POOL_BYTE`]): runs are taken oldest-first
+/// only while they fit, so a tier of large runs merges a few at a time. `None`
+/// leaves selection bounded only by `max_width`.
+///
+/// `inputs` is `(snapshot_id, deletion_threshold, bytes)`, oldest-first (i.e.
+/// `UUIDv7` lexical order). See [`ProtectedMergeSelection`] for the outcomes.
 fn select_protected_snapshot_merge_tier(
     inputs: &[(String, i64, u64)],
     min_runs: usize,
     max_width: usize,
     base_bytes: u64,
     growth: u64,
-) -> Vec<(String, i64)> {
+    max_pass_bytes: Option<u64>,
+) -> ProtectedMergeSelection {
     if inputs.len() < 2 || min_runs < 2 {
         // A merge needs at least two runs, and a floor below 2 is meaningless.
-        return Vec::new();
+        return ProtectedMergeSelection::NoQualifyingTier;
     }
 
     // Group input indices by tier, preserving oldest-first order within a tier.
@@ -2689,19 +2744,82 @@ fn select_protected_snapshot_merge_tier(
     // BTreeMap iterates tiers in ascending order, so the first qualifying tier
     // is the lowest one.
     for (_tier, indices) in tiers {
-        if indices.len() >= min_runs {
-            return indices
-                .into_iter()
-                .take(max_width.max(2))
-                .map(|i| {
-                    let (id, threshold, _) = &inputs[i];
-                    (id.clone(), *threshold)
-                })
-                .collect();
+        if indices.len() < min_runs {
+            continue;
         }
+        let width = max_width.max(2);
+        let mut selected: Vec<(String, i64)> = Vec::with_capacity(width.min(indices.len()));
+        let mut selected_bytes: u64 = 0;
+        for &idx in &indices {
+            if selected.len() == width {
+                break;
+            }
+            let (id, threshold, bytes) = &inputs[idx];
+            if let Some(budget) = max_pass_bytes {
+                let next = selected_bytes.saturating_add(*bytes);
+                if next > budget {
+                    break;
+                }
+                selected_bytes = next;
+            }
+            selected.push((id.clone(), *threshold));
+        }
+
+        if selected.len() >= 2 {
+            return ProtectedMergeSelection::Merge(selected);
+        }
+
+        // The oldest-first walk could not fit two runs of a qualifying tier, so the
+        // tier is settled (see `OverPassBudget` for why we do not hunt for a smaller
+        // fitting pair). Every higher tier holds strictly larger runs, so stop rather
+        // than walking up.
+        let oldest_pair_bytes = indices
+            .iter()
+            .take(2)
+            .map(|&i| inputs[i].2)
+            .fold(0u64, u64::saturating_add);
+        return ProtectedMergeSelection::OverPassBudget {
+            tier_runs: indices.len(),
+            oldest_pair_bytes,
+        };
     }
 
-    Vec::new()
+    ProtectedMergeSelection::NoQualifyingTier
+}
+
+/// Outcome of [`select_protected_snapshot_merge_tier`], distinguishing "nothing
+/// has accumulated yet" from "the qualifying tier's runs are too large to pair
+/// within the pass budget" — the caller logs the two differently.
+#[derive(Debug, PartialEq, Eq)]
+enum ProtectedMergeSelection {
+    /// Consolidate these runs: always at least 2, oldest-first.
+    Merge(Vec<(String, i64)>),
+    /// No size tier has accumulated `min_runs` same-size runs yet.
+    NoQualifyingTier,
+    /// A tier has enough runs, but its two OLDEST do not fit `max_pass_bytes`, so
+    /// the oldest-first walk cannot form a pair and the pass declines.
+    ///
+    /// Note this is the oldest pair, not the smallest: a tier spans a byte range
+    /// (up to `growth`×), so a smaller pair in the same tier could still fit. The
+    /// walk deliberately does not go looking for one. Runs this large buy one scan
+    /// branch for a very large rewrite — the pass's worst-value work — and merging
+    /// out of creation order widens the merged manifest's sequence range, which
+    /// makes the bake's clean-prefix gate more likely to block. Declining is the
+    /// better trade; a run that later levels up or shrinks becomes eligible again.
+    OverPassBudget {
+        tier_runs: usize,
+        oldest_pair_bytes: u64,
+    },
+}
+
+impl ProtectedMergeSelection {
+    /// The runs to merge, or empty for either declining outcome.
+    fn into_inputs(self) -> Vec<(String, i64)> {
+        match self {
+            Self::Merge(inputs) => inputs,
+            Self::NoQualifyingTier | Self::OverPassBudget { .. } => Vec::new(),
+        }
+    }
 }
 
 /// Write shape — encoder fan-out cap and size estimate — for the
@@ -7976,6 +8094,54 @@ impl CayenneTableProvider {
         use datafusion::execution::memory_pool::MemoryPool;
         let limit = MemoryPool::memory_limit(&*self.context.runtime_env().memory_pool);
         deletion_bytes_over_ceiling(self.pk_deletion_strategy.approx_resident_bytes(), &limit)
+    }
+
+    /// Ceiling on the on-disk bytes one protected-snapshot merge pass may select.
+    /// Both the size-tier subset merge and the seq-prefix bake union their whole
+    /// selected set in a single streaming pass, so both need it.
+    ///
+    /// Read off the pool the merge accounts against — the dedicated compaction pool
+    /// when `cayenne_compaction_memory_fraction` carved one, else the query pool,
+    /// the resolution [`Self::create_compaction_session_context`] uses. `None` when
+    /// that pool is unbounded, leaving selection bounded only by run count.
+    ///
+    /// The fallback is the looser of the two: with no carve the ceiling is measured
+    /// against the larger query pool. That is consistent (no memory was set aside
+    /// for compaction, so it may use the whole pool), but a small-RAM host wanting a
+    /// tighter bound should carve the pool.
+    /// Total on-disk bytes of `snapshot_id`, or `None` when it cannot be listed
+    /// (reported at WARN, matching the size-tier path, so a listing failure is never
+    /// mistaken for the budget declining a merge).
+    ///
+    /// Split out of the seq-prefix bake, which `Box::pin`s it. That bake is one of the
+    /// largest async fns in the crate, and inlining this arm — a listing buffer plus a
+    /// `tracing` expansion, both live across the await — grew its future enough to put
+    /// a multi-threaded test worker over the default 2 MiB stack. Issue #12436 records
+    /// the same budget for neighbouring tests in this family; boxing keeps this rarely
+    /// taken I/O arm off the parent frame for one allocation on a background path.
+    async fn snapshot_bytes_for_merge_budget(&self, snapshot_id: &str) -> Option<u64> {
+        match self.list_snapshot_files_with_sizes(snapshot_id).await {
+            Ok(files) => Some(files.iter().map(|(_, sz)| *sz).sum()),
+            Err(error) => {
+                tracing::warn!(
+                    target: "cayenne::compaction",
+                    table = self.table_metadata.table_name.as_str(),
+                    snapshot_id,
+                    %error,
+                    "Failed to size seq-prefix bake input; ending the prefix here rather \
+                     than counting it as free against the pass memory budget"
+                );
+                None
+            }
+        }
+    }
+
+    fn protected_merge_input_budget_bytes(&self) -> Option<u64> {
+        use datafusion::execution::memory_pool::MemoryPool;
+        let env = super::compaction::compaction_runtime_env()
+            .unwrap_or_else(|| Arc::clone(self.context.runtime_env()));
+        let limit = MemoryPool::memory_limit(&*env.memory_pool);
+        protected_merge_input_budget_for_pool(&limit)
     }
 
     /// Best-effort write-time read-back (`deletion_mode: position`): scan newly
@@ -16521,7 +16687,7 @@ impl CayenneTableProvider {
     /// ([`Self::partition_cold_manifest_for_promotion`]), read the canonical
     /// visible stream restricted to warm + dirty cold files (all deletes
     /// applied, single-version per key — the proven rewrite read with a
-    /// [`super::cold_partition::ColdScanFileSubset`] session extension),
+    /// [`super::cold_partition::ColdScanFiles`] session extension),
     /// Z-order cluster it, write read-optimized Vortex to the cold store, then
     /// atomically register the new files PLUS the carried-forward clean
     /// manifest rows + overwrite-clear the warm tier + flip to a fresh empty
@@ -16833,18 +16999,23 @@ impl CayenneTableProvider {
         // files' across promotions. Watch `datalake_rewrite_selectivity`; if it
         // ratchets up, the counter-measure is a recluster policy (full rewrite
         // past a dirty-fraction threshold).
-        let (dirty_cold, clean_cold) = (partition.dirty, partition.clean);
+        let (dirty_cold, clean_cold) = (Arc::new(partition.dirty), partition.clean);
 
         // Canonical visible read (all tiers, all deletes applied, single-version
         // per key) — reuses the proven rewrite read so cold is correct by
-        // construction. The session's `ColdScanFileSubset` extension restricts
-        // its cold branch to the dirty files: clean files stay out of the
-        // stream entirely.
-        let dirty_urls: std::collections::HashSet<String> =
-            dirty_cold.iter().map(|f| f.file_url.clone()).collect();
+        // construction. The session's `ColdScanFiles` extension SUPPLIES its
+        // cold branch the dirty files: clean files stay out of the stream
+        // entirely.
+        //
+        // The extension carries the classified rows themselves, so the rewrite
+        // reads exactly the listing this promotion classified. Handing down
+        // their URLs instead would leave the scan to select them out of its own
+        // later manifest capture, and a dirty file absent from that capture
+        // would be dropped from the rewrite while the commit below still
+        // retires it — silent row loss (#12708).
         let ctx = self.create_compaction_session_context_with_config(
             SessionConfig::default().with_extension(Arc::new(
-                super::cold_partition::ColdScanFileSubset(dirty_urls),
+                super::cold_partition::ColdScanFiles(Arc::clone(&dirty_cold)),
             )),
         );
         let (stream, _generation_before) = self.visible_file_stream_for_rewrite(&ctx).await?;
@@ -17231,6 +17402,9 @@ impl CayenneTableProvider {
         // distribution (e.g. one carried-forward merged snapshot dwarfing the
         // small new deltas). This is diagnostic I/O outside the fence.
         let sizing_start = std::time::Instant::now();
+        // Resolved before sizing: under a finite budget an unsizeable candidate must be
+        // DROPPED, not counted as free (see the per-candidate arm below).
+        let max_pass_bytes = self.protected_merge_input_budget_bytes();
         let mut sized_candidates: Vec<(String, i64, u64)> = Vec::with_capacity(candidates.len());
         for (snapshot_id, threshold) in &candidates {
             let bytes = match self.list_snapshot_files_with_sizes(snapshot_id).await {
@@ -17240,10 +17414,19 @@ impl CayenneTableProvider {
                         target: "cayenne::compaction",
                         table = self.table_metadata.table_name.as_str(),
                         snapshot_id = snapshot_id,
-                        "Failed to size protected-snapshot merge input for tiering: {e}"
+                        budgeted = max_pass_bytes.is_some(),
+                        "Failed to size protected-snapshot merge input: {e}"
                     );
-                    // Treat as tier 0 (unknown/small) so it stays a merge
-                    // candidate rather than being skipped as "large".
+                    if max_pass_bytes.is_some() {
+                        // The budget is a memory ceiling, so an unknown size cannot be
+                        // treated as small: counting it as 0 would let an arbitrarily
+                        // large run in for free and defeat the bound. Drop it as a
+                        // candidate instead; a later pass retries once it can be sized.
+                        continue;
+                    }
+                    // No budget to defeat, so keep the historical treat-as-tier-0
+                    // behavior: the run stays a candidate rather than being skipped
+                    // as "large".
                     0
                 }
             };
@@ -17258,15 +17441,48 @@ impl CayenneTableProvider {
         // only when its tier fills up and it levels up) and read amplification
         // to at most `min_runs - 1` un-merged runs per tier — instead of folding
         // the large carried-forward blob back in on every pass.
+        // `max_pass_bytes` (resolved above) is the absolute per-pass input ceiling above
+        // the relative size tiers, so a tier of very large runs consolidates a few at a
+        // time (issue #12013).
         let min_runs = self.context.compaction_trigger_protected_snapshots().max(2);
-        let inputs = select_protected_snapshot_merge_tier(
+        let selection = select_protected_snapshot_merge_tier(
             &sized_candidates,
             min_runs,
             PROTECTED_MERGE_MAX_WIDTH,
             PROTECTED_TIER_BASE_BYTES,
             PROTECTED_TIER_GROWTH,
+            max_pass_bytes,
         );
 
+        if let ProtectedMergeSelection::OverPassBudget {
+            tier_runs,
+            oldest_pair_bytes,
+        } = &selection
+        {
+            // Declining here costs less than it appears. A merge's benefit is one fewer
+            // scan branch, which is the same whether the runs are 8 MiB or 8 GiB; its
+            // cost is the bytes it rewrites. So a large-run tier is the worst-value work
+            // this pass can do, and leaving it settled is the same call the
+            // current-snapshot picker makes for files at or above the target size.
+            //
+            // The alarm for the read amplification that remains belongs to the read
+            // path, which already WARNs at `8 x compaction_trigger_protected_snapshots`
+            // protected snapshots (`scan_protected_snapshots`) — on the harm itself
+            // rather than on this proxy for it. This line is the cause, for whoever
+            // investigates that warning.
+            tracing::debug!(
+                target: "cayenne::compaction",
+                table = self.table_metadata.table_name.as_str(),
+                tier_runs,
+                oldest_pair_bytes,
+                max_pass_bytes = max_pass_bytes.unwrap_or(u64::MAX),
+                "Skipping fast protected-snapshot compaction: the qualifying tier's two oldest \
+                 runs exceed the pass memory budget"
+            );
+            return Ok(false);
+        }
+
+        let inputs = selection.into_inputs();
         if inputs.len() < 2 {
             tracing::debug!(
                 target: "cayenne::compaction",
@@ -17274,6 +17490,7 @@ impl CayenneTableProvider {
                 candidates = sized_candidates.len(),
                 min_runs,
                 tier_base_bytes = PROTECTED_TIER_BASE_BYTES,
+                max_pass_bytes = max_pass_bytes.unwrap_or(u64::MAX),
                 "Skipping fast protected-snapshot compaction: no size tier has enough runs to merge"
             );
             return Ok(false);
@@ -17315,6 +17532,7 @@ impl CayenneTableProvider {
             total_input_bytes,
             largest_input_bytes,
             dominance_pct,
+            max_pass_bytes = max_pass_bytes.unwrap_or(u64::MAX),
             phase1_fence_ms,
             sizing_ms,
             "Running fast protected-snapshot subset compaction"
@@ -17751,6 +17969,17 @@ impl CayenneTableProvider {
     /// `run_compaction_trigger`.
     #[doc(hidden)]
     pub async fn bake_seq_prefix_protected_snapshots(&self) -> Result<bool> {
+        // Boxed so the whole bake body lives on the heap rather than in the caller's
+        // frame. This is one of the largest async fns in the crate, and its future is
+        // inlined into every caller's — the compaction trigger, and the property tests
+        // that drive it directly. Growing it by even a small budgeted-selection block
+        // put a `#[tokio::test(flavor = "multi_thread")]` worker over the default 2 MiB
+        // stack; issue #12436 records the same budget for neighbouring tests in this
+        // family. One allocation per pass on a background path.
+        Box::pin(self.bake_seq_prefix_protected_snapshots_inner()).await
+    }
+
+    async fn bake_seq_prefix_protected_snapshots_inner(&self) -> Result<bool> {
         // GATE: key-delete tables only. Position deletes are file-scoped (the
         // prune is a no-op for them) and their subset compaction must serialize
         // against writers — neither is the seq-prefix bake's domain.
@@ -17821,6 +18050,22 @@ impl CayenneTableProvider {
         let candidate_ids = &ordered_ids[..split];
         let mut selected: Vec<(String, i64)> = Vec::with_capacity(candidate_ids.len());
         let mut cutoff: i64 = i64::MIN;
+        // The bake unions its whole selected prefix in one streaming pass and has no
+        // size tiers, so it needs the same absolute input ceiling as the size-tier
+        // path (issue #12013). Truncating is safe: it only lowers T, and the
+        // clean-prefix gate re-validates the resurrect-critical prune against
+        // whatever prefix was selected.
+        //
+        // Sizing costs one listing per candidate, so it runs only under a finite
+        // budget, and those sizes are reused for the encode fan-out below. On an
+        // unbounded pool the encode sizing stays after the clean-prefix gate, so a
+        // blocked bake pays no listings.
+        let max_pass_bytes = self.protected_merge_input_budget_bytes();
+        let mut selected_input_bytes: u64 = 0;
+        // Why the prefix stopped short, for the skip log below. A budget stop is
+        // expected steady state; a sizing failure is an I/O problem that must not
+        // masquerade as one.
+        let mut stopped_early: Option<&'static str> = None;
         for id in candidate_ids {
             let files = self
                 .catalog
@@ -17828,6 +18073,28 @@ impl CayenneTableProvider {
                 .await
                 .unwrap_or_default();
             let threshold = thresholds.get(id).copied().unwrap_or(0);
+            if let Some(budget) = max_pass_bytes {
+                // On-disk bytes, sized as the size-tier path sizes its candidates.
+                // An unknown size must NOT count as 0: the budget is a memory ceiling,
+                // and counting an unsizeable run as free would let an arbitrarily large
+                // one in and defeat the bound. End the prefix instead; the next tick
+                // retries once it can be sized.
+                let Some(candidate_bytes) =
+                    Box::pin(self.snapshot_bytes_for_merge_budget(id)).await
+                else {
+                    stopped_early = Some("sizing_failed");
+                    break;
+                };
+                let next = selected_input_bytes.saturating_add(candidate_bytes);
+                if next > budget {
+                    // Stop here. `cutoff` has only accumulated over already-selected
+                    // snapshots, so T matches the truncated set; the next tick bakes
+                    // the rest.
+                    stopped_early = Some("over_budget");
+                    break;
+                }
+                selected_input_bytes = next;
+            }
             if files.is_empty() {
                 // Empty manifest ⟹ a CDC-published snapshot whose async manifest
                 // population has not landed yet — both compaction paths author the
@@ -17861,7 +18128,10 @@ impl CayenneTableProvider {
                 table = self.table_metadata.table_name.as_str(),
                 candidates = candidate_ids.len(),
                 keep_recent = BAKE_KEEP_RECENT_SNAPSHOTS,
-                "Skipping seq-prefix bake: fewer than two manifest-populated older snapshots to bake"
+                stopped_early = stopped_early.unwrap_or("none"),
+                max_pass_bytes = max_pass_bytes.unwrap_or(u64::MAX),
+                "Skipping seq-prefix bake: fewer than two older snapshots fit the pass memory \
+                 budget"
             );
             return Ok(false);
         }
@@ -17874,10 +18144,14 @@ impl CayenneTableProvider {
             target: "cayenne::compaction",
             table = self.table_metadata.table_name.as_str(),
             input_count = selected.len(),
+            candidates = candidate_ids.len(),
             keep_recent = BAKE_KEEP_RECENT_SNAPSHOTS,
             prefix_cutoff,
             fence_max_delete_seq,
             deletion_index_len = deletion_snapshot.delete_len(),
+            selected_input_bytes,
+            max_pass_bytes = max_pass_bytes.unwrap_or(u64::MAX),
+            stopped_early = stopped_early.unwrap_or("none"),
             "Running seq-prefix bake (consolidating the clean older prefix)"
         );
 
@@ -17943,13 +18217,19 @@ impl CayenneTableProvider {
         // not apply; size the parallel-encode fan-out from the selected inputs'
         // on-disk bytes exactly as the size-tier path does. `is_position_based()`
         // is false here (gated above), so `keeps_positions_serial` is false.
-        let mut total_input_bytes: u64 = 0;
-        for (snapshot_id, _) in &selected {
-            total_input_bytes += match self.list_snapshot_files_with_sizes(snapshot_id).await {
-                Ok(files) => files.iter().map(|(_, sz)| *sz).sum(),
-                Err(_) => 0,
-            };
-        }
+        let total_input_bytes = if max_pass_bytes.is_some() {
+            // Summed by the budget-bounded selection above.
+            selected_input_bytes
+        } else {
+            let mut bytes: u64 = 0;
+            for (snapshot_id, _) in &selected {
+                bytes += match self.list_snapshot_files_with_sizes(snapshot_id).await {
+                    Ok(files) => files.iter().map(|(_, sz)| *sz).sum(),
+                    Err(_) => 0,
+                };
+            }
+            bytes
+        };
         let (target_partitions, estimated_bytes) = subset_merge_write_shape(
             /* keeps_positions_serial */ false,
             state.config().target_partitions(),
@@ -18711,9 +18991,9 @@ impl CayenneTableProvider {
     }
 
     /// [`Self::create_compaction_session_context`] with an explicit config —
-    /// the carry-forward promotion attaches its [`ColdScanFileSubset`]
-    /// extension here so its private session's cold branch reads only the
-    /// dirty files being rewritten.
+    /// the carry-forward promotion attaches its
+    /// [`super::cold_partition::ColdScanFiles`] extension here so its private
+    /// session's cold branch reads only the dirty files being rewritten.
     fn create_compaction_session_context_with_config(
         &self,
         config: SessionConfig,
@@ -25900,7 +26180,11 @@ impl CayenneTableProvider {
     /// a manifest read after the caller's capture can belong to a later promotion,
     /// and pairing it with the captured warm snapshot double-counts every promoted
     /// row. Each row carries its serialized Vortex `FileStatistics` blob, so
-    /// listing-time pruning runs with NO object-store round-trip. The returned plan
+    /// listing-time pruning runs with NO object-store round-trip.
+    ///
+    /// A promotion's private session overrides `cold_files` entirely with its
+    /// [`super::cold_partition::ColdScanFiles`] extension — see the override
+    /// below for why that is a replacement and not a filter. The returned plan
     /// is a Vortex `DataSourceExec`; the caller wraps it with the key-based
     /// (`Ignore`) deletion filter and unions it into the scan tree.
     async fn build_cold_tier_scan_plan(
@@ -25932,18 +26216,12 @@ impl CayenneTableProvider {
         }
 
         // Carry-forward promotion: the promotion's PRIVATE session carries a
-        // `ColdScanFileSubset` config extension restricting this branch to the
-        // dirty files being rewritten (clean files are carried forward by
-        // manifest reference, never re-read). User-query sessions never carry
-        // the extension, so queries always see the full captured manifest.
-        let cold_files: Vec<&crate::metadata::ColdTierFile> =
-            match scan_config.get_extension::<super::cold_partition::ColdScanFileSubset>() {
-                Some(subset) => cold_files
-                    .iter()
-                    .filter(|f| subset.0.contains(&f.file_url))
-                    .collect(),
-                None => cold_files.iter().collect(),
-            };
+        // `ColdScanFiles` config extension supplying the dirty files being
+        // rewritten. User-query sessions never carry it, so queries always see
+        // the full captured manifest.
+        let promotion_files = scan_config.get_extension::<super::cold_partition::ColdScanFiles>();
+        let cold_files =
+            super::cold_partition::cold_files_for_scan(cold_files, promotion_files.as_deref());
         // No early all-empty guard needed: the per-file loop skips zero-size
         // files and the `object_store_url is None` / `kept.is_empty()` checks
         // below both return `Ok(None)` when nothing survives.
@@ -28402,14 +28680,22 @@ impl super::compaction::CompactionRunner for CayenneTableProvider {
         let Some(_pass) = super::compaction::try_track_compaction_pass() else {
             return Ok(false);
         };
-        // Routes to the fast protected-snapshot subset compaction, which only
-        // rewrites immutable protected snapshots and CAS-swaps them in the
-        // catalog. Key-delete tables can run concurrently with appends because
-        // post-fence deletes still apply to the merged snapshot by sequence.
-        // Position-delete tables serialize the rewrite inside
-        // `compact_protected_snapshots_subset`, because their tombstones are
-        // file-path scoped and would otherwise be lost if they target a file
-        // that is swapped away by the merge.
+        // One trigger runs up to three passes, in this order:
+        //
+        // 1. Seq-prefix bake — shrinks the merge-on-read deletion index by
+        //    re-encoding protected-snapshot survivors. Key-delete mode only.
+        //    Falls through to the passes below on success.
+        // 2. Current-snapshot small-file compaction — rewrites the CURRENT
+        //    snapshot. Takes the subset path (re-encode the picked files,
+        //    hardlink the rest) only when `subset_rewrite_eligibility` holds;
+        //    otherwise a full re-encode that also folds in and clears EVERY
+        //    protected snapshot and flips the snapshot pointer. A committed
+        //    pass returns early, so pass 3 is skipped this trigger.
+        // 3. Protected-snapshot subset merge — size-tiered consolidation of the
+        //    protected set alone.
+        //
+        // So this trigger is not confined to the protected set: pass 2 rewrites
+        // `S0` and can consume the whole protected set as a side effect.
 
         // NOTE: cold-tier graduation (storage-cascade bottom tier) does NOT run
         // here. It is a heavy whole-table rewrite + object-store upload, so it
@@ -28503,6 +28789,15 @@ impl super::compaction::CompactionRunner for CayenneTableProvider {
             return Ok(true);
         }
 
+        // Pass 3: the fast protected-snapshot subset merge, which rewrites only
+        // immutable protected snapshots and CAS-swaps them in the catalog —
+        // never `S0`, its pointer, or its delete files. Key-delete tables can
+        // run concurrently with appends because post-fence deletes still apply
+        // to the merged snapshot by sequence. Position-delete tables serialize
+        // the rewrite inside `compact_protected_snapshots_subset`, because their
+        // tombstones are file-path scoped and would otherwise be lost if they
+        // target a file that is swapped away by the merge.
+        //
         // Cheap lock-free early-out first: skip acquiring `compaction_lock` /
         // `listing_fence` and building a session context unless the protected
         // set already has enough runs to be worth merging. `protected_snapshots`
@@ -29923,7 +30218,8 @@ mod tests {
             sized("c", base * 4), // tier 1
             sized("d", base * 5), // tier 1
         ];
-        let selected = select_protected_snapshot_merge_tier(&inputs, 2, 32, base, growth);
+        let selected =
+            select_protected_snapshot_merge_tier(&inputs, 2, 32, base, growth, None).into_inputs();
         let ids: Vec<&str> = selected.iter().map(|(id, _)| id.as_str()).collect();
         assert_eq!(ids, vec!["a", "b"]);
     }
@@ -29934,8 +30230,10 @@ mod tests {
         let growth = 8;
         // One run per tier — no tier reaches min_runs = 2.
         let inputs = vec![sized("a", 1024), sized("b", base * 4)];
-        let selected = select_protected_snapshot_merge_tier(&inputs, 2, 32, base, growth);
-        assert!(selected.is_empty());
+        assert_eq!(
+            select_protected_snapshot_merge_tier(&inputs, 2, 32, base, growth, None),
+            ProtectedMergeSelection::NoQualifyingTier
+        );
     }
 
     #[test]
@@ -29949,7 +30247,8 @@ mod tests {
             sized("c", 300),
             sized("d", 400),
         ];
-        let selected = select_protected_snapshot_merge_tier(&inputs, 2, 2, base, growth);
+        let selected =
+            select_protected_snapshot_merge_tier(&inputs, 2, 2, base, growth, None).into_inputs();
         let ids: Vec<&str> = selected.iter().map(|(id, _)| id.as_str()).collect();
         assert_eq!(ids, vec!["a", "b"]);
     }
@@ -29959,18 +30258,124 @@ mod tests {
         let base = 8 * 1024 * 1024;
         let growth = 8;
         // Fewer than two inputs, or a sub-2 floor, can never merge.
-        assert!(
-            select_protected_snapshot_merge_tier(&[sized("a", 1)], 2, 32, base, growth).is_empty()
+        assert_eq!(
+            select_protected_snapshot_merge_tier(&[sized("a", 1)], 2, 32, base, growth, None),
+            ProtectedMergeSelection::NoQualifyingTier
         );
-        assert!(
+        assert_eq!(
             select_protected_snapshot_merge_tier(
                 &[sized("a", 1), sized("b", 2)],
                 1,
                 32,
                 base,
-                growth
-            )
-            .is_empty()
+                growth,
+                None
+            ),
+            ProtectedMergeSelection::NoQualifyingTier
+        );
+    }
+
+    #[test]
+    fn select_merge_tier_takes_only_the_runs_that_fit_the_pass_budget() {
+        // Regression test for #12013: eight same-tier 1 GiB runs were unioned in one
+        // pass, OOM-killing a small-RAM host. A 3 GiB budget takes the three oldest;
+        // later passes consolidate the rest.
+        let base = 8 * 1024 * 1024;
+        let growth = 8;
+        let gib = 1024 * 1024 * 1024;
+        let inputs: Vec<(String, i64, u64)> = (0..8)
+            .map(|i| sized(&format!("s{i}"), gib))
+            .collect::<Vec<_>>();
+
+        let selected =
+            select_protected_snapshot_merge_tier(&inputs, 2, 32, base, growth, Some(3 * gib))
+                .into_inputs();
+        let ids: Vec<&str> = selected.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids, vec!["s0", "s1", "s2"], "oldest-first, budget-bounded");
+
+        // An unbounded pool keeps the prior behavior: the whole tier, up to max_width.
+        let unbounded = select_protected_snapshot_merge_tier(&inputs, 2, 32, base, growth, None)
+            .into_inputs()
+            .len();
+        assert_eq!(unbounded, 8);
+    }
+
+    #[test]
+    fn select_merge_tier_declines_when_two_runs_cannot_fit_the_pass_budget() {
+        // A tier whose runs are too large to pair within the budget is settled: one
+        // run is not a merge, and every higher tier is larger, so the pass declines.
+        let base = 8 * 1024 * 1024;
+        let growth = 8;
+        let gib = 1024 * 1024 * 1024;
+        let inputs: Vec<(String, i64, u64)> = (0..4)
+            .map(|i| sized(&format!("s{i}"), 4 * gib))
+            .collect::<Vec<_>>();
+
+        // Reported as a budget stall rather than "nothing accumulated", so the caller
+        // can escalate the read amplification it implies.
+        assert_eq!(
+            select_protected_snapshot_merge_tier(&inputs, 2, 32, base, growth, Some(6 * gib)),
+            ProtectedMergeSelection::OverPassBudget {
+                tier_runs: 4,
+                oldest_pair_bytes: 8 * gib,
+            }
+        );
+        // Exactly two fitting is enough to make progress.
+        let pair =
+            select_protected_snapshot_merge_tier(&inputs, 2, 32, base, growth, Some(8 * gib))
+                .into_inputs();
+        let ids: Vec<&str> = pair.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids, vec!["s0", "s1"]);
+    }
+
+    #[test]
+    fn select_merge_tier_reports_the_oldest_pair_not_the_smallest() {
+        // A tier spans a byte range, so the oldest pair can be larger than a later
+        // pair. The walk is oldest-first and declines rather than hunting for a
+        // fitting pair (see `OverPassBudget`); the reported bytes are the oldest pair,
+        // which is what the skip log must quote.
+        let base = 8 * 1024 * 1024;
+        let growth = 8;
+        let gib = 1024 * 1024 * 1024;
+        // All tier 3 (> 8 MiB * 8^2 = 512 MiB): 4 GiB, 4 GiB, then two 1 GiB runs.
+        let inputs = vec![
+            sized("old_a", 4 * gib),
+            sized("old_b", 4 * gib),
+            sized("new_a", gib),
+            sized("new_b", gib),
+        ];
+        assert_eq!(
+            select_protected_snapshot_merge_tier(&inputs, 2, 32, base, growth, Some(3 * gib)),
+            ProtectedMergeSelection::OverPassBudget {
+                tier_runs: 4,
+                oldest_pair_bytes: 8 * gib,
+            },
+            "the two 1 GiB runs would fit, but the walk is oldest-first by design"
+        );
+    }
+
+    #[test]
+    fn protected_merge_input_budget_scales_with_the_pool_and_is_none_when_unbounded() {
+        use datafusion::execution::memory_pool::MemoryLimit;
+
+        assert_eq!(
+            protected_merge_input_budget_for_pool(&MemoryLimit::Finite(1_000)),
+            Some(1_000 * PROTECTED_MERGE_INPUT_BYTES_PER_POOL_BYTE)
+        );
+        // An unbounded/unknown pool has no ceiling to derive a budget from, so
+        // selection stays unbounded — never clamped to zero.
+        assert_eq!(
+            protected_merge_input_budget_for_pool(&MemoryLimit::Infinite),
+            None
+        );
+        assert_eq!(
+            protected_merge_input_budget_for_pool(&MemoryLimit::Unknown),
+            None
+        );
+        // A pool near usize::MAX must saturate, not wrap.
+        assert_eq!(
+            protected_merge_input_budget_for_pool(&MemoryLimit::Finite(usize::MAX)),
+            Some(u64::MAX)
         );
     }
 
@@ -30062,6 +30467,146 @@ mod tests {
                 now,
             ),
             None
+        );
+    }
+
+    /// End-to-end regression for #12013 on the real compaction path: under a finite
+    /// pool the subset merge must decline a tier whose runs cannot be paired within
+    /// the per-pass budget, instead of unioning up to
+    /// [`PROTECTED_MERGE_MAX_WIDTH`] of them and driving the host OOM. The
+    /// unbounded-pool control shows the bound is gated on a finite pool.
+    ///
+    /// The only size assumption is that the budget sits below the two smallest runs,
+    /// checked as a precondition against the real on-disk sizes. Smallest, not oldest
+    /// (which is what selection takes and the WARN reports): the smallest pair is the
+    /// minimum possible pair sum, so exceeding the budget proves no pair can fit.
+    #[tokio::test]
+    async fn subset_compaction_declines_when_no_two_runs_fit_the_pass_memory_budget() {
+        use arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::execution::memory_pool::GreedyMemoryPool;
+        use datafusion_execution::runtime_env::RuntimeEnvBuilder;
+
+        // 4× this is the per-pass budget: far below one Vortex snapshot, so no pair
+        // of runs can fit. The precondition below checks that against real sizes.
+        const POOL_BYTES: usize = 512;
+        const TRIGGER: usize = 4;
+        const ROWS: i64 = 6;
+
+        let config = || VortexConfig {
+            // File-backed protected snapshots (not absorbed by the inline memtable).
+            inline_max_rows: 0,
+            compaction_trigger_protected_snapshots: TRIGGER,
+            // Only our explicit call runs; never race the background tick.
+            compaction_background_interval_ms: 3_600_000,
+            ..VortexConfig::default()
+        };
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        let expected: Vec<(i64, i64)> = (0..ROWS).map(|i| (i, i * 10)).collect();
+
+        // Finite pool: the per-pass budget binds and the merge declines.
+        let finite_rt = Arc::new(
+            RuntimeEnvBuilder::new()
+                .with_memory_pool(Arc::new(GreedyMemoryPool::new(POOL_BYTES)))
+                .build()
+                .expect("finite-pool runtime env"),
+        );
+        let (finite, _catalog, _tmp) =
+            create_cdc_upsert_table_with_vortex_config("subset_budget_finite", finite_rt, config())
+                .await;
+        // Six one-row upserts publish six small, same-tier protected snapshots.
+        for i in 0..ROWS {
+            insert_batch(
+                &finite,
+                id_value_batch(Arc::clone(&schema), &[i], &[i * 10]),
+            )
+            .await;
+        }
+
+        let before = finite.protected_snapshots.load_full().len();
+        assert!(
+            before >= TRIGGER,
+            "precondition: need >= {TRIGGER} protected snapshots to arm the tier, got {before}"
+        );
+
+        // Precondition: the budget sits below the two smallest runs, so a declining
+        // pass is the budget's doing and not an unarmed tier.
+        let budget = finite
+            .protected_merge_input_budget_bytes()
+            .expect("a finite pool must yield a budget");
+        let mut sizes: Vec<u64> = Vec::new();
+        for id in finite.protected_snapshots.load_full().keys() {
+            let bytes = finite
+                .list_snapshot_files_with_sizes(id)
+                .await
+                .expect("list snapshot files")
+                .iter()
+                .map(|(_, sz)| *sz)
+                .sum();
+            sizes.push(bytes);
+        }
+        sizes.sort_unstable();
+        let two_smallest: u64 = sizes.iter().take(2).sum();
+        assert!(
+            two_smallest > budget,
+            "precondition: the two smallest runs ({two_smallest} B) must exceed the \
+             {budget} B pass budget; lower POOL_BYTES"
+        );
+
+        let merged = finite
+            .compact_protected_snapshots_subset(usize::MAX)
+            .await
+            .expect("a declined pass is a no-op, never an error");
+        assert!(
+            !merged,
+            "the pass must decline: no two runs fit the {budget} B budget"
+        );
+        assert_eq!(
+            finite.protected_snapshots.load_full().len(),
+            before,
+            "a declined pass must leave the protected set untouched"
+        );
+        let finite_ctx = SessionContext::new();
+        assert_eq!(
+            collect_id_value_pairs(&finite_ctx, &finite, "subset_budget_finite").await,
+            expected,
+            "declining must never lose rows"
+        );
+
+        // Unbounded-pool control: no ceiling to derive a budget from, so the tier
+        // merges as it did before the fix.
+        let unbounded_ctx = SessionContext::new();
+        let (unbounded, _catalog2, _tmp2) = create_cdc_upsert_table_with_vortex_config(
+            "subset_budget_unbounded",
+            unbounded_ctx.runtime_env(),
+            config(),
+        )
+        .await;
+        for i in 0..ROWS {
+            insert_batch(
+                &unbounded,
+                id_value_batch(Arc::clone(&schema), &[i], &[i * 10]),
+            )
+            .await;
+        }
+        assert_eq!(
+            unbounded.protected_merge_input_budget_bytes(),
+            None,
+            "an unbounded pool must leave selection unbounded"
+        );
+        assert!(
+            unbounded
+                .compact_protected_snapshots_subset(usize::MAX)
+                .await
+                .expect("control compaction should not error"),
+            "the same tier must still merge on an unbounded pool"
+        );
+        assert_eq!(
+            collect_id_value_pairs(&unbounded_ctx, &unbounded, "subset_budget_unbounded").await,
+            expected,
+            "the control merge must preserve all rows"
         );
     }
 
@@ -38141,6 +38686,71 @@ mod tests {
             key100,
             vec![(100, 999)],
             "key 100 present exactly once as its re-inserted > T value 999, got {key100:?}"
+        );
+    }
+
+    /// #12013 companion for the other path that unions protected snapshots: the
+    /// seq-prefix bake selects an entire older prefix with no size tiers, so an
+    /// unbounded prefix of large runs is the same OOM. Under a finite pool the prefix
+    /// is truncated to what fits the per-pass budget; here nothing fits, so the bake
+    /// declines. `seq_prefix_bake_leaves_above_cutoff_snapshots_readable` is the
+    /// unbounded-pool control on the same fixture.
+    #[tokio::test]
+    async fn seq_prefix_bake_declines_when_the_prefix_exceeds_the_pass_memory_budget() {
+        use datafusion::execution::memory_pool::GreedyMemoryPool;
+        use datafusion_execution::runtime_env::RuntimeEnvBuilder;
+
+        // 4× this is the per-pass budget: far below one Vortex snapshot, checked as a
+        // precondition below.
+        const POOL_BYTES: usize = 512;
+
+        let ctx = SessionContext::new();
+        let finite_rt = Arc::new(
+            RuntimeEnvBuilder::new()
+                .with_memory_pool(Arc::new(GreedyMemoryPool::new(POOL_BYTES)))
+                .build()
+                .expect("finite-pool runtime env"),
+        );
+        let (provider, _tmp, _ids) =
+            build_seq_prefix_fixture("bake_budget_finite", finite_rt, &[10, 20, 30, 40, 50]).await;
+        let before = provider.protected_snapshots.load_full();
+
+        let budget = provider
+            .protected_merge_input_budget_bytes()
+            .expect("a finite pool must yield a budget");
+        let mut smallest = u64::MAX;
+        for id in before.keys() {
+            let bytes: u64 = provider
+                .list_snapshot_files_with_sizes(id)
+                .await
+                .expect("list snapshot files")
+                .iter()
+                .map(|(_, sz)| *sz)
+                .sum();
+            smallest = smallest.min(bytes);
+        }
+        assert!(
+            smallest > budget,
+            "precondition: the smallest run ({smallest} B) must exceed the {budget} B \
+             pass budget; lower POOL_BYTES"
+        );
+
+        assert!(
+            !provider
+                .bake_seq_prefix_protected_snapshots()
+                .await
+                .expect("a declined bake is a no-op, never an error"),
+            "the bake must decline: no two prefix snapshots fit the {budget} B budget"
+        );
+        assert_eq!(
+            provider.protected_snapshots.load_full().len(),
+            before.len(),
+            "a declined bake must leave the protected set untouched"
+        );
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, "bake_budget_finite").await,
+            vec![(0, 0), (1, 10), (2, 20), (3, 30), (4, 40)],
+            "declining must never lose rows"
         );
     }
 
