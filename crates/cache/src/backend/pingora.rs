@@ -210,7 +210,8 @@ where
         {
             // Publish the value and its metadata under one hold of the shard so a
             // concurrent eviction of this key cannot land between them (see
-            // `evict_to_weight_limit`). `remove_metadata` is not reused here because the
+            // `evict_to_weight_limit`). The shard is taken here rather than through a
+            // helper because the metadata drop and the publish share one hold, and the
             // lock is not reentrant.
             let mut shard = self.metadata_shards[shard_idx].write();
 
@@ -304,8 +305,8 @@ where
         // `insert` publishes them under one hold: a concurrent `insert` of this key that
         // landed between the two would leave its metadata behind while this call removed
         // the value it names — a key `len()`/`iter_keys()` still report but `get()` can
-        // never serve. `remove_metadata` is not reused here because the lock is not
-        // reentrant.
+        // never serve. The shard is taken here rather than through a helper because both
+        // drops share one hold, and the lock is not reentrant.
         let mut shard = self.metadata_shards[shard_idx].write();
         shard.remove(key);
 
@@ -979,8 +980,10 @@ mod tests {
         // already applied — the state the removal actually finds.
         //
         // Removing unconditionally here drops the metadata and the value the insert just
-        // published, which both loses a write that reported success and, until the
-        // metadata drop lands, leaves a key `len()` reports and `get()` cannot serve.
+        // published, so a write that reported success is discarded and the key is absent
+        // from the cache entirely. Both sides go under one hold of the shard, so no
+        // observer sees them out of step — losing the write is the whole of the damage,
+        // and it is what this test pins.
         let backend = create_backend(4096, 60);
         let key = 11u64;
 
