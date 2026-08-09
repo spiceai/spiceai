@@ -27,10 +27,6 @@ jobs:
     runs-on: spiceai-dev-runners
     # `release-lto` links the whole graph with fat LTO; it is far slower than release.
     timeout-minutes: 300
-    env:
-      # `build.rs` declares `rerun-if-env-changed` on this, so it has to be identical
-      # for every cargo invocation in the job or the crate rebuilds between them.
-      SPICED_BUILD_FLAVOR: crash-check
     strategy:
       fail-fast: false
       matrix:
@@ -155,8 +151,8 @@ jobs:
           set -euo pipefail
           grep -q "profile=${{ matrix.profile }}" report.txt \
             || { echo "report does not name the profile it was built with"; exit 1; }
-          grep -q 'flavor=crash-check' report.txt \
-            || { echo "flavor label did not reach the binary"; exit 1; }
+          grep -qE 'features=[a-z,]+' report.txt \
+            || { echo "report does not name the features it was built with"; exit 1; }
           grep -qE 'spiced=v[0-9]' report.txt \
             || { echo "report carries no version"; exit 1; }
 

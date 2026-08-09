@@ -114,8 +114,8 @@ pub fn install(version: &str) {
     // Formatted now, not in the handler: allocating there is not signal-safe, and a
     // pre-built line cannot crowd out the rest of the report's fixed buffer.
     let mut identity = format!(
-        "spiced={version} flavor={} profile={}",
-        env!("SPICED_BUILD_FLAVOR"),
+        "spiced={version} features={} profile={}",
+        env!("SPICED_BUILD_FEATURES"),
         env!("SPICED_BUILD_PROFILE"),
     );
     // Clip here rather than let the handler truncate the fields after it: the version
@@ -915,7 +915,7 @@ mod tests {
         // a report that cannot name its own build cannot be symbolized against the
         // right binary. Present on every platform, unlike the fields below.
         let version_field = format!("spiced={TEST_VERSION}");
-        for field in [version_field.as_str(), "flavor=", "profile="] {
+        for field in [version_field.as_str(), "features=", "profile="] {
             assert!(
                 stderr.contains(field),
                 "report is missing `{field}`: {stderr}"
