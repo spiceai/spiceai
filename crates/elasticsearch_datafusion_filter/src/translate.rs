@@ -81,7 +81,9 @@ fn translate(schema: &EsFilterSchema, expr: &Expr) -> Outcome {
             | Operator::Lt
             | Operator::LtEq
             | Operator::Gt
-            | Operator::GtEq => translate_comparison(schema, &binary.left, binary.op, &binary.right),
+            | Operator::GtEq => {
+                translate_comparison(schema, &binary.left, binary.op, &binary.right)
+            }
             _ => Outcome::Unsupported,
         },
         Expr::InList(in_list) => translate_in_list(schema, in_list),
@@ -123,25 +125,25 @@ fn translate_comparison(
     }
 
     match op {
-        Operator::Eq => translate_eq(field_type, column, value),
-        Operator::NotEq => negate_if_exact(translate_eq(field_type, column, value)),
-        Operator::Lt => translate_range(field_type, column, "lt", value),
-        Operator::LtEq => translate_range(field_type, column, "lte", value),
-        Operator::Gt => translate_range(field_type, column, "gt", value),
-        Operator::GtEq => translate_range(field_type, column, "gte", value),
+        Operator::Eq => translate_eq(field_type, column, &value),
+        Operator::NotEq => negate_if_exact(translate_eq(field_type, column, &value)),
+        Operator::Lt => translate_range(field_type, column, "lt", &value),
+        Operator::LtEq => translate_range(field_type, column, "lte", &value),
+        Operator::Gt => translate_range(field_type, column, "gt", &value),
+        Operator::GtEq => translate_range(field_type, column, "gte", &value),
         _ => Outcome::Unsupported,
     }
 }
 
-fn translate_eq(field_type: &EsFieldType, column: &str, value: Value) -> Outcome {
+fn translate_eq(field_type: &EsFieldType, column: &str, value: &Value) -> Outcome {
     let field = field_type.value_field(column);
     Outcome::Pushable {
         exact: field_type.is_exact_for_value_match(),
-        clause: json!({ "term": { field: value } }),
+        clause: json!({ "term": { field: value.clone() } }),
     }
 }
 
-fn translate_range(field_type: &EsFieldType, column: &str, es_op: &str, value: Value) -> Outcome {
+fn translate_range(field_type: &EsFieldType, column: &str, es_op: &str, value: &Value) -> Outcome {
     // A range on a boolean field is nonsensical; everything else that reached here has a
     // value that matches the field type.
     if matches!(field_type, EsFieldType::Boolean) {
@@ -153,13 +155,16 @@ fn translate_range(field_type: &EsFieldType, column: &str, es_op: &str, value: V
     let exact = matches!(field_type, EsFieldType::Integer);
     Outcome::Pushable {
         exact,
-        clause: json!({ "range": { field: { es_op: value } } }),
+        clause: json!({ "range": { field: { es_op: value.clone() } } }),
     }
 }
 
 // ── IN / NOT IN ──────────────────────────────────────────────────────────────
 
-fn translate_in_list(schema: &EsFilterSchema, in_list: &datafusion::logical_expr::expr::InList) -> Outcome {
+fn translate_in_list(
+    schema: &EsFilterSchema,
+    in_list: &datafusion::logical_expr::expr::InList,
+) -> Outcome {
     let Some(column) = as_column(&in_list.expr) else {
         return Outcome::Unsupported;
     };
@@ -198,7 +203,10 @@ fn translate_in_list(schema: &EsFilterSchema, in_list: &datafusion::logical_expr
 
 // ── BETWEEN / NOT BETWEEN ─────────────────────────────────────────────────────
 
-fn translate_between(schema: &EsFilterSchema, between: &datafusion::logical_expr::expr::Between) -> Outcome {
+fn translate_between(
+    schema: &EsFilterSchema,
+    between: &datafusion::logical_expr::expr::Between,
+) -> Outcome {
     let Some(column) = as_column(&between.expr) else {
         return Outcome::Unsupported;
     };
@@ -438,7 +446,6 @@ fn scalar_to_json(value: &ScalarValue) -> Option<Value> {
 }
 
 #[cfg(test)]
-#[expect(clippy::expect_used, reason = "tests")]
 mod tests {
     use super::*;
     use datafusion::logical_expr::{col, lit};
@@ -503,7 +510,10 @@ mod tests {
     fn text_eq_targets_keyword_subfield_inexact() {
         let expr = col("title").eq(lit("hello"));
         assert_eq!(classify(&expr), TableProviderFilterPushDown::Inexact);
-        assert_eq!(clause(&expr), json!({ "term": { "title.keyword": "hello" } }));
+        assert_eq!(
+            clause(&expr),
+            json!({ "term": { "title.keyword": "hello" } })
+        );
     }
 
     #[test]
@@ -537,7 +547,10 @@ mod tests {
     fn float_range_is_inexact() {
         let expr = col("score").lt_eq(lit(9.9_f64));
         assert_eq!(classify(&expr), TableProviderFilterPushDown::Inexact);
-        assert_eq!(clause(&expr), json!({ "range": { "score": { "lte": 9.9 } } }));
+        assert_eq!(
+            clause(&expr),
+            json!({ "range": { "score": { "lte": 9.9 } } })
+        );
     }
 
     #[test]
@@ -606,7 +619,10 @@ mod tests {
     #[test]
     fn prefix_like_on_text_targets_keyword_subfield() {
         let expr = col("title").like(lit("hel%"));
-        assert_eq!(clause(&expr), json!({ "prefix": { "title.keyword": "hel" } }));
+        assert_eq!(
+            clause(&expr),
+            json!({ "prefix": { "title.keyword": "hel" } })
+        );
     }
 
     #[test]
@@ -640,7 +656,9 @@ mod tests {
 
     #[test]
     fn and_of_two_exact_is_exact_filter() {
-        let expr = col("age").gt(lit(18_i64)).and(col("status").eq(lit("open")));
+        let expr = col("age")
+            .gt(lit(18_i64))
+            .and(col("status").eq(lit("open")));
         assert_eq!(classify(&expr), TableProviderFilterPushDown::Exact);
         assert_eq!(
             clause(&expr),
@@ -653,7 +671,9 @@ mod tests {
 
     #[test]
     fn and_with_one_unsupported_pushes_the_other_inexact() {
-        let expr = col("age").gt(lit(18_i64)).and(col("unmapped").eq(lit(1_i64)));
+        let expr = col("age")
+            .gt(lit(18_i64))
+            .and(col("unmapped").eq(lit(1_i64)));
         assert_eq!(classify(&expr), TableProviderFilterPushDown::Inexact);
         assert_eq!(clause(&expr), json!({ "range": { "age": { "gt": 18 } } }));
     }

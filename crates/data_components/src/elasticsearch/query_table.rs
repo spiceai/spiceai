@@ -74,11 +74,11 @@ impl ElasticsearchQueryTable {
         }
     }
 
-    /// Translate the filters DataFusion is pushing into a single non-scoring `bool.filter`
+    /// Translate the filters `DataFusion` is pushing into a single non-scoring `bool.filter`
     /// clause list. Every filter reaching this point was reported pushable by
     /// `supports_filters_pushdown`, so a translation miss is an internal inconsistency and is
     /// surfaced as an error rather than silently dropping the predicate (which would over-return
-    /// rows for an `Exact` filter DataFusion is no longer re-checking).
+    /// rows for an `Exact` filter `DataFusion` is no longer re-checking).
     fn build_filter_clauses(
         &self,
         filters: &[Expr],
@@ -233,7 +233,15 @@ impl ExecutionPlan for ElasticsearchQueryExec {
         let limit = self.limit;
 
         let stream = futures::stream::try_unfold(
-            ElasticsearchScanState::new(client, index, full_schema, projection, query, source, limit),
+            ElasticsearchScanState::new(
+                client,
+                index,
+                full_schema,
+                projection,
+                query,
+                source,
+                limit,
+            ),
             |mut state| async move {
                 state
                     .next_batch()

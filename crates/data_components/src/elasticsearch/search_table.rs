@@ -27,13 +27,13 @@ use datafusion::common::project_schema;
 use datafusion::datasource::TableType;
 use datafusion::error::DataFusionError;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
+use datafusion::logical_expr::TableProviderFilterPushDown;
 use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
 };
-use datafusion::logical_expr::TableProviderFilterPushDown;
 use datafusion::prelude::Expr;
 use elasticsearch::{Elasticsearch, KnnQuery, SearchRequest};
 use elasticsearch_datafusion_filter::{EsFilterSchema, classify_filter, translate_filter};
@@ -45,7 +45,7 @@ use super::query_table::hits_to_record_batch;
 /// The translated clause is injected into the Elasticsearch pre-filter (kNN `filter` / text
 /// `bool.filter`), which closes the top-N-then-filter hazard by making Elasticsearch apply the
 /// predicate *before* selecting the top-K candidates. Every pushdown is reported `Inexact` so
-/// DataFusion still re-checks each row above the scan — a conservative safety net given the
+/// `DataFusion` still re-checks each row above the scan — a conservative safety net given the
 /// search result schema and PK-join above the scan.
 fn classify_search_filter(schema: &EsFilterSchema, filter: &Expr) -> TableProviderFilterPushDown {
     match classify_filter(schema, filter) {
@@ -57,7 +57,7 @@ fn classify_search_filter(schema: &EsFilterSchema, filter: &Expr) -> TableProvid
 }
 
 /// Translate the pushable filters into a single non-scoring `bool.filter` clause, or `None` when
-/// nothing pushes. Filters that fail to translate are left for DataFusion's above-scan re-check
+/// nothing pushes. Filters that fail to translate are left for `DataFusion`'s above-scan re-check
 /// (every search-path pushdown is `Inexact`), so they are skipped rather than erroring.
 fn build_search_filter(schema: &EsFilterSchema, filters: &[Expr]) -> Option<serde_json::Value> {
     let clauses: Vec<serde_json::Value> = filters
