@@ -2054,6 +2054,42 @@ fn make_datalake_nation_dataset(
     dataset
 }
 
+/// Number of files in the datalake manifest, read straight from the Cayenne
+/// metastore.
+///
+/// This is the only signal that a promotion actually *committed*. Cold files are
+/// uploaded before the metastore commit, so the presence of a `.vortex` object is
+/// also consistent with an orphan from a failed commit — after which the warm
+/// tier is untouched and cross-tier queries still answer from it.
+///
+/// `Ok(0)` covers "the table isn't there yet", which is the normal state before
+/// the first promotion.
+fn committed_datalake_file_count(metadata_dir: &std::path::Path) -> Result<i64, String> {
+    let db_path = metadata_dir.join("cayenne.db");
+    if !db_path.exists() {
+        return Ok(0);
+    }
+    let conn = rusqlite::Connection::open(&db_path)
+        .map_err(|e| format!("failed to open the Cayenne metastore {}: {e}", db_path.display()))?;
+    // The runtime holds this database open; wait rather than fail on its writes.
+    conn.busy_timeout(Duration::from_secs(10))
+        .map_err(|e| format!("failed to set the metastore busy timeout: {e}"))?;
+    let exists: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'cayenne_cold_tier_file'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|e| format!("failed to probe for the datalake manifest table: {e}"))?;
+    if exists == 0 {
+        return Ok(0);
+    }
+    conn.query_row("SELECT COUNT(*) FROM cayenne_cold_tier_file", [], |row| {
+        row.get(0)
+    })
+    .map_err(|e| format!("failed to count datalake manifest rows: {e}"))
+}
+
 /// Run `sql` and return the single `i64` value of the first column of the
 /// first row (for `SELECT COUNT(*) …`-style assertions).
 async fn query_single_i64(rt: &Runtime, sql: &str) -> Result<i64, String> {
@@ -2406,22 +2442,34 @@ async fn datalake_age_trigger_e2e_inner(
     // The 500ms tiering tick marks the warm generation, then promotes once it has
     // been resident 3s. The ceiling is generous because the assertion under test
     // is that promotion happens at all without a reachable size trigger.
+    //
+    // Poll the COMMITTED manifest, not the store: the cold files are uploaded
+    // before the metastore commit, so an object alone would also be satisfied by
+    // an orphan left behind by a failed commit — under which the warm tier is
+    // still intact and the queries below would pass without a promotion.
     let promoted = wait_until_true(Duration::from_mins(3), || async {
-        let list_prefix = ObjectPath::from(format!("{prefix}/"));
-        let mut stream = store.list(Some(&list_prefix));
-        while let Some(Ok(meta)) = stream.next().await {
-            if meta.location.as_ref().ends_with(".vortex") && meta.size > 0 {
-                return true;
-            }
-        }
-        false
+        committed_datalake_file_count(metadata_dir).unwrap_or(0) > 0
     })
     .await;
     if !promoted {
-        return Err(
-            "timed out waiting for an age-triggered warm→datalake promotion (no .vortex objects on the store); the byte trigger was unreachable, so only cayenne_datalake_warm_max_age_ms could promote"
-                .to_string(),
-        );
+        let detail = committed_datalake_file_count(metadata_dir)
+            .map_or_else(|e| format!(" (last manifest read: {e})"), |_| String::new());
+        return Err(format!(
+            "timed out waiting for an age-triggered warm→datalake promotion (no committed datalake manifest rows); the byte trigger was unreachable, so only cayenne_datalake_warm_max_age_ms could promote{detail}"
+        ));
+    }
+
+    // The commit registers files it has already uploaded, so the manifest above
+    // implies these objects — assert it to catch a manifest referencing nothing.
+    let objects = list_objects_under_prefix(store, &format!("{prefix}/")).await?;
+    if !objects
+        .iter()
+        .any(|(path, size)| path.ends_with(".vortex") && *size > 0)
+    {
+        return Err(format!(
+            "datalake manifest is committed but the store holds no non-empty .vortex object under {prefix}/ ({} objects)",
+            objects.len()
+        ));
     }
 
     // Cross-tier correctness after an age-triggered move: the promoted rows are

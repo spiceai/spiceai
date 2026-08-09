@@ -1769,6 +1769,8 @@ test_with_backends!(test_cold_tier_age_trigger_promotes_below_size_thresholds_im
 async fn test_cold_tier_age_trigger_promotes_below_size_thresholds_impl(
     fixture: common::TestFixture,
 ) -> TestResult<()> {
+    const MAX_AGE_MS: u64 = 50;
+
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
         Field::new("value", DataType::Int64, false),
@@ -1778,7 +1780,6 @@ async fn test_cold_tier_age_trigger_promotes_below_size_thresholds_impl(
     std::fs::create_dir_all(&cold_dir)?;
     let cold_url = format!("file://{}", cold_dir.to_string_lossy());
 
-    const MAX_AGE_MS: u64 = 50;
     let table_options = CreateTableOptions {
         table_name: "cold_age_t".to_string(),
         schema: Arc::clone(&schema),

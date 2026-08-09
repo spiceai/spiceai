@@ -9064,6 +9064,10 @@
           "description": "Warm-tier data moves to the datalake once the warm tier's Vortex file count reaches this threshold. 0 (default) disables the file-count trigger; when cayenne_datalake_warm_max_bytes is also 0/unset, the byte trigger defaults to 16 x cayenne_datalake_target_file_size_mb.",
           "type": "string"
         },
+        "cayenne_datalake_warm_max_age_ms": {
+          "description": "Warm-tier data moves to the datalake once it has been resident this long, even when below the byte and file thresholds — the backstop for a low-volume table that never reaches cayenne_datalake_warm_max_bytes and would otherwise stay in the warm tier indefinitely. 0 (default) disables the age trigger. Residency is measured from the first tiering check that observed the data, so it is accurate to within one cayenne_datalake_tiering_check_interval_ms and resets across a restart. An age-triggered move publishes whatever has accumulated, so a small value produces small datalake files.",
+          "type": "string"
+        },
         "cayenne_datalake_tiering_check_interval_ms": {
           "description": "How often the background loop checks whether warm-tier data should move to the datalake (a check does not guarantee a move). Normally auto-tuned; override for testing. Default: 60000 (60s).",
           "type": "string"
