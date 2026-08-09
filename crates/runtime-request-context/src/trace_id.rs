@@ -33,7 +33,7 @@ use opentelemetry::trace::TraceId;
 /// Header a client sets to pin the trace id for a request without speaking W3C
 /// trace context. The value is a 32-character hexadecimal (16-byte) id, the
 /// same shape as the `trace_id` column of `runtime.task_history`.
-pub const SPICE_TRACE_ID_HEADER: &str = "x-spice-trace-id";
+pub const SPICE_TRACE_ID_HEADER: &str = "spice-trace-id";
 
 /// Length of a trace id in hexadecimal characters (16 bytes).
 pub const TRACE_ID_HEX_LEN: usize = 32;
