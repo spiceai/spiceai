@@ -139,12 +139,34 @@ where
             .map(|meta| Instant::now() >= meta.expires_at)
     }
 
-    /// Remove a key from metadata tracking and update total weight.
-    fn remove_metadata(&self, key: u64) -> Option<KeyMetadata> {
+    /// Drop an entry that was observed expired, provided it is still expired once the
+    /// shard is held. Returns whether the entry was removed.
+    ///
+    /// The metadata and the value go under one hold of the shard, for the same reason
+    /// `insert`, `remove` and `evict_to_weight_limit` publish or drop them together: a
+    /// concurrent `insert` of this key that landed between the two would have its fresh
+    /// metadata left behind while this call removed the value it names — a key
+    /// `len()`/`iter_keys()` still report but `get()` can never serve — and its value
+    /// would be discarded even though the write reported success.
+    ///
+    /// The expiry is re-checked here because the caller observed it under a read lock it
+    /// has since released. An `insert` in that gap has already published a live entry, so
+    /// the observation is stale and the entry is left alone.
+    fn remove_if_expired(&self, key: u64) -> bool {
         let shard_idx = Self::get_shard_index(key);
         let mut shard = self.metadata_shards[shard_idx].write();
-        let meta = shard.remove(&key)?;
-        Some(meta)
+
+        // Already gone, or made live again by an insert since the observation.
+        if shard
+            .get(&key)
+            .is_none_or(|meta| Instant::now() < meta.expires_at)
+        {
+            return false;
+        }
+
+        shard.remove(&key);
+        self.cache.remove(key);
+        true
     }
 
     /// Evict least-recently-used entries until the cache is back within its weight limit.
@@ -218,9 +240,11 @@ where
                 return None;
             }
             Some(true) => {
-                // Key is expired - remove from both metadata and pingora-lru
-                self.remove_metadata(*key);
-                self.cache.remove(*key);
+                // Key is expired - remove from both metadata and pingora-lru, under one
+                // hold of the shard so a concurrent `insert` cannot land between them.
+                // If that insert got there first the entry is live again and is left
+                // alone; this `get` still reports the miss it was about to report.
+                self.remove_if_expired(*key);
                 return None;
             }
             Some(false) => {
@@ -907,6 +931,97 @@ mod tests {
 
         // Key 2 should still be valid (inserted 60ms ago)
         assert!(backend.get(&2).await.is_some());
+    }
+
+    /// Backdate a key's expiry so the next `get` takes the expiry arm without the
+    /// test having to wait out a TTL.
+    fn expire_now(backend: &PingoraBackend<TestValue>, key: u64) {
+        let shard_idx = PingoraBackend::<TestValue>::get_shard_index(key);
+        let mut shard = backend.metadata_shards[shard_idx].write();
+        let meta = shard.get_mut(&key).expect("key has metadata to backdate");
+        meta.expires_at = Instant::now()
+            .checked_sub(Duration::from_millis(1))
+            .expect("instant is within range");
+    }
+
+    #[tokio::test]
+    async fn test_expiry_spares_an_entry_an_insert_made_live() {
+        // The interleaving this guards: a `get` observes the key expired under the read
+        // lock, releases it, and a concurrent `insert` republishes the key before the
+        // removal runs. `remove_if_expired` stands in for that removal with the insert
+        // already applied — the state the removal actually finds.
+        //
+        // Removing unconditionally here drops the metadata and the value the insert just
+        // published, which both loses a write that reported success and, until the
+        // metadata drop lands, leaves a key `len()` reports and `get()` cannot serve.
+        let backend = create_backend(4096, 60);
+        let key = 11u64;
+
+        backend.insert(key, TestValue::new("stale")).await;
+        expire_now(&backend, key);
+
+        // The racing insert: it republishes the key with a live expiry.
+        backend.insert(key, TestValue::new("fresh")).await;
+
+        assert!(
+            !backend.remove_if_expired(key),
+            "a live entry must not be removed on a stale expiry observation"
+        );
+
+        assert_eq!(backend.len().await, 1);
+        assert_eq!(backend.get(&key).await, Some(TestValue::new("fresh")));
+    }
+
+    #[tokio::test]
+    async fn test_remove_if_expired_reports_what_it_did() {
+        let backend = create_backend(4096, 60);
+
+        // Absent key — nothing to remove.
+        assert!(!backend.remove_if_expired(1));
+
+        // Live key — left in place.
+        backend.insert(2, TestValue::new("live")).await;
+        assert!(!backend.remove_if_expired(2));
+        assert_eq!(backend.get(&2).await, Some(TestValue::new("live")));
+
+        // Lapsed key — removed.
+        backend.insert(3, TestValue::new("stale")).await;
+        expire_now(&backend, 3);
+        assert!(backend.remove_if_expired(3));
+        assert!(backend.get(&3).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_expired_get_removes_metadata_and_value_together() {
+        let backend = create_backend(4096, 60);
+        let key = 7u64;
+
+        backend.insert(key, TestValue::new("stale")).await;
+        expire_now(&backend, key);
+
+        assert!(backend.get(&key).await.is_none());
+
+        // Both sides of the entry are gone, so the key is absent from every view of the
+        // cache rather than lingering in the one `len()`/`iter_keys()` read.
+        assert_eq!(backend.len().await, 0);
+        assert!(backend.iter_keys().await.is_empty());
+        assert_eq!(backend.weighted_size().await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_expired_get_is_idempotent_when_the_value_is_already_gone() {
+        let backend = create_backend(4096, 60);
+        let key = 9u64;
+
+        backend.insert(key, TestValue::new("stale")).await;
+        expire_now(&backend, key);
+
+        // Take the value out from under the expiry, leaving metadata that names nothing.
+        backend.cache.remove(key);
+
+        assert!(backend.get(&key).await.is_none());
+        assert_eq!(backend.len().await, 0);
+        assert!(backend.iter_keys().await.is_empty());
     }
 
     // ===================
