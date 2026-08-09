@@ -610,7 +610,7 @@ mod tests {
 
         tracing::subscriber::with_default(subscriber, || {
             tracing::warn!(
-                target: "runtime::accelerated_table::refresh_task",
+                target: "runtime::accelerated::refresh_task",
                 "Failed to load data for dataset taxi_trips"
             );
             tracing::info!(target: "task_history", "sql_query");

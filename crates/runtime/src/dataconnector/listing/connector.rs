@@ -53,7 +53,7 @@ use {
 };
 
 use crate::Runtime;
-use crate::accelerated_table::AcceleratedTable;
+use crate::accelerated::AcceleratedTable;
 use crate::component::dataset::Dataset;
 use crate::dataconnector::{
     ConnectorComponent, DataConnector, DataConnectorError, DataConnectorResult,

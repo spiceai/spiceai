@@ -266,38 +266,6 @@ where
     }
 }
 
-/// True when a `spice_sys` failure is the runtime shutting down under a task on the
-/// blocking pool, rather than the operation itself failing.
-///
-/// A sidecar helper that runs on the blocking pool surfaces a shutdown as a
-/// cancelled [`tokio::task::JoinError`] wrapped in [`Error::External`], which
-/// callers see only as an opaque `"Acceleration error: task ... was cancelled"` —
-/// hence classifying by type rather than by message. The task never started, so
-/// there is nothing to retry and nothing an operator can act on; a caller that
-/// reports its failures at `warn` should report this one below the default level.
-///
-/// Prefer this over the `RuntimeStatus::is_shutdown()` guard the refresh task uses
-/// for the same purpose: `is_shutdown()` is only *coincidental* — every failure that
-/// races a shutdown gets quietened, including real ones — whereas the `JoinError`
-/// is a *causal* statement that this specific work did not run.
-///
-/// The condition it reads is "the task was cancelled", and the shutdown reading
-/// holds because a `spawn_blocking` task is cancelled only when the runtime is
-/// dropped with the task still queued; nothing here calls `JoinHandle::abort`. A
-/// caller that starts aborting sidecar tasks (a per-operation timeout, say) has to
-/// revisit that.
-///
-/// The whole source chain is walked, so it holds however deeply the caller has
-/// boxed or wrapped the error. A *panicked* task is deliberately not matched: that
-/// is a bug and must stay loud.
-pub(crate) fn is_shutdown_cancellation(error: &(dyn std::error::Error + 'static)) -> bool {
-    std::iter::successors(Some(error), |error| std::error::Error::source(*error)).any(|error| {
-        error
-            .downcast_ref::<tokio::task::JoinError>()
-            .is_some_and(tokio::task::JoinError::is_cancelled)
-    })
-}
-
 /// Retries for a sidecar write contending with another writer, on top of the
 /// initial attempt. Bounded and short: paired with [`UPSERT_MAX_RETRY_DELAY`] the
 /// worst-case added latency stays well under one checkpoint/commit interval, and a
@@ -721,7 +689,8 @@ async fn acceleration_connection(
 
 #[cfg(test)]
 mod tests {
-    use super::{Error, is_shutdown_cancellation};
+    use super::Error;
+    use runtime_async::is_shutdown_cancellation;
 
     #[cfg(any(feature = "mongodb", feature = "mysql"))]
     #[tokio::test]
