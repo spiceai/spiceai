@@ -2565,7 +2565,7 @@ fn validate_datalake_table_options(
     let mut warnings = Vec::new();
     // First, so it heads the datalake warnings emitted at registration.
     warnings.push(format!(
-        "Dataset '{table_name}': the Cayenne datalake (cold) tier is in preview; verify query correctness and performance before using it for production workloads."
+        "Dataset '{table_name}': the Cayenne datalake tier is in preview; verify query correctness and performance before using it for production workloads."
     ));
     if options.primary_key.is_empty() {
         // Promotion classifies and rewrites cold files by primary key, and
