@@ -28,11 +28,6 @@ fn main() {
     println!("cargo:rustc-env=GIT_COMMIT_HASH={git_hash}");
     println!("cargo:rustc-env=SPICED_BUILD_PROFILE={}", build_profile());
     println!("cargo:rustc-env=SPICED_BUILD_FEATURES={}", build_features());
-    // Architectures ship under one version and their offsets differ.
-    println!(
-        "cargo:rustc-env=SPICED_BUILD_TARGET={}",
-        std::env::var("TARGET").unwrap_or_else(|_| "unknown".to_owned())
-    );
 }
 
 /// The cargo profile the binary is being built with.
@@ -68,7 +63,17 @@ fn build_profile() -> String {
 /// several places in each repository, and a label they must each remember to set
 /// eventually goes wrong rather than merely missing.
 fn build_features() -> String {
-    let distinguishing = ["models", "metal", "cuda", "odbc", "nfs", "smb"];
+    let distinguishing = [
+        "models",
+        "metal",
+        "cuda",
+        "odbc",
+        "nfs",
+        "smb",
+        "alloc-jemalloc",
+        "alloc-mimalloc",
+        "alloc-system",
+    ];
     let enabled: Vec<&str> = distinguishing
         .into_iter()
         .filter(|feature| {

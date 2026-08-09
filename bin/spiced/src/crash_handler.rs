@@ -109,9 +109,10 @@ pub fn install(version: &str) -> Result<(), InstallError> {
     // The commit and target are their own fields: a `release` build's version omits
     // the commit, and every architecture ships under one version.
     let mut identity = format!(
-        "spiced={version} commit={} target={} features={} profile={}",
+        "spiced={version} commit={} target={}_{} features={} profile={}",
         env!("GIT_COMMIT_HASH"),
-        env!("SPICED_BUILD_TARGET"),
+        std::env::consts::OS,
+        std::env::consts::ARCH,
         env!("SPICED_BUILD_FEATURES"),
         env!("SPICED_BUILD_PROFILE"),
     );
@@ -365,90 +366,78 @@ fn text_offset(addr: u64) -> Option<u64> {
         .then(|| addr.saturating_sub(image.base as u64))
 }
 
-/// RSP's index into `mcontext_t::gregs`, as [`REG_RIP`].
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-const REG_RSP: usize = 15;
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-const _: () = assert!(libc::REG_RSP == 15);
-
-/// The stack pointer at the point of the fault.
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-fn stack_pointer(cc: &crash_handler::CrashContext) -> u64 {
-    cc.context.uc_mcontext.gregs[REG_RSP].cast_unsigned()
-}
-
-#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
-fn stack_pointer(cc: &crash_handler::CrashContext) -> u64 {
-    cc.context.uc_mcontext.sp
-}
-
-#[cfg(all(
-    target_os = "linux",
-    not(any(target_arch = "x86_64", target_arch = "aarch64"))
-))]
-fn stack_pointer(_cc: &crash_handler::CrashContext) -> u64 {
-    0
-}
-
-/// The return address, where the architecture keeps one in a register.
+/// The registers the report reads, captured in one place per architecture.
 ///
-/// aarch64's `blr` leaves it in `x30`, so no memory read is needed. x86-64 pushes it,
-/// and it is recovered from the stack instead.
+/// One block per architecture rather than one function per register: an architecture
+/// that supplies two of the three and forgets the last would still compile, and would
+/// report a zero stack pointer or no caller with no diagnostic.
+#[cfg(target_os = "linux")]
+struct Registers {
+    /// Where the fault happened.
+    ip: u64,
+    /// Where the stack was, for recovering a caller the instruction pointer lost.
+    sp: u64,
+    /// The return address, on architectures that keep one in a register. aarch64's
+    /// `blr` leaves it in `x30`; x86-64 pushes it, so it comes off the stack instead.
+    lr: Option<u64>,
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+impl Registers {
+    fn capture(cc: &crash_handler::CrashContext) -> Self {
+        // `crash-context` exposes the register file as a bare array with no named
+        // accessors, so the indices are spelled out and pinned to libc's definitions.
+        const REG_RIP: usize = 16;
+        const REG_RSP: usize = 15;
+        const _: () = assert!(libc::REG_RIP == 16 && libc::REG_RSP == 15);
+
+        Self {
+            ip: cc.context.uc_mcontext.gregs[REG_RIP].cast_unsigned(),
+            sp: cc.context.uc_mcontext.gregs[REG_RSP].cast_unsigned(),
+            lr: None,
+        }
+    }
+}
+
 #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
-#[expect(
-    clippy::unnecessary_wraps,
-    reason = "architectures without a link register share this signature"
-)]
-fn link_register(cc: &crash_handler::CrashContext) -> Option<u64> {
-    Some(cc.context.uc_mcontext.regs[30])
-}
-
-#[cfg(all(target_os = "linux", not(target_arch = "aarch64")))]
-fn link_register(_cc: &crash_handler::CrashContext) -> Option<u64> {
-    None
-}
-
-/// RIP's index into `mcontext_t::gregs`. `crash-context` exposes the register file
-/// as a bare array with no named accessors, so the index has to be spelled out;
-/// the assertion pins it to libc's definition rather than trusting a literal.
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-const REG_RIP: usize = 16;
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-const _: () = assert!(libc::REG_RIP == 16);
-
-/// The instruction pointer at the point of the fault.
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-fn instruction_pointer(cc: &crash_handler::CrashContext) -> u64 {
-    cc.context.uc_mcontext.gregs[REG_RIP].cast_unsigned()
-}
-
-#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
-fn instruction_pointer(cc: &crash_handler::CrashContext) -> u64 {
-    cc.context.uc_mcontext.pc
+impl Registers {
+    fn capture(cc: &crash_handler::CrashContext) -> Self {
+        Self {
+            ip: cc.context.uc_mcontext.pc,
+            sp: cc.context.uc_mcontext.sp,
+            lr: Some(cc.context.uc_mcontext.regs[30]),
+        }
+    }
 }
 
 #[cfg(all(
     target_os = "linux",
     not(any(target_arch = "x86_64", target_arch = "aarch64"))
 ))]
-fn instruction_pointer(_cc: &crash_handler::CrashContext) -> u64 {
-    0
+impl Registers {
+    fn capture(_cc: &crash_handler::CrashContext) -> Self {
+        Self {
+            ip: 0,
+            sp: 0,
+            lr: None,
+        }
+    }
 }
 
 /// Emit what was formatted, and say so when it did not all fit.
 ///
-/// A `Cursor` over a fixed slice stops at capacity and reports the failure rather than
-/// panicking, so a report that outgrows its buffer ends mid-field. `complete` carries
-/// whether that happened; the marker goes out in its own `write(2)`, since by then
-/// there is no room in the buffer for it.
-fn flush(buf: &[u8], position: u64, complete: bool) {
+/// A `Cursor` over a fixed slice writes what it can and then fails, leaving the
+/// position at the buffer's length — so a full buffer is exactly the case where
+/// something was lost. The marker goes out in its own `write(2)`, since by then there
+/// is no room in the buffer for it.
+fn flush(buf: &[u8], position: u64) {
     #[expect(
         clippy::cast_possible_truncation,
         reason = "the cursor position is bounded by the buffer length"
     )]
     let written = position as usize;
     raw_write(&buf[..written]);
-    if !complete {
+    if written == buf.len() {
         raw_write(b"=== crash report truncated ===\n");
     }
 }
@@ -513,7 +502,8 @@ fn report(cc: &crash_handler::CrashContext) {
     let name_len = thread_name(&mut name);
     let thread = core::str::from_utf8(&name[..name_len]).unwrap_or("?");
 
-    let ip = instruction_pointer(cc);
+    let registers = Registers::capture(cc);
+    let ip = registers.ip;
     let image = IMAGE.get();
     let base = image.map_or(0, |image| image.base) as u64;
     // An offset only means anything when `ip` is code from this binary. After a jump
@@ -521,68 +511,64 @@ fn report(cc: &crash_handler::CrashContext) {
     // mapped at all — and `ip - base` is then a number `addr2line` will accept and
     // resolve to the wrong place.
     let offset = text_offset(ip);
+    let fault = fault_address(cc);
     let uptime = START.get().map_or(0, |s| s.elapsed().as_secs());
 
     // Formatting into a fixed slice cannot allocate; every write is checked so an
     // overrun is reported rather than silently swallowed. See `flush`.
     let mut buf = [0u8; REPORT_BUF];
     let mut cur = std::io::Cursor::new(&mut buf[..]);
-    let mut complete = true;
-    complete &= writeln!(cur, "\n=== native crash ===").is_ok();
+    let _ = writeln!(cur, "\n=== native crash ===");
     // Already a formatted line, ending in a newline; reading it is an atomic load.
     if let Some(identity) = IDENTITY.get() {
-        complete &= cur.write_all(identity.as_bytes()).is_ok();
+        let _ = cur.write_all(identity.as_bytes());
     }
-    complete &= write!(
+    let _ = write!(
         cur,
         "signal={} code={} ({}) ",
         signal_name(cc.siginfo.ssi_signo),
         cc.siginfo.ssi_code,
         signal_code_name(cc.siginfo.ssi_signo, cc.siginfo.ssi_code),
-    )
-    .is_ok();
+    );
     // A signal that was sent rather than faulted carries no address, but it does say
     // who sent it — which is the difference between aborting ourselves and being
     // killed from outside.
-    complete &= match (fault_address(cc), signal_sender(cc)) {
+    let _ = match (fault, signal_sender(cc)) {
         (Some(addr), _) => write!(cur, "addr=0x{addr:x}"),
         (None, Some(sender)) => {
             write!(cur, "sender_pid={} sender_uid={}", sender.0, sender.1)
         }
         (None, None) => write!(cur, "addr=n/a"),
-    }
-    .is_ok();
-    complete &= write!(cur, " ip=0x{ip:x} base=0x{base:x}").is_ok();
+    };
+    let _ = write!(cur, " ip=0x{ip:x} base=0x{base:x}");
     // Say why there is no offset rather than print one that cannot be used. The two
     // reasons differ: an ip outside the mapping is the program's problem, an
     // unresolved base is this handler's.
-    complete &= match offset {
+    let _ = match offset {
         Some(offset) => write!(cur, " offset=0x{offset:x}"),
         None if image.is_none() => write!(
             cur,
             " (load base unresolved - /proc/self/maps was not parsed)"
         ),
         None => write!(cur, " (ip not in the spiced text mapping)"),
-    }
-    .is_ok();
-    complete &= write!(
+    };
+    let _ = write!(
         cur,
         "\nthread=\"{}\" pid={} tid={} uptime={}s\n",
         thread, cc.pid, cc.tid, uptime,
-    )
-    .is_ok();
+    );
     // Only when the offset is one `addr2line` can actually use.
     if let Some(offset) = offset {
-        complete &= writeln!(cur, "symbolize: addr2line -e spiced -fCi 0x{offset:x}").is_ok();
+        let _ = writeln!(cur, "symbolize: addr2line -e spiced -fCi 0x{offset:x}");
     }
     // Flushed before the stack section: reading the stack can fault again, and a
     // second fault inside the handler ends the process with the signal still blocked.
     // Writing first costs the stack section rather than the whole report.
     // Ends the cursor's borrow of `buf` before the buffer is read back.
     let position = cur.position();
-    flush(&buf, position, complete);
+    flush(&buf, position);
 
-    report_stack(cc, ip, fault_address(cc));
+    report_stack(&registers, fault);
 }
 
 /// How many words above the stack pointer are examined for a return address.
@@ -597,48 +583,42 @@ const STACK_WORDS: usize = 16;
 ///
 /// `ip` and `fault_addr` are passed in because the caller already has them.
 #[cfg(target_os = "linux")]
-fn report_stack(cc: &crash_handler::CrashContext, ip: u64, fault_addr: Option<u64>) {
+fn report_stack(registers: &Registers, fault: Option<u64>) {
     use std::io::Write as _;
 
-    let sp = stack_pointer(cc);
+    let sp = registers.sp;
     // A return address sits at the stack pointer only if nothing has run since the
     // call, which holds when the fault is the instruction fetch itself. A fault inside
     // a function — this binary's or a library's — has a frame of its own.
-    let immediate_call = fault_addr == Some(ip);
+    let immediate_call = fault == Some(registers.ip);
 
     let mut buf = [0u8; REPORT_BUF];
     let mut cur = std::io::Cursor::new(&mut buf[..]);
-    let mut complete = true;
-    complete &= write!(cur, "stack: sp=0x{sp:x}").is_ok();
+    let _ = write!(cur, "stack: sp=0x{sp:x}");
 
     // aarch64 keeps the return address in a register, so it needs no stack read.
-    let mut caller = link_register(cc).and_then(|lr| {
-        complete &= write!(cur, " lr=0x{lr:x}").is_ok();
+    let mut caller = registers.lr.and_then(|lr| {
+        let _ = write!(cur, " lr=0x{lr:x}");
         immediate_call.then_some(lr).and_then(text_offset)
     });
 
-    // One probe for the whole window in the common case. It is allowed to fail — a
-    // stack pointer near the end of its mapping reads back short — so a failure falls
-    // back to probing each word, rather than giving up the section entirely.
-    let base = usize::try_from(sp).ok();
-    let whole_window = base.is_some_and(|base| {
-        readable(
-            std::ptr::with_exposed_provenance::<u8>(base),
-            STACK_WORDS * size_of::<u64>(),
-        )
-    });
-
     let mut listed_candidates = false;
-    for word in 0..base.map_or(0, |_| STACK_WORDS) {
-        let Some(at) = base.and_then(|base| base.checked_add(word * size_of::<u64>())) else {
+    for word in 0..STACK_WORDS {
+        let Some(at) = usize::try_from(sp)
+            .ok()
+            .and_then(|sp| sp.checked_add(word * size_of::<u64>()))
+        else {
             break;
         };
+        // Probed a word at a time: the whole point is that this stack pointer may be
+        // the thing that was corrupted, and a wider probe crosses mapping boundaries
+        // that a narrow one does not.
         let ptr = std::ptr::with_exposed_provenance::<u8>(at);
-        if !whole_window && !readable(ptr, size_of::<u64>()) {
+        if !readable(ptr, size_of::<u64>()) {
             break;
         }
-        // SAFETY: one of the probes above established that these eight bytes are
-        // readable, and a stack word has no validity invariants.
+        // SAFETY: the probe above established that these eight bytes are readable, and
+        // a stack word has no validity invariants.
         let value = unsafe { ptr.cast::<u64>().read_unaligned() };
         let Some(offset) = text_offset(value) else {
             continue;
@@ -646,30 +626,29 @@ fn report_stack(cc: &crash_handler::CrashContext, ip: u64, fault_addr: Option<u6
         // Only the first word of an interrupted call is a return address; everything
         // else is a candidate, which may be live or long stale.
         if word == 0 && immediate_call && caller.is_none() {
-            complete &= write!(cur, " ret=0x{value:x} (+0x{offset:x})").is_ok();
+            let _ = write!(cur, " ret=0x{value:x} (+0x{offset:x})");
             caller = Some(offset);
         } else {
             if !listed_candidates {
-                complete &= write!(cur, "\nstack candidates:").is_ok();
+                let _ = write!(cur, "\nstack candidates:");
                 listed_candidates = true;
             }
-            complete &= write!(cur, " +0x{offset:x}").is_ok();
+            let _ = write!(cur, " +0x{offset:x}");
         }
     }
-    complete &= writeln!(cur).is_ok();
+    let _ = writeln!(cur);
 
     if let Some(offset) = caller {
-        complete &= writeln!(
+        let _ = writeln!(
             cur,
             "symbolize caller: addr2line -e spiced -fCi 0x{offset:x}"
-        )
-        .is_ok();
+        );
     }
-    complete &= writeln!(cur, "=== end native crash ===").is_ok();
+    let _ = writeln!(cur, "=== end native crash ===");
 
     // Ends the cursor's borrow of `buf` before the buffer is read back.
     let position = cur.position();
-    flush(&buf, position, complete);
+    flush(&buf, position);
 }
 
 /// A reduced report. `CrashContext` is platform-specific: on macOS it carries a Mach
@@ -683,21 +662,19 @@ fn report(_cc: &crash_handler::CrashContext) {
     let uptime = START.get().map_or(0, |s| s.elapsed().as_secs());
     let mut buf = [0u8; REPORT_BUF];
     let mut cur = std::io::Cursor::new(&mut buf[..]);
-    let mut complete = true;
-    complete &= writeln!(cur, "\n=== native crash ===").is_ok();
+    let _ = writeln!(cur, "\n=== native crash ===");
     if let Some(identity) = IDENTITY.get() {
-        complete &= cur.write_all(identity.as_bytes()).is_ok();
+        let _ = cur.write_all(identity.as_bytes());
     }
-    complete &= write!(
+    let _ = write!(
         cur,
         "(reduced report: full detail is Linux-only)\n\
          uptime={uptime}s\n\
          === end native crash ===\n",
-    )
-    .is_ok();
+    );
     // Ends the cursor's borrow of `buf` before the buffer is read back.
     let position = cur.position();
-    flush(&buf, position, complete);
+    flush(&buf, position);
 }
 
 #[cfg(all(test, unix))]
