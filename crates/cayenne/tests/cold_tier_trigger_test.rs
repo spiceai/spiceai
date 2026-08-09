@@ -65,18 +65,18 @@ fn count_vortex_files(dir: &std::path::Path) -> usize {
     count
 }
 
+/// Rows a real scan returns. Projects a column rather than issuing `COUNT(*)`,
+/// which can be folded from the maintained statistics instead of reading rows.
 async fn row_count(ctx: &SessionContext, table: &str) -> TestResult<i64> {
     let batches = ctx
-        .sql(&format!("SELECT COUNT(*) FROM {table}"))
+        .sql(&format!("SELECT id FROM {table}"))
         .await?
         .collect()
         .await?;
     Ok(batches
-        .first()
-        .and_then(|b| b.column(0).as_any().downcast_ref::<Int64Array>())
-        .and_then(|a| a.values().first())
-        .copied()
-        .unwrap_or(0))
+        .iter()
+        .map(|b| i64::try_from(b.num_rows()).unwrap_or(i64::MAX))
+        .sum())
 }
 
 /// Append `ids` and checkpoint, producing exactly one durable warm file.

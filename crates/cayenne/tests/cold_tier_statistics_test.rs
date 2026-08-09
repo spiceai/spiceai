@@ -48,18 +48,21 @@ fn maintained_row_count(table: &CayenneTableProvider) -> Option<Precision<usize>
     Some(table.statistics()?.num_rows)
 }
 
+/// Rows a real scan returns.
+///
+/// Projects a column and sums the batches rather than issuing `COUNT(*)`: an
+/// unfiltered count can be folded from the maintained statistics, which are the
+/// value under test, so a count would let one drifted number confirm itself.
 async fn scan_row_count(ctx: &SessionContext) -> TestResult<i64> {
     let batches = ctx
-        .sql(&format!("SELECT COUNT(*) FROM {TABLE}"))
+        .sql(&format!("SELECT id FROM {TABLE}"))
         .await?
         .collect()
         .await?;
     Ok(batches
-        .first()
-        .and_then(|b| b.column(0).as_any().downcast_ref::<Int64Array>())
-        .and_then(|a| a.values().first())
-        .copied()
-        .unwrap_or(0))
+        .iter()
+        .map(|b| i64::try_from(b.num_rows()).unwrap_or(i64::MAX))
+        .sum())
 }
 
 /// Flush everything the count depends on: RAM/inline tiers into durable warm
@@ -71,24 +74,32 @@ async fn settle(table: &CayenneTableProvider) -> TestResult<()> {
     Ok(())
 }
 
-/// Assert the maintained count and a real scan agree. An `Exact` count may be
-/// substituted directly into a result, so a wrong value here is a wrong answer.
+/// Assert a real scan returns `expected` rows and the maintained statistics
+/// report the same number as `Exact`.
+///
+/// The precision is asserted, not just the value: only `Exact` lets `COUNT(*)` be
+/// answered from metadata, so a promotion that demoted a correct count to
+/// `Inexact` would silently cost that optimization. An `Exact` count may also be
+/// substituted into a result, so a wrong value here is a wrong answer.
 async fn assert_count_agrees(
     table: &CayenneTableProvider,
     ctx: &SessionContext,
-    expected: i64,
+    expected: usize,
     phase: &str,
 ) -> TestResult<()> {
     assert_eq!(
         scan_row_count(ctx).await?,
-        expected,
+        i64::try_from(expected)?,
         "scanned rows ({phase})"
     );
 
     let maintained = maintained_row_count(table)
         .unwrap_or_else(|| panic!("maintained statistics must be populated ({phase})"));
-    let value = i64::try_from(*maintained.get_value().unwrap_or(&0)).unwrap_or(i64::MAX);
-    assert_eq!(value, expected, "maintained statistics rows ({phase})");
+    assert_eq!(
+        maintained,
+        Precision::Exact(expected),
+        "maintained statistics ({phase})"
+    );
     Ok(())
 }
 
@@ -227,6 +238,9 @@ async fn test_cold_tier_statistics_survive_promotion_impl(
 /// Ignored as a defect marker for #12846, not a flaky test: the table reports
 /// `Exact(110)` while the cold manifest correctly holds 109 rows. Un-ignore it
 /// with the fix; do not weaken the assertions to make it pass.
+///
+/// Pinned on `SQLite` only — the accounting is backend-independent, so one
+/// marker is enough (same shape as `prop_concurrent_cold_sqlite`).
 #[test]
 #[ignore = "https://github.com/spiceai/spiceai/issues/12846 — a folded delete tombstone leaves the maintained row count stale and Exact"]
 fn test_cold_tier_statistics_follow_a_folded_delete_sqlite() -> Result<(), String> {
