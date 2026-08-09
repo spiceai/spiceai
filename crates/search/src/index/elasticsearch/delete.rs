@@ -98,7 +98,8 @@ const DELETE_CHUNK_ROWS: usize = 512;
 ///
 /// Issues one `_delete_by_query` request per [`DELETE_CHUNK_ROWS`]-row slice of `keys` rather
 /// than a single request for the whole batch, so a large delete can't build an unbounded
-/// clause or id list.
+/// clause or id list. Every chunk is issued even when an earlier one comes back only partially
+/// applied; the first such response is reported once the batch is through.
 ///
 /// Shared by [`super::ElasticsearchIndex`] and [`super::ElasticsearchTextIndex`], which both
 /// address documents the same way (client + index name + primary key columns).
@@ -117,6 +118,12 @@ pub async fn delete_by_keys(
             .iter()
             .all(|f| key_columns.iter().any(|c| c == f.name()));
 
+    // Hold the first body-level failure and keep going. Each chunk is an independent
+    // `_delete_by_query` over its own slice of `keys`, so returning at the first partial response
+    // would leave every later chunk unissued, turning a report of a partial delete into a cause
+    // of a larger one.
+    let mut partial: Option<Error> = None;
+
     let mut offset = 0;
     while offset < keys.num_rows() {
         let len = DELETE_CHUNK_ROWS.min(keys.num_rows() - offset);
@@ -132,13 +139,22 @@ pub async fn delete_by_keys(
             continue;
         };
 
+        // A transport error still stops the batch: it says the request never reached the index,
+        // so the later chunks have nothing to reach either.
         let resp = client
             .delete_by_query(es_index, &query)
             .await
             .boxed()
             .map_err(DataFusionError::External)?;
-        inspect_delete_response(&resp, es_index)
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        if let Err(e) = inspect_delete_response(&resp, es_index) {
+            // Report the first, which is the one whose surrounding state a reconcile starts from;
+            // later chunks fail the same way once the index has diverged.
+            partial.get_or_insert(e);
+        }
+    }
+
+    if let Some(e) = partial {
+        return Err(DataFusionError::External(Box::new(e)));
     }
 
     Ok(())
@@ -1250,6 +1266,38 @@ mod tests {
         assert!(
             err.to_string().contains("1 version conflict(s)"),
             "the second chunk's conflict should be the reported one: {err}"
+        );
+    }
+
+    /// An early chunk's partial delete does not cancel the rest of the batch. The chunks address
+    /// disjoint slices of `keys`, so stopping at the first partial response would leave documents
+    /// behind for rows no request ever named — the very divergence this check exists to report.
+    #[tokio::test]
+    async fn an_early_partial_delete_still_issues_the_remaining_chunks() {
+        let client = RecordingClient::answering_in_turn(vec![
+            json!({"total": 1, "deleted": 0, "version_conflicts": 1, "failures": []}),
+            clean_delete_response(DELETE_CHUNK_ROWS as u64),
+        ]);
+        let ids: Vec<String> = (0..=DELETE_CHUNK_ROWS).map(|i| i.to_string()).collect();
+
+        let err = delete_by_keys(
+            &client,
+            "idx",
+            &[pk("id", DataType::Utf8)],
+            &["id".to_string()],
+            &string_key_batch(ids.iter().map(|s| Some(s.as_str())).collect()),
+        )
+        .await
+        .expect_err("the first chunk's partial delete must still surface");
+
+        assert_eq!(
+            client.queries().len(),
+            2,
+            "the second chunk should have been issued despite the first coming back partial"
+        );
+        assert!(
+            err.to_string().contains("1 version conflict(s)"),
+            "the first chunk's conflict should be the reported one: {err}"
         );
     }
 
