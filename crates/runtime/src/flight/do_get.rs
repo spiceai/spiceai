@@ -24,7 +24,10 @@ use tonic::{Request, Response, Status};
 
 use crate::{
     datafusion::request_context_extension::get_current_datafusion,
-    flight::{metrics, util::attach_cache_metadata},
+    flight::{
+        metrics, traced_ticket,
+        util::{attach_cache_metadata, attach_trace_id_metadata},
+    },
 };
 use runtime_request_context::{AsyncMarker, RequestContext};
 use telemetry::timing::TimedStream;
@@ -34,12 +37,29 @@ use super::{Service, flightsql, to_tonic_err};
 pub(crate) async fn handle(
     request: Request<Ticket>,
 ) -> Result<Response<<Service as FlightService>::DoGetStream>, Status> {
+    // `get_flight_info` answered the client with a trace id and wrapped the
+    // ticket with it. Adopting it here, before any query runs, is what makes
+    // that id name this execution — the work that can fail — rather than the
+    // planning call the client could not have correlated on.
+    let request = adopt_ticket_trace_id(request).await;
+
+    // The id the query will actually run under, in the order the task resolves
+    // it: a client that pinned one on this request outranks the ticket, so
+    // reporting the ticket's would name an id no record carries.
+    let context = RequestContext::current(AsyncMarker::new().await);
+    let trace_id = context
+        .client_trace_id()
+        .or_else(|| context.propagated_trace_id())
+        .cloned();
+
     let msg: Any = match Message::decode(&*request.get_ref().ticket) {
         Ok(msg) => msg,
-        Err(_) => return Box::pin(do_get_simple(request)).await,
+        Err(_) => {
+            return with_trace_id(Box::pin(do_get_simple(request)).await, trace_id.as_deref());
+        }
     };
 
-    match Command::try_from(msg).map_err(to_tonic_err)? {
+    let result = match Command::try_from(msg).map_err(to_tonic_err)? {
         Command::CommandStatementQuery(command) => {
             Box::pin(flightsql::statement_query::do_get(command)).await
         }
@@ -137,6 +157,42 @@ pub(crate) async fn handle(
                 any.type_url
             )))
         }
+    };
+
+    with_trace_id(result, trace_id.as_deref())
+}
+
+/// Records the trace id a `get_flight_info` wrapped into the ticket on the
+/// request, and returns the request holding the ticket underneath.
+///
+/// A ticket without one — minted by an older runtime, or by a client that
+/// built its own — passes through unchanged and the query numbers itself.
+async fn adopt_ticket_trace_id(request: Request<Ticket>) -> Request<Ticket> {
+    let Some((trace_id, inner)) = traced_ticket::unwrap(request.get_ref()) else {
+        return request;
+    };
+
+    RequestContext::current(AsyncMarker::new().await).set_propagated_trace_id(trace_id);
+
+    let (metadata, extensions, _) = request.into_parts();
+    Request::from_parts(metadata, extensions, inner)
+}
+
+/// Returns the trace id alongside the result stream, for clients that read
+/// gRPC response metadata.
+///
+/// The id is also in the `FlightInfo` this ticket came from, which is the only
+/// place a Flight SQL JDBC caller can read it; this covers everything else.
+fn with_trace_id<T>(
+    result: Result<Response<T>, Status>,
+    trace_id: Option<&str>,
+) -> Result<Response<T>, Status> {
+    match (result, trace_id) {
+        (Ok(mut response), Some(trace_id)) => {
+            attach_trace_id_metadata(&mut response, trace_id);
+            Ok(response)
+        }
+        (result, _) => result,
     }
 }
 

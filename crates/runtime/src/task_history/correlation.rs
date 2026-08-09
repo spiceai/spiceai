@@ -36,7 +36,10 @@ limitations under the License.
 
 use std::sync::Arc;
 
-use opentelemetry::trace::{TraceContextExt, TraceId};
+use opentelemetry::{
+    Context,
+    trace::{SpanContext, TraceContextExt, TraceFlags, TraceId, TraceState},
+};
 use opentelemetry_sdk::trace::{IdGenerator, RandomIdGenerator};
 use runtime_request_context::RequestContext;
 use tracing::Span;
@@ -54,8 +57,9 @@ pub const TRACE_SPAN_NAME: &str = "query";
 /// is already in scope.
 const TRACE_SPAN_TARGET: &str = "runtime::query::trace";
 
-/// Records any client-pinned trace id on `task_span`, then returns the span
-/// that carries the task's id onto the log.
+/// Puts `task_span` on the task's trace id — recording a client-pinned one, or
+/// joining a trace already returned to the client — then returns the span that
+/// carries the same id onto the log.
 ///
 /// Enter the returned span around the whole task — planning, execution, and
 /// result streaming — so a failure raised at any point in that window is
@@ -69,6 +73,7 @@ const TRACE_SPAN_TARGET: &str = "runtime::query::trace";
 #[must_use]
 pub fn begin_task_trace(task_span: &Span, request_context: &RequestContext) -> Span {
     record_task_history_trace_id(task_span, request_context);
+    join_propagated_trace(task_span, request_context);
 
     let trace_id = resolve_trace_id(request_context, task_span);
 
@@ -106,6 +111,97 @@ pub fn record_task_history_trace_id(span: &Span, request_context: &RequestContex
     }
 }
 
+/// The trace id to return to the client for work this request has not started
+/// yet, recorded so everything the request goes on to do adopts it.
+///
+/// For the first RPC of an exchange that answers the client before the query
+/// runs — Flight SQL's `GetFlightInfo`. A pinned id is returned unchanged; a
+/// caller that pinned nothing gets a freshly minted one, and that id then
+/// reaches the RPC which does run the query (see `flight::traced_ticket`), so
+/// the two name one trace.
+pub fn publish_trace_id(request_context: &RequestContext) -> Arc<str> {
+    if let Some(pinned) = request_context.client_trace_id() {
+        return Arc::clone(pinned);
+    }
+
+    // The exporter's own generator, so an id minted here is the same shape and
+    // quality as one it would have written.
+    Arc::clone(request_context.propagated_trace_id_or_mint(|| {
+        Arc::from(RandomIdGenerator::default().new_trace_id().to_string())
+    }))
+}
+
+/// Names the span id [`join_propagated_trace`] anchors a joined trace on.
+///
+/// The exporter reads it to drop that anchor from the `parent_span_id` column:
+/// it identifies no task and, left in place, would hide the query from
+/// `spice trace`, which roots its tree on a null parent.
+pub const SYNTHETIC_PARENT_ATTR: &str = "synthetic_parent_id";
+
+/// Puts `task_span` in the trace whose id an earlier RPC of this exchange
+/// already returned to the client, so the row it writes carries that id.
+///
+/// Joining the trace — rather than declaring the id as an override the way a
+/// client-pinned one is — is what keeps this free. An override is reconciled
+/// after the fact by `TaskSpan::write`, which scans `runtime.task_history` for
+/// every row already written under the id being replaced and rewrites them;
+/// that is a scan per query on a path every Flight SQL query takes. A joined
+/// trace is simply the span's own id, correct at write time, and child spans
+/// (`ballista_stage` rows) inherit it for free.
+///
+/// A client-pinned id wins over a propagated one and keeps the override path:
+/// the id is then the caller's, and its `traceparent` may name a parent span
+/// that the anchor below would displace.
+///
+/// No-op when the task-history layer is not installed — there is no `OTel`
+/// span to place, and [`resolve_trace_id`] falls back to the propagated id
+/// directly for the log.
+fn join_propagated_trace(task_span: &Span, request_context: &RequestContext) {
+    if request_context.client_trace_id().is_some() {
+        return;
+    }
+    let Some(propagated) = request_context.propagated_trace_id() else {
+        return;
+    };
+    let Ok(trace_id) = TraceId::from_hex(propagated) else {
+        // Unreachable for an id this runtime minted; a corrupted one costs
+        // correlation, not the query.
+        tracing::warn!("Ignoring malformed propagated trace id '{propagated}'");
+        return;
+    };
+
+    // Only the request's first task anchors itself. A nested task — a cache
+    // fill, NSQL's generated SQL, a sub-query — is already in this trace
+    // through the task above it, and anchoring it too would replace its real
+    // parent with one that names nothing, flattening the `task_history` tree.
+    if !request_context.claim_trace_join() {
+        return;
+    }
+
+    // A span context is only valid with *both* ids, so joining a trace costs a
+    // span id even though no span answers to it. It is dropped from the row by
+    // the exporter — see `SYNTHETIC_PARENT_ATTR`.
+    let anchor = RandomIdGenerator::default().new_span_id();
+    let parent = Context::new().with_remote_span_context(SpanContext::new(
+        trace_id,
+        anchor,
+        TraceFlags::SAMPLED,
+        true,
+        TraceState::default(),
+    ));
+
+    if let Err(e) = task_span.set_parent(parent) {
+        // Expected whenever there is no row to place: with
+        // `runtime.task_history.enabled: false` the layer is absent, and the
+        // span may be filtered out. Not a warning — it would be one per query
+        // in a supported configuration, and the log still gets the id from
+        // `resolve_trace_id`.
+        tracing::debug!("Not recording task under trace {propagated}: {e}");
+        return;
+    }
+    tracing::info!(target: "task_history", parent: task_span, synthetic_parent_id = %anchor);
+}
+
 /// The `traceparent` span this task is a child of, but only when that span
 /// belongs to `trace_id`.
 ///
@@ -130,15 +226,23 @@ pub fn same_trace_parent_span(
 /// the first of these that applies:
 ///
 /// 1. the id the client pinned;
-/// 2. the span's own OpenTelemetry trace id, when task history is recording.
+/// 2. the id an earlier RPC of this exchange already returned to the client —
+///    [`join_propagated_trace`] has put the span in that trace, so this is the
+///    span's own id too, but it is read from the request because the join is a
+///    no-op when task history is off;
+/// 3. the span's own OpenTelemetry trace id, when task history is recording.
 ///    Reusing it is what makes a log record and the row it belongs to name the
 ///    same id, at no cost — the alternative, minting an id here and rewriting
 ///    every row to match, is a full scan of the task-history table per query;
-/// 3. a freshly generated id, when task history is disabled and there is no
+/// 4. a freshly generated id, when task history is disabled and there is no
 ///    span context to borrow.
 fn resolve_trace_id(request_context: &RequestContext, task_span: &Span) -> Arc<str> {
     if let Some(pinned) = request_context.client_trace_id() {
         return Arc::clone(pinned);
+    }
+
+    if let Some(propagated) = request_context.propagated_trace_id() {
+        return Arc::clone(propagated);
     }
 
     // `TraceId::INVALID` is what an unnumbered span reports, which is every
@@ -156,7 +260,7 @@ fn resolve_trace_id(request_context: &RequestContext, task_span: &Span) -> Arc<s
 #[cfg(test)]
 mod tests {
     use super::*;
-    use runtime_request_context::{Protocol, RequestContextBuilder};
+    use runtime_request_context::{Protocol, RequestContextBuilder, TRACE_ID_HEX_LEN};
 
     const PINNED: &str = "4bf92f3577b34da6a3ce929d0e0e4736";
 
@@ -263,5 +367,101 @@ mod tests {
 
         assert_eq!(&*resolve_trace_id(&ctx, &Span::none()), PINNED);
         assert_eq!(&*resolve_trace_id(&ctx, &Span::none()), PINNED);
+    }
+
+    const PROPAGATED: &str = "0af7651916cd43dd8448eb211c80319c";
+
+    /// The whole point of propagating an id through a Flight ticket: the task
+    /// that runs the query adopts the id an earlier RPC already returned,
+    /// rather than generating one the client never saw.
+    #[test]
+    fn resolve_adopts_a_propagated_id_instead_of_generating_one() {
+        let ctx = unpinned();
+        ctx.set_propagated_trace_id(Arc::from(PROPAGATED));
+
+        assert_eq!(&*resolve_trace_id(&ctx, &Span::none()), PROPAGATED);
+        assert_eq!(
+            &*resolve_trace_id(&ctx, &Span::none()),
+            PROPAGATED,
+            "an adopted id is stable, unlike a generated one"
+        );
+    }
+
+    /// A client that pinned an id gets that id, even on a request whose ticket
+    /// carries one: the pinned id is the caller's and is what it correlates on.
+    #[test]
+    fn a_pinned_id_beats_a_propagated_one() {
+        let ctx = pinned();
+        ctx.set_propagated_trace_id(Arc::from(PROPAGATED));
+
+        assert_eq!(&*resolve_trace_id(&ctx, &Span::none()), PINNED);
+    }
+
+    /// Only the request's top task anchors itself on the trace. A nested task
+    /// is already in it through the task above, and re-anchoring would trade
+    /// that task's real parent for one that names nothing.
+    #[test]
+    fn only_the_first_task_of_a_request_joins_the_trace() {
+        let ctx = unpinned();
+        ctx.set_propagated_trace_id(Arc::from(PROPAGATED));
+
+        assert!(ctx.claim_trace_join(), "the top task joins");
+        assert!(!ctx.claim_trace_join(), "a nested task must not re-anchor");
+
+        assert_eq!(
+            &*resolve_trace_id(&ctx, &Span::none()),
+            PROPAGATED,
+            "a nested task still logs under the same id"
+        );
+    }
+
+    /// A second id cannot move a request already numbered — the task that read
+    /// the first has already logged under it.
+    #[test]
+    fn the_first_propagated_id_wins() {
+        let ctx = unpinned();
+        ctx.set_propagated_trace_id(Arc::from(PROPAGATED));
+        ctx.set_propagated_trace_id(Arc::from(PINNED));
+
+        assert_eq!(&*resolve_trace_id(&ctx, &Span::none()), PROPAGATED);
+    }
+
+    /// `GetFlightInfo` returns the id before the query runs, and `DoGet` has to
+    /// end up on the same one, so the minting has to happen exactly once.
+    #[test]
+    fn publish_mints_one_id_and_records_it_for_the_request() {
+        let ctx = unpinned();
+
+        let published = publish_trace_id(&ctx);
+        assert_eq!(published.len(), TRACE_ID_HEX_LEN);
+        assert_eq!(
+            publish_trace_id(&ctx),
+            published,
+            "a second call must return the id already handed to the client"
+        );
+        assert_eq!(
+            ctx.propagated_trace_id().map(AsRef::as_ref),
+            Some(&*published),
+            "the id has to be on the request, or the task would resolve another"
+        );
+        assert_eq!(&*resolve_trace_id(&ctx, &Span::none()), &*published);
+    }
+
+    /// A pinned id is returned as-is and deliberately *not* recorded as
+    /// propagated: it keeps the override path, which is what also writes the
+    /// caller's `traceparent` span to the row as the task's parent.
+    #[test]
+    fn publish_returns_a_pinned_id_without_adopting_it() {
+        let ctx = pinned();
+
+        assert_eq!(&*publish_trace_id(&ctx), PINNED);
+        assert!(ctx.propagated_trace_id().is_none());
+    }
+
+    /// Two requests get two ids — the id identifies a query, not a connection,
+    /// which is the whole reason a pooled client cannot pin one up front.
+    #[test]
+    fn publish_mints_a_distinct_id_per_request() {
+        assert_ne!(publish_trace_id(&unpinned()), publish_trace_id(&unpinned()));
     }
 }

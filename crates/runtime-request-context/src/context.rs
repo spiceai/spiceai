@@ -33,7 +33,7 @@ use std::{
     marker::PhantomData,
     sync::{
         Arc, LazyLock, OnceLock, RwLock,
-        atomic::{AtomicI16, AtomicU8},
+        atomic::{AtomicBool, AtomicI16, AtomicU8},
     },
 };
 use tokio_util::sync::CancellationToken;
@@ -66,6 +66,24 @@ pub struct RequestContext {
     /// client supplied neither, or for a context built without headers — the
     /// runtime then numbers the request's tasks itself.
     client_trace_id: Option<Arc<str>>,
+    /// A trace id this runtime minted earlier in the same protocol exchange
+    /// and already handed to the client, so this request's work has to be
+    /// recorded under it. Flight SQL splits one query across two RPCs:
+    /// `GetFlightInfo` returns the id and carries it to `DoGet` in the ticket
+    /// (see `flight::traced_ticket`), which is what makes the id a client
+    /// reads name the execution rather than the planning call.
+    ///
+    /// Set after the context is built, because a ticket is not a header — it
+    /// is decoded once the RPC is already being dispatched. [`OnceLock`]
+    /// because a request has exactly one: a second write would fork the id
+    /// mid-request, so it is ignored.
+    propagated_trace_id: OnceLock<Arc<str>>,
+    /// Whether a task in this request has already joined the propagated trace.
+    ///
+    /// Only the first one does. A nested task — a cache fill, a sub-query — is
+    /// already inside that trace through the task above it, and re-anchoring it
+    /// would replace its real parent and flatten the `task_history` tree.
+    trace_joined: AtomicBool,
     nested_query_level: AtomicI16,
     /// The raw `authorization` header value from the incoming request, if present.
     /// Used to forward credentials when proxying requests (e.g. scheduler → executor).
@@ -324,6 +342,49 @@ impl RequestContext {
     #[must_use]
     pub fn client_trace_id(&self) -> Option<&Arc<str>> {
         self.client_trace_id.as_ref()
+    }
+
+    /// The trace id an earlier RPC of this same exchange already returned to
+    /// the client, if one was carried in.
+    ///
+    /// Unlike [`Self::client_trace_id`] this id is the runtime's own, so the
+    /// task that adopts it can join that trace outright rather than declaring
+    /// an override the exporter has to reconcile afterwards.
+    #[must_use]
+    pub fn propagated_trace_id(&self) -> Option<&Arc<str>> {
+        self.propagated_trace_id.get()
+    }
+
+    /// Records the trace id carried in by the transport.
+    ///
+    /// Call before the request's work starts — once a task has resolved its
+    /// id, a later write cannot move it. Ignored if one is already set, so
+    /// the first id to arrive is the one the whole request uses.
+    pub fn set_propagated_trace_id(&self, trace_id: Arc<str>) {
+        if self.propagated_trace_id.set(trace_id).is_err() {
+            tracing::debug!(
+                "Ignoring a second propagated trace id: this request already resolved one"
+            );
+        }
+    }
+
+    /// The propagated trace id, minting and recording one with `mint` if the
+    /// request arrived without one.
+    ///
+    /// For the request that *starts* an exchange and has to name an id before
+    /// any work runs. Racing callers agree on one id: the first to arrive
+    /// wins and every caller is handed that one.
+    pub fn propagated_trace_id_or_mint(&self, mint: impl FnOnce() -> Arc<str>) -> &Arc<str> {
+        self.propagated_trace_id.get_or_init(mint)
+    }
+
+    /// Claims the one trace join this request gets, returning `true` to the
+    /// first caller only.
+    ///
+    /// The request's first task anchors itself on the propagated trace; every
+    /// task under it is already in that trace and must keep the parent it has.
+    pub fn claim_trace_join(&self) -> bool {
+        !self.trace_joined.swap(true, Ordering::Relaxed)
     }
 
     /// Returns the raw `authorization` header value from the incoming request, if present.
@@ -742,6 +803,8 @@ impl RequestContextBuilder {
             extensions: RwLock::new(self.extensions),
             trace_parent: self.trace_parent,
             client_trace_id,
+            propagated_trace_id: OnceLock::new(),
+            trace_joined: AtomicBool::new(false),
             nested_query_level: AtomicI16::new(0),
             authorization_header: self.authorization_header,
             cancellation_token: self.cancellation_token.unwrap_or_default(),

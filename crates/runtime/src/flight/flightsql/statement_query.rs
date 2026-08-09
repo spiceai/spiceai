@@ -30,9 +30,13 @@ use crate::{
     flight::{
         Service, is_auth_read_only,
         metrics::track_flight_request,
-        record_batches_to_flight_stream, to_tonic_err, transaction_error_to_status,
-        util::{attach_cache_metadata, set_flightsql_protocol},
+        record_batches_to_flight_stream, to_tonic_err, traced_ticket, transaction_error_to_status,
+        util::{
+            attach_cache_metadata, attach_trace_id_metadata, set_flightsql_protocol,
+            with_trace_id_app_metadata,
+        },
     },
+    task_history::correlation,
 };
 use runtime_request_context::{AsyncMarker, RequestContext};
 use telemetry::timing::TimedStream;
@@ -51,6 +55,10 @@ pub(crate) async fn get_flight_info(
     let context = RequestContext::current(AsyncMarker::new().await);
     let datafusion = get_current_datafusion(&context);
 
+    // Resolved before planning, so a plan failure is logged under the id the
+    // successful path hands back rather than one of its own.
+    let trace_id = correlation::publish_trace_id(&context);
+
     // A `BEGIN … COMMIT` body advertises the schema of its FINAL statement (for
     // the canonical gate+write shape, the write's row-count schema). Plan just
     // that statement for its schema — the body is NOT executed here; any write
@@ -63,9 +71,14 @@ pub(crate) async fn get_flight_info(
 
     let fd = request.into_inner();
 
-    let endpoint = FlightEndpoint::new().with_ticket(Ticket {
-        ticket: query.as_any().encode_to_vec().into(),
-    });
+    // The id rides the ticket so `do_get` — a separate request, which is what
+    // actually runs the query — records its work under the id returned here.
+    let endpoint = FlightEndpoint::new().with_ticket(traced_ticket::wrap(
+        Ticket {
+            ticket: query.as_any().encode_to_vec().into(),
+        },
+        &trace_id,
+    ));
 
     let info = FlightInfo::new()
         .with_endpoint(endpoint)
@@ -73,7 +86,9 @@ pub(crate) async fn get_flight_info(
         .map_err(to_tonic_err)?
         .with_descriptor(fd);
 
-    Ok(Response::new(info))
+    let mut response = Response::new(with_trace_id_app_metadata(info, &trace_id));
+    attach_trace_id_metadata(&mut response, &trace_id);
+    Ok(response)
 }
 
 pub(crate) async fn do_get(

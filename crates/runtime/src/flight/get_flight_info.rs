@@ -21,7 +21,14 @@ use arrow_flight::{
 use prost::Message;
 use tonic::{Request, Response, Status};
 
-use crate::{datafusion::request_context_extension::get_current_datafusion, flight::metrics};
+use crate::{
+    datafusion::request_context_extension::get_current_datafusion,
+    flight::{
+        metrics, traced_ticket,
+        util::{attach_trace_id_metadata, with_trace_id_app_metadata},
+    },
+    task_history::correlation,
+};
 use runtime_request_context::{AsyncMarker, RequestContext};
 
 use super::{Service, flightsql, to_tonic_err};
@@ -166,15 +173,21 @@ async fn get_flight_info_simple(
     let context = RequestContext::current(AsyncMarker::new().await);
     let datafusion = get_current_datafusion(&context);
 
+    // Resolved before planning, so a plan failure is logged under the id the
+    // successful path hands back rather than one of its own.
+    let trace_id = correlation::publish_trace_id(&context);
+
     let sql: &str = std::str::from_utf8(&fd.cmd).map_err(to_tonic_err)?;
     let (arrow_schema, _) = Service::get_arrow_schema(datafusion, sql)
         .await
         .map_err(to_tonic_err)?;
 
+    let descriptor = fd.clone();
+    let ticket = traced_ticket::wrap(Ticket { ticket: fd.cmd }, &trace_id);
     let info = FlightInfo {
-        flight_descriptor: Some(fd.clone()),
+        flight_descriptor: Some(descriptor),
         endpoint: vec![FlightEndpoint {
-            ticket: Some(Ticket { ticket: fd.cmd }),
+            ticket: Some(ticket),
             ..Default::default()
         }],
         ..Default::default()
@@ -182,5 +195,7 @@ async fn get_flight_info_simple(
     .try_with_schema(&arrow_schema)
     .map_err(to_tonic_err)?;
 
-    Ok(Response::new(info))
+    let mut response = Response::new(with_trace_id_app_metadata(info, &trace_id));
+    attach_trace_id_metadata(&mut response, &trace_id);
+    Ok(response)
 }

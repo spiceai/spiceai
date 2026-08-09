@@ -86,12 +86,68 @@ The id covers a query's whole lifetime — planning, execution, and result
 streaming — so a failure raised at any point in that window is attributable,
 including one raised mid-stream after the response has begun.
 
-Because the id is on the log rather than in the response, correlation is
-server-side: an operator holding a failure record can find every record for that
-query. A caller that needs the id on its own side pins one.
+An HTTP caller that needs the id on its own side pins one — it controls the
+headers of every request it sends. A pooled Flight SQL client cannot, which is
+what the next section is for.
 
 The span is entered around SQL query execution. A chat completion, a search, or an
 embedding call is a task-history task in its own right and gets a `trace_id` column,
 but its log records carry the id only for the queries it runs — under a pinned id
 those queries share the caller's id, and with task history recording they inherit
 the parent task's trace id.
+
+## Reading the id back over Flight
+
+A client that pools connections cannot pin an id per query: with HikariCP the JDBC
+URL — and so every gRPC header the Arrow Flight SQL driver sends — is fixed when the
+pool is built, while correlation is wanted per query. So Flight *returns* the id
+instead, on every query, with nothing to configure.
+
+| Where                            | Read it with                                                     |
+| -------------------------------- | ---------------------------------------------------------------- |
+| `FlightInfo.app_metadata`        | Any Flight SQL client; the only surface the JDBC driver exposes    |
+| `x-spice-trace-id` response metadata on `GetFlightInfo` and `DoGet` | A Flight client middleware or gRPC interceptor |
+
+`app_metadata` is JSON so it can carry a second field later:
+
+```json
+{ "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736" }
+```
+
+From the Arrow Flight SQL JDBC driver, unwrap the result set — this works through a
+HikariCP proxy, which delegates `unwrap`:
+
+```java
+try (ResultSet rs = statement.executeQuery(sql)) {
+    byte[] metadata = rs.unwrap(ArrowFlightJdbcFlightStreamResultSet.class).getAppMetadata();
+    // {"trace_id":"4bf92f3577b34da6a3ce929d0e0e4736"}
+}
+```
+
+Log that id next to the application's own request id and the two sides join:
+
+```sql
+SELECT * FROM runtime.task_history WHERE trace_id = '4bf92f35…';
+```
+
+### Why the id survives the two RPCs
+
+A Flight SQL query is two requests — `GetFlightInfo` plans it, `DoGet` runs it — each
+with its own headers and its own request context. `GetFlightInfo` is the one that can
+answer the client, but `DoGet` is the one that executes and logs a failure, so an id
+returned by the first and unused by the second would name the planning call and
+correlate nothing.
+
+`GetFlightInfo` therefore resolves the id, returns it, and wraps the ticket it hands
+out with it; `DoGet` unwraps it and joins that trace before the query starts. Tickets
+are opaque to clients, which echo them back unread, and a ticket without an id — from
+an older runtime, or a client that built its own — still works: the query numbers
+itself as before.
+
+Joining the trace, rather than declaring the id as an override the way a pinned one
+is, is what keeps this free: an override is reconciled afterwards by scanning
+`runtime.task_history` for the rows to rewrite, which on this path would be a scan per
+query.
+
+An HTTP response does not carry the id. An HTTP caller pins one per request, which a
+pooled Flight SQL client is the case that cannot.
