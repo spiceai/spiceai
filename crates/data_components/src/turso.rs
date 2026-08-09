@@ -2297,7 +2297,23 @@ const MAP_KEY_COLUMN: usize = 0;
 /// Position of the value column in a `MapArray`'s entries struct.
 const MAP_VALUE_COLUMN: usize = 1;
 
-/// Serializes the elements of one list value as a JSON array, for storage in a `TEXT` column.
+/// Version of the encoding written for a list value's elements.
+///
+/// A payload carrying this version was written by an encoder whose output the reader can trust. A
+/// payload carrying no version at all was written before the marker existed, which includes every
+/// payload written by the encoder that stored the literal `[null]` for every list whatever the list
+/// held. Those two are the same bytes for a list of one null, so the version is the only thing that
+/// separates a stored list the reader may serve from one it may not.
+const LIST_ENCODING_VERSION: u64 = 1;
+
+/// Envelope member naming the [`LIST_ENCODING_VERSION`] a payload was written under.
+const LIST_ENCODING_VERSION_KEY: &str = "v";
+
+/// Envelope member holding a list payload's elements.
+const LIST_ENCODING_ELEMENTS_KEY: &str = "e";
+
+/// Serializes the elements of one list value for storage in a `TEXT` column, as a JSON envelope
+/// naming the encoding version the elements were written under.
 fn list_elements_to_json(
     elements: &ArrayRef,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
@@ -2309,7 +2325,17 @@ fn list_elements_to_json(
         )?)?);
     }
 
-    serde_json::to_string(&json_values)
+    let mut envelope = serde_json::Map::with_capacity(2);
+    envelope.insert(
+        LIST_ENCODING_VERSION_KEY.to_string(),
+        serde_json::Value::from(LIST_ENCODING_VERSION),
+    );
+    envelope.insert(
+        LIST_ENCODING_ELEMENTS_KEY.to_string(),
+        serde_json::Value::Array(json_values),
+    );
+
+    serde_json::to_string(&envelope)
         .map_err(|e| format!("Failed to serialize List as JSON: {e}").into())
 }
 
@@ -2424,6 +2450,7 @@ fn decode_stored_lists(
     let mut elements: Vec<ScalarValue> = Vec::new();
     let mut lengths = Vec::with_capacity(rows.len());
     let mut validity = Vec::with_capacity(rows.len());
+    let mut unversioned = 0;
 
     for row in rows {
         if let Some(values) = decode_stored_list_row(row.get(col_idx), element_type) {
@@ -2431,10 +2458,15 @@ fn decode_stored_lists(
             validity.push(true);
             elements.extend(values);
         } else {
+            if is_unversioned_list_payload(row.get(col_idx)) {
+                unversioned += 1;
+            }
             lengths.push(0);
             validity.push(false);
         }
     }
+
+    warn_on_unversioned_list_payloads(unversioned);
 
     Ok(DecodedLists {
         elements: scalars_to_array(elements, element_type)?,
@@ -2463,6 +2495,7 @@ fn decode_stored_fixed_size_lists(
     // rows and let the element vector grow, rather than trusting `rows * width` as a capacity.
     let mut elements: Vec<ScalarValue> = Vec::with_capacity(rows.len());
     let mut validity = Vec::with_capacity(rows.len());
+    let mut unversioned = 0;
 
     for row in rows {
         if let Some(values) = decode_stored_list_row(row.get(col_idx), element_type)
@@ -2471,11 +2504,16 @@ fn decode_stored_fixed_size_lists(
             validity.push(true);
             elements.extend(values);
         } else {
+            if is_unversioned_list_payload(row.get(col_idx)) {
+                unversioned += 1;
+            }
             // A null row still owns its slots in the element array.
             validity.push(false);
             elements.extend(std::iter::repeat_n(unset.clone(), slots));
         }
     }
+
+    warn_on_unversioned_list_payloads(unversioned);
 
     Ok(DecodedFixedSizeLists {
         elements: scalars_to_array(elements, element_type)?,
@@ -2519,8 +2557,8 @@ fn decode_stored_maps(
     })
 }
 
-/// The elements of one stored list, or `None` if nothing was stored for it or it does not decode as
-/// a JSON array of the declared element type.
+/// The elements of one stored list, or `None` if nothing was stored for it, it was written before
+/// [`LIST_ENCODING_VERSION`] existed, or it does not decode as the declared element type.
 fn decode_stored_list_row(
     stored: Option<&TursoValue>,
     element_type: &DataType,
@@ -2528,11 +2566,54 @@ fn decode_stored_list_row(
     let Some(TursoValue::Text(json)) = stored else {
         return None;
     };
-    let elements: Vec<serde_json::Value> = serde_json::from_str(json).ok()?;
-    elements
+    stored_list_elements(json)?
         .iter()
         .map(|element| json_value_to_scalar(element, element_type))
         .collect()
+}
+
+/// The elements a list payload carries, or `None` if it is not an envelope written under
+/// [`LIST_ENCODING_VERSION`].
+fn stored_list_elements(json: &str) -> Option<Vec<serde_json::Value>> {
+    let mut envelope: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_str(json).ok()?;
+    if envelope.get(LIST_ENCODING_VERSION_KEY)?.as_u64()? != LIST_ENCODING_VERSION {
+        return None;
+    }
+    match envelope.remove(LIST_ENCODING_ELEMENTS_KEY)? {
+        serde_json::Value::Array(elements) => Some(elements),
+        _ => None,
+    }
+}
+
+/// Whether a stored value is a list payload written before [`LIST_ENCODING_VERSION`] existed — a
+/// bare JSON array rather than an envelope.
+///
+/// Told apart from the other ways a row reads as null so that the reason it read as null can be
+/// reported: an unversioned payload is refused for its provenance, not for its contents, and a
+/// refresh is what repairs it.
+fn is_unversioned_list_payload(stored: Option<&TursoValue>) -> bool {
+    let Some(TursoValue::Text(json)) = stored else {
+        return false;
+    };
+    serde_json::from_str::<Vec<serde_json::Value>>(json).is_ok()
+}
+
+/// Emits one WARN per scanned list column that held payloads predating
+/// [`LIST_ENCODING_VERSION`], naming the refresh that rebuilds them.
+///
+/// Separate from the per-scan conversion-failure WARN, which reports the same cells as type drift.
+/// This one has the specific cause and the specific remedy.
+fn warn_on_unversioned_list_payloads(count: usize) {
+    if count == 0 {
+        return;
+    }
+    tracing::warn!(
+        "Turso read: {count} stored list value(s) predate the list encoding version and were \
+         returned as NULL. A list written before that version cannot be told apart from one \
+         written by the encoder that stored every list as a single null, so its contents are not \
+         served. Refresh this dataset to rebuild them."
+    );
 }
 
 /// The entries of one stored map, or `None` if nothing was stored for it or it does not decode as a
@@ -3515,6 +3596,20 @@ mod tests {
         ScalarValue::List(Arc::new(builder.finish()))
     }
 
+    /// The stored form of a list payload written under the current encoding version.
+    ///
+    /// Built rather than written as a literal so that a test asserts the envelope's shape without
+    /// depending on the member order `serde_json::Map` happens to keep — see [`stored_json`].
+    fn list_envelope(elements: serde_json::Value) -> serde_json::Value {
+        let mut envelope = serde_json::Map::with_capacity(2);
+        envelope.insert(
+            LIST_ENCODING_VERSION_KEY.to_string(),
+            serde_json::Value::from(LIST_ENCODING_VERSION),
+        );
+        envelope.insert(LIST_ENCODING_ELEMENTS_KEY.to_string(), elements);
+        serde_json::Value::Object(envelope)
+    }
+
     /// Regression test for #12628: a list scalar wraps its elements in a one-row array, so
     /// iterating the wrapper serialized one null per list instead of the list's contents.
     #[test]
@@ -3526,8 +3621,8 @@ mod tests {
         .expect("an Int32 list should convert");
 
         assert_eq!(
-            value,
-            TursoValue::Text("[1,2,3]".to_string()),
+            stored_json(&value),
+            list_envelope(serde_json::json!([1, 2, 3])),
             "the list's elements should be serialized, not the wrapper array"
         );
     }
@@ -3541,7 +3636,10 @@ mod tests {
         )
         .expect("a list with a null element should convert");
 
-        assert_eq!(value, TursoValue::Text("[1,null,3]".to_string()));
+        assert_eq!(
+            stored_json(&value),
+            list_envelope(serde_json::json!([1, null, 3]))
+        );
     }
 
     /// An empty list is distinct from a null list.
@@ -3550,7 +3648,125 @@ mod tests {
         let value = scalar_value_to_turso(int32_list_scalar(vec![]), TimestampFormat::default())
             .expect("an empty list should convert");
 
-        assert_eq!(value, TursoValue::Text("[]".to_string()));
+        assert_eq!(stored_json(&value), list_envelope(serde_json::json!([])));
+    }
+
+    /// The `List<Int32>` type the stored-payload tests below read against.
+    fn int32_list_type() -> DataType {
+        DataType::List(Arc::new(Field::new("item", DataType::Int32, true)))
+    }
+
+    /// Reads one already-stored value back as the declared type, the way a scan does — the entry
+    /// point a payload written by an older build arrives through.
+    fn read_stored(stored: TursoValue, data_type: DataType) -> ArrayRef {
+        let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new("c", data_type, true)]));
+        let batch = TursoTableProvider::values_to_record_batch(&[vec![stored]], &schema)
+            .expect("the stored value should be readable");
+        Arc::clone(batch.column(0))
+    }
+
+    /// Regression test for #12632: a `mode: file` acceleration keeps its payloads across an
+    /// upgrade, and every list the pre-#12628 writer stored is the literal `[null]`, whatever the
+    /// list held. Reading that as a one-element list holding null serves a value the source never
+    /// had — and stops warning about it, because it now parses.
+    #[test]
+    fn test_a_pre_version_list_payload_is_not_served_as_data() {
+        let column = read_stored(TursoValue::Text("[null]".to_string()), int32_list_type());
+
+        assert!(
+            column.is_null(0),
+            "a list payload predating the encoding version should read as NULL, not as a \
+             one-element list holding null"
+        );
+    }
+
+    /// The refusal is by provenance, not by contents: a payload the pre-version writer could not
+    /// have produced is still unversioned, and nothing separates it from one that it did.
+    #[test]
+    fn test_a_pre_version_list_payload_holding_contents_is_not_served() {
+        let column = read_stored(TursoValue::Text("[1,2,3]".to_string()), int32_list_type());
+
+        assert!(
+            column.is_null(0),
+            "an unversioned list payload should read as NULL whatever it holds"
+        );
+    }
+
+    /// The other half of the same rule: a list of one null written by the *current* encoder is
+    /// real data and must survive. Without the version marker this is the same stored text as the
+    /// corrupt payload above, which is why the marker exists.
+    #[test]
+    fn test_a_versioned_single_null_list_still_reads_back() {
+        assert_round_trips(&int32_list_scalar(vec![None]));
+    }
+
+    /// A refused payload is a non-NULL stored value that read as NULL, so the existing per-scan
+    /// conversion-failure WARN counts it. Nothing about the upgrade is silent.
+    #[test]
+    fn test_a_pre_version_list_payload_is_counted_as_a_conversion_failure() {
+        let schema: SchemaRef =
+            Arc::new(Schema::new(vec![Field::new("c", int32_list_type(), true)]));
+        let rows = vec![vec![TursoValue::Text("[null]".to_string())]];
+        let batch = TursoTableProvider::values_to_record_batch(&rows, &schema)
+            .expect("the stored value should be readable");
+
+        assert_eq!(
+            TursoTableProvider::count_conversion_failures(&rows, &batch),
+            vec![1],
+            "a refused legacy payload should be reported, not counted as genuinely NULL"
+        );
+    }
+
+    /// The fixed-size arm decodes through the same payload reader, so it refuses the same payloads.
+    #[test]
+    fn test_a_pre_version_fixed_size_list_payload_is_not_served() {
+        let column = read_stored(
+            TursoValue::Text("[null]".to_string()),
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Int32, true)), 1),
+        );
+
+        assert!(
+            column.is_null(0),
+            "a fixed-size list payload predating the encoding version should read as NULL"
+        );
+    }
+
+    /// A payload naming a version this build does not write is refused rather than read under the
+    /// current rules, so a file written by a newer build cannot be misread by an older one.
+    #[test]
+    fn test_a_list_envelope_of_another_version_is_not_served() {
+        let stored = serde_json::json!({
+            LIST_ENCODING_VERSION_KEY: LIST_ENCODING_VERSION + 1,
+            LIST_ENCODING_ELEMENTS_KEY: [1, 2, 3],
+        })
+        .to_string();
+
+        assert!(
+            read_stored(TursoValue::Text(stored), int32_list_type()).is_null(0),
+            "an envelope naming an unknown encoding version should read as NULL"
+        );
+    }
+
+    /// An envelope whose elements member is missing or is not an array names a version whose shape
+    /// it does not have, so it is refused rather than read as an empty list.
+    #[test]
+    fn test_a_list_envelope_without_an_elements_array_is_not_served() {
+        for elements in [None, Some(serde_json::json!(7))] {
+            let mut envelope = serde_json::Map::with_capacity(2);
+            envelope.insert(
+                LIST_ENCODING_VERSION_KEY.to_string(),
+                serde_json::Value::from(LIST_ENCODING_VERSION),
+            );
+            if let Some(elements) = &elements {
+                envelope.insert(LIST_ENCODING_ELEMENTS_KEY.to_string(), elements.clone());
+            }
+            let stored = serde_json::Value::Object(envelope).to_string();
+
+            assert!(
+                read_stored(TursoValue::Text(stored), int32_list_type()).is_null(0),
+                "an envelope with elements {elements:?} should read as NULL"
+            );
+        }
     }
 
     /// A null list is SQL NULL, not the text `[]`.
