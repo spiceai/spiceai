@@ -29,7 +29,7 @@ use datafusion::{
     sql::TableReference,
 };
 use futures::TryStreamExt;
-use runtime::{Runtime, accelerated_table::AcceleratedTable};
+use runtime::{Runtime, accelerated::AcceleratedTable};
 use runtime_request_context::{CacheControl, Protocol, RequestContext, UserAgent};
 use spicepod::{
     acceleration::{Acceleration, Mode, OnConflictBehavior, RefreshMode},

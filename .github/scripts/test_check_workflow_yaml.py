@@ -183,6 +183,152 @@ class CheckStepBudgetTest(unittest.TestCase):
         )
 
 
+def _nightly_with_suites(*suites: tuple[str, str], trigger: str = "schedule") -> str:
+    """A scheduled job running each `(name, if)` suite in turn; empty `if` omits it."""
+    header = (
+        "---\non:\n"
+        + ("  schedule:\n    - cron: '0 0 * * *'\n" if trigger == "schedule" else "")
+        + ("  workflow_dispatch:\n" if trigger != "schedule" else "")
+        + "\njobs:\n  nightly:\n    runs-on: ubuntu-24.04\n    steps:\n"
+    )
+    body = "".join(
+        f"      - name: {name}\n"
+        + (f"        if: {condition}\n" if condition else "")
+        + "        run: cargo nextest run -- suite\n"
+        for name, condition in suites
+    )
+    return header + body
+
+
+def _hidden(label: str) -> str:
+    return (
+        f"job `nightly` lets an earlier suite's failure skip `{label}`; give it "
+        "`if: ${{ !cancelled() && <its existing condition> }}` so the job's "
+        "conclusion reports every suite"
+    )
+
+
+class CheckSuiteVisibilityTest(unittest.TestCase):
+    """#12625: a nightly's first failing suite skips every suite behind it."""
+
+    def test_the_first_suite_needs_no_condition(self):
+        """Nothing precedes it, so nothing can hide it."""
+        self.assertEqual(
+            check_workflow_yaml.check_workflow(_nightly_with_suites(("Run A", ""))), []
+        )
+
+    def test_a_later_suite_with_no_condition_is_reported(self):
+        self.assertEqual(
+            check_workflow_yaml.check_workflow(
+                _nightly_with_suites(("Run A", ""), ("Run B", ""))
+            ),
+            [_hidden("Run B")],
+        )
+
+    def test_a_later_suite_gated_only_on_a_secret_is_reported(self):
+        """The shape the nightly actually had: a condition that `success()` still gates."""
+        self.assertEqual(
+            check_workflow_yaml.check_workflow(
+                _nightly_with_suites(("Run A", ""), ("Run B", "env.HAS_KEY == 'true'"))
+            ),
+            [_hidden("Run B")],
+        )
+
+    def test_every_hidden_suite_is_reported(self):
+        self.assertEqual(
+            check_workflow_yaml.check_workflow(
+                _nightly_with_suites(("Run A", ""), ("Run B", ""), ("Run C", ""))
+            ),
+            [_hidden("Run B"), _hidden("Run C")],
+        )
+
+    def test_a_not_cancelled_guard_is_accepted(self):
+        self.assertEqual(
+            check_workflow_yaml.check_workflow(
+                _nightly_with_suites(
+                    ("Run A", ""),
+                    ("Run B", "${{ !cancelled() && env.HAS_KEY == 'true' }}"),
+                )
+            ),
+            [],
+        )
+
+    def test_an_always_guard_is_accepted(self):
+        """Weaker than `!cancelled()` — it also survives cancellation — but sufficient."""
+        self.assertEqual(
+            check_workflow_yaml.check_workflow(
+                _nightly_with_suites(("Run A", ""), ("Run B", "${{ always() }}"))
+            ),
+            [],
+        )
+
+    def test_a_status_function_inside_a_quoted_literal_does_not_count(self):
+        """Comparing against the text `'always()'` is not a call to it."""
+        self.assertEqual(
+            check_workflow_yaml.check_workflow(
+                _nightly_with_suites(
+                    ("Run A", ""), ("Run B", "${{ env.MODE == 'always()' }}")
+                )
+            ),
+            [_hidden("Run B")],
+        )
+
+    def test_a_real_status_function_beside_a_quoted_literal_is_accepted(self):
+        """Dropping the literal must not take the genuine call out with it."""
+        self.assertEqual(
+            check_workflow_yaml.check_workflow(
+                _nightly_with_suites(
+                    ("Run A", ""),
+                    ("Run B", "${{ !cancelled() && env.MODE == 'always()' }}"),
+                )
+            ),
+            [],
+        )
+
+    def test_a_pr_gate_is_left_alone(self):
+        """Stopping at the first failure is the point of a gate; this only covers nightlies."""
+        self.assertEqual(
+            check_workflow_yaml.check_workflow(
+                _nightly_with_suites(("Run A", ""), ("Run B", ""), trigger="dispatch")
+            ),
+            [],
+        )
+
+    def test_a_step_that_runs_no_suite_is_left_alone(self):
+        """Setup and teardown steps are not results the run exists to report."""
+        workflow = (
+            "---\non:\n  schedule:\n    - cron: '0 0 * * *'\n\njobs:\n  nightly:\n"
+            "    runs-on: ubuntu-24.04\n    steps:\n"
+            "      - name: Run A\n        run: cargo nextest run -- suite\n"
+            "      - name: Tidy up\n        run: rm -rf ./scratch\n"
+        )
+        self.assertEqual(check_workflow_yaml.check_workflow(workflow), [])
+
+    def test_a_snapshot_push_behind_a_suite_is_reported(self):
+        """The refresh is what a nightly exists to produce, so a red suite must not skip it."""
+        workflow = (
+            "---\non:\n  schedule:\n    - cron: '0 0 * * *'\n\njobs:\n  nightly:\n"
+            "    runs-on: ubuntu-24.04\n    steps:\n"
+            "      - name: Run A\n        run: cargo nextest run -- suite\n"
+            "      - name: Push snapshots to branch\n"
+            "        if: github.event_name == 'schedule'\n"
+            "        uses: ./.github/actions/push-snap-changes\n"
+        )
+        self.assertEqual(
+            check_workflow_yaml.check_workflow(workflow),
+            [_hidden("Push snapshots to branch")],
+        )
+
+    def test_an_unnamed_suite_is_reported_by_position(self):
+        workflow = (
+            "---\non:\n  schedule:\n    - cron: '0 0 * * *'\n\njobs:\n  nightly:\n"
+            "    runs-on: ubuntu-24.04\n    steps:\n"
+            "      - run: cargo test --workspace\n"
+            "      - run: cargo test -p spice\n"
+        )
+        self.assertEqual(check_workflow_yaml.check_workflow(workflow), [_hidden("step 2")])
+
+
 def _workflow_with_conditions(job_if: str = "", step_if: str = "") -> str:
     """A one-step workflow, with each `if:` line omitted when passed empty."""
     return "".join(
@@ -375,6 +521,163 @@ class CheckConditionContextTest(unittest.TestCase):
             "steps.probe.outputs.ok == '1'\n      run: echo hello\n"
         )
         self.assertEqual(check_workflow_yaml.check_action(action), [])
+
+
+def _workflow_running_the_runtime(
+    command: str = "cargo nextest run --archive-file ./integration.tar.zst -- openai_test",
+    prelude: str = "",
+    with_cache_setup: bool = True,
+) -> str:
+    """A job that sets up the compiler cache and then runs the Spice runtime."""
+    return "".join(
+        [
+            "---\non:\n  workflow_dispatch:\n\njobs:\n  test-models:\n",
+            "    runs-on: spiceai-macos\n    steps:\n",
+            (
+                "      - name: Set up spiceio\n"
+                "        uses: spiceai/spiceio/.github/actions/setup@0870da5\n"
+                if with_cache_setup
+                else ""
+            ),
+            "      - name: Run OpenAI integration test\n        run: |\n",
+            f"          {prelude}\n" if prelude else "",
+            f"          {command}\n",
+        ]
+    )
+
+
+class CheckCacheEndpointIsolationTest(unittest.TestCase):
+    """#12624: the cache's `AWS_ENDPOINT_URL` redirects the runtime's S3 traffic."""
+
+    EXPECTED = (
+        "job `test-models` step `Run OpenAI integration test` runs the Spice runtime after "
+        "`spiceio/.github/actions/setup` has exported `AWS_ENDPOINT_URL`, which sends every "
+        "`s3://` dataset to the compiler cache — start the step with `unset AWS_ENDPOINT_URL`"
+    )
+
+    def test_a_test_run_after_the_cache_setup_is_reported(self):
+        """The shape trunk shipped on 2026-08-05, before the guard existed."""
+        self.assertEqual(
+            check_workflow_yaml.check_workflow(_workflow_running_the_runtime()),
+            [self.EXPECTED],
+        )
+
+    def test_dropping_the_endpoint_first_is_accepted(self):
+        self.assertEqual(
+            check_workflow_yaml.check_workflow(
+                _workflow_running_the_runtime(prelude="unset AWS_ENDPOINT_URL")
+            ),
+            [],
+        )
+
+    def test_a_spice_run_is_covered_too(self):
+        """The CLI reads the same environment as the archived test binary."""
+        self.assertEqual(
+            check_workflow_yaml.check_workflow(
+                _workflow_running_the_runtime(command="spice run &")
+            ),
+            [self.EXPECTED],
+        )
+
+    def test_a_job_without_the_cache_setup_is_left_alone(self):
+        self.assertEqual(
+            check_workflow_yaml.check_workflow(
+                _workflow_running_the_runtime(with_cache_setup=False)
+            ),
+            [],
+        )
+
+    def test_building_the_archive_still_gets_the_cache(self):
+        """`nextest archive` compiles — that is exactly what the endpoint is for."""
+        self.assertEqual(
+            check_workflow_yaml.check_workflow(
+                _workflow_running_the_runtime(
+                    command="cargo nextest archive -p runtime --archive-file integration.tar.zst"
+                )
+            ),
+            [],
+        )
+
+    def test_a_downloaded_test_binary_is_covered_too(self):
+        """`integration_llms.yml` runs a binary it downloaded, with env prefixes."""
+        self.assertEqual(
+            check_workflow_yaml.check_workflow(
+                _workflow_running_the_runtime(
+                    command='CARGO_MANIFEST_DIR="${PWD}" ./integration_test/llms_integration_test'
+                )
+            ),
+            [self.EXPECTED],
+        )
+
+    def test_the_variable_named_only_in_a_comment_does_not_count(self):
+        """A mention is not a drop; the guard must read the command, not the prose."""
+        self.assertEqual(
+            check_workflow_yaml.check_workflow(
+                _workflow_running_the_runtime(prelude="# unset AWS_ENDPOINT_URL one day")
+            ),
+            [self.EXPECTED],
+        )
+
+    def test_a_runtime_named_only_in_a_comment_is_not_an_invocation(self):
+        """The converse false positive: prose about the command must not fail a step."""
+        workflow = (
+            "---\non:\n  workflow_dispatch:\n\njobs:\n  test-models:\n"
+            "    runs-on: spiceai-macos\n    steps:\n"
+            "      - name: Set up spiceio\n"
+            "        uses: spiceai/spiceio/.github/actions/setup@0870da5\n"
+            "      - name: Note\n        run: |\n"
+            "          # cargo nextest run happens in the next job\n"
+            "          echo noted\n"
+        )
+        self.assertEqual(check_workflow_yaml.check_workflow(workflow), [])
+
+    def test_dropping_it_after_the_runtime_has_started_is_reported(self):
+        """Order matters: the child process is already gone by then."""
+        workflow = (
+            "---\non:\n  workflow_dispatch:\n\njobs:\n  test-models:\n"
+            "    runs-on: spiceai-macos\n    steps:\n"
+            "      - name: Set up spiceio\n"
+            "        uses: spiceai/spiceio/.github/actions/setup@0870da5\n"
+            "      - name: Run OpenAI integration test\n        run: |\n"
+            "          cargo nextest run -- openai_test\n"
+            "          unset AWS_ENDPOINT_URL\n"
+        )
+        self.assertEqual(check_workflow_yaml.check_workflow(workflow), [self.EXPECTED])
+
+    def test_a_drop_inside_a_conditional_is_reported(self):
+        """Indented means it is inside an `if` or a function and may not run."""
+        workflow = (
+            "---\non:\n  workflow_dispatch:\n\njobs:\n  test-models:\n"
+            "    runs-on: spiceai-macos\n    steps:\n"
+            "      - name: Set up spiceio\n"
+            "        uses: spiceai/spiceio/.github/actions/setup@0870da5\n"
+            "      - name: Run OpenAI integration test\n        run: |\n"
+            '          if [ "$CI" = "false" ]; then\n'
+            "            unset AWS_ENDPOINT_URL\n"
+            "          fi\n"
+            "          cargo nextest run -- openai_test\n"
+        )
+        self.assertEqual(check_workflow_yaml.check_workflow(workflow), [self.EXPECTED])
+
+    def test_unset_f_removes_a_function_not_the_variable(self):
+        self.assertEqual(
+            check_workflow_yaml.check_workflow(
+                _workflow_running_the_runtime(prelude="unset -f AWS_ENDPOINT_URL")
+            ),
+            [self.EXPECTED],
+        )
+
+    def test_a_runtime_step_before_the_cache_setup_is_left_alone(self):
+        """The export does not exist yet, so there is nothing to inherit."""
+        workflow = (
+            "---\non:\n  workflow_dispatch:\n\njobs:\n  test-models:\n"
+            "    runs-on: spiceai-macos\n    steps:\n"
+            "      - name: Run OpenAI integration test\n        run: |\n"
+            "          cargo nextest run -- openai_test\n"
+            "      - name: Set up spiceio\n"
+            "        uses: spiceai/spiceio/.github/actions/setup@0870da5\n"
+        )
+        self.assertEqual(check_workflow_yaml.check_workflow(workflow), [])
 
 
 class CheckActionTest(unittest.TestCase):

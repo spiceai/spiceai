@@ -35,6 +35,7 @@ use std::{
 };
 
 use app::AppBuilder;
+use cache::{metrics::CacheMetrics, result::query::CachedQueryResult};
 use futures::StreamExt;
 use opentelemetry::global;
 use opentelemetry_sdk::{Resource, metrics::SdkMeterProvider};
@@ -58,6 +59,26 @@ const EXPECTED_MEMORY_METRICS: &[&str] = &[
     "process_resident_memory_bytes",
     "query_memory_pool_used_bytes",
     "cayenne_compaction_memory_pool_used_bytes",
+];
+
+/// Series the SQL results cache must export as soon as it is enabled, whether or
+/// not anything has been recorded on them yet.
+///
+/// Each instrument is a `LazyLock` that only registers with the meter when
+/// something first derefs it, so a counter that has not fired exports nothing at
+/// all — not a zero. On a healthy runtime `results_cache_evictions` and both
+/// stale-while-revalidate counters are exactly the ones that never fire, and an
+/// absent series reads as a broken exporter rather than as "nothing happened".
+const EXPECTED_RESULTS_CACHE_METRICS: &[&str] = &[
+    "results_cache_requests",
+    "results_cache_hits",
+    "results_cache_misses",
+    "results_cache_evictions",
+    "results_cache_stale_swr_count",
+    "results_cache_swr_background_query_count",
+    "results_cache_items_count",
+    "results_cache_size_bytes",
+    "results_cache_max_size_bytes",
 ];
 
 /// Small enough that the sort below cannot fit, large enough that the runtime
@@ -220,6 +241,60 @@ fn memory_gauges_are_exported_to_the_operator_metrics_pipeline() {
     );
 }
 
+/// The sampler's first sample lands before the operator's provider exists, and
+/// the gauge must still reach `/metrics` afterwards.
+///
+/// `tokio::time::interval` fires its first tick immediately, so
+/// `spawn_mem_tier_repartition_sampler` records before `init_metrics` installs
+/// the Prometheus provider. An instrument cached at that moment binds to the
+/// startup noop provider for the life of the process, which is what kept
+/// `query_memory_pool_used_bytes` and `cayenne_compaction_memory_pool_used_bytes`
+/// off `/metrics` entirely — regression test for #12667.
+///
+/// `process_resident_memory_bytes` is asserted alongside them even though it was
+/// scrapable, because it was only ever scrapable by accident: it is recorded
+/// after a `spawn_blocking(...).await` in the same loop iteration, and that
+/// round-trip happened to outlast the window. Nothing holds that ordering, so it
+/// is pinned here rather than left to survive on timing.
+///
+/// [`memory_gauges_are_exported_to_the_operator_metrics_pipeline`] cannot catch
+/// that: it forces [`PROMETHEUS`] first, so it only ever records after the
+/// install. This test records *before* it, which under `cargo nextest` — one
+/// process per test, the gate's runner — means the global provider really is
+/// the noop one at that point. Under `cargo test` a sibling thread may have
+/// installed it already, which costs the test its teeth but not its safety: the
+/// seal below always follows the install, never precedes it.
+#[test]
+fn a_gauge_recorded_before_the_provider_is_installed_still_reaches_metrics() {
+    // Deliberately ahead of `&*PROMETHEUS`: this is the sampler's first tick.
+    telemetry::track_process_resident_memory_bytes(1_024, &[]);
+    telemetry::cayenne::track_query_memory_pool_used_bytes(2_048, &[]);
+    telemetry::cayenne::track_compaction_memory_pool_used_bytes(4_096, &[]);
+
+    // `init_metrics` installing the operator's provider, then declaring it final.
+    let registry = &*PROMETHEUS;
+    telemetry::seal_operator_meter_provider();
+
+    // The sampler's next tick, two seconds later in production.
+    telemetry::track_process_resident_memory_bytes(8_192, &[]);
+    telemetry::cayenne::track_query_memory_pool_used_bytes(16_384, &[]);
+    telemetry::cayenne::track_compaction_memory_pool_used_bytes(32_768, &[]);
+
+    let reported = reported_metric_names(registry);
+    let missing: Vec<&str> = EXPECTED_MEMORY_METRICS
+        .iter()
+        .copied()
+        .filter(|metric| !reported.contains(*metric))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "memory gauges {missing:?} were recorded before the meter provider was installed and \
+         never recovered; a gauge cached against the startup noop provider never reaches \
+         /metrics. Reported: {:?}",
+        sorted(&reported)
+    );
+}
+
 /// Reads the resident set size directly and touches no instrument, so it needs
 /// no meter provider.
 #[test]
@@ -300,5 +375,31 @@ async fn a_mid_stream_pool_refusal_is_counted_as_resources_exhausted() {
         increment(&before, &after, "QueryExecutionError") < 1.0,
         "capacity must not also be counted as a generic execution failure; \
          counts went from {before:?} to {after:?}"
+    );
+}
+
+/// The runtime calls `init` for each configured cache at startup, and that is the
+/// only chance an instrument nothing has touched gets to appear on `/metrics`.
+#[test]
+fn cache_counters_are_exported_before_anything_is_recorded() {
+    let registry = &*PROMETHEUS;
+
+    // Exactly what `Runtime::init_cache_metrics` calls once `runtime.caching.sql_results`
+    // is configured. Nothing else in this test touches a cache instrument, so a series
+    // present afterwards was published by `init` rather than by a real cache event.
+    CachedQueryResult::init();
+
+    let reported = reported_metric_names(registry);
+    let missing: Vec<&str> = EXPECTED_RESULTS_CACHE_METRICS
+        .iter()
+        .copied()
+        .filter(|metric| !reported.contains(*metric))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "cache metrics {missing:?} were not exported after the cache was initialised, so an \
+         operator scraping a healthy runtime cannot tell them from a broken exporter; \
+         reported: {:?}",
+        sorted(&reported)
     );
 }

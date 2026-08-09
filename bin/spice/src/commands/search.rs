@@ -17,7 +17,7 @@ limitations under the License.
 //! `spice search` command - Semantic search REPL.
 
 use crate::context::RuntimeContext;
-use crate::error::{ConnectionFailedSnafu, InvalidResponseSnafu, Result};
+use crate::error::{ConnectionFailedSnafu, InvalidResponseSnafu, Result, read_response};
 use crate::output::{OutputFormat, TableOutput};
 use clap::Args;
 use repl::util::{Spinner, create_editor_with_history, save_history};
@@ -249,8 +249,9 @@ async fn send_search_request(
         model: args.model.clone(),
     };
 
+    // A search embeds its query before it can run, so its duration is a model's.
     let mut request = ctx
-        .http_client()
+        .inference_http_client()
         .post(&url)
         .header("Content-Type", "application/json")
         .header("Cache-Control", &args.cache_control)
@@ -272,7 +273,6 @@ async fn send_search_request(
         .await
         .context(ConnectionFailedSnafu { endpoint: &url })?;
 
-    let status = response.status();
     // Check cache status header
     let cache_status = response
         .headers()
@@ -281,11 +281,11 @@ async fn send_search_request(
         .map(String::from);
     let from_cache = matches!(cache_status.as_deref(), Some("HIT" | "STALE"));
 
-    let text = response.text().await.unwrap_or_default();
+    let (status, text) = read_response(response, &url).await?;
 
     if !status.is_success() {
         return Err(InvalidResponseSnafu {
-            message: format!("Search failed: {text}"),
+            message: format!("Search failed with status {status}: {text}"),
         }
         .build());
     }

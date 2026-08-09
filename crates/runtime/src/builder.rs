@@ -152,13 +152,13 @@ const MISC_RUNTIME_PARAMS: &[&str] = &[
 fn known_runtime_params() -> Vec<&'static str> {
     let mut known = Vec::with_capacity(
         KNOWN_CAYENNE_RUNTIME_PARAMS.len()
-            + crate::accelerated_table::refresh_task::changes::CDC_RUNTIME_PARAMS.len()
+            + crate::accelerated::refresh_task::changes::CDC_RUNTIME_PARAMS.len()
             + dataconnector::http_rate_control::HTTP_RATE_CONTROL_RUNTIME_PARAMS.len()
             + crate::cluster::CLUSTER_GRPC_RUNTIME_PARAMS.len()
             + MISC_RUNTIME_PARAMS.len(),
     );
     known.extend_from_slice(KNOWN_CAYENNE_RUNTIME_PARAMS);
-    known.extend_from_slice(crate::accelerated_table::refresh_task::changes::CDC_RUNTIME_PARAMS);
+    known.extend_from_slice(crate::accelerated::refresh_task::changes::CDC_RUNTIME_PARAMS);
     known.extend_from_slice(dataconnector::http_rate_control::HTTP_RATE_CONTROL_RUNTIME_PARAMS);
     known.extend_from_slice(crate::cluster::CLUSTER_GRPC_RUNTIME_PARAMS);
     known.extend_from_slice(MISC_RUNTIME_PARAMS);
@@ -322,6 +322,13 @@ impl RuntimeBuilder {
     }
 
     pub async fn build(self) -> Runtime {
+        // `runtime-table` walks provider wrappers by checked downcast, so it can only
+        // see through types it can name. Hand it the complete table, which includes
+        // wrappers defined here (the Iceberg cluster provider). Without this the
+        // `LayerWalk::Read` index scan stops at those wrappers and misses the indexes
+        // beneath them; `table_layers_are_installed_for_the_accelerated_table` guards it.
+        runtime_table::table_layers::install(crate::table_layers::TABLE_PROVIDER_LAYERS);
+
         // Initialize DataFusion tracer for span context propagation across async boundaries
         if let Err(e) = tracers::init_datafusion_tracer() {
             tracing::warn!(
@@ -573,10 +580,8 @@ impl RuntimeBuilder {
         // `cdc_*` knobs from `runtime.params`; missing or rejected values
         // fall back to the matching `SPICE_CDC_*` env var, then to defaults,
         // with a warning for rejected explicit values.
-        crate::accelerated_table::refresh_task::changes::set_cdc_config(
-            crate::accelerated_table::refresh_task::changes::cdc_config_from_params(
-                &spicepod_rt.params,
-            ),
+        crate::accelerated::refresh_task::changes::set_cdc_config(
+            crate::accelerated::refresh_task::changes::cdc_config_from_params(&spicepod_rt.params),
         );
 
         // Create resource monitor early so it can be passed to DataFusion
@@ -807,6 +812,7 @@ impl RuntimeBuilder {
         let mut rt = Runtime {
             app: shared_app,
             apply_app_lock: Arc::new(tokio::sync::Mutex::new(())),
+            initial_load: Arc::new(crate::InitialLoad::default()),
             df,
             llm_runtime_stores: Arc::new(crate::model::LlmRuntimeStores::default()),
             http_rate_control_registry,
@@ -817,7 +823,7 @@ impl RuntimeBuilder {
             tool_factories: Arc::new(Mutex::new(HashMap::new())),
             pods_watcher: Arc::new(RwLock::new(self.pods_watcher)),
             secrets,
-            spaced_tracer: Arc::new(tracers::SpacedTracer::new(Duration::from_secs(15))),
+            spaced_tracer: Arc::new(util::tracers::SpacedTracer::new(Duration::from_secs(15))),
             autoload_extensions: Arc::new(self.autoload_extensions),
             extensions: Arc::new(RwLock::new(HashMap::new())),
             datasets_health_monitor,
@@ -3060,7 +3066,7 @@ mod test {
         let known = known_runtime_params();
         let family_keys = KNOWN_CAYENNE_RUNTIME_PARAMS
             .iter()
-            .chain(crate::accelerated_table::refresh_task::changes::CDC_RUNTIME_PARAMS)
+            .chain(crate::accelerated::refresh_task::changes::CDC_RUNTIME_PARAMS)
             .chain(dataconnector::http_rate_control::HTTP_RATE_CONTROL_RUNTIME_PARAMS)
             .chain(MISC_RUNTIME_PARAMS);
         for key in family_keys {

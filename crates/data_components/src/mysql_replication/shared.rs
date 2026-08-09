@@ -1861,6 +1861,7 @@ async fn deliver_commit(
         );
         slot.deliver(commit_pos);
         match deliver_to_member(
+            &member.metrics,
             &member.sender,
             Ok(envelope),
             shutdown_epoch,
@@ -1952,6 +1953,7 @@ async fn handle_statement(
                 );
                 slot.deliver(&commit_pos);
                 match deliver_to_member(
+                    &member.metrics,
                     &member.sender,
                     Ok(envelope),
                     shutdown_epoch,
@@ -2031,6 +2033,7 @@ enum DeliverOutcome {
 /// prolonged stall and abandoning on shutdown. One slow member must not wedge
 /// the pump (and thus the group) or block shutdown indefinitely.
 async fn deliver_to_member(
+    metrics: &MetricsCollector,
     sender: &mpsc::Sender<std::result::Result<ChangeEnvelope, StreamError>>,
     envelope: std::result::Result<ChangeEnvelope, StreamError>,
     shutdown_epoch: u64,
@@ -2047,7 +2050,14 @@ async fn deliver_to_member(
                     return DeliverOutcome::ShutdownAbandon;
                 }
                 stalled_for += MEMBER_SEND_STALL_WARN;
-                tracing::warn!(dataset = %dataset, stalled_for = ?stalled_for, "shared mysql binlog member sink is not draining; the pump is waiting to deliver committed changes");
+                // The pump reads the dump socket for the whole group, so this
+                // wait is also time the socket goes undrained: past the
+                // session's `net_write_timeout` the source aborts the dump and
+                // every member on it resumes from its acked position. Counted,
+                // not only logged, so a wedged apply stays visible after the
+                // warning scrolls away.
+                metrics.add_send_stalled(MEMBER_SEND_STALL_WARN.as_secs());
+                tracing::warn!(dataset = %dataset, stalled_for = ?stalled_for, "shared mysql binlog member sink is not draining; the pump is waiting to deliver committed changes (watch dataset_mysql_replication_member_send_stalled_seconds_total)");
                 pending = returned;
             }
         }
@@ -2352,6 +2362,8 @@ async fn poll_head_and_heartbeat(
 
 #[cfg(test)]
 mod tests {
+    use crate::mysql_replication::metrics::Metrics;
+
     use super::*;
 
     fn key(db: &str, t: &str) -> MemberKey {
@@ -2708,6 +2720,64 @@ mod tests {
         );
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn a_member_stall_accrues_the_send_stalled_counter() {
+        // The pump reads the dump socket for the whole group, so time spent
+        // waiting on one member's full channel is time the socket goes
+        // undrained — the thing that ends in an aborted dump (#12527). The
+        // warning scrolls away; the counter is what names the dataset that will
+        // trigger the next reconnect.
+        //
+        // The stall interval is a constant, so the virtual clock converts
+        // cleanly: no production path here derives a sleep from a real-clock
+        // read.
+        let metrics = MetricsCollector::new();
+        let (sender, mut receiver) = mpsc::channel(1);
+        sender
+            .send(Err(StreamError::External(
+                "occupies the channel".to_string(),
+            )))
+            .await
+            .expect("the channel starts empty");
+
+        let deliver = {
+            let metrics = Arc::clone(&metrics);
+            let epoch = crate::cdc::shutdown_epoch();
+            tokio::spawn(async move {
+                deliver_to_member(
+                    &metrics,
+                    &sender,
+                    Err(StreamError::External("must be delivered".to_string())),
+                    epoch,
+                    "test_dataset",
+                )
+                .await
+            })
+        };
+
+        // Two stall intervals with the channel still full, then drain it so the
+        // must-deliver completes rather than looping forever.
+        tokio::time::sleep(MEMBER_SEND_STALL_WARN * 2 + Duration::from_millis(1)).await;
+        let stalled = Metrics::new(Arc::clone(&metrics)).member_send_stalled_seconds_total();
+        assert_eq!(
+            stalled,
+            MEMBER_SEND_STALL_WARN.as_secs() * 2,
+            "each stall interval must accrue, so one long stall is distinguishable from none"
+        );
+
+        let _queued = receiver.recv().await.expect("the queued envelope");
+        let outcome = deliver.await.expect("the delivery task");
+        assert!(
+            matches!(outcome, DeliverOutcome::Sent),
+            "a stalled delivery must still be delivered once the sink drains"
+        );
+        assert_eq!(
+            Metrics::new(metrics).member_send_stalled_seconds_total(),
+            stalled,
+            "a successful send must not accrue stall time"
+        );
+    }
+
     #[tokio::test]
     async fn deliver_to_member_reports_receiver_gone() {
         // A dropped receiver (dataset stream torn down) must surface as
@@ -2716,6 +2786,7 @@ mod tests {
         let (sender, receiver) = mpsc::channel(1);
         drop(receiver);
         let outcome = deliver_to_member(
+            &MetricsCollector::new(),
             &sender,
             Err(StreamError::External("x".to_string())),
             crate::cdc::shutdown_epoch(),

@@ -169,6 +169,17 @@ pub struct Secrets {
     // This order is the reverse of the order in which the secret stores are defined in the SpicePod.
     // This maintains the precedence order we want, since we will search through the secret stores in their order here.
     stores: IndexMap<String, Arc<dyn SecretStore>>,
+    /// Stores the runtime owns rather than the spicepod: they are not declared
+    /// in a `secrets:` section, and [`Secrets::load_from`] re-appends them after
+    /// clearing the registry.
+    ///
+    /// This exists because `load_from` clears `stores`, so anything registered
+    /// through [`Secrets::register_store`] before a reload was silently dropped
+    /// — and a control-plane-delivered store disappearing on the next spicepod
+    /// load fails every component that referenced it. Holding built-ins
+    /// separately makes surviving a reload a property of the type rather than
+    /// something each caller has to remember to redo.
+    builtin_stores: Vec<(String, Arc<dyn SecretStore>)>,
 }
 
 pub struct ParamStr<'a>(pub &'a str);
@@ -194,6 +205,7 @@ impl Secrets {
     pub fn new() -> Self {
         Self {
             stores: IndexMap::new(),
+            builtin_stores: Vec::new(),
         }
     }
 
@@ -217,14 +229,52 @@ impl Secrets {
             Arc::new(SchedulerRPCSecretStore::new(expander, executor_id)) as Arc<dyn SecretStore>,
         );
 
-        Self { stores }
+        Self {
+            stores,
+            builtin_stores: Vec::new(),
+        }
     }
 
     /// Registers a single secret store under the given name, appended at the
-    /// end of the precedence order. Primarily useful for wiring fake stores in
-    /// tests without touching process environment variables.
+    /// end of the precedence order — i.e. consulted **last** by the
+    /// `${ secrets:KEY }` walk, after every spicepod-declared store.
+    ///
+    /// Does **not** survive [`Self::load_from`], which clears the registry.
+    /// A store that must outlive a spicepod reload belongs in
+    /// [`Self::register_builtin_store`].
     pub fn register_store(&mut self, name: impl Into<String>, store: Arc<dyn SecretStore>) {
         self.stores.insert(name.into(), store);
+    }
+
+    /// Registers a store the runtime owns: appended at the lowest precedence
+    /// like [`Self::register_store`], but **re-applied after every
+    /// [`Self::load_from`]** instead of being cleared with the
+    /// spicepod-declared stores.
+    ///
+    /// This is how control-plane-delivered secrets participate in the default
+    /// `${ secrets:KEY }` walk without a spicepod declaring anything, and
+    /// without a later reload silently removing them. Re-registering the same
+    /// name replaces the previous store rather than adding a second entry.
+    pub fn register_builtin_store(&mut self, name: impl Into<String>, store: Arc<dyn SecretStore>) {
+        let name = name.into();
+        self.builtin_stores
+            .retain(|(existing, _)| existing != &name);
+        self.builtin_stores.push((name.clone(), Arc::clone(&store)));
+        self.stores.insert(name, store);
+    }
+
+    /// Append the built-in stores at the end of the precedence order.
+    ///
+    /// Called at the very end of [`Self::load_from`], after the `reverse()`
+    /// that establishes spicepod precedence, so a built-in is consulted last —
+    /// a user-declared store holding the same key wins. `entry` keeps a
+    /// spicepod store of the same name authoritative over the built-in.
+    fn append_builtin_stores(&mut self) {
+        for (name, store) in &self.builtin_stores {
+            self.stores
+                .entry(name.clone())
+                .or_insert_with(|| Arc::clone(store));
+        }
     }
 
     /// Initializes the runtime secrets based on the provided secret store configuration.
@@ -296,6 +346,10 @@ impl Secrets {
 
         // Reverse the order of the secret stores to maintain the expected precedence order.
         self.stores.reverse();
+
+        // After the reverse, so built-ins land at the lowest precedence — a
+        // user-declared store holding the same key still wins.
+        self.append_builtin_stores();
 
         Ok(())
     }
@@ -1107,6 +1161,11 @@ mod tests {
         }
     }
 
+    /// A single-store scope for `get_secret_from_stores`.
+    fn only(store: &str) -> std::collections::HashSet<String> {
+        std::iter::once(store.to_string()).collect()
+    }
+
     /// A store whose lookup parks until it is released, standing in for the
     /// network round trip the remote stores (`aws_secrets_manager`,
     /// `azure_keyvault`, `hashicorp_vault`, `scheduler_rpc`) make on a miss.
@@ -1137,7 +1196,112 @@ mod tests {
                 .into_iter()
                 .map(|(name, store)| (name.to_string(), store))
                 .collect(),
+            builtin_stores: Vec::new(),
         }
+    }
+
+    /// A built-in store must survive `load_from`, which clears the registry.
+    /// This is the bug the built-in list exists to close: a delivered store
+    /// registered through `register_store` was silently dropped by the next
+    /// spicepod load, failing every component that referenced it.
+    #[tokio::test]
+    async fn builtin_store_survives_a_secrets_reload() {
+        let mut secrets = super::Secrets::new();
+        secrets.register_builtin_store(
+            "cloud",
+            std::sync::Arc::new(MapStore::new(&[("delivered_key", "from-cloud")])),
+        );
+
+        // A reload with no `secrets:` section clears the registry and reloads
+        // the default `env` store.
+        secrets.load_from(&[]).await.expect("reload succeeds");
+
+        let value = secrets
+            .get_secret_from_stores("delivered_key", &only("cloud"))
+            .await
+            .expect("lookup")
+            .expect("the built-in store must still be registered");
+        assert_eq!(value.expose_secret(), "from-cloud");
+    }
+
+    /// A plain `register_store` deliberately does **not** survive a reload —
+    /// asserted so the difference between the two registration paths stays a
+    /// tested contract rather than a comment.
+    #[tokio::test]
+    async fn a_plain_registered_store_does_not_survive_a_reload() {
+        let mut secrets = super::Secrets::new();
+        secrets.register_store("scratch", std::sync::Arc::new(MapStore::new(&[("k", "v")])));
+        secrets.load_from(&[]).await.expect("reload succeeds");
+
+        assert!(
+            secrets
+                .get_secret_from_stores("k", &only("scratch"))
+                .await
+                .expect("an unregistered store is not an error, just no answer")
+                .is_none(),
+            "a non-built-in store is cleared by load_from"
+        );
+    }
+
+    /// The delivered store sits at the **lowest** precedence, so a
+    /// user-declared store holding the same key wins. That preserves the local
+    /// override, and it is precedence-by-position, so it is asserted rather
+    /// than assumed.
+    #[tokio::test]
+    async fn builtin_store_loses_to_a_user_declared_store_for_the_same_key() {
+        let mut secrets = super::Secrets::new();
+        secrets.register_builtin_store(
+            "cloud",
+            std::sync::Arc::new(MapStore::new(&[("shared_key", "from-cloud")])),
+        );
+        // Stand in for a spicepod-declared store: registered after the reload
+        // so it occupies the registry the way `load_from` would leave it.
+        secrets.load_from(&[]).await.expect("reload succeeds");
+
+        let ordered = secrets_with_stores(vec![
+            (
+                "vault",
+                std::sync::Arc::new(MapStore::new(&[("shared_key", "from-vault")])),
+            ),
+            (
+                "cloud",
+                std::sync::Arc::new(MapStore::new(&[("shared_key", "from-cloud")])),
+            ),
+        ]);
+        let resolved = ordered
+            .get_secret("shared_key")
+            .await
+            .expect("lookup")
+            .expect("resolves");
+        assert_eq!(
+            resolved.expose_secret(),
+            "from-vault",
+            "a user-declared store must win over the delivered one"
+        );
+    }
+
+    /// Re-registering the same built-in name replaces it rather than stacking a
+    /// second entry, so a redeploy that rebuilds the store does not leave a
+    /// stale one shadowing it.
+    #[tokio::test]
+    async fn re_registering_a_builtin_replaces_it() {
+        let mut secrets = super::Secrets::new();
+        secrets.register_builtin_store(
+            "cloud",
+            std::sync::Arc::new(MapStore::new(&[("k", "first")])),
+        );
+        secrets.register_builtin_store(
+            "cloud",
+            std::sync::Arc::new(MapStore::new(&[("k", "second")])),
+        );
+        secrets.load_from(&[]).await.expect("reload succeeds");
+
+        let value = secrets
+            .get_secret_from_stores("k", &only("cloud"))
+            .await
+            .expect("lookup")
+            .expect("present");
+        assert_eq!(value.expose_secret(), "second");
     }
 
     /// The registry swap on the executor bind path must not wait behind an

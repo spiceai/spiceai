@@ -31,7 +31,7 @@ pub struct CloudLink {
     pub org: String,
     pub app: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub app_id: Option<i64>,
+    pub project_id: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub region: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
