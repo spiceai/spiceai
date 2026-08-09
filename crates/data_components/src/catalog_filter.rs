@@ -40,6 +40,9 @@ use globset::GlobSet;
 pub struct TableSelector {
     include: Option<Arc<GlobSet>>,
     exclude: Option<Arc<GlobSet>>,
+    /// Literal prefix of each `include` pattern, for [`TableSelector::may_select_within`].
+    /// Empty when the patterns were not supplied, which disables that prune.
+    include_literal_prefixes: Arc<Vec<String>>,
 }
 
 impl TableSelector {
@@ -50,7 +53,68 @@ impl TableSelector {
         Self {
             include: include.map(Arc::new),
             exclude: exclude.map(Arc::new),
+            include_literal_prefixes: Arc::default(),
         }
+    }
+
+    /// Records the raw `include` patterns the compiled set was built from,
+    /// enabling [`TableSelector::may_select_within`].
+    ///
+    /// A [`GlobSet`] cannot be introspected, so answering "can this container
+    /// hold anything I want?" needs the source patterns. They must describe the
+    /// same set as the compiled `include`, or a container will be skipped that
+    /// shouldn't be.
+    ///
+    /// Optional because omitting it is safe: without the patterns the prune
+    /// simply never fires, costing queries rather than correctness. That is the
+    /// opposite of `exclude`, where dropping half the configuration silently
+    /// registers tables the user excluded (#12636) -- which is why `exclude` is
+    /// a constructor argument and this is not.
+    #[must_use]
+    pub fn with_include_patterns(mut self, patterns: &[String]) -> Self {
+        self.include_literal_prefixes = Arc::new(
+            patterns
+                .iter()
+                .map(|pattern| glob_literal_prefix(pattern))
+                .collect(),
+        );
+        self
+    }
+
+    /// Whether any `include` pattern could match a name beginning with
+    /// `"{container}."` -- a schema, database, or namespace worth interrogating.
+    ///
+    /// Lets a connector skip a container's metadata queries entirely instead of
+    /// discovering its tables and then rejecting each one. Returns `true` when
+    /// the patterns were never supplied, so the prune is opt-in.
+    ///
+    /// Conservative by construction: it must never answer `false` for a
+    /// container that can contribute a table, because the resulting skip is
+    /// silent -- the tables simply never appear. Answering `true` unnecessarily
+    /// only costs queries.
+    ///
+    /// A pattern matches only strings beginning with its literal prefix `L`. The
+    /// candidate is `{container}.{table}` with `table` unknown, so such a string
+    /// can exist only when `L` is a prefix of `"{container}."` (any table
+    /// completes it), or `"{container}."` is a prefix of `L` (the rest of `L`
+    /// constrains the table name, which some table name can satisfy).
+    ///
+    /// This is why a pattern beginning with a metacharacter never prunes:
+    /// `*.orders` has an empty literal prefix, and `*` matches `.` in
+    /// `globset`, so it can match a table in any container.
+    #[must_use]
+    pub fn may_select_within(&self, container: &str) -> bool {
+        // No patterns recorded: either none were configured (an absent `include`
+        // selects everything) or the caller did not supply them. Both mean the
+        // prune cannot rule anything out.
+        if self.include_literal_prefixes.is_empty() {
+            return true;
+        }
+
+        let container_prefix = format!("{container}.");
+        self.include_literal_prefixes.iter().any(|literal| {
+            container_prefix.starts_with(literal.as_str()) || literal.starts_with(&container_prefix)
+        })
     }
 
     /// A selector that selects every table -- an unconfigured catalog.
@@ -104,10 +168,156 @@ impl TableSelector {
     }
 }
 
+/// The literal prefix of a glob pattern: everything before the first
+/// metacharacter. Every string the pattern matches must begin with this.
+///
+/// A backslash ends the prefix rather than being interpreted, because its
+/// meaning is platform-dependent (an escape on Unix, a separator on Windows).
+/// Stopping early is always safe: a shorter prefix is a weaker necessary
+/// condition, so it can only cause a container to be kept, never dropped.
+fn glob_literal_prefix(pattern: &str) -> String {
+    let mut prefix = String::new();
+    for c in pattern.chars() {
+        match c {
+            '*' | '?' | '[' | '{' | '\\' => break,
+            other => prefix.push(other),
+        }
+    }
+    prefix
+}
+
 #[cfg(test)]
 mod tests {
-    use super::TableSelector;
-    use globset::{GlobSet, GlobSetBuilder};
+    use super::{TableSelector, glob_literal_prefix};
+    use globset::{Glob, GlobSet, GlobSetBuilder};
+
+    /// A selector carrying the raw include patterns, as `table_selector()` builds it.
+    fn sel(patterns: &[&str]) -> TableSelector {
+        let owned: Vec<String> = patterns.iter().map(|p| (*p).to_string()).collect();
+        let mut builder = GlobSetBuilder::new();
+        for p in patterns {
+            builder.add(Glob::new(p).expect("glob pattern should parse"));
+        }
+        TableSelector::new(Some(builder.build().expect("glob set should build")), None)
+            .with_include_patterns(&owned)
+    }
+
+    #[test]
+    fn glob_literal_prefix_stops_at_the_first_metacharacter() {
+        assert_eq!(glob_literal_prefix("public.orders"), "public.orders");
+        assert_eq!(glob_literal_prefix("public.*"), "public.");
+        assert_eq!(glob_literal_prefix("sales_*.orders"), "sales_");
+        assert_eq!(glob_literal_prefix("*.orders"), "");
+        assert_eq!(glob_literal_prefix("*"), "");
+        assert_eq!(glob_literal_prefix("{public,sales}.*"), "");
+        assert_eq!(glob_literal_prefix("[ps]ublic.*"), "");
+        assert_eq!(glob_literal_prefix("?ublic.orders"), "");
+        assert_eq!(glob_literal_prefix(r"pub\lic.orders"), "pub");
+    }
+
+    #[test]
+    fn may_select_within_keeps_only_containers_a_literal_pattern_can_reach() {
+        assert!(sel(&["public.orders"]).may_select_within("public"));
+        assert!(!sel(&["public.orders"]).may_select_within("sales"));
+        assert!(sel(&["public.*"]).may_select_within("public"));
+        assert!(!sel(&["public.*"]).may_select_within("sales"));
+    }
+
+    #[test]
+    fn may_select_within_never_prunes_a_non_literal_container_component() {
+        // `*` matches `.` in globset, so these can reach a table in any container.
+        for pattern in ["*.orders", "*", "*.*", "{public,sales}.*", "?ublic.orders"] {
+            for container in ["public", "sales", "anything_at_all"] {
+                assert!(
+                    sel(&[pattern]).may_select_within(container),
+                    "pattern {pattern} must not prune container {container}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn may_select_within_handles_partial_container_wildcards() {
+        let s = sel(&["sales_*.orders"]);
+        assert!(s.may_select_within("sales_east"));
+        assert!(s.may_select_within("sales_"));
+        assert!(!s.may_select_within("public"));
+        assert!(!s.may_select_within("sales"));
+    }
+
+    #[test]
+    fn may_select_within_keeps_a_container_any_one_pattern_can_reach() {
+        let s = sel(&["public.orders", "sales.*"]);
+        assert!(s.may_select_within("public"));
+        assert!(s.may_select_within("sales"));
+        assert!(!s.may_select_within("audit"));
+        assert!(sel(&["public.orders", "*.audit_log"]).may_select_within("anything"));
+    }
+
+    #[test]
+    fn may_select_within_is_disabled_without_recorded_patterns() {
+        // An unconfigured catalog, and a selector built without the raw patterns:
+        // both must prune nothing. `exclude` never prunes either -- proving an
+        // exclude set covers *every* table in a container is a far harder claim.
+        assert!(TableSelector::select_all().may_select_within("public"));
+        assert!(TableSelector::new(Some(globset(&["public.*"])), None).may_select_within("sales"));
+        assert!(
+            TableSelector::new(None, Some(globset(&["private.*"])))
+                .with_include_patterns(&[])
+                .may_select_within("private")
+        );
+    }
+
+    /// The property the prune must never violate: if the selector selects
+    /// `container.table`, it must keep `container`. A violation is silent -- the
+    /// table simply never appears -- so it is checked over pattern shapes rather
+    /// than by example.
+    #[test]
+    fn may_select_within_never_contradicts_selects_table() {
+        let pattern_sets: &[&[&str]] = &[
+            &["public.orders"],
+            &["public.*"],
+            &["*.orders"],
+            &["*"],
+            &["*.*"],
+            &["sales_*.orders"],
+            &["sales_*.*"],
+            &["{public,sales}.*"],
+            &["[ps]ublic.*"],
+            &["?ublic.orders"],
+            &["public.order?"],
+            &["public.orders", "sales.*"],
+            &["public.*", "*.audit_log"],
+            &["pg_*.*"],
+        ];
+        let containers = [
+            "public",
+            "sales",
+            "sales_east",
+            "sales_",
+            "audit",
+            "pg_toast",
+            "s",
+            "",
+        ];
+        let tables = ["orders", "order1", "audit_log", "lineitem", "x", ""];
+
+        for patterns in pattern_sets {
+            let selector = sel(patterns);
+            for container in containers {
+                let kept = selector.may_select_within(container);
+                for table in tables {
+                    if selector.selects_table(container, table) {
+                        assert!(
+                            kept,
+                            "patterns {patterns:?} select {container}.{table}, but the prune \
+                             dropped {container} -- the table would silently disappear"
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     fn globset(patterns: &[&str]) -> GlobSet {
         let mut builder = GlobSetBuilder::new();
