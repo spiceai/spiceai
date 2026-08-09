@@ -333,7 +333,10 @@ fn readable(ptr: *const u8, len: usize) -> bool {
     };
     // SAFETY: `write` reads at most `len` bytes from `ptr` and reports `EFAULT` rather
     // than faulting if it cannot. The fd is a pipe this process holds both ends of.
-    unsafe { libc::write(fds[1], ptr.cast(), len) >= 0 }
+    let copied = unsafe { libc::write(fds[1], ptr.cast(), len) };
+    // A range that runs off the end of a mapping copies the readable part and returns
+    // a short count, so only the full count means all of it can be read.
+    usize::try_from(copied).is_ok_and(|copied| copied == len)
 }
 
 /// `addr` as an offset into the executable file, if it points into this binary's code.
@@ -599,27 +602,29 @@ fn report_stack(cc: &crash_handler::CrashContext, ip: u64, fault_addr: Option<u6
         immediate_call.then_some(lr).and_then(text_offset)
     });
 
-    // One probe for the whole window: a corrupt stack pointer is the case this guards,
-    // and it fails the window as readily as it fails the first word.
-    let window = usize::try_from(sp).ok().filter(|sp| {
+    // One probe for the whole window in the common case. It is allowed to fail — a
+    // stack pointer near the end of its mapping reads back short — so a failure falls
+    // back to probing each word, rather than giving up the section entirely.
+    let base = usize::try_from(sp).ok();
+    let whole_window = base.is_some_and(|base| {
         readable(
-            std::ptr::with_exposed_provenance::<u8>(*sp),
+            std::ptr::with_exposed_provenance::<u8>(base),
             STACK_WORDS * size_of::<u64>(),
         )
     });
 
     let mut listed_candidates = false;
-    for word in 0..window.map_or(0, |_| STACK_WORDS) {
-        let Some(at) = window.and_then(|sp| sp.checked_add(word * size_of::<u64>())) else {
+    for word in 0..base.map_or(0, |_| STACK_WORDS) {
+        let Some(at) = base.and_then(|base| base.checked_add(word * size_of::<u64>())) else {
             break;
         };
-        // SAFETY: the probe above established the whole window is readable, and a stack
-        // word has no validity invariants.
-        let value = unsafe {
-            std::ptr::with_exposed_provenance::<u8>(at)
-                .cast::<u64>()
-                .read_unaligned()
-        };
+        let ptr = std::ptr::with_exposed_provenance::<u8>(at);
+        if !whole_window && !readable(ptr, size_of::<u64>()) {
+            break;
+        }
+        // SAFETY: one of the probes above established that these eight bytes are
+        // readable, and a stack word has no validity invariants.
+        let value = unsafe { ptr.cast::<u64>().read_unaligned() };
         let Some(offset) = text_offset(value) else {
             continue;
         };
