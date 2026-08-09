@@ -10,10 +10,13 @@
 # credentials: a stub `df` on PATH reports whatever free space a case needs, and a
 # stub `make` prints whatever a case needs the watcher to read.
 #
-# `failure_kind` names a third cause with the same consequence — a run that was
-# signalled and so judged nothing at all — so its cases live here too, alongside
-# `describe_check_failure`, which turns any of the three into what the run
-# publishes.
+# `failure_kind` names two further causes with the same consequence — a run that
+# was signalled and so judged nothing at all, and a branch whose Makefile has no
+# rule for a target the gate invokes, so nothing was compiled — so their cases
+# live here too, alongside `describe_check_failure`, which turns any of them into
+# what the run publishes. The make-target preflight is here for the same reason
+# the disk one is: it decides whether a run gets to start, and getting it wrong
+# either way is the bug.
 #
 # Usage: scripts/test_signoff_disk_guard.sh
 
@@ -171,6 +174,187 @@ assert_preflight "falls back to the default floor on a non-integer override" 70 
 assert_preflight "proceeds when free space is unknown" 0 "" \
   SIGNOFF_REMOTE_RUN=1 STUB_DF_RC=1
 
+echo "make_target_exists + preflight_make_targets"
+# These cases run the *real* `make` against a real Makefile: the question is
+# what GNU make itself answers for a target it cannot resolve, so stubbing make
+# would only test the stub. That also means they must not put $stub_dir first on
+# PATH — assert_recorder below leaves a fake `make` there.
+fixture_dir="$(mktemp -d)"
+trap 'rm -rf "$stub_dir" "$fixture_dir"' EXIT
+
+# A Makefile defining exactly the named targets, each a no-op. From the probe's
+# point of view this is what a branch based before a target was added looks
+# like: every other target resolves, that one does not.
+write_makefile() {
+  local dir="$1"
+  shift
+  : >"$dir/Makefile"
+  local target
+  for target in "$@"; do
+    printf '.PHONY: %s\n%s:\n\t@true\n\n' "$target" "$target" >>"$dir/Makefile"
+  done
+}
+
+# Runs one function from the subject with DIR as the working directory, so the
+# probe reads DIR's Makefile. Echoes "<rc>|<output>" like call_subject.
+call_subject_in() {
+  local dir="$1" snippet="$2"
+  shift 2
+  local output rc
+  output="$(cd "$dir" && env "$@" \
+    bash -c 'source "$1"; shift; '"$snippet" _ "$subject" 2>&1)"
+  rc=$?
+  printf '%s|%s' "$rc" "$output"
+}
+
+assert_target_exists() {
+  local name="$1" dir="$2" target="$3" want_rc="$4"
+  shift 4
+  tests_run=$((tests_run + 1))
+
+  local result rc output
+  result="$(call_subject_in "$dir" "make_target_exists ${target}" "$@")"
+  rc="${result%%|*}"
+  output="${result#*|}"
+
+  if [[ "$rc" -ne "$want_rc" ]]; then
+    fail_test "$name: expected exit ${want_rc}, got ${rc} (output: ${output})"
+    return
+  fi
+  echo "  ok: $name"
+}
+
+# $4 is the exit status preflight_make_targets should return: 0 to proceed, 71
+# to stop.
+assert_preflight_targets() {
+  local name="$1" dir="$2" want_rc="$3" want_output="${4:-}"
+  shift 4
+  tests_run=$((tests_run + 1))
+
+  local summary="$fixture_dir/summary"
+  : >"$summary"
+
+  local result rc output
+  result="$(call_subject_in "$dir" 'preflight_make_targets' \
+    GITHUB_STEP_SUMMARY="$summary" "$@")"
+  rc="${result%%|*}"
+  output="${result#*|}"
+
+  if [[ "$rc" -ne "$want_rc" ]]; then
+    fail_test "$name: expected exit ${want_rc}, got ${rc} (output: ${output})"
+    return
+  fi
+  if [[ -n "$want_output" ]]; then
+    if [[ "$output" != *"$want_output"* ]] && ! grep -qF "$want_output" "$summary"; then
+      fail_test "$name: expected '${want_output}' in the output or step summary, got '${output}' / '$(cat "$summary")'"
+      return
+    fi
+  fi
+  echo "  ok: $name"
+}
+
+complete_dir="$fixture_dir/complete"
+mkdir -p "$complete_dir"
+write_makefile "$complete_dir" lint-rust nextest-packages nextest verify-cli
+
+# The #12813 branch exactly: everything the gate needs except the target added
+# to trunk in f7c9485b1.
+predates_dir="$fixture_dir/predates-verify-cli"
+mkdir -p "$predates_dir"
+write_makefile "$predates_dir" lint-rust nextest-packages nextest
+
+assert_target_exists "resolves a target the Makefile defines" "$complete_dir" verify-cli 0
+assert_target_exists "reports a target the Makefile does not define" "$predates_dir" verify-cli 1
+
+# A missing prerequisite reports the same "No rule to make target" phrase. The
+# target itself exists, so the run must proceed and let the step report it in
+# its own words — not be relabelled as a branch that predates the gate.
+prereq_dir="$fixture_dir/missing-prereq"
+mkdir -p "$prereq_dir"
+printf '.PHONY: verify-cli\nverify-cli: some-absent-file\n\t@true\n' >"$prereq_dir/Makefile"
+assert_target_exists "a missing prerequisite is not a missing target" "$prereq_dir" verify-cli 0
+
+# No Makefile at all reports the same "No rule to make target" phrase, and that
+# is the honest answer: the gate cannot run a single target in such a checkout.
+empty_dir="$fixture_dir/no-makefile"
+mkdir -p "$empty_dir"
+assert_target_exists "reports a missing target when there is no Makefile at all" "$empty_dir" verify-cli 1
+
+# A make that fails for its *own* reasons is a different matter: that reading is
+# not one to refuse a branch on, and the step that hits it reports it in its own
+# words. An unparseable Makefile says "missing separator", never "No rule".
+broken_dir="$fixture_dir/broken-makefile"
+mkdir -p "$broken_dir"
+printf 'this is not a makefile\n' >"$broken_dir/Makefile"
+assert_target_exists "treats a Makefile make cannot parse as target present" "$broken_dir" verify-cli 0
+
+# ...as is a runner with no make at all, which says "command not found". A PATH
+# holding bash and nothing else: emptying it outright would take `bash` with it
+# and test nothing.
+no_make_path="$fixture_dir/path-without-make"
+mkdir -p "$no_make_path"
+ln -sf "$(command -v bash)" "$no_make_path/bash"
+assert_target_exists "treats a runner with no make as target present" \
+  "$complete_dir" verify-cli 0 PATH="$no_make_path"
+
+assert_preflight_targets "proceeds when every target resolves" "$complete_dir" 0 ""
+assert_preflight_targets "stops a branch whose Makefile predates a target" "$predates_dir" 71 "verify-cli"
+assert_preflight_targets "says the branch was not evaluated" "$predates_dir" 71 "not evaluated"
+assert_preflight_targets "names the remedy rather than only the symptom" "$predates_dir" 71 "Merge trunk into the branch"
+# Unlike the disk floor, this is fatal locally too: it is not a threshold a
+# developer may reasonably run under, it is a step certain to fail.
+assert_preflight_targets "stops a local run as well as a remote one" "$predates_dir" 71 "no rule for"
+assert_preflight_targets "annotates a remote stop for the run page" "$predates_dir" 71 \
+  "::error title=Sign-off cannot run on this branch::" SIGNOFF_REMOTE_RUN=1
+# Reporting only the first would send the author round the loop once per target.
+several_dir="$fixture_dir/predates-several"
+mkdir -p "$several_dir"
+write_makefile "$several_dir" lint-rust
+assert_preflight_targets "lists every missing target, not just the first" "$several_dir" 71 \
+  "nextest verify-cli nextest-packages"
+
+# Requiring a target the run will not invoke refuses a branch that could have
+# completed every step selected for it. `nextest-packages` is reached only
+# through run_targeted_tests, and remote sign-off turns targeted work off by
+# default — so on that run the target is never invoked and must not be probed.
+targeted_off_dir="$fixture_dir/predates-nextest-packages"
+mkdir -p "$targeted_off_dir"
+write_makefile "$targeted_off_dir" lint-rust nextest verify-cli
+assert_preflight_targets "probes nextest-packages when targeted work is on" \
+  "$targeted_off_dir" 71 "nextest-packages"
+assert_preflight_targets "proceeds without nextest-packages when targeted work is off" \
+  "$targeted_off_dir" 0 "" SIGNOFF_SKIP_TARGETED_LINT=1 SIGNOFF_SKIP_TARGETED_TESTS=1
+# Either switch alone leaves the targeted path unreachable, so either alone is
+# enough to stop asking for the target.
+assert_preflight_targets "proceeds when only targeted tests are off" \
+  "$targeted_off_dir" 0 "" SIGNOFF_SKIP_TARGETED_TESTS=1
+# The unconditional targets stay required whatever the targeted switches say.
+assert_preflight_targets "still stops on an unconditional target with targeted work off" \
+  "$predates_dir" 71 "verify-cli" SIGNOFF_SKIP_TARGETED_LINT=1 SIGNOFF_SKIP_TARGETED_TESTS=1
+
+# A preflight run_checks never calls is a preflight that does nothing, and no
+# case above would notice — so assert the wiring, not just the function. Called
+# with no revision, run_checks skips the Rust-changes check and reaches the
+# preflight directly, so this needs neither git nor a build. Only the refusing
+# direction is exercised: letting it proceed would run the real gate.
+tests_run=$((tests_run + 1))
+wiring_result="$(call_subject_in "$predates_dir" 'run_checks')"
+if [[ "${wiring_result%%|*}" -ne 71 ]]; then
+  fail_test "run_checks stops on a missing make target before running any step: got ${wiring_result}"
+elif [[ "${wiring_result#*|}" != *"verify-cli"* ]]; then
+  fail_test "run_checks stops on a missing make target before running any step: expected 'verify-cli' in ${wiring_result}"
+else
+  echo "  ok: run_checks stops on a missing make target before running any step"
+fi
+
+# The list is only worth anything if it matches the Makefile the gate actually
+# runs: rename a target in the root Makefile without updating
+# SIGNOFF_MAKE_TARGETS and every sign-off refuses to start. Asserted with
+# targeted work on, so the conditional entry is covered here too.
+assert_preflight_targets "every sign-off make target resolves in the repo's own Makefile" \
+  "$(cd "$script_dir/.." && pwd)" 0 ""
+
+echo
 echo "run_make_step + build_hit_disk_full"
 # The watcher has to notice the linker's death without swallowing make's own
 # exit status, and without eating the output the Actions log shows the reader.
@@ -274,6 +458,32 @@ assert_recorder "records sccache failing to reach its storage" \
 assert_recorder "records a storage failure reported without the startup prefix" \
   'echo "sccache: error: cache storage failed to read: Unexpected (temporary)"; exit 101' \
   101 no "" yes
+# The third spelling (#12622). sccache reaches this one when the server it spawns
+# never comes up inside the startup timeout, which is how an endpoint that stops
+# answering during a run reads once the previous server has exited. Wording is
+# verbatim from sccache's `connect_or_start_server`; the second line is the same
+# bail's own continuation, unprefixed, and must not be what the guard matches.
+assert_recorder "records sccache timing out waiting for its server to start" \
+  'echo "sccache: error: Timed out waiting for server startup. Maybe the remote service is unreachable?"
+   echo "Run with SCCACHE_LOG=debug SCCACHE_NO_DAEMON=1 to get more information"
+   echo "error: process didn'"'"'t exit successfully: \`sccache /Users/runner/.rustup/toolchains/1.96.1-aarch64-apple-darwin/bin/rustc -vV\` (exit status: 2)"
+   exit 101' \
+  101 no "Timed out waiting for server startup" yes
+# `sccache --start-server` bails with the same sentence and no trailing advice,
+# so the guard anchors on the prefix the two share rather than on either whole
+# sentence — this case fails if the pattern ever pins the "Maybe the remote
+# service is unreachable?" suffix.
+assert_recorder "records the bare startup-timeout wording too" \
+  'echo "sccache: error: Timed out waiting for server startup"; exit 101' \
+  101 no "" yes
+# The other direction, as for the storage spellings: the sentence only counts on
+# sccache's own error channel. A build that merely prints it — a test asserting
+# on the wording, or a log echoed back — is still a failure about the branch.
+assert_recorder "leaves a failure unmarked when the timeout wording is only quoted" \
+  'echo "Timed out waiting for server startup"
+   echo "error[E0308]: mismatched types"
+   exit 101' \
+  101 no "E0308" no
 # The direction that matters: a genuine defect must not be excused because the
 # word sccache appeared. Only sccache's own `error:` channel counts.
 assert_recorder "leaves a compile failure unmarked when sccache merely ran" \
@@ -354,6 +564,56 @@ elif [[ "$broken_output" != *"KIND=disk"* ]]; then
 else
   echo "  ok: a watcher that died disarms the watch and lets free space classify"
 fi
+
+# The case above asserts make's status survives a dead watcher, but its stub
+# make writes a single short line, so whether make finishes writing before the
+# watcher closes the pipe is a race — it reported 141 (SIGPIPE) in roughly one
+# run in fifteen (#12734). The race was the test's, the loss was not: a watcher
+# placed downstream of make and exiting at once takes make's status with it,
+# and the more the step writes, the likelier that is. So this case pins the
+# same guarantee under a make that keeps writing, where the old ordering fails
+# every time rather than occasionally.
+tests_run=$((tests_run + 1))
+chatty_dir="$stub_dir/chatty-writer"
+mkdir -p "$chatty_dir"
+cat >"$chatty_dir/awk" <<STUB
+#!/usr/bin/env bash
+set -uo pipefail
+for arg in "\$@"; do
+  [[ "\$arg" == pat=* ]] && exit 2
+done
+exec "${real_awk}" "\$@"
+STUB
+chmod +x "$chatty_dir/awk"
+# Enough output that a closed reader is certain to be noticed, and an explicit
+# status afterwards so anything other than 101 means make never got to return.
+cat >"$chatty_dir/make" <<'STUB'
+#!/usr/bin/env bash
+set -uo pipefail
+for i in $(seq 1 2000); do
+  echo "compiling crate number ${i} with a line long enough to fill a pipe buffer"
+done
+exit 101
+STUB
+chmod +x "$chatty_dir/make"
+
+chatty_output="$(env "PATH=$chatty_dir:$stub_dir:$PATH" SIGNOFF_DISK_WATCH=1 \
+  STUB_FREE_KB="$(gib_to_kb 200)" \
+  bash -c 'source "$1"
+    if run_make_step some-target >/dev/null; then step_rc=0; else step_rc=$?; fi
+    echo "RC=${step_rc}"
+    echo "ARMED=${SIGNOFF_DISK_WATCH:+yes}"' _ "$subject" 2>&1)"
+
+if [[ "$chatty_output" == *"RC=141"* ]]; then
+  fail_test "a watcher that cannot run must not cost make its status to SIGPIPE: '${chatty_output}'"
+elif [[ "$chatty_output" != *"RC=101"* ]]; then
+  fail_test "a chatty step under a dead watcher still reports make's own status: expected RC=101, got '${chatty_output}'"
+elif [[ "$chatty_output" == *"ARMED=yes"* ]]; then
+  fail_test "a watcher that never ran must leave the watch disarmed: '${chatty_output}'"
+else
+  echo "  ok: a step that keeps writing still reports its own status when the watcher cannot run"
+fi
+rm -rf "$chatty_dir"
 rm -rf "$broken_dir"
 
 echo "failure_kind"
@@ -386,6 +646,22 @@ assert_failure_kind "a hit without an armed watch falls back to free space" 101 
   SIGNOFF_DISK_HIT=1 STUB_FREE_KB="$(gib_to_kb 200)"
 assert_failure_kind "calls the preflight's own refusal a disk failure" 70 "disk" \
   STUB_FREE_KB="$(gib_to_kb 60)"
+
+# The third way to reach "the checks reached no verdict": the branch's Makefile
+# had no rule for a target the gate invokes, so nothing was compiled at all.
+# It has to stay distinct from "checks" — a verdict worded like a lint denial is
+# what sent authors to read a 14k-line log of passing tests (#12813).
+assert_failure_kind "calls a missing make target its own kind, not a check failure" 71 "missing-target" \
+  STUB_FREE_KB="$(gib_to_kb 200)"
+# The preflight refused before anything ran, so no later reading may overrule
+# it — neither a volume that happens to be empty nor a stale cache flag.
+assert_failure_kind "keeps a missing make target distinct on a near-empty volume" 71 "missing-target" \
+  STUB_FREE_KB="$(gib_to_kb 1)"
+assert_failure_kind "keeps a missing make target distinct with a cache hit recorded" 71 "missing-target" \
+  SIGNOFF_DISK_WATCH=1 SIGNOFF_CACHE_HIT=1 STUB_FREE_KB="$(gib_to_kb 200)"
+# ...and it must not swallow a genuinely signalled run, which is decided first.
+assert_failure_kind "a signalled run stays signalled, not a missing target" 143 "signalled" \
+  STUB_FREE_KB="$(gib_to_kb 200)"
 # The other direction matters just as much: a real defect on a tight disk must
 # not be excused as infrastructure, or a broken branch signs off as "re-dispatch
 # me". 10 GiB is under the 25 GiB preflight floor and well over the critical bar.
@@ -499,6 +775,17 @@ assert_describe "still publishes the unreachable-cache verdict" 101 \
 assert_describe "still publishes a genuine check failure" 101 \
   "Sign-off checks failed after 21195s (triggered by someone)" \
   "sign-off checks failed" STUB_FREE_KB="$(gib_to_kb 200)"
+
+# A branch that predates a gate target has to say so in the commit status
+# itself: that description is all most readers see, and worded as a check
+# failure it is indistinguishable from a lint denial. It also has to carry the
+# remedy, because the reader who needs it is not going to open the log.
+assert_describe "says a missing make target could not run, not that checks failed" 71 \
+  "Sign-off could not run after 21195s — branch predates a make target the gate needs; merge trunk in (triggered by someone)" \
+  "the checks did not run" STUB_FREE_KB="$(gib_to_kb 200)"
+assert_describe "tells the author to merge trunk in" 71 \
+  "Sign-off could not run after 21195s — branch predates a make target the gate needs; merge trunk in (triggered by someone)" \
+  "merge trunk in and sign off again" STUB_FREE_KB="$(gib_to_kb 200)"
 echo
 
 # `08` passes the digit regex, but bash arithmetic reads a leading zero as

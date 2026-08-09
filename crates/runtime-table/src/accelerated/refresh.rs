@@ -1763,7 +1763,11 @@ mod tests {
         )
         .await;
 
-        // Known limitation, doesn't dedup
+        // The source holds `11:11:15Z` twice against the one copy the accelerator stored, so
+        // the multiset subtraction cancels one and appends the other: 4 + 1 = 5. Set
+        // subtraction used to drop both and leave 4, which is the defect in #12499 - the
+        // second copy is a row the source really does have and the accelerator really is
+        // missing. Sibling coverage for the `UnixMillis` case below.
         test(
             vec!["2012-12-01T11:11:15Z", "2012-12-01T11:11:15Z"],
             vec![
@@ -1772,8 +1776,8 @@ mod tests {
                 "2012-12-01T11:11:12Z",
                 "2012-12-01T11:11:15Z",
             ],
-            4,
-            "should not apply same timestamp data",
+            5,
+            "should apply the incoming copy the accelerator does not already hold",
         )
         .await;
     }
@@ -2171,10 +2175,15 @@ mod tests {
             "should fetch all data as 3 seconds is enough to cover all time span in source with millis",
         )
         .await;
+        // `duplicated_incoming_data` serves the source batch twice, so the source holds two
+        // copies of every row in 4..=10 - 14 rows - against the four already stored. Only
+        // `9` is stored, and the dedup subtracts the stored rows as a multiset, so it
+        // cancels *one* of the two incoming `9`s and the other is appended: 4 + 13 = 17.
+        // Regression coverage for #12499.
         test(
             vec![4, 5, 6, 7, 8, 9, 10],
             vec![1, 2, 3, 9],
-            16, // all the data
+            17, // all the data, with one of the two incoming `9`s cancelled by the stored one
             Some(TimeFormat::UnixMillis),
             Some(Duration::from_secs(3)),
             true,
