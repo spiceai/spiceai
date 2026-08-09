@@ -556,7 +556,9 @@ fn report(cc: &crash_handler::CrashContext) {
     // Flushed before the stack section: reading the stack can fault again, and a
     // second fault inside the handler ends the process with the signal still blocked.
     // Writing first costs the stack section rather than the whole report.
-    flush(&buf, cur.position(), complete);
+    // Ends the cursor's borrow of `buf` before the buffer is read back.
+    let position = cur.position();
+    flush(&buf, position, complete);
 
     report_stack(cc, ip, fault_address(cc));
 }
@@ -641,7 +643,9 @@ fn report_stack(cc: &crash_handler::CrashContext, ip: u64, fault_addr: Option<u6
     }
     complete &= write!(cur, "=== end native crash ===\n").is_ok();
 
-    flush(&buf, cur.position(), complete);
+    // Ends the cursor's borrow of `buf` before the buffer is read back.
+    let position = cur.position();
+    flush(&buf, position, complete);
 }
 
 /// A reduced report. `CrashContext` is platform-specific: on macOS it carries a Mach
@@ -667,7 +671,9 @@ fn report(_cc: &crash_handler::CrashContext) {
          === end native crash ===\n",
     )
     .is_ok();
-    flush(&buf, cur.position(), complete);
+    // Ends the cursor's borrow of `buf` before the buffer is read back.
+    let position = cur.position();
+    flush(&buf, position, complete);
 }
 
 #[cfg(all(test, unix))]
