@@ -56,7 +56,33 @@ pub(crate) async fn runtime_ready_check(rt: &Runtime) {
 }
 
 pub(crate) async fn runtime_ready_check_with_timeout(rt: &Runtime, duration: Duration) {
-    assert!(wait_until_true(duration, || async { rt.status().is_ready() }).await);
+    assert!(
+        wait_until_true(duration, || async { rt.status().is_ready() }).await,
+        "the runtime did not become ready within {duration:?} — {}",
+        describe_component_statuses(rt)
+    );
+}
+
+/// Name every registered component and the state it is in.
+///
+/// The readiness wait elapses identically whether a component failed to load, is
+/// still initializing, or was never registered at all, so on its own it says only
+/// that the runtime is not ready. `ComponentStatus::Error` carries the message that
+/// put the component in that state, so naming the states turns the timeout into the
+/// reason for it.
+fn describe_component_statuses(rt: &Runtime) -> String {
+    let statuses = rt.status().get_all_statuses();
+    if statuses.is_empty() {
+        return "no components were registered".to_string();
+    }
+
+    let mut described: Vec<String> = statuses
+        .iter()
+        .map(|(component, status)| format!("{component}: {status:?}"))
+        .collect();
+    // `get_all_statuses` returns a `HashMap`, so sort for a stable message.
+    described.sort();
+    described.join(", ")
 }
 
 pub(crate) async fn runtime_ready_check_with_timeout_err(
