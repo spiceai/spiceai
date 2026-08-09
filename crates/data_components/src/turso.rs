@@ -2310,8 +2310,25 @@ const LIST_ENCODING_VERSION: u64 = 1;
 /// A list that genuinely holds a single null encodes to the same bytes, so an *unversioned* payload
 /// of this shape cannot be attributed to either writer and is refused. Any other unversioned shape
 /// is proof of a writer that was not the broken one, so it is served.
+///
+/// Only a `List` column can hold such a payload — see [`PreVersionWriter`].
 fn is_pre_version_list_shape(elements: &[serde_json::Value]) -> bool {
     matches!(elements, [serde_json::Value::Null])
+}
+
+/// Whether the pre-version writer could have stored anything under the column being read.
+///
+/// It had one list arm, for `ScalarValue::List`. `LargeList` and `FixedSizeList` values reached the
+/// unsupported-type path instead and never became rows, so a payload under one of those columns can
+/// only have come from a writer that serialized the list's real contents — including the one that
+/// encodes to a bare array of a single null. Applying the ambiguity there would refuse correct data
+/// for a collision that cannot have happened.
+#[derive(Clone, Copy)]
+enum PreVersionWriter {
+    /// A column type it stored, so its one ambiguous shape is undecidable here.
+    CouldHaveStored,
+    /// A column type it never stored, so no payload under this column is its output.
+    NeverStored,
 }
 
 /// Envelope member naming the [`LIST_ENCODING_VERSION`] a payload was written under.
@@ -2438,7 +2455,14 @@ fn list_column<O: OffsetSizeTrait>(
     col_idx: usize,
     element_field: &FieldRef,
 ) -> Result<ArrayRef, Box<dyn std::error::Error + Send + Sync>> {
-    let decoded = decode_stored_lists(rows, col_idx, element_field)?;
+    // 32-bit offsets are a `List`, which the pre-version writer stored; 64-bit offsets are a
+    // `LargeList`, which it did not.
+    let pre_version_writer = if O::IS_LARGE {
+        PreVersionWriter::NeverStored
+    } else {
+        PreVersionWriter::CouldHaveStored
+    };
+    let decoded = decode_stored_lists(rows, col_idx, element_field, pre_version_writer)?;
     Ok(Arc::new(GenericListArray::<O>::try_new(
         Arc::clone(element_field),
         OffsetBuffer::from_lengths(decoded.lengths),
@@ -2453,6 +2477,7 @@ fn decode_stored_lists(
     rows: &[Vec<TursoValue>],
     col_idx: usize,
     element_field: &FieldRef,
+    pre_version_writer: PreVersionWriter,
 ) -> Result<DecodedLists, Box<dyn std::error::Error + Send + Sync>> {
     let element_type = element_field.data_type();
     let mut elements: Vec<ScalarValue> = Vec::new();
@@ -2461,8 +2486,12 @@ fn decode_stored_lists(
     let mut refusals = ListRefusals::default();
 
     for row in rows {
-        if let Some(values) = decode_stored_list_row(row.get(col_idx), element_type, &mut refusals)
-        {
+        if let Some(values) = decode_stored_list_row(
+            row.get(col_idx),
+            element_type,
+            pre_version_writer,
+            &mut refusals,
+        ) {
             lengths.push(values.len());
             validity.push(true);
             elements.extend(values);
@@ -2504,8 +2533,14 @@ fn decode_stored_fixed_size_lists(
     let mut refusals = ListRefusals::default();
 
     for row in rows {
-        if let Some(values) = decode_stored_list_row(row.get(col_idx), element_type, &mut refusals)
-            .filter(|values| values.len() == slots)
+        if let Some(values) = decode_stored_list_row(
+            row.get(col_idx),
+            element_type,
+            // The pre-version writer never stored a `FixedSizeList`.
+            PreVersionWriter::NeverStored,
+            &mut refusals,
+        )
+        .filter(|values| values.len() == slots)
         {
             validity.push(true);
             elements.extend(values);
@@ -2565,8 +2600,9 @@ fn decode_stored_maps(
 enum StoredListPayload {
     /// Elements to decode as the column's element type.
     Elements(Vec<serde_json::Value>),
-    /// An unversioned payload of the one shape the broken writer produced — see
-    /// [`is_pre_version_list_shape`]. Undecidable, so refused.
+    /// An unversioned payload of the one shape the broken writer produced, under a column that
+    /// writer stored — see [`is_pre_version_list_shape`] and [`PreVersionWriter`]. Undecidable, so
+    /// refused.
     AmbiguousPreVersion,
     /// An envelope naming an encoding version this build does not write, so its shape is not one
     /// this reader knows how to interpret.
@@ -2582,7 +2618,11 @@ enum StoredListPayload {
 /// one shape, so only that shape is ambiguous and every other bare array is provably from a writer
 /// that serialized the list's real contents. Refusing all of them would discard correct data to no
 /// benefit.
-fn classify_stored_list(json: &str) -> StoredListPayload {
+///
+/// The same argument bounds which columns the ambiguity applies to at all: under a column the broken
+/// writer never stored, even that one shape is unambiguous. `pre_version_writer` carries which kind
+/// of column this is — see [`PreVersionWriter`].
+fn classify_stored_list(json: &str, pre_version_writer: PreVersionWriter) -> StoredListPayload {
     match serde_json::from_str::<serde_json::Value>(json) {
         Ok(serde_json::Value::Object(mut envelope)) => {
             let version = envelope
@@ -2598,13 +2638,12 @@ fn classify_stored_list(json: &str) -> StoredListPayload {
                 _ => StoredListPayload::Unreadable,
             }
         }
-        Ok(serde_json::Value::Array(elements)) => {
-            if is_pre_version_list_shape(&elements) {
+        Ok(serde_json::Value::Array(elements)) => match pre_version_writer {
+            PreVersionWriter::CouldHaveStored if is_pre_version_list_shape(&elements) => {
                 StoredListPayload::AmbiguousPreVersion
-            } else {
-                StoredListPayload::Elements(elements)
             }
-        }
+            _ => StoredListPayload::Elements(elements),
+        },
         _ => StoredListPayload::Unreadable,
     }
 }
@@ -2628,12 +2667,13 @@ struct ListRefusals {
 fn decode_stored_list_row(
     stored: Option<&TursoValue>,
     element_type: &DataType,
+    pre_version_writer: PreVersionWriter,
     refusals: &mut ListRefusals,
 ) -> Option<Vec<ScalarValue>> {
     let Some(TursoValue::Text(json)) = stored else {
         return None;
     };
-    let elements = match classify_stored_list(json) {
+    let elements = match classify_stored_list(json, pre_version_writer) {
         StoredListPayload::Elements(elements) => elements,
         StoredListPayload::AmbiguousPreVersion => {
             refusals.ambiguous_pre_version += 1;
@@ -3800,17 +3840,58 @@ mod tests {
         );
     }
 
-    /// The fixed-size arm decodes through the same payload reader, so it refuses the same payloads.
+    /// The ambiguity is bounded by which columns the broken writer could have written, not only by
+    /// the payload's shape. It had one list arm, for `ScalarValue::List`; a `FixedSizeList` reached
+    /// the unsupported-type path and never became a row. So a single-null array under a fixed-size
+    /// column is the current encoder's output for a list that genuinely holds one null, and
+    /// refusing it would discard data on a collision that cannot have happened.
     #[test]
-    fn test_an_ambiguous_pre_version_fixed_size_list_payload_is_not_served() {
+    fn test_a_single_null_fixed_size_list_payload_is_served_as_data() {
         let column = read_stored(
             TursoValue::Text("[null]".to_string()),
             DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Int32, true)), 1),
         );
 
         assert!(
-            column.is_null(0),
-            "a fixed-size list payload predating the encoding version should read as NULL"
+            !column.is_null(0),
+            "no payload under a fixed-size list column can be the broken writer's, so this is data"
+        );
+
+        let elements = column
+            .as_any()
+            .downcast_ref::<arrow::array::FixedSizeListArray>()
+            .expect("the column should read back as a fixed-size list")
+            .value(0);
+        assert_eq!(elements.len(), 1, "the list should hold its one element");
+        assert!(
+            elements.is_null(0),
+            "that element is the null that was stored"
+        );
+    }
+
+    /// `LargeList` is in the same class as `FixedSizeList`, and for the same reason: the broken
+    /// writer had no arm for it either, so its single-null payload is data rather than a collision.
+    #[test]
+    fn test_a_single_null_large_list_payload_is_served_as_data() {
+        let column = read_stored(
+            TursoValue::Text("[null]".to_string()),
+            DataType::LargeList(Arc::new(Field::new("item", DataType::Int32, true))),
+        );
+
+        assert!(
+            !column.is_null(0),
+            "no payload under a large list column can be the broken writer's, so this is data"
+        );
+
+        let elements = column
+            .as_any()
+            .downcast_ref::<arrow::array::LargeListArray>()
+            .expect("the column should read back as a large list")
+            .value(0);
+        assert_eq!(elements.len(), 1, "the list should hold its one element");
+        assert!(
+            elements.is_null(0),
+            "that element is the null that was stored"
         );
     }
 
