@@ -68,6 +68,18 @@ pub enum Error {
     #[snafu(display("Failed to reach the Spice Cloud endpoint {url}: {source}"))]
     Http { url: String, source: reqwest::Error },
 
+    #[snafu(display(
+        "Failed to reach the Spice Cloud endpoint {url}: its TLS certificate was rejected as \
+         outside its validity period, which almost always means this host's clock is wrong: \
+         {advice}. See: https://spiceai.org/docs"
+    ))]
+    CertificateValidity {
+        url: String,
+        /// The measured skew and its fix, or the generic clock check when the
+        /// offset could not be measured.
+        advice: String,
+    },
+
     #[snafu(display("Spice Cloud rejected the request ({status}): {message}"))]
     Rejected { status: u16, message: String },
 
@@ -86,6 +98,10 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 impl Error {
     /// `true` only when the cloud *authoritatively rejected* the request
     /// (4xx `Rejected`): retrying the same request cannot succeed.
+    ///
+    /// Note this deliberately EXCLUDES [`Error::CertificateValidity`] — a
+    /// skewed host clock is fixable and the request never reached the cloud,
+    /// so the adoption code is still live and must not be burned.
     ///
     /// Note this deliberately EXCLUDES [`Error::ProofOfPossession`]. A
     /// proof-of-possession / key-material failure is *local* and never reaches
@@ -166,6 +182,36 @@ struct EnrollRequest<'a> {
     /// (never `false`) when unset — absence is the wire default.
     #[serde(skip_serializing_if = "Option::is_none")]
     create_app: Option<bool>,
+    /// Where this instance runs. A **sibling of `instance`, not a member of
+    /// it**: everything in [`InstanceFacts`] is probed from the host, while
+    /// the region is whatever the operator declared with
+    /// `spice connect --region`.
+    ///
+    /// Omitted (never `null`) when unset — the cloud reads absence as "leave
+    /// the stored region alone", so a re-enrol cannot erase a region set in
+    /// the portal.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    region: Option<&'a str>,
+}
+
+/// The customer-declared attributes an enrollment carries alongside the probed
+/// host facts: which app to attach to, and where the instance runs. Borrowed
+/// from a [`CloudConnectConfig`] by [`EnrollAttributes::from_config`].
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct EnrollAttributes<'a> {
+    pub(crate) app_name: Option<&'a str>,
+    pub(crate) create_app: bool,
+    pub(crate) region: Option<&'a str>,
+}
+
+impl<'a> EnrollAttributes<'a> {
+    pub(crate) fn from_config(config: &'a CloudConnectConfig) -> Self {
+        Self {
+            app_name: config.adopt_app_name.as_deref(),
+            create_app: config.adopt_create_app,
+            region: config.instance_region.as_deref(),
+        }
+    }
 }
 
 /// Wire shape of a successful enroll response.
@@ -180,6 +226,16 @@ struct EnrollResponseWire {
     /// or carried an attachment. Absent on older control planes.
     #[serde(default)]
     app_name: Option<String>,
+    /// The org the adoption code was scoped to, so the CLI can name it in the
+    /// enroll summary rather than making the customer look it up. Absent on
+    /// control planes that do not report it.
+    #[serde(default)]
+    org: Option<String>,
+    /// The region now stored on the registry row — the declared `region` when
+    /// one was sent, otherwise whatever the row already held. Absent on
+    /// control planes that do not report it.
+    #[serde(default)]
+    region: Option<String>,
 }
 
 /// Parsed result of a successful enrollment.
@@ -195,6 +251,11 @@ pub struct EnrollOutcome {
     pub not_after_unix: u64,
     /// The app the instance was attached to at enroll, if any.
     pub app_name: Option<String>,
+    /// The org the instance enrolled into, when the cloud reported it.
+    pub org: Option<String>,
+    /// The region stored on the registry row after this enroll, when the
+    /// cloud reported it.
+    pub region: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -205,6 +266,10 @@ struct RenewRequest<'a> {
     /// The freshly-generated X25519 encryption public key (RFC 8410 SPKI
     /// PEM). The cloud records it in the same transaction that rotates the
     /// identity key, and seals to it from that commit on.
+    ///
+    /// Required, not optional: the endpoint rejects a renewal that omits it,
+    /// and an encryption key that never rotated would outlive the identity it
+    /// belongs to.
     ///
     /// Not covered by `pop_sig`, which signs the CSR DER alone — this field's
     /// integrity rests on the server-authenticated TLS to the cloud.
@@ -238,6 +303,10 @@ pub(crate) struct EnrollClient {
     http: reqwest::Client,
     enroll_url: String,
     renew_url: String,
+    /// Base URL and trust roots, retained so a TLS handshake failure can be
+    /// diagnosed for clock skew (see [`crate::clock_skew::diagnose`]).
+    base_url: String,
+    ca_cert_pem: Option<String>,
 }
 
 impl EnrollClient {
@@ -263,31 +332,58 @@ impl EnrollClient {
             http,
             enroll_url: format!("{base}{ENROLL_PATH}"),
             renew_url: format!("{base}{RENEW_PATH}"),
+            base_url: base.to_string(),
+            ca_cert_pem: config.ca_cert_pem.clone(),
         })
+    }
+
+    /// Measure this host's clock against the cloud for a certificate-validity
+    /// failure, falling back to a generic clock check when no measurement can
+    /// be made (the probe itself failed, or a proxy stripped `Date`).
+    async fn clock_advice(&self) -> String {
+        match crate::clock_skew::diagnose(&self.base_url, self.ca_cert_pem.as_deref()).await {
+            Some(skew) if skew.is_significant() => skew.advice(),
+            // A measured-but-small skew means the certificate really is
+            // outside its window for another reason, so do not claim a clock
+            // problem that is not there.
+            Some(_) => format!(
+                "this host's clock agrees with Spice Cloud, so the certificate is genuinely \
+                 outside its validity period — check for a TLS-intercepting proxy on this \
+                 network. Host time is {}",
+                chrono::Utc::now().to_rfc3339()
+            ),
+            None => format!(
+                "check this host's clock (currently {}) and enable NTP time synchronization \
+                 (for example `sudo timedatectl set-ntp true`)",
+                chrono::Utc::now().to_rfc3339()
+            ),
+        }
     }
 
     /// First-contact enrollment: present the one-time adoption code, the
     /// CSR for a freshly-generated keypair, and the host facts — plus the
-    /// optional app attachment (`app_name`, `create_app`). No bearer
-    /// token — the code is the credential.
+    /// optional app attachment and declared region (see
+    /// [`EnrollAttributes`]). No bearer token — the code is the credential.
     pub(crate) async fn enroll(
         &self,
         adoption_code: &str,
         material: &EnrollmentMaterial,
         facts: &InstanceFacts,
-        app_name: Option<&str>,
-        create_app: bool,
+        attributes: &EnrollAttributes<'_>,
     ) -> Result<EnrollOutcome> {
         let request = EnrollRequest {
             adoption_code,
             csr_pem: &material.csr_pem,
             enc_pubkey_pem: &material.enc_public_key_pem,
             instance: facts,
-            app_name,
+            app_name: attributes.app_name,
             // `create_app` is meaningless without an app to name, so it
             // rides only alongside `app_name` — the wire never carries the
             // orphaned combination even if a caller sets the flag alone.
-            create_app: app_name.and(create_app.then_some(true)),
+            create_app: attributes
+                .app_name
+                .and(attributes.create_app.then_some(true)),
+            region: attributes.region,
         };
         let wire: EnrollResponseWire = self.post_json(&self.enroll_url, &request).await?;
         let not_after_unix = parse_not_after(&self.enroll_url, &wire.not_after)?;
@@ -308,6 +404,8 @@ impl EnrollClient {
             gateway_addr: wire.gateway_addr,
             not_after_unix,
             app_name: wire.app_name,
+            org: wire.org,
+            region: wire.region,
         })
     }
 
@@ -315,6 +413,11 @@ impl EnrollClient {
     /// current leaf and the current-key proof-of-possession signature over
     /// the new CSR. Works within the grace window even when the presented
     /// leaf is already expired.
+    ///
+    /// `material` also carries the freshly-generated X25519 encryption key: its
+    /// public half rides this request so the cloud re-pins both keys in one
+    /// atomic update, and the caller installs the private half as current while
+    /// retaining the outgoing one for a single rotation.
     pub(crate) async fn renew(
         &self,
         current: &Identity,
@@ -340,15 +443,38 @@ impl EnrollClient {
         url: &str,
         body: &Req,
     ) -> Result<Resp> {
-        let response = self
-            .http
-            .post(url)
-            .json(body)
-            .send()
-            .await
-            .context(HttpSnafu {
-                url: url.to_string(),
-            })?;
+        let response = match self.http.post(url).json(body).send().await {
+            Ok(response) => response,
+            Err(source) => {
+                // A TLS validity rejection is the shape a wrong host clock
+                // produces at every layer of this flow. Diagnose it here
+                // rather than handing the operator a bare certificate error.
+                if crate::clock_skew::looks_like_certificate_validity_failure(&source) {
+                    return Err(Error::CertificateValidity {
+                        url: url.to_string(),
+                        advice: self.clock_advice().await,
+                    });
+                }
+                return Err(Error::Http {
+                    url: url.to_string(),
+                    source,
+                });
+            }
+        };
+
+        // Every Spice Cloud response carries `Date`, so measure the host's
+        // clock against it whether or not the request succeeded — the offset
+        // is the difference between "the cloud is broken" and "this host's
+        // clock is wrong", and it costs nothing to read.
+        let skew = response
+            .headers()
+            .get(reqwest::header::DATE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(crate::clock_skew::from_date_header)
+            .filter(|skew| skew.is_significant());
+        if let Some(skew) = skew {
+            tracing::warn!("Cloud Connect: {}", skew.advice());
+        }
 
         let status = response.status();
         if status.is_success() {
@@ -362,11 +488,18 @@ impl EnrollClient {
         }
 
         // Non-2xx: surface the server's `{ "error": "..." }` message when
-        // present, falling back to a bounded slice of the raw body.
+        // present, falling back to a bounded slice of the raw body. Append the
+        // measured skew when there is one — a host hours out of step can have
+        // its CSR or its renewal proof-of-possession refused, and the cloud's
+        // message alone would not say why.
         let message = match response.text().await {
             Ok(text) => serde_json::from_str::<ErrorBody>(&text)
                 .map_or_else(|_| bounded(&text, 256), |b| b.error),
             Err(_) => String::new(),
+        };
+        let message = match skew {
+            Some(skew) => format!("{message} ({})", skew.advice()),
+            None => message,
         };
         // 5xx is transient by definition; 429 (rate limit) and 408 (request
         // timeout) are the 4xx statuses that are also transient — treating
@@ -399,7 +532,7 @@ pub(crate) async fn acquire_identity(
     client: &EnrollClient,
     adoption_code: &str,
     config: &CloudConnectConfig,
-) -> Result<(Identity, Option<String>)> {
+) -> Result<(Identity, EnrollRegistration)> {
     let material =
         IdentityStore::generate_enrollment().map_err(|source| Error::ProofOfPossession {
             reason: format!("failed to generate enrollment key material: {source}"),
@@ -410,10 +543,14 @@ pub(crate) async fn acquire_identity(
             adoption_code,
             &material,
             &facts,
-            config.adopt_app_name.as_deref(),
-            config.adopt_create_app,
+            &EnrollAttributes::from_config(config),
         )
         .await?;
+    let registration = EnrollRegistration {
+        app_name: outcome.app_name,
+        org: outcome.org,
+        region: outcome.region,
+    };
     let identity = Identity {
         identifier: outcome.instance_id,
         identity_cert_pem: outcome.identity_cert_pem,
@@ -424,8 +561,29 @@ pub(crate) async fn acquire_identity(
         not_after_unix: Some(outcome.not_after_unix),
         enc_private_key_pem: material.enc_private_key_pem,
         enc_public_key_pem: material.enc_public_key_pem,
+        // A fresh enrollment has no prior key to retain.
+        enc_previous_private_key_pem: String::new(),
+        // Minted below so an identity always leaves enrollment able to write
+        // its delivered-secrets cache.
+        cache_key_b64: String::new(),
     };
-    Ok((identity, outcome.app_name))
+    let mut identity = identity;
+    identity.ensure_cache_key();
+    Ok((identity, registration))
+}
+
+/// What the cloud recorded on the registry row for this enrollment — the parts
+/// worth reporting to the operator, distinct from the identity itself.
+#[derive(Debug, Clone, Default)]
+pub struct EnrollRegistration {
+    /// The app the instance was attached to at enroll, if any.
+    pub app_name: Option<String>,
+    /// The org the instance enrolled into, when the cloud reported it.
+    pub org: Option<String>,
+    /// The region on the registry row after this enroll, when the cloud
+    /// reported it. Present even when this enroll declared no `--region`, since
+    /// an omitted region leaves any previously-set value in place.
+    pub region: Option<String>,
 }
 
 /// Errors from the one-shot [`enroll_now`] flow.
@@ -473,8 +631,9 @@ impl EnrollNowError {
 pub struct EnrollNowOutcome {
     /// The issued (and persisted) identity.
     pub identity: Identity,
-    /// The app the instance was attached to at enroll, if any.
-    pub app_name: Option<String>,
+    /// What the cloud recorded on the registry row (app attachment, org,
+    /// region).
+    pub registration: EnrollRegistration,
 }
 
 /// One-shot out-of-band enrollment: present `config.adoption_code` to the
@@ -507,7 +666,7 @@ pub async fn enroll_now(config: &CloudConnectConfig) -> Result<EnrollNowOutcome,
     };
     let client = EnrollClient::new(config).context(EnrollSnafu)?;
 
-    let (identity, app_name) = match acquire_identity(&client, code, config).await {
+    let (identity, registration) = match acquire_identity(&client, code, config).await {
         Ok(enrolled) => enrolled,
         Err(source) => {
             if source.is_credential_rejection() {
@@ -542,7 +701,10 @@ pub async fn enroll_now(config: &CloudConnectConfig) -> Result<EnrollNowOutcome,
         path: config.identity_path.clone(),
     })?;
 
-    Ok(EnrollNowOutcome { identity, app_name })
+    Ok(EnrollNowOutcome {
+        identity,
+        registration,
+    })
 }
 
 /// Best-effort removal of the staged pending-code file. A missing file is
@@ -744,6 +906,7 @@ mod tests {
             pending_adopt_code_path: None,
             adopt_app_name: None,
             adopt_create_app: false,
+            instance_region: None,
             runtime_version: "v0-test".to_string(),
             heartbeat_interval: Duration::from_secs(30),
             telemetry_interval: Duration::from_mins(1),
@@ -751,15 +914,19 @@ mod tests {
         }
     }
 
-    #[test]
-    fn enroll_request_omits_absent_app_attachment_fields() {
-        let facts = InstanceFacts {
+    fn test_facts() -> InstanceFacts {
+        InstanceFacts {
             fingerprint: "f".to_string(),
             hostname: "h".to_string(),
             os: "o".to_string(),
             arch: "a".to_string(),
             runtime_version: "v".to_string(),
-        };
+        }
+    }
+
+    #[test]
+    fn enroll_request_omits_absent_app_attachment_fields() {
+        let facts = test_facts();
         let bare = serde_json::to_value(EnrollRequest {
             adoption_code: "code",
             csr_pem: "csr",
@@ -767,6 +934,7 @@ mod tests {
             instance: &facts,
             app_name: None,
             create_app: None,
+            region: None,
         })
         .expect("serialize bare request");
         // Absent attachment fields must be omitted, not sent as null/false —
@@ -782,10 +950,118 @@ mod tests {
             instance: &facts,
             app_name: Some("my-app"),
             create_app: Some(true),
+            region: None,
         })
         .expect("serialize attach request");
         assert_eq!(attached["app_name"], "my-app");
         assert_eq!(attached["create_app"], true);
+    }
+
+    #[test]
+    fn enroll_request_carries_region_beside_the_host_facts() {
+        let facts = test_facts();
+        let declared = serde_json::to_value(EnrollRequest {
+            adoption_code: "code",
+            csr_pem: "csr",
+            enc_pubkey_pem: "enc",
+            instance: &facts,
+            app_name: None,
+            create_app: None,
+            region: Some("on-prem-syd"),
+        })
+        .expect("serialize request with a region");
+
+        // The region is customer-declared, not probed: it must be a sibling of
+        // `instance`, never a member of it. The cloud reads it from the top
+        // level and would ignore it nested.
+        assert_eq!(declared["region"], "on-prem-syd");
+        assert!(
+            declared["instance"].get("region").is_none(),
+            "the region must not be nested inside the probed host facts"
+        );
+    }
+
+    #[test]
+    fn enroll_request_omits_an_absent_region_rather_than_nulling_it() {
+        let facts = test_facts();
+        let omitted = serde_json::to_value(EnrollRequest {
+            adoption_code: "code",
+            csr_pem: "csr",
+            enc_pubkey_pem: "enc",
+            instance: &facts,
+            app_name: None,
+            create_app: None,
+            region: None,
+        })
+        .expect("serialize request without a region");
+
+        // Absence means "leave the stored region alone". Sending `null` would
+        // make every re-enrol — the recovery path past the renewal grace
+        // window — silently erase a region set in the portal.
+        assert!(
+            omitted.get("region").is_none(),
+            "an omitted --region must not appear on the wire at all"
+        );
+    }
+
+    #[test]
+    fn enroll_attributes_read_the_config() {
+        let mut config = test_config("https://cloud.spice.ai");
+        config.adopt_app_name = Some("edge-fleet".to_string());
+        config.adopt_create_app = true;
+        config.instance_region = Some("us-west-2".to_string());
+
+        let attributes = EnrollAttributes::from_config(&config);
+        assert_eq!(attributes.app_name, Some("edge-fleet"));
+        assert!(attributes.create_app);
+        assert_eq!(attributes.region, Some("us-west-2"));
+    }
+
+    #[test]
+    fn enroll_response_tolerates_a_control_plane_that_omits_org_and_region() {
+        // Both fields are additive: an older control plane omits them and the
+        // enroll must still succeed rather than failing to decode.
+        let wire: EnrollResponseWire = serde_json::from_value(serde_json::json!({
+            "instance_id": "inst_1",
+            "identity_cert_pem": "cert",
+            "ca_bundle_pem": "ca",
+            "gateway_addr": "gateway:7320",
+            "not_after": "2030-01-01T00:00:00Z",
+        }))
+        .expect("decode a response without org/region");
+        assert!(wire.org.is_none());
+        assert!(wire.region.is_none());
+
+        let full: EnrollResponseWire = serde_json::from_value(serde_json::json!({
+            "instance_id": "inst_1",
+            "identity_cert_pem": "cert",
+            "ca_bundle_pem": "ca",
+            "gateway_addr": "gateway:7320",
+            "not_after": "2030-01-01T00:00:00Z",
+            "app_name": "my-app",
+            "org": "my-org",
+            "region": "us-west-2",
+        }))
+        .expect("decode a full response");
+        assert_eq!(full.org.as_deref(), Some("my-org"));
+        assert_eq!(full.region.as_deref(), Some("us-west-2"));
+        assert_eq!(full.app_name.as_deref(), Some("my-app"));
+    }
+
+    #[test]
+    fn certificate_validity_error_is_not_an_authoritative_rejection() {
+        // A skewed clock never reached the cloud, so the adoption code is
+        // still live: classifying this as authoritative would burn it.
+        let err = Error::CertificateValidity {
+            url: "https://cloud.spice.ai/v1/cloud-connect/enroll".to_string(),
+            advice: "host clock is 42 minutes behind Spice Cloud".to_string(),
+        };
+        assert!(!err.is_authoritative_rejection());
+        assert!(!err.is_credential_rejection());
+        assert!(
+            err.to_string().contains("clock"),
+            "the message must name the clock: {err}"
+        );
     }
 
     #[test]

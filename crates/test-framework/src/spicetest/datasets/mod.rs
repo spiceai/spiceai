@@ -76,6 +76,8 @@ pub struct NotStarted {
     reference_schema: Option<String>,
     streaming_metrics_sender: Option<mpsc::Sender<QueryMetricEvent>>,
     query_duration_threshold: Option<Duration>,
+    /// Fleet-wide target query issue rate. `0.0` (the default) runs closed-loop.
+    target_qps: f64,
     query_set_type: Option<QuerySet>,
     query_overrides: Option<QueryOverrides>,
 }
@@ -95,6 +97,8 @@ impl Default for NotStarted {
             reference_schema: None,
             streaming_metrics_sender: None,
             query_duration_threshold: None,
+            // 0.0 = closed-loop, the historical behaviour.
+            target_qps: 0.0,
             query_set_type: None,
             query_overrides: None,
         }
@@ -155,6 +159,15 @@ impl NotStarted {
     #[must_use]
     pub fn with_validate(mut self, validate: bool) -> Self {
         self.validate = validate;
+        self
+    }
+
+    /// Pin the aggregate query issue rate, so two builds under comparison do
+    /// identical work and the difference lands in latency rather than in
+    /// throughput. `0.0` keeps the closed-loop behaviour.
+    #[must_use]
+    pub fn with_target_qps(mut self, target_qps: f64) -> Self {
+        self.target_qps = target_qps;
         self
     }
 
@@ -299,6 +312,10 @@ impl SpiceTest<NotStarted> {
             })
             .unwrap_or_default();
 
+        // ONE pacer shared by every worker: the target is a fleet-wide issue
+        // rate, not a per-worker one.
+        let pacer = crate::spicetest::pacer::QueryPacer::new(self.state.target_qps);
+
         let mut query_workers = Vec::new();
         for id in 0..self.state.parallel_count {
             let worker_executor = if per_worker_executors.is_empty() {
@@ -321,7 +338,8 @@ impl SpiceTest<NotStarted> {
             .with_scale_factor(self.state.scale_factor)
             .with_shutdown_token(shutdown_token.clone())
             .with_skip_row_count_validation(row_count_validation_skip_queries.clone())
-            .with_validate_row_count(self.validate_row_count);
+            .with_validate_row_count(self.validate_row_count)
+            .with_pacer(pacer.clone());
 
             if let Some(multi) = &multi {
                 worker = worker.with_progress_bar(multi.add(self.get_new_progress_bar()));

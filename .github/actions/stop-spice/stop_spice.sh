@@ -35,7 +35,13 @@ set -uo pipefail
 
 # Ports `spiced` binds (HTTP, Flight). Left unquoted where used so the
 # space-separated value splits into words.
-SPICE_STOP_PORTS="${SPICE_STOP_PORTS:-8090 50051}"
+#
+# A job that allocated its own ports exports them (see
+# .github/actions/allocate-spice-ports, #12419); check those rather than the
+# defaults, or this reports on ports belonging to a *different* runner
+# instance's job — noise that reads as a leak — while never confirming ours
+# came free. Jobs that did not allocate keep spiced's defaults.
+SPICE_STOP_PORTS="${SPICE_STOP_PORTS:-${SPICE_HTTP_PORT:-8090} ${SPICE_FLIGHT_PORT:-50051}}"
 
 # Seconds to wait for a graceful exit before escalating to SIGKILL, and then for
 # the ports to clear. Kept short: this runs in cleanup on every job.

@@ -20,7 +20,7 @@ use crate::cluster::partition::get_partition_filter_exprs;
 use crate::dataaccelerator::BootstrapStatus;
 use crate::dataaccelerator::spice_sys::OpenOption;
 use crate::dataaccelerator::spice_sys::caching_engine::CachingEngineSys;
-use crate::dataaccelerator::spice_sys::is_shutdown_cancellation;
+use crate::dataconnector::refresh_source::ConnectorRefreshSource;
 use crate::init::dataset_initialization::DatasetInitialization;
 use crate::{
     AcceleratedTableInvalidChangesSnafu, AcceleratorEngineNotAvailableSnafu,
@@ -30,7 +30,7 @@ use crate::{
     UnableToBuildDatasetSnafu, UnableToCreateAcceleratedTableSnafu,
     UnableToInitializeDataConnectorSnafu, UnableToLoadDatasetConnectorSnafu,
     UnknownDataConnectorSnafu,
-    accelerated_table::AcceleratedTable,
+    accelerated::AcceleratedTable,
     component::dataset::{
         Dataset,
         acceleration::{Acceleration, RefreshMode},
@@ -46,22 +46,22 @@ use crate::{
         parameters::ConnectorParamsBuilder,
     },
     embeddings::connector::EmbeddingConnector,
-    error_spaced,
-    federated_table::FederatedTable,
+    federated::FederatedTable,
     search::full_text::connector::FullTextConnector,
     status,
     tracing_util::dataset_registered_trace,
-    warn_spaced,
 };
 use app::App;
 use datafusion::sql::TableReference;
 use futures::StreamExt;
 use futures::future::join_all;
 use opentelemetry::KeyValue;
+use runtime_async::is_shutdown_cancellation;
 use runtime_metrics::{self as metrics, components::register_component_metric};
 use snafu::prelude::*;
 use tokio::sync::Semaphore;
 use util::{RetryError, fibonacci_backoff::FibonacciBackoffBuilder, retry};
+use util::{error_spaced, warn_spaced};
 
 impl Runtime {
     pub(crate) async fn load_datasets(self: Arc<Self>) {
@@ -355,6 +355,12 @@ impl Runtime {
             .await
         {
             Ok(data_connector) => data_connector,
+            // This is the only failure this function raises, and reporting it is
+            // owned here: the component status, the `LOAD_ERROR` count, and one log
+            // line at the level the failure's permanence warrants. Callers -- both
+            // `try_load_dataset_once` and the hot-reload path in `update_dataset` --
+            // propagate it without reporting it again, so one failure is counted
+            // once and writes one status. See #12365.
             Err(err) => {
                 let ds_name = &ds.name;
                 self.status.update_dataset(
@@ -505,18 +511,13 @@ impl Runtime {
                 tracing::debug!(dataset = %ds.name, duration_ms = connector_start.elapsed().as_millis(), "Dataset connector created");
                 connector
             }
-            Err(err) => {
-                if !self.status.is_shutdown() {
-                    let ds_name = &ds.name;
-                    self.status.update_dataset(
-                        ds_name,
-                        status::ComponentStatus::error_with_message(err.to_string()),
-                    );
-                    metrics::datasets::LOAD_ERROR.add(1, &[]);
-                    warn_spaced!(spaced_tracer, "{} {err}", ds_name.table());
-                }
-                return Err(err);
-            }
+            // `load_dataset_connector` owns reporting for this failure -- the
+            // status, the `LOAD_ERROR` count, and a log line at the level its
+            // permanence warrants -- and raises no other error, so propagating it
+            // unreported leaves nothing unreported (#12365). Its reporting is
+            // unconditional, including during teardown, so this arm needs no
+            // `is_shutdown()` guard of its own to keep the count at one.
+            Err(err) => return Err(err),
         };
 
         // Check shutdown between connector load and registration.
@@ -847,9 +848,9 @@ impl Runtime {
                     .resolve_refresh_mode(ds.acceleration.as_ref().and_then(|a| a.refresh_mode));
                 ds = Self::apply_inferred_acceleration(ds, &provider, resolved_refresh_mode);
                 FederatedTable::new(
-                    Arc::clone(&ds),
+                    Arc::new(ds.spec.clone()),
                     provider,
-                    Arc::clone(&data_connector),
+                    ConnectorRefreshSource::new_arc(Arc::clone(&data_connector), Arc::clone(&ds)),
                     self.status.shutdown_token(),
                     allow_schema_mismatch,
                 )
@@ -859,8 +860,8 @@ impl Runtime {
                 // We couldn't connect to the federated table. If the dataset has an existing
                 // accelerated table, we can defer the federated table creation.
                 if let Some(federated_table) = FederatedTable::new_deferred(
-                    Arc::clone(&ds),
-                    Arc::clone(&data_connector),
+                    Arc::new(ds.spec.clone()),
+                    ConnectorRefreshSource::new_arc(Arc::clone(&data_connector), Arc::clone(&ds)),
                     self.status.shutdown_token(),
                 )
                 .await
@@ -1015,7 +1016,7 @@ impl Runtime {
 
         // Drop the dataset's CDC schema-evolution settings; a reload re-installs
         // them at registration before the changes stream starts.
-        crate::accelerated_table::refresh_task::changes::remove_cdc_schema_evolution(&ds_name);
+        crate::accelerated::refresh_task::changes::remove_cdc_schema_evolution(&ds_name);
 
         tracing::info!("Unloaded dataset {}", &ds_name);
         let engine = ds_acceleration.map_or_else(
@@ -1095,11 +1096,9 @@ impl Runtime {
                 }
             }
             Err(e) => {
+                // `load_dataset_connector` set the error status for this failure.
+                // Only the hot-reload context it cannot know is added here (#12365).
                 tracing::error!("Unable to update dataset {}: {e}", ds.name);
-                self.status.update_dataset(
-                    &ds.name,
-                    status::ComponentStatus::error_with_message(e.to_string()),
-                );
             }
         }
     }
@@ -1200,9 +1199,9 @@ impl Runtime {
             )
         });
         let federated_table = FederatedTable::new(
-            Arc::clone(&ds),
+            Arc::new(ds.spec.clone()),
             read_table,
-            Arc::clone(&connector),
+            ConnectorRefreshSource::new_arc(Arc::clone(&connector), Arc::clone(&ds)),
             self.status.shutdown_token(),
             allow_schema_mismatch,
         )
@@ -2290,6 +2289,111 @@ mod tests {
         assert!(
             DfError::UnableToLockDataWriters {}.is_retriable(),
             "contention on an internal lock is transient"
+        );
+    }
+
+    /// Installs a `MeterProvider` backed by a scrapable Prometheus registry, so the
+    /// `datasets::LOAD_ERROR` counter this module writes can be read back.
+    ///
+    /// The metric statics are `LazyLock`s that bind to whichever provider is global
+    /// when they are first touched, and that binding survives a later
+    /// `set_meter_provider`. So this rewires the meter for the whole process and only
+    /// the first caller in it wins -- keep it to a single test, as
+    /// `tests/query_failure_err_code.rs` does.
+    fn install_prometheus_meter_provider() -> prometheus::Registry {
+        let registry = prometheus::Registry::new();
+
+        let exporter = opentelemetry_prometheus::exporter()
+            .with_registry(registry.clone())
+            .without_scope_info()
+            .without_units()
+            .without_counter_suffixes()
+            .without_target_info()
+            .build()
+            .expect("to build the prometheus exporter");
+
+        let provider = opentelemetry_sdk::metrics::SdkMeterProvider::builder()
+            .with_resource(opentelemetry_sdk::Resource::builder().build())
+            .with_reader(exporter)
+            .build();
+        opentelemetry::global::set_meter_provider(provider);
+
+        registry
+    }
+
+    /// Reads a counter's current value, treating "never incremented" as zero -- a
+    /// counter that was never written does not appear among the gathered families.
+    fn counter_value(registry: &prometheus::Registry, name: &str) -> f64 {
+        registry
+            .gather()
+            .iter()
+            .find(|family| {
+                family.name() == name
+                    && family.get_field_type() == prometheus::proto::MetricType::COUNTER
+            })
+            .and_then(|family| family.get_metric().first())
+            .map_or(0.0, |metric| metric.get_counter().value())
+    }
+
+    /// A dataset whose `from:` names no registered connector, so building its
+    /// connector always fails.
+    fn unloadable_dataset(runtime: &Arc<crate::Runtime>) -> Arc<Dataset> {
+        let spec =
+            spicepod::component::dataset::Dataset::new("not_a_real_connector:any", "reported_once");
+        let app = app::AppBuilder::new("single_load_error_report")
+            .with_dataset(spec.clone())
+            .build();
+
+        Arc::new(
+            DatasetBuilder::try_from(spec)
+                .expect("valid dataset builder")
+                .with_app(Arc::new(app))
+                .with_runtime(Arc::clone(runtime))
+                .build()
+                .expect("valid runtime dataset"),
+        )
+    }
+
+    /// Regression test for #12365: `load_dataset_connector` reports a connector
+    /// failure -- component status, `LOAD_ERROR`, and a log line -- and its caller
+    /// then reported the very same error again, so one unloadable dataset advanced
+    /// `dataset_load_errors` by 2 per attempt instead of 1.
+    ///
+    /// The teardown half is asserted in the same test on purpose: installing the
+    /// meter provider rewires the process, so only one test per binary can do it.
+    /// Deleting the caller's block also deleted the `is_shutdown()` guard around it,
+    /// and that guard only ever suppressed the duplicate -- the callee counted
+    /// regardless -- so a failure during teardown counted exactly one before this
+    /// change and must still count exactly one.
+    #[tokio::test]
+    async fn a_dataset_connector_failure_counts_one_load_error() {
+        let registry = install_prometheus_meter_provider();
+        let runtime = Arc::new(crate::Runtime::builder().build().await);
+
+        let before = counter_value(&registry, "dataset_load_errors");
+        runtime
+            .try_load_dataset_once(unloadable_dataset(&runtime), BootstrapStatus::None, None)
+            .await
+            .expect_err("a connector that cannot be created must fail the load");
+        let counted = counter_value(&registry, "dataset_load_errors") - before;
+
+        assert!(
+            (counted - 1.0).abs() < f64::EPSILON,
+            "one failure must be counted once, not once per reporting site; counted {counted}"
+        );
+
+        runtime.status.mark_shutdown();
+
+        let before = counter_value(&registry, "dataset_load_errors");
+        runtime
+            .try_load_dataset_once(unloadable_dataset(&runtime), BootstrapStatus::None, None)
+            .await
+            .expect_err("a connector that cannot be created must fail the load");
+        let counted = counter_value(&registry, "dataset_load_errors") - before;
+
+        assert!(
+            (counted - 1.0).abs() < f64::EPSILON,
+            "teardown counted one load error before this change; counted {counted}"
         );
     }
 }

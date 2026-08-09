@@ -42,7 +42,7 @@ use runtime::catalogconnector::cayenne::provider::CayenneCatalogProvider;
 use runtime::config::Config;
 use runtime::dataaccelerator::cayenne::s3::generate_bucket_name;
 use runtime::dataupdate::{DataUpdate, UpdateType};
-use runtime::{Runtime, accelerated_table::AcceleratedTable};
+use runtime::{Runtime, accelerated::AcceleratedTable};
 use runtime_auth::FlightBasicAuth;
 use runtime_auth::api_key::ApiKeyAuth;
 use spicepod::acceleration::{Acceleration, Mode, OnConflictBehavior, RefreshMode};

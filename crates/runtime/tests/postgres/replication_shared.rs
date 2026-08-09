@@ -76,6 +76,7 @@ fn shared_params(port: u16) -> ReplicationParams {
         publication_name: PUBLICATION.into(),
         initial_snapshot: true,
         snapshot_on_resume: false,
+        ephemeral_accelerator: false,
         status_interval: Duration::from_secs(1),
         bootstrap_batch_size: 8192,
         shared: true,
@@ -1051,6 +1052,232 @@ async fn shared_and_independent_slots_coexist() -> Result<(), anyhow::Error> {
         .await?;
     source
         .simple_query(&format!("DROP PUBLICATION IF EXISTS {INDEP_PUBLICATION}"))
+        .await?;
+    Ok(())
+}
+
+/// Whether the slot has acknowledged everything up to `lsn` — the point past
+/// which Postgres is free to recycle that WAL. Returns the verdict and the
+/// slot's current `confirmed_flush_lsn` for the assertion message.
+async fn slot_acked_past(
+    client: &tokio_postgres::Client,
+    lsn: &str,
+) -> Result<(bool, String), anyhow::Error> {
+    let row = client
+        .query_one(
+            "SELECT confirmed_flush_lsn >= $1::text::pg_lsn, confirmed_flush_lsn::text \
+             FROM pg_replication_slots WHERE slot_name = $2",
+            &[&lsn, &SLOT],
+        )
+        .await?;
+    Ok((row.get(0), row.get(1)))
+}
+
+/// Regression for #12609: on a shared slot that is *resuming* — every member
+/// rejoining without an initial snapshot, which is what a durable accelerator
+/// does on every restart — the member that joins SECOND must still receive the
+/// changes committed while the slot had no consumer.
+///
+/// The hazard is join order, not the restart itself. The first joiner starts
+/// the pump, is promoted to streaming on connect, and, having nothing in
+/// flight, is credited up to the server's WAL end by the next keepalive
+/// (`AckTable::credit_idle`). A member registering after that is seated at the
+/// shared floor, which is now that credited position — above changes to its own
+/// table that nobody ever consumed. The floor only ever rises, so the pump's
+/// reconnect cannot go back for them: the rows are acknowledged to Postgres
+/// without being applied, no error is raised, and the accelerated table
+/// silently disagrees with the source until something forces a re-snapshot.
+///
+/// Both tables get a row while the slot is idle. The first joiner's row proves
+/// the resume replay works at all; the second joiner's row is the one that goes
+/// missing. Idle heartbeats are what make the failure deterministic rather than
+/// join-order luck: they are emitted from the same keepalive branch that
+/// credits idle members, so seeing one after the first joiner has committed
+/// everything proves the credit happened.
+#[tokio::test(flavor = "multi_thread")]
+async fn shared_slot_resume_delivers_gap_changes_to_the_second_joiner() -> Result<(), anyhow::Error>
+{
+    let _tracing = init_tracing(Some("data_components::postgres_replication=debug,info"));
+
+    let port = common::get_random_port()?;
+    let _container = common::start_postgres_docker_container_with_logical_wal(port).await?;
+    let port = u16::try_from(port).expect("port fits in u16");
+    let source = pg_client(port).await?;
+
+    create_table(&source, "resume_gap_first", &[(1, "f1")]).await?;
+    create_table(&source, "resume_gap_second", &[(1, "s1")]).await?;
+
+    // --- 1. Both datasets join the slot and snapshot, establishing the slot
+    // history that makes the next boot a resume rather than a fresh join. ---
+    let mut first = start_replication_stream(input_for(port, "resume_gap_first"));
+    let boot_first = next_envelope(&mut first, "bootstrap first").await?;
+    assert_eq!(num_rows(&boot_first), 1, "bootstrap first rows");
+    boot_first.commit().await?;
+    wait_for_ready(&mut first, "first readiness catch-up")
+        .await?
+        .commit()
+        .await?;
+
+    let mut second = start_replication_stream(input_for(port, "resume_gap_second"));
+    let boot_second = next_envelope(&mut second, "bootstrap second").await?;
+    assert_eq!(num_rows(&boot_second), 1, "bootstrap second rows");
+    boot_second.commit().await?;
+    wait_for_ready(&mut second, "second readiness catch-up")
+        .await?
+        .commit()
+        .await?;
+
+    // --- 2. Every member leaves: the pump exits and releases the slot, which
+    // persists (this is a restart, not a teardown). ---
+    drop(first);
+    drop(second);
+    wait_for_walsender_count(&source, 0).await?;
+    assert_eq!(slot_count(&source).await?, 1, "the slot must persist");
+
+    // --- 3. Both tables change while the slot has no consumer. ---
+    source
+        .simple_query("INSERT INTO public.resume_gap_first VALUES (2, 'f2-gap')")
+        .await?;
+    source
+        .simple_query("INSERT INTO public.resume_gap_second VALUES (2, 's2-gap')")
+        .await?;
+    let gap_lsn: String = source
+        .query_one("SELECT pg_current_wal_lsn()::text", &[])
+        .await?
+        .get(0);
+
+    // --- 4. The first table rejoins alone, replays its gap row, and is then
+    // credited to the WAL head — past the SECOND table's gap row, which no
+    // member has consumed. ---
+    let mut first_rejoined = start_replication_stream(input_for(port, "resume_gap_first"));
+    expect_single_change(&mut first_rejoined, "gap row for the first joiner", "c", 2).await?;
+    // Two idle heartbeats after that commit put the slot in exactly the state
+    // the hazard needs. `credit_idle` runs on every keepalive and skips a
+    // member with an uncommitted envelope, so the heartbeat following our
+    // commit proves the first joiner was credited to the server's WAL end —
+    // which is past both gap rows. (The first heartbeat may have been queued
+    // before the commit landed; the second cannot have been.)
+    for round in 1..=2 {
+        wait_for_ready(
+            &mut first_rejoined,
+            &format!("first joiner idle heartbeat {round}"),
+        )
+        .await?
+        .commit()
+        .await?;
+    }
+
+    // Crediting the first joiner must not carry the SLOT's acknowledgement past
+    // a change no member has consumed: below `confirmed_flush_lsn` Postgres is
+    // free to recycle the WAL, which is what makes the loss unrecoverable.
+    let (acked_past_gap, confirmed_flush) = slot_acked_past(&source, &gap_lsn).await?;
+    anyhow::ensure!(
+        !acked_past_gap,
+        "slot {SLOT} acknowledged up to {confirmed_flush}, past a change (>= {gap_lsn}) owed to a \
+         published table with no member — that WAL is now recyclable (#12609)"
+    );
+
+    // --- 5. The second table rejoins after its slot-mate has been credited.
+    // Its gap row is still owed to it. ---
+    let mut second_rejoined = start_replication_stream(input_for(port, "resume_gap_second"));
+    let gap = next_change_envelope(&mut second_rejoined, "gap row for the second joiner")
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "a member joining a resuming shared slot second must still receive changes \
+                 committed while the slot had no consumer (#12609): {e}"
+            )
+        })?;
+    assert_eq!(
+        ops_of(&gap),
+        vec!["c".to_string()],
+        "second joiner gap row op"
+    );
+    assert_eq!(
+        ids_of(&gap),
+        vec![2],
+        "the second joiner must receive its gap change as a WAL replay, not as a fresh snapshot"
+    );
+    gap.commit().await?;
+
+    // --- Cleanup ---
+    drop(first_rejoined);
+    drop(second_rejoined);
+    drop_replication_slot_when_inactive(&source, SLOT).await?;
+    source
+        .simple_query(&format!("DROP PUBLICATION IF EXISTS {PUBLICATION}"))
+        .await?;
+    Ok(())
+}
+
+/// `drop_slot_after_shutdown` is what stops a non-persistent accelerator's slot
+/// from pinning WAL on the source for the whole time Spice is down, so its
+/// observable effect -- the slot actually disappearing -- is asserted against a
+/// real server rather than inferred from unit-level logic.
+///
+/// Both halves of the contract are covered:
+///
+///   * while a walsender still holds the slot, `PostgreSQL` refuses the drop
+///     (SQLSTATE `55006`); the call must retry within its budget and then give
+///     up *leaving the slot intact*, never erroring or hanging; and
+///   * once the stream is gone it must actually drop, tolerating the window in
+///     which the server has not yet cleared the walsender.
+#[tokio::test(flavor = "multi_thread")]
+async fn drop_slot_after_shutdown_releases_an_inactive_slot() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("data_components::postgres_replication=debug,info"));
+
+    let port = common::get_random_port()?;
+    let _container = common::start_postgres_docker_container_with_logical_wal(port).await?;
+    let port = u16::try_from(port).expect("port fits in u16");
+    let source = pg_client(port).await?;
+
+    create_table(&source, "drop_slot_tbl", &[(1, "a"), (2, "b")]).await?;
+
+    // Bring the slot into existence the same way production does -- via a live
+    // stream -- so the drop runs against a slot with a real walsender history.
+    let mut stream = start_replication_stream(input_for(port, "drop_slot_tbl"));
+    next_envelope(&mut stream, "bootstrap")
+        .await?
+        .commit()
+        .await?;
+    wait_for_ready(&mut stream, "readiness catch-up")
+        .await?
+        .commit()
+        .await?;
+    assert_eq!(slot_count(&source).await?, 1, "slot should exist");
+
+    // The slot is held by a live walsender: the drop must fail closed. It
+    // retries on 55006 for its budget, then returns without dropping -- and
+    // without propagating an error, since shutdown must never block or fail on
+    // the source.
+    let params = shared_params(port);
+    data_components::postgres_replication::slot::drop_slot_after_shutdown(&params).await;
+    assert_eq!(
+        slot_count(&source).await?,
+        1,
+        "an actively-held slot must survive the drop attempt"
+    );
+
+    // Release the stream and wait for the server to actually clear the
+    // walsender before dropping for real. The drop's own 55006 retry covers a
+    // brief overlap, but polling the observable condition here keeps the test
+    // from depending on the pump tearing down inside that budget under load.
+    drop(stream);
+    wait_for_walsender_count(&source, 0).await?;
+    data_components::postgres_replication::slot::drop_slot_after_shutdown(&params).await;
+    assert_eq!(
+        slot_count(&source).await?,
+        0,
+        "slot should be gone once no walsender holds it"
+    );
+
+    // Idempotent: a second call finds nothing (SQLSTATE 42704) and is a no-op
+    // rather than an error -- shutdown can race with an external cleanup.
+    data_components::postgres_replication::slot::drop_slot_after_shutdown(&params).await;
+    assert_eq!(slot_count(&source).await?, 0, "second drop is a no-op");
+
+    source
+        .simple_query(&format!("DROP PUBLICATION IF EXISTS {PUBLICATION}"))
         .await?;
     Ok(())
 }

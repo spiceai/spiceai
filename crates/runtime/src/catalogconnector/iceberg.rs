@@ -17,7 +17,7 @@ limitations under the License.
 use super::{CatalogConnector, ConnectorComponent, ParameterSpec, Parameters};
 use crate::{
     Runtime,
-    component::catalog::Catalog,
+    component::catalog::{Catalog, table_selector},
     dataconnector::parameters::{ConnectorParams, aws::initiate_config_with_credentials},
     http::v1::iceberg::namespace::Namespace as HttpNamespace,
 };
@@ -186,7 +186,7 @@ impl IcebergCatalog {
         let catalog_provider = IcebergCatalogProvider::try_new(
             Arc::new(hadoop_catalog),
             None,
-            catalog.include.as_ref(),
+            &table_selector(catalog),
             table_wrapper,
         )
         .await
@@ -447,7 +447,7 @@ impl CatalogConnector for IcebergCatalog {
         let catalog_provider = IcebergCatalogProvider::try_new(
             Arc::new(catalog_client),
             namespace.map(|n| n.name().clone()),
-            catalog.include.as_ref(),
+            &table_selector(catalog),
             table_wrapper,
         )
         .await
@@ -751,6 +751,14 @@ pub fn parse_hadoop_table_url(
         .path_segments()
         .map(std::iter::Iterator::count)
         .context(UrlParseNoSourceSnafu)?;
+
+    // The segment offsets below — `count - 2` for the namespace and the warehouse leaves,
+    // `count - 1` for the nodes — require a path naming both a namespace and a table. Reject a
+    // shorter one explicitly: left to `usize` arithmetic the subtraction decides it instead,
+    // which aborts a debug build and elsewhere depends on the wrap landing out of range.
+    if count < 2 {
+        return MissingNamespaceSnafu.fail();
+    }
 
     let table_name = parsed
         .path_segments()
@@ -1271,5 +1279,39 @@ mod tests {
         let props = HashMap::new();
         let op = build_opendal_operator("ftp://my-host/path", &props);
         assert!(op.is_err(), "Unsupported scheme should fail");
+    }
+
+    /// A Hadoop table URL must name both a namespace and a table. Anything shorter is rejected
+    /// as `MissingNamespace`, identically in every build profile. Regression test for #12539.
+    #[test]
+    fn test_parse_hadoop_table_url_rejects_short_paths() {
+        // A warehouse mounted at the filesystem root, or a namespace simply left out.
+        for url in [
+            "file:///events",
+            "file:///",
+            "s3a://my-bucket/table-with-no-namespace",
+            "s3a://my-bucket/",
+        ] {
+            let Err(err) = parse_hadoop_table_url(url, None) else {
+                panic!("{url} names no namespace and must be rejected");
+            };
+            assert!(
+                matches!(err, Error::MissingNamespace),
+                "{url} should be rejected as MissingNamespace, got: {err}"
+            );
+        }
+
+        // Supplying a warehouse URI does not rescue a short table URL: the namespace is read
+        // from the table URL before the warehouse is consulted at all.
+        let Err(err) = parse_hadoop_table_url("file:///events", Some("file:///")) else {
+            panic!("an explicit warehouse does not supply the missing namespace");
+        };
+        assert!(matches!(err, Error::MissingNamespace), "got: {err}");
+
+        // The shortest path that does name both still parses, so the guard is not off by one.
+        let (_, namespace, table_name) =
+            parse_hadoop_table_url("s3a://my-bucket/ns/tbl", None).expect("two segments parse");
+        assert_eq!(namespace.name().to_url_string().as_str(), "ns");
+        assert_eq!(table_name, "tbl");
     }
 }
