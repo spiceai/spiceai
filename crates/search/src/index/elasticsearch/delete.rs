@@ -20,7 +20,7 @@ use datafusion::common::ScalarValue;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use elasticsearch::Elasticsearch;
 use serde_json::{Value, json};
-use snafu::{ResultExt, Snafu};
+use snafu::Snafu;
 
 use super::write;
 use crate::index::chunking::ChunkedSearchIndex;
@@ -99,7 +99,9 @@ const DELETE_CHUNK_ROWS: usize = 512;
 /// Issues one `_delete_by_query` request per [`DELETE_CHUNK_ROWS`]-row slice of `keys` rather
 /// than a single request for the whole batch, so a large delete can't build an unbounded
 /// clause or id list. Every chunk is issued even when an earlier one comes back only partially
-/// applied; the first such response is reported once the batch is through.
+/// applied, or fails outright against an index that was reached; the first such failure is
+/// reported once the batch is through. Only a refused connection ends the batch early, since it
+/// is the one failure that says the later chunks have nothing to reach either.
 ///
 /// Shared by [`super::ElasticsearchIndex`] and [`super::ElasticsearchTextIndex`], which both
 /// address documents the same way (client + index name + primary key columns).
@@ -118,11 +120,10 @@ pub async fn delete_by_keys(
             .iter()
             .all(|f| key_columns.iter().any(|c| c == f.name()));
 
-    // Hold the first body-level failure and keep going. Each chunk is an independent
-    // `_delete_by_query` over its own slice of `keys`, so returning at the first partial response
-    // would leave every later chunk unissued, turning a report of a partial delete into a cause
-    // of a larger one.
-    let mut partial: Option<Error> = None;
+    // Hold the first failure and keep going. Each chunk is an independent `_delete_by_query` over
+    // its own slice of `keys`, so returning at the first one would leave every later chunk
+    // unissued, turning a report of a partial delete into a cause of a larger one.
+    let mut failure: Option<DataFusionError> = None;
 
     let mut offset = 0;
     while offset < keys.num_rows() {
@@ -139,22 +140,37 @@ pub async fn delete_by_keys(
             continue;
         };
 
-        // A transport error still stops the batch: it says the request never reached the index,
-        // so the later chunks have nothing to reach either.
-        let resp = client
-            .delete_by_query(es_index, &query)
-            .await
-            .boxed()
-            .map_err(DataFusionError::External)?;
+        let resp = match client.delete_by_query(es_index, &query).await {
+            Ok(resp) => resp,
+            Err(e) => {
+                // Only a refused connection proves this chunk never reached the index, and so
+                // that no later chunk will either — stopping there costs nothing and spares a
+                // dead node one request per remaining chunk. Every other error leaves the
+                // delete's fate unknown: `JsonParse` is raised *after* a 2xx, so Elasticsearch
+                // ran that delete and only the body was unreadable, and a status error or a
+                // timeout can each land on a request the index already applied in part. Treating
+                // those as "never reached" and returning is what would leave the later chunks
+                // unissued — the same larger divergence a partial body is held open for above.
+                let never_reached = matches!(
+                    &e,
+                    elasticsearch::Error::HttpRequest { source } if source.is_connect()
+                );
+                failure.get_or_insert(DataFusionError::External(Box::new(e)));
+                if never_reached {
+                    break;
+                }
+                continue;
+            }
+        };
         if let Err(e) = inspect_delete_response(&resp, es_index) {
             // Report the first, which is the one whose surrounding state a reconcile starts from;
             // later chunks fail the same way once the index has diverged.
-            partial.get_or_insert(e);
+            failure.get_or_insert(DataFusionError::External(Box::new(e)));
         }
     }
 
-    if let Some(e) = partial {
-        return Err(DataFusionError::External(Box::new(e)));
+    if let Some(e) = failure {
+        return Err(e);
     }
 
     Ok(())
@@ -455,6 +471,10 @@ mod tests {
         /// One response per request, in order; the last one answers every request beyond it, so a
         /// single-element list answers a whole multi-request delete the same way.
         responses: Vec<Value>,
+        /// Request ordinals (1-based) answered with a client error instead of a body. The error
+        /// carries a status, so it stands for the kind Elasticsearch itself raised — the request
+        /// reached the index, and the delete's fate there is unknown.
+        erroring: Vec<usize>,
     }
 
     impl Default for RecordingClient {
@@ -475,7 +495,14 @@ mod tests {
             Self {
                 queries: Mutex::new(Vec::new()),
                 responses,
+                erroring: Vec::new(),
             }
+        }
+
+        /// Answers the `nth` request (1-based) with a client error rather than a body.
+        fn erroring_on(mut self, nth: usize) -> Self {
+            self.erroring.push(nth);
+            self
         }
 
         fn queries(&self) -> Vec<Value> {
@@ -504,6 +531,12 @@ mod tests {
                 queries.push(query.clone());
                 queries.len()
             };
+            if self.erroring.contains(&issued) {
+                return Err(EsError::ElasticsearchError {
+                    status: 502,
+                    message: format!("request {issued} failed at the index"),
+                });
+            }
             let response = self
                 .responses
                 .get(issued - 1)
@@ -1298,6 +1331,91 @@ mod tests {
         assert!(
             err.to_string().contains("1 version conflict(s)"),
             "the first chunk's conflict should be the reported one: {err}"
+        );
+    }
+
+    /// The same reasoning as the partial-body case above, on the arm that reports through an
+    /// `Err` instead of a 200 body. An error from the client does not mean the request never
+    /// reached the index — `JsonParse` is raised only after a 2xx, and a status error can land on
+    /// a delete Elasticsearch already applied in part — so returning at the first one would leave
+    /// the later chunks unissued and turn one chunk's unknown outcome into a batch-wide one.
+    #[tokio::test]
+    async fn an_early_chunk_error_still_issues_the_remaining_chunks() {
+        let client = RecordingClient::answering(clean_delete_response(DELETE_CHUNK_ROWS as u64))
+            .erroring_on(1);
+        let ids: Vec<String> = (0..=DELETE_CHUNK_ROWS).map(|i| i.to_string()).collect();
+
+        let err = delete_by_keys(
+            &client,
+            "idx",
+            &[pk("id", DataType::Utf8)],
+            &["id".to_string()],
+            &string_key_batch(ids.iter().map(|s| Some(s.as_str())).collect()),
+        )
+        .await
+        .expect_err("the first chunk's failure must still surface");
+
+        assert_eq!(
+            client.queries().len(),
+            2,
+            "the second chunk should have been issued despite the first erroring"
+        );
+        assert!(
+            err.to_string().contains("request 1 failed at the index"),
+            "the first chunk's error should be the reported one: {err}"
+        );
+    }
+
+    /// A later chunk's error is reported when every earlier one applied cleanly — without this,
+    /// the loop could swallow the last chunk's failure and report the whole delete as applied.
+    #[tokio::test]
+    async fn a_later_chunk_error_is_still_reported() {
+        let client = RecordingClient::answering(clean_delete_response(DELETE_CHUNK_ROWS as u64))
+            .erroring_on(2);
+        let ids: Vec<String> = (0..=DELETE_CHUNK_ROWS).map(|i| i.to_string()).collect();
+
+        let err = delete_by_keys(
+            &client,
+            "idx",
+            &[pk("id", DataType::Utf8)],
+            &["id".to_string()],
+            &string_key_batch(ids.iter().map(|s| Some(s.as_str())).collect()),
+        )
+        .await
+        .expect_err("a failure in the last chunk must not be reported as a clean delete");
+
+        assert_eq!(client.queries().len(), 2);
+        assert!(
+            err.to_string().contains("request 2 failed at the index"),
+            "the erroring chunk should be the reported one: {err}"
+        );
+    }
+
+    /// The first failure is the reported one whether it arrived as an `Err` or as a partial body:
+    /// it is the one whose surrounding state a reconcile starts from.
+    #[tokio::test]
+    async fn the_first_of_two_failing_chunks_is_the_reported_one() {
+        let client = RecordingClient::answering_in_turn(vec![
+            clean_delete_response(0),
+            json!({"total": 1, "deleted": 0, "version_conflicts": 1, "failures": []}),
+        ])
+        .erroring_on(1);
+        let ids: Vec<String> = (0..=DELETE_CHUNK_ROWS).map(|i| i.to_string()).collect();
+
+        let err = delete_by_keys(
+            &client,
+            "idx",
+            &[pk("id", DataType::Utf8)],
+            &["id".to_string()],
+            &string_key_batch(ids.iter().map(|s| Some(s.as_str())).collect()),
+        )
+        .await
+        .expect_err("both chunks failed, so the delete must not report success");
+
+        assert_eq!(client.queries().len(), 2);
+        assert!(
+            err.to_string().contains("request 1 failed at the index"),
+            "the earlier failure should win over the later partial body: {err}"
         );
     }
 
