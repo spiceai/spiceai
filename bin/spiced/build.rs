@@ -28,6 +28,11 @@ fn main() {
     println!("cargo:rustc-env=GIT_COMMIT_HASH={git_hash}");
     println!("cargo:rustc-env=SPICED_BUILD_PROFILE={}", build_profile());
     println!("cargo:rustc-env=SPICED_BUILD_FEATURES={}", build_features());
+    // Architectures ship under one version and their offsets differ.
+    println!(
+        "cargo:rustc-env=SPICED_BUILD_TARGET={}",
+        std::env::var("TARGET").unwrap_or_else(|_| "unknown".to_owned())
+    );
 }
 
 /// The cargo profile the binary is being built with.

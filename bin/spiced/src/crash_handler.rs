@@ -106,8 +106,12 @@ pub fn install(version: &str) -> Result<(), InstallError> {
     resolve_image();
     // Formatted now, not in the handler: allocating there is not signal-safe, and a
     // pre-built line cannot crowd out the rest of the report's fixed buffer.
+    // The commit and target are their own fields: a `release` build's version omits
+    // the commit, and every architecture ships under one version.
     let mut identity = format!(
-        "spiced={version} features={} profile={}",
+        "spiced={version} commit={} target={} features={} profile={}",
+        env!("GIT_COMMIT_HASH"),
+        env!("SPICED_BUILD_TARGET"),
         env!("SPICED_BUILD_FEATURES"),
         env!("SPICED_BUILD_PROFILE"),
     );
@@ -808,7 +812,13 @@ mod tests {
 
         // Which build crashed. Present on every platform, unlike the fields below.
         let version_field = format!("spiced={TEST_VERSION}");
-        for field in [version_field.as_str(), "features=", "profile="] {
+        for field in [
+            version_field.as_str(),
+            "commit=",
+            "target=",
+            "features=",
+            "profile=",
+        ] {
             assert!(
                 stderr.contains(field),
                 "report is missing `{field}`: {stderr}"
