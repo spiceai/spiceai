@@ -267,15 +267,25 @@ where
         // expiry — stays. The cache then serves a value the writer replaced, for the TTL of
         // the replacement (#12838).
         //
-        // So the pair goes under one hold of the key's shard, the same lock `insert`,
-        // `remove` and `remove_if_expired` publish or drop a value and its metadata under.
-        // That makes this read atomic with respect to those writers: an `insert` that lands
-        // before the hold is what `remove` returns and what the re-admit puts back, and one
-        // that arrives during it waits and then wins outright. The lock is taken in the
-        // order `insert` already takes it — shard, then the pingora-lru shard underneath
-        // `remove`/`admit` — so it adds no new ordering against eviction.
+        // So the pair goes under one hold of the key's shard, the lock every writer of an
+        // entry — `insert`, `remove`, `remove_if_expired`, `evict_to_weight_limit`, `clear` —
+        // takes for writing. An `insert` that lands before the hold is what `remove` returns
+        // and what the re-admit puts back; one that arrives during it waits and then wins
+        // outright.
+        //
+        // A *read* hold is what that needs, and all it needs: this path reads the shard's
+        // metadata and never changes it, so excluding the writers is the whole requirement,
+        // and holding it shared leaves concurrent hits — and `len()`/`iter_keys()` — running
+        // in parallel as they did before. Two hits on one key can still each `remove` and
+        // have one of them come back empty; that is the transient miss noted above, which
+        // costs a re-fetch and cannot lose a write.
+        //
+        // The lock is taken in the order `insert` already takes it — shard, then the
+        // pingora-lru shard underneath `remove`/`admit` — so it adds no new ordering against
+        // eviction, which materialises its victims (`evict_to_limit` returns an owned `Vec`)
+        // before it takes any shard.
         let shard_idx = Self::get_shard_index(*key);
-        let _shard = self.metadata_shards[shard_idx].write();
+        let _shard = self.metadata_shards[shard_idx].read();
 
         let (entry, weight) = self.cache.remove(*key)?;
 
