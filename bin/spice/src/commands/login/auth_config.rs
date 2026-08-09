@@ -36,12 +36,7 @@ use std::path::Path;
 ///
 /// Returns an error if the .env file cannot be read or written.
 pub fn merge_auth_config(auth_type: &str, params: &[(&str, &str)]) -> Result<()> {
-    // Determine which env file to use
-    let env_file = if Path::new(".env.local").exists() {
-        ".env.local"
-    } else {
-        ".env"
-    };
+    let env_file = env_file_path();
 
     // Read existing env vars (ignore errors - file might not exist)
     let mut env_vars: HashMap<String, String> = if Path::new(env_file).exists() {
@@ -71,6 +66,37 @@ pub fn merge_auth_config(auth_type: &str, params: &[(&str, &str)]) -> Result<()>
     }
 
     Ok(())
+}
+
+/// The env file credentials are read from and written to.
+///
+/// `.env.local` wins when present. Every reader and the writer must agree on
+/// this, or a credential is stored where nothing looks for it.
+#[must_use]
+pub fn env_file_path() -> &'static str {
+    if Path::new(".env.local").exists() {
+        ".env.local"
+    } else {
+        ".env"
+    }
+}
+
+/// Read one variable from the env file, using the same parse as the writer.
+///
+/// Shares [`read_env_file`] so a value the writer quoted is unquoted the same
+/// way, and `KEY = value` spacing is accepted on both sides.
+#[must_use]
+pub fn read_env_var(var: &str) -> Option<String> {
+    read_env_file(env_file_path())
+        .ok()?
+        .remove(var)
+        .filter(|value| !value.is_empty())
+}
+
+/// Every variable currently set in the env file.
+#[must_use]
+pub fn env_file_vars() -> HashMap<String, String> {
+    read_env_file(env_file_path()).unwrap_or_default()
 }
 
 /// Read environment variables from a .env file.

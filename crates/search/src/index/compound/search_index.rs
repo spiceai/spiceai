@@ -29,9 +29,10 @@ use runtime_datafusion_index::{Index, WriteWindow};
 use crate::index::{SearchIndex, VectorIndex};
 
 use super::{
-    CompoundReadMode, CompoundVectorIndex, Error, compound_delete_by_keys, compound_on_write_start,
-    compound_required_columns, compound_write, fallback::fallback_on_empty_plan,
-    validate_compatibility,
+    COMPOUND_WRITE_COMPLETE_FAILURE_IS_FATAL, COMPOUND_WRITE_START_FAILURE_IS_FATAL,
+    CompoundReadMode, CompoundVectorIndex, Error, compound_delete_by_keys,
+    compound_on_write_complete, compound_on_write_start, compound_required_columns, compound_write,
+    fallback::fallback_on_empty_plan, validate_compatibility,
 };
 
 /// A [`SearchIndex`] that writes through to two compatible underlying indexes and serves
@@ -114,12 +115,7 @@ impl Index for CompoundSearchIndex {
     }
 
     async fn on_write_complete(&self) -> Result<(), DataFusionError> {
-        // As with `on_write_failed`: both completion callbacks must run.
-        let (primary_result, secondary_result) = futures::join!(
-            self.primary.on_write_complete(),
-            self.secondary.on_write_complete()
-        );
-        primary_result.and(secondary_result)
+        compound_on_write_complete(self.primary.as_ref(), self.secondary.as_ref()).await
     }
 
     async fn delete_by_keys(&self, keys: RecordBatch) -> DataFusionResult<()> {
@@ -133,15 +129,11 @@ impl Index for CompoundSearchIndex {
     }
 
     fn write_start_failure_is_fatal(&self) -> bool {
-        // `compound_on_write_start` fails if either half fails to start, so either half
-        // treating that as fatal makes it fatal for this compound index.
-        self.primary.write_start_failure_is_fatal() || self.secondary.write_start_failure_is_fatal()
+        COMPOUND_WRITE_START_FAILURE_IS_FATAL
     }
 
     fn write_complete_failure_is_fatal(&self) -> bool {
-        // Either half failing to finalize leaves this compound index stale.
-        self.primary.write_complete_failure_is_fatal()
-            || self.secondary.write_complete_failure_is_fatal()
+        COMPOUND_WRITE_COMPLETE_FAILURE_IS_FATAL
     }
 
     fn as_any(&self) -> &dyn Any {

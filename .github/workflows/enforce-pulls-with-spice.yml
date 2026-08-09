@@ -41,6 +41,9 @@ jobs:
     # the self-hosted pool that the darwin build and benchmark matrices contend for, so PR
     # hygiene does not queue behind hours of heavy work.
     runs-on: ubuntu-24.04
+    # Slowest observed success in the 2026-07-25..08-08 window: 7 s. The ceiling is
+    # for an action wedged on an unresponsive GitHub API, not for a slow check.
+    timeout-minutes: 10
     permissions:
       contents: read
       pull-requests: write

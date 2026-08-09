@@ -22,7 +22,7 @@ limitations under the License.
 //! These tests deliberately exercise the *full* pipeline (auth principal ->
 //! `RequestContext` -> `Query::run_internal` -> `TableProvider::scan` ->
 //! `CachingAccelerationScanExec::execute` -> `DuckDB`) because the unit tests
-//! in `accelerated_table::caching` cannot reach the two failure modes that
+//! in `runtime_table::accelerated::caching` cannot reach the two failure modes that
 //! were caught only by manual end-to-end testing:
 //!
 //! 1. **Filters passed to `TableProvider::scan` are an optimization hint,
@@ -219,7 +219,7 @@ async fn collect_served_at(rt: &Runtime, ctx: &Arc<RequestContext>) -> usize {
         .await;
     // Cache writes flow through an async channel to a background flush
     // task with a 500ms flush interval (`CACHE_WRITE_FLUSH_INTERVAL_MS`
-    // in `accelerated_table::caching`). Wait long enough that the write
+    // in `runtime_table::accelerated::caching`). Wait long enough that the write
     // is guaranteed to have landed in the accelerator before the next
     // scan looks for the row.
     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
@@ -247,7 +247,7 @@ async fn collect_served_at(rt: &Runtime, ctx: &Arc<RequestContext>) -> usize {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn caching_accelerator_isolates_per_principal_e2e() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some(
-        "integration=debug,runtime=debug,runtime::accelerated_table::caching=debug",
+        "integration=debug,runtime=debug,runtime::accelerated::caching=debug",
     ));
     register_test_connectors().await;
 

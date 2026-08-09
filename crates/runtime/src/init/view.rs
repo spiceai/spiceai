@@ -21,7 +21,7 @@ use crate::{
     Runtime, UnableToAttachViewSnafu,
     component::view::{View, ViewBuilder},
     secrets::Secrets,
-    status, view, warn_spaced,
+    status, view,
 };
 use app::App;
 use datafusion::sql::{TableReference, parser::DFParser, sqlparser::dialect::PostgreSqlDialect};
@@ -34,6 +34,7 @@ use tokio::sync::RwLock;
 use util::topological_ordering::{
     construct_effected_in_topological_order, construct_topological_ordering,
 };
+use util::warn_spaced;
 
 /// Represents a validated view with its parsed dependencies
 pub(crate) struct ValidatedView {

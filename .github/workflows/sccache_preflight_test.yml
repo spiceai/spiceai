@@ -1,0 +1,59 @@
+---
+name: Compiler-Cache Pre-flight Tests
+
+# The `setup-sccache` action puts sccache in front of every `rustc` invocation,
+# so storage it cannot reach fails each one and the job reports a compile error
+# naming a crate rather than the cache. Nothing else exercises the pre-flight
+# that catches this, and neither direction of its decision is observable until
+# it is already wrong in production.
+#
+# Under-degrading fails the build for an infrastructure outage, and in the merge
+# queue that false verdict dequeues the batch and cancels every sibling
+# candidate with it (#12770). Over-degrading drops a cache that was answering,
+# turning every build into an uncached one.
+on:
+  pull_request:
+    branches:
+      - trunk
+      - release-*
+      - release/*
+      - feature-*
+    paths:
+      - '.github/actions/setup-sccache/action.yml'
+      - '.github/actions/setup-sccache/verify_compiler_cache.sh'
+      - 'scripts/test_sccache_preflight.sh'
+      - '.github/workflows/sccache_preflight_test.yml'
+  push:
+    branches:
+      - trunk
+    paths:
+      - '.github/actions/setup-sccache/action.yml'
+      - '.github/actions/setup-sccache/verify_compiler_cache.sh'
+      - 'scripts/test_sccache_preflight.sh'
+      - '.github/workflows/sccache_preflight_test.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  test-sccache-preflight:
+    name: Unit tests for the compiler-cache pre-flight
+    # GitHub-hosted on purpose: this is a sub-second check and must not queue
+    # behind the self-hosted pool whose cache it is about.
+    runs-on: ubuntu-24.04
+    # A checkout plus a local bash script against a stub `sccache` — the job
+    # reads the repository and nothing else.
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Run tests
+        # Invoked through `bash` rather than as `./…` so the job does not depend
+        # on the script's executable bit surviving a checkout on every platform.
+        run: bash scripts/test_sccache_preflight.sh

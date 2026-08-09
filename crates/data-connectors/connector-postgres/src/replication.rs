@@ -35,7 +35,7 @@ use datafusion::sql::TableReference;
 use futures::StreamExt;
 use opentelemetry::KeyValue;
 use runtime::component::dataset::Dataset;
-use runtime::federated_table::FederatedTable;
+use runtime::federated::FederatedTable;
 use runtime::parameters::{ExposedParamLookup, Parameters};
 use runtime_api_types::v1::ComponentType;
 use runtime_metrics::component::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback};

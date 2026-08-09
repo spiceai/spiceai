@@ -40,7 +40,7 @@ use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult,
 };
-use runtime::federated_table::FederatedTable;
+use runtime::federated::FederatedTable;
 use runtime::parameters::{ParameterSpec, Parameters};
 use secrecy::ExposeSecret;
 use snafu::prelude::*;

@@ -29,6 +29,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use data_components::RefreshableCatalogProvider;
+use data_components::catalog_filter::TableSelector;
 use datafusion::catalog::{CatalogProvider, SchemaProvider, TableProvider};
 use datafusion::error::Result as DFResult;
 use datafusion::execution::runtime_env::RuntimeEnv;
@@ -141,6 +142,10 @@ pub struct CayenneCatalogProvider {
     metadata_dir: String,
     /// Shared `RuntimeEnv` from the main Spice runtime for cache coherence.
     runtime_env: Arc<RuntimeEnv>,
+    /// Which of the catalog's tables the configuration selects. Applied to the
+    /// namespace-qualified name (`"{namespace}.{table}"`), matching the naming
+    /// the SQL catalog connectors match `include`/`exclude` against.
+    table_selector: TableSelector,
     /// Schema providers keyed by namespace name, created dynamically via DDL.
     schemas: RwLock<HashMap<String, Arc<dyn SchemaProvider>>>,
 }
@@ -159,6 +164,12 @@ impl CayenneCatalogProvider {
     ///
     /// Initializes the `SQLite` metadata catalog and local file storage.
     ///
+    /// `table_selector` carries the catalog's `include`/`exclude` patterns;
+    /// pass [`TableSelector::select_all`] for a catalog that configured
+    /// neither. It is taken as its own argument rather than a
+    /// [`CayenneCatalogProviderConfig`] field because it decides which tables
+    /// exist for this catalog, not how they are stored or tuned.
+    ///
     /// # Errors
     ///
     /// Returns an error if the metadata or data directories cannot be created,
@@ -166,6 +177,7 @@ impl CayenneCatalogProvider {
     pub async fn try_new(
         config: CayenneCatalogProviderConfig,
         runtime_env: Arc<RuntimeEnv>,
+        table_selector: TableSelector,
     ) -> Result<Self> {
         let catalog_name = DEFAULT_CATALOG_NAME;
         let spice_data_base_path = config.spice_data_base_path.as_str();
@@ -220,6 +232,7 @@ impl CayenneCatalogProvider {
             data_base_path,
             metadata_dir,
             runtime_env,
+            table_selector,
             schemas: RwLock::new(HashMap::new()),
         };
 
@@ -254,6 +267,16 @@ impl CayenneCatalogProvider {
     #[must_use]
     pub fn metadata_dir(&self) -> &str {
         &self.metadata_dir
+    }
+
+    /// Returns which of the catalog's tables the configuration selects.
+    ///
+    /// Schema providers built outside [`Self::refresh`] -- the DDL path -- take
+    /// their selector from here, so every namespace in the catalog resolves a
+    /// table name the same way.
+    #[must_use]
+    pub fn table_selector(&self) -> &TableSelector {
+        &self.table_selector
     }
 
     /// Returns the schema provider for a namespace if it exists.
@@ -360,7 +383,17 @@ impl RefreshableCatalogProvider for CayenneCatalogProvider {
         // Group tables by namespace (tables stored as "namespace/table_name" in metadata).
         let mut grouped: HashMap<String, Vec<String>> = HashMap::new();
         for full_name in &table_names {
-            if let Some((ns, _table)) = full_name.split_once('/') {
+            if let Some((ns, table)) = full_name.split_once('/') {
+                // The catalog's `include`/`exclude` decide membership here, at
+                // the point the catalog discovers a table, so a withheld table
+                // never reaches a schema provider.
+                if let Some(reason) = self
+                    .table_selector
+                    .rejection_reason(&format!("{ns}.{table}"))
+                {
+                    tracing::debug!("Cayenne table '{ns}.{table}' {reason}, skipping");
+                    continue;
+                }
                 grouped
                     .entry(ns.to_string())
                     .or_default()
@@ -379,6 +412,7 @@ impl RefreshableCatalogProvider for CayenneCatalogProvider {
                 ns,
                 full_names,
                 Arc::clone(&self.runtime_env),
+                self.table_selector.clone(),
             )
             .await?;
 
@@ -433,6 +467,9 @@ pub struct CayenneSchemaProvider {
     namespace: String,
     /// Shared `RuntimeEnv` for cache coherence with the main runtime.
     runtime_env: Arc<RuntimeEnv>,
+    /// The catalog's selector, carried down so the lazy-load path in
+    /// [`SchemaProvider::table`] withholds the same tables discovery does.
+    table_selector: TableSelector,
     /// Table providers keyed by short (unqualified) table name.
     tables: RwLock<HashMap<String, Arc<dyn TableProvider>>>,
 }
@@ -457,6 +494,7 @@ impl CayenneSchemaProvider {
         namespace: &str,
         full_table_names: &[String],
         runtime_env: Arc<RuntimeEnv>,
+        table_selector: TableSelector,
     ) -> Result<Self> {
         let ns_prefix = format!("{namespace}/");
         let mut tables: HashMap<String, Arc<dyn TableProvider>> = HashMap::new();
@@ -481,21 +519,28 @@ impl CayenneSchemaProvider {
             catalog,
             namespace: namespace.to_string(),
             runtime_env,
+            table_selector,
             tables: RwLock::new(tables),
         })
     }
 
     /// Create an empty schema provider for a namespace (used by DDL).
+    ///
+    /// Callers pass the owning catalog's
+    /// [`CayenneCatalogProvider::table_selector`] so a namespace created by DDL
+    /// resolves table names the same way a discovered one does.
     #[must_use]
     pub fn new_empty(
         catalog: Arc<dyn MetadataCatalog>,
         namespace: String,
         runtime_env: Arc<RuntimeEnv>,
+        table_selector: TableSelector,
     ) -> Self {
         Self {
             catalog,
             namespace,
             runtime_env,
+            table_selector,
             tables: RwLock::new(HashMap::new()),
         }
     }
@@ -554,6 +599,18 @@ impl CayenneSchemaProvider {
         &self.namespace
     }
 
+    /// Whether the catalog selects `short_name` in this namespace.
+    ///
+    /// For callers that enumerate the metadata catalog themselves instead of
+    /// reading this provider's tables -- cluster table discovery does, to avoid
+    /// depending on the in-memory cache. Asking here keeps them from picking up
+    /// a table the catalog's `include`/`exclude` withheld.
+    #[must_use]
+    pub fn selects_table(&self, short_name: &str) -> bool {
+        self.table_selector
+            .selects_table(&self.namespace, short_name)
+    }
+
     /// Construct the full metadata table name for a short table name.
     fn full_table_name(&self, short_name: &str) -> String {
         format!("{}/{short_name}", self.namespace)
@@ -596,9 +653,26 @@ impl SchemaProvider for CayenneSchemaProvider {
     }
 
     async fn table(&self, name: &str) -> DFResult<Option<Arc<dyn TableProvider>>> {
-        // Check in-memory cache first
+        // Check in-memory cache first. The cache holds what this catalog has
+        // already registered -- discovery filtered it on the way in, and DDL
+        // registers deliberately -- so it is served without re-deciding, which
+        // also keeps `table` and `table_names` reporting the same set.
         if let Some(provider) = self.tables.read().get(name) {
             return Ok(Some(Arc::clone(provider)));
+        }
+
+        // A miss falls through to the catalog, which would otherwise re-admit a
+        // table `refresh` withheld: naming it in a query is enough. Apply the
+        // same decision here so `exclude` cannot be bypassed that way.
+        if let Some(reason) = self
+            .table_selector
+            .rejection_reason(&format!("{}.{name}", self.namespace))
+        {
+            tracing::debug!(
+                "Cayenne table '{}.{name}' {reason}, not loading it",
+                self.namespace
+            );
+            return Ok(None);
         }
 
         // Try to load from catalog (lazy loading) using namespace-prefixed name

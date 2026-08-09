@@ -67,6 +67,8 @@ jobs:
     # stuck.
     name: Attestation
     runs-on: ubuntu-latest
+    # A few API calls. Anything past this is a wedged step, not a slow one.
+    timeout-minutes: 15
     permissions:
       contents: read
       statuses: read
@@ -625,6 +627,10 @@ jobs:
   check_changes:
     if: ${{ github.event_name != 'pull_request' }}
     runs-on: spiceai-macos
+    # A full-history checkout (`fetch-depth: 0`) and a path diff. Sized for a
+    # cold runner having to clone from scratch, not the ~1 min a warm
+    # self-hosted workspace takes.
+    timeout-minutes: 45
     outputs:
       relevant_changes: ${{ steps.check.outputs.relevant_changes }}
     steps:
@@ -646,6 +652,8 @@ jobs:
   lint-rust:
     name: Rust Lint
     runs-on: spiceai-macos
+    # Slowest observed success in the 2026-07-25..08-08 window: 126 min.
+    timeout-minutes: 300
     needs: check_changes
     if: ${{ github.event_name != 'pull_request' }}
     env:
@@ -738,6 +746,8 @@ jobs:
   build-test:
     name: Build and Test
     runs-on: spiceai-macos
+    # Slowest observed success in the 2026-07-25..08-08 window: 117 min.
+    timeout-minutes: 300
     needs: [check_changes]
     if: ${{ github.event_name != 'pull_request' }}
     env:
@@ -872,6 +882,8 @@ jobs:
   build-install-release:
     name: Build (release profile)
     runs-on: spiceai-macos
+    # Slowest observed success in the 2026-07-25..08-08 window: 106 min.
+    timeout-minutes: 300
     needs: [check_changes]
     if: ${{ github.event_name != 'pull_request' }}
     env:
