@@ -64,28 +64,16 @@ static START: OnceLock<std::time::Instant> = OnceLock::new();
 /// its own artifact cannot be symbolized against the right one.
 static IDENTITY: OnceLock<String> = OnceLock::new();
 
-/// The report buffer. Checked against [`MAX_REPORT`] rather than chosen by eye.
+/// The buffer each part of the report is formatted into.
 const REPORT_BUF: usize = 1024;
 
 /// How much of the identity line is kept. The version has no inherent length limit,
-/// so it is clipped at install to keep the rest of the report bounded.
+/// so it is clipped at install; every other field is fixed-width and well inside what
+/// is left. A part that outgrows the buffer anyway is caught at runtime, not here —
+/// see `flush`.
 const MAX_IDENTITY: usize = 192;
 
-/// The longest report that can be produced, so a new field breaks the build rather
-/// than silently truncating the fields printed after it. Each term is the widest its
-/// part can format to; `u64` is 20 digits, `i32` 11, a hex `u64` 16.
-#[cfg(target_os = "linux")]
-const MAX_REPORT: usize = 47                 // banner and trailer
-    + MAX_IDENTITY
-    + 46                                     // signal=… code=… (…)
-    + 43                                     // sender_pid=… sender_uid=…, the wider arm
-    + 46                                     // ip= base=
-    + 60                                     // offset=, or the widest reason it is absent
-    + 1
-    + 86                                     // thread= pid= tid= uptime=
-    + 55; // symbolize line
-#[cfg(target_os = "linux")]
-const _: () = assert!(MAX_REPORT <= REPORT_BUF);
+const _: () = assert!(MAX_IDENTITY < REPORT_BUF / 2);
 
 /// Install fatal-signal reporting. Call once, as early in `main` as possible, so
 /// faults during startup are covered.
@@ -107,14 +95,7 @@ pub fn install(version: &str) {
     );
     // Clip here rather than let the handler truncate the fields after it: the version
     // is the one input with no length limit of its own.
-    if identity.len() > MAX_IDENTITY - 1 {
-        // Back off to a char boundary so the truncation cannot split a code point.
-        let mut end = MAX_IDENTITY - 1;
-        while !identity.is_char_boundary(end) {
-            end -= 1;
-        }
-        identity.truncate(end);
-    }
+    identity.truncate(identity.floor_char_boundary(MAX_IDENTITY - 1));
     identity.push('\n');
     let _ = IDENTITY.set(identity);
 
@@ -259,26 +240,33 @@ fn signal_code_name(signo: u32, code: i32) -> &'static str {
     }
 }
 
-/// `si_addr`'s offset in the kernel's `siginfo_t` on 64-bit Linux: the
-/// `si_signo`/`si_errno`/`si_code` header, four bytes of padding, then the union.
+// `crash-handler` copies `size_of::<signalfd_siginfo>()` bytes out of the kernel's
+// `siginfo_t` (`crash-handler-0.8.0/src/linux/state.rs:431`), so reading them back as
+// a `siginfo_t` needs the destination to fit, and to be no less aligned. A libc change
+// should break the build rather than the report.
 #[cfg(target_os = "linux")]
-const SI_ADDR_OFFSET: usize = 16;
+const _: () = assert!(size_of::<libc::siginfo_t>() <= size_of::<libc::signalfd_siginfo>());
+#[cfg(target_os = "linux")]
+const _: () = assert!(align_of::<libc::siginfo_t>() <= align_of::<libc::signalfd_siginfo>());
 
-// `crash-handler` copies `size_of::<signalfd_siginfo>()` bytes out of a `siginfo_t`
-// (`crash-handler-0.8.0/src/linux/state.rs:431`), so the destination must not be the
-// larger of the two and `si_addr` must fall inside what was copied. A libc change
-// should break the build, not the report.
-#[cfg(target_os = "linux")]
-const _: () = assert!(size_of::<libc::signalfd_siginfo>() <= size_of::<libc::siginfo_t>());
-#[cfg(target_os = "linux")]
-const _: () = assert!(SI_ADDR_OFFSET + size_of::<u64>() <= size_of::<libc::signalfd_siginfo>());
-
-/// The faulting address, or `None` when the signal carries none.
+/// The signal information the kernel actually delivered.
 ///
 /// `CrashContext::siginfo` is typed `libc::signalfd_siginfo` but holds `siginfo_t`
-/// bytes. The layouts agree only up to `si_code`: `ssi_addr` is at offset 72, which is
-/// padding in a `siginfo_t`, so it reads `0x0` for every fault. Upstream:
-/// `EmbarkStudios/crash-handling#49`. Do not simplify this back to `ssi_addr`.
+/// bytes: `crash-handler` reinterprets the kernel's pointer before copying it. The two
+/// layouts agree only up to `si_code` — `ssi_addr` sits at offset 72, which is padding
+/// in a `siginfo_t`, so it reads `0x0` for every fault. Upstream:
+/// `EmbarkStudios/crash-handling#49`; delete this when that is fixed.
+///
+/// Reinterpreted once, here, so the fields can be read through `libc`'s own accessors,
+/// which derive each offset per architecture instead of hardcoding it.
+#[cfg(target_os = "linux")]
+fn kernel_siginfo(cc: &crash_handler::CrashContext) -> &libc::siginfo_t {
+    // SAFETY: the bytes are a `siginfo_t` (see above), and the assertions establish
+    // that one fits within, and is no more aligned than, what holds them.
+    unsafe { &*std::ptr::from_ref(&cc.siginfo).cast::<libc::siginfo_t>() }
+}
+
+/// The faulting address, or `None` when the signal carries none.
 #[cfg(target_os = "linux")]
 fn fault_address(cc: &crash_handler::CrashContext) -> Option<u64> {
     // `_sigfault` is the live union member only for a kernel-raised fault. A signal
@@ -293,37 +281,17 @@ fn fault_address(cc: &crash_handler::CrashContext) -> Option<u64> {
         return None;
     }
 
-    // SAFETY: `siginfo` holds `siginfo_t` bytes (see above). The offset and the read
-    // are bounded by the assertions above, and the field is plain data.
-    Some(unsafe {
-        std::ptr::from_ref(&cc.siginfo)
-            .cast::<u8>()
-            .add(SI_ADDR_OFFSET)
-            .cast::<u64>()
-            .read_unaligned()
-    })
+    // SAFETY: `si_addr` is the live union member for the signals filtered above.
+    Some(unsafe { kernel_siginfo(cc).si_addr() } as u64)
 }
-
-/// `si_pid` and `si_uid` within the kernel's `siginfo_t`: `_sifields._kill` occupies
-/// the same union the fault address does, so these share `SI_ADDR_OFFSET`'s start.
-#[cfg(target_os = "linux")]
-const SI_PID_OFFSET: usize = 16;
-#[cfg(target_os = "linux")]
-const SI_UID_OFFSET: usize = 20;
-
-#[cfg(target_os = "linux")]
-const _: () = assert!(SI_UID_OFFSET + size_of::<u32>() <= size_of::<libc::signalfd_siginfo>());
 
 /// Who sent the signal, when it was sent rather than raised by a fault.
 ///
 /// A `SIGABRT` reaches this handler whether the process aborted itself or something
 /// outside sent it. A sender pid equal to our own means it was self-inflicted. An OOM
 /// kill is not covered: the kernel sends `SIGKILL`, which cannot be caught.
-///
-/// Read at the real offsets for the same reason as [`fault_address`]: `ssi_pid` and
-/// `ssi_uid` land on padding and on half of `si_addr`.
 #[cfg(target_os = "linux")]
-fn signal_sender(cc: &crash_handler::CrashContext) -> Option<(u32, u32)> {
+fn signal_sender(cc: &crash_handler::CrashContext) -> Option<(i32, u32)> {
     // `_kill` (and `_rt`, for `sigqueue`) is the live union member only for these.
     if !matches!(
         cc.siginfo.ssi_code,
@@ -332,15 +300,9 @@ fn signal_sender(cc: &crash_handler::CrashContext) -> Option<(u32, u32)> {
         return None;
     }
 
-    // SAFETY: as `fault_address` — `siginfo` holds `siginfo_t` bytes, both offsets are
-    // bounded by the assertion above, and both fields are plain data.
-    unsafe {
-        let base = std::ptr::from_ref(&cc.siginfo).cast::<u8>();
-        Some((
-            base.add(SI_PID_OFFSET).cast::<u32>().read_unaligned(),
-            base.add(SI_UID_OFFSET).cast::<u32>().read_unaligned(),
-        ))
-    }
+    // SAFETY: `_kill` is the live union member for the codes filtered above.
+    let si = kernel_siginfo(cc);
+    Some(unsafe { (si.si_pid(), si.si_uid()) })
 }
 
 /// A pipe used to test whether an address is readable: `write(2)` reports `EFAULT`
@@ -451,6 +413,24 @@ fn instruction_pointer(_cc: &crash_handler::CrashContext) -> u64 {
     0
 }
 
+/// Emit what was formatted, and say so when it did not all fit.
+///
+/// A `Cursor` over a fixed slice stops at capacity and reports the failure rather than
+/// panicking, so a report that outgrows its buffer ends mid-field. `complete` carries
+/// whether that happened; the marker goes out in its own `write(2)`, since by then
+/// there is no room in the buffer for it.
+fn flush(buf: &[u8], position: u64, complete: bool) {
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "the cursor position is bounded by the buffer length"
+    )]
+    let written = position as usize;
+    raw_write(&buf[..written]);
+    if !complete {
+        raw_write(b"=== crash report truncated ===\n");
+    }
+}
+
 /// Write `bytes` to stderr with a raw `write(2)`. Partial writes are ignored: there is
 /// nothing useful to do about them from a signal handler, and the process is dying.
 fn raw_write(bytes: &[u8]) {
@@ -518,16 +498,11 @@ fn report(cc: &crash_handler::CrashContext) {
     // through a corrupted pointer it is not — it can be in a shared library, or not
     // mapped at all — and `ip - base` is then a number `addr2line` will accept and
     // resolve to the wrong place.
-    let in_text = image
-        .zip(usize::try_from(ip).ok())
-        .is_some_and(|(image, ip)| image.text.contains(&ip));
-    let offset = ip.saturating_sub(base);
+    let offset = text_offset(ip);
     let uptime = START.get().map_or(0, |s| s.elapsed().as_secs());
 
-    // Formatting into a fixed slice cannot allocate. A `Cursor` stops at capacity and
-    // returns an error rather than panicking, so every write is checked: `MAX_REPORT`
-    // says this cannot happen, and `complete` is what catches it if the arithmetic
-    // behind that constant ever stops being true.
+    // Formatting into a fixed slice cannot allocate; every write is checked so an
+    // overrun is reported rather than silently swallowed. See `flush`.
     let mut buf = [0u8; REPORT_BUF];
     let mut cur = std::io::Cursor::new(&mut buf[..]);
     let mut complete = true;
@@ -559,15 +534,13 @@ fn report(cc: &crash_handler::CrashContext) {
     // Say why there is no offset rather than print one that cannot be used. The two
     // reasons differ: an ip outside the mapping is the program's problem, an
     // unresolved base is this handler's.
-    complete &= if in_text {
-        write!(cur, " offset=0x{offset:x}")
-    } else if image.is_none() {
-        write!(
+    complete &= match offset {
+        Some(offset) => write!(cur, " offset=0x{offset:x}"),
+        None if image.is_none() => write!(
             cur,
             " (load base unresolved - /proc/self/maps was not parsed)"
-        )
-    } else {
-        write!(cur, " (ip not in the spiced text mapping)")
+        ),
+        None => write!(cur, " (ip not in the spiced text mapping)"),
     }
     .is_ok();
     complete &= write!(
@@ -577,43 +550,20 @@ fn report(cc: &crash_handler::CrashContext) {
     )
     .is_ok();
     // Only when the offset is one `addr2line` can actually use.
-    if in_text {
+    if let Some(offset) = offset {
         complete &= writeln!(cur, "symbolize: addr2line -e spiced -fCi 0x{offset:x}").is_ok();
     }
     // Flushed before the stack section: reading the stack can fault again, and a
     // second fault inside the handler ends the process with the signal still blocked.
     // Writing first costs the stack section rather than the whole report.
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "the cursor position is bounded by the buffer length"
-    )]
-    let written = cur.position() as usize;
-    raw_write(&buf[..written]);
-    if !complete {
-        // Its own `write(2)`: by definition there was no room left in the buffer.
-        raw_write(b"=== crash report truncated ===\n");
-    }
+    flush(&buf, cur.position(), complete);
 
-    report_stack(cc);
-    raw_write(b"=== end native crash ===\n");
+    report_stack(cc, ip, fault_address(cc));
 }
 
 /// How many words above the stack pointer are examined for a return address.
 #[cfg(target_os = "linux")]
 const STACK_WORDS: usize = 16;
-
-/// Sized like [`MAX_REPORT`], for the second write.
-#[cfg(target_os = "linux")]
-const STACK_BUF: usize = 1024;
-#[cfg(target_os = "linux")]
-const _: () = assert!(
-    38 + 24                      // stack: sp=… ret=…
-        + 22                     // (+0x…)
-        + 18                     // lr=…
-        + 62                     // the caller's symbolize line
-        + 18 + STACK_WORDS * 21  // the candidate list
-        <= STACK_BUF
-);
 
 /// Where the crash came from, when the instruction pointer no longer says.
 ///
@@ -621,72 +571,77 @@ const _: () = assert!(
 /// still left it in `x30`. Only words pointing into this binary's code are reported;
 /// the rest of a stack resembles addresses without being them.
 ///
-/// Every read is probed first: the stack pointer may itself be corrupt.
+/// `ip` and `fault_addr` are passed in because the caller already has them.
 #[cfg(target_os = "linux")]
-fn report_stack(cc: &crash_handler::CrashContext) {
+fn report_stack(cc: &crash_handler::CrashContext, ip: u64, fault_addr: Option<u64>) {
     use std::io::Write as _;
 
     let sp = stack_pointer(cc);
-    let ip = instruction_pointer(cc);
     // A return address sits at the stack pointer only if nothing has run since the
     // call, which holds when the fault is the instruction fetch itself. A fault inside
     // a function — this binary's or a library's — has a frame of its own.
-    let immediate_call = fault_address(cc) == Some(ip);
+    let immediate_call = fault_addr == Some(ip);
 
-    let mut buf = [0u8; STACK_BUF];
+    let mut buf = [0u8; REPORT_BUF];
     let mut cur = std::io::Cursor::new(&mut buf[..]);
-    let _ = write!(cur, "stack: sp=0x{sp:x}");
+    let mut complete = true;
+    complete &= write!(cur, "stack: sp=0x{sp:x}").is_ok();
 
     // aarch64 keeps the return address in a register, so it needs no stack read.
     let mut caller = link_register(cc).and_then(|lr| {
-        let _ = write!(cur, " lr=0x{lr:x}");
-        immediate_call.then(|| text_offset(lr)).flatten()
+        complete &= write!(cur, " lr=0x{lr:x}").is_ok();
+        immediate_call.then_some(lr).and_then(text_offset)
     });
 
-    let mut candidates = 0;
-    for word in 0..STACK_WORDS {
-        let Some(at) = sp.checked_add((word * size_of::<u64>()) as u64) else {
+    // One probe for the whole window: a corrupt stack pointer is the case this guards,
+    // and it fails the window as readily as it fails the first word.
+    let window = usize::try_from(sp).ok().filter(|sp| {
+        readable(
+            std::ptr::with_exposed_provenance::<u8>(*sp),
+            STACK_WORDS * size_of::<u64>(),
+        )
+    });
+
+    let mut listed_candidates = false;
+    for word in 0..window.map_or(0, |_| STACK_WORDS) {
+        let Some(at) = window.and_then(|sp| sp.checked_add(word * size_of::<u64>())) else {
             break;
         };
-        let ptr =
-            std::ptr::with_exposed_provenance::<u8>(usize::try_from(at).unwrap_or(usize::MAX));
-        if !readable(ptr, size_of::<u64>()) {
-            break;
-        }
-        // SAFETY: the probe above established that these eight bytes are readable, and
-        // a stack word has no validity invariants.
-        let value = unsafe { ptr.cast::<u64>().read_unaligned() };
+        // SAFETY: the probe above established the whole window is readable, and a stack
+        // word has no validity invariants.
+        let value = unsafe {
+            std::ptr::with_exposed_provenance::<u8>(at)
+                .cast::<u64>()
+                .read_unaligned()
+        };
         let Some(offset) = text_offset(value) else {
             continue;
         };
         // Only the first word of an interrupted call is a return address; everything
         // else is a candidate, which may be live or long stale.
         if word == 0 && immediate_call && caller.is_none() {
-            let _ = write!(cur, " ret=0x{value:x} (+0x{offset:x})");
+            complete &= write!(cur, " ret=0x{value:x} (+0x{offset:x})").is_ok();
             caller = Some(offset);
         } else {
-            if candidates == 0 {
-                let _ = write!(cur, "\nstack candidates:");
+            if !listed_candidates {
+                complete &= write!(cur, "\nstack candidates:").is_ok();
+                listed_candidates = true;
             }
-            let _ = write!(cur, " +0x{offset:x}");
-            candidates += 1;
+            complete &= write!(cur, " +0x{offset:x}").is_ok();
         }
     }
-    let _ = writeln!(cur);
+    complete &= writeln!(cur).is_ok();
 
     if let Some(offset) = caller {
-        let _ = writeln!(
+        complete &= writeln!(
             cur,
             "symbolize caller: addr2line -e spiced -fCi 0x{offset:x}"
-        );
+        )
+        .is_ok();
     }
+    complete &= write!(cur, "=== end native crash ===\n").is_ok();
 
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "the cursor position is bounded by the buffer length"
-    )]
-    let written = cur.position() as usize;
-    raw_write(&buf[..written]);
+    flush(&buf, cur.position(), complete);
 }
 
 /// A reduced report. `CrashContext` is platform-specific: on macOS it carries a Mach
@@ -712,15 +667,7 @@ fn report(_cc: &crash_handler::CrashContext) {
          === end native crash ===\n",
     )
     .is_ok();
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "the cursor position is bounded by the buffer length"
-    )]
-    let written = cur.position() as usize;
-    raw_write(&buf[..written]);
-    if !complete {
-        raw_write(b"=== crash report truncated ===\n");
-    }
+    flush(&buf, cur.position(), complete);
 }
 
 #[cfg(all(test, unix))]
@@ -775,11 +722,6 @@ mod tests {
         std::hint::black_box(());
     }
 
-    /// Install the handler, take a real fault, and assert the report reached stderr.
-    ///
-    /// The process under test necessarily dies, so this re-executes its own binary
-    /// with `CHILD` set and asserts on the child's output. A genuine fault exercises
-    /// the `si_code > 0` path and populates `addr` and `ip`; a sent signal does not.
     /// Run the crashing child and return what it printed.
     ///
     /// The process under test dies, so this re-executes its own binary with `CHILD`

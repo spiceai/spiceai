@@ -83,11 +83,11 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
         run: |
           set -euo pipefail
-          cargo test -p spiced --lib --profile "$PROFILE" --no-run \
-            --message-format=json > cargo-build.json
-          # The single test executable for spiced's lib target.
-          TEST_BIN=$(jq -r 'select(.profile.test == true) | .executable' \
-            cargo-build.json | grep . | tail -1)
+          TEST_BIN=$(cargo test -p spiced --lib --profile "$PROFILE" --no-run \
+            --message-format=json \
+            | jq -r 'select(.reason == "compiler-artifact"
+                       and (.target.kind | contains(["lib"]))
+                       and .executable != null) | .executable')
           echo "TEST_BIN=$TEST_BIN" | tee -a "$GITHUB_ENV"
           test -x "$TEST_BIN"
 
@@ -99,14 +99,11 @@ jobs:
             echo "(no symtab, no DWARF, no build-id)"
           readelf -n "$TEST_BIN" | grep -i 'build id' || echo "(no build id)"
 
+      # The binary directly, not through cargo: the tests carry the real assertions,
+      # and a second `cargo test` only re-resolves the dependency graph to reach them.
       - name: Run the test
-        # Match the build step's env or cargo re-fingerprints and rebuilds.
-        env:
-          CARGO_INCREMENTAL: 0
-          PROFILE: ${{ matrix.profile }}
         run: |
-          cargo test -p spiced --lib --profile "$PROFILE" \
-            crash_handler -- --nocapture
+          "$TEST_BIN" crash_handler --nocapture
 
       # Re-run the faulting child directly so the report itself lands in the log.
       # The child is meant to die, so drop the shell's inherited `-e`.
