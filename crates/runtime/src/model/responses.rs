@@ -16,24 +16,27 @@ limitations under the License.
 
 use crate::Runtime;
 use crate::model::ToolUsingResponses;
-use crate::model::params::get_params_spec;
+use crate::model::params::azure::AzureModelParams;
+use crate::model::params::openai::OpenAiModelParams;
+use crate::model::params::xai::XaiModelParams;
 use crate::model::tool_use_responses::OpenAIResponsesTools;
 use crate::model::wrapper::responses::ResponsesWrapper;
-use crate::parameters::Parameters;
 use crate::tools::registry::{TOOL_EMBEDDING_MODEL_PARAM, prepare_model_tools};
 use crate::tools::utils::{create_table_allowlist, get_tools_with_allowlist};
 use llms::chat::Error as LlmError;
-use llms::openai::{DEFAULT_LLM_MODEL, UsageTier};
+use llms::openai::DEFAULT_LLM_MODEL;
 use llms::responses::Responses;
+use runtime_parameters_typed::TypedParams;
+use runtime_secrets::Secrets;
 use runtime_tools::options::SpiceToolsOptions;
-use secrecy::SecretString;
+use secrecy::{ExposeSecret, SecretString};
 use serde_json::Value;
 use spicepod::component::model::{Model, ModelSource};
-use std::str::FromStr;
 use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, LazyLock},
 };
+use tokio::sync::RwLock;
 
 pub type LLMResponsesModelStore = HashMap<String, Arc<dyn Responses>>;
 
@@ -80,25 +83,7 @@ pub async fn try_to_responses_model(
         return Err(LlmError::ResponsesNotSupported { from: source });
     }
 
-    let param_spec = get_params_spec(&source).ok_or(LlmError::UnsupportedTaskForModel {
-        from: component.from.clone(),
-        task: "llm".into(),
-    })?;
-
-    let params_struct = Parameters::try_new(
-        &format!("model {source}"),
-        params.clone().into_iter().collect::<Vec<_>>(),
-        source.short_name(),
-        rt.secrets(),
-        param_spec,
-    )
-    .await
-    .map_err(|e| LlmError::ModelParameterFailed {
-        model: component.name.clone(),
-        source: e,
-    })?;
-
-    let model = construct_model(component, &params_struct)?;
+    let model = construct_model(component, params, &rt.secrets()).await?;
 
     let openai_responses_tools: Option<Vec<OpenAIResponsesTools>> =
         extract_secret!(params, "openai_responses_tools").and_then(|v| {
@@ -157,24 +142,48 @@ pub async fn try_to_responses_model(
     Ok(tool_model)
 }
 
-fn construct_model(
+async fn typed_params<P: TypedParams>(
+    component: &Model,
+    params: &HashMap<String, SecretString>,
+    source: ModelSource,
+    secrets: &Arc<RwLock<Secrets>>,
+) -> Result<P, LlmError> {
+    P::try_from_params(&format!("model {source}"), params.clone(), secrets)
+        .await
+        .map_err(|e| LlmError::ModelParameterFailed {
+            model: component.name.clone(),
+            source: Box::new(e),
+        })
+}
+
+async fn construct_model(
     component: &spicepod::component::model::Model,
-    params: &Parameters,
+    params: &HashMap<String, SecretString>,
+    secrets: &Arc<RwLock<Secrets>>,
 ) -> Result<Arc<dyn Responses>, LlmError> {
     let model_id = component.get_model_id();
-    let prefix = component.get_source().ok_or(LlmError::UnknownModelSource {
+    let source = component.get_source().ok_or(LlmError::UnknownModelSource {
         from: component.from.clone(),
     })?;
 
-    let model = match prefix {
-        ModelSource::OpenAi => openai(model_id, params),
-        ModelSource::Azure => azure(model_id, component.name.as_str(), params),
-
-        ModelSource::Xai => xai(model_id.as_deref(), params),
+    let model = match source {
+        ModelSource::OpenAi => {
+            let p = typed_params::<OpenAiModelParams>(component, params, source.clone(), secrets)
+                .await?;
+            openai(model_id, params, &p)
+        }
+        ModelSource::Azure => {
+            let p = typed_params::<AzureModelParams>(component, params, source.clone(), secrets)
+                .await?;
+            azure(model_id, component.name.as_str(), &p)
+        }
+        ModelSource::Xai => {
+            let p =
+                typed_params::<XaiModelParams>(component, params, source.clone(), secrets).await?;
+            xai(model_id.as_deref(), &p)
+        }
         _ => Err(LlmError::ResponsesNotSupported {
-            from: component.get_source().ok_or(LlmError::UnknownModelSource {
-                from: component.from.clone(),
-            })?,
+            from: source.clone(),
         }),
     }?;
 
@@ -193,7 +202,7 @@ fn construct_model(
         model,
         component.name.as_str(),
         system_prompt,
-        get_openai_responses_request_overrides(component, params.prefix()),
+        get_openai_responses_request_overrides(component, source.short_name()),
     )))
 }
 
@@ -212,39 +221,32 @@ pub fn get_openai_responses_request_overrides(model: &Model, prefix: &str) -> Ve
     request_overrides.into_iter().collect()
 }
 
-fn openai(model_id: Option<String>, params: &Parameters) -> Result<Arc<dyn Responses>, LlmError> {
-    let api_base = params.get("endpoint").expose().ok();
-    let api_key = params.get("api_key").expose().ok();
-    let org_id = params.get("org_id").expose().ok();
-    let project_id = params.get("project_id").expose().ok();
-    let usage_tier = params
-        .get("usage_tier")
-        .expose()
-        .ok()
-        .map(UsageTier::from_str)
-        .transpose()
-        .map_err(|_| LlmError::InvalidParamValueError {
-            param: "openai_usage_tier".to_string(),
-            message: "Must be 'free', 'tier1', 'tier2', 'tier3', 'tier4', or 'tier5'".to_string(),
-        })?;
+fn openai(
+    model_id: Option<String>,
+    raw_params: &HashMap<String, SecretString>,
+    params: &OpenAiModelParams,
+) -> Result<Arc<dyn Responses>, LlmError> {
+    let api_base = Some(params.endpoint.as_str());
+    let api_key = params.api_key.as_ref().map(ExposeSecret::expose_secret);
+    let org_id = params.org_id.as_deref();
+    let project_id = params.project_id.as_deref();
+    let usage_tier = Some(params.usage_tier);
 
-    if let Some(temperature_str) = params.get("temperature").expose().ok() {
-        match temperature_str.parse::<f64>() {
-            Ok(temperature) => {
-                if temperature < 0.0 {
-                    return Err(LlmError::InvalidParamValueError {
-                        param: "openai_temperature".to_string(),
-                        message: "Ensure it is a non-negative number.".to_string(),
-                    });
-                }
-            }
-            Err(_) => {
-                return Err(LlmError::InvalidParamValueError {
-                    param: "openai_temperature".to_string(),
-                    message: "Ensure it is a non-negative number.".to_string(),
-                });
-            }
-        }
+    // Reject a negative or unparseable `temperature` override at load time. The
+    // value is read from the raw params map because overrides are passthrough
+    // (see `crate::model::params::common`), accepting the unprefixed,
+    // `openai_`-prefixed forms.
+    let temperature = raw_params
+        .get("temperature")
+        .or_else(|| raw_params.get("openai_temperature"))
+        .map(ExposeSecret::expose_secret);
+    if let Some(temperature_str) = temperature
+        && !matches!(temperature_str.parse::<f64>(), Ok(t) if t >= 0.0)
+    {
+        return Err(LlmError::InvalidParamValueError {
+            param: "openai_temperature".to_string(),
+            message: "Ensure it is a non-negative number.".to_string(),
+        });
     }
 
     Ok(Arc::new(llms::openai::new_openai_client(
@@ -260,7 +262,7 @@ fn openai(model_id: Option<String>, params: &Parameters) -> Result<Arc<dyn Respo
 fn azure(
     model_id: Option<String>,
     model_name: &str,
-    params: &Parameters,
+    params: &AzureModelParams,
 ) -> Result<Arc<dyn Responses>, LlmError> {
     let Some(model_name) = model_id else {
         return Err(LlmError::FailedToLoadModel {
@@ -269,11 +271,11 @@ fn azure(
 ).into(),
         });
     };
-    let api_base = params.get("endpoint").expose().ok();
-    let api_version = params.get("api_version").expose().ok();
-    let deployment_name = params.get("deployment_name").expose().ok();
-    let api_key = params.get("api_key").expose().ok();
-    let entra_token = params.get("entra_token").expose().ok();
+    let api_base = params.endpoint.as_deref();
+    let api_version = params.api_version.as_deref();
+    let deployment_name = params.deployment_name.as_deref();
+    let api_key = params.api_key.as_ref().map(ExposeSecret::expose_secret);
+    let entra_token = params.entra_token.as_ref().map(ExposeSecret::expose_secret);
 
     if api_base.is_none() {
         return Err(LlmError::FailedToLoadModel {
@@ -311,8 +313,8 @@ fn azure(
     )) as Arc<dyn Responses>)
 }
 
-fn xai(model_id: Option<&str>, params: &Parameters) -> Result<Arc<dyn Responses>, LlmError> {
-    let Some(api_key) = params.get("api_key").expose().ok() else {
+fn xai(model_id: Option<&str>, params: &XaiModelParams) -> Result<Arc<dyn Responses>, LlmError> {
+    let Some(api_key) = params.api_key.as_ref().map(ExposeSecret::expose_secret) else {
         return Err(LlmError::FailedToLoadModel {
             source: "No `xai_api_key` provided for xAI model.".into(),
         });

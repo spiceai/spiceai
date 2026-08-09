@@ -21,7 +21,9 @@ limitations under the License.
 
 use super::{CatalogConnector, ConnectorComponent, ParameterSpec};
 use crate::{
-    Runtime, component::catalog::Catalog, dataconnector::parameters::ConnectorParams,
+    Runtime,
+    component::catalog::{Catalog, table_selector},
+    dataconnector::parameters::ConnectorParams,
     parameters::ExposedParamLookup,
 };
 use async_trait::async_trait;
@@ -318,7 +320,7 @@ impl CatalogConnector for DuckLakeCatalog {
             catalog_name,
             writable,
             ddl_enabled,
-            catalog.include.clone(),
+            table_selector(catalog),
         ));
 
         // Initial refresh to populate schemas and tables

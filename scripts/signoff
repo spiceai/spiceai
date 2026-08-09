@@ -25,7 +25,7 @@
 #   scripts/signoff --no-verify     Sign off without running the checks (honor system)
 #   scripts/signoff status          Show the sign-off status of HEAD
 #   scripts/signoff mine            Show attestation status for all your open PRs
-#   scripts/signoff clear-pending   Turn a left-behind pending status into a failure
+#   scripts/signoff clear-pending   Restate a left-behind pending status as incomplete
 #   scripts/signoff preflight-disk  Check the work volume's free space (CI: run
 #                                   before the toolchain setup steps)
 #   scripts/signoff check           Show whether trunk requires sign-off
@@ -68,6 +68,12 @@ readonly VERSION="1.5.0"
 readonly STATUS_CONTEXT="signoff"
 readonly TARGET_BRANCH="${SIGNOFF_BRANCH:-trunk}"
 readonly TARGET_REMOTE="${SIGNOFF_REMOTE:-origin}"
+# Seconds to wait between attempts at a commit-status POST; the number of
+# attempts is one more than the number of entries. A verdict can cost hours of
+# runner time and exists nowhere but that POST, so one transient response must
+# not discard it. Empty means post once. Overridable so the unit tests do not
+# pay for the waits.
+readonly STATUS_POST_BACKOFF="${SIGNOFF_STATUS_POST_BACKOFF-5 15 30 60}"
 DEBUG="${SIGNOFF_DEBUG:-}"
 VCS=""
 JJ_REMOTE_URL=""
@@ -605,16 +611,68 @@ append_step_summary() {
   printf '%s\n' "$text" >>"$GITHUB_STEP_SUMMARY" 2>/dev/null || true
 }
 
+# A status post that never lands leaves the commit carrying whatever it had.
+# For a remote run that is the `pending` posted on the way in, which the
+# Attestation check renders as a failure and which every reader — `signoff
+# mine`, the PR-sweep tooling — takes for a run still in flight, so nobody
+# re-dispatches. That state is indistinguishable from a live run, and a warning
+# in the log of a finished job does not reach anyone looking at the PR.
+warn_status_not_recorded() {
+  local sha="$1" state="$2" attempts="$3"
+  info "warning: could not post ${STATUS_CONTEXT}=${state} on ${sha:0:12} after ${attempts} attempt(s)"
+
+  # A `pending` that fails to post strands nothing: the commit keeps whatever it
+  # had, and this run still has its own verdict to post later. It is the verdict
+  # failing that leaves a reader holding a `pending` they cannot tell from a run
+  # still going, so that is what the summary is for.
+  if [[ "$state" != "pending" ]]; then
+    append_step_summary \
+      "### Sign-off"$'\n'"**Verdict not recorded** on \`${sha:0:12}\` — the \`${STATUS_CONTEXT}=${state}\` status did not post after ${attempts} attempt(s). Any \`pending\` left on this commit is stale, not a run in flight: sign off again."$'\n'
+  fi
+}
+
 # Post a commit status for STATUS_CONTEXT. Used for pending/failure on remote
 # runs and the final success attestation.
+#
+# Retried with backoff: this call is the only place a verdict exists, and a
+# transient response — a 5xx, a network blip, a 401 from a job that has outlived
+# its token — would otherwise discard hours of runner time for good.
 post_commit_status() {
   local repo="$1" sha="$2" state="$3" description="$4"
   description="${description:0:140}"
   debug "posting ${STATUS_CONTEXT}=${state} on ${repo}@${sha}: ${description}"
-  gh api --method POST "repos/${repo}/statuses/${sha}" \
-    -f state="$state" \
-    -f context="${STATUS_CONTEXT}" \
-    -f "description=${description}" >/dev/null
+
+  local -a backoff=()
+  read -r -a backoff <<<"$STATUS_POST_BACKOFF" || true
+  local attempts=$((${#backoff[@]} + 1))
+
+  local attempt=1 response
+  while true; do
+    if response=$(gh api --method POST "repos/${repo}/statuses/${sha}" \
+      -f state="$state" \
+      -f context="${STATUS_CONTEXT}" \
+      -f "description=${description}" 2>&1); then
+      if (( attempt > 1 )); then
+        info "posted ${STATUS_CONTEXT}=${state} on ${sha:0:12} on attempt ${attempt}"
+      fi
+      return 0
+    fi
+
+    # Report the response, not just that the call failed: "Bad credentials" on a
+    # job that has outlived its token reads differently from a 5xx, and only the
+    # second is something retrying can fix. Which one it was decides whether the
+    # answer here is more attempts or a fresh token.
+    info "warning: posting ${STATUS_CONTEXT}=${state} on ${sha:0:12} failed (attempt ${attempt}/${attempts}): $(printf '%s' "$response" | tr '\n' ' ')"
+
+    if (( attempt >= attempts )); then
+      warn_status_not_recorded "$sha" "$state" "$attempts"
+      return 1
+    fi
+    # Never fatal: a backoff this cannot honour must not abort the run before
+    # the attempt that would have recorded the verdict.
+    sleep "${backoff[attempt - 1]}" || true
+    attempt=$((attempt + 1))
+  done
 }
 
 # The STATUS_CONTEXT state currently on a commit: success/pending/failure/error,
@@ -758,11 +816,28 @@ readonly DISK_FULL_PATTERN='No space left on device|errno=28'
 # so, exactly as the disk guard above does for a volume that filled.
 #
 # Anchored on sccache's own `error:` channel, which rustc, clippy and nextest
-# have no way to produce while reporting on the branch. Two spellings: the
-# startup failure observed on the pool, and the storage failure without the
-# startup prefix, for an invocation that reaches a live server and then cannot
-# read through it.
-readonly CACHE_UNUSABLE_PATTERN='sccache: error: Server startup failed|sccache: error: cache storage failed'
+# have no way to produce while reporting on the branch.
+#
+# The alternatives are taken from sccache's source rather than from the spellings
+# we happen to have seen, so the set is an enumeration and not a running tally.
+# `connect_or_start_server` is the whole of the path a `RUSTC_WRAPPER=sccache`
+# call takes, and it has four outcomes: `Ok` compiles and `AddrInUse` retries,
+# while `ServerStartup::Err` bails with `Server startup failed: {reason}` and
+# `ServerStartup::TimedOut` bails with `Timed out waiting for server startup`.
+# So those two are the ways an unusable cache reaches this channel, and the third
+# alternative below is the storage self-check's own `cache storage failed to
+# read: {…}`, for an invocation that reaches a live server and then cannot read
+# through it. sccache prints the first line of the error as `sccache: error: {}`
+# and every later cause as `sccache: caused by: {}`, so the anchor belongs on the
+# first line only.
+#
+# The timeout is matched on the prefix its two bails share — sccache words it
+# `Timed out waiting for server startup. Maybe the remote service is
+# unreachable?` from the wrapper path and bare from `--start-server`. Keep it a
+# prefix: this string is an awk ERE, so the `?` ending the longer wording is a
+# quantifier, and spelling that sentence out here would match `unreachabl` plus
+# an optional `e` while reading as though it were deliberate.
+readonly CACHE_UNUSABLE_PATTERN='sccache: error: Server startup failed|sccache: error: cache storage failed|sccache: error: Timed out waiting for server startup'
 
 # Set to 1 on remote runs, where run_make_step watches build output for the
 # out-of-disk and unusable-cache signatures. Separates "watched, and it was
@@ -1537,14 +1612,33 @@ cmd_correct_cancelled() {
   return 0
 }
 
-# Replace a `pending` sign-off status with a failure.
+# Restate a left-behind `pending` sign-off status as a run that reached no verdict.
 #
 # A remote run posts `pending` before it starts the checks, so a run that never
 # reaches a verdict — the job is terminated at its budget, the runner goes away —
-# leaves that `pending` on the commit for good. `status` and `mine` then render
-# the branch as a sign-off still in progress, which is the one thing it is not.
+# leaves that `pending` on the commit carrying its "in progress" wording, which
+# is the one thing the run is not.
 #
-# Only `pending` is replaced. A run that finished has already posted its own
+# The state stays `pending`; only the description changes. Nothing judged the diff,
+# so `failure` would assert what no check established — pr.yml reads it as a code
+# failure, Attestation rejects it on the head commit (#12362), and a red `signoff`
+# never self-clears, leaving the commit disqualified until someone re-dispatches by
+# hand. `pending` is what this run's own signalled path already leaves standing (see
+# `describe_check_failure`), and pr.yml does not reject it: a pending is not a
+# verdict. Attestation then decides on its own terms — red for an ordinary head,
+# which really is not signed off, and pointing at re-running sign-off rather than at
+# a phantom defect; green only where pr.yml already allows it, on a fast-tracked head
+# or a verified inheritance chain, which a dead run is no reason to block.
+#
+# `correct-cancelled` reaches the same end state from the other direction: it repairs
+# a `failure`/`error` into `pending` and leaves an existing `pending` alone. Neither
+# handler ever writes a verdict, because neither ending is evidence about the diff.
+#
+# A dormant `pending` stays distinguishable from a live one: `mine` takes its ⟳ from
+# the in-flight run list, not from this status, and `status` reports any non-success
+# as "not signed off". The description carries the rest.
+#
+# Only `pending` is rewritten. A run that finished has already posted its own
 # success or failure, and overwriting that would discard the real verdict; the
 # same guard makes this safe to run unconditionally at the end of a job.
 #
@@ -1569,7 +1663,7 @@ cmd_clear_pending() {
     return 0
   fi
 
-  post_commit_status "$repo" "$sha" failure "$reason" \
+  post_commit_status "$repo" "$sha" pending "$reason" \
     || fail "failed to post the sign-off status (do you have write access to ${repo}?)"
   append_step_summary "### Sign-off"$'\n'"**Incomplete** on \`${sha:0:12}\` — ${reason}"$'\n'
   echo "${NO} ${sha:0:12} — ${reason}"
@@ -1912,8 +2006,10 @@ Developers:
   scripts/signoff status       Show the sign-off status of HEAD
   scripts/signoff mine         Show attestation status for all your open PRs
   scripts/signoff clear-pending [reason]
-                               Replace a left-behind '${STATUS_CONTEXT}' pending status
-                               on HEAD with a failure (no-op for any other state)
+                               Restate a left-behind '${STATUS_CONTEXT}' pending status
+                               on HEAD as a run that reached no verdict: it stays
+                               pending, with [reason] as its description (no-op for
+                               any other state)
 
 CI (.github/workflows/signoff.yml):
   scripts/signoff correct-cancelled [<sha>] [<owner/repo>]

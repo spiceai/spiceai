@@ -30,7 +30,7 @@ use datafusion::{
     physical_plan::ExecutionPlan,
     prelude::SessionContext,
 };
-use runtime_datafusion_index::Index;
+use runtime_datafusion_index::{Index, WriteWindow};
 
 use super::{CompoundReadMode, CompoundSearchIndex, CompoundVectorIndex, Error};
 use crate::index::{SearchIndex, VectorIndex};
@@ -154,8 +154,8 @@ impl Index for MockIndex {
         vec![self.search_column.clone(), self.label.to_string()]
     }
 
-    async fn on_write_start(&self) -> Result<(), DataFusionError> {
-        self.record("on_write_start");
+    async fn on_write_start(&self, window: WriteWindow) -> Result<(), DataFusionError> {
+        self.record(&format!("on_write_start:{window:?}"));
         if self.fail_on_write_start {
             return Err(DataFusionError::Execution(format!(
                 "{} refuses to start a write",
@@ -505,18 +505,47 @@ async fn lifecycle_hooks_forward_to_both_indexes() {
     let secondary = MockIndex::new("secondary", &events);
     let idx = compound(primary, secondary, CompoundReadMode::PrimaryOnly);
 
-    idx.on_write_start().await.expect("start");
+    idx.on_write_start(WriteWindow::Append)
+        .await
+        .expect("start");
     idx.on_write_complete().await.expect("complete");
     idx.on_write_failed().await.expect("failed");
 
     let events = events.lock().expect("event log mutex").clone();
     for side in ["primary", "secondary"] {
-        for event in ["on_write_start", "on_write_complete", "on_write_failed"] {
+        for event in [
+            "on_write_start:Append",
+            "on_write_complete",
+            "on_write_failed",
+        ] {
             assert!(
                 events.contains(&format!("{side}:{event}")),
                 "missing {side}:{event} in {events:?}"
             );
         }
+    }
+}
+
+/// A wrapper that swallowed the window would silently downgrade a replacing write to an
+/// append on the index it wraps, leaving entries for rows the source dropped (#12066). Both
+/// halves must be told the same window.
+#[tokio::test]
+async fn replace_all_window_forwards_to_both_indexes() {
+    let events = Arc::new(Mutex::new(vec![]));
+    let primary = MockIndex::new("primary", &events);
+    let secondary = MockIndex::new("secondary", &events);
+    let idx = compound(primary, secondary, CompoundReadMode::PrimaryOnly);
+
+    idx.on_write_start(WriteWindow::ReplaceAll)
+        .await
+        .expect("start");
+
+    let events = events.lock().expect("event log mutex").clone();
+    for side in ["primary", "secondary"] {
+        assert!(
+            events.contains(&format!("{side}:on_write_start:ReplaceAll")),
+            "missing {side}:on_write_start:ReplaceAll in {events:?}"
+        );
     }
 }
 
@@ -700,7 +729,7 @@ async fn on_write_start_rolls_back_primary_when_secondary_fails() {
     secondary.fail_on_write_start = true;
 
     let idx = compound(primary, secondary, CompoundReadMode::PrimaryOnly);
-    idx.on_write_start()
+    idx.on_write_start(WriteWindow::Append)
         .await
         .expect_err("secondary start failure must propagate");
 

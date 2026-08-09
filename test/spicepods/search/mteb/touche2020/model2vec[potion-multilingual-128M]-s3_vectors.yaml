@@ -1,10 +1,10 @@
 version: v1
 kind: Spicepod
-name: openai[text-embedding-3-small]-s3_vectors
+name: model2vec[potion-multilingual-128M]-s3_vectors
 datasets:
 
-  # MTEB Quora Retrieval dataset files (*.parquet) are automatically downloaded by the test operator.
-  # https://huggingface.co/datasets/mteb/QuoraRetrieval_test_top_250_only_w_correct-v2/tree/main
+  # MTEB Touche-2020 Retrieval dataset files (*.parquet) are automatically downloaded by the test operator.
+  # https://huggingface.co/datasets/mteb/touche2020
 
   - from: file:./corpus.parquet
     name: corpus
@@ -15,14 +15,14 @@ datasets:
       engine: s3_vectors
       params:
         s3_vectors_bucket: spice-ci-search-benchmarks-variant-001
-        s3_vectors_index: default
+        s3_vectors_index: touche2020
         s3_vectors_aws_region: us-east-2
         s3_vectors_aws_access_key_id: ${env:AWS_S3_VECTORS_KEY}
         s3_vectors_aws_secret_access_key: ${env:AWS_S3_VECTORS_SECRET}
     columns:
       - name: text
         embeddings:
-          - from: openai_embed
+          - from: potion
             row_id:
               - _id
 
@@ -37,7 +37,5 @@ datasets:
       enabled: true
 
 embeddings:
-  - from: openai:text-embedding-3-small
-    name: openai_embed
-    params:
-      openai_api_key: ${ secrets:OPENAI_API_KEY }
+  - from: model2vec:minishlab/potion-multilingual-128M
+    name: potion
