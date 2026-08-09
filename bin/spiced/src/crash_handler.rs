@@ -377,6 +377,10 @@ fn stack_pointer(_cc: &crash_handler::CrashContext) -> u64 {
 /// aarch64's `blr` leaves it in `x30`, so no memory read is needed. x86-64 pushes it,
 /// and it is recovered from the stack instead.
 #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "architectures without a link register share this signature"
+)]
 fn link_register(cc: &crash_handler::CrashContext) -> Option<u64> {
     Some(cc.context.uc_mcontext.regs[30])
 }
@@ -506,7 +510,7 @@ fn report(cc: &crash_handler::CrashContext) {
     let mut buf = [0u8; REPORT_BUF];
     let mut cur = std::io::Cursor::new(&mut buf[..]);
     let mut complete = true;
-    complete &= write!(cur, "\n=== native crash ===\n").is_ok();
+    complete &= writeln!(cur, "\n=== native crash ===").is_ok();
     // Already a formatted line, ending in a newline; reading it is an atomic load.
     if let Some(identity) = IDENTITY.get() {
         complete &= cur.write_all(identity.as_bytes()).is_ok();
@@ -524,8 +528,8 @@ fn report(cc: &crash_handler::CrashContext) {
     // killed from outside.
     complete &= match (fault_address(cc), signal_sender(cc)) {
         (Some(addr), _) => write!(cur, "addr=0x{addr:x}"),
-        (None, Some((sender_pid, sender_uid))) => {
-            write!(cur, "sender_pid={sender_pid} sender_uid={sender_uid}")
+        (None, Some(sender)) => {
+            write!(cur, "sender_pid={} sender_uid={}", sender.0, sender.1)
         }
         (None, None) => write!(cur, "addr=n/a"),
     }
@@ -641,7 +645,7 @@ fn report_stack(cc: &crash_handler::CrashContext, ip: u64, fault_addr: Option<u6
         )
         .is_ok();
     }
-    complete &= write!(cur, "=== end native crash ===\n").is_ok();
+    complete &= writeln!(cur, "=== end native crash ===").is_ok();
 
     // Ends the cursor's borrow of `buf` before the buffer is read back.
     let position = cur.position();
@@ -660,7 +664,7 @@ fn report(_cc: &crash_handler::CrashContext) {
     let mut buf = [0u8; REPORT_BUF];
     let mut cur = std::io::Cursor::new(&mut buf[..]);
     let mut complete = true;
-    complete &= write!(cur, "\n=== native crash ===\n").is_ok();
+    complete &= writeln!(cur, "\n=== native crash ===").is_ok();
     if let Some(identity) = IDENTITY.get() {
         complete &= cur.write_all(identity.as_bytes()).is_ok();
     }
@@ -881,10 +885,15 @@ mod tests {
         let output = crash_child("wild_call");
         let stderr = String::from_utf8_lossy(&output.stderr);
 
-        assert_eq!(
-            output.status.signal(),
-            Some(libc::SIGSEGV),
-            "child should die from SIGSEGV, got {:?}",
+        // Which fault a wild jump raises is architecture-specific: x86-64 reports an
+        // unmapped instruction fetch as `SIGSEGV`, aarch64 as `SIGBUS`. The subject
+        // here is what the report says, so accept either.
+        assert!(
+            matches!(
+                output.status.signal(),
+                Some(libc::SIGSEGV | libc::SIGBUS | libc::SIGILL)
+            ),
+            "child should die from a fault, got {:?}: {stderr}",
             output.status
         );
         assert!(
