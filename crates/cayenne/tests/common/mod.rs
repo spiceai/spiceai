@@ -108,73 +108,36 @@ impl TestFixture {
     }
 }
 
+/// Stack size for the thread a backend-parameterized test body runs on.
+///
+/// The mutation and cold-tier workloads plan and unparse deeply enough to need
+/// more than the 2 MiB std gives a thread, and how much more depends on the
+/// metastore backend: the Turso variants of four of them need above 2 MiB where
+/// their `SQLite` siblings fit (#12436). 16 MiB matches the headroom
+/// `runtime`'s own deep-plan tests reserve
+/// (`crates/runtime/tests/cayenne/transaction.rs`), and is address space
+/// reserved rather than memory committed.
+pub const TEST_STACK_SIZE: usize = 16 * 1024 * 1024;
+
 /// Run a test with all available backends
 #[macro_export]
 macro_rules! test_with_backends {
     ($test_fn:ident) => {
         paste::paste! {
             #[test]
-            fn [<$test_fn _sqlite>]() -> Result<(), Box<dyn std::error::Error>> {
+            fn [<$test_fn _sqlite>]() -> Result<(), String> {
                 tracing::debug!("\n🔧 Running {} with SQLite backend", stringify!($test_fn));
-                common::run_with_backend_on_test_stack(common::BackendType::Sqlite, $test_fn)
+                common::run_with_backend_blocking(common::BackendType::Sqlite, $test_fn)
             }
 
             #[cfg(feature = "turso")]
             #[test]
-            fn [<$test_fn _turso>]() -> Result<(), Box<dyn std::error::Error>> {
+            fn [<$test_fn _turso>]() -> Result<(), String> {
                 tracing::debug!("\n🔧 Running {} with Turso backend", stringify!($test_fn));
-                common::run_with_backend_on_test_stack(common::BackendType::Turso, $test_fn)
+                common::run_with_backend_blocking(common::BackendType::Turso, $test_fn)
             }
         }
     };
-}
-
-/// Stack for a backend test body.
-///
-/// `#[tokio::test]` builds a current-thread runtime and polls the whole future
-/// on the test thread, whose default stack is 2 MiB. A fixture here holds a live
-/// table provider *and* the test's own state across every await, so in a debug
-/// build the margin is small enough that a change anywhere else in the crate can
-/// exhaust it — `prop_sequential_memory_impl_turso` needed between 2 and 4 MiB
-/// and aborted on `stack overflow` with no code of its own having changed.
-/// Sizing the stack here keeps that margin a property of the harness rather than
-/// of whatever else happens to be linked in.
-const TEST_STACK_BYTES: usize = 16 * 1024 * 1024;
-
-/// Helper to run a test function with a specific backend, on a thread sized by
-/// [`TEST_STACK_BYTES`].
-///
-/// Keeps `#[tokio::test]`'s semantics — a current-thread runtime, the body
-/// polled to completion on one thread — and changes only the stack it runs on.
-///
-/// # Errors
-///
-/// Returns the test body's error, or an error if the runtime cannot be built or
-/// the test thread panics.
-pub fn run_with_backend_on_test_stack<F, Fut>(
-    backend: BackendType,
-    test_fn: F,
-) -> Result<(), Box<dyn std::error::Error>>
-where
-    F: FnOnce(TestFixture) -> Fut + Send + 'static,
-    Fut: std::future::Future<Output = Result<(), Box<dyn std::error::Error>>>,
-{
-    // The body's error is not `Send`, so it is stringified to cross the join.
-    // Tests report failures by message, so nothing actionable is lost.
-    let outcome = std::thread::Builder::new()
-        .stack_size(TEST_STACK_BYTES)
-        .spawn(move || {
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|error| error.to_string())?
-                .block_on(run_with_backend(backend, test_fn))
-                .map_err(|error| error.to_string())
-        })?
-        .join()
-        .map_err(|_| "backend test thread panicked".to_string())?;
-    outcome?;
-    Ok(())
 }
 
 /// Helper to run a test function with a specific backend
@@ -188,6 +151,48 @@ where
 {
     let fixture = TestFixture::new(backend).await?;
     test_fn(fixture).await
+}
+
+/// [`run_with_backend`] on a thread with a [`TEST_STACK_SIZE`] stack, for
+/// callers that are synchronous — which every `test_with_backends!` body is,
+/// because the stack a body needs is a property of the thread it runs on and
+/// `#[tokio::test]` builds its runtime on the thread libtest hands it.
+///
+/// The runtime built here matches what `#[tokio::test]` would have built (a
+/// current-thread runtime with all drivers enabled); `thread_stack_size`
+/// extends the same headroom to the blocking pool, whose threads the attribute
+/// also leaves at the std default.
+///
+/// The body's `Box<dyn Error>` is not `Send`, so a returned error is flattened
+/// to its message before crossing the join. A panic is resumed rather than
+/// flattened, so an assertion failure still reaches libtest as the panic it
+/// was, with its payload and location intact.
+pub fn run_with_backend_blocking<F, Fut>(backend: BackendType, test_fn: F) -> Result<(), String>
+where
+    F: FnOnce(TestFixture) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<(), Box<dyn std::error::Error>>> + 'static,
+{
+    let outcome = std::thread::Builder::new()
+        .stack_size(TEST_STACK_SIZE)
+        .spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .thread_stack_size(TEST_STACK_SIZE)
+                .enable_all()
+                .build()
+                .map_err(|e| format!("failed to build tokio runtime: {e}"))?
+                .block_on(async move {
+                    run_with_backend(backend, test_fn)
+                        .await
+                        .map_err(|e| e.to_string())
+                })
+        })
+        .map_err(|e| format!("failed to spawn test thread: {e}"))?
+        .join();
+
+    match outcome {
+        Ok(result) => result,
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
 }
 
 // ============================================================================

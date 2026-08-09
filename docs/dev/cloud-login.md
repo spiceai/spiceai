@@ -5,7 +5,8 @@ three login methods, how they resolve credentials, where tokens are stored,
 and the contracts each method has with the Spice Cloud API.
 
 > Audience: Spice CLI / Spice Cloud engineers. For end-user docs, see the
-> public Spice Cloud auth docs.
+> public Spice Cloud auth docs. For which **organization** a credential serves
+> and which org commands act on, see [`cloud-multi-org.md`](./cloud-multi-org.md).
 
 ## Overview
 
@@ -48,10 +49,17 @@ implemented in `execute_login_with_chooser`.
   contexts. Do not derive `Debug` on `OAuthTokenRequest` or `OAuthTokenResponse`
   in the client crate.
 
+All methods accept the global `--org <org>`, which states the organization the
+credential is expected to serve. The CLI verifies that claim against the server
+before storing the credential and files it under a per-org variable, so
+authenticating against a second org never displaces the first. See
+[`cloud-multi-org.md`](./cloud-multi-org.md) for the storage layout and the
+verification rules.
+
 ## Credential storage
 
 After a successful login, all methods call
-`save_token_and_print_login_result(token)` which:
+`save_token_and_print_login_result(token, target)` which:
 
 1. Constructs an authenticated `CloudClient` with the **freshly obtained
    token** (`CloudClient::with_token(token)`), bypassing the normal
@@ -69,11 +77,13 @@ After a successful login, all methods call
    verification are separate API calls, and we should not silently discard a
    valid token because the second call hiccupped.
 
-Logout (`spice cloud logout`) only removes `SPICE_SPICEAI_TOKEN` and
-`SPICE_SPICEAI_API_KEY` from the env file. It does **not** revoke the token
-server-side and does not currently clear the platform keychain entry written
-by other CLI commands. Filing a server-side revocation endpoint is tracked
-separately.
+Logout (`spice cloud logout`) removes credentials from the env file: by default
+(`--scope active`) the credential for the organization in effect, and with
+`--scope all` every stored org credential plus `SPICE_SPICEAI_TOKEN`,
+`SPICE_SPICEAI_API_KEY`, and the OAuth client pair. It does **not** revoke the
+token server-side and does not currently clear the platform keychain entry
+written by other CLI commands. Filing a server-side revocation endpoint is
+tracked separately.
 
 ## Method 1 — Subscription Login
 

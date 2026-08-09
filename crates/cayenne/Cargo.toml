@@ -114,6 +114,7 @@ result-correctness-duckdb = ["dep:duckdb"]
 result-correctness-chdb = ["dep:chdb-rust"]
 
 [dev-dependencies]
+vortex-io = { workspace = true }
 # Kept only for the `row_converter` byte-identity equivalence test; Cayenne's runtime no
 # longer depends on arrow-row's (unstable) row format.
 arrow-row = { workspace = true }
@@ -121,6 +122,9 @@ criterion = { version = "0.7", features = ["html_reports", "async_tokio"] }
 datafusion-federation.workspace = true
 datafusion-functions-aggregate = { workspace = true }
 datafusion-functions = { workspace = true }
+# Compiles the `include`/`exclude` patterns the catalog-selector tests feed to
+# `data_components::catalog_filter::TableSelector`.
+globset = { workspace = true }
 insta = { workspace = true, features = ["json"] }
 paste.workspace = true
 rstest = "0.26.1"
@@ -396,6 +400,11 @@ name = "apply_partial_filter_empty_alloc"
 [[bench]]
 harness = false
 name = "pk_lookup_file_group_fanout"
+required-features = ["duckdb-bench"]
+
+[[bench]]
+harness = false
+name = "selective_join_pk_probe"
 required-features = ["duckdb-bench"]
 
 [[bench]]

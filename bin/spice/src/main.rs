@@ -131,8 +131,15 @@ struct Cli {
     cloud: bool,
 
     /// Spice.ai Cloud runtime endpoint region used with --cloud.
-    #[arg(long, global = true, value_parser = parse_cloud_region, default_value = DEFAULT_CLOUD_REGION, requires = "cloud")]
-    cloud_region: String,
+    ///
+    /// Not declared `requires = "cloud"`, because clap's generic
+    /// missing-required-argument error is the wrong diagnosis on
+    /// `spice connect`: there the flag is a confusion with `--region` (where
+    /// the instance runs) or `--endpoint` (which control plane to enroll
+    /// against), and the command says so itself. The `--cloud` requirement is
+    /// enforced for every other command by [`validate_cloud_region_usage`].
+    #[arg(long, global = true, value_parser = parse_cloud_region)]
+    cloud_region: Option<String>,
 
     /// HTTP endpoint of the Spice runtime to talk to (default `http://127.0.0.1:8090`).
     ///
@@ -318,7 +325,7 @@ fn main() {
     if std::io::stderr().is_terminal()
         && !cli.machine
         && !matches!(cli.command, Commands::Version(_) | Commands::Completions(_))
-        && !is_json_output(&cli.command)
+        && !is_json_output(&mut cli.command)
     {
         eprintln!("Spice.ai OSS CLI {}", version::cli_version());
     }
@@ -331,7 +338,28 @@ fn main() {
         } else {
             tracing::error!("{e}");
         }
-        std::process::exit(1);
+        std::process::exit(exit_code_for(&e));
+    }
+}
+
+/// Exit code for a failed command.
+///
+/// Authentication failures get their own code so automation can re-authenticate
+/// and retry without parsing the message, matching the convention `gh` uses
+/// (<https://cli.github.com/manual/gh_help_exit-codes>).
+fn exit_code_for(error: &spice::error::Error) -> i32 {
+    use spice::error::CloudErrorCode;
+
+    match error.cloud_code() {
+        Some(
+            CloudErrorCode::NotAuthenticated
+            | CloudErrorCode::TokenExpired
+            | CloudErrorCode::OrgCredentialMissing,
+        ) => 4,
+        _ => match error {
+            spice::error::Error::Unauthorized => 4,
+            _ => 1,
+        },
     }
 }
 
@@ -516,6 +544,26 @@ fn normalize_cloud_region_flags(args: impl IntoIterator<Item = OsString>) -> Vec
     normalized
 }
 
+/// Reject `--cloud-region` on commands that have no cloud to apply it to.
+///
+/// This is the guard clap used to enforce with `requires = "cloud"`. It moved
+/// here so `spice connect` can diagnose the flag itself: on that command
+/// `--cloud-region` is a confusion with `--region` or `--endpoint`, and
+/// "the following required arguments were not provided: --cloud" points at
+/// none of it. `connect` is therefore exempt here and refuses the flag in
+/// `connect::execute`, with a message naming the two flags that do apply.
+fn validate_cloud_region_usage(cli: &Cli) -> Result<()> {
+    if cli.cloud_region.is_none() || cli.cloud || matches!(cli.command, Commands::Connect(_)) {
+        return Ok(());
+    }
+    Err(spice::error::Error::InvalidArgument {
+        message: "--cloud-region requires --cloud: it selects which Spice.ai Cloud region to \
+                  query. Pass --cloud alongside it to target Spice.ai Cloud, or drop it to use \
+                  the local runtime."
+            .to_string(),
+    })
+}
+
 fn parse_cloud_region(value: &str) -> std::result::Result<String, String> {
     if let Some(region) = normalize_data_region(value) {
         return Ok(region);
@@ -685,40 +733,8 @@ fn apply_machine_acceleration_mode(args: &mut AccelerationArgs) {
 }
 
 fn apply_machine_cloud_mode(command: &mut cloud::CloudCommands) {
-    match command {
-        cloud::CloudCommands::Whoami(args) => args.output = OutputFormat::Json,
-        cloud::CloudCommands::Apps(args) => args.output = OutputFormat::Json,
-        cloud::CloudCommands::Deployments(args) => args.output = OutputFormat::Json,
-        cloud::CloudCommands::Regions(args) => args.output = OutputFormat::Json,
-        cloud::CloudCommands::Images(args) => args.output = OutputFormat::Json,
-        cloud::CloudCommands::Logs(args) => args.output = OutputFormat::Json,
-        cloud::CloudCommands::Deploy(args) => args.output = OutputFormat::Json,
-        cloud::CloudCommands::Inspect(args) => args.output = OutputFormat::Json,
-        cloud::CloudCommands::ApiKeys(args) => args.output = OutputFormat::Json,
-        cloud::CloudCommands::Metrics(args) => args.output = OutputFormat::Json,
-        cloud::CloudCommands::Secrets(command) => match command {
-            cloud::SecretsCommands::List(args) => args.output = OutputFormat::Json,
-            cloud::SecretsCommands::Set(args) => args.output = OutputFormat::Json,
-            cloud::SecretsCommands::Get(args) => args.output = OutputFormat::Json,
-            cloud::SecretsCommands::Delete(args) => args.output = OutputFormat::Json,
-        },
-        cloud::CloudCommands::Create(command) => match command {
-            cloud::CreateCommands::App(args) => args.output = OutputFormat::Json,
-            cloud::CreateCommands::Deployment(args) => args.output = OutputFormat::Json,
-        },
-        cloud::CloudCommands::Get(cloud::GetCommands::App(args)) => {
-            args.output = OutputFormat::Json;
-        }
-        cloud::CloudCommands::Update(cloud::UpdateCommands::App(args)) => {
-            args.output = OutputFormat::Json;
-        }
-        cloud::CloudCommands::Delete(cloud::DeleteCommands::App(args)) => {
-            args.output = OutputFormat::Json;
-        }
-        cloud::CloudCommands::Login(_)
-        | cloud::CloudCommands::Logout
-        | cloud::CloudCommands::Link(_)
-        | cloud::CloudCommands::Unlink => {}
+    if let Some(output) = command.output_mut() {
+        *output = OutputFormat::Json;
     }
 }
 
@@ -748,12 +764,22 @@ fn should_write_machine_clap_error(error: &clap::Error) -> bool {
 }
 
 fn write_machine_error(error: &spice::error::Error) {
+    let mut detail = serde_json::Map::new();
+    detail.insert(
+        "code".to_string(),
+        serde_json::Value::from(machine_error_code(error)),
+    );
+    detail.insert(
+        "message".to_string(),
+        serde_json::Value::from(error.to_string()),
+    );
+    if let Some(hint) = error.hint() {
+        detail.insert("hint".to_string(), serde_json::Value::from(hint));
+    }
+
     let body = serde_json::json!({
         "status": "error",
-        "error": {
-            "code": machine_error_code(error),
-            "message": error.to_string(),
-        }
+        "error": serde_json::Value::Object(detail),
     });
 
     match serde_json::to_string(&body) {
@@ -774,7 +800,9 @@ fn machine_error_code(error: &spice::error::Error) -> &'static str {
         spice::error::Error::RuntimeHttp { .. } => "runtime_http_error",
         spice::error::Error::ConnectionFailed { .. } => "connection_failed",
         spice::error::Error::HttpRequestFailed { .. } => "http_request_failed",
+        spice::error::Error::HttpClientBuild { .. } => "http_client_build",
         spice::error::Error::InvalidResponse { .. } => "invalid_response",
+        spice::error::Error::ResponseIncomplete { .. } => "response_incomplete",
         spice::error::Error::Registry { .. } => "registry",
         spice::error::Error::ConfigIo { .. } => "config_io",
         spice::error::Error::ConfigParse { .. } => "config_parse",
@@ -783,6 +811,7 @@ fn machine_error_code(error: &spice::error::Error) -> &'static str {
         spice::error::Error::RuntimeVersion { .. } => "runtime_version",
         spice::error::Error::Environment { .. } => "environment",
         spice::error::Error::InvalidArgument { .. } => "invalid_argument",
+        spice::error::Error::Cloud { code, .. } => code.as_str(),
         spice::error::Error::DeviceAuthorizationDenied => "device_authorization_denied",
         spice::error::Error::HomeDirectoryNotFound => "home_directory_not_found",
         spice::error::Error::Repl { .. } => "repl",
@@ -796,7 +825,7 @@ fn machine_error_code(error: &spice::error::Error) -> &'static str {
 }
 
 /// Returns true if the command will output JSON, so the banner should be suppressed.
-fn is_json_output(cmd: &Commands) -> bool {
+fn is_json_output(cmd: &mut Commands) -> bool {
     match cmd {
         Commands::Status(a) => a.output == OutputFormat::Json,
         Commands::Datasets(a) => a.output == OutputFormat::Json,
@@ -819,55 +848,21 @@ fn is_json_output(cmd: &Commands) -> bool {
                     ..
                 }),
         }) => *output == OutputFormat::Json,
-        Commands::Cloud(a) => match &a.command {
-            cloud::CloudCommands::Whoami(x) => x.output == OutputFormat::Json,
-            cloud::CloudCommands::Apps(x) => x.output == OutputFormat::Json,
-            cloud::CloudCommands::Regions(x) => x.output == OutputFormat::Json,
-            cloud::CloudCommands::Images(x) => x.output == OutputFormat::Json,
-            cloud::CloudCommands::Deployments(x) => x.output == OutputFormat::Json,
-            cloud::CloudCommands::Inspect(x) => x.output == OutputFormat::Json,
-            cloud::CloudCommands::ApiKeys(x) => x.output == OutputFormat::Json,
-            cloud::CloudCommands::Metrics(x) => x.output == OutputFormat::Json,
-            cloud::CloudCommands::Logs(x) => x.output == OutputFormat::Json,
-            cloud::CloudCommands::Deploy(x) => x.output == OutputFormat::Json,
-
-            cloud::CloudCommands::Secrets(cloud::SecretsCommands::List(x)) => {
-                x.output == OutputFormat::Json
-            }
-            cloud::CloudCommands::Secrets(cloud::SecretsCommands::Set(x)) => {
-                x.output == OutputFormat::Json
-            }
-            cloud::CloudCommands::Secrets(cloud::SecretsCommands::Get(x)) => {
-                x.output == OutputFormat::Json
-            }
-            cloud::CloudCommands::Secrets(cloud::SecretsCommands::Delete(x)) => {
-                x.output == OutputFormat::Json
-            }
-            cloud::CloudCommands::Create(cloud::CreateCommands::App(x)) => {
-                x.output == OutputFormat::Json
-            }
-            cloud::CloudCommands::Create(cloud::CreateCommands::Deployment(x)) => {
-                x.output == OutputFormat::Json
-            }
-            cloud::CloudCommands::Get(cloud::GetCommands::App(x)) => x.output == OutputFormat::Json,
-            cloud::CloudCommands::Update(cloud::UpdateCommands::App(x)) => {
-                x.output == OutputFormat::Json
-            }
-            cloud::CloudCommands::Delete(cloud::DeleteCommands::App(x)) => {
-                x.output == OutputFormat::Json
-            }
-            cloud::CloudCommands::Login(_)
-            | cloud::CloudCommands::Logout
-            | cloud::CloudCommands::Link(_)
-            | cloud::CloudCommands::Unlink => false,
-        },
+        // Cloud commands answer for themselves, from the one match in cloud::mod.
+        Commands::Cloud(a) => a.command.produces_json(),
         _ => false,
     }
 }
 
 fn run_cli(cli: Cli) -> Result<()> {
+    validate_cloud_region_usage(&cli)?;
+
     // Create runtime context from CLI args
-    let cloud_region = cli.cloud.then_some(cli.cloud_region.as_str());
+    let resolved_cloud_region = cli
+        .cloud_region
+        .clone()
+        .unwrap_or_else(|| DEFAULT_CLOUD_REGION.to_string());
+    let cloud_region = cli.cloud.then_some(resolved_cloud_region.as_str());
     let ctx = RuntimeContext::with_args(
         cli.http_endpoint,
         cli.api_key,
@@ -910,7 +905,12 @@ fn run_cli(cli: Cli) -> Result<()> {
                 .map_err(|e| spice::error::Error::RuntimeExecution { source: e })?;
             rt.block_on(add::execute(&ctx, args))?;
         }
-        Commands::Connect(args) => {
+        Commands::Connect(mut args) => {
+            // `--cloud-region` on `connect` says which Spice Cloud to enroll
+            // into. Hand it to the command rather than dropping it here, so it
+            // participates in the documented enroll-endpoint precedence
+            // instead of being silently accepted and ignored.
+            args.cloud_region.clone_from(&cli.cloud_region);
             let rt = tokio::runtime::Runtime::new()
                 .map_err(|e| spice::error::Error::RuntimeExecution { source: e })?;
             rt.block_on(connect::execute(&ctx, args))?;
@@ -1083,7 +1083,7 @@ mod tests {
     }
 
     fn is_json(args: &[&str]) -> bool {
-        is_json_output(&parse(args).command)
+        is_json_output(&mut parse(args).command)
     }
 
     fn parse_with_machine_mode(args: &[&str]) -> Cli {
@@ -1119,6 +1119,7 @@ mod tests {
         let cli = parse_with_machine_mode(&["spice", "--machine", "cloud", "secrets", "list"]);
         let Commands::Cloud(cloud::CloudArgs {
             command: cloud::CloudCommands::Secrets(cloud::SecretsCommands::List(args)),
+            ..
         }) = cli.command
         else {
             panic!("expected cloud secrets list command");
@@ -1305,7 +1306,10 @@ mod tests {
     fn cloud_flag_defaults_region_without_consuming_command() {
         let cli = parse_normalized(&["spice", "--cloud", "status"]);
         assert!(cli.cloud);
-        assert_eq!(cli.cloud_region, DEFAULT_CLOUD_REGION);
+        assert_eq!(
+            cli.cloud_region, None,
+            "the region is resolved at use, not at parse"
+        );
 
         let Commands::Status(_) = cli.command else {
             panic!("expected status command");
@@ -1314,21 +1318,54 @@ mod tests {
 
     #[test]
     fn cloud_region_without_cloud_is_rejected() {
-        let Err(error) = try_parse_normalized(&["spice", "--cloud-region", "us-west-2", "status"])
-        else {
-            panic!("cloud-region without cloud should fail parsing");
+        // It parses (clap no longer carries the guard) but is refused before
+        // anything runs, with a message naming both flags.
+        let cli = parse_normalized(&["spice", "--cloud-region", "us-west-2", "status"]);
+        let Err(error) = validate_cloud_region_usage(&cli) else {
+            panic!("cloud-region without cloud should be rejected");
         };
 
         let message = error.to_string();
-        assert!(message.contains("--cloud"));
-        assert!(message.contains("--cloud-region"));
+        assert!(message.contains("--cloud"), "{message}");
+        assert!(message.contains("--cloud-region"), "{message}");
+    }
+
+    /// `connect` is exempt from the `--cloud` requirement here so it can
+    /// diagnose the flag itself: clap's "missing --cloud" would be the wrong
+    /// answer for what is really a confusion with `--region`/`--endpoint`. The
+    /// command's own refusal is covered in `cli_integration`.
+    #[test]
+    fn cloud_region_is_left_to_connect_to_diagnose() {
+        let cli = parse_normalized(&[
+            "spice",
+            "connect",
+            "SPICE-ADOPT-7K2PX-9XYZ2-A1B2C-D3E4F",
+            "--cloud-region",
+            "us-west-2",
+        ]);
+        assert!(!cli.cloud);
+        assert_eq!(cli.cloud_region.as_deref(), Some("us-west-2"));
+        validate_cloud_region_usage(&cli)
+            .expect("connect refuses the flag itself, with a better message");
+    }
+
+    #[test]
+    fn cloud_region_with_cloud_is_accepted() {
+        let cli = parse_normalized(&["spice", "--cloud", "--cloud-region", "us-west-2", "status"]);
+        validate_cloud_region_usage(&cli).expect("--cloud-region is valid alongside --cloud");
+    }
+
+    #[test]
+    fn absent_cloud_region_is_never_rejected() {
+        let cli = parse_normalized(&["spice", "status"]);
+        validate_cloud_region_usage(&cli).expect("no region, nothing to validate");
     }
 
     #[test]
     fn cloud_flag_accepts_legacy_region_value() {
         let cli = parse_normalized(&["spice", "--cloud", "us-west-2", "status"]);
         assert!(cli.cloud);
-        assert_eq!(cli.cloud_region, "us-west-2");
+        assert_eq!(cli.cloud_region.as_deref(), Some("us-west-2"));
 
         let Commands::Status(_) = cli.command else {
             panic!("expected status command");
@@ -1339,7 +1376,7 @@ mod tests {
     fn cloud_flag_accepts_legacy_unlisted_region_value() {
         let cli = parse_normalized(&["spice", "--cloud", "eu-central-1", "status"]);
         assert!(cli.cloud);
-        assert_eq!(cli.cloud_region, "eu-central-1");
+        assert_eq!(cli.cloud_region.as_deref(), Some("eu-central-1"));
 
         let Commands::Status(_) = cli.command else {
             panic!("expected status command");
@@ -1350,7 +1387,7 @@ mod tests {
     fn cloud_flag_accepts_full_data_region_value() {
         let cli = parse_normalized(&["spice", "--cloud", "us-west-2-prod-aws-data", "status"]);
         assert!(cli.cloud);
-        assert_eq!(cli.cloud_region, "us-west-2");
+        assert_eq!(cli.cloud_region.as_deref(), Some("us-west-2"));
 
         let Commands::Status(_) = cli.command else {
             panic!("expected status command");
@@ -1394,7 +1431,7 @@ mod tests {
     fn cloud_flag_accepts_equals_region_value() {
         let cli = parse_normalized(&["spice", "--cloud=us-west-2", "status"]);
         assert!(cli.cloud);
-        assert_eq!(cli.cloud_region, "us-west-2");
+        assert_eq!(cli.cloud_region.as_deref(), Some("us-west-2"));
 
         let Commands::Status(_) = cli.command else {
             panic!("expected status command");
@@ -1405,7 +1442,7 @@ mod tests {
     fn cloud_flag_accepts_equals_unlisted_region_value() {
         let cli = parse_normalized(&["spice", "--cloud=eu-central-1", "status"]);
         assert!(cli.cloud);
-        assert_eq!(cli.cloud_region, "eu-central-1");
+        assert_eq!(cli.cloud_region.as_deref(), Some("eu-central-1"));
 
         let Commands::Status(_) = cli.command else {
             panic!("expected status command");
@@ -1416,7 +1453,7 @@ mod tests {
     fn cloud_flag_accepts_equals_full_data_region_value() {
         let cli = parse_normalized(&["spice", "--cloud=us-west-2-prod-aws-data", "status"]);
         assert!(cli.cloud);
-        assert_eq!(cli.cloud_region, "us-west-2");
+        assert_eq!(cli.cloud_region.as_deref(), Some("us-west-2"));
 
         let Commands::Status(_) = cli.command else {
             panic!("expected status command");
@@ -1427,7 +1464,10 @@ mod tests {
     fn cloud_flag_does_not_consume_top_level_command_as_region() {
         let cli = parse_normalized(&["spice", "--cloud", "models"]);
         assert!(cli.cloud);
-        assert_eq!(cli.cloud_region, DEFAULT_CLOUD_REGION);
+        assert_eq!(
+            cli.cloud_region, None,
+            "the region is resolved at use, not at parse"
+        );
 
         let Commands::Models(_) = cli.command else {
             panic!("expected models command");
@@ -1476,7 +1516,7 @@ mod tests {
     fn direct_sql_flag_normalizes_trailing_cloud_region() {
         let cli = parse_normalized(&["spice", "-sql", "show tables", "--cloud", "us-west-2"]);
         assert!(cli.cloud);
-        assert_eq!(cli.cloud_region, "us-west-2");
+        assert_eq!(cli.cloud_region.as_deref(), Some("us-west-2"));
 
         let Commands::Sql(args) = cli.command else {
             panic!("expected sql command");
@@ -1629,6 +1669,7 @@ mod tests {
 
         let Commands::Cloud(cloud::CloudArgs {
             command: cloud::CloudCommands::Login(login_args),
+            ..
         }) = cli.command
         else {
             panic!("expected cloud login command");
@@ -1655,6 +1696,7 @@ mod tests {
 
         let Commands::Cloud(cloud::CloudArgs {
             command: cloud::CloudCommands::Login(login_args),
+            ..
         }) = cli.command
         else {
             panic!("expected cloud login command");
@@ -1688,7 +1730,7 @@ mod tests {
         // must cause the banner to be suppressed, otherwise piping to `jq` breaks.
         let json_producing: &[&[&str]] = &[
             &["spice", "cloud", "whoami", "--output", "json"],
-            &["spice", "cloud", "apps", "--output", "json"],
+            &["spice", "cloud", "projects", "--output", "json"],
             &["spice", "cloud", "regions", "--output", "json"],
             &["spice", "cloud", "images", "--output", "json"],
             &["spice", "cloud", "deployments", "--output", "json"],
@@ -1711,7 +1753,7 @@ mod tests {
                 "spice",
                 "cloud",
                 "create",
-                "app",
+                "project",
                 "name",
                 "--region",
                 "us-east-1",
@@ -1720,11 +1762,24 @@ mod tests {
             ],
             &["spice", "cloud", "create", "deployment", "--output", "json"],
             &[
-                "spice", "cloud", "get", "app", "org/app", "--output", "json",
+                "spice",
+                "cloud",
+                "get",
+                "project",
+                "org/project",
+                "--output",
+                "json",
             ],
-            &["spice", "cloud", "update", "app", "--output", "json"],
+            &["spice", "cloud", "update", "project", "--output", "json"],
             &[
-                "spice", "cloud", "delete", "app", "org/app", "--yes", "--output", "json",
+                "spice",
+                "cloud",
+                "delete",
+                "project",
+                "org/project",
+                "--yes",
+                "--output",
+                "json",
             ],
         ];
         for argv in json_producing {

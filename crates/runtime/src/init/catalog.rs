@@ -22,12 +22,13 @@ use crate::{
     catalogconnector::{self, CatalogConnector, get_catalog_provider},
     component::catalog::{Catalog, CatalogBuilder},
     dataconnector::parameters::ConnectorParamsBuilder,
-    status, warn_spaced,
+    status,
 };
 use app::App;
 use futures::future::join_all;
 use runtime_metrics as metrics;
 use snafu::prelude::*;
+use util::warn_spaced;
 use util::{RetryError, fibonacci_backoff::FibonacciBackoffBuilder, retry};
 
 impl Runtime {
@@ -99,10 +100,18 @@ impl Runtime {
     }
 
     async fn load_catalog_connector(&self, catalog: &Catalog) -> Result<Arc<dyn CatalogConnector>> {
-        let spaced_tracer = Arc::clone(&self.spaced_tracer);
         let catalog = catalog.clone();
 
         let source = catalog.provider.clone();
+
+        // Resolve the provider before building parameters. The builder resolves it too — it
+        // reads the factory's prefix and parameter list — and fails with
+        // `InvalidConnectorType`, which names no alternative, so it used to answer every
+        // typo'd provider before `UnknownCatalogConnector` could. See #12415.
+        if !catalogconnector::is_registered(&source).await {
+            return Err(unknown_catalog_connector(&source).await);
+        }
+
         let params = ConnectorParamsBuilder::for_catalog(source.clone().into(), &catalog)
             .build(self.secrets(), self.tokio_io_runtime())
             .await
@@ -110,21 +119,9 @@ impl Runtime {
 
         let Some(catalog_connector) = catalogconnector::create_new_connector(&source, params).await
         else {
-            let catalog_name = &catalog.name;
-            metrics::catalogs::LOAD_ERROR.add(1, &[]);
-            let suggestion = catalogconnector::suggest_catalog_connector(&source).await;
-            let available = catalogconnector::registered_catalog_names().await;
-            let err = crate::Error::UnknownCatalogConnector {
-                catalog_connector: source,
-                suggestion,
-                available,
-            };
-            self.status.update_catalog(
-                catalog_name,
-                status::ComponentStatus::error_with_message(err.to_string()),
-            );
-            warn_spaced!(spaced_tracer, "{} {err}", catalog_name);
-            return Err(err);
+            // Only reachable if the provider is deregistered between the check above and this
+            // lookup; report the same error rather than a second, blunter one.
+            return Err(unknown_catalog_connector(&source).await);
         };
 
         Ok(catalog_connector)
@@ -258,6 +255,20 @@ impl Runtime {
     }
 }
 
+/// The error for a catalog naming a provider this build does not register: the closest
+/// registered name plus the full list, so the message names a fix.
+///
+/// Reporting is the caller's. `load_catalog` counts `catalogs::LOAD_ERROR` and writes the
+/// component status for every error `load_catalog_connector` returns, so doing either here
+/// too would report one misconfigured catalog twice per attempt. See #12442.
+async fn unknown_catalog_connector(source: &str) -> crate::Error {
+    crate::Error::UnknownCatalogConnector {
+        catalog_connector: source.to_string(),
+        suggestion: catalogconnector::suggest_catalog_connector(source).await,
+        available: catalogconnector::registered_catalog_names().await,
+    }
+}
+
 /// Returns `true` when a catalog load failure cannot be cleared by retrying it.
 ///
 /// `load_catalog` retries with unbounded backoff, so a failure that is a pure
@@ -330,6 +341,65 @@ mod tests {
 
     fn initialize_error(source: Box<dyn std::error::Error + Send + Sync>) -> crate::Error {
         crate::Error::UnableToInitializeCatalogConnector { source }
+    }
+
+    fn test_catalog(from: &str, runtime: &Arc<Runtime>) -> Catalog {
+        CatalogBuilder::try_new(from.to_string(), "test_catalog")
+            .expect("valid catalog builder")
+            .with_app(Arc::new(app::AppBuilder::new("catalog_typo").build()))
+            .with_runtime(Arc::clone(runtime))
+            .build()
+            .expect("valid runtime catalog")
+    }
+
+    /// The #12415 regression: `ConnectorParamsBuilder::build` resolves the provider first and
+    /// fails with `InvalidConnectorType`, which names no alternative, so the
+    /// suggestion-bearing `UnknownCatalogConnector` written for this case was unreachable.
+    #[tokio::test]
+    async fn a_misspelled_catalog_provider_suggests_the_closest_provider() {
+        // `Runtime::builder().build()` registers the default catalog connectors itself, so
+        // `iceberg` is present for the suggestion to find without this test touching the
+        // process-global registry on its own account.
+        let runtime = Arc::new(Runtime::builder().build().await);
+        let catalog = test_catalog("iceber:some_catalog", &runtime);
+
+        // `CatalogConnector` is not `Debug`, so the success case cannot be unwrapped for the
+        // error the way `expect_err` would.
+        let Err(err) = runtime.load_catalog_connector(&catalog).await else {
+            panic!("a provider that is not registered must fail")
+        };
+
+        assert!(
+            matches!(err, crate::Error::UnknownCatalogConnector { .. }),
+            "expected UnknownCatalogConnector, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("Did you mean 'iceberg'?"),
+            "the error should name the closest registered provider: {err}"
+        );
+    }
+
+    /// #12442: `load_catalog` counts `catalogs::LOAD_ERROR` and writes the component status for
+    /// every error `load_catalog_connector` returns, so reporting the unknown-provider failure
+    /// here as well would report one misconfigured catalog twice per attempt.
+    #[tokio::test]
+    async fn an_unknown_catalog_provider_leaves_reporting_to_the_caller() {
+        let runtime = Arc::new(Runtime::builder().build().await);
+        let catalog = test_catalog("not_a_real_catalog_connector:some_catalog", &runtime);
+
+        let Err(err) = runtime.load_catalog_connector(&catalog).await else {
+            panic!("a provider that is not registered must fail")
+        };
+        assert!(
+            matches!(err, crate::Error::UnknownCatalogConnector { .. }),
+            "expected UnknownCatalogConnector, got: {err}"
+        );
+
+        let statuses = runtime.status().get_catalog_statuses();
+        assert!(
+            !statuses.contains_key("test_catalog"),
+            "load_catalog_connector must leave the status to load_catalog, wrote: {statuses:?}"
+        );
     }
 
     /// The #12417 regression: before this fix every failure `load_catalog_connector`

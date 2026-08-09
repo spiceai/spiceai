@@ -23,6 +23,77 @@ use std::path::PathBuf;
 /// Result type alias for the Spice CLI.
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+/// Stable machine-readable codes for Spice Cloud failures.
+///
+/// Scripts and agents branch on these, so the strings are part of the CLI's
+/// contract: rename one only with the same care as renaming a flag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloudErrorCode {
+    /// No Spice Cloud credential is available locally.
+    NotAuthenticated,
+    /// The credential was rejected (401) — expired, revoked, or malformed.
+    TokenExpired,
+    /// Authenticated, but the identity may not perform this action (403).
+    Forbidden,
+    /// The named organization does not exist, or is invisible to this identity.
+    OrgNotFound,
+    /// The identity is not a member of the requested organization.
+    OrgForbidden,
+    /// Two explicit signals named different organizations.
+    OrgConflict,
+    /// An organization was named, but no credential is bound to it.
+    OrgCredentialMissing,
+    /// No project by that name exists in the organization being acted on.
+    ProjectNotFound,
+    /// The project exists, but under a different organization than the active one.
+    WrongOrg,
+    /// A deployment is already in flight for this app.
+    DeployConflict,
+    /// A deployment reached a terminal failed status.
+    DeployFailed,
+    /// A deployment did not reach a terminal status before the wait elapsed.
+    /// Distinct from [`Self::DeployFailed`]: the deployment may still succeed.
+    DeployTimeout,
+    /// The requested resource does not exist.
+    NotFound,
+    /// The request conflicts with the resource's current state.
+    Conflict,
+    /// The Spice Cloud API returned an unexpected response.
+    ApiError,
+    /// The command's arguments are inconsistent or unusable.
+    InvalidRequest,
+}
+
+impl CloudErrorCode {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NotAuthenticated => "not_authenticated",
+            Self::TokenExpired => "token_expired",
+            Self::Forbidden => "forbidden",
+            Self::OrgNotFound => "org_not_found",
+            Self::OrgForbidden => "org_forbidden",
+            Self::OrgConflict => "org_conflict",
+            Self::OrgCredentialMissing => "org_credential_missing",
+            Self::ProjectNotFound => "project_not_found",
+            Self::WrongOrg => "wrong_org",
+            Self::DeployConflict => "deploy_conflict",
+            Self::DeployFailed => "deploy_failed",
+            Self::DeployTimeout => "deploy_timeout",
+            Self::NotFound => "not_found",
+            Self::Conflict => "conflict",
+            Self::ApiError => "api_error",
+            Self::InvalidRequest => "invalid_request",
+        }
+    }
+}
+
+impl std::fmt::Display for CloudErrorCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Error types for the Spice CLI.
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub))]
@@ -72,6 +143,15 @@ pub enum Error {
     #[snafu(display("Invalid HTTP response: {message}"))]
     InvalidResponse { message: String },
 
+    /// A response the runtime reported as successful did not arrive in full
+    #[snafu(display(
+        "Failed to read the response from {endpoint}: {source}. The request was accepted, so the result may be incomplete rather than empty -- check the runtime's logs, then retry. See: https://spiceai.org/docs/api"
+    ))]
+    ResponseIncomplete {
+        endpoint: String,
+        source: reqwest::Error,
+    },
+
     /// A Spicepod registry failed to serve a pod. The message is already fully formed, so it is
     /// displayed verbatim rather than blamed on the user's argument.
     #[snafu(display("{message}"))]
@@ -112,6 +192,19 @@ pub enum Error {
     #[snafu(display("Invalid argument: {message}"))]
     InvalidArgument { message: String },
 
+    /// A Spice Cloud operation failed, carrying a stable code scripts can branch on.
+    #[snafu(display(
+        "{message}{}",
+        hint.as_deref().map(|hint| format!(" {hint}")).unwrap_or_default()
+    ))]
+    Cloud {
+        code: CloudErrorCode,
+        message: String,
+        /// Actionable next step, appended to the message for humans and kept
+        /// separate for `--machine` output.
+        hint: Option<String>,
+    },
+
     /// User denied device authorization during cloud login.
     #[snafu(display("Device authorization was denied"))]
     DeviceAuthorizationDenied,
@@ -121,6 +214,14 @@ pub enum Error {
         "Could not determine home directory. Set HOME (Unix) or USERPROFILE (Windows) environment variable."
     ))]
     HomeDirectoryNotFound,
+
+    /// The HTTP client could not be built.
+    ///
+    /// Not recoverable by falling back to a default client: the built one carries the
+    /// same-origin redirect policy that keeps the API key from being forwarded off
+    /// origin, and a default client would not (#12495).
+    #[snafu(display("Could not build the HTTP client: {source}"))]
+    HttpClientBuild { source: reqwest::Error },
 
     /// REPL error
     #[snafu(display("SQL REPL error: {message}"))]
@@ -149,6 +250,50 @@ pub enum Error {
     /// Enrollment against the Spice Cloud control plane failed.
     #[snafu(display("Failed to enroll with Spice Cloud: {message}"))]
     CloudConnectEnroll { message: String },
+}
+
+impl Error {
+    /// Build a Spice Cloud error carrying a stable machine code.
+    #[must_use]
+    pub fn cloud(code: CloudErrorCode, message: impl Into<String>) -> Self {
+        Self::Cloud {
+            code,
+            message: message.into(),
+            hint: None,
+        }
+    }
+
+    /// Build a Spice Cloud error with a stable machine code and a next step.
+    #[must_use]
+    pub fn cloud_with_hint(
+        code: CloudErrorCode,
+        message: impl Into<String>,
+        hint: impl Into<String>,
+    ) -> Self {
+        Self::Cloud {
+            code,
+            message: message.into(),
+            hint: Some(hint.into()),
+        }
+    }
+
+    /// The Spice Cloud code for this error, if it is a cloud failure.
+    #[must_use]
+    pub fn cloud_code(&self) -> Option<CloudErrorCode> {
+        match self {
+            Self::Cloud { code, .. } => Some(*code),
+            _ => None,
+        }
+    }
+
+    /// The actionable hint attached to this error, if any.
+    #[must_use]
+    pub fn hint(&self) -> Option<&str> {
+        match self {
+            Self::Cloud { hint, .. } => hint.as_deref(),
+            _ => None,
+        }
+    }
 }
 
 /// Check an HTTP response status and return an appropriate error for non-success responses.
@@ -194,9 +339,101 @@ pub async fn check_response(
     .build())
 }
 
+/// Read a response's status and body, distinguishing a body that failed to arrive from one
+/// that was empty.
+///
+/// On a non-success status the body only decorates a message that already reports the
+/// failure, so a read error there yields an empty string rather than replacing the status
+/// the caller is about to report. On a success status the body *is* the result: a read that
+/// stopped part-way — a deadline firing mid-response, a reset connection, a truncated
+/// response — must be reported rather than defaulted to an empty success.
+pub async fn read_response(
+    response: reqwest::Response,
+    endpoint: &str,
+) -> Result<(StatusCode, String)> {
+    let status = response.status();
+    match response.text().await {
+        Ok(body) => Ok((status, body)),
+        Err(_) if !status.is_success() => Ok((status, String::new())),
+        Err(source) => Err(Error::ResponseIncomplete {
+            endpoint: endpoint.to_string(),
+            source,
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A response whose body fails part-way through, under the caller's choice of status.
+    fn response_with_unreadable_body(status: StatusCode) -> reqwest::Response {
+        let failure = std::io::Error::other("the connection went away mid-body");
+        let body = reqwest::Body::wrap_stream(futures::stream::once(async {
+            Err::<Vec<u8>, std::io::Error>(failure)
+        }));
+
+        let response = http::Response::builder()
+            .status(status)
+            .body(body)
+            .expect("a response with a status and a body is well-formed");
+
+        reqwest::Response::from(response)
+    }
+
+    /// A body that stopped part-way through is not an empty result: reading it with
+    /// `unwrap_or_default` reported an empty success, which is
+    /// <https://github.com/spiceai/spiceai/issues/12587>.
+    #[tokio::test]
+    async fn a_body_that_fails_on_a_success_status_is_an_error() {
+        let response = response_with_unreadable_body(StatusCode::OK);
+
+        let error = read_response(response, "http://runtime/v1/nsql")
+            .await
+            .expect_err("a body that did not arrive is not a result");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("http://runtime/v1/nsql"),
+            "the error should name the endpoint, got: {message}"
+        );
+        assert!(
+            matches!(error, Error::ResponseIncomplete { .. }),
+            "expected an incomplete-response error, got: {message}"
+        );
+    }
+
+    /// On a failing status the body is only decoration for a message that already reports the
+    /// failure, so a body that could not be read must not replace the status with a transport
+    /// error — the caller still has to be able to say what the server answered.
+    #[tokio::test]
+    async fn a_body_that_fails_on_an_error_status_keeps_the_status() {
+        let response = response_with_unreadable_body(StatusCode::INTERNAL_SERVER_ERROR);
+
+        let (status, body) = read_response(response, "http://runtime/v1/nsql")
+            .await
+            .expect("the status is the result here, not the body");
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body, "");
+    }
+
+    #[tokio::test]
+    async fn a_body_that_arrives_is_returned_with_its_status() {
+        let response = reqwest::Response::from(
+            http::Response::builder()
+                .status(StatusCode::OK)
+                .body("SELECT 1")
+                .expect("a response with a status and a body is well-formed"),
+        );
+
+        let (status, body) = read_response(response, "http://runtime/v1/nsql")
+            .await
+            .expect("a body that arrived in full is a result");
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "SELECT 1");
+    }
 
     #[test]
     fn test_unauthorized_error_message() {
@@ -205,6 +442,49 @@ mod tests {
             err.to_string(),
             "unauthorized: invalid or missing Spice API key. Run `spice login` or set SPICE_API_KEY."
         );
+    }
+
+    #[test]
+    fn cloud_error_appends_hint_to_the_message_on_one_line() {
+        let err = Error::cloud_with_hint(
+            CloudErrorCode::ProjectNotFound,
+            "App 'team-app' not found in org 'lukekim'.",
+            "Run 'spice cloud orgs' to see the orgs you can access.",
+        );
+
+        let rendered = err.to_string();
+        assert_eq!(
+            rendered,
+            "App 'team-app' not found in org 'lukekim'. Run 'spice cloud orgs' to see the orgs you can access."
+        );
+        assert!(!rendered.contains('\n'), "error messages stay on one line");
+        assert_eq!(err.cloud_code(), Some(CloudErrorCode::ProjectNotFound));
+    }
+
+    #[test]
+    fn cloud_error_without_hint_renders_only_the_message() {
+        let err = Error::cloud(CloudErrorCode::TokenExpired, "Unauthorized: token expired.");
+        assert_eq!(err.to_string(), "Unauthorized: token expired.");
+        assert!(err.hint().is_none());
+    }
+
+    #[test]
+    fn cloud_error_codes_are_stable_strings() {
+        // Scripts and agents branch on these; changing one is a breaking change.
+        assert_eq!(
+            CloudErrorCode::NotAuthenticated.as_str(),
+            "not_authenticated"
+        );
+        assert_eq!(CloudErrorCode::TokenExpired.as_str(), "token_expired");
+        assert_eq!(CloudErrorCode::OrgNotFound.as_str(), "org_not_found");
+        assert_eq!(CloudErrorCode::OrgForbidden.as_str(), "org_forbidden");
+        assert_eq!(
+            CloudErrorCode::ProjectNotFound.as_str(),
+            "project_not_found"
+        );
+        assert_eq!(CloudErrorCode::WrongOrg.as_str(), "wrong_org");
+        assert_eq!(CloudErrorCode::DeployConflict.as_str(), "deploy_conflict");
+        assert_eq!(CloudErrorCode::DeployFailed.as_str(), "deploy_failed");
     }
 
     #[test]

@@ -43,6 +43,12 @@ dotenv.workspace = true
 # Cross-platform directories
 dirs = "6"
 
+# Deterministic per-instance-directory systemd unit names (`spice connect --install`)
+sha2.workspace = true
+
+# Host name for the adoption-code mint label (`spice connect` codeless path)
+gethostname.workspace = true
+
 # Semver comparison
 semver = "1"
 
@@ -118,6 +124,7 @@ release = []
 
 [dev-dependencies]
 assert_cmd = "2"
+http.workspace = true
 insta = { workspace = true, features = ["filters", "json"] }
 predicates = "3"
 rstest = "0.26.1"

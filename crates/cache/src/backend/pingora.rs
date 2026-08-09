@@ -32,6 +32,15 @@ use std::time::{Duration, Instant};
 // 3. Improved throughput for concurrent operations (2-3x faster than single-threaded caches)
 const NUM_KEY_SHARDS: usize = 16;
 
+/// Entries to reserve per shard when the cache is created.
+///
+/// pingora-lru takes this as a predicted item count and reserves it eagerly, so it cannot
+/// be derived from `max_size`, which is a byte budget: a 128 MiB cache would ask each of
+/// the 16 shards to reserve 8.4 million entries before a single value is cached. The
+/// shards grow on demand, so a small reservation only costs a few reallocations while the
+/// cache is still cold.
+const SHARD_RESERVED_ENTRIES: usize = 16;
+
 /// Metadata for a cached entry, stored separately from the value.
 ///
 /// This allows TTL checks without touching the pingora-lru structure,
@@ -42,6 +51,16 @@ struct KeyMetadata {
     expires_at: Instant,
 }
 
+/// A cached value together with the key it was admitted under.
+///
+/// pingora-lru reports only values and weights when it evicts, so the key travels with
+/// the value. Without it an eviction could not name the metadata entry it has to drop,
+/// and `len()`/`iter_keys()` would keep reporting keys whose values are gone.
+struct KeyedValue<V> {
+    key: u64,
+    value: V,
+}
+
 /// Pingora-LRU based cache backend implementation
 ///
 /// Provides:
@@ -50,7 +69,10 @@ struct KeyMetadata {
 /// - Separate metadata tracking for TTL and size (avoids race conditions on expiry checks)
 ///
 /// Architecture:
-/// - Values are stored in pingora-lru which handles LRU eviction
+/// - Values are stored in pingora-lru, paired with their key so evictions can be traced
+///   back to the metadata they invalidate
+/// - Eviction is driven by this backend: pingora-lru only enforces the weight limit when
+///   asked to, so `insert` and `run_pending_tasks` evict down to it
 /// - Metadata (TTL expiry, weight) is stored separately in sharded `HashMaps`
 /// - TTL checks use metadata first, avoiding unnecessary cache removals
 /// - `weighted_size()` uses pingora-lru's native `weight()` method for accuracy
@@ -63,7 +85,7 @@ pub struct PingoraBackend<V>
 where
     V: Clone + Send + Sync + 'static,
 {
-    cache: Arc<Lru<V, 16>>,
+    cache: Arc<Lru<KeyedValue<V>, 16>>,
     // 16-shard metadata tracking for TTL checks and key iteration
     // Each shard covers 1/16th of the key space (key % 16)
     // Stores expiry time and weight for each key
@@ -84,9 +106,8 @@ where
     /// Creates a new Pingora backend with explicit capacity and TTL.
     #[must_use]
     pub fn with_params(max_capacity: u64, ttl: std::time::Duration) -> Self {
-        let total_capacity = usize::try_from(max_capacity).unwrap_or(usize::MAX);
-        let capacity_per_shard = (total_capacity / NUM_KEY_SHARDS).max(16);
-        let cache = Arc::new(Lru::with_capacity(total_capacity, capacity_per_shard));
+        let weight_limit = usize::try_from(max_capacity).unwrap_or(usize::MAX);
+        let cache = Arc::new(Lru::with_capacity(weight_limit, SHARD_RESERVED_ENTRIES));
 
         // Initialize 16 shards for metadata tracking
         let metadata_shards: Arc<[RwLock<HashMap<u64, KeyMetadata>>; NUM_KEY_SHARDS]> =
@@ -125,6 +146,32 @@ where
         let meta = shard.remove(&key)?;
         Some(meta)
     }
+
+    /// Evict least-recently-used entries until the cache is back within its weight limit.
+    ///
+    /// pingora-lru never consults the limit on its own — `admit` only adds weight — so
+    /// nothing bounds the cache unless this is called. Eviction is per shard and picks the
+    /// coldest entry of each shard it visits, so the entries dropped approximate the
+    /// least-recently-used set rather than ordering it globally.
+    fn evict_to_weight_limit(&self) {
+        for (entry, _) in self.cache.evict_to_limit() {
+            // A concurrent `insert` can re-admit the key between its eviction above and
+            // the metadata drop. Holding the shard across both the drop and the re-admit
+            // check serialises this against `insert`, which publishes the value and its
+            // metadata under the same lock: either the insert has already published and
+            // both are dropped here, or it has not started and will publish both after.
+            // Without the lock the insert could slip its metadata write in after this
+            // branch and leave metadata naming a value that was just removed — a key
+            // `len()`/`iter_keys()` still report but `get()` can never serve.
+            let shard_idx = Self::get_shard_index(entry.key);
+            let mut shard = self.metadata_shards[shard_idx].write();
+            shard.remove(&entry.key);
+
+            if self.cache.peek(entry.key) {
+                self.cache.remove(entry.key);
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -137,20 +184,29 @@ where
         let weight = value.get_memory_size();
         let expires_at = Instant::now() + self.ttl;
 
-        // If key already exists, remove old metadata first to update weight correctly
-        if self.remove_metadata(key).is_some() {
-            // Remove from pingora-lru as well (admit will re-add)
-            let _ = self.cache.remove(key);
+        let shard_idx = Self::get_shard_index(key);
+        {
+            // Publish the value and its metadata under one hold of the shard so a
+            // concurrent eviction of this key cannot land between them (see
+            // `evict_to_weight_limit`). `remove_metadata` is not reused here because the
+            // lock is not reentrant.
+            let mut shard = self.metadata_shards[shard_idx].write();
+
+            // If key already exists, remove old metadata first to update weight correctly
+            if shard.remove(&key).is_some() {
+                // Remove from pingora-lru as well (admit will re-add)
+                let _ = self.cache.remove(key);
+            }
+
+            // Store the value in pingora-lru, keyed so an eviction can find its metadata
+            self.cache.admit(key, KeyedValue { key, value }, weight);
+
+            shard.insert(key, KeyMetadata { expires_at });
         }
 
-        // Store the value in pingora-lru
-        self.cache.admit(key, value, weight);
-
-        // Store metadata in appropriate shard
-        let shard_idx = Self::get_shard_index(key);
-        self.metadata_shards[shard_idx]
-            .write()
-            .insert(key, KeyMetadata { expires_at });
+        // Admitting is what pushes the cache over its limit, so bring it back under.
+        // A value heavier than the whole limit is evicted again here, as it is on Moka.
+        self.evict_to_weight_limit();
     }
 
     async fn get(&self, key: &u64) -> Option<V> {
@@ -180,21 +236,29 @@ where
         // 2. We already verified the item isn't expired (no unnecessary re-admission)
         // 3. Overall system throughput is 2-3x higher than alternatives
         // 4. Cache misses are handled gracefully by upstream code
-        let (value, weight) = self.cache.remove(*key)?;
+        let (entry, weight) = self.cache.remove(*key)?;
 
-        // Re-admit to maintain the value in cache (promotes to head of LRU)
-        let cloned_value = value.clone();
-        self.cache.admit(*key, value, weight);
+        // Re-admit to maintain the value in cache (promotes to head of LRU).
+        // The weight is unchanged, so this cannot push the cache over its limit.
+        let cloned_value = entry.value.clone();
+        self.cache.admit(*key, entry, weight);
 
         Some(cloned_value)
     }
 
     async fn remove(&self, key: &u64) -> Option<V> {
-        // Remove from metadata tracking (this also updates total_weight)
-        self.remove_metadata(*key);
+        let shard_idx = Self::get_shard_index(*key);
 
-        // Remove from pingora-lru and return the value
-        self.cache.remove(*key).map(|(value, _)| value)
+        // Drop the metadata and the value under one hold of the shard, for the same reason
+        // `insert` publishes them under one hold: a concurrent `insert` of this key that
+        // landed between the two would leave its metadata behind while this call removed
+        // the value it names — a key `len()`/`iter_keys()` still report but `get()` can
+        // never serve. `remove_metadata` is not reused here because the lock is not
+        // reentrant.
+        let mut shard = self.metadata_shards[shard_idx].write();
+        shard.remove(key);
+
+        self.cache.remove(*key).map(|(entry, _)| entry.value)
     }
 
     async fn clear(&self) {
@@ -247,7 +311,11 @@ where
     }
 
     async fn run_pending_tasks(&self) {
-        // Pingora handles eviction internally, no pending tasks needed
+        // `insert` already evicts, so this is normally a no-op. It still runs the sweep
+        // because the metrics path and `LruCache::checkpoint` call it to read a settled
+        // size, and because a cache that stopped being written to should not hold weight
+        // it has been asked to give up.
+        self.evict_to_weight_limit();
     }
 }
 
@@ -878,5 +946,126 @@ mod tests {
 
         backend.remove(&1).await;
         assert!(backend.is_empty().await);
+    }
+
+    // ===================
+    // max_size / eviction tests
+    // ===================
+
+    /// Collect the keys of `range` that the cache still serves.
+    async fn present_keys(
+        backend: &PingoraBackend<TestValue>,
+        range: std::ops::Range<u64>,
+    ) -> Vec<u64> {
+        let mut present = Vec::new();
+        for key in range {
+            if backend.get(&key).await.is_some() {
+                present.push(key);
+            }
+        }
+        present
+    }
+
+    #[tokio::test]
+    async fn insert_evicts_until_the_cache_fits_its_max_size() {
+        // 100 weight units of room, fed 50 entries that each fill it exactly.
+        let backend = create_backend(100, 60);
+
+        for i in 0..50u64 {
+            backend.insert(i, TestValue::with_size("x", 100)).await;
+        }
+
+        assert_eq!(
+            backend.weighted_size().await,
+            100,
+            "the cache should hold its configured weight, not a multiple of it"
+        );
+        assert_eq!(
+            backend.len().await,
+            1,
+            "only the entries that fit in max_size should be resident"
+        );
+        assert_eq!(
+            present_keys(&backend, 0..50).await.len(),
+            1,
+            "exactly one of the 50 inserted entries should still be served"
+        );
+    }
+
+    #[tokio::test]
+    async fn eviction_drops_the_metadata_of_evicted_keys() {
+        // Room for three entries of weight 100.
+        let backend = create_backend(300, 60);
+
+        for i in 0..10u64 {
+            backend.insert(i, TestValue::with_size("x", 100)).await;
+        }
+
+        let mut reported = backend.iter_keys().await;
+        reported.sort_unstable();
+        let mut served = present_keys(&backend, 0..10).await;
+        served.sort_unstable();
+
+        assert_eq!(
+            reported, served,
+            "iter_keys should name the entries the cache can serve, not ones it evicted"
+        );
+        assert_eq!(backend.len().await, 3);
+        assert_eq!(backend.weighted_size().await, 300);
+    }
+
+    #[tokio::test]
+    async fn a_value_heavier_than_max_size_is_not_retained() {
+        let backend = create_backend(100, 60);
+
+        backend
+            .insert(1, TestValue::with_size("oversized", 500))
+            .await;
+
+        assert_eq!(backend.get(&1).await, None);
+        assert_eq!(
+            backend.weighted_size().await,
+            0,
+            "a value that cannot fit the budget should not be left occupying it"
+        );
+        assert_eq!(backend.len().await, 0);
+    }
+
+    #[tokio::test]
+    async fn entries_within_max_size_are_not_evicted() {
+        let backend = create_backend(1000, 60);
+
+        for i in 0..5u64 {
+            backend.insert(i, TestValue::with_size("x", 100)).await;
+        }
+
+        assert_eq!(backend.len().await, 5);
+        assert_eq!(backend.weighted_size().await, 500);
+        assert_eq!(present_keys(&backend, 0..5).await, vec![0, 1, 2, 3, 4]);
+    }
+
+    #[tokio::test]
+    async fn run_pending_tasks_leaves_a_cache_that_already_fits_alone() {
+        let backend = create_backend(1000, 60);
+
+        for i in 0..5u64 {
+            backend.insert(i, TestValue::with_size("x", 100)).await;
+        }
+
+        backend.run_pending_tasks().await;
+
+        assert_eq!(backend.len().await, 5);
+        assert_eq!(backend.weighted_size().await, 500);
+    }
+
+    #[tokio::test]
+    async fn a_large_max_size_does_not_reserve_its_entries_up_front() {
+        // The reservation is an item count. Deriving it from this byte budget would ask
+        // each of the 16 shards to reserve 67 million entries before anything is cached.
+        let backend = create_backend(1024 * 1024 * 1024, 60);
+
+        backend.insert(1, TestValue::new("value")).await;
+
+        assert_eq!(backend.get(&1).await, Some(TestValue::new("value")));
     }
 }
