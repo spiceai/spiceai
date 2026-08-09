@@ -18,22 +18,26 @@ limitations under the License.
 
 use std::time::Duration;
 
-use reqwest::Client;
+use reqwest::{Client, RequestBuilder};
 use snafu::ResultExt;
 
 use crate::error::{self, HttpRequestSnafu, Result};
 use crate::redirect::same_origin_redirect_policy;
 use crate::types::{
-    ApiKeysResponse, App, AppsResponse, AuthContext, AuthContextRaw, AuthExchangeRequest,
-    AuthExchangeResponse, ContainerImagesResponse, CreateAppRequest, CreateDeploymentRequest,
-    Deployment, DeploymentsResponse, LogsResponse, MetricsResponse, MintAdoptionCodeRequest,
-    MintAdoptionCodeResponse, OAuthTokenRequest, OAuthTokenResponse, RegenerateApiKeyRequest,
-    RegenerateApiKeyResponse, RegionsResponse, Secret, SecretsResponse, SetSecretRequest,
-    UpdateAppRequest,
+    ApiKeysResponse, AuthContext, AuthContextRaw, AuthExchangeRequest, AuthExchangeResponse,
+    ContainerImagesResponse, CreateDeploymentRequest, CreateProjectRequest, Deployment,
+    DeploymentsResponse, LogsResponse, MetricsResponse, MintAdoptionCodeRequest,
+    MintAdoptionCodeResponse, OAuthTokenRequest, OAuthTokenResponse, Org, OrgsResponse, Project,
+    ProjectsResponse, RegenerateApiKeyRequest, RegenerateApiKeyResponse, RegionsResponse, Secret,
+    SecretsResponse, SetSecretRequest, UpdateProjectRequest,
 };
 
 const DEFAULT_BASE_URL: &str = "https://api.spice.ai";
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Header carrying the organization a management request should act on. Tokens
+/// minted for a single org ignore it; the server is the authority on membership.
+const ORG_HEADER: &str = "X-Org-Name";
 
 /// Build the underlying HTTP client.
 ///
@@ -56,6 +60,7 @@ pub struct CloudClient {
     base_url: String,
     client: Client,
     token: Option<String>,
+    org: Option<String>,
 }
 
 #[expect(
@@ -74,6 +79,7 @@ impl CloudClient {
             base_url: base_url.trim_end_matches('/').to_string(),
             client,
             token: None,
+            org: None,
         })
     }
 
@@ -86,6 +92,16 @@ impl CloudClient {
     #[must_use]
     pub fn with_token(mut self, token: impl Into<String>) -> Self {
         self.token = Some(token.into());
+        self
+    }
+
+    /// Set the organization every authenticated request should act on.
+    ///
+    /// Sent as `X-Org-Name`. Membership is enforced server-side, so this only
+    /// states intent — it never grants access the token does not already have.
+    #[must_use]
+    pub fn with_org(mut self, org: impl Into<String>) -> Self {
+        self.org = Some(org.into());
         self
     }
 
@@ -196,47 +212,86 @@ impl CloudClient {
         self.handle_response(response).await
     }
 
-    /// Get the authentication context for the current token.
+    /// Get the authentication context for the current token — the identity and
+    /// the organization the token itself is bound to.
+    ///
+    /// Deliberately sends no org context, even when this client has one.
+    /// Passing `org_name` turns the call into a *membership* probe ("who am I
+    /// in this org"), whose answer echoes the org that was asked about. A
+    /// caller comparing that answer against the org it requested would learn
+    /// nothing — which is exactly how a credential bound to another
+    /// organization could be accepted. Use [`Self::get_auth_context_for_org`]
+    /// when a membership probe is what you want.
     pub async fn get_auth_context(&self) -> Result<AuthContext> {
+        self.get_auth_context_for_org(None).await
+    }
+
+    /// Get the authentication context for `org`, rather than the token's own org.
+    ///
+    /// The endpoint answers "who am I, in this org" and returns the app API key
+    /// for that org's default app, so it doubles as a membership probe. A caller
+    /// that is not a member gets a `Forbidden` or `NotFound` error.
+    pub async fn get_auth_context_for_org(&self, org: Option<&str>) -> Result<AuthContext> {
         let url = format!("{}/api/spice-cli/auth", self.oauth_base_url());
-        let response = self
-            .client
-            .get(&url)
-            .bearer_auth(self.token_str())
-            .send()
-            .await
-            .context(HttpRequestSnafu)?;
+        let mut request = self.authed(self.client.get(&url));
+        if let Some(org) = org {
+            request = request.query(&[("org_name", org)]);
+        }
+        let response = request.send().await.context(HttpRequestSnafu)?;
 
         let raw: AuthContextRaw = self.handle_response(response).await?;
         Ok(raw.into())
     }
 
     // ========================================================================
-    // Apps
+    // Organizations
     // ========================================================================
 
-    /// List all apps visible to the current token.
-    pub async fn list_apps(&self) -> Result<Vec<App>> {
-        let url = format!("{}/v1/apps", self.base_url);
+    /// List the organizations the authenticated identity belongs to.
+    ///
+    /// Returns [`error::Error::NotFound`] when the deployment does not serve the
+    /// endpoint; callers that can degrade should treat that as "unknown" rather
+    /// than "no orgs".
+    pub async fn list_orgs(&self) -> Result<Vec<Org>> {
+        let url = format!("{}/v1/orgs", self.base_url);
         let response = self
-            .client
-            .get(&url)
-            .bearer_auth(self.token_str())
+            .authed(self.client.get(&url))
             .send()
             .await
             .context(HttpRequestSnafu)?;
 
-        let apps: AppsResponse = self.handle_response(response).await?;
-        Ok(apps.apps)
+        let orgs: OrgsResponse = self.handle_response(response).await?;
+        Ok(orgs.into_orgs())
     }
 
-    /// Get a single app by numeric ID.
-    pub async fn get_app_by_id(&self, app_id: i64) -> Result<App> {
-        let url = format!("{}/v1/apps/{}", self.base_url, app_id);
+    // ========================================================================
+    // Projects
+    // ========================================================================
+
+    /// List all projects visible to the current token.
+    ///
+    /// Uses `/v1/apps`, which Spice Cloud preserves as a permanent alias of
+    /// `/v1/projects` specifically so existing CLI, Terraform, and SDK clients
+    /// keep working across the rename. The response envelope differs by path
+    /// (`apps` vs `projects`); [`ProjectsResponse`] accepts either, so moving
+    /// to the canonical path later is a one-line change.
+    pub async fn list_projects(&self) -> Result<Vec<Project>> {
+        let url = format!("{}/v1/apps", self.base_url);
         let response = self
-            .client
-            .get(&url)
-            .bearer_auth(self.token_str())
+            .authed(self.client.get(&url))
+            .send()
+            .await
+            .context(HttpRequestSnafu)?;
+
+        let projects: ProjectsResponse = self.handle_response(response).await?;
+        Ok(projects.into_projects())
+    }
+
+    /// Get a single project by numeric ID.
+    pub async fn get_project_by_id(&self, project_id: i64) -> Result<Project> {
+        let url = format!("{}/v1/apps/{}", self.base_url, project_id);
+        let response = self
+            .authed(self.client.get(&url))
             .send()
             .await
             .context(HttpRequestSnafu)?;
@@ -244,13 +299,11 @@ impl CloudClient {
         self.handle_response(response).await
     }
 
-    /// Create a new app.
-    pub async fn create_app(&self, request: &CreateAppRequest) -> Result<App> {
+    /// Create a new project.
+    pub async fn create_project(&self, request: &CreateProjectRequest) -> Result<Project> {
         let url = format!("{}/v1/apps", self.base_url);
         let response = self
-            .client
-            .post(&url)
-            .bearer_auth(self.token_str())
+            .authed(self.client.post(&url))
             .json(request)
             .send()
             .await
@@ -259,13 +312,15 @@ impl CloudClient {
         self.handle_response(response).await
     }
 
-    /// Update an existing app.
-    pub async fn update_app(&self, app_id: i64, request: &UpdateAppRequest) -> Result<App> {
-        let url = format!("{}/v1/apps/{}", self.base_url, app_id);
+    /// Update an existing project.
+    pub async fn update_project(
+        &self,
+        project_id: i64,
+        request: &UpdateProjectRequest,
+    ) -> Result<Project> {
+        let url = format!("{}/v1/apps/{}", self.base_url, project_id);
         let response = self
-            .client
-            .put(&url)
-            .bearer_auth(self.token_str())
+            .authed(self.client.put(&url))
             .json(request)
             .send()
             .await
@@ -274,13 +329,11 @@ impl CloudClient {
         self.handle_response(response).await
     }
 
-    /// Delete (soft-delete) an app.
-    pub async fn delete_app(&self, app_id: i64) -> Result<()> {
-        let url = format!("{}/v1/apps/{}", self.base_url, app_id);
+    /// Delete (soft-delete) a project.
+    pub async fn delete_project(&self, project_id: i64) -> Result<()> {
+        let url = format!("{}/v1/apps/{}", self.base_url, project_id);
         let response = self
-            .client
-            .delete(&url)
-            .bearer_auth(self.token_str())
+            .authed(self.client.delete(&url))
             .send()
             .await
             .context(HttpRequestSnafu)?;
@@ -292,10 +345,10 @@ impl CloudClient {
     // Deployments
     // ========================================================================
 
-    /// List deployments for an app.
+    /// List deployments for a project.
     pub async fn list_deployments(
         &self,
-        app_id: i64,
+        project_id: i64,
         limit: usize,
         status: Option<&str>,
     ) -> Result<Vec<Deployment>> {
@@ -303,16 +356,14 @@ impl CloudClient {
 
         let mut url = format!(
             "{}/v1/apps/{}/deployments?limit={}",
-            self.base_url, app_id, limit
+            self.base_url, project_id, limit
         );
         if let Some(s) = status {
             let _ = write!(url, "&status={s}");
         }
 
         let response = self
-            .client
-            .get(&url)
-            .bearer_auth(self.token_str())
+            .authed(self.client.get(&url))
             .send()
             .await
             .context(HttpRequestSnafu)?;
@@ -324,14 +375,12 @@ impl CloudClient {
     /// Create a new deployment.
     pub async fn create_deployment(
         &self,
-        app_id: i64,
+        project_id: i64,
         request: &CreateDeploymentRequest,
     ) -> Result<Deployment> {
-        let url = format!("{}/v1/apps/{}/deployments", self.base_url, app_id);
+        let url = format!("{}/v1/apps/{}/deployments", self.base_url, project_id);
         let response = self
-            .client
-            .post(&url)
-            .bearer_auth(self.token_str())
+            .authed(self.client.post(&url))
             .json(request)
             .send()
             .await
@@ -343,7 +392,7 @@ impl CloudClient {
     /// Get deployment logs.
     pub async fn get_deployment_logs(
         &self,
-        app_id: i64,
+        project_id: i64,
         deployment_id: i64,
         limit: usize,
         since: Option<&str>,
@@ -352,16 +401,14 @@ impl CloudClient {
 
         let mut url = format!(
             "{}/v1/apps/{}/deployments/{}/logs?limit={}",
-            self.base_url, app_id, deployment_id, limit
+            self.base_url, project_id, deployment_id, limit
         );
         if let Some(s) = since {
             let _ = write!(url, "&since={s}");
         }
 
         let response = self
-            .client
-            .get(&url)
-            .bearer_auth(self.token_str())
+            .authed(self.client.get(&url))
             .send()
             .await
             .context(HttpRequestSnafu)?;
@@ -383,9 +430,7 @@ impl CloudClient {
         }
 
         let response = self
-            .client
-            .get(&url)
-            .bearer_auth(self.token_str())
+            .authed(self.client.get(&url))
             .send()
             .await
             .context(HttpRequestSnafu)?;
@@ -406,9 +451,7 @@ impl CloudClient {
         }
 
         let response = self
-            .client
-            .get(&url)
-            .bearer_auth(self.token_str())
+            .authed(self.client.get(&url))
             .send()
             .await
             .context(HttpRequestSnafu)?;
@@ -420,13 +463,11 @@ impl CloudClient {
     // Secrets
     // ========================================================================
 
-    /// List secrets for an app.
-    pub async fn list_secrets(&self, app_id: i64) -> Result<Vec<Secret>> {
-        let url = format!("{}/v1/apps/{}/secrets", self.base_url, app_id);
+    /// List secrets for a project.
+    pub async fn list_secrets(&self, project_id: i64) -> Result<Vec<Secret>> {
+        let url = format!("{}/v1/apps/{}/secrets", self.base_url, project_id);
         let response = self
-            .client
-            .get(&url)
-            .bearer_auth(self.token_str())
+            .authed(self.client.get(&url))
             .send()
             .await
             .context(HttpRequestSnafu)?;
@@ -436,12 +477,10 @@ impl CloudClient {
     }
 
     /// Get a single secret by name.
-    pub async fn get_secret(&self, app_id: i64, name: &str) -> Result<Secret> {
-        let url = format!("{}/v1/apps/{}/secrets/{}", self.base_url, app_id, name);
+    pub async fn get_secret(&self, project_id: i64, name: &str) -> Result<Secret> {
+        let url = format!("{}/v1/apps/{}/secrets/{}", self.base_url, project_id, name);
         let response = self
-            .client
-            .get(&url)
-            .bearer_auth(self.token_str())
+            .authed(self.client.get(&url))
             .send()
             .await
             .context(HttpRequestSnafu)?;
@@ -450,17 +489,15 @@ impl CloudClient {
     }
 
     /// Create or update a secret.
-    pub async fn set_secret(&self, app_id: i64, name: &str, value: &str) -> Result<Secret> {
-        let url = format!("{}/v1/apps/{}/secrets", self.base_url, app_id);
+    pub async fn set_secret(&self, project_id: i64, name: &str, value: &str) -> Result<Secret> {
+        let url = format!("{}/v1/apps/{}/secrets", self.base_url, project_id);
         let request = SetSecretRequest {
             name: name.to_string(),
             value: value.to_string(),
         };
 
         let response = self
-            .client
-            .post(&url)
-            .bearer_auth(self.token_str())
+            .authed(self.client.post(&url))
             .json(&request)
             .send()
             .await
@@ -470,12 +507,10 @@ impl CloudClient {
     }
 
     /// Delete a secret.
-    pub async fn delete_secret(&self, app_id: i64, name: &str) -> Result<()> {
-        let url = format!("{}/v1/apps/{}/secrets/{}", self.base_url, app_id, name);
+    pub async fn delete_secret(&self, project_id: i64, name: &str) -> Result<()> {
+        let url = format!("{}/v1/apps/{}/secrets/{}", self.base_url, project_id, name);
         let response = self
-            .client
-            .delete(&url)
-            .bearer_auth(self.token_str())
+            .authed(self.client.delete(&url))
             .send()
             .await
             .context(HttpRequestSnafu)?;
@@ -487,13 +522,11 @@ impl CloudClient {
     // API Keys
     // ========================================================================
 
-    /// Get API keys for an app.
-    pub async fn get_api_keys(&self, app_id: i64) -> Result<ApiKeysResponse> {
-        let url = format!("{}/v1/apps/{}/api-keys", self.base_url, app_id);
+    /// Get API keys for a project.
+    pub async fn get_api_keys(&self, project_id: i64) -> Result<ApiKeysResponse> {
+        let url = format!("{}/v1/apps/{}/api-keys", self.base_url, project_id);
         let response = self
-            .client
-            .get(&url)
-            .bearer_auth(self.token_str())
+            .authed(self.client.get(&url))
             .send()
             .await
             .context(HttpRequestSnafu)?;
@@ -504,16 +537,14 @@ impl CloudClient {
     /// Regenerate an API key.
     pub async fn regenerate_api_key(
         &self,
-        app_id: i64,
+        project_id: i64,
         key_number: u8,
     ) -> Result<RegenerateApiKeyResponse> {
-        let url = format!("{}/v1/apps/{}/api-keys", self.base_url, app_id);
+        let url = format!("{}/v1/apps/{}/api-keys", self.base_url, project_id);
         let request = RegenerateApiKeyRequest { key_number };
 
         let response = self
-            .client
-            .post(&url)
-            .bearer_auth(self.token_str())
+            .authed(self.client.post(&url))
             .json(&request)
             .send()
             .await
@@ -529,9 +560,12 @@ impl CloudClient {
     /// Mint a single-use standalone-instance adoption code.
     ///
     /// This is the codeless-connect path: a host already authenticated with
-    /// `spice login` holds an org-scoped credential, so `spice connect` mints
-    /// its own code and redeems it in the same command rather than sending the
-    /// customer to the portal.
+    /// `spice login` can mint its own code and redeem it in the same command
+    /// rather than sending the customer to the portal.
+    ///
+    /// The code is minted in the client's org context, so a credential that
+    /// spans several orgs adopts the instance into the requested one rather
+    /// than the token's default.
     ///
     /// Requires org admin/owner. The plaintext code is returned once and must
     /// never be printed or persisted — the caller consumes it immediately.
@@ -541,9 +575,7 @@ impl CloudClient {
     ) -> Result<MintAdoptionCodeResponse> {
         let url = format!("{}/v1/instance-adoption-codes", self.base_url);
         let response = self
-            .client
-            .post(&url)
-            .bearer_auth(self.token_str())
+            .authed(self.client.post(&url))
             .json(request)
             .send()
             .await
@@ -556,14 +588,14 @@ impl CloudClient {
     // Metrics
     // ========================================================================
 
-    /// Get metrics for an app's pods.
-    pub async fn get_app_metrics(
+    /// Get metrics for a project's instances.
+    pub async fn get_project_metrics(
         &self,
-        app_id: i64,
+        project_id: i64,
         window: Option<&str>,
     ) -> Result<MetricsResponse> {
-        let url = format!("{}/v1/apps/{}/metrics", self.base_url, app_id);
-        let mut request = self.client.get(&url).bearer_auth(self.token_str());
+        let url = format!("{}/v1/apps/{}/metrics", self.base_url, project_id);
+        let mut request = self.authed(self.client.get(&url));
         if let Some(w) = window {
             request = request.query(&[("window", w)]);
         }
@@ -642,6 +674,19 @@ impl CloudClient {
 
     fn token_str(&self) -> &str {
         self.token.as_deref().unwrap_or("")
+    }
+
+    /// Apply the bearer token and, when set, the org context header.
+    ///
+    /// An org name that cannot be encoded as a header value surfaces as a
+    /// request error at send time rather than being dropped, so a command never
+    /// silently runs against the token's default org instead of the requested one.
+    fn authed(&self, request: RequestBuilder) -> RequestBuilder {
+        let request = request.bearer_auth(self.token_str());
+        match &self.org {
+            Some(org) => request.header(ORG_HEADER, org),
+            None => request,
+        }
     }
 }
 
@@ -839,6 +884,116 @@ mod tests {
         assert_eq!(
             client.get_auth_url("ABCD1234"),
             "https://spice.ai/auth/token?code=ABCD1234"
+        );
+    }
+
+    #[test]
+    fn the_identity_probe_does_not_ask_about_a_particular_org() {
+        // `get_auth_context` must report the org the token is *bound to*. If it
+        // forwarded this client's org it would become a membership probe whose
+        // answer echoes the org asked about, and a caller comparing that answer
+        // against its request would accept a credential bound elsewhere.
+        let client = CloudClient::new("https://api.spice.ai")
+            .expect("cloud client should build")
+            .with_token("token")
+            .with_org("spicehq");
+
+        let identity = client
+            .authed(
+                client
+                    .client
+                    .get(format!("{}/api/spice-cli/auth", client.oauth_base_url())),
+            )
+            .build()
+            .expect("request should build");
+        assert!(
+            identity
+                .url()
+                .query()
+                .is_none_or(|q| !q.contains("org_name")),
+            "the identity probe must not pin an org: {}",
+            identity.url()
+        );
+
+        // The explicit membership probe still does.
+        let membership = client
+            .authed(
+                client
+                    .client
+                    .get(format!("{}/api/spice-cli/auth", client.oauth_base_url())),
+            )
+            .query(&[("org_name", "spicehq")])
+            .build()
+            .expect("request should build");
+        assert!(
+            membership
+                .url()
+                .query()
+                .is_some_and(|q| q.contains("org_name=spicehq")),
+            "the membership probe must pin the org: {}",
+            membership.url()
+        );
+    }
+
+    #[test]
+    fn authed_requests_carry_the_org_header() {
+        let client = CloudClient::new("https://api.spice.ai")
+            .expect("cloud client should build")
+            .with_token("token")
+            .with_org("spicehq");
+
+        let request = client
+            .authed(client.client.get("https://api.spice.ai/v1/apps"))
+            .build()
+            .expect("request should build");
+
+        assert_eq!(
+            request
+                .headers()
+                .get(super::ORG_HEADER)
+                .and_then(|value| value.to_str().ok()),
+            Some("spicehq")
+        );
+        assert!(
+            request
+                .headers()
+                .contains_key(reqwest::header::AUTHORIZATION)
+        );
+    }
+
+    /// Every authenticated request must be built through [`CloudClient::authed`],
+    /// because that is the only place the org context is attached. A request
+    /// that applies the bearer token itself still authenticates, so it fails
+    /// nowhere — it just acts on the token's default org, silently targeting the
+    /// wrong organization for anyone whose credential reaches more than one.
+    #[test]
+    fn the_bearer_token_is_only_ever_applied_by_authed() {
+        // Split so this assertion does not match its own source text.
+        let needle = concat!("bearer_", "auth(");
+        let applications = include_str!("client.rs").matches(needle).count();
+
+        assert_eq!(
+            applications, 1,
+            "`{needle}` must appear exactly once — inside `authed`. A new call site \
+             means some request carries the token without the org header; build it \
+             with `self.authed(self.client.post(&url))` instead."
+        );
+    }
+
+    #[test]
+    fn authed_requests_omit_the_org_header_when_no_org_is_set() {
+        let client = CloudClient::new("https://api.spice.ai")
+            .expect("cloud client should build")
+            .with_token("token");
+
+        let request = client
+            .authed(client.client.get("https://api.spice.ai/v1/apps"))
+            .build()
+            .expect("request should build");
+
+        assert!(
+            !request.headers().contains_key(super::ORG_HEADER),
+            "no org context should mean no org header, so the server uses the token's own org"
         );
     }
 
