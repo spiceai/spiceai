@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-#![allow(clippy::expect_used)]
+#![expect(clippy::expect_used, reason = "integration-test helpers")]
 
 //! A selective query must read fewer datalake files than a full scan.
 //!
