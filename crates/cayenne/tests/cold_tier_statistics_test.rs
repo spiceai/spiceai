@@ -14,8 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-#![allow(clippy::expect_used)]
-
 //! Table statistics must survive a warm→datalake promotion.
 //!
 //! Promotion moves every live row to the cold store and leaves the warm snapshot
@@ -43,11 +41,6 @@ const TABLE: &str = "stats_t";
 
 test_with_backends!(test_cold_tier_statistics_survive_promotion_impl);
 
-/// Row count the maintained statistics report, with its precision.
-fn maintained_row_count(table: &CayenneTableProvider) -> Option<Precision<usize>> {
-    Some(table.statistics()?.num_rows)
-}
-
 /// Rows a real scan returns.
 ///
 /// Projects a column and sums the batches rather than issuing `COUNT(*)`: an
@@ -59,10 +52,11 @@ async fn scan_row_count(ctx: &SessionContext) -> TestResult<i64> {
         .await?
         .collect()
         .await?;
-    Ok(batches
-        .iter()
-        .map(|b| i64::try_from(b.num_rows()).unwrap_or(i64::MAX))
-        .sum())
+    let mut rows = 0;
+    for batch in &batches {
+        rows += i64::try_from(batch.num_rows())?;
+    }
+    Ok(rows)
 }
 
 /// Flush everything the count depends on: RAM/inline tiers into durable warm
@@ -93,8 +87,10 @@ async fn assert_count_agrees(
         "scanned rows ({phase})"
     );
 
-    let maintained = maintained_row_count(table)
-        .unwrap_or_else(|| panic!("maintained statistics must be populated ({phase})"));
+    let maintained = table
+        .statistics()
+        .unwrap_or_else(|| panic!("maintained statistics must be populated ({phase})"))
+        .num_rows;
     assert_eq!(
         maintained,
         Precision::Exact(expected),
@@ -103,33 +99,20 @@ async fn assert_count_agrees(
     Ok(())
 }
 
-async fn delete_id(table: &Arc<CayenneTableProvider>, id: i64) -> TestResult<u64> {
+async fn delete_id(table: &CayenneTableProvider, id: i64) -> TestResult<()> {
     let ctx = SessionContext::new();
     let plan = table
         .delete_from(&ctx.state(), vec![col("id").eq(lit(id))])
         .await?;
-    let results = datafusion::physical_plan::collect(plan, ctx.task_ctx()).await?;
-    Ok(results
-        .first()
-        .and_then(|b| {
-            b.column(0)
-                .as_any()
-                .downcast_ref::<arrow::array::UInt64Array>()
-        })
-        .and_then(|a| a.values().first())
-        .copied()
-        .unwrap_or(0))
+    datafusion::physical_plan::collect(plan, ctx.task_ctx()).await?;
+    Ok(())
 }
 
-async fn insert_range(
-    table: &CayenneTableProvider,
-    schema: &Arc<Schema>,
-    ids: std::ops::Range<i64>,
-) -> TestResult<()> {
+async fn insert_range(table: &CayenneTableProvider, ids: std::ops::Range<i64>) -> TestResult<()> {
     let ids: Vec<i64> = ids.collect();
     let values: Vec<i64> = ids.iter().map(|i| i * 2).collect();
     let batch = RecordBatch::try_new(
-        Arc::clone(schema),
+        schema(),
         vec![
             Arc::new(Int64Array::from(ids)),
             Arc::new(Int64Array::from(values)),
@@ -182,12 +165,11 @@ async fn create_table(
 async fn test_cold_tier_statistics_survive_promotion_impl(
     fixture: common::TestFixture,
 ) -> TestResult<()> {
-    let schema = schema();
     let ctx = SessionContext::new();
     let table = create_table(&fixture, &ctx).await?;
 
     // Baseline: 100 warm rows, nothing promoted yet.
-    insert_range(&table, &schema, 0..100).await?;
+    insert_range(&table, 0..100).await?;
     settle(&table).await?;
     assert_count_agrees(&table, &ctx, 100, "warm only").await?;
 
@@ -202,7 +184,7 @@ async fn test_cold_tier_statistics_survive_promotion_impl(
 
     // A write after promotion straddles the tiers: 100 cold + 50 warm. The count
     // must cover both.
-    insert_range(&table, &schema, 100..150).await?;
+    insert_range(&table, 100..150).await?;
     settle(&table).await?;
     assert_count_agrees(&table, &ctx, 150, "cold + warm delta").await?;
 
@@ -239,8 +221,9 @@ async fn test_cold_tier_statistics_survive_promotion_impl(
 /// `Exact(110)` while the cold manifest correctly holds 109 rows. Un-ignore it
 /// with the fix; do not weaken the assertions to make it pass.
 ///
-/// Pinned on `SQLite` only — the accounting is backend-independent, so one
-/// marker is enough (same shape as `prop_concurrent_cold_sqlite`).
+/// Registered by hand on `SQLite` rather than through `test_with_backends!`,
+/// which emits its own `#[test]` attributes and has no hook for `#[ignore]`.
+/// Convert it to `test_with_backends!` when un-ignoring, so Turso is covered too.
 #[test]
 #[ignore = "https://github.com/spiceai/spiceai/issues/12846 — a folded delete tombstone leaves the maintained row count stale and Exact"]
 fn test_cold_tier_statistics_follow_a_folded_delete_sqlite() -> Result<(), String> {
@@ -253,11 +236,10 @@ fn test_cold_tier_statistics_follow_a_folded_delete_sqlite() -> Result<(), Strin
 async fn test_cold_tier_statistics_follow_a_folded_delete_impl(
     fixture: common::TestFixture,
 ) -> TestResult<()> {
-    let schema = schema();
     let ctx = SessionContext::new();
     let table = create_table(&fixture, &ctx).await?;
 
-    insert_range(&table, &schema, 0..100).await?;
+    insert_range(&table, 0..100).await?;
     settle(&table).await?;
     assert!(table.promote_warm_to_cold().await?, "promotion should fire");
     table.flush_pending_maintenance().await?;
@@ -272,7 +254,7 @@ async fn test_cold_tier_statistics_follow_a_folded_delete_impl(
 
     // A promotion needs warm data to graduate, so the next batch is what carries
     // the tombstone into the datalake: 99 live + 10 new = 109.
-    insert_range(&table, &schema, 100..110).await?;
+    insert_range(&table, 100..110).await?;
     settle(&table).await?;
     assert!(
         table.promote_warm_to_cold().await?,

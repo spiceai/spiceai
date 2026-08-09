@@ -58,29 +58,24 @@ test_with_backends!(test_cold_tier_selective_query_prunes_files_impl);
 /// The warm snapshot is empty after promotion, so every file counted is a
 /// datalake file.
 fn planned_file_count(plan: &Arc<dyn ExecutionPlan>) -> usize {
-    let mut files = 0;
-    accumulate_planned_files(plan, &mut files);
-    files
-}
-
-fn accumulate_planned_files(plan: &Arc<dyn ExecutionPlan>, files: &mut usize) {
     if let Some(exec) = plan.downcast_ref::<DataSourceExec>() {
-        if let Some(config) = exec.data_source().downcast_ref::<FileScanConfig>() {
-            *files += config.file_groups.iter().map(FileGroup::len).sum::<usize>();
-        }
-        return;
+        return exec
+            .data_source()
+            .downcast_ref::<FileScanConfig>()
+            .map_or(0, |config| {
+                config.file_groups.iter().map(FileGroup::len).sum()
+            });
     }
-    for child in plan.children() {
-        accumulate_planned_files(child, files);
-    }
+    plan.children().into_iter().map(planned_file_count).sum()
 }
 
-async fn planned_files_for(
-    table: &Arc<CayenneTableProvider>,
-    ctx: &SessionContext,
-    filters: &[Expr],
-) -> TestResult<usize> {
-    let plan = table.scan(&ctx.state(), None, filters, None).await?;
+/// Plan `sql` and count the datalake files it would open.
+///
+/// Goes through SQL rather than calling `TableProvider::scan` with hand-built
+/// filters: that would hand the provider its predicate directly and keep passing
+/// even if `supports_filters_pushdown` regressed and real queries stopped pruning.
+async fn planned_files_for(ctx: &SessionContext, sql: &str) -> TestResult<usize> {
+    let plan = ctx.sql(sql).await?.create_physical_plan().await?;
     Ok(planned_file_count(&plan))
 }
 
@@ -136,6 +131,8 @@ async fn test_cold_tier_selective_query_prunes_files_impl(
 
     // One promotion per `id` band. Promotions carry untouched cold files forward
     // by manifest reference, so every band keeps its own tight `id` range.
+    let mut files_per_band: Vec<usize> = Vec::new();
+    let mut files_before = 0;
     for band in 0..BANDS {
         let ids: Vec<i64> = (band * BAND_SIZE..(band + 1) * BAND_SIZE).collect();
         let values: Vec<i64> = ids.iter().map(|i| i * 2).collect();
@@ -147,45 +144,48 @@ async fn test_cold_tier_selective_query_prunes_files_impl(
             ],
         )?;
         common::insert_batch(table.as_ref(), batch).await?;
-        let _ = table.checkpoint_inlined_data().await;
-        let _ = table.checkpoint_mem_tier().await;
+        table.checkpoint_inlined_data().await?;
+        table.checkpoint_mem_tier().await?;
         assert!(
             table.promote_warm_to_cold().await?,
             "promotion {band} should fire with cold_tier_warm_max_files = 1"
         );
+
+        // Files this band contributed. Promotions carry untouched cold files
+        // forward, so the manifest only grows, and the delta is the band's own
+        // share. Measured rather than assumed: how many objects a band splits
+        // into is the writer's business, and hard-coding it would make a change
+        // in file size or write parallelism look like a pruning regression.
+        let total = fixture
+            .catalog
+            .list_cold_tier_files(table.table_id())
+            .await?
+            .len();
+        files_per_band.push(total - files_before);
+        files_before = total;
     }
 
-    let cold_files = fixture
-        .catalog
-        .list_cold_tier_files(table.table_id())
-        .await?;
-    let bands = usize::try_from(BANDS).unwrap_or(1);
-    assert!(
-        cold_files.len() >= bands && cold_files.len() % bands == 0,
-        "expected every band to contribute the same number of datalake files, got {}",
-        cold_files.len()
-    );
-
-    // Unfiltered: every cold file is planned.
-    let all_files = planned_files_for(&table, &ctx, &[]).await?;
+    let all_files = planned_files_for(&ctx, "SELECT id FROM prune_t").await?;
     assert_eq!(
-        all_files,
-        cold_files.len(),
+        all_files, files_before,
         "an unfiltered scan plans every datalake file"
     );
 
     // Only the band whose statistics cover the key can satisfy a point filter, so
-    // exactly that band's share survives. More means the blob is not consulted.
-    let point_files = planned_files_for(&table, &ctx, &[col("id").eq(lit(150i64))]).await?;
+    // exactly that band's files survive. More means the blob is not consulted.
+    let point_files = planned_files_for(&ctx, "SELECT id FROM prune_t WHERE id = 150").await?;
+    assert!(
+        point_files < all_files,
+        "the point filter pruned nothing: {point_files} of {all_files} files planned"
+    );
     assert_eq!(
-        point_files,
-        all_files / bands,
-        "a point filter must prune the datalake down to the band containing the \
-         key (planned {point_files} of {all_files})"
+        point_files, files_per_band[1],
+        "a point filter must prune the datalake down to the band holding the key \
+         (planned {point_files} of {all_files})"
     );
 
     // A filter that matches nothing prunes every file: the plan opens no data.
-    let empty_files = planned_files_for(&table, &ctx, &[col("id").eq(lit(-1i64))]).await?;
+    let empty_files = planned_files_for(&ctx, "SELECT id FROM prune_t WHERE id = -1").await?;
     assert_eq!(
         empty_files, 0,
         "a filter outside every file's statistics prunes the whole datalake branch"
@@ -202,12 +202,5 @@ async fn test_cold_tier_selective_query_prunes_files_impl(
         (95..=105).collect::<Vec<_>>(),
         "a range spanning two datalake files returns rows from both"
     );
-    assert!(
-        collect_ids(&ctx, "SELECT id FROM prune_t WHERE id = -1")
-            .await?
-            .is_empty(),
-        "a fully pruned query returns no rows"
-    );
-
     Ok(())
 }

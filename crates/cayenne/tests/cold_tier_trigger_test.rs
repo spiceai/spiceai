@@ -14,8 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-#![allow(clippy::expect_used)]
-
 //! What decides whether a warm→datalake promotion runs at all.
 //!
 //! Two behaviours registration only validates or warns about, and that no test
@@ -73,30 +71,36 @@ async fn row_count(ctx: &SessionContext, table: &str) -> TestResult<i64> {
         .await?
         .collect()
         .await?;
-    Ok(batches
-        .iter()
-        .map(|b| i64::try_from(b.num_rows()).unwrap_or(i64::MAX))
-        .sum())
+    let mut rows = 0;
+    for batch in &batches {
+        rows += i64::try_from(batch.num_rows())?;
+    }
+    Ok(rows)
 }
 
-/// Append `ids` and checkpoint, producing exactly one durable warm file.
+/// Append `ids` and checkpoint them into a durable warm file.
+///
+/// The batch is smaller than the inline threshold, so the checkpoints are what
+/// actually produce the file the promotion trigger counts. Their results are
+/// propagated rather than discarded: a silently failed checkpoint would leave the
+/// warm tier empty, and an empty warm tier declines promotion for a reason that
+/// looks exactly like the threshold under test.
 async fn append_one_warm_file(
     table: &CayenneTableProvider,
-    schema: &Arc<Schema>,
     ids: std::ops::Range<i64>,
 ) -> TestResult<()> {
     let ids: Vec<i64> = ids.collect();
     let values: Vec<i64> = ids.iter().map(|i| i * 2).collect();
     let batch = RecordBatch::try_new(
-        Arc::clone(schema),
+        schema(),
         vec![
             Arc::new(Int64Array::from(ids)),
             Arc::new(Int64Array::from(values)),
         ],
     )?;
     common::insert_batch(table, batch).await?;
-    let _ = table.checkpoint_inlined_data().await;
-    let _ = table.checkpoint_mem_tier().await;
+    table.checkpoint_inlined_data().await?;
+    table.checkpoint_mem_tier().await?;
     Ok(())
 }
 
@@ -142,7 +146,6 @@ async fn create_table(
 async fn test_promotion_waits_for_the_configured_warm_file_count_impl(
     fixture: common::TestFixture,
 ) -> TestResult<()> {
-    let schema = schema();
     let cold_dir = fixture.temp_dir.path().join("cold_threshold");
     let ctx = SessionContext::new();
     let table = create_table(
@@ -160,12 +163,21 @@ async fn test_promotion_waits_for_the_configured_warm_file_count_impl(
     )
     .await?;
 
-    for file in 1..WARM_MAX_FILES {
-        let start = i64::try_from(file).unwrap_or(0) * 100;
-        append_one_warm_file(&table, &schema, start - 100..start).await?;
+    for file in 0..WARM_MAX_FILES - 1 {
+        let start = i64::try_from(file)? * 100;
+        append_one_warm_file(&table, start..start + 100).await?;
+        // The threshold counts warm files, so the test's arithmetic only holds if
+        // each append produced exactly one. Asserting it keeps a declined
+        // promotion attributable to the threshold rather than to a short warm tier.
+        assert_eq!(
+            count_vortex_files(&fixture.data_path),
+            file + 1,
+            "expected one warm file per append"
+        );
         assert!(
             !table.promote_warm_to_cold().await?,
-            "promotion must decline with {file} warm file(s), below the configured {WARM_MAX_FILES}"
+            "promotion must decline with {} warm file(s), below the configured {WARM_MAX_FILES}",
+            file + 1
         );
     }
     assert!(
@@ -183,8 +195,8 @@ async fn test_promotion_waits_for_the_configured_warm_file_count_impl(
     );
 
     // The file that reaches the threshold graduates the whole warm tier.
-    let start = i64::try_from(WARM_MAX_FILES).unwrap_or(0) * 100 - 100;
-    append_one_warm_file(&table, &schema, start..start + 100).await?;
+    let start = i64::try_from(WARM_MAX_FILES - 1)? * 100;
+    append_one_warm_file(&table, start..start + 100).await?;
     assert!(
         table.promote_warm_to_cold().await?,
         "promotion must fire at {WARM_MAX_FILES} warm files"
@@ -197,7 +209,7 @@ async fn test_promotion_waits_for_the_configured_warm_file_count_impl(
         .iter()
         .map(|f| f.row_count)
         .sum();
-    let expected = i64::try_from(WARM_MAX_FILES).unwrap_or(0) * 100;
+    let expected = i64::try_from(WARM_MAX_FILES)? * 100;
     assert_eq!(
         promoted_rows, expected,
         "the promotion that fires graduates every warm row, not just the last file"
@@ -213,10 +225,15 @@ async fn test_promotion_waits_for_the_configured_warm_file_count_impl(
 
 /// Without a primary key the tier cannot classify or rewrite by key, so it stays
 /// inert: promotion declines, nothing is written, and warm keeps serving.
+///
+/// The table asks for `DeletionMode::Key`, the same mode the promoting table in
+/// this file uses. `Key` resolves to `Key` only when there is a key to record and
+/// to `Position` otherwise, and promotion is key-mode only — so the absent
+/// primary key is what makes this table decline, and the contrast with its
+/// sibling is exactly that one field.
 async fn test_datalake_tier_is_inert_without_a_primary_key_impl(
     fixture: common::TestFixture,
 ) -> TestResult<()> {
-    let schema = schema();
     let cold_dir = fixture.temp_dir.path().join("cold_no_pk");
     let ctx = SessionContext::new();
     let table = create_table(
@@ -228,19 +245,20 @@ async fn test_datalake_tier_is_inert_without_a_primary_key_impl(
         VortexConfig {
             // Trigger on any warm file — the most permissive setting the tier has.
             cold_tier_warm_max_files: 1,
+            deletion_mode: DeletionMode::Key,
             ..VortexConfig::default()
         },
     )
     .await?;
 
-    append_one_warm_file(&table, &schema, 0..100).await?;
-    append_one_warm_file(&table, &schema, 100..200).await?;
+    append_one_warm_file(&table, 0..100).await?;
 
-    // Guard against a vacuous pass: promotion must decline over real warm files,
-    // not an empty input.
-    assert!(
-        count_vortex_files(&fixture.data_path) > 0,
-        "expected durable warm files before testing the promotion decision"
+    // Guard against a vacuous pass: promotion must decline over a warm tier that
+    // is over the trigger, not an empty one.
+    assert_eq!(
+        count_vortex_files(&fixture.data_path),
+        1,
+        "expected a durable warm file before testing the promotion decision"
     );
     assert!(
         !table.promote_warm_to_cold().await?,
@@ -261,7 +279,7 @@ async fn test_datalake_tier_is_inert_without_a_primary_key_impl(
     );
     assert_eq!(
         row_count(&ctx, "no_pk_t").await?,
-        200,
+        100,
         "the table keeps serving every row from the warm tier"
     );
 
