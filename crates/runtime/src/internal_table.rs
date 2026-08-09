@@ -23,15 +23,15 @@ use snafu::prelude::*;
 use tokio::sync::RwLock;
 
 use crate::Runtime;
-use crate::accelerated_table::{AcceleratedTableBuilderError, Retention};
+use crate::accelerated::{AcceleratedTableBuilderError, Retention};
 use crate::component::access::AccessMode;
 use crate::component::dataset::acceleration::Acceleration;
 use crate::component::dataset::builder::DatasetBuilder;
-use crate::federated_table::FederatedTable;
+use crate::federated::FederatedTable;
 use crate::secrets::Secrets;
 use crate::status;
 use crate::{
-    accelerated_table::{AcceleratedTable, refresh::Refresh},
+    accelerated::{AcceleratedTable, refresh::Refresh},
     dataaccelerator::{self},
     dataconnector::{DataConnector, DataConnectorError, sink::SinkConnector},
 };
