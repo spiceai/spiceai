@@ -55,11 +55,6 @@ struct Image {
 #[cfg(target_os = "linux")]
 static IMAGE: OnceLock<Image> = OnceLock::new();
 
-/// `addr2line` up to the offset, built at install so the handler writes bytes rather
-/// than formatting a path. Printed only when the offset is one `addr2line` can use.
-#[cfg(target_os = "linux")]
-static SYMBOLIZE_PREFIX: OnceLock<String> = OnceLock::new();
-
 /// For the `uptime` field: crashes clustered at a fixed point after startup look
 /// very different from ones that need hours of load.
 static START: OnceLock<std::time::Instant> = OnceLock::new();
@@ -73,13 +68,8 @@ static IDENTITY: OnceLock<String> = OnceLock::new();
 const REPORT_BUF: usize = 1024;
 
 /// How much of the identity line is kept. The version has no inherent length limit,
-/// so it is clipped at install, where clipping can be logged.
+/// so it is clipped at install to keep the rest of the report bounded.
 const MAX_IDENTITY: usize = 192;
-
-/// How long the `addr2line` prefix may be. `PATH_MAX` is four times the whole buffer,
-/// so a path that does not fit falls back to a bare `spiced`.
-#[cfg(target_os = "linux")]
-const MAX_SYMBOLIZE_PREFIX: usize = 320;
 
 /// The longest report that can be produced, so a new field breaks the build rather
 /// than silently truncating the fields printed after it. Each term is the widest its
@@ -93,7 +83,7 @@ const MAX_REPORT: usize = 47                 // banner and trailer
     + 60                                     // offset=, or the widest reason it is absent
     + 1
     + 86                                     // thread= pid= tid= uptime=
-    + MAX_SYMBOLIZE_PREFIX + 17; // symbolize line
+    + 55; // symbolize line
 #[cfg(target_os = "linux")]
 const _: () = assert!(MAX_REPORT <= REPORT_BUF);
 
@@ -116,17 +106,13 @@ pub fn install(version: &str) {
         env!("SPICED_BUILD_PROFILE"),
     );
     // Clip here rather than let the handler truncate the fields after it: the version
-    // is the one unbounded input, and this is where losing bytes can be reported.
+    // is the one input with no length limit of its own.
     if identity.len() > MAX_IDENTITY - 1 {
         // Back off to a char boundary so the truncation cannot split a code point.
         let mut end = MAX_IDENTITY - 1;
         while !identity.is_char_boundary(end) {
             end -= 1;
         }
-        tracing::warn!(
-            "Build identity is too long for a crash report and was clipped to {end} bytes; \
-             a native crash will name this build only partially"
-        );
         identity.truncate(end);
     }
     identity.push('\n');
@@ -157,7 +143,6 @@ fn resolve_image() {
     if let Some(fds) = open_probe() {
         let _ = PROBE_FDS.set(fds);
     }
-    let _ = SYMBOLIZE_PREFIX.set(symbolize_prefix());
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -216,36 +201,6 @@ fn read_image() -> Option<Image> {
         base: base?,
         text: text_start..text_end,
     })
-}
-
-/// The `addr2line` invocation, up to the offset.
-///
-/// Uses the real path so the command runs as printed. An oversized path falls back to
-/// a bare `spiced`: a clipped path looks runnable and is not.
-#[cfg(target_os = "linux")]
-fn symbolize_prefix() -> String {
-    let exe = std::fs::read_link("/proc/self/exe")
-        .ok()
-        .and_then(|path| path.to_str().map(str::to_owned));
-    match exe {
-        Some(exe) => {
-            let prefix = format!("addr2line -e {exe} -fCi 0x");
-            if prefix.len() <= MAX_SYMBOLIZE_PREFIX {
-                return prefix;
-            }
-            tracing::warn!(
-                "Executable path is too long to print in a crash report; \
-                 the symbolize command will name the binary generically"
-            );
-        }
-        None => {
-            tracing::warn!(
-                "Could not resolve the executable's path; \
-                 the symbolize command in a crash report will name the binary generically"
-            );
-        }
-    }
-    "addr2line -e spiced -fCi 0x".to_owned()
 }
 
 #[cfg(target_os = "linux")]
@@ -623,11 +578,7 @@ fn report(cc: &crash_handler::CrashContext) {
     .is_ok();
     // Only when the offset is one `addr2line` can actually use.
     if in_text {
-        if let Some(prefix) = SYMBOLIZE_PREFIX.get() {
-            complete &= write!(cur, "symbolize: ").is_ok();
-            complete &= cur.write_all(prefix.as_bytes()).is_ok();
-            complete &= writeln!(cur, "{offset:x}").is_ok();
-        }
+        complete &= writeln!(cur, "symbolize: addr2line -e spiced -fCi 0x{offset:x}").is_ok();
     }
     // Flushed before the stack section: reading the stack can fault again, and a
     // second fault inside the handler ends the process with the signal still blocked.
@@ -656,11 +607,11 @@ const STACK_WORDS: usize = 16;
 const STACK_BUF: usize = 1024;
 #[cfg(target_os = "linux")]
 const _: () = assert!(
-    38 + 24                          // stack: rsp=… ret=…
-        + 22                         // (+0x…)
-        + 18                         // lr=…
-        + MAX_SYMBOLIZE_PREFIX + 17  // the caller's symbolize line
-        + 18 + STACK_WORDS * 21      // the candidate list
+    38 + 24                      // stack: sp=… ret=…
+        + 22                     // (+0x…)
+        + 18                     // lr=…
+        + 62                     // the caller's symbolize line
+        + 18 + STACK_WORDS * 21  // the candidate list
         <= STACK_BUF
 );
 
@@ -723,10 +674,11 @@ fn report_stack(cc: &crash_handler::CrashContext) {
     }
     let _ = writeln!(cur);
 
-    if let Some((offset, prefix)) = caller.zip(SYMBOLIZE_PREFIX.get()) {
-        let _ = write!(cur, "symbolize caller: ");
-        let _ = cur.write_all(prefix.as_bytes());
-        let _ = writeln!(cur, "{offset:x}");
+    if let Some(offset) = caller {
+        let _ = writeln!(
+            cur,
+            "symbolize caller: addr2line -e spiced -fCi 0x{offset:x}"
+        );
     }
 
     #[expect(
