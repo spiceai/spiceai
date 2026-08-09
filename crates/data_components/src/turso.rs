@@ -2299,12 +2299,20 @@ const MAP_VALUE_COLUMN: usize = 1;
 
 /// Version of the encoding written for a list value's elements.
 ///
-/// A payload carrying this version was written by an encoder whose output the reader can trust. A
-/// payload carrying no version at all was written before the marker existed, which includes every
-/// payload written by the encoder that stored the literal `[null]` for every list whatever the list
-/// held. Those two are the same bytes for a list of one null, so the version is the only thing that
-/// separates a stored list the reader may serve from one it may not.
+/// A payload carrying this version was written by an encoder whose output the reader can trust. It
+/// is not the only payload the reader will serve, because a version marker is not what makes a
+/// stored list correct — see [`classify_stored_list`] for what an unversioned payload is judged on.
 const LIST_ENCODING_VERSION: u64 = 1;
+
+/// The one payload the pre-version writer produced, for every list whatever the list held: a JSON
+/// array of exactly one null.
+///
+/// A list that genuinely holds a single null encodes to the same bytes, so an *unversioned* payload
+/// of this shape cannot be attributed to either writer and is refused. Any other unversioned shape
+/// is proof of a writer that was not the broken one, so it is served.
+fn is_pre_version_list_shape(elements: &[serde_json::Value]) -> bool {
+    matches!(elements, [serde_json::Value::Null])
+}
 
 /// Envelope member naming the [`LIST_ENCODING_VERSION`] a payload was written under.
 const LIST_ENCODING_VERSION_KEY: &str = "v";
@@ -2450,23 +2458,21 @@ fn decode_stored_lists(
     let mut elements: Vec<ScalarValue> = Vec::new();
     let mut lengths = Vec::with_capacity(rows.len());
     let mut validity = Vec::with_capacity(rows.len());
-    let mut unversioned = 0;
+    let mut refusals = ListRefusals::default();
 
     for row in rows {
-        if let Some(values) = decode_stored_list_row(row.get(col_idx), element_type) {
+        if let Some(values) = decode_stored_list_row(row.get(col_idx), element_type, &mut refusals)
+        {
             lengths.push(values.len());
             validity.push(true);
             elements.extend(values);
         } else {
-            if is_unversioned_list_payload(row.get(col_idx)) {
-                unversioned += 1;
-            }
             lengths.push(0);
             validity.push(false);
         }
     }
 
-    warn_on_unversioned_list_payloads(unversioned);
+    warn_on_refused_list_payloads(&refusals);
 
     Ok(DecodedLists {
         elements: scalars_to_array(elements, element_type)?,
@@ -2495,25 +2501,22 @@ fn decode_stored_fixed_size_lists(
     // rows and let the element vector grow, rather than trusting `rows * width` as a capacity.
     let mut elements: Vec<ScalarValue> = Vec::with_capacity(rows.len());
     let mut validity = Vec::with_capacity(rows.len());
-    let mut unversioned = 0;
+    let mut refusals = ListRefusals::default();
 
     for row in rows {
-        if let Some(values) = decode_stored_list_row(row.get(col_idx), element_type)
+        if let Some(values) = decode_stored_list_row(row.get(col_idx), element_type, &mut refusals)
             .filter(|values| values.len() == slots)
         {
             validity.push(true);
             elements.extend(values);
         } else {
-            if is_unversioned_list_payload(row.get(col_idx)) {
-                unversioned += 1;
-            }
             // A null row still owns its slots in the element array.
             validity.push(false);
             elements.extend(std::iter::repeat_n(unset.clone(), slots));
         }
     }
 
-    warn_on_unversioned_list_payloads(unversioned);
+    warn_on_refused_list_payloads(&refusals);
 
     Ok(DecodedFixedSizeLists {
         elements: scalars_to_array(elements, element_type)?,
@@ -2557,63 +2560,120 @@ fn decode_stored_maps(
     })
 }
 
-/// The elements of one stored list, or `None` if nothing was stored for it, it was written before
-/// [`LIST_ENCODING_VERSION`] existed, or it does not decode as the declared element type.
+/// What a stored list payload turns out to be, decided in one parse so that a refused cell can say
+/// why without the payload being read twice.
+enum StoredListPayload {
+    /// Elements to decode as the column's element type.
+    Elements(Vec<serde_json::Value>),
+    /// An unversioned payload of the one shape the broken writer produced — see
+    /// [`is_pre_version_list_shape`]. Undecidable, so refused.
+    AmbiguousPreVersion,
+    /// An envelope naming an encoding version this build does not write, so its shape is not one
+    /// this reader knows how to interpret.
+    UnknownVersion,
+    /// Not a list payload this reader recognises at all.
+    Unreadable,
+}
+
+/// Decides what a stored list payload is.
+///
+/// An envelope is served when it names [`LIST_ENCODING_VERSION`]. A bare array carries no version,
+/// so it predates the marker — but that alone does not condemn it: the broken writer emitted exactly
+/// one shape, so only that shape is ambiguous and every other bare array is provably from a writer
+/// that serialized the list's real contents. Refusing all of them would discard correct data to no
+/// benefit.
+fn classify_stored_list(json: &str) -> StoredListPayload {
+    match serde_json::from_str::<serde_json::Value>(json) {
+        Ok(serde_json::Value::Object(mut envelope)) => {
+            let version = envelope
+                .get(LIST_ENCODING_VERSION_KEY)
+                .and_then(serde_json::Value::as_u64);
+            if version != Some(LIST_ENCODING_VERSION) {
+                return StoredListPayload::UnknownVersion;
+            }
+            match envelope.remove(LIST_ENCODING_ELEMENTS_KEY) {
+                Some(serde_json::Value::Array(elements)) => StoredListPayload::Elements(elements),
+                // Claims a version whose shape it does not have, so it is corrupt rather than
+                // written under a rule this reader could apply.
+                _ => StoredListPayload::Unreadable,
+            }
+        }
+        Ok(serde_json::Value::Array(elements)) => {
+            if is_pre_version_list_shape(&elements) {
+                StoredListPayload::AmbiguousPreVersion
+            } else {
+                StoredListPayload::Elements(elements)
+            }
+        }
+        _ => StoredListPayload::Unreadable,
+    }
+}
+
+/// Per-column tally of stored list cells refused for a reason an operator can act on.
+///
+/// Counted rather than logged per row so a scan reports once instead of once per cell.
+#[derive(Default)]
+struct ListRefusals {
+    /// Payloads of the shape the broken writer produced, which cannot be attributed.
+    ambiguous_pre_version: usize,
+    /// Payloads written under an encoding version newer than this build's.
+    unknown_version: usize,
+}
+
+/// The elements of one stored list, or `None` if nothing was stored for it, it cannot be
+/// attributed, or it does not decode as the declared element type.
+///
+/// Records the refusals worth reporting in `refusals`; a payload that is simply unreadable is not
+/// one of them, because the existing conversion-failure WARN already covers it as drift.
 fn decode_stored_list_row(
     stored: Option<&TursoValue>,
     element_type: &DataType,
+    refusals: &mut ListRefusals,
 ) -> Option<Vec<ScalarValue>> {
     let Some(TursoValue::Text(json)) = stored else {
         return None;
     };
-    stored_list_elements(json)?
+    let elements = match classify_stored_list(json) {
+        StoredListPayload::Elements(elements) => elements,
+        StoredListPayload::AmbiguousPreVersion => {
+            refusals.ambiguous_pre_version += 1;
+            return None;
+        }
+        StoredListPayload::UnknownVersion => {
+            refusals.unknown_version += 1;
+            return None;
+        }
+        StoredListPayload::Unreadable => return None,
+    };
+    elements
         .iter()
         .map(|element| json_value_to_scalar(element, element_type))
         .collect()
 }
 
-/// The elements a list payload carries, or `None` if it is not an envelope written under
-/// [`LIST_ENCODING_VERSION`].
-fn stored_list_elements(json: &str) -> Option<Vec<serde_json::Value>> {
-    let mut envelope: serde_json::Map<String, serde_json::Value> =
-        serde_json::from_str(json).ok()?;
-    if envelope.get(LIST_ENCODING_VERSION_KEY)?.as_u64()? != LIST_ENCODING_VERSION {
-        return None;
-    }
-    match envelope.remove(LIST_ENCODING_ELEMENTS_KEY)? {
-        serde_json::Value::Array(elements) => Some(elements),
-        _ => None,
-    }
-}
-
-/// Whether a stored value is a list payload written before [`LIST_ENCODING_VERSION`] existed — a
-/// bare JSON array rather than an envelope.
-///
-/// Told apart from the other ways a row reads as null so that the reason it read as null can be
-/// reported: an unversioned payload is refused for its provenance, not for its contents, and a
-/// refresh is what repairs it.
-fn is_unversioned_list_payload(stored: Option<&TursoValue>) -> bool {
-    let Some(TursoValue::Text(json)) = stored else {
-        return false;
-    };
-    serde_json::from_str::<Vec<serde_json::Value>>(json).is_ok()
-}
-
-/// Emits one WARN per scanned list column that held payloads predating
-/// [`LIST_ENCODING_VERSION`], naming the refresh that rebuilds them.
+/// Emits one WARN per refusal reason a scanned list column hit, each naming its own remedy.
 ///
 /// Separate from the per-scan conversion-failure WARN, which reports the same cells as type drift.
-/// This one has the specific cause and the specific remedy.
-fn warn_on_unversioned_list_payloads(count: usize) {
-    if count == 0 {
-        return;
+/// These say what actually happened and what fixes it.
+fn warn_on_refused_list_payloads(refusals: &ListRefusals) {
+    if refusals.ambiguous_pre_version > 0 {
+        let count = refusals.ambiguous_pre_version;
+        tracing::warn!(
+            "Turso read: {count} stored list value(s) hold the single-null payload that a build \
+             predating the list encoding version wrote for every list, whatever the list held. \
+             That is also what a list genuinely holding one null looks like, so these cannot be \
+             attributed and were returned as NULL rather than served. Refresh this dataset to \
+             rebuild them."
+        );
     }
-    tracing::warn!(
-        "Turso read: {count} stored list value(s) predate the list encoding version and were \
-         returned as NULL. A list written before that version cannot be told apart from one \
-         written by the encoder that stored every list as a single null, so its contents are not \
-         served. Refresh this dataset to rebuild them."
-    );
+    if refusals.unknown_version > 0 {
+        let count = refusals.unknown_version;
+        tracing::warn!(
+            "Turso read: {count} stored list value(s) name a list encoding version this build does \
+             not write, and were returned as NULL. This acceleration was written by a newer build \
+             than the one reading it: upgrade this build, or refresh the dataset to rewrite them."
+        );
+    }
 }
 
 /// The entries of one stored map, or `None` if nothing was stored for it or it does not decode as a
@@ -3666,30 +3726,53 @@ mod tests {
     }
 
     /// Regression test for #12632: a `mode: file` acceleration keeps its payloads across an
-    /// upgrade, and every list the pre-#12628 writer stored is the literal `[null]`, whatever the
-    /// list held. Reading that as a one-element list holding null serves a value the source never
-    /// had — and stops warning about it, because it now parses.
+    /// upgrade, and every list the pre-#12628 writer stored is the literal single-null array,
+    /// whatever the list held. Reading that as a one-element list holding null serves a value the
+    /// source never had — and stops warning about it, because it now parses.
     #[test]
-    fn test_a_pre_version_list_payload_is_not_served_as_data() {
+    fn test_an_ambiguous_pre_version_list_payload_is_not_served_as_data() {
         let column = read_stored(TursoValue::Text("[null]".to_string()), int32_list_type());
 
         assert!(
             column.is_null(0),
-            "a list payload predating the encoding version should read as NULL, not as a \
+            "the one payload shape the broken writer produced should read as NULL, not as a \
              one-element list holding null"
         );
     }
 
-    /// The refusal is by provenance, not by contents: a payload the pre-version writer could not
-    /// have produced is still unversioned, and nothing separates it from one that it did.
+    /// The refusal is confined to the one ambiguous shape. An unversioned payload holding anything
+    /// else could not have come from the broken writer — that writer emitted a single null for
+    /// every list — so it is real data and must still be served, rather than being discarded for
+    /// merely predating the marker.
     #[test]
-    fn test_a_pre_version_list_payload_holding_contents_is_not_served() {
-        let column = read_stored(TursoValue::Text("[1,2,3]".to_string()), int32_list_type());
+    fn test_an_unversioned_list_payload_holding_contents_is_still_served() {
+        let mut expected = ListBuilder::new(Int32Builder::new());
+        for element in [1, 2, 3] {
+            expected.values().append_value(element);
+        }
+        expected.append(true);
+        let expected = ScalarValue::List(Arc::new(expected.finish()))
+            .to_array()
+            .expect("the list should build an array");
+
+        assert_eq!(
+            read_stored(TursoValue::Text("[1,2,3]".to_string()), int32_list_type()).as_ref(),
+            expected.as_ref(),
+            "an unversioned payload the broken writer could not have produced should be served"
+        );
+    }
+
+    /// An unversioned empty list is in the same class: the broken writer wrote a single null even
+    /// for an empty list, so a stored empty array is proof of a writer that was not it.
+    #[test]
+    fn test_an_unversioned_empty_list_payload_is_still_served() {
+        let column = read_stored(TursoValue::Text("[]".to_string()), int32_list_type());
 
         assert!(
-            column.is_null(0),
-            "an unversioned list payload should read as NULL whatever it holds"
+            !column.is_null(0),
+            "an unversioned empty list should be served, not refused for lacking a version"
         );
+        assert_eq!(column.len(), 1, "the batch should hold the one row read");
     }
 
     /// The other half of the same rule: a list of one null written by the *current* encoder is
@@ -3703,7 +3786,7 @@ mod tests {
     /// A refused payload is a non-NULL stored value that read as NULL, so the existing per-scan
     /// conversion-failure WARN counts it. Nothing about the upgrade is silent.
     #[test]
-    fn test_a_pre_version_list_payload_is_counted_as_a_conversion_failure() {
+    fn test_an_ambiguous_pre_version_list_payload_is_counted_as_a_conversion_failure() {
         let schema: SchemaRef =
             Arc::new(Schema::new(vec![Field::new("c", int32_list_type(), true)]));
         let rows = vec![vec![TursoValue::Text("[null]".to_string())]];
@@ -3719,7 +3802,7 @@ mod tests {
 
     /// The fixed-size arm decodes through the same payload reader, so it refuses the same payloads.
     #[test]
-    fn test_a_pre_version_fixed_size_list_payload_is_not_served() {
+    fn test_an_ambiguous_pre_version_fixed_size_list_payload_is_not_served() {
         let column = read_stored(
             TursoValue::Text("[null]".to_string()),
             DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Int32, true)), 1),
@@ -3745,6 +3828,32 @@ mod tests {
             read_stored(TursoValue::Text(stored), int32_list_type()).is_null(0),
             "an envelope naming an unknown encoding version should read as NULL"
         );
+    }
+
+    /// The version must be the integer this build writes, not merely something that reads as one.
+    /// A float, a string, or a boolean in that member means the payload was not written by an
+    /// encoder this reader knows, so accepting any of them would serve a shape on a coincidence.
+    #[test]
+    fn test_a_list_envelope_whose_version_is_not_an_integer_is_not_served() {
+        for version in [
+            serde_json::json!(1.0),
+            serde_json::json!("1"),
+            serde_json::json!(true),
+            serde_json::json!(null),
+        ] {
+            let mut envelope = serde_json::Map::with_capacity(2);
+            envelope.insert(LIST_ENCODING_VERSION_KEY.to_string(), version.clone());
+            envelope.insert(
+                LIST_ENCODING_ELEMENTS_KEY.to_string(),
+                serde_json::json!([1, 2, 3]),
+            );
+            let stored = serde_json::Value::Object(envelope).to_string();
+
+            assert!(
+                read_stored(TursoValue::Text(stored), int32_list_type()).is_null(0),
+                "an envelope whose version member is {version} should read as NULL"
+            );
+        }
     }
 
     /// An envelope whose elements member is missing or is not an array names a version whose shape
