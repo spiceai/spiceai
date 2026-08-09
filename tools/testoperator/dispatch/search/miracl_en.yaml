@@ -1,0 +1,6 @@
+tests:
+  search:
+    spicepod_path: test/spicepods/search/mteb/miracl_en/full_text_search-duckdb[file].yaml
+    runner_type: spiceai-dev-runners
+    benchmark_dataset: miracl_en_retrieval
+    ready_wait: 1800

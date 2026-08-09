@@ -27,13 +27,12 @@ use datafusion::catalog::{CatalogProvider, SchemaProvider};
 use datafusion::datasource::TableProvider;
 use datafusion::error::Result as DFResult;
 use datafusion::sql::TableReference;
-use globset::GlobSet;
 use mysql_async::prelude::Queryable;
 use snafu::prelude::*;
 
 use crate::{
     DESCRIPTION_METADATA_KEY, FieldMetadata, Read, RefreshableCatalogProvider,
-    SOURCE_TYPE_METADATA_KEY, metadata_enriched_table_provider,
+    SOURCE_TYPE_METADATA_KEY, catalog_filter::TableSelector, metadata_enriched_table_provider,
 };
 
 #[derive(Debug, Snafu)]
@@ -80,7 +79,7 @@ pub struct MySQLCatalogProvider {
     pool: mysql_async::Pool,
     table_creator: Arc<dyn Read>,
     schemas: RwLock<HashMap<String, Arc<MySQLSchemaProvider>>>,
-    include: Option<Arc<GlobSet>>,
+    selector: TableSelector,
 }
 
 impl std::fmt::Debug for MySQLCatalogProvider {
@@ -95,13 +94,13 @@ impl MySQLCatalogProvider {
     pub fn new(
         pool: mysql_async::Pool,
         table_creator: Arc<dyn Read>,
-        include: Option<GlobSet>,
+        selector: TableSelector,
     ) -> Self {
         Self {
             pool,
             table_creator,
             schemas: RwLock::new(HashMap::new()),
-            include: include.map(Arc::new),
+            selector,
         }
     }
 
@@ -114,7 +113,7 @@ impl MySQLCatalogProvider {
                 self.pool.clone(),
                 schema_name.clone(),
                 Arc::clone(&self.table_creator),
-                self.include.clone(),
+                self.selector.clone(),
             );
             schema_provider.refresh_tables().await?;
             schemas.insert(schema_name, Arc::new(schema_provider));
@@ -182,7 +181,7 @@ pub struct MySQLSchemaProvider {
     schema_name: String,
     table_creator: Arc<dyn Read>,
     tables: RwLock<HashMap<String, Arc<dyn TableProvider>>>,
-    include: Option<Arc<GlobSet>>,
+    selector: TableSelector,
 }
 
 impl std::fmt::Debug for MySQLSchemaProvider {
@@ -199,14 +198,14 @@ impl MySQLSchemaProvider {
         pool: mysql_async::Pool,
         schema_name: String,
         table_creator: Arc<dyn Read>,
-        include: Option<Arc<GlobSet>>,
+        selector: TableSelector,
     ) -> Self {
         Self {
             pool,
             schema_name,
             table_creator,
             tables: RwLock::new(HashMap::new()),
-            include,
+            selector,
         }
     }
 
@@ -226,11 +225,11 @@ impl MySQLSchemaProvider {
 
         let mut tables = HashMap::new();
         for table_name in table_names {
-            let schema_with_table = format!("{}.{}", self.schema_name, table_name);
-            if let Some(include) = &self.include
-                && !include.is_match(&schema_with_table)
-            {
-                tracing::debug!("Table {schema_with_table} is not included, skipping");
+            if !self.selector.selects_table(&self.schema_name, &table_name) {
+                tracing::debug!(
+                    "Table {}.{table_name} is not selected by the catalog's include/exclude patterns, skipping",
+                    self.schema_name
+                );
                 continue;
             }
 
