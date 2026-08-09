@@ -36,6 +36,8 @@ limitations under the License.
 
 use std::sync::OnceLock;
 
+use snafu::{ResultExt, Snafu};
+
 /// Kept alive for the process lifetime; dropping a [`CrashHandler`] detaches it.
 static HANDLER: OnceLock<crash_handler::CrashHandler> = OnceLock::new();
 
@@ -75,15 +77,31 @@ const MAX_IDENTITY: usize = 192;
 
 const _: () = assert!(MAX_IDENTITY < REPORT_BUF / 2);
 
+#[derive(Debug, Snafu)]
+#[snafu(display(
+    "Fatal-signal reporting is unavailable; a native crash will produce no diagnostics: {source}"
+))]
+pub struct InstallError {
+    source: crash_handler::Error,
+}
+
 /// Install fatal-signal reporting. Call once, as early in `main` as possible, so
 /// faults during startup are covered.
 ///
 /// `version` is passed in rather than rebuilt here: `main` already composes it, and
 /// the feature flags it encodes belong with the rest of the version logic.
 ///
-/// A failure to attach is logged and ignored: refusing to start without crash
-/// reporting would be worse than starting without it.
-pub fn install(version: &str) {
+/// A failure to attach is returned rather than logged, and the caller does nothing
+/// with it beyond reporting it: refusing to start without crash reporting would be
+/// worse than starting without it. It is returned because this runs before any
+/// tracing subscriber exists — a message emitted here would reach no one — so the
+/// caller logs it once there is somewhere for it to go.
+///
+/// # Errors
+///
+/// Fails when the signal handler cannot be attached, most commonly because another
+/// handler already owns the process's fatal signals.
+pub fn install(version: &str) -> Result<(), InstallError> {
     let _ = START.set(std::time::Instant::now());
     resolve_image();
     // Formatted now, not in the handler: allocating there is not signal-safe, and a
@@ -102,16 +120,9 @@ pub fn install(version: &str) {
     // SAFETY: the closure is async-signal-safe — see the module docs.
     let event = unsafe { crash_handler::make_crash_event(on_crash) };
 
-    match crash_handler::CrashHandler::attach(event) {
-        Ok(handler) => {
-            let _ = HANDLER.set(handler);
-        }
-        Err(err) => {
-            tracing::warn!(
-                "Fatal-signal reporting is unavailable; a native crash will produce no diagnostics: {err}"
-            );
-        }
-    }
+    let handler = crash_handler::CrashHandler::attach(event).context(InstallSnafu)?;
+    let _ = HANDLER.set(handler);
+    Ok(())
 }
 
 /// Resolve everything the report needs about the running binary. Only the Linux
@@ -771,7 +782,7 @@ mod tests {
         use std::os::unix::process::ExitStatusExt as _;
 
         if let Some(role) = std::env::var_os(CHILD) {
-            super::install(TEST_VERSION);
+            super::install(TEST_VERSION).expect("install fatal-signal reporting");
             match role.to_str() {
                 Some("abort") => {
                     // SAFETY: raising a signal at ourselves is the behaviour under test.
