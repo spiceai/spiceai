@@ -794,6 +794,13 @@ readonly EXIT_MAKE_TARGET_MISSING=71
 # never reached a verdict of its own — the process tree was signalled. That is
 # how a `Sign off` step reads when its `timeout-minutes` budget expires (#12518)
 # and how a cancelled job reads (#12424); a recipe that genuinely fails exits 2.
+#
+# It only reads that way when make dies *without* handling the signal. GNU make
+# installs its own handler: it removes the target it was building, then kills
+# itself with the signal — but a recipe line that traps and exits, or a
+# sub-make, can return an ordinary small status instead, and that is what this
+# script then observes. So this bound is a sufficient test for "signalled", not
+# a necessary one; SIGNOFF_SIGNALLED below is what covers the rest.
 readonly EXIT_SIGNAL_BASE=128
 # How the linker's out-of-disk death actually reads in the run log:
 # `ld: write() failed, errno=28 (No space left on device)`. Either spelling is
@@ -1036,6 +1043,48 @@ disk_is_critical() {
   (( free < DISK_CRITICAL_GIB ))
 }
 
+# Set to 1 by the handler armed in watch_for_signals when this process is
+# signalled.
+#
+# Cancelling an Actions job signals the whole process group, so this script and
+# the `make` it is waiting on both receive it. When make answers with a small
+# status of its own rather than dying of the signal, the 128+signum reading
+# above sees an ordinary failing status and classification falls through to
+# "checks" — so a run that judged nothing published `signoff=failure` saying the
+# branch's checks failed (#12710). Recording the signal where it is unambiguous,
+# in the process that also receives it, is what separates the two.
+#
+# A shell variable rather than a file, for the same reason as SIGNOFF_DISK_HIT:
+# a handler that has to allocate to report is a handler that fails in exactly
+# the conditions worth reporting.
+#
+# Seeded from the environment so the unit tests can set up a classification
+# without signalling anything.
+SIGNOFF_SIGNALLED="${SIGNOFF_SIGNALLED:-}"
+
+# Record that this run was signalled, for failure_kind to read once the `make`
+# it was waiting on returns.
+#
+# Deliberately does nothing else. The handler runs between commands, so the work
+# of describing and publishing happens on the normal path with the exit status
+# intact; re-raising here would instead kill the script before it could decline
+# to publish, and leave the `pending` it posted on the way in unexplained.
+note_signal() {
+  SIGNOFF_SIGNALLED=1
+}
+
+# Arm the signal handler. Remote runs only, and called only from the verify
+# path: trapping INT locally would swallow the Ctrl-C an interactive `make
+# signoff` expects to stop it, and this script has nothing to gain from
+# surviving one. Same remote-only shape, and same reason, as SIGNOFF_DISK_WATCH.
+#
+# HUP as well as INT and TERM: a runner tearing down can drop the controlling
+# terminal before it signals anything else.
+watch_for_signals() {
+  # shellcheck disable=SC2064  # No expansion here; the handler is a function.
+  trap note_signal INT TERM HUP
+}
+
 # Names what broke in a check run that did not pass, given run_checks' exit
 # status: "signalled" when nothing judged the branch at all, "disk" when the work
 # volume is the cause, "cache" when sccache could not reach its storage and so
@@ -1053,7 +1102,15 @@ failure_kind() {
   # describe a `make` that *returned*: the preflight refusing to start (70) and
   # a build that printed ENOSPC and died. Neither can coexist with a status that
   # says make itself was killed.
-  if [[ "$check_status" -ge "$EXIT_SIGNAL_BASE" ]]; then
+  #
+  # Two readings, because either one alone misses a case. The status covers a
+  # make that died of the signal, including on a local run with no handler
+  # armed; the recorded signal covers a make that handled it and returned a
+  # small status of its own, which is indistinguishable from a failing recipe by
+  # status alone (#12710). Note the recorded signal is checked even against
+  # EXIT_DISK_EXHAUSTED below: a run signalled during the preflight reached no
+  # verdict either, and "no verdict" outranks naming a cause.
+  if [[ -n "$SIGNOFF_SIGNALLED" ]] || [[ "$check_status" -ge "$EXIT_SIGNAL_BASE" ]]; then
     echo "signalled"
     return
   fi
@@ -1636,6 +1693,11 @@ cmd_signoff() {
       # the pool's sccache endpoint are both pool-only. Arming cannot fail —
       # there is no file to create and so nothing to clean up on exit.
       SIGNOFF_DISK_WATCH=1
+      # From here on there is a `pending` on the commit and a verdict to decide,
+      # so a signal from here on has to be told apart from a failing recipe.
+      # Armed after the post, so a signal arriving before there is anything to
+      # publish still stops the script outright.
+      watch_for_signals
     fi
     # Capture status without wrapping in `if`/`||` (those also disable set -e
     # for the LHS). run_checks uses explicit `|| return` so make failures still
@@ -1644,7 +1706,16 @@ cmd_signoff() {
     run_checks "$revision"
     check_status=$?
     set -e
-    if [[ "$check_status" -ne 0 ]]; then
+    # A recorded signal takes this branch even on status 0. `make` returning 0
+    # says the commands that ran succeeded, not that all of them ran: a recipe
+    # line that traps the cancellation and exits 0, or a sub-make that swallows
+    # it, ends the checks early with nothing to distinguish the result from a
+    # clean pass. Falling through would post `signoff=success` — a run that
+    # judged nothing certifying the commit, which is the same mistake as #12710's
+    # false `failure` and the more costly direction of it, since it clears a
+    # branch to merge. The signalled case publishes no verdict either way, so
+    # what stands is the `pending` this run posted on its way in.
+    if [[ "$check_status" -ne 0 || -n "$SIGNOFF_SIGNALLED" ]]; then
       elapsed=$(( $(date +%s) - start ))
       describe_check_failure "$check_status" "$elapsed" "$user"
       if is_remote_run; then
@@ -1722,6 +1793,80 @@ cmd_status() {
   fi
 }
 
+# How long cmd_correct_cancelled waits for a dying run's last status post to
+# land before reading the commit as settled.
+#
+# The `if: cancelled()` step that calls it starts as soon as the `Sign off` step
+# is marked cancelled, which is not the same moment that step's process stops
+# writing: on run 31144830314 the handler read `pending` at 05:16:20Z and the
+# `failure` it existed to withdraw was posted at 05:16:24Z, four seconds later
+# (#12710). Reading once therefore samples a commit still being written to.
+#
+# ~15s covers that margin with room to spare and costs nothing anyone waits on —
+# the job is already cancelled and this step is the last thing in it. It is not
+# a correctness boundary in either direction: overshooting the window leaves the
+# same false `failure` as reading once does, and the run that wrote it is gone,
+# so no wait can be long enough to be *required*.
+#
+# Overridable from the environment so the unit tests can exercise the polling
+# without spending the window on every case that never reaches it.
+readonly DEFAULT_CANCELLED_SETTLE_ATTEMPTS=5
+readonly DEFAULT_CANCELLED_SETTLE_SLEEP_SECONDS=3
+
+# One of the two settle knobs, as a base-10 integer: $1 the environment variable
+# to read, $2 the default to fall back to when it is unset or unusable.
+#
+# Validated for the same reason preflight_disk validates its floor, and it
+# matters more here: an unvalidated value reaches an arithmetic context, where a
+# non-integer is a `set -e` abort — and aborting in *this* command would leave
+# the false `failure` it exists to withdraw standing on the commit. A bad value
+# falls back rather than failing.
+settle_knob() {
+  local name="$1" fallback="$2" value="${!1:-$2}"
+  if [[ ! "$value" =~ ^[0-9]+$ ]]; then
+    info "warning: ${name}='${value}' is not an integer — using ${fallback}"
+    value="$fallback"
+  fi
+  # Force base 10: bash arithmetic reads a leading zero as octal, so a
+  # well-meaning `05` is an arithmetic error rather than 5.
+  printf '%s\n' "$((10#$value))"
+}
+
+# The STATUS_CONTEXT state on a commit, once a dying run has had a chance to
+# finish writing it. Prints the state ("" when the context is unset) and returns
+# 0; returns non-zero only when the status could not be read at all, which every
+# caller must keep distinct from "unset" — see cmd_correct_cancelled.
+#
+# Only `pending` is waited on. It is the state a run posts on its way in and so
+# the one a late verdict overwrites; `failure`/`error` is already the verdict
+# being withdrawn, a `success` is settled and must not be second-guessed, and an
+# unset context means no run got as far as posting anything. Returning
+# immediately on all three keeps the wait off every path that cannot benefit
+# from it.
+settled_signoff_state() {
+  local repo="$1" sha="$2" combined state attempt attempts sleep_seconds
+  attempts=$(settle_knob CANCELLED_SETTLE_ATTEMPTS "$DEFAULT_CANCELLED_SETTLE_ATTEMPTS")
+  sleep_seconds=$(settle_knob CANCELLED_SETTLE_SLEEP_SECONDS "$DEFAULT_CANCELLED_SETTLE_SLEEP_SECONDS")
+  # Zero attempts would read nothing at all and report the commit as unset,
+  # which is the one answer that is never true — the loop must run at least once.
+  (( attempts >= 1 )) || attempts=1
+
+  for (( attempt = 1; attempt <= attempts; attempt++ )); do
+    combined=$(gh api "repos/${repo}/commits/${sha}/status" 2>/dev/null) || return 1
+    state=$(combined_status_state "$combined" 2>/dev/null) || state=""
+    [[ "$state" == "pending" ]] || { printf '%s\n' "$state"; return 0; }
+    (( attempt < attempts )) || break
+    sleep "$sleep_seconds"
+  done
+
+  # Still `pending` after the wait: either the run reached no verdict and
+  # declined to publish one — which is what a cancelled run is now supposed to
+  # leave behind (#12710) — or it died before it could. Both are `pending`, and
+  # `pending` is the state this command would write anyway.
+  printf '%s\n' "$state"
+  return 0
+}
+
 # Repair the sign-off status a *cancelled* Remote Sign-off run left behind.
 #
 # Usage: cmd_correct_cancelled [<sha>] [<owner/repo>]
@@ -1753,7 +1898,7 @@ cmd_status() {
 # where the API may be unreachable and the exit status is not worth anything: it
 # must never mask the cancellation itself, so every path exits 0.
 cmd_correct_cancelled() {
-  local sha="${1:-}" repo="${2:-${GITHUB_REPOSITORY:-}}" combined state
+  local sha="${1:-}" repo="${2:-${GITHUB_REPOSITORY:-}}" state
 
   # `|| true` on each fallback: a resolver that fails leaves the value empty, and
   # the emptiness check below is what reports it. Splitting those into separate
@@ -1769,11 +1914,10 @@ cmd_correct_cancelled() {
 
   # A read failure must not be treated as "unset" — that would license a write over
   # a status we simply could not see, which is the bug this command exists to fix.
-  if ! combined=$(gh api "repos/${repo}/commits/${sha}/status" 2>/dev/null); then
+  if ! state=$(settled_signoff_state "$repo" "$sha"); then
     info "could not read the ${STATUS_CONTEXT} status on ${sha} — leaving it alone."
     return 0
   fi
-  state=$(combined_status_state "$combined" 2>/dev/null) || state=""
 
   case "$state" in
     failure | error)
