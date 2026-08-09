@@ -258,8 +258,25 @@ where
         // This is acceptable because:
         // 1. The window is extremely small (single-digit microseconds)
         // 2. We already verified the item isn't expired (no unnecessary re-admission)
-        // 3. Overall system throughput is 2-3x higher than alternatives
-        // 4. Cache misses are handled gracefully by upstream code
+        // 3. Cache misses are handled gracefully by upstream code
+        //
+        // What is *not* acceptable is another request writing this key inside that window.
+        // The pair below is a read expressed as a mutation, so an `insert` that completes
+        // between the remove and the re-admit is undone by the re-admit: the old value goes
+        // back over the new one, while the insert's metadata — and so the new entry's
+        // expiry — stays. The cache then serves a value the writer replaced, for the TTL of
+        // the replacement (#12838).
+        //
+        // So the pair goes under one hold of the key's shard, the same lock `insert`,
+        // `remove` and `remove_if_expired` publish or drop a value and its metadata under.
+        // That makes this read atomic with respect to those writers: an `insert` that lands
+        // before the hold is what `remove` returns and what the re-admit puts back, and one
+        // that arrives during it waits and then wins outright. The lock is taken in the
+        // order `insert` already takes it — shard, then the pingora-lru shard underneath
+        // `remove`/`admit` — so it adds no new ordering against eviction.
+        let shard_idx = Self::get_shard_index(*key);
+        let _shard = self.metadata_shards[shard_idx].write();
+
         let (entry, weight) = self.cache.remove(*key)?;
 
         // Re-admit to maintain the value in cache (promotes to head of LRU).
@@ -1022,6 +1039,120 @@ mod tests {
         assert!(backend.get(&key).await.is_none());
         assert_eq!(backend.len().await, 0);
         assert!(backend.iter_keys().await.is_empty());
+    }
+
+    /// Parks a reader inside `get`'s remove → re-admit window, so a writer can be aimed at
+    /// exactly the gap the bug lives in. `get` clones the value between the two calls, which
+    /// is the only point in the window this backend hands control to the value type.
+    #[derive(Debug)]
+    struct GatedValue {
+        data: String,
+        /// Set only on the copy the cache holds, so the reader's own clone-of-a-clone and
+        /// the writer's fresh value pass straight through.
+        gate: Option<Arc<Gate>>,
+    }
+
+    #[derive(Debug)]
+    struct Gate {
+        entered: std::sync::mpsc::SyncSender<()>,
+        release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl Clone for GatedValue {
+        fn clone(&self) -> Self {
+            if let Some(gate) = &self.gate {
+                gate.entered.send(()).expect("the test awaits this");
+                gate.release
+                    .lock()
+                    .expect("gate mutex is not poisoned")
+                    .recv()
+                    .expect("the test releases this");
+            }
+            Self {
+                data: self.data.clone(),
+                gate: None,
+            }
+        }
+    }
+
+    impl Sizeable for GatedValue {
+        fn get_memory_size(&self) -> usize {
+            self.data.len()
+        }
+    }
+
+    /// The hit path reads by removing the value and re-admitting it. An `insert` that
+    /// completes between the two is then undone by the re-admit: the old value goes back
+    /// over the new one, and the new one's metadata stays, so the cache serves the replaced
+    /// value for the replacement's TTL (#12838).
+    ///
+    /// Driven through the gate above rather than by racing two tasks and hoping: the window
+    /// is a few microseconds wide, so a stress test reports the bug only occasionally and
+    /// passes on the broken code most runs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_hit_cannot_re_admit_over_a_concurrent_insert() {
+        let backend = Arc::new(PingoraBackend::<GatedValue>::with_params(
+            4096,
+            Duration::from_mins(1),
+        ));
+        let key = 11u64;
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel::<()>(1);
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        backend
+            .insert(
+                key,
+                GatedValue {
+                    data: "old".to_string(),
+                    gate: Some(Arc::new(Gate {
+                        entered: entered_tx,
+                        release: std::sync::Mutex::new(release_rx),
+                    })),
+                },
+            )
+            .await;
+
+        let reader = Arc::clone(&backend);
+        let hit = tokio::spawn(async move { reader.get(&key).await });
+        entered_rx
+            .recv()
+            .expect("the reader reaches the re-admit window");
+
+        // The reader is now holding the value out of the cache, mid-read.
+        let writer = Arc::clone(&backend);
+        let mut wrote = tokio::spawn(async move {
+            writer
+                .insert(
+                    key,
+                    GatedValue {
+                        data: "new".to_string(),
+                        gate: None,
+                    },
+                )
+                .await;
+        });
+
+        // The insert must not be able to land while the read is mid-flight; if it does, the
+        // re-admit below puts "old" back on top of it.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(250), &mut wrote)
+                .await
+                .is_err(),
+            "an insert completed inside the hit path's remove/re-admit window"
+        );
+
+        release_tx.send(()).expect("the reader is waiting on this");
+        hit.await.expect("the read task does not panic");
+        wrote.await.expect("the write task does not panic");
+
+        let served = backend
+            .get(&key)
+            .await
+            .expect("the key is cached after both operations");
+        assert_eq!(
+            served.data, "new",
+            "the reader's re-admit undid the concurrent insert"
+        );
     }
 
     // ===================
