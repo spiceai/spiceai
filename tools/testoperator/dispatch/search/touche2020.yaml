@@ -1,0 +1,6 @@
+tests:
+  search:
+    spicepod_path: test/spicepods/search/mteb/touche2020/full_text_search-duckdb[file].yaml
+    runner_type: spiceai-dev-runners
+    benchmark_dataset: touche2020_retrieval
+    ready_wait: 1800

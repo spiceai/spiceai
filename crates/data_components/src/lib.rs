@@ -177,6 +177,7 @@ pub mod sqlite;
 pub mod turso;
 pub mod unity_catalog;
 
+pub mod catalog_filter;
 pub mod key_filter;
 pub mod pk_filter_expr;
 pub mod rate_limit;

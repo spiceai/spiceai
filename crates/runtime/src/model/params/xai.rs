@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,22 +14,19 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use util::concat_arrays;
+use runtime_parameters::TypedParams;
+use secrecy::SecretString;
 
-use super::{COMMON_MODEL_PARAMETERS_WITH_DEPRECATED, PARAM_WITH_DEPRE_LEN};
-use crate::parameters::ParameterSpec;
-
-pub const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
-    ParameterSpec,
-    XAI_PARAM_LEN,
-    PARAM_WITH_DEPRE_LEN,
-    { XAI_PARAM_LEN + PARAM_WITH_DEPRE_LEN },
->(XAI_PARAMETERS, COMMON_MODEL_PARAMETERS_WITH_DEPRECATED);
-
-const XAI_PARAM_LEN: usize = 2;
-
-pub(crate) const XAI_PARAMETERS: [ParameterSpec; XAI_PARAM_LEN] = [
-    ParameterSpec::component("api_key").description("The xAI API key."),
-    ParameterSpec::component("usage_tier")
-        .description("xAI usage tier (0-4). Used for rate limit defaults."),
-];
+/// Parameters for `from: xai` chat/responses models.
+#[derive(TypedParams)]
+#[params(
+    prefix = "xai",
+    passthrough = crate::model::params::common::PREFIXED_COMMON,
+    emit_specs
+)]
+pub struct XaiModelParams {
+    /// The `xAI` API key.
+    pub api_key: Option<SecretString>,
+    /// `xAI` usage tier (0-4). Used for rate limit defaults.
+    pub usage_tier: Option<String>,
+}

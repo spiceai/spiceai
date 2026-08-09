@@ -191,8 +191,6 @@ sqlite = [
 ]
 turso = ["dep:turso", "dep:turso-shared", "datafusion-table-providers/sqlite-federation"]
 
-test_hadoop_catalog_docker = []
-
 [dev-dependencies]
 arrow = { workspace = true, features = ["prettyprint"] }
 arrow-array = { workspace = true }
