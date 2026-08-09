@@ -91,8 +91,9 @@ fn main() {
     // Before anything else, so a fault during startup is still reported. A native
     // crash is not a panic: without this the process dies silently with exit 139.
     // Attaching runs before the banner but reports after it, so the banner stays the
-    // first line of the log.
-    let crash_reporting = spiced::crash_handler::install();
+    // first line of the log. The version goes in so a report names the build that
+    // produced it.
+    let crash_reporting = spiced::crash_handler::install(&get_version_string());
 
     let matches = spiced::Args::command().get_matches();
     let open_telemetry_deprecated =
