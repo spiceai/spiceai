@@ -751,7 +751,9 @@ mod tests {
             .expect("run the crashing child")
     }
 
-    /// Read a `key=value` field back out of a report.
+    /// Read a `key=value` field back out of a report. Only the Linux report has
+    /// fields to read.
+    #[cfg(target_os = "linux")]
     fn field<'a>(report: &'a str, key: &str) -> Option<&'a str> {
         report
             .split_whitespace()
