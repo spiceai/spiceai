@@ -31,9 +31,8 @@ limitations under the License.
 //! such as the build identity, is resolved at install time.
 //!
 //! The report is formatted into fixed stack buffers and emitted in a few bounded
-//! `write(2)` calls rather than one. Inspecting the stack can fault a second time —
-//! the stack pointer may be what was corrupted — so the fields are already out by the
-//! time that is attempted.
+//! `write(2)` calls. The fields are flushed before the stack is inspected, since a
+//! corrupt stack pointer would fault a second time and end the process.
 
 use std::sync::OnceLock;
 
@@ -73,14 +72,12 @@ static IDENTITY: OnceLock<String> = OnceLock::new();
 /// The report buffer. Checked against [`MAX_REPORT`] rather than chosen by eye.
 const REPORT_BUF: usize = 1024;
 
-/// How much of the identity line is kept. The version is the only part of a report
-/// with no inherent length limit, so it is clipped here — at install, where clipping
-/// can be logged — to keep the rest of the report provably bounded.
+/// How much of the identity line is kept. The version has no inherent length limit,
+/// so it is clipped at install, where clipping can be logged.
 const MAX_IDENTITY: usize = 192;
 
-/// How long the `addr2line` prefix may be. The executable's path is the other input
-/// with no inherent limit — `PATH_MAX` is four times this whole buffer — so a path
-/// that will not fit falls back to a bare `spiced` at install.
+/// How long the `addr2line` prefix may be. `PATH_MAX` is four times the whole buffer,
+/// so a path that does not fit falls back to a bare `spiced`.
 #[cfg(target_os = "linux")]
 const MAX_SYMBOLIZE_PREFIX: usize = 320;
 
@@ -223,9 +220,8 @@ fn read_image() -> Option<Image> {
 
 /// The `addr2line` invocation, up to the offset.
 ///
-/// Uses the real path so the command is runnable as printed. A path that would not fit
-/// the report's budget falls back to a bare `spiced` — a clipped path is worse than a
-/// generic one, because it looks runnable and is not.
+/// Uses the real path so the command runs as printed. An oversized path falls back to
+/// a bare `spiced`: a clipped path looks runnable and is not.
 #[cfg(target_os = "linux")]
 fn symbolize_prefix() -> String {
     let exe = std::fs::read_link("/proc/self/exe")
@@ -308,30 +304,26 @@ fn signal_code_name(signo: u32, code: i32) -> &'static str {
     }
 }
 
-/// `si_addr`'s offset within the kernel's `siginfo_t` on 64-bit Linux: the
-/// `si_signo`/`si_errno`/`si_code` header plus four bytes of alignment padding,
-/// then `_sifields._sigfault.si_addr` as the union's first member.
+/// `si_addr`'s offset in the kernel's `siginfo_t` on 64-bit Linux: the
+/// `si_signo`/`si_errno`/`si_code` header, four bytes of padding, then the union.
 #[cfg(target_os = "linux")]
 const SI_ADDR_OFFSET: usize = 16;
 
-// `crash-handler` copies `size_of::<signalfd_siginfo>()` bytes *out of* a `siginfo_t`
-// (`crash-handler-0.8.0/src/linux/state.rs:431`), so the destination type must not be
-// the larger of the two, and `si_addr` has to fall inside what was copied. Both hold
-// at 128 bytes today; assert rather than assume, so a libc change breaks the build
-// instead of the report.
+// `crash-handler` copies `size_of::<signalfd_siginfo>()` bytes out of a `siginfo_t`
+// (`crash-handler-0.8.0/src/linux/state.rs:431`), so the destination must not be the
+// larger of the two and `si_addr` must fall inside what was copied. A libc change
+// should break the build, not the report.
 #[cfg(target_os = "linux")]
 const _: () = assert!(size_of::<libc::signalfd_siginfo>() <= size_of::<libc::siginfo_t>());
 #[cfg(target_os = "linux")]
 const _: () = assert!(SI_ADDR_OFFSET + size_of::<u64>() <= size_of::<libc::signalfd_siginfo>());
 
-/// The faulting address, or `None` when `siginfo` does not carry one.
+/// The faulting address, or `None` when the signal carries none.
 ///
-/// `CrashContext::siginfo` is typed `libc::signalfd_siginfo` but holds the bytes of a
-/// `siginfo_t`: `crash-handler` reinterprets the kernel's pointer before copying it.
-/// The two layouts agree only on `si_signo`, `si_errno` and `si_code` — `ssi_addr`
-/// sits at offset 72, where a `siginfo_t` has trailing padding — so reading it reports
-/// `0x0` for every fault, and the address has to be read at its real offset instead.
-/// Upstream: `EmbarkStudios/crash-handling#49`. Do not "simplify" this to `ssi_addr`.
+/// `CrashContext::siginfo` is typed `libc::signalfd_siginfo` but holds `siginfo_t`
+/// bytes. The layouts agree only up to `si_code`: `ssi_addr` is at offset 72, which is
+/// padding in a `siginfo_t`, so it reads `0x0` for every fault. Upstream:
+/// `EmbarkStudios/crash-handling#49`. Do not simplify this back to `ssi_addr`.
 #[cfg(target_os = "linux")]
 fn fault_address(cc: &crash_handler::CrashContext) -> Option<u64> {
     // `_sigfault` is the live union member only for a kernel-raised fault. A signal
@@ -370,13 +362,11 @@ const _: () = assert!(SI_UID_OFFSET + size_of::<u32>() <= size_of::<libc::signal
 /// Who sent the signal, when it was sent rather than raised by a fault.
 ///
 /// A `SIGABRT` reaches this handler whether the process aborted itself or something
-/// outside sent it, and the report otherwise cannot tell those apart. A sender pid
-/// equal to our own means it was self-inflicted. (An OOM kill is not among the cases
-/// this separates: the kernel sends `SIGKILL`, which cannot be caught at all.)
+/// outside sent it. A sender pid equal to our own means it was self-inflicted. An OOM
+/// kill is not covered: the kernel sends `SIGKILL`, which cannot be caught.
 ///
-/// Read at the real offsets for the same reason as [`fault_address`]: the `siginfo`
-/// handed to the callback is `siginfo_t` bytes wearing another struct's type, so
-/// `ssi_pid`/`ssi_uid` read padding and the low half of `si_addr` respectively.
+/// Read at the real offsets for the same reason as [`fault_address`]: `ssi_pid` and
+/// `ssi_uid` land on padding and on half of `si_addr`.
 #[cfg(target_os = "linux")]
 fn signal_sender(cc: &crash_handler::CrashContext) -> Option<(u32, u32)> {
     // `_kill` (and `_rt`, for `sigqueue`) is the live union member only for these.
@@ -398,15 +388,12 @@ fn signal_sender(cc: &crash_handler::CrashContext) -> Option<(u32, u32)> {
     }
 }
 
-/// The write end of a pipe, opened at install, used to test whether an address can be
-/// read without faulting: `write(2)` reports `EFAULT` for an unreadable buffer instead
-/// of raising a signal, and is async-signal-safe.
+/// A pipe used to test whether an address is readable: `write(2)` reports `EFAULT`
+/// instead of raising a signal, and is async-signal-safe.
 ///
-/// A pipe rather than `/dev/null`, which the kernel completes without ever reading the
-/// buffer — every probe against it would pass. The read end is deliberately held open
-/// too: closing it would make each probe raise `SIGPIPE`. A whole report probes far
-/// less than a pipe's capacity, and the handler only ever runs once, so the writes
-/// cannot accumulate enough to block.
+/// Not `/dev/null`, which the kernel completes without reading the buffer, so every
+/// probe would pass. Both ends are kept: closing the read end would make each probe
+/// raise `SIGPIPE`. One report's probes are far below the pipe's capacity.
 #[cfg(target_os = "linux")]
 static PROBE_FDS: OnceLock<[i32; 2]> = OnceLock::new();
 
@@ -420,9 +407,8 @@ fn open_probe() -> Option<[i32; 2]> {
 
 /// Whether `len` bytes at `ptr` can be read without faulting.
 ///
-/// Conservative: any error at all, not just `EFAULT`, is treated as unreadable. The
-/// cost of being wrong here is a second fault inside the handler, which kills the
-/// process before the rest of the report is written.
+/// Any error, not only `EFAULT`, counts as unreadable: a wrong answer here faults
+/// inside the handler and ends the process.
 #[cfg(target_os = "linux")]
 fn readable(ptr: *const u8, len: usize) -> bool {
     let Some(fds) = PROBE_FDS.get() else {
@@ -471,9 +457,8 @@ fn stack_pointer(_cc: &crash_handler::CrashContext) -> u64 {
 
 /// The return address, where the architecture keeps one in a register.
 ///
-/// On aarch64 a `blr` leaves it in `x30`, so a jump through a corrupted pointer names
-/// its caller without reading memory at all. x86-64 pushes it instead, and it is
-/// recovered from the stack below.
+/// aarch64's `blr` leaves it in `x30`, so no memory read is needed. x86-64 pushes it,
+/// and it is recovered from the stack instead.
 #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
 fn link_register(cc: &crash_handler::CrashContext) -> Option<u64> {
     Some(cc.context.uc_mcontext.regs[30])
@@ -617,8 +602,8 @@ fn report(cc: &crash_handler::CrashContext) {
     .is_ok();
     complete &= write!(cur, " ip=0x{ip:x} base=0x{base:x}").is_ok();
     // Say why there is no offset rather than print one that cannot be used. The two
-    // reasons are worth telling apart: one is a bug in the crashing program, the other
-    // is a bug in this handler.
+    // reasons differ: an ip outside the mapping is the program's problem, an
+    // unresolved base is this handler's.
     complete &= if in_text {
         write!(cur, " offset=0x{offset:x}")
     } else if image.is_none() {
@@ -644,11 +629,9 @@ fn report(cc: &crash_handler::CrashContext) {
             complete &= writeln!(cur, "{offset:x}").is_ok();
         }
     }
-    // Written before the stack section, not with it. Reading the stack is the one part
-    // of this report that can fault again — the stack pointer itself may be what was
-    // corrupted — and a second fault here kills the process outright, since the signal
-    // is blocked inside its own handler. Flushing first means that costs the stack
-    // section rather than the whole report.
+    // Flushed before the stack section: reading the stack can fault again, and a
+    // second fault inside the handler ends the process with the signal still blocked.
+    // Writing first costs the stack section rather than the whole report.
     #[expect(
         clippy::cast_possible_truncation,
         reason = "the cursor position is bounded by the buffer length"
@@ -681,26 +664,22 @@ const _: () = assert!(
         <= STACK_BUF
 );
 
-/// Where the crash came *from*, when the instruction pointer no longer says.
+/// Where the crash came from, when the instruction pointer no longer says.
 ///
-/// After a call through a corrupted pointer the faulting address names nothing — but
-/// the return address the call pushed is still on the stack, and on aarch64 still in
-/// `x30`. Words are reported only when they point into this binary's code, since a
-/// stack is full of data that looks like nothing in particular.
+/// A call through a corrupted pointer still pushed its return address, and on aarch64
+/// still left it in `x30`. Only words pointing into this binary's code are reported;
+/// the rest of a stack resembles addresses without being them.
 ///
-/// Every read is probed first: this runs with an unknown stack pointer, and faulting
-/// here would take the process down before the rest of the report is out.
+/// Every read is probed first: the stack pointer may itself be corrupt.
 #[cfg(target_os = "linux")]
 fn report_stack(cc: &crash_handler::CrashContext) {
     use std::io::Write as _;
 
     let sp = stack_pointer(cc);
     let ip = instruction_pointer(cc);
-    // A return address is only where a call left it if nothing has run since. That
-    // holds when the fault is the instruction fetch itself — the address executed is
-    // the address that faulted — because no code at the target got as far as its
-    // prologue. A fault *inside* a function, this binary's or a shared library's, has
-    // a frame of its own, and the word at the stack pointer is not a return address.
+    // A return address sits at the stack pointer only if nothing has run since the
+    // call, which holds when the fault is the instruction fetch itself. A fault inside
+    // a function — this binary's or a library's — has a frame of its own.
     let immediate_call = fault_address(cc) == Some(ip);
 
     let mut buf = [0u8; STACK_BUF];
@@ -797,23 +776,20 @@ mod tests {
     /// Set in the child process to select the crashing role.
     const CHILD: &str = "SPICED_CRASH_HANDLER_TEST_CHILD";
 
-    /// Distinctive enough that finding it in the report proves the string reached it
-    /// from the caller, rather than matching something the report prints anyway.
+    /// Distinctive, so finding it proves the string came from the caller.
     const TEST_VERSION: &str = "v0.0.0-crash-handler-test";
 
     /// The address the child faults at.
     ///
-    /// Deliberately not null: a null write is reported as `addr=0x0`, which is also
-    /// what a mis-decoded `siginfo` produces, so it is the one address at which the
-    /// reported fault address cannot be checked. Wider than 32 bits so a truncating
-    /// format would be caught too, and below bit 47 so it stays canonical — on x86-64
-    /// a fault at a non-canonical address is delivered with `si_addr == 0` whatever
-    /// address was actually touched, which would look exactly like a decoding bug.
+    /// Not null: a null write reports `addr=0x0`, which a mis-decoded `siginfo` also
+    /// produces, so it is the one address that cannot be checked. Wider than 32 bits
+    /// to catch a truncating format, and below bit 47 to stay canonical — x86-64
+    /// delivers `si_addr == 0` for a non-canonical address whatever was touched.
     #[cfg(target_os = "linux")]
     const FAULT_ADDR: usize = 0x5eed_dead_0000;
 
-    /// macOS reports no address, and an unmapped high address is not guaranteed to
-    /// raise `SIGSEGV` there, so the non-Linux child keeps the null write.
+    /// macOS reports no address and need not raise `SIGSEGV` for a high one, so the
+    /// non-Linux child keeps the null write.
     #[cfg(not(target_os = "linux"))]
     const FAULT_ADDR: usize = 0;
 
@@ -828,13 +804,12 @@ mod tests {
         }
     }
 
-    /// The address the wild-call child jumps to: low enough to be below the load base
-    /// and never mapped, so the fault happens with `ip` already outside the image.
+    /// Below the load base and never mapped, so the fault happens with `ip` already
+    /// outside the image.
     #[cfg(target_os = "linux")]
     const WILD_CALL_ADDR: usize = 0x91;
 
-    /// Jump through a corrupted function pointer, the shape the report cannot
-    /// currently localize: `ip` ends up somewhere that is not code from this binary.
+    /// Jump through a corrupted function pointer, leaving `ip` outside this binary.
     #[cfg(target_os = "linux")]
     #[inline(never)]
     #[unsafe(no_mangle)]
@@ -843,8 +818,8 @@ mod tests {
         let callee: extern "C" fn() =
             unsafe { std::mem::transmute::<usize, extern "C" fn()>(WILD_CALL_ADDR) };
         callee();
-        // Unreachable, but it stops the call above being turned into a tail jump,
-        // which would leave no return address behind for the report to recover.
+        // Unreachable, but stops the call becoming a tail jump, which would leave no
+        // return address to recover.
         std::hint::black_box(());
     }
 
@@ -855,9 +830,9 @@ mod tests {
     /// the `si_code > 0` path and populates `addr` and `ip`; a sent signal does not.
     /// Run the crashing child and return what it printed.
     ///
-    /// The process under test necessarily dies, so this re-executes its own binary
-    /// with `CHILD` set. The child always re-enters through `reports_a_fatal_signal`,
-    /// which dispatches on the role, so there is one entry point to keep in step.
+    /// The process under test dies, so this re-executes its own binary with `CHILD`
+    /// set. The child always re-enters through `reports_a_fatal_signal`, which
+    /// dispatches on the role.
     fn crash_child(role: &str) -> std::process::Output {
         // `module_path!` is crate-qualified; libtest filters are not.
         let module = module_path!();
@@ -911,9 +886,7 @@ mod tests {
             String::from_utf8_lossy(&output.stdout)
         );
 
-        // Which artifact crashed. Several release flavors ship under one version, so
-        // a report that cannot name its own build cannot be symbolized against the
-        // right binary. Present on every platform, unlike the fields below.
+        // Which build crashed. Present on every platform, unlike the fields below.
         let version_field = format!("spiced={TEST_VERSION}");
         for field in [version_field.as_str(), "features=", "profile="] {
             assert!(
@@ -946,10 +919,8 @@ mod tests {
                 "load base was not resolved; reports would not be symbolizable: {stderr}"
             );
 
-            // The address the kernel reported must be the address the child touched.
-            // `siginfo` reaches us typed as a `signalfd_siginfo`, whose fields do not
-            // line up past `si_code`, so a report that reads the wrong offset lands
-            // here as `addr=0x0`.
+            // The reported address must be the one the child touched: reading it at
+            // the wrong offset lands here as `addr=0x0`.
             assert!(
                 stderr.contains(&format!("addr=0x{FAULT_ADDR:x}")),
                 "reported fault address is not the one faulted on \
@@ -962,10 +933,9 @@ mod tests {
         }
     }
 
-    /// A raised `SIGABRT` reaches the same handler but carries no fault address, so it
-    /// exercises the branch a `SIGSEGV` never reaches. Worth its own case: `abort()`,
-    /// an allocation failure and an external kill all arrive this way, and the report
-    /// has to say who sent the signal rather than invent an address.
+    /// A raised `SIGABRT` carries no fault address, so it covers a branch `SIGSEGV`
+    /// never reaches. `abort()`, an allocation failure and an external kill all arrive
+    /// this way.
     #[test]
     #[cfg(target_os = "linux")]
     fn reports_a_raised_abort() {
@@ -985,15 +955,13 @@ mod tests {
             "abort was not reported: {stderr}"
         );
 
-        // No `_sigfault` union member, so no address to report — the field that used
-        // to be printed unconditionally from a struct that never held one.
+        // No `_sigfault` union member, so there is no address to report.
         assert!(
             !stderr.contains("addr=0x"),
             "a signal with no fault address reported one anyway: {stderr}"
         );
 
-        // `raise` targets our own process, so the sender is the crashing process
-        // itself. Anything else in production means something outside killed us.
+        // `raise` targets this process, so it is its own sender.
         let sender = field(&stderr, "sender_pid=").expect("report should name the sender");
         let reported = field(&stderr, "pid=").expect("report should carry its own pid");
         assert_eq!(
@@ -1003,8 +971,8 @@ mod tests {
     }
 
     /// A jump through a corrupted pointer leaves `ip` outside this binary, where no
-    /// file offset computed from it is meaningful. The report has to say so rather
-    /// than print a command that resolves to whatever happens to sit at that offset.
+    /// file offset from it is meaningful. The report says so instead of printing a
+    /// command that resolves to whatever sits at that offset.
     #[test]
     #[cfg(target_os = "linux")]
     fn declines_to_symbolize_a_wild_jump() {
@@ -1028,8 +996,8 @@ mod tests {
             "report should say the ip is not in this binary: {stderr}"
         );
 
-        // The two things that made the original report misleading: an offset clamped
-        // to zero, and a command built from it that resolves to something.
+        // The two things that made such a report misleading: an offset clamped to
+        // zero, and a command built from it.
         assert!(
             !stderr.contains("offset="),
             "no file offset should be reported for an ip outside the image: {stderr}"
@@ -1039,8 +1007,7 @@ mod tests {
             "a command that cannot work should not be printed: {stderr}"
         );
 
-        // What the instruction pointer no longer says, the stack does: the call that
-        // jumped to the wild address pushed the address it would have returned to.
+        // What the instruction pointer no longer says, the stack does.
         assert!(
             stderr.contains("stack: sp=0x"),
             "report should carry the stack pointer: {stderr}"

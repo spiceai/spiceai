@@ -1,11 +1,9 @@
 ---
 name: Crash Report Check
 
-# No other workflow runs `spiced`'s unit tests on Linux, so the Linux-only half of
-# `crash_handler.rs` is compiled but never executed. Run this by hand after touching
-# the handler: it takes a real SIGSEGV under each release profile, checks the report
-# names the address that was actually faulted on, and checks the `offset` it prints
-# symbolizes back to the faulting symbol.
+# The Linux half of `crash_handler.rs` is the only half that runs in production, and
+# no other workflow executes it. Run this after touching the handler: it takes real
+# faults under each release profile and checks the reports are usable.
 on:
   workflow_dispatch:
     inputs:
@@ -15,8 +13,7 @@ on:
         default: '["release", "release-lto"]'
         type: string
 
-# Each leg builds spiced from scratch on a shared runner pool, so a superseded run
-# should stop rather than compete with the one that replaced it.
+# Each leg builds spiced from scratch on a shared runner pool.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -71,8 +68,7 @@ jobs:
           uname -a
           cat /proc/sys/kernel/randomize_va_space || true
 
-      # Built exactly as the profile ships — no debuginfo or strip overrides — so the
-      # symbolization check below reflects what a real report from that artifact gives.
+      # Built as the profile ships, so symbolization below reflects a real report.
       - name: Build the test binary
         env:
           CARGO_INCREMENTAL: 0
@@ -120,8 +116,7 @@ jobs:
           cat report.txt
           echo "──────────────────────────"
 
-      # A raised signal carries no fault address but does say who sent it — the
-      # difference between aborting ourselves and being killed from outside.
+      # A raised signal carries no fault address, but does say who sent it.
       - name: Show a raised-abort report
         run: |
           set +e
@@ -142,10 +137,8 @@ jobs:
             echo "a signal with no fault address reported one anyway"; exit 1
           fi
 
-      # Several release flavors ship under one version, so a report that cannot name
-      # its own build cannot be symbolized against the right binary. `profile=` must
-      # be the profile this leg built, not cargo's `PROFILE`, which says "release"
-      # for both of them.
+      # `profile=` must be the profile this leg built, not cargo's `PROFILE`, which
+      # reports "release" for both.
       - name: Check the report identifies its artifact
         run: |
           set -euo pipefail
@@ -156,9 +149,7 @@ jobs:
           grep -qE 'spiced=v[0-9]' report.txt \
             || { echo "report carries no version"; exit 1; }
 
-      # `siginfo` reaches the handler typed as a `signalfd_siginfo`, whose fields stop
-      # lining up after `si_code`, so a report reading the wrong offset shows addr=0x0
-      # for every fault. Assert the address the child actually faulted on.
+      # Reading the address at the wrong offset shows addr=0x0 for every fault.
       - name: Check the reported fault address
         run: |
           set -euo pipefail
@@ -173,11 +164,9 @@ jobs:
             echo "load base was not resolved"; exit 1
           fi
 
-      # The point of the report: does the printed offset actually symbolize? Function
-      # names resolve from `.symtab`, which both release profiles keep; line numbers
-      # and inline frames need debug info these artifacts do not yet ship.
-      # A jump through a corrupted pointer leaves `ip` outside this binary, where a
-      # file offset computed from it resolves to whatever happens to sit there.
+      # Function names resolve from `.symtab`, which both release profiles keep; line
+      # numbers need debug info these artifacts do not ship.
+      # A jump through a corrupted pointer leaves `ip` outside this binary.
       - name: Show a wild-jump report
         run: |
           set +e
@@ -196,8 +185,7 @@ jobs:
           if grep -qE 'offset=|symbolize: ' wild.txt; then
             echo "a command that cannot work was printed anyway"; exit 1
           fi
-          # The payoff: with the ip useless, the caller has to come off the stack,
-          # and it has to resolve to the function that made the wild call.
+          # With the ip useless, the caller must come off the stack and resolve.
           CALLER=$(grep -oE 'symbolize caller: .* 0x[0-9a-f]+' wild.txt \
             | grep -oE '0x[0-9a-f]+$')
           test -n "$CALLER" || { echo "no caller recovered"; exit 1; }

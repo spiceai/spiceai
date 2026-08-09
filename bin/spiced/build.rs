@@ -32,10 +32,9 @@ fn main() {
 
 /// The cargo profile the binary is being built with.
 ///
-/// Cargo's own `PROFILE` collapses every profile that inherits `release` down to
-/// `release`, so it cannot tell `release` from `release-lto` — which are the two
-/// profiles that ship, and which differ in whether a crash report can be symbolized.
-/// The profile directory can: `OUT_DIR` is `<target>/<profile>/build/<pkg>-<hash>/out`.
+/// Cargo's `PROFILE` reports `release` for every profile inheriting it, so it cannot
+/// separate `release` from `release-lto`. `OUT_DIR` can: it is
+/// `<target>/<profile>/build/<pkg>-<hash>/out`.
 fn build_profile() -> String {
     std::env::var("OUT_DIR")
         .ok()
@@ -55,16 +54,14 @@ fn build_profile() -> String {
 
 /// The optional features that tell one shipped artifact from another.
 ///
-/// The version string already separates OSS from enterprise, and encodes `models`,
-/// `metal` and `cuda`. What it does not encode is `odbc`, `nfs` and `smb` — which is
-/// what leaves two pairs of artifacts indistinguishable at the same version, enterprise
-/// `models` against `nas` and OSS `default` against `odbc`. Their code differs, so a
-/// report symbolized against the wrong one of a pair resolves to the wrong place.
+/// The version string encodes `models`, `metal` and `cuda`, but not `odbc`, `nfs` or
+/// `smb`, which leaves enterprise `models` against `nas` and OSS `default` against
+/// `odbc` identical at the same version. They compile to different code, so
+/// symbolizing against the wrong one resolves to the wrong place.
 ///
-/// Read from cargo's own view of the build rather than passed in by the workflows:
-/// `spiced` is built from five places in this repository and more in the enterprise
-/// one, and a label every one of them has to remember to set is a label that is
-/// eventually wrong rather than merely absent.
+/// Read from cargo rather than passed in by the workflows: `spiced` is built from
+/// several places in each repository, and a label they must each remember to set
+/// eventually goes wrong rather than merely missing.
 fn build_features() -> String {
     let distinguishing = ["models", "metal", "cuda", "odbc", "nfs", "smb"];
     let enabled: Vec<&str> = distinguishing
