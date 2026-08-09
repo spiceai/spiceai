@@ -1757,3 +1757,191 @@ async fn test_cold_tier_bounded_zorder_multi_run_promotion_impl(
 
     Ok(())
 }
+
+test_with_backends!(test_cold_tier_age_trigger_promotes_below_size_thresholds_impl);
+
+/// The age trigger publishes a warm tier far below the byte/file thresholds —
+/// the low-volume case those thresholds alone leave warm indefinitely.
+///
+/// Also pins the two-phase semantics: the tick that first observes a generation
+/// only marks it, so promotion happens on a later tick, once the data really has
+/// been resident for `cold_tier_warm_max_age_ms`.
+async fn test_cold_tier_age_trigger_promotes_below_size_thresholds_impl(
+    fixture: common::TestFixture,
+) -> TestResult<()> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("value", DataType::Int64, false),
+    ]));
+
+    let cold_dir = fixture.temp_dir.path().join("cold");
+    std::fs::create_dir_all(&cold_dir)?;
+    let cold_url = format!("file://{}", cold_dir.to_string_lossy());
+
+    const MAX_AGE_MS: u64 = 50;
+    let table_options = CreateTableOptions {
+        table_name: "cold_age_t".to_string(),
+        schema: Arc::clone(&schema),
+        primary_key: vec!["id".to_string()],
+        on_conflict: None,
+        base_path: fixture.data_path.to_string_lossy().to_string(),
+        partition_column: None,
+        vortex_config: VortexConfig {
+            cold_tier_location: Some(cold_url),
+            cold_clustering_columns: vec!["id".to_string()],
+            // Both size triggers off, so only the age trigger can promote here.
+            cold_tier_warm_max_bytes: 0,
+            cold_tier_warm_max_files: 0,
+            cold_tier_warm_max_age_ms: MAX_AGE_MS,
+            cold_target_file_size_mb: 16,
+            deletion_mode: DeletionMode::Key,
+            ..VortexConfig::default()
+        },
+    };
+
+    let catalog: Arc<dyn MetadataCatalog> =
+        Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
+    let ctx = SessionContext::new();
+    let table = Arc::new(
+        CayenneTableProvider::create_table(catalog, table_options, ctx.runtime_env()).await?,
+    );
+    ctx.register_table("cold_age_t", Arc::clone(&table) as Arc<dyn TableProvider>)?;
+
+    // 3 rows — orders of magnitude below any size threshold.
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1i64, 2, 3])),
+            Arc::new(Int64Array::from(vec![10i64, 20, 30])),
+        ],
+    )?;
+    common::insert_batch(table.as_ref(), batch).await?;
+    let _ = table.checkpoint_inlined_data().await;
+    let _ = table.checkpoint_mem_tier().await;
+
+    // First evaluation only marks the generation.
+    assert!(
+        !table.promote_warm_to_cold().await?,
+        "the first evaluation must only start the age clock, not promote"
+    );
+    assert!(
+        fixture
+            .catalog
+            .list_cold_tier_files(table.table_id())
+            .await?
+            .is_empty(),
+        "nothing should reach the datalake before the age bound elapses"
+    );
+
+    // Elapsed time is the condition under test, so it has to actually pass.
+    tokio::time::sleep(std::time::Duration::from_millis(MAX_AGE_MS * 2)).await;
+
+    assert!(
+        table.promote_warm_to_cold().await?,
+        "promotion should fire once warm data has aged past cold_tier_warm_max_age_ms"
+    );
+
+    let cold = fixture
+        .catalog
+        .list_cold_tier_files(table.table_id())
+        .await?;
+    assert!(
+        !cold.is_empty(),
+        "expected datalake files registered after the age-triggered move"
+    );
+    let cold_rows: i64 = cold.iter().map(|f| f.row_count).sum();
+    assert_eq!(cold_rows, 3, "all 3 rows moved to the datalake");
+
+    // Row conservation across the tier move, read back through the scan path.
+    assert_eq!(row_count(&ctx, "cold_age_t").await?, 3);
+    assert_eq!(
+        collect_pairs(&ctx, "SELECT id, value FROM cold_age_t").await?,
+        vec![(1, 10), (2, 20), (3, 30)],
+        "cross-tier scan returns the exact row set after an age-triggered move"
+    );
+
+    // The mark resets on a successful promotion, so a spent clock cannot re-fire.
+    tokio::time::sleep(std::time::Duration::from_millis(MAX_AGE_MS * 2)).await;
+    assert!(
+        !table.promote_warm_to_cold().await?,
+        "an empty warm tier must not promote again on the previous generation's clock"
+    );
+
+    Ok(())
+}
+
+test_with_backends!(test_cold_tier_age_trigger_disabled_by_default_impl);
+
+/// Back-compat guard: with the age trigger at its `0` default and no reachable
+/// size trigger, a low-volume table stays warm however long it waits.
+async fn test_cold_tier_age_trigger_disabled_by_default_impl(
+    fixture: common::TestFixture,
+) -> TestResult<()> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("value", DataType::Int64, false),
+    ]));
+
+    let cold_dir = fixture.temp_dir.path().join("cold");
+    std::fs::create_dir_all(&cold_dir)?;
+    let cold_url = format!("file://{}", cold_dir.to_string_lossy());
+
+    let table_options = CreateTableOptions {
+        table_name: "cold_no_age_t".to_string(),
+        schema: Arc::clone(&schema),
+        primary_key: vec!["id".to_string()],
+        on_conflict: None,
+        base_path: fixture.data_path.to_string_lossy().to_string(),
+        partition_column: None,
+        vortex_config: VortexConfig {
+            cold_tier_location: Some(cold_url),
+            cold_clustering_columns: vec!["id".to_string()],
+            // A byte threshold this table cannot reach; age left at its default.
+            cold_tier_warm_max_bytes: 1024 * 1024 * 1024,
+            cold_tier_warm_max_files: 0,
+            cold_target_file_size_mb: 16,
+            deletion_mode: DeletionMode::Key,
+            ..VortexConfig::default()
+        },
+    };
+    assert_eq!(
+        table_options.vortex_config.cold_tier_warm_max_age_ms, 0,
+        "the age trigger must default to disabled"
+    );
+
+    let catalog: Arc<dyn MetadataCatalog> =
+        Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
+    let ctx = SessionContext::new();
+    let table = Arc::new(
+        CayenneTableProvider::create_table(catalog, table_options, ctx.runtime_env()).await?,
+    );
+
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1i64, 2, 3])),
+            Arc::new(Int64Array::from(vec![10i64, 20, 30])),
+        ],
+    )?;
+    common::insert_batch(table.as_ref(), batch).await?;
+    let _ = table.checkpoint_inlined_data().await;
+    let _ = table.checkpoint_mem_tier().await;
+
+    // Two evaluations separated by a real wait.
+    assert!(!table.promote_warm_to_cold().await?);
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(
+        !table.promote_warm_to_cold().await?,
+        "a disabled age trigger must never promote a table below its byte threshold"
+    );
+    assert!(
+        fixture
+            .catalog
+            .list_cold_tier_files(table.table_id())
+            .await?
+            .is_empty(),
+        "no datalake files without a reachable trigger"
+    );
+
+    Ok(())
+}

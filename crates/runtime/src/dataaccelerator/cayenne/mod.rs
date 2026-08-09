@@ -1672,6 +1672,11 @@ impl CayenneAccelerator {
                 &["cayenne_datalake_warm_max_files"],
                 config.cold_tier_warm_max_files,
             );
+            config.cold_tier_warm_max_age_ms = autotune::auto_or_u64(
+                acceleration,
+                &["cayenne_datalake_warm_max_age_ms"],
+                config.cold_tier_warm_max_age_ms,
+            );
             config.cold_tier_background_interval_ms = autotune::auto_or_u64(
                 acceleration,
                 &["cayenne_datalake_tiering_check_interval_ms"],
@@ -1688,6 +1693,10 @@ impl CayenneAccelerator {
             // inert): promote once warm accumulates 16 target cold files'
             // worth of data. Data is sorted per clustering run, so a larger
             // accumulation yields better zone-map pruning in the written files.
+            //
+            // `cold_tier_warm_max_age_ms` is deliberately not part of this
+            // condition: it is a staleness backstop, not a substitute for a size
+            // trigger, so setting age alone still gets the size default.
             if config.cold_tier_enabled()
                 && config.cold_tier_warm_max_bytes == 0
                 && config.cold_tier_warm_max_files == 0
@@ -2554,6 +2563,10 @@ fn validate_datalake_table_options(
         return Ok(Vec::new());
     }
     let mut warnings = Vec::new();
+    // First, so it heads the datalake warnings emitted at registration.
+    warnings.push(format!(
+        "Dataset '{table_name}': the Cayenne datalake (cold) tier is in preview; verify query correctness and performance before using it for production workloads."
+    ));
     if options.primary_key.is_empty() {
         // Promotion classifies and rewrites cold files by primary key, and
         // deletes against cold-resident rows are key-based, so the promoter
@@ -2682,8 +2695,8 @@ fn wrap_with_native_vector_indexes(
 const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
     ParameterSpec,
     S3_PARAMS_LEN,
-    63,
-    { S3_PARAMS_LEN + 63 },
+    64,
+    { S3_PARAMS_LEN + 64 },
 >(
     S3_PARAMETERS,
     [
@@ -2749,6 +2762,8 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
             .description("Warm-tier data moves to the datalake once the warm tier's total Vortex bytes reach this threshold. Pairs with cayenne_datalake_warm_max_files; 0 disables the byte trigger, but when BOTH triggers are 0/unset this one defaults to 16 x cayenne_datalake_target_file_size_mb."),
         ParameterSpec::component("datalake_warm_max_files")
             .description("Warm-tier data moves to the datalake once the warm tier's Vortex file count reaches this threshold. 0 (default) disables the file-count trigger; when cayenne_datalake_warm_max_bytes is also 0/unset, the byte trigger defaults to 16 x cayenne_datalake_target_file_size_mb."),
+        ParameterSpec::component("datalake_warm_max_age_ms")
+            .description("Warm-tier data moves to the datalake once it has been resident this long, even when below the byte and file thresholds — the backstop for a low-volume table that never reaches cayenne_datalake_warm_max_bytes and would otherwise stay in the warm tier indefinitely. 0 (default) disables the age trigger. Residency is measured from the first tiering check that observed the data, so it is accurate to within one cayenne_datalake_tiering_check_interval_ms and resets across a restart. An age-triggered move publishes whatever has accumulated, so a small value produces small datalake files."),
         ParameterSpec::component("datalake_tiering_check_interval_ms")
             .description("How often the background loop checks whether warm-tier data should move to the datalake (a check does not guarantee a move). Normally auto-tuned; override for testing. Default: 60000 (60s)."),
         ParameterSpec::component("datalake_gc_interval_ms")
@@ -5160,6 +5175,73 @@ mod tests {
         assert_eq!(config.cdc_mem_tier_max_age_ms, 7_890);
     }
 
+    async fn datalake_config_for_params(
+        params: &[(&str, &str)],
+    ) -> cayenne::metadata::VortexConfig {
+        let app = Arc::new(AppBuilder::new("test").build());
+        let rt = Arc::new(crate::Runtime::builder().build().await);
+
+        let mut dataset = DatasetBuilder::try_new("dl_age".to_string(), "dl_age")
+            .expect("dataset builder")
+            .with_app(app)
+            .with_runtime(rt)
+            .build()
+            .expect("dataset");
+        dataset.acceleration = Some(Acceleration {
+            engine: Engine::Cayenne,
+            mode: Mode::File,
+            refresh_mode: Some(RefreshMode::Changes),
+            params: params
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect(),
+            ..Default::default()
+        });
+
+        CayenneAccelerator::get_vortex_config("dl_age", &dataset).await
+    }
+
+    #[tokio::test]
+    async fn test_datalake_warm_max_age_ms_is_resolved() {
+        let config = datalake_config_for_params(&[
+            ("cayenne_datalake_location", "s3://bucket/prefix/"),
+            ("cayenne_datalake_warm_max_age_ms", "3600000"),
+        ])
+        .await;
+
+        assert_eq!(config.cold_tier_warm_max_age_ms, 3_600_000);
+    }
+
+    /// The age trigger is a backstop, not a substitute for a size trigger, so
+    /// setting it alone must leave the byte default in place.
+    #[tokio::test]
+    async fn test_datalake_warm_max_age_ms_does_not_suppress_the_byte_default() {
+        let config = datalake_config_for_params(&[
+            ("cayenne_datalake_location", "s3://bucket/prefix/"),
+            ("cayenne_datalake_warm_max_age_ms", "3600000"),
+        ])
+        .await;
+
+        assert_eq!(config.cold_tier_warm_max_age_ms, 3_600_000);
+        assert_eq!(
+            config.cold_tier_warm_max_bytes,
+            i64::try_from(config.cold_target_file_size_mb * 16 * 1024 * 1024)
+                .expect("byte default fits i64"),
+            "setting only the age trigger must not disable the default byte trigger"
+        );
+    }
+
+    /// Back-compat: the age trigger defaults off, so an existing datalake config
+    /// keeps promoting on size alone across an upgrade.
+    #[tokio::test]
+    async fn test_datalake_warm_max_age_ms_defaults_disabled() {
+        let config =
+            datalake_config_for_params(&[("cayenne_datalake_location", "s3://bucket/prefix/")])
+                .await;
+
+        assert_eq!(config.cold_tier_warm_max_age_ms, 0);
+    }
+
     /// Unset mem-tier caps are auto-derived from host memory for the CDC
     /// profile (range-asserted, since the test host's RAM varies), while a
     /// non-small-write profile keeps the static serde defaults untouched.
@@ -5419,11 +5501,20 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_datalake_valid_config_is_silent() {
+    fn test_validate_datalake_valid_config_warns_only_preview() {
         let options = datalake_test_options(vec!["id".to_string()], datalake_enabled_config());
         let warnings = validate_datalake_table_options("dl_t", &options)
             .expect("well-formed datalake config validates cleanly");
-        assert!(warnings.is_empty(), "well-formed config emits no warnings");
+        assert_eq!(
+            warnings.len(),
+            1,
+            "a well-formed config emits the preview notice and nothing else: {warnings:?}"
+        );
+        assert!(
+            warnings[0].contains("in preview"),
+            "unexpected warning: {}",
+            warnings[0]
+        );
     }
 
     #[test]
@@ -5431,11 +5522,18 @@ mod tests {
         let options = datalake_test_options(vec![], datalake_enabled_config());
         let warnings = validate_datalake_table_options("dl_t", &options)
             .expect("a PK-less datalake table registers (tier inactive), it must not fail");
-        assert_eq!(warnings.len(), 1, "exactly the inactive-tier warning");
+        assert_eq!(
+            warnings.len(),
+            2,
+            "the preview notice plus the inactive-tier warning: {warnings:?}"
+        );
         assert!(
-            warnings[0].contains("INACTIVE"),
-            "unexpected warning: {}",
-            warnings[0]
+            warnings.iter().any(|w| w.contains("in preview")),
+            "missing the preview notice: {warnings:?}"
+        );
+        assert!(
+            warnings.iter().any(|w| w.contains("INACTIVE")),
+            "missing the inactive-tier warning: {warnings:?}"
         );
     }
 
@@ -5493,11 +5591,14 @@ mod tests {
         let options = datalake_test_options(vec!["id".to_string()], config);
         let warnings = validate_datalake_table_options("dl_t", &options)
             .expect("unknown clustering column is a warning, not an error");
-        assert_eq!(warnings.len(), 1, "exactly the unknown column is flagged");
+        assert_eq!(
+            warnings.len(),
+            2,
+            "the preview notice plus exactly the unknown column: {warnings:?}"
+        );
         assert!(
-            warnings[0].contains("no_such_column"),
-            "unexpected warning: {}",
-            warnings[0]
+            warnings.iter().any(|w| w.contains("no_such_column")),
+            "missing the unknown-column warning: {warnings:?}"
         );
     }
 

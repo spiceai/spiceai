@@ -1137,6 +1137,7 @@ impl CayenneCatalog {
             || stored_vc.cold_clustering_run_size_mb != new_vc.cold_clustering_run_size_mb
             || stored_vc.cold_tier_warm_max_bytes != new_vc.cold_tier_warm_max_bytes
             || stored_vc.cold_tier_warm_max_files != new_vc.cold_tier_warm_max_files
+            || stored_vc.cold_tier_warm_max_age_ms != new_vc.cold_tier_warm_max_age_ms
             || stored_vc.cold_tier_background_interval_ms
                 != new_vc.cold_tier_background_interval_ms;
         if !cold_fields_differ {
@@ -1155,6 +1156,7 @@ impl CayenneCatalog {
         stored.vortex_config.cold_clustering_run_size_mb = new_vc.cold_clustering_run_size_mb;
         stored.vortex_config.cold_tier_warm_max_bytes = new_vc.cold_tier_warm_max_bytes;
         stored.vortex_config.cold_tier_warm_max_files = new_vc.cold_tier_warm_max_files;
+        stored.vortex_config.cold_tier_warm_max_age_ms = new_vc.cold_tier_warm_max_age_ms;
         stored.vortex_config.cold_tier_background_interval_ms =
             new_vc.cold_tier_background_interval_ms;
 

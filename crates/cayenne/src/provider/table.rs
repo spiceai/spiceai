@@ -1561,6 +1561,16 @@ pub struct CayenneTableProvider {
     /// Table-scoped warning dedupe for protected snapshot ids that cannot
     /// provide a `UUIDv7` timestamp for age-triggered maintenance.
     protected_snapshot_age_warning_keys: Arc<ParkingMutex<BoundedFifoSet>>,
+    /// When the tiering loop first observed the current generation of
+    /// un-promoted warm data, for the `cold_tier_warm_max_age_ms` trigger.
+    /// `None` means the warm tier was empty at the last observation.
+    ///
+    /// Owned by the tiering tick alone, not by the write path: an age bound in
+    /// minutes tolerates a tick of imprecision, and this keeps per-write
+    /// bookkeeping off the CDC path. A snapshot-derived clock cannot serve here,
+    /// because compaction mints a fresh snapshot id for data that never left the
+    /// warm tier.
+    warm_generation_first_seen: Arc<ParkingMutex<Option<Instant>>>,
     /// Cached visible primary-key set for auto conflict detection.
     ///
     /// The first auto-mode insert still scans existing data to build the set;
@@ -5813,6 +5823,7 @@ impl CayenneTableProvider {
             protected_snapshot_age_warning_keys: Arc::new(ParkingMutex::new(
                 BoundedFifoSet::with_capacity(PROTECTED_SNAPSHOT_AGE_WARNING_KEY_LIMIT),
             )),
+            warm_generation_first_seen: Arc::new(ParkingMutex::new(None)),
             pk_keyset_cache: Arc::new(ParkingMutex::new(None)),
             sharded_pk_keyset_cache: Arc::new(ParkingMutex::new(None)),
             pk_warm_probe_done: Arc::new(AtomicBool::new(false)),
@@ -7004,6 +7015,7 @@ impl CayenneTableProvider {
             protected_snapshot_age_warning_keys: Arc::clone(
                 &self.protected_snapshot_age_warning_keys,
             ),
+            warm_generation_first_seen: Arc::clone(&self.warm_generation_first_seen),
             pk_keyset_cache: Arc::clone(&self.pk_keyset_cache),
             sharded_pk_keyset_cache: Arc::clone(&self.sharded_pk_keyset_cache),
             pk_warm_probe_done: Arc::clone(&self.pk_warm_probe_done),
@@ -16660,6 +16672,23 @@ impl CayenneTableProvider {
         ))
     }
 
+    /// Drop the warm-generation age mark so the next tick that finds warm data
+    /// starts a fresh clock.
+    fn clear_warm_generation_mark(&self) {
+        *self.warm_generation_first_seen.lock() = None;
+    }
+
+    /// Age of the current generation of un-promoted warm data, marking it as of
+    /// now when this is the first tick to observe it (so a fresh generation reads
+    /// 0 rather than firing immediately).
+    ///
+    /// Only the tiering tick calls this, under `compaction_lock`.
+    fn mark_and_measure_warm_generation_age_ms(&self) -> u64 {
+        let mut mark = self.warm_generation_first_seen.lock();
+        let first_seen = mark.get_or_insert_with(Instant::now);
+        duration_millis_saturating(first_seen.elapsed())
+    }
+
     async fn promote_warm_to_cold_inner(&self) -> Result<bool> {
         let vc = &self.table_metadata.vortex_config;
         if !vc.cold_tier_enabled() {
@@ -16687,12 +16716,13 @@ impl CayenneTableProvider {
         // lock it skips and drops `write_lock`, so no cycle can form.
         let _compaction_guard = self.compaction_lock.lock().await;
 
-        // Trigger: warm tier large/numerous enough to graduate.
+        // Trigger: warm tier large/numerous/old enough to graduate.
         let current_snapshot_id = self.get_current_snapshot_id();
         let warm = self
             .list_compaction_candidate_files_with_sizes(&current_snapshot_id)
             .await?;
         if warm.is_empty() {
+            self.clear_warm_generation_mark();
             return Ok(false);
         }
         let warm_bytes: i64 = warm
@@ -16700,18 +16730,24 @@ impl CayenneTableProvider {
             .map(|(_, s)| i64::try_from(*s).unwrap_or(i64::MAX))
             .sum();
         let warm_files = warm.len();
+        // Reads 0 on the tick that first sees this generation, and grows after.
+        let warm_age_ms = self.mark_and_measure_warm_generation_age_ms();
         let over_bytes =
             vc.cold_tier_warm_max_bytes > 0 && warm_bytes >= vc.cold_tier_warm_max_bytes;
         let over_files =
             vc.cold_tier_warm_max_files > 0 && warm_files >= vc.cold_tier_warm_max_files;
-        if !(over_bytes || over_files) {
+        let over_age =
+            vc.cold_tier_warm_max_age_ms > 0 && warm_age_ms >= vc.cold_tier_warm_max_age_ms;
+        if !(over_bytes || over_files || over_age) {
             tracing::debug!(
                 target: "cayenne::compaction",
                 table = self.table_metadata.table_name.as_str(),
                 warm_bytes,
                 warm_files,
+                warm_age_ms,
                 max_bytes = vc.cold_tier_warm_max_bytes,
                 max_files = vc.cold_tier_warm_max_files,
+                max_age_ms = vc.cold_tier_warm_max_age_ms,
                 "Datalake tiering evaluation completed; no tier transition required"
             );
             return Ok(false);
@@ -16726,6 +16762,16 @@ impl CayenneTableProvider {
             clustering = "z_order",
             warm_bytes,
             warm_files,
+            warm_age_ms,
+            // An age-triggered move publishes whatever accumulated, so it explains
+            // a smaller output than a size-triggered one.
+            trigger = if over_bytes {
+                "warm_max_bytes"
+            } else if over_files {
+                "warm_max_files"
+            } else {
+                "warm_max_age"
+            },
             "Moving warm-tier data to the datalake (Z-order clustered)"
         );
 
@@ -16847,6 +16893,11 @@ impl CayenneTableProvider {
             // inferred must still be committed, not silently orphaned. (No new
             // files with dirty files present IS a legitimate commit: every
             // dirty row was deleted.)
+            //
+            // The warm files stay resident, so restart the age clock: otherwise an
+            // age-triggered no-op repeats this read every tick rather than once
+            // per age window.
+            self.clear_warm_generation_mark();
             return Ok(false);
         }
 
@@ -16910,6 +16961,10 @@ impl CayenneTableProvider {
             // metastore read, and no capture can observe one half without the other.
             self.store_cold_manifest(&new_snapshot_id, &cold_files);
         }
+        // The commit cleared the warm tier, so reset the age clock now: writes
+        // landing before the next tick would otherwise be judged against the
+        // promoted generation's mark and re-fire the age trigger immediately.
+        self.clear_warm_generation_mark();
         if let Err(error) = self.prune_snapshot_manifest_to(&new_snapshot_id).await {
             tracing::warn!(
                 target: "cayenne::compaction",

@@ -1978,12 +1978,16 @@ const DATALAKE_TEST_REGION: &str = "us-west-2";
 
 /// Build the `nation` dataset (25 rows, public demo bucket) accelerated by
 /// Cayenne with the datalake tier enabled at `datalake_location`.
+///
+/// `warm_max_age_ms` sets the residency trigger when present; left unset the
+/// tier promotes on `warm_max_bytes` alone.
 fn make_datalake_nation_dataset(
     cayenne_data_dir: &std::path::Path,
     cayenne_metadata_dir: &std::path::Path,
     datalake_location: &str,
     s3_creds: (&str, &str),
     warm_max_bytes: &str,
+    warm_max_age_ms: Option<&str>,
     refresh_mode: RefreshMode,
 ) -> Dataset {
     let mut dataset = Dataset::new(
@@ -2021,6 +2025,12 @@ fn make_datalake_nation_dataset(
             "500".to_string(),
         ),
     ]);
+    if let Some(age_ms) = warm_max_age_ms {
+        params.insert(
+            "cayenne_datalake_warm_max_age_ms".to_string(),
+            age_ms.to_string(),
+        );
+    }
     let (key, secret) = s3_creds;
     params.insert("cayenne_datalake_s3_auth".to_string(), "key".to_string());
     params.insert("cayenne_datalake_s3_key".to_string(), key.to_string());
@@ -2177,6 +2187,7 @@ async fn datalake_e2e_inner(
                 location,
                 s3_creds,
                 "1", // tiny trigger: promote as soon as any warm data exists
+                None,
                 RefreshMode::Append,
             ))
             .build();
@@ -2246,6 +2257,7 @@ async fn datalake_e2e_inner(
                 location,
                 s3_creds,
                 "999999999999", // changed trigger: reconcile persists it silently
+                None,
                 RefreshMode::Append,
             ))
             .build();
@@ -2266,5 +2278,166 @@ async fn datalake_e2e_inner(
             ));
         }
     }
+    Ok(())
+}
+
+/// The residency-age trigger promotes end-to-end, through the real runtime, on a
+/// table whose size can never reach the byte threshold — the low-volume case the
+/// size triggers alone leave in the warm tier indefinitely.
+///
+/// Uses its own S3 prefix and data directory, asserted empty at start, so the
+/// appearance of any `.vortex` object can only be an age-triggered promotion: the
+/// byte trigger is set beyond what 25 rows can reach and the file trigger is left
+/// off. Credentials and cost are as for [`test_cayenne_datalake_tier_e2e`] — it
+/// FAILS rather than skips when they are missing.
+#[tokio::test]
+async fn test_cayenne_datalake_warm_max_age_e2e() -> Result<(), String> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+
+    let (Ok(key), Ok(secret)) = (
+        std::env::var("AWS_SNAPSHOT_KEY"),
+        std::env::var("AWS_SNAPSHOT_SECRET"),
+    ) else {
+        return Err(
+            "AWS_SNAPSHOT_KEY/AWS_SNAPSHOT_SECRET must be set (read/write on the integration-test bucket)"
+                .to_string(),
+        );
+    };
+    if key.is_empty() || secret.is_empty() {
+        return Err(
+            "AWS_SNAPSHOT_KEY/AWS_SNAPSHOT_SECRET must be non-empty (read/write on the integration-test bucket)"
+                .to_string(),
+        );
+    }
+
+    test_request_context()
+        .scope(async {
+            let temp_dir = tempfile::tempdir()
+                .map_err(|e| format!("failed to create Cayenne temp directory: {e}"))?;
+            let data_dir = temp_dir.path().join("data");
+            let metadata_dir = temp_dir.path().join("metadata");
+
+            let run_suffix: u64 = rand::rng().random();
+            let prefix = format!("cayenne-datalake-age-e2e/{run_suffix:016x}");
+            let location = format!("s3://{DATALAKE_TEST_BUCKET}/{prefix}/");
+
+            let store: Arc<dyn ObjectStore> = Arc::new(
+                AmazonS3Builder::new()
+                    .with_bucket_name(DATALAKE_TEST_BUCKET)
+                    .with_region(DATALAKE_TEST_REGION)
+                    .with_access_key_id(&key)
+                    .with_secret_access_key(&secret)
+                    .build()
+                    .map_err(|e| format!("failed to build S3 client: {e}"))?,
+            );
+
+            // Precondition for soundness: an empty prefix means a later .vortex
+            // object can only have come from this run's age-triggered promotion.
+            let preexisting = list_objects_under_prefix(&store, &format!("{prefix}/")).await?;
+            if !preexisting.is_empty() {
+                return Err(format!(
+                    "datalake age test prefix s3://{DATALAKE_TEST_BUCKET}/{prefix}/ is not empty at test start ({} objects, e.g. {:?}); promotion detection would be unsound",
+                    preexisting.len(),
+                    preexisting.keys().next()
+                ));
+            }
+
+            let result = datalake_age_trigger_e2e_inner(
+                &data_dir,
+                &metadata_dir,
+                &location,
+                (&key, &secret),
+                &store,
+                &prefix,
+            )
+            .await;
+
+            let list_prefix = ObjectPath::from(format!("{prefix}/"));
+            let mut stream = store.list(Some(&list_prefix));
+            while let Some(Ok(meta)) = stream.next().await {
+                let _ = store.delete(&meta.location).await;
+            }
+
+            result
+        })
+        .await
+}
+
+async fn datalake_age_trigger_e2e_inner(
+    data_dir: &std::path::Path,
+    metadata_dir: &std::path::Path,
+    location: &str,
+    s3_creds: (&str, &str),
+    store: &Arc<dyn ObjectStore>,
+    prefix: &str,
+) -> Result<(), String> {
+    let app = AppBuilder::new("test_cayenne_datalake_age_e2e")
+        .with_dataset(make_datalake_nation_dataset(
+            data_dir,
+            metadata_dir,
+            location,
+            s3_creds,
+            // Beyond anything 25 rows can reach, so the byte trigger can never
+            // fire and only residency age can promote.
+            "999999999999",
+            Some("3000"),
+            RefreshMode::Append,
+        ))
+        .build();
+    configure_test_datafusion();
+    let rt = Runtime::builder().with_app(app).build().await;
+    let cloned_rt = Arc::new(rt.clone());
+    tokio::select! {
+        () = tokio::time::sleep(Duration::from_mins(4)) => {
+            return Err("Timed out waiting for dataset to load".to_string());
+        }
+        () = cloned_rt.load_components() => {}
+    }
+    runtime_ready_check_with_timeout(&rt, Duration::from_mins(5)).await;
+
+    let count = query_single_i64(&rt, "SELECT COUNT(*) FROM nation").await?;
+    if count != 25 {
+        return Err(format!(
+            "expected 25 nation rows before promotion, got {count}"
+        ));
+    }
+
+    // The 500ms tiering tick marks the warm generation, then promotes once it has
+    // been resident 3s. The ceiling is generous because the assertion under test
+    // is that promotion happens at all without a reachable size trigger.
+    let promoted = wait_until_true(Duration::from_mins(3), || async {
+        let list_prefix = ObjectPath::from(format!("{prefix}/"));
+        let mut stream = store.list(Some(&list_prefix));
+        while let Some(Ok(meta)) = stream.next().await {
+            if meta.location.as_ref().ends_with(".vortex") && meta.size > 0 {
+                return true;
+            }
+        }
+        false
+    })
+    .await;
+    if !promoted {
+        return Err(
+            "timed out waiting for an age-triggered warm→datalake promotion (no .vortex objects on the store); the byte trigger was unreachable, so only cayenne_datalake_warm_max_age_ms could promote"
+                .to_string(),
+        );
+    }
+
+    // Cross-tier correctness after an age-triggered move: the promoted rows are
+    // served from the datalake with the warm tier cleared.
+    let count = query_single_i64(&rt, "SELECT COUNT(*) FROM nation").await?;
+    if count != 25 {
+        return Err(format!(
+            "expected 25 nation rows after the age-triggered promotion, got {count}"
+        ));
+    }
+    let point = query_single_i64(&rt, "SELECT COUNT(*) FROM nation WHERE n_nationkey = 7").await?;
+    if point != 1 {
+        return Err(format!(
+            "expected 1 row for n_nationkey=7 after the age-triggered promotion, got {point}"
+        ));
+    }
+
     Ok(())
 }

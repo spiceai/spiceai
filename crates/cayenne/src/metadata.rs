@@ -1170,6 +1170,19 @@ pub struct VortexConfig {
     /// (`0` disables the file-count trigger). Set from
     /// `cayenne_datalake_warm_max_files`.
     pub cold_tier_warm_max_files: usize,
+    /// The warm tier moves to the datalake once data has been resident this long,
+    /// even when below the byte/file thresholds (`0`, the default, disables the
+    /// age trigger). Set from `cayenne_datalake_warm_max_age_ms`.
+    ///
+    /// The backstop for a low-volume table that never reaches
+    /// `cold_tier_warm_max_bytes` and would otherwise stay warm indefinitely.
+    ///
+    /// Residency is measured from the first tiering tick that observed the data,
+    /// so it is accurate to within one `cold_tier_background_interval_ms` and
+    /// resets across a restart — as with the RAM-tier age cap
+    /// (`cdc_mem_tier_max_age_ms`), and for the same reason: it keeps per-write
+    /// timestamp bookkeeping off the CDC path.
+    pub cold_tier_warm_max_age_ms: u64,
     /// How often (ms) the background loop checks whether to move warm-tier data
     /// to the datalake. Datalake tiering is not latency-critical, so this is much coarser than the
     /// compaction interval. Set from the user-facing
@@ -1528,6 +1541,7 @@ impl Default for VortexConfig {
             cold_clustering_run_size_mb: None,
             cold_tier_warm_max_bytes: 0,
             cold_tier_warm_max_files: 0,
+            cold_tier_warm_max_age_ms: 0,
             cold_tier_background_interval_ms: 60_000,
             cold_tier_gc_interval_ms: 300_000,
         }
