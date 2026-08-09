@@ -329,7 +329,9 @@ pub(crate) async fn submit(
         Ok(e) => e,
         Err(resp) => return resp,
     };
-    let result = executor.submit(request, read_only).await;
+    let result = executor
+        .submit(request, read_only, crate::jobs::current_job_owner().await)
+        .await;
 
     match result {
         Ok(state) => {
@@ -374,7 +376,8 @@ pub(crate) async fn get_query(
         Ok(e) => e,
         Err(resp) => return resp,
     };
-    let result = executor.get_status(&query_id).await;
+    let caller = crate::jobs::current_job_owner().await;
+    let result = executor.get_status(&query_id, &caller).await;
 
     match result {
         Ok(state) => {
@@ -382,7 +385,7 @@ pub(crate) async fn get_query(
 
             // If succeeded, include first chunk data
             if state.status == JobStatus::Succeeded
-                && let Ok(batches) = executor.get_chunk(&query_id, 0).await
+                && let Ok(batches) = executor.get_chunk(&query_id, 0, &caller).await
                 && let Some(result) = &state.result
             {
                 match build_chunk_response(&query_id, 0, &batches, result) {
@@ -425,7 +428,8 @@ pub(crate) async fn get_status(
         Ok(e) => e,
         Err(resp) => return resp,
     };
-    let result = executor.get_status(&query_id).await;
+    let caller = crate::jobs::current_job_owner().await;
+    let result = executor.get_status(&query_id, &caller).await;
 
     match result {
         Ok(state) => {
@@ -489,7 +493,8 @@ pub(crate) async fn get_results(
     }
 
     // First check the job state
-    let state = match executor.get_status(&query_id).await {
+    let caller = crate::jobs::current_job_owner().await;
+    let state = match executor.get_status(&query_id, &caller).await {
         Ok(s) => s,
         Err(e) => return error_to_response(&e),
     };
@@ -525,7 +530,7 @@ pub(crate) async fn get_results(
             .into_response();
     }
 
-    let result = executor.get_chunk(&query_id, partition).await;
+    let result = executor.get_chunk(&query_id, partition, &caller).await;
 
     match result {
         Ok(batches) => {
@@ -587,7 +592,8 @@ pub(crate) async fn get_chunk(
         Err(resp) => return resp,
     };
     // First check the job state to get manifest
-    let state = match executor.get_status(&query_id).await {
+    let caller = crate::jobs::current_job_owner().await;
+    let state = match executor.get_status(&query_id, &caller).await {
         Ok(s) => s,
         Err(e) => return error_to_response(&e),
     };
@@ -609,7 +615,7 @@ pub(crate) async fn get_chunk(
         return (status_code, Json(serde_json::json!({"error": error_msg}))).into_response();
     }
 
-    let result = executor.get_chunk(&query_id, chunk_index).await;
+    let result = executor.get_chunk(&query_id, chunk_index, &caller).await;
 
     match result {
         Ok(batches) => {
@@ -661,7 +667,8 @@ pub(crate) async fn cancel(
         Ok(e) => e,
         Err(resp) => return resp,
     };
-    let result = executor.cancel(&query_id).await;
+    let caller = crate::jobs::current_job_owner().await;
+    let result = executor.cancel(&query_id, &caller).await;
 
     match result {
         Ok(state) => {
@@ -712,7 +719,12 @@ pub(crate) async fn cancel_active(
         }
     };
 
-    if rt.df.query_cancel_registry().cancel(parsed_uuid) {
+    let caller = crate::jobs::current_job_owner().await;
+    if rt
+        .df
+        .query_cancel_registry()
+        .cancel_owned(parsed_uuid, &caller)
+    {
         return (
             StatusCode::OK,
             Json(CancelActiveQueryResponse {
@@ -751,9 +763,10 @@ pub(crate) async fn list_active(Extension(rt): Extension<Arc<Runtime>>) -> Respo
         return response;
     }
 
+    let caller = crate::jobs::current_job_owner().await;
     let registry = rt.df.query_cancel_registry();
     let queries: Vec<ActiveQuerySummary> = registry
-        .list()
+        .list_for(&caller)
         .into_iter()
         .map(|info| ActiveQuerySummary {
             query_id: info.query_id.to_string(),
@@ -808,7 +821,8 @@ pub(crate) async fn list(
         _ => None,
     });
 
-    match executor.list_jobs(status_filter).await {
+    let caller = crate::jobs::current_job_owner().await;
+    match executor.list_jobs(status_filter, &caller).await {
         Ok(jobs) => {
             let limit = query.limit.unwrap_or(100);
             let queries: Vec<QuerySummary> = jobs
@@ -1082,9 +1096,20 @@ mod tests {
         let query_id = Uuid::new_v4();
         let token = CancellationToken::new();
         let registry = rt.df.query_cancel_registry();
-        let _guard = registry.register(query_id, "SELECT 1", Protocol::Http, token.clone());
+        let _guard = registry.register(
+            query_id,
+            "SELECT 1",
+            Protocol::Http,
+            Arc::from(crate::jobs::PUBLIC_JOB_OWNER),
+            token.clone(),
+        );
 
-        let response = cancel_active(Extension(rt), Path(query_id.to_string())).await;
+        // Run the handler inside a real unauthenticated HTTP request context:
+        // outside any scope the runtime resolves to the internal `system`
+        // scope, which by design cannot reach a user-submitted query.
+        let response = Arc::new(RequestContextBuilder::new(Protocol::Http).build())
+            .scope(cancel_active(Extension(rt), Path(query_id.to_string())))
+            .await;
 
         assert_eq!(response.status(), StatusCode::OK);
         assert!(token.is_cancelled());
@@ -1105,16 +1130,20 @@ mod tests {
             long_query_id,
             &long_sql,
             Protocol::Http,
+            Arc::from(crate::jobs::PUBLIC_JOB_OWNER),
             CancellationToken::new(),
         );
         let _short_guard = registry.register(
             short_query_id,
             "SELECT 1",
             Protocol::Flight,
+            Arc::from(crate::jobs::PUBLIC_JOB_OWNER),
             CancellationToken::new(),
         );
 
-        let response = list_active(Extension(rt)).await;
+        let response = Arc::new(RequestContextBuilder::new(Protocol::Http).build())
+            .scope(list_active(Extension(rt)))
+            .await;
 
         assert_eq!(response.status(), StatusCode::OK);
         let body = response_json(response).await;
@@ -1185,6 +1214,93 @@ mod tests {
         let values: Vec<i32> = (0..row_count).collect();
         arrow::array::RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(values))])
             .expect("to create batch")
+    }
+
+    /// A background/internal caller resolves to the `system` scope, which must
+    /// not reach a query submitted by a user request.
+    #[tokio::test]
+    async fn active_query_api_does_not_serve_user_queries_to_internal_callers() {
+        let rt = test_runtime().await;
+        let query_id = Uuid::new_v4();
+        let token = CancellationToken::new();
+        let registry = rt.df.query_cancel_registry();
+        let _guard = registry.register(
+            query_id,
+            "SELECT 1",
+            Protocol::Http,
+            Arc::from(crate::jobs::PUBLIC_JOB_OWNER),
+            token.clone(),
+        );
+
+        // No scope in force: `RequestContext::current` yields the internal
+        // context, whose cache namespace is `System`.
+        let response = cancel_active(Extension(rt), Path(query_id.to_string())).await;
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(!token.is_cancelled());
+    }
+
+    /// A write-capable principal must not see, or be able to stop, another
+    /// principal's in-flight query through the sync active-query API.
+    #[tokio::test]
+    async fn active_query_api_is_scoped_to_the_submitting_principal() {
+        let rt = test_runtime().await;
+        let registry = rt.df.query_cancel_registry();
+
+        let context = Arc::new(RequestContextBuilder::new(Protocol::Http).build());
+        context
+            .set_auth_principal(Arc::new(ApiKey::ReadWrite {
+                key: "writer-a".to_string(),
+            }) as AuthPrincipalRef)
+            .expect("auth principal should be set");
+        let caller_scope: Arc<str> = Arc::from(context.cache_namespace().storage_id());
+
+        let mine = Uuid::from_u128(1);
+        let theirs = Uuid::from_u128(2);
+        let their_token = CancellationToken::new();
+        let _mine_guard = registry.register(
+            mine,
+            "SELECT mine",
+            Protocol::Http,
+            Arc::clone(&caller_scope),
+            CancellationToken::new(),
+        );
+        let _theirs_guard = registry.register(
+            theirs,
+            "SELECT theirs",
+            Protocol::Http,
+            Arc::from("apikey:some-other-principal"),
+            their_token.clone(),
+        );
+
+        let listed = Arc::clone(&context)
+            .scope(list_active(Extension(Arc::clone(&rt))))
+            .await;
+        assert_eq!(listed.status(), StatusCode::OK);
+        let body = response_json(listed).await;
+        assert_eq!(body["total_count"], 1);
+        let rendered = body["queries"].to_string();
+        assert!(
+            rendered.contains("SELECT mine"),
+            "the caller must still see its own query: {rendered}"
+        );
+        assert!(
+            !rendered.contains("SELECT theirs"),
+            "another principal's SQL must not be disclosed: {rendered}"
+        );
+
+        let cancelled = context
+            .scope(cancel_active(Extension(rt), Path(theirs.to_string())))
+            .await;
+        assert_eq!(
+            cancelled.status(),
+            StatusCode::NOT_FOUND,
+            "another principal's query must read as missing, not as cancellable"
+        );
+        assert!(
+            !their_token.is_cancelled(),
+            "a refused cancellation must leave the other principal's query running"
+        );
     }
 
     #[test]
