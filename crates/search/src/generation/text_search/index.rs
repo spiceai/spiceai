@@ -1164,6 +1164,7 @@ mod tests {
             vec![3],
             "id 3 stays"
         );
+    }
 
     // Regression test for #12228.
     #[tokio::test]
