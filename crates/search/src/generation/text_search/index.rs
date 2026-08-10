@@ -30,8 +30,8 @@ use runtime_datafusion_index::{Index, WriteWindow};
 use snafu::{ResultExt, ensure};
 use tantivy::merge_policy::LogMergePolicy;
 use tantivy::schema::{
-    DocParsingError, FieldEntry, IndexRecordOption, Schema, SchemaBuilder,
-    TextFieldIndexing, TextOptions, Type,
+    DocParsingError, FieldEntry, IndexRecordOption, Schema, SchemaBuilder, TextFieldIndexing,
+    TextOptions, Type,
 };
 use tantivy::{TantivyDocument, TantivyError};
 use tantivy_datafusion_filter::{array_to_terms, is_tokenized, text_tokenizer};
@@ -1074,9 +1074,31 @@ mod tests {
     /// silent-truncation gap (#12231).
     #[tokio::test]
     async fn filter_pushdown_finds_row_beyond_candidate_cap() {
-        use arrow::array::Int32Array;
+        use crate::SEARCH_SCORE_COLUMN_NAME;
+        use arrow::array::{Float64Array, Int32Array};
         use datafusion::logical_expr::TableProviderFilterPushDown;
         use datafusion::prelude::{col, lit};
+
+        fn score_for_id(rows: &[RecordBatch], target: i32) -> f64 {
+            for rb in rows {
+                let ids = rb
+                    .column_by_name("id")
+                    .expect("id column present")
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .expect("id column is Int32");
+                let scores = rb
+                    .column_by_name(SEARCH_SCORE_COLUMN_NAME)
+                    .expect("score column present")
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .expect("score column is Float64");
+                if let Some(row) = (0..ids.len()).find(|&row| ids.value(row) == target) {
+                    return scores.value(row);
+                }
+            }
+            panic!("id={target} must be present in the search results");
+        }
 
         let index = new_test_index();
         let ids: Vec<i32> = (1..=50).collect();
@@ -1092,13 +1114,23 @@ mod tests {
             .expect("Failed to create FullTextSearchFieldIndex");
 
         // The provider must advertise `id = 47` as an Exact pushdown (`id` is an indexed i64).
-        let target = 47_i64;
+        let target_id = 47_i32;
+        let target = i64::from(target_id);
         let filter = col("id").eq(lit(target));
         let support = fts.classify_filters(&[&filter]);
         assert!(
             matches!(support.as_slice(), [TableProviderFilterPushDown::Exact]),
             "expected Exact pushdown for `id = {target}`, got {support:?}"
         );
+
+        let unfiltered_rows: Vec<RecordBatch> = fts
+            .search("shared".to_string(), vec![], 1000)
+            .await
+            .expect("failed to run unfiltered search")
+            .try_collect()
+            .await
+            .expect("failed to collect unfiltered search results");
+        let unfiltered_score = score_for_id(&unfiltered_rows, target_id);
 
         // With the filter pushed into the index, a limit of 1 still finds the target row.
         let queries = fts
@@ -1113,7 +1145,10 @@ mod tests {
             .expect("failed to collect search results");
 
         let total: usize = rows.iter().map(RecordBatch::num_rows).sum();
-        assert_eq!(total, 1, "the pushed filter must isolate exactly the target row");
+        assert_eq!(
+            total, 1,
+            "the pushed filter must isolate exactly the target row"
+        );
         let rb = &rows[0];
         let id_idx = rb.schema().index_of("id").expect("id column present");
         let ids_out = rb
@@ -1122,12 +1157,20 @@ mod tests {
             .downcast_ref::<Int32Array>()
             .expect("id column is Int32");
         assert_eq!(ids_out.value(0), 47, "the filtered row must be id=47");
+        assert_eq!(
+            score_for_id(&rows, target_id),
+            unfiltered_score,
+            "SQL filters must not contribute to the full-text relevance score"
+        );
 
         // A range predicate `id BETWEEN 10 AND 12` is likewise Exact and returns exactly that set.
         let range = col("id").between(lit(10_i64), lit(12_i64));
         let range_support = fts.classify_filters(&[&range]);
         assert!(
-            matches!(range_support.as_slice(), [TableProviderFilterPushDown::Exact]),
+            matches!(
+                range_support.as_slice(),
+                [TableProviderFilterPushDown::Exact]
+            ),
             "expected Exact pushdown for BETWEEN, got {range_support:?}"
         );
         let range_queries = fts
@@ -1153,7 +1196,11 @@ mod tests {
             })
             .collect();
         got.sort_unstable();
-        assert_eq!(got, vec![10, 11, 12], "BETWEEN must return exactly the in-range rows");
+        assert_eq!(
+            got,
+            vec![10, 11, 12],
+            "BETWEEN must return exactly the in-range rows"
+        );
     }
 
     #[tokio::test]

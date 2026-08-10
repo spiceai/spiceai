@@ -33,7 +33,7 @@ use datafusion::logical_expr::{
 };
 use tantivy::Term;
 use tantivy::query::{AllQuery, BooleanQuery, Occur, Query, RangeQuery, TermQuery};
-use tantivy::schema::{Field, FieldType, IndexRecordOption, Schema};
+use tantivy::schema::{Field, IndexRecordOption, Schema, Type};
 
 use crate::schema::is_tokenized;
 use crate::terms::array_to_terms;
@@ -47,48 +47,37 @@ const STRICT_CAST: CastOptions<'static> = CastOptions {
     format_options: arrow::util::display::FormatOptions::new(),
 };
 
-/// The tantivy value kind of an index column that a filter can be pushed against.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FieldKind {
-    I64,
-    U64,
-    F64,
-    Bool,
-    /// Untokenized `STRING` text (a primary key or explicit store column) — matchable by a
-    /// single [`TermQuery`] on the raw value.
-    StrExact,
+/// The Arrow type a literal must be coerced to before encoding a term for this field.
+fn arrow_type(value_type: Type) -> Option<DataType> {
+    match value_type {
+        Type::I64 => Some(DataType::Int64),
+        Type::U64 => Some(DataType::UInt64),
+        Type::F64 => Some(DataType::Float64),
+        Type::Bool => Some(DataType::Boolean),
+        Type::Str => Some(DataType::Utf8),
+        _ => None,
+    }
 }
 
-impl FieldKind {
-    /// The Arrow type a literal must be coerced to before encoding a term for this field.
-    fn arrow_type(self) -> DataType {
-        match self {
-            FieldKind::I64 => DataType::Int64,
-            FieldKind::U64 => DataType::UInt64,
-            FieldKind::F64 => DataType::Float64,
-            FieldKind::Bool => DataType::Boolean,
-            FieldKind::StrExact => DataType::Utf8,
-        }
+/// Whether a literal of `dt` may be compared against this field. Guards against surprising
+/// cross-type coercions (e.g. treating an integer literal as text): only same-family literals are
+/// accepted, then range-checked by the strict cast in [`literal_to_term`].
+fn accepts(value_type: Type, dt: &DataType) -> bool {
+    match value_type {
+        Type::I64 | Type::U64 => dt.is_integer(),
+        // A float field may be compared against an integer or a float literal.
+        Type::F64 => dt.is_integer() || dt.is_floating(),
+        Type::Bool => matches!(dt, DataType::Boolean),
+        Type::Str => matches!(
+            dt,
+            DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+        ),
+        _ => false,
     }
+}
 
-    /// Whether a literal of `dt` may be compared against this field. Guards against surprising
-    /// cross-type coercions (e.g. treating an integer literal as text): only same-family
-    /// literals are accepted, then range-checked by the strict cast in [`literal_to_term`].
-    fn accepts(self, dt: &DataType) -> bool {
-        match self {
-            FieldKind::I64 | FieldKind::U64 => dt.is_integer(),
-            // A float field may be compared against an integer or a float literal.
-            FieldKind::F64 => dt.is_integer() || dt.is_floating(),
-            FieldKind::Bool => matches!(dt, DataType::Boolean),
-            FieldKind::StrExact => {
-                matches!(dt, DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View)
-            }
-        }
-    }
-
-    fn is_numeric(self) -> bool {
-        matches!(self, FieldKind::I64 | FieldKind::U64 | FieldKind::F64)
-    }
+fn is_numeric(value_type: Type) -> bool {
+    matches!(value_type, Type::I64 | Type::U64 | Type::F64)
 }
 
 /// The outcome of translating a single filter (sub)expression.
@@ -175,8 +164,7 @@ fn combine(schema: &Schema, left: &Expr, right: &Expr, occur: Occur) -> Translat
         Translated::Unsupported => return Translated::Unsupported,
     };
 
-    let query: Box<dyn Query> =
-        Box::new(BooleanQuery::new(vec![(occur, lq), (occur, rq)]));
+    let query: Box<dyn Query> = Box::new(BooleanQuery::new(vec![(occur, lq), (occur, rq)]));
     if l_exact && r_exact {
         Translated::Exact(query)
     } else {
@@ -194,18 +182,18 @@ fn comparison(schema: &Schema, left: &Expr, op: Operator, right: &Expr) -> Trans
         },
     };
 
-    let Some((field, kind)) = classify_column(schema, column) else {
+    let Some((field, value_type)) = classify_column(schema, column) else {
         return Translated::Unsupported;
     };
 
     match op {
-        Operator::Eq => eq_query(field, kind, scalar),
-        Operator::NotEq => match eq_query(field, kind, scalar) {
+        Operator::Eq => eq_query(field, value_type, scalar),
+        Operator::NotEq => match eq_query(field, value_type, scalar) {
             Translated::Exact(q) | Translated::Inexact(q) => Translated::Inexact(negate(q)),
             Translated::Unsupported => Translated::Unsupported,
         },
         Operator::Lt | Operator::LtEq | Operator::Gt | Operator::GtEq => {
-            range_query(field, kind, op, scalar)
+            range_query(field, value_type, op, scalar)
         }
         _ => Translated::Unsupported,
     }
@@ -213,15 +201,15 @@ fn comparison(schema: &Schema, left: &Expr, op: Operator, right: &Expr) -> Trans
 
 /// Build an equality [`TermQuery`]. Float equality is fragile (binary-representation mismatch),
 /// so it is reported `Inexact` and re-checked; every other exact-eligible field is `Exact`.
-fn eq_query(field: Field, kind: FieldKind, scalar: &ScalarValue) -> Translated {
-    if !kind.accepts(&scalar.data_type()) {
+fn eq_query(field: Field, value_type: Type, scalar: &ScalarValue) -> Translated {
+    if !accepts(value_type, &scalar.data_type()) {
         return Translated::Unsupported;
     }
-    let Some(term) = literal_to_term(field, kind, scalar) else {
+    let Some(term) = literal_to_term(field, value_type, scalar) else {
         return Translated::Unsupported;
     };
     let query: Box<dyn Query> = Box::new(TermQuery::new(term, IndexRecordOption::Basic));
-    if kind == FieldKind::F64 {
+    if value_type == Type::F64 {
         Translated::Inexact(query)
     } else {
         Translated::Exact(query)
@@ -229,13 +217,13 @@ fn eq_query(field: Field, kind: FieldKind, scalar: &ScalarValue) -> Translated {
 }
 
 /// Build a numeric [`RangeQuery`]. Ranges are only meaningful over numeric fields; on any other
-/// field kind the comparison is not pushed. NULL rows carry no term, so they are excluded by the
+/// field type the comparison is not pushed. NULL rows carry no term, so they are excluded by the
 /// range exactly as SQL excludes them — the range is `Exact`.
-fn range_query(field: Field, kind: FieldKind, op: Operator, scalar: &ScalarValue) -> Translated {
-    if !kind.is_numeric() || !kind.accepts(&scalar.data_type()) {
+fn range_query(field: Field, value_type: Type, op: Operator, scalar: &ScalarValue) -> Translated {
+    if !is_numeric(value_type) || !accepts(value_type, &scalar.data_type()) {
         return Translated::Unsupported;
     }
-    let Some(term) = literal_to_term(field, kind, scalar) else {
+    let Some(term) = literal_to_term(field, value_type, scalar) else {
         return Translated::Unsupported;
     };
 
@@ -249,26 +237,23 @@ fn range_query(field: Field, kind: FieldKind, op: Operator, scalar: &ScalarValue
     Translated::Exact(Box::new(RangeQuery::new(lower, upper)))
 }
 
-fn between(
-    schema: &Schema,
-    expr: &Expr,
-    negated: bool,
-    low: &Expr,
-    high: &Expr,
-) -> Translated {
+fn between(schema: &Schema, expr: &Expr, negated: bool, low: &Expr, high: &Expr) -> Translated {
     let (Some(column), Some(lo), Some(hi)) = (as_column(expr), as_literal(low), as_literal(high))
     else {
         return Translated::Unsupported;
     };
-    let Some((field, kind)) = classify_column(schema, column) else {
+    let Some((field, value_type)) = classify_column(schema, column) else {
         return Translated::Unsupported;
     };
-    if !kind.is_numeric() || !kind.accepts(&lo.data_type()) || !kind.accepts(&hi.data_type()) {
+    if !is_numeric(value_type)
+        || !accepts(value_type, &lo.data_type())
+        || !accepts(value_type, &hi.data_type())
+    {
         return Translated::Unsupported;
     }
     let (Some(lo_term), Some(hi_term)) = (
-        literal_to_term(field, kind, lo),
-        literal_to_term(field, kind, hi),
+        literal_to_term(field, value_type, lo),
+        literal_to_term(field, value_type, hi),
     ) else {
         return Translated::Unsupported;
     };
@@ -288,7 +273,7 @@ fn in_list(schema: &Schema, expr: &Expr, list: &[Expr], negated: bool) -> Transl
     let Some(column) = as_column(expr) else {
         return Translated::Unsupported;
     };
-    let Some((field, kind)) = classify_column(schema, column) else {
+    let Some((field, value_type)) = classify_column(schema, column) else {
         return Translated::Unsupported;
     };
 
@@ -300,12 +285,12 @@ fn in_list(schema: &Schema, expr: &Expr, list: &[Expr], negated: bool) -> Transl
         };
         // `IN (.., NULL, ..)` has three-valued semantics that a term set cannot reproduce
         // (especially under negation); leave it entirely to DataFusion.
-        if scalar.is_null() || !kind.accepts(&scalar.data_type()) {
+        if scalar.is_null() || !accepts(value_type, &scalar.data_type()) {
             return Translated::Unsupported;
         }
         // A literal that does not fit the field's type can never equal any stored value, so
         // dropping it preserves the match set exactly (for both `IN` and `NOT IN`).
-        if let Some(term) = literal_to_term(field, kind, scalar) {
+        if let Some(term) = literal_to_term(field, value_type, scalar) {
             clauses.push((
                 Occur::Should,
                 Box::new(TermQuery::new(term, IndexRecordOption::Basic)),
@@ -314,7 +299,7 @@ fn in_list(schema: &Schema, expr: &Expr, list: &[Expr], negated: bool) -> Transl
     }
 
     let query: Box<dyn Query> = Box::new(BooleanQuery::new(clauses));
-    let exact = kind != FieldKind::F64;
+    let exact = value_type != Type::F64;
     match (negated, exact) {
         // Negation adds the column's NULL rows to the match set → superset → `Inexact`.
         (true, _) => Translated::Inexact(negate(query)),
@@ -333,10 +318,10 @@ fn like_prefix(schema: &Schema, like: &Like) -> Translated {
     let Some(column) = as_column(&like.expr) else {
         return Translated::Unsupported;
     };
-    let Some((field, kind)) = classify_column(schema, column) else {
+    let Some((field, value_type)) = classify_column(schema, column) else {
         return Translated::Unsupported;
     };
-    if kind != FieldKind::StrExact {
+    if value_type != Type::Str {
         return Translated::Unsupported;
     }
     let Some(pattern) = as_literal(&like.pattern).and_then(as_utf8) else {
@@ -356,43 +341,41 @@ fn like_prefix(schema: &Schema, like: &Like) -> Translated {
 
 /// Classify an index column by its tantivy field type, or [`None`] when the column is not in the
 /// index (e.g. the synthesized `_score` column, or a base-table column that is neither a primary
-/// key, a `search_field`, nor a `store_field`) or is a kind no filter can be pushed against
+/// key, a `search_field`, nor a `store_field`) or has a type no filter can be pushed against
 /// (tokenized text, bytes, dates).
-fn classify_column(schema: &Schema, column: &str) -> Option<(Field, FieldKind)> {
+fn classify_column(schema: &Schema, column: &str) -> Option<(Field, Type)> {
     let field = schema.get_field(column).ok()?;
     let field_type = schema.get_field_entry(field).field_type();
     if !field_type.is_indexed() {
         return None;
     }
-    let kind = match field_type {
-        FieldType::I64(_) => FieldKind::I64,
-        FieldType::U64(_) => FieldKind::U64,
-        FieldType::F64(_) => FieldKind::F64,
-        FieldType::Bool(_) => FieldKind::Bool,
-        FieldType::Str(_) => {
+    let value_type = field_type.value_type();
+    match value_type {
+        Type::I64 | Type::U64 | Type::F64 | Type::Bool => {}
+        Type::Str => {
             // A tokenized `search_field` is stemmed into multiple terms; no single term equals
             // the raw SQL string, so equality/term filters are not sound against it.
             if is_tokenized(field_type) {
                 return None;
             }
-            FieldKind::StrExact
         }
         // Bytes, dates, JSON, IP, and facets are not filter-pushdown targets today.
         _ => return None,
-    };
-    Some((field, kind))
+    }
+    Some((field, value_type))
 }
 
 /// Coerce `scalar` to the field's tantivy value type and encode it as a single [`Term`]. Reuses
 /// [`array_to_terms`] so literal encoding matches the encoding used everywhere else. Returns
 /// [`None`] when the literal is NULL, out of range for the target type (strict cast errors), or
 /// otherwise not encodable — in which case the caller must not push the filter.
-fn literal_to_term(field: Field, kind: FieldKind, scalar: &ScalarValue) -> Option<Term> {
+fn literal_to_term(field: Field, value_type: Type, scalar: &ScalarValue) -> Option<Term> {
     if scalar.is_null() {
         return None;
     }
+    let target_type = arrow_type(value_type)?;
     let coerced = scalar
-        .cast_to_with_options(&kind.arrow_type(), &STRICT_CAST)
+        .cast_to_with_options(&target_type, &STRICT_CAST)
         .ok()?;
     if coerced.is_null() {
         return None;
@@ -617,7 +600,9 @@ mod tests {
         // Float IN is Inexact for the same reason `=` on a float is.
         assert_inexact(&col("f").in_list(vec![lit(1.5_f64)], false));
         // A NULL in the list has three-valued semantics a term set cannot reproduce.
-        assert_unsupported(&col("i").in_list(vec![lit(1_i64), lit(ScalarValue::Int64(None))], false));
+        assert_unsupported(
+            &col("i").in_list(vec![lit(1_i64), lit(ScalarValue::Int64(None))], false),
+        );
     }
 
     #[test]

@@ -29,7 +29,9 @@ use arrow_json::reader::Decoder;
 use async_stream::stream;
 use async_trait::async_trait;
 use datafusion::{
-    catalog::TableProvider, error::DataFusionError, execution::SendableRecordBatchStream,
+    catalog::TableProvider,
+    error::DataFusionError,
+    execution::SendableRecordBatchStream,
     logical_expr::{Expr, TableProviderFilterPushDown},
     physical_plan::stream::RecordBatchStreamAdapter,
 };
@@ -41,7 +43,7 @@ use snafu::{ResultExt, Snafu};
 use tantivy::{
     Searcher, TantivyError,
     collector::TopDocs,
-    query::{BooleanQuery, Occur, Query, QueryParser, QueryParserError},
+    query::{BooleanQuery, ConstScoreQuery, Occur, Query, QueryParser, QueryParserError},
     query_grammar::{Delimiter, UserInputAst, UserInputLeaf, UserInputLiteral},
     schema::{FieldType, OwnedValue},
     tokenizer::{LowerCaser, SimpleTokenizer, TextAnalyzer},
@@ -410,7 +412,10 @@ impl FullTextSearchFieldIndex {
             let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::with_capacity(filters.len() + 1);
             clauses.push((Occur::Must, text_query));
             for f in filters {
-                clauses.push((Occur::Must, f.box_clone()));
+                clauses.push((
+                    Occur::Must,
+                    Box::new(ConstScoreQuery::new(f.box_clone(), 0.0)),
+                ));
             }
             Box::new(BooleanQuery::new(clauses))
         };
