@@ -87,33 +87,12 @@ impl IcebergClusterTableProvider {
 // one with a default) forces an explicit decision here, rather than silently
 // bypassing this wrapper's distributed-scan handling.
 #[deny(clippy::missing_trait_methods)]
-#[async_trait]
-impl TableLayer for IcebergClusterTableProvider {
-    /// Wraps a cluster-visible Iceberg scan so it can cross node boundaries. It
-    /// carries no schema, CDC or write semantics of its own, so only read
-    /// discovery needs to see past it — which is exactly the step that used to
-    /// require `runtime` to ship this type's accessor down to the accelerated
-    /// table.
-    fn route<'a>(
-        &'a self,
-        walk: LayerWalk,
-        below: &'a Arc<dyn TableProvider>,
-    ) -> Option<&'a Arc<dyn TableProvider>> {
-        match walk {
-            LayerWalk::Read | LayerWalk::Index => Some(below),
-            _ => None,
-        }
-    }
-
-
-
-
-
-
-
-
-
-    async fn scan(
+impl IcebergClusterTableProvider {
+    /// Builds the plan for a scan of this layer.
+    ///
+    /// Reached only through this type's `TableLayer::scan_with_args`, which is
+    /// the single scan entry point a layer exposes.
+    async fn scan_plan(
         &self,
         _below: &Arc<dyn TableProvider>,
         state: &dyn Session,
@@ -141,20 +120,45 @@ impl TableLayer for IcebergClusterTableProvider {
 
         Ok(plan)
     }
+}
+
+#[async_trait]
+impl TableLayer for IcebergClusterTableProvider {
+    /// Wraps a cluster-visible Iceberg scan so it can cross node boundaries. It
+    /// carries no schema, CDC or write semantics of its own, so only read
+    /// discovery needs to see past it — which is exactly the step that used to
+    /// require `runtime` to ship this type's accessor down to the accelerated
+    /// table.
+    fn route<'a>(
+        &'a self,
+        walk: LayerWalk,
+        below: &'a Arc<dyn TableProvider>,
+    ) -> Option<&'a Arc<dyn TableProvider>> {
+        match walk {
+            LayerWalk::Read | LayerWalk::Index => Some(below),
+            _ => None,
+        }
+    }
+
+
+
+
+
+
+
+
+
 
     async fn scan_with_args<'a>(
         &self,
-        _below: &Arc<dyn TableProvider>,
+        below: &Arc<dyn TableProvider>,
         state: &dyn Session,
         args: ScanArgs<'a>,
     ) -> DFResult<ScanResult> {
-        // Route through our own `scan` (mirroring the trait's default) so the
-        // distributed `IcebergScanExec` wrapping is applied. Forwarding straight
-        // to `self.inner` would bypass it and make Iceberg scans unserializable.
         let projection = args.projection().map(<[usize]>::to_vec);
         let plan = self
-            .scan(
-                _below,
+            .scan_plan(
+                below,
                 state,
                 projection.as_ref(),
                 args.filters().unwrap_or(&[]),
@@ -163,8 +167,4 @@ impl TableLayer for IcebergClusterTableProvider {
             .await?;
         Ok(plan.into())
     }
-
-
-
-
 }

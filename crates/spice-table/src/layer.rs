@@ -151,17 +151,17 @@ pub trait TableLayer: Any + Send + Sync + Debug + 'static {
         below.get_column_default(column)
     }
 
-    async fn scan(
-        &self,
-        below: &Arc<dyn TableProvider>,
-        state: &dyn Session,
-        projection: Option<&Vec<usize>>,
-        filters: &[Expr],
-        limit: Option<usize>,
-    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        below.scan(state, projection, filters, limit).await
-    }
-
+    /// Builds the plan for a scan of this layer, or forwards to the table
+    /// beneath.
+    ///
+    /// The *only* scan entry point a layer implements. `TableProvider` offers two
+    /// — `scan` and `scan_with_args` — and a layer overriding one but not the
+    /// other would have its work silently skipped for callers taking the other
+    /// path. `SpiceTable` funnels both into this, so that cannot happen.
+    ///
+    /// Takes `ScanArgs`/`ScanResult` rather than loose parameters so that
+    /// whatever DataFusion adds to them passes through untouched instead of
+    /// being dropped in translation.
     async fn scan_with_args<'a>(
         &self,
         below: &Arc<dyn TableProvider>,
@@ -505,9 +505,15 @@ impl TableProvider for SpiceTable {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        self.layer
-            .scan(&self.below, state, projection, filters, limit)
-            .await
+        let args = ScanArgs::default()
+            .with_projection(projection.map(Vec::as_slice))
+            .with_filters(Some(filters))
+            .with_limit(limit);
+        Ok(self
+            .layer
+            .scan_with_args(&self.below, state, args)
+            .await?
+            .into_inner())
     }
 
     async fn scan_with_args<'a>(

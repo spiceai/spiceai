@@ -52,6 +52,7 @@ use spicepod::component::embeddings::{
 use tokio::sync::RwLock;
 
 use super::common::{is_valid_embedding_type, is_valid_offset_type, vector_length};
+use datafusion::catalog::{ScanArgs, ScanResult};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -160,11 +161,26 @@ enum SourceShape {
 /// query time per-element similarities are aggregated into a single
 /// per-row score via `aggregation`.
 impl EmbeddingTable {
-    /// The schema this layer presents: the base table's, with the synthetic
-    /// embedding columns appended.
+    /// The schema this layer presents over the table it was constructed with.
+    ///
+    /// For a caller that holds only the layer. Anything holding the stack should
+    /// ask the table itself, so a rebuild that replaced what this layer sits over
+    /// is reflected.
     #[must_use]
     pub fn schema(&self) -> SchemaRef {
-        let base_schema = self.base_table.schema();
+        self.schema_over(&self.base_table)
+    }
+
+    /// The schema this layer presents over `base`: that table's, with the
+    /// synthetic embedding columns appended.
+    ///
+    /// Takes the table rather than reading `self.base_table` because a rebuild
+    /// can replace what this layer sits over (metadata enrichment is pushed to
+    /// the base), and a schema computed from the stale field would drop whatever
+    /// the rebuild added.
+    #[must_use]
+    pub fn schema_over(&self, base: &Arc<dyn TableProvider>) -> SchemaRef {
+        let base_schema = base.schema();
         let mut base_fields: Vec<_> = (0..base_schema.fields.len())
             .filter_map(|i| base_schema.fields.get(i).cloned())
             .collect();
@@ -716,13 +732,13 @@ impl EmbeddingTable {
     ///     - Any projection index >=6 is an embedding column.
     ///
     /// The order of the additionally-generated embedding columns in [`Self::Schema`] is alphabetical.
-    fn columns_to_embed(&self, projection: Option<&Vec<usize>>) -> Vec<String> {
+    fn columns_to_embed(&self, base: &Arc<dyn TableProvider>, projection: Option<&Vec<usize>>) -> Vec<String> {
         // Order of embedding columns in [`Self::Schema`] is alphabetical.
         match projection {
             None => self.get_additional_embedding_columns_sorted(),
             Some(column_idx) => {
                 let additional_fields = self.get_additional_embedding_field_names();
-                let base_cols = self.base_table.schema().fields.len();
+                let base_cols = base.schema().fields.len();
 
                 column_idx
                     .iter()
@@ -812,6 +828,93 @@ impl EmbeddingTable {
 }
 
 #[deny(clippy::missing_trait_methods)]
+impl EmbeddingTable {
+    /// Builds the plan for a scan of this layer.
+    ///
+    /// Reached only through this type's `TableLayer::scan_with_args`, which is
+    /// the single scan entry point a layer exposes.
+    async fn scan_plan(
+        &self,
+        below: &Arc<dyn TableProvider>,
+        state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        filters: &[Expr],
+        limit: Option<usize>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        let columns_to_embed = self.columns_to_embed(below, projection);
+        let num_base_cols = below.schema().fields.len();
+
+        // No embedding work is needed.
+        if columns_to_embed.is_empty() {
+            tracing::trace!(
+                "For `EmbeddingTable`, no additional embedding columns to compute. Forwarding entirely to base table."
+            );
+            return self
+                .base_table
+                .scan(
+                    state,
+                    projection
+                        .as_ref()
+                        .map(|p| {
+                            p.iter()
+                                .filter(|&&idx| idx < num_base_cols)
+                                .copied()
+                                .collect()
+                        })
+                        .as_ref(),
+                    filters,
+                    limit,
+                )
+                .await;
+        }
+        tracing::trace!(
+            "For `EmbeddingTable`, additional embedding columns to compute: {columns_to_embed:?}"
+        );
+        let schema = &self.schema_over(below);
+
+        let scan_embed_columns: HashMap<String, EmbeddingColumnConfig> = self
+            .embedded_columns
+            .iter()
+            .filter(|(c, _m)| columns_to_embed.contains(c))
+            .map(|(c, m)| (c.clone(), m.clone()))
+            .collect();
+
+        // Need to ensure base table gets the underlying column for each embedding column specified (as well as everything in the original [`projection`]).
+        let projection_for_base_table: Option<Vec<usize>> = match projection.cloned() {
+            None => None,
+            Some(mut proj) => {
+                let mut base_cols = scan_embed_columns
+                    .keys()
+                    .filter_map(|c| schema.column_with_name(c).map(|(idx, _field)| idx))
+                    .collect_vec();
+                proj.append(&mut base_cols);
+                Some(
+                    proj.iter()
+                        .unique()
+                        .filter(|&&c| c < num_base_cols) // Don't include embedding columns for `base_table`
+                        .copied()
+                        .collect_vec(),
+                )
+            }
+        };
+
+        let projected_schema = project_schema(&self.schema_over(below), projection)?;
+        let base_plan = self
+            .base_table
+            .scan(state, projection_for_base_table.as_ref(), filters, limit)
+            .await?;
+
+        Ok(Arc::new(EmbeddingTableExec::new(
+            &projected_schema,
+            filters,
+            limit,
+            base_plan,
+            Arc::new(scan_embed_columns),
+            Arc::clone(&self.embedding_models),
+        )) as Arc<dyn ExecutionPlan>)
+    }
+}
+
 #[async_trait]
 impl TableLayer for EmbeddingTable {
     /// Merges synthetic `<col>_embedding` columns into the schema, so a walk whose
@@ -844,95 +947,15 @@ impl TableLayer for EmbeddingTable {
         None
     }
 
-    fn schema(&self, _below: &Arc<dyn TableProvider>) -> SchemaRef {
-        EmbeddingTable::schema(self)
+    fn schema(&self, below: &Arc<dyn TableProvider>) -> SchemaRef {
+        self.schema_over(below)
     }
 
-    async fn scan(
-        &self,
-        _below: &Arc<dyn TableProvider>,
-        state: &dyn Session,
-        projection: Option<&Vec<usize>>,
-        filters: &[Expr],
-        limit: Option<usize>,
-    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        let columns_to_embed = self.columns_to_embed(projection);
-        let num_base_cols = self.base_table.schema().fields.len();
-
-        // No embedding work is needed.
-        if columns_to_embed.is_empty() {
-            tracing::trace!(
-                "For `EmbeddingTable`, no additional embedding columns to compute. Forwarding entirely to base table."
-            );
-            return self
-                .base_table
-                .scan(
-                    state,
-                    projection
-                        .as_ref()
-                        .map(|p| {
-                            p.iter()
-                                .filter(|&&idx| idx < num_base_cols)
-                                .copied()
-                                .collect()
-                        })
-                        .as_ref(),
-                    filters,
-                    limit,
-                )
-                .await;
-        }
-        tracing::trace!(
-            "For `EmbeddingTable`, additional embedding columns to compute: {columns_to_embed:?}"
-        );
-        let schema = &self.schema();
-
-        let scan_embed_columns: HashMap<String, EmbeddingColumnConfig> = self
-            .embedded_columns
-            .iter()
-            .filter(|(c, _m)| columns_to_embed.contains(c))
-            .map(|(c, m)| (c.clone(), m.clone()))
-            .collect();
-
-        // Need to ensure base table gets the underlying column for each embedding column specified (as well as everything in the original [`projection`]).
-        let projection_for_base_table: Option<Vec<usize>> = match projection.cloned() {
-            None => None,
-            Some(mut proj) => {
-                let mut base_cols = scan_embed_columns
-                    .keys()
-                    .filter_map(|c| schema.column_with_name(c).map(|(idx, _field)| idx))
-                    .collect_vec();
-                proj.append(&mut base_cols);
-                Some(
-                    proj.iter()
-                        .unique()
-                        .filter(|&&c| c < num_base_cols) // Don't include embedding columns for `base_table`
-                        .copied()
-                        .collect_vec(),
-                )
-            }
-        };
-
-        let projected_schema = project_schema(&self.schema(), projection)?;
-        let base_plan = self
-            .base_table
-            .scan(state, projection_for_base_table.as_ref(), filters, limit)
-            .await?;
-
-        Ok(Arc::new(EmbeddingTableExec::new(
-            &projected_schema,
-            filters,
-            limit,
-            base_plan,
-            Arc::new(scan_embed_columns),
-            Arc::clone(&self.embedding_models),
-        )) as Arc<dyn ExecutionPlan>)
-    }
 
     /// Any filter in [`filters`] can still be exact
     fn supports_filters_pushdown(
         &self,
-        _below: &Arc<dyn TableProvider>,
+        below: &Arc<dyn TableProvider>,
         filters: &[&Expr],
     ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
         let base_field_names: HashSet<String> = self
@@ -955,7 +978,7 @@ impl TableLayer for EmbeddingTable {
                     .count();
 
                 if additional_fields_count == 0 {
-                    self.base_table.supports_filters_pushdown(&[f]).map(|v| {
+                    below.supports_filters_pushdown(&[f]).map(|v| {
                         v.first()
                             .cloned()
                             .unwrap_or(TableProviderFilterPushDown::Unsupported)
@@ -972,27 +995,24 @@ impl TableLayer for EmbeddingTable {
         None
     }
 
-
-
-
     async fn scan_with_args<'a>(
         &self,
-        _below: &Arc<dyn TableProvider>,
+        below: &Arc<dyn TableProvider>,
         state: &dyn Session,
-        args: datafusion::catalog::ScanArgs<'a>,
-    ) -> DataFusionResult<datafusion::catalog::ScanResult> {
+        args: ScanArgs<'a>,
+    ) -> DataFusionResult<ScanResult> {
+        let projection = args.projection().map(<[usize]>::to_vec);
         let plan = self
-            .scan(
-                _below,
+            .scan_plan(
+                below,
                 state,
-                args.projection().map(<[usize]>::to_vec).as_ref(),
+                projection.as_ref(),
                 args.filters().unwrap_or(&[]),
                 args.limit(),
             )
             .await?;
         Ok(plan.into())
     }
-
 }
 
 #[cfg(test)]

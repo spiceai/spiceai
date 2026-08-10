@@ -41,6 +41,7 @@ use itertools::Itertools;
 use util::session_state::builder_from_existing;
 
 use crate::index::VectorIndex;
+use datafusion::catalog::{ScanArgs, ScanResult};
 
 /// A [`TableProvider`] that adds an embedding column to an underlying [`TableProvider`].
 #[derive(Debug, Clone)]
@@ -51,12 +52,16 @@ pub struct VectorScanTableProvider {
 }
 
 impl VectorScanTableProvider {
-    /// The schema this layer presents: the table beneath, with the vector index's
-    /// own columns merged in.
+    /// The schema this layer presents over `base`: that table's, with the vector
+    /// index's own columns merged in.
+    ///
+    /// Takes the table rather than reading `self.table_provider` because a
+    /// rebuild can replace what this layer sits over (metadata enrichment is
+    /// pushed to the base), and a schema computed from the stale field would drop
+    /// whatever the rebuild added.
     #[must_use]
-    pub fn schema(&self) -> SchemaRef {
-        let mut fields_map = self
-            .table_provider
+    pub fn schema_over(&self, base: &Arc<dyn TableProvider>) -> SchemaRef {
+        let mut fields_map = base
             .schema()
             .fields()
             .iter()
@@ -135,13 +140,14 @@ impl VectorScanTableProvider {
 
     fn columns_projected(
         &self,
+        base: &Arc<dyn TableProvider>,
         projection: Option<&Vec<usize>>,
     ) -> Result<HashSet<String>, DataFusionError> {
         let source_schema = match projection {
-            None => self.schema(),
+            None => self.schema_over(base),
             Some(indices) => {
                 let projected = self
-                    .schema()
+                    .schema_over(base)
                     .project(indices)
                     .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
                 Arc::new(projected)
@@ -156,9 +162,10 @@ impl VectorScanTableProvider {
         Ok(columns_requested)
     }
 
-    /// Return all columns that appear in the [`Self::vector_index_list`] that are not in [`Self::table_provider`] as well as all primary keys.
-    fn columns_needed_from_index(&self) -> Vec<Expr> {
-        let table_schema = self.table_provider.schema();
+    /// Every column in [`Self::vector_index_list`] absent from `base`, plus all
+    /// primary keys.
+    fn columns_needed_from_index(&self, base: &Arc<dyn TableProvider>) -> Vec<Expr> {
+        let table_schema = base.schema();
         self.vector_index_list
             .schema()
             .columns()
@@ -194,50 +201,30 @@ fn columns_missing_from(expr: &[Expr], schema: &Fields) -> Vec<String> {
         .collect::<Vec<_>>()
 }
 
-#[async_trait]
-impl TableLayer for VectorScanTableProvider {
-    /// Merges vector-index columns into the schema, so a walk whose query must
-    /// not see them stops here: CDC detection looks *for* this layer, and a
-    /// source bootstrap `SELECT` must never reference a synthetic column. Reads
-    /// and source peeling see past it — the columns it adds are the point of a
-    /// read, and the source walk exists to get beneath them.
-    fn route<'a>(
-        &'a self,
-        walk: LayerWalk,
-        below: &'a Arc<dyn TableProvider>,
-    ) -> Option<&'a Arc<dyn TableProvider>> {
-        match walk {
-            LayerWalk::Read | LayerWalk::Source | LayerWalk::Index => Some(below),
-            LayerWalk::CdcDetection | LayerWalk::Write | LayerWalk::RetentionDelete => None,
-        }
-    }
-
-    fn schema(&self, _below: &Arc<dyn TableProvider>) -> SchemaRef {
-        VectorScanTableProvider::schema(self)
-    }
-
-
-
-
-    async fn scan(
+impl VectorScanTableProvider {
+    /// Builds the plan for a scan of this layer.
+    ///
+    /// Reached only through this type's `TableLayer::scan_with_args`, which is
+    /// the single scan entry point a layer exposes.
+    async fn scan_plan(
         &self,
-        _below: &Arc<dyn TableProvider>,
+        below: &Arc<dyn TableProvider>,
         state: &dyn Session,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        let columns_requested = self.columns_projected(projection)?;
+        let columns_requested = self.columns_projected(below, projection)?;
 
         if Self::schema_is_sufficient(
-            self.table_provider.schema().fields(),
+            below.schema().fields(),
             &columns_requested,
             filters,
         ) {
             let mut builder = Self::apply_proj_and_filter(
                 LogicalPlanBuilder::scan(
                     "base_table",
-                    Arc::new(DefaultTableSource::new(Arc::clone(&self.table_provider))),
+                    Arc::new(DefaultTableSource::new(Arc::clone(below))),
                     None,
                 )?,
                 &columns_requested,
@@ -278,12 +265,12 @@ impl TableLayer for VectorScanTableProvider {
         // Join on primary keys, prefer to use columns from base table, push down filters where we can.
         let mut join = LogicalPlanBuilder::scan(
             "base_table",
-            Arc::new(DefaultTableSource::new(Arc::clone(&self.table_provider))),
+            Arc::new(DefaultTableSource::new(Arc::clone(below))),
             None,
         )?
         .join(
             LogicalPlanBuilder::new_from_arc(Arc::clone(&self.vector_index_list))
-                .project(self.columns_needed_from_index())?
+                .project(self.columns_needed_from_index(below))?
                 .alias("vector_index")?
                 .build()?,
             JoinType::Left,
@@ -331,6 +318,52 @@ impl TableLayer for VectorScanTableProvider {
             Some(state) => state.create_physical_plan(&join.build()?).await,
             None => state.create_physical_plan(&join.build()?).await,
         }
+    }
+}
+
+#[async_trait]
+impl TableLayer for VectorScanTableProvider {
+    /// Merges vector-index columns into the schema, so a walk whose query must
+    /// not see them stops here: CDC detection looks *for* this layer, and a
+    /// source bootstrap `SELECT` must never reference a synthetic column. Reads
+    /// and source peeling see past it — the columns it adds are the point of a
+    /// read, and the source walk exists to get beneath them.
+    fn route<'a>(
+        &'a self,
+        walk: LayerWalk,
+        below: &'a Arc<dyn TableProvider>,
+    ) -> Option<&'a Arc<dyn TableProvider>> {
+        match walk {
+            LayerWalk::Read | LayerWalk::Source | LayerWalk::Index => Some(below),
+            LayerWalk::CdcDetection | LayerWalk::Write | LayerWalk::RetentionDelete => None,
+        }
+    }
+
+    fn schema(&self, below: &Arc<dyn TableProvider>) -> SchemaRef {
+        self.schema_over(below)
+    }
+
+
+
+
+
+    async fn scan_with_args<'a>(
+        &self,
+        below: &Arc<dyn TableProvider>,
+        state: &dyn Session,
+        args: ScanArgs<'a>,
+    ) -> DataFusionResult<ScanResult> {
+        let projection = args.projection().map(<[usize]>::to_vec);
+        let plan = self
+            .scan_plan(
+                below,
+                state,
+                projection.as_ref(),
+                args.filters().unwrap_or(&[]),
+                args.limit(),
+            )
+            .await?;
+        Ok(plan.into())
     }
 }
 
