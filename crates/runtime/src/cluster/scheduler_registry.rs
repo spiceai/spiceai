@@ -21,9 +21,11 @@ limitations under the License.
 //! `heartbeats/{id}.json`. See
 //! `plans/consolidate-cluster-state-into-cluster-json.md`.
 
+use arc_swap::ArcSwapOption;
+use object_store::UpdateVersion;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use app::spicepod::component::runtime::Scheduler as SchedulerConfig;
@@ -81,13 +83,6 @@ enum Membership {
 /// resolved by re-reading membership rather than by writing harder.
 const MAX_HEARTBEAT_CAS_ATTEMPTS: usize = 3;
 
-/// Consecutive failures to read the current heartbeat before this incarnation
-/// will write without a version predicate. Without the version, a write cannot
-/// prove it is not overwriting a successor, so skipping is preferred while the
-/// TTL still has slack; only when self-eviction becomes the greater risk is a
-/// blind write attempted, and then only against a freshly re-read membership.
-const BLIND_WRITE_AFTER_BEAT_READ_FAILURES: usize = 2;
-
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Failed to initialize scheduler state object store: {source}"))]
@@ -127,8 +122,12 @@ struct SchedulerRegistryRunner {
     /// superseded. Sticky, so a later failed read cannot resume claiming the
     /// heartbeat key.
     superseded: Arc<AtomicBool>,
-    /// Consecutive failures to read the current heartbeat object.
-    beat_read_failures: Arc<AtomicUsize>,
+    /// Version of this incarnation's last successful heartbeat write. A read
+    /// failure therefore does not force a choice between writing blind and
+    /// skipping: the write stays conditional on what this process last wrote, so
+    /// a successor that has written since is protected by the predicate rather
+    /// than by a liveness guess.
+    last_written_version: Arc<ArcSwapOption<UpdateVersion>>,
 }
 
 pub async fn start_scheduler_registry(
@@ -202,7 +201,7 @@ pub async fn start_scheduler_registry(
         peers,
         job_executor,
         superseded: Arc::new(AtomicBool::new(false)),
-        beat_read_failures: Arc::new(AtomicUsize::new(0)),
+        last_written_version: Arc::new(ArcSwapOption::empty()),
     };
 
     runner.run(cancel).await
@@ -485,32 +484,32 @@ impl SchedulerRegistryRunner {
     async fn write_heartbeat(&self, mut membership: Membership) -> Result<()> {
         for _ in 0..MAX_HEARTBEAT_CAS_ATTEMPTS {
             let read_timeout = membership_check_timeout(self.entry.ttl_ms);
-            let observed = match tokio::time::timeout(
+            let (observed, from_cache) = match tokio::time::timeout(
                 read_timeout,
                 self.heartbeats.read_versioned(&self.scheduler_id),
             )
             .await
             {
-                Ok(Ok(result)) => {
-                    self.beat_read_failures.store(0, Ordering::Relaxed);
-                    result
-                }
+                Ok(Ok(result)) => (result, false),
                 // A read error and a read timeout are the same situation: the
                 // current beat is unknown. Aborting the tick here would let
                 // repeated transient errors suppress every beat until the TTL
                 // lapses and this healthy scheduler is reaped.
-                Ok(Err(err)) => {
-                    return self.beat_read_failed(membership, &format!("{err}")).await;
-                }
-                Err(_elapsed) => {
-                    return self.beat_read_failed(membership, "read timed out").await;
-                }
+                Ok(Err(err)) => match self.cached_predicate(&format!("{err}")) {
+                    Some(version) => (Some((None, version)), true),
+                    None => return Ok(()),
+                },
+                Err(_elapsed) => match self.cached_predicate("read timed out") {
+                    Some(version) => (Some((None, version)), true),
+                    None => return Ok(()),
+                },
             };
 
             // An unparsable payload reads back as `None`: the holder is unknown,
             // which is not evidence that it is ours, so it is treated like a
             // foreign beat.
-            if let Some((beat, _)) = observed.as_ref()
+            if !from_cache
+                && let Some((beat, _)) = observed.as_ref()
                 && beat
                     .as_ref()
                     .is_none_or(|beat| beat.instance_id != self.instance_id)
@@ -538,7 +537,10 @@ impl SchedulerRegistryRunner {
                 )
                 .await
             {
-                Ok(()) => return Ok(()),
+                Ok(version) => {
+                    self.last_written_version.store(version.map(Arc::new));
+                    return Ok(());
+                }
                 Err(heartbeat::Error::HeartbeatSupersededDuringWrite { .. }) => {
                     // Someone else wrote between the read and the write. Only a
                     // fresh membership read decides retry versus retire.
@@ -570,41 +572,33 @@ impl SchedulerRegistryRunner {
         Ok(())
     }
 
-    /// The current beat could not be read, so no version predicate is
-    /// available. A write would then be unable to prove it is not overwriting a
-    /// successor, and skipping cannot continue forever without the TTL lapsing.
-    /// Skip while the TTL still has slack; once failures persist, write only
-    /// against a *freshly* re-read membership — the tick's earlier confirmation
-    /// may be a heartbeat interval old, which is long enough for a takeover.
-    async fn beat_read_failed(&self, membership: Membership, reason: &str) -> Result<()> {
-        let failures = self.beat_read_failures.fetch_add(1, Ordering::Relaxed) + 1;
-        if membership == Membership::ConfirmedSelf
-            && failures >= BLIND_WRITE_AFTER_BEAT_READ_FAILURES
-            && self.read_membership().await == Some(true)
-        {
+    /// The current beat could not be read. Rather than choose between writing
+    /// without a predicate (which cannot prove it is not overwriting a
+    /// successor) and skipping until the TTL lapses (which gets a healthy
+    /// scheduler reaped), fall back to the version this incarnation last wrote.
+    ///
+    /// The write therefore stays conditional through a read outage: if a
+    /// successor has written since, the predicate fails and the caller
+    /// reconciles against membership instead of clobbering it. Read-only
+    /// outages, where writes still succeed, no longer force either bad choice.
+    ///
+    /// Returns `None` when there is nothing to condition on — only before this
+    /// incarnation's first successful write — in which case the beat is skipped.
+    fn cached_predicate(&self, reason: &str) -> Option<UpdateVersion> {
+        let Some(version) = self.last_written_version.load_full() else {
             tracing::warn!(
                 scheduler_id = %self.scheduler_id,
-                failures,
                 reason,
-                "Cannot read the heartbeat; writing without a version predicate as the re-confirmed owner"
+                "Cannot read the current heartbeat and no prior write to condition on; skipping this beat"
             );
-            return self.overwrite_heartbeat().await;
-        }
+            return None;
+        };
         tracing::warn!(
             scheduler_id = %self.scheduler_id,
-            failures,
             reason,
-            "Cannot read the current heartbeat; skipping this beat"
+            "Cannot read the current heartbeat; writing conditionally against the last version this process wrote"
         );
-        Ok(())
-    }
-
-    async fn overwrite_heartbeat(&self) -> Result<()> {
-        let now = now_ms()?;
-        self.heartbeats
-            .heartbeat(&self.scheduler_id, self.instance_id, now, self.entry.ttl_ms)
-            .await
-            .context(HeartbeatSnafu)
+        Some(UpdateVersion::clone(&version))
     }
 
     async fn refresh_peers(&self) -> Result<()> {
@@ -765,7 +759,7 @@ mod tests {
             peers: Arc::new(RwLock::new(HashMap::new())),
             job_executor,
             superseded: Arc::new(AtomicBool::new(false)),
-            beat_read_failures: Arc::new(AtomicUsize::new(0)),
+            last_written_version: Arc::new(ArcSwapOption::empty()),
         };
         runner.register_self().await.expect("register");
 
@@ -833,7 +827,7 @@ mod tests {
             peers: Arc::new(RwLock::new(HashMap::new())),
             job_executor,
             superseded: Arc::new(AtomicBool::new(false)),
-            beat_read_failures: Arc::new(AtomicUsize::new(0)),
+            last_written_version: Arc::new(ArcSwapOption::empty()),
         };
         runner.register_self().await.expect("register");
 
@@ -911,6 +905,345 @@ mod tests {
             );
             assert!(timeout <= MEMBERSHIP_CHECK_TIMEOUT_CAP);
         }
+    }
+
+    /// Store whose heartbeat *reads* fail on demand while writes keep working —
+    /// the asymmetric outage that decides between clobbering a successor and
+    /// letting a healthy scheduler's TTL lapse.
+    #[derive(Debug)]
+    struct FailingBeatReads {
+        inner: Arc<dyn ObjectStore>,
+        failing: std::sync::atomic::AtomicBool,
+    }
+
+    impl std::fmt::Display for FailingBeatReads {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "FailingBeatReads")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for FailingBeatReads {
+        async fn get_opts(
+            &self,
+            location: &object_store::path::Path,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            if location.as_ref().contains("heartbeats/")
+                && self.failing.load(std::sync::atomic::Ordering::Relaxed)
+            {
+                return Err(object_store::Error::Generic {
+                    store: "FailingBeatReads",
+                    source: "injected heartbeat read failure".into(),
+                });
+            }
+            self.inner.get_opts(location, options).await
+        }
+        async fn put_opts(
+            &self,
+            location: &object_store::path::Path,
+            payload: object_store::PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            self.inner.put_opts(location, payload, opts).await
+        }
+        async fn put_multipart_opts(
+            &self,
+            location: &object_store::path::Path,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+        fn list(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<
+                'static,
+                object_store::Result<object_store::path::Path>,
+            >,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>
+        {
+            self.inner.delete_stream(locations)
+        }
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+        async fn copy_opts(
+            &self,
+            from: &object_store::path::Path,
+            to: &object_store::path::Path,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    /// Builds a runner over the given stores. `inner` is the un-wrapped store, so
+    /// a test can observe and seed state the runner sees through its wrapper.
+    fn runner_over(
+        cluster: &Arc<ClusterStateStore>,
+        heartbeats: &Arc<SchedulerHeartbeatStore>,
+        inner: &Arc<dyn ObjectStore>,
+        instance_id: Uuid,
+    ) -> SchedulerRegistryRunner {
+        let entry = SchedulerEntry {
+            scheduler_id: "test:50051".to_string(),
+            instance_id,
+            advertise_address: "test:50051".to_string(),
+            grpc_address: "test:50051".to_string(),
+            http_address: "test:8090".to_string(),
+            started_at_ms: 0,
+            ttl_ms: 30_000,
+            build_version: "test".to_string(),
+            labels: HashMap::new(),
+        };
+        let job_store = crate::jobs::JobStore::new(Arc::clone(inner), "", instance_id.to_string());
+        let df = DataFusionBuilder::new(
+            status::RuntimeStatus::new(),
+            Arc::new(AcceleratorEngineRegistry::default()),
+            Handle::current(),
+        )
+        .build();
+        let job_executor = Arc::new(crate::jobs::JobExecutor::new(
+            Arc::new(job_store),
+            Arc::new(df),
+        ));
+        SchedulerRegistryRunner {
+            cluster: Arc::clone(cluster),
+            heartbeats: Arc::clone(heartbeats),
+            reaper: Reaper::new(Arc::clone(cluster), Arc::clone(heartbeats)),
+            scheduler_id: "test:50051".to_string(),
+            instance_id,
+            entry,
+            peers: Arc::new(RwLock::new(HashMap::new())),
+            job_executor,
+            superseded: Arc::new(AtomicBool::new(false)),
+            last_written_version: Arc::new(ArcSwapOption::empty()),
+        }
+    }
+
+    /// A read-only outage must not cost this scheduler its liveness. Writes still
+    /// work, so the beat is written conditionally against the version this
+    /// process last wrote rather than skipped until the TTL lapses.
+    #[tokio::test]
+    async fn a_heartbeat_read_outage_still_refreshes_the_heartbeat() {
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let wrapper = Arc::new(FailingBeatReads {
+            inner: Arc::clone(&inner),
+            failing: std::sync::atomic::AtomicBool::new(false),
+        });
+        let store: Arc<dyn ObjectStore> = Arc::clone(&wrapper) as Arc<dyn ObjectStore>;
+        let cluster = Arc::new(ClusterStateStore::new(Arc::clone(&inner), ""));
+        let heartbeats = Arc::new(SchedulerHeartbeatStore::new(Arc::clone(&store), ""));
+        cluster.bootstrap().await.expect("bootstrap");
+        let observer = Arc::new(SchedulerHeartbeatStore::new(Arc::clone(&inner), ""));
+
+        let instance_id = Uuid::new_v4();
+        let runner = runner_over(&cluster, &heartbeats, &inner, instance_id);
+        runner.register_self().await.expect("register");
+        // One good tick, so there is a version to condition on.
+        runner.send_heartbeat().await.expect("first beat");
+        let before = observer
+            .read("test:50051")
+            .await
+            .expect("read")
+            .expect("present");
+
+        wrapper
+            .failing
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        runner
+            .send_heartbeat()
+            .await
+            .expect("a read outage must not fail the loop");
+
+        let after = observer
+            .read("test:50051")
+            .await
+            .expect("read")
+            .expect("present");
+        assert_eq!(
+            after.instance_id, instance_id,
+            "the beat must still belong to this incarnation"
+        );
+        assert!(
+            after.last_heartbeat_ms >= before.last_heartbeat_ms,
+            "a read outage must not suppress the beat: {} < {}",
+            after.last_heartbeat_ms,
+            before.last_heartbeat_ms
+        );
+        assert!(
+            !runner.superseded.load(Ordering::Relaxed),
+            "a read outage is not evidence of supersession"
+        );
+    }
+
+    /// When membership has already moved to the successor, a read outage must not
+    /// stop this incarnation from noticing: it retires on the membership read
+    /// alone, without attempting any write.
+    #[tokio::test]
+    async fn a_read_outage_retires_when_membership_has_moved_on() {
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let wrapper = Arc::new(FailingBeatReads {
+            inner: Arc::clone(&inner),
+            failing: std::sync::atomic::AtomicBool::new(false),
+        });
+        let store: Arc<dyn ObjectStore> = Arc::clone(&wrapper) as Arc<dyn ObjectStore>;
+        let cluster = Arc::new(ClusterStateStore::new(Arc::clone(&inner), ""));
+        let heartbeats = Arc::new(SchedulerHeartbeatStore::new(Arc::clone(&store), ""));
+        cluster.bootstrap().await.expect("bootstrap");
+        let observer = Arc::new(SchedulerHeartbeatStore::new(Arc::clone(&inner), ""));
+
+        let instance_id = Uuid::new_v4();
+        let successor = Uuid::new_v4();
+        let runner = runner_over(&cluster, &heartbeats, &inner, instance_id);
+        runner.register_self().await.expect("register");
+        runner.send_heartbeat().await.expect("first beat");
+
+        // A real takeover: membership *and* the heartbeat move to the successor.
+        cluster
+            .mutate(|state| {
+                if let Some(entry) = state.schedulers.get_mut("test:50051") {
+                    entry.instance_id = successor;
+                    entry.started_at_ms = 50_000;
+                }
+                MutationOutcome::Apply
+            })
+            .await
+            .expect("successor claims membership");
+        heartbeats
+            .heartbeat("test:50051", successor, 60_000, 30_000)
+            .await
+            .expect("successor beat");
+
+        wrapper
+            .failing
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        runner
+            .send_heartbeat()
+            .await
+            .expect("losing the key must not fail the loop");
+
+        let beat = observer
+            .read("test:50051")
+            .await
+            .expect("read")
+            .expect("present");
+        assert_eq!(
+            beat.instance_id, successor,
+            "a successor must not be clobbered by a write made during a read outage"
+        );
+        assert!(
+            runner.superseded.load(Ordering::Relaxed),
+            "losing the conditional write to the registered incarnation retires this one"
+        );
+    }
+
+    /// The clobber this change exists to prevent, in the form that actually
+    /// reaches the conditional write: the beat has been written by someone else,
+    /// but membership still names this incarnation, so it does not retire. Its
+    /// beat cannot be read, so ownership of the *object* cannot be re-observed —
+    /// only the version it last wrote is available. That predicate no longer
+    /// matches, so the write must fail rather than overwrite the other beat.
+    #[tokio::test]
+    async fn a_read_outage_does_not_clobber_a_beat_written_since_the_last_write() {
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let wrapper = Arc::new(FailingBeatReads {
+            inner: Arc::clone(&inner),
+            failing: std::sync::atomic::AtomicBool::new(false),
+        });
+        let store: Arc<dyn ObjectStore> = Arc::clone(&wrapper) as Arc<dyn ObjectStore>;
+        let cluster = Arc::new(ClusterStateStore::new(Arc::clone(&inner), ""));
+        let heartbeats = Arc::new(SchedulerHeartbeatStore::new(Arc::clone(&store), ""));
+        cluster.bootstrap().await.expect("bootstrap");
+        let observer = Arc::new(SchedulerHeartbeatStore::new(Arc::clone(&inner), ""));
+
+        let instance_id = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        let runner = runner_over(&cluster, &heartbeats, &inner, instance_id);
+        runner.register_self().await.expect("register");
+        // A good tick, so there is a version to condition on.
+        runner.send_heartbeat().await.expect("first beat");
+
+        // Someone else writes the key. Membership is untouched, so this
+        // incarnation still believes — correctly — that it is registered.
+        heartbeats
+            .heartbeat("test:50051", other, 60_000, 30_000)
+            .await
+            .expect("other beat");
+
+        wrapper
+            .failing
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        runner
+            .send_heartbeat()
+            .await
+            .expect("a contended beat during a read outage must not fail the loop");
+
+        let beat = observer
+            .read("test:50051")
+            .await
+            .expect("read")
+            .expect("present");
+        assert_eq!(
+            beat.instance_id, other,
+            "a write during a read outage must stay conditional and lose to the newer beat"
+        );
+        assert_eq!(
+            beat.last_heartbeat_ms, 60_000,
+            "the other beat must be left exactly as written"
+        );
+    }
+
+    /// Before the first successful write there is nothing to condition on, so an
+    /// unreadable beat is skipped rather than overwritten blind.
+    #[tokio::test]
+    async fn a_read_outage_before_any_write_skips_the_beat() {
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let wrapper = Arc::new(FailingBeatReads {
+            inner: Arc::clone(&inner),
+            failing: std::sync::atomic::AtomicBool::new(false),
+        });
+        let store: Arc<dyn ObjectStore> = Arc::clone(&wrapper) as Arc<dyn ObjectStore>;
+        let cluster = Arc::new(ClusterStateStore::new(Arc::clone(&inner), ""));
+        let heartbeats = Arc::new(SchedulerHeartbeatStore::new(Arc::clone(&store), ""));
+        cluster.bootstrap().await.expect("bootstrap");
+        let observer = Arc::new(SchedulerHeartbeatStore::new(Arc::clone(&inner), ""));
+
+        let instance_id = Uuid::new_v4();
+        let foreign = Uuid::new_v4();
+        let runner = runner_over(&cluster, &heartbeats, &inner, instance_id);
+        runner.register_self().await.expect("register");
+        // Someone else's beat is present, and this incarnation has never written
+        // through the conditional path, so it holds no version.
+        heartbeats
+            .heartbeat("test:50051", foreign, 40_000, 30_000)
+            .await
+            .expect("foreign beat");
+
+        wrapper
+            .failing
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        runner.send_heartbeat().await.expect("skip must not fail");
+
+        let beat = observer
+            .read("test:50051")
+            .await
+            .expect("read")
+            .expect("present");
+        assert_eq!(
+            beat.instance_id, foreign,
+            "with no version to condition on the beat must be skipped, not written blind"
+        );
     }
 
     /// Store that lets a successor take over *between* the heartbeat read and
@@ -1075,7 +1408,7 @@ mod tests {
             peers: Arc::new(RwLock::new(HashMap::new())),
             job_executor,
             superseded: Arc::new(AtomicBool::new(false)),
-            beat_read_failures: Arc::new(AtomicUsize::new(0)),
+            last_written_version: Arc::new(ArcSwapOption::empty()),
         };
         // Registered and heartbeating normally, so the membership check passes
         // and the conditional write is actually attempted.
@@ -1223,7 +1556,7 @@ mod tests {
             peers: Arc::new(RwLock::new(HashMap::new())),
             job_executor,
             superseded: Arc::new(AtomicBool::new(false)),
-            beat_read_failures: Arc::new(AtomicUsize::new(0)),
+            last_written_version: Arc::new(ArcSwapOption::empty()),
         };
 
         // Paused time auto-advances once the read is the only pending work, so
@@ -1301,7 +1634,7 @@ mod tests {
             peers: Arc::new(RwLock::new(HashMap::new())),
             job_executor,
             superseded: Arc::new(AtomicBool::new(false)),
-            beat_read_failures: Arc::new(AtomicUsize::new(0)),
+            last_written_version: Arc::new(ArcSwapOption::empty()),
         };
 
         runner
@@ -1371,7 +1704,7 @@ mod tests {
             peers: Arc::new(RwLock::new(HashMap::new())),
             job_executor,
             superseded: Arc::new(AtomicBool::new(false)),
-            beat_read_failures: Arc::new(AtomicUsize::new(0)),
+            last_written_version: Arc::new(ArcSwapOption::empty()),
         };
 
         runner
@@ -1459,7 +1792,7 @@ mod tests {
             peers: Arc::new(RwLock::new(HashMap::new())),
             job_executor,
             superseded: Arc::new(AtomicBool::new(false)),
-            beat_read_failures: Arc::new(AtomicUsize::new(0)),
+            last_written_version: Arc::new(ArcSwapOption::empty()),
         };
 
         runner
@@ -1521,7 +1854,7 @@ mod tests {
             peers: Arc::new(RwLock::new(HashMap::new())),
             job_executor,
             superseded: Arc::new(AtomicBool::new(false)),
-            beat_read_failures: Arc::new(AtomicUsize::new(0)),
+            last_written_version: Arc::new(ArcSwapOption::empty()),
         };
         runner.register_self().await.expect("register");
 
@@ -1603,7 +1936,7 @@ mod tests {
             peers: Arc::new(RwLock::new(HashMap::new())),
             job_executor,
             superseded: Arc::new(AtomicBool::new(false)),
-            beat_read_failures: Arc::new(AtomicUsize::new(0)),
+            last_written_version: Arc::new(ArcSwapOption::empty()),
         };
 
         runner

@@ -238,16 +238,33 @@ impl SchedulerHeartbeatStore {
         }
     }
 
+    /// A version is only usable as a write predicate when it actually carries an
+    /// identifier. Some stores return neither an `ETag` nor a version, and passing
+    /// an empty predicate would assert a condition the store cannot check.
+    fn usable_version_of(e_tag: Option<String>, version: Option<String>) -> Option<UpdateVersion> {
+        if e_tag.is_none() && version.is_none() {
+            return None;
+        }
+        Some(UpdateVersion { e_tag, version })
+    }
+
     /// Writes the heartbeat only if the stored object is still the one the
     /// caller observed (`expected`), or is still absent when `expected` is
     /// `None`.
     ///
     /// The key is shared by every incarnation of a `scheduler_id`, so an
     /// unconditional write lets a superseded process clobber the incarnation
-    /// that replaced it. Making the write conditional turns "I am still the
-    /// registered incarnation" into part of the write itself: if anyone else
-    /// wrote in between, this fails with
-    /// [`Error::HeartbeatSupersededDuringWrite`] instead of overwriting them.
+    /// that replaced it. A conditional write means that if anyone else wrote in
+    /// between, this fails with [`Error::HeartbeatSupersededDuringWrite`]
+    /// instead of overwriting them.
+    ///
+    /// This is **not** an ownership fence. It proves only that the object has
+    /// not changed since `expected` was observed; it says nothing about whether
+    /// the caller is still the registered incarnation. Callers that need
+    /// ownership must check membership separately, as `write_heartbeat` does.
+    ///
+    /// Returns the version of the object just written, so a caller can keep
+    /// writing conditionally even while reads are failing.
     pub async fn heartbeat_if_unchanged(
         &self,
         scheduler_id: &str,
@@ -255,7 +272,7 @@ impl SchedulerHeartbeatStore {
         now_ms: u64,
         ttl_ms: u64,
         expected: Option<&UpdateVersion>,
-    ) -> Result<()> {
+    ) -> Result<Option<UpdateVersion>> {
         let beat = SchedulerHeartbeat {
             scheduler_id: scheduler_id.to_string(),
             instance_id,
@@ -269,21 +286,45 @@ impl SchedulerHeartbeatStore {
             None => PutMode::Create,
         };
 
-        match self
-            .store
-            .put_opts(&path, payload.into(), PutOptions::from(mode))
-            .await
-        {
-            Ok(_) => Ok(()),
-            Err(ObjectStoreError::Precondition { .. } | ObjectStoreError::AlreadyExists { .. }) => {
-                Err(Error::HeartbeatSupersededDuringWrite {
-                    scheduler_id: scheduler_id.to_string(),
-                })
+        // Transient write failures are retried with the *same* predicate, as the
+        // unconditional path does. If a retried attempt turns out to have
+        // already landed, the next one fails its precondition and surfaces as
+        // supersession, which the caller reconciles against membership — so a
+        // brief write-error burst cannot consume consecutive ticks and let a
+        // healthy scheduler's TTL lapse.
+        let mut attempt = 0usize;
+        loop {
+            attempt += 1;
+            match self
+                .store
+                .put_opts(
+                    &path,
+                    payload.clone().into(),
+                    PutOptions::from(mode.clone()),
+                )
+                .await
+            {
+                Ok(result) => return Ok(Self::usable_version_of(result.e_tag, result.version)),
+                Err(
+                    ObjectStoreError::Precondition { .. } | ObjectStoreError::AlreadyExists { .. },
+                ) => {
+                    return Err(Error::HeartbeatSupersededDuringWrite {
+                        scheduler_id: scheduler_id.to_string(),
+                    });
+                }
+                Err(source) if attempt >= MAX_HEARTBEAT_ATTEMPTS => {
+                    return Err(Error::Write {
+                        path: path.to_string(),
+                        source,
+                    });
+                }
+                Err(source) => tracing::warn!(
+                    path = %path,
+                    attempt,
+                    error = %source,
+                    "Conditional heartbeat write failed; retrying with the same predicate"
+                ),
             }
-            Err(source) => Err(Error::Write {
-                path: path.to_string(),
-                source,
-            }),
         }
     }
 
