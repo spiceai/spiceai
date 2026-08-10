@@ -130,7 +130,7 @@ fn start_time_only_changes(
         (
             "runtime.output_level",
             Process,
-            *output_level != current.output_level,
+            !same_start_time_config(output_level.as_ref(), current.output_level.as_ref()),
         ),
         (
             "runtime.query",
@@ -637,6 +637,12 @@ mod tests {
                             keys: vec![ApiKey::parse_str("secret:rw")],
                         }),
                     });
+                }),
+            ),
+            (
+                "runtime.output_level",
+                Box::new(|rt: &mut SpicepodRuntime| {
+                    rt.output_level = Some(OutputLevel::default());
                 }),
             ),
             (
