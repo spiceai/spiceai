@@ -52,8 +52,10 @@ use tonic::Status;
 use tonic::async_trait;
 use tonic::codec::CompressionEncoding;
 
-use crate::{Runtime, tracers::OnceTracer, warn_once};
+use crate::Runtime;
 use runtime_query_engine::query_engine::{QueryEngine, UpdateType};
+use util::tracers::OnceTracer;
+use util::warn_once;
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 

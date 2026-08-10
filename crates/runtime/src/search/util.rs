@@ -17,7 +17,7 @@ limitations under the License.
 
 use std::sync::Arc;
 
-use crate::accelerated_table::AcceleratedTable;
+use crate::accelerated::AcceleratedTable;
 use crate::table_layers::TABLE_PROVIDER_LAYERS;
 use datafusion::datasource::TableProvider;
 use datafusion::error::DataFusionError;

@@ -21,7 +21,9 @@ limitations under the License.
 
 use super::{CatalogConnector, ConnectorComponent, ParameterSpec};
 use crate::{
-    Runtime, component::catalog::Catalog, dataconnector::parameters::ConnectorParams,
+    Runtime,
+    component::catalog::{Catalog, table_selector},
+    dataconnector::parameters::ConnectorParams,
     parameters::Parameters,
 };
 use async_trait::async_trait;
@@ -353,7 +355,7 @@ impl CatalogConnector for CayenneCatalogConnector {
         let runtime_env = runtime.datafusion().ctx.runtime_env();
         let provider_config = self.parse_provider_config().await;
         let refreshable_provider = Arc::new(
-            CayenneCatalogProvider::try_new(provider_config, runtime_env)
+            CayenneCatalogProvider::try_new(provider_config, runtime_env, table_selector(catalog))
                 .await
                 .map_err(|e| super::Error::UnableToGetCatalogProvider {
                     connector: PREFIX.to_string(),

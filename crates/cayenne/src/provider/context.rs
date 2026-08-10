@@ -947,9 +947,11 @@ impl CayenneContext {
         if !self.dynamic_tuning {
             return None;
         }
-        // Detect the environment (cgroup-aware memory usage) and fold it in, so
-        // the loop closes on memory as well as ingest/query behavior.
-        tuning::sample_mem_pressure(&self.ingest_stats);
+        // Memory pressure is sampled once per tick by `observe_environment`, which
+        // the same tick body runs first: re-sampling here would re-read the cgroup
+        // files microseconds later for no new information, and would let the
+        // controller act on a different reading than the one the tick already
+        // exported as a gauge.
         let now = std::time::Instant::now();
         let since_last = (*self.last_adjust.lock()).map_or(std::time::Duration::MAX, |t| {
             now.saturating_duration_since(t)

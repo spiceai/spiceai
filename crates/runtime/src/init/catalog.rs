@@ -22,12 +22,13 @@ use crate::{
     catalogconnector::{self, CatalogConnector, get_catalog_provider},
     component::catalog::{Catalog, CatalogBuilder},
     dataconnector::parameters::ConnectorParamsBuilder,
-    status, warn_spaced,
+    status,
 };
 use app::App;
 use futures::future::join_all;
 use runtime_metrics as metrics;
 use snafu::prelude::*;
+use util::warn_spaced;
 use util::{RetryError, fibonacci_backoff::FibonacciBackoffBuilder, retry};
 
 impl Runtime {

@@ -924,6 +924,18 @@ pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
         runtime::dataaccelerator::cayenne::register_cayenne_telemetry();
     }
 
+    // The global meter provider is now final: either `init_metrics` replaced the
+    // startup noop provider above, or metrics are not configured and the noop one
+    // stands. Operator instruments may cache from here on.
+    //
+    // This is outside the `needs_metrics` block on purpose. A deployment that
+    // exports nothing still records into these instruments, and leaving the seal
+    // off would make every such record rebuild its instrument forever rather than
+    // once. Sealing after `init_metrics` — rather than relying on the first record
+    // landing late enough — is what keeps a startup-time sampler's gauges on the
+    // operator's provider (#12667).
+    telemetry::seal_operator_meter_provider();
+
     let (tls_config, client_auth_mode) = tls::load_tls_config(
         &args,
         spicepod_tls_config.as_ref(),

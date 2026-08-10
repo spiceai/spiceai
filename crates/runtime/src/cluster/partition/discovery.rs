@@ -23,7 +23,7 @@ limitations under the License.
 use std::collections::HashMap;
 
 use crate::{
-    accelerated_table::AcceleratedTable,
+    accelerated::AcceleratedTable,
     cluster::partition::{Error, PartitionDiscoverySnafu, PartitionValue, Result},
     datafusion::DataFusion,
     search::util::find_concrete_table_provider,
