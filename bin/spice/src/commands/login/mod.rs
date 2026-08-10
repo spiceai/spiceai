@@ -699,7 +699,8 @@ mod tests {
     /// yet, so it has to keep polling rather than end the login.
     #[test]
     fn a_not_found_status_is_retriable() {
-        let Some(ExchangeOutcome::Transient(message)) = classify_exchange_status(status(404)) else {
+        let Some(ExchangeOutcome::Transient(message)) = classify_exchange_status(status(404))
+        else {
             panic!("404 should be retriable");
         };
         assert!(
