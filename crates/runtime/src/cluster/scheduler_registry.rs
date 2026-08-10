@@ -54,6 +54,20 @@ const DEFAULT_TTL_MS: u64 = 30_000;
 /// TTL and delay a beat far enough for peers to reap a healthy scheduler.
 const MEMBERSHIP_CHECK_TIMEOUT_CAP: Duration = Duration::from_secs(2);
 
+/// Deadline for a single conditional heartbeat write.
+///
+/// Object-store clients default to request timeouts around the same order as a
+/// scheduler's TTL, so one stalled write would otherwise hold the registry task —
+/// which also drives discovery, recovery and the reaper — for a whole TTL while
+/// the last good beat ages out. Cancelling a write is safe here only because an
+/// unknown outcome clears the retained version instead of being mistaken for
+/// supersession: the next tick re-reads the beat rather than trusting a predicate
+/// that may already have been superseded by this very write.
+fn heartbeat_write_timeout(ttl_ms: u64) -> Duration {
+    let interval = Duration::from_millis(ttl_ms.saturating_div(HEARTBEAT_DIVISOR).max(1));
+    interval / 2
+}
+
 /// Deadline for the membership read that gates a heartbeat, as a fraction of
 /// that scheduler's heartbeat interval so it always fits inside one beat.
 fn membership_check_timeout(ttl_ms: u64) -> Duration {
@@ -413,13 +427,45 @@ impl SchedulerRegistryRunner {
             // beat and re-confirm ownership. Liveness is delayed by at most one
             // interval, where overwriting could silence a live successor.
             Err(heartbeat::Error::HeartbeatSupersededDuringWrite { .. }) => {
-                self.last_written_version.store(None);
-                tracing::warn!(
-                    scheduler_id = %self.scheduler_id,
-                    instance_id = %self.instance_id,
-                    "Heartbeat changed while registering; leaving it for the first beat to reconcile"
-                );
-                Ok(())
+                // The key moved between the observation and this write. Membership
+                // was just committed under OCC, so this incarnation is provably the
+                // registered owner *now* and may reclaim the key — but only against
+                // a freshly read version, so a successor that registered after this
+                // commit still wins. Leaving it unwritten instead would publish no
+                // liveness at all, and if `cluster.json` then became unreadable
+                // this incarnation could not reclaim later either.
+                let observed = self
+                    .heartbeats
+                    .read_versioned(&self.scheduler_id)
+                    .await
+                    .context(HeartbeatSnafu)?;
+                let expected = observed.as_ref().map(|(_, version)| version.clone());
+                match self
+                    .heartbeats
+                    .heartbeat_if_unchanged(
+                        &self.scheduler_id,
+                        self.instance_id,
+                        now_ms()?,
+                        self.entry.ttl_ms,
+                        expected.as_ref(),
+                    )
+                    .await
+                {
+                    Ok(version) => {
+                        self.last_written_version.store(version.map(Arc::new));
+                        Ok(())
+                    }
+                    Err(heartbeat::Error::HeartbeatSupersededDuringWrite { .. }) => {
+                        self.last_written_version.store(None);
+                        tracing::warn!(
+                            scheduler_id = %self.scheduler_id,
+                            instance_id = %self.instance_id,
+                            "Heartbeat contended twice while registering; leaving it for the first beat"
+                        );
+                        Ok(())
+                    }
+                    Err(source) => Err(Error::Heartbeat { source }),
+                }
             }
             Err(source) => Err(Error::Heartbeat { source }),
         }
@@ -438,27 +484,7 @@ impl SchedulerRegistryRunner {
             return Ok(());
         }
 
-        match self.read_membership().await {
-            Some(false) => {
-                // A successful read proved someone else owns the id. Retire.
-                self.superseded.store(true, Ordering::Relaxed);
-                tracing::warn!(
-                    scheduler_id = %self.scheduler_id,
-                    instance_id = %self.instance_id,
-                    "This scheduler incarnation is no longer registered; it will stop heartbeating"
-                );
-                Ok(())
-            }
-            // Registered, or membership unreadable. Both proceed, and for the
-            // same reason: heartbeats deliberately live outside `cluster.json`
-            // so emission does not depend on that document, and suppressing
-            // beats when it cannot be read would self-evict a healthy
-            // scheduler. Proceeding is safe because the write path re-confirms
-            // ownership against a fresh read before it will touch a beat
-            // belonging to another incarnation — this observation is not
-            // carried forward as proof of anything.
-            Some(true) | None => self.write_heartbeat().await,
-        }
+        self.write_heartbeat().await
     }
 
     /// `Some(true)` when a successful, bounded read shows this incarnation
@@ -532,61 +558,85 @@ impl SchedulerRegistryRunner {
                 },
             };
 
-            // An unparsable payload reads back as `None`: the holder is unknown,
-            // which is not evidence that it is ours, so it is treated like a
-            // foreign beat.
-            // A beat belonging to someone else — or one that cannot be parsed, so
-            // the holder is unknown — may only be reclaimed against a membership
-            // read taken *after* it was observed. The read this tick started with
-            // may predate a successor's registration, and a version predicate
-            // does not help: it proves the object has not changed since the beat
-            // was read, not that this incarnation still owns the id.
-            if !from_cache
-                && let Some((beat, _)) = observed.as_ref()
-                && beat
-                    .as_ref()
-                    .is_none_or(|beat| beat.instance_id != self.instance_id)
-            {
-                let holder = beat.as_ref().map(|b| b.instance_id);
-                match self.read_membership().await {
-                    // Freshly proven to still own the id, so reclaiming the key
-                    // is legitimate: fall through to the conditional write.
-                    Some(true) => {}
-                    Some(false) => {
-                        self.superseded.store(true, Ordering::Relaxed);
-                        tracing::warn!(
-                            scheduler_id = %self.scheduler_id,
-                            instance_id = %self.instance_id,
-                            holder = ?holder,
-                            "Another incarnation holds the heartbeat and is the registered owner; retiring"
-                        );
-                        return Ok(());
-                    }
-                    None => {
-                        tracing::warn!(
-                            scheduler_id = %self.scheduler_id,
-                            instance_id = %self.instance_id,
-                            holder = ?holder,
-                            "Another incarnation holds the heartbeat and membership is unreadable; skipping this beat"
-                        );
-                        return Ok(());
-                    }
+            // Ownership is confirmed *after* the beat was read, for every write
+            // rather than only for writes over a foreign beat. Refreshing a beat
+            // that is already ours looks safe but is not: once membership has
+            // moved to a successor, that refresh is exactly the zombie write this
+            // guards against — it keeps the key naming a superseded incarnation,
+            // so `list_alive` drops the live successor and its jobs are re-driven.
+            //
+            // A version predicate cannot substitute for this: it proves the beat
+            // object has not changed since it was read, not that this incarnation
+            // still owns the id, and ownership lives in a different object.
+            //
+            // An unparsable payload reads back as `None`, so the holder is
+            // unknown, which is not evidence that it is ours.
+            let holder = observed
+                .as_ref()
+                .and_then(|(beat, _)| beat.as_ref())
+                .map(|beat| beat.instance_id);
+            let ours = holder == Some(self.instance_id);
+            // No object at all is different from an object whose holder cannot be
+            // determined: the write is then a create, which fails outright if a
+            // successor got there first, so it cannot displace anyone.
+            let absent = observed.is_none();
+            match self.read_membership().await {
+                Some(true) => {}
+                Some(false) => {
+                    self.superseded.store(true, Ordering::Relaxed);
+                    tracing::warn!(
+                        scheduler_id = %self.scheduler_id,
+                        instance_id = %self.instance_id,
+                        holder = ?holder,
+                        "The registered incarnation is someone else; retiring instead of writing"
+                    );
+                    return Ok(());
+                }
+                // Membership is unreadable. Refreshing a beat that is already
+                // ours — or creating one where there is none — still fails open,
+                // because suppressing beats on an unreadable `cluster.json` would
+                // self-evict a healthy scheduler, and heartbeats deliberately do
+                // not depend on that document. A beat that exists but is not
+                // provably ours is left alone: claiming it would assert ownership
+                // that cannot be shown.
+                None if ours || from_cache || absent => {}
+                None => {
+                    tracing::warn!(
+                        scheduler_id = %self.scheduler_id,
+                        instance_id = %self.instance_id,
+                        holder = ?holder,
+                        "Another incarnation holds the heartbeat and membership is unreadable; skipping this beat"
+                    );
+                    return Ok(());
                 }
             }
 
             let expected = observed.as_ref().map(|(_, version)| version.clone());
             let now = now_ms()?;
-            match self
-                .heartbeats
-                .heartbeat_if_unchanged(
+            let write_timeout = heartbeat_write_timeout(self.entry.ttl_ms);
+            let written = tokio::time::timeout(
+                write_timeout,
+                self.heartbeats.heartbeat_if_unchanged(
                     &self.scheduler_id,
                     self.instance_id,
                     now,
                     self.entry.ttl_ms,
                     expected.as_ref(),
-                )
-                .await
-            {
+                ),
+            )
+            .await;
+            let Ok(written) = written else {
+                // The write may or may not have landed, so the retained version
+                // can no longer be trusted as a predicate.
+                self.last_written_version.store(None);
+                tracing::warn!(
+                    scheduler_id = %self.scheduler_id,
+                    timeout_ms = write_timeout.as_millis(),
+                    "Heartbeat write did not complete in time; its outcome is unknown"
+                );
+                return Ok(());
+            };
+            match written {
                 Ok(version) => {
                     self.last_written_version.store(version.map(Arc::new));
                     return Ok(());
@@ -1120,6 +1170,255 @@ mod tests {
         assert!(
             runner.superseded.load(Ordering::Relaxed),
             "the fresh membership read proves supersession, which must be sticky"
+        );
+    }
+
+    /// Store whose heartbeat writes hang once armed. Object-store clients default
+    /// to request timeouts on the order of a scheduler TTL, so this is the shape
+    /// that would otherwise hold the registry task for a whole TTL.
+    #[derive(Debug)]
+    struct StallingBeatWrites {
+        inner: Arc<dyn ObjectStore>,
+        armed: std::sync::atomic::AtomicBool,
+    }
+
+    impl std::fmt::Display for StallingBeatWrites {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "StallingBeatWrites")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for StallingBeatWrites {
+        async fn get_opts(
+            &self,
+            location: &object_store::path::Path,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+        async fn put_opts(
+            &self,
+            location: &object_store::path::Path,
+            payload: object_store::PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            if location.as_ref().contains("heartbeats/")
+                && self.armed.load(std::sync::atomic::Ordering::Relaxed)
+            {
+                return std::future::pending().await;
+            }
+            self.inner.put_opts(location, payload, opts).await
+        }
+        async fn put_multipart_opts(
+            &self,
+            location: &object_store::path::Path,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+        fn list(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<
+                'static,
+                object_store::Result<object_store::path::Path>,
+            >,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>
+        {
+            self.inner.delete_stream(locations)
+        }
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+        async fn copy_opts(
+            &self,
+            from: &object_store::path::Path,
+            to: &object_store::path::Path,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    /// A stalled write must not hold the registry task — which also drives
+    /// discovery, recovery and the reaper — for anything like a TTL, and because
+    /// its outcome is unknown it must not leave a predicate behind that the next
+    /// tick would trust.
+    #[tokio::test]
+    async fn a_stalled_write_is_bounded_and_discards_its_predicate() {
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let wrapper = Arc::new(StallingBeatWrites {
+            inner: Arc::clone(&inner),
+            armed: std::sync::atomic::AtomicBool::new(false),
+        });
+        let store: Arc<dyn ObjectStore> = Arc::clone(&wrapper) as Arc<dyn ObjectStore>;
+        let cluster = Arc::new(ClusterStateStore::new(Arc::clone(&inner), ""));
+        let heartbeats = Arc::new(SchedulerHeartbeatStore::new(Arc::clone(&store), ""));
+        cluster.bootstrap().await.expect("bootstrap");
+
+        let instance_id = Uuid::new_v4();
+        let mut runner = runner_over(&cluster, &heartbeats, &inner, instance_id);
+        // Short TTL: the write deadline scales with it, keeping the test quick.
+        runner.entry.ttl_ms = 600;
+        runner.register_self().await.expect("register");
+        assert!(
+            runner.last_written_version.load_full().is_some(),
+            "registration must retain the version it wrote"
+        );
+
+        wrapper
+            .armed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let deadline = heartbeat_write_timeout(runner.entry.ttl_ms);
+        let started = tokio::time::Instant::now();
+        runner
+            .send_heartbeat()
+            .await
+            .expect("a stalled write must not fail the loop");
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < deadline * 4,
+            "a stalled write must be bounded near its {}ms deadline, took {}ms",
+            deadline.as_millis(),
+            elapsed.as_millis()
+        );
+        assert!(
+            runner.last_written_version.load_full().is_none(),
+            "a write whose outcome is unknown must not leave a predicate behind"
+        );
+    }
+
+    /// Store that writes a foreign beat once, just before the caller's own write
+    /// lands, so a conditional write finds the key changed under it.
+    #[derive(Debug)]
+    struct StealKeyBeforeWrite {
+        inner: Arc<dyn ObjectStore>,
+        thief: Uuid,
+        armed: std::sync::atomic::AtomicBool,
+    }
+
+    impl std::fmt::Display for StealKeyBeforeWrite {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "StealKeyBeforeWrite")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for StealKeyBeforeWrite {
+        async fn get_opts(
+            &self,
+            location: &object_store::path::Path,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+        async fn put_opts(
+            &self,
+            location: &object_store::path::Path,
+            payload: object_store::PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            if location.as_ref().contains("heartbeats/")
+                && self.armed.swap(false, std::sync::atomic::Ordering::Relaxed)
+            {
+                let beat = crate::cluster::heartbeat::SchedulerHeartbeat {
+                    scheduler_id: "test:50051".to_string(),
+                    instance_id: self.thief,
+                    last_heartbeat_ms: 5_000,
+                    ttl_ms: 30_000,
+                };
+                self.inner
+                    .put_opts(
+                        location,
+                        serde_json::to_vec(&beat).expect("serialize").into(),
+                        object_store::PutOptions::from(object_store::PutMode::Overwrite),
+                    )
+                    .await?;
+            }
+            self.inner.put_opts(location, payload, opts).await
+        }
+        async fn put_multipart_opts(
+            &self,
+            location: &object_store::path::Path,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+        fn list(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<
+                'static,
+                object_store::Result<object_store::path::Path>,
+            >,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>
+        {
+            self.inner.delete_stream(locations)
+        }
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+        async fn copy_opts(
+            &self,
+            from: &object_store::path::Path,
+            to: &object_store::path::Path,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    /// A seed write that loses its race must not leave the registered incarnation
+    /// with no liveness at all: membership was just committed under OCC, so it may
+    /// reclaim the key against a freshly read version. Leaving it unwritten would
+    /// also strand it if `cluster.json` became unreadable afterwards.
+    #[tokio::test]
+    async fn a_contended_seed_write_still_publishes_liveness() {
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let thief = Uuid::new_v4();
+        let wrapper = Arc::new(StealKeyBeforeWrite {
+            inner: Arc::clone(&inner),
+            thief,
+            armed: std::sync::atomic::AtomicBool::new(true),
+        });
+        let store: Arc<dyn ObjectStore> = Arc::clone(&wrapper) as Arc<dyn ObjectStore>;
+        let cluster = Arc::new(ClusterStateStore::new(Arc::clone(&inner), ""));
+        let heartbeats = Arc::new(SchedulerHeartbeatStore::new(Arc::clone(&store), ""));
+        cluster.bootstrap().await.expect("bootstrap");
+        let observer = Arc::new(SchedulerHeartbeatStore::new(Arc::clone(&inner), ""));
+
+        let instance_id = Uuid::new_v4();
+        let runner = runner_over(&cluster, &heartbeats, &inner, instance_id);
+        runner.register_self().await.expect("register");
+
+        let beat = observer
+            .read("test:50051")
+            .await
+            .expect("read")
+            .expect("a registered incarnation must publish a heartbeat");
+        assert_eq!(
+            beat.instance_id, instance_id,
+            "the registered incarnation must reclaim the key it just won"
         );
     }
 
