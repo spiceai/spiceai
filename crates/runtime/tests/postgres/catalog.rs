@@ -563,17 +563,21 @@ async fn test_unsupported_type_action_override_drops_table() -> Result<(), anyho
 
 /// Catalog discovery must not be steerable by anything in the source database.
 ///
-/// The connector classifies the server from its version, and takes different
-/// catalog queries for Redshift. That lookup resolves through `search_path`, so
-/// a `public.version()` in the source — which a user may define for any reason —
-/// could decide the classification. A PostgreSQL server misread as Redshift is
-/// not a cosmetic error: discovery then issues `SHOW COLUMNS`, which it cannot
-/// answer, and every table fails to resolve.
+/// The connector classifies the server from its version and takes different
+/// catalog queries for Redshift, so the classification must depend only on the
+/// server. It reads `pg_catalog.version()`, which nothing in the database can
+/// shadow.
 ///
-/// This lives here rather than only in `datafusion-table-providers` because the
-/// fix is a dependency's, and a rev bump that lost it would otherwise surface as
-/// a mystery catalog failure. The shadow below is exactly what would fool an
-/// unqualified lookup.
+/// An unqualified `version()` would resolve through `search_path`, letting a
+/// `public.version()` in the source — which a user may define for any reason —
+/// decide the classification. That is the regression this guards: a PostgreSQL
+/// server misread as Redshift makes discovery issue `SHOW COLUMNS`, which it
+/// cannot answer, so every table fails to resolve.
+///
+/// The check lives here as well as in `datafusion-table-providers` because the
+/// qualification is the dependency's; a rev bump that lost it would otherwise
+/// surface as a catalog that fails to load for no visible reason. The shadow
+/// below is what an unqualified lookup would resolve to.
 #[tokio::test]
 async fn test_catalog_discovery_ignores_a_shadowed_version_function() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));

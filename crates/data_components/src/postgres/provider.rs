@@ -53,7 +53,7 @@ pub enum Error {
     QueryFailed { source: tokio_postgres::Error },
 
     #[snafu(display(
-        "PostgreSQL schema resolution failed: {source}. Check that the connected role can read `pg_catalog`. Docs: https://spiceai.org/docs/components/data-connectors/postgres"
+        "Failed to resolve table schemas for the PostgreSQL catalog: {source}. Check that the connected role can read `pg_catalog`, and that every column type is supported or `unsupported_type_action` permits it. Docs: https://spiceai.org/docs/components/data-connectors/postgres"
     ))]
     SchemaResolutionFailed {
         source: Box<dyn std::error::Error + Send + Sync>,
@@ -466,11 +466,14 @@ impl PostgresSchemaProvider {
     ) -> Result<()> {
         let table_names = self.list_tables().await?;
 
-        // One query for every relation's columns, instead of one per table on
-        // the way to building its provider. Best-effort: a failure here leaves
-        // the map empty and each table resolves its own schema, which is what
-        // happened before. Relations the catalog query cannot describe are
-        // absent from it and take the same per-table path.
+        // One query for every relation's columns, rather than one per table on
+        // the way to building its provider.
+        //
+        // The map is advisory: an entry lets a table skip its own schema query,
+        // and its absence means that table resolves individually. A failure here
+        // is therefore not fatal -- an empty map resolves every table
+        // individually -- and relations the catalog query cannot describe are
+        // absent for the same reason.
         let schemas = match self.list_column_schemas().await {
             Ok(schemas) => schemas,
             Err(e) => {
@@ -508,9 +511,9 @@ impl PostgresSchemaProvider {
     /// Every relation's Arrow schema for this `PostgreSQL` schema, in one query.
     ///
     /// A missing entry means "resolve this one individually", never "no
-    /// columns": relations the catalog query does not describe -- and every
-    /// table on Redshift, where the per-table `SHOW COLUMNS` cannot be batched
-    /// -- are simply absent.
+    /// columns". Relations the catalog query does not describe are absent, as is
+    /// every table on Redshift, where the per-table `SHOW COLUMNS` cannot be
+    /// batched.
     async fn list_column_schemas(&self) -> Result<HashMap<String, SchemaRef>> {
         let conn = self
             .pool
