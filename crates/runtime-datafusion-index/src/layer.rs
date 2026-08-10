@@ -84,8 +84,10 @@ pub enum LayerWalk {
 /// `below.scan(..)` runs every lower layer and then the base provider.
 #[async_trait]
 pub trait TableLayer: Send + Sync + Debug + 'static {
-    /// A short name for diagnostics.
-    fn name(&self) -> &'static str;
+    /// A short name for diagnostics. Defaults to the implementing type.
+    fn name(&self) -> &'static str {
+        std::any::type_name::<Self>()
+    }
 
     /// Whether a walk may see past this layer.
     ///
@@ -272,21 +274,6 @@ impl SpiceTable {
         }
     }
 
-    /// The table reached by peeling every layer transparent to `walk`.
-    #[must_use]
-    pub fn peel(&self, walk: LayerWalk) -> Arc<dyn TableProvider> {
-        let mut current = self;
-        loop {
-            if !current.layer.transparent_to(walk) {
-                return Arc::clone(&current.below);
-            }
-            match current.below_table() {
-                Some(table) => current = table,
-                None => return Arc::clone(&current.below),
-            }
-        }
-    }
-
     /// The first layer carrying an index of type `T`, paired with the table
     /// that index is bound to.
     #[must_use]
@@ -335,6 +322,29 @@ impl SpiceTable {
             None => transform(Arc::clone(&self.below)),
         };
         Self::over(Arc::clone(&self.layer), rebuilt_below)
+    }
+}
+
+/// The table reached by peeling every layer transparent to `walk`, stopping
+/// *at* the first opaque layer — the result still includes that layer, whose
+/// semantics the walk must not route around.
+///
+/// Returns `top` itself when it is not layered at all. Borrows into the stack:
+/// every node is already held as an `Arc` by the node above it.
+#[must_use]
+pub fn peel_to<'a>(
+    top: &'a Arc<dyn TableProvider>,
+    walk: LayerWalk,
+) -> &'a Arc<dyn TableProvider> {
+    let mut current = top;
+    loop {
+        let Some(table) = current.downcast_ref::<SpiceTable>() else {
+            return current;
+        };
+        if !table.layer.transparent_to(walk) {
+            return current;
+        }
+        current = &table.below;
     }
 }
 

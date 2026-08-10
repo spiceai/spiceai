@@ -78,10 +78,6 @@ impl IndexLayer {
 
 #[async_trait]
 impl TableLayer for IndexLayer {
-    fn name(&self) -> &'static str {
-        "index"
-    }
-
     /// An index layer is what CDC detection looks *for*, so detection must stop
     /// here rather than see past it. Every other walk passes through: an index
     /// adds no columns and rewrites no write.

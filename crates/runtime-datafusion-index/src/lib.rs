@@ -29,7 +29,7 @@ mod delete;
 mod layer;
 mod provider;
 pub use delete::{build_key_match_predicate, resolve_keys_matching_predicate};
-pub use layer::{LayerWalk, SpiceTable, TableLayer};
+pub use layer::{LayerWalk, SpiceTable, TableLayer, peel_to};
 pub use provider::*;
 
 #[derive(Debug, Snafu)]
