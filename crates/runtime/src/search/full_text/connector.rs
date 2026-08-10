@@ -31,7 +31,7 @@ use crate::component::{
 use crate::dataconnector::{DataConnector, DataConnectorError, DataConnectorResult};
 use crate::federated::FederatedTable;
 use crate::search::full_text::table::add_full_text_search_to_table;
-use spice_table::{LayerWalk, SpiceTable};
+use spice_table::LayerWalk;
 use futures::StreamExt;
 use runtime_metrics::component::MetricsProvider;
 
@@ -56,14 +56,13 @@ impl FullTextConnector {
         F: Fn(&Arc<dyn DataConnector>, Arc<FederatedTable>) -> Option<ChangesStream>,
     {
         let table_provider = federated_table.try_table_provider_sync()?;
-        let indexed_table = table_provider
-            .downcast_ref::<SpiceTable>()?
-            .first_indexed(LayerWalk::Index)?;
+        let indexed_table = spice_table::nodes(table_provider.as_ref(), LayerWalk::Index)
+            .find(|node| !node.indexes().is_empty())?;
 
         // This will process all `Index`s, including vector indexes if provided (i.e. from `EmbeddingConnector`).
         // This is required so that the index layer can be peeled in both cases —
         // whether or not there is an `EmbeddingConnector` underneath.
-        let all_indexes = indexed_table.layer().indexes().to_vec();
+        let all_indexes = indexed_table.indexes().to_vec();
 
         // A full-text index written by this change stream must not defer its commits
         // to the sink write lifecycle: the two share one tantivy writer, so a window

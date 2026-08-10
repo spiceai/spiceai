@@ -20,7 +20,7 @@ use std::sync::Arc;
 use crate::accelerated::AcceleratedTable;
 use datafusion::datasource::TableProvider;
 use datafusion::error::DataFusionError;
-use spice_table::{Index, LayerWalk, SpiceTable, find_concrete};
+use spice_table::{Index, LayerWalk, find_concrete};
 use runtime_search::table_provider_explorer::TableProviderExplorer;
 
 /// Attempt to return a concrete [`TableProvider`] type from a given
@@ -37,7 +37,14 @@ pub fn find_concrete_table_provider<T: TableProvider + 'static>(
 pub fn find_index_in_table_provider<T: Index + 'static>(
     tbl: &Arc<dyn TableProvider>,
 ) -> Option<(Vec<&T>, Arc<dyn TableProvider>)> {
-    tbl.downcast_ref::<SpiceTable>()?.find_index::<T>()
+    spice_table::nodes(tbl.as_ref(), LayerWalk::Index).find_map(|node| {
+        let found: Vec<&T> = node
+            .indexes()
+            .iter()
+            .filter_map(|index| index.as_any().downcast_ref::<T>())
+            .collect();
+        (!found.is_empty()).then(|| (found, Arc::clone(node.below())))
+    })
 }
 
 /// Runtime's implementation of [`TableProviderExplorer`].

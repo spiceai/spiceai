@@ -117,6 +117,16 @@ impl FederationProvider for PolyTableProvider {
 
 #[async_trait]
 impl TableLayer for PolyTableProvider {
+    /// A rebuild must not push a transform beneath this layer: it owns its
+    /// children and routes writes to one of them, so a transform landing
+    /// underneath would sit where a write walk stops — the CDC write path would
+    /// no longer find the accelerator it targets. Keeping the fold above it also
+    /// means `below` is never replaced, so the child held here and the table
+    /// handed to this layer cannot diverge.
+    fn rebuild_descends(&self) -> bool {
+        false
+    }
+
     /// A read/write split around an accelerator: `below` is the writer side,
     /// which is what composition runs against. Only the write walk steps through
     /// — reads of an accelerated dataset reach the accelerator through the

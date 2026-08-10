@@ -1790,6 +1790,16 @@ impl AcceleratedTable {
 
 #[async_trait]
 impl TableLayer for AcceleratedTable {
+    /// A rebuild must not push a transform beneath this layer: it owns its
+    /// children and routes writes to one of them, so a transform landing
+    /// underneath would sit where a write walk stops — the CDC write path would
+    /// no longer find the accelerator it targets. Keeping the fold above it also
+    /// means `below` is never replaced, so the child held here and the table
+    /// handed to this layer cannot diverge.
+    fn rebuild_descends(&self) -> bool {
+        false
+    }
+
     /// An accelerated table owns two tables, and the walk says which one is
     /// meant: read-side questions are about where the data came from, write-side
     /// questions about where it is stored. Answering here is what keeps callers

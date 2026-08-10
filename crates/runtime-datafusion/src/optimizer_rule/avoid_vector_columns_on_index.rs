@@ -77,7 +77,7 @@ impl AvoidDerivedVectorColumnOnIndexRule {
         let indexed_table = default_table_source
             .table_provider
             .downcast_ref::<SpiceTable>()
-            .filter(|table| !table.layer().indexes().is_empty())?;
+            .filter(|table| !table.indexes().is_empty())?;
 
         let _vector_scan_table = spice_table::find_layer::<VectorScanTableProvider>(
             indexed_table.below().as_ref(),
@@ -158,7 +158,7 @@ impl AvoidDerivedVectorColumnOnIndexRule {
                     projections,
                     Arc::new(LogicalPlan::TableScan(tbl_scan)),
                 )?),
-                index_scan.layer().indexes().to_vec(),
+                index_scan.indexes().to_vec(),
             )),
         }))
     }
@@ -182,7 +182,7 @@ impl OptimizerRule for AvoidDerivedVectorColumnOnIndexRule {
             return Ok(Transformed::no(plan));
         };
 
-        let derived_columns = Self::derived_vector_index_columns(indexed.layer().indexes());
+        let derived_columns = Self::derived_vector_index_columns(indexed.indexes());
         let projected_derived_columns: Vec<&String> = derived_columns
             .iter()
             .filter(|&c| {

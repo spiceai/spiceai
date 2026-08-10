@@ -59,7 +59,7 @@ pub fn table_provider_with_spicepod_metadata<S: std::hash::BuildHasher>(
     };
 
     match provider.downcast_ref::<spice_table::SpiceTable>() {
-        Some(table) => table.rebuild_base(&enrich),
+        Some(_) => spice_table::rebuild_base(&provider, &enrich),
         None => enrich(provider),
     }
 }
@@ -125,9 +125,7 @@ mod tests {
             &columns,
         );
 
-        let embedding_node = wrapped
-            .downcast_ref::<SpiceTable>()
-            .and_then(|table| table.find_node::<EmbeddingTable>(LayerWalk::Read))
+        let embedding_node = spice_table::nodes(wrapped.as_ref(), LayerWalk::Read).find(|node| node.layer_as::<EmbeddingTable>().is_some())
             .expect("metadata wrap must keep the embedding layer discoverable for the changes stream");
 
         // Metadata enrichment is pushed *below* the embedding layer, not stacked on
@@ -241,9 +239,7 @@ mod tests {
         let (table_metadata, columns) = spicepod_metadata_fixture();
         let wrapped = table_provider_with_spicepod_metadata(indexed, &table_metadata, &columns);
 
-        let index_node = wrapped
-            .downcast_ref::<SpiceTable>()
-            .and_then(|table| table.find_node::<IndexLayer>(LayerWalk::Index))
+        let index_node = spice_table::nodes(wrapped.as_ref(), LayerWalk::Index).find(|node| node.layer_as::<IndexLayer>().is_some())
             .expect("the index layer must remain discoverable for the index analyzer");
 
         assert!(
@@ -273,18 +269,13 @@ mod tests {
         let (table_metadata, columns) = spicepod_metadata_fixture();
         let wrapped = table_provider_with_spicepod_metadata(indexed, &table_metadata, &columns);
 
-        let index_node = wrapped
-            .downcast_ref::<SpiceTable>()
-            .and_then(|table| table.find_node::<IndexLayer>(LayerWalk::Index))
+        let index_node = spice_table::nodes(wrapped.as_ref(), LayerWalk::Index).find(|node| node.layer_as::<IndexLayer>().is_some())
             .expect("the index layer must remain discoverable for the index analyzer");
 
-        let vector_node = index_node
-            .below()
-            .downcast_ref::<SpiceTable>()
-            .and_then(|table| {
-                table.find_node::<search::index::vector_table::VectorScanTableProvider>(
-                    LayerWalk::Read,
-                )
+        let vector_node = spice_table::nodes(index_node.below().as_ref(), LayerWalk::Read)
+            .find(|node| {
+                node.layer_as::<search::index::vector_table::VectorScanTableProvider>()
+                    .is_some()
             })
             .expect("a vector-scan layer under an index layer must stay discoverable");
 

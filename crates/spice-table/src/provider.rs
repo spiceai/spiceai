@@ -70,6 +70,15 @@ impl IndexLayer {
             .collect()
     }
 
+    /// The indexes this layer binds to the table beneath it.
+    ///
+    /// Position matters: an index is bound to what sits *below* its layer, which
+    /// is what a search executes against.
+    #[must_use]
+    pub fn indexes(&self) -> &[Arc<dyn Index + Send + Sync>] {
+        &self.indexes
+    }
+
     #[must_use]
     pub fn get_all_indexes(&self) -> Vec<Arc<dyn Index + Send + Sync>> {
         self.indexes.clone()
@@ -92,9 +101,6 @@ impl TableLayer for IndexLayer {
         }
     }
 
-    fn indexes(&self) -> &[Arc<dyn Index + Send + Sync>] {
-        &self.indexes
-    }
 
     /// The layer is replaced by the indexed `LogicalPlan` during indexing, so
     /// the table beneath it must not supply one.

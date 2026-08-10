@@ -129,11 +129,10 @@ impl ElasticsearchFullTextConnector {
         F: Fn(&Arc<dyn DataConnector>, Arc<FederatedTable>) -> Option<ChangesStream>,
     {
         let table_provider = federated_table.try_table_provider_sync()?;
-        let indexed_table = table_provider
-            .downcast_ref::<spice_table::SpiceTable>()?
-            .first_indexed(spice_table::LayerWalk::Index)?;
+        let indexed_table = spice_table::nodes(table_provider.as_ref(), spice_table::LayerWalk::Index)
+            .find(|node| !node.indexes().is_empty())?;
 
-        let indexes = Indexes::new(indexed_table.layer().indexes().to_vec());
+        let indexes = Indexes::new(indexed_table.indexes().to_vec());
         let underlying_table = Arc::new(FederatedTable::Immediate(Arc::clone(
             indexed_table.below(),
         )));

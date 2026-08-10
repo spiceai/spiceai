@@ -188,8 +188,8 @@ pub(crate) async fn wrap_accelerator_with_duckdb_vector_indexes(
     // vector indexes join the ones already registered, rather than stacking a
     // second layer that discovery would have to find separately.
     let (mut provider, below) = match accelerator_provider.downcast_ref::<SpiceTable>() {
-        Some(table) if !table.layer().indexes().is_empty() => (
-            IndexLayer::with_indexes(table.layer().indexes().to_vec()),
+        Some(table) if !table.indexes().is_empty() => (
+            IndexLayer::with_indexes(table.indexes().to_vec()),
             Arc::clone(table.below()),
         ),
         _ => (IndexLayer::new(), Arc::clone(&accelerator_provider)),

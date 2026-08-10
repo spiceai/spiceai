@@ -115,13 +115,6 @@ pub trait TableLayer: Any + Send + Sync + Debug + 'static {
         Some(below)
     }
 
-    /// Indexes this layer binds to the table beneath it.
-    ///
-    /// Position matters: an index is bound to the table *below* the layer
-    /// carrying it, which is what a search executes against.
-    fn indexes(&self) -> &[Arc<dyn Index + Send + Sync>] {
-        &[]
-    }
 
     fn schema(&self, below: &Arc<dyn TableProvider>) -> SchemaRef {
         below.schema()
@@ -149,6 +142,18 @@ pub trait TableLayer: Any + Send + Sync + Debug + 'static {
         column: &str,
     ) -> Option<&'a Expr> {
         below.get_column_default(column)
+    }
+
+    /// Whether a rebuild may push a transform *beneath* this layer.
+    ///
+    /// `false` stops the fold here and the transform is applied to the stack
+    /// including this layer. A router answers `false`: it owns its children and
+    /// routes writes to one of them, so a transform inserted underneath would sit
+    /// where a write walk stops — the CDC write path would no longer find the
+    /// accelerator it targets. It also means a router's `below` can never be
+    /// replaced, so the child it holds and the table it is handed cannot diverge.
+    fn rebuild_descends(&self) -> bool {
+        true
     }
 
     /// Builds the plan for a scan of this layer, or forwards to the table
@@ -232,13 +237,12 @@ pub trait TableLayer: Any + Send + Sync + Debug + 'static {
 /// costs nothing per call.
 #[derive(Debug, Clone)]
 pub struct SpiceTable {
+    /// The one capability this node adds.
     layer: Arc<dyn TableLayer>,
-    /// The fully-composed table beneath this layer, ready to hand to it.
-    ///
-    /// Layered or not: navigation recovers the layered case by downcasting to
-    /// [`SpiceTable`]. That is the one downcast this design keeps, of the one
-    /// type it owns, in the one crate that defines it — so a construction site
-    /// can hand over any provider without knowing whether it is layered.
+    /// The fully-composed table it sits over — another [`SpiceTable`] or a
+    /// provider Spice does not manage. A node is therefore both "this layer" and
+    /// "everything from here down", which is what lets a borrow of one stand for
+    /// a sub-stack.
     below: Arc<dyn TableProvider>,
 }
 
@@ -262,56 +266,28 @@ impl SpiceTable {
         &self.below
     }
 
-    /// The layered table beneath this one, or `None` at the last layer.
-    #[must_use]
-    pub fn below_table(&self) -> Option<&SpiceTable> {
-        self.below.downcast_ref::<SpiceTable>()
-    }
 
     /// The base provider the stack terminates at.
     #[must_use]
     pub fn base_provider(&self) -> &Arc<dyn TableProvider> {
         let mut current = self;
-        while let Some(table) = current.below_table() {
+        while let Some(table) = current.below.downcast_ref::<SpiceTable>() {
             current = table;
         }
         &current.below
     }
 
-    /// Visits each layered node from this one down, stopping at the first layer
-    /// opaque to `walk`.
-    pub fn visit(&self, walk: LayerWalk, visit: &mut dyn FnMut(&SpiceTable)) {
-        let mut current = self;
-        loop {
-            visit(current);
-            let Some(next) = current.layer.route(walk, &current.below) else {
-                return;
-            };
-            match next.downcast_ref::<SpiceTable>() {
-                Some(table) => current = table,
-                None => return,
-            }
-        }
-    }
 
-    /// The first layer carrying an index of type `T`, paired with the table
-    /// that index is bound to.
+
+    /// The indexes this node's layer carries, or empty when it carries none.
+    ///
+    /// Names [`IndexLayer`] rather than putting an accessor on [`TableLayer`]:
+    /// a capability belongs to the layer that provides it, and `IndexLayer` lives
+    /// here in the foundation crate, so naming it costs nothing.
     #[must_use]
-    pub fn find_index<T: Index + 'static>(&self) -> Option<(Vec<&T>, Arc<dyn TableProvider>)> {
-        let mut current = self;
-        loop {
-            let found: Vec<&T> = current
-                .layer
-                .indexes()
-                .iter()
-                .filter_map(|index| index.as_any().downcast_ref::<T>())
-                .collect();
-            if !found.is_empty() {
-                return Some((found, Arc::clone(&current.below)));
-            }
-            let next = current.layer.route(LayerWalk::Index, &current.below)?;
-            current = next.downcast_ref::<SpiceTable>()?;
-        }
+    pub fn indexes(&self) -> &[Arc<dyn Index + Send + Sync>] {
+        self.layer_as::<crate::IndexLayer>()
+            .map_or(&[], crate::IndexLayer::indexes)
     }
 
     /// This node's layer as a concrete type, or `None` if it is another kind.
@@ -324,75 +300,9 @@ impl SpiceTable {
         (self.layer.as_ref() as &dyn Any).downcast_ref::<T>()
     }
 
-    /// The first node reachable by `walk` whose layer is a `T`.
-    ///
-    /// Returns the node rather than the layer, so a caller can also inspect what
-    /// the layer sits on — which is how "this layer is below that one" is
-    /// expressed.
-    #[must_use]
-    pub fn find_node<T: TableLayer>(&self, walk: LayerWalk) -> Option<&SpiceTable> {
-        let mut current = self;
-        loop {
-            if current.layer_as::<T>().is_some() {
-                return Some(current);
-            }
-            let next = current.layer.route(walk, &current.below)?;
-            current = next.downcast_ref::<SpiceTable>()?;
-        }
-    }
 
-    /// The first layer reachable by `walk` that carries any index, together with
-    /// the table those indexes are bound to.
-    #[must_use]
-    pub fn first_indexed(&self, walk: LayerWalk) -> Option<&SpiceTable> {
-        let mut current = self;
-        loop {
-            if !current.layer.indexes().is_empty() {
-                return Some(current);
-            }
-            let next = current.layer.route(walk, &current.below)?;
-            current = next.downcast_ref::<SpiceTable>()?;
-        }
-    }
 
-    /// Every index carried by any layer reachable by `walk`, outermost first.
-    ///
-    /// De-duplicated by identity: one index may be carried by more than one
-    /// layer, and a caller driving write lifecycle hooks must not run them twice.
-    #[must_use]
-    pub fn all_indexes(&self, walk: LayerWalk) -> Vec<Arc<dyn Index + Send + Sync>> {
-        let mut indexes: Vec<Arc<dyn Index + Send + Sync>> = Vec::new();
-        let mut seen = std::collections::HashSet::new();
-        let mut current = self;
-        loop {
-            for index in current.layer.indexes() {
-                if seen.insert(Arc::as_ptr(index).cast::<()>()) {
-                    indexes.push(Arc::clone(index));
-                }
-            }
-            let Some(next) = current.layer.route(walk, &current.below) else {
-                return indexes;
-            };
-            match next.downcast_ref::<SpiceTable>() {
-                Some(table) => current = table,
-                None => return indexes,
-            }
-        }
-    }
 
-    /// Rebuilds the stack with `transform` applied to the base provider,
-    /// preserving every layer above it.
-    #[must_use]
-    pub fn rebuild_base(
-        &self,
-        transform: &dyn Fn(Arc<dyn TableProvider>) -> Arc<dyn TableProvider>,
-    ) -> Arc<Self> {
-        let rebuilt_below = match self.below_table() {
-            Some(table) => table.rebuild_base(transform) as Arc<dyn TableProvider>,
-            None => transform(Arc::clone(&self.below)),
-        };
-        Self::over(Arc::clone(&self.layer), rebuilt_below)
-    }
 }
 
 /// Steps one level down from `current`, following `walk`.
@@ -441,19 +351,71 @@ pub fn find_concrete<T: TableProvider + 'static>(
     }
 }
 
-/// Finds a specific [`TableLayer`] in the stack, following `walk`.
+
+/// The layered nodes reachable from `top` by `walk`, outermost first.
+///
+/// The single traversal primitive: every "find the layer that…" and "collect
+/// the…" question over a stack is a fold across this, rather than its own
+/// method. Non-layered links (a federation adaptor) are crossed rather than
+/// yielded, so a caller never has to know one is there.
+pub fn nodes(top: &dyn TableProvider, walk: LayerWalk) -> Nodes<'_> {
+    Nodes {
+        current: Some(top),
+        walk,
+    }
+}
+
+/// Iterator over the layered nodes of a stack. See [`nodes`].
+pub struct Nodes<'a> {
+    current: Option<&'a dyn TableProvider>,
+    walk: LayerWalk,
+}
+
+impl<'a> Iterator for Nodes<'a> {
+    type Item = &'a SpiceTable;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while let Some(current) = self.current {
+            self.current = step(current, self.walk).map(Arc::as_ref);
+            if let Some(node) = current.downcast_ref::<SpiceTable>() {
+                return Some(node);
+            }
+        }
+        None
+    }
+}
+
+/// The layer of type `T` reachable from `top` by `walk`.
+///
+/// A convenience over [`nodes`] for the common case. A caller that also needs the
+/// table the layer sits over folds across [`nodes`] directly, so it holds the
+/// node and cannot end up with a layer detached from its stack.
 #[must_use]
 pub fn find_layer<T: TableLayer>(top: &dyn TableProvider, walk: LayerWalk) -> Option<&T> {
-    let mut current = top;
-    loop {
-        if let Some(found) = current
-            .downcast_ref::<SpiceTable>()
-            .and_then(SpiceTable::layer_as::<T>)
-        {
-            return Some(found);
-        }
-        current = step(current, walk)?.as_ref();
+    nodes(top, walk).find_map(SpiceTable::layer_as::<T>)
+}
+
+/// Rebuilds the stack with `transform` applied at its base, keeping every layer
+/// above it.
+///
+/// Stops at a layer that does not let a rebuild descend (see
+/// [`TableLayer::rebuild_descends`]) and applies `transform` to the stack
+/// including that layer — which is what keeps a transform from landing beneath a
+/// router, where a write walk would stop short of it.
+#[must_use]
+pub fn rebuild_base(
+    top: &Arc<dyn TableProvider>,
+    transform: &dyn Fn(Arc<dyn TableProvider>) -> Arc<dyn TableProvider>,
+) -> Arc<dyn TableProvider> {
+    let Some(node) = top.downcast_ref::<SpiceTable>() else {
+        return transform(Arc::clone(top));
+    };
+    if !node.layer.rebuild_descends() {
+        return transform(Arc::clone(top));
     }
+
+    let rebuilt_below = rebuild_base(&node.below, transform);
+    SpiceTable::over(Arc::clone(&node.layer), rebuilt_below) as Arc<dyn TableProvider>
 }
 
 /// The table reached by peeling every layer transparent to `walk`, stopping
@@ -635,9 +597,6 @@ mod tests {
             Some(below)
         }
 
-        fn indexes(&self) -> &[Arc<dyn Index + Send + Sync>] {
-            &self.indexes
-        }
     }
 
     /// Stands in for an accelerated table: two sides, and the walk decides which
@@ -649,6 +608,10 @@ mod tests {
     }
 
     impl TableLayer for TestRouter {
+        fn rebuild_descends(&self) -> bool {
+            false
+        }
+
         fn route<'a>(
             &'a self,
             walk: LayerWalk,
@@ -733,10 +696,15 @@ mod tests {
         let middle = SpiceTable::over(TestLayer::opaque(LayerWalk::CdcDetection), bottom);
         let top = SpiceTable::over(TestLayer::indexed("top"), middle);
 
-        let mut seen = Vec::new();
-        top.visit(LayerWalk::CdcDetection, &mut |table| {
-            seen.push(table.layer().indexes().first().map(|i| i.name()));
-        });
+        let top: Arc<dyn TableProvider> = top;
+        let seen: Vec<_> = nodes(top.as_ref(), LayerWalk::CdcDetection)
+            .map(|table| {
+                table
+                    .layer_as::<TestLayer>()
+                    .and_then(|l| l.indexes.first())
+                    .map(|i| i.name())
+            })
+            .collect();
         assert_eq!(
             seen,
             vec![Some("top"), None],
@@ -752,9 +720,14 @@ mod tests {
         let bottom = SpiceTable::over(TestLayer::indexed("bottom"), base());
         let top = SpiceTable::over(TestLayer::indexed("top"), Arc::clone(&bottom) as Arc<dyn TableProvider>);
 
-        let (found, bound) = top.find_index::<TestIndex>().expect("an index");
-        assert_eq!(found.len(), 1);
-        assert_eq!(found[0].name(), "top", "outermost index layer wins");
+        let top: Arc<dyn TableProvider> = top;
+        let (found, bound) = nodes(top.as_ref(), LayerWalk::Index)
+            .find_map(|node| {
+                let layer = node.layer_as::<TestLayer>()?;
+                layer.indexes.first().map(|index| (index, node.below()))
+            })
+            .expect("an index");
+        assert_eq!(found.name(), "top", "outermost index layer wins");
         assert!(
             bound.downcast_ref::<SpiceTable>().is_some(),
             "the bound table is the stack below the matching layer, not the base"
@@ -767,7 +740,11 @@ mod tests {
         let middle = SpiceTable::over(TestLayer::marker(), bottom);
         let top = SpiceTable::over(TestLayer::indexed("top"), middle);
 
-        let names: Vec<_> = top.all_indexes(LayerWalk::Index).iter().map(|i| i.name()).collect();
+        let top: Arc<dyn TableProvider> = top;
+        let names: Vec<_> = nodes(top.as_ref(), LayerWalk::Index)
+            .filter_map(|node| node.layer_as::<TestLayer>())
+            .flat_map(|layer| layer.indexes.iter().map(|i| i.name()))
+            .collect();
         assert_eq!(names, vec!["top", "bottom"]);
     }
 
@@ -788,19 +765,54 @@ mod tests {
         assert_eq!(top.table_type(), base_table.table_type());
     }
 
+    /// A router owns its children and routes writes to one of them, so a
+    /// transform pushed beneath it would sit where a write walk stops. The fold
+    /// must stop above it and wrap the router instead.
+    #[test]
+    fn rebuild_stops_above_a_layer_that_does_not_let_it_descend() {
+        let accelerator = base();
+        let router: Arc<dyn TableProvider> = SpiceTable::over(
+            Arc::new(TestRouter { source: None }),
+            Arc::clone(&accelerator),
+        );
+
+        let marker = base();
+        let rebuilt = rebuild_base(&router, &|inner| {
+            // the transform receives the router itself, not its child
+            assert!(
+                Arc::ptr_eq(&inner, &router),
+                "a rebuild must not descend past a router"
+            );
+            Arc::clone(&marker)
+        });
+        assert!(Arc::ptr_eq(&rebuilt, &marker));
+    }
+
     #[test]
     fn rebuild_base_replaces_the_base_and_keeps_every_layer() {
         let top = SpiceTable::over(TestLayer::indexed("top"), SpiceTable::over(TestLayer::marker(), base()));
 
         let replacement = base();
-        let rebuilt = top.rebuild_base(&|_| Arc::clone(&replacement));
+        let top: Arc<dyn TableProvider> = top;
+        let rebuilt = rebuild_base(&top, &|_| Arc::clone(&replacement));
 
         assert_eq!(
-            rebuilt.all_indexes(LayerWalk::Index).iter().map(|i| i.name()).collect::<Vec<_>>(),
+            {
+                nodes(rebuilt.as_ref(), LayerWalk::Index)
+                    .filter_map(|node| node.layer_as::<TestLayer>())
+                    .flat_map(|layer| layer.indexes.iter().map(|i| i.name()))
+                    .collect::<Vec<_>>()
+            },
             vec!["top"],
             "layers above the base must survive a rebuild"
         );
-        assert!(Arc::ptr_eq(rebuilt.base_provider(), &replacement));
+        assert!(Arc::ptr_eq(
+            rebuilt
+                .downcast_ref::<SpiceTable>()
+                .expect("rebuilt stack is layered")
+                .base_provider(),
+            &replacement
+        ));
     }
 }
 

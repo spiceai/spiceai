@@ -102,7 +102,7 @@ impl OptimizerRule for IndexTableScanOptimizerRule {
                 let underlying = Arc::clone(&default_source.table_provider);
                 let Some(indexes) = underlying
                     .downcast_ref::<SpiceTable>()
-                    .map(|table| table.layer().indexes())
+                    .map(|table| table.indexes())
                     .filter(|indexes| !indexes.is_empty())
                 else {
                     return Ok(Transformed::no(LogicalPlan::TableScan(table_scan)));

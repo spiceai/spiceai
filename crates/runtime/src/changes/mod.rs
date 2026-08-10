@@ -32,7 +32,12 @@ impl From<Arc<SpiceTable>> for Indexes {
     /// Collects the indexes carried anywhere in the table's stack, so a change
     /// stream maintains every one of them and not just the outermost layer's.
     fn from(table: Arc<SpiceTable>) -> Self {
-        Self(table.all_indexes(LayerWalk::Index))
+        Self(
+            spice_table::nodes(table.as_ref(), LayerWalk::Index)
+                .flat_map(SpiceTable::indexes)
+                .map(Arc::clone)
+                .collect(),
+        )
     }
 }
 

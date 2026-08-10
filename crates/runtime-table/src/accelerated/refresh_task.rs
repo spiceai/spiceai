@@ -149,7 +149,7 @@ fn metadata_enriched_table_provider_preserving_indexes(
     };
 
     match provider.downcast_ref::<SpiceTable>() {
-        Some(table) => table.rebuild_base(&enrich),
+        Some(_) => spice_table::rebuild_base(&provider, &enrich),
         None => enrich(provider),
     }
 }
@@ -168,9 +168,12 @@ struct RefreshStat {
 pub(crate) fn collect_indexes_from_provider(
     root: &Arc<dyn datafusion::catalog::TableProvider>,
 ) -> Vec<Arc<dyn spice_table::Index + Send + Sync>> {
-    root.downcast_ref::<SpiceTable>()
-        .map(|table| table.all_indexes(LayerWalk::Read))
-        .unwrap_or_default()
+    let mut seen = std::collections::HashSet::new();
+    spice_table::nodes(root.as_ref(), LayerWalk::Read)
+        .flat_map(SpiceTable::indexes)
+        .filter(|index| seen.insert(Arc::as_ptr(index).cast::<()>()))
+        .map(Arc::clone)
+        .collect()
 }
 
 /// Walks the federated provider chain and collects indexes from **every** [`IndexLayer`]
@@ -2922,11 +2925,9 @@ mod tests {
         );
 
         let wrapped = table_provider_with_existing_metadata(indexed_provider);
-        let index_node = wrapped
-            .downcast_ref::<SpiceTable>()
-            .and_then(|table| table.find_node::<IndexLayer>(LayerWalk::Index))
+        let index_node = spice_table::nodes(wrapped.as_ref(), LayerWalk::Index).find(|node| node.layer_as::<IndexLayer>().is_some())
             .expect("the index layer should remain the outermost layer");
-        assert_eq!(index_node.layer().indexes().len(), 1);
+        assert_eq!(index_node.indexes().len(), 1);
         assert!(
             spice_table::find_layer::<MetadataEnrichedTableProvider>(
                 index_node.below().as_ref(),

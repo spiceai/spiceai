@@ -197,7 +197,7 @@ impl TableSink {
         let provider_indexes_before: Vec<Arc<dyn Index + Send + Sync>> = providers_before_write
             .iter()
             .filter_map(|p| p.downcast_ref::<SpiceTable>())
-            .flat_map(|table| table.layer().indexes().to_vec())
+            .flat_map(|table| table.indexes().to_vec())
             .collect();
 
         // A replacing write drops source rows by not re-sending them, so an index backed by its
@@ -249,7 +249,7 @@ impl TableSink {
         let provider_indexes_after: Vec<Arc<dyn Index + Send + Sync>> = providers_after_write
             .iter()
             .filter_map(|p| p.downcast_ref::<SpiceTable>())
-            .flat_map(|table| table.layer().indexes().to_vec())
+            .flat_map(|table| table.indexes().to_vec())
             .collect();
 
         finalize_indexes(
@@ -277,7 +277,7 @@ async fn run_on_write_failed(
     let provider_indexes: Vec<Arc<dyn Index + Send + Sync>> = providers
         .iter()
         .filter_map(|p| p.downcast_ref::<SpiceTable>())
-        .flat_map(|table| table.layer().indexes().to_vec())
+        .flat_map(|table| table.indexes().to_vec())
         .collect();
 
     rollback_indexes(

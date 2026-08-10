@@ -116,9 +116,9 @@ fn register_index(
     index: Arc<dyn Index + Send + Sync>,
 ) -> Arc<SpiceTable> {
     if let Some(table) = inner_table_provider.downcast_ref::<SpiceTable>()
-        && !table.layer().indexes().is_empty()
+        && !table.indexes().is_empty()
     {
-        let mut indexes = table.layer().indexes().to_vec();
+        let mut indexes = table.indexes().to_vec();
         indexes.push(index);
         return SpiceTable::over(
             Arc::new(IndexLayer::with_indexes(indexes)),

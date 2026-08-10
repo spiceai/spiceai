@@ -227,8 +227,8 @@ async fn wrap_table_as_index_s3(
     let (mut provider, layer_below) = match inner_table_provider
         .downcast_ref::<spice_table::SpiceTable>()
     {
-        Some(table) if !table.layer().indexes().is_empty() => (
-            IndexLayer::with_indexes(table.layer().indexes().to_vec()),
+        Some(table) if !table.indexes().is_empty() => (
+            IndexLayer::with_indexes(table.indexes().to_vec()),
             Arc::clone(table.below()),
         ),
         _ => (IndexLayer::new(), Arc::clone(&inner_table_provider)),
@@ -440,8 +440,8 @@ async fn wrap_table_as_index_elasticsearch(
     let (mut provider, layer_below) = match inner_table_provider
         .downcast_ref::<spice_table::SpiceTable>()
     {
-        Some(table) if !table.layer().indexes().is_empty() => (
-            IndexLayer::with_indexes(table.layer().indexes().to_vec()),
+        Some(table) if !table.indexes().is_empty() => (
+            IndexLayer::with_indexes(table.indexes().to_vec()),
             Arc::clone(table.below()),
         ),
         _ => (IndexLayer::new(), Arc::clone(&inner_table_provider)),
