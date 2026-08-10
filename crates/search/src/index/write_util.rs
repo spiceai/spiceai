@@ -328,9 +328,8 @@ pub fn create_embedding_array(
             builder.values().append_slice(embedding);
             builder.append(true);
         } else {
-            // A null fixed-size-list slot still occupies `dimension` values in
-            // Arrow's child array. The child field is non-nullable, so use
-            // placeholder values and represent nullness only in the parent.
+            // Store `f32` child values, not `Option<f32>`. Use zero-valued
+            // child slots and represent a null embedding at the list level.
             builder.values().append_value_n(0.0, expected_dim);
             builder.append(false);
         }
