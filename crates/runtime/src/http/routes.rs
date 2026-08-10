@@ -539,10 +539,9 @@ async fn track_metrics(
     mut req: Request<Body>,
     next: Next,
 ) -> impl IntoResponse {
-    let app_lock = app.read().await;
-    let app = app_lock.as_ref().map(Arc::clone);
+    let app = app.read().await.as_ref().map(Arc::clone);
     let mut request_context_builder = RequestContext::builder(Protocol::Http)
-        .with_app_opt(app_lock.as_ref().map(Arc::clone))
+        .with_app_opt(app.clone())
         .from_headers(&headers);
 
     if let Some(ext) = DatabricksAuthExtension::from_headers(&app, &Some(Arc::clone(&df)), &headers)

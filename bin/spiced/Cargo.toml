@@ -18,6 +18,7 @@ connector-adbc = { path = "../../crates/data-connectors/connector-adbc", optiona
 connector-kafka = { path = "../../crates/data-connectors/connector-kafka", optional = true }
 connector-clickhouse = { path = "../../crates/data-connectors/connector-clickhouse", optional = true }
 connector-cosmosdb = { path = "../../crates/data-connectors/connector-cosmosdb", optional = true }
+datafusion = { workspace = true }
 connector-databricks = { path = "../../crates/data-connectors/connector-databricks", optional = true }
 connector-delta-lake = { path = "../../crates/data-connectors/connector-delta-lake", optional = true }
 connector-dynamodb = { path = "../../crates/data-connectors/connector-dynamodb", optional = true }

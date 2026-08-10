@@ -990,25 +990,64 @@ impl ArrayToNdjsonPush {
         matches!(self.state, ParsingState::Complete)
     }
 
+    /// Signal that no more bytes will arrive.
+    ///
+    /// Every state other than [`ParsingState::Complete`] means the array was
+    /// still open when the input ran out, so the elements already emitted are
+    /// a prefix of the file rather than the whole of it. Without this call the
+    /// adapter has no end-of-input transition at all: a body cut short mid-way
+    /// simply stops producing rows, and the short result is indistinguishable
+    /// from a complete one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::UnexpectedEof`] if the array was never opened
+    /// or never closed.
+    pub fn finish(&self) -> io::Result<()> {
+        let detail = match self.state {
+            ParsingState::Complete => return self.ensure_only_trailing_whitespace(),
+            ParsingState::ExpectingArrayStart => {
+                "the input ended before the opening '[' — the body is empty or contains only whitespace"
+            }
+            ParsingState::ExpectingFirstElement
+            | ParsingState::ExpectingElement
+            | ParsingState::ExpectingCommaOrClosingBracket => {
+                "the input ended before the closing ']' — the file is truncated"
+            }
+        };
+
+        Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            format!(
+                "Failed to read JSON array: {detail}. Rows read so far are only part of the file. Re-fetch the complete file, or set the dataset's 'format' to match its contents."
+            ),
+        ))
+    }
+
     /// Process accumulated buffer data using `serde_json::StreamDeserializer`
     #[expect(clippy::cast_possible_truncation)]
     fn process_buffer(&mut self) -> io::Result<()> {
         if matches!(self.state, ParsingState::Complete) {
-            return Ok(());
+            return self.take_trailing_whitespace();
         }
 
         // Skip whitespace and consume opening bracket if not done yet
         if matches!(self.state, ParsingState::ExpectingArrayStart) {
             let mut cursor = io::Cursor::new(&self.buffer);
-            if matches!(skip_ws_until(&mut cursor, b'['), Ok(())) {
-                let consumed = cursor.position() as usize;
-                if consumed <= self.buffer.len() {
-                    self.buffer.drain(..consumed);
-                    self.state = ParsingState::ExpectingFirstElement;
+            match skip_ws_until(&mut cursor, b'[') {
+                Ok(()) => {
+                    let consumed = cursor.position() as usize;
+                    if consumed <= self.buffer.len() {
+                        self.buffer.drain(..consumed);
+                        self.state = ParsingState::ExpectingFirstElement;
+                    }
                 }
-            } else {
-                // Not enough data yet
-                return Ok(());
+                // Only a buffer that has not reached the `[` yet is waiting on
+                // more bytes. Any other error means the payload is not a JSON
+                // array at all — an NDJSON or object body read as one is a
+                // configuration mistake, not a short read.
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
+                Err(e) => return Err(e),
             }
         }
 
@@ -1027,7 +1066,7 @@ impl ArrayToNdjsonPush {
                             let consumed = cursor.position() as usize;
                             self.buffer.drain(..consumed);
                             self.state = ParsingState::Complete;
-                            return Ok(());
+                            return self.take_trailing_whitespace();
                         }
                         Ok(_) => {
                             // The next non-whitespace byte is not a closing bracket, so we're expecting an element
@@ -1043,22 +1082,46 @@ impl ArrayToNdjsonPush {
                     let mut stream = Deserializer::from_reader(cursor).into_iter::<Box<RawValue>>();
                     match stream.next() {
                         Some(Ok(element)) => {
+                            // Calculate how many bytes were consumed
+                            let consumed = stream.byte_offset();
+
+                            // A scalar has no closing delimiter, so serde ends
+                            // it at the end of the buffer and reports success:
+                            // `[123` yields `123` even though the next push
+                            // could make it `123456`. Emitting now would emit a
+                            // value the file never contained. Objects, arrays
+                            // and strings all end on a delimiter, so only a
+                            // scalar running to the buffer's end is ambiguous.
+                            if consumed == self.buffer.len() && self.may_be_truncated() {
+                                return Ok(());
+                            }
+
                             // Successfully parsed an element
                             let element_bytes = element.get().as_bytes();
 
                             // Filter and add to pending
                             filter_element_bytes(element_bytes, &mut self.pending);
 
-                            // Calculate how many bytes were consumed
-                            let consumed = stream.byte_offset();
                             self.buffer.drain(..consumed);
 
                             self.state = ParsingState::ExpectingCommaOrClosingBracket;
                         }
                         Some(Err(e)) => {
-                            // Check if this is a "need more data" error
-                            if e.classify() == Category::Eof || e.classify() == Category::Syntax {
-                                // This is expected when we have partial data - just wait for more
+                            // Waiting on every error drops the malformed element
+                            // and every one after it: each later push re-parses
+                            // the same bytes from the same offset and fails the
+                            // same way, so nothing is ever emitted again.
+                            //
+                            // `Category::Eof` is most of the "the buffer stops
+                            // part-way through an element" case — a truncated
+                            // object, string or literal — but not all of it. A
+                            // buffer ending inside a numeric literal (`-`, `1.`,
+                            // `1e`) is reported as `Category::Syntax`, because
+                            // what serde has read is not a number and it cannot
+                            // know more is coming. So a syntax error only counts
+                            // as malformed once the buffer ends on a byte that
+                            // no continuation could extend into a value.
+                            if e.classify() == Category::Eof || self.may_be_truncated() {
                                 return Ok(());
                             }
 
@@ -1085,7 +1148,7 @@ impl ArrayToNdjsonPush {
                             let consumed = cursor.position() as usize;
                             self.buffer.drain(..consumed);
                             self.state = ParsingState::Complete;
-                            return Ok(());
+                            return self.take_trailing_whitespace();
                         }
                         Ok(byte) => {
                             return Err(io::Error::new(
@@ -1104,6 +1167,69 @@ impl ArrayToNdjsonPush {
         }
 
         Ok(())
+    }
+
+    /// Whether everything left after the closing `]` is whitespace.
+    ///
+    /// Reaching `]` ends the array but not necessarily the input: the closing
+    /// bracket is drained and whatever followed it stays in the buffer, and
+    /// every later push is accumulated but never parsed. Without this check a
+    /// body holding more than the one array it was read as — a second
+    /// concatenated array, or a larger document that merely starts with one —
+    /// yields that first array's rows and reports success, which is the same
+    /// silent short read as a truncated file.
+    /// [`Self::ensure_only_trailing_whitespace`], then drop what it verified.
+    ///
+    /// Bytes arriving once the array has closed are appended to the buffer but
+    /// never parsed, so without this the buffer holds the whole tail and each
+    /// push rescans all of it. Whitespace that has already been checked cannot
+    /// become anything else, so nothing is lost by discarding it.
+    fn take_trailing_whitespace(&mut self) -> io::Result<()> {
+        self.ensure_only_trailing_whitespace()?;
+        self.buffer.clear();
+        Ok(())
+    }
+
+    /// Bytes held but not yet parsed, so a test can show the tail is dropped
+    /// rather than accumulated.
+    #[cfg(test)]
+    fn buffered_len(&self) -> usize {
+        self.buffer.len()
+    }
+
+    fn ensure_only_trailing_whitespace(&self) -> io::Result<()> {
+        let Some(byte) = self
+            .buffer
+            .iter()
+            .find(|b| !b.is_ascii_whitespace())
+            .copied()
+        else {
+            return Ok(());
+        };
+
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "Failed to read JSON array: found '{byte}' after the closing ']'. The body holds more than the single JSON array it was read as, so the rows returned are only its first array. Check the file for concatenated or trailing content, or set the dataset's 'format' to match its contents.",
+                byte = byte.escape_ascii()
+            ),
+        ))
+    }
+
+    /// Whether the buffer ends part-way through a token, so that bytes still
+    /// to arrive could change how it parses.
+    ///
+    /// Only scalars need this. A truncated object, array or string leaves
+    /// serde inside a structure it knows is unterminated, which it reports as
+    /// `Category::Eof`; a truncated number or literal looks to serde like a
+    /// complete but invalid value, and is reported as `Category::Syntax`. The
+    /// bytes those tokens are built from are exactly the ones tested here, so
+    /// a buffer ending on any other byte — `]`, `}`, `,` — has stopped at a
+    /// boundary no continuation can move.
+    fn may_be_truncated(&self) -> bool {
+        self.buffer
+            .last()
+            .is_some_and(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'+' | b'.'))
     }
 
     /// Get the next non-whitespace byte
@@ -1840,23 +1966,424 @@ mod tests {
             assert!(adapter.is_complete());
         }
 
+        /// A body that is not a JSON array cannot become one by reading more of
+        /// it, so it is a configuration error rather than a short read.
         #[test]
         fn test_push_invalid_json_missing_bracket() {
             let mut adapter = ArrayToNdjsonPush::new();
-            adapter
+            let err = adapter
                 .push_bytes(b"{\"name\": \"John\"}")
-                .expect("Push should succeed");
-            assert!(adapter.try_read() == ReadResult::NotReady);
+                .expect_err("a non-array payload must be reported");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+            assert!(
+                err.to_string().contains("expected '['"),
+                "the error should name what it expected, got: {err}"
+            );
         }
 
         #[test]
         fn test_push_invalid_json_malformed_element() {
             let mut adapter = ArrayToNdjsonPush::new();
             adapter.push_bytes(b"[").expect("Push should succeed");
-            adapter
+            // missing quotes around John
+            let err = adapter
                 .push_bytes(b"{\"name\": John}]")
-                .expect("Push should succeed"); // missing quotes around John
-            assert!(adapter.try_read() == ReadResult::NotReady);
+                .expect_err("a malformed element must be reported");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        }
+
+        /// Regression test for #12755. A malformed element used to be read as
+        /// "not enough data yet": it was dropped along with every element after
+        /// it, `push_bytes` returned `Ok`, and the scan ended normally with the
+        /// rows missing.
+        #[test]
+        fn malformed_element_is_reported_rather_than_silently_dropping_the_rest() {
+            let mut adapter = ArrayToNdjsonPush::new();
+            let err = adapter
+                .push_bytes(br#"[{"a":1},{"a" 2},{"a":3}]"#)
+                .expect_err("the malformed second element must be reported");
+
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+            assert!(
+                err.to_string().contains("expected `:`"),
+                "the error should describe the malformation, got: {err}"
+            );
+
+            // The well-formed element before the failure is still readable —
+            // the error reports where the array stopped being parseable, it
+            // does not discard what already parsed.
+            assert_eq!(
+                read_all_push(&mut adapter),
+                vec![r#"{"a":1}"#.to_string()],
+                "elements parsed before the failure should survive"
+            );
+        }
+
+        /// Every malformation `serde_json` classifies as a syntax error has to
+        /// surface. These are the shapes that used to be swallowed.
+        #[test]
+        fn every_malformed_element_shape_is_reported() {
+            for body in [
+                r#"[{"a" 1}]"#,         // missing colon
+                r#"[{"a": tru3}]"#,     // bad token
+                r#"[{"a": 1,}]"#,       // trailing comma inside the object
+                r#"[{"a":1},]"#,        // trailing comma inside the array
+                r#"[{"a":1} {"b":2}]"#, // missing separator
+            ] {
+                let mut adapter = ArrayToNdjsonPush::new();
+                let err = adapter
+                    .push_bytes(body.as_bytes())
+                    .expect_err(&format!("`{body}` must be reported"));
+                assert_eq!(
+                    err.kind(),
+                    io::ErrorKind::InvalidData,
+                    "`{body}` reported the wrong error kind"
+                );
+            }
+        }
+
+        /// The other half of the fix: a buffer that merely stops part-way
+        /// through an element is still "wait for more bytes".
+        ///
+        /// The whole fix rests on `Category::Eof` covering every incomplete
+        /// buffer, so this splits each body at every byte offset — including
+        /// offsets inside an escape sequence and inside a multi-byte UTF-8
+        /// character, where a misclassification would turn a valid streamed
+        /// read into a spurious hard error. Splitting on bytes rather than
+        /// `char`s is deliberate: a chunk boundary from an object store lands
+        /// wherever it lands.
+        #[test]
+        fn a_truncated_element_still_waits_for_more_bytes() {
+            for (body, expected) in [
+                (
+                    r#"[{"a":1,"b":"x y"},{"c":[1,2]},{"d":true},{"e":null}]"#,
+                    vec![
+                        r#"{"a":1,"b":"x y"}"#,
+                        r#"{"c":[1,2]}"#,
+                        r#"{"d":true}"#,
+                        r#"{"e":null}"#,
+                    ],
+                ),
+                // Escapes, a quote and a bracket inside a string, and nesting.
+                (
+                    r#"[{"a":"he said \"hi\" [not] a bracket"},{"b":{"c":[{"d":1}]}}]"#,
+                    vec![
+                        r#"{"a":"he said \"hi\" [not] a bracket"}"#,
+                        r#"{"b":{"c":[{"d":1}]}}"#,
+                    ],
+                ),
+                // Multi-byte UTF-8, and a \u escape.
+                (
+                    r#"[{"k":"héllo wörld"},{"k":"日本語"},{"k":"é"}]"#,
+                    vec![
+                        r#"{"k":"héllo wörld"}"#,
+                        r#"{"k":"日本語"}"#,
+                        r#"{"k":"é"}"#,
+                    ],
+                ),
+                // Numbers that only a delimiter terminates: negatives,
+                // fractions and exponents.
+                (
+                    r#"[{"n":-1.5e-3},{"n":0},{"n":1e10},{"n":-0.0}]"#,
+                    vec![
+                        r#"{"n":-1.5e-3}"#,
+                        r#"{"n":0}"#,
+                        r#"{"n":1e10}"#,
+                        r#"{"n":-0.0}"#,
+                    ],
+                ),
+            ] {
+                let bytes = body.as_bytes();
+                let expected: Vec<String> = expected.iter().map(|s| (*s).to_string()).collect();
+
+                for split in 1..bytes.len() {
+                    let mut adapter = ArrayToNdjsonPush::new();
+                    let (head, tail) = bytes.split_at(split);
+
+                    adapter.push_bytes(head).unwrap_or_else(|e| {
+                        panic!("`{body}` split at {split}: head must not error: {e}")
+                    });
+                    let mut lines = read_all_push(&mut adapter);
+
+                    adapter.push_bytes(tail).unwrap_or_else(|e| {
+                        panic!("`{body}` split at {split}: tail must not error: {e}")
+                    });
+                    lines.extend(read_all_push(&mut adapter));
+
+                    assert_eq!(
+                        lines, expected,
+                        "`{body}` split at {split} lost or changed rows"
+                    );
+                    assert!(
+                        adapter.is_complete(),
+                        "`{body}` split at {split} did not complete"
+                    );
+                }
+            }
+        }
+
+        /// `Category::Eof` does not cover every incomplete buffer: serde
+        /// reports a buffer that stops inside a numeric literal as a syntax
+        /// error, because what it has read is not a number. Treating every
+        /// syntax error as fatal would therefore fail a valid array whose
+        /// chunk boundary happened to land mid-number.
+        #[test]
+        fn a_syntax_error_at_a_truncation_boundary_waits_for_more_bytes() {
+            for head in [
+                r#"[{"n":-"#,   // a lone minus
+                r#"[{"n":1."#,  // a fraction with no digits yet
+                r#"[{"n":1e"#,  // an exponent with no digits yet
+                r#"[{"n":1e-"#, // an exponent with only its sign
+                r#"[{"n":tru"#, // a literal mid-token
+            ] {
+                let mut adapter = ArrayToNdjsonPush::new();
+                let err = adapter.push_bytes(head.as_bytes());
+                assert!(
+                    err.is_ok(),
+                    "`{head}` stops mid-token and must wait, got: {err:?}"
+                );
+            }
+
+            // ...and the malformation is still reported as soon as the buffer
+            // stops ending mid-token.
+            let mut adapter = ArrayToNdjsonPush::new();
+            adapter
+                .push_bytes(br#"[{"n":1e"#)
+                .expect("a truncated exponent must wait");
+            let err = adapter
+                .push_bytes(b"}]")
+                .expect_err("the completed element is malformed and must be reported");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        }
+
+        /// A scalar element split across two pushes must not be emitted as the
+        /// prefix that happened to arrive first. serde ends a number at the end
+        /// of the buffer and reports success, so `[123` + `456]` used to yield
+        /// the row `123` — a value the file never contained — and then fail on
+        /// the leftover `456`.
+        #[test]
+        fn a_scalar_split_across_pushes_is_not_emitted_as_its_prefix() {
+            for (head, tail, expected) in [
+                (&b"[123"[..], &b"456]"[..], vec!["123456"]),
+                (&b"[1"[..], &b"2.5e3]"[..], vec!["12.5e3"]),
+                (&b"[tru"[..], &b"e]"[..], vec!["true"]),
+                (&b"[1,2"[..], &b"3]"[..], vec!["1", "23"]),
+                // A scalar followed by a delimiter is unambiguous and still
+                // emits without waiting.
+                (&b"[123,"[..], &b"4]"[..], vec!["123", "4"]),
+            ] {
+                let mut adapter = ArrayToNdjsonPush::new();
+                adapter.push_bytes(head).expect("head must not error");
+                let mut lines = read_all_push(&mut adapter);
+                adapter.push_bytes(tail).expect("tail must not error");
+                lines.extend(read_all_push(&mut adapter));
+
+                assert_eq!(
+                    lines,
+                    expected,
+                    "{} + {} produced the wrong rows",
+                    String::from_utf8_lossy(head),
+                    String::from_utf8_lossy(tail)
+                );
+                assert!(adapter.is_complete());
+            }
+        }
+
+        /// Splitting an array of bare scalars at every byte offset must yield
+        /// the same rows, whichever byte the chunk boundary lands on.
+        #[test]
+        fn an_array_of_scalars_survives_every_split() {
+            let body = br#"[1,-2.5,3e4,true,false,null,"s"]"#;
+            let expected = vec!["1", "-2.5", "3e4", "true", "false", "null", r#""s""#];
+
+            for split in 1..body.len() {
+                let mut adapter = ArrayToNdjsonPush::new();
+                let (head, tail) = body.split_at(split);
+
+                adapter
+                    .push_bytes(head)
+                    .unwrap_or_else(|e| panic!("split at {split}: head must not error: {e}"));
+                let mut lines = read_all_push(&mut adapter);
+
+                adapter
+                    .push_bytes(tail)
+                    .unwrap_or_else(|e| panic!("split at {split}: tail must not error: {e}"));
+                lines.extend(read_all_push(&mut adapter));
+
+                assert_eq!(lines, expected, "split at {split} lost or changed rows");
+                assert!(adapter.is_complete(), "split at {split} did not complete");
+            }
+        }
+
+        /// Reaching `]` ends the array but not the input. Anything after the
+        /// closing bracket means the body is not the single array it was read
+        /// as, so returning that first array's rows and reporting success is
+        /// the same silent short read as a truncated file.
+        #[test]
+        fn trailing_content_after_the_closing_bracket_is_reported() {
+            for body in [
+                &b"[1]garbage"[..],
+                &b"[1][2]"[..],
+                &br#"[{"a":1}] {"b":2}"#[..],
+                &br#"[{"a":1}]garbage"#[..],
+                // A stray delimiter is trailing content too: the array is
+                // already closed, so neither can belong to it.
+                &b"[1]]"[..],
+                &b"[1],"[..],
+                &b"[]x"[..],
+            ] {
+                let mut adapter = ArrayToNdjsonPush::new();
+                let Err(err) = adapter.push_bytes(body) else {
+                    panic!(
+                        "{} must be reported, not silently truncated to its first array",
+                        String::from_utf8_lossy(body)
+                    )
+                };
+                assert_eq!(
+                    err.kind(),
+                    io::ErrorKind::InvalidData,
+                    "{} reported the wrong error kind",
+                    String::from_utf8_lossy(body)
+                );
+            }
+        }
+
+        /// The bytes after `]` need not arrive in the push that closed the
+        /// array. A later push is accumulated but never parsed, so without an
+        /// explicit check it is dropped in silence.
+        #[test]
+        fn trailing_content_arriving_after_completion_is_reported() {
+            let mut adapter = ArrayToNdjsonPush::new();
+            adapter
+                .push_bytes(br#"[{"a":1}]"#)
+                .expect("a well-formed array must not error");
+            assert!(adapter.is_complete());
+
+            let err = adapter
+                .push_bytes(br#"{"b":2}"#)
+                .expect_err("content pushed after the array closed must be reported");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+
+            // `finish` guards the same condition, so a consumer that only
+            // checks the end of the stream reaches the same verdict.
+            assert!(
+                adapter.finish().is_err(),
+                "finish must agree that the body held more than one array"
+            );
+        }
+
+        /// The guard above must reject only what cannot belong to the file. A
+        /// JSON array ending in a newline is the ordinary case, and rejecting
+        /// it would turn every well-formed file into a read failure.
+        #[test]
+        fn whitespace_after_the_closing_bracket_is_accepted() {
+            for (body, expected) in [
+                (&b"[1]\n"[..], vec!["1"]),
+                (&b"[1] "[..], vec!["1"]),
+                (&br#"[{"a":1}]  "#[..], vec![r#"{"a":1}"#]),
+                (&b"[{\"a\":1}]\r\n\t "[..], vec![r#"{"a":1}"#]),
+                (&b"[]\n"[..], vec![]),
+            ] {
+                let mut adapter = ArrayToNdjsonPush::new();
+                adapter.push_bytes(body).unwrap_or_else(|e| {
+                    panic!(
+                        "{} is well formed and must not error: {e}",
+                        String::from_utf8_lossy(body)
+                    )
+                });
+                assert_eq!(
+                    read_all_push(&mut adapter),
+                    expected,
+                    "{} produced the wrong rows",
+                    String::from_utf8_lossy(body)
+                );
+                assert!(adapter.is_complete());
+                adapter.finish().unwrap_or_else(|e| {
+                    panic!(
+                        "{} is well formed and must finish cleanly: {e}",
+                        String::from_utf8_lossy(body)
+                    )
+                });
+            }
+        }
+
+        /// Whitespace after the closing bracket is checked and then dropped,
+        /// so a long run of it arriving across many pushes is neither retained
+        /// nor rescanned. Trailing content still has to be caught once the
+        /// whitespace before it has been discarded.
+        #[test]
+        fn a_long_whitespace_tail_is_consumed_across_pushes() {
+            let mut adapter = ArrayToNdjsonPush::new();
+            adapter
+                .push_bytes(br#"[{"a":1}]"#)
+                .expect("a well-formed array must not error");
+            assert_eq!(read_all_push(&mut adapter), vec![r#"{"a":1}"#.to_string()]);
+
+            for _ in 0..512 {
+                adapter
+                    .push_bytes(b"    \n\t")
+                    .expect("whitespace after the array must stay acceptable");
+            }
+            adapter
+                .finish()
+                .expect("a whitespace tail must finish cleanly");
+            assert_eq!(
+                adapter.buffered_len(),
+                0,
+                "the whitespace tail must be dropped, not retained and rescanned on every push"
+            );
+
+            // The guard is still armed once the whitespace has been dropped.
+            let err = adapter
+                .push_bytes(b"x")
+                .expect_err("content after a whitespace tail must still be reported");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        }
+
+        /// A UTF-8 BOM arrives a byte at a time like anything else, and a
+        /// partial BOM must not be mistaken for a body that is not an array.
+        #[test]
+        fn a_byte_wise_bom_before_the_array_is_not_an_error() {
+            let mut adapter = ArrayToNdjsonPush::new();
+            for byte in b"\xEF\xBB\xBF[{\"a\":1}]" {
+                adapter
+                    .push_bytes(&[*byte])
+                    .expect("a BOM must not be reported as a non-array body");
+            }
+            assert_eq!(read_all_push(&mut adapter), vec![r#"{"a":1}"#.to_string()]);
+            assert!(adapter.is_complete());
+        }
+
+        /// A `json_format: array` dataset pointed at an NDJSON or object body
+        /// used to read as an empty result rather than a configuration error.
+        #[test]
+        fn a_body_that_is_not_an_array_is_reported() {
+            for body in [
+                r#"{"a":1}"#,             // a bare object
+                "{\"a\":1}\n{\"a\":2}\n", // NDJSON
+                r#""just a string""#,
+                "42",
+            ] {
+                let mut adapter = ArrayToNdjsonPush::new();
+                let err = adapter.push_bytes(body.as_bytes()).expect_err(&format!(
+                    "`{body}` is not a JSON array and must be reported"
+                ));
+                assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+            }
+        }
+
+        /// Whitespace before the `[` still arrives a byte at a time without
+        /// being mistaken for a non-array body.
+        #[test]
+        fn leading_whitespace_before_the_array_is_not_an_error() {
+            let mut adapter = ArrayToNdjsonPush::new();
+            for byte in b"  \n\t  [{\"a\":1}]" {
+                adapter
+                    .push_bytes(&[*byte])
+                    .expect("leading whitespace must not error");
+            }
+            assert_eq!(read_all_push(&mut adapter), vec![r#"{"a":1}"#.to_string()]);
+            assert!(adapter.is_complete());
         }
 
         #[test]

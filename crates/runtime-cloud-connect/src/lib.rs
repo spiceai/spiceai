@@ -90,8 +90,9 @@ use tokio::task::JoinHandle;
 
 pub use config::CloudConnectConfig;
 pub use handlers::{
-    ApplyOutcome, Capability, CommandError, PostApply, RestartMode, RuntimeHandle, RuntimePhase,
-    SpicepodDeployment, StatusReport,
+    ApplyOutcome, Capability, CommandError, MAX_QUERY_RESULT_BYTES, MAX_QUERY_ROWS, PostApply,
+    QueryOutcome, RestartMode, RuntimeHandle, RuntimePhase, SpicepodDeployment, StatusReport,
+    effective_max_rows,
 };
 pub use identity::{Identity, IdentityStore};
 pub use supervisor::Supervisor;
@@ -99,9 +100,12 @@ pub use supervisor::Supervisor;
 /// Revision of the `spice.cloud.v1` contract this client implements,
 /// announced in `Hello.protocol_version`.
 ///
-/// Bump it when the contract gains a command, field, or enum variant a peer
-/// can only use once it knows the other side has it; the package name changes
-/// only for a break this number cannot bridge.
+/// Bump it only for a change neither absent-oneof tolerance nor
+/// `Hello.capabilities` can carry — a peer that would misread the stream
+/// without knowing. A purely additive command does not qualify: an older peer
+/// decodes it as an absent body and answers unsupported, and `capabilities`
+/// already says self-descriptively what this instance answers. The package
+/// name changes only for a break this number cannot bridge.
 pub const PROTOCOL_VERSION: u32 = 1;
 
 use shutdown::Shutdown;
