@@ -33,8 +33,8 @@ limitations under the License.
 //!
 //! macOS installs a `LaunchDaemon`, not a `LaunchAgent`: an agent runs only
 //! while its user is logged in, which is not the guarantee `--install` makes.
-//! A daemon starts at boot and survives logout, at the cost of root — the same
-//! cost the systemd path already pays.
+//! A daemon starts at boot and survives logout. Root installs and manages its
+//! definition, while the runtime itself runs as the non-root operator.
 //!
 //! ## One service per instance directory
 //!
@@ -44,7 +44,8 @@ limitations under the License.
 //! into the definition as its working directory. A `--install` or `remove` in
 //! one instance directory can therefore never touch another instance's service.
 //!
-//! v1 runs `spiced` as root. A dedicated service user is planned hardening.
+//! Both back ends run `spiced` as the non-root operator who invoked `sudo` (or
+//! owns the instance directory).
 
 #[cfg(unix)]
 #[cfg_attr(not(target_os = "macos"), expect(dead_code))]
@@ -54,6 +55,9 @@ mod launchd;
 mod systemd;
 
 use std::path::{Path, PathBuf};
+
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt as _;
 
 use sha2::{Digest as _, Sha256};
 
@@ -93,6 +97,102 @@ const RUNTIME_STAGE_DIR: &str = "/usr/local/lib/spice";
 
 /// File name of the staged runtime inside [`RUNTIME_STAGE_DIR`].
 const STAGED_RUNTIME_FILE: &str = "spiced";
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ServiceAccount {
+    uid: u32,
+    gid: u32,
+}
+
+/// Resolve the non-root account the installed service should run as.
+///
+/// `sudo` records the invoking uid/gid. For a direct root session, the owner of
+/// the instance directory is the only safe local signal. A root-owned instance
+/// with no sudo caller is ambiguous and is rejected instead of installing a
+/// privileged service over user-controlled configuration.
+#[cfg(unix)]
+fn service_account(instance_dir: &Path) -> Result<ServiceAccount> {
+    let caller_ids = (std::env::var_os("SUDO_UID"), std::env::var_os("SUDO_GID"));
+    if caller_ids.0.is_some() || caller_ids.1.is_some() {
+        let uid = caller_ids
+            .0
+            .and_then(|value| value.to_str().and_then(|value| value.parse::<u32>().ok()));
+        let gid = caller_ids
+            .1
+            .and_then(|value| value.to_str().and_then(|value| value.parse::<u32>().ok()));
+        if let (Some(uid), Some(gid)) = (uid, gid)
+            && uid != 0
+            && gid != 0
+        {
+            return Ok(ServiceAccount { uid, gid });
+        }
+        return Err(Error::InvalidArgument {
+            message: "Failed to install the Spice Cloud Connect service: SUDO_UID and SUDO_GID must identify the non-root operator who will run spiced. Re-run from that account with `sudo spice connect --install`.".to_string(),
+        });
+    }
+
+    let metadata = std::fs::metadata(instance_dir).map_err(|e| Error::CloudConnectIo {
+        message: format!(
+            "inspect instance directory {} to choose the service account: {e}",
+            instance_dir.display()
+        ),
+    })?;
+    if metadata.uid() != 0 && metadata.gid() != 0 {
+        return Ok(ServiceAccount {
+            uid: metadata.uid(),
+            gid: metadata.gid(),
+        });
+    }
+
+    Err(Error::InvalidArgument {
+        message: format!(
+            "Failed to install the Spice Cloud Connect service: {} is root-owned and no non-root sudo caller is available. Run the command from the intended operator account with `sudo spice connect --install`.",
+            instance_dir.display()
+        ),
+    })
+}
+
+/// Give the service account access to the enrolled identity and managed state.
+/// Symlinks are rejected so a root install cannot be steered into changing the
+/// ownership of an unrelated target.
+#[cfg(unix)]
+fn provision_config_ownership(path: &Path, account: ServiceAccount) -> Result<()> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|e| Error::CloudConnectIo {
+        message: format!("inspect Spice config directory {}: {e}", path.display()),
+    })?;
+    if metadata.file_type().is_symlink() {
+        return Err(Error::InvalidArgument {
+            message: format!(
+                "Failed to install the Spice Cloud Connect service: config path {} is a symlink; use a real directory so ownership can be provisioned safely.",
+                path.display()
+            ),
+        });
+    }
+    if metadata.is_dir() {
+        for entry in std::fs::read_dir(path).map_err(|e| Error::CloudConnectIo {
+            message: format!("read Spice config directory {}: {e}", path.display()),
+        })? {
+            let entry = entry.map_err(|e| Error::CloudConnectIo {
+                message: format!(
+                    "read an entry in Spice config directory {}: {e}",
+                    path.display()
+                ),
+            })?;
+            provision_config_ownership(&entry.path(), account)?;
+        }
+    }
+    std::os::unix::fs::lchown(path, Some(account.uid), Some(account.gid)).map_err(|e| {
+        Error::CloudConnectIo {
+            message: format!(
+                "set ownership of Spice Cloud Connect state {} to {}:{}: {e}",
+                path.display(),
+                account.uid,
+                account.gid
+            ),
+        }
+    })
+}
 
 /// The `spiced` the installed service runs.
 fn staged_runtime_path() -> PathBuf {
@@ -240,7 +340,8 @@ pub(crate) fn preflight() -> std::result::Result<(), PreflightFailure> {
     backend::preflight()
 }
 
-/// Install (or reinstall) and start the service for `instance_dir`.
+/// Install (or reinstall) and start the service for `instance_dir`, preserving
+/// the resolved `config_dir` in the service environment.
 ///
 /// Idempotent, and the in-place upgrade path: re-running restages the current
 /// `spiced` binary, rewrites the service definition, and restarts the service,
@@ -254,8 +355,12 @@ pub(crate) fn preflight() -> std::result::Result<(), PreflightFailure> {
 /// Returns an error when the runtime cannot be staged, the definition cannot be
 /// written, or the supervisor rejects it. Since this runs *after* the enroll,
 /// the messages say that the identity is already staged and how to resume.
-pub(crate) fn install(instance_dir: &Path, spiced_path: &Path) -> Result<InstalledService> {
-    backend::install(instance_dir, spiced_path)
+pub(crate) fn install(
+    instance_dir: &Path,
+    config_dir: &Path,
+    spiced_path: &Path,
+) -> Result<InstalledService> {
+    backend::install(instance_dir, config_dir, spiced_path)
 }
 
 /// Stop and delete the service for `instance_dir`.
@@ -316,11 +421,10 @@ fn is_root() -> bool {
 
 /// Stage `source` as the root-owned `spiced` the installed service runs.
 ///
-/// The service runs as root, so the program it executes must not be a path an
-/// unprivileged user can write: the runtime is commonly installed under an
-/// operator's `~/.spice/bin`, and pointing a root service at it would let that
-/// user swap the binary and gain root. Copying into a root-owned directory
-/// (0755, and created by a root process so root-owned) severs that.
+/// The runtime is commonly installed under an operator's `~/.spice/bin`.
+/// Copying it into a root-owned directory (0755, and created by a root process)
+/// prevents later replacement behind the supervisor's back and gives every
+/// installed instance one stable executable.
 ///
 /// Copying every install also makes the documented upgrade path work: re-running
 /// `--install` restages whatever `spiced` the CLI now resolves. One host has one
@@ -342,7 +446,10 @@ fn is_root() -> bool {
 /// already executes, so a runtime that turns out to be unusable must never
 /// reach it: publishing first and checking afterwards would take out the
 /// instances that were working.
-fn stage_runtime(source: &Path, verify_staged: fn(&Path, &Path) -> Result<()>) -> Result<PathBuf> {
+fn stage_runtime<F>(source: &Path, verify_staged: F) -> Result<PathBuf>
+where
+    F: Fn(&Path, &Path) -> Result<()> + Copy,
+{
     let dest = staged_runtime_path();
     ensure_root_only_dir(Path::new(RUNTIME_STAGE_DIR))?;
     stage_runtime_at(source, &dest, verify_staged)?;
@@ -350,11 +457,10 @@ fn stage_runtime(source: &Path, verify_staged: fn(&Path, &Path) -> Result<()>) -
 }
 
 /// [`stage_runtime`] against an explicit destination.
-fn stage_runtime_at(
-    source: &Path,
-    dest: &Path,
-    verify_staged: fn(&Path, &Path) -> Result<()>,
-) -> Result<()> {
+fn stage_runtime_at<F>(source: &Path, dest: &Path, verify_staged: F) -> Result<()>
+where
+    F: Fn(&Path, &Path) -> Result<()> + Copy,
+{
     let stamp_path = dest.with_extension("stamp");
     let stamp = source_stamp(source);
 
@@ -395,11 +501,10 @@ fn stage_runtime_at(
 /// is the binary every installed service re-executes when it restarts:
 /// publishing first and checking afterwards would hand an unusable runtime to
 /// the instances that were working.
-fn publish_runtime(
-    source: &Path,
-    dest: &Path,
-    verify_staged: fn(&Path, &Path) -> Result<()>,
-) -> Result<()> {
+fn publish_runtime<F>(source: &Path, dest: &Path, verify_staged: F) -> Result<()>
+where
+    F: Fn(&Path, &Path) -> Result<()> + Copy,
+{
     let staging = dest.with_extension("incoming");
     let _ = std::fs::remove_file(&staging);
     if let Err(err) = copy_as_root_only_executable(source, &staging) {
@@ -423,10 +528,10 @@ fn publish_runtime(
 /// Create `dir` if absent and refuse to use it unless only root can change what
 /// it holds.
 ///
-/// Creating the directory is not enough on its own. The service executes and
-/// writes as root, so anyone who can write the directory — or rename any
-/// directory on the path to it — can substitute what root runs or where root
-/// writes. An existing `/usr/local/lib/spice` (or `/usr/local/lib`, or
+/// Creating the directory is not enough on its own. Root publishes the shared
+/// runtime here, so anyone who can write the directory — or rename any
+/// directory on the path to it — can substitute what every installed service
+/// runs. An existing `/usr/local/lib/spice` (or `/usr/local/lib`, or
 /// `/usr/local`) that is group- or world-writable, or a symlink into somewhere
 /// that is, hands that power to a local user, and `create_dir_all` on an
 /// existing directory changes nothing about it.
@@ -452,8 +557,8 @@ fn ensure_root_only_dir(dir: &Path) -> Result<()> {
         })?;
 
     // The leaf is checked without following symlinks: a symlinked directory
-    // points the root service somewhere this check cannot vouch for, even if
-    // the target itself looks fine today.
+    // points the root-managed runtime staging somewhere this check cannot
+    // vouch for, even if the target itself looks fine today.
     let leaf = std::fs::symlink_metadata(dir).map_err(|e| Error::CloudConnectIo {
         message: format!("inspect {}: {e}", dir.display()),
     })?;
@@ -461,7 +566,7 @@ fn ensure_root_only_dir(dir: &Path) -> Result<()> {
         return Err(Error::InvalidArgument {
             message: format!(
                 "Failed to install the Spice Cloud Connect service: {dir} is a symlink. \
-                 The service runs and writes as root, so it must use a real, root-owned \
+                 The runtime staging is managed by root, so it must use a real, root-owned \
                  directory. Replace the symlink with a directory owned by root \
                  (`chown root {dir}`, `chmod 755 {dir}`) and re-run \
                  `sudo spice connect --install`.",
@@ -602,7 +707,11 @@ mod unsupported {
         Err(PreflightFailure::UnsupportedPlatform)
     }
 
-    pub(super) fn install(_instance_dir: &Path, _spiced_path: &Path) -> Result<InstalledService> {
+    pub(super) fn install(
+        _instance_dir: &Path,
+        _config_dir: &Path,
+        _spiced_path: &Path,
+    ) -> Result<InstalledService> {
         Err(PreflightFailure::UnsupportedPlatform.into())
     }
 

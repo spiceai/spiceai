@@ -692,7 +692,7 @@ fn install_service(ctx: &RuntimeContext, config_dir: &Path) -> Result<()> {
         ),
     })?;
 
-    let installed = service::install(&instance_dir, &spiced_path)?;
+    let installed = service::install(&instance_dir, config_dir, &spiced_path)?;
 
     println!("Installed the Spice Cloud Connect service.");
     println!("  service:   {}", installed.name);

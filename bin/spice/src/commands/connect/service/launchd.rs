@@ -108,10 +108,18 @@ fn service_target(label: &str) -> String {
 /// Render the daemon definition for an instance.
 ///
 /// `instance_dir` is baked in as `WorkingDirectory` so the daemon resolves its
-/// spicepod and `<dir>/.spice` state from the directory the operator enrolled,
-/// not from wherever launchd happens to start it. `spiced_path` is the absolute
-/// binary path resolved at install time.
-pub(super) fn render_plist(label: &str, instance_dir: &Path, spiced_path: &Path) -> String {
+/// spicepod from the directory the operator enrolled, not from wherever
+/// launchd happens to start it. `config_dir` preserves the resolved Spice state
+/// directory and `spiced_path` is the absolute binary path resolved at install
+/// time.
+pub(super) fn render_plist(
+    label: &str,
+    instance_dir: &Path,
+    config_dir: &Path,
+    spiced_path: &Path,
+    user_name: &str,
+    group_name: &str,
+) -> String {
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -126,6 +134,15 @@ pub(super) fn render_plist(label: &str, instance_dir: &Path, spiced_path: &Path)
 	</array>
 	<key>WorkingDirectory</key>
 	<string>{instance_dir}</string>
+	<key>UserName</key>
+	<string>{user_name}</string>
+	<key>GroupName</key>
+	<string>{group_name}</string>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>SPICE_CONFIG_DIR</key>
+		<string>{config_dir}</string>
+	</dict>
 	<key>RunAtLoad</key>
 	<true/>
 	<!-- Every deployment applies by restart: the runtime validates and persists
@@ -147,7 +164,35 @@ pub(super) fn render_plist(label: &str, instance_dir: &Path, spiced_path: &Path)
         label = xml_escape(label),
         spiced = xml_escape(&spiced_path.display().to_string()),
         instance_dir = xml_escape(&instance_dir.display().to_string()),
+        config_dir = xml_escape(&config_dir.display().to_string()),
+        user_name = xml_escape(user_name),
+        group_name = xml_escape(group_name),
     )
+}
+
+/// launchd requires account names rather than the numeric ids systemd accepts.
+fn account_names(account: super::ServiceAccount) -> Result<(String, String)> {
+    let user = nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(account.uid))
+        .map_err(|e| Error::CloudConnectIo {
+            message: format!("look up service user {}: {e}", account.uid),
+        })?
+        .ok_or_else(|| Error::InvalidArgument {
+            message: format!(
+                "Failed to install the Spice Cloud Connect service: uid {} has no local account name for launchd.",
+                account.uid
+            ),
+        })?;
+    let group = nix::unistd::Group::from_gid(nix::unistd::Gid::from_raw(account.gid))
+        .map_err(|e| Error::CloudConnectIo {
+            message: format!("look up service group {}: {e}", account.gid),
+        })?
+        .ok_or_else(|| Error::InvalidArgument {
+            message: format!(
+                "Failed to install the Spice Cloud Connect service: gid {} has no local group name for launchd.",
+                account.gid
+            ),
+        })?;
+    Ok((user.name, group.name))
 }
 
 pub(super) fn preflight() -> std::result::Result<(), PreflightFailure> {
@@ -157,12 +202,32 @@ pub(super) fn preflight() -> std::result::Result<(), PreflightFailure> {
     Ok(())
 }
 
-pub(super) fn install(instance_dir: &Path, spiced_path: &Path) -> Result<InstalledService> {
-    let staged_runtime = super::stage_runtime(spiced_path, verify_staged_runtime_executes)?;
+pub(super) fn install(
+    instance_dir: &Path,
+    config_dir: &Path,
+    spiced_path: &Path,
+) -> Result<InstalledService> {
+    let account = super::service_account(instance_dir)?;
+    let (user_name, group_name) = account_names(account)?;
+    super::provision_config_ownership(config_dir, account)?;
+
+    let staged_runtime = super::stage_runtime(spiced_path, |staged, source| {
+        verify_staged_runtime_executes(staged, source, account)
+    })?;
 
     let label = job_label_for_dir(instance_dir);
     let path = plist_path(&label);
-    write_daemon_plist(&path, &render_plist(&label, instance_dir, &staged_runtime))?;
+    write_daemon_plist(
+        &path,
+        &render_plist(
+            &label,
+            instance_dir,
+            config_dir,
+            &staged_runtime,
+            &user_name,
+            &group_name,
+        ),
+    )?;
 
     // Before loading, not after: launchd serves the definition a job was
     // bootstrapped with, so loading over a job that is still there would leave
@@ -526,15 +591,32 @@ fn write_daemon_plist(path: &Path, plist: &str) -> Result<()> {
 ///
 /// launchd bootstraps a job whose program cannot be executed and then reports
 /// nothing: the job exists, never runs, and the instance is silently offline.
-/// Running the copy once turns every cause of that — a quarantine attribute, a
-/// code signature the kernel rejects, the wrong architecture — into an error
-/// before the job is created.
+/// Running the copy once as the same unprivileged account launchd will use
+/// turns every cause of that — a quarantine attribute, a code signature the
+/// kernel rejects, the wrong architecture — into an error before the job is
+/// created, without executing operator-supplied code as root.
 ///
 /// The copy has to be the subject rather than `source`, because copying is what
 /// drops `com.apple.quarantine`: checking the source would condemn a runtime
 /// that stages perfectly well.
-fn verify_staged_runtime_executes(staged: &Path, source: &Path) -> Result<()> {
-    let failure = match std::process::Command::new(staged).arg("--version").output() {
+fn verify_staged_runtime_executes(
+    staged: &Path,
+    source: &Path,
+    account: super::ServiceAccount,
+) -> Result<()> {
+    use std::os::unix::process::CommandExt as _;
+
+    let mut command = std::process::Command::new(staged);
+    command
+        .arg("--version")
+        .uid(account.uid)
+        .gid(account.gid)
+        // The candidate is operator-supplied. Give it no installer secrets or
+        // dynamic-loader overrides while probing it.
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .current_dir("/");
+    let failure = match command.output() {
         Ok(output) if output.status.success() => return Ok(()),
         Ok(output) => {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -759,9 +841,20 @@ fn xml_unescape(value: &str) -> String {
 mod tests {
     use super::*;
 
+    const TEST_USER: &str = "spice-operator";
+    const TEST_GROUP: &str = "spice-users";
+
     fn rendered(dir: &str) -> (String, String) {
         let label = job_label_for_dir(Path::new(dir));
-        let plist = render_plist(&label, Path::new(dir), &super::super::staged_runtime_path());
+        let config_dir = Path::new(dir).join(".spice");
+        let plist = render_plist(
+            &label,
+            Path::new(dir),
+            &config_dir,
+            &super::super::staged_runtime_path(),
+            TEST_USER,
+            TEST_GROUP,
+        );
         (label, plist)
     }
 
@@ -841,10 +934,33 @@ mod tests {
     }
 
     #[test]
+    fn rendered_plist_preserves_the_resolved_config_directory() {
+        let label = job_label_for_dir(Path::new("/opt/edge-1"));
+        let plist = render_plist(
+            &label,
+            Path::new("/opt/edge-1"),
+            Path::new("/var/lib/spice/custom-config"),
+            Path::new("/usr/bin/spiced"),
+            TEST_USER,
+            TEST_GROUP,
+        );
+        assert!(plist.contains(
+            "<key>SPICE_CONFIG_DIR</key>\n\t\t<string>/var/lib/spice/custom-config</string>"
+        ));
+    }
+
+    #[test]
+    fn rendered_plist_runs_as_the_non_root_operator() {
+        let (_, plist) = rendered("/opt/edge-1");
+        assert!(plist.contains("<key>UserName</key>\n\t<string>spice-operator</string>"));
+        assert!(plist.contains("<key>GroupName</key>\n\t<string>spice-users</string>"));
+    }
+
+    #[test]
     fn rendered_plist_runs_the_staged_runtime_with_cloud_connect() {
         let (_, plist) = rendered("/opt/edge-1");
-        // The daemon runs as root, so the program must be the staged root-owned
-        // copy, never the operator's own `~/.spice/bin/spiced`.
+        // The daemon is unprivileged, but the program remains the staged
+        // root-owned copy, never the operator's replaceable runtime.
         assert_eq!(
             parse_program(&plist),
             Some(super::super::staged_runtime_path())
@@ -858,7 +974,10 @@ mod tests {
         let plist = render_plist(
             "ai.spice.cloud-connect.x",
             dir,
+            &dir.join(".spice"),
             Path::new("/usr/bin/spiced"),
+            TEST_USER,
+            TEST_GROUP,
         );
         assert!(
             plist.contains("<string>/opt/a&amp;b&lt;c&gt;</string>"),

@@ -59,19 +59,9 @@ const POP_DOMAIN: &str = "spice-cloud-connect/release/v1";
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
-        "Failed to build the mTLS client for the Spice Cloud release request: {source}"
+        "Failed to build the HTTPS client for the Spice Cloud release request: {source}"
     ))]
     ClientBuild { source: reqwest::Error },
-
-    #[snafu(display(
-        "Failed to release instance {instance_id} (Spice Cloud): the local identity file is \
-         invalid ({source}). Delete this instance in the Spice Cloud portal to finish removing \
-         it. See: https://spiceai.org/docs"
-    ))]
-    Identity {
-        instance_id: String,
-        source: reqwest::Error,
-    },
 
     #[snafu(display("Invalid CA certificate PEM for the Spice Cloud release request: {source}"))]
     CaCert { source: reqwest::Error },
@@ -190,32 +180,14 @@ pub async fn release(
         pop_sig: &pop_sig,
     };
 
-    // The leaf is also presented as the TLS client identity, for a control
-    // plane that fronts this surface with mTLS. reqwest wants the certificate
-    // and its key in one PEM buffer, so concatenate rather than re-encoding
-    // either. This is transport, not authorization — the release is authorized
-    // by the proof-of-possession above.
-    let mut client_pem = String::with_capacity(
-        identity.identity_cert_pem.len() + identity.private_key_pem.len() + 2,
-    );
-    client_pem.push_str(identity.identity_cert_pem.trim_end());
-    client_pem.push('\n');
-    client_pem.push_str(identity.private_key_pem.trim_end());
-    client_pem.push('\n');
-    let client_identity =
-        reqwest::Identity::from_pem(client_pem.as_bytes()).context(IdentitySnafu {
-            instance_id: identity.identifier.clone(),
-        })?;
-
-    // `reqwest::Identity::from_pem` builds a rustls identity, and the workspace
-    // compiles both TLS backends in, so the backend has to be pinned to match:
-    // a builder left on the default resolves to native-tls and rejects the
-    // identity outright. Every other `.identity()` call site pins it the same way.
+    // Do not present the leaf as a TLS client identity. Release is deliberately
+    // authorized by the body proof above because the leaf may be expired; an
+    // mTLS handshake would reject it before the endpoint could verify that
+    // proof and decommission the instance.
     let mut builder = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .connect_timeout(Duration::from_secs(10))
-        .use_rustls_tls()
-        .identity(client_identity);
+        .use_rustls_tls();
     if let Some(ca_pem) = ca_cert_pem {
         for cert in reqwest::Certificate::from_pem_bundle(ca_pem.as_bytes()).context(CaCertSnafu)? {
             builder = builder.add_root_certificate(cert);
@@ -300,37 +272,6 @@ mod tests {
     }
 
     #[test]
-    fn identity_pem_concatenation_keeps_both_blocks_intact() {
-        // The client PEM must contain the leaf and the key as two complete,
-        // separately-delimited blocks: a missing newline between them would
-        // make the buffer unparseable and the release unauthenticatable.
-        let identity = Identity {
-            identifier: "inst_1".to_string(),
-            identity_cert_pem: "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----"
-                .to_string(),
-            private_key_pem: "-----BEGIN PRIVATE KEY-----\nBBBB\n-----END PRIVATE KEY-----\n\n"
-                .to_string(),
-            public_key_pem: String::new(),
-            ca_bundle_pem: String::new(),
-            gateway_addr: String::new(),
-            not_after_unix: None,
-            app_id: None,
-            enc_private_key_pem: String::new(),
-            enc_public_key_pem: String::new(),
-            enc_previous_private_key_pem: String::new(),
-            cache_key_b64: String::new(),
-        };
-        let mut pem = String::new();
-        pem.push_str(identity.identity_cert_pem.trim_end());
-        pem.push('\n');
-        pem.push_str(identity.private_key_pem.trim_end());
-        pem.push('\n');
-
-        assert!(pem.contains("-----END CERTIFICATE-----\n-----BEGIN PRIVATE KEY-----"));
-        assert!(pem.ends_with("-----END PRIVATE KEY-----\n"));
-    }
-
-    #[test]
     fn bounded_truncates_on_char_boundaries() {
         assert_eq!(bounded("short", 256), "short");
         // A multi-byte char straddling the limit must not be split.
@@ -340,8 +281,7 @@ mod tests {
 
     /// A self-signed leaf plus its key, in the PEM shape an enrolled identity
     /// holds them. The keypair is rcgen's default (ECDSA P-256, `aws_lc_rs`),
-    /// which is what `IdentityStore::generate_enrollment` produces, so the
-    /// identity here is presented over TLS exactly as a real one is.
+    /// which is what `IdentityStore::generate_enrollment` produces.
     fn self_signed_identity() -> Identity {
         let key = rcgen::KeyPair::generate().expect("generate leaf keypair");
         let params = rcgen::CertificateParams::new(vec!["localhost".to_string()])
@@ -364,20 +304,18 @@ mod tests {
         }
     }
 
-    // A scheme-less endpoint. `release` builds the client before it hands the
-    // URL to reqwest, so the send fails on the URL itself and never opens a
-    // socket: the client build stays the only thing under test, and no listener
-    // that happens to be up on this host can answer in its place.
+    // A scheme-less endpoint. The send fails on the URL itself and never opens
+    // a socket, so no listener that happens to be up can answer in its place.
     const UNSENDABLE_ENDPOINT: &str = "not-a-url";
 
     #[tokio::test]
-    async fn release_builds_its_mtls_client_from_a_real_identity() {
-        // `reqwest::Identity::from_pem` yields a rustls identity, and the
-        // workspace compiles native-tls in alongside rustls, so a client
-        // builder that does not pin rustls rejects the identity and the
-        // release fails before it ever reaches the URL. Getting as far as the
-        // send is what proves the backend and the identity agree.
-        let identity = self_signed_identity();
+    async fn release_does_not_use_the_leaf_as_a_tls_client_identity() {
+        // A release must reach the endpoint even when the stored leaf is
+        // expired. Making it deliberately unparseable proves the transport
+        // treats it as the opaque body credential it is: constructing a TLS
+        // client identity from it would fail before reqwest reached the URL.
+        let mut identity = self_signed_identity();
+        identity.identity_cert_pem = "expired leaf forwarded in the request body".to_string();
 
         let Err(err) = release(UNSENDABLE_ENDPOINT, &identity, None).await else {
             panic!("release against an unsendable endpoint must not succeed");
@@ -390,9 +328,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn release_builds_its_mtls_client_with_extra_trust_roots() {
-        // The self-hosted path adds root certificates to the same builder, so
-        // it has to agree with the identity's backend too.
+    async fn release_builds_its_https_client_with_extra_trust_roots() {
+        // The self-hosted path adds root certificates to the HTTPS builder.
         let ca_key = rcgen::KeyPair::generate().expect("generate CA keypair");
         let mut ca_params =
             rcgen::CertificateParams::new(Vec::<String>::new()).expect("CA certificate params");
@@ -416,9 +353,8 @@ mod tests {
 
     #[tokio::test]
     async fn release_reports_a_truncated_private_key_as_a_proof_error() {
-        // Signing happens before the mTLS client is built so an unusable key is
-        // reported as a proof-of-possession failure naming the instance, not as
-        // a generic TLS identity error.
+        // Signing happens before the HTTP request so an unusable key is
+        // reported as a proof-of-possession failure naming the instance.
         let mut identity = self_signed_identity();
         identity.private_key_pem = String::new();
 

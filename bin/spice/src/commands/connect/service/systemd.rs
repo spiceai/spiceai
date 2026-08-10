@@ -18,7 +18,7 @@ limitations under the License.
 
 use std::path::{Path, PathBuf};
 
-use super::{InstalledService, PreflightFailure, SYSTEMD_RUNTIME_MARKER};
+use super::{InstalledService, PreflightFailure, SYSTEMD_RUNTIME_MARKER, ServiceAccount};
 use crate::error::{Error, Result};
 
 /// Directory systemd reads administrator-provided unit files from.
@@ -42,21 +42,33 @@ pub(super) fn unit_name_for_dir(dir: &Path) -> String {
 /// Render the unit file for an instance.
 ///
 /// `instance_dir` is baked in as `WorkingDirectory` so the service resolves its
-/// spicepod and `<dir>/.spice` state from the directory the operator enrolled,
-/// not from wherever systemd happens to start it. `spiced_path` is the absolute
-/// binary path resolved at install time.
-pub(super) fn render_unit(instance_dir: &Path, spiced_path: &Path) -> String {
-    format!(
+/// spicepod from the directory the operator enrolled, not from wherever
+/// systemd happens to start it. `config_dir` preserves the resolved Spice state
+/// directory and `spiced_path` is the absolute binary path resolved at install
+/// time.
+fn render_unit(
+    instance_dir: &Path,
+    config_dir: &Path,
+    spiced_path: &Path,
+    account: ServiceAccount,
+) -> Result<String> {
+    let instance_dir = escape_systemd_path(instance_dir)?;
+    let config_dir = escape_systemd_path(config_dir)?;
+    let spiced = escape_systemd_path(spiced_path)?;
+    Ok(format!(
         "[Unit]\n\
-         Description=Spice runtime connected to Spice Cloud ({instance_dir})\n\
+         Description=Spice runtime connected to Spice Cloud\n\
          Documentation=https://spiceai.org/docs\n\
          After=network-online.target\n\
          Wants=network-online.target\n\
          \n\
          [Service]\n\
          Type=simple\n\
-         WorkingDirectory={instance_dir}\n\
-         ExecStart={spiced} --cloud-connect\n\
+         User={uid}\n\
+         Group={gid}\n\
+         WorkingDirectory=\"{instance_dir}\"\n\
+         Environment=\"SPICE_CONFIG_DIR={config_dir}\"\n\
+         ExecStart=\"{spiced}\" --cloud-connect\n\
          # Every deployment applies by restart: the runtime validates and\n\
          # persists the new spicepod, exits 0, and this relaunches it on the\n\
          # new configuration. Without Restart=always a deployment would stop\n\
@@ -71,9 +83,42 @@ pub(super) fn render_unit(instance_dir: &Path, spiced_path: &Path) -> String {
          \n\
          [Install]\n\
          WantedBy=multi-user.target\n",
-        instance_dir = instance_dir.display(),
-        spiced = spiced_path.display(),
-    )
+        uid = account.uid,
+        gid = account.gid,
+    ))
+}
+
+/// Escape a path for a double-quoted systemd directive value.
+///
+/// `%` still expands specifiers inside quotes, so it is doubled. Newlines and
+/// other control characters are rejected rather than allowed to become new
+/// directives, and non-UTF-8 paths are rejected because unit files are UTF-8.
+fn escape_systemd_path(path: &Path) -> Result<String> {
+    let value = path.to_str().ok_or_else(|| Error::InvalidArgument {
+        message: format!(
+            "Failed to install the Spice Cloud Connect service: path {} is not valid UTF-8 and cannot be represented safely in a systemd unit.",
+            path.display()
+        ),
+    })?;
+    if value.chars().any(char::is_control) {
+        return Err(Error::InvalidArgument {
+            message: format!(
+                "Failed to install the Spice Cloud Connect service: path {} contains a control character and cannot be represented safely in a systemd unit.",
+                path.display()
+            ),
+        });
+    }
+
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '\\' => escaped.push_str("\\\\"),
+            '"' => escaped.push_str("\\\""),
+            '%' => escaped.push_str("%%"),
+            _ => escaped.push(ch),
+        }
+    }
+    Ok(escaped)
 }
 
 pub(super) fn preflight() -> std::result::Result<(), PreflightFailure> {
@@ -86,21 +131,28 @@ pub(super) fn preflight() -> std::result::Result<(), PreflightFailure> {
     Ok(())
 }
 
-pub(super) fn install(instance_dir: &Path, spiced_path: &Path) -> Result<InstalledService> {
+pub(super) fn install(
+    instance_dir: &Path,
+    config_dir: &Path,
+    spiced_path: &Path,
+) -> Result<InstalledService> {
+    let account = super::service_account(instance_dir)?;
+    super::provision_config_ownership(config_dir, account)?;
+
     // systemd reports a unit whose `ExecStart` will not run, so the staged copy
     // needs no separate check.
     let staged_runtime = super::stage_runtime(spiced_path, |_, _| Ok(()))?;
 
     let name = unit_name_for_dir(instance_dir);
     let path = PathBuf::from(SYSTEMD_UNIT_DIR).join(&name);
-    let unit = render_unit(instance_dir, &staged_runtime);
+    let unit = render_unit(instance_dir, config_dir, &staged_runtime, account)?;
 
     std::fs::write(&path, unit).map_err(|e| Error::CloudConnectIo {
         message: format!(
-            "write systemd unit {}: {e}. The identity is staged at {}/.spice — fix the problem \
+            "write systemd unit {}: {e}. The identity is staged at {} — fix the problem \
              and re-run `sudo spice connect --install` to finish.",
             path.display(),
-            instance_dir.display()
+            config_dir.display()
         ),
     })?;
 
@@ -209,7 +261,7 @@ pub(super) fn discover_all() -> Vec<InstalledService> {
 
 /// Parse the `WorkingDirectory=` value out of a rendered unit.
 fn parse_working_dir(unit: &str) -> Option<PathBuf> {
-    unit_directive(unit, "WorkingDirectory=").map(PathBuf::from)
+    parse_systemd_word(unit_directive(unit, "WorkingDirectory=")?).map(PathBuf::from)
 }
 
 /// Parse the binary `ExecStart=` runs out of a rendered unit, dropping its
@@ -220,7 +272,52 @@ fn parse_exec_runtime(unit: &str) -> Option<PathBuf> {
     // systemd allows `-`/`@`/`+` prefixes on the executable; strip them so the
     // reported path is the binary itself.
     let exec = exec.trim_start_matches(['-', '@', '+', '!', ':']);
-    exec.split_whitespace().next().map(PathBuf::from)
+    parse_systemd_word(exec).map(PathBuf::from)
+}
+
+/// Parse the first systemd word emitted by [`escape_systemd_path`], while also
+/// accepting the unquoted values written by older Spice releases.
+fn parse_systemd_word(value: &str) -> Option<String> {
+    let value = value.trim_start();
+    let word = if let Some(rest) = value.strip_prefix('"') {
+        let mut word = String::new();
+        let mut escaped = false;
+        let mut closed = false;
+        for ch in rest.chars() {
+            if escaped {
+                word.push(ch);
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                closed = true;
+                break;
+            } else {
+                word.push(ch);
+            }
+        }
+        if escaped || !closed {
+            return None;
+        }
+        word
+    } else {
+        value.split_whitespace().next()?.to_string()
+    };
+    if word.is_empty() {
+        return None;
+    }
+
+    // `%%` is how the renderer writes a literal percent sign. Preserve a lone
+    // `%` from a hand-written/legacy unit rather than guessing at a specifier.
+    let mut decoded = String::with_capacity(word.len());
+    let mut chars = word.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '%' && chars.peek() == Some(&'%') {
+            let _ = chars.next();
+        }
+        decoded.push(ch);
+    }
+    Some(decoded)
 }
 
 /// The value of a `Key=` directive in a rendered unit, trimmed and non-empty.
@@ -286,6 +383,21 @@ fn systemctl(args: &[&str]) -> Result<()> {
 mod tests {
     use super::*;
 
+    const TEST_ACCOUNT: ServiceAccount = ServiceAccount {
+        uid: 1000,
+        gid: 1001,
+    };
+
+    fn rendered(instance_dir: &str, config_dir: &str, spiced_path: &str) -> String {
+        render_unit(
+            Path::new(instance_dir),
+            Path::new(config_dir),
+            Path::new(spiced_path),
+            TEST_ACCOUNT,
+        )
+        .expect("test paths are safe systemd values")
+    }
+
     #[test]
     fn unit_name_is_legible_and_prefixed() {
         let name = unit_name_for_dir(Path::new("/opt/edge-1"));
@@ -309,11 +421,12 @@ mod tests {
 
     #[test]
     fn rendered_unit_bakes_the_absolute_working_directory() {
-        let unit = render_unit(
-            Path::new("/opt/edge-1"),
-            Path::new("/root/.spice/bin/spiced"),
+        let unit = rendered(
+            "/opt/edge-1",
+            "/opt/edge-1/.spice",
+            "/root/.spice/bin/spiced",
         );
-        assert!(unit.contains("WorkingDirectory=/opt/edge-1\n"));
+        assert!(unit.contains("WorkingDirectory=\"/opt/edge-1\"\n"));
         assert_eq!(
             parse_working_dir(&unit),
             Some(PathBuf::from("/opt/edge-1")),
@@ -323,18 +436,19 @@ mod tests {
 
     #[test]
     fn rendered_unit_runs_spiced_with_cloud_connect() {
-        let unit = render_unit(
-            Path::new("/opt/edge-1"),
-            Path::new("/root/.spice/bin/spiced"),
+        let unit = rendered(
+            "/opt/edge-1",
+            "/opt/edge-1/.spice",
+            "/root/.spice/bin/spiced",
         );
-        assert!(unit.contains("ExecStart=/root/.spice/bin/spiced --cloud-connect\n"));
+        assert!(unit.contains("ExecStart=\"/root/.spice/bin/spiced\" --cloud-connect\n"));
     }
 
     #[test]
     fn rendered_unit_always_restarts() {
         // `Restart=always` is the contract every deployment depends on: the
         // runtime exits 0 to apply an update and systemd relaunches it.
-        let unit = render_unit(Path::new("/opt/edge-1"), Path::new("/usr/bin/spiced"));
+        let unit = rendered("/opt/edge-1", "/opt/edge-1/.spice", "/usr/bin/spiced");
         assert!(unit.contains("\nRestart=always\n"));
         // A rate limit would let a crash loop give up permanently.
         assert!(unit.contains("StartLimitIntervalSec=0"));
@@ -343,12 +457,60 @@ mod tests {
 
     #[test]
     fn rendered_unit_runs_the_root_owned_staged_runtime() {
-        // The unit runs as root, so ExecStart must be the staged root-owned copy
-        // — never the operator's `~/.spice/bin/spiced`, which they could later
-        // replace to gain root.
+        // ExecStart stays the staged root-owned copy — never the operator's
+        // replaceable `~/.spice/bin/spiced`.
         let staged = super::super::staged_runtime_path();
-        let unit = render_unit(Path::new("/opt/edge-1"), &staged);
+        let unit = render_unit(
+            Path::new("/opt/edge-1"),
+            Path::new("/opt/edge-1/.spice"),
+            &staged,
+            TEST_ACCOUNT,
+        )
+        .expect("render unit");
         assert_eq!(parse_exec_runtime(&unit), Some(staged));
+    }
+
+    #[test]
+    fn rendered_unit_runs_as_the_non_root_operator() {
+        let unit = rendered("/opt/edge-1", "/opt/edge-1/.spice", "/usr/bin/spiced");
+        assert!(unit.contains("User=1000\n"));
+        assert!(unit.contains("Group=1001\n"));
+    }
+
+    #[test]
+    fn rendered_unit_preserves_a_custom_config_directory() {
+        let unit = rendered(
+            "/opt/edge-1",
+            "/var/lib/spice/custom config",
+            "/usr/bin/spiced",
+        );
+        assert!(unit.contains("Environment=\"SPICE_CONFIG_DIR=/var/lib/spice/custom config\"\n"));
+    }
+
+    #[test]
+    fn rendered_unit_escapes_specifiers_quotes_and_spaces() {
+        let dir = Path::new("/opt/edge %i/quoted\"dir");
+        let unit = render_unit(
+            dir,
+            &dir.join(".spice"),
+            Path::new("/usr/local/lib/spice/spiced"),
+            TEST_ACCOUNT,
+        )
+        .expect("hostile but valid path is escaped");
+        assert!(unit.contains("WorkingDirectory=\"/opt/edge %%i/quoted\\\"dir\""));
+        assert_eq!(parse_working_dir(&unit), Some(dir.to_path_buf()));
+    }
+
+    #[test]
+    fn rendered_unit_rejects_a_directive_injection_path() {
+        let err = render_unit(
+            Path::new("/opt/edge\nExecStart=/bin/sh"),
+            Path::new("/opt/edge/.spice"),
+            Path::new("/usr/bin/spiced"),
+            TEST_ACCOUNT,
+        )
+        .expect_err("newlines must not enter unit syntax");
+        assert!(matches!(err, Error::InvalidArgument { .. }));
     }
 
     #[test]

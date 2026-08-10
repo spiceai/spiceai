@@ -63,6 +63,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use app::{App, AppBuilder};
+use arrow::array::RecordBatch;
 use arrow::error::ArrowError;
 use arrow::ipc::writer::StreamWriter;
 use async_trait::async_trait;
@@ -153,6 +154,7 @@ fn build_config(runtime_version: &str) -> CloudConnectConfig {
 /// A deployment applies by persisting this file and restarting, so on every
 /// start it — not the instance directory's `spicepod.yaml` — is the
 /// configuration a cloud-managed instance serves.
+#[derive(Debug)]
 pub struct CloudManagedSpicepod {
     pub path: PathBuf,
     /// The persisted YAML, kept so an `ApplySpicepod` can tell a redelivery of
@@ -160,26 +162,39 @@ pub struct CloudManagedSpicepod {
     pub spicepod_yaml: String,
 }
 
+#[derive(Debug)]
+pub struct CloudManagedSpicepodReadError {
+    pub path: PathBuf,
+    pub source: std::io::Error,
+}
+
 /// The cloud-managed spicepod this instance starts on, or `None` when Cloud
 /// Connect is not configured or no deployment has ever landed here.
 ///
 /// Reads files only — no control-plane round trip — so an instance whose
 /// gateway is unreachable still comes up on its deployed configuration.
-pub async fn cloud_managed_spicepod(cloud_connect_flag: bool) -> Option<CloudManagedSpicepod> {
+pub async fn cloud_managed_spicepod(
+    cloud_connect_flag: bool,
+) -> std::result::Result<Option<CloudManagedSpicepod>, CloudManagedSpicepodReadError> {
     if !is_configured(cloud_connect_flag) {
-        return None;
+        return Ok(None);
     }
     let config_dir = CloudConnectConfig::default_config_dir();
     let path = config_dir.join(CLOUD_MANAGED_SPICEPOD_FILE);
-    // An unreadable file is the same as an absent one here: the caller falls
-    // back to the local spicepod, which leaves the instance reachable for the
-    // deployment that fixes it. `is_configured` ran before this, so a missing
-    // file is the ordinary not-yet-deployed case.
-    let spicepod_yaml = tokio::fs::read_to_string(&path).await.ok()?;
-    Some(CloudManagedSpicepod {
-        path,
-        spicepod_yaml,
-    })
+    read_cloud_managed_spicepod(path).await
+}
+
+async fn read_cloud_managed_spicepod(
+    path: PathBuf,
+) -> std::result::Result<Option<CloudManagedSpicepod>, CloudManagedSpicepodReadError> {
+    match tokio::fs::read_to_string(&path).await {
+        Ok(spicepod_yaml) => Ok(Some(CloudManagedSpicepod {
+            path,
+            spicepod_yaml,
+        })),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(CloudManagedSpicepodReadError { path, source }),
+    }
 }
 
 /// The delivered-secrets store and its cache key, restored from local state.
@@ -1046,8 +1061,12 @@ impl RuntimeHandle for SpicedRuntimeHandle {
             );
             return Ok(None);
         };
-        reader
-            .collect_otlp_export(&app_id)
+        let reader = reader.clone();
+        tokio::task::spawn_blocking(move || reader.collect_otlp_export(&app_id))
+            .await
+            .map_err(|err| {
+                CommandError::internal(format!("The metrics encoder stopped unexpectedly: {err}"))
+            })?
             .map_err(|err| CommandError::internal(err.to_string()))
     }
 
@@ -1173,14 +1192,14 @@ impl std::io::Write for BoundedBuffer {
     }
 }
 
-/// Encode at most `max_rows` rows of `stream` as one complete Arrow IPC stream
+/// Encode a result of at most `max_rows` rows as one complete Arrow IPC stream
 /// of at most [`MAX_QUERY_RESULT_BYTES`] bytes.
 ///
-/// Truncation is by slicing, which shares the batch's buffers rather than
-/// copying, and the stream is dropped as soon as the row cap is reached so the
-/// rows past it are never fetched. An empty result still produces a valid
-/// stream carrying the schema, so the caller can tell "no rows" from "no
-/// answer".
+/// One row beyond the cap is read so an exact-cap result can be distinguished
+/// from a truncated one. Encoding runs on Tokio's blocking pool and receives
+/// batches over a one-slot channel, retaining the streaming bound without
+/// doing synchronous Arrow serialization on a runtime worker. An empty result
+/// still produces a valid stream carrying the schema.
 async fn bounded_arrow_ipc(
     mut stream: SendableRecordBatchStream,
     max_rows: u32,
@@ -1188,51 +1207,80 @@ async fn bounded_arrow_ipc(
     let schema = stream.schema();
     let limit = max_rows as usize;
     let overflowed = Arc::new(AtomicBool::new(false));
-    let sink = BoundedBuffer {
-        bytes: Vec::new(),
-        limit: MAX_QUERY_RESULT_BYTES,
-        overflowed: Arc::clone(&overflowed),
-    };
-
-    let mut writer = StreamWriter::try_new(sink, &schema)
-        .map_err(|source| encode_error(&overflowed, &source))?;
-
-    let mut rows: usize = 0;
-    while rows < limit {
-        let Some(batch) = stream.next().await else {
-            break;
+    let encoder_overflowed = Arc::clone(&overflowed);
+    let (sender, mut receiver) = tokio::sync::mpsc::channel::<RecordBatch>(1);
+    let encoder = tokio::task::spawn_blocking(move || {
+        let sink = BoundedBuffer {
+            bytes: Vec::new(),
+            limit: MAX_QUERY_RESULT_BYTES,
+            overflowed: Arc::clone(&encoder_overflowed),
         };
-        // A failure that surfaces here rather than at planning is usually the
-        // instance's — a federated source going away mid-scan — so it takes the
-        // same classification as one from `run()` rather than being blamed on
-        // the statement.
-        let batch = batch.map_err(|source| datafusion_error(&source))?;
-        if batch.num_rows() == 0 {
-            continue;
+        let mut writer = StreamWriter::try_new(sink, &schema)
+            .map_err(|source| encode_error(&encoder_overflowed, &source))?;
+        let mut rows = 0_u64;
+        while let Some(batch) = receiver.blocking_recv() {
+            rows = rows.saturating_add(batch.num_rows() as u64);
+            writer
+                .write(&batch)
+                .map_err(|source| encode_error(&encoder_overflowed, &source))?;
         }
-        let take = (limit - rows).min(batch.num_rows());
-        let batch = if take == batch.num_rows() {
-            batch
-        } else {
-            batch.slice(0, take)
-        };
-        rows += take;
         writer
-            .write(&batch)
-            .map_err(|source| encode_error(&overflowed, &source))?;
+            .finish()
+            .map_err(|source| encode_error(&encoder_overflowed, &source))?;
+        let sink = writer
+            .into_inner()
+            .map_err(|source| encode_error(&encoder_overflowed, &source))?;
+        Ok(QueryOutcome {
+            arrow_ipc: sink.bytes,
+            row_count: rows,
+        })
+    });
+
+    let stream_result = async {
+        let mut rows = 0_usize;
+        let mut exceeded = false;
+        while let Some(batch) = stream.next().await {
+            // A failure that surfaces here rather than at planning is usually
+            // the instance's — a federated source going away mid-scan.
+            let batch = batch.map_err(|source| datafusion_error(&source))?;
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            let remaining = limit.saturating_sub(rows);
+            if batch.num_rows() > remaining {
+                exceeded = true;
+                break;
+            }
+            rows += batch.num_rows();
+            if sender.send(batch).await.is_err() {
+                // The encoder has already produced the more specific error;
+                // stop pulling the query stream and surface it below.
+                break;
+            }
+        }
+        Ok::<bool, CommandError>(exceeded)
     }
+    .await;
+    drop(sender);
 
-    writer
-        .finish()
-        .map_err(|source| encode_error(&overflowed, &source))?;
-    let sink = writer
-        .into_inner()
-        .map_err(|source| encode_error(&overflowed, &source))?;
+    // Always join the blocking task, including after a stream failure, so an
+    // encoder never outlives the command that owns it.
+    let outcome = encoder.await.map_err(|err| {
+        CommandError::internal(format!(
+            "The query result encoder stopped unexpectedly: {err}"
+        ))
+    })?;
+    let exceeded = stream_result?;
+    if exceeded {
+        return Err(row_limit_error(max_rows));
+    }
+    outcome
+}
 
-    Ok(QueryOutcome {
-        arrow_ipc: sink.bytes,
-        row_count: rows as u64,
-    })
+fn row_limit_error(max_rows: u32) -> CommandError {
+    CommandError::result_too_large(format!(
+        "The query result exceeds the {max_rows}-row Cloud Connect limit and was not sent. Add or reduce LIMIT, narrow the projection, or aggregate the result and run it again."
+    ))
 }
 
 /// Classify an encoder failure: the byte cap, or a genuine fault.
@@ -1345,7 +1393,7 @@ async fn replace_canonical_spicepod(incoming: &Path, path: &Path) -> Result<(), 
 mod tests {
     use super::*;
 
-    use arrow::array::{Int32Array, RecordBatch, StringArray};
+    use arrow::array::{Int32Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
     use arrow::ipc::reader::StreamReader;
     use datafusion::physical_plan::memory::MemoryStream;
@@ -1364,6 +1412,36 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("create scratch dir");
         dir
+    }
+
+    #[tokio::test]
+    async fn a_missing_managed_deployment_is_an_ordinary_absence() {
+        let dir = scratch_dir("managed-missing");
+        let path = dir.join(CLOUD_MANAGED_SPICEPOD_FILE);
+
+        let deployed = read_cloud_managed_spicepod(path)
+            .await
+            .expect("a missing deployment is not a read failure");
+        assert!(deployed.is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_managed_deployment_is_not_treated_as_missing() {
+        let dir = scratch_dir("managed-unreadable");
+        let path = dir.join(CLOUD_MANAGED_SPICEPOD_FILE);
+        tokio::fs::write(&path, [0xff])
+            .await
+            .expect("write invalid UTF-8 fixture");
+
+        let Err(err) = read_cloud_managed_spicepod(path.clone()).await else {
+            panic!("invalid UTF-8 must remain a read failure");
+        };
+        assert_eq!(err.path, path);
+        assert_eq!(err.source.kind(), std::io::ErrorKind::InvalidData);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
@@ -1571,34 +1649,40 @@ mod tests {
         assert_eq!(total_rows(&batches), 0);
     }
 
-    /// The row cap truncates, and it truncates *mid-batch* — a cap that only
-    /// worked on batch boundaries would return 600 rows for a 600-row batch.
+    /// A row over the cap fails instead of returning an apparently complete
+    /// result that was silently truncated inside a batch.
     #[tokio::test]
-    async fn the_row_cap_truncates_inside_a_batch() {
-        let outcome = bounded_arrow_ipc(
+    async fn the_row_cap_rejects_a_partial_batch() {
+        let err = bounded_arrow_ipc(
             stream_of(int_schema(), vec![int_batch(0, 600)]),
             MAX_QUERY_ROWS,
         )
         .await
-        .expect("a truncated result encodes");
-
-        assert_eq!(outcome.row_count, u64::from(MAX_QUERY_ROWS));
-        let (_, batches) = decode(&outcome.arrow_ipc);
-        assert_eq!(
-            total_rows(&batches),
-            MAX_QUERY_ROWS as usize,
-            "the encoded stream must carry no more rows than the cap"
+        .expect_err("a truncated result must be refused");
+        assert!(
+            matches!(err, CommandError::ResultTooLarge { .. }),
+            "an over-cap result must be typed result-too-large, got {err:?}"
         );
     }
 
-    /// The cap is a row count across the whole result, not per batch.
+    /// The cap is enforced across the whole result, not per batch.
     #[tokio::test]
-    async fn the_row_cap_spans_batches() {
+    async fn the_row_cap_rejects_rows_in_a_later_batch() {
         let batches: Vec<RecordBatch> = (0..10).map(|i| int_batch(i * 100, 100)).collect();
-        let outcome = bounded_arrow_ipc(stream_of(int_schema(), batches), 250)
+        let err = bounded_arrow_ipc(stream_of(int_schema(), batches), 250)
             .await
-            .expect("a truncated result encodes");
+            .expect_err("a truncated result must be refused");
+        assert!(matches!(err, CommandError::ResultTooLarge { .. }));
+    }
 
+    #[tokio::test]
+    async fn a_result_with_exactly_the_row_cap_succeeds() {
+        let outcome = bounded_arrow_ipc(
+            stream_of(int_schema(), vec![int_batch(0, 100), int_batch(100, 150)]),
+            250,
+        )
+        .await
+        .expect("an exact-cap result is complete");
         assert_eq!(outcome.row_count, 250);
         let (_, decoded) = decode(&outcome.arrow_ipc);
         assert_eq!(total_rows(&decoded), 250);

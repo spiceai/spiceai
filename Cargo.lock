@@ -3603,7 +3603,6 @@ dependencies = [
  "object_store 0.13.2",
  "parking_lot",
  "paste",
- "regex",
  "roaring",
  "rstest 0.26.1",
  "runtime-datafusion",
