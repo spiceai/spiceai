@@ -23,6 +23,7 @@ limitations under the License.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use app::spicepod::component::runtime::Scheduler as SchedulerConfig;
@@ -36,13 +37,19 @@ use uuid::Uuid;
 
 use crate::Runtime;
 use crate::cluster::cluster_state::{
-    self, ClusterStateStore, MutateError, MutationOutcome, SchedulerEntry,
+    self, ClusterStateStore, MutateError, MutateOk, MutationOutcome, SchedulerEntry,
 };
 use crate::cluster::heartbeat::{self, CLOCK_SKEW_TOLERANCE_MS, SchedulerHeartbeatStore};
 use crate::cluster::reaper::Reaper;
 use runtime_metrics::cluster as cluster_metrics;
 
 const DEFAULT_TTL_MS: u64 = 30_000;
+
+/// Deadline for the membership read that gates a heartbeat. Must stay well
+/// below the heartbeat interval (`ttl / HEARTBEAT_DIVISOR`) so a slow store
+/// cannot delay a beat far enough for peers to consider this scheduler dead.
+/// `membership_check_timeout_is_below_the_heartbeat_interval` pins that.
+const MEMBERSHIP_CHECK_TIMEOUT: Duration = Duration::from_secs(2);
 const DISCOVERY_INTERVAL: Duration = Duration::from_secs(5);
 const JOB_RECOVERY_INTERVAL: Duration = Duration::from_secs(10);
 const HEARTBEAT_DIVISOR: u64 = 3;
@@ -82,6 +89,10 @@ struct SchedulerRegistryRunner {
     entry: SchedulerEntry,
     peers: Arc<RwLock<SchedulerPeers>>,
     job_executor: Arc<crate::jobs::JobExecutor>,
+    /// Set once this incarnation has been *definitively* observed as
+    /// superseded. Sticky, so a later failed read cannot resume claiming the
+    /// heartbeat key.
+    superseded: Arc<AtomicBool>,
 }
 
 pub async fn start_scheduler_registry(
@@ -154,6 +165,7 @@ pub async fn start_scheduler_registry(
         entry,
         peers,
         job_executor,
+        superseded: Arc::new(AtomicBool::new(false)),
     };
 
     runner.run(cancel).await
@@ -340,6 +352,74 @@ impl SchedulerRegistryRunner {
     }
 
     async fn send_heartbeat(&self) -> Result<()> {
+        // `scheduler_id` is `{advertise_host}:{port}` and so is stable across
+        // restarts, while `instance_id` is per-process. Two incarnations can
+        // therefore share the heartbeat key, and registration deliberately
+        // lets a new one take over once the old looks stale. An incarnation
+        // that has been superseded must stop claiming the id: otherwise it
+        // keeps overwriting the key with its own `instance_id`, `list_alive`
+        // filters the *registered* incarnation out as an orphan, and peers
+        // re-drive jobs it is still running.
+
+        if self.superseded.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+
+        // Only a *successful* read is evidence of supersession. Heartbeats
+        // deliberately live outside `cluster.json` so the high-frequency write
+        // path does not depend on that document; making emission conditional
+        // on reading it would mean a slow or failing GET silently suppresses
+        // beats and self-evicts a healthy scheduler — producing exactly the
+        // false-dead job re-drive this change exists to prevent. So fail open
+        // on a read error and only decline on a definitive observation.
+        // Bound the read. Failing open covers an *erroring* store, but a hung
+        // or very slow GET would block this loop before the heartbeat write,
+        // and once that exceeds the TTL peers reap this healthy scheduler and
+        // re-drive its jobs — the exact failure the fail-open behaviour exists
+        // to prevent. A timeout is treated exactly like an error: heartbeat
+        // anyway.
+        let membership =
+            match tokio::time::timeout(MEMBERSHIP_CHECK_TIMEOUT, self.cluster.read()).await {
+                Ok(result) => result,
+                Err(_elapsed) => {
+                    tracing::warn!(
+                        scheduler_id = %self.scheduler_id,
+                        timeout_ms = MEMBERSHIP_CHECK_TIMEOUT.as_millis(),
+                        "Timed out confirming cluster membership; heartbeating anyway"
+                    );
+                    return self.write_heartbeat().await;
+                }
+            };
+        match membership {
+            Ok(state) => {
+                let registered = state
+                    .schedulers
+                    .get(&self.scheduler_id)
+                    .map(|entry| entry.instance_id);
+                if registered != Some(self.instance_id) {
+                    self.superseded.store(true, Ordering::Relaxed);
+                    tracing::warn!(
+                        scheduler_id = %self.scheduler_id,
+                        instance_id = %self.instance_id,
+                        registered = ?registered,
+                        "This scheduler incarnation is no longer registered; it will stop heartbeating"
+                    );
+                    return Ok(());
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    scheduler_id = %self.scheduler_id,
+                    error = %err,
+                    "Could not confirm cluster membership; heartbeating anyway"
+                );
+            }
+        }
+
+        self.write_heartbeat().await
+    }
+
+    async fn write_heartbeat(&self) -> Result<()> {
         let now = now_ms()?;
         self.heartbeats
             .heartbeat(&self.scheduler_id, self.instance_id, now, self.entry.ttl_ms)
@@ -383,7 +463,7 @@ impl SchedulerRegistryRunner {
     async fn shutdown(&self) {
         let scheduler_id = self.scheduler_id.clone();
         let instance_id = self.instance_id;
-        if let Err(err) = self
+        let owned_the_entry = match self
             .cluster
             .mutate(|state| match state.schedulers.get(&scheduler_id) {
                 Some(entry) if entry.instance_id == instance_id => {
@@ -394,10 +474,34 @@ impl SchedulerRegistryRunner {
             })
             .await
         {
-            tracing::warn!("Failed to remove scheduler entry on shutdown: {err}");
-        }
-        if let Err(err) = self.heartbeats.delete(&self.scheduler_id).await {
-            tracing::warn!("Failed to delete heartbeat on shutdown: {err}");
+            Ok(MutateOk::Committed) => true,
+            // We were not the registered incarnation, so the id — and the
+            // heartbeat object under it — belongs to someone else now.
+            Ok(MutateOk::AlreadySatisfied) => false,
+            Err(err) => {
+                tracing::warn!("Failed to remove scheduler entry on shutdown: {err}");
+                false
+            }
+        };
+
+        // The heartbeat object is keyed by scheduler id alone, so a superseded
+        // incarnation deleting it would remove the *successor's* liveness and
+        // make it look orphaned until its next tick — the same false-orphan
+        // window this change exists to close. The object store has no
+        // conditional delete, so only delete when we just removed our own
+        // membership entry, which proves we still owned the id. Otherwise
+        // leave it: with our entry gone the stale object is inert, and it is
+        // overwritten by whoever owns the id next.
+        if owned_the_entry {
+            if let Err(err) = self.heartbeats.delete(&self.scheduler_id).await {
+                tracing::warn!("Failed to delete heartbeat on shutdown: {err}");
+            }
+        } else {
+            tracing::debug!(
+                scheduler_id = %self.scheduler_id,
+                instance_id = %self.instance_id,
+                "Not deleting the heartbeat: this incarnation no longer owns the scheduler id"
+            );
         }
     }
 }
@@ -445,6 +549,7 @@ mod tests {
     use crate::dataaccelerator::AcceleratorEngineRegistry;
     use crate::datafusion::builder::DataFusionBuilder;
     use crate::status;
+    use object_store::ObjectStoreExt;
     use object_store::memory::InMemory;
 
     #[tokio::test]
@@ -486,6 +591,7 @@ mod tests {
             entry,
             peers: Arc::new(RwLock::new(HashMap::new())),
             job_executor,
+            superseded: Arc::new(AtomicBool::new(false)),
         };
         runner.register_self().await.expect("register");
 
@@ -499,5 +605,268 @@ mod tests {
         assert!(!snap.schedulers.contains_key("test:50051"));
         let beat = heartbeats.read("test:50051").await.expect("read hb");
         assert!(beat.is_none());
+    }
+
+    /// A superseded incarnation must stop claiming the shared heartbeat key.
+    /// `scheduler_id` is stable across restarts, so without this an old
+    /// process keeps overwriting the key with its own `instance_id`,
+    /// `list_alive` filters the registered incarnation out as an orphan, and
+    /// peers re-drive jobs it is still running.
+    #[tokio::test]
+    async fn a_superseded_incarnation_stops_heartbeating() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let cluster = Arc::new(ClusterStateStore::new(Arc::clone(&store), ""));
+        let heartbeats = Arc::new(SchedulerHeartbeatStore::new(Arc::clone(&store), ""));
+        cluster.bootstrap().await.expect("bootstrap");
+
+        let instance_id = Uuid::new_v4();
+        let successor = Uuid::new_v4();
+        let entry = SchedulerEntry {
+            scheduler_id: "test:50051".to_string(),
+            instance_id,
+            advertise_address: "test:50051".to_string(),
+            grpc_address: "test:50051".to_string(),
+            http_address: "test:8090".to_string(),
+            started_at_ms: 0,
+            ttl_ms: 30_000,
+            build_version: "test".to_string(),
+            labels: HashMap::new(),
+        };
+        let job_store = crate::jobs::JobStore::new(Arc::clone(&store), "", instance_id.to_string());
+        let df = DataFusionBuilder::new(
+            status::RuntimeStatus::new(),
+            Arc::new(AcceleratorEngineRegistry::default()),
+            Handle::current(),
+        )
+        .build();
+        let job_executor = Arc::new(crate::jobs::JobExecutor::new(
+            Arc::new(job_store),
+            Arc::new(df),
+        ));
+        let runner = SchedulerRegistryRunner {
+            cluster: Arc::clone(&cluster),
+            heartbeats: Arc::clone(&heartbeats),
+            reaper: Reaper::new(Arc::clone(&cluster), Arc::clone(&heartbeats)),
+            scheduler_id: "test:50051".to_string(),
+            instance_id,
+            entry: entry.clone(),
+            peers: Arc::new(RwLock::new(HashMap::new())),
+            job_executor,
+            superseded: Arc::new(AtomicBool::new(false)),
+        };
+        runner.register_self().await.expect("register");
+
+        // A successor takes the id over, as registration allows once the old
+        // incarnation looks stale.
+        let mut successor_entry = entry;
+        successor_entry.instance_id = successor;
+        cluster
+            .mutate(|state| {
+                state
+                    .schedulers
+                    .insert("test:50051".to_string(), successor_entry.clone());
+                MutationOutcome::Apply
+            })
+            .await
+            .expect("successor takes over");
+        heartbeats
+            .heartbeat("test:50051", successor, 10_000, 30_000)
+            .await
+            .expect("successor heartbeat");
+
+        // The superseded runner must now decline to write.
+        runner.send_heartbeat().await.expect("send_heartbeat");
+
+        let beat = heartbeats
+            .read("test:50051")
+            .await
+            .expect("read hb")
+            .expect("heartbeat present");
+        assert_eq!(
+            beat.instance_id, successor,
+            "a superseded incarnation must not overwrite the registered one's heartbeat"
+        );
+        assert_eq!(beat.last_heartbeat_ms, 10_000);
+
+        // The decision is sticky. Make the next cluster read fail outright and
+        // heartbeat again: fail-open would otherwise write, so this is what
+        // actually proves the guard — asserting the flag alone would pass even
+        // with the guard removed.
+        store
+            .delete(&object_store::path::Path::from("cluster.json"))
+            .await
+            .expect("remove cluster state so the next read fails");
+        runner
+            .send_heartbeat()
+            .await
+            .expect("send_heartbeat after supersession");
+
+        let beat = heartbeats
+            .read("test:50051")
+            .await
+            .expect("read hb")
+            .expect("heartbeat present");
+        assert_eq!(
+            beat.instance_id, successor,
+            "a later failed read must not let a superseded incarnation resume claiming the key"
+        );
+        assert_eq!(beat.last_heartbeat_ms, 10_000);
+        assert!(runner.superseded.load(Ordering::Relaxed));
+    }
+
+    /// The membership read is on the heartbeat path, so its deadline must be
+    /// comfortably inside one heartbeat interval — otherwise a slow store
+    /// delays beats far enough for peers to reap a healthy scheduler.
+    #[test]
+    fn membership_check_timeout_is_below_the_heartbeat_interval() {
+        let interval = Duration::from_millis(DEFAULT_TTL_MS.saturating_div(HEARTBEAT_DIVISOR));
+        assert!(
+            MEMBERSHIP_CHECK_TIMEOUT * 2 <= interval,
+            "membership read deadline {MEMBERSHIP_CHECK_TIMEOUT:?} leaves too little room in a {interval:?} heartbeat interval"
+        );
+    }
+
+    /// A superseded incarnation must not delete the heartbeat key on the way
+    /// out: the key is shared, so deleting it removes the *successor's*
+    /// liveness and makes it look orphaned until its next tick.
+    #[tokio::test]
+    async fn a_superseded_incarnation_does_not_delete_the_successors_heartbeat() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let cluster = Arc::new(ClusterStateStore::new(Arc::clone(&store), ""));
+        let heartbeats = Arc::new(SchedulerHeartbeatStore::new(Arc::clone(&store), ""));
+        cluster.bootstrap().await.expect("bootstrap");
+
+        let instance_id = Uuid::new_v4();
+        let successor = Uuid::new_v4();
+        let entry = SchedulerEntry {
+            scheduler_id: "test:50051".to_string(),
+            instance_id,
+            advertise_address: "test:50051".to_string(),
+            grpc_address: "test:50051".to_string(),
+            http_address: "test:8090".to_string(),
+            started_at_ms: 0,
+            ttl_ms: 30_000,
+            build_version: "test".to_string(),
+            labels: HashMap::new(),
+        };
+        let job_store = crate::jobs::JobStore::new(Arc::clone(&store), "", instance_id.to_string());
+        let df = DataFusionBuilder::new(
+            status::RuntimeStatus::new(),
+            Arc::new(AcceleratorEngineRegistry::default()),
+            Handle::current(),
+        )
+        .build();
+        let job_executor = Arc::new(crate::jobs::JobExecutor::new(
+            Arc::new(job_store),
+            Arc::new(df),
+        ));
+        let runner = SchedulerRegistryRunner {
+            cluster: Arc::clone(&cluster),
+            heartbeats: Arc::clone(&heartbeats),
+            reaper: Reaper::new(Arc::clone(&cluster), Arc::clone(&heartbeats)),
+            scheduler_id: "test:50051".to_string(),
+            instance_id,
+            entry: entry.clone(),
+            peers: Arc::new(RwLock::new(HashMap::new())),
+            job_executor,
+            superseded: Arc::new(AtomicBool::new(false)),
+        };
+        runner.register_self().await.expect("register");
+
+        // A successor takes the id over and publishes its own liveness.
+        let mut successor_entry = entry;
+        successor_entry.instance_id = successor;
+        cluster
+            .mutate(|state| {
+                state
+                    .schedulers
+                    .insert("test:50051".to_string(), successor_entry.clone());
+                MutationOutcome::Apply
+            })
+            .await
+            .expect("successor takes over");
+        heartbeats
+            .heartbeat("test:50051", successor, 10_000, 30_000)
+            .await
+            .expect("successor heartbeat");
+
+        runner.shutdown().await;
+
+        let beat = heartbeats
+            .read("test:50051")
+            .await
+            .expect("read hb")
+            .expect("the successor's heartbeat must survive the old incarnation's shutdown");
+        assert_eq!(beat.instance_id, successor);
+        let snap = cluster.read().await.expect("read");
+        assert_eq!(
+            snap.schedulers.get("test:50051").map(|e| e.instance_id),
+            Some(successor),
+            "shutdown must not remove the successor's membership entry"
+        );
+    }
+
+    /// Heartbeats deliberately live outside `cluster.json`. Gating them on a
+    /// read of that document must fail OPEN: a slow or failing GET is not
+    /// evidence of supersession, and suppressing the beat would let peers reap
+    /// a healthy scheduler and re-drive its jobs.
+    #[tokio::test]
+    async fn a_failed_cluster_read_does_not_suppress_the_heartbeat() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let cluster = Arc::new(ClusterStateStore::new(Arc::clone(&store), ""));
+        let heartbeats = Arc::new(SchedulerHeartbeatStore::new(Arc::clone(&store), ""));
+        // Deliberately NOT bootstrapped: `cluster.read()` fails, standing in
+        // for a timed-out or erroring GET of the cluster document.
+
+        let instance_id = Uuid::new_v4();
+        let entry = SchedulerEntry {
+            scheduler_id: "test:50051".to_string(),
+            instance_id,
+            advertise_address: "test:50051".to_string(),
+            grpc_address: "test:50051".to_string(),
+            http_address: "test:8090".to_string(),
+            started_at_ms: 0,
+            ttl_ms: 30_000,
+            build_version: "test".to_string(),
+            labels: HashMap::new(),
+        };
+        let job_store = crate::jobs::JobStore::new(Arc::clone(&store), "", instance_id.to_string());
+        let df = DataFusionBuilder::new(
+            status::RuntimeStatus::new(),
+            Arc::new(AcceleratorEngineRegistry::default()),
+            Handle::current(),
+        )
+        .build();
+        let job_executor = Arc::new(crate::jobs::JobExecutor::new(
+            Arc::new(job_store),
+            Arc::new(df),
+        ));
+        let runner = SchedulerRegistryRunner {
+            cluster: Arc::clone(&cluster),
+            heartbeats: Arc::clone(&heartbeats),
+            reaper: Reaper::new(Arc::clone(&cluster), Arc::clone(&heartbeats)),
+            scheduler_id: "test:50051".to_string(),
+            instance_id,
+            entry,
+            peers: Arc::new(RwLock::new(HashMap::new())),
+            job_executor,
+            superseded: Arc::new(AtomicBool::new(false)),
+        };
+
+        runner
+            .send_heartbeat()
+            .await
+            .expect("a failed cluster read must not fail the heartbeat");
+
+        let beat = heartbeats
+            .read("test:50051")
+            .await
+            .expect("read hb")
+            .expect("heartbeat must still have been written");
+        assert_eq!(beat.instance_id, instance_id);
+        assert!(
+            !runner.superseded.load(Ordering::Relaxed),
+            "a read failure is not evidence of supersession"
+        );
     }
 }
