@@ -17,7 +17,7 @@ use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
 use runtime_datafusion_index::{Index, IndexedTableProvider};
 use snafu::ResultExt;
-use spicepod::semantic::{Column, IndexStore, MetadataType};
+use spicepod::semantic::{Column, IndexStore};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -88,7 +88,10 @@ pub(crate) fn build_full_text_database_index(
         derived_store_fields = columns
             .iter()
             .filter_map(|c| {
-                if c.as_vector_metadata() == Some(MetadataType::NonFilterable) {
+                // Both metadata kinds are only about vector-search's own metadata filter;
+                // either one still means the column should be projectable and, per its
+                // tantivy type, filterable through the FTS index too.
+                if c.as_vector_metadata().is_some() {
                     Some(c.name.clone())
                 } else {
                     None
