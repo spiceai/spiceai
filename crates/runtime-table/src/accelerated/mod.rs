@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use runtime_component::ClusterRole;
+use runtime_datafusion_index::{LayerWalk, SpiceTable, TableLayer};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -1367,6 +1368,16 @@ impl AcceleratedTable {
     }
 
     #[must_use]
+    /// Presents this accelerated table as a layered [`SpiceTable`].
+    ///
+    /// The table beneath is this table's own accelerator, so the layer and its
+    /// `below` cannot disagree about which provider composition runs against.
+    #[must_use]
+    pub fn into_table(self: Arc<Self>) -> Arc<SpiceTable> {
+        let accelerator = Arc::clone(&self.accelerator);
+        SpiceTable::over(self, accelerator)
+    }
+
     pub fn get_accelerator_ref(&self) -> &Arc<dyn TableProvider> {
         &self.accelerator
     }
@@ -1495,28 +1506,43 @@ impl Drop for AcceleratedTable {
 }
 
 #[async_trait]
-impl TableProvider for AcceleratedTable {
-    fn constraints(&self) -> Option<&Constraints> {
-        self.accelerator.constraints()
+impl TableLayer for AcceleratedTable {
+    /// An accelerated table owns two tables, and the walk says which one is
+    /// meant: read-side questions are about where the data came from, write-side
+    /// questions about where it is stored. Answering here is what keeps callers
+    /// from having to name this type or know it has two sides.
+    ///
+    /// The federated side may not be resolved yet; `None` stops the walk here
+    /// rather than letting it fall through to the accelerator and report the
+    /// source as something it is not.
+    fn route<'a>(
+        &'a self,
+        walk: LayerWalk,
+        _below: &'a Arc<dyn TableProvider>,
+    ) -> Option<&'a Arc<dyn TableProvider>> {
+        match walk {
+            LayerWalk::Read | LayerWalk::Source | LayerWalk::CdcDetection => {
+                self.federated.try_table_provider_sync_ref()
+            }
+            LayerWalk::Write | LayerWalk::RetentionDelete | LayerWalk::Index => {
+                Some(&self.accelerator)
+            }
+        }
     }
 
-    fn schema(&self) -> SchemaRef {
+
+    fn schema(&self, _below: &Arc<dyn TableProvider>) -> SchemaRef {
         if let Some(s) = self.user_facing_schema.as_ref() {
             return Arc::clone(s);
         }
         self.accelerator.schema()
     }
 
-    fn table_type(&self) -> TableType {
-        self.accelerator.table_type()
-    }
 
-    fn statistics(&self) -> Option<datafusion::common::Statistics> {
-        self.accelerator.statistics()
-    }
 
     fn supports_filters_pushdown(
         &self,
+        _below: &Arc<dyn TableProvider>,
         filters: &[&Expr],
     ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
         // In caching mode, we handle filters ourselves (not pushed to accelerator)
@@ -1551,6 +1577,7 @@ impl TableProvider for AcceleratedTable {
 
     async fn scan(
         &self,
+        _below: &Arc<dyn TableProvider>,
         state: &dyn Session,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
@@ -1816,6 +1843,7 @@ impl TableProvider for AcceleratedTable {
 
     async fn insert_into(
         &self,
+        _below: &Arc<dyn TableProvider>,
         state: &dyn Session,
         input: Arc<dyn ExecutionPlan>,
         overwrite: InsertOp,
@@ -1881,6 +1909,7 @@ impl TableProvider for AcceleratedTable {
 
     async fn delete_from(
         &self,
+        _below: &Arc<dyn TableProvider>,
         state: &dyn Session,
         filters: Vec<Expr>,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
@@ -1925,6 +1954,7 @@ impl TableProvider for AcceleratedTable {
 
     async fn update(
         &self,
+        _below: &Arc<dyn TableProvider>,
         state: &dyn Session,
         assignments: Vec<(String, Expr)>,
         filters: Vec<Expr>,
@@ -1972,22 +2002,12 @@ impl TableProvider for AcceleratedTable {
         }
     }
 
-    fn get_table_definition(&self) -> Option<&str> {
-        self.accelerator.get_table_definition()
-    }
 
-    fn get_logical_plan(
-        &self,
-    ) -> Option<std::borrow::Cow<'_, datafusion::logical_expr::LogicalPlan>> {
-        self.accelerator.get_logical_plan()
-    }
 
-    fn get_column_default(&self, column: &str) -> Option<&Expr> {
-        self.accelerator.get_column_default(column)
-    }
 
     async fn scan_with_args<'a>(
         &self,
+        _below: &Arc<dyn TableProvider>,
         state: &dyn Session,
         args: datafusion::catalog::ScanArgs<'a>,
     ) -> DataFusionResult<datafusion::catalog::ScanResult> {
@@ -2002,7 +2022,7 @@ impl TableProvider for AcceleratedTable {
         Ok(plan.into())
     }
 
-    async fn truncate(&self, state: &dyn Session) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+    async fn truncate(&self, _below: &Arc<dyn TableProvider>, state: &dyn Session) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         if self.refresh_mode == RefreshMode::Snapshot {
             return Err(datafusion::error::DataFusionError::Execution(format!(
                 "truncate on accelerated table {} is not permitted when refresh_mode is 'snapshot'; the accelerator is driven exclusively from the snapshot store",

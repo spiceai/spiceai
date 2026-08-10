@@ -207,17 +207,9 @@ impl<E: TableProviderExplorer> SearchEngine<E> {
         use crate::full_text::{
             as_compound_text_candidate_generations, as_es_text_candidate_generations,
         };
-        use runtime_datafusion_index::IndexedTableProvider;
         use search::generation::text_search::index::FullTextDatabaseIndex;
 
         let base_table_provider = self.df.get_table(tbl).await?;
-
-        let Some(indexed_table) = self
-            .explorer
-            .find_concrete::<IndexedTableProvider>(&base_table_provider)
-        else {
-            return Some(Ok(vec![]));
-        };
 
         // Compound (write-through) full-text index: a warm Tantivy primary paired with an
         // external Elasticsearch secondary. Registered instead of the concrete indexes for
@@ -227,10 +219,11 @@ impl<E: TableProviderExplorer> SearchEngine<E> {
         #[cfg(feature = "elasticsearch")]
         {
             use search::index::compound::CompoundSearchIndex;
-            if let Some(compound) = indexed_table
-                .get_indexes::<CompoundSearchIndex>()
-                .into_iter()
-                .find(|c| Arc::new((*c).clone()).as_vector_index().is_none())
+            if let Some((compounds, _)) =
+                self.explorer.find_index::<CompoundSearchIndex>(&base_table_provider)
+                && let Some(compound) = compounds
+                    .into_iter()
+                    .find(|c| Arc::new((*c).clone()).as_vector_index().is_none())
             {
                 return Some(
                     as_compound_text_candidate_generations(
@@ -244,7 +237,11 @@ impl<E: TableProviderExplorer> SearchEngine<E> {
             }
         }
 
-        if let Some(fts) = indexed_table.get_index::<FullTextDatabaseIndex>() {
+        if let Some((fts, _)) = self
+            .explorer
+            .find_index::<FullTextDatabaseIndex>(&base_table_provider)
+            && let Some(fts) = fts.first()
+        {
             return Some(
                 as_candidate_generations(
                     &fts.with_new_base(Arc::clone(&base_table_provider)),
@@ -259,8 +256,11 @@ impl<E: TableProviderExplorer> SearchEngine<E> {
         #[cfg(feature = "elasticsearch")]
         {
             use search::index::elasticsearch::ElasticsearchTextIndex;
-            let es_indexes = indexed_table.get_indexes::<ElasticsearchTextIndex>();
-            if !es_indexes.is_empty() {
+            if let Some((es_indexes, _)) = self
+                .explorer
+                .find_index::<ElasticsearchTextIndex>(&base_table_provider)
+                && !es_indexes.is_empty()
+            {
                 return Some(
                     as_es_text_candidate_generations(es_indexes, Arc::clone(&self.df), tbl.clone())
                         .await
