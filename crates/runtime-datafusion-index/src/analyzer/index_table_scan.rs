@@ -52,9 +52,9 @@ use datafusion::{
 use futures::{StreamExt, TryStreamExt};
 use itertools::Itertools;
 
-use crate::{Index, IndexedTableProvider};
+use crate::{Index, SpiceTable};
 
-/// [`OptimizerRule`] that looks for [`IndexedTableProvider`] nodes and adds an [`IndexTableScanNode`].
+/// [`OptimizerRule`] that looks for indexed tables and adds an [`IndexTableScanNode`].
 #[derive(Debug, Default)]
 pub struct IndexTableScanOptimizerRule {}
 
@@ -100,16 +100,17 @@ impl OptimizerRule for IndexTableScanOptimizerRule {
                     return Ok(Transformed::no(LogicalPlan::TableScan(table_scan)));
                 };
                 let underlying = Arc::clone(&default_source.table_provider);
-                let Some(indexed_table_provider) =
-                    underlying.downcast_ref::<IndexedTableProvider>()
+                let Some(indexes) = underlying
+                    .downcast_ref::<SpiceTable>()
+                    .map(|table| table.layer().indexes())
+                    .filter(|indexes| !indexes.is_empty())
                 else {
                     return Ok(Transformed::no(LogicalPlan::TableScan(table_scan)));
                 };
                 let projected_schema = Arc::clone(&table_scan.projected_schema);
 
                 // Filter to just the indexes that can be served by the projected schema
-                let available_indexes: Vec<_> = indexed_table_provider
-                    .indexes
+                let available_indexes: Vec<_> = indexes
                     .iter()
                     .filter(|index| {
                         // Check if all required columns for this index are in the projected schema
@@ -123,7 +124,7 @@ impl OptimizerRule for IndexTableScanOptimizerRule {
 
                 if available_indexes.is_empty() {
                     // No indexes can be served by the projected schema
-                    let required_columns = indexed_table_provider.indexes.iter().flat_map(|i| i.required_columns()).collect::<HashSet<_>>().into_iter().join(",");
+                    let required_columns = indexes.iter().flat_map(|i| i.required_columns()).collect::<HashSet<_>>().into_iter().join(",");
                     let projected_schema_columns = projected_schema.fields().iter().map(|c| c.name()).join(",");
                     tracing::warn!(
                         "Could not index table {}, did not find expected columns [{required_columns}] in the projected schema [{projected_schema_columns}]",
@@ -656,7 +657,7 @@ mod test {
     };
 
     use crate::{
-        Index, IndexedTableProvider,
+        Index, IndexLayer, SpiceTable,
         analyzer::{IndexTableScanExtensionPlanner, IndexTableScanOptimizerRule},
     };
 
@@ -787,7 +788,7 @@ mod test {
         index: Arc<dyn Index + Send + Sync>,
         table: Arc<dyn TableProvider>,
     ) -> Arc<dyn TableProvider> {
-        Arc::new(IndexedTableProvider::new(table).add_index(index)) as Arc<dyn TableProvider>
+        (SpiceTable::over(Arc::new(IndexLayer::new().add_index(index)), table)) as Arc<dyn TableProvider>
     }
 
     fn test_one_row_batch() -> RecordBatch {
@@ -911,13 +912,13 @@ mod test {
         let table = mem_table_from_batches(vec![test_one_row_batch()]);
 
         // build an IndexedTableProvider with *two* indexes, in order
-        let provider = IndexedTableProvider::new(table)
+        let provider = SpiceTable::over(Arc::new(IndexLayer::new()
             .add_index(Arc::clone(&idx1) as Arc<dyn Index + Send + Sync>)
-            .add_index(Arc::clone(&idx2) as Arc<dyn Index + Send + Sync>);
+            .add_index(Arc::clone(&idx2) as Arc<dyn Index + Send + Sync>)), table);
 
         ctx.register_table(
             "pipeline_idx_table",
-            Arc::new(provider) as Arc<dyn TableProvider>,
+            provider as Arc<dyn TableProvider>,
         )
         .expect("valid table");
 
@@ -948,12 +949,12 @@ mod test {
         let bad_idx = Arc::new(TestIndex::new(vec!["id".to_string()], Some(|_| Ok(vec![]))));
 
         let table = mem_table(); // empty batch is fine; the error is from the index
-        let provider = IndexedTableProvider::new(table)
-            .add_index(Arc::clone(&bad_idx) as Arc<dyn Index + Send + Sync>);
+        let provider = SpiceTable::over(Arc::new(IndexLayer::new()
+            .add_index(Arc::clone(&bad_idx) as Arc<dyn Index + Send + Sync>)), table);
 
         ctx.register_table(
             "zero_batches_idx_table",
-            Arc::new(provider) as Arc<dyn TableProvider>,
+            provider as Arc<dyn TableProvider>,
         )
         .expect("valid table");
 
@@ -983,12 +984,12 @@ mod test {
         ));
 
         let table = mem_table(); // any input works
-        let provider = IndexedTableProvider::new(table)
-            .add_index(Arc::clone(&bad_idx) as Arc<dyn Index + Send + Sync>);
+        let provider = SpiceTable::over(Arc::new(IndexLayer::new()
+            .add_index(Arc::clone(&bad_idx) as Arc<dyn Index + Send + Sync>)), table);
 
         ctx.register_table(
             "multi_batches_idx_table",
-            Arc::new(provider) as Arc<dyn TableProvider>,
+            provider as Arc<dyn TableProvider>,
         )
         .expect("valid table");
 
@@ -1015,13 +1016,13 @@ mod test {
         ));
 
         let table = mem_table_from_batches(vec![test_one_row_batch()]);
-        let provider = IndexedTableProvider::new(table)
+        let provider = SpiceTable::over(Arc::new(IndexLayer::new()
             .add_index(Arc::clone(&pass_through) as Arc<dyn Index + Send + Sync>)
-            .add_index(Arc::clone(&failing) as Arc<dyn Index + Send + Sync>);
+            .add_index(Arc::clone(&failing) as Arc<dyn Index + Send + Sync>)), table);
 
         ctx.register_table(
             "late_fail_idx_table",
-            Arc::new(provider) as Arc<dyn TableProvider>,
+            provider as Arc<dyn TableProvider>,
         )
         .expect("valid table");
 
@@ -1062,11 +1063,11 @@ mod test {
         ));
 
         let table = mem_table_from_batches(vec![one_row_batch()]);
-        let provider = IndexedTableProvider::new(table)
-            .add_index(Arc::clone(&idx) as Arc<dyn Index + Send + Sync>);
+        let provider = SpiceTable::over(Arc::new(IndexLayer::new()
+            .add_index(Arc::clone(&idx) as Arc<dyn Index + Send + Sync>)), table);
         ctx.register_table(
             "schema_change_type",
-            Arc::new(provider) as Arc<dyn TableProvider>,
+            provider as Arc<dyn TableProvider>,
         )
         .expect("valid");
 
@@ -1112,12 +1113,12 @@ mod test {
         ));
 
         let table = mem_table_from_batches(vec![one_row_batch()]);
-        let provider = IndexedTableProvider::new(table)
-            .add_index(Arc::clone(&idx_add) as Arc<dyn Index + Send + Sync>);
+        let provider = SpiceTable::over(Arc::new(IndexLayer::new()
+            .add_index(Arc::clone(&idx_add) as Arc<dyn Index + Send + Sync>)), table);
 
         ctx.register_table(
             "schema_change_add",
-            Arc::new(provider) as Arc<dyn TableProvider>,
+            provider as Arc<dyn TableProvider>,
         )
         .expect("valid");
 
@@ -1178,12 +1179,12 @@ mod test {
         ));
 
         let table = mem_table_from_batches(vec![one_row_batch()]);
-        let provider = IndexedTableProvider::new(table)
-            .add_index(Arc::clone(&idx) as Arc<dyn Index + Send + Sync>);
+        let provider = SpiceTable::over(Arc::new(IndexLayer::new()
+            .add_index(Arc::clone(&idx) as Arc<dyn Index + Send + Sync>)), table);
 
         ctx.register_table(
             "field_meta_diff_table",
-            Arc::new(provider) as Arc<dyn TableProvider>,
+            provider as Arc<dyn TableProvider>,
         )
         .expect("valid");
 
@@ -1225,12 +1226,12 @@ mod test {
         ));
 
         let table = mem_table_from_batches(vec![one_row_batch()]);
-        let provider = IndexedTableProvider::new(table)
-            .add_index(Arc::clone(&idx) as Arc<dyn Index + Send + Sync>);
+        let provider = SpiceTable::over(Arc::new(IndexLayer::new()
+            .add_index(Arc::clone(&idx) as Arc<dyn Index + Send + Sync>)), table);
 
         ctx.register_table(
             "metadata_diff_table",
-            Arc::new(provider) as Arc<dyn TableProvider>,
+            provider as Arc<dyn TableProvider>,
         )
         .expect("valid");
 

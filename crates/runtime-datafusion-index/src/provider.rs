@@ -18,44 +18,35 @@ use std::{borrow::Cow, sync::Arc};
 
 use async_trait::async_trait;
 use datafusion::{
-    arrow::datatypes::SchemaRef,
-    catalog::{ScanArgs, ScanResult, Session, TableProvider},
-    common::{Constraints, Statistics},
-    datasource::TableType,
+    catalog::{Session, TableProvider},
     error::Result as DataFusionResult,
-    logical_expr::{LogicalPlan, TableProviderFilterPushDown, dml::InsertOp},
+    logical_expr::LogicalPlan,
     physical_plan::ExecutionPlan,
     prelude::Expr,
 };
 
 use crate::Index;
+use crate::layer::{LayerWalk, TableLayer};
 
-/// A `TableProvider` that wraps another `TableProvider` and adds indexing capabilities.
-#[derive(Debug, Clone)]
-pub struct IndexedTableProvider {
-    /// The underlying `TableProvider` that provides the data.
-    pub underlying: Arc<dyn TableProvider>,
-
-    /// Indexes that are available to make queries more efficient or enable new functionality (i.e. full text search indexes).
-    ///
-    /// In the future, indexes will be required to implement a trait - but for now all existing
-    /// use-cases are supported via UDTFs that downcast indexes to the correct type.
-    pub indexes: Vec<Arc<dyn Index + Send + Sync>>,
+/// Carries the indexes attached to the table beneath it.
+///
+/// Indexes are bound to the table *below* this layer — that is what a search
+/// executes against — so a stack may hold several index layers at different
+/// depths, each with its own bound table.
+#[derive(Debug, Clone, Default)]
+pub struct IndexLayer {
+    indexes: Vec<Arc<dyn Index + Send + Sync>>,
 }
 
-impl IndexedTableProvider {
-    pub fn new(underlying: Arc<dyn TableProvider>) -> Self {
-        IndexedTableProvider::with_indexes(underlying, vec![])
+impl IndexLayer {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
     }
 
-    pub fn with_indexes(
-        underlying: Arc<dyn TableProvider>,
-        indexes: Vec<Arc<dyn Index + Send + Sync>>,
-    ) -> Self {
-        Self {
-            underlying,
-            indexes,
-        }
+    #[must_use]
+    pub fn with_indexes(indexes: Vec<Arc<dyn Index + Send + Sync>>) -> Self {
+        Self { indexes }
     }
 
     #[must_use]
@@ -83,95 +74,53 @@ impl IndexedTableProvider {
     pub fn get_all_indexes(&self) -> Vec<Arc<dyn Index + Send + Sync>> {
         self.indexes.clone()
     }
-
-    #[must_use]
-    pub fn get_underlying(&self) -> Arc<dyn TableProvider> {
-        Arc::clone(&self.underlying)
-    }
-
-    #[must_use]
-    pub fn get_underlying_ref(&self) -> &Arc<dyn TableProvider> {
-        &self.underlying
-    }
 }
 
-#[deny(clippy::missing_trait_methods)]
 #[async_trait]
-impl TableProvider for IndexedTableProvider {
-    fn schema(&self) -> SchemaRef {
-        self.underlying.schema()
+impl TableLayer for IndexLayer {
+    fn name(&self) -> &'static str {
+        "index"
     }
 
-    fn constraints(&self) -> Option<&Constraints> {
-        self.underlying.constraints()
+    /// An index layer is what CDC detection looks *for*, so detection must stop
+    /// here rather than see past it. Every other walk passes through: an index
+    /// adds no columns and rewrites no write.
+    fn transparent_to(&self, walk: LayerWalk) -> bool {
+        walk != LayerWalk::CdcDetection
     }
 
-    fn table_type(&self) -> TableType {
-        self.underlying.table_type()
+    fn indexes(&self) -> &[Arc<dyn Index + Send + Sync>] {
+        &self.indexes
     }
 
-    fn get_table_definition(&self) -> Option<&str> {
-        self.underlying.get_table_definition()
-    }
-
-    fn get_logical_plan(&self) -> Option<Cow<'_, LogicalPlan>> {
-        // Cannot use underlying `get_logical_plan` as `IndexedTableProvider` will be replaced
-        // with the `LogicalPlan` during indexing.
+    /// The layer is replaced by the indexed `LogicalPlan` during indexing, so
+    /// the table beneath it must not supply one.
+    fn get_logical_plan<'a>(
+        &'a self,
+        _below: &'a Arc<dyn TableProvider>,
+    ) -> Option<Cow<'a, LogicalPlan>> {
         None
-    }
-
-    fn get_column_default(&self, column: &str) -> Option<&Expr> {
-        self.underlying.get_column_default(column)
-    }
-
-    async fn scan(
-        &self,
-        state: &dyn Session,
-        projection: Option<&Vec<usize>>,
-        filters: &[Expr],
-        limit: Option<usize>,
-    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        self.underlying
-            .scan(state, projection, filters, limit)
-            .await
-    }
-
-    fn supports_filters_pushdown(
-        &self,
-        filters: &[&Expr],
-    ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
-        self.underlying.supports_filters_pushdown(filters)
-    }
-
-    fn statistics(&self) -> Option<Statistics> {
-        self.underlying.statistics()
-    }
-
-    async fn insert_into(
-        &self,
-        state: &dyn Session,
-        input: Arc<dyn ExecutionPlan>,
-        insert_op: InsertOp,
-    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        self.underlying.insert_into(state, input, insert_op).await
     }
 
     async fn delete_from(
         &self,
+        below: &Arc<dyn TableProvider>,
         state: &dyn Session,
         filters: Vec<Expr>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        // Resolve each attached index's matching keys against `self.underlying`'s *current*
-        // (pre-delete) rows first — there's nothing left to resolve once they're gone. The
-        // accelerator-table delete below remains authoritative and runs first: only after it
-        // succeeds do we best-effort delete the previously-resolved keys from each index. This
-        // way a failed/partial row delete never leaves an index missing entries for rows that
-        // were never actually removed. A resolve failure just skips that index's cleanup this
-        // round (self-heals via full refresh); it never blocks the row delete.
+        // Resolve each attached index's matching keys against `below`'s
+        // *current* (pre-delete) rows first — there's nothing left to resolve
+        // once they're gone. The row delete below remains authoritative and
+        // runs first: only after it succeeds do we best-effort delete the
+        // previously-resolved keys from each index. This way a failed/partial
+        // row delete never leaves an index missing entries for rows that were
+        // never actually removed. A resolve failure just skips that index's
+        // cleanup this round (self-heals via full refresh); it never blocks the
+        // row delete.
         let mut resolved_keys = Vec::with_capacity(self.indexes.len());
         for index in &self.indexes {
             match index
-                .resolve_delete_keys(&self.underlying, state, filters.clone())
+                .resolve_delete_keys(below, state, filters.clone())
                 .await
             {
                 Ok(Some(keys)) => resolved_keys.push((index, keys)),
@@ -185,7 +134,7 @@ impl TableProvider for IndexedTableProvider {
             }
         }
 
-        let result = self.underlying.delete_from(state, filters).await?;
+        let result = below.delete_from(state, filters).await?;
 
         for (index, keys) in resolved_keys {
             if let Err(e) = index.delete_by_keys(keys).await {
@@ -197,26 +146,5 @@ impl TableProvider for IndexedTableProvider {
         }
 
         Ok(result)
-    }
-
-    async fn update(
-        &self,
-        state: &dyn Session,
-        assignments: Vec<(String, Expr)>,
-        filters: Vec<Expr>,
-    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        self.underlying.update(state, assignments, filters).await
-    }
-
-    async fn scan_with_args<'a>(
-        &self,
-        state: &dyn Session,
-        args: ScanArgs<'a>,
-    ) -> DataFusionResult<ScanResult> {
-        self.underlying.scan_with_args(state, args).await
-    }
-
-    async fn truncate(&self, state: &dyn Session) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        self.underlying.truncate(state).await
     }
 }
