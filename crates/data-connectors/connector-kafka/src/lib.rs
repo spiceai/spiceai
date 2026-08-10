@@ -36,7 +36,7 @@ use runtime::{
         UnableToGetReadProviderSnafu, parameters::ConnectorParams,
     },
     datafusion::refresh_sql,
-    federated_table::FederatedTable,
+    federated::FederatedTable,
     parameters::{ExposedParamLookup, ParameterSpec, Parameters},
 };
 use runtime_api_types::v1::ComponentType;

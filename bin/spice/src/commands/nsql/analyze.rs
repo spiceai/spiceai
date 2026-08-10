@@ -45,7 +45,7 @@ limitations under the License.
 //! `runtime.task_history` for metrics after the request completes.
 
 use crate::context::RuntimeContext;
-use crate::error::{ConnectionFailedSnafu, InvalidResponseSnafu, Result};
+use crate::error::{ConnectionFailedSnafu, InvalidResponseSnafu, Result, read_response};
 use clap::Args;
 use opentelemetry::trace::TraceId;
 use rand::Rng;
@@ -324,8 +324,9 @@ async fn send_nsql_request_with_trace(
         model: model.to_string(),
     };
 
+    // Text-to-SQL is a model round trip, so its duration is the model's.
     let mut request = ctx
-        .http_client()
+        .inference_http_client()
         .post(&url)
         .header("Content-Type", "application/json")
         .header("Accept", "application/sql")
@@ -341,8 +342,7 @@ async fn send_nsql_request_with_trace(
         .await
         .context(ConnectionFailedSnafu { endpoint: &url })?;
 
-    let status = response.status();
-    let text = response.text().await.unwrap_or_default();
+    let (status, text) = read_response(response, &url).await?;
 
     if !status.is_success() {
         return Err(InvalidResponseSnafu {

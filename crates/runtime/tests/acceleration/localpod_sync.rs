@@ -104,7 +104,7 @@ async fn wait_for_count(rt: &Runtime, table: &str, expected: usize, timeout: Dur
 async fn test_localpod_full_refresh_synchronization_with_arrow_parent() -> Result<(), anyhow::Error>
 {
     let _tracing = init_tracing(Some(
-        "integration=debug,runtime=debug,runtime::accelerated_table=trace",
+        "integration=debug,runtime=debug,runtime_table::accelerated=trace",
     ));
 
     test_request_context()

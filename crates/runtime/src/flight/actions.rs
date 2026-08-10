@@ -250,7 +250,9 @@ async fn handle_cancel_query(body: &[u8]) -> Result<Vec<u8>, Status> {
     }
 
     let df = get_current_datafusion(&context);
-    let cancelled = df.query_cancel_registry().cancel(parsed);
+    let cancelled = df
+        .query_cancel_registry()
+        .cancel_owned(parsed, &crate::jobs::current_job_owner().await);
 
     let resp = CancelQueryResponse {
         query_id: req.query_id,

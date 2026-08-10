@@ -559,6 +559,7 @@ pub(crate) async fn acquire_identity(
         ca_bundle_pem: outcome.ca_bundle_pem,
         gateway_addr: outcome.gateway_addr,
         not_after_unix: Some(outcome.not_after_unix),
+        app_id: None,
         enc_private_key_pem: material.enc_private_key_pem,
         enc_public_key_pem: material.enc_public_key_pem,
         // A fresh enrollment has no prior key to retain.
@@ -730,12 +731,28 @@ fn discard_pending_code_file(config: &CloudConnectConfig) {
 /// private key, base64-encoded. This authorizes the rotation — a leaked
 /// certificate alone (which is not a secret) must not be able to renew.
 pub(crate) fn sign_pop(current_private_key_pem: &str, csr_pem: &str) -> Result<String> {
-    let key = pem::parse(current_private_key_pem).map_err(|source| Error::ProofOfPossession {
-        reason: format!("current private key is not valid PEM: {source}"),
-    })?;
     let csr = pem::parse(csr_pem).map_err(|source| Error::ProofOfPossession {
         reason: format!("CSR is not valid PEM: {source}"),
     })?;
+    sign_pop_payload(current_private_key_pem, csr.contents())
+        .map_err(|reason| Error::ProofOfPossession { reason })
+}
+
+/// Sign an arbitrary proof-of-possession payload with an identity's private
+/// key: a DER-encoded ECDSA P-256/SHA-256 signature over `payload`,
+/// base64-encoded. `/renew` signs a CSR's DER bytes ([`sign_pop`]);
+/// `/release` signs its own domain-separated
+/// `spice-cloud-connect/release/v1\n{instance_id}` payload.
+///
+/// The error is the bare reason rather than a typed error so each flow names
+/// itself in the error it surfaces, instead of nesting one flow's message
+/// inside another's.
+pub(crate) fn sign_pop_payload(
+    private_key_pem: &str,
+    payload: &[u8],
+) -> std::result::Result<String, String> {
+    let key = pem::parse(private_key_pem)
+        .map_err(|source| format!("current private key is not valid PEM: {source}"))?;
 
     // aws-lc-rs is the same backend rcgen generated the keypair with (see
     // Cargo.toml), so the persisted PKCS#8 always round-trips here.
@@ -743,16 +760,11 @@ pub(crate) fn sign_pop(current_private_key_pem: &str, csr_pem: &str) -> Result<S
         &aws_lc_rs::signature::ECDSA_P256_SHA256_ASN1_SIGNING,
         key.contents(),
     )
-    .map_err(|source| Error::ProofOfPossession {
-        reason: format!("current private key is not a PKCS#8 ECDSA P-256 key: {source}"),
-    })?;
+    .map_err(|source| format!("current private key is not a PKCS#8 ECDSA P-256 key: {source}"))?;
     let rng = aws_lc_rs::rand::SystemRandom::new();
-    let signature =
-        key_pair
-            .sign(&rng, csr.contents())
-            .map_err(|source| Error::ProofOfPossession {
-                reason: format!("signing failed: {source}"),
-            })?;
+    let signature = key_pair
+        .sign(&rng, payload)
+        .map_err(|source| format!("signing failed: {source}"))?;
     Ok(base64::engine::general_purpose::STANDARD.encode(signature.as_ref()))
 }
 
@@ -910,7 +922,9 @@ mod tests {
             runtime_version: "v0-test".to_string(),
             heartbeat_interval: Duration::from_secs(30),
             telemetry_interval: Duration::from_mins(1),
+            metrics_interval: Duration::from_secs(30),
             renewal_lead: Duration::from_hours(12),
+            query_deadline: Duration::from_mins(1),
         }
     }
 
@@ -1006,7 +1020,7 @@ mod tests {
 
     #[test]
     fn enroll_attributes_read_the_config() {
-        let mut config = test_config("https://cloud.spice.ai");
+        let mut config = test_config("https://api.spice.ai");
         config.adopt_app_name = Some("edge-fleet".to_string());
         config.adopt_create_app = true;
         config.instance_region = Some("us-west-2".to_string());
@@ -1053,7 +1067,7 @@ mod tests {
         // A skewed clock never reached the cloud, so the adoption code is
         // still live: classifying this as authoritative would burn it.
         let err = Error::CertificateValidity {
-            url: "https://cloud.spice.ai/v1/cloud-connect/enroll".to_string(),
+            url: "https://api.spice.ai/v1/cloud-connect/enroll".to_string(),
             advice: "host clock is 42 minutes behind Spice Cloud".to_string(),
         };
         assert!(!err.is_authoritative_rejection());
@@ -1088,15 +1102,15 @@ mod tests {
 
     #[test]
     fn enroll_urls_join_with_and_without_trailing_slash() {
-        for endpoint in ["https://cloud.spice.ai/", "https://cloud.spice.ai"] {
+        for endpoint in ["https://api.spice.ai/", "https://api.spice.ai"] {
             let client = EnrollClient::new(&test_config(endpoint)).expect("client");
             assert_eq!(
                 client.enroll_url,
-                "https://cloud.spice.ai/v1/cloud-connect/enroll"
+                "https://api.spice.ai/v1/cloud-connect/enroll"
             );
             assert_eq!(
                 client.renew_url,
-                "https://cloud.spice.ai/v1/cloud-connect/renew"
+                "https://api.spice.ai/v1/cloud-connect/renew"
             );
         }
     }

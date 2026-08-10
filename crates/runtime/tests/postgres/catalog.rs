@@ -133,6 +133,28 @@ fn pg_catalog(port: usize) -> Catalog {
     catalog
 }
 
+/// The `(column_name, data_type)` pairs the catalog reports for `table`, ordered
+/// by column name.
+async fn catalog_columns(
+    rt: &Arc<Runtime>,
+    table: &str,
+) -> Result<Vec<(String, String)>, anyhow::Error> {
+    let batches = run_query(
+        rt,
+        &format!(
+            "SELECT column_name, data_type FROM information_schema.columns \
+             WHERE table_catalog = '{CATALOG_NAME}' AND table_schema = 'public' \
+             AND table_name = '{table}' ORDER BY column_name"
+        ),
+    )
+    .await?;
+
+    Ok(string_column_values(&batches, "column_name")
+        .into_iter()
+        .zip(string_column_values(&batches, "data_type"))
+        .collect())
+}
+
 /// Collect the values of a `Utf8` column across every batch, in row order.
 fn string_column_values(batches: &[RecordBatch], column: &str) -> Vec<String> {
     let mut values = Vec::new();
@@ -153,9 +175,15 @@ fn string_column_values(batches: &[RecordBatch], column: &str) -> Vec<String> {
     values
 }
 
-/// Seed a plain table, a materialized view over it, and (via `postgres_fdw`) a
-/// foreign table pointed at it, to confirm all three relation kinds are
+/// Seed a plain table, a materialized view over it, and (via `postgres_fdw`)
+/// foreign tables pointed at it, to confirm all three relation kinds are
 /// discovered (#11725).
+///
+/// Three foreign tables, each isolating a different property (#12585): one wraps
+/// a populated remote table, one wraps an empty one so the reported schema can be
+/// checked independently of whether any rows exist, and one points at a server
+/// that refuses every connection so that resolving its schema at all is only
+/// possible without reading its data.
 async fn seed_matview_and_foreign_table(port: usize) -> Result<(), anyhow::Error> {
     let pool = common::get_postgres_connection_pool(port, None).await?;
     let conn = pool
@@ -165,9 +193,10 @@ async fn seed_matview_and_foreign_table(port: usize) -> Result<(), anyhow::Error
 
     conn.conn
         .simple_query(
-            "CREATE TABLE source_data (id INT PRIMARY KEY, val TEXT); \
-             INSERT INTO source_data (id, val) VALUES (1, 'a'), (2, 'b'); \
-             CREATE MATERIALIZED VIEW mv_source_data AS SELECT * FROM source_data;",
+            "CREATE TABLE source_data (id INT PRIMARY KEY, val TEXT, amount NUMERIC(10,2)); \
+             INSERT INTO source_data (id, val, amount) VALUES (1, 'a', 1.50), (2, 'b', 2.25); \
+             CREATE MATERIALIZED VIEW mv_source_data AS SELECT * FROM source_data; \
+             CREATE TABLE empty_source (id INT, note TEXT);",
         )
         .await?;
 
@@ -178,10 +207,29 @@ async fn seed_matview_and_foreign_table(port: usize) -> Result<(), anyhow::Error
                  OPTIONS (host 'localhost', port '5432', dbname 'postgres'); \
              CREATE USER MAPPING FOR postgres SERVER loopback \
                  OPTIONS (user 'postgres', password '{}'); \
-             CREATE FOREIGN TABLE ft_source_data (id INT, val TEXT) \
-                 SERVER loopback OPTIONS (table_name 'source_data');",
+             CREATE FOREIGN TABLE ft_source_data (id INT, val TEXT, amount NUMERIC(10,2)) \
+                 SERVER loopback OPTIONS (table_name 'source_data'); \
+             CREATE FOREIGN TABLE ft_empty (id INT, note TEXT) \
+                 SERVER loopback OPTIONS (table_name 'empty_source');",
             common::PG_PASSWORD
         ))
+        .await?;
+
+    // A server that can never be reached: port 1 refuses immediately. A foreign
+    // table's columns are declared locally, so `pg_attribute` can describe this
+    // one in full, but *any* attempt to read its rows fails. Registering it with
+    // its declared schema is therefore only possible without a data query, which
+    // is what makes this table a check of the mechanism rather than the result.
+    // `CREATE SERVER` does not connect, so seeding stays fast.
+    conn.conn
+        .simple_query(
+            "CREATE SERVER unreachable FOREIGN DATA WRAPPER postgres_fdw \
+                 OPTIONS (host 'localhost', port '1', dbname 'postgres'); \
+             CREATE USER MAPPING FOR postgres SERVER unreachable \
+                 OPTIONS (user 'postgres', password 'unused'); \
+             CREATE FOREIGN TABLE ft_unreachable (id INT, label TEXT) \
+                 SERVER unreachable OPTIONS (table_name 'nonexistent');",
+        )
         .await?;
 
     Ok(())
@@ -323,11 +371,14 @@ async fn test_materialized_view_and_foreign_table_discovered() -> Result<(), any
             assert_eq!(
                 string_column_values(&tables, "table_name"),
                 vec![
+                    "empty_source".to_string(),
+                    "ft_empty".to_string(),
                     "ft_source_data".to_string(),
+                    "ft_unreachable".to_string(),
                     "mv_source_data".to_string(),
                     "source_data".to_string(),
                 ],
-                "the base table, materialized view, and foreign table should all be registered"
+                "the base tables, materialized view, and foreign tables should all be registered"
             );
 
             let mv_count = run_query(
@@ -343,6 +394,63 @@ async fn test_materialized_view_and_foreign_table_discovered() -> Result<(), any
             )
             .await?;
             assert_batches_eq!(&["+---+", "| n |", "+---+", "| 2 |", "+---+"], &ft_count);
+
+            // A foreign table's schema comes from its local `pg_attribute`
+            // definition, not from sampling its rows, so it carries the declared
+            // types rather than whatever a sample row happened to imply. An empty
+            // foreign table used to register with no columns at all, and a
+            // `NUMERIC(p,s)` column used to widen to the fallback precision.
+            assert_eq!(
+                catalog_columns(&rt, "ft_empty").await?,
+                vec![
+                    ("id".to_string(), "Int32".to_string()),
+                    ("note".to_string(), "Utf8".to_string()),
+                ],
+                "an empty foreign table must still expose its declared columns"
+            );
+
+            assert!(
+                catalog_columns(&rt, "ft_source_data")
+                    .await?
+                    .contains(&("amount".to_string(), "Decimal128(10, 2)".to_string())),
+                "a foreign table must report the declared precision of its remote column"
+            );
+
+            // `ft_unreachable` points at a server that refuses every connection.
+            // Its columns are declared locally, so `pg_attribute` can describe it
+            // in full while any read of its rows fails -- registering it with its
+            // declared schema is therefore possible only without a data query.
+            //
+            // The precondition is asserted rather than assumed: if the endpoint
+            // ever stopped refusing, this table would quietly stop distinguishing
+            // the two paths and the check below would pass for the wrong reason.
+            let source_pool = common::get_postgres_connection_pool(port, None).await?;
+            let source = source_pool
+                .connect_direct()
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let data_query = source
+                .conn
+                .simple_query("SELECT * FROM ft_unreachable LIMIT 1")
+                .await;
+            anyhow::ensure!(
+                data_query.is_err(),
+                "reading ft_unreachable must fail, otherwise it cannot show that \
+                 discovery avoided a data query"
+            );
+
+            // A regression that read rows instead would have had that read fail,
+            // so `build_table_providers_for_schema` would skip the table -- it
+            // would be missing from the listing above and have no columns here.
+            assert_eq!(
+                catalog_columns(&rt, "ft_unreachable").await?,
+                vec![
+                    ("id".to_string(), "Int32".to_string()),
+                    ("label".to_string(), "Utf8".to_string()),
+                ],
+                "a foreign table whose data is unreachable must still resolve its \
+                 schema, proving discovery issued no data query against it"
+            );
 
             Ok(())
         })

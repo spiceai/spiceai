@@ -36,7 +36,7 @@ use datafusion_table_providers::sql::arrow_sql_gen::statement::{
 use mysql_async::{Params, Row, prelude::Queryable};
 use runtime::{
     Runtime,
-    accelerated_table::{AcceleratedTable, refresh::Refresh, refresh_task::RefreshTask},
+    accelerated::{AcceleratedTable, refresh::Refresh, refresh_task::RefreshTask},
 };
 use spicepod::acceleration::Acceleration;
 use tokio::runtime::Handle;

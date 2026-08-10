@@ -10,18 +10,21 @@
 # silently changes meaning: it stops catching hangs and starts reporting pool
 # contention as a test failure.
 #
-# That is #12336 / #12434. The `cayenne::mutation_property_test` concurrency
-# property tests need 2-4 minutes of real work, the global ceiling was 360s, and
-# contention on the self-hosted pool was measured stretching them by up to 3.7x.
-# Sign-off then failed on unrelated PRs: in run 30858006237 one variant passed at
-# 356.1s while its matched sibling was killed at 360.015s. Those binaries also
-# carry `retries = 0` (a retry that passes would hide a real convergence race),
-# so the kill was an unrecoverable merge-queue failure.
+# That is #12336 / #12434 / #12811. The `cayenne::mutation_property_test`
+# concurrency property tests need 2-4 minutes of real work, and contention on the
+# self-hosted pool stretches them severalfold. Sign-off then fails on unrelated
+# PRs: in run 30858006237 one variant passed at 356.1s while its matched sibling
+# was killed at 360.015s. Those binaries also carry `retries = 0` (a retry that
+# passes would hide a real convergence race), so the kill is an unrecoverable
+# merge-queue failure.
 #
 # This guard keeps the ceiling ahead of the measurements instead of trusting a
 # comment to stay true. For each binary with a recorded baseline it resolves the
 # ceiling the way nextest does and requires it to clear
-# `baseline * CONTENTION_FACTOR`. It also asserts the two settings stay coupled:
+# `baseline * CONTENTION_FACTOR * CONTENTION_HEADROOM` — the worst contention
+# measured so far, plus room for the next increment, because a ceiling sized to
+# exactly the last measurement is one busy day from failing again (#12811). It
+# also asserts the two settings stay coupled:
 # the convergence binaries must keep `retries = 0` (so a real failure is never
 # retried into a pass) *and* keep an explicit ceiling (so a timeout is not a hard
 # gate failure).
@@ -48,11 +51,23 @@ QUIET_BASELINE_SECONDS = {
 
 # Worst same-test slowdown measured between a quiet pool and a saturated one.
 #
-# Source: merge-queue run 30723487049, where
+# Source: sign-off run 31239284344, where
 # `mutation_property_test prop_concurrent_upsert_only_key_sqlite` passed at
-# 338.0s against a 92.0s quiet baseline in run 30833882620. Contention on this
+# 422.1s against a 92.0s quiet baseline in run 30833882620. Contention on this
 # pool is shared-machine CPU starvation, so it applies to any binary here.
-CONTENTION_FACTOR = 3.7
+CONTENTION_FACTOR = 4.6
+
+# Multiplier applied on top of `CONTENTION_FACTOR` when sizing a ceiling.
+#
+# `CONTENTION_FACTOR` is the worst slowdown observed *so far*. Sizing a ceiling
+# to exactly that leaves it correct only until the pool gets busier by any
+# margin at all, and each time it does, the miss costs a full sign-off cycle and
+# reports a code failure on a diff that never touched these tests (#12811). So a
+# ceiling has to clear the measured worst case by enough to absorb the next
+# increment, not merely match it. Every additional second of headroom is paid
+# for only by a genuine hang, which is a bug being fixed rather than a routine
+# cost.
+CONTENTION_HEADROOM = 1.25
 
 # Binaries whose failures must never be retried: they assert that the accelerated
 # table converges to a reference model, so a retry that happens to pass hides a
@@ -178,7 +193,7 @@ def check_config(config_path: Path) -> list[str]:
         )
 
     for binary, baseline in sorted(QUIET_BASELINE_SECONDS.items()):
-        required = baseline * CONTENTION_FACTOR
+        required = baseline * CONTENTION_FACTOR * CONTENTION_HEADROOM
         try:
             ceiling = ceiling_seconds(resolve(config, binary, "slow-timeout"))
         except ValueError as exc:
@@ -190,9 +205,9 @@ def check_config(config_path: Path) -> list[str]:
             problems.append(
                 f"{name}: {binary} is killed after {ceiling:.0f}s, but its slowest test "
                 f"needs {baseline:.1f}s on a quiet pool and contention has been measured "
-                f"multiplying runtimes by {CONTENTION_FACTOR}x, so it needs at least "
-                f"{required:.0f}s. As configured, pool load decides whether unrelated PRs "
-                "pass. See #12336."
+                f"multiplying runtimes by {CONTENTION_FACTOR}x, so with {CONTENTION_HEADROOM}x "
+                f"headroom for the next increment it needs at least {required:.0f}s. As "
+                "configured, pool load decides whether unrelated PRs pass. See #12336 / #12811."
             )
 
     for binary in sorted(ZERO_RETRY_BINARIES):
@@ -255,8 +270,8 @@ def main(argv: list[str] | None = None) -> int:
 
     print(
         f"OK: {args.config.name} keeps every measured binary's kill ceiling above "
-        f"its quiet baseline x {CONTENTION_FACTOR}, and the convergence binaries "
-        "keep retries = 0 with an explicit ceiling"
+        f"its quiet baseline x {CONTENTION_FACTOR} x {CONTENTION_HEADROOM}, and the "
+        "convergence binaries keep retries = 0 with an explicit ceiling"
     )
     return 0
 
