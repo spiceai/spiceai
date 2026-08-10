@@ -62,6 +62,20 @@ const DISCOVERY_INTERVAL: Duration = Duration::from_secs(5);
 const JOB_RECOVERY_INTERVAL: Duration = Duration::from_secs(10);
 const HEARTBEAT_DIVISOR: u64 = 3;
 
+/// What this tick could prove about who owns the scheduler id.
+///
+/// A conditional write can only prove "the object did not change since I read
+/// it" — it cannot prove "I am the registered incarnation". That distinction is
+/// what keeps a superseded incarnation from refreshing over its successor when
+/// membership is merely unreadable, so it is carried explicitly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Membership {
+    /// A successful read showed this incarnation registered.
+    ConfirmedSelf,
+    /// Membership could not be read. Not evidence either way.
+    Unknown,
+}
+
 /// Compare-and-set attempts for one heartbeat before skipping this beat.
 /// Contention means another incarnation is writing the same key, which is
 /// resolved by re-reading membership rather than by writing harder.
@@ -373,97 +387,118 @@ impl SchedulerRegistryRunner {
         // keeps overwriting the key with its own `instance_id`, `list_alive`
         // filters the *registered* incarnation out as an orphan, and peers
         // re-drive jobs it is still running.
-
         if self.superseded.load(Ordering::Relaxed) {
             return Ok(());
         }
 
-        // Only a *successful* read is evidence of supersession. Heartbeats
-        // deliberately live outside `cluster.json` so the high-frequency write
-        // path does not depend on that document; making emission conditional
-        // on reading it would mean a slow or failing GET silently suppresses
-        // beats and self-evicts a healthy scheduler — producing exactly the
-        // false-dead job re-drive this change exists to prevent. So fail open
-        // on a read error and only decline on a definitive observation.
-        // Bound the read. Failing open covers an *erroring* store, but a hung
-        // or very slow GET would block this loop before the heartbeat write,
-        // and once that exceeds the TTL peers reap this healthy scheduler and
-        // re-drive its jobs — the exact failure the fail-open behaviour exists
-        // to prevent. A timeout is treated exactly like an error: heartbeat
-        // anyway.
+        match self.read_membership().await {
+            Some(true) => self.write_heartbeat(Membership::ConfirmedSelf).await,
+            Some(false) => {
+                // A successful read proved someone else owns the id. Retire.
+                self.superseded.store(true, Ordering::Relaxed);
+                tracing::warn!(
+                    scheduler_id = %self.scheduler_id,
+                    instance_id = %self.instance_id,
+                    "This scheduler incarnation is no longer registered; it will stop heartbeating"
+                );
+                Ok(())
+            }
+            // Membership unreadable. Heartbeats deliberately live outside
+            // `cluster.json` so emission does not depend on that document:
+            // suppressing beats here would self-evict a healthy scheduler.
+            // The write path still refuses to overwrite *another*
+            // incarnation's beat without proof, so failing open cannot clobber
+            // a successor.
+            None => self.write_heartbeat(Membership::Unknown).await,
+        }
+    }
+
+    /// `Some(true)` when a successful, bounded read shows this incarnation
+    /// registered, `Some(false)` when it shows someone else (or nobody), and
+    /// `None` when membership could not be read at all.
+    async fn read_membership(&self) -> Option<bool> {
         let read_timeout = membership_check_timeout(self.entry.ttl_ms);
-        let membership = match tokio::time::timeout(read_timeout, self.cluster.read()).await {
-            Ok(result) => result,
+        match tokio::time::timeout(read_timeout, self.cluster.read()).await {
+            Ok(Ok(state)) => Some(
+                state
+                    .schedulers
+                    .get(&self.scheduler_id)
+                    .map(|entry| entry.instance_id)
+                    == Some(self.instance_id),
+            ),
+            Ok(Err(err)) => {
+                tracing::warn!(
+                    scheduler_id = %self.scheduler_id,
+                    error = %err,
+                    "Could not confirm cluster membership; heartbeating anyway"
+                );
+                None
+            }
             Err(_elapsed) => {
                 tracing::warn!(
                     scheduler_id = %self.scheduler_id,
                     timeout_ms = read_timeout.as_millis(),
                     "Timed out confirming cluster membership; heartbeating anyway"
                 );
-                return self.write_heartbeat().await;
-            }
-        };
-        match membership {
-            Ok(state) => {
-                let registered = state
-                    .schedulers
-                    .get(&self.scheduler_id)
-                    .map(|entry| entry.instance_id);
-                if registered != Some(self.instance_id) {
-                    self.superseded.store(true, Ordering::Relaxed);
-                    tracing::warn!(
-                        scheduler_id = %self.scheduler_id,
-                        instance_id = %self.instance_id,
-                        registered = ?registered,
-                        "This scheduler incarnation is no longer registered; it will stop heartbeating"
-                    );
-                    return Ok(());
-                }
-            }
-            Err(err) => {
-                tracing::warn!(
-                    scheduler_id = %self.scheduler_id,
-                    error = %err,
-                    "Could not confirm cluster membership; heartbeating anyway"
-                );
+                None
             }
         }
-
-        self.write_heartbeat().await
     }
-
-    /// Writes the heartbeat, but only over the object this incarnation just
-    /// observed.
+    /// Writes the heartbeat without ever overwriting another incarnation's.
     ///
-    /// The membership check and the write cannot be one operation — they touch
-    /// different objects — so a successor can register and publish between
-    /// them. Making the write conditional closes that: if anyone else wrote in
-    /// between, the put fails its precondition and this incarnation re-checks
-    /// membership rather than clobbering the successor. Whoever is actually
-    /// registered wins, and a superseded incarnation retires instead of
-    /// retrying.
-    async fn write_heartbeat(&self) -> Result<()> {
+    /// A conditional write proves only "the object did not change since I read
+    /// it" — it cannot prove "I am the registered incarnation". The two are
+    /// therefore combined: the version predicate closes the window between
+    /// checking membership and writing, while `membership` decides whether
+    /// writing over a *foreign* beat is permitted at all.
+    ///
+    /// - Our own beat, or none yet: refresh it. Safe even when membership is
+    ///   unreadable, and refusing would self-evict a healthy scheduler.
+    /// - A foreign beat: overwrite only with a successful membership read
+    ///   proving we are registered. Without that proof, skip the beat — a
+    ///   superseded incarnation must not refresh over its successor merely
+    ///   because `cluster.json` was slow.
+    async fn write_heartbeat(&self, membership: Membership) -> Result<()> {
         for _ in 0..MAX_HEARTBEAT_CAS_ATTEMPTS {
-            // The conditional write needs the current object version, so this
-            // path now reads as well as writes. Bound that read the same way as
-            // the membership read: a store whose reads hang must not wedge the
-            // registry loop. Skipping a beat costs slack against the TTL, which
-            // tolerates several missed beats; hanging costs the loop entirely.
             let read_timeout = membership_check_timeout(self.entry.ttl_ms);
-            let Ok(observed) = tokio::time::timeout(
+            let observed = match tokio::time::timeout(
                 read_timeout,
                 self.heartbeats.read_versioned(&self.scheduler_id),
             )
             .await
-            else {
+            {
+                Ok(result) => result.context(HeartbeatSnafu)?,
+                Err(_elapsed) => {
+                    // The current beat is unknown. With membership confirmed we
+                    // are entitled to the key, so write unconditionally rather
+                    // than skip: skipping repeatedly would let the TTL lapse and
+                    // get this healthy scheduler reaped. Without that proof,
+                    // skip — writing blind could clobber a successor.
+                    if membership == Membership::ConfirmedSelf {
+                        return self.overwrite_heartbeat().await;
+                    }
+                    tracing::warn!(
+                        scheduler_id = %self.scheduler_id,
+                        timeout_ms = read_timeout.as_millis(),
+                        "Timed out reading the heartbeat with membership unconfirmed; skipping this beat"
+                    );
+                    return Ok(());
+                }
+            };
+
+            if let Some((beat, _)) = observed.as_ref()
+                && beat.instance_id != self.instance_id
+                && membership != Membership::ConfirmedSelf
+            {
                 tracing::warn!(
                     scheduler_id = %self.scheduler_id,
-                    timeout_ms = read_timeout.as_millis(),
-                    "Timed out reading the current heartbeat; skipping this beat"
+                    instance_id = %self.instance_id,
+                    holder = %beat.instance_id,
+                    "Another incarnation holds the heartbeat and membership is unconfirmed; skipping this beat"
                 );
                 return Ok(());
-            };
-            let observed = observed.context(HeartbeatSnafu)?;
+            }
+
             let expected = observed.as_ref().map(|(_, version)| version.clone());
             let now = now_ms()?;
             match self
@@ -479,10 +514,21 @@ impl SchedulerRegistryRunner {
             {
                 Ok(()) => return Ok(()),
                 Err(heartbeat::Error::HeartbeatSupersededDuringWrite { .. }) => {
-                    // Someone else wrote. Re-read membership: if they took the
-                    // id over we must stop; otherwise retry over their object.
-                    if self.observe_supersession().await {
-                        return Ok(());
+                    // Someone else wrote between the read and the write. Only a
+                    // fresh membership read decides retry versus retire.
+                    match self.read_membership().await {
+                        // Still ours: fall through to the next attempt.
+                        Some(true) => {}
+                        Some(false) => {
+                            self.superseded.store(true, Ordering::Relaxed);
+                            tracing::warn!(
+                                scheduler_id = %self.scheduler_id,
+                                instance_id = %self.instance_id,
+                                "Lost the heartbeat to the registered incarnation; retiring"
+                            );
+                            return Ok(());
+                        }
+                        None => return Ok(()),
                     }
                 }
                 Err(source) => return Err(Error::Heartbeat { source }),
@@ -495,29 +541,12 @@ impl SchedulerRegistryRunner {
         Ok(())
     }
 
-    /// Returns true when a successful membership read shows this incarnation
-    /// is no longer the registered one, recording that decision as sticky.
-    async fn observe_supersession(&self) -> bool {
-        let read_timeout = membership_check_timeout(self.entry.ttl_ms);
-        let Ok(Ok(state)) = tokio::time::timeout(read_timeout, self.cluster.read()).await else {
-            // Unknown, not evidence: fail open and let the caller retry.
-            return false;
-        };
-        let registered = state
-            .schedulers
-            .get(&self.scheduler_id)
-            .map(|entry| entry.instance_id);
-        if registered == Some(self.instance_id) {
-            return false;
-        }
-        self.superseded.store(true, Ordering::Relaxed);
-        tracing::warn!(
-            scheduler_id = %self.scheduler_id,
-            instance_id = %self.instance_id,
-            registered = ?registered,
-            "Another incarnation owns this scheduler id; retiring this one's heartbeat"
-        );
-        true
+    async fn overwrite_heartbeat(&self) -> Result<()> {
+        let now = now_ms()?;
+        self.heartbeats
+            .heartbeat(&self.scheduler_id, self.instance_id, now, self.entry.ttl_ms)
+            .await
+            .context(HeartbeatSnafu)
     }
 
     async fn refresh_peers(&self) -> Result<()> {
@@ -1050,6 +1079,152 @@ mod tests {
         let beat: crate::cluster::heartbeat::SchedulerHeartbeat =
             serde_json::from_slice(&bytes).expect("parse");
         assert_eq!(beat.instance_id, instance_id);
+    }
+
+    /// A conditional write proves only that the object did not change — not
+    /// that the writer owns the id. So when membership is unreadable and the
+    /// heartbeat belongs to a *successor*, the beat must be skipped: otherwise a
+    /// superseded incarnation refreshes over the live one every tick for as
+    /// long as `cluster.json` stays slow.
+    #[tokio::test]
+    async fn an_unconfirmed_incarnation_does_not_overwrite_a_successors_heartbeat() {
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let store: Arc<dyn ObjectStore> = Arc::new(HangingReads(Arc::clone(&inner)));
+        // Seed membership and the successor's heartbeat through the inner store,
+        // so the wrapper only affects later cluster reads.
+        let seed_cluster = Arc::new(ClusterStateStore::new(Arc::clone(&inner), ""));
+        let heartbeats = Arc::new(SchedulerHeartbeatStore::new(Arc::clone(&store), ""));
+        seed_cluster.bootstrap().await.expect("bootstrap");
+
+        let instance_id = Uuid::new_v4();
+        let successor = Uuid::new_v4();
+        heartbeats
+            .heartbeat("test:50051", successor, 20_000, 30_000)
+            .await
+            .expect("successor heartbeat");
+
+        let entry = SchedulerEntry {
+            scheduler_id: "test:50051".to_string(),
+            instance_id,
+            advertise_address: "test:50051".to_string(),
+            grpc_address: "test:50051".to_string(),
+            http_address: "test:8090".to_string(),
+            started_at_ms: 0,
+            ttl_ms: 30_000,
+            build_version: "test".to_string(),
+            labels: HashMap::new(),
+        };
+        let job_store = crate::jobs::JobStore::new(Arc::clone(&inner), "", instance_id.to_string());
+        let df = DataFusionBuilder::new(
+            status::RuntimeStatus::new(),
+            Arc::new(AcceleratorEngineRegistry::default()),
+            Handle::current(),
+        )
+        .build();
+        let job_executor = Arc::new(crate::jobs::JobExecutor::new(
+            Arc::new(job_store),
+            Arc::new(df),
+        ));
+        let runner = SchedulerRegistryRunner {
+            // Cluster reads go through the hanging wrapper: membership unknown.
+            cluster: Arc::new(ClusterStateStore::new(Arc::clone(&store), "")),
+            heartbeats: Arc::clone(&heartbeats),
+            reaper: Reaper::new(
+                Arc::new(ClusterStateStore::new(Arc::clone(&store), "")),
+                Arc::clone(&heartbeats),
+            ),
+            scheduler_id: "test:50051".to_string(),
+            instance_id,
+            entry,
+            peers: Arc::new(RwLock::new(HashMap::new())),
+            job_executor,
+            superseded: Arc::new(AtomicBool::new(false)),
+        };
+
+        runner
+            .send_heartbeat()
+            .await
+            .expect("an unconfirmed beat must not fail the loop");
+
+        let beat = heartbeats
+            .read("test:50051")
+            .await
+            .expect("read hb")
+            .expect("heartbeat present");
+        assert_eq!(
+            beat.instance_id, successor,
+            "an incarnation that cannot prove membership must not overwrite a successor's heartbeat"
+        );
+        assert_eq!(beat.last_heartbeat_ms, 20_000);
+    }
+
+    /// The mirror case: our *own* beat with membership unreadable must still be
+    /// refreshed. Skipping here would let the TTL lapse and get a healthy
+    /// scheduler reaped — the failure this whole change exists to prevent.
+    #[tokio::test]
+    async fn an_unconfirmed_incarnation_still_refreshes_its_own_heartbeat() {
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let store: Arc<dyn ObjectStore> = Arc::new(HangingReads(Arc::clone(&inner)));
+        let heartbeats = Arc::new(SchedulerHeartbeatStore::new(Arc::clone(&store), ""));
+
+        let instance_id = Uuid::new_v4();
+        heartbeats
+            .heartbeat("test:50051", instance_id, 1_000, 30_000)
+            .await
+            .expect("own heartbeat");
+
+        let entry = SchedulerEntry {
+            scheduler_id: "test:50051".to_string(),
+            instance_id,
+            advertise_address: "test:50051".to_string(),
+            grpc_address: "test:50051".to_string(),
+            http_address: "test:8090".to_string(),
+            started_at_ms: 0,
+            ttl_ms: 30_000,
+            build_version: "test".to_string(),
+            labels: HashMap::new(),
+        };
+        let job_store = crate::jobs::JobStore::new(Arc::clone(&inner), "", instance_id.to_string());
+        let df = DataFusionBuilder::new(
+            status::RuntimeStatus::new(),
+            Arc::new(AcceleratorEngineRegistry::default()),
+            Handle::current(),
+        )
+        .build();
+        let job_executor = Arc::new(crate::jobs::JobExecutor::new(
+            Arc::new(job_store),
+            Arc::new(df),
+        ));
+        let runner = SchedulerRegistryRunner {
+            cluster: Arc::new(ClusterStateStore::new(Arc::clone(&store), "")),
+            heartbeats: Arc::clone(&heartbeats),
+            reaper: Reaper::new(
+                Arc::new(ClusterStateStore::new(Arc::clone(&store), "")),
+                Arc::clone(&heartbeats),
+            ),
+            scheduler_id: "test:50051".to_string(),
+            instance_id,
+            entry,
+            peers: Arc::new(RwLock::new(HashMap::new())),
+            job_executor,
+            superseded: Arc::new(AtomicBool::new(false)),
+        };
+
+        runner
+            .send_heartbeat()
+            .await
+            .expect("refreshing our own beat must succeed");
+
+        let beat = heartbeats
+            .read("test:50051")
+            .await
+            .expect("read hb")
+            .expect("heartbeat present");
+        assert_eq!(beat.instance_id, instance_id);
+        assert!(
+            beat.last_heartbeat_ms > 1_000,
+            "our own heartbeat must be refreshed even when membership is unreadable"
+        );
     }
 
     /// A superseded incarnation must not delete the heartbeat key on the way
