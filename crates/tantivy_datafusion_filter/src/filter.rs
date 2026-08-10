@@ -139,11 +139,13 @@ fn translate(schema: &Schema, expr: &Expr) -> Translated {
             negated,
         }) => in_list(schema, expr, list, *negated),
         Expr::Like(like) => like_prefix(schema, like),
-        // A negation over a nullable column includes the column's NULL rows (SQL excludes them),
-        // so the pushed query is a superset — always `Inexact`, never `Exact`.
+        // Negation is only safe when the inner query is exact. Complementing an inexact superset
+        // would produce a subset and could permanently drop rows before DataFusion rechecks it.
         Expr::Not(inner) => match translate(schema, inner) {
-            Translated::Exact(q) | Translated::Inexact(q) => Translated::Inexact(negate(q)),
-            Translated::Unsupported => Translated::Unsupported,
+            // A negation over a nullable column includes the column's NULL rows (SQL excludes
+            // them), so the pushed query is a superset — `Inexact`.
+            Translated::Exact(q) => Translated::Inexact(negate(q)),
+            Translated::Inexact(_) | Translated::Unsupported => Translated::Unsupported,
         },
         _ => Translated::Unsupported,
     }
@@ -189,8 +191,8 @@ fn comparison(schema: &Schema, left: &Expr, op: Operator, right: &Expr) -> Trans
     match op {
         Operator::Eq => eq_query(field, value_type, scalar),
         Operator::NotEq => match eq_query(field, value_type, scalar) {
-            Translated::Exact(q) | Translated::Inexact(q) => Translated::Inexact(negate(q)),
-            Translated::Unsupported => Translated::Unsupported,
+            Translated::Exact(q) => Translated::Inexact(negate(q)),
+            Translated::Inexact(_) | Translated::Unsupported => Translated::Unsupported,
         },
         Operator::Lt | Operator::LtEq | Operator::Gt | Operator::GtEq => {
             range_query(field, value_type, op, scalar)
@@ -299,12 +301,13 @@ fn in_list(schema: &Schema, expr: &Expr, list: &[Expr], negated: bool) -> Transl
     }
 
     let query: Box<dyn Query> = Box::new(BooleanQuery::new(clauses));
-    let exact = value_type != Type::F64;
-    match (negated, exact) {
+    match (negated, value_type == Type::F64) {
         // Negation adds the column's NULL rows to the match set → superset → `Inexact`.
-        (true, _) => Translated::Inexact(negate(query)),
-        (false, true) => Translated::Exact(query),
-        (false, false) => Translated::Inexact(query),
+        (true, false) => Translated::Inexact(negate(query)),
+        // Float fields are currently rejected by `classify_column`; keep this defensive arm
+        // unsupported if that policy changes without revisiting signed-zero correctness.
+        (_, true) => Translated::Unsupported,
+        (false, false) => Translated::Exact(query),
     }
 }
 
@@ -312,7 +315,7 @@ fn in_list(schema: &Schema, expr: &Expr, list: &[Expr], negated: bool) -> Transl
 /// [`RangeQuery`] `[prefix, prefix⁺)`. Reported `Inexact`: `LIKE` is case-sensitive over the raw
 /// term and the upper bound may fall back to unbounded (a superset), so `DataFusion` re-checks.
 fn like_prefix(schema: &Schema, like: &Like) -> Translated {
-    if like.case_insensitive {
+    if like.case_insensitive || like.negated {
         return Translated::Unsupported;
     }
     let Some(column) = as_column(&like.expr) else {
@@ -350,8 +353,14 @@ fn classify_column(schema: &Schema, column: &str) -> Option<(Field, Type)> {
         return None;
     }
     let value_type = field_type.value_type();
+    // Tantivy preserves the bitwise distinction between -0.0 and +0.0, unlike SQL. Until index
+    // writes and query bounds canonicalize signed zero consistently, float pushdown can omit valid
+    // rows and cannot be repaired by an `Inexact` residual filter.
+    if value_type == Type::F64 {
+        return None;
+    }
     match value_type {
-        Type::I64 | Type::U64 | Type::F64 | Type::Bool => {}
+        Type::I64 | Type::U64 | Type::Bool => {}
         Type::Str => {
             // A tokenized `search_field` is stemmed into multiple terms; no single term equals
             // the raw SQL string, so equality/term filters are not sound against it.
@@ -540,8 +549,10 @@ mod tests {
     }
 
     #[test]
-    fn eq_on_float_is_inexact() {
-        assert_inexact(&col("f").eq(lit(1.5_f64)));
+    fn float_pushdown_is_unsupported() {
+        assert_unsupported(&col("f").eq(lit(1.5_f64)));
+        assert_unsupported(&col("f").lt(lit(1.5_f64)));
+        assert_unsupported(&col("f").in_list(vec![lit(1.5_f64)], false));
     }
 
     #[test]
@@ -562,7 +573,6 @@ mod tests {
         assert_exact(&col("i").lt_eq(lit(5_i64)));
         assert_exact(&col("i").gt(lit(5_i64)));
         assert_exact(&col("i").gt_eq(lit(5_i64)));
-        assert_exact(&col("f").gt(lit(1.5_f64))); // float *ranges* are exact; only float `=` is inexact
         assert_exact(&col("u").lt(lit(100_i64)));
     }
 
@@ -597,8 +607,6 @@ mod tests {
         assert_exact(&col("s").in_list(vec![lit("a"), lit("b")], false));
         // Negated IN adds NULL rows to the match set (superset), so it is Inexact.
         assert_inexact(&col("i").in_list(vec![lit(1_i64), lit(2_i64)], true));
-        // Float IN is Inexact for the same reason `=` on a float is.
-        assert_inexact(&col("f").in_list(vec![lit(1.5_f64)], false));
         // A NULL in the list has three-valued semantics a term set cannot reproduce.
         assert_unsupported(
             &col("i").in_list(vec![lit(1_i64), lit(ScalarValue::Int64(None))], false),
@@ -646,6 +654,15 @@ mod tests {
             false,
         ));
         assert_unsupported(&tokenized);
+        // Negated LIKE cannot use the positive prefix range as a sound superset.
+        let negated = Expr::Like(Like::new(
+            true,
+            Box::new(col("s")),
+            Box::new(lit("abc%")),
+            None,
+            false,
+        ));
+        assert_unsupported(&negated);
     }
 
     #[test]
@@ -653,9 +670,9 @@ mod tests {
         // AND/OR of two Exact children is Exact.
         assert_exact(&col("i").eq(lit(1_i64)).and(col("s").eq(lit("x"))));
         assert_exact(&col("i").eq(lit(1_i64)).or(col("u").eq(lit(2_i64))));
-        // An Inexact child taints the whole combination.
-        assert_inexact(&col("i").eq(lit(1_i64)).and(col("f").eq(lit(1.5_f64))));
-        assert_inexact(&col("f").eq(lit(1.5_f64)).or(col("i").eq(lit(1_i64))));
+        // An Unsupported child makes the whole combination Unsupported.
+        assert_unsupported(&col("i").eq(lit(1_i64)).and(col("f").eq(lit(1.5_f64))));
+        assert_unsupported(&col("f").eq(lit(1.5_f64)).or(col("i").eq(lit(1_i64))));
         // An Unsupported child makes the whole combination Unsupported.
         assert_unsupported(&col("i").eq(lit(1_i64)).and(col("body").eq(lit("x"))));
         assert_unsupported(&col("i").eq(lit(1_i64)).or(col("i").is_null()));
@@ -667,6 +684,15 @@ mod tests {
         assert_inexact(&Expr::Not(Box::new(col("i").eq(lit(5_i64)))));
         assert_inexact(&col("i").not_eq(lit(5_i64)));
         assert_inexact(&col("s").not_eq(lit("x")));
+        assert_unsupported(&Expr::Not(Box::new(col("f").eq(lit(1.5_f64)))));
+        assert_unsupported(&col("f").not_eq(lit(1.5_f64)));
+        assert_unsupported(&Expr::Not(Box::new(Expr::Like(Like::new(
+            false,
+            Box::new(col("s")),
+            Box::new(lit("abc%")),
+            None,
+            false,
+        )))));
         // NOT of an unsupported inner is still unsupported.
         assert_unsupported(&Expr::Not(Box::new(col("body").eq(lit("x")))));
     }
