@@ -31,7 +31,8 @@ use datafusion::{
     scalar::ScalarValue,
     sql::TableReference,
 };
-use spice_table::{Index, SpiceTable, analyzer::IndexTableScanNode};
+use runtime_datafusion_index::analyzer::IndexTableScanNode;
+use spice_table::{Index, SpiceTable};
 use search::index::{VectorScanTableProvider, derived_columns_from_vector_index};
 
 /// An [`OptimizerRule`] that, for any [`LogicalPlan`] with a [`IndexTableScanNode`] extension node, find all
