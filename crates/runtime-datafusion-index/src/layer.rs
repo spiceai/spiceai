@@ -445,3 +445,181 @@ impl TableProvider for SpiceTable {
         self.layer.truncate(&self.below, state).await
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::datasource::MemTable;
+    use std::any::Any;
+
+    #[derive(Debug)]
+    struct TestIndex(&'static str);
+
+    impl Index for TestIndex {
+        fn name(&self) -> &'static str {
+            self.0
+        }
+        fn required_columns(&self) -> Vec<String> {
+            vec!["id".to_string()]
+        }
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct TestLayer {
+        opaque_to: Vec<LayerWalk>,
+        indexes: Vec<Arc<dyn Index + Send + Sync>>,
+    }
+
+    impl TestLayer {
+        fn marker() -> Arc<dyn TableLayer> {
+            Arc::new(Self::default())
+        }
+
+        fn opaque(walk: LayerWalk) -> Arc<dyn TableLayer> {
+            Arc::new(Self {
+                opaque_to: vec![walk],
+                ..Self::default()
+            })
+        }
+
+        fn indexed(name: &'static str) -> Arc<dyn TableLayer> {
+            Arc::new(Self {
+                indexes: vec![Arc::new(TestIndex(name))],
+                ..Self::default()
+            })
+        }
+    }
+
+    impl TableLayer for TestLayer {
+        fn transparent_to(&self, walk: LayerWalk) -> bool {
+            !self.opaque_to.contains(&walk)
+        }
+
+        fn indexes(&self) -> &[Arc<dyn Index + Send + Sync>] {
+            &self.indexes
+        }
+    }
+
+    fn base() -> Arc<dyn TableProvider> {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        Arc::new(MemTable::try_new(schema, vec![vec![]]).expect("mem table"))
+    }
+
+    /// Regression test: peeling must stop *at* an opaque layer, not below it.
+    /// Returning the table underneath would route a walk past semantics the
+    /// layer exists to enforce — a retention delete past a deletion provider,
+    /// for instance, deletes from the wrong table.
+    #[test]
+    fn peel_stops_at_the_opaque_layer_not_below_it() {
+        let bottom = SpiceTable::over(TestLayer::marker(), base());
+        let opaque = SpiceTable::over(TestLayer::opaque(LayerWalk::RetentionDelete), bottom);
+        let top: Arc<dyn TableProvider> = SpiceTable::over(TestLayer::marker(), opaque);
+
+        let peeled = peel_to(&top, LayerWalk::RetentionDelete);
+        let peeled_table = peeled
+            .downcast_ref::<SpiceTable>()
+            .expect("peel should stop at the opaque layer, which is layered");
+        assert!(
+            !peeled_table.layer().transparent_to(LayerWalk::RetentionDelete),
+            "peel returned the table below the opaque layer instead of including it"
+        );
+    }
+
+    #[test]
+    fn peel_reaches_the_base_when_every_layer_is_transparent() {
+        let inner = SpiceTable::over(TestLayer::marker(), base());
+        let top: Arc<dyn TableProvider> = SpiceTable::over(TestLayer::marker(), inner);
+
+        let peeled = peel_to(&top, LayerWalk::Read);
+        assert!(
+            peeled.downcast_ref::<MemTable>().is_some(),
+            "a fully transparent stack should peel to the base provider"
+        );
+    }
+
+    #[test]
+    fn peel_returns_an_unlayered_provider_unchanged() {
+        let plain = base();
+        assert!(peel_to(&plain, LayerWalk::Read).downcast_ref::<MemTable>().is_some());
+    }
+
+    #[test]
+    fn visit_walks_outermost_first_and_stops_after_the_opaque_layer() {
+        let bottom = SpiceTable::over(TestLayer::indexed("bottom"), base());
+        let middle = SpiceTable::over(TestLayer::opaque(LayerWalk::CdcDetection), bottom);
+        let top = SpiceTable::over(TestLayer::indexed("top"), middle);
+
+        let mut seen = Vec::new();
+        top.visit(LayerWalk::CdcDetection, &mut |table| {
+            seen.push(table.layer().indexes().first().map(|i| i.name()));
+        });
+        assert_eq!(
+            seen,
+            vec![Some("top"), None],
+            "visit must include the opaque layer and stop there"
+        );
+    }
+
+    /// An index is bound to the table *beneath* the layer carrying it — that is
+    /// what a search executes against — so the first match must return its own
+    /// `below`, not the base of the whole stack.
+    #[test]
+    fn find_index_returns_the_table_the_index_is_bound_to() {
+        let bottom = SpiceTable::over(TestLayer::indexed("bottom"), base());
+        let top = SpiceTable::over(TestLayer::indexed("top"), Arc::clone(&bottom) as Arc<dyn TableProvider>);
+
+        let (found, bound) = top.find_index::<TestIndex>().expect("an index");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].name(), "top", "outermost index layer wins");
+        assert!(
+            bound.downcast_ref::<SpiceTable>().is_some(),
+            "the bound table is the stack below the matching layer, not the base"
+        );
+    }
+
+    #[test]
+    fn all_indexes_collects_every_layer_outermost_first() {
+        let bottom = SpiceTable::over(TestLayer::indexed("bottom"), base());
+        let middle = SpiceTable::over(TestLayer::marker(), bottom);
+        let top = SpiceTable::over(TestLayer::indexed("top"), middle);
+
+        let names: Vec<_> = top.all_indexes().iter().map(|i| i.name()).collect();
+        assert_eq!(names, vec!["top", "bottom"]);
+    }
+
+    #[test]
+    fn base_provider_reaches_through_every_layer() {
+        let inner = SpiceTable::over(TestLayer::marker(), base());
+        let top = SpiceTable::over(TestLayer::indexed("top"), inner);
+        assert!(top.base_provider().downcast_ref::<MemTable>().is_some());
+    }
+
+    /// The defaulted trait methods must reach the base, or a layer that
+    /// declares nothing would silently change the table it wraps.
+    #[test]
+    fn defaulted_methods_delegate_through_the_stack() {
+        let base_table = base();
+        let top = SpiceTable::over(TestLayer::marker(), SpiceTable::over(TestLayer::marker(), Arc::clone(&base_table)));
+        assert_eq!(top.schema(), base_table.schema());
+        assert_eq!(top.table_type(), base_table.table_type());
+    }
+
+    #[test]
+    fn rebuild_base_replaces_the_base_and_keeps_every_layer() {
+        let top = SpiceTable::over(TestLayer::indexed("top"), SpiceTable::over(TestLayer::marker(), base()));
+
+        let replacement = base();
+        let rebuilt = top.rebuild_base(&|_| Arc::clone(&replacement));
+
+        assert_eq!(
+            rebuilt.all_indexes().iter().map(|i| i.name()).collect::<Vec<_>>(),
+            vec!["top"],
+            "layers above the base must survive a rebuild"
+        );
+        assert!(Arc::ptr_eq(rebuilt.base_provider(), &replacement));
+    }
+}
