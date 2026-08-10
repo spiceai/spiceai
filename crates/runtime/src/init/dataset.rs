@@ -1592,22 +1592,35 @@ impl Runtime {
         new_app: &Arc<App>,
     ) {
         let valid_datasets = Arc::clone(&self).get_valid_datasets(new_app, LogErrors(true));
-        let startup_datasets = valid_datasets;
 
         // Validate Cayenne snapshot consistency before initializing accelerators.
         let acceleration_sources: Vec<Arc<dyn AccelerationSource>> =
-            startup_datasets.iter().map(|ds| ds.clone_arc()).collect();
+            valid_datasets.iter().map(|ds| ds.clone_arc()).collect();
         if let Err(err) = validate_cayenne_snapshot_consistency(&acceleration_sources) {
             tracing::error!("{err}");
             return;
         }
 
-        let init_results = self
-            .initialize_datasets_accelerators(&startup_datasets)
-            .await;
         let existing_datasets = Arc::clone(&self).get_valid_datasets(current_app, LogErrors(false));
 
-        for ds in &startup_datasets {
+        // Only the datasets this diff loads or updates are initialized: `mode: file_create`
+        // deletes the acceleration state on init, and an unchanged dataset keeps serving from
+        // the `AcceleratedTable` it already has.
+        let datasets_to_apply: Vec<Arc<Dataset>> = valid_datasets
+            .into_iter()
+            .filter(|ds| {
+                existing_datasets
+                    .iter()
+                    .find(|current| current.name == ds.name)
+                    .is_none_or(|current| current != ds)
+            })
+            .collect();
+
+        let init_results = self
+            .initialize_datasets_accelerators(&datasets_to_apply)
+            .await;
+
+        for ds in &datasets_to_apply {
             let bootstrap_status = match init_results.get(&ds.name) {
                 Some(Ok(status)) => status.clone(),
                 Some(Err(_)) => {
@@ -1620,10 +1633,8 @@ impl Runtime {
                 }
             };
 
-            if let Some(current_ds) = existing_datasets.iter().find(|d| d.name == ds.name) {
-                if ds != current_ds {
-                    Arc::clone(&self).update_dataset(Arc::clone(ds)).await;
-                }
+            if existing_datasets.iter().any(|d| d.name == ds.name) {
+                Arc::clone(&self).update_dataset(Arc::clone(ds)).await;
             } else {
                 self.status
                     .update_dataset(&ds.name, status::ComponentStatus::Initializing);
