@@ -909,7 +909,7 @@ pub async fn start(
 
     let mut server = server
         .layer(
-            RequestContextLayer::new(app, rt.datafusion(), session_store, rt.secrets())
+            RequestContextLayer::new(rt.app(), rt.datafusion(), session_store, rt.secrets())
                 .with_job_executor(job_executor),
         )
         // mTLS principal injection runs *after* RequestContextLayer
