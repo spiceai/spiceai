@@ -1549,6 +1549,7 @@ impl Query {
                         res_stream,
                         cache_manager.raw_cache_key,
                         datasets,
+                        query_start,
                     )
                 } else {
                     res_stream

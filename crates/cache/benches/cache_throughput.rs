@@ -64,6 +64,7 @@ impl CacheMetrics for BenchValue {
     fn record_size(_size: u64) {}
     fn record_max_size(_size: u64) {}
     fn record_eviction(_reason: EvictionReason) {}
+    fn record_stale_rejection() {}
     fn update_hit_ratio(_hits: u64, _total: u64) {}
     fn publish_counters_at_zero() {}
 }
