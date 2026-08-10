@@ -659,10 +659,10 @@ impl DataAccelerator for TursoAccelerator {
 
             // `pools` is keyed by file path and a cached pool keeps serving the
             // file it opened, so a pool cached for a path with nothing on it is
-            // holding a file that was replaced there. Evict it before anything
-            // opens what lands at `path` next — the snapshot restore below
-            // resolves this dataset's checkpoint through this same pool, as does
-            // the table the reload re-registers.
+            // bound to no file currently at that path. Evict it before anything
+            // opens what lands there next — the snapshot restore below resolves
+            // this dataset's checkpoint through this same pool, as does the
+            // table the reload re-registers.
             if !std::path::Path::new(&path).exists() {
                 self.pools.lock().await.remove(&path);
             }
