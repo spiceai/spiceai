@@ -422,6 +422,44 @@ impl TursoAccelerator {
         Ok(pool)
     }
 
+    /// Returns the shared connection pool for the database file at `db_path`.
+    ///
+    /// Callers holding an [`AccelerationSource`] should use [`Self::get_shared_pool`],
+    /// which derives the path from the source and applies its timestamp format and
+    /// storage pragmas. This variant serves databases that belong to the runtime
+    /// rather than to a dataset — the Cayenne metastore's `cayenne.db` — where there
+    /// is a path but no source to derive one from.
+    ///
+    /// Going through the cache matters for more than saving a handle. The lock that
+    /// serializes DDL against an open `BEGIN CONCURRENT` write lives on the
+    /// [`TursoConnectionPool`] instance, so two pools over one file hold two
+    /// independent locks and exclude nothing.
+    pub async fn get_shared_pool_for_path(
+        &self,
+        db_path: &str,
+    ) -> Result<Arc<TursoConnectionPool>> {
+        let mut pools = self.pools.lock().await;
+        if let Some(pool) = pools.get(db_path) {
+            return Ok(Arc::clone(pool));
+        }
+
+        let pool = Arc::new(
+            TursoConnectionPool::new(db_path)
+                .await
+                .map_err(|e| match e {
+                    data_components::turso::Error::TursoDatabaseError { source } => {
+                        Error::TursoDatabaseError { source }
+                    }
+                    _ => Error::AccelerationCreationFailed {
+                        source: Box::new(e),
+                    },
+                })?,
+        );
+
+        pools.insert(db_path.to_string(), Arc::clone(&pool));
+        Ok(pool)
+    }
+
     /// Per-storage SQLite/Turso pragma overrides applied after pool creation.
     ///
     /// On EBS-class network-attached storage we bump the page cache to absorb
@@ -1787,5 +1825,45 @@ mod tests {
                 "TimestampNanosecond should round-trip correctly"
             );
         }
+    }
+
+    /// One database file gets one pool, because the lock that serializes DDL
+    /// against an open `BEGIN CONCURRENT` write lives on the pool instance.
+    /// Two pools over one file hold two independent locks and exclude nothing.
+    #[tokio::test]
+    async fn get_shared_pool_for_path_returns_one_pool_per_file() {
+        let dir = std::env::temp_dir().join("spice_turso_shared_pool_by_path");
+        std::fs::create_dir_all(&dir).expect("temp directory should be creatable");
+        let metastore = dir.join("cayenne.db").to_string_lossy().to_string();
+        let unrelated = dir.join("other.db").to_string_lossy().to_string();
+        cleanup_turso_test_files(&metastore);
+        cleanup_turso_test_files(&unrelated);
+
+        let accelerator = TursoAccelerator::new();
+
+        let first = accelerator
+            .get_shared_pool_for_path(&metastore)
+            .await
+            .expect("a pool should be created for a path with no acceleration source");
+        let second = accelerator
+            .get_shared_pool_for_path(&metastore)
+            .await
+            .expect("a second request for the same path should resolve");
+        let other = accelerator
+            .get_shared_pool_for_path(&unrelated)
+            .await
+            .expect("a pool should be created for a second path");
+
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "two requests for the same database file must share one pool"
+        );
+        assert!(
+            !Arc::ptr_eq(&first, &other),
+            "distinct database files must not share a pool"
+        );
+
+        cleanup_turso_test_files(&metastore);
+        cleanup_turso_test_files(&unrelated);
     }
 }

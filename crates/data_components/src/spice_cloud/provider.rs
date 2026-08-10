@@ -19,12 +19,12 @@ limitations under the License.
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::catalog_filter::TableSelector;
 use async_trait::async_trait;
 use datafusion::catalog::{CatalogProvider, SchemaProvider, TableProvider};
 use datafusion::error::Result as DFResult;
 use datafusion::sql::TableReference;
 use futures::future::try_join_all;
-use globset::GlobSet;
 use iceberg::{Catalog, NamespaceIdent};
 use snafu::prelude::*;
 
@@ -93,14 +93,12 @@ impl SpiceCloudPlatformCatalogProvider {
         client: Arc<RestCatalog>,
         root_namespace: NamespaceIdent,
         connector: Arc<dyn Read>,
-        include: Option<GlobSet>,
+        selector: TableSelector,
     ) -> Result<Self> {
         let schema_names: Vec<_> = client
             .list_namespaces(Some(&root_namespace))
             .await
             .context(ListNamespacesSnafu)?;
-
-        let include = include.map(Arc::new);
 
         let providers = try_join_all(schema_names.iter().map(|name| {
             let mut child_namespace_vec = root_namespace.clone().inner();
@@ -120,7 +118,7 @@ impl SpiceCloudPlatformCatalogProvider {
                 Arc::clone(&client),
                 child_namespace,
                 Arc::clone(&connector),
-                include.clone(),
+                selector.clone(),
             )
         }))
         .await?;
@@ -189,7 +187,7 @@ impl SpiceCloudPlatformSchemaProvider {
         client: Arc<RestCatalog>,
         namespace: NamespaceIdent,
         connector: Arc<dyn Read>,
-        include: Option<Arc<GlobSet>>,
+        selector: TableSelector,
     ) -> Result<Self> {
         let table_names: Vec<_> = client
             .list_tables(&namespace)
@@ -222,10 +220,10 @@ impl SpiceCloudPlatformSchemaProvider {
                             table_name.name().to_string(),
                         ),
                     };
-                if let Some(include) = &include
-                    && !include.is_match(schema_and_table)
-                {
-                    tracing::debug!("Table {} is not included", table_reference);
+                if !selector.selects(&schema_and_table) {
+                    tracing::debug!(
+                        "Table {table_reference} is not selected by the catalog's include/exclude patterns, skipping"
+                    );
                     return None;
                 }
                 Some(table_reference)

@@ -20,7 +20,7 @@ use crate::cluster::partition::get_partition_filter_exprs;
 use crate::dataaccelerator::BootstrapStatus;
 use crate::dataaccelerator::spice_sys::OpenOption;
 use crate::dataaccelerator::spice_sys::caching_engine::CachingEngineSys;
-use crate::dataaccelerator::spice_sys::is_shutdown_cancellation;
+use crate::dataconnector::refresh_source::ConnectorRefreshSource;
 use crate::init::dataset_initialization::DatasetInitialization;
 use crate::{
     AcceleratedTableInvalidChangesSnafu, AcceleratorEngineNotAvailableSnafu,
@@ -30,7 +30,7 @@ use crate::{
     UnableToBuildDatasetSnafu, UnableToCreateAcceleratedTableSnafu,
     UnableToInitializeDataConnectorSnafu, UnableToLoadDatasetConnectorSnafu,
     UnknownDataConnectorSnafu,
-    accelerated_table::AcceleratedTable,
+    accelerated::AcceleratedTable,
     component::dataset::{
         Dataset,
         acceleration::{Acceleration, RefreshMode},
@@ -46,22 +46,22 @@ use crate::{
         parameters::ConnectorParamsBuilder,
     },
     embeddings::connector::EmbeddingConnector,
-    error_spaced,
-    federated_table::FederatedTable,
+    federated::FederatedTable,
     search::full_text::connector::FullTextConnector,
     status,
     tracing_util::dataset_registered_trace,
-    warn_spaced,
 };
 use app::App;
 use datafusion::sql::TableReference;
 use futures::StreamExt;
 use futures::future::join_all;
 use opentelemetry::KeyValue;
+use runtime_async::is_shutdown_cancellation;
 use runtime_metrics::{self as metrics, components::register_component_metric};
 use snafu::prelude::*;
 use tokio::sync::Semaphore;
 use util::{RetryError, fibonacci_backoff::FibonacciBackoffBuilder, retry};
+use util::{error_spaced, warn_spaced};
 
 impl Runtime {
     pub(crate) async fn load_datasets(self: Arc<Self>) {
@@ -848,9 +848,9 @@ impl Runtime {
                     .resolve_refresh_mode(ds.acceleration.as_ref().and_then(|a| a.refresh_mode));
                 ds = Self::apply_inferred_acceleration(ds, &provider, resolved_refresh_mode);
                 FederatedTable::new(
-                    Arc::clone(&ds),
+                    Arc::new(ds.spec.clone()),
                     provider,
-                    Arc::clone(&data_connector),
+                    ConnectorRefreshSource::new_arc(Arc::clone(&data_connector), Arc::clone(&ds)),
                     self.status.shutdown_token(),
                     allow_schema_mismatch,
                 )
@@ -860,8 +860,8 @@ impl Runtime {
                 // We couldn't connect to the federated table. If the dataset has an existing
                 // accelerated table, we can defer the federated table creation.
                 if let Some(federated_table) = FederatedTable::new_deferred(
-                    Arc::clone(&ds),
-                    Arc::clone(&data_connector),
+                    Arc::new(ds.spec.clone()),
+                    ConnectorRefreshSource::new_arc(Arc::clone(&data_connector), Arc::clone(&ds)),
                     self.status.shutdown_token(),
                 )
                 .await
@@ -1016,7 +1016,7 @@ impl Runtime {
 
         // Drop the dataset's CDC schema-evolution settings; a reload re-installs
         // them at registration before the changes stream starts.
-        crate::accelerated_table::refresh_task::changes::remove_cdc_schema_evolution(&ds_name);
+        crate::accelerated::refresh_task::changes::remove_cdc_schema_evolution(&ds_name);
 
         tracing::info!("Unloaded dataset {}", &ds_name);
         let engine = ds_acceleration.map_or_else(
@@ -1199,9 +1199,9 @@ impl Runtime {
             )
         });
         let federated_table = FederatedTable::new(
-            Arc::clone(&ds),
+            Arc::new(ds.spec.clone()),
             read_table,
-            Arc::clone(&connector),
+            ConnectorRefreshSource::new_arc(Arc::clone(&connector), Arc::clone(&ds)),
             self.status.shutdown_token(),
             allow_schema_mismatch,
         )

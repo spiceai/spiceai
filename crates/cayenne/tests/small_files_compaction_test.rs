@@ -83,8 +83,19 @@ fn aggressive_sorted_compaction_config() -> VortexConfig {
     }
 }
 
-/// Same as [`aggressive_compaction_config`] but forces key-based deletion so
-/// warm-subset compaction (not the position full-rewrite path) is exercised.
+/// Same as [`aggressive_compaction_config`] but forces key-based deletion.
+///
+/// Key deletion is *necessary* for the warm-subset rewrite but not sufficient:
+/// `subset_rewrite_eligibility` also requires the picker's candidate to be a
+/// proper subset of the current files. This config does not settle which
+/// rewrite runs, and neither does its file count: `compaction_max_files_per_pick`
+/// caps the files taken from the single tier bucket that fired, not the
+/// snapshot, so a candidate is a proper subset — well under the cap of 32 —
+/// whenever any current file is already settled or sits in the other tier.
+///
+/// So the tests here assert delete/row semantics, never a rewrite path. The
+/// path is observable via `last_small_file_compact_path()`, and
+/// `p1_subset_path_test.rs` is where each one is driven and asserted.
 fn aggressive_key_deletion_compaction_config() -> VortexConfig {
     VortexConfig {
         deletion_mode: cayenne::metadata::DeletionMode::Key,
@@ -1083,13 +1094,19 @@ async fn compact_current_after_seed_then_more_preserves_all_rows(
             "explicit phase-B compact must reduce file count ({files_before} → {files_after})"
         );
     } else {
-        // Post-write already drained the backlog; require only that the
-        // snapshot is not still holding every phase-B append as its own file.
-        let total_appends = usize::try_from(seed_batches + more).expect("fits");
+        // Post-write already drained the backlog. The bound has to be what an
+        // un-consolidated phase B would leave — the files phase A settled on
+        // plus one per phase-B append, since each append clears
+        // `INLINE_MAX_ROWS` and is too small to shard. Comparing against the
+        // raw append total instead asserts nothing: phase A already proved
+        // `files_a < seed_batches`, so `files_a + more < seed_batches + more`
+        // holds by construction whether or not post-write consolidated.
+        let unconsolidated = files_a + usize::try_from(more).expect("fits");
         assert!(
-            files_before < total_appends,
+            files_before < unconsolidated,
             "without an explicit compact, post-write must have consolidated \
-             below {total_appends} files (found {files_before})"
+             below {unconsolidated} files (phase-A settled at {files_a}, \
+             +{more} appends; found {files_before})"
         );
     }
     assert_eq!(count_rows(&ctx, "two_phase_compact").await, expected);
@@ -1257,16 +1274,23 @@ async fn build_append_only_key_delete_table(
     (table, ctx, table_id)
 }
 
-test_with_backends!(warm_subset_preserves_key_deletes_and_rows);
-async fn warm_subset_preserves_key_deletes_and_rows(
+test_with_backends!(key_delete_survives_compaction_and_reseed);
+async fn key_delete_survives_compaction_and_reseed(
     fixture: common::TestFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Append-only key-mode PK table: compact, DELETE one PK, re-seed, compact
     // again. MoR must keep the deleted key hidden and the exact row total must
     // match what we inserted after the delete.
+    //
+    // Which rewrite this drives — full or warm subset — is deliberately not
+    // asserted: the candidate is a proper subset whenever a current file is
+    // settled or in the other tier, and the sizes here do not pin that down
+    // (see `aggressive_key_deletion_compaction_config`). What the PK buys is
+    // the key-delete topology — a PK-less table resolves to position-based
+    // deletion and a different MoR path.
     let schema = pk_schema();
     let (table, ctx, table_id) =
-        build_append_only_key_delete_table(&fixture, "warm_subset_deletes", Arc::clone(&schema))
+        build_append_only_key_delete_table(&fixture, "key_delete_survives", Arc::clone(&schema))
             .await;
 
     let batch_rows: i64 = 1500;
@@ -1282,12 +1306,12 @@ async fn warm_subset_preserves_key_deletes_and_rows(
     let Some((_snap_a, files_a)) = wait_until_current_snapshot_compacts(
         &table,
         &fixture,
-        "warm_subset_deletes",
+        "key_delete_survives",
         usize::try_from(seed_batches).expect("fits"),
     )
     .await?
     else {
-        panic!("key-mode append-only table should produce a warm-subset compaction candidate");
+        panic!("key-mode append-only table should produce a small-file compaction candidate");
     };
     assert!(
         files_a < usize::try_from(seed_batches).expect("fits"),
@@ -1304,14 +1328,14 @@ async fn warm_subset_preserves_key_deletes_and_rows(
         .expect("run delete");
 
     assert_eq!(
-        count_rows_matching(&ctx, "warm_subset_deletes", "id = 10").await,
+        count_rows_matching(&ctx, "key_delete_survives", "id = 10").await,
         0,
         "delete must hide id=10"
     );
-    let before = count_rows(&ctx, "warm_subset_deletes").await;
+    let before = count_rows(&ctx, "key_delete_survives").await;
     let snap_after_delete = fixture
         .catalog
-        .get_table("warm_subset_deletes")
+        .get_table("key_delete_survives")
         .await?
         .current_snapshot_id;
 
@@ -1344,7 +1368,7 @@ async fn warm_subset_preserves_key_deletes_and_rows(
 
     let snap_after = fixture
         .catalog
-        .get_table("warm_subset_deletes")
+        .get_table("key_delete_survives")
         .await?
         .current_snapshot_id;
     let files_after = count_vortex_files(&fixture.data_path, &table_id, &snap_after).await;
@@ -1358,15 +1382,15 @@ async fn warm_subset_preserves_key_deletes_and_rows(
     // Exact expected total: rows before re-seed + more_batches * batch_rows.
     // (id=10 is already excluded from `before`.)
     let expected = before + batch_rows * more_batches;
-    let after = count_rows(&ctx, "warm_subset_deletes").await;
+    let after = count_rows(&ctx, "key_delete_survives").await;
     assert_eq!(
         after, expected,
         "exact row total after re-seed + compact (before={before}, more={more_batches}*{batch_rows})"
     );
     assert_eq!(
-        count_rows_matching(&ctx, "warm_subset_deletes", "id = 10").await,
+        count_rows_matching(&ctx, "key_delete_survives", "id = 10").await,
         0,
-        "deleted key must remain hidden after warm-subset compaction (MoR kept)"
+        "deleted key must remain hidden after compaction (MoR kept)"
     );
 
     Ok(())
@@ -1449,21 +1473,21 @@ async fn a_seed_is_consolidated_before_its_fanout_can_be_listed(
     Ok(())
 }
 
-test_with_backends!(warm_subset_reduces_small_file_fanout);
-async fn warm_subset_reduces_small_file_fanout(
+test_with_backends!(full_rewrite_reduces_small_file_fanout);
+async fn full_rewrite_reduces_small_file_fanout(
     fixture: common::TestFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let schema = pk_schema();
     let (table, ctx, _table_id) = build_table(
         &fixture,
-        "warm_subset_fanout",
+        "full_rewrite_fanout",
         Arc::clone(&schema),
         None,
         // No primary key, so `DeletionMode::Key` resolves to position-based
         // deletion and `subset_rewrite_eligibility` rejects the subset rewrite
         // outright — what this exercises is the full-rewrite small-file path.
-        // `warm_subset_preserves_key_deletes_and_rows` builds a real PK table and
-        // is the one that covers subset rewrite.
+        // The subset rewrite is covered by `p1_subset_path_test.rs`, which
+        // asserts the recorded path rather than inferring it from the config.
         aggressive_key_deletion_compaction_config(),
     )
     .await;
@@ -1473,7 +1497,7 @@ async fn warm_subset_reduces_small_file_fanout(
     // read taken after the loop is not reliably the un-compacted one.
     let pre_snapshot = fixture
         .catalog
-        .get_table("warm_subset_fanout")
+        .get_table("full_rewrite_fanout")
         .await?
         .current_snapshot_id;
 
@@ -1496,7 +1520,7 @@ async fn warm_subset_reduces_small_file_fanout(
     let Some((post_snap, post_count)) = wait_until_current_snapshot_compacts(
         &table,
         &fixture,
-        "warm_subset_fanout",
+        "full_rewrite_fanout",
         seeded_appends,
     )
     .await?
@@ -1510,7 +1534,7 @@ async fn warm_subset_reduces_small_file_fanout(
         "compaction must strictly reduce fan-out (seeded={seeded_appends}, post={post_count})"
     );
     assert_eq!(
-        count_rows(&ctx, "warm_subset_fanout").await,
+        count_rows(&ctx, "full_rewrite_fanout").await,
         batch_rows * batches
     );
     Ok(())

@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use spice_cloud_client::CloudClient;
-use spice_cloud_client::types::UpdateAppRequest;
+use spice_cloud_client::types::UpdateProjectRequest;
 use system_adapter_protocol::DatasetConfig;
 use uuid::Uuid;
 
@@ -166,12 +166,12 @@ pub(crate) async fn provision_scp_app(
             scp.image_tag, scp.channel
         );
         cloud
-            .update_app(
+            .update_project(
                 app_id,
-                &UpdateAppRequest {
+                &UpdateProjectRequest {
                     image_tag: scp.image_tag.clone(),
                     update_channel: scp.channel.as_ref().map(ToString::to_string),
-                    ..UpdateAppRequest::default()
+                    ..UpdateProjectRequest::default()
                 },
             )
             .await
@@ -249,7 +249,7 @@ pub(crate) async fn wait_for_scp_executor_count(
             return;
         }
 
-        match cloud.get_app_metrics(app_id, None).await {
+        match cloud.get_project_metrics(app_id, None).await {
             Ok(metrics) => {
                 if let Some(cluster) = &metrics.cluster
                     && let Some(count) = cluster.active_executors_count

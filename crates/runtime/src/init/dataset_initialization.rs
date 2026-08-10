@@ -52,7 +52,7 @@ use crate::Error as RuntimeError;
 use crate::component::dataset::Dataset;
 use crate::dataaccelerator::BootstrapStatus;
 use crate::dataconnector::{DataConnector, NewDataConnectorResult};
-use crate::{Result, Runtime, accelerated_table::AcceleratedTable};
+use crate::{Result, Runtime, accelerated::AcceleratedTable};
 
 /// Where the `DataConnector` for this dataset comes from.
 pub enum ConnectorSource {

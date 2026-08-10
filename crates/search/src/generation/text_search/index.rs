@@ -856,9 +856,14 @@ fn parse_json_array(
 mod tests {
 
     use super::*;
-    use arrow::{array::record_batch, util::pretty::pretty_format_batches};
+    use arrow::{
+        array::{Array, StringArray, record_batch},
+        util::pretty::pretty_format_batches,
+    };
     use arrow_schema::{ArrowError, Schema};
     use datafusion::datasource::{MemTable, TableProvider};
+    use datafusion::physical_plan::collect;
+    use datafusion::prelude::SessionContext;
     use futures::{StreamExt, TryStreamExt};
     use runtime_datafusion_index::{Index, WriteWindow};
     use std::time::Duration;
@@ -1052,7 +1057,6 @@ mod tests {
     async fn search_and_format(idx: &FullTextSearchFieldIndex, query: impl Into<String>) -> String {
         let rb: Vec<RecordBatch> = idx
             .search(query.into(), vec![], 1000)
-            .await
             .expect("Failed to search")
             .map(|res| match res {
                 Ok(rb) => sort_columns_alphabetically(&rb)
@@ -1066,12 +1070,9 @@ mod tests {
         format!("{}", pretty_format_batches(&rb).expect("failed to format"))
     }
 
-    /// End-to-end proof that an `Exact` SQL filter is applied *inside* the tantivy index rather
-    /// than above the candidate scan. Every row matches the full-text term, so a low-priority row
-    /// would never surface within a tiny top-K; pushing `id = <target>` into the index shrinks the
-    /// candidate set to exactly that row, and it is found even at `limit = 1`. Post-filtering a
-    /// `limit = 1` scan would instead return zero rows for the target — regression test for the
-    /// silent-truncation gap (#12231).
+    /// Verifies that an exact filter is included in the tantivy query before the top-K limit is
+    /// applied. With `id = 47` pushed down, the matching document remains available even when
+    /// `limit = 1`. Regression test for #12231.
     #[tokio::test]
     async fn filter_pushdown_finds_row_beyond_candidate_cap() {
         use crate::SEARCH_SCORE_COLUMN_NAME;
@@ -1125,7 +1126,6 @@ mod tests {
 
         let unfiltered_rows: Vec<RecordBatch> = fts
             .search("shared".to_string(), vec![], 1000)
-            .await
             .expect("failed to run unfiltered search")
             .try_collect()
             .await
@@ -1138,7 +1138,6 @@ mod tests {
             .expect("failed to translate pushable filter");
         let rows: Vec<RecordBatch> = fts
             .search("shared".to_string(), queries, 1)
-            .await
             .expect("failed to search")
             .try_collect()
             .await
@@ -1178,7 +1177,6 @@ mod tests {
             .expect("failed to translate range filter");
         let range_rows: Vec<RecordBatch> = fts
             .search("shared".to_string(), range_queries, 1000)
-            .await
             .expect("failed to search")
             .try_collect()
             .await
@@ -1201,6 +1199,178 @@ mod tests {
             vec![10, 11, 12],
             "BETWEEN must return exactly the in-range rows"
         );
+    }
+
+    // Regression test for #12228.
+    #[tokio::test]
+    async fn test_search_preserves_all_nullable_stored_columns() {
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new("title", DataType::Utf8, false),
+                Field::new("subtitle", DataType::Utf8, true),
+                Field::new("body", DataType::Utf8, false),
+            ])),
+            vec![
+                Arc::new(arrow::array::Int32Array::from(vec![1, 2])),
+                Arc::new(StringArray::from(vec!["first title", "second title"])),
+                Arc::new(StringArray::from(vec![None::<&str>, None])),
+                Arc::new(StringArray::from(vec![
+                    "matching body one",
+                    "matching body two",
+                ])),
+            ],
+        )
+        .expect("Failed to create test batch");
+        let table = Arc::new(
+            MemTable::try_new(batch.schema(), vec![vec![batch.clone()]])
+                .expect("Failed to create test table"),
+        );
+        let index = FullTextDatabaseIndex::try_new(
+            table,
+            vec!["body".to_string()],
+            Some(vec!["id".to_string()]),
+            None,
+            &[
+                "title".to_string(),
+                "subtitle".to_string(),
+                "body".to_string(),
+            ],
+        )
+        .expect("Failed to create FullTextDatabaseIndex");
+        index
+            .compute_index(vec![batch])
+            .await
+            .expect("failed to compute_index");
+
+        let search_index = index
+            .full_text_search_field_index("body")
+            .expect("Failed to create FullTextSearchFieldIndex");
+        let batches = search_index
+            .search("matching".to_string(), vec![], 100)
+            .expect("Failed to search")
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("Failed to collect search results");
+
+        assert_eq!(batches.len(), 1, "expected one result page");
+        let result = &batches[0];
+        assert_eq!(result.schema(), search_index.result_schema());
+        let titles = result
+            .column_by_name("title")
+            .expect("result schema must retain title")
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("title must retain its Utf8 type");
+        let subtitles = result
+            .column_by_name("subtitle")
+            .expect("result schema must retain subtitle")
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("subtitle must retain its Utf8 type");
+        let bodies = result
+            .column_by_name("body")
+            .expect("result schema must retain body")
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("body must retain its Utf8 type");
+        assert!(titles.iter().any(|title| title == Some("first title")));
+        assert!(bodies.iter().any(|body| body == Some("matching body one")));
+        assert_eq!(subtitles.null_count(), 2);
+        assert!(subtitles.is_null(0));
+        assert!(subtitles.is_null(1));
+    }
+
+    // Regression test for #12228: exercises the execution path (`FullTextSearchQuery::scan`
+    // -> `FullTextSearchExec::execute`), not just `FullTextSearchFieldIndex::search`, since the
+    // reported bug was in `FullTextSearchExec`'s positional projection shifting columns.
+    #[tokio::test]
+    async fn test_search_exec_projection_does_not_shift_columns() {
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new("title", DataType::Utf8, false),
+                Field::new("subtitle", DataType::Utf8, true),
+                Field::new("body", DataType::Utf8, false),
+            ])),
+            vec![
+                Arc::new(arrow::array::Int32Array::from(vec![1, 2])),
+                Arc::new(StringArray::from(vec!["first title", "second title"])),
+                Arc::new(StringArray::from(vec![None::<&str>, None])),
+                Arc::new(StringArray::from(vec![
+                    "matching body one",
+                    "matching body two",
+                ])),
+            ],
+        )
+        .expect("Failed to create test batch");
+        let table = Arc::new(
+            MemTable::try_new(batch.schema(), vec![vec![batch.clone()]])
+                .expect("Failed to create test table"),
+        );
+        let index = FullTextDatabaseIndex::try_new(
+            table,
+            vec!["body".to_string()],
+            Some(vec!["id".to_string()]),
+            None,
+            &[
+                "title".to_string(),
+                "subtitle".to_string(),
+                "body".to_string(),
+            ],
+        )
+        .expect("Failed to create FullTextDatabaseIndex");
+        index
+            .compute_index(vec![batch])
+            .await
+            .expect("failed to compute_index");
+
+        let search_index = Arc::new(
+            index
+                .full_text_search_field_index("body")
+                .expect("Failed to create FullTextSearchFieldIndex"),
+        );
+        let query = FullTextSearchQuery {
+            index: search_index,
+            query: "matching".to_string(),
+            pre_limit: None,
+        };
+
+        let ctx = SessionContext::new();
+        let full_schema = query.schema();
+        // Project onto a subset that skips the leading nullable `subtitle` column, so a
+        // positional (rather than name-based) projection would shift `body` into
+        // `title`'s slot -- the exact regression from #12228.
+        let projection = vec![
+            full_schema.index_of("body").expect("body in schema"),
+            full_schema.index_of("title").expect("title in schema"),
+        ];
+
+        let plan = query
+            .scan(&ctx.state(), Some(&projection), &[], None)
+            .await
+            .expect("scan should succeed");
+        let batches = collect(plan, ctx.task_ctx())
+            .await
+            .expect("execution should succeed");
+
+        assert_eq!(batches.len(), 1, "expected one result page");
+        let result = &batches[0];
+        assert_eq!(result.schema().field(0).name(), "body");
+        assert_eq!(result.schema().field(1).name(), "title");
+
+        let bodies = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("body must retain its Utf8 type");
+        let titles = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("title must retain its Utf8 type");
+        assert!(bodies.iter().any(|body| body == Some("matching body one")));
+        assert!(titles.iter().any(|title| title == Some("first title")));
     }
 
     #[tokio::test]
