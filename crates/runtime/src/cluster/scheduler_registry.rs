@@ -64,20 +64,6 @@ const DISCOVERY_INTERVAL: Duration = Duration::from_secs(5);
 const JOB_RECOVERY_INTERVAL: Duration = Duration::from_secs(10);
 const HEARTBEAT_DIVISOR: u64 = 3;
 
-/// What this tick could prove about who owns the scheduler id.
-///
-/// A conditional write can only prove "the object did not change since I read
-/// it" — it cannot prove "I am the registered incarnation". That distinction is
-/// what keeps a superseded incarnation from refreshing over its successor when
-/// membership is merely unreadable, so it is carried explicitly.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Membership {
-    /// A successful read showed this incarnation registered.
-    ConfirmedSelf,
-    /// Membership could not be read. Not evidence either way.
-    Unknown,
-}
-
 /// Compare-and-set attempts for one heartbeat before skipping this beat.
 /// Contention means another incarnation is writing the same key, which is
 /// resolved by re-reading membership rather than by writing harder.
@@ -420,7 +406,6 @@ impl SchedulerRegistryRunner {
         }
 
         match self.read_membership().await {
-            Some(true) => self.write_heartbeat(Membership::ConfirmedSelf).await,
             Some(false) => {
                 // A successful read proved someone else owns the id. Retire.
                 self.superseded.store(true, Ordering::Relaxed);
@@ -431,13 +416,15 @@ impl SchedulerRegistryRunner {
                 );
                 Ok(())
             }
-            // Membership unreadable. Heartbeats deliberately live outside
-            // `cluster.json` so emission does not depend on that document:
-            // suppressing beats here would self-evict a healthy scheduler.
-            // The write path still refuses to overwrite *another*
-            // incarnation's beat without proof, so failing open cannot clobber
-            // a successor.
-            None => self.write_heartbeat(Membership::Unknown).await,
+            // Registered, or membership unreadable. Both proceed, and for the
+            // same reason: heartbeats deliberately live outside `cluster.json`
+            // so emission does not depend on that document, and suppressing
+            // beats when it cannot be read would self-evict a healthy
+            // scheduler. Proceeding is safe because the write path re-confirms
+            // ownership against a fresh read before it will touch a beat
+            // belonging to another incarnation — this observation is not
+            // carried forward as proof of anything.
+            Some(true) | None => self.write_heartbeat().await,
         }
     }
 
@@ -482,11 +469,13 @@ impl SchedulerRegistryRunner {
     ///
     /// - Our own beat, or none yet: refresh it. Safe even when membership is
     ///   unreadable, and refusing would self-evict a healthy scheduler.
-    /// - A foreign beat: overwrite only with a successful membership read
-    ///   proving we are registered. Without that proof, skip the beat — a
-    ///   superseded incarnation must not refresh over its successor merely
-    ///   because `cluster.json` was slow.
-    async fn write_heartbeat(&self, mut membership: Membership) -> Result<()> {
+    /// - A foreign beat: overwrite only against a membership read taken *after*
+    ///   that beat was observed, proving we are still registered. Without that
+    ///   proof, skip the beat — a superseded incarnation must not refresh over
+    ///   its successor merely because `cluster.json` was slow, and an
+    ///   observation from earlier in the tick may predate a successor's
+    ///   registration.
+    async fn write_heartbeat(&self) -> Result<()> {
         for _ in 0..MAX_HEARTBEAT_CAS_ATTEMPTS {
             let read_timeout = membership_check_timeout(self.entry.ttl_ms);
             let (observed, from_cache) = match tokio::time::timeout(
@@ -513,20 +502,43 @@ impl SchedulerRegistryRunner {
             // An unparsable payload reads back as `None`: the holder is unknown,
             // which is not evidence that it is ours, so it is treated like a
             // foreign beat.
+            // A beat belonging to someone else — or one that cannot be parsed, so
+            // the holder is unknown — may only be reclaimed against a membership
+            // read taken *after* it was observed. The read this tick started with
+            // may predate a successor's registration, and a version predicate
+            // does not help: it proves the object has not changed since the beat
+            // was read, not that this incarnation still owns the id.
             if !from_cache
                 && let Some((beat, _)) = observed.as_ref()
                 && beat
                     .as_ref()
                     .is_none_or(|beat| beat.instance_id != self.instance_id)
-                && membership != Membership::ConfirmedSelf
             {
-                tracing::warn!(
-                    scheduler_id = %self.scheduler_id,
-                    instance_id = %self.instance_id,
-                    holder = ?beat.as_ref().map(|b| b.instance_id),
-                    "Another incarnation holds the heartbeat and membership is unconfirmed; skipping this beat"
-                );
-                return Ok(());
+                let holder = beat.as_ref().map(|b| b.instance_id);
+                match self.read_membership().await {
+                    // Freshly proven to still own the id, so reclaiming the key
+                    // is legitimate: fall through to the conditional write.
+                    Some(true) => {}
+                    Some(false) => {
+                        self.superseded.store(true, Ordering::Relaxed);
+                        tracing::warn!(
+                            scheduler_id = %self.scheduler_id,
+                            instance_id = %self.instance_id,
+                            holder = ?holder,
+                            "Another incarnation holds the heartbeat and is the registered owner; retiring"
+                        );
+                        return Ok(());
+                    }
+                    None => {
+                        tracing::warn!(
+                            scheduler_id = %self.scheduler_id,
+                            instance_id = %self.instance_id,
+                            holder = ?holder,
+                            "Another incarnation holds the heartbeat and membership is unreadable; skipping this beat"
+                        );
+                        return Ok(());
+                    }
+                }
             }
 
             let expected = observed.as_ref().map(|(_, version)| version.clone());
@@ -550,11 +562,9 @@ impl SchedulerRegistryRunner {
                     // Someone else wrote between the read and the write. Only a
                     // fresh membership read decides retry versus retire.
                     match self.read_membership().await {
-                        // Still ours. Remember that: this read is proof of
-                        // ownership, and without promoting it a retry would
-                        // still refuse a foreign beat and leave the rightful
-                        // owner unable to reclaim its key.
-                        Some(true) => membership = Membership::ConfirmedSelf,
+                        // Still ours, so retry: the next attempt re-reads the
+                        // beat and re-confirms ownership before writing.
+                        Some(true) => {}
                         Some(false) => {
                             self.superseded.store(true, Ordering::Relaxed);
                             tracing::warn!(
@@ -911,6 +921,156 @@ mod tests {
             );
             assert!(timeout <= MEMBERSHIP_CHECK_TIMEOUT_CAP);
         }
+    }
+
+    /// Store that lets a successor complete its takeover *between* the membership
+    /// read and the heartbeat read. That window is invisible to a version
+    /// predicate: the predicate proves the beat object has not changed since it
+    /// was read, while what went stale is the membership observation that
+    /// authorised overwriting a foreign beat at all.
+    #[derive(Debug)]
+    struct TakeOverBetweenMembershipAndBeatRead {
+        inner: Arc<dyn ObjectStore>,
+        cluster: Arc<ClusterStateStore>,
+        heartbeats: Arc<SchedulerHeartbeatStore>,
+        successor: Uuid,
+        armed: std::sync::atomic::AtomicBool,
+    }
+
+    impl std::fmt::Display for TakeOverBetweenMembershipAndBeatRead {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "TakeOverBetweenMembershipAndBeatRead")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for TakeOverBetweenMembershipAndBeatRead {
+        async fn get_opts(
+            &self,
+            location: &object_store::path::Path,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            let result = self.inner.get_opts(location, options).await;
+            // Fire once, after the membership read has been answered: the caller
+            // now holds a `ConfirmedSelf` observation that is already obsolete.
+            if location.as_ref().contains("cluster.json")
+                && self.armed.swap(false, std::sync::atomic::Ordering::Relaxed)
+            {
+                self.cluster
+                    .mutate(|state| {
+                        if let Some(entry) = state.schedulers.get_mut("test:50051") {
+                            entry.instance_id = self.successor;
+                            entry.started_at_ms = 50_000;
+                        }
+                        MutationOutcome::Apply
+                    })
+                    .await
+                    .expect("successor claims membership");
+                self.heartbeats
+                    .heartbeat("test:50051", self.successor, 60_000, 30_000)
+                    .await
+                    .expect("successor beat");
+            }
+            result
+        }
+        async fn put_opts(
+            &self,
+            location: &object_store::path::Path,
+            payload: object_store::PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            self.inner.put_opts(location, payload, opts).await
+        }
+        async fn put_multipart_opts(
+            &self,
+            location: &object_store::path::Path,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+        fn list(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<
+                'static,
+                object_store::Result<object_store::path::Path>,
+            >,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>
+        {
+            self.inner.delete_stream(locations)
+        }
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+        async fn copy_opts(
+            &self,
+            from: &object_store::path::Path,
+            to: &object_store::path::Path,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    /// A membership observation authorising the overwrite of a foreign beat can be
+    /// obsolete by the time the beat is read. A version predicate does not cover
+    /// that window, so the overwrite must be re-authorised against a fresh read.
+    #[tokio::test]
+    async fn a_successor_registering_before_the_beat_read_is_not_clobbered() {
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        // The takeover the wrapper performs must not re-enter the wrapper, so it
+        // acts through stores bound directly to the un-wrapped object store.
+        let inner_cluster = Arc::new(ClusterStateStore::new(Arc::clone(&inner), ""));
+        let inner_heartbeats = Arc::new(SchedulerHeartbeatStore::new(Arc::clone(&inner), ""));
+        let successor = Uuid::new_v4();
+        let wrapper = Arc::new(TakeOverBetweenMembershipAndBeatRead {
+            inner: Arc::clone(&inner),
+            cluster: Arc::clone(&inner_cluster),
+            heartbeats: Arc::clone(&inner_heartbeats),
+            successor,
+            armed: std::sync::atomic::AtomicBool::new(false),
+        });
+        let store: Arc<dyn ObjectStore> = Arc::clone(&wrapper) as Arc<dyn ObjectStore>;
+        // The runner reads membership *through* the wrapper, which is what lets
+        // the successor land between its membership read and its beat read.
+        let cluster = Arc::new(ClusterStateStore::new(Arc::clone(&store), ""));
+        let heartbeats = Arc::new(SchedulerHeartbeatStore::new(Arc::clone(&store), ""));
+        inner_cluster.bootstrap().await.expect("bootstrap");
+
+        let instance_id = Uuid::new_v4();
+        let runner = runner_over(&cluster, &heartbeats, &inner, instance_id);
+        runner.register_self().await.expect("register");
+
+        wrapper
+            .armed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        runner
+            .send_heartbeat()
+            .await
+            .expect("losing the id mid-tick must not fail the loop");
+
+        let beat = inner_heartbeats
+            .read("test:50051")
+            .await
+            .expect("read")
+            .expect("present");
+        assert_eq!(
+            beat.instance_id, successor,
+            "a successor that registered before the beat was read must not be clobbered"
+        );
+        assert!(
+            runner.superseded.load(Ordering::Relaxed),
+            "the fresh membership read proves supersession, which must be sticky"
+        );
     }
 
     /// Store whose heartbeat *reads* fail on demand while writes keep working —
