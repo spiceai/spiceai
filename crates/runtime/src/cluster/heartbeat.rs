@@ -303,11 +303,20 @@ impl SchedulerHeartbeatStore {
             .await
         {
             Ok(result) => Ok(Self::usable_version_of(result.e_tag, result.version)),
-            Err(ObjectStoreError::Precondition { .. } | ObjectStoreError::AlreadyExists { .. }) => {
-                Err(Error::HeartbeatSupersededDuringWrite {
-                    scheduler_id: scheduler_id.to_string(),
-                })
-            }
+            // `NotFound` belongs with the conflict cases: a conditional update
+            // whose target has been deleted since it was read has lost the same
+            // race, and some stores report it that way rather than as a
+            // precondition failure. Treating it as a hard error would abort
+            // registration *after* membership was committed, leaving a registered
+            // entry with no running registry, where the caller can simply re-read
+            // and create the key instead.
+            Err(
+                ObjectStoreError::Precondition { .. }
+                | ObjectStoreError::AlreadyExists { .. }
+                | ObjectStoreError::NotFound { .. },
+            ) => Err(Error::HeartbeatSupersededDuringWrite {
+                scheduler_id: scheduler_id.to_string(),
+            }),
             Err(source) => Err(Error::Write {
                 path: path.to_string(),
                 source,
