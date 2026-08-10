@@ -250,6 +250,36 @@ fn arrow_type_to_turso_ddl(data_type: &DataType) -> &'static str {
 pub use data_components::turso::TursoConnectionPool;
 use runtime_acceleration::snapshot::AccelerationEngine;
 
+/// Removes the sidecar files Turso keeps beside the database at `path`, which
+/// Turso applies to whatever database is at that path next: a logical log beside
+/// a database whose header says WAL mode fails the open as corrupt.
+///
+/// Names follow `turso_core`: the logical log replaces the database file's
+/// extension (`logical_log_exists`), the write-ahead log and its coordination
+/// file are suffixes of the path (`coordination_path_for_wal_path`).
+///
+/// A sidecar that cannot be removed is not fatal — the database file is the
+/// wipe's contract, and a sidecar that does break the next open is reported by
+/// that open.
+async fn remove_database_sidecars(path: &str) {
+    let sidecars = [
+        std::path::Path::new(path).with_extension("db-log"),
+        PathBuf::from(format!("{path}-wal")),
+        PathBuf::from(format!("{path}-tshm")),
+    ];
+
+    for sidecar in sidecars {
+        match tokio::fs::remove_file(&sidecar).await {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => tracing::warn!(
+                "Failed to remove the Turso file {} left beside the recreated acceleration {path}: {err}",
+                sidecar.display()
+            ),
+        }
+    }
+}
+
 pub struct TursoAccelerator {
     // Store connection pools for file-based databases
     pools: Arc<Mutex<std::collections::HashMap<String, Arc<TursoConnectionPool>>>>,
@@ -620,13 +650,28 @@ impl DataAccelerator for TursoAccelerator {
                         Error::AccelerationInitializationFailed { source: err.into() }
                     })?;
                 }
+
+                // Not gated on the database file having existed: sidecars left
+                // behind by a database file that is already gone break the open
+                // of the one created in its place just the same.
+                remove_database_sidecars(&path).await;
+            }
+
+            // `pools` is keyed by file path and a cached pool keeps serving the
+            // file it opened, so a pool cached for a path with nothing on it is
+            // bound to no file currently at that path. Evict it before anything
+            // opens what lands there next — the snapshot restore below resolves
+            // this dataset's checkpoint through this same pool, as does the
+            // table the reload re-registers.
+            if !std::path::Path::new(&path).exists() {
+                self.pools.lock().await.remove(&path);
             }
 
             let bootstrap_status = download_snapshot_if_needed(
                 acceleration,
                 source,
                 registry,
-                runtime_acceleration::snapshot::AccelerationLayout::file(PathBuf::from(path)),
+                runtime_acceleration::snapshot::AccelerationLayout::file(PathBuf::from(&path)),
                 AccelerationEngine::Turso,
                 None,
             )
