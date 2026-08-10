@@ -353,6 +353,28 @@ pub trait Read: Send + Sync {
         &self,
         table_reference: TableReference,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn Error + Send + Sync>>;
+
+    /// A provider for a table whose schema the caller has already resolved.
+    ///
+    /// Lets a caller that obtained many schemas at once -- a catalog resolving a
+    /// whole namespace in one query, say -- avoid a round trip per table.
+    ///
+    /// The default ignores the schema and resolves it again, so a connector that
+    /// does not override this is slower but never wrong. That is the reason this
+    /// is defaulted at all, against the usual rule that a defaulted trait method
+    /// silently no-ops in an implementor that forgets it: here the "no-op" is the
+    /// existing behavior, not a dropped one.
+    ///
+    /// Implementors that do override it must produce a provider indistinguishable
+    /// from [`Read::table_provider`]'s -- same wrappers, same pushdown -- or a
+    /// table will plan differently depending on how it was discovered.
+    async fn table_provider_with_schema(
+        &self,
+        table_reference: TableReference,
+        _schema: SchemaRef,
+    ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn Error + Send + Sync>> {
+        self.table_provider(table_reference).await
+    }
 }
 
 #[async_trait]

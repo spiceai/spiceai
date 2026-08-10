@@ -560,3 +560,71 @@ async fn test_unsupported_type_action_override_drops_table() -> Result<(), anyho
         })
         .await
 }
+
+/// Catalog discovery must not be steerable by anything in the source database.
+///
+/// The connector classifies the server from its version, and takes different
+/// catalog queries for Redshift. That lookup resolves through `search_path`, so
+/// a `public.version()` in the source — which a user may define for any reason —
+/// could decide the classification. A PostgreSQL server misread as Redshift is
+/// not a cosmetic error: discovery then issues `SHOW COLUMNS`, which it cannot
+/// answer, and every table fails to resolve.
+///
+/// This lives here rather than only in `datafusion-table-providers` because the
+/// fix is a dependency's, and a rev bump that lost it would otherwise surface as
+/// a mystery catalog failure. The shadow below is exactly what would fool an
+/// unqualified lookup.
+#[tokio::test]
+async fn test_catalog_discovery_ignores_a_shadowed_version_function() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    test_request_context()
+        .scope(async {
+            let port = common::get_random_port()?;
+            let _container = common::start_postgres_docker_container(port).await?;
+
+            let pool = common::get_postgres_connection_pool(port, None).await?;
+            let conn = pool
+                .connect_direct()
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            conn.conn
+                .simple_query(
+                    "CREATE TABLE widgets (id INT PRIMARY KEY, name TEXT NOT NULL); \
+                     INSERT INTO widgets (id, name) VALUES (1, 'widget'); \
+                     CREATE FUNCTION public.version() RETURNS text LANGUAGE sql IMMUTABLE AS \
+                       $$ SELECT 'PostgreSQL 8.0.2 on i686-pc-linux-gnu, Redshift 1.0.12345'::text $$; \
+                     ALTER DATABASE postgres SET search_path = public, pg_catalog;",
+                )
+                .await?;
+
+            // Loading at all is the assertion: a server misclassified as
+            // Redshift cannot answer the queries discovery would then issue.
+            let rt = start_runtime(pg_catalog(port)).await?;
+
+            let tables = run_query(
+                &rt,
+                &format!(
+                    "SELECT table_name FROM information_schema.tables \
+                     WHERE table_catalog = '{CATALOG_NAME}' AND table_schema = 'public' \
+                     ORDER BY table_name"
+                ),
+            )
+            .await?;
+            assert_eq!(
+                string_column_values(&tables, "table_name"),
+                vec!["widgets".to_string()],
+                "discovery must classify the server from pg_catalog, not a shadowed version()"
+            );
+
+            let rows = run_query(
+                &rt,
+                &format!("SELECT COUNT(*) AS n FROM {CATALOG_NAME}.public.widgets"),
+            )
+            .await?;
+            assert_batches_eq!(&["+---+", "| n |", "+---+", "| 1 |", "+---+"], &rows);
+
+            Ok(())
+        })
+        .await
+}

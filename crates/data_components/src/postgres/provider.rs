@@ -24,6 +24,7 @@ use std::sync::{Arc, RwLock};
 
 use crate::catalog_filter::TableSelector;
 use async_trait::async_trait;
+use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::catalog::{CatalogProvider, SchemaProvider};
 use datafusion::common::utils::quote_identifier;
 use datafusion::datasource::TableProvider;
@@ -50,6 +51,13 @@ pub enum Error {
         "PostgreSQL query failed: {source}. Check SQL syntax and that referenced tables exist. Docs: https://spiceai.org/docs/components/data-connectors/postgres"
     ))]
     QueryFailed { source: tokio_postgres::Error },
+
+    #[snafu(display(
+        "PostgreSQL schema resolution failed: {source}. Check that the connected role can read `pg_catalog`. Docs: https://spiceai.org/docs/components/data-connectors/postgres"
+    ))]
+    SchemaResolutionFailed {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 
     /// Wraps errors from the shared `connector-postgres-common` queries
     /// (`list_schemas`/`list_tables`, re-exported below) so this crate's own
@@ -458,6 +466,23 @@ impl PostgresSchemaProvider {
     ) -> Result<()> {
         let table_names = self.list_tables().await?;
 
+        // One query for every relation's columns, instead of one per table on
+        // the way to building its provider. Best-effort: a failure here leaves
+        // the map empty and each table resolves its own schema, which is what
+        // happened before. Relations the catalog query cannot describe are
+        // absent from it and take the same per-table path.
+        let schemas = match self.list_column_schemas().await {
+            Ok(schemas) => schemas,
+            Err(e) => {
+                tracing::warn!(
+                    schema = %self.schema_name,
+                    error = %e,
+                    "Failed to resolve schemas for this PostgreSQL schema in one query, falling back to per-table resolution"
+                );
+                HashMap::new()
+            }
+        };
+
         let tables = build_table_providers_for_schema(
             &self.schema_name,
             table_names,
@@ -465,6 +490,7 @@ impl PostgresSchemaProvider {
             &self.selector,
             foreign_keys,
             comments,
+            &schemas,
         )
         .await;
 
@@ -477,6 +503,26 @@ impl PostgresSchemaProvider {
         }
 
         Ok(())
+    }
+
+    /// Every relation's Arrow schema for this `PostgreSQL` schema, in one query.
+    ///
+    /// A missing entry means "resolve this one individually", never "no
+    /// columns": relations the catalog query does not describe -- and every
+    /// table on Redshift, where the per-table `SHOW COLUMNS` cannot be batched
+    /// -- are simply absent.
+    async fn list_column_schemas(&self) -> Result<HashMap<String, SchemaRef>> {
+        let conn = self
+            .pool
+            .connect_direct()
+            .await
+            .context(ConnectionFailedSnafu)?;
+
+        conn.get_schemas_in(&self.schema_name)
+            .await
+            .map_err(|e| Error::SchemaResolutionFailed {
+                source: Box::new(e),
+            })
     }
 
     async fn list_tables(&self) -> Result<Vec<String>> {
@@ -542,6 +588,7 @@ async fn build_table_providers_for_schema(
     selector: &TableSelector,
     foreign_keys: &ForeignKeyMap,
     comments: &CommentMap,
+    schemas: &HashMap<String, SchemaRef>,
 ) -> HashMap<String, Arc<dyn TableProvider>> {
     let mut tables = HashMap::new();
 
@@ -554,7 +601,18 @@ async fn build_table_providers_for_schema(
 
         let table_ref = TableReference::partial(schema_name.to_owned(), table_name.clone());
 
-        match table_creator.table_provider(table_ref).await {
+        // A schema resolved in bulk skips this table's own schema query; without
+        // one, the provider resolves it as it always did.
+        let provider = match schemas.get(&table_name) {
+            Some(schema) => {
+                table_creator
+                    .table_provider_with_schema(table_ref, Arc::clone(schema))
+                    .await
+            }
+            None => table_creator.table_provider(table_ref).await,
+        };
+
+        match provider {
             Ok(provider) => {
                 let mut table_metadata = HashMap::new();
                 if let Some(fks) = foreign_keys.get(&table_name) {
@@ -691,6 +749,7 @@ mod tests {
         catalog_filter::TableSelector,
     };
     use async_trait::async_trait;
+    use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
     use datafusion::catalog::Session;
     use datafusion::datasource::{TableProvider, TableType};
     use datafusion::error::Result as DataFusionResult;
@@ -735,6 +794,9 @@ mod tests {
     struct MockRead {
         fail_tables: HashSet<String>,
         seen_tables: Mutex<Vec<String>>,
+        /// Tables built from a caller-supplied schema, so a test can tell which
+        /// construction path each one took.
+        supplied_schema_tables: Mutex<Vec<String>>,
     }
 
     impl MockRead {
@@ -742,7 +804,15 @@ mod tests {
             Self {
                 fail_tables,
                 seen_tables: Mutex::new(Vec::new()),
+                supplied_schema_tables: Mutex::new(Vec::new()),
             }
+        }
+
+        fn supplied_schema_tables(&self) -> Vec<String> {
+            self.supplied_schema_tables
+                .lock()
+                .expect("supplied_schema_tables mutex should not be poisoned")
+                .clone()
         }
 
         fn seen_tables(&self) -> Vec<String> {
@@ -778,6 +848,19 @@ mod tests {
             }
 
             Ok(Arc::new(MockTableProvider))
+        }
+
+        async fn table_provider_with_schema(
+            &self,
+            table_reference: TableReference,
+            _schema: SchemaRef,
+        ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>>
+        {
+            self.supplied_schema_tables
+                .lock()
+                .expect("supplied_schema_tables mutex should not be poisoned")
+                .push(table_reference.table().to_string());
+            self.table_provider(table_reference).await
         }
     }
 
@@ -857,6 +940,51 @@ mod tests {
         );
     }
 
+    /// A table whose schema was resolved in bulk must not resolve it again, and
+    /// one that was not must still be resolved individually.
+    ///
+    /// The whole saving depends on that split: sending every table down the
+    /// bulk path would mis-describe the ones the catalog query cannot cover,
+    /// and sending none down it would restore the per-table round trip the bulk
+    /// query was added to remove. Neither is visible in the resulting catalog,
+    /// so the paths are recorded and asserted rather than inferred.
+    #[tokio::test]
+    async fn test_build_table_providers_uses_a_resolved_schema_only_where_one_exists() {
+        let table_creator = Arc::new(MockRead::new(HashSet::new()));
+        let read: Arc<dyn Read> = Arc::clone(&table_creator) as Arc<dyn Read>;
+
+        // `orders` was covered by the bulk query; `lineitem` was not, standing in
+        // for a relation the catalog query cannot describe.
+        let mut schemas: HashMap<String, SchemaRef> = HashMap::new();
+        schemas.insert(
+            "orders".to_string(),
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, true)])),
+        );
+
+        let tables = build_table_providers_for_schema(
+            "public",
+            vec!["orders".to_string(), "lineitem".to_string()],
+            &read,
+            &TableSelector::select_all(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &schemas,
+        )
+        .await;
+
+        assert_eq!(tables.len(), 2, "both tables should be registered");
+        assert_eq!(
+            table_creator.supplied_schema_tables(),
+            vec!["orders".to_string()],
+            "only the table with a resolved schema should skip its own schema query"
+        );
+        assert_eq!(
+            table_creator.seen_tables(),
+            vec!["public.orders".to_string(), "public.lineitem".to_string()],
+            "both tables should still reach the factory"
+        );
+    }
+
     #[tokio::test]
     async fn test_build_table_providers_applies_include_filter_before_factory() {
         let read = Arc::new(MockRead::new(HashSet::new()));
@@ -872,6 +1000,7 @@ mod tests {
             &selector,
             &no_fks,
             &no_comments,
+            &HashMap::new(),
         )
         .await;
 
@@ -895,6 +1024,7 @@ mod tests {
             &selector,
             &no_fks,
             &no_comments,
+            &HashMap::new(),
         )
         .await;
 
@@ -919,6 +1049,7 @@ mod tests {
             &TableSelector::select_all(),
             &no_fks,
             &no_comments,
+            &HashMap::new(),
         )
         .await;
 
@@ -948,6 +1079,7 @@ mod tests {
             &TableSelector::select_all(),
             &no_fks,
             &no_comments,
+            &HashMap::new(),
         )
         .await;
 
@@ -977,6 +1109,7 @@ mod tests {
             &TableSelector::select_all(),
             &fk_map,
             &no_comments,
+            &HashMap::new(),
         )
         .await;
 
@@ -1028,6 +1161,7 @@ mod tests {
             &TableSelector::select_all(),
             &fk_map,
             &no_comments,
+            &HashMap::new(),
         )
         .await;
 
@@ -1082,6 +1216,7 @@ mod tests {
             &TableSelector::select_all(),
             &no_fks,
             &comments,
+            &HashMap::new(),
         )
         .await;
 
