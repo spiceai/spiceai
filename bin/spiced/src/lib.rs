@@ -375,8 +375,10 @@ pub struct Args {
 
     /// How many CPUs the runtime should behave as though it has, as a
     /// Kubernetes CPU quantity (`4`, `3.5`, `3500m`). `auto` (the default)
-    /// detects it from the cgroup CPU quota, the pod's `requests.cpu`, or the
-    /// host. Takes precedence over `SPICE_CPU_CORES` and `runtime.cpu.cores`.
+    /// detects it from the cgroup CPU limit, a bounded multiple of the pod's
+    /// `requests.cpu`, or the host. `all` uses every available core regardless
+    /// of the request, still respecting a CPU limit. Takes precedence over
+    /// `SPICE_CPU_CORES` and `runtime.cpu.cores`.
     #[arg(long, value_name = "CORES")]
     pub cpu_cores: Option<String>,
 
@@ -427,6 +429,45 @@ fn spawn_sighup_reload_task(control: std::sync::Arc<runtime::tls::TlsControl>) {
     }
 }
 
+/// How often to re-read the cgroup CPU share looking for an in-place pod resize.
+///
+/// Slow on purpose. A resize is a human- or VPA-scale event, the read is two small
+/// pseudo-files, and the only outcome is a log line — so there is nothing to gain
+/// from noticing it a minute sooner.
+const CPU_SHARE_POLL: Duration = Duration::from_mins(1);
+
+/// Watch for the pod being resized underneath us, and say so once when it happens.
+///
+/// The CPU budget resolves once at startup and every pool it sized captured its
+/// width then, so a resize cannot be applied without a restart. What it can be is
+/// visible: see [`cpu_budget::ShareDriftWatcher`] for why this reads the raw cgroup
+/// share rather than the declared request (an environment variable cannot change
+/// under a running container).
+fn spawn_cpu_share_drift_task() {
+    let watcher = cpu_budget::cpu_budget().share_drift_watcher();
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(CPU_SHARE_POLL);
+        // The first tick fires immediately and would compare the seed against
+        // itself; skip straight to the cadence.
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            // Two small reads off a timer, but still filesystem work: keep it off
+            // the async worker so a slow /sys cannot stall a runtime thread.
+            let current = match tokio::task::spawn_blocking(cpu_budget::detect_cpu_share).await {
+                Ok(share) => share,
+                Err(err) => {
+                    tracing::debug!("CPU share poll: read task failed: {err}");
+                    continue;
+                }
+            };
+            if let Some(drift) = watcher.observe(current) {
+                tracing::warn!("{drift}");
+            }
+        }
+    });
+}
+
 /// The parsed spicepod, where it came from, and the load error tolerated in
 /// pods-watcher mode.
 ///
@@ -455,6 +496,10 @@ pub struct AppBundle {
 /// created: [`cpu_budget::cpu_budget`] lazily detects into the same cell, so a
 /// read beforehand pins the detected value.
 ///
+/// Logs through whatever subscriber the caller holds. That is also before [`run`]
+/// installs the global one, so the caller covers the whole startup window with a
+/// temporary subscriber rather than each step carrying its own.
+///
 /// # Errors
 ///
 /// Fails when the configured value is not a positive CPU quantity or `auto`.
@@ -474,9 +519,9 @@ pub fn install_cpu_budget(args: &Args, app: Option<&App>) -> Result<(), cpu_budg
     );
 
     let budget = cpu_budget::CpuBudget::resolve(&config, &cpu_budget::HostReadings::detect())?;
-    in_tracing_context(|| budget.log_summary());
+    budget.log_summary();
     if let Err(err) = budget.install() {
-        in_tracing_context(|| tracing::warn!("{err}"));
+        tracing::warn!("{err}");
     }
     Ok(())
 }
@@ -861,12 +906,13 @@ pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
         // The CPU entitlement every one of those pools was sized from.
         // `tokio_runtime_workers` above is the cross-check.
         let budget = cpu_budget::cpu_budget();
+        spawn_cpu_share_drift_task();
         telemetry::register_cpu_budget_metrics(
             u64::try_from(budget.cores()).unwrap_or(u64::MAX),
             budget.millicores(),
             budget.source().as_str(),
             budget.limit_millicores(),
-            budget.request_millicores(),
+            budget.declared_request_millicores(),
         );
 
         // Cayenne write-path backpressure occupancy gauges (encode budget, in-memory
@@ -877,6 +923,18 @@ pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
         // apply path when ingest falls behind.
         runtime::dataaccelerator::cayenne::register_cayenne_telemetry();
     }
+
+    // The global meter provider is now final: either `init_metrics` replaced the
+    // startup noop provider above, or metrics are not configured and the noop one
+    // stands. Operator instruments may cache from here on.
+    //
+    // This is outside the `needs_metrics` block on purpose. A deployment that
+    // exports nothing still records into these instruments, and leaving the seal
+    // off would make every such record rebuild its instrument forever rather than
+    // once. Sealing after `init_metrics` — rather than relying on the first record
+    // landing late enough — is what keeps a startup-time sampler's gauges on the
+    // operator's provider (#12667).
+    telemetry::seal_operator_meter_provider();
 
     let (tls_config, client_auth_mode) = tls::load_tls_config(
         &args,

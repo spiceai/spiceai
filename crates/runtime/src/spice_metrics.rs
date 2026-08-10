@@ -26,8 +26,8 @@ use snafu::prelude::*;
 use tokio::sync::RwLock;
 
 use crate::Runtime;
-use crate::accelerated_table::Retention;
-use crate::accelerated_table::refresh::Refresh;
+use crate::accelerated::Retention;
+use crate::accelerated::refresh::Refresh;
 use crate::component::dataset::TimeFormat;
 use crate::component::dataset::acceleration::Acceleration;
 use crate::datafusion::Error as DataFusionError;

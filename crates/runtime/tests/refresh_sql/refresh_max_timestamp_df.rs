@@ -24,7 +24,7 @@ use datafusion::prelude::SessionContext;
 use datafusion_expr::CreateExternalTable;
 use datafusion_federation::{FederatedPlanner, FederatedTableProviderAdaptor};
 use runtime::Runtime;
-use runtime::accelerated_table::refresh_task::{accelerator_table_provider, max_timestamp_df};
+use runtime::accelerated::refresh_task::{accelerator_table_provider, max_timestamp_df};
 use runtime::component::dataset::acceleration::Engine;
 use runtime::datafusion::builder::AnalyzerRulesBuilder;
 use runtime_datafusion::extension::bytes_processed::BytesProcessedPhysicalOptimizer;

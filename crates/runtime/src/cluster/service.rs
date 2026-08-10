@@ -1293,6 +1293,12 @@ pub(crate) async fn discover_cayenne_tables(datafusion: &DataFusion) -> Vec<Tabl
                             let Some(short_name) = full_name.strip_prefix(&namespace_prefix) else {
                                 continue;
                             };
+                            // Listing the metadata catalog reaches tables the
+                            // catalog's include/exclude withheld, which the
+                            // schema provider itself never registered.
+                            if !cayenne_schema.selects_table(short_name) {
+                                continue;
+                            }
                             let key = (
                                 catalog_name.clone(),
                                 schema_name.clone(),

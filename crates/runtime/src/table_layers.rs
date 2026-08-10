@@ -36,32 +36,20 @@ limitations under the License.
 //! add its layer here in the same change and decide each field deliberately —
 //! `None` is a semantic statement (the walk must stop), not a default.
 
-use std::sync::Arc;
-
-use datafusion_federation::FederatedTableProviderAdaptor;
-use runtime_datafusion_index::{
-    INDEXED_INNER, IndexedTableProvider, InnerProviderFn, TableProviderLayer,
+// Defined in `runtime-table`, the lowest crate that can name their wrapper types.
+// Each layer entry exists exactly once; this crate adds only the entries whose
+// types live here, and assembles the single table below.
+pub(crate) use runtime_table::table_layers::{
+    EMBEDDING_LAYER, FEDERATED_ADAPTOR_LAYER, INDEXED_LAYER, METADATA_ENRICHED_LAYER,
+    VECTOR_SCAN_LAYER,
 };
-use runtime_search::embeddings::table::EmbeddingTable;
-use search::index::VectorScanTableProvider;
 
-use crate::accelerated_table::AcceleratedTable;
+use runtime_datafusion_index::{InnerProviderFn, TableProviderLayer};
+
+use crate::accelerated::AcceleratedTable;
 use crate::dataconnector::iceberg_cluster::IcebergClusterTableProvider;
-use data_components::MetadataEnrichedTableProvider;
 use data_components::iceberg::delete::IcebergDeletionProvider;
 use data_components::poly::PolyTableProvider;
-
-/// Inner-provider accessor for [`FederatedTableProviderAdaptor`].
-pub(crate) const FEDERATED_ADAPTOR_INNER: InnerProviderFn = |tbl| {
-    tbl.downcast_ref::<FederatedTableProviderAdaptor>()
-        .and_then(|adaptor| adaptor.table_provider.as_ref())
-};
-
-/// Inner-provider accessor for [`MetadataEnrichedTableProvider`].
-pub(crate) const METADATA_ENRICHED_INNER: InnerProviderFn = |tbl| {
-    tbl.downcast_ref::<MetadataEnrichedTableProvider>()
-        .map(MetadataEnrichedTableProvider::get_inner_ref)
-};
 
 /// Inner-provider accessor for [`IcebergClusterTableProvider`].
 pub(crate) const ICEBERG_CLUSTER_INNER: InnerProviderFn = |tbl| {
@@ -73,18 +61,6 @@ pub(crate) const ICEBERG_CLUSTER_INNER: InnerProviderFn = |tbl| {
 pub(crate) const ICEBERG_DELETION_INNER: InnerProviderFn = |tbl| {
     tbl.downcast_ref::<IcebergDeletionProvider>()
         .map(IcebergDeletionProvider::inner)
-};
-
-/// Inner-provider accessor for [`EmbeddingTable`]: its base table.
-pub(crate) const EMBEDDING_INNER: InnerProviderFn = |tbl| {
-    tbl.downcast_ref::<EmbeddingTable>()
-        .map(EmbeddingTable::get_underlying_ref)
-};
-
-/// Inner-provider accessor for [`VectorScanTableProvider`]: its base table.
-pub(crate) const VECTOR_SCAN_INNER: InnerProviderFn = |tbl| {
-    tbl.downcast_ref::<VectorScanTableProvider>()
-        .map(|v| &v.table_provider)
 };
 
 /// Inner-provider accessor for [`AcceleratedTable`]. Resolves to the federated
@@ -103,98 +79,6 @@ pub(crate) const ACCELERATED_INNER: InnerProviderFn = |tbl| {
 pub(crate) const POLY_WRITER_INNER: InnerProviderFn = |tbl| {
     tbl.downcast_ref::<PolyTableProvider>()
         .map(PolyTableProvider::writer_ref)
-};
-
-/// [`IndexedTableProvider`]: carries the search/vector indexes for a dataset.
-/// Opaque to CDC detection — it is one of the layers that detection looks
-/// *for* — and write-transparent (`insert_into` is a pass-through).
-pub(crate) const INDEXED_LAYER: TableProviderLayer = TableProviderLayer {
-    name: "IndexedTableProvider",
-    read: Some(INDEXED_INNER),
-    cdc_detection: None,
-    source: Some(INDEXED_INNER),
-    write: Some(INDEXED_INNER),
-    rebuild: Some(|outer, rebuild_inner| {
-        let indexed = outer.downcast_ref::<IndexedTableProvider>()?;
-        Some(Arc::new(IndexedTableProvider::with_indexes(
-            rebuild_inner(indexed.get_underlying()),
-            indexed.get_all_indexes(),
-        )))
-    }),
-};
-
-/// [`EmbeddingTable`]: merges synthetic `<col>_embedding` columns into its
-/// schema. Opaque to CDC detection (detection looks for it); source peels
-/// through it so a source connector's bootstrap `SELECT` never references the
-/// synthetic columns.
-pub(crate) const EMBEDDING_LAYER: TableProviderLayer = TableProviderLayer {
-    name: "EmbeddingTable",
-    read: Some(EMBEDDING_INNER),
-    cdc_detection: None,
-    source: Some(EMBEDDING_INNER),
-    write: None,
-    rebuild: Some(|outer, rebuild_inner| {
-        let embedding = outer.downcast_ref::<EmbeddingTable>()?;
-        let mut rebuilt = embedding.clone();
-        rebuilt.base_table = rebuild_inner(Arc::clone(&embedding.base_table));
-        Some(Arc::new(rebuilt))
-    }),
-};
-
-/// [`VectorScanTableProvider`]: merges vector-index columns into its schema.
-/// Same walk profile as [`EMBEDDING_LAYER`] and for the same reasons.
-pub(crate) const VECTOR_SCAN_LAYER: TableProviderLayer = TableProviderLayer {
-    name: "VectorScanTableProvider",
-    read: Some(VECTOR_SCAN_INNER),
-    cdc_detection: None,
-    source: Some(VECTOR_SCAN_INNER),
-    write: None,
-    rebuild: Some(|outer, rebuild_inner| {
-        let vector_scan = outer.downcast_ref::<VectorScanTableProvider>()?;
-        let mut rebuilt = vector_scan.clone();
-        rebuilt.table_provider = rebuild_inner(Arc::clone(&vector_scan.table_provider));
-        Some(Arc::new(rebuilt))
-    }),
-};
-
-/// [`MetadataEnrichedTableProvider`]: injects spicepod table/column metadata
-/// into the schema; carries no read, CDC or source semantics of its own. Its
-/// rebuild *strips* the layer and recurses, because rebuild transforms are
-/// how enrichment is (re)applied — the transform at the base of the stack
-/// re-adds enrichment with current metadata, and keeping the stale layer
-/// would shadow it.
-pub(crate) const METADATA_ENRICHED_LAYER: TableProviderLayer = TableProviderLayer {
-    name: "MetadataEnrichedTableProvider",
-    read: Some(METADATA_ENRICHED_INNER),
-    cdc_detection: Some(METADATA_ENRICHED_INNER),
-    source: Some(METADATA_ENRICHED_INNER),
-    write: None,
-    rebuild: Some(|outer, rebuild_inner| {
-        let enriched = outer.downcast_ref::<MetadataEnrichedTableProvider>()?;
-        Some(rebuild_inner(Arc::clone(enriched.get_inner_ref())))
-    }),
-};
-
-/// [`FederatedTableProviderAdaptor`]: the federation adaptor around a source
-/// provider; transparent everywhere except writes. An adaptor with no inner
-/// provider cannot be stepped through or rebuilt around, so walks stop at it
-/// and rebuild keeps it unchanged.
-pub(crate) const FEDERATED_ADAPTOR_LAYER: TableProviderLayer = TableProviderLayer {
-    name: "FederatedTableProviderAdaptor",
-    read: Some(FEDERATED_ADAPTOR_INNER),
-    cdc_detection: Some(FEDERATED_ADAPTOR_INNER),
-    source: Some(FEDERATED_ADAPTOR_INNER),
-    write: None,
-    rebuild: Some(|outer, rebuild_inner| {
-        let adaptor = outer.downcast_ref::<FederatedTableProviderAdaptor>()?;
-        let Some(inner) = adaptor.table_provider.as_ref() else {
-            return Some(Arc::clone(outer));
-        };
-        Some(Arc::new(FederatedTableProviderAdaptor::new_with_provider(
-            Arc::clone(&adaptor.source),
-            rebuild_inner(Arc::clone(inner)),
-        )))
-    }),
 };
 
 /// [`IcebergClusterTableProvider`]: read-discovery only.
@@ -253,7 +137,7 @@ pub(crate) const UPSERT_DEDUP_LAYER: TableProviderLayer =
 /// Every wrapper layer the runtime can stack around a dataset's provider —
 /// the layer set walks use unless a call site has a documented reason to
 /// restrict it.
-pub(crate) const TABLE_PROVIDER_LAYERS: &[TableProviderLayer] = &[
+pub const TABLE_PROVIDER_LAYERS: &[TableProviderLayer] = &[
     INDEXED_LAYER,
     EMBEDDING_LAYER,
     VECTOR_SCAN_LAYER,
@@ -268,6 +152,10 @@ pub(crate) const TABLE_PROVIDER_LAYERS: &[TableProviderLayer] = &[
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use runtime_datafusion_index::IndexedTableProvider;
+
     use super::*;
     use arrow_schema::{DataType, Field, Schema};
     use data_components::arrow::write::MemTable;
@@ -359,6 +247,29 @@ mod tests {
                     layer.name
                 );
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod install_guard_tests {
+    /// The accelerated table can only see through wrappers whose types it can name,
+    /// so `runtime` must hand it the layers defined here. If this list and the one
+    /// `runtime-table` owns ever diverge without the install, index discovery
+    /// silently stops at an `IcebergClusterTableProvider`.
+    #[test]
+    fn every_layer_runtime_owns_reaches_the_accelerated_table() {
+        runtime_table::table_layers::install(super::TABLE_PROVIDER_LAYERS);
+        let installed: Vec<&str> = runtime_table::table_layers::layers()
+            .iter()
+            .map(|l| l.name)
+            .collect();
+        for layer in super::TABLE_PROVIDER_LAYERS {
+            assert!(
+                installed.contains(&layer.name),
+                "{} is missing from the layer table the accelerated table walks",
+                layer.name
+            );
         }
     }
 }

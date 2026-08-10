@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::accelerated_table::AcceleratedTable;
+use crate::accelerated::AcceleratedTable;
 use crate::component::dataset::Dataset;
 use crate::dataconnector::ConnectorComponent;
 use crate::dataconnector::listing::LISTING_TABLE_PARAMETERS;

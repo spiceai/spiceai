@@ -62,7 +62,8 @@ pub(crate) fn build_local_extra_envs(setup_config: &SetupConfig) -> HashMap<Stri
     let mut map = HashMap::new();
     map.insert(
         "SPICED_LOG".to_string(),
-        "info,cayenne=info,runtime::accelerated_table::refresh_task::changes=info,data_components=info".to_string(),
+        "info,cayenne=info,runtime::accelerated::refresh_task::changes=info,data_components=info"
+            .to_string(),
     );
     if let FederatedStorageConfig::MongoDB { uri, .. } = &setup_config.storage {
         map.insert(
