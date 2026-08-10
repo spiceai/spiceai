@@ -355,36 +355,38 @@ impl RequestContext {
         self.propagated_trace_id.get()
     }
 
-    /// Records the trace id carried in by the transport.
+    /// Records `trace_id` as this request's propagated id, and returns the id
+    /// the request ends up using.
     ///
-    /// Call before the request's work starts — once a task has resolved its
-    /// id, a later write cannot move it. Ignored if one is already set, so
-    /// the first id to arrive is the one the whole request uses.
-    pub fn set_propagated_trace_id(&self, trace_id: Arc<str>) {
-        if self.propagated_trace_id.set(trace_id).is_err() {
-            tracing::debug!(
-                "Ignoring a second propagated trace id: this request already resolved one"
-            );
-        }
+    /// The first id to arrive wins: once a task has resolved one it has
+    /// already logged under it, so a later write cannot move it. Serves both
+    /// the request that *receives* an id (the ticket at `DoGet`) and the one
+    /// that *mints* it before any work runs (`GetFlightInfo`), which is why it
+    /// hands back the winner rather than reporting whether it stored one.
+    pub fn propagate_trace_id(&self, trace_id: Arc<str>) -> &Arc<str> {
+        self.propagated_trace_id.get_or_init(|| trace_id)
     }
 
-    /// The propagated trace id, minting and recording one with `mint` if the
-    /// request arrived without one.
+    /// The propagated id, for the request's first task only.
     ///
-    /// For the request that *starts* an exchange and has to name an id before
-    /// any work runs. Racing callers agree on one id: the first to arrive
-    /// wins and every caller is handed that one.
-    pub fn propagated_trace_id_or_mint(&self, mint: impl FnOnce() -> Arc<str>) -> &Arc<str> {
-        self.propagated_trace_id.get_or_init(mint)
+    /// That task anchors itself on the trace; every task under it is already
+    /// inside it and must keep the parent it has, so they are handed `None`.
+    pub fn claim_propagated_trace(&self) -> Option<&Arc<str>> {
+        let trace_id = self.propagated_trace_id.get()?;
+        (!self.trace_joined.swap(true, Ordering::Relaxed)).then_some(trace_id)
     }
 
-    /// Claims the one trace join this request gets, returning `true` to the
-    /// first caller only.
+    /// The id this request's work is recorded under, if one is already
+    /// settled: the id the client pinned, else one an earlier RPC of the same
+    /// exchange returned.
     ///
-    /// The request's first task anchors itself on the propagated trace; every
-    /// task under it is already in that trace and must keep the parent it has.
-    pub fn claim_trace_join(&self) -> bool {
-        !self.trace_joined.swap(true, Ordering::Relaxed)
+    /// The single spelling of that precedence. A task with neither resolves an
+    /// id of its own from its span, which only the task-history layer can do —
+    /// see `task_history::correlation`.
+    #[must_use]
+    pub fn settled_trace_id(&self) -> Option<&Arc<str>> {
+        self.client_trace_id()
+            .or_else(|| self.propagated_trace_id())
     }
 
     /// Returns the raw `authorization` header value from the incoming request, if present.

@@ -78,7 +78,11 @@ pub(crate) fn wrap(ticket: Ticket, trace_id: &str) -> Ticket {
 /// unreadable — an unusable id costs correlation, never the query.
 #[must_use]
 pub(crate) fn unwrap(ticket: &Ticket) -> Option<(Arc<str>, Ticket)> {
-    let any = Any::decode(&*ticket.ticket).ok()?;
+    // Decoded from the `Bytes` rather than from a slice of it: prost copies a
+    // `bytes` field out of a slice, and shares it out of a `Bytes`. Cloning
+    // first is a refcount bump, and keeps the inner ticket below a view of the
+    // wire buffer instead of a copy.
+    let any = Any::decode(ticket.ticket.clone()).ok()?;
     if any.type_url != TRACED_TICKET_TYPE_URL {
         return None;
     }

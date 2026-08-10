@@ -86,27 +86,30 @@ The id covers a query's whole lifetime — planning, execution, and result
 streaming — so a failure raised at any point in that window is attributable,
 including one raised mid-stream after the response has begun.
 
-An HTTP caller that needs the id on its own side pins one — it controls the
-headers of every request it sends. A pooled Flight SQL client cannot, which is
-what the next section is for.
-
 The span is entered around SQL query execution. A chat completion, a search, or an
 embedding call is a task-history task in its own right and gets a `trace_id` column,
 but its log records carry the id only for the queries it runs — under a pinned id
 those queries share the caller's id, and with task history recording they inherit
 the parent task's trace id.
 
-## Reading the id back over Flight
+## Reading the id back
 
-A client that pools connections cannot pin an id per query: with HikariCP the JDBC
-URL — and so every gRPC header the Arrow Flight SQL driver sends — is fixed when the
-pool is built, while correlation is wanted per query. So Flight *returns* the id
-instead, on every query, with nothing to configure.
+Pinning presumes a caller can set a header per query. Plenty cannot: with HikariCP
+the JDBC URL — and so every gRPC header the Arrow Flight SQL driver sends — is fixed
+when the pool is built, and an MCP client does not choose the headers of a tool call
+at all. So Spice *returns* the id as well, on every response it has settled one for,
+with nothing to configure.
 
-| Where                            | Read it with                                                     |
-| -------------------------------- | ---------------------------------------------------------------- |
-| `FlightInfo.app_metadata`        | Any Flight SQL client; the only surface the JDBC driver exposes    |
-| `spice-trace-id` response metadata on `GetFlightInfo` and `DoGet` | A Flight client middleware or gRPC interceptor |
+| Protocol            | Where                                                                  |
+| ------------------- | ---------------------------------------------------------------------- |
+| HTTP, MCP           | `spice-trace-id` response header                                        |
+| Flight, Flight SQL  | `spice-trace-id` response metadata — gRPC metadata *is* HTTP/2 headers  |
+| Flight SQL          | also `FlightInfo.app_metadata`, the only surface the JDBC driver exposes |
+
+Each protocol writes it in the layer that wraps every request, below the point a
+handler's error becomes a response, so **a failed query carries the id too** — which
+is the response most worth correlating. A request that ran no query (a health check, a
+handshake) carries no header.
 
 `app_metadata` is JSON so it can carry a second field later:
 
@@ -149,5 +152,5 @@ is, is what keeps this free: an override is reconciled afterwards by scanning
 `runtime.task_history` for the rows to rewrite, which on this path would be a scan per
 query.
 
-An HTTP response does not carry the id. An HTTP caller pins one per request, which a
-pooled Flight SQL client is the case that cannot.
+Only Flight SQL needs this. HTTP and MCP answer from the same request that ran the
+query, so the id is simply read off the request once a task has resolved one.

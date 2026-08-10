@@ -33,7 +33,7 @@ use spicepod::component::runtime::{
 
 use runtime_query_engine::query_engine::{QueryEngine, QueryRequest};
 
-use super::TaskSpan;
+use super::{TaskSpan, correlation::TRACE_JOIN_ANCHOR};
 
 /// Label key used to identify plan capture spans in OpenTelemetry traces.
 /// This is used to override the default behavior of `captured_output` processing to ensure that
@@ -341,21 +341,17 @@ impl TaskHistoryExporter {
         let trace_id: Arc<str> = span.span_context.trace_id().to_string().into();
         let span_id: Arc<str> = span.span_context.span_id().to_string().into();
         // A task that joined a trace whose id was handed to the client by an
-        // earlier RPC is anchored on a span id that names no task (see
-        // `correlation::SYNTHETIC_PARENT_ATTR`). Reporting it as the parent
-        // would point the column at a row that is never written, and
-        // `spice trace` — which roots its tree on a null parent — would not
-        // show the query at all. In this table the task *is* the trace root.
-        let synthetic_parent: Option<Arc<str>> = extract_attr!(
-            span,
-            crate::task_history::correlation::SYNTHETIC_PARENT_ATTR
-        );
-        let parent_span_id: Option<Arc<str>> = if span.parent_span_id == SpanId::INVALID {
-            None
-        } else {
-            Some(span.parent_span_id.to_string().into())
-        };
-        let parent_span_id = parent_span_id.filter(|id| Some(id) != synthetic_parent.as_ref());
+        // earlier RPC is anchored on `TRACE_JOIN_ANCHOR`, which names no task.
+        // Reporting it as the parent would point the column at a row that is
+        // never written, and `spice trace` — which roots its tree on a null
+        // parent — would not show the query at all. Such a task *is* the trace
+        // root as far as this table is concerned.
+        let parent_span_id: Option<Arc<str>> =
+            if span.parent_span_id == SpanId::INVALID || span.parent_span_id == TRACE_JOIN_ANCHOR {
+                None
+            } else {
+                Some(span.parent_span_id.to_string().into())
+            };
         let task: Arc<str> = extract_attr!(span, "task_override").unwrap_or(span.name.into());
         let input: Arc<str> = Self::process_context_payload(
             &self.captured_context,
@@ -448,13 +444,9 @@ impl TaskHistoryExporter {
                 Self::process_context_payload(&self.captured_context, task.as_ref(), output)
             });
 
-        // Remove the attributes that were read into columns above from
-        // `labels`, if they exist (no issue if they don't).
+        // Remove trace_id and parent_id from `labels`, if they exist (no issue if they don't).
         labels.remove(&Into::<Arc<str>>::into("trace_id"));
         labels.remove(&Into::<Arc<str>>::into("parent_id"));
-        labels.remove(&Into::<Arc<str>>::into(
-            crate::task_history::correlation::SYNTHETIC_PARENT_ATTR,
-        ));
 
         TaskSpan {
             trace_id,

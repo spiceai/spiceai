@@ -57,6 +57,28 @@ pub fn normalize_trace_id(value: &str) -> Option<Arc<str>> {
     (trace_id != TraceId::INVALID).then(|| Arc::from(trace_id.to_string()))
 }
 
+/// Returns the request's trace id to the caller, once its work has settled on
+/// one, under the same header name a client uses to pin one.
+///
+/// Called by each protocol's request-context middleware, on the way out and
+/// below the layer that turns a handler's error into a response — so the id
+/// reaches failures too, which are the responses most worth correlating. A
+/// request that resolved no id (a health check, a handshake) gets no header.
+pub fn attach_trace_id(headers: &mut HeaderMap, request_context: &crate::RequestContext) {
+    let Some(trace_id) = request_context.settled_trace_id() else {
+        return;
+    };
+    match axum::http::HeaderValue::from_str(trace_id) {
+        Ok(value) => {
+            headers.insert(SPICE_TRACE_ID_HEADER, value);
+        }
+        // Unreachable for a normalized id — 32 hexadecimal characters are
+        // always a valid header value — and losing the header costs
+        // correlation rather than the response.
+        Err(e) => tracing::warn!("Failed to return trace id '{trace_id}': {e}"),
+    }
+}
+
 /// Reads [`SPICE_TRACE_ID_HEADER`] from `headers`. `Ok(None)` means the header
 /// was absent.
 ///

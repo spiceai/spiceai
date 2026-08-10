@@ -49,13 +49,9 @@ use crate::{
     },
     flight::{
         Service, is_auth_read_only, metrics, record_batches_to_flight_stream, to_tonic_err,
-        traced_ticket, transaction_error_to_status,
-        util::{
-            attach_cache_metadata, attach_trace_id_metadata, set_flightsql_protocol,
-            with_trace_id_app_metadata,
-        },
+        transaction_error_to_status,
+        util::{attach_cache_metadata, set_flightsql_protocol},
     },
-    task_history::correlation,
 };
 use runtime_request_context::{AsyncMarker, RequestContext};
 use telemetry::timing::TimedStream;
@@ -280,10 +276,6 @@ pub(crate) async fn get_flight_info(
     let context = RequestContext::current(AsyncMarker::new().await);
     let datafusion = get_current_datafusion(&context);
 
-    // Resolved before planning, so a plan failure is logged under the id the
-    // successful path hands back rather than one of its own.
-    let trace_id = correlation::publish_trace_id(&context);
-
     // Try to get schema, but if it fails due to type inference issues with parameters,
     // we'll omit the schema from FlightInfo. The actual schema will be determined during execution.
     // For a `BEGIN … COMMIT` body, advertise the final statement's schema.
@@ -310,16 +302,9 @@ pub(crate) async fn get_flight_info(
 
     let fd = request.into_inner();
 
-    // The id rides the ticket so `do_get` — a separate request, which is what
-    // actually runs the query — records its work under the id returned here.
-    // A prepared statement's handle cannot carry it: one handle serves every
-    // execution, and each execution is a query of its own.
-    let endpoint = FlightEndpoint::new().with_ticket(traced_ticket::wrap(
-        Ticket {
-            ticket: handle.as_any().encode_to_vec().into(),
-        },
-        &trace_id,
-    ));
+    let endpoint = FlightEndpoint::new().with_ticket(Ticket {
+        ticket: handle.as_any().encode_to_vec().into(),
+    });
 
     let mut info = FlightInfo::new()
         .with_endpoint(endpoint)
@@ -330,9 +315,7 @@ pub(crate) async fn get_flight_info(
         info = info.try_with_schema(&schema).map_err(to_tonic_err)?;
     }
 
-    let mut response = Response::new(with_trace_id_app_metadata(info, &trace_id));
-    attach_trace_id_metadata(&mut response, &trace_id);
-    Ok(response)
+    Ok(Response::new(info))
 }
 
 pub(crate) async fn do_get(

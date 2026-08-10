@@ -38,7 +38,7 @@ use std::sync::Arc;
 
 use opentelemetry::{
     Context,
-    trace::{SpanContext, TraceContextExt, TraceFlags, TraceId, TraceState},
+    trace::{SpanContext, SpanId, TraceContextExt, TraceFlags, TraceId, TraceState},
 };
 use opentelemetry_sdk::trace::{IdGenerator, RandomIdGenerator};
 use runtime_request_context::RequestContext;
@@ -76,6 +76,13 @@ pub fn begin_task_trace(task_span: &Span, request_context: &RequestContext) -> S
     join_propagated_trace(task_span, request_context);
 
     let trace_id = resolve_trace_id(request_context, task_span);
+
+    // Record it, so the response can name the id the work was recorded under.
+    // A protocol that hands the id out before the query runs (Flight SQL's
+    // `GetFlightInfo`) has already put it here and this is a no-op; one that
+    // cannot — HTTP, MCP — has no id to return until a task resolves one, and
+    // this is where that happens.
+    request_context.propagate_trace_id(Arc::clone(&trace_id));
 
     // Deliberately NOT `target: "task_history"`: that target is what the
     // console layer filters out, and this span exists to be seen there. It is
@@ -123,20 +130,26 @@ pub fn publish_trace_id(request_context: &RequestContext) -> Arc<str> {
     if let Some(pinned) = request_context.client_trace_id() {
         return Arc::clone(pinned);
     }
-
-    // The exporter's own generator, so an id minted here is the same shape and
-    // quality as one it would have written.
-    Arc::clone(request_context.propagated_trace_id_or_mint(|| {
-        Arc::from(RandomIdGenerator::default().new_trace_id().to_string())
-    }))
+    Arc::clone(request_context.propagate_trace_id(mint_trace_id()))
 }
 
-/// Names the span id [`join_propagated_trace`] anchors a joined trace on.
+/// A fresh trace id, from the exporter's own generator so one minted here is
+/// the same shape and quality as one it would have written.
+fn mint_trace_id() -> Arc<str> {
+    Arc::from(RandomIdGenerator::default().new_trace_id().to_string())
+}
+
+/// The span [`join_propagated_trace`] anchors a joined trace on.
 ///
-/// The exporter reads it to drop that anchor from the `parent_span_id` column:
-/// it identifies no task and, left in place, would hide the query from
-/// `spice trace`, which roots its tree on a null parent.
-pub const SYNTHETIC_PARENT_ATTR: &str = "synthetic_parent_id";
+/// A span context is only valid with *both* ids, so joining a trace costs a
+/// span id even though no span answers to it. A constant rather than a fresh
+/// id per query: it names nothing either way, and a value the exporter already
+/// knows needs no attribute to carry it across.
+///
+/// The exporter drops it from the `parent_span_id` column — left in place it
+/// would point at a row that is never written, and `spice trace` roots its
+/// tree on a null parent, so the query would not appear at all.
+pub const TRACE_JOIN_ANCHOR: SpanId = SpanId::from_bytes(*b"spictrac");
 
 /// Puts `task_span` in the trace whose id an earlier RPC of this exchange
 /// already returned to the client, so the row it writes carries that id.
@@ -151,7 +164,7 @@ pub const SYNTHETIC_PARENT_ATTR: &str = "synthetic_parent_id";
 ///
 /// A client-pinned id wins over a propagated one and keeps the override path:
 /// the id is then the caller's, and its `traceparent` may name a parent span
-/// that the anchor below would displace.
+/// that the anchor would displace.
 ///
 /// No-op when the task-history layer is not installed — there is no `OTel`
 /// span to place, and [`resolve_trace_id`] falls back to the propagated id
@@ -160,7 +173,11 @@ fn join_propagated_trace(task_span: &Span, request_context: &RequestContext) {
     if request_context.client_trace_id().is_some() {
         return;
     }
-    let Some(propagated) = request_context.propagated_trace_id() else {
+    // Only the request's first task anchors itself. A nested task — a cache
+    // fill, NSQL's generated SQL, a sub-query — is already in this trace
+    // through the task above it, and anchoring it too would replace its real
+    // parent with one that names nothing, flattening the `task_history` tree.
+    let Some(propagated) = request_context.claim_propagated_trace() else {
         return;
     };
     let Ok(trace_id) = TraceId::from_hex(propagated) else {
@@ -170,21 +187,9 @@ fn join_propagated_trace(task_span: &Span, request_context: &RequestContext) {
         return;
     };
 
-    // Only the request's first task anchors itself. A nested task — a cache
-    // fill, NSQL's generated SQL, a sub-query — is already in this trace
-    // through the task above it, and anchoring it too would replace its real
-    // parent with one that names nothing, flattening the `task_history` tree.
-    if !request_context.claim_trace_join() {
-        return;
-    }
-
-    // A span context is only valid with *both* ids, so joining a trace costs a
-    // span id even though no span answers to it. It is dropped from the row by
-    // the exporter — see `SYNTHETIC_PARENT_ATTR`.
-    let anchor = RandomIdGenerator::default().new_span_id();
     let parent = Context::new().with_remote_span_context(SpanContext::new(
         trace_id,
-        anchor,
+        TRACE_JOIN_ANCHOR,
         TraceFlags::SAMPLED,
         true,
         TraceState::default(),
@@ -197,9 +202,7 @@ fn join_propagated_trace(task_span: &Span, request_context: &RequestContext) {
         // in a supported configuration, and the log still gets the id from
         // `resolve_trace_id`.
         tracing::debug!("Not recording task under trace {propagated}: {e}");
-        return;
     }
-    tracing::info!(target: "task_history", parent: task_span, synthetic_parent_id = %anchor);
 }
 
 /// The `traceparent` span this task is a child of, but only when that span
@@ -237,21 +240,15 @@ pub fn same_trace_parent_span(
 /// 4. a freshly generated id, when task history is disabled and there is no
 ///    span context to borrow.
 fn resolve_trace_id(request_context: &RequestContext, task_span: &Span) -> Arc<str> {
-    if let Some(pinned) = request_context.client_trace_id() {
-        return Arc::clone(pinned);
-    }
-
-    if let Some(propagated) = request_context.propagated_trace_id() {
-        return Arc::clone(propagated);
+    if let Some(settled) = request_context.settled_trace_id() {
+        return Arc::clone(settled);
     }
 
     // `TraceId::INVALID` is what an unnumbered span reports, which is every
     // span when the task-history layer is not installed.
     let span_trace_id = task_span.context().span().span_context().trace_id();
     if span_trace_id == TraceId::INVALID {
-        // The exporter's own generator, so an id minted here is the same shape
-        // and quality as one it would have written.
-        return Arc::from(RandomIdGenerator::default().new_trace_id().to_string());
+        return mint_trace_id();
     }
 
     Arc::from(span_trace_id.to_string())
@@ -377,7 +374,7 @@ mod tests {
     #[test]
     fn resolve_adopts_a_propagated_id_instead_of_generating_one() {
         let ctx = unpinned();
-        ctx.set_propagated_trace_id(Arc::from(PROPAGATED));
+        ctx.propagate_trace_id(Arc::from(PROPAGATED));
 
         assert_eq!(&*resolve_trace_id(&ctx, &Span::none()), PROPAGATED);
         assert_eq!(
@@ -392,7 +389,7 @@ mod tests {
     #[test]
     fn a_pinned_id_beats_a_propagated_one() {
         let ctx = pinned();
-        ctx.set_propagated_trace_id(Arc::from(PROPAGATED));
+        ctx.propagate_trace_id(Arc::from(PROPAGATED));
 
         assert_eq!(&*resolve_trace_id(&ctx, &Span::none()), PINNED);
     }
@@ -403,10 +400,17 @@ mod tests {
     #[test]
     fn only_the_first_task_of_a_request_joins_the_trace() {
         let ctx = unpinned();
-        ctx.set_propagated_trace_id(Arc::from(PROPAGATED));
+        ctx.propagate_trace_id(Arc::from(PROPAGATED));
 
-        assert!(ctx.claim_trace_join(), "the top task joins");
-        assert!(!ctx.claim_trace_join(), "a nested task must not re-anchor");
+        assert_eq!(
+            ctx.claim_propagated_trace().map(AsRef::as_ref),
+            Some(PROPAGATED),
+            "the top task joins"
+        );
+        assert!(
+            ctx.claim_propagated_trace().is_none(),
+            "a nested task must not re-anchor"
+        );
 
         assert_eq!(
             &*resolve_trace_id(&ctx, &Span::none()),
@@ -420,8 +424,8 @@ mod tests {
     #[test]
     fn the_first_propagated_id_wins() {
         let ctx = unpinned();
-        ctx.set_propagated_trace_id(Arc::from(PROPAGATED));
-        ctx.set_propagated_trace_id(Arc::from(PINNED));
+        ctx.propagate_trace_id(Arc::from(PROPAGATED));
+        ctx.propagate_trace_id(Arc::from(PINNED));
 
         assert_eq!(&*resolve_trace_id(&ctx, &Span::none()), PROPAGATED);
     }

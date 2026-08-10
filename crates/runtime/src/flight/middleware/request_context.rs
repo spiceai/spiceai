@@ -167,7 +167,12 @@ where
             // completion does not cancel the token.
             let cancel_guard = request_context.cancellation_token().clone().drop_guard();
             let response = inner.call(req).await?;
-            let (parts, body) = response.into_parts();
+            let (mut parts, body) = response.into_parts();
+            // gRPC metadata *is* HTTP/2 headers, so this is the same write the
+            // HTTP server makes, and it lands below tonic — which has already
+            // turned a handler's `Status` into a response — so failures carry
+            // the id too.
+            runtime_request_context::attach_trace_id(&mut parts.headers, &request_context);
             let body = util::cancel_guard_body::CancelGuardBody::new(body, cancel_guard);
             Ok(http::Response::from_parts(parts, body))
         }))

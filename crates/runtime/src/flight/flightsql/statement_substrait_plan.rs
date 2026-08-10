@@ -41,13 +41,9 @@ use crate::datafusion::sql_validator::validate_sql_query_read_only;
 use crate::flight::{
     Service, handle_datafusion_error, is_auth_read_only,
     metrics::track_flight_request,
-    to_tonic_err, traced_ticket,
-    util::{
-        attach_cache_metadata, attach_trace_id_metadata, set_flightsql_protocol,
-        with_trace_id_app_metadata,
-    },
+    to_tonic_err,
+    util::{attach_cache_metadata, set_flightsql_protocol},
 };
-use crate::task_history::correlation;
 use crate::{datafusion::DataFusion, flight::handle_query_error};
 use runtime_request_context::{AsyncMarker, RequestContext};
 use telemetry::timing::TimedStream;
@@ -128,10 +124,6 @@ pub(crate) async fn get_flight_info(
     let context = RequestContext::current(AsyncMarker::new().await);
     let datafusion = get_current_datafusion(&context);
 
-    // Resolved before planning, so a plan failure is logged under the id the
-    // successful path hands back rather than one of its own.
-    let trace_id = correlation::publish_trace_id(&context);
-
     let (plan, cache_key) = decode_plan(&cmd, &datafusion).await?;
 
     let read_only = is_auth_read_only(&context);
@@ -146,14 +138,9 @@ pub(crate) async fn get_flight_info(
 
     let fd = request.into_inner();
 
-    // The id rides the ticket so `do_get` — a separate request, which is what
-    // actually runs the plan — records its work under the id returned here.
-    let endpoint = FlightEndpoint::new().with_ticket(traced_ticket::wrap(
-        Ticket {
-            ticket: cmd.as_any().encode_to_vec().into(),
-        },
-        &trace_id,
-    ));
+    let endpoint = FlightEndpoint::new().with_ticket(Ticket {
+        ticket: cmd.as_any().encode_to_vec().into(),
+    });
 
     let info = FlightInfo::new()
         .with_endpoint(endpoint)
@@ -161,9 +148,7 @@ pub(crate) async fn get_flight_info(
         .map_err(to_tonic_err)?
         .with_descriptor(fd);
 
-    let mut response = Response::new(with_trace_id_app_metadata(info, &trace_id));
-    attach_trace_id_metadata(&mut response, &trace_id);
-    Ok(response)
+    Ok(Response::new(info))
 }
 
 /// Execute a Substrait plan and stream the results.

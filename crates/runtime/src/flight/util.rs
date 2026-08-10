@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use arrow_flight::FlightInfo;
 use bytes::Bytes;
 use cache::result::CacheStatus;
 use tonic::{
@@ -22,52 +21,21 @@ use tonic::{
     metadata::{Ascii, MetadataValue},
 };
 
-use runtime_request_context::{AsyncMarker, Protocol, RequestContext, SPICE_TRACE_ID_HEADER};
+use runtime_request_context::{AsyncMarker, Protocol, RequestContext};
 
 use crate::datafusion::request_context_extension::DataFusionContextExtension;
 
-/// Returns the trace id to the caller as gRPC response metadata, under the
-/// same name the request header that pins one uses.
-///
-/// gRPC metadata *is* HTTP/2 headers, so this is the Flight counterpart of the
-/// HTTP response header — and what a client with a Flight middleware or a
-/// gRPC interceptor reads. A Flight SQL JDBC caller cannot see response
-/// metadata and reads [`with_trace_id_app_metadata`] instead.
-pub(crate) fn attach_trace_id_metadata<T>(response: &mut Response<T>, trace_id: &str) {
-    match trace_id.parse::<MetadataValue<Ascii>>() {
-        Ok(value) => {
-            response.metadata_mut().insert(SPICE_TRACE_ID_HEADER, value);
-        }
-        // Unreachable for a normalized id — 32 hexadecimal characters are
-        // always valid metadata — and losing the header costs correlation
-        // rather than the response.
-        Err(e) => tracing::warn!("Failed to return trace id '{trace_id}': {e}"),
-    }
-}
-
-/// Returns the trace id in `FlightInfo.app_metadata`, as
+/// The trace id as a `FlightInfo.app_metadata` payload:
 /// `{"trace_id":"<32 hex characters>"}`.
 ///
-/// This is the one place a Flight SQL JDBC caller can read it: the driver
-/// surfaces it as `ArrowFlightJdbcFlightStreamResultSet.getAppMetadata()`, and
-/// surfaces neither response metadata nor per-message `app_metadata`. JSON
-/// rather than the bare id so a second field can be added without breaking a
-/// client that already parses this one.
-///
-/// Interpolated rather than serialized because a trace id is normalized before
-/// it reaches here — 32 lowercase hexadecimal characters — so there is nothing
-/// a JSON encoder would escape.
+/// `app_metadata` is the one place a Flight SQL JDBC caller can read it — the
+/// driver surfaces it as
+/// `ArrowFlightJdbcFlightStreamResultSet.getAppMetadata()`, and surfaces
+/// neither response metadata nor per-message `app_metadata`. JSON so a second
+/// field can be added without breaking a client that already parses this one.
 #[must_use]
-pub(crate) fn with_trace_id_app_metadata(info: FlightInfo, trace_id: &str) -> FlightInfo {
-    debug_assert!(
-        trace_id.bytes().all(|b| b.is_ascii_hexdigit()),
-        "a trace id reaching the wire is normalized hexadecimal"
-    );
-
-    FlightInfo {
-        app_metadata: Bytes::from(format!(r#"{{"trace_id":"{trace_id}"}}"#)),
-        ..info
-    }
+pub(crate) fn trace_id_app_metadata(trace_id: &str) -> Bytes {
+    Bytes::from(serde_json::json!({ "trace_id": trace_id }).to_string())
 }
 
 pub fn attach_cache_metadata<T>(

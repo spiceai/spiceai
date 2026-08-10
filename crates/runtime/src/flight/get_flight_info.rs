@@ -23,10 +23,7 @@ use tonic::{Request, Response, Status};
 
 use crate::{
     datafusion::request_context_extension::get_current_datafusion,
-    flight::{
-        metrics, traced_ticket,
-        util::{attach_trace_id_metadata, with_trace_id_app_metadata},
-    },
+    flight::{metrics, traced_ticket, util::trace_id_app_metadata},
     task_history::correlation,
 };
 use runtime_request_context::{AsyncMarker, RequestContext};
@@ -36,6 +33,38 @@ use super::{Service, flightsql, to_tonic_err};
 pub(crate) async fn handle(
     request: Request<FlightDescriptor>,
 ) -> Result<Response<FlightInfo>, Status> {
+    // Resolved before any handler runs, so a failure while planning is logged
+    // under the same id a successful call hands back. Every ticket this call
+    // emits then carries it to `do_get` — the request that actually runs the
+    // query — and the client reads it off the `FlightInfo`. Doing it here
+    // rather than in each handler is what makes that true of every command
+    // rather than of the ones someone remembered.
+    let trace_id =
+        correlation::publish_trace_id(&RequestContext::current(AsyncMarker::new().await));
+
+    dispatch(request)
+        .await
+        .map(|response| response.map(|info| trace(info, &trace_id)))
+}
+
+/// Puts `trace_id` where a client can read it: in `app_metadata`, and on every
+/// ticket the call hands out so the `do_get` that redeems one adopts it.
+fn trace(info: FlightInfo, trace_id: &str) -> FlightInfo {
+    FlightInfo {
+        endpoint: info
+            .endpoint
+            .into_iter()
+            .map(|endpoint| FlightEndpoint {
+                ticket: endpoint.ticket.map(|t| traced_ticket::wrap(t, trace_id)),
+                ..endpoint
+            })
+            .collect(),
+        ..info
+    }
+    .with_app_metadata(trace_id_app_metadata(trace_id))
+}
+
+async fn dispatch(request: Request<FlightDescriptor>) -> Result<Response<FlightInfo>, Status> {
     let Ok(message) = Any::decode(&*request.get_ref().cmd) else {
         return get_flight_info_simple(request).await;
     };
@@ -173,21 +202,15 @@ async fn get_flight_info_simple(
     let context = RequestContext::current(AsyncMarker::new().await);
     let datafusion = get_current_datafusion(&context);
 
-    // Resolved before planning, so a plan failure is logged under the id the
-    // successful path hands back rather than one of its own.
-    let trace_id = correlation::publish_trace_id(&context);
-
     let sql: &str = std::str::from_utf8(&fd.cmd).map_err(to_tonic_err)?;
     let (arrow_schema, _) = Service::get_arrow_schema(datafusion, sql)
         .await
         .map_err(to_tonic_err)?;
 
-    let descriptor = fd.clone();
-    let ticket = traced_ticket::wrap(Ticket { ticket: fd.cmd }, &trace_id);
     let info = FlightInfo {
-        flight_descriptor: Some(descriptor),
+        flight_descriptor: Some(fd.clone()),
         endpoint: vec![FlightEndpoint {
-            ticket: Some(ticket),
+            ticket: Some(Ticket { ticket: fd.cmd }),
             ..Default::default()
         }],
         ..Default::default()
@@ -195,7 +218,5 @@ async fn get_flight_info_simple(
     .try_with_schema(&arrow_schema)
     .map_err(to_tonic_err)?;
 
-    let mut response = Response::new(with_trace_id_app_metadata(info, &trace_id));
-    attach_trace_id_metadata(&mut response, &trace_id);
-    Ok(response)
+    Ok(Response::new(info))
 }
