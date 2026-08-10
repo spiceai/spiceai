@@ -1435,6 +1435,13 @@ fn cayenne_accelerations(
 /// * The **PK keyset, CDC coalesce buffer, and inline memtable** are write-path
 ///   state that only a small-write (CDC-profile) table populates, so they are
 ///   counted only for those.
+/// * The **inline-admission buffer plus the serialized entry it produces** are
+///   counted for every profile that inlines small writes, which now includes the
+///   whole-table replace. One of each per acceleration is exact for the overwrite
+///   path: `CayenneContext` hands out a single inline-admission slot, and a
+///   partitioned dataset's children share the parent's context
+///   (`CayennePartitionCreator::new`), so N concurrent partition overwrites still
+///   hold at most one buffer and one blob between them.
 ///
 /// The globally coordinated in-memory tier and the virtual (non-resident) metastore
 /// mmap are intentionally excluded: the tier is already capped at host/5 and the
@@ -1489,6 +1496,28 @@ fn estimate_cayenne_reservation_bytes(
                 |mb| mb.saturating_mul(MIB),
             );
         total = total.saturating_add(segment);
+
+        // Inline-admission state: the bounded Arrow buffer a write is admitted
+        // through, plus the Arrow IPC entry it serializes into. Byte-valued
+        // params, so no MB conversion; the accelerator's key lists (with the
+        // `cayenne_`-prefixed aliases) and its unset defaults are mirrored here.
+        if profile.inlines_small_writes() {
+            let inline_entry =
+                parse_u64(&params, &["cayenne_inline_max_bytes", "inline_max_bytes"]).unwrap_or(
+                    u64::try_from(cayenne::metadata::DEFAULT_INLINE_MAX_BYTES).unwrap_or(u64::MAX),
+                );
+            let inline_buffer = parse_u64(
+                &params,
+                &["cayenne_inline_max_buffer_bytes", "inline_max_buffer_bytes"],
+            )
+            .unwrap_or(
+                u64::try_from(cayenne::metadata::DEFAULT_INLINE_MAX_BUFFER_BYTES)
+                    .unwrap_or(u64::MAX),
+            );
+            total = total
+                .saturating_add(inline_entry)
+                .saturating_add(inline_buffer);
+        }
 
         if !profile.uses_cdc_tier() {
             continue;

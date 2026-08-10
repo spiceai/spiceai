@@ -832,6 +832,21 @@ impl RefreshWriteProfile {
     pub(crate) const fn uses_cdc_tier(self) -> bool {
         matches!(self, RefreshWriteProfile::SmallWrite)
     }
+
+    /// Whether a table on this profile keeps small writes in the metastore inline
+    /// tier instead of turning them into tiny Vortex files.
+    ///
+    /// True for the two profiles whose writes are small by shape: a CDC-style
+    /// stream of deltas, and a whole-table replace of a table small enough to fit
+    /// the admission caps. The whole-table replace is the one that most needs it —
+    /// nothing accumulates across its refreshes, so its background compactor is
+    /// off and the tiny files one refresh writes would never be merged.
+    pub(crate) const fn inlines_small_writes(self) -> bool {
+        matches!(
+            self,
+            RefreshWriteProfile::SmallWrite | RefreshWriteProfile::BulkOverwrite
+        )
+    }
 }
 
 fn apply_refresh_mode_defaults(
@@ -872,9 +887,16 @@ fn apply_refresh_mode_defaults(
             // table that also takes `INSERT`s still consolidates; an operator can
             // also set `cayenne_compaction_background_interval_ms` explicitly.
             config.compaction_background_interval_ms = 0;
-            config.inline_max_rows = 0;
-            config.inline_max_bytes = 0;
-            config.inline_max_buffer_bytes = 0;
+            // Same static admission caps as a CDC delta, for the same reason and
+            // then some: a refresh that fits them becomes ONE metastore row
+            // instead of `write_concurrency` tiny Vortex files that — with the
+            // background compactor off, above — nothing would ever merge. The
+            // `inline_flush_*` memtable caps are deliberately left at their
+            // defaults: a whole-table replace leaves exactly one inline entry, so
+            // the flush caps never bind.
+            config.inline_max_rows = SMALL_WRITE_INLINE_MAX_ROWS;
+            config.inline_max_bytes = SMALL_WRITE_INLINE_MAX_BYTES;
+            config.inline_max_buffer_bytes = SMALL_WRITE_INLINE_MAX_BUFFER_BYTES;
         }
         RefreshWriteProfile::BulkAppend => {
             config.inline_max_rows = 0;
@@ -5058,10 +5080,11 @@ mod tests {
         let app = Arc::new(AppBuilder::new("test").build());
         let rt = Arc::new(crate::Runtime::builder().build().await);
 
+        // The bulk-APPEND profile only. `full` (and an unset mode, which the
+        // connector default resolves to `full`) is the bulk-OVERWRITE profile and
+        // does inline — see `test_full_refresh_disables_background_compaction`.
         for (table_name, refresh_mode) in [
             ("append_manual_load", Some(RefreshMode::Append)),
-            ("default_load", None),
-            ("full_load", Some(RefreshMode::Full)),
             ("snapshot_load", Some(RefreshMode::Snapshot)),
             ("disabled_load", Some(RefreshMode::Disabled)),
         ] {
@@ -5313,8 +5336,20 @@ mod tests {
             "full refresh must not spawn a background compactor"
         );
         assert_eq!(
-            config.inline_max_rows, 0,
-            "inlining stays off for a whole-table replace"
+            config.inline_max_rows, SMALL_WRITE_INLINE_MAX_ROWS,
+            "a whole-table replace small enough to be admitted must inline: with the background \
+             compactor off, the tiny Vortex files it would otherwise write are never merged"
+        );
+        assert_eq!(config.inline_max_bytes, SMALL_WRITE_INLINE_MAX_BYTES);
+        assert_eq!(
+            config.inline_max_buffer_bytes,
+            SMALL_WRITE_INLINE_MAX_BUFFER_BYTES
+        );
+        assert_eq!(
+            config.inline_flush_max_rows,
+            cayenne::metadata::DEFAULT_INLINE_FLUSH_MAX_ROWS,
+            "the cumulative flush caps stay at their defaults — a replace leaves one entry, so \
+             the flush gate never binds"
         );
 
         // An explicit interval still wins: a pod that mixes in-place writes with
@@ -5619,9 +5654,18 @@ mod tests {
             CayenneAccelerator::get_vortex_config("full_partial_override", &large_write_dataset)
                 .await;
 
+        // Bulk-overwrite inlines too, on the same static caps as small-write, so
+        // the un-overridden knobs keep those defaults rather than the zeros that
+        // meant "this profile never inlines".
         assert_eq!(large_write_config.inline_max_rows, 321);
-        assert_eq!(large_write_config.inline_max_bytes, 0);
-        assert_eq!(large_write_config.inline_max_buffer_bytes, 0);
+        assert_eq!(
+            large_write_config.inline_max_bytes,
+            SMALL_WRITE_INLINE_MAX_BYTES
+        );
+        assert_eq!(
+            large_write_config.inline_max_buffer_bytes,
+            SMALL_WRITE_INLINE_MAX_BUFFER_BYTES
+        );
     }
 
     #[tokio::test]
