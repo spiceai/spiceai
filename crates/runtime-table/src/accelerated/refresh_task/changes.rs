@@ -541,10 +541,11 @@ const CDC_PREFETCH_BUFFER_DEFAULT: usize = 128;
 // fixed per-batch publish cost (one EBS directory `sync_all()` per batch per table)
 // over more rows. `max_coalesced_bytes` (128 MiB default) bounds the burst DRAINED
 // from the channel — not what sits in it. The channel's bound is this envelope
-// count, and an envelope carries a materialized batch of any width, so the bytes
-// queued ahead of apply are bounded by nothing. `cdc_prefetch_buffer_bytes`
-// measures them; treat a large value as real process memory that no budget
-// accounts for. The drain never waits, so low-load latency is unchanged
+// count, and an envelope carries a batch of any width, so the size of what is
+// queued ahead of apply is bounded by nothing. `cdc_prefetch_buffer_bytes`
+// estimates it, on the same decode-free scale `max_coalesced_bytes` budgets
+// against; a large value means memory no budget accounts for and is worth
+// investigating. The drain never waits, so low-load latency is unchanged
 // (burst.len()==1).
 const CDC_PREFETCH_BUFFER_MAX: usize = 16384;
 const CDC_MAX_COALESCED_ENVELOPES_DEFAULT: usize = 256;
@@ -1073,8 +1074,9 @@ impl RefreshTask {
         // loop is the bottleneck, the reader parks on `send` and stops pulling.
         // That bounds the number of envelopes in flight, not their size — a full
         // channel holds `prefetch_buffer` batches of whatever width the source
-        // produces, which at a large scale factor is a substantial and otherwise
-        // unmeasured share of the process. `cdc_prefetch_buffer_bytes` reports it.
+        // produces, which at a large scale factor can be a substantial and
+        // otherwise unmeasured share of the process. `cdc_prefetch_buffer_bytes`
+        // estimates it.
         let (tx, mut rx) = tokio::sync::mpsc::channel::<
             Result<cdc::ChangeEnvelope, cdc::StreamError>,
         >(cdc_cfg.prefetch_buffer);
@@ -1085,14 +1087,23 @@ impl RefreshTask {
         // while the reader's real sender lives, so it can never resurrect a closed
         // channel.
         let tx_probe = tx.downgrade();
-        // Bytes resident in the channel above. The capacity bound counts
-        // envelopes, so this is not derivable from occupancy: a mid-range
-        // envelope count can hold anything from kilobytes to gigabytes depending
-        // on how wide the source's batches are. The reader adds an envelope's
-        // encoded size as it hands it over and the apply loop subtracts it on
-        // receipt, so the value tracks what is actually queued ahead of apply.
+        // Estimated size of what is queued in the channel above. The capacity
+        // bound counts envelopes, so this is not derivable from occupancy: a
+        // mid-range envelope count can hold anything from kilobytes to gigabytes
+        // depending on how wide the source's batches are. The reader adds an
+        // envelope's encoded size as it hands it over and the apply loop
+        // subtracts it on receipt, so the value tracks what is queued ahead of
+        // apply. `encoded_len` is a decode-free estimate, not measured resident
+        // bytes — see `CDC_PREFETCH_BUFFER_BYTES` for what it does and does not
+        // claim.
         let prefetch_bytes = Arc::new(AtomicU64::new(0));
         let reader_prefetch_bytes = Arc::clone(&prefetch_bytes);
+        // Zeroes the gauge once this stream is gone, however it goes (see
+        // `PrefetchBytesGaugeReset`). Held for the whole function so the reset
+        // also covers the finalize/commit drain below, not just the apply loop.
+        let _prefetch_gauge_reset = PrefetchBytesGaugeReset {
+            labels: metric_labels.clone(),
+        };
 
         let reader_dataset = dataset_name.clone();
         let reader_metric_labels = metric_labels.clone();
@@ -3093,6 +3104,28 @@ fn cdc_item_budget_bytes(item: &Result<cdc::ChangeEnvelope, cdc::StreamError>) -
     // accumulates before applying; the real Arrow build is deferred to apply
     // time (`into_parts_offloaded_burst`), off the source's shared read path.
     item.as_ref().map_or(0, cdc::ChangeEnvelope::encoded_len)
+}
+
+/// Zeroes `cdc_prefetch_buffer_bytes` for one dataset when the CDC stream that
+/// feeds it goes away.
+///
+/// The gauge is only ever recorded from inside the apply loop, so its last
+/// reading outlives that loop. Every exit — a `break` out to the finalize drain,
+/// or the whole future being dropped mid-`await` when the refresh task is
+/// cancelled — drops the receiver and everything still queued behind it, but
+/// leaves the exported value describing a backlog that no longer exists. An
+/// operator reading a torn-down dataset would see prefetch memory that was
+/// already freed, which is the same class of lie the gauge exists to stop
+/// telling. `Drop` is what covers the cancellation path; resetting at each
+/// `break` would not, since an aborted task never reaches one.
+struct PrefetchBytesGaugeReset {
+    labels: DatasetMetricLabels,
+}
+
+impl Drop for PrefetchBytesGaugeReset {
+    fn drop(&mut self) {
+        metrics::CDC_PREFETCH_BUFFER_BYTES.record(0, self.labels.dataset());
+    }
 }
 
 /// Subtract from the CDC prefetch byte counter without wrapping.
