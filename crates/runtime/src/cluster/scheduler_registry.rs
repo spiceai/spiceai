@@ -23,7 +23,7 @@ limitations under the License.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use app::spicepod::component::runtime::Scheduler as SchedulerConfig;
@@ -81,6 +81,13 @@ enum Membership {
 /// resolved by re-reading membership rather than by writing harder.
 const MAX_HEARTBEAT_CAS_ATTEMPTS: usize = 3;
 
+/// Consecutive failures to read the current heartbeat before this incarnation
+/// will write without a version predicate. Without the version, a write cannot
+/// prove it is not overwriting a successor, so skipping is preferred while the
+/// TTL still has slack; only when self-eviction becomes the greater risk is a
+/// blind write attempted, and then only against a freshly re-read membership.
+const BLIND_WRITE_AFTER_BEAT_READ_FAILURES: usize = 2;
+
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Failed to initialize scheduler state object store: {source}"))]
@@ -120,6 +127,8 @@ struct SchedulerRegistryRunner {
     /// superseded. Sticky, so a later failed read cannot resume claiming the
     /// heartbeat key.
     superseded: Arc<AtomicBool>,
+    /// Consecutive failures to read the current heartbeat object.
+    beat_read_failures: Arc<AtomicUsize>,
 }
 
 pub async fn start_scheduler_registry(
@@ -193,6 +202,7 @@ pub async fn start_scheduler_registry(
         peers,
         job_executor,
         superseded: Arc::new(AtomicBool::new(false)),
+        beat_read_failures: Arc::new(AtomicUsize::new(0)),
     };
 
     runner.run(cancel).await
@@ -326,23 +336,35 @@ impl SchedulerRegistryRunner {
             .cluster
             .mutate(|state| {
                 if let Some(existing) = state.schedulers.get(&scheduler_id) {
-                    // Judge the registered entry only by *its own*
-                    // heartbeat. The key is shared, so a beat left by some
-                    // other incarnation says nothing about this entry: if a
-                    // successor commits its membership and dies before its
-                    // first beat, the predecessor's beat is what remains, and
-                    // treating that as a mismatch would lock the id forever
+                    // Judge the registered entry by *its own* heartbeat. The
+                    // key is shared, so a beat left by another incarnation says
+                    // nothing about this entry: if a successor commits its
+                    // membership and dies before its first beat, the
+                    // predecessor's beat is what remains, and treating that as
+                    // a disqualifying mismatch would lock the id forever
                     // (registration refuses, and the reaper skips the same
-                    // mismatch). An unrelated beat is therefore treated as no
-                    // beat, which falls through to the startup grace window.
-                    let own_beat = observed
-                        .as_ref()
-                        .filter(|beat| beat.instance_id == existing.instance_id);
-                    let stale_or_missing = if let Some(beat) = own_beat {
-                        beat.is_stale(now)
-                    } else {
-                        let grace = existing.ttl_ms.saturating_add(CLOCK_SKEW_TOLERANCE_MS);
-                        now.saturating_sub(existing.started_at_ms) > grace
+                    // mismatch).
+                    //
+                    // A foreign beat is therefore not proof this entry is
+                    // alive — but a *fresh* one is proof that something is
+                    // actively writing the key, so it still blocks takeover.
+                    // Otherwise a legacy writer that briefly overwrites a live
+                    // successor's beat would let a third incarnation evict that
+                    // live successor. Recovery is then delayed by at most the
+                    // TTL it takes the foreign beat to go stale.
+                    let stale_or_missing = match observed.as_ref() {
+                        Some(beat) if beat.instance_id == existing.instance_id => {
+                            beat.is_stale(now)
+                        }
+                        Some(foreign) => {
+                            let grace = existing.ttl_ms.saturating_add(CLOCK_SKEW_TOLERANCE_MS);
+                            foreign.is_stale(now)
+                                && now.saturating_sub(existing.started_at_ms) > grace
+                        }
+                        None => {
+                            let grace = existing.ttl_ms.saturating_add(CLOCK_SKEW_TOLERANCE_MS);
+                            now.saturating_sub(existing.started_at_ms) > grace
+                        }
                     };
                     if stale_or_missing {
                         state.schedulers.insert(scheduler_id.clone(), entry.clone());
@@ -469,42 +491,19 @@ impl SchedulerRegistryRunner {
             )
             .await
             {
-                Ok(Ok(result)) => result,
+                Ok(Ok(result)) => {
+                    self.beat_read_failures.store(0, Ordering::Relaxed);
+                    result
+                }
                 // A read error and a read timeout are the same situation: the
                 // current beat is unknown. Aborting the tick here would let
                 // repeated transient errors suppress every beat until the TTL
                 // lapses and this healthy scheduler is reaped.
                 Ok(Err(err)) => {
-                    if membership == Membership::ConfirmedSelf {
-                        tracing::warn!(
-                            scheduler_id = %self.scheduler_id,
-                            error = %err,
-                            "Could not read the current heartbeat; writing as the confirmed owner"
-                        );
-                        return self.overwrite_heartbeat().await;
-                    }
-                    tracing::warn!(
-                        scheduler_id = %self.scheduler_id,
-                        error = %err,
-                        "Could not read the current heartbeat with membership unconfirmed; skipping this beat"
-                    );
-                    return Ok(());
+                    return self.beat_read_failed(membership, &format!("{err}")).await;
                 }
                 Err(_elapsed) => {
-                    // The current beat is unknown. With membership confirmed we
-                    // are entitled to the key, so write unconditionally rather
-                    // than skip: skipping repeatedly would let the TTL lapse and
-                    // get this healthy scheduler reaped. Without that proof,
-                    // skip — writing blind could clobber a successor.
-                    if membership == Membership::ConfirmedSelf {
-                        return self.overwrite_heartbeat().await;
-                    }
-                    tracing::warn!(
-                        scheduler_id = %self.scheduler_id,
-                        timeout_ms = read_timeout.as_millis(),
-                        "Timed out reading the heartbeat with membership unconfirmed; skipping this beat"
-                    );
-                    return Ok(());
+                    return self.beat_read_failed(membership, "read timed out").await;
                 }
             };
 
@@ -567,6 +566,35 @@ impl SchedulerRegistryRunner {
         tracing::warn!(
             scheduler_id = %self.scheduler_id,
             "Heartbeat contended by another incarnation; skipping this beat"
+        );
+        Ok(())
+    }
+
+    /// The current beat could not be read, so no version predicate is
+    /// available. A write would then be unable to prove it is not overwriting a
+    /// successor, and skipping cannot continue forever without the TTL lapsing.
+    /// Skip while the TTL still has slack; once failures persist, write only
+    /// against a *freshly* re-read membership — the tick's earlier confirmation
+    /// may be a heartbeat interval old, which is long enough for a takeover.
+    async fn beat_read_failed(&self, membership: Membership, reason: &str) -> Result<()> {
+        let failures = self.beat_read_failures.fetch_add(1, Ordering::Relaxed) + 1;
+        if membership == Membership::ConfirmedSelf
+            && failures >= BLIND_WRITE_AFTER_BEAT_READ_FAILURES
+            && self.read_membership().await == Some(true)
+        {
+            tracing::warn!(
+                scheduler_id = %self.scheduler_id,
+                failures,
+                reason,
+                "Cannot read the heartbeat; writing without a version predicate as the re-confirmed owner"
+            );
+            return self.overwrite_heartbeat().await;
+        }
+        tracing::warn!(
+            scheduler_id = %self.scheduler_id,
+            failures,
+            reason,
+            "Cannot read the current heartbeat; skipping this beat"
         );
         Ok(())
     }
@@ -737,6 +765,7 @@ mod tests {
             peers: Arc::new(RwLock::new(HashMap::new())),
             job_executor,
             superseded: Arc::new(AtomicBool::new(false)),
+            beat_read_failures: Arc::new(AtomicUsize::new(0)),
         };
         runner.register_self().await.expect("register");
 
@@ -804,6 +833,7 @@ mod tests {
             peers: Arc::new(RwLock::new(HashMap::new())),
             job_executor,
             superseded: Arc::new(AtomicBool::new(false)),
+            beat_read_failures: Arc::new(AtomicUsize::new(0)),
         };
         runner.register_self().await.expect("register");
 
@@ -883,19 +913,136 @@ mod tests {
         }
     }
 
-    /// The exact interleaving the conditional write exists for: a successor
-    /// takes the id over and publishes *after* this incarnation has confirmed
-    /// membership but *before* its write lands. The write must fail its
-    /// precondition and retire rather than clobber the successor.
+    /// Store that lets a successor take over *between* the heartbeat read and
+    /// the conditional write, which is the only way to reach the CAS-conflict
+    /// branch: installing the successor beforehand makes the initial membership
+    /// check retire first, so the conditional write is never attempted.
+    ///
+    /// The successor claims membership as well as the heartbeat, because that is
+    /// what a real takeover does — `register_self` mutates `cluster.json` before
+    /// it beats. A heartbeat-only writer has no ownership claim, and reclaiming
+    /// the key from one is correct rather than a clobber.
+    #[derive(Debug)]
+    struct PublishBetweenReadAndWrite {
+        inner: Arc<dyn ObjectStore>,
+        cluster: Arc<ClusterStateStore>,
+        successor: Uuid,
+        armed: std::sync::atomic::AtomicBool,
+    }
+
+    impl std::fmt::Display for PublishBetweenReadAndWrite {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "PublishBetweenReadAndWrite")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for PublishBetweenReadAndWrite {
+        async fn get_opts(
+            &self,
+            location: &object_store::path::Path,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            let result = self.inner.get_opts(location, options).await;
+            // After the heartbeat has been read once, let the successor take the
+            // key. The pending conditional write then finds a changed object.
+            if location.as_ref().contains("heartbeats/")
+                && self.armed.swap(false, std::sync::atomic::Ordering::Relaxed)
+            {
+                self.cluster
+                    .mutate(|state| {
+                        if let Some(entry) = state.schedulers.get_mut("test:50051") {
+                            entry.instance_id = self.successor;
+                            entry.started_at_ms = 50_000;
+                        }
+                        MutationOutcome::Apply
+                    })
+                    .await
+                    .expect("successor claims membership");
+                let beat = crate::cluster::heartbeat::SchedulerHeartbeat {
+                    scheduler_id: "test:50051".to_string(),
+                    instance_id: self.successor,
+                    last_heartbeat_ms: 50_000,
+                    ttl_ms: 30_000,
+                };
+                self.inner
+                    .put_opts(
+                        location,
+                        serde_json::to_vec(&beat).expect("serialize").into(),
+                        object_store::PutOptions::from(object_store::PutMode::Overwrite),
+                    )
+                    .await?;
+            }
+            result
+        }
+        async fn put_opts(
+            &self,
+            location: &object_store::path::Path,
+            payload: object_store::PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            self.inner.put_opts(location, payload, opts).await
+        }
+        async fn put_multipart_opts(
+            &self,
+            location: &object_store::path::Path,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+        fn list(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<
+                'static,
+                object_store::Result<object_store::path::Path>,
+            >,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>
+        {
+            self.inner.delete_stream(locations)
+        }
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+        async fn copy_opts(
+            &self,
+            from: &object_store::path::Path,
+            to: &object_store::path::Path,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    /// The interleaving the conditional write exists for: membership still names
+    /// this incarnation when it checks, and the successor publishes after the
+    /// heartbeat read but before the write lands. The write must lose its
+    /// precondition and leave the successor's beat intact.
     #[tokio::test]
     async fn a_successor_publishing_mid_write_is_not_clobbered() {
-        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let cluster = Arc::new(ClusterStateStore::new(Arc::clone(&store), ""));
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let successor = Uuid::new_v4();
+        let cluster = Arc::new(ClusterStateStore::new(Arc::clone(&inner), ""));
+        let wrapper = Arc::new(PublishBetweenReadAndWrite {
+            inner: Arc::clone(&inner),
+            cluster: Arc::clone(&cluster),
+            successor,
+            armed: std::sync::atomic::AtomicBool::new(false),
+        });
+        let store: Arc<dyn ObjectStore> = Arc::clone(&wrapper) as Arc<dyn ObjectStore>;
         let heartbeats = Arc::new(SchedulerHeartbeatStore::new(Arc::clone(&store), ""));
         cluster.bootstrap().await.expect("bootstrap");
 
         let instance_id = Uuid::new_v4();
-        let successor = Uuid::new_v4();
         let entry = SchedulerEntry {
             scheduler_id: "test:50051".to_string(),
             instance_id,
@@ -907,7 +1054,7 @@ mod tests {
             build_version: "test".to_string(),
             labels: HashMap::new(),
         };
-        let job_store = crate::jobs::JobStore::new(Arc::clone(&store), "", instance_id.to_string());
+        let job_store = crate::jobs::JobStore::new(Arc::clone(&inner), "", instance_id.to_string());
         let df = DataFusionBuilder::new(
             status::RuntimeStatus::new(),
             Arc::new(AcceleratorEngineRegistry::default()),
@@ -924,32 +1071,20 @@ mod tests {
             reaper: Reaper::new(Arc::clone(&cluster), Arc::clone(&heartbeats)),
             scheduler_id: "test:50051".to_string(),
             instance_id,
-            entry: entry.clone(),
+            entry,
             peers: Arc::new(RwLock::new(HashMap::new())),
             job_executor,
             superseded: Arc::new(AtomicBool::new(false)),
+            beat_read_failures: Arc::new(AtomicUsize::new(0)),
         };
+        // Registered and heartbeating normally, so the membership check passes
+        // and the conditional write is actually attempted.
         runner.register_self().await.expect("register");
 
-        // Simulate the interleaving: membership still names this incarnation
-        // when it checks, and the successor registers *and* publishes before
-        // the write lands. Writing the successor's heartbeat here changes the
-        // object version the old incarnation observed at registration time.
-        let mut successor_entry = entry;
-        successor_entry.instance_id = successor;
-        cluster
-            .mutate(|state| {
-                state
-                    .schedulers
-                    .insert("test:50051".to_string(), successor_entry.clone());
-                MutationOutcome::Apply
-            })
-            .await
-            .expect("successor takes over");
-        heartbeats
-            .heartbeat("test:50051", successor, 20_000, 30_000)
-            .await
-            .expect("successor heartbeat");
+        // Arm the interleaving for the next heartbeat read.
+        wrapper
+            .armed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
 
         runner
             .send_heartbeat()
@@ -963,11 +1098,7 @@ mod tests {
             .expect("heartbeat present");
         assert_eq!(
             beat.instance_id, successor,
-            "the successor's heartbeat must survive a concurrent write by the old incarnation"
-        );
-        assert!(
-            runner.superseded.load(Ordering::Relaxed),
-            "losing the write must make the old incarnation observe it was superseded"
+            "a successor that took over mid-write must not be clobbered"
         );
     }
 
@@ -1092,6 +1223,7 @@ mod tests {
             peers: Arc::new(RwLock::new(HashMap::new())),
             job_executor,
             superseded: Arc::new(AtomicBool::new(false)),
+            beat_read_failures: Arc::new(AtomicUsize::new(0)),
         };
 
         // Paused time auto-advances once the read is the only pending work, so
@@ -1169,6 +1301,7 @@ mod tests {
             peers: Arc::new(RwLock::new(HashMap::new())),
             job_executor,
             superseded: Arc::new(AtomicBool::new(false)),
+            beat_read_failures: Arc::new(AtomicUsize::new(0)),
         };
 
         runner
@@ -1238,6 +1371,7 @@ mod tests {
             peers: Arc::new(RwLock::new(HashMap::new())),
             job_executor,
             superseded: Arc::new(AtomicBool::new(false)),
+            beat_read_failures: Arc::new(AtomicUsize::new(0)),
         };
 
         runner
@@ -1294,8 +1428,10 @@ mod tests {
             })
             .await
             .expect("seed the crashed successor");
+        // Long stale: a *fresh* foreign beat deliberately still blocks
+        // takeover, because something is actively writing the key.
         heartbeats
-            .heartbeat("test:50051", predecessor, 1_000, 30_000)
+            .heartbeat("test:50051", predecessor, 1, 1)
             .await
             .expect("predecessor heartbeat");
 
@@ -1323,6 +1459,7 @@ mod tests {
             peers: Arc::new(RwLock::new(HashMap::new())),
             job_executor,
             superseded: Arc::new(AtomicBool::new(false)),
+            beat_read_failures: Arc::new(AtomicUsize::new(0)),
         };
 
         runner
@@ -1384,6 +1521,7 @@ mod tests {
             peers: Arc::new(RwLock::new(HashMap::new())),
             job_executor,
             superseded: Arc::new(AtomicBool::new(false)),
+            beat_read_failures: Arc::new(AtomicUsize::new(0)),
         };
         runner.register_self().await.expect("register");
 
@@ -1465,6 +1603,7 @@ mod tests {
             peers: Arc::new(RwLock::new(HashMap::new())),
             job_executor,
             superseded: Arc::new(AtomicBool::new(false)),
+            beat_read_failures: Arc::new(AtomicUsize::new(0)),
         };
 
         runner
