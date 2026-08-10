@@ -61,7 +61,7 @@ use datafusion_expr::dml::InsertOp;
 use datafusion_federation::FederatedTableProviderAdaptor;
 use tokio::runtime::Handle;
 
-use crate::accelerated_table::AcceleratedTable;
+use crate::accelerated::AcceleratedTable;
 use crate::config::ClusterRole;
 use crate::datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
 use datafusion_ddl::{SharedDdlExtensionStore, has_ddl_extensions};

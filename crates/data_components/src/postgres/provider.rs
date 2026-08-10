@@ -22,6 +22,7 @@ limitations under the License.
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
+use crate::catalog_filter::TableSelector;
 use async_trait::async_trait;
 use datafusion::catalog::{CatalogProvider, SchemaProvider};
 use datafusion::common::utils::quote_identifier;
@@ -29,7 +30,6 @@ use datafusion::datasource::TableProvider;
 use datafusion::error::Result as DFResult;
 use datafusion::sql::TableReference;
 use datafusion_table_providers::sql::db_connection_pool::postgrespool::PostgresConnectionPool;
-use globset::GlobSet;
 use snafu::prelude::*;
 
 use crate::{
@@ -99,8 +99,7 @@ pub struct PostgresCatalogProvider {
     pool: Arc<PostgresConnectionPool>,
     table_creator: Arc<dyn Read>,
     schemas: RwLock<HashMap<String, Arc<PostgresSchemaProvider>>>,
-    include: Option<Arc<GlobSet>>,
-    exclude: Option<Arc<GlobSet>>,
+    selector: TableSelector,
 }
 
 impl std::fmt::Debug for PostgresCatalogProvider {
@@ -116,16 +115,14 @@ impl PostgresCatalogProvider {
         catalog_name: String,
         pool: Arc<PostgresConnectionPool>,
         table_creator: Arc<dyn Read>,
-        include: Option<GlobSet>,
-        exclude: Option<GlobSet>,
+        selector: TableSelector,
     ) -> Self {
         Self {
             catalog_name,
             pool,
             table_creator,
             schemas: RwLock::new(HashMap::new()),
-            include: include.map(Arc::new),
-            exclude: exclude.map(Arc::new),
+            selector,
         }
     }
 
@@ -134,6 +131,28 @@ impl PostgresCatalogProvider {
 
         let mut schemas = HashMap::new();
         for schema_name in &schema_names {
+            // A schema no `include` pattern can reach cannot contribute a table,
+            // so skip its `list_foreign_keys` + `list_comments` + `list_tables`
+            // round trips. It is still registered, empty, because that is exactly
+            // what interrogating it would have produced -- pruning changes the
+            // queries issued, never the catalog's namespace.
+            if !self.selector.may_select_within(schema_name) {
+                tracing::debug!(
+                    schema = %schema_name,
+                    "Schema cannot match any include pattern, skipping its metadata queries"
+                );
+                schemas.insert(
+                    schema_name.clone(),
+                    Arc::new(PostgresSchemaProvider::new(
+                        Arc::clone(&self.pool),
+                        schema_name.clone(),
+                        Arc::clone(&self.table_creator),
+                        self.selector.clone(),
+                    )),
+                );
+                continue;
+            }
+
             let foreign_keys = match self.list_foreign_keys(schema_name).await {
                 Ok(fks) => fks,
                 Err(e) => {
@@ -161,8 +180,7 @@ impl PostgresCatalogProvider {
                 Arc::clone(&self.pool),
                 schema_name.clone(),
                 Arc::clone(&self.table_creator),
-                self.include.clone(),
-                self.exclude.clone(),
+                self.selector.clone(),
             );
             // A single schema's table discovery failing (e.g. a transient
             // connection reset or lock timeout) must not abort the whole catalog
@@ -405,8 +423,7 @@ pub struct PostgresSchemaProvider {
     schema_name: String,
     table_creator: Arc<dyn Read>,
     tables: RwLock<HashMap<String, Arc<dyn TableProvider>>>,
-    include: Option<Arc<GlobSet>>,
-    exclude: Option<Arc<GlobSet>>,
+    selector: TableSelector,
 }
 
 impl std::fmt::Debug for PostgresSchemaProvider {
@@ -423,16 +440,14 @@ impl PostgresSchemaProvider {
         pool: Arc<PostgresConnectionPool>,
         schema_name: String,
         table_creator: Arc<dyn Read>,
-        include: Option<Arc<GlobSet>>,
-        exclude: Option<Arc<GlobSet>>,
+        selector: TableSelector,
     ) -> Self {
         Self {
             pool,
             schema_name,
             table_creator,
             tables: RwLock::new(HashMap::new()),
-            include,
-            exclude,
+            selector,
         }
     }
 
@@ -447,8 +462,7 @@ impl PostgresSchemaProvider {
             &self.schema_name,
             table_names,
             &self.table_creator,
-            self.include.as_deref(),
-            self.exclude.as_deref(),
+            &self.selector,
             foreign_keys,
             comments,
         )
@@ -492,18 +506,6 @@ fn foreign_key_target(catalog: &str, schema: &str, table: &str) -> String {
     )
 }
 
-fn is_table_selected(
-    schema_name: &str,
-    table_name: &str,
-    include: Option<&GlobSet>,
-    exclude: Option<&GlobSet>,
-) -> bool {
-    let schema_with_table = format!("{schema_name}.{table_name}");
-    let included = include.is_none_or(|globset| globset.is_match(&schema_with_table));
-    let excluded = exclude.is_some_and(|globset| globset.is_match(&schema_with_table));
-    included && !excluded
-}
-
 /// What `refresh_schemas` does with a single schema after attempting to refresh
 /// its tables (#11724). Factored out as a pure decision so the
 /// (refresh succeeded / failed) × (previous entry present / absent) matrix can be
@@ -537,8 +539,7 @@ async fn build_table_providers_for_schema(
     schema_name: &str,
     table_names: Vec<String>,
     table_creator: &Arc<dyn Read>,
-    include: Option<&GlobSet>,
-    exclude: Option<&GlobSet>,
+    selector: &TableSelector,
     foreign_keys: &ForeignKeyMap,
     comments: &CommentMap,
 ) -> HashMap<String, Arc<dyn TableProvider>> {
@@ -546,12 +547,7 @@ async fn build_table_providers_for_schema(
 
     for table_name in table_names {
         let schema_with_table = format!("{schema_name}.{table_name}");
-        if !is_table_selected(schema_name, &table_name, include, exclude) {
-            let reason = if include.is_some_and(|globset| !globset.is_match(&schema_with_table)) {
-                "does not match include patterns"
-            } else {
-                "matches exclude patterns"
-            };
+        if let Some(reason) = selector.rejection_reason(&schema_with_table) {
             tracing::debug!("Table {schema_with_table} is not selected ({reason}), skipping");
             continue;
         }
@@ -688,11 +684,11 @@ impl SchemaProvider for PostgresSchemaProvider {
 mod tests {
     use super::{
         CommentMap, ForeignKeyConstraint, ForeignKeyMap, SchemaRefreshOutcome, TableComments,
-        build_table_providers_for_schema, foreign_key_target, is_table_selected,
-        schema_refresh_outcome,
+        build_table_providers_for_schema, foreign_key_target, schema_refresh_outcome,
     };
     use crate::{
         DESCRIPTION_METADATA_KEY, FOREIGN_KEYS_METADATA_KEY, Read, SOURCE_TYPE_METADATA_KEY,
+        catalog_filter::TableSelector,
     };
     use async_trait::async_trait;
     use datafusion::catalog::Session;
@@ -785,12 +781,12 @@ mod tests {
         }
     }
 
-    fn make_globset(patterns: &[&str]) -> Arc<globset::GlobSet> {
+    fn make_globset(patterns: &[&str]) -> globset::GlobSet {
         let mut builder = GlobSetBuilder::new();
         for pattern in patterns {
             builder.add(Glob::new(pattern).expect("glob pattern should parse"));
         }
-        Arc::new(builder.build().expect("glob set should build"))
+        builder.build().expect("glob set should build")
     }
 
     /// Regression test for #11727: a foreign-key target whose schema or table
@@ -861,34 +857,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_is_table_selected_with_glob_filter() {
-        let include = make_globset(&["public.orders"]);
-        assert!(is_table_selected("public", "orders", Some(&include), None));
-        assert!(!is_table_selected(
-            "public",
-            "lineitem",
-            Some(&include),
-            None
-        ));
-    }
-
-    #[test]
-    fn test_is_table_selected_with_exclude_filter() {
-        let exclude = make_globset(&["public.secrets"]);
-        assert!(is_table_selected("public", "orders", None, Some(&exclude)));
-        assert!(!is_table_selected(
-            "public",
-            "secrets",
-            None,
-            Some(&exclude)
-        ));
-    }
-
     #[tokio::test]
     async fn test_build_table_providers_applies_include_filter_before_factory() {
         let read = Arc::new(MockRead::new(HashSet::new()));
-        let include = make_globset(&["public.orders"]);
+        let selector = TableSelector::new(Some(make_globset(&["public.orders"])), None);
         let table_creator: Arc<dyn Read> = Arc::<MockRead>::clone(&read);
         let no_fks: ForeignKeyMap = HashMap::new();
         let no_comments: CommentMap = HashMap::new();
@@ -897,8 +869,7 @@ mod tests {
             "public",
             vec!["orders".to_string(), "lineitem".to_string()],
             &table_creator,
-            Some(&include),
-            None,
+            &selector,
             &no_fks,
             &no_comments,
         )
@@ -912,7 +883,7 @@ mod tests {
     #[tokio::test]
     async fn test_build_table_providers_applies_exclude_filter_before_factory() {
         let read = Arc::new(MockRead::new(HashSet::new()));
-        let exclude = make_globset(&["public.lineitem"]);
+        let selector = TableSelector::new(None, Some(make_globset(&["public.lineitem"])));
         let table_creator: Arc<dyn Read> = Arc::<MockRead>::clone(&read);
         let no_fks: ForeignKeyMap = HashMap::new();
         let no_comments: CommentMap = HashMap::new();
@@ -921,8 +892,7 @@ mod tests {
             "public",
             vec!["orders".to_string(), "lineitem".to_string()],
             &table_creator,
-            None,
-            Some(&exclude),
+            &selector,
             &no_fks,
             &no_comments,
         )
@@ -946,8 +916,7 @@ mod tests {
             "public",
             vec!["orders".to_string(), "lineitem".to_string()],
             &table_creator,
-            None,
-            None,
+            &TableSelector::select_all(),
             &no_fks,
             &no_comments,
         )
@@ -976,8 +945,7 @@ mod tests {
             "public",
             vec!["orders".to_string(), "lineitem".to_string()],
             &table_creator,
-            None,
-            None,
+            &TableSelector::select_all(),
             &no_fks,
             &no_comments,
         )
@@ -1006,8 +974,7 @@ mod tests {
             "public",
             vec!["orders".to_string(), "lineitem".to_string()],
             &table_creator,
-            None,
-            None,
+            &TableSelector::select_all(),
             &fk_map,
             &no_comments,
         )
@@ -1058,8 +1025,7 @@ mod tests {
             "public",
             vec!["order_lines".to_string()],
             &table_creator,
-            None,
-            None,
+            &TableSelector::select_all(),
             &fk_map,
             &no_comments,
         )
@@ -1113,8 +1079,7 @@ mod tests {
             "public",
             vec!["orders".to_string()],
             &table_creator,
-            None,
-            None,
+            &TableSelector::select_all(),
             &no_fks,
             &comments,
         )

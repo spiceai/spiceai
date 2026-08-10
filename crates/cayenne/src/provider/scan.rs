@@ -996,7 +996,7 @@ impl ExecutionPlan for CayenneAccelerationExec {
 
 /// Charges a scan's materialized batches against the `DataFusion` memory pool.
 ///
-/// Reading Cayenne means canonicalizing Vortex's compressed encodings (RunEnd,
+/// Reading Cayenne means canonicalizing Vortex's compressed encodings (`RunEnd`,
 /// Constant, dictionary) into flat Arrow, and that expansion is the single
 /// largest allocator in the process at scale: a SF-1000 heap profile put ~50 GiB
 /// under `vortex_buffer::BufferMut::with_capacity_preferred_aligned`, reached
@@ -1023,11 +1023,26 @@ impl ExecutionPlan for CayenneAccelerationExec {
 /// rather than its whole downstream lifetime, which this stream cannot observe.
 /// Whatever an operator above retains, it reserves for itself.
 ///
-/// Over budget returns `ResourcesExhausted` before the decode runs, so a scan
-/// that cannot fit fails without allocating. That is a deliberate behaviour
-/// change: a query that used to drift toward an OOM kill now errors.
+/// A pre-poll charge that does not fit returns `ResourcesExhausted` before the
+/// decode runs, so a scan that cannot fit its estimate fails without allocating.
+/// That is a deliberate behaviour change: a query that used to drift toward an
+/// OOM kill now errors.
 ///
 /// # What this does NOT bound
+///
+/// **A batch bigger than the running estimate is allocated before it can be
+/// refused.** What is charged pre-poll is the estimate, not the batch: the first
+/// batch of every partition is charged at `INITIAL_BATCH_ESTIMATE_BYTES`, and
+/// any later batch that decodes larger than the high-water estimate is fully
+/// materialized by `inner.poll_next` before `try_resize` measures it — the
+/// refusal then drops the batch that already exists (which is the path
+/// `a_failed_settle_releases_the_charge_and_recharges_next_poll` exercises).
+/// So the bound is one batch behind on the way up: a single decode far larger
+/// than anything seen before can still exhaust the host. The estimate ratchets
+/// (`self.estimate.max(actual)`), so it is only the *growing* edge that is
+/// unbounded, not the steady state. Charging a defensible upper bound instead
+/// would mean knowing the decoded size before decoding it, which is what moving
+/// the reservation into the materializing leaf below would buy.
 ///
 /// Accounting attaches to the outermost wrapper only (`scan_guard.is_some()`),
 /// so it charges one estimate per output partition. Under a base+delta plan the

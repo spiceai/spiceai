@@ -89,6 +89,12 @@ pub struct SharedMemberSetup {
     /// `GENERATED` columns of this member's table — see
     /// [`SlotInfo::generated_columns`].
     pub generated_columns: Vec<String>,
+    /// Every table in the shared publication as `(schema, table)`, read after
+    /// this member was added. On a resuming slot this is the set of tables
+    /// whose changes the slot is still accumulating, whether or not a dataset
+    /// has subscribed yet — the caller holds the ack floor for the ones that
+    /// have not, so their changes are not acked away before they join.
+    pub publication_tables: Vec<(String, String)>,
 }
 
 /// Idempotent setup for one member of a shared slot: validates the table's
@@ -117,11 +123,19 @@ pub async fn setup_shared_member(
                 let table_added =
                     ensure_publication(&client, &params.publication_name, schema_name, table_name)
                         .await?;
+                // After `ensure_publication`, which both adds this member's
+                // table and repairs a publication missing
+                // `publish_via_partition_root` — with that option set,
+                // `pg_publication_tables` reports a partitioned table under its
+                // root, which is the name members subscribe with.
+                let publication_tables =
+                    list_publication_tables(&client, &params.publication_name).await?;
                 let slot = ensure_slot(&client, params).await?;
                 Ok(SharedMemberSetup {
                     slot,
                     table_added,
                     generated_columns,
+                    publication_tables,
                 })
             }
             .await;
@@ -245,6 +259,24 @@ async fn ensure_slot(
     //   * Some(lsn) lsn>0 — normal resume from the durable checkpoint.
     match read_slot_confirmed_flush(client, &params.slot_name).await? {
         Some(confirmed_flush_lsn) if confirmed_flush_lsn != 0 => {
+            // An accelerator that boots empty is about to re-snapshot the whole
+            // table, so every byte of WAL between the pre-restart checkpoint and
+            // that snapshot is redundant -- after a long outage, that is the
+            // entire downtime, decoded and applied only to be overwritten by the
+            // snapshot. Skip it by moving the slot forward first.
+            if let Some(advanced_lsn) = advance_slot_for_rebootstrap(client, params).await {
+                return Ok(SlotInfo {
+                    slot_name: params.slot_name.clone(),
+                    publication_name: params.publication_name.clone(),
+                    consistent_lsn: advanced_lsn,
+                    snapshot_name: None,
+                    generated_columns: Vec::new(),
+                    // The old history is gone, so this slot carries none for any
+                    // member -- the same contract as a slot created this process.
+                    created_fresh: true,
+                });
+            }
+
             tracing::info!(
                 slot = %params.slot_name,
                 publication = %params.publication_name,
@@ -326,6 +358,147 @@ async fn ensure_slot(
         generated_columns: Vec::new(),
         created_fresh: true,
     })
+}
+
+/// SQLSTATE `55006` (`object_in_use`) — the slot is still held by an active
+/// walsender, so it cannot be advanced or dropped.
+const SQLSTATE_OBJECT_IN_USE_ADVANCE: &str = "55006";
+/// SQLSTATE `42883` (`undefined_function`) — `pg_replication_slot_advance` is
+/// `PostgreSQL` 11+. On an older server the advance is simply skipped.
+const SQLSTATE_UNDEFINED_FUNCTION: &str = "42883";
+
+/// Move `params.slot_name` forward to the current WAL position, for a member
+/// that is about to re-snapshot anyway, and return the LSN streaming should
+/// start from. `None` means "do not advance" — the caller resumes from
+/// `confirmed_flush_lsn` exactly as before.
+///
+/// The win is skipping *re-delivery*: after an outage the slot's checkpoint can
+/// be hours behind, and every one of those changes would be decoded and applied
+/// only to be overwritten by the snapshot. Advancing sets `confirmed_flush_lsn`
+/// to the current position so `START_REPLICATION` never re-reads them. Note that
+/// `restart_lsn` — what actually governs WAL *retention* on the source — trails
+/// `confirmed_flush_lsn` and catches up on subsequent slot activity rather than
+/// immediately, so this is not a prompt way to release retained WAL (dropping
+/// the slot at shutdown is; see [`drop_slot_after_shutdown`]).
+///
+/// # Why this is safe
+///
+/// Streaming must start at an LSN **at or before** the bootstrap snapshot's
+/// visibility point. Undershooting only replays WAL the snapshot already
+/// covers, which the primary-key upsert absorbs; overshooting would silently
+/// skip changes. This reads `pg_current_wal_lsn()` and advances *before* the
+/// caller opens its `REPEATABLE READ` bootstrap transaction (`ensure_slot` runs
+/// inside setup, which strictly precedes bootstrap), so the snapshot is always
+/// taken at or after the returned LSN.
+///
+/// # Why both gate conditions are required
+///
+/// * `ephemeral_accelerator` — the accelerator starts empty, so the snapshot
+///   reconstructs the entire table. There is no pre-existing accelerator state
+///   for the upsert to merge into, and therefore no rows deleted at the source
+///   during the outage that could survive it. A *durable* accelerator fails this:
+///   its snapshot merges into existing rows, so discarding the WAL that carried
+///   the deletes would leave them behind.
+/// * `snapshot_on_resume` — a snapshot is definitely going to run. Advancing
+///   without one would skip WAL with nothing to fill the gap.
+///
+/// On a shared slot the advance discards history for every member;
+/// [`super::Error::SharedSlotDurabilityMismatch`] keeps a durable member off such
+/// a slot in the first place.
+async fn advance_slot_for_rebootstrap(
+    client: &tokio_postgres::Client,
+    params: &ReplicationParams,
+) -> Option<u64> {
+    if !params.slot_is_disposable() {
+        return None;
+    }
+
+    // Read the target BEFORE advancing (and before the caller's bootstrap
+    // transaction), so the snapshot can only ever be at or after it.
+    let target = match current_wal_lsn(client).await {
+        Ok(lsn) => lsn,
+        Err(e) => {
+            tracing::warn!(
+                slot = %params.slot_name,
+                "could not read the current WAL position to fast-forward the replication slot; \
+                 resuming from the existing checkpoint and replaying the backlog instead: {e}"
+            );
+            return None;
+        }
+    };
+
+    match slot_advance(client, &params.slot_name, target).await {
+        Ok(end_lsn) => {
+            tracing::info!(
+                slot = %params.slot_name,
+                advanced_to = %format_lsn(end_lsn),
+                "Fast-forwarded the replication slot past the accumulated backlog: this \
+                 accelerator starts empty and re-snapshots on every start, so the skipped WAL \
+                 would only have been overwritten by the snapshot"
+            );
+            Some(end_lsn)
+        }
+        Err(e) => {
+            // Every failure falls back to a plain resume, which is exactly the
+            // previous behavior: correct, just slower.
+            let sqlstate = match &e {
+                super::Error::SetupExec { source } => {
+                    source.as_db_error().map(|db| db.code().code().to_string())
+                }
+                _ => None,
+            };
+            match sqlstate.as_deref() {
+                // A later member joining a slot the pump is already streaming.
+                // Nothing to fast-forward past -- the slot is current.
+                Some(SQLSTATE_OBJECT_IN_USE_ADVANCE) => tracing::debug!(
+                    slot = %params.slot_name,
+                    "replication slot is active; skipping the fast-forward"
+                ),
+                Some(SQLSTATE_UNDEFINED_FUNCTION) => tracing::debug!(
+                    slot = %params.slot_name,
+                    "pg_replication_slot_advance is unavailable (PostgreSQL 11+); \
+                     resuming from the existing checkpoint"
+                ),
+                _ => tracing::warn!(
+                    slot = %params.slot_name,
+                    "could not fast-forward the replication slot; resuming from the existing \
+                     checkpoint and replaying the backlog instead: {e}"
+                ),
+            }
+            None
+        }
+    }
+}
+
+/// The server's current WAL insert position.
+async fn current_wal_lsn(client: &tokio_postgres::Client) -> Result<u64> {
+    let row = client
+        .query_one("SELECT pg_current_wal_lsn()::text", &[])
+        .await
+        .context(SetupExecSnafu)?;
+    parse_lsn(&row.get::<_, String>(0))
+}
+
+/// `pg_replication_slot_advance`, returning the position the server actually
+/// moved to — it may stop short of `target`, and that value (never `target`) is
+/// what streaming must start from.
+async fn slot_advance(
+    client: &tokio_postgres::Client,
+    slot_name: &str,
+    target: u64,
+) -> Result<u64> {
+    let target_lsn = format_lsn(target);
+    // Both arguments are cast explicitly: the function takes (name, pg_lsn), and
+    // binding Rust `String`s without the casts leaves parameter-type inference to
+    // resolve `text` against those, which fails.
+    let row = client
+        .query_one(
+            "SELECT end_lsn::text FROM pg_replication_slot_advance($1::name, $2::pg_lsn)",
+            &[&slot_name, &target_lsn],
+        )
+        .await
+        .context(SetupExecSnafu)?;
+    parse_lsn(&row.get::<_, String>(0))
 }
 
 /// SQLSTATE 42710 (`duplicate_object`) from `pg_create_logical_replication_slot`
@@ -517,6 +690,25 @@ async fn ensure_publish_via_partition_root(
     }
 }
 
+/// Every table in a publication, as `(schema, table)`. An absent publication
+/// yields an empty list.
+async fn list_publication_tables(
+    client: &tokio_postgres::Client,
+    publication_name: &str,
+) -> Result<Vec<(String, String)>> {
+    let rows = client
+        .query(
+            "SELECT schemaname, tablename FROM pg_publication_tables WHERE pubname = $1",
+            &[&publication_name],
+        )
+        .await
+        .context(SetupExecSnafu)?;
+    Ok(rows
+        .iter()
+        .map(|row| (row.get::<_, String>(0), row.get::<_, String>(1)))
+        .collect())
+}
+
 /// Best-effort removal of a table from a (shared) publication. Used when a
 /// member detaches while its initial snapshot is still running: tearing the
 /// table out of the publication forces any future rejoin — in-process or after
@@ -662,6 +854,112 @@ async fn create_logical_slot(
     Ok((consistent_lsn, lsn_str))
 }
 
+/// Total time [`drop_slot_after_shutdown`] will spend waiting for the server to
+/// mark a just-released slot inactive. `PostgreSQL` clears the flag within
+/// milliseconds of the walsender exiting; this only covers scheduling jitter,
+/// and is deliberately short so a slow or unreachable source cannot stall a
+/// graceful shutdown.
+const DROP_SLOT_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+/// How long to wait for the setup connection used to drop the slot. Separate
+/// from [`DROP_SLOT_BUDGET`], which only covers the retry loop *after* a
+/// connection exists; without this an unreachable source would stall shutdown
+/// for the OS connect timeout.
+const DROP_SLOT_CONNECT_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+/// How often to retry the drop while the server still reports the slot active.
+const DROP_SLOT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+/// SQLSTATE `55006` (`object_in_use`) — the slot is still marked active because
+/// the walsender we just disconnected has not fully exited yet.
+const SQLSTATE_OBJECT_IN_USE: &str = "55006";
+/// SQLSTATE `42704` (`undefined_object`) — the slot is already gone.
+const SQLSTATE_UNDEFINED_OBJECT: &str = "42704";
+
+/// Drop `params.slot_name` on graceful shutdown, for a stream whose accelerator
+/// does not survive a restart (see [`ReplicationParams::ephemeral_accelerator`]).
+///
+/// Such a slot has no resume value — the accelerator boots empty and re-snapshots
+/// — but left behind it keeps pinning WAL on the source for as long as Spice is
+/// down. Dropping it releases that WAL immediately.
+///
+/// Best-effort by construction: shutdown must not block on the source, and a slot
+/// that survives (ungraceful exit, unreachable server, insufficient privilege)
+/// costs only retained WAL, never correctness — the next start re-snapshots
+/// either way. Every failure is therefore logged, not propagated.
+///
+/// Bounded end to end: [`DROP_SLOT_CONNECT_BUDGET`] caps establishing the
+/// connection and [`DROP_SLOT_BUDGET`] caps the retry loop after it, so an
+/// unreachable source delays shutdown by at most their sum. Bounding only the
+/// retries would leave the connect itself free to hang for the OS timeout —
+/// exactly the case where the source is gone and this cleanup matters least.
+///
+/// Call only *after* the replication connection has been dropped; `PostgreSQL`
+/// refuses to drop a slot an active walsender still holds.
+pub async fn drop_slot_after_shutdown(params: &ReplicationParams) {
+    // Bound the connect explicitly. Everything below is governed by
+    // `DROP_SLOT_BUDGET`, but that budget only starts once a connection exists —
+    // and a source that is unreachable at shutdown (the very case in which this
+    // cleanup matters least) would otherwise hang here for the OS connect
+    // timeout, blocking the pump's exit. Shutdown must never wait on the source.
+    let connected = tokio::time::timeout(DROP_SLOT_CONNECT_BUDGET, connect_setup(params)).await;
+    let (client, connection_task) = match connected {
+        Ok(Ok(pair)) => pair,
+        Ok(Err(e)) => {
+            tracing::warn!(
+                slot = %params.slot_name,
+                "could not connect to drop the replication slot on shutdown; it will keep retaining WAL on the source until dropped manually: {e}"
+            );
+            return;
+        }
+        Err(_) => {
+            tracing::warn!(
+                slot = %params.slot_name,
+                "timed out after {}s connecting to drop the replication slot on shutdown; it will keep retaining WAL on the source until dropped manually (DROP: `SELECT pg_drop_replication_slot('{}')`)",
+                DROP_SLOT_CONNECT_BUDGET.as_secs(),
+                params.slot_name,
+            );
+            return;
+        }
+    };
+
+    let deadline = tokio::time::Instant::now() + DROP_SLOT_BUDGET;
+    loop {
+        let Err(error) = client
+            .execute("SELECT pg_drop_replication_slot($1)", &[&params.slot_name])
+            .await
+        else {
+            tracing::info!(
+                slot = %params.slot_name,
+                "dropped the replication slot on shutdown (non-persistent accelerator; the slot has no resume value and would otherwise retain WAL on the source)"
+            );
+            break;
+        };
+
+        match error.as_db_error().map(|db| db.code().code()) {
+            // Already gone — a concurrent drop raced us.
+            Some(SQLSTATE_UNDEFINED_OBJECT) => break,
+            // The walsender has not finished exiting; retry within the budget.
+            Some(SQLSTATE_OBJECT_IN_USE) if tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(DROP_SLOT_POLL_INTERVAL).await;
+            }
+            _ => {
+                // `pg_error_detail` rather than `{error}`: tokio_postgres renders
+                // a server error as the opaque string "db error", which would
+                // leave this line -- the only diagnostic an operator gets for a
+                // slot still retaining WAL -- with nothing actionable in it.
+                tracing::warn!(
+                    slot = %params.slot_name,
+                    "could not drop the replication slot on shutdown; it will keep retaining WAL on the source until dropped manually (DROP: `SELECT pg_drop_replication_slot('{}')`): {}",
+                    params.slot_name,
+                    super::pg_error_detail(&error),
+                );
+                break;
+            }
+        }
+    }
+
+    drop(client);
+    connection_task.abort();
+}
+
 /// Parses a Postgres LSN string like "16/B374D848" into a u64.
 /// Errors on malformed input rather than defaulting to 0, because 0 is also
 /// the "server decides" sentinel downstream — silently coercing invalid input
@@ -707,6 +1005,14 @@ fn quote_ident(ident: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The advance target is bound as `pg_lsn`, so it must round-trip through
+    /// the exact textual form Postgres accepts.
+    #[test]
+    fn advance_target_renders_as_a_pg_lsn_literal() {
+        let target = parse_lsn("1B/4E300F8").expect("parse");
+        assert_eq!(format_lsn(target), "1B/4E300F8");
+    }
 
     #[test]
     fn lsn_round_trip() {

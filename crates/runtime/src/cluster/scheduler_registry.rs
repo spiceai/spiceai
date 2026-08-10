@@ -176,7 +176,7 @@ async fn recover_orphaned_jobs(
     };
 
     let jobs = match job_executor
-        .list_jobs(Some(crate::jobs::JobStatus::Running))
+        .list_all_jobs(Some(crate::jobs::JobStatus::Running))
         .await
     {
         Ok(jobs) => jobs,

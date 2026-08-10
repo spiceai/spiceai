@@ -18,6 +18,7 @@ use runtime::Runtime;
 use runtime::component::dataset::Dataset;
 use runtime::dataconnector::listing::{
     LISTING_TABLE_PARAMETERS, ListingTableConnector, ObjectVersionType, build_fragments,
+    object_store_timeout_message,
 };
 use runtime::dataconnector::parameters::{
     Validator,
@@ -40,6 +41,8 @@ use tokio::runtime::Handle;
 use url::Url;
 
 static PREFIX: &str = "abfs";
+
+const ABFS_DOCS: &str = "https://spiceai.org/docs/components/data-connectors/abfs";
 
 static VALIDATORS: LazyLock<
     Vec<
@@ -340,6 +343,23 @@ impl ListingTableConnector for AzureBlobFS {
     ) -> DataConnectorError {
         match error {
             object_store::Error::Generic { source, .. } => {
+                // A timeout arrives in the same `Generic` variant as an authentication failure, so
+                // it is classified first: the auth checks below key off which credentials are
+                // configured, not off what failed, and would report a network timeout as a bad
+                // secret.
+                if let Some(message) = object_store_timeout_message(
+                    source.as_ref(),
+                    "Azure",
+                    self.params.get("client_timeout").expose().ok(),
+                    ABFS_DOCS,
+                ) {
+                    return DataConnectorError::UnableToConnectInternal {
+                        dataconnector: format!("{self}"),
+                        connector_component: ConnectorComponent::from(dataset),
+                        source: message.into(),
+                    };
+                }
+
                 // Try to provide more specific error messages based on auth method
                 let has_msi = self.params.get("msi_endpoint").expose().ok().is_some();
                 let has_use_cli = self
@@ -410,3 +430,154 @@ runtime::register_data_connector!(
     CONNECTOR_NAME,
     AzureBlobFSFactory
 );
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use app::AppBuilder;
+    use object_store::client::{HttpError, HttpErrorKind};
+    use runtime::builder::RuntimeBuilder;
+    use runtime::component::dataset::builder::DatasetBuilder;
+    use runtime_secrets::Secrets;
+    use tokio::sync::RwLock;
+
+    fn create_test_connector(params: Parameters) -> AzureBlobFS {
+        AzureBlobFS {
+            params,
+            runtime: None,
+            tokio_io_runtime: Handle::current(),
+        }
+    }
+
+    /// Component parameters must be passed `abfs_`-prefixed and runtime parameters unprefixed —
+    /// `Parameters::try_new` silently drops a key on the wrong side of that rule, which would
+    /// leave a credential unset and quietly turn the tests below into no-ops.
+    async fn create_test_parameters(params: Vec<(String, secrecy::SecretString)>) -> Parameters {
+        Parameters::try_new(
+            "abfs_test",
+            params,
+            PREFIX,
+            Arc::new(RwLock::new(Secrets::new())),
+            PARAMETERS.as_ref(),
+        )
+        .await
+        .expect("valid ABFS test parameters")
+    }
+
+    async fn create_test_dataset() -> Dataset {
+        DatasetBuilder::try_new("abfs://container/path/".to_string(), "test")
+            .expect("dataset builder should be created")
+            .with_app(Arc::new(AppBuilder::new("test").build()))
+            .with_runtime(Arc::new(RuntimeBuilder::new().build().await))
+            .build()
+            .expect("dataset should be built")
+    }
+
+    /// `object_store` flattens a transport failure into `Error::Generic`, keeping the
+    /// classification only as a typed `HttpError` in the source chain.
+    fn generic_error(kind: HttpErrorKind) -> object_store::Error {
+        object_store::Error::Generic {
+            store: "MicrosoftAzure",
+            source: Box::new(HttpError::new(
+                kind,
+                std::io::Error::other("upstream transport failure"),
+            )),
+        }
+    }
+
+    /// A timed-out request arrives in the same `Generic` variant an authentication failure does,
+    /// so classifying it by which credential is configured reports a working `client_id` as
+    /// broken and never names the parameter that resolves it (#12793).
+    #[tokio::test]
+    async fn a_timeout_is_not_reported_as_a_client_credentials_failure() {
+        let params = create_test_parameters(vec![(
+            "abfs_client_id".to_string(),
+            "00000000-0000-0000-0000-000000000000".to_string().into(),
+        )])
+        .await;
+        let connector = create_test_connector(params);
+        let dataset = create_test_dataset().await;
+
+        let message = connector
+            .handle_object_store_error(&dataset, generic_error(HttpErrorKind::Timeout))
+            .to_string();
+
+        assert!(
+            message.contains("client_timeout"),
+            "a timeout should point at client_timeout, got: {message}"
+        );
+        assert!(
+            !message.contains("authentication failed"),
+            "a timeout must not be reported as an authentication failure, got: {message}"
+        );
+    }
+
+    /// The same holds for the SAS and managed-identity branches: every credential the connector
+    /// keys off must lose to the timeout check, not just the first one.
+    #[tokio::test]
+    async fn a_timeout_is_not_reported_against_any_configured_credential() {
+        for credential in ["abfs_sas_string", "abfs_msi_endpoint"] {
+            let params =
+                create_test_parameters(vec![(credential.to_string(), "value".to_string().into())])
+                    .await;
+            let connector = create_test_connector(params);
+            let dataset = create_test_dataset().await;
+
+            let message = connector
+                .handle_object_store_error(&dataset, generic_error(HttpErrorKind::Timeout))
+                .to_string();
+
+            assert!(
+                message.contains("client_timeout") && !message.contains("authentication failed"),
+                "a timeout with {credential} configured must not be blamed on it, got: {message}"
+            );
+        }
+    }
+
+    /// The timeout check must not swallow the classification it runs ahead of: a `Generic` error
+    /// that is *not* a timeout is still reported against the configured credential.
+    #[tokio::test]
+    async fn a_non_timeout_error_still_reports_the_configured_auth_method() {
+        let params = create_test_parameters(vec![(
+            "abfs_client_id".to_string(),
+            "00000000-0000-0000-0000-000000000000".to_string().into(),
+        )])
+        .await;
+        let connector = create_test_connector(params);
+        let dataset = create_test_dataset().await;
+
+        let message = connector
+            .handle_object_store_error(&dataset, generic_error(HttpErrorKind::Decode))
+            .to_string();
+
+        assert!(
+            message.contains("client credentials authentication failed"),
+            "a non-timeout error should keep its auth classification, got: {message}"
+        );
+        assert!(
+            !message.contains("client_timeout"),
+            "a non-timeout error must not be reported as a timeout, got: {message}"
+        );
+    }
+
+    /// The message names the number to raise, not just the parameter.
+    #[tokio::test]
+    async fn a_timeout_surfaces_the_configured_client_timeout() {
+        let params = create_test_parameters(vec![(
+            "client_timeout".to_string(),
+            "120s".to_string().into(),
+        )])
+        .await;
+        let connector = create_test_connector(params);
+        let dataset = create_test_dataset().await;
+
+        let message = connector
+            .handle_object_store_error(&dataset, generic_error(HttpErrorKind::Timeout))
+            .to_string();
+
+        assert!(
+            message.contains("120s"),
+            "the configured client_timeout should be surfaced, got: {message}"
+        );
+    }
+}

@@ -79,6 +79,13 @@ impl CayenneMemoryAccount {
             // `effective_pk_keyset_budget` is what prevents growth, and once the
             // bytes EXIST, hiding them would let siblings over-commit against
             // headroom that is not there.
+            //
+            // This is a publication, not an admission — the caller already grew.
+            // Two tables can read the same headroom, both grow into it, and the
+            // second land here with nothing left, so the aggregate can exceed
+            // the ceiling by what was in flight between the two. See
+            // `try_reserve_keyset_bytes` for why that is the intended trade and
+            // what bounds the overshoot.
             if !super::pk_keyset_budget::try_reserve_keyset_bytes(growth) {
                 super::pk_keyset_budget::force_reserve_keyset_bytes(growth);
             }
@@ -108,6 +115,23 @@ impl CayenneMemoryAccount {
     #[must_use]
     pub(crate) fn reserved_bytes(&self) -> usize {
         self.reservation.lock().size()
+    }
+}
+
+impl Drop for CayenneMemoryAccount {
+    /// Return this table's share of the process-global keyset ceiling.
+    ///
+    /// Without this a dropped table's share is never released, so a pod that
+    /// creates and drops tables — a re-registration, a schema evolution, a test
+    /// harness building providers in a loop — walks the fleet budget down until
+    /// every surviving table is refused and falls back to a bloom, with no
+    /// memory actually in use. The `MemoryReservation` beside it already frees
+    /// itself on drop; this gives the fleet budget the same property.
+    fn drop(&mut self) {
+        let held = self.keyset_bytes.load(Ordering::Relaxed);
+        if held > 0 {
+            super::pk_keyset_budget::release_keyset_bytes(held as u64);
+        }
     }
 }
 
@@ -168,22 +192,5 @@ mod tests {
             pool.reserved() >= 10_000,
             "Cayenne over-commit must be visible in the pool's reserved total"
         );
-    }
-}
-
-impl Drop for CayenneMemoryAccount {
-    /// Return this table's share of the process-global keyset ceiling.
-    ///
-    /// Without this a dropped table's share is never released, so a pod that
-    /// creates and drops tables — a re-registration, a schema evolution, a test
-    /// harness building providers in a loop — walks the fleet budget down until
-    /// every surviving table is refused and falls back to a bloom, with no
-    /// memory actually in use. The `MemoryReservation` beside it already frees
-    /// itself on drop; this gives the fleet budget the same property.
-    fn drop(&mut self) {
-        let held = self.keyset_bytes.load(Ordering::Relaxed);
-        if held > 0 {
-            super::pk_keyset_budget::release_keyset_bytes(held as u64);
-        }
     }
 }

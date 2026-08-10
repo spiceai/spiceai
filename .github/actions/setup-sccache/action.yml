@@ -44,8 +44,8 @@ runs:
       shell: bash
       run: |
         if ! command -v sccache &> /dev/null; then
-          echo "Error: sccache is not installed on this macOS runner"
-          exit 1
+          echo "::warning::sccache is not installed on this macOS runner; building without the compiler cache."
+          exit 0
         fi
         sccache --version
 
@@ -100,3 +100,37 @@ runs:
         New-Item -ItemType Directory -Force -Path $configDir | Out-Null
         $config = "[cache.s3]`nbucket = `"sccache`"`nendpoint = `"${{ inputs.minio_endpoint }}`"`nuse_ssl = false`nserver_side_encryption = false`nno_credentials = false`nregion = `"us-east-1`""
         $config | Out-File -FilePath "$configDir\config" -Encoding utf8
+
+    - name: Confirm the compiler cache answers before wrapping rustc
+      if: (runner.os == 'Linux' && inputs.minio_endpoint != '') || (runner.os == 'macOS' && (inputs.minio_endpoint != '' || inputs.spiceio_endpoint != ''))
+      shell: bash
+      # Invoked through `bash` rather than as `./…` so the step does not depend on
+      # the script's executable bit surviving a checkout on every platform.
+      run: bash "$GITHUB_ACTION_PATH/verify_compiler_cache.sh"
+
+    - name: Confirm the compiler cache answers before wrapping rustc (Windows)
+      if: runner.os == 'Windows' && inputs.minio_endpoint != ''
+      shell: pwsh
+      run: |
+        # `--zero-stats` goes through sccache's connect_or_start_server, so it fails
+        # when the server cannot come up. `--show-stats` does not: with no daemon
+        # running it reports synthesized empty stats and exits 0, succeeding on
+        # exactly the unreachable storage this step exists to catch.
+        $ErrorActionPreference = 'Continue'
+        $reachable = $false
+        $detail = 'sccache was not found on PATH'
+        if (Get-Command sccache -ErrorAction SilentlyContinue) {
+          $output = & sccache --zero-stats 2>&1 | Out-String
+          if ($LASTEXITCODE -eq 0) {
+            $reachable = $true
+          } else {
+            $detail = ($output -replace '\r?\n', ' ').Trim()
+          }
+        }
+        if ($reachable) {
+          Write-Output 'Compiler cache is reachable.'
+        } else {
+          Write-Output "::warning::Compiler cache is unreachable; building without it. sccache reported: $detail"
+          "RUSTC_WRAPPER=" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "SCCACHE_SETUP=false" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+        }

@@ -186,6 +186,101 @@ pub async fn autoload_secret<R: SecretAutoload>(
     secret
 }
 
+/// A parameter that a [`TypedParams`] struct accepts but does not bind to a
+/// field: it is consumed (so it never trips [`warn_leftover_keys`]), folded
+/// into the typo-suggestion candidate set, and — when `deprecated` — warned on
+/// if present. Used via `#[params(passthrough = <PATH>)]` for large shared
+/// parameter groups (e.g. the OpenAI-compatible chat-completion overrides all
+/// model providers accept) whose values are read elsewhere from the raw params
+/// map rather than off the typed struct.
+#[derive(Debug, Clone, Copy)]
+pub struct PassthroughParam {
+    /// The unprefixed parameter name.
+    pub name: &'static str,
+    /// `true` when the key is component-scoped (prefixed with the container
+    /// prefix, like `ParameterSpec::component`); `false` for runtime
+    /// (unprefixed) keys.
+    pub prefixed: bool,
+    /// `Some(note)` when this key is deprecated; a warning fires when present.
+    pub deprecated: Option<&'static str>,
+    /// Description surfaced by schema generation (empty when undocumented).
+    pub description: &'static str,
+}
+
+impl PassthroughParam {
+    /// A runtime (unprefixed) passthrough key.
+    #[must_use]
+    pub const fn runtime(name: &'static str) -> Self {
+        Self {
+            name,
+            prefixed: false,
+            deprecated: None,
+            description: "",
+        }
+    }
+
+    /// A component (prefixed) passthrough key.
+    #[must_use]
+    pub const fn component(name: &'static str) -> Self {
+        Self {
+            name,
+            prefixed: true,
+            deprecated: None,
+            description: "",
+        }
+    }
+
+    /// Marks this passthrough key deprecated with `note`.
+    #[must_use]
+    pub const fn deprecated(mut self, note: &'static str) -> Self {
+        self.deprecated = Some(note);
+        self
+    }
+
+    /// Attaches a schema description.
+    #[must_use]
+    pub const fn description(mut self, description: &'static str) -> Self {
+        self.description = description;
+        self
+    }
+
+    /// The user-facing key for this passthrough param under `prefix`, mirroring
+    /// the derive's prefixing rules: runtime keys are bare; component keys are
+    /// `{prefix}_{name}` unless `name` already carries the prefix.
+    #[must_use]
+    pub fn user_key(&self, prefix: &str) -> String {
+        if self.prefixed && !self.name.starts_with(&format!("{prefix}_")) {
+            format!("{prefix}_{}", self.name)
+        } else {
+            self.name.to_string()
+        }
+    }
+}
+
+/// Consumes every `#[params(passthrough = ...)]` key from `params` so it never
+/// trips [`warn_leftover_keys`], emits a deprecation warning for each present
+/// deprecated key, and returns the user-facing keys so callers can fold them
+/// into the typo-suggestion candidate set. Mirrors the deprecation/known-key
+/// handling of `Parameters::try_new`.
+pub fn consume_passthrough<S: std::hash::BuildHasher>(
+    component_name: &str,
+    params: &mut HashMap<String, SecretString, S>,
+    prefix: &str,
+    table: &[PassthroughParam],
+) -> Vec<String> {
+    let mut keys = Vec::with_capacity(table.len());
+    for param in table {
+        let user_key = param.user_key(prefix);
+        if params.remove(&user_key).is_some()
+            && let Some(note) = param.deprecated
+        {
+            warn_deprecated(component_name, &user_key, Some(note));
+        }
+        keys.push(user_key);
+    }
+    keys
+}
+
 /// Emits the deprecation warning for a present deprecated parameter.
 pub fn warn_deprecated(component_name: &str, user_key: &str, note: Option<&str>) {
     if let Some(note) = note {

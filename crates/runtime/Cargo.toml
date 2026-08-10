@@ -151,6 +151,7 @@ runtime-search = { path = "../runtime-search" }
 runtime-tools = { path = "../runtime-tools" }
 runtime-datafusion-index = { path = "../runtime-datafusion-index" }
 runtime-datafusion-udfs = { path = "../runtime-datafusion-udfs" }
+runtime-table = { path = "../runtime-table" }
 runtime-resources = { path = "../runtime-resources" }
 runtime-object-store = { path = "../runtime-object-store" }
 runtime-parameters = { path = "../runtime-parameters" }
@@ -185,6 +186,7 @@ telemetry = { path = "../telemetry" }
 tera = { version = "1.17" }
 tiberius = { workspace = true, optional = true }
 token_provider = { path = "../token_provider" }
+tokenizers.workspace = true
 tokio.workspace = true
 tokio-rusqlite = { workspace = true, optional = true }
 tokio-rustls = "0.26.0"
@@ -305,7 +307,7 @@ bedrock = []
 cosmosdb = []
 cuda = ["llms/cuda"]
 databricks = ["data_components/databricks", "dep:duration-parse"]
-debezium = ["kafka", "data_components/debezium"]
+debezium = ["kafka", "data_components/debezium", "runtime-table/debezium"]
 delta_lake = ["data_components/delta_lake"]
 dev = ["openapi", "otel-arrow/dev", "mcp"]
 dremio = []
@@ -341,7 +343,7 @@ wasm-functions = ["runtime-datafusion-udfs/wasm-functions"]
 wasm-functions-compile = ["runtime-datafusion-udfs/wasm-functions-compile"]
 iceberg-write = []
 imap = []
-kafka = ["data_components/kafka"]
+kafka = ["data_components/kafka", "runtime-table/kafka"]
 keyring-secret-store = ["runtime-secrets/keyring-secret-store"]
 mcp = ["dep:rmcp", "runtime-tools/mcp", "tools/mcp"]
 metal = ["llms/metal"]
@@ -365,6 +367,7 @@ openapi = [
     "dep:utoipa",
     "mcp",
     "runtime-acceleration/openapi",
+    "runtime-table/openapi",
     "runtime-api-types/openapi",
     "runtime-search/openapi",
     "runtime-tools/openapi",

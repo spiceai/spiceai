@@ -90,7 +90,7 @@ use {
 };
 
 #[cfg(feature = "elasticsearch")]
-use crate::accelerated_table::AcceleratedTable;
+use crate::accelerated::AcceleratedTable;
 
 #[cfg(feature = "s3_vectors")]
 use search::index::s3_vectors::S3Vector;
