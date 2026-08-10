@@ -65,14 +65,27 @@ const MEMBERSHIP_CHECK_TIMEOUT_CAP: Duration = Duration::from_secs(2);
 /// that may already have been superseded by this very write.
 fn heartbeat_write_timeout(ttl_ms: u64) -> Duration {
     let interval = Duration::from_millis(ttl_ms.saturating_div(HEARTBEAT_DIVISOR).max(1));
-    interval / 2
+    interval / 3
 }
 
 /// Deadline for the membership read that gates a heartbeat, as a fraction of
 /// that scheduler's heartbeat interval so it always fits inside one beat.
 fn membership_check_timeout(ttl_ms: u64) -> Duration {
     let interval = Duration::from_millis(ttl_ms.saturating_div(HEARTBEAT_DIVISOR).max(1));
-    (interval / 2).min(MEMBERSHIP_CHECK_TIMEOUT_CAP)
+    (interval / 6).min(MEMBERSHIP_CHECK_TIMEOUT_CAP)
+}
+
+/// Worst case wall time for one heartbeat tick, from the deadlines above:
+/// `MAX_HEARTBEAT_CAS_ATTEMPTS` x (beat read + ownership read + write + the
+/// ownership read after a write conflict). The fractions are chosen so this stays
+/// below the TTL for *any* `ttl_ms`, because a tick that can outlast the TTL
+/// starves the beats it exists to publish — and it also blocks discovery,
+/// recovery and the reaper, which share the task.
+#[cfg(test)]
+fn worst_case_tick(ttl_ms: u64) -> Duration {
+    let reads = membership_check_timeout(ttl_ms) * 3;
+    let write = heartbeat_write_timeout(ttl_ms);
+    (reads + write) * u32::try_from(MAX_HEARTBEAT_CAS_ATTEMPTS).unwrap_or(u32::MAX)
 }
 
 const DISCOVERY_INTERVAL: Duration = Duration::from_secs(5);
@@ -406,17 +419,7 @@ impl SchedulerRegistryRunner {
         // Its version is retained, because without one an incarnation whose reads
         // fail from birth would have nothing to condition on and would skip every
         // beat until it was reaped.
-        match self
-            .heartbeats
-            .heartbeat_if_unchanged(
-                &self.scheduler_id,
-                self.instance_id,
-                now,
-                self.entry.ttl_ms,
-                observed_version.as_ref(),
-            )
-            .await
-        {
+        match self.write_seed_beat(observed_version.as_ref()).await {
             Ok(version) => {
                 self.last_written_version.store(version.map(Arc::new));
                 Ok(())
@@ -439,18 +442,36 @@ impl SchedulerRegistryRunner {
                     .read_versioned(&self.scheduler_id)
                     .await
                     .context(HeartbeatSnafu)?;
+                // A fresh *version* is not a fresh ownership proof. Between this
+                // incarnation's membership commit and this point, a successor can
+                // have committed membership and published its own beat; writing
+                // against that beat's version would replace a live successor. So
+                // ownership is re-confirmed here, exactly as the heartbeat path
+                // does before touching a beat it does not hold.
+                match self.read_membership().await {
+                    Some(true) => {}
+                    Some(false) => {
+                        self.superseded.store(true, Ordering::Relaxed);
+                        self.last_written_version.store(None);
+                        tracing::warn!(
+                            scheduler_id = %self.scheduler_id,
+                            instance_id = %self.instance_id,
+                            "Lost the registration to another incarnation while seeding; retiring"
+                        );
+                        return Ok(());
+                    }
+                    None => {
+                        self.last_written_version.store(None);
+                        tracing::warn!(
+                            scheduler_id = %self.scheduler_id,
+                            instance_id = %self.instance_id,
+                            "Cannot re-confirm ownership while seeding; leaving the heartbeat alone"
+                        );
+                        return Ok(());
+                    }
+                }
                 let expected = observed.as_ref().map(|(_, version)| version.clone());
-                match self
-                    .heartbeats
-                    .heartbeat_if_unchanged(
-                        &self.scheduler_id,
-                        self.instance_id,
-                        now_ms()?,
-                        self.entry.ttl_ms,
-                        expected.as_ref(),
-                    )
-                    .await
-                {
+                match self.write_seed_beat(expected.as_ref()).await {
                     Ok(version) => {
                         self.last_written_version.store(version.map(Arc::new));
                         Ok(())
@@ -468,6 +489,38 @@ impl SchedulerRegistryRunner {
                 }
             }
             Err(source) => Err(Error::Heartbeat { source }),
+        }
+    }
+
+    /// A registration heartbeat write, bounded like the loop's writes: an
+    /// unbounded put here can outlast the grace period that lets another
+    /// incarnation take the id over, which is worse than publishing late.
+    async fn write_seed_beat(
+        &self,
+        expected: Option<&UpdateVersion>,
+    ) -> std::result::Result<Option<UpdateVersion>, heartbeat::Error> {
+        let write_timeout = heartbeat_write_timeout(self.entry.ttl_ms);
+        match tokio::time::timeout(
+            write_timeout,
+            self.heartbeats.heartbeat_if_unchanged(
+                &self.scheduler_id,
+                self.instance_id,
+                now_ms().unwrap_or_default(),
+                self.entry.ttl_ms,
+                expected,
+            ),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_elapsed) => {
+                tracing::warn!(
+                    scheduler_id = %self.scheduler_id,
+                    timeout_ms = write_timeout.as_millis(),
+                    "Registration heartbeat write did not complete in time"
+                );
+                Ok(None)
+            }
         }
     }
 
@@ -1173,6 +1226,77 @@ mod tests {
         );
     }
 
+    /// Reclaiming a contended seed is authorised by the membership commit that
+    /// preceded it — but only until someone else commits membership. A fresh
+    /// *version* is not an ownership proof, so a successor that took the id in
+    /// that window must survive.
+    #[tokio::test]
+    async fn a_contended_seed_does_not_reclaim_from_a_registered_successor() {
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let thief = Uuid::new_v4();
+        let wrapper = Arc::new(StealKeyBeforeWrite {
+            inner: Arc::clone(&inner),
+            cluster: Arc::new(ClusterStateStore::new(Arc::clone(&inner), "")),
+            thief,
+            steal_membership: true,
+            armed: std::sync::atomic::AtomicBool::new(true),
+        });
+        let store: Arc<dyn ObjectStore> = Arc::clone(&wrapper) as Arc<dyn ObjectStore>;
+        let cluster = Arc::new(ClusterStateStore::new(Arc::clone(&store), ""));
+        let heartbeats = Arc::new(SchedulerHeartbeatStore::new(Arc::clone(&store), ""));
+        ClusterStateStore::new(Arc::clone(&inner), "")
+            .bootstrap()
+            .await
+            .expect("bootstrap");
+        let observer = Arc::new(SchedulerHeartbeatStore::new(Arc::clone(&inner), ""));
+
+        let instance_id = Uuid::new_v4();
+        let runner = runner_over(&cluster, &heartbeats, &inner, instance_id);
+        runner.register_self().await.expect("register");
+
+        let beat = observer
+            .read("test:50051")
+            .await
+            .expect("read")
+            .expect("present");
+        assert_eq!(
+            beat.instance_id, thief,
+            "a successor that registered during the seed must not be reclaimed from"
+        );
+        assert!(
+            runner.superseded.load(Ordering::Relaxed),
+            "losing the registration while seeding must retire this incarnation"
+        );
+    }
+
+    /// A tick that can outlast the TTL starves the beats it exists to publish, and
+    /// blocks discovery, recovery and the reaper on the same task. The deadlines
+    /// are fractions of the interval precisely so their worst-case sum stays under
+    /// the TTL for *any* `ttl_ms`, not just the default.
+    #[test]
+    fn the_worst_case_tick_stays_within_the_ttl() {
+        for ttl_ms in [
+            1,
+            10,
+            100,
+            1_000,
+            6_000,
+            15_000,
+            18_000,
+            DEFAULT_TTL_MS,
+            300_000,
+        ] {
+            let worst = worst_case_tick(ttl_ms);
+            let ttl = Duration::from_millis(ttl_ms);
+            assert!(
+                // A 1ms TTL is the one value the bound cannot hold for: every
+                // deadline floors at 1ms, so their sum necessarily exceeds it.
+                worst < ttl || ttl_ms == 1,
+                "ttl_ms={ttl_ms}: worst-case tick {worst:?} does not fit inside a {ttl:?} TTL"
+            );
+        }
+    }
+
     /// Store whose heartbeat writes hang once armed. Object-store clients default
     /// to request timeouts on the order of a scheduler TTL, so this is the shape
     /// that would otherwise hold the registry task for a whole TTL.
@@ -1304,7 +1428,11 @@ mod tests {
     #[derive(Debug)]
     struct StealKeyBeforeWrite {
         inner: Arc<dyn ObjectStore>,
+        cluster: Arc<ClusterStateStore>,
         thief: Uuid,
+        /// When set, the thief also commits membership, so it is the registered
+        /// owner rather than a writer with no claim.
+        steal_membership: bool,
         armed: std::sync::atomic::AtomicBool,
     }
 
@@ -1345,6 +1473,18 @@ mod tests {
                         object_store::PutOptions::from(object_store::PutMode::Overwrite),
                     )
                     .await?;
+                if self.steal_membership {
+                    self.cluster
+                        .mutate(|state| {
+                            if let Some(entry) = state.schedulers.get_mut("test:50051") {
+                                entry.instance_id = self.thief;
+                                entry.started_at_ms = 50_000;
+                            }
+                            MutationOutcome::Apply
+                        })
+                        .await
+                        .expect("thief claims membership");
+                }
             }
             self.inner.put_opts(location, payload, opts).await
         }
@@ -1398,7 +1538,9 @@ mod tests {
         let thief = Uuid::new_v4();
         let wrapper = Arc::new(StealKeyBeforeWrite {
             inner: Arc::clone(&inner),
+            cluster: Arc::new(ClusterStateStore::new(Arc::clone(&inner), "")),
             thief,
+            steal_membership: false,
             armed: std::sync::atomic::AtomicBool::new(true),
         });
         let store: Arc<dyn ObjectStore> = Arc::clone(&wrapper) as Arc<dyn ObjectStore>;
