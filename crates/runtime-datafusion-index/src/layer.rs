@@ -67,10 +67,11 @@ pub enum LayerWalk {
     Write,
     /// Peel to the provider a retention delete should execute against.
     ///
-    /// Narrower than [`LayerWalk::Source`]: retention needs the accelerator's
-    /// own provider, so it must not see past a layer that redirects to the
-    /// source side or carries delete semantics of its own.
+    /// Narrower than [`LayerWalk::Source`]: retention must not see past a layer
+    /// carrying delete semantics of its own.
     RetentionDelete,
+    /// Find where a dataset's indexes live.
+    Index,
 }
 
 /// One capability stacked onto a dataset's provider.
@@ -89,13 +90,27 @@ pub trait TableLayer: Send + Sync + Debug + 'static {
         std::any::type_name::<Self>()
     }
 
-    /// Whether a walk may see past this layer.
+    /// Where `walk` continues, or `None` when it stops at this layer.
     ///
-    /// Defaults to transparent. Override for a layer that *is* what some walk
-    /// looks for, or whose semantics a walk must not route around.
-    fn transparent_to(&self, walk: LayerWalk) -> bool {
+    /// Defaults to the table beneath — transparent to everything. Two kinds of
+    /// layer override it:
+    ///
+    /// * one that *is* what a walk looks for, or whose semantics a walk must
+    ///   not route around, returns `None` for that walk;
+    /// * a **router** owning more than one table returns whichever its own
+    ///   semantics say that walk means. An accelerated table sends read and
+    ///   source walks to the federated source but write and index walks to the
+    ///   accelerator, and `None` when the side asked for is not yet resolved.
+    ///
+    /// Because the layer answers, no caller has to name a router's type or know
+    /// it has two sides.
+    fn route<'a>(
+        &'a self,
+        walk: LayerWalk,
+        below: &'a Arc<dyn TableProvider>,
+    ) -> Option<&'a Arc<dyn TableProvider>> {
         let _ = walk;
-        true
+        Some(below)
     }
 
     /// Indexes this layer binds to the table beneath it.
@@ -267,10 +282,10 @@ impl SpiceTable {
         let mut current = self;
         loop {
             visit(current);
-            if !current.layer.transparent_to(walk) {
+            let Some(next) = current.layer.route(walk, &current.below) else {
                 return;
-            }
-            match current.below_table() {
+            };
+            match next.downcast_ref::<SpiceTable>() {
                 Some(table) => current = table,
                 None => return,
             }
@@ -292,10 +307,8 @@ impl SpiceTable {
             if !found.is_empty() {
                 return Some((found, Arc::clone(&current.below)));
             }
-            match current.below_table() {
-                Some(table) => current = table,
-                None => return None,
-            }
+            let next = current.layer.route(LayerWalk::Index, &current.below)?;
+            current = next.downcast_ref::<SpiceTable>()?;
         }
     }
 
@@ -306,7 +319,10 @@ impl SpiceTable {
         let mut current = self;
         loop {
             indexes.extend(current.layer.indexes().iter().map(Arc::clone));
-            match current.below_table() {
+            let Some(next) = current.layer.route(LayerWalk::Index, &current.below) else {
+                return indexes;
+            };
+            match next.downcast_ref::<SpiceTable>() {
                 Some(table) => current = table,
                 None => return indexes,
             }
@@ -341,10 +357,10 @@ pub fn peel_to(top: &Arc<dyn TableProvider>, walk: LayerWalk) -> &Arc<dyn TableP
         let Some(table) = current.downcast_ref::<SpiceTable>() else {
             return current;
         };
-        if !table.layer.transparent_to(walk) {
+        let Some(next) = table.layer.route(walk, &table.below) else {
             return current;
-        }
-        current = &table.below;
+        };
+        current = next;
     }
 }
 
@@ -495,13 +511,61 @@ mod tests {
     }
 
     impl TableLayer for TestLayer {
-        fn transparent_to(&self, walk: LayerWalk) -> bool {
-            !self.opaque_to.contains(&walk)
+        fn route<'a>(
+            &'a self,
+            walk: LayerWalk,
+            below: &'a Arc<dyn TableProvider>,
+        ) -> Option<&'a Arc<dyn TableProvider>> {
+            if self.opaque_to.contains(&walk) {
+                return None;
+            }
+            Some(below)
         }
 
         fn indexes(&self) -> &[Arc<dyn Index + Send + Sync>] {
             &self.indexes
         }
+    }
+
+    /// Stands in for an accelerated table: two sides, and the walk decides which
+    /// one it means. `below` is the accelerator; `source` is the federated side,
+    /// which may not be resolved yet.
+    #[derive(Debug)]
+    pub(super) struct TestRouter {
+        pub(super) source: Option<Arc<dyn TableProvider>>,
+    }
+
+    impl TableLayer for TestRouter {
+        fn route<'a>(
+            &'a self,
+            walk: LayerWalk,
+            below: &'a Arc<dyn TableProvider>,
+        ) -> Option<&'a Arc<dyn TableProvider>> {
+            match walk {
+                LayerWalk::Read | LayerWalk::Source | LayerWalk::CdcDetection => {
+                    self.source.as_ref()
+                }
+                LayerWalk::Write | LayerWalk::RetentionDelete | LayerWalk::Index => Some(below),
+            }
+        }
+    }
+
+    pub(super) fn layered_marker() -> Arc<dyn TableProvider> {
+        SpiceTable::over(TestLayer::marker(), base())
+    }
+
+    /// Whether `reached` is `expected`, or the table `expected` wraps — peeling
+    /// a transparent marker lands on its base.
+    pub(super) fn reached_within(
+        reached: &Arc<dyn TableProvider>,
+        expected: &Arc<dyn TableProvider>,
+    ) -> bool {
+        if Arc::ptr_eq(reached, expected) {
+            return true;
+        }
+        expected
+            .downcast_ref::<SpiceTable>()
+            .is_some_and(|table| Arc::ptr_eq(reached, table.below()))
     }
 
     fn base() -> Arc<dyn TableProvider> {
@@ -524,7 +588,10 @@ mod tests {
             .downcast_ref::<SpiceTable>()
             .expect("peel should stop at the opaque layer, which is layered");
         assert!(
-            !peeled_table.layer().transparent_to(LayerWalk::RetentionDelete),
+            peeled_table
+                .layer()
+                .route(LayerWalk::RetentionDelete, peeled_table.below())
+                .is_none(),
             "peel returned the table below the opaque layer instead of including it"
         );
     }
@@ -621,5 +688,55 @@ mod tests {
             "layers above the base must survive a rebuild"
         );
         assert!(Arc::ptr_eq(rebuilt.base_provider(), &replacement));
+    }
+}
+
+#[cfg(test)]
+mod router_tests {
+    use super::tests::*;
+    use super::*;
+
+    /// A router owning two tables decides for itself which one a walk means, so
+    /// no caller has to name its type or know it has two sides. Read walks reach
+    /// the source; write and index walks reach the accelerator.
+    #[test]
+    fn a_router_sends_each_walk_to_its_own_side() {
+        let accelerator = layered_marker();
+        let source = layered_marker();
+        let router: Arc<dyn TableProvider> = SpiceTable::over(
+            Arc::new(TestRouter {
+                source: Some(Arc::clone(&source)),
+            }),
+            Arc::clone(&accelerator),
+        );
+
+        for (walk, expected) in [
+            (LayerWalk::Read, &source),
+            (LayerWalk::Source, &source),
+            (LayerWalk::Write, &accelerator),
+            (LayerWalk::Index, &accelerator),
+        ] {
+            let reached = peel_to(&router, walk);
+            assert!(
+                reached_within(reached, expected),
+                "{walk:?} reached the wrong side of the router"
+            );
+        }
+    }
+
+    /// The federated side of an accelerated table may not be resolved yet. A
+    /// walk asking for it must stop at the router rather than silently fall
+    /// through to the accelerator and report the wrong table.
+    #[test]
+    fn a_router_stops_a_walk_whose_side_is_unresolved() {
+        let accelerator = layered_marker();
+        let router: Arc<dyn TableProvider> =
+            SpiceTable::over(Arc::new(TestRouter { source: None }), accelerator);
+
+        let reached = peel_to(&router, LayerWalk::Read);
+        assert!(
+            Arc::ptr_eq(reached, &router),
+            "an unresolved side must stop the walk at the router"
+        );
     }
 }

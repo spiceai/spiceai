@@ -81,8 +81,15 @@ impl TableLayer for IndexLayer {
     /// An index layer is what CDC detection looks *for*, so detection must stop
     /// here rather than see past it. Every other walk passes through: an index
     /// adds no columns and rewrites no write.
-    fn transparent_to(&self, walk: LayerWalk) -> bool {
-        walk != LayerWalk::CdcDetection
+    fn route<'a>(
+        &'a self,
+        walk: LayerWalk,
+        below: &'a Arc<dyn TableProvider>,
+    ) -> Option<&'a Arc<dyn TableProvider>> {
+        match walk {
+            LayerWalk::CdcDetection => None,
+            _ => Some(below),
+        }
     }
 
     fn indexes(&self) -> &[Arc<dyn Index + Send + Sync>] {
