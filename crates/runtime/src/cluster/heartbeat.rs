@@ -31,6 +31,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::StreamExt;
+use object_store::UpdateVersion;
 use object_store::path::Path;
 use object_store::{Error as ObjectStoreError, ObjectStore, ObjectStoreExt, PutMode, PutOptions};
 use serde::{Deserialize, Serialize};
@@ -73,6 +74,11 @@ pub enum Error {
     },
     #[snafu(display("Failed to (de)serialize heartbeat: {source}"))]
     Serde { source: serde_json::Error },
+    #[snafu(display(
+        "Heartbeat for {scheduler_id} was written by another incarnation during this write"
+    ))]
+    HeartbeatSupersededDuringWrite { scheduler_id: String },
+
     #[snafu(display("Heartbeat write for {scheduler_id} exhausted retries: {source}"))]
     RetryExhausted {
         scheduler_id: String,
@@ -186,6 +192,84 @@ impl SchedulerHeartbeatStore {
                     tokio::time::sleep(delay).await;
                 }
             }
+        }
+    }
+
+    /// Reads the heartbeat together with the object version needed to write it
+    /// back conditionally. `None` means the object does not exist yet.
+    pub async fn read_versioned(
+        &self,
+        scheduler_id: &str,
+    ) -> Result<Option<(SchedulerHeartbeat, UpdateVersion)>> {
+        let path = self.path_for(scheduler_id);
+        match self.store.get(&path).await {
+            Ok(result) => {
+                let version = UpdateVersion {
+                    e_tag: result.meta.e_tag.clone(),
+                    version: result.meta.version.clone(),
+                };
+                let bytes = result.bytes().await.map_err(|source| Error::Read {
+                    path: path.to_string(),
+                    source,
+                })?;
+                let beat: SchedulerHeartbeat =
+                    serde_json::from_slice(&bytes).context(SerdeSnafu)?;
+                Ok(Some((beat, version)))
+            }
+            Err(ObjectStoreError::NotFound { .. }) => Ok(None),
+            Err(source) => Err(Error::Read {
+                path: path.to_string(),
+                source,
+            }),
+        }
+    }
+
+    /// Writes the heartbeat only if the stored object is still the one the
+    /// caller observed (`expected`), or is still absent when `expected` is
+    /// `None`.
+    ///
+    /// The key is shared by every incarnation of a `scheduler_id`, so an
+    /// unconditional write lets a superseded process clobber the incarnation
+    /// that replaced it. Making the write conditional turns "I am still the
+    /// registered incarnation" into part of the write itself: if anyone else
+    /// wrote in between, this fails with
+    /// [`Error::HeartbeatSupersededDuringWrite`] instead of overwriting them.
+    pub async fn heartbeat_if_unchanged(
+        &self,
+        scheduler_id: &str,
+        instance_id: Uuid,
+        now_ms: u64,
+        ttl_ms: u64,
+        expected: Option<&UpdateVersion>,
+    ) -> Result<()> {
+        let beat = SchedulerHeartbeat {
+            scheduler_id: scheduler_id.to_string(),
+            instance_id,
+            last_heartbeat_ms: now_ms,
+            ttl_ms,
+        };
+        let payload = serde_json::to_vec(&beat).context(SerdeSnafu)?;
+        let path = self.path_for(scheduler_id);
+        let mode = match expected {
+            Some(version) => PutMode::Update(version.clone()),
+            None => PutMode::Create,
+        };
+
+        match self
+            .store
+            .put_opts(&path, payload.into(), PutOptions::from(mode))
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(ObjectStoreError::Precondition { .. } | ObjectStoreError::AlreadyExists { .. }) => {
+                Err(Error::HeartbeatSupersededDuringWrite {
+                    scheduler_id: scheduler_id.to_string(),
+                })
+            }
+            Err(source) => Err(Error::Write {
+                path: path.to_string(),
+                source,
+            }),
         }
     }
 
