@@ -16,7 +16,7 @@ limitations under the License.
 use async_trait::async_trait;
 use data_components::cdc::ChangesStream;
 use datafusion::datasource::TableProvider;
-use runtime_datafusion_index::IndexedTableProvider;
+use spice_table::IndexLayer;
 use search::generation::text_search::index::FullTextDatabaseIndex;
 use search::index::chunking::ChunkedSearchIndex;
 use search::index::compound::CompoundSearchIndex;
@@ -36,7 +36,7 @@ use crate::search::util::find_concrete_table_provider;
 use futures::StreamExt;
 use runtime_metrics::component::MetricsProvider;
 
-/// A [`DataConnector`] middleware that, for [`Dataset`]s needing full text search capabilies, creates a [`IndexedTableProvider`] using the underlying [`TableProvider`]s and a [`FullTextDatabaseIndex`](search::generation::text_search::index::FullTextDatabaseIndex). If no full text search capabilities are needed it is not unnecessarily nested.
+/// A [`DataConnector`] middleware that, for [`Dataset`]s needing full text search capabilies, creates a [`IndexLayer`] using the underlying [`TableProvider`]s and a [`FullTextDatabaseIndex`](search::generation::text_search::index::FullTextDatabaseIndex). If no full text search capabilities are needed it is not unnecessarily nested.
 #[derive(Debug)]
 pub struct FullTextConnector {
     inner_connector: Arc<dyn DataConnector>,
@@ -57,17 +57,17 @@ impl FullTextConnector {
         F: Fn(&Arc<dyn DataConnector>, Arc<FederatedTable>) -> Option<ChangesStream>,
     {
         let table_provider = federated_table.try_table_provider_sync()?;
-        let indexed_table = find_concrete_table_provider::<IndexedTableProvider>(&table_provider)?;
+        let indexed_table = find_concrete_table_provider::<IndexLayer>(&table_provider)?;
 
         // This will process all `Index`s, including vector indexes if provided (i.e. from `EmbeddingConnector`).
-        // This is required so that [`IndexedTableProvider`] can be unwrapped (i.e. [`IndexedTableProvider::get_underlying`])
+        // This is required so that [`IndexLayer`] can be unwrapped (i.e. [`IndexLayer::get_underlying`])
         //  in both cases there is and isn't a `EmbeddingConnector` underneath.
         let all_indexes = indexed_table.get_all_indexes();
 
         // A full-text index written by this change stream must not defer its commits
         // to the sink write lifecycle: the two share one tantivy writer, so a window
         // commit would publish a partial refresh and a window rollback would discard
-        // these change-stream documents. `IndexedTableProvider::get_all_indexes` returns
+        // these change-stream documents. `IndexLayer::get_all_indexes` returns
         // whatever was registered, unpeeled, so the tantivy tier can be reached only
         // indirectly — nested as the primary of a `CompoundSearchIndex` (the warm/external
         // full-text compound, registered in place of its tiers) or wrapped in a
@@ -238,7 +238,7 @@ mod tests {
     use arrow::util::pretty::pretty_format_batches;
     use datafusion::datasource::MemTable;
     use futures::TryStreamExt;
-    use runtime_datafusion_index::{Index, WriteWindow};
+    use spice_table::{Index, WriteWindow};
     use search::index::SearchIndex;
     use search::index::compound::CompoundReadMode;
 
@@ -263,7 +263,7 @@ mod tests {
     }
 
     /// Regression test for #12061: the warm/external full-text tier registers a
-    /// `CompoundSearchIndex` in place of its tiers, so `IndexedTableProvider::get_all_indexes`
+    /// `CompoundSearchIndex` in place of its tiers, so `IndexLayer::get_all_indexes`
     /// never surfaces the nested `FullTextDatabaseIndex` directly. `mark_full_text_cdc_attached`
     /// has to peel through the compound to reach it, or the tantivy tier keeps deferring
     /// commits and a failed refresh discards change-stream documents for good.

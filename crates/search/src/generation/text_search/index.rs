@@ -26,7 +26,7 @@ use async_trait::async_trait;
 use datafusion::datasource::{DefaultTableSource, TableProvider};
 use datafusion::error::DataFusionError;
 use datafusion::logical_expr::{LogicalPlan, LogicalPlanBuilder};
-use runtime_datafusion_index::{Index, WriteWindow};
+use spice_table::{Index, WriteWindow};
 use snafu::{ResultExt, ensure};
 use tantivy::merge_policy::LogMergePolicy;
 use tantivy::schema::{
@@ -886,7 +886,7 @@ mod tests {
     use datafusion::physical_plan::collect;
     use datafusion::prelude::SessionContext;
     use futures::{StreamExt, TryStreamExt};
-    use runtime_datafusion_index::{Index, WriteWindow};
+    use spice_table::{Index, WriteWindow};
     use std::time::Duration;
 
     /// Create a basic [`MemTable`] with fields: `id`, `content`.

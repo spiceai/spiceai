@@ -40,7 +40,7 @@ use datafusion::{
 use datafusion_table_providers::util::column_reference::ColumnReference;
 use futures::{StreamExt, TryStreamExt};
 use itertools::Itertools;
-use runtime_datafusion_index::IndexedTableProvider;
+use spice_table::IndexLayer;
 #[cfg(test)]
 use runtime_datafusion_udfs::{
     bucket::BUCKET_SCALAR_UDF_NAME,
@@ -655,7 +655,7 @@ fn runtime_indexes_from_provider(
         return vec![];
     };
 
-    find_concrete_table_provider::<IndexedTableProvider>(table_provider).map_or_else(
+    find_concrete_table_provider::<IndexLayer>(table_provider).map_or_else(
         Vec::new,
         |indexed_table| {
             indexed_table
@@ -733,7 +733,7 @@ fn is_full_text_search_index(kind: &str) -> bool {
 /// it is never misclassified as full-text; returns `None` for any other index, leaving the
 /// caller to use [`Index::name`].
 fn compound_index_kind(
-    index: &Arc<dyn runtime_datafusion_index::Index + Send + Sync>,
+    index: &Arc<dyn spice_table::Index + Send + Sync>,
 ) -> Option<String> {
     use search::index::SearchIndex;
     use search::index::compound::CompoundSearchIndex;

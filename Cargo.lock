@@ -16938,6 +16938,7 @@ dependencies = [
  "snowflake-api",
  "spice-cloud",
  "spice-cloud-client",
+ "spice-table",
  "spiceai",
  "spicepod",
  "sysinfo 0.38.4",
@@ -17247,6 +17248,7 @@ dependencies = [
  "search",
  "serde_json",
  "snafu",
+ "spice-table",
  "tokio",
  "tokio-stream",
  "tokio-util",
@@ -17267,6 +17269,7 @@ dependencies = [
  "futures",
  "itertools 0.14.0",
  "snafu",
+ "spice-table",
  "tokio",
  "tracing",
 ]
@@ -17521,6 +17524,7 @@ dependencies = [
  "serde",
  "serde_json",
  "snafu",
+ "spice-table",
  "spicepod",
  "telemetry",
  "tokio",
@@ -17625,6 +17629,7 @@ dependencies = [
  "search",
  "serde",
  "snafu",
+ "spice-table",
  "spicepod",
  "telemetry",
  "tokio",
@@ -18380,6 +18385,7 @@ dependencies = [
  "serde",
  "serde_json",
  "snafu",
+ "spice-table",
  "tantivy",
  "tempfile",
  "tokio",
@@ -19325,6 +19331,16 @@ dependencies = [
  "serde_json",
  "snafu",
  "url",
+]
+
+[[package]]
+name = "spice-table"
+version = "2.2.0-unstable"
+dependencies = [
+ "async-trait",
+ "datafusion",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

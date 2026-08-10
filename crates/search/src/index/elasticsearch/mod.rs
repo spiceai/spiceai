@@ -40,7 +40,7 @@ use datafusion_expr::LogicalPlanBuilder;
 use elasticsearch::Elasticsearch;
 use futures::future::try_join_all;
 use llms::embeddings::Embed;
-use runtime_datafusion_index::{Index, WriteWindow};
+use spice_table::{Index, WriteWindow};
 use tokio::sync::Mutex;
 
 use crate::SEARCH_SCORE_COLUMN_NAME;

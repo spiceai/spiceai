@@ -40,7 +40,7 @@ use futures::future::try_join_all;
 use itertools::Itertools;
 use llms::embeddings::Embed;
 use parking_lot::RwLock;
-use runtime_datafusion_index::Index;
+use spice_table::Index;
 use snafu::{ResultExt, Snafu, ensure};
 
 use crate::index::{

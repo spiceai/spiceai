@@ -30,7 +30,7 @@ use datafusion::{
     physical_plan::ExecutionPlan,
     prelude::SessionContext,
 };
-use runtime_datafusion_index::{Index, WriteWindow};
+use spice_table::{Index, WriteWindow};
 
 use super::{CompoundReadMode, CompoundSearchIndex, CompoundVectorIndex, Error};
 use crate::index::{SearchIndex, VectorIndex};

@@ -15,7 +15,7 @@ limitations under the License.
 */
 use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
-use runtime_datafusion_index::{Index, IndexedTableProvider};
+use spice_table::{Index, IndexLayer};
 use snafu::ResultExt;
 use spicepod::semantic::{Column, IndexStore, MetadataType};
 use std::path::PathBuf;
@@ -108,17 +108,17 @@ pub(crate) fn build_full_text_database_index(
     .boxed()
 }
 
-/// Registers `index` on `inner_table_provider`, reusing the existing [`IndexedTableProvider`]
+/// Registers `index` on `inner_table_provider`, reusing the existing [`IndexLayer`]
 /// chain when one is already present so multiple indexes compose onto a single provider.
 fn register_index(
     inner_table_provider: &Arc<dyn TableProvider>,
     index: Arc<dyn Index + Send + Sync>,
-) -> IndexedTableProvider {
+) -> IndexLayer {
     let provider =
-        if let Some(idx_tbl) = inner_table_provider.downcast_ref::<IndexedTableProvider>() {
+        if let Some(idx_tbl) = inner_table_provider.downcast_ref::<IndexLayer>() {
             idx_tbl.clone()
         } else {
-            IndexedTableProvider::new(Arc::clone(inner_table_provider))
+            IndexLayer::new(Arc::clone(inner_table_provider))
         };
     provider.add_index(index)
 }
@@ -130,7 +130,7 @@ pub(crate) fn add_full_text_search_to_table(
     inner_table_provider: &Arc<dyn TableProvider>,
     columns: &[Column],
     tbl: &TableReference,
-) -> Result<IndexedTableProvider, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<IndexLayer, Box<dyn std::error::Error + Send + Sync>> {
     let index =
         build_full_text_database_index(Arc::clone(inner_table_provider), columns, tbl, None)?;
     Ok(register_index(
@@ -146,7 +146,7 @@ pub(crate) fn add_full_text_search_to_table(
 /// Elasticsearch model. At query time `call_with_es_indexes` in the UDTF dispatcher
 /// selects the requested column from `search_fields` on that shared instance.
 ///
-/// The index is registered via [`IndexedTableProvider::add_index`] so it is visible to the
+/// The index is registered via [`IndexLayer::add_index`] so it is visible to the
 /// query optimizer and can be discovered by `find_index_in_table_provider` for `text_search()`
 /// queries. For the accelerator-side path, indexes are automatically discovered from the
 /// federated provider chain — no manual registration is needed.
@@ -156,7 +156,7 @@ pub(crate) async fn add_elasticsearch_fts_to_table(
     columns: &[spicepod::semantic::Column],
     tbl: &datafusion::sql::TableReference,
     fts_params: &runtime_search::store_params::elasticsearch::ElasticsearchFtsConfig,
-) -> Result<IndexedTableProvider, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<IndexLayer, Box<dyn std::error::Error + Send + Sync>> {
     let index =
         build_elasticsearch_text_index(Arc::clone(&inner_table_provider), columns, tbl, fts_params)
             .await?;
@@ -191,7 +191,7 @@ pub(crate) async fn add_compound_fts_to_table(
     tbl: &datafusion::sql::TableReference,
     fts_params: &runtime_search::store_params::elasticsearch::ElasticsearchFtsConfig,
     on_zero_results: &crate::component::dataset::acceleration::ZeroResultsAction,
-) -> Result<IndexedTableProvider, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<IndexLayer, Box<dyn std::error::Error + Send + Sync>> {
     use crate::component::dataset::acceleration::ZeroResultsAction;
     use search::index::SearchIndex;
     use search::index::compound::{CompoundReadMode, CompoundSearchIndex};
@@ -269,7 +269,7 @@ pub(crate) async fn add_compound_fts_to_table(
 /// Builds (but does not register) an [`ElasticsearchTextIndex`] for all FTS-enabled columns.
 ///
 /// The returned index is added to the federated provider chain via
-/// [`IndexedTableProvider::add_index`] in [`add_elasticsearch_fts_to_table`]. On the
+/// [`IndexLayer::add_index`] in [`add_elasticsearch_fts_to_table`]. On the
 /// accelerator write path, indexes are automatically discovered from the federated provider
 /// chain by [`RefreshTaskBuilder::build`] — no manual `sink_index` plumbing is needed.
 #[cfg(feature = "elasticsearch")]

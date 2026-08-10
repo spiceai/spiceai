@@ -31,7 +31,7 @@ use datafusion_table_providers::{
 };
 use futures::future::try_join_all;
 use llms::embeddings::Embed;
-use runtime_datafusion_index::Index;
+use spice_table::Index;
 use snafu::ResultExt;
 
 use crate::{

@@ -22,7 +22,7 @@ use arrow_json::{EncoderOptions, writer::make_encoder};
 use arrow_schema::Field;
 use data_components::s3_vectors::S3VectorsTable;
 use itertools::Itertools;
-use runtime_datafusion_index::Index;
+use spice_table::Index;
 use serde_json::Value;
 use snafu::{ResultExt, Snafu};
 

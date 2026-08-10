@@ -37,8 +37,8 @@ use data_components::cdc::{ChangeEnvelope, ChangesStream, StreamError, replace_c
 use datafusion::datasource::TableProvider;
 use futures::StreamExt;
 use itertools::Itertools;
-use runtime_datafusion_index::{
-    IndexedTableProvider, LayerWalk, find_concrete_table_provider_in, peel_to_innermost,
+use spice_table::{
+    IndexLayer, LayerWalk, find_concrete_table_provider_in, peel_to_innermost,
 };
 use runtime_metrics::component::MetricsProvider;
 use search::generation::text_search::index::FullTextDatabaseIndex;
@@ -349,7 +349,7 @@ impl DataConnector for EmbeddingConnector {
         dataset: &Dataset,
     ) -> Option<ChangesStream> {
         let table_provider = federated_table.try_table_provider_sync()?;
-        if let Some(indexed_table) = find_concrete_table_provider_in::<IndexedTableProvider>(
+        if let Some(indexed_table) = find_concrete_table_provider_in::<IndexLayer>(
             &table_provider,
             TABLE_PROVIDER_LAYERS,
             LayerWalk::CdcDetection,
@@ -392,7 +392,7 @@ impl DataConnector for EmbeddingConnector {
 
             Some(stream)
 
-        // `VectorScanTableProvider` is generally wrapped by a `IndexedTableProvider` (as above), but in the case both [`Self`] and the [`FullTextConnector`] exist, the latter will unwrap the `IndexedTableProvider` first. It will correctly handle indexing vector indexes as that point.
+        // `VectorScanTableProvider` is generally wrapped by a `IndexLayer` (as above), but in the case both [`Self`] and the [`FullTextConnector`] exist, the latter will unwrap the `IndexLayer` first. It will correctly handle indexing vector indexes as that point.
         } else if let Some(vector_scan) = find_concrete_table_provider_in::<VectorScanTableProvider>(
             &table_provider,
             TABLE_PROVIDER_LAYERS,
@@ -433,7 +433,7 @@ impl DataConnector for EmbeddingConnector {
     fn append_stream(&self, federated_table: Arc<FederatedTable>) -> Option<ChangesStream> {
         let table_provider = federated_table.try_table_provider_sync()?;
 
-        if let Some(indexed_table) = find_concrete_table_provider_in::<IndexedTableProvider>(
+        if let Some(indexed_table) = find_concrete_table_provider_in::<IndexLayer>(
             &table_provider,
             TABLE_PROVIDER_LAYERS,
             LayerWalk::CdcDetection,
@@ -455,7 +455,7 @@ impl DataConnector for EmbeddingConnector {
             return Some(stream);
         }
 
-        // A `VectorScanTableProvider` is usually wrapped by an `IndexedTableProvider` (as
+        // A `VectorScanTableProvider` is usually wrapped by an `IndexLayer` (as
         // above), but when a `FullTextConnector` also exists it peels that layer off before
         // delegating here, so the vector scan is what we see. Mirror `changes_stream`: hand
         // the scan's inner provider down and let the outer connector re-apply the indexes.
@@ -732,13 +732,13 @@ pub(crate) async fn try_wrap_view_accelerator_with_hnsw(
     Ok(true)
 }
 
-/// Peel an [`IndexedTableProvider`]'s index and enrichment layers down to the raw
+/// Peel an [`IndexLayer`]'s index and enrichment layers down to the raw
 /// source provider, so the source connector's changes stream sees the schema of the
 /// table it actually reads from — only real source columns, never the synthetic
 /// `<col>_embedding` columns that a `VectorScanTableProvider` or `EmbeddingTable` merges
 /// into its schema (which would make the source's bootstrap `SELECT` reference a column
 /// that does not exist in the source table). A metadata-enrichment layer can sit between
-/// the `IndexedTableProvider` and its inner provider, so it is peeled too — see
+/// the `IndexLayer` and its inner provider, so it is peeled too — see
 /// [`LayerWalk::Source`] and the layer table in [`crate::table_layers`].
 ///
 /// This always resolves to a source provider (never `None`): the caller re-applies the
@@ -807,7 +807,7 @@ mod tests {
     }
 
     /// The provider stack an `EmbeddingConnector` is handed when the dataset also has
-    /// full-text search: the outer `FullTextConnector` peels its own `IndexedTableProvider`
+    /// full-text search: the outer `FullTextConnector` peels its own `IndexLayer`
     /// off before delegating, leaving the vector scan on top.
     fn vector_scan_over_memtable() -> Arc<FederatedTable> {
         let vector_scan = VectorScanTableProvider {

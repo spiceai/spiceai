@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use runtime_component::ClusterRole;
-use runtime_datafusion_index::{LayerWalk, SpiceTable, TableLayer};
+use spice_table::{LayerWalk, SpiceTable, TableLayer};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};

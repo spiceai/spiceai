@@ -21,8 +21,8 @@ use crate::accelerated::AcceleratedTable;
 use crate::table_layers::TABLE_PROVIDER_LAYERS;
 use datafusion::datasource::TableProvider;
 use datafusion::error::DataFusionError;
-use runtime_datafusion_index::{
-    Index, IndexedTableProvider, LayerWalk, find_concrete_table_provider_in,
+use spice_table::{
+    Index, IndexLayer, LayerWalk, find_concrete_table_provider_in,
 };
 use runtime_search::table_provider_explorer::TableProviderExplorer;
 
@@ -47,14 +47,14 @@ pub fn find_index_in_table_provider<T: Index + 'static>(
         return Some(indexes);
     }
 
-    let mut indexed_table_opt = find_concrete_table_provider::<IndexedTableProvider>(tbl);
+    let mut indexed_table_opt = find_concrete_table_provider::<IndexLayer>(tbl);
     while let Some(indexed_table) = indexed_table_opt {
         let indexes = indexed_table.get_indexes::<T>();
         if !indexes.is_empty() {
             return Some((indexes, Arc::clone(&indexed_table.underlying)));
         }
         indexed_table_opt =
-            find_concrete_table_provider::<IndexedTableProvider>(&indexed_table.underlying);
+            find_concrete_table_provider::<IndexLayer>(&indexed_table.underlying);
     }
     None
 }
@@ -91,7 +91,7 @@ mod tests {
     use crate::table_layers::ICEBERG_CLUSTER_LAYER;
     use arrow_schema::{DataType, Field, Schema};
     use data_components::arrow::write::MemTable;
-    use runtime_datafusion_index::find_concrete_table_provider_in;
+    use spice_table::find_concrete_table_provider_in;
     use runtime_search::embeddings::table::EmbeddingTable;
     use search::generation::text_search::index::FullTextDatabaseIndex;
     use std::sync::Arc;
@@ -130,10 +130,10 @@ mod tests {
             .expect("cannot make full text table"),
         );
 
-        let wrapped_table = Arc::new(IndexedTableProvider::new(base_table).add_index(index))
+        let wrapped_table = Arc::new(IndexLayer::new(base_table).add_index(index))
             as Arc<dyn TableProvider>;
 
-        assert!(find_concrete_table_provider::<IndexedTableProvider>(&wrapped_table).is_some());
+        assert!(find_concrete_table_provider::<IndexLayer>(&wrapped_table).is_some());
 
         assert!(find_concrete_table_provider::<EmbeddingTable>(&wrapped_table).is_none());
     }
@@ -154,7 +154,7 @@ mod tests {
             "a non-accelerated provider must be scannable"
         );
 
-        let wrapped: Arc<dyn TableProvider> = Arc::new(IndexedTableProvider::new(base));
+        let wrapped: Arc<dyn TableProvider> = Arc::new(IndexLayer::new(base));
         assert!(
             RuntimeTableProviderExplorer
                 .not_ready_error(&wrapped)
@@ -233,13 +233,13 @@ mod tests {
             .expect("cannot make full text table"),
         );
 
-        let wrapped = Arc::new(IndexedTableProvider::new(base_table).add_index(index))
+        let wrapped = Arc::new(IndexLayer::new(base_table).add_index(index))
             as Arc<dyn TableProvider>;
 
-        // The default set peels the IndexedTableProvider down to the MemTable.
+        // The default set peels the IndexLayer down to the MemTable.
         assert!(
             find_concrete_table_provider::<MemTable>(&wrapped).is_some(),
-            "default layer table must peel IndexedTableProvider"
+            "default layer table must peel IndexLayer"
         );
 
         // A restricted set that lacks the indexed-table layer must not peel it.
@@ -255,7 +255,7 @@ mod tests {
 
         // The layer itself is still reachable directly under a restricted set.
         assert!(
-            find_concrete_table_provider_in::<IndexedTableProvider>(&wrapped, &[], LayerWalk::Read)
+            find_concrete_table_provider_in::<IndexLayer>(&wrapped, &[], LayerWalk::Read)
                 .is_some(),
             "an empty layer set must still match the outermost provider"
         );

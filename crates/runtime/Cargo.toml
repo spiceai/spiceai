@@ -62,6 +62,7 @@ datafusion-spark.workspace = true
 datafusion-substrait = { workspace = true }
 datafusion-table-providers = { workspace = true }
 db_connection_pool = { path = "../db_connection_pool" }
+spice-table = { path = "../spice-table" }
 tokio-postgres = { workspace = true, optional = true }
 document_parse = { path = "../document_parse" }
 duckdb = { workspace = true, features = [

@@ -23,7 +23,7 @@ use datafusion_table_providers::{
     duckdb::{TableDefinition, write::DuckDBTableWriter},
     sql::db_connection_pool::duckdbpool::DuckDbConnectionPool,
 };
-use runtime_datafusion_index::{Index, IndexedTableProvider};
+use spice_table::{Index, IndexLayer};
 use runtime_secrets::{Secrets, get_params_with_secrets};
 use search::{generation::util::get_primary_keys, index::duckdb::DuckDBVectorIndex};
 use snafu::prelude::*;
@@ -185,10 +185,10 @@ pub(crate) async fn wrap_accelerator_with_duckdb_vector_indexes(
     table_definition.add_ignored_index_prefix("__spice_vss_");
 
     let mut provider =
-        if let Some(indexed) = accelerator_provider.downcast_ref::<IndexedTableProvider>() {
+        if let Some(indexed) = accelerator_provider.downcast_ref::<IndexLayer>() {
             indexed.clone()
         } else {
-            IndexedTableProvider::new(Arc::clone(&accelerator_provider))
+            IndexLayer::new(Arc::clone(&accelerator_provider))
         };
 
     for (column, config) in embedding_columns {
@@ -263,7 +263,7 @@ fn normalized_duckdb_vector_param_name(key: &str) -> Option<&'static str> {
 fn duckdb_writer_context(
     provider: &Arc<dyn TableProvider>,
 ) -> Option<(Arc<DuckDbConnectionPool>, Arc<TableDefinition>)> {
-    if let Some(indexed) = provider.downcast_ref::<IndexedTableProvider>() {
+    if let Some(indexed) = provider.downcast_ref::<IndexLayer>() {
         return duckdb_writer_context(&indexed.underlying);
     }
 

@@ -36,7 +36,7 @@ use {
     crate::embeddings::construct_chunker,
     arrow_schema::{Schema, SchemaRef},
     chunking::ChunkingConfig,
-    runtime_datafusion_index::{Index, IndexedTableProvider},
+    spice_table::{Index, IndexLayer},
     runtime_search::embeddings::warm_index::with_memory_warm_index,
     search::index::{
         SearchIndex, VectorIndex, VectorScanTableProvider, chunking::ChunkedSearchIndex,
@@ -223,10 +223,10 @@ async fn wrap_table_as_index_s3(
         })
         .collect();
     let mut provider =
-        if let Some(indexed) = inner_table_provider.downcast_ref::<IndexedTableProvider>() {
+        if let Some(indexed) = inner_table_provider.downcast_ref::<IndexLayer>() {
             indexed.clone()
         } else {
-            IndexedTableProvider::new(Arc::clone(&inner_table_provider))
+            IndexLayer::new(Arc::clone(&inner_table_provider))
         };
     for (column, config) in embedding_columns {
         let chunking = config.chunking.as_ref().filter(|cfg| cfg.enabled);
@@ -306,13 +306,13 @@ async fn wrap_table_as_index_s3(
 /// it to `provider`.
 #[cfg(any(feature = "s3_vectors", feature = "elasticsearch"))]
 async fn construct_chunked_vector_index(
-    mut provider: IndexedTableProvider,
+    mut provider: IndexLayer,
     embedding_models: &Arc<RwLock<EmbeddingModelStore>>,
     chunking: &EmbeddingChunkConfig,
     index: Arc<dyn SearchIndex>,
     model_name: &str,
     file_format: Option<&str>,
-) -> Result<IndexedTableProvider, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<IndexLayer, Box<dyn std::error::Error + Send + Sync>> {
     let chunker = construct_chunker(
         model_name,
         &ChunkingConfig {
@@ -426,11 +426,11 @@ async fn wrap_table_as_index_elasticsearch(
         .collect();
 
     let mut provider = if let Some(indexed) =
-        inner_table_provider.downcast_ref::<runtime_datafusion_index::IndexedTableProvider>()
+        inner_table_provider.downcast_ref::<spice_table::IndexLayer>()
     {
         indexed.clone()
     } else {
-        runtime_datafusion_index::IndexedTableProvider::new(Arc::clone(&inner_table_provider))
+        spice_table::IndexLayer::new(Arc::clone(&inner_table_provider))
     };
 
     let Some(embed_udf) = ctx.state().scalar_functions().get(EMBED_UDF_NAME).cloned() else {

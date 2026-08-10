@@ -54,7 +54,7 @@ pub fn table_provider_with_spicepod_metadata<S: std::hash::BuildHasher>(
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
 
-    runtime_datafusion_index::rebuild_innermost_table_provider(
+    spice_table::rebuild_innermost_table_provider(
         provider,
         &[
             crate::table_layers::INDEXED_LAYER,
@@ -89,7 +89,7 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use data_components::MetadataEnrichedTableProvider;
     use datafusion::datasource::{MemTable, TableProvider};
-    use runtime_datafusion_index::IndexedTableProvider;
+    use spice_table::IndexLayer;
     use runtime_search::embeddings::table::EmbeddingTable;
     use spicepod::semantic::Column;
 
@@ -229,12 +229,12 @@ mod tests {
     #[test]
     fn embedding_table_under_indexed_provider_stays_discoverable() {
         // A dataset with both `embeddings` and `full_text_search` nests an
-        // `EmbeddingTable` under the `IndexedTableProvider` the FTS connector builds.
+        // `EmbeddingTable` under the `IndexLayer` the FTS connector builds.
         // `FullTextConnector::with_indexed_stream` hands `get_underlying()` to
         // `EmbeddingConnector::changes_stream`, which downcasts to `EmbeddingTable`; if
         // the metadata wrap hides it there, no changes stream is attached and
         // `refresh_mode: changes` fails with "a changes stream is required".
-        let indexed = Arc::new(IndexedTableProvider::with_indexes(
+        let indexed = Arc::new(IndexLayer::with_indexes(
             embedding_table_over_memtable(),
             vec![],
         )) as Arc<dyn TableProvider>;
@@ -243,28 +243,28 @@ mod tests {
         let wrapped = table_provider_with_spicepod_metadata(indexed, &table_metadata, &columns);
 
         let found_indexed = wrapped
-            .downcast_ref::<IndexedTableProvider>()
-            .expect("IndexedTableProvider must remain discoverable for the index analyzer");
+            .downcast_ref::<IndexLayer>()
+            .expect("IndexLayer must remain discoverable for the index analyzer");
 
         assert!(
             found_indexed
                 .get_underlying()
                 .downcast_ref::<EmbeddingTable>()
                 .is_some(),
-            "EmbeddingTable nested under an IndexedTableProvider must stay discoverable"
+            "EmbeddingTable nested under an IndexLayer must stay discoverable"
         );
     }
 
     #[test]
     fn vector_scan_under_indexed_provider_stays_discoverable() {
         // A dataset with `embeddings`, `full_text_search` and `vectors` enabled nests a
-        // `VectorScanTableProvider` under the `IndexedTableProvider` (the FTS index is
+        // `VectorScanTableProvider` under the `IndexLayer` (the FTS index is
         // added to the same provider the vector engine created).
         // `FullTextConnector::with_indexed_stream` hands `get_underlying()` to
         // `EmbeddingConnector::changes_stream`, which downcasts to
         // `VectorScanTableProvider` to reach the raw source; if the metadata wrap hides
         // it there, `refresh_mode: changes` fails with "a changes stream is required".
-        let indexed = Arc::new(IndexedTableProvider::with_indexes(
+        let indexed = Arc::new(IndexLayer::with_indexes(
             vector_scan_over_memtable(),
             vec![],
         )) as Arc<dyn TableProvider>;
@@ -273,13 +273,13 @@ mod tests {
         let wrapped = table_provider_with_spicepod_metadata(indexed, &table_metadata, &columns);
 
         let found_indexed = wrapped
-            .downcast_ref::<IndexedTableProvider>()
-            .expect("IndexedTableProvider must remain discoverable for the index analyzer");
+            .downcast_ref::<IndexLayer>()
+            .expect("IndexLayer must remain discoverable for the index analyzer");
 
         let underlying = found_indexed.get_underlying();
         let vector_scan = underlying
             .downcast_ref::<search::index::vector_table::VectorScanTableProvider>()
-            .expect("VectorScanTableProvider under an IndexedTableProvider must stay discoverable");
+            .expect("VectorScanTableProvider under an IndexLayer must stay discoverable");
 
         // Enrichment lands below the vector scan, on the raw source provider, so the
         // source-facing bootstrap schema carries no synthetic embedding columns.

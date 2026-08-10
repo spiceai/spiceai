@@ -26,7 +26,7 @@ limitations under the License.
 //! Each wrapper is described exactly once here, as a [`TableProviderLayer`]
 //! declaring per-walk transparency and (where supported) how to rebuild the
 //! layer around a transformed inner provider. Walk call sites select a walk
-//! kind ([`runtime_datafusion_index::LayerWalk`]) instead of enumerating
+//! kind ([`spice_table::LayerWalk`]) instead of enumerating
 //! wrapper types; a wrapper type
 //! that is missing an entry here is opaque to every walk, which silently
 //! disables the behavior the walk feeds (index writes on change streams, CDC
@@ -44,7 +44,7 @@ pub(crate) use runtime_table::table_layers::{
     VECTOR_SCAN_LAYER,
 };
 
-use runtime_datafusion_index::{InnerProviderFn, TableProviderLayer};
+use spice_table::{InnerProviderFn, TableProviderLayer};
 
 use crate::accelerated::AcceleratedTable;
 use crate::dataconnector::iceberg_cluster::IcebergClusterTableProvider;
@@ -154,14 +154,14 @@ pub const TABLE_PROVIDER_LAYERS: &[TableProviderLayer] = &[
 mod tests {
     use std::sync::Arc;
 
-    use runtime_datafusion_index::IndexedTableProvider;
+    use spice_table::IndexLayer;
 
     use super::*;
     use arrow_schema::{DataType, Field, Schema};
     use data_components::arrow::write::MemTable;
     use data_components::metadata_enriched_table_provider;
     use datafusion::datasource::TableProvider;
-    use runtime_datafusion_index::LayerWalk;
+    use spice_table::LayerWalk;
     use std::collections::HashMap;
 
     fn mem_table() -> Arc<dyn TableProvider> {
@@ -215,7 +215,7 @@ mod tests {
         let base = mem_table();
 
         let indexed: Arc<dyn TableProvider> =
-            Arc::new(IndexedTableProvider::new(Arc::clone(&base)));
+            Arc::new(IndexLayer::new(Arc::clone(&base)));
         let enriched = metadata_enriched_table_provider(
             Arc::clone(&base),
             HashMap::from([("k".to_string(), "v".to_string())]),

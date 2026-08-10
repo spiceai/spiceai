@@ -54,6 +54,7 @@ members = [
     "crates/runtime-search",
     "crates/runtime-tools",
     "crates/runtime-datafusion-index",
+    "crates/spice-table",
     "crates/runtime-datafusion-udfs",
     "crates/runtime-proto",
     "crates/runtime-parameter-spec",

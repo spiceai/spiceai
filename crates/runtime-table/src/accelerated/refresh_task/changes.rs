@@ -57,7 +57,7 @@ use runtime_component::schema_evolution::{
 };
 use runtime_datafusion::error::{find_datafusion_root, format_datafusion_error};
 use runtime_datafusion::execution_plan::schema_cast::SchemaCastScanExec;
-use runtime_datafusion_index::{IndexedTableProvider, LayerWalk, find_concrete_table_provider_in};
+use spice_table::{IndexLayer, LayerWalk, find_concrete_table_provider_in};
 use runtime_metrics::acceleration as metrics;
 use runtime_search::embeddings::table::EmbeddingTable;
 use runtime_status as status;
@@ -2604,7 +2604,7 @@ impl RefreshTask {
     /// the wrappers it is created behind. Non-partitioned Cayenne tables are
     /// wrapped in `PolyTableProvider` (read/write split), optionally
     /// `UpsertDedupTableProvider` (when `remove_duplicates`/`last_write_wins` is
-    /// set), and `IndexedTableProvider` (vector indexes). A direct downcast to
+    /// set), and `IndexLayer` (vector indexes). A direct downcast to
     /// `CayenneTableProvider` misses through any of these, so without peeling the
     /// CDC apply silently falls back to the synchronous `insert_into` path and
     /// loses pipelined finalization (backgrounded publish, no blocking
@@ -2612,10 +2612,10 @@ impl RefreshTask {
     ///
     /// Uses [`LayerWalk::Write`], which steps only through wrappers whose
     /// `insert_into` is a pass-through (`PolyTableProvider` to its writer side,
-    /// `IndexedTableProvider`) — see the layer table in [`crate::table_layers`].
+    /// `IndexLayer`) — see the layer table in [`crate::table_layers`].
     ///
     /// NOTE: `UpsertDedupTableProvider` is opaque to the write walk. Unlike
-    /// `PolyTableProvider` (delegates writes) and `IndexedTableProvider`
+    /// `PolyTableProvider` (delegates writes) and `IndexLayer`
     /// (`insert_into` is a pass-through), it *rewrites* the write on insert
     /// (dedup / last-write-wins via `UpsertDedupExec`). Routing CDC past it to the
     /// inner provider would bypass that transform, so a dedup-configured table
@@ -2888,7 +2888,7 @@ impl RefreshTask {
 
                 if handled_by_cayenne_cdc_path {
                     // Cayenne's fast CDC-delete path bypasses `TableProvider::delete_from`
-                    // entirely, so it never reaches `IndexedTableProvider::delete_from`'s
+                    // entirely, so it never reaches `IndexLayer::delete_from`'s
                     // index-aware handling on either side — drive index deletion explicitly
                     // here instead, across both the accelerator and federated sides (an
                     // external-store vector/search index, e.g. S3 Vectors, is attached only
@@ -2919,7 +2919,7 @@ impl RefreshTask {
                         .context(crate::accelerated::FailedToWriteDataSnafu)?;
 
                     // `self.accelerator.delete_from` above already drives any
-                    // `IndexedTableProvider` wrapping the accelerator itself (e.g. the DuckDB
+                    // `IndexLayer` wrapping the accelerator itself (e.g. the DuckDB
                     // vector engine) through its own index-aware handling. It cannot reach an
                     // index attached only on the federated side (e.g. S3 Vectors, Elasticsearch)
                     // — that's a distinct `TableProvider` chain — so drive those explicitly here.
@@ -3094,7 +3094,7 @@ async fn delete_matching_rows_from_arrow_provider(
     provider: &Arc<dyn TableProvider>,
     rows: &RecordBatch,
 ) -> crate::accelerated::Result<Option<u64>> {
-    if let Some(indexed) = provider.downcast_ref::<IndexedTableProvider>() {
+    if let Some(indexed) = provider.downcast_ref::<IndexLayer>() {
         return Box::pin(delete_matching_rows_from_arrow_provider(
             indexed.get_underlying_ref(),
             rows,
@@ -3152,7 +3152,7 @@ async fn delete_matching_rows_from_arrow_provider(
 async fn perform_change_write_maintenance(
     provider: &Arc<dyn TableProvider>,
 ) -> crate::accelerated::Result<()> {
-    if let Some(indexed) = provider.downcast_ref::<IndexedTableProvider>() {
+    if let Some(indexed) = provider.downcast_ref::<IndexLayer>() {
         return Box::pin(perform_change_write_maintenance(
             indexed.get_underlying_ref(),
         ))
@@ -4811,7 +4811,7 @@ mod tests {
             MemTable::try_new(Arc::clone(&schema), vec![vec![initial.clone()]])
                 .expect("mem table should be created"),
         );
-        let wrapped = Arc::new(IndexedTableProvider::new(
+        let wrapped = Arc::new(IndexLayer::new(
             Arc::clone(&table) as Arc<dyn TableProvider>
         )) as Arc<dyn TableProvider>;
 

@@ -356,7 +356,7 @@ mod tests {
         prelude::{Expr, SessionConfig, SessionContext},
     };
     use datafusion_expr::{LogicalPlan, TableScan};
-    use runtime_datafusion_index::Index;
+    use spice_table::Index;
 
     use crate::{
         SEARCH_SCORE_COLUMN_NAME,

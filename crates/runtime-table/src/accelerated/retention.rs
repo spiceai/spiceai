@@ -33,7 +33,7 @@ use datafusion::{
 };
 use runtime_component::dataset::TimeFormat;
 use runtime_datafusion::{is_spice_internal_dataset, session_config::get_df_default_config};
-use runtime_datafusion_index::{
+use spice_table::{
     INDEXED_INNER, Index, InnerProviderFn, resolve_keys_matching_predicate,
 };
 use runtime_object_store::registry::default_runtime_env;
@@ -50,8 +50,8 @@ use tokio::sync::Mutex;
 const INDEX_WRAPPER_INNER_FNS: &[InnerProviderFn] =
     &[INDEXED_INNER, EMBEDDING_INNER, METADATA_ENRICHED_INNER];
 
-/// Strips `IndexedTableProvider`/`EmbeddingTable`/`MetadataEnrichedTableProvider` wrapper layers
-/// so the actual accelerator delete below bypasses `IndexedTableProvider::delete_from`'s
+/// Strips `IndexLayer`/`EmbeddingTable`/`MetadataEnrichedTableProvider` wrapper layers
+/// so the actual accelerator delete below bypasses `IndexLayer::delete_from`'s
 /// index-aware handling — retention needs the *warm-only* index scope (see
 /// [`warm_delete_target`]), which is a different policy than that generic path's full/both-scope
 /// delete.
@@ -567,23 +567,23 @@ mod tests {
     #[test]
     fn test_strip_index_wrapper_layers_unwraps_all_known_layers() {
         use data_components::MetadataEnrichedTableProvider;
-        use runtime_datafusion_index::IndexedTableProvider;
+        use spice_table::IndexLayer;
 
         let mem_table: Arc<dyn TableProvider> = Arc::new(
             MemTable::try_new(create_test_schema(), vec![]).expect("mem table should be created"),
         );
 
-        // IndexedTableProvider alone.
+        // IndexLayer alone.
         let wrapped: Arc<dyn TableProvider> =
-            Arc::new(IndexedTableProvider::new(Arc::clone(&mem_table)));
+            Arc::new(IndexLayer::new(Arc::clone(&mem_table)));
         assert!(
             strip_index_wrapper_layers(&wrapped)
                 .downcast_ref::<MemTable>()
                 .is_some(),
-            "stripping an IndexedTableProvider must yield the underlying MemTable"
+            "stripping an IndexLayer must yield the underlying MemTable"
         );
 
-        // MetadataEnrichedTableProvider nested inside an IndexedTableProvider (the shape
+        // MetadataEnrichedTableProvider nested inside an IndexLayer (the shape
         // `table_provider_with_spicepod_metadata` produces).
         let metadata_enriched: Arc<dyn TableProvider> =
             Arc::new(MetadataEnrichedTableProvider::new(
@@ -591,7 +591,7 @@ mod tests {
                 std::collections::HashMap::from([("key".to_string(), "value".to_string())]),
             ));
         let wrapped_with_metadata: Arc<dyn TableProvider> =
-            Arc::new(IndexedTableProvider::new(metadata_enriched));
+            Arc::new(IndexLayer::new(metadata_enriched));
         assert!(
             strip_index_wrapper_layers(&wrapped_with_metadata)
                 .downcast_ref::<MemTable>()

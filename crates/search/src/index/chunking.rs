@@ -31,7 +31,7 @@ use datafusion::{
 use datafusion_expr::ident;
 use futures::future::try_join_all;
 use itertools::Itertools;
-use runtime_datafusion_index::{Index, WriteWindow, build_key_match_predicate};
+use spice_table::{Index, WriteWindow, build_key_match_predicate};
 use snafu::{ResultExt, Snafu};
 use util::{arrow::repeat, convert_string_arrow_to_iterator};
 

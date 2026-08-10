@@ -26,8 +26,8 @@ use std::sync::Arc;
 
 use data_components::MetadataEnrichedTableProvider;
 use datafusion_federation::FederatedTableProviderAdaptor;
-use runtime_datafusion_index::InnerProviderFn;
-use runtime_datafusion_index::{INDEXED_INNER, IndexedTableProvider, TableProviderLayer};
+use spice_table::InnerProviderFn;
+use spice_table::{INDEXED_INNER, IndexLayer, TableProviderLayer};
 use runtime_search::embeddings::table::EmbeddingTable;
 use search::index::VectorScanTableProvider;
 
@@ -49,18 +49,18 @@ pub const VECTOR_SCAN_INNER: InnerProviderFn = |tbl| {
         .map(|v| &v.table_provider)
 };
 
-/// [`IndexedTableProvider`]: carries the search/vector indexes for a dataset.
+/// [`IndexLayer`]: carries the search/vector indexes for a dataset.
 /// Opaque to CDC detection — it is one of the layers that detection looks
 /// *for* — and write-transparent (`insert_into` is a pass-through).
 pub const INDEXED_LAYER: TableProviderLayer = TableProviderLayer {
-    name: "IndexedTableProvider",
+    name: "IndexLayer",
     read: Some(INDEXED_INNER),
     cdc_detection: None,
     source: Some(INDEXED_INNER),
     write: Some(INDEXED_INNER),
     rebuild: Some(|outer, rebuild_inner| {
-        let indexed = outer.downcast_ref::<IndexedTableProvider>()?;
-        Some(Arc::new(IndexedTableProvider::with_indexes(
+        let indexed = outer.downcast_ref::<IndexLayer>()?;
+        Some(Arc::new(IndexLayer::with_indexes(
             rebuild_inner(indexed.get_underlying()),
             indexed.get_all_indexes(),
         )))

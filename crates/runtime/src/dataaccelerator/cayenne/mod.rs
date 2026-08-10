@@ -54,7 +54,7 @@ use crate::dataaccelerator::{FilePathError, snapshots::download_snapshot_if_need
 use crate::parameters::ParameterSpec;
 use crate::spice_data_base_path;
 use runtime_acceleration::snapshot::{AccelerationEngine, AccelerationLayout};
-use runtime_datafusion_index::{Index, IndexedTableProvider};
+use spice_table::{Index, IndexLayer};
 use search::index::native_vector::NativeVectorIndex;
 use spicepod::acceleration as spicepod_acceleration;
 
@@ -2609,7 +2609,7 @@ fn validate_datalake_table_options(
 
 /// Build a [`NativeVectorIndex`] for each `FixedSizeList<Float32, N>` column in
 /// the schema. These indexes are attached to the accelerated table via
-/// [`IndexedTableProvider`] so the search engine's `get_vector_index()` can
+/// [`IndexLayer`] so the search engine's `get_vector_index()` can
 /// discover them and route `vector_search()` queries through the SIMD distance
 /// UDFs rather than the on-the-fly `embed()` fallback.
 ///
@@ -2621,7 +2621,7 @@ fn validate_datalake_table_options(
 /// additional spicepod configuration.
 ///
 /// Empty schemas and schemas without vector columns return an empty vec — the
-/// caller should skip the `IndexedTableProvider` wrap in that case.
+/// caller should skip the `IndexLayer` wrap in that case.
 fn native_vector_indexes_for_schema(
     schema: &Schema,
     table_name: &str,
@@ -2663,7 +2663,7 @@ fn native_vector_indexes_for_schema(
         .collect()
 }
 
-/// Wrap a table provider in [`IndexedTableProvider`] when the schema has at
+/// Wrap a table provider in [`IndexLayer`] when the schema has at
 /// least one vector column.
 fn wrap_with_native_vector_indexes(
     provider: Arc<dyn TableProvider>,
@@ -2675,7 +2675,7 @@ fn wrap_with_native_vector_indexes(
     if indexes.is_empty() {
         provider
     } else {
-        Arc::new(IndexedTableProvider::with_indexes(provider, indexes)) as Arc<dyn TableProvider>
+        Arc::new(IndexLayer::with_indexes(provider, indexes)) as Arc<dyn TableProvider>
     }
 }
 

@@ -52,7 +52,7 @@ use datafusion::{
 use futures::{StreamExt, TryStreamExt};
 use itertools::Itertools;
 
-use crate::{Index, SpiceTable};
+use spice_table::{Index, SpiceTable};
 
 /// [`OptimizerRule`] that looks for indexed tables and adds an [`IndexTableScanNode`].
 #[derive(Debug, Default)]
@@ -656,10 +656,8 @@ mod test {
         prelude::SessionContext,
     };
 
-    use crate::{
-        Index, IndexLayer, SpiceTable,
-        analyzer::{IndexTableScanExtensionPlanner, IndexTableScanOptimizerRule},
-    };
+    use crate::analyzer::{IndexTableScanExtensionPlanner, IndexTableScanOptimizerRule};
+    use spice_table::{Index, IndexLayer, SpiceTable};
 
     #[derive(Debug, Default)]
     pub struct TestQueryPlanner {}

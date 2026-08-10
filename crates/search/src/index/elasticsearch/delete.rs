@@ -65,9 +65,9 @@ const DELETE_CHUNK_ROWS: usize = 512;
 /// remains subject to the mapping gap above.
 ///
 /// Only reads `key_columns` from `keys`, ignoring any other column present — `keys` may be
-/// shaped by [`runtime_datafusion_index::Index::required_columns`] (a superset of the primary
+/// shaped by [`spice_table::Index::required_columns`] (a superset of the primary
 /// key) rather than the primary key alone, since that's what the default
-/// [`runtime_datafusion_index::Index::resolve_delete_keys`] resolves against.
+/// [`spice_table::Index::resolve_delete_keys`] resolves against.
 ///
 /// Issues one `_delete_by_query` request per [`DELETE_CHUNK_ROWS`]-row slice of `keys` rather
 /// than a single request for the whole batch, so a large delete can't build an unbounded
