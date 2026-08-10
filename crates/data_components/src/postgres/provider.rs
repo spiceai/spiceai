@@ -131,6 +131,28 @@ impl PostgresCatalogProvider {
 
         let mut schemas = HashMap::new();
         for schema_name in &schema_names {
+            // A schema no `include` pattern can reach cannot contribute a table,
+            // so skip its `list_foreign_keys` + `list_comments` + `list_tables`
+            // round trips. It is still registered, empty, because that is exactly
+            // what interrogating it would have produced -- pruning changes the
+            // queries issued, never the catalog's namespace.
+            if !self.selector.may_select_within(schema_name) {
+                tracing::debug!(
+                    schema = %schema_name,
+                    "Schema cannot match any include pattern, skipping its metadata queries"
+                );
+                schemas.insert(
+                    schema_name.clone(),
+                    Arc::new(PostgresSchemaProvider::new(
+                        Arc::clone(&self.pool),
+                        schema_name.clone(),
+                        Arc::clone(&self.table_creator),
+                        self.selector.clone(),
+                    )),
+                );
+                continue;
+            }
+
             let foreign_keys = match self.list_foreign_keys(schema_name).await {
                 Ok(fks) => fks,
                 Err(e) => {

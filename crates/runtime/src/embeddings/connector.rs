@@ -13,7 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use crate::accelerated_table::{self, AcceleratedTable};
+use crate::accelerated::{self, AcceleratedTable};
 use crate::changes::Indexes;
 use crate::changes::index_change_envelope;
 use crate::component::ComponentInitialization;
@@ -27,7 +27,7 @@ use crate::embeddings::execution_plan::{
     compute_additional_embedding_columns, construct_record_batch,
 };
 use crate::embeddings::index::table::wrap_table_as_index;
-use crate::federated_table::FederatedTable;
+use crate::federated::FederatedTable;
 use crate::model::ENABLE_MODEL_SUPPORT_MESSAGE;
 use crate::model::EmbeddingModelStore;
 use crate::secrets::Secrets;
@@ -288,7 +288,7 @@ impl DataConnector for EmbeddingConnector {
     async fn on_accelerator_setup(
         &self,
         dataset: &Dataset,
-        builder: &mut accelerated_table::Builder,
+        builder: &mut accelerated::Builder,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.inner_connector
             .on_accelerator_setup(dataset, builder)
@@ -699,7 +699,7 @@ pub(crate) fn duckdb_embedding_columns_from_view(
 pub(crate) async fn try_wrap_view_accelerator_with_hnsw(
     view: &View,
     table: &datafusion::sql::TableReference,
-    builder: &mut crate::accelerated_table::Builder,
+    builder: &mut crate::accelerated::Builder,
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     let Some(vector_engine) = duckdb_vector_store_for_view(view) else {
         return Ok(false);
