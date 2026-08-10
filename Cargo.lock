@@ -19389,6 +19389,7 @@ dependencies = [
  "connector-spiceai",
  "cpu-budget",
  "crash-handler",
+ "datafusion",
  "event_stream",
  "futures",
  "libc",

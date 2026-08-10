@@ -160,6 +160,15 @@ pub enum Error {
     #[snafu(display("Failed to start Spice runtime: {source}"))]
     UnableToConstructSpiceApp { source: Box<app::Error> },
 
+    #[snafu(display(
+        "Failed to read the persisted Spice Cloud deployment at {}: {source}",
+        path.display()
+    ))]
+    UnableToReadCloudManagedSpicepod {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+
     #[snafu(display("Unable to start Spice Runtime servers: {source}"))]
     UnableToStartServers { source: Box<runtime::Error> },
 
@@ -644,6 +653,21 @@ pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
         None
     };
 
+    // A reader of its own for the metrics Cloud Connect pushes to the control
+    // plane. Separate from the cluster reader above rather than shared: each
+    // reader registered with the meter provider gets its own pipeline and so
+    // sees every data point, whereas two consumers of one reader would divide
+    // them under delta temporality.
+    //
+    // Created here because readers are fixed when the meter provider is built,
+    // which happens well before Cloud Connect starts — so the decision is made
+    // from the same cheap on-disk/flag probe that gates log capture.
+    let cloud_connect_metrics = if cloud_connect::is_configured(args.cloud_connect) {
+        Some(runtime::metrics_reader::MetricsReader::new_cumulative())
+    } else {
+        None
+    };
+
     match resolved_cluster_config {
         Ok(resolved_cluster_config) => {
             // Validate that scheduler mode has state_location configured
@@ -827,8 +851,13 @@ pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
         .and_then(|c| c.otel_exporter.as_ref())
         .filter(|c| c.enabled);
 
-    let needs_metrics =
-        prometheus_registry.is_some() || otel_config.is_some() || metrics_reader.is_some();
+    // Cloud Connect counts: its reader only produces data once it is attached to
+    // the meter provider built below, and `spiced --cloud-connect` alone sets
+    // none of the other three signals.
+    let needs_metrics = prometheus_registry.is_some()
+        || otel_config.is_some()
+        || metrics_reader.is_some()
+        || cloud_connect_metrics.is_some();
 
     if needs_metrics {
         // Resolve secrets in OTEL exporter headers before initializing metrics
@@ -863,12 +892,15 @@ pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
 
         init_metrics(
             &rt.datafusion(),
-            prometheus_registry.clone(),
-            otel_config,
-            resolved_otel_headers,
-            metrics_reader,
-            resource_attributes,
-            metric_prefix,
+            MetricsInit {
+                registry: prometheus_registry.clone(),
+                otel_config,
+                resolved_otel_headers,
+                metrics_reader,
+                cloud_connect_metrics: cloud_connect_metrics.clone(),
+                resource_attributes,
+                metric_prefix,
+            },
         )
         .context(UnableToInitializeMetricsSnafu)?;
 
@@ -1057,6 +1089,7 @@ pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
         cloud_connect_flag,
         delivered_secrets,
         running_deployment,
+        cloud_connect_metrics,
     )
     .await;
 
@@ -1086,8 +1119,30 @@ pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
     result
 }
 
-/// What `build_app` decided about the deployed spicepod, logged once tracing
-/// exists.
+/// Whether a failed local spicepod load should be tolerated by starting on an
+/// empty spicepod instead of exiting.
+fn tolerates_missing_spicepod(args: &Args, error: &app::Error) -> bool {
+    tolerates_missing_spicepod_when_configured(
+        args,
+        error,
+        cloud_connect::is_configured(args.cloud_connect),
+    )
+}
+
+/// Pure policy behind [`tolerates_missing_spicepod`]. Keeping the configuration
+/// signal separate makes the implicit activation paths (an enrolled identity,
+/// pending adoption code, or adoption-code environment variable) testable
+/// without mutating process-global environment state.
+fn tolerates_missing_spicepod_when_configured(
+    args: &Args,
+    error: &app::Error,
+    cloud_connect_configured: bool,
+) -> bool {
+    cloud_connect_configured && args.spicepod.is_none() && error.is_spicepod_missing()
+}
+
+/// What `build_app` decided about which spicepod this start serves, logged once
+/// tracing exists.
 enum DeploymentNote {
     /// The runtime started on the deployed spicepod.
     Loaded { path: PathBuf },
@@ -1105,6 +1160,9 @@ enum DeploymentNote {
     /// The watcher is not installed: reconciling the local spicepod into a
     /// deployed app would swap the deployed configuration out from under it.
     PodsWatcherDeclined,
+    /// A cloud-managed instance found no spicepod — neither deployed nor local —
+    /// and started on an empty one.
+    NoSpicepod,
 }
 
 impl DeploymentNote {
@@ -1129,6 +1187,9 @@ impl DeploymentNote {
             Self::PodsWatcherDeclined => tracing::warn!(
                 "Spice Cloud Connect: --pods-watcher-enabled was ignored because this instance serves a deployed spicepod. Watching the local spicepod.yaml would replace the deployed configuration while the instance kept reporting the deployment as applied. Edit the app in Spice Cloud and deploy it instead."
             ),
+            Self::NoSpicepod => {
+                tracing::warn!("No existing spicepod was found. Starting Runtime without one.");
+            }
         }
     }
 }
@@ -1188,7 +1249,14 @@ pub async fn build_app(args: &Args) -> Result<AppBundle> {
     // that file and restarting, so reading anything else here would drop every
     // deployment on the floor at the moment it was meant to take effect.
     let mut deployment_note = None;
-    if let Some(deployed) = cloud_connect::cloud_managed_spicepod(args.cloud_connect).await {
+    let cloud_managed_spicepod = cloud_connect::cloud_managed_spicepod(args.cloud_connect)
+        .await
+        .map_err(
+            |cloud_connect::CloudManagedSpicepodReadError { path, source }| {
+                Error::UnableToReadCloudManagedSpicepod { path, source }
+            },
+        )?;
+    if let Some(deployed) = cloud_managed_spicepod {
         match AppBuilder::build_from_path(deployed.path.clone()).await {
             Ok(mut app) => {
                 app.runtime = apply_overrides(app.runtime, &args.set_runtime)?;
@@ -1249,6 +1317,17 @@ pub async fn build_app(args: &Args) -> Result<AppBundle> {
                     local_error: e.to_string(),
                 });
                 None
+            } else if tolerates_missing_spicepod(args, &e) {
+                // A cloud-managed instance that has connected but not yet
+                // received a deployment has no spicepod anywhere: none was
+                // deployed, and `spice connect` writes nothing to the instance
+                // directory. Come up on an empty spicepod so the control plane
+                // can reach it and deploy one, rather than exiting with the
+                // "run spice init" guidance that does not apply here.
+                deployment_note = Some(DeploymentNote::NoSpicepod);
+                let mut app = App::default();
+                app.runtime = apply_overrides(app.runtime, &args.set_runtime)?;
+                Some(Arc::new(app))
             } else {
                 // In normal mode, fail immediately if spicepod cannot be loaded
                 return Err(Error::UnableToConstructSpiceApp {
@@ -1289,15 +1368,36 @@ pub async fn build_app(args: &Args) -> Result<AppBundle> {
 /// Caller is expected to short-circuit (not invoke this fn) when none of the
 /// three sources is configured — otherwise an empty `MeterProvider` would be
 /// installed.
+struct MetricsInit<'a> {
+    /// Prometheus scrape registry, when `/metrics` is served.
+    registry: Option<prometheus::Registry>,
+    /// OTEL push exporter, with the headers already resolved from secrets.
+    otel_config: Option<&'a app::spicepod::component::runtime::OtelExporterConfig>,
+    resolved_otel_headers: std::collections::HashMap<String, String>,
+    /// On-demand reader for cluster metrics collection.
+    metrics_reader: Option<runtime::metrics_reader::MetricsReader>,
+    /// On-demand reader for the metrics pushed over Cloud Connect.
+    cloud_connect_metrics: Option<runtime::metrics_reader::MetricsReader>,
+    /// `runtime.telemetry.properties`, as dimensions on every exported metric.
+    resource_attributes: Vec<KeyValue>,
+    /// `runtime.telemetry.metric_prefix`, applied as an SDK-level view.
+    metric_prefix: Option<String>,
+}
+
 fn init_metrics(
     df: &Arc<DataFusion>,
-    registry: Option<prometheus::Registry>,
-    otel_config: Option<&app::spicepod::component::runtime::OtelExporterConfig>,
-    resolved_otel_headers: std::collections::HashMap<String, String>,
-    metrics_reader: Option<runtime::metrics_reader::MetricsReader>,
-    resource_attributes: Vec<KeyValue>,
-    metric_prefix: Option<String>,
+    init: MetricsInit<'_>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let MetricsInit {
+        registry,
+        otel_config,
+        resolved_otel_headers,
+        metrics_reader,
+        cloud_connect_metrics,
+        resource_attributes,
+        metric_prefix,
+    } = init;
+
     // Apply user-configured `runtime.telemetry.properties` as OpenTelemetry
     // resource attributes so they appear as dimensions/tags on every metric
     // exported by any of the readers attached below (Prometheus scrape,
@@ -1372,6 +1472,13 @@ fn init_metrics(
     if let Some(reader) = metrics_reader {
         provider_builder = provider_builder.with_reader(reader);
         tracing::debug!("Cluster metrics reader enabled for on-demand OTLP collection");
+    }
+
+    // Case 2b: Cloud Connect push. Its own reader, so the cumulative totals it
+    // reports are unaffected by any other consumer collecting.
+    if let Some(reader) = cloud_connect_metrics {
+        provider_builder = provider_builder.with_reader(reader);
+        tracing::debug!("Cloud Connect metrics reader enabled for pushed OTLP export");
     }
 
     // Case 3: OTEL push exporter
@@ -1641,6 +1748,78 @@ mod tests {
         assert!(!should_warn_telemetry_disabled_setting_ignored(
             None, &config
         ));
+    }
+
+    /// The load failure a directory with no `spicepod.yaml` produces — what a
+    /// freshly connected instance hits on startup.
+    async fn missing_spicepod_error(dir: &std::path::Path) -> app::Error {
+        AppBuilder::build_from_path(dir)
+            .await
+            .expect_err("a directory with no spicepod.yaml must fail to load")
+    }
+
+    #[tokio::test]
+    async fn cloud_connect_starts_on_an_empty_spicepod_when_none_exists() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let error = missing_spicepod_error(dir.path()).await;
+
+        let args = Args::parse_from(["spiced", "--cloud-connect"]);
+        assert!(tolerates_missing_spicepod(&args, &error));
+    }
+
+    #[tokio::test]
+    async fn an_enrolled_instance_starts_without_the_explicit_flag_or_a_spicepod() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let error = missing_spicepod_error(dir.path()).await;
+
+        let args = Args::parse_from(["spiced"]);
+        assert!(tolerates_missing_spicepod_when_configured(
+            &args, &error, true
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_missing_spicepod_stays_fatal_without_cloud_connect() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let error = missing_spicepod_error(dir.path()).await;
+
+        let args = Args::parse_from(["spiced"]);
+        assert!(!tolerates_missing_spicepod(&args, &error));
+    }
+
+    #[tokio::test]
+    async fn an_explicitly_named_spicepod_stays_fatal_when_absent() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("spicepod.yaml");
+        let error = AppBuilder::build_from_path(&path)
+            .await
+            .expect_err("a spicepod.yaml that does not exist must fail to load");
+
+        let args = Args::parse_from([
+            std::ffi::OsStr::new("spiced"),
+            std::ffi::OsStr::new("--cloud-connect"),
+            path.as_os_str(),
+        ]);
+        assert_eq!(args.spicepod.as_deref(), Some(path.as_path()));
+        assert!(!tolerates_missing_spicepod(&args, &error));
+    }
+
+    /// A spicepod that exists but does not parse must not be swallowed as
+    /// "no spicepod" — the runtime would silently serve nothing.
+    #[tokio::test]
+    async fn a_malformed_spicepod_stays_fatal_under_cloud_connect() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::write(
+            dir.path().join("spicepod.yaml"),
+            "version: v1\nkind: Spicepod\nname: broken\ndatasets: 'not a list'\n",
+        )
+        .expect("write spicepod.yaml");
+        let error = AppBuilder::build_from_path(dir.path())
+            .await
+            .expect_err("a malformed spicepod.yaml must fail to load");
+
+        let args = Args::parse_from(["spiced", "--cloud-connect"]);
+        assert!(!tolerates_missing_spicepod(&args, &error));
     }
 
     #[test]
