@@ -60,6 +60,20 @@ fn membership_check_timeout(ttl_ms: u64) -> Duration {
     let interval = Duration::from_millis(ttl_ms.saturating_div(HEARTBEAT_DIVISOR).max(1));
     (interval / 2).min(MEMBERSHIP_CHECK_TIMEOUT_CAP)
 }
+
+/// Deadline for one whole heartbeat tick.
+///
+/// Individual reads have their own deadlines, but a tick can perform several of
+/// them — a membership read, then per retry a beat read, an ownership
+/// re-confirmation, and a post-conflict re-read — and bounding each one says
+/// nothing about their sum. Against a uniformly slow store those deadlines stack
+/// into far more than one interval, which delays every other duty on the same
+/// task and, for a short TTL, can exceed the TTL itself while the scheduler is
+/// healthy. Capping the tick at one interval means a slow tick can postpone the
+/// next beat by at most one slot, and the staleness tolerance absorbs that.
+fn heartbeat_tick_budget(ttl_ms: u64) -> Duration {
+    Duration::from_millis(ttl_ms.saturating_div(HEARTBEAT_DIVISOR).max(1))
+}
 const DISCOVERY_INTERVAL: Duration = Duration::from_secs(5);
 const JOB_RECOVERY_INTERVAL: Duration = Duration::from_secs(10);
 const HEARTBEAT_DIVISOR: u64 = 3;
@@ -405,6 +419,22 @@ impl SchedulerRegistryRunner {
             return Ok(());
         }
 
+        let budget = heartbeat_tick_budget(self.entry.ttl_ms);
+        match tokio::time::timeout(budget, self.heartbeat_tick()).await {
+            Ok(result) => result,
+            Err(_elapsed) => {
+                tracing::warn!(
+                    scheduler_id = %self.scheduler_id,
+                    budget_ms = budget.as_millis(),
+                    "Heartbeat tick exceeded its budget; skipping this beat"
+                );
+                Ok(())
+            }
+        }
+    }
+
+    /// One heartbeat tick, run under the deadline imposed by `send_heartbeat`.
+    async fn heartbeat_tick(&self) -> Result<()> {
         match self.read_membership().await {
             Some(false) => {
                 // A successful read proved someone else owns the id. Retire.
@@ -1073,6 +1103,127 @@ mod tests {
         );
     }
 
+    /// Store whose heartbeat writes never complete. Reads carry their own
+    /// deadlines but writes do not, so this is what an unbounded tick stalls on
+    /// indefinitely.
+    #[derive(Debug)]
+    struct HangingBeatWrites {
+        inner: Arc<dyn ObjectStore>,
+        /// Set after registration, so only the tick's own write hangs.
+        armed: std::sync::atomic::AtomicBool,
+    }
+
+    impl std::fmt::Display for HangingBeatWrites {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "HangingBeatWrites")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for HangingBeatWrites {
+        async fn get_opts(
+            &self,
+            location: &object_store::path::Path,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+        async fn put_opts(
+            &self,
+            location: &object_store::path::Path,
+            payload: object_store::PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            if location.as_ref().contains("heartbeats/")
+                && self.armed.load(std::sync::atomic::Ordering::Relaxed)
+            {
+                return std::future::pending().await;
+            }
+            self.inner.put_opts(location, payload, opts).await
+        }
+        async fn put_multipart_opts(
+            &self,
+            location: &object_store::path::Path,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+        fn list(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<
+                'static,
+                object_store::Result<object_store::path::Path>,
+            >,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>
+        {
+            self.inner.delete_stream(locations)
+        }
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+        async fn copy_opts(
+            &self,
+            from: &object_store::path::Path,
+            to: &object_store::path::Path,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    /// Individual reads carry deadlines; the write does not. Bounding the parts
+    /// therefore says nothing about the whole, so the tick itself is bounded —
+    /// otherwise a store that accepts a write and never answers stalls the task
+    /// that also drives discovery, recovery and the reaper.
+    #[tokio::test]
+    async fn a_hanging_write_cannot_stall_a_tick_past_its_budget() {
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let wrapper = Arc::new(HangingBeatWrites {
+            inner: Arc::clone(&inner),
+            armed: std::sync::atomic::AtomicBool::new(false),
+        });
+        let store: Arc<dyn ObjectStore> = Arc::clone(&wrapper) as Arc<dyn ObjectStore>;
+        let cluster = Arc::new(ClusterStateStore::new(Arc::clone(&inner), ""));
+        let heartbeats = Arc::new(SchedulerHeartbeatStore::new(Arc::clone(&store), ""));
+        cluster.bootstrap().await.expect("bootstrap");
+
+        let instance_id = Uuid::new_v4();
+        let mut runner = runner_over(&cluster, &heartbeats, &inner, instance_id);
+        // A short TTL keeps the test quick and is the case where an unbounded tick
+        // is most damaging: it can outlast the TTL while the scheduler is healthy.
+        runner.entry.ttl_ms = 300;
+        runner.register_self().await.expect("register");
+        // Only the tick's own write hangs; registration completed normally.
+        wrapper
+            .armed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let budget = heartbeat_tick_budget(runner.entry.ttl_ms);
+        let started = tokio::time::Instant::now();
+        runner
+            .send_heartbeat()
+            .await
+            .expect("a hanging write must not fail the loop");
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < budget * 4,
+            "a tick must stay near its {}ms budget, took {}ms",
+            budget.as_millis(),
+            elapsed.as_millis()
+        );
+    }
+
     /// Store whose heartbeat *reads* fail on demand while writes keep working —
     /// the asymmetric outage that decides between clobbering a successor and
     /// letting a healthy scheduler's TTL lapse.
@@ -1462,8 +1613,8 @@ mod tests {
         let foreign = Uuid::new_v4();
         let runner = runner_over(&cluster, &heartbeats, &inner, instance_id);
         runner.register_self().await.expect("register");
-        // Someone else's beat is present, and this incarnation has never written
-        // through the conditional path, so it holds no version.
+        // Someone else's beat replaces the one registration wrote, so the version
+        // this incarnation retained is now stale.
         heartbeats
             .heartbeat("test:50051", foreign, 40_000, 30_000)
             .await

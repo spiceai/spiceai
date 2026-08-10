@@ -296,6 +296,15 @@ impl SchedulerHeartbeatStore {
         // supersession, which the caller reconciles against membership — so a
         // brief write-error burst cannot consume consecutive ticks and let a
         // healthy scheduler's TTL lapse.
+        // Retries back off, and the whole sequence is capped well inside one
+        // heartbeat interval (a third of the TTL): retrying a fast-failing store
+        // with no delay would burn every attempt within a few milliseconds and
+        // give this path none of the burst tolerance the unconditional write has.
+        let retry_budget = Duration::from_millis(ttl_ms / 9);
+        let mut backoff = FibonacciBackoffBuilder::new()
+            .max_retries(Some(MAX_HEARTBEAT_ATTEMPTS))
+            .max_duration(Some(retry_budget))
+            .build();
         let mut attempt = 0usize;
         loop {
             attempt += 1;
@@ -322,12 +331,22 @@ impl SchedulerHeartbeatStore {
                         source,
                     });
                 }
-                Err(source) => tracing::warn!(
-                    path = %path,
-                    attempt,
-                    error = %source,
-                    "Conditional heartbeat write failed; retrying with the same predicate"
-                ),
+                Err(source) => {
+                    let Some(delay) = backoff.next_duration() else {
+                        return Err(Error::Write {
+                            path: path.to_string(),
+                            source,
+                        });
+                    };
+                    tracing::warn!(
+                        path = %path,
+                        attempt,
+                        error = %source,
+                        retry_in_ms = delay.as_millis(),
+                        "Conditional heartbeat write failed; retrying with the same predicate"
+                    );
+                    tokio::time::sleep(delay).await;
+                }
             }
         }
     }
