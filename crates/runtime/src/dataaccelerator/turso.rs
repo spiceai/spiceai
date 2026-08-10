@@ -627,8 +627,7 @@ impl DataAccelerator for TursoAccelerator {
             }
 
             // If mode is FileCreate, snapshot the existing file (if enabled) then delete it to start fresh
-            let file_recreated = acceleration.mode == Mode::FileCreate;
-            if file_recreated {
+            if acceleration.mode == Mode::FileCreate {
                 let file_path = std::path::Path::new(&path);
                 if file_path.exists() {
                     snapshot_before_recreate(
@@ -658,6 +657,16 @@ impl DataAccelerator for TursoAccelerator {
                 remove_database_sidecars(&path).await;
             }
 
+            // `pools` is keyed by file path and a cached pool keeps serving the
+            // file it opened, so a pool cached for a path with nothing on it is
+            // holding a file that was replaced there. Evict it before anything
+            // opens what lands at `path` next — the snapshot restore below
+            // resolves this dataset's checkpoint through this same pool, as does
+            // the table the reload re-registers.
+            if !std::path::Path::new(&path).exists() {
+                self.pools.lock().await.remove(&path);
+            }
+
             let bootstrap_status = download_snapshot_if_needed(
                 acceleration,
                 source,
@@ -667,14 +676,6 @@ impl DataAccelerator for TursoAccelerator {
                 None,
             )
             .await;
-
-            // `pools` is keyed by file path and a cached pool keeps serving the
-            // file it opened, so evict it once the file at `path` has been
-            // replaced: the pool below must bind the file now there, not the one
-            // this dataset's `spice_sys` metadata was last read from.
-            if file_recreated || bootstrap_status.is_bootstrapped() {
-                self.pools.lock().await.remove(&path);
-            }
 
             // Initialize the database file using the shared pool
             let pool = self.get_shared_pool(source).await?;
