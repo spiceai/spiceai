@@ -290,64 +290,28 @@ impl SchedulerHeartbeatStore {
             None => PutMode::Create,
         };
 
-        // Transient write failures are retried with the *same* predicate, as the
-        // unconditional path does. If a retried attempt turns out to have
-        // already landed, the next one fails its precondition and surfaces as
-        // supersession, which the caller reconciles against membership — so a
-        // brief write-error burst cannot consume consecutive ticks and let a
-        // healthy scheduler's TTL lapse.
-        // Retries back off, and the whole sequence is capped well inside one
-        // heartbeat interval (a third of the TTL): retrying a fast-failing store
-        // with no delay would burn every attempt within a few milliseconds and
-        // give this path none of the burst tolerance the unconditional write has.
-        let retry_budget = Duration::from_millis(ttl_ms / 9);
-        let mut backoff = FibonacciBackoffBuilder::new()
-            .max_retries(Some(MAX_HEARTBEAT_ATTEMPTS))
-            .max_duration(Some(retry_budget))
-            .build();
-        let mut attempt = 0usize;
-        loop {
-            attempt += 1;
-            match self
-                .store
-                .put_opts(
-                    &path,
-                    payload.clone().into(),
-                    PutOptions::from(mode.clone()),
-                )
-                .await
-            {
-                Ok(result) => return Ok(Self::usable_version_of(result.e_tag, result.version)),
-                Err(
-                    ObjectStoreError::Precondition { .. } | ObjectStoreError::AlreadyExists { .. },
-                ) => {
-                    return Err(Error::HeartbeatSupersededDuringWrite {
-                        scheduler_id: scheduler_id.to_string(),
-                    });
-                }
-                Err(source) if attempt >= MAX_HEARTBEAT_ATTEMPTS => {
-                    return Err(Error::Write {
-                        path: path.to_string(),
-                        source,
-                    });
-                }
-                Err(source) => {
-                    let Some(delay) = backoff.next_duration() else {
-                        return Err(Error::Write {
-                            path: path.to_string(),
-                            source,
-                        });
-                    };
-                    tracing::warn!(
-                        path = %path,
-                        attempt,
-                        error = %source,
-                        retry_in_ms = delay.as_millis(),
-                        "Conditional heartbeat write failed; retrying with the same predicate"
-                    );
-                    tokio::time::sleep(delay).await;
-                }
+        // Deliberately a single attempt. Retrying a *conditional* write after an
+        // ambiguous failure is what makes a lost acknowledgement dangerous: the
+        // retry's precondition fails against a write that may have been our own,
+        // which cannot be distinguished from a successor's. The caller treats an
+        // unknown outcome as "the retained version can no longer be trusted"
+        // instead, and the store's own retry policy still covers transport
+        // errors.
+        match self
+            .store
+            .put_opts(&path, payload.into(), PutOptions::from(mode))
+            .await
+        {
+            Ok(result) => Ok(Self::usable_version_of(result.e_tag, result.version)),
+            Err(ObjectStoreError::Precondition { .. } | ObjectStoreError::AlreadyExists { .. }) => {
+                Err(Error::HeartbeatSupersededDuringWrite {
+                    scheduler_id: scheduler_id.to_string(),
+                })
             }
+            Err(source) => Err(Error::Write {
+                path: path.to_string(),
+                source,
+            }),
         }
     }
 
