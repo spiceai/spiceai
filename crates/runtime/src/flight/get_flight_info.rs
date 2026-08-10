@@ -55,7 +55,7 @@ fn trace(info: FlightInfo, trace_id: &str) -> FlightInfo {
             .endpoint
             .into_iter()
             .map(|endpoint| FlightEndpoint {
-                ticket: endpoint.ticket.map(|t| traced_ticket::wrap(t, trace_id)),
+                ticket: endpoint.ticket.map(|t| traced_ticket::wrap(&t, trace_id)),
                 ..endpoint
             })
             .collect(),

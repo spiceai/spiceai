@@ -54,7 +54,7 @@ const TRACED_TICKET_TYPE_URL: &str = "type.googleapis.com/spiceai.flight.TracedT
 /// one fixed-length field and the remainder is opaque, so the split needs no
 /// schema, and the inner ticket is passed through byte-for-byte.
 #[must_use]
-pub(crate) fn wrap(ticket: Ticket, trace_id: &str) -> Ticket {
+pub(crate) fn wrap(ticket: &Ticket, trace_id: &str) -> Ticket {
     debug_assert_eq!(trace_id.len(), TRACE_ID_HEX_LEN, "trace ids are normalized");
 
     let mut value = BytesMut::with_capacity(TRACE_ID_HEX_LEN + ticket.ticket.len());
@@ -125,7 +125,7 @@ mod tests {
     fn round_trips_the_id_and_the_ticket_underneath() {
         let inner = ticket(b"SELECT 1");
         let (trace_id, unwrapped) =
-            unwrap(&wrap(inner.clone(), TRACE_ID)).expect("a wrapped ticket unwraps");
+            unwrap(&wrap(&inner, TRACE_ID)).expect("a wrapped ticket unwraps");
 
         assert_eq!(&*trace_id, TRACE_ID);
         assert_eq!(unwrapped, inner, "the inner ticket must survive byte-exact");
@@ -154,7 +154,7 @@ mod tests {
     #[test]
     fn handles_an_empty_inner_ticket() {
         let (trace_id, unwrapped) = unwrap(&wrap(
-            Ticket {
+            &Ticket {
                 ticket: Bytes::new(),
             },
             TRACE_ID,
