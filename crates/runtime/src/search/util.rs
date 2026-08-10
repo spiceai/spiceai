@@ -68,111 +68,108 @@ impl TableProviderExplorer for RuntimeTableProviderExplorer {
 mod tests {
     use super::*;
     use crate::dataconnector::iceberg_cluster::IcebergClusterTableProvider;
-    use crate::table_layers::ICEBERG_CLUSTER_LAYER;
     use arrow_schema::{DataType, Field, Schema};
     use data_components::arrow::write::MemTable;
-    use spice_table::find_concrete_table_provider_in;
+    use datafusion::sql::TableReference;
     use runtime_search::embeddings::table::EmbeddingTable;
     use search::generation::text_search::index::FullTextDatabaseIndex;
+    use spice_table::{IndexLayer, SpiceTable};
     use std::sync::Arc;
 
-    #[tokio::test]
-    async fn test_find_concrete_table_provider_direct_match() {
-        let base: Arc<dyn TableProvider> = Arc::new(
-            MemTable::try_new(Arc::new(Schema::empty()), vec![]).expect("failed to make table"),
-        );
-
-        assert!(find_concrete_table_provider::<EmbeddingTable>(&base).is_none());
-    }
-
-    #[test]
-    fn test_find_concrete_table_provider_wrapped_in_full_text() {
-        let base_table: Arc<dyn TableProvider> = Arc::new(
+    fn base_table() -> Arc<dyn TableProvider> {
+        Arc::new(
             MemTable::try_new(
                 Arc::new(Schema::new(vec![Field::new(
                     "search_field",
                     DataType::Utf8,
                     false,
                 )])),
-                vec![],
+                vec![vec![]],
             )
             .expect("failed to make table"),
-        );
+        )
+    }
 
-        let index = Arc::new(
+    fn full_text_index(base: &Arc<dyn TableProvider>) -> Arc<dyn Index + Send + Sync> {
+        Arc::new(
             FullTextDatabaseIndex::try_new(
-                Arc::clone(&base_table),
+                Arc::clone(base),
                 vec!["search_field".to_string()],
                 Some(vec!["search_field".to_string()]),
                 None,
                 &[],
             )
             .expect("cannot make full text table"),
-        );
+        )
+    }
 
-        let wrapped_table = Arc::new(IndexLayer::new(base_table).add_index(index))
-            as Arc<dyn TableProvider>;
+    /// An index layer over `base`, as full-text registration builds it.
+    fn indexed(base: &Arc<dyn TableProvider>) -> Arc<dyn TableProvider> {
+        let index = full_text_index(base);
+        SpiceTable::over(
+            Arc::new(IndexLayer::with_indexes(vec![index])),
+            Arc::clone(base),
+        ) as Arc<dyn TableProvider>
+    }
 
-        assert!(find_concrete_table_provider::<IndexLayer>(&wrapped_table).is_some());
+    #[test]
+    fn a_bare_provider_carries_no_layers() {
+        let base = base_table();
+        assert!(find_concrete_table_provider::<EmbeddingTable>(&base).is_none());
+        assert!(spice_table::find_layer::<IndexLayer>(&base, LayerWalk::Index).is_none());
+    }
 
-        assert!(find_concrete_table_provider::<EmbeddingTable>(&wrapped_table).is_none());
+    #[test]
+    fn an_index_layer_is_discoverable_and_does_not_invent_others() {
+        let wrapped = indexed(&base_table());
+
+        assert!(spice_table::find_layer::<IndexLayer>(&wrapped, LayerWalk::Index).is_some());
+        assert!(find_concrete_table_provider::<EmbeddingTable>(&wrapped).is_none());
     }
 
     /// A provider with no accelerator behind it has no load to wait on, so it
     /// must never be reported as not-ready — otherwise search would reject
     /// federated-only datasets outright (#10956).
     #[test]
-    fn test_not_ready_error_is_none_without_an_accelerated_table() {
-        let base: Arc<dyn TableProvider> = Arc::new(
-            MemTable::try_new(Arc::new(Schema::empty()), vec![]).expect("failed to make table"),
-        );
-
+    fn not_ready_error_is_none_without_an_accelerated_table() {
+        let base = base_table();
         assert!(
-            RuntimeTableProviderExplorer
-                .not_ready_error(&base)
-                .is_none(),
+            RuntimeTableProviderExplorer.not_ready_error(&base).is_none(),
             "a non-accelerated provider must be scannable"
         );
 
-        let wrapped: Arc<dyn TableProvider> = Arc::new(IndexLayer::new(base));
+        let wrapped = indexed(&base);
         assert!(
             RuntimeTableProviderExplorer
                 .not_ready_error(&wrapped)
                 .is_none(),
-            "a wrapped non-accelerated provider must be scannable"
+            "a layered non-accelerated provider must be scannable"
         );
     }
 
     #[test]
-    fn test_find_concrete_table_provider_peels_iceberg_cluster_wrapper() {
-        use datafusion::sql::TableReference;
-
-        let base: Arc<dyn TableProvider> = Arc::new(
-            MemTable::try_new(Arc::new(Schema::empty()), vec![]).expect("failed to make table"),
-        );
-
+    fn read_discovery_sees_through_the_iceberg_cluster_layer() {
+        let base = base_table();
         let wrapped: Arc<dyn TableProvider> = Arc::new(IcebergClusterTableProvider::new(
             TableReference::bare("trips"),
             Arc::clone(&base),
-        ));
+        ))
+        .into_table();
 
         assert!(
             find_concrete_table_provider::<MemTable>(&wrapped).is_some(),
-            "find_concrete_table_provider must peel IcebergClusterTableProvider"
+            "read discovery must see through the Iceberg cluster layer"
         );
     }
 
-    /// A vector-enabled dataset nests its source under a
-    /// `VectorScanTableProvider`; read-path discovery (health checks, CDC
-    /// ingest lookup) must see the source through it.
+    /// A vector-enabled dataset nests its source under a vector-scan layer;
+    /// read-path discovery (health checks, CDC ingest lookup) must see the
+    /// source through it.
     #[test]
-    fn test_find_concrete_table_provider_peels_vector_scan_wrapper() {
+    fn read_discovery_sees_through_the_vector_scan_layer() {
         use search::index::VectorScanTableProvider;
 
-        let base: Arc<dyn TableProvider> = Arc::new(
-            MemTable::try_new(Arc::new(Schema::empty()), vec![]).expect("failed to make table"),
-        );
-
+        let base = base_table();
         let plan = datafusion::logical_expr::LogicalPlanBuilder::empty(false)
             .build()
             .expect("empty logical plan should build");
@@ -180,64 +177,60 @@ mod tests {
             table_provider: Arc::clone(&base),
             vector_index_list: Arc::new(plan),
             primary_key: vec![],
-        });
+        })
+        .into_table();
 
         assert!(
             find_concrete_table_provider::<MemTable>(&wrapped).is_some(),
-            "find_concrete_table_provider must peel VectorScanTableProvider"
+            "read discovery must see through the vector-scan layer"
         );
     }
 
+    /// The gap that forced the `install()` seam: an index nested under a wrapper
+    /// only `runtime` can name. `runtime-table` drives index discovery but
+    /// cannot name `IcebergClusterTableProvider`, so it used to be handed a
+    /// table of layer accessors at startup — and a missing entry meant discovery
+    /// stopped here and silently reported no indexes.
+    ///
+    /// Nothing is handed down now: the cluster layer answers for itself, so the
+    /// index below it is found. This is the regression test for that whole class
+    /// of silent short traversal.
     #[test]
-    fn test_find_concrete_table_provider_in_respects_restricted_layer_set() {
-        let base_table: Arc<dyn TableProvider> = Arc::new(
-            MemTable::try_new(
-                Arc::new(Schema::new(vec![Field::new(
-                    "search_field",
-                    DataType::Utf8,
-                    false,
-                )])),
-                vec![],
-            )
-            .expect("failed to make table"),
-        );
+    fn an_index_below_a_runtime_owned_wrapper_is_still_discovered() {
+        let base = base_table();
+        let outer: Arc<dyn TableProvider> = Arc::new(IcebergClusterTableProvider::new(
+            TableReference::bare("trips"),
+            indexed(&base),
+        ))
+        .into_table();
 
-        let index = Arc::new(
-            FullTextDatabaseIndex::try_new(
-                Arc::clone(&base_table),
-                vec!["search_field".to_string()],
-                Some(vec!["search_field".to_string()]),
-                None,
-                &[],
-            )
-            .expect("cannot make full text table"),
-        );
-
-        let wrapped = Arc::new(IndexLayer::new(base_table).add_index(index))
-            as Arc<dyn TableProvider>;
-
-        // The default set peels the IndexLayer down to the MemTable.
+        let (found, bound) = find_index_in_table_provider::<FullTextDatabaseIndex>(&outer)
+            .expect("an index below a runtime-owned wrapper must be discovered");
+        assert_eq!(found.len(), 1);
         assert!(
-            find_concrete_table_provider::<MemTable>(&wrapped).is_some(),
-            "default layer table must peel IndexLayer"
+            bound.downcast_ref::<MemTable>().is_some(),
+            "the index must be bound to the table beneath its own layer"
         );
+    }
 
-        // A restricted set that lacks the indexed-table layer must not peel it.
+    /// CDC detection looks *for* an index layer, so it must not see past one.
+    /// Were it transparent, a dataset whose indexes a change stream is supposed
+    /// to maintain would be treated as having none.
+    #[test]
+    fn cdc_detection_stops_at_an_index_layer_that_reads_see_through() {
+        let base = base_table();
+        let wrapped = indexed(&base);
+
         assert!(
-            find_concrete_table_provider_in::<MemTable>(
-                &wrapped,
-                &[ICEBERG_CLUSTER_LAYER],
-                LayerWalk::Read
-            )
-            .is_none(),
-            "restricted layer sets must not peel layers outside the provided set"
+            Arc::ptr_eq(spice_table::peel_to(&wrapped, LayerWalk::Read), &base),
+            "a read walk must see past an index layer"
         );
-
-        // The layer itself is still reachable directly under a restricted set.
         assert!(
-            find_concrete_table_provider_in::<IndexLayer>(&wrapped, &[], LayerWalk::Read)
-                .is_some(),
-            "an empty layer set must still match the outermost provider"
+            Arc::ptr_eq(
+                spice_table::peel_to(&wrapped, LayerWalk::CdcDetection),
+                &wrapped
+            ),
+            "CDC detection must stop at the index layer it is looking for"
         );
     }
 }

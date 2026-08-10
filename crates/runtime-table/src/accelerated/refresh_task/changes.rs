@@ -2623,7 +2623,7 @@ impl RefreshTask {
     /// semantics) and emits the fallback warning below.
     #[cfg(not(windows))]
     fn cayenne_accelerator(&self) -> Option<&CayenneTableProvider> {
-        find_concrete::<CayenneTableProvider>(self.accelerator.as_ref(), LayerWalk::Write)
+        find_concrete::<CayenneTableProvider>(&self.accelerator, LayerWalk::Write)
     }
 
     /// Effective per-plan delete-key cap for this dataset: the process-global
@@ -3096,14 +3096,6 @@ async fn delete_matching_rows_from_arrow_provider(
         return Box::pin(delete_matching_rows_from_arrow_provider(table.below(), rows)).await;
     }
 
-    if let Some(embedding_table) = provider.downcast_ref::<EmbeddingTable>() {
-        return Box::pin(delete_matching_rows_from_arrow_provider(
-            embedding_table.get_underlying_ref(),
-            rows,
-        ))
-        .await;
-    }
-
     if let Some(table) = provider.downcast_ref::<MemTable>() {
         return table
             .delete_matching_rows(rows)
@@ -3150,13 +3142,6 @@ async fn perform_change_write_maintenance(
     // actually performs maintenance.
     if let Some(table) = provider.downcast_ref::<SpiceTable>() {
         return Box::pin(perform_change_write_maintenance(table.below())).await;
-    }
-
-    if let Some(embedding_table) = provider.downcast_ref::<EmbeddingTable>() {
-        return Box::pin(perform_change_write_maintenance(
-            embedding_table.get_underlying_ref(),
-        ))
-        .await;
     }
 
     if let Some(partitioned) = provider.downcast_ref::<PartitionTableProvider>() {

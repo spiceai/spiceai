@@ -2639,7 +2639,7 @@ fn accelerator_df(
 }
 
 pub fn accelerator_table_provider(accelerator: &Arc<dyn TableProvider>) -> Arc<dyn TableProvider> {
-    match accelerator.downcast_ref::<PolyTableProvider>() {
+    match spice_table::find_layer::<PolyTableProvider>(accelerator, spice_table::LayerWalk::Write) {
         Some(poly) => match poly
             .get_federated_table_provider()
             .downcast_ref::<FederatedTableProviderAdaptor>()
@@ -2655,7 +2655,9 @@ pub fn accelerator_table_provider(accelerator: &Arc<dyn TableProvider>) -> Arc<d
             | Some(FederatedTableProviderAdaptor {
                 source: _,
                 table_provider: None,
-            }) => Arc::new(EnsureSchema::new(Arc::new(poly.clone()))),
+            }) => Arc::new(EnsureSchema::new(
+                Arc::new(poly.clone()).into_table() as Arc<dyn TableProvider>
+            )),
         },
         None => Arc::new(EnsureSchema::new(Arc::clone(accelerator))),
     }

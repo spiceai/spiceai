@@ -30,6 +30,7 @@ limitations under the License.
 //! In a single-node session the wrapper is a transparent pass-through: it returns
 //! the inner scan unchanged, so non-distributed plans are unaffected.
 
+use spice_table::{LayerWalk, SpiceTable, TableLayer};
 use std::borrow::Cow;
 use std::sync::Arc;
 
@@ -63,6 +64,13 @@ impl std::fmt::Debug for IcebergClusterTableProvider {
 }
 
 impl IcebergClusterTableProvider {
+    /// Presents this layer over the table it wraps.
+    #[must_use]
+    pub fn into_table(self: Arc<Self>) -> Arc<SpiceTable> {
+        let below = Arc::clone(&self.inner);
+        SpiceTable::over(self, below)
+    }
+
     /// Wraps `inner` with the reference used to resolve it for distributed
     /// execution.
     #[must_use]
@@ -84,44 +92,34 @@ impl IcebergClusterTableProvider {
 // bypassing this wrapper's distributed-scan handling.
 #[deny(clippy::missing_trait_methods)]
 #[async_trait]
-impl TableProvider for IcebergClusterTableProvider {
-    fn schema(&self) -> ArrowSchemaRef {
-        self.inner.schema()
+impl TableLayer for IcebergClusterTableProvider {
+    /// Wraps a cluster-visible Iceberg scan so it can cross node boundaries. It
+    /// carries no schema, CDC or write semantics of its own, so only read
+    /// discovery needs to see past it — which is exactly the step that used to
+    /// require `runtime` to ship this type's accessor down to the accelerated
+    /// table.
+    fn route<'a>(
+        &'a self,
+        walk: LayerWalk,
+        below: &'a Arc<dyn TableProvider>,
+    ) -> Option<&'a Arc<dyn TableProvider>> {
+        match walk {
+            LayerWalk::Read | LayerWalk::Index => Some(below),
+            _ => None,
+        }
     }
 
-    fn constraints(&self) -> Option<&Constraints> {
-        self.inner.constraints()
-    }
 
-    fn table_type(&self) -> TableType {
-        self.inner.table_type()
-    }
 
-    fn get_table_definition(&self) -> Option<&str> {
-        self.inner.get_table_definition()
-    }
 
-    fn get_logical_plan(&'_ self) -> Option<Cow<'_, LogicalPlan>> {
-        self.inner.get_logical_plan()
-    }
 
-    fn get_column_default(&self, column: &str) -> Option<&Expr> {
-        self.inner.get_column_default(column)
-    }
 
-    fn supports_filters_pushdown(
-        &self,
-        filters: &[&Expr],
-    ) -> DFResult<Vec<TableProviderFilterPushDown>> {
-        self.inner.supports_filters_pushdown(filters)
-    }
 
-    fn statistics(&self) -> Option<Statistics> {
-        self.inner.statistics()
-    }
+
 
     async fn scan(
         &self,
+        _below: &Arc<dyn TableProvider>,
         state: &dyn Session,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
@@ -150,6 +148,7 @@ impl TableProvider for IcebergClusterTableProvider {
 
     async fn scan_with_args<'a>(
         &self,
+        _below: &Arc<dyn TableProvider>,
         state: &dyn Session,
         args: ScanArgs<'a>,
     ) -> DFResult<ScanResult> {
@@ -168,33 +167,7 @@ impl TableProvider for IcebergClusterTableProvider {
         Ok(plan.into())
     }
 
-    async fn insert_into(
-        &self,
-        state: &dyn Session,
-        input: Arc<dyn ExecutionPlan>,
-        overwrite: InsertOp,
-    ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        self.inner.insert_into(state, input, overwrite).await
-    }
 
-    async fn delete_from(
-        &self,
-        state: &dyn Session,
-        filters: Vec<Expr>,
-    ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        self.inner.delete_from(state, filters).await
-    }
 
-    async fn update(
-        &self,
-        state: &dyn Session,
-        assignments: Vec<(String, Expr)>,
-        filters: Vec<Expr>,
-    ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        self.inner.update(state, assignments, filters).await
-    }
 
-    async fn truncate(&self, state: &dyn Session) -> DFResult<Arc<dyn ExecutionPlan>> {
-        self.inner.truncate(state).await
-    }
 }
