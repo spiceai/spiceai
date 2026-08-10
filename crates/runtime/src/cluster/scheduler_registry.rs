@@ -739,6 +739,140 @@ mod tests {
         }
     }
 
+    /// Object store whose `get` never returns, standing in for a hung backend.
+    /// Everything else delegates to an in-memory store so the heartbeat write
+    /// under test still works.
+    #[derive(Debug)]
+    struct HangingReads(Arc<dyn ObjectStore>);
+
+    impl std::fmt::Display for HangingReads {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "HangingReads")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for HangingReads {
+        async fn get_opts(
+            &self,
+            _location: &object_store::path::Path,
+            _options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            std::future::pending().await
+        }
+        async fn put_opts(
+            &self,
+            location: &object_store::path::Path,
+            payload: object_store::PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            self.0.put_opts(location, payload, opts).await
+        }
+        async fn put_multipart_opts(
+            &self,
+            location: &object_store::path::Path,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.0.put_multipart_opts(location, opts).await
+        }
+        fn list(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.0.list(prefix)
+        }
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<
+                'static,
+                object_store::Result<object_store::path::Path>,
+            >,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>
+        {
+            self.0.delete_stream(locations)
+        }
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.0.list_with_delimiter(prefix).await
+        }
+        async fn copy_opts(
+            &self,
+            from: &object_store::path::Path,
+            to: &object_store::path::Path,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.0.copy_opts(from, to, options).await
+        }
+    }
+
+    /// A hung membership read must not suppress the heartbeat. This is the
+    /// branch that keeps a healthy scheduler from being reaped when the store
+    /// stalls rather than errors, so it is exercised directly.
+    #[tokio::test(start_paused = true)]
+    async fn a_hung_cluster_read_does_not_suppress_the_heartbeat() {
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let store: Arc<dyn ObjectStore> = Arc::new(HangingReads(Arc::clone(&inner)));
+        let cluster = Arc::new(ClusterStateStore::new(Arc::clone(&store), ""));
+        let heartbeats = Arc::new(SchedulerHeartbeatStore::new(Arc::clone(&store), ""));
+
+        let instance_id = Uuid::new_v4();
+        let entry = SchedulerEntry {
+            scheduler_id: "test:50051".to_string(),
+            instance_id,
+            advertise_address: "test:50051".to_string(),
+            grpc_address: "test:50051".to_string(),
+            http_address: "test:8090".to_string(),
+            started_at_ms: 0,
+            ttl_ms: 30_000,
+            build_version: "test".to_string(),
+            labels: HashMap::new(),
+        };
+        let job_store = crate::jobs::JobStore::new(Arc::clone(&store), "", instance_id.to_string());
+        let df = DataFusionBuilder::new(
+            status::RuntimeStatus::new(),
+            Arc::new(AcceleratorEngineRegistry::default()),
+            Handle::current(),
+        )
+        .build();
+        let job_executor = Arc::new(crate::jobs::JobExecutor::new(
+            Arc::new(job_store),
+            Arc::new(df),
+        ));
+        let runner = SchedulerRegistryRunner {
+            cluster,
+            heartbeats: Arc::clone(&heartbeats),
+            reaper: Reaper::new(
+                Arc::new(ClusterStateStore::new(Arc::clone(&store), "")),
+                Arc::clone(&heartbeats),
+            ),
+            scheduler_id: "test:50051".to_string(),
+            instance_id,
+            entry,
+            peers: Arc::new(RwLock::new(HashMap::new())),
+            job_executor,
+            superseded: Arc::new(AtomicBool::new(false)),
+        };
+
+        // Paused time auto-advances once the read is the only pending work, so
+        // the deadline fires without a real wait.
+        runner
+            .send_heartbeat()
+            .await
+            .expect("a hung membership read must not fail the heartbeat");
+
+        let beat = inner
+            .get(&heartbeats.path_for("test:50051"))
+            .await
+            .expect("the heartbeat must still have been written");
+        let bytes = beat.bytes().await.expect("bytes");
+        let beat: crate::cluster::heartbeat::SchedulerHeartbeat =
+            serde_json::from_slice(&bytes).expect("parse");
+        assert_eq!(beat.instance_id, instance_id);
+    }
+
     /// A superseded incarnation must not delete the heartbeat key on the way
     /// out: the key is shared, so deleting it removes the *successor's*
     /// liveness and makes it look orphaned until its next tick.
