@@ -937,7 +937,9 @@ impl CayenneCatalog {
     /// Returns [`CatalogError::InvalidOperationNoSource`] if either UUID is
     /// malformed.
     /// Returns [`CatalogError::FailedToSetCurrentSnapshot`] if the
-    /// `execute_batch` call against the borrowed transaction fails.
+    /// `execute_batch` call against the borrowed transaction fails, and
+    /// [`CatalogError::InvalidOperation`] if inserting the overwrite's inline
+    /// replacement row fails after it.
     pub async fn commit_overwrite_in_txn(
         &self,
         txn: &mut dyn MetastoreTransaction,
@@ -993,9 +995,14 @@ impl CayenneCatalog {
         if let Some(inlined) = inlined {
             let (_inlined_id, insert) =
                 inlined_data_insert(inlined.clone(), table_id, inlined.sequence_number);
+            // NOT `FailedToSetCurrentSnapshot`: the snapshot UPDATE above already
+            // succeeded, so reporting this as a snapshot failure points at the
+            // wrong statement.
             txn.execute(insert)
                 .await
-                .map_err(|e| CatalogError::FailedToSetCurrentSnapshot {
+                .map_err(|e| CatalogError::InvalidOperation {
+                    message: "Failed to insert the inlined replacement rows for the overwrite"
+                        .to_string(),
                     source: Box::new(e),
                 })?;
         }

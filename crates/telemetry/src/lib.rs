@@ -1982,7 +1982,7 @@ pub mod cayenne {
             .add(pages, &[]);
     }
 
-    // METRIC 3 — inline admission flips. One increment each time a CDC batch that
+    // METRIC 3 — inline admission flips. One increment each time a write that
     // could have updated the inline memtable instead fell back to a Vortex staged
     // write, labeled by `table` and the `reason` it could not inline:
     // `rows_cap` / `bytes_cap` (the inline buffer overflowed its row or byte cap),
