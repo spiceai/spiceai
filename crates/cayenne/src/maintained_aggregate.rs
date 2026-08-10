@@ -113,11 +113,16 @@ pub enum MaintainedAggregateFunction {
 #[derive(Debug)]
 pub struct MaintainedAggregateRegistry {
     state: RwLock<RegistryState>,
-    /// Upper bound on retained index entries across all views: per-PK
-    /// contributions plus distinct `MIN`/`MAX` multiset values. When the total
-    /// would exceed this, the registry fails safe to `Stale` and clears all
+    /// Upper bound on approximate resident BYTES retained across all views:
+    /// per-PK contributions plus distinct `MIN`/`MAX` multiset values. When the
+    /// total would exceed this, the registry fails safe to `Stale` and clears all
     /// retained state.
-    max_index_entries: usize,
+    ///
+    /// Bytes, not entries: entry width varies by orders of magnitude with key and
+    /// aggregate-input types, so a count cap bounds memory only for one schema
+    /// shape. This is derived from `runtime.query.memory_limit` by the provider,
+    /// so the index cannot grow past the operator's budget.
+    max_index_bytes: usize,
     /// Whether a per-PK index is maintained (a non-empty PK was configured), so
     /// UPDATE/DELETE can be retracted incrementally rather than marking stale.
     has_pk_index: bool,
@@ -159,6 +164,54 @@ struct MaintainedAggregateView {
     /// Updated on every `MIN`/`MAX` insert/retract so cap checks stay O(1)
     /// regardless of group cardinality.
     retained_multiset_entries: usize,
+    /// Approximate resident bytes held by `pk_index`, maintained incrementally
+    /// on every insert/retract. Tracked rather than computed because summing the
+    /// map would be O(live rows) on every CDC batch.
+    approx_pk_index_bytes: usize,
+}
+
+/// Approximate resident bytes one `MIN`/`MAX` ordered-multiset node costs: the
+/// retained `ScalarValue`, its occurrence counter, and the node's container
+/// overhead. Deliberately a flat estimate — the nodes are small and uniform,
+/// unlike PK entries whose width varies with the key and captured inputs.
+const APPROX_MULTISET_NODE_BYTES: usize = std::mem::size_of::<ScalarValue>() + 32;
+
+/// Approximate resident bytes one `pk_index` entry costs: the key scalars, the
+/// stored `RowEntry` (its group key and captured aggregate inputs), and the
+/// `HashMap` slot overhead. Charges every component the map actually holds — an
+/// estimate that drops one bounds the index at a fraction of its real size.
+fn approx_pk_index_entry_bytes(pk: &[ScalarValue], entry: &RowEntry) -> usize {
+    /// Allocator-dependent per-slot control/allocation overhead; kept next to the
+    /// estimate it belongs to, as in `provider::pk_index`.
+    const HASHMAP_ENTRY_OVERHEAD_BYTES: usize = 16;
+
+    let pk_bytes = pk
+        .iter()
+        .fold(0_usize, |total, scalar| total.saturating_add(scalar.size()));
+    let group_key_bytes = entry
+        .group_key
+        .iter()
+        .fold(0_usize, |total, scalar| total.saturating_add(scalar.size()));
+    let input_bytes = entry.inputs.iter().fold(0_usize, |total, input| {
+        total.saturating_add(input.as_ref().map_or(
+            std::mem::size_of::<Option<ScalarValue>>(),
+            ScalarValue::size,
+        ))
+    });
+
+    // `size_of::<RowEntry>()` covers the value's own inline width, including the
+    // `Vec` headers of its group key and inputs. The *key* needs the same
+    // treatment: `pk_bytes` sums only the scalars behind the pointer, so without
+    // this the map's `Vec<ScalarValue>` header goes uncharged and every entry is
+    // undercounted by a fixed amount — a systematic bias in the one direction
+    // that matters, since it lets the index sit over budget while reporting
+    // itself under.
+    pk_bytes
+        .saturating_add(std::mem::size_of::<Vec<ScalarValue>>())
+        .saturating_add(group_key_bytes)
+        .saturating_add(input_bytes)
+        .saturating_add(std::mem::size_of::<RowEntry>())
+        .saturating_add(HASHMAP_ENTRY_OVERHEAD_BYTES)
 }
 
 /// One row's retraction record: which group it joined and the per-aggregate
@@ -527,7 +580,7 @@ impl MaintainedAggregateRegistry {
 
     /// As [`Self::try_new`], but maintains a per-PK contribution index keyed on
     /// `pk_columns` so UPDATE/DELETE can be retracted incrementally (see
-    /// [`Self::apply_pk_deletes`]). `max_index_entries` bounds all retained index
+    /// [`Self::apply_pk_deletes`]). `max_index_bytes` bounds all retained index
     /// entries across the views; exceeding it fails the registry safe to `Stale`.
     ///
     /// # Errors
@@ -538,16 +591,16 @@ impl MaintainedAggregateRegistry {
         specs: &[MaintainedAggregateSpec],
         schema: &SchemaRef,
         pk_columns: &[usize],
-        max_index_entries: usize,
+        max_index_bytes: usize,
     ) -> DataFusionResult<Self> {
-        Self::try_new_inner(specs, schema, pk_columns, max_index_entries)
+        Self::try_new_inner(specs, schema, pk_columns, max_index_bytes)
     }
 
     fn try_new_inner(
         specs: &[MaintainedAggregateSpec],
         schema: &SchemaRef,
         pk_columns: &[usize],
-        max_index_entries: usize,
+        max_index_bytes: usize,
     ) -> DataFusionResult<Self> {
         let has_pk_index = !pk_columns.is_empty();
         let views = specs
@@ -561,7 +614,7 @@ impl MaintainedAggregateRegistry {
                 status: RegistryStatus::Fresh,
                 views,
             }),
-            max_index_entries,
+            max_index_bytes,
             has_pk_index,
         })
     }
@@ -579,6 +632,31 @@ impl MaintainedAggregateRegistry {
     #[must_use]
     pub fn supports_retraction(&self) -> bool {
         self.has_pk_index
+    }
+
+    /// Whether the registry is currently stale, i.e. serving nothing and
+    /// discarding every delta until a rebuild restores it.
+    ///
+    /// Staleness is a *recoverable* degradation, not a terminal state: every
+    /// fail-safe path (cap exceeded, apply-queue overflow, accumulator overflow,
+    /// epoch gap) lands here, and only a rebuild clears it. Callers poll this to
+    /// drive that rebuild — without one, a single transient failure would disable
+    /// maintained aggregates for the provider's whole lifetime.
+    #[must_use]
+    pub fn is_stale(&self) -> bool {
+        self.state.read().status == RegistryStatus::Stale
+    }
+
+    /// Approximate resident bytes currently retained across every view, and the
+    /// byte budget they are held to. Exposed for observability: an operator
+    /// diagnosing a stale registry needs to see how close the indexes are to
+    /// their cap.
+    #[must_use]
+    pub fn retained_bytes_and_budget(&self) -> (usize, usize) {
+        (
+            retained_index_bytes(&self.state.read().views),
+            self.max_index_bytes,
+        )
     }
 
     /// Mark all maintained aggregate views stale at `epoch` and detach their
@@ -644,13 +722,17 @@ impl MaintainedAggregateRegistry {
             }
             // Check after every Arrow batch so a multi-batch CDC envelope cannot
             // accumulate unbounded retained state before the final cap check.
-            if retained_index_entries(&state.views) > self.max_index_entries {
-                failure = Some(index_cap_exceeded());
+            if retained_index_bytes(&state.views) > self.max_index_bytes {
+                failure = Some(index_cap_exceeded(
+                    retained_index_entries(&state.views),
+                    retained_index_bytes(&state.views),
+                    self.max_index_bytes,
+                ));
                 break 'outer;
             }
         }
 
-        finalize_maintenance_pass(&mut state, self.max_index_entries, failure)
+        finalize_maintenance_pass(&mut state, self.max_index_bytes, failure)
     }
 
     /// Retract delete rows whose primary-key columns are supplied directly as
@@ -679,12 +761,12 @@ impl MaintainedAggregateRegistry {
             }
         }
 
-        finalize_maintenance_pass(&mut state, self.max_index_entries, failure)
+        finalize_maintenance_pass(&mut state, self.max_index_bytes, failure)
     }
 
     /// Rebuild every view from a complete table snapshot. Bounds memory: the
     /// retained index total is checked against its cap after each batch, so rebuilding a
-    /// table larger than `max_index_entries` fails safe to stale (clearing the
+    /// table larger than `max_index_bytes` fails safe to stale (clearing the
     /// indexes) instead of growing the index unbounded.
     ///
     /// # Errors
@@ -714,12 +796,16 @@ impl MaintainedAggregateRegistry {
             // Bail incrementally so a table larger than the cap fails safe to
             // stale before the retained indexes grow unbounded (rather than only
             // after the full rebuild, which could OOM first).
-            if retained_index_entries(&state.views) > self.max_index_entries {
-                failure = Some(index_cap_exceeded());
+            if retained_index_bytes(&state.views) > self.max_index_bytes {
+                failure = Some(index_cap_exceeded(
+                    retained_index_entries(&state.views),
+                    retained_index_bytes(&state.views),
+                    self.max_index_bytes,
+                ));
                 break 'outer;
             }
         }
-        finalize_maintenance_pass(&mut state, self.max_index_entries, failure)
+        finalize_maintenance_pass(&mut state, self.max_index_bytes, failure)
     }
 
     /// Materialize a maintained aggregate batch matching `aggregate`, if fresh.
@@ -853,6 +939,7 @@ impl MaintainedAggregateView {
             pk_columns,
             pk_index: HashMap::new(),
             retained_multiset_entries: 0,
+            approx_pk_index_bytes: 0,
         })
     }
 
@@ -895,7 +982,7 @@ impl MaintainedAggregateView {
         self.retained_multiset_entries = self
             .retained_multiset_entries
             .checked_add(retained_entries_added)
-            .ok_or_else(index_cap_exceeded)?;
+            .ok_or_else(index_entry_overflow)?;
         Ok(())
     }
 
@@ -903,10 +990,12 @@ impl MaintainedAggregateView {
         self.groups.clear();
         self.pk_index.clear();
         self.retained_multiset_entries = 0;
+        self.approx_pk_index_bytes = 0;
     }
 
     fn take_retained_state(&mut self) -> RetiredViewState {
         self.retained_multiset_entries = 0;
+        self.approx_pk_index_bytes = 0;
         (
             std::mem::take(&mut self.groups),
             std::mem::take(&mut self.pk_index),
@@ -917,6 +1006,21 @@ impl MaintainedAggregateView {
         self.pk_index
             .len()
             .saturating_add(self.retained_multiset_entries)
+    }
+
+    /// Approximate resident bytes this view retains for cap accounting: the
+    /// per-PK index (tracked incrementally, since walking it would be O(rows) on
+    /// every batch) plus the `MIN`/`MAX` multiset nodes.
+    ///
+    /// The estimate is charged against `runtime.query.memory_limit`, so it must
+    /// not under-count — an estimate that drops a component bounds the index at a
+    /// fraction of its believed size. Mirrors
+    /// `crate::provider::pk_index::approx_pk_keyset_entry_bytes`.
+    fn approx_index_bytes(&self) -> usize {
+        self.approx_pk_index_bytes.saturating_add(
+            self.retained_multiset_entries
+                .saturating_mul(APPROX_MULTISET_NODE_BYTES),
+        )
     }
 
     /// Build a key (group key or PK) from the given column indices at `row`.
@@ -974,6 +1078,9 @@ impl MaintainedAggregateView {
     /// in the index contributed nothing, so retraction is a no-op.
     fn retract_pk(&mut self, pk: &[ScalarValue]) -> DataFusionResult<()> {
         if let Some(entry) = self.pk_index.remove(pk) {
+            self.approx_pk_index_bytes = self
+                .approx_pk_index_bytes
+                .saturating_sub(approx_pk_index_entry_bytes(pk, &entry));
             self.retract_entry(&entry)?;
         }
         Ok(())
@@ -1019,6 +1126,9 @@ impl MaintainedAggregateView {
             let pk = if indexed {
                 let pk = Self::scalar_key(batch, row, self.pk_columns.iter().copied())?;
                 if let Some(old) = self.pk_index.remove(&pk) {
+                    self.approx_pk_index_bytes = self
+                        .approx_pk_index_bytes
+                        .saturating_sub(approx_pk_index_entry_bytes(&pk, &old));
                     self.retract_entry(&old)?;
                 }
                 Some(pk)
@@ -1037,13 +1147,14 @@ impl MaintainedAggregateView {
                 Self::scalar_key(batch, row, self.spec.group_by.iter().map(|c| c.index))?;
             if let Some(pk) = pk {
                 let inputs = self.capture_inputs(batch, row)?;
-                self.pk_index.insert(
-                    pk,
-                    RowEntry {
-                        group_key: group_key.clone(),
-                        inputs,
-                    },
-                );
+                let entry = RowEntry {
+                    group_key: group_key.clone(),
+                    inputs,
+                };
+                self.approx_pk_index_bytes = self
+                    .approx_pk_index_bytes
+                    .saturating_add(approx_pk_index_entry_bytes(&pk, &entry));
+                self.pk_index.insert(pk, entry);
             }
             self.insert_into_group(group_key, batch, row)?;
         }
@@ -1340,7 +1451,7 @@ impl GroupAccumulator {
         for aggregate in &mut self.aggregates {
             retained_entries_added = retained_entries_added
                 .checked_add(aggregate.apply_insert_row(batch, row)?)
-                .ok_or_else(index_cap_exceeded)?;
+                .ok_or_else(index_entry_overflow)?;
         }
         // `checked_add` (not saturating): a silently-clamped counter would break
         // the "drop the group when its last row is retracted" invariant, so an
@@ -2222,37 +2333,71 @@ fn begin_maintenance_pass(state: &mut RegistryState, epoch: u64) -> bool {
 }
 
 /// Finalize a maintenance pass: if `failure` is set, or the retained indexes now
-/// exceed `max_index_entries`, clear every index, mark the registry stale, and
+/// exceed `max_index_bytes`, clear every index, mark the registry stale, and
 /// return the reason (so the write-path applier can log it); otherwise the
 /// registry stays fresh. Centralizes the fail-safe across the insert, PK-delete,
 /// and rebuild paths so memory is bounded on every mutating path.
 fn finalize_maintenance_pass(
     state: &mut RegistryState,
-    max_index_entries: usize,
+    max_index_bytes: usize,
     failure: Option<DataFusionError>,
 ) -> DataFusionResult<()> {
-    let over_cap = retained_index_entries(&state.views) > max_index_entries;
+    let retained_bytes = retained_index_bytes(&state.views);
+    let over_cap = retained_bytes > max_index_bytes;
     if failure.is_some() || over_cap {
+        // Capture the size of what is being discarded BEFORE clearing, so the
+        // error names what the index actually cost.
+        let retained_entries = retained_index_entries(&state.views);
         for view in &mut state.views {
             view.clear();
         }
         state.status = RegistryStatus::Stale;
-        return Err(failure.unwrap_or_else(index_cap_exceeded));
+        return Err(failure.unwrap_or_else(|| {
+            index_cap_exceeded(retained_entries, retained_bytes, max_index_bytes)
+        }));
     }
     Ok(())
 }
 
+/// Total approximate resident bytes retained across every view — the quantity
+/// the cap bounds. O(views), not O(rows): each view tracks its own total
+/// incrementally.
+fn retained_index_bytes(views: &[MaintainedAggregateView]) -> usize {
+    views.iter().fold(0_usize, |total, view| {
+        total.saturating_add(view.approx_index_bytes())
+    })
+}
+
+/// Total retained index entries across every view. Reported alongside the byte
+/// total when the cap trips, so an operator can see both what was retained and
+/// what it cost.
 fn retained_index_entries(views: &[MaintainedAggregateView]) -> usize {
     views.iter().fold(0_usize, |total, view| {
         total.saturating_add(view.index_len())
     })
 }
 
-fn index_cap_exceeded() -> DataFusionError {
+/// A retained-entry counter overflowed `usize`. Distinct from
+/// [`index_cap_exceeded`]: that is the budget doing its job, this is arithmetic
+/// that cannot happen on a 64-bit host and is handled rather than panicked on.
+fn index_entry_overflow() -> DataFusionError {
     DataFusionError::Execution(
-        "Maintained aggregate indexes exceeded their retained-entry cap; falling back to base table scan"
+        "Maintained aggregate retained-entry count overflowed; falling back to base table scan"
             .to_string(),
     )
+}
+
+/// Names what the index held and what it was allowed to hold, so an operator can
+/// tell "the budget is too small" from "this table is too big to maintain" without
+/// reading the code.
+fn index_cap_exceeded(
+    retained_entries: usize,
+    retained_bytes: usize,
+    max_index_bytes: usize,
+) -> DataFusionError {
+    DataFusionError::Execution(format!(
+        "Maintained aggregate indexes exceeded their memory budget ({retained_entries} retained entries, ~{retained_bytes} bytes, budget {max_index_bytes} bytes); falling back to base table scan. Raise 'runtime.query.memory_limit' or narrow the maintained aggregate's filter."
+    ))
 }
 
 fn count_overflow() -> DataFusionError {
@@ -2741,6 +2886,122 @@ mod tests {
         Ok(out)
     }
 
+    /// The retained-index cap is a BYTE budget, not an entry count: entry width
+    /// varies by orders of magnitude with key and aggregate-input types, so a
+    /// count cap bounds memory for exactly one schema shape. A budget too small
+    /// to hold the index must fail safe to stale rather than grow past it.
+    #[test]
+    fn retained_index_cap_is_enforced_in_bytes() -> DataFusionResult<()> {
+        // One entry cannot fit in 8 bytes, so the very first batch trips the cap.
+        let registry =
+            MaintainedAggregateRegistry::try_new_with_pk(&[sum_i_spec()], &schema(), &[2], 8)?;
+        let result = registry.apply_insert_batches(1, &[group_batch(&[("a", 1, 10)])]);
+
+        assert!(
+            result.is_err(),
+            "an index that cannot fit its byte budget must fail safe, not grow past it"
+        );
+        assert!(
+            registry.is_stale(),
+            "tripping the byte cap must leave the registry stale so queries fall back to base scans"
+        );
+        let (retained, budget) = registry.retained_bytes_and_budget();
+        assert_eq!(retained, 0, "failing safe must clear all retained state");
+        assert_eq!(budget, 8, "the configured byte budget is reported as-is");
+        Ok(())
+    }
+
+    /// Byte accounting must be symmetric: a retraction has to release exactly what
+    /// its insert charged, or a steady-state upsert workload leaks budget until it
+    /// trips the cap and disables the view for no reason.
+    #[test]
+    fn retained_index_bytes_return_to_zero_after_full_retraction() -> DataFusionResult<()> {
+        let registry = MaintainedAggregateRegistry::try_new_with_pk(
+            &[sum_i_spec()],
+            &schema(),
+            &[2],
+            usize::MAX,
+        )?;
+        let (empty_bytes, _) = registry.retained_bytes_and_budget();
+
+        registry.apply_insert_batches(
+            1,
+            &[group_batch(&[("a", 1, 10), ("a", 2, 20), ("b", 3, 5)])],
+        )?;
+        let (loaded_bytes, _) = registry.retained_bytes_and_budget();
+        assert!(
+            loaded_bytes > empty_bytes,
+            "indexing rows must charge bytes (was {loaded_bytes}, empty {empty_bytes})"
+        );
+
+        // Retract every indexed row.
+        registry.apply_pk_deletes(
+            2,
+            &group_batch(&[("", 1, 0), ("", 2, 0), ("", 3, 0)]).project(&[2])?,
+        )?;
+        let (drained_bytes, _) = registry.retained_bytes_and_budget();
+        assert_eq!(
+            drained_bytes, empty_bytes,
+            "retracting every row must release exactly what indexing charged"
+        );
+        Ok(())
+    }
+
+    /// Repeatedly upserting the SAME primary key must not accumulate byte charges:
+    /// each upsert retracts the prior entry before re-indexing. A leak here is the
+    /// realistic way a long-running CDC table would drift into a false cap trip.
+    #[test]
+    fn repeated_upsert_of_one_pk_does_not_leak_index_bytes() -> DataFusionResult<()> {
+        let registry = MaintainedAggregateRegistry::try_new_with_pk(
+            &[sum_i_spec()],
+            &schema(),
+            &[2],
+            usize::MAX,
+        )?;
+        registry.apply_insert_batches(1, &[group_batch(&[("a", 1, 10)])])?;
+        let (after_first, _) = registry.retained_bytes_and_budget();
+
+        for epoch in 2..=16_u64 {
+            registry.apply_insert_batches(
+                epoch,
+                &[group_batch(&[("a", 1, i64::try_from(epoch).unwrap_or(0))])],
+            )?;
+        }
+        let (after_many, _) = registry.retained_bytes_and_budget();
+
+        assert_eq!(
+            after_many, after_first,
+            "re-upserting one PK must hold steady state, not accumulate byte charges"
+        );
+        assert!(!registry.is_stale(), "steady-state upserts must stay fresh");
+        Ok(())
+    }
+
+    /// `is_stale` is what drives the provider's rebuild-to-recover path, so it must
+    /// report the state transitions that path keys on.
+    #[test]
+    fn is_stale_tracks_the_registry_lifecycle() -> DataFusionResult<()> {
+        let registry = MaintainedAggregateRegistry::try_new_with_pk(
+            &[sum_i_spec()],
+            &schema(),
+            &[2],
+            usize::MAX,
+        )?;
+        assert!(!registry.is_stale(), "a fresh registry is not stale");
+
+        registry.mark_stale(1);
+        assert!(registry.is_stale(), "mark_stale must be observable");
+
+        // A rebuild is the only path back to fresh — this is what the provider's
+        // re-arm calls, and why staleness must not be terminal.
+        registry.rebuild_from_batches(2, &[group_batch(&[("a", 1, 10)])])?;
+        assert!(
+            !registry.is_stale(),
+            "rebuilding must clear staleness so maintained state serves again"
+        );
+        Ok(())
+    }
+
     #[test]
     fn retracts_a_subset_of_a_group_by_pk() -> DataFusionResult<()> {
         let registry = MaintainedAggregateRegistry::try_new_with_pk(
@@ -2899,23 +3160,66 @@ mod tests {
         Ok(())
     }
 
+    /// PK contribution records and `MIN`/`MAX` multiset nodes must share ONE
+    /// budget — an accounting that charged only the PK index would let a
+    /// `MIN`/`MAX` view grow past the operator's memory limit unmeasured.
+    ///
+    /// Expressed in bytes rather than entries: entry width varies by key and
+    /// aggregate-input type, so bytes are what actually bound memory. The test
+    /// derives the boundary from the measured footprint instead of hard-coding
+    /// one, so it stays honest if `ScalarValue`'s layout changes.
     #[test]
-    fn pk_and_min_max_entries_all_count_toward_cap() -> DataFusionResult<()> {
-        // Two distinct rows retain two PK contribution records plus two `MIN`
-        // and two `MAX` multiset nodes: six entries total.
-        let at_cap =
-            MaintainedAggregateRegistry::try_new_with_pk(&[min_max_i_spec()], &schema(), &[2], 6)?;
-        at_cap.apply_insert_batches(1, &[group_batch(&[("a", 1, 10), ("a", 2, 20)])])?;
-        assert_eq!(at_cap.state.read().views[0].index_len(), 6);
+    fn pk_and_min_max_bytes_all_count_toward_cap() -> DataFusionResult<()> {
+        let rows = group_batch(&[("a", 1, 10), ("a", 2, 20)]);
 
-        let over_cap =
-            MaintainedAggregateRegistry::try_new_with_pk(&[min_max_i_spec()], &schema(), &[2], 5)?;
-        let result =
-            over_cap.apply_insert_batches(1, &[group_batch(&[("a", 1, 10), ("a", 2, 20)])]);
+        // Measure what two rows of a MIN/MAX view actually retain.
+        let unbounded = MaintainedAggregateRegistry::try_new_with_pk(
+            &[min_max_i_spec()],
+            &schema(),
+            &[2],
+            usize::MAX,
+        )?;
+        unbounded.apply_insert_batches(1, std::slice::from_ref(&rows))?;
+        let (retained_bytes, _) = unbounded.retained_bytes_and_budget();
+        // Two rows retain two PK contribution records plus two `MIN` and two
+        // `MAX` multiset nodes: six entries, all charged.
+        assert_eq!(
+            unbounded.state.read().views[0].index_len(),
+            6,
+            "two rows retain 2 PK records + 2 MIN + 2 MAX multiset nodes"
+        );
+        assert!(
+            retained_bytes > 0,
+            "retained state must be charged in bytes, not silently free"
+        );
+
+        // Exactly enough budget: the same load fits and stays fresh.
+        let at_cap = MaintainedAggregateRegistry::try_new_with_pk(
+            &[min_max_i_spec()],
+            &schema(),
+            &[2],
+            retained_bytes,
+        )?;
+        at_cap.apply_insert_batches(1, std::slice::from_ref(&rows))?;
+        assert!(
+            !at_cap.is_stale(),
+            "a load that exactly fits its budget must stay fresh"
+        );
+
+        // One byte short: the multiset nodes are what push it over, proving they
+        // are charged alongside the PK records rather than ignored.
+        let over_cap = MaintainedAggregateRegistry::try_new_with_pk(
+            &[min_max_i_spec()],
+            &schema(),
+            &[2],
+            retained_bytes.saturating_sub(1),
+        )?;
+        let result = over_cap.apply_insert_batches(1, &[rows]);
         assert!(
             result.is_err(),
-            "PK records and ordered-multiset nodes must share one exact cap"
+            "PK records and ordered-multiset nodes must share one byte budget"
         );
+        assert!(over_cap.is_stale(), "an over-budget load must fail safe");
         Ok(())
     }
 
