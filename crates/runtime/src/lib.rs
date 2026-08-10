@@ -580,6 +580,10 @@ pub struct Runtime {
     /// keeping the read-lock-for-diff / write-lock-for-swap discipline, so the
     /// diff phase can still read the app `RwLock` without deadlocking.
     apply_app_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Query-side terms of the coordinated `DuckDB` accelerator memory budget, so
+    /// [`Runtime::apply_app`] can re-split it for the acceleration set a reloaded
+    /// app declares.
+    duckdb_budget_context: builder::DuckDbBudgetContext,
     /// State of the process's one-time initial component load, so a caller that
     /// cannot wait for it can stop it. See [`Runtime::supersede_initial_load`].
     /// Shared, not copied, so every clone of the runtime supersedes the same load.

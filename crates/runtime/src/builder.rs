@@ -49,7 +49,13 @@ use spicepod::component::runtime::Runtime as SpicepodRuntime;
 use spicepod::component::runtime::RuntimeReadyState as SpicepodRuntimeReadyState;
 use spicepod::component::runtime::SourceRateControl as SpicepodSourceRateControl;
 use spicepod::component::runtime::TelemetryConfig;
-use std::{collections::HashMap, net::SocketAddr, str::FromStr, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    net::SocketAddr,
+    str::FromStr,
+    sync::{Arc, LazyLock, OnceLock},
+    time::Duration,
+};
 use telemetry::timing::TimeMeasurement;
 use token_provider::registry::TokenProviderRegistry;
 use tokio::runtime::Handle;
@@ -508,56 +514,62 @@ impl RuntimeBuilder {
         // the DuckDB accelerator to apply, and warn with what was applied /
         // recommended. An explicit `runtime.query.memory_limit` / per-dataset
         // `duckdb_memory_limit` always overrides. See `accelerator_memory_budget`.
+        //
+        // Only a CDC pod pays the reduced query-pool default (it leaves room for the
+        // in-memory tier); a bulk-only Cayenne pod keeps the standard default minus
+        // its measured cache reservation. Same expression the DataFusion builder
+        // applies, so the projected base matches the pool it will build.
+        let cayenne_cdc_active = dedicated_thread_pools_enabled && cayenne_workload.uses_cdc_tier();
         let duckdb_budget_inputs = duckdb_budget_inputs(self.app.as_ref());
-        let has_duckdb_instances = duckdb_budget_inputs.num_unset_instances > 0
-            || duckdb_budget_inputs.num_explicit_instances > 0;
-        let duckdb_query_pool_cap = if has_duckdb_instances {
-            // Only a CDC pod pays the reduced query-pool default (it leaves room for
-            // the in-memory tier); a bulk-only Cayenne pod keeps the standard default
-            // minus its measured cache reservation. Same expression the DataFusion
-            // builder applies, so the projected base matches the pool it will build.
-            let cayenne_cdc_active =
-                dedicated_thread_pools_enabled && cayenne_workload.uses_cdc_tier();
-            let total_memory = crate::resource_monitor::get_total_memory();
-            // DuckDB's own default memory_limit is ~80% of HOST RAM (not the cgroup
-            // limit), so project the un-coordinated ceiling from host memory —
-            // otherwise a container (host RAM > cgroup) would under-estimate it and
-            // skip coordination exactly where the OOM risk is highest.
-            let duckdb_default_per_instance =
-                crate::accelerator_memory_budget::duckdb_default_per_instance_bytes(
-                    crate::resource_monitor::get_host_memory(),
-                );
-            let base_query_budget = crate::datafusion::builder::effective_query_memory_limit(
-                None,
-                cayenne_cdc_active,
-                cayenne_reservation_bytes,
-                None,
-            );
+        let base_query_budget = OnceLock::new();
+        let (duckdb_query_pool_cap, query_pool_ceiling_bytes) = if duckdb_budget_inputs.is_empty() {
+            // No DuckDB accelerators (or the duckdb feature isn't compiled in): skip
+            // the cgroup/host memory probes and the planner entirely — the plan would
+            // NoOp anyway. Publish an empty budget so no reservation from a runtime
+            // built earlier in this process survives.
+            crate::accelerator_memory_budget::clear_duckdb_budget();
+            (None, memory_limit)
+        } else {
+            let (total_memory, duckdb_default_per_instance) = *DUCKDB_BUDGET_HOST_TERMS;
             let plan = crate::accelerator_memory_budget::plan(
                 total_memory,
                 duckdb_default_per_instance,
-                base_query_budget,
+                *base_query_budget.get_or_init(|| {
+                    crate::datafusion::builder::effective_query_memory_limit(
+                        None,
+                        cayenne_cdc_active,
+                        cayenne_reservation_bytes,
+                        None,
+                    )
+                }),
                 memory_limit,
                 &duckdb_budget_inputs,
             );
             crate::accelerator_memory_budget::publish_duckdb_budget(
-                plan.per_instance_cap_bytes,
-                plan.duckdb_reservation_bytes,
+                &plan,
+                duckdb_budget_inputs.num_unset_instances,
+                duckdb_default_per_instance,
             );
             emit_duckdb_memory_budget_warning(
                 &plan,
                 total_memory,
                 duckdb_default_per_instance,
                 &duckdb_budget_inputs,
+                QueryPoolSizing::Sizing,
             );
-            plan.query_pool_cap_bytes
-        } else {
-            // No DuckDB accelerators (or the duckdb feature isn't compiled in): skip
-            // the cgroup/host memory probes and the planner entirely — the plan would
-            // NoOp anyway. Clear any previously-published budget so a hot-reload that
-            // removed all DuckDB accelerators doesn't leave a stale reservation.
-            crate::accelerator_memory_budget::publish_duckdb_budget(0, 0);
-            None
+            (
+                plan.query_pool_cap_bytes,
+                Some(plan.effective_query_pool_bytes),
+            )
+        };
+        // A reload re-splits this budget for the acceleration set the new app
+        // declares; the query pool it is split against is built once below and is
+        // not resizable, so the ceiling in effect is fixed input to that re-split.
+        let duckdb_budget_context = DuckDbBudgetContext {
+            query_pool_ceiling_bytes,
+            cayenne_cdc_active,
+            cayenne_reservation_bytes,
+            base_query_budget,
         };
 
         #[cfg(not(windows))]
@@ -812,6 +824,7 @@ impl RuntimeBuilder {
         let mut rt = Runtime {
             app: shared_app,
             apply_app_lock: Arc::new(tokio::sync::Mutex::new(())),
+            duckdb_budget_context,
             initial_load: Arc::new(crate::InitialLoad::default()),
             df,
             llm_runtime_stores: Arc::new(crate::model::LlmRuntimeStores::default()),
@@ -1538,6 +1551,103 @@ fn estimate_cayenne_reservation_bytes(
     0
 }
 
+/// Cgroup-aware total memory, and `DuckDB`'s own ~80%-of-HOST-RAM per-instance
+/// default. Probed once: each rebuilds a sysinfo `System`, and neither moves over the
+/// process's life, so a reload re-plans against the terms its build used. `DuckDB`
+/// sizes its default from HOST RAM rather than the cgroup limit, so a container (host
+/// RAM > cgroup) would otherwise under-estimate that ceiling and skip coordination
+/// exactly where the OOM risk is highest.
+static DUCKDB_BUDGET_HOST_TERMS: LazyLock<(u64, u64)> = LazyLock::new(|| {
+    (
+        crate::resource_monitor::get_total_memory(),
+        crate::accelerator_memory_budget::duckdb_default_per_instance_bytes(
+            crate::resource_monitor::get_host_memory(),
+        ),
+    )
+});
+
+/// Whether the query memory pool is still being sized, or already exists at a ceiling
+/// the caller cannot move. Selects the guidance
+/// [`emit_duckdb_memory_budget_warning`] gives an operator whose ceilings do not fit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueryPoolSizing {
+    /// The runtime is building; the plan's query-pool cap is about to be applied.
+    Sizing,
+    /// A reload; the pool exists and only a restart re-sizes it.
+    Fixed,
+}
+
+/// The query-side terms of the coordinated `DuckDB` memory budget, carried by the
+/// [`Runtime`] so a reload can re-split it for the acceleration set the new app
+/// declares (see [`DuckDbBudgetContext::publish_for`]).
+#[derive(Debug, Clone)]
+pub(crate) struct DuckDbBudgetContext {
+    /// The query-pool ceiling in effect. `None` when nothing narrowed it: the build
+    /// configured no `DuckDB` accelerator and no explicit `runtime.query.memory_limit`,
+    /// so the pool took its default for this host.
+    query_pool_ceiling_bytes: Option<u64>,
+    cayenne_cdc_active: bool,
+    cayenne_reservation_bytes: u64,
+    /// What the query pool would be with no `DuckDB` coordination — the region the
+    /// pool and the `DuckDB` instances are split out of. Derived on first use: a pod
+    /// that builds without `DuckDB` accelerators never pays for it.
+    base_query_budget: OnceLock<u64>,
+}
+
+impl DuckDbBudgetContext {
+    /// Re-plans the coordinated `DuckDB` budget for `app` and publishes it, so every
+    /// `DuckDB` instance created from `app` is capped for the acceleration set `app`
+    /// declares. Call before anything initializes those accelerators; an instance
+    /// that already exists keeps the `memory_limit` it was created with, which the
+    /// published aggregate reservation goes on covering.
+    ///
+    /// The query memory pool is sized once, at build, and is not resizable, so the
+    /// ceiling already in effect is honored verbatim here and the `DuckDB` instances
+    /// absorb the whole re-split. Adding accelerators to a pod whose query pool
+    /// already claims the splittable region therefore caps them at the per-instance
+    /// floor and warns that a restart is what re-splits it, rather than publishing a
+    /// cap that fits nowhere.
+    pub(crate) fn publish_for(&self, app: &Arc<App>) {
+        let inputs = duckdb_budget_inputs(Some(app));
+        if inputs.is_empty() {
+            crate::accelerator_memory_budget::clear_duckdb_budget();
+            return;
+        }
+
+        let (total_memory, duckdb_default_per_instance) = *DUCKDB_BUDGET_HOST_TERMS;
+        let base_query_budget = *self.base_query_budget.get_or_init(|| {
+            crate::datafusion::builder::effective_query_memory_limit(
+                None,
+                self.cayenne_cdc_active,
+                self.cayenne_reservation_bytes,
+                None,
+            )
+        });
+        let plan = crate::accelerator_memory_budget::plan(
+            total_memory,
+            duckdb_default_per_instance,
+            base_query_budget,
+            Some(self.query_pool_ceiling_bytes.unwrap_or(base_query_budget)),
+            &inputs,
+        );
+        // A reload that leaves the budget where it was repeats guidance the operator
+        // has already been given, so only a budget that moved is worth a warning.
+        if crate::accelerator_memory_budget::publish_duckdb_budget(
+            &plan,
+            inputs.num_unset_instances,
+            duckdb_default_per_instance,
+        ) {
+            emit_duckdb_memory_budget_warning(
+                &plan,
+                total_memory,
+                duckdb_default_per_instance,
+                &inputs,
+                QueryPoolSizing::Fixed,
+            );
+        }
+    }
+}
+
 /// Deduped-by-instance summary of the `DuckDB` accelerators in `app`, for the
 /// coordinated memory budget ([`crate::accelerator_memory_budget::plan`]).
 ///
@@ -1683,6 +1793,7 @@ fn emit_duckdb_memory_budget_warning(
     total_memory: u64,
     duckdb_default_per_instance: u64,
     inputs: &crate::accelerator_memory_budget::DuckDbBudgetInputs,
+    query_pool: QueryPoolSizing,
 ) {
     use crate::accelerator_memory_budget::PlanOutcome;
 
@@ -1703,6 +1814,15 @@ fn emit_duckdb_memory_budget_warning(
     } else {
         ""
     };
+    // Only a restart re-sizes an existing query memory pool, so on a reload the
+    // recommended runtime.query.memory_limit is not something this process can apply
+    // to itself.
+    let fixed_pool = if query_pool == QueryPoolSizing::Fixed {
+        " The query memory pool is sized when the runtime starts and a reload cannot resize it, so restart spiced if the pool needs sizing alongside them."
+    } else {
+        ""
+    };
+    let query_pool_fixed = query_pool == QueryPoolSizing::Fixed;
 
     if n == 0 {
         // Every DuckDB instance set an explicit duckdb_memory_limit — there are no
@@ -1713,9 +1833,11 @@ fn emit_duckdb_memory_budget_warning(
                 total_memory_bytes = total_memory,
                 query_pool_bytes = plan.effective_query_pool_bytes,
                 duckdb_explicit_bytes = inputs.sum_explicit_bytes,
-                "The explicit DuckDB accelerator memory limits plus the query memory limit exceed the coordinated memory budget and cut into the safety headroom below the {total_h} available to this process; combined ceilings may approach or exceed it and risk an OOM kill under load. Lower the per-dataset duckdb_memory_limit values and/or runtime.query.memory_limit so combined ceilings fit.{mixed} For details, visit: https://spiceai.org/docs/reference/memory"
+                "The explicit DuckDB accelerator memory limits plus the query memory limit exceed the coordinated memory budget and cut into the safety headroom below the {total_h} available to this process; combined ceilings may approach or exceed it and risk an OOM kill under load. Lower the per-dataset duckdb_memory_limit values and/or runtime.query.memory_limit so combined ceilings fit.{mixed}{fixed_pool} For details, visit: https://spiceai.org/docs/reference/memory"
             );
-        } else {
+        } else if query_pool == QueryPoolSizing::Sizing {
+            // A reload reaching here reduced nothing: the explicit ceilings fit
+            // beside the query pool that was already in effect.
             tracing::warn!(
                 total_memory_bytes = total_memory,
                 query_pool_bytes = plan.effective_query_pool_bytes,
@@ -1723,6 +1845,19 @@ fn emit_duckdb_memory_budget_warning(
                 "Reduced the DataFusion query memory limit to {query_h} so it plus the explicit DuckDB accelerator memory limits fit the {total_h} available to this process. To customize, set runtime.query.memory_limit.{mixed} For details, visit: https://spiceai.org/docs/reference/memory"
             );
         }
+    } else if plan.residual_overcommit && query_pool_fixed {
+        // The query pool is the value it was built with, so recommending it back as
+        // runtime.query.memory_limit would only pin the size that leaves no room —
+        // the split this pod needs is the one a restart computes with the
+        // accelerators present.
+        tracing::warn!(
+            total_memory_bytes = total_memory,
+            projected_ceiling_bytes = plan.projected_ceiling_bytes,
+            query_pool_bytes = plan.effective_query_pool_bytes,
+            duckdb_unset_instances = n,
+            duckdb_per_instance_bytes = plan.per_instance_cap_bytes,
+            "The {n} DuckDB instance(s) without an explicit duckdb_memory_limit do not fit beside the {query_h} query memory limit already in effect, so a DuckDB instance created from here is held to the {per_instance_h} per-instance floor; any that already exists keeps the memory_limit it was created with until it is recreated. Combined ceilings may approach or exceed the {total_h} available to this process and risk an OOM kill under load. The query memory pool is sized when the runtime starts and a reload cannot resize it: reduce the number of distinct DuckDB files, or set duckdb_memory_limit on each DuckDB-accelerated dataset, then restart spiced so the query pool is sized alongside them.{mixed} For details, visit: https://spiceai.org/docs/reference/memory"
+        );
     } else if plan.residual_overcommit {
         tracing::warn!(
             total_memory_bytes = total_memory,
@@ -1732,6 +1867,20 @@ fn emit_duckdb_memory_budget_warning(
             recommended_duckdb_memory_limit_bytes = plan.per_instance_cap_bytes,
             recommended_query_memory_limit_bytes = plan.effective_query_pool_bytes,
             "Even after auto-capping, the {n} DuckDB instance(s) without an explicit duckdb_memory_limit plus the query memory limit exceed the coordinated memory budget and cut into the safety headroom below the {total_h} available to this process; combined ceilings may approach or exceed it and risk an OOM kill under load. Reduce the number of distinct DuckDB files, or set runtime.query.memory_limit: \"{query_h}\" and duckdb_memory_limit: \"{per_instance_h}\" on each DuckDB-accelerated dataset so combined ceilings fit.{mixed} For details, visit: https://spiceai.org/docs/reference/memory"
+        );
+    } else if query_pool_fixed {
+        // Only a DuckDB instance created from here reads the new cap, so this split
+        // describes what the pod is moving to, not what it already holds: no claim
+        // that live ceilings now fit, and no cold-start counterfactual — an
+        // already-coordinated pod's next instance would have taken the previous cap,
+        // not DuckDB's own default.
+        tracing::warn!(
+            total_memory_bytes = total_memory,
+            query_pool_bytes = plan.effective_query_pool_bytes,
+            duckdb_unset_instances = n,
+            duckdb_per_instance_bytes = plan.per_instance_cap_bytes,
+            duckdb_unset_instance_paths = ?inputs.unset_instance_labels,
+            "Re-split the coordinated DuckDB accelerator memory budget for the reloaded configuration: the {n} DuckDB instance(s) without an explicit duckdb_memory_limit are capped at {per_instance_h} each, beside the {query_h} query memory limit already in effect. The cap applies to a DuckDB instance created from here; any that already exists keeps the memory_limit it was created with — which may differ from this split — until it is recreated. To customize, set per-dataset duckdb_memory_limit.{mixed} For details, visit: https://spiceai.org/docs/reference/memory"
         );
     } else {
         tracing::warn!(

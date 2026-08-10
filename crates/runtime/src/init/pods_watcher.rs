@@ -91,11 +91,16 @@ impl Runtime {
         current_app: Option<&Arc<App>>,
         new_app: Arc<App>,
     ) -> bool {
-        if let Some(current_app) = current_app {
-            if *current_app == new_app {
-                return false;
-            }
+        if current_app.is_some_and(|current_app| *current_app == new_app) {
+            return false;
+        }
 
+        // Re-split the coordinated DuckDB accelerator memory budget for the
+        // acceleration set `new_app` declares, before the diffs below initialize any
+        // accelerator that reads it.
+        self.duckdb_budget_context.publish_for(&new_app);
+
+        if let Some(current_app) = current_app {
             tracing::debug!("Updated pods information: {new_app:?}");
             tracing::debug!("Previous pods information: {current_app:?}");
 
@@ -129,5 +134,168 @@ impl Runtime {
         *self.app.write().await = Some(new_app);
 
         true
+    }
+}
+
+#[cfg(all(test, feature = "duckdb"))]
+mod tests {
+    use std::path::Path;
+    use std::sync::Arc;
+
+    use app::AppBuilder;
+    use spicepod::acceleration::{Acceleration, Mode};
+    use spicepod::component::dataset::Dataset;
+    use spicepod::param::Params;
+
+    use crate::Runtime;
+    use crate::accelerator_memory_budget::{
+        DUCKDB_MIN_INSTANCE_CAP_BYTES, duckdb_auto_memory_limit_option,
+        duckdb_total_reservation_bytes,
+    };
+
+    const MIB: u64 = 1024 * 1024;
+
+    /// A dataset declaring one `DuckDB` instance of its own. No build of the runtime
+    /// resolves its `from:`, so it fails its load permanently instead of retrying:
+    /// the budget is planned from the accelerations the Spicepod declares, before
+    /// any of them is initialized.
+    fn duckdb_dataset(name: &str, duckdb_file: &Path) -> Dataset {
+        let mut dataset = Dataset::new("not_a_real_connector:any", name);
+        dataset.acceleration = Some(Acceleration {
+            enabled: true,
+            engine: Some("duckdb".to_string()),
+            mode: Mode::File,
+            params: Some(Params::from_string_map(
+                [(
+                    "duckdb_file".to_string(),
+                    duckdb_file.to_string_lossy().to_string(),
+                )]
+                .into_iter()
+                .collect(),
+            )),
+            ..Acceleration::default()
+        });
+        dataset
+    }
+
+    /// The published per-instance cap, in whole MiB — the `memory_limit` the `DuckDB`
+    /// accelerator gives an instance it creates for a dataset that set none itself.
+    fn published_per_instance_mib() -> Option<u64> {
+        duckdb_auto_memory_limit_option()?
+            .strip_suffix("MiB")?
+            .parse()
+            .ok()
+    }
+
+    /// A reload changes which `DuckDB` instances exist, so it must republish the
+    /// coordinated budget: a second instance splits what the first one held to
+    /// itself, removing every `DuckDB` accelerator clears the budget rather than
+    /// leaving the reservation the removed instances held, and a pod that gains its
+    /// first accelerator on reload gets the per-instance floor — its query pool was
+    /// sized without coordinating for `DuckDB` and only a restart re-sizes it.
+    ///
+    /// One test, because the budget is process-global: two tests reading it run
+    /// concurrently in one test binary and would each see the other's runtime.
+    #[tokio::test]
+    async fn apply_app_republishes_the_duckdb_memory_budget() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let one = duckdb_dataset("one", &dir.path().join("one.db"));
+        let two = duckdb_dataset("two", &dir.path().join("two.db"));
+
+        let rt = Arc::new(
+            Runtime::builder()
+                .with_app(
+                    AppBuilder::new("duckdb_budget_reload")
+                        .with_dataset(one.clone())
+                        .build(),
+                )
+                .build()
+                .await,
+        );
+        let one_instance = published_per_instance_mib()
+            .expect("building with a DuckDB accelerator publishes a per-instance cap");
+
+        let both = AppBuilder::new("duckdb_budget_reload")
+            .with_dataset(one)
+            .with_dataset(two)
+            .build();
+        assert!(
+            Arc::clone(&rt).apply_app(Arc::new(both)).await,
+            "the reload adds a dataset, so it must be applied"
+        );
+
+        let two_instances = published_per_instance_mib()
+            .expect("a reload that keeps a DuckDB accelerator keeps a per-instance cap");
+        assert!(
+            two_instances < one_instance,
+            "the reload added a second DuckDB instance, so the published cap must shrink: {two_instances} MiB vs {one_instance} MiB"
+        );
+        assert!(
+            two_instances.abs_diff(one_instance / 2) <= 1,
+            "the two instances must split what the single instance held: {two_instances} MiB vs {one_instance} MiB"
+        );
+        // The instance that already exists keeps the memory_limit it was created
+        // with, so the aggregate still has to cover it at the larger cap.
+        let reservation_after_two = duckdb_total_reservation_bytes();
+        assert!(
+            reservation_after_two >= 2 * one_instance * MIB,
+            "the reservation must cover the first instance at the cap it was created with: {reservation_after_two} bytes"
+        );
+
+        let unaccelerated = AppBuilder::new("duckdb_budget_reload")
+            .with_dataset(Dataset::new("not_a_real_connector:any", "plain"))
+            .build();
+        assert!(
+            Arc::clone(&rt).apply_app(Arc::new(unaccelerated)).await,
+            "the reload removes both datasets, so it must be applied"
+        );
+        assert_eq!(
+            published_per_instance_mib(),
+            None,
+            "a reload that removes every DuckDB accelerator must clear the per-instance cap"
+        );
+        assert_eq!(
+            duckdb_total_reservation_bytes(),
+            0,
+            "a reload that removes every DuckDB accelerator must clear the reservation"
+        );
+
+        rt.shutdown().await;
+
+        // A pod built without a DuckDB accelerator sized its query pool without
+        // coordinating for one; the accelerator a reload adds is held to the
+        // per-instance floor, because only a restart re-sizes that pool.
+        let uncoordinated = Arc::new(
+            Runtime::builder()
+                .with_app(
+                    AppBuilder::new("duckdb_budget_first")
+                        .with_dataset(Dataset::new("not_a_real_connector:any", "plain"))
+                        .build(),
+                )
+                .build()
+                .await,
+        );
+        assert_eq!(
+            published_per_instance_mib(),
+            None,
+            "a pod with no DuckDB accelerator publishes no cap"
+        );
+
+        let accelerated = AppBuilder::new("duckdb_budget_first")
+            .with_dataset(duckdb_dataset("first", &dir.path().join("first.db")))
+            .build();
+        assert!(
+            Arc::clone(&uncoordinated)
+                .apply_app(Arc::new(accelerated))
+                .await,
+            "the reload adds a DuckDB-accelerated dataset, so it must be applied"
+        );
+        assert_eq!(
+            published_per_instance_mib(),
+            Some(DUCKDB_MIN_INSTANCE_CAP_BYTES / MIB),
+            "the query pool already holds the splittable region, so the instance the reload adds gets the per-instance floor"
+        );
+
+        uncoordinated.shutdown().await;
     }
 }
