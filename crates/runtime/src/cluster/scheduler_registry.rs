@@ -315,7 +315,6 @@ impl SchedulerRegistryRunner {
             .read(&self.scheduler_id)
             .await
             .context(HeartbeatSnafu)?;
-        let observed_instance = observed.as_ref().map(|b| b.instance_id);
 
         let entry = self.entry.clone();
         let scheduler_id = self.scheduler_id.clone();
@@ -327,22 +326,25 @@ impl SchedulerRegistryRunner {
             .cluster
             .mutate(|state| {
                 if let Some(existing) = state.schedulers.get(&scheduler_id) {
-                    // Allow takeover only if (a) the heartbeat we
-                    // observed matches the existing entry's
-                    // instance_id (so we are taking over the
-                    // incarnation we judged stale), AND (b) that
-                    // observation is in fact stale, OR there is no
-                    // heartbeat at all and the existing entry has
-                    // had time to publish one.
-                    let observed_matches =
-                        observed_instance.is_none_or(|i| i == existing.instance_id);
-                    let stale_or_missing = if let Some(beat) = observed.as_ref() {
+                    // Judge the registered entry only by *its own*
+                    // heartbeat. The key is shared, so a beat left by some
+                    // other incarnation says nothing about this entry: if a
+                    // successor commits its membership and dies before its
+                    // first beat, the predecessor's beat is what remains, and
+                    // treating that as a mismatch would lock the id forever
+                    // (registration refuses, and the reaper skips the same
+                    // mismatch). An unrelated beat is therefore treated as no
+                    // beat, which falls through to the startup grace window.
+                    let own_beat = observed
+                        .as_ref()
+                        .filter(|beat| beat.instance_id == existing.instance_id);
+                    let stale_or_missing = if let Some(beat) = own_beat {
                         beat.is_stale(now)
                     } else {
                         let grace = existing.ttl_ms.saturating_add(CLOCK_SKEW_TOLERANCE_MS);
                         now.saturating_sub(existing.started_at_ms) > grace
                     };
-                    if observed_matches && stale_or_missing {
+                    if stale_or_missing {
                         state.schedulers.insert(scheduler_id.clone(), entry.clone());
                         MutationOutcome::Apply
                     } else if existing.instance_id == instance_id {
@@ -467,7 +469,27 @@ impl SchedulerRegistryRunner {
             )
             .await
             {
-                Ok(result) => result.context(HeartbeatSnafu)?,
+                Ok(Ok(result)) => result,
+                // A read error and a read timeout are the same situation: the
+                // current beat is unknown. Aborting the tick here would let
+                // repeated transient errors suppress every beat until the TTL
+                // lapses and this healthy scheduler is reaped.
+                Ok(Err(err)) => {
+                    if membership == Membership::ConfirmedSelf {
+                        tracing::warn!(
+                            scheduler_id = %self.scheduler_id,
+                            error = %err,
+                            "Could not read the current heartbeat; writing as the confirmed owner"
+                        );
+                        return self.overwrite_heartbeat().await;
+                    }
+                    tracing::warn!(
+                        scheduler_id = %self.scheduler_id,
+                        error = %err,
+                        "Could not read the current heartbeat with membership unconfirmed; skipping this beat"
+                    );
+                    return Ok(());
+                }
                 Err(_elapsed) => {
                     // The current beat is unknown. With membership confirmed we
                     // are entitled to the key, so write unconditionally rather
@@ -486,14 +508,19 @@ impl SchedulerRegistryRunner {
                 }
             };
 
+            // An unparsable payload reads back as `None`: the holder is unknown,
+            // which is not evidence that it is ours, so it is treated like a
+            // foreign beat.
             if let Some((beat, _)) = observed.as_ref()
-                && beat.instance_id != self.instance_id
+                && beat
+                    .as_ref()
+                    .is_none_or(|beat| beat.instance_id != self.instance_id)
                 && membership != Membership::ConfirmedSelf
             {
                 tracing::warn!(
                     scheduler_id = %self.scheduler_id,
                     instance_id = %self.instance_id,
-                    holder = %beat.instance_id,
+                    holder = ?beat.as_ref().map(|b| b.instance_id),
                     "Another incarnation holds the heartbeat and membership is unconfirmed; skipping this beat"
                 );
                 return Ok(());
@@ -1224,6 +1251,89 @@ mod tests {
         assert!(
             beat.last_heartbeat_ms > 1_000,
             "our own heartbeat must be refreshed even when membership is unreadable"
+        );
+    }
+
+    /// A successor that commits its membership entry and dies before its first
+    /// heartbeat leaves the *predecessor's* beat under a shared key. That must
+    /// not lock the id: registration has to judge the entry by its own beat,
+    /// treat an unrelated one as absent, and take over after the grace window.
+    #[tokio::test]
+    async fn a_successor_that_died_before_its_first_heartbeat_does_not_lock_the_id() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let cluster = Arc::new(ClusterStateStore::new(Arc::clone(&store), ""));
+        let heartbeats = Arc::new(SchedulerHeartbeatStore::new(Arc::clone(&store), ""));
+        cluster.bootstrap().await.expect("bootstrap");
+
+        let predecessor = Uuid::new_v4();
+        let dead_successor = Uuid::new_v4();
+        let newcomer = Uuid::new_v4();
+
+        // Membership names a successor that never published a beat, while the
+        // shared key still holds the predecessor's.
+        let mut dead_entry = SchedulerEntry {
+            scheduler_id: "test:50051".to_string(),
+            instance_id: dead_successor,
+            advertise_address: "test:50051".to_string(),
+            grpc_address: "test:50051".to_string(),
+            http_address: "test:8090".to_string(),
+            started_at_ms: 0,
+            ttl_ms: 30_000,
+            build_version: "test".to_string(),
+            labels: HashMap::new(),
+        };
+        cluster
+            .mutate(|state| {
+                state
+                    .schedulers
+                    .insert("test:50051".to_string(), dead_entry.clone());
+                MutationOutcome::Apply
+            })
+            .await
+            .expect("seed the crashed successor");
+        heartbeats
+            .heartbeat("test:50051", predecessor, 1_000, 30_000)
+            .await
+            .expect("predecessor heartbeat");
+
+        // A fresh process starts long after the grace window.
+        dead_entry.instance_id = newcomer;
+        let entry = dead_entry;
+        let job_store = crate::jobs::JobStore::new(Arc::clone(&store), "", newcomer.to_string());
+        let df = DataFusionBuilder::new(
+            status::RuntimeStatus::new(),
+            Arc::new(AcceleratorEngineRegistry::default()),
+            Handle::current(),
+        )
+        .build();
+        let job_executor = Arc::new(crate::jobs::JobExecutor::new(
+            Arc::new(job_store),
+            Arc::new(df),
+        ));
+        let runner = SchedulerRegistryRunner {
+            cluster: Arc::clone(&cluster),
+            heartbeats: Arc::clone(&heartbeats),
+            reaper: Reaper::new(Arc::clone(&cluster), Arc::clone(&heartbeats)),
+            scheduler_id: "test:50051".to_string(),
+            instance_id: newcomer,
+            entry,
+            peers: Arc::new(RwLock::new(HashMap::new())),
+            job_executor,
+            superseded: Arc::new(AtomicBool::new(false)),
+        };
+
+        runner
+            .register_self()
+            .await
+            .expect("an unrelated heartbeat must not block takeover");
+
+        let snap = cluster.read().await.expect("read");
+        assert_eq!(
+            snap.schedulers
+                .get("test:50051")
+                .map(|entry| entry.instance_id),
+            Some(newcomer),
+            "the id must be recoverable, not locked by a stale unrelated heartbeat"
         );
     }
 

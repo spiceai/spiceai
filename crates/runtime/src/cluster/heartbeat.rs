@@ -197,10 +197,15 @@ impl SchedulerHeartbeatStore {
 
     /// Reads the heartbeat together with the object version needed to write it
     /// back conditionally. `None` means the object does not exist yet.
+    /// The version is what a conditional write needs; the payload is only used
+    /// to see *whose* beat it is. An unparsable payload therefore yields
+    /// `Some((None, version))` rather than an error: failing here would stop a
+    /// healthy scheduler from ever repairing its own key, where the previous
+    /// unconditional write self-healed.
     pub async fn read_versioned(
         &self,
         scheduler_id: &str,
-    ) -> Result<Option<(SchedulerHeartbeat, UpdateVersion)>> {
+    ) -> Result<Option<(Option<SchedulerHeartbeat>, UpdateVersion)>> {
         let path = self.path_for(scheduler_id);
         match self.store.get(&path).await {
             Ok(result) => {
@@ -212,8 +217,17 @@ impl SchedulerHeartbeatStore {
                     path: path.to_string(),
                     source,
                 })?;
-                let beat: SchedulerHeartbeat =
-                    serde_json::from_slice(&bytes).context(SerdeSnafu)?;
+                let beat = match serde_json::from_slice::<SchedulerHeartbeat>(&bytes) {
+                    Ok(beat) => Some(beat),
+                    Err(err) => {
+                        tracing::warn!(
+                            path = %path,
+                            error = %err,
+                            "Unparsable heartbeat payload; treating the holder as unknown"
+                        );
+                        None
+                    }
+                };
                 Ok(Some((beat, version)))
             }
             Err(ObjectStoreError::NotFound { .. }) => Ok(None),
