@@ -460,7 +460,7 @@ impl SchedulerRegistryRunner {
     ///   proving we are registered. Without that proof, skip the beat — a
     ///   superseded incarnation must not refresh over its successor merely
     ///   because `cluster.json` was slow.
-    async fn write_heartbeat(&self, membership: Membership) -> Result<()> {
+    async fn write_heartbeat(&self, mut membership: Membership) -> Result<()> {
         for _ in 0..MAX_HEARTBEAT_CAS_ATTEMPTS {
             let read_timeout = membership_check_timeout(self.entry.ttl_ms);
             let observed = match tokio::time::timeout(
@@ -544,8 +544,11 @@ impl SchedulerRegistryRunner {
                     // Someone else wrote between the read and the write. Only a
                     // fresh membership read decides retry versus retire.
                     match self.read_membership().await {
-                        // Still ours: fall through to the next attempt.
-                        Some(true) => {}
+                        // Still ours. Remember that: this read is proof of
+                        // ownership, and without promoting it a retry would
+                        // still refuse a foreign beat and leave the rightful
+                        // owner unable to reclaim its key.
+                        Some(true) => membership = Membership::ConfirmedSelf,
                         Some(false) => {
                             self.superseded.store(true, Ordering::Relaxed);
                             tracing::warn!(
