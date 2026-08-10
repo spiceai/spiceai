@@ -35,8 +35,8 @@ use std::sync::Arc;
 /// changes stream both rely on that discoverability: wrapping one of these
 /// layers opaquely instead hides it, so no changes stream is attached and
 /// `refresh_mode: changes` fails with "a changes stream is required".
-/// Restricted to the layers a registration-time source stack contains; see
-/// the layer table in [`crate::table_layers`].
+/// Enrichment is applied at the base so every layer above it — indexes,
+/// embeddings, vector scans — stays intact and discoverable.
 pub fn table_provider_with_spicepod_metadata<S: std::hash::BuildHasher>(
     provider: Arc<dyn TableProvider>,
     table_metadata: &HashMap<String, String, S>,
@@ -54,21 +54,14 @@ pub fn table_provider_with_spicepod_metadata<S: std::hash::BuildHasher>(
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
 
-    spice_table::rebuild_innermost_table_provider(
-        provider,
-        &[
-            crate::table_layers::INDEXED_LAYER,
-            crate::table_layers::EMBEDDING_LAYER,
-            crate::table_layers::VECTOR_SCAN_LAYER,
-        ],
-        &|innermost| {
-            metadata_enriched_table_provider(
-                innermost,
-                table_metadata.clone(),
-                field_metadata.clone(),
-            )
-        },
-    )
+    let enrich = |base: Arc<dyn TableProvider>| {
+        metadata_enriched_table_provider(base, table_metadata.clone(), field_metadata.clone())
+    };
+
+    match provider.downcast_ref::<spice_table::SpiceTable>() {
+        Some(table) => table.rebuild_base(&enrich),
+        None => enrich(provider),
+    }
 }
 
 fn field_metadata_from_columns(columns: &[Column]) -> FieldMetadata {

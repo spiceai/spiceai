@@ -312,14 +312,22 @@ impl SpiceTable {
         }
     }
 
-    /// Every index carried by any layer in the stack, outermost first.
+    /// Every index carried by any layer reachable by `walk`, outermost first.
+    ///
+    /// De-duplicated by identity: one index may be carried by more than one
+    /// layer, and a caller driving write lifecycle hooks must not run them twice.
     #[must_use]
-    pub fn all_indexes(&self) -> Vec<Arc<dyn Index + Send + Sync>> {
-        let mut indexes = Vec::new();
+    pub fn all_indexes(&self, walk: LayerWalk) -> Vec<Arc<dyn Index + Send + Sync>> {
+        let mut indexes: Vec<Arc<dyn Index + Send + Sync>> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
         let mut current = self;
         loop {
-            indexes.extend(current.layer.indexes().iter().map(Arc::clone));
-            let Some(next) = current.layer.route(LayerWalk::Index, &current.below) else {
+            for index in current.layer.indexes() {
+                if seen.insert(Arc::as_ptr(index).cast::<()>()) {
+                    indexes.push(Arc::clone(index));
+                }
+            }
+            let Some(next) = current.layer.route(walk, &current.below) else {
                 return indexes;
             };
             match next.downcast_ref::<SpiceTable>() {
@@ -341,6 +349,26 @@ impl SpiceTable {
             None => transform(Arc::clone(&self.below)),
         };
         Self::over(Arc::clone(&self.layer), rebuilt_below)
+    }
+}
+
+/// Finds a specific concrete [`TableProvider`] in the stack, following `walk`.
+///
+/// Downcasting here does not reintroduce the dependency this module removes: a
+/// caller asking for a *particular* type already depends on it. What it no
+/// longer has to name is every wrapper in between.
+#[must_use]
+pub fn find_concrete<T: TableProvider + 'static>(
+    top: &Arc<dyn TableProvider>,
+    walk: LayerWalk,
+) -> Option<&T> {
+    let mut current = top;
+    loop {
+        if let Some(found) = current.downcast_ref::<T>() {
+            return Some(found);
+        }
+        let table = current.downcast_ref::<SpiceTable>()?;
+        current = table.layer.route(walk, &table.below)?;
     }
 }
 
@@ -654,7 +682,7 @@ mod tests {
         let middle = SpiceTable::over(TestLayer::marker(), bottom);
         let top = SpiceTable::over(TestLayer::indexed("top"), middle);
 
-        let names: Vec<_> = top.all_indexes().iter().map(|i| i.name()).collect();
+        let names: Vec<_> = top.all_indexes(LayerWalk::Index).iter().map(|i| i.name()).collect();
         assert_eq!(names, vec!["top", "bottom"]);
     }
 
@@ -683,7 +711,7 @@ mod tests {
         let rebuilt = top.rebuild_base(&|_| Arc::clone(&replacement));
 
         assert_eq!(
-            rebuilt.all_indexes().iter().map(|i| i.name()).collect::<Vec<_>>(),
+            rebuilt.all_indexes(LayerWalk::Index).iter().map(|i| i.name()).collect::<Vec<_>>(),
             vec!["top"],
             "layers above the base must survive a rebuild"
         );

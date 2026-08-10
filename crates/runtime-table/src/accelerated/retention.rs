@@ -21,7 +21,6 @@ use crate::accelerated::{
 };
 use crate::federated::FederatedTable;
 use crate::filter_converter::{TimestampFilterConvert, create_timestamp_filter_convert};
-use crate::table_layers::{EMBEDDING_INNER, METADATA_ENRICHED_INNER};
 use arrow::array::{RecordBatch, UInt64Array};
 use cache::Caching;
 use datafusion::{
@@ -33,37 +32,23 @@ use datafusion::{
 };
 use runtime_component::dataset::TimeFormat;
 use runtime_datafusion::{is_spice_internal_dataset, session_config::get_df_default_config};
-use spice_table::{
-    INDEXED_INNER, Index, InnerProviderFn, resolve_keys_matching_predicate,
-};
+use spice_table::{Index, LayerWalk, peel_to, resolve_keys_matching_predicate};
 use runtime_object_store::registry::default_runtime_env;
 use search::index::compound::{CompoundSearchIndex, CompoundVectorIndex};
 use tokio::runtime::Handle;
 use tokio::sync::Mutex;
 
-/// The wrapper layers stripped by [`strip_index_wrapper_layers`] below. Deliberately narrower
-/// than [`crate::table_layers::TABLE_PROVIDER_LAYERS`]: it excludes `ACCELERATED_INNER` (which resolves to the
-/// *federated/source* table, not the accelerator — peeling it here would redirect a delete to the
-/// wrong table entirely) and the Iceberg/federated-adaptor accessors (source-side wrappers that
-/// never wrap an accelerator's raw provider; `IcebergDeletionProvider` in particular has real
-/// delete semantics of its own, not a passthrough, so it must never be silently skipped).
-const INDEX_WRAPPER_INNER_FNS: &[InnerProviderFn] =
-    &[INDEXED_INNER, EMBEDDING_INNER, METADATA_ENRICHED_INNER];
-
-/// Strips `IndexLayer`/`EmbeddingTable`/`MetadataEnrichedTableProvider` wrapper layers
-/// so the actual accelerator delete below bypasses `IndexLayer::delete_from`'s
-/// index-aware handling — retention needs the *warm-only* index scope (see
-/// [`warm_delete_target`]), which is a different policy than that generic path's full/both-scope
-/// delete.
+/// Peels to the provider a retention delete must execute against, bypassing
+/// `IndexLayer::delete_from`'s index-aware handling — retention needs the
+/// *warm-only* index scope (see [`warm_delete_target`]), a different policy from
+/// that generic path's full/both-scope delete.
+///
+/// Each layer decides for itself whether [`LayerWalk::RetentionDelete`] may see
+/// past it, so a layer with delete semantics of its own — or one redirecting to
+/// the source side, which would send the delete to the wrong table entirely —
+/// stops the peel rather than being silently skipped here.
 fn strip_index_wrapper_layers(tbl: &Arc<dyn TableProvider>) -> Arc<dyn TableProvider> {
-    let mut current = Arc::clone(tbl);
-    while let Some(inner) = INDEX_WRAPPER_INNER_FNS
-        .iter()
-        .find_map(|f| f(current.as_ref()))
-    {
-        current = Arc::clone(inner);
-    }
-    current
+    Arc::clone(peel_to(tbl, LayerWalk::RetentionDelete))
 }
 
 /// Resolves the index a retention delete should actually hit: for a compound (fallback-composed)

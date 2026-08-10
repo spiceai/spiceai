@@ -63,9 +63,9 @@ impl AcceleratedTable {
         match Arc::clone(&self).create_federated_table_source() {
             Some(table_source) => Arc::new(FederatedTableProviderAdaptor::new_with_provider(
                 table_source,
-                self,
+                self.into_table(),
             )),
-            None => self,
+            None => self.into_table(),
         }
     }
 }

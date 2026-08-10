@@ -57,7 +57,7 @@ use runtime_component::schema_evolution::{
 };
 use runtime_datafusion::error::{find_datafusion_root, format_datafusion_error};
 use runtime_datafusion::execution_plan::schema_cast::SchemaCastScanExec;
-use spice_table::{IndexLayer, LayerWalk, find_concrete_table_provider_in};
+use spice_table::{LayerWalk, SpiceTable, find_concrete};
 use runtime_metrics::acceleration as metrics;
 use runtime_search::embeddings::table::EmbeddingTable;
 use runtime_status as status;
@@ -2623,11 +2623,7 @@ impl RefreshTask {
     /// semantics) and emits the fallback warning below.
     #[cfg(not(windows))]
     fn cayenne_accelerator(&self) -> Option<&CayenneTableProvider> {
-        find_concrete_table_provider_in::<CayenneTableProvider>(
-            &self.accelerator,
-            crate::table_layers::layers(),
-            LayerWalk::Write,
-        )
+        find_concrete::<CayenneTableProvider>(&self.accelerator, LayerWalk::Write)
     }
 
     /// Effective per-plan delete-key cap for this dataset: the process-global
@@ -3094,12 +3090,10 @@ async fn delete_matching_rows_from_arrow_provider(
     provider: &Arc<dyn TableProvider>,
     rows: &RecordBatch,
 ) -> crate::accelerated::Result<Option<u64>> {
-    if let Some(indexed) = provider.downcast_ref::<IndexLayer>() {
-        return Box::pin(delete_matching_rows_from_arrow_provider(
-            indexed.get_underlying_ref(),
-            rows,
-        ))
-        .await;
+    // Peel any layers stacked on the accelerator to reach the provider that
+    // actually holds the rows.
+    if let Some(table) = provider.downcast_ref::<SpiceTable>() {
+        return Box::pin(delete_matching_rows_from_arrow_provider(table.below(), rows)).await;
     }
 
     if let Some(embedding_table) = provider.downcast_ref::<EmbeddingTable>() {
@@ -3152,11 +3146,10 @@ async fn delete_matching_rows_from_arrow_provider(
 async fn perform_change_write_maintenance(
     provider: &Arc<dyn TableProvider>,
 ) -> crate::accelerated::Result<()> {
-    if let Some(indexed) = provider.downcast_ref::<IndexLayer>() {
-        return Box::pin(perform_change_write_maintenance(
-            indexed.get_underlying_ref(),
-        ))
-        .await;
+    // Peel any layers stacked on the accelerator to reach the provider that
+    // actually performs maintenance.
+    if let Some(table) = provider.downcast_ref::<SpiceTable>() {
+        return Box::pin(perform_change_write_maintenance(table.below())).await;
     }
 
     if let Some(embedding_table) = provider.downcast_ref::<EmbeddingTable>() {

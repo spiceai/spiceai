@@ -74,9 +74,8 @@ use runtime_datafusion::refresh_scan::get_data;
 use runtime_datafusion::refresh_sql;
 use runtime_datafusion::schema_provider::ensure_schema_exists;
 use runtime_datafusion::session_config::get_df_default_config;
-use spice_table::rebuild_innermost_table_provider;
+use spice_table::{LayerWalk, SpiceTable};
 use runtime_datafusion_index::analyzer::{IndexTableScanExtensionPlanner, IndexTableScanOptimizerRule};
-use spice_table::IndexLayer;
 use runtime_metrics::acceleration as metrics;
 use runtime_metrics::telemetry::track_bytes_processed;
 use runtime_object_store::registry::default_runtime_env;
@@ -134,10 +133,8 @@ fn table_provider_with_existing_metadata(
     metadata_enriched_table_provider_preserving_indexes(provider, &table_metadata, &field_metadata)
 }
 
-/// Pushes metadata enrichment to the base of the provider stack, rebuilding
-/// the index, stale-enrichment and federation layers around it so they stay
-/// discoverable by downcast. Restricted to the layers a refresh-path provider
-/// stack contains; see the layer table in [`crate::table_layers`].
+/// Pushes metadata enrichment to the base of the provider stack, keeping every
+/// layer above it intact so indexes and federation stay discoverable.
 fn metadata_enriched_table_provider_preserving_indexes(
     provider: Arc<dyn TableProvider>,
     table_metadata: &HashMap<String, String>,
@@ -147,21 +144,14 @@ fn metadata_enriched_table_provider_preserving_indexes(
         return provider;
     }
 
-    rebuild_innermost_table_provider(
-        provider,
-        &[
-            crate::table_layers::INDEXED_LAYER,
-            crate::table_layers::METADATA_ENRICHED_LAYER,
-            crate::table_layers::FEDERATED_ADAPTOR_LAYER,
-        ],
-        &|innermost| {
-            metadata_enriched_table_provider(
-                innermost,
-                table_metadata.clone(),
-                field_metadata.clone(),
-            )
-        },
-    )
+    let enrich = |base: Arc<dyn TableProvider>| {
+        metadata_enriched_table_provider(base, table_metadata.clone(), field_metadata.clone())
+    };
+
+    match provider.downcast_ref::<SpiceTable>() {
+        Some(table) => table.rebuild_base(&enrich),
+        None => enrich(provider),
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -170,35 +160,17 @@ struct RefreshStat {
     pub memory_size: usize,
 }
 
-/// Synchronous traversal: walks a provider chain and collects indexes from every
-/// [`IndexLayer`] layer, stepping through every read-transparent layer
-/// (see [`crate::table_layers`]) so an index nested under a metadata-enrichment
-/// or vector-scan layer is not silently missed. Kept as a plain fn (not async)
-/// so that the `HashSet<*const ()>` used for dedup never appears inside an
-/// async fn and cannot make the enclosing future non-`Send`.
+/// Collects the indexes attached anywhere in a dataset's stack.
+///
+/// Kept as a plain fn (not async) so the identity set used for de-duplication
+/// never appears inside an async fn and cannot make the enclosing future
+/// non-`Send`.
 pub(crate) fn collect_indexes_from_provider(
     root: &Arc<dyn datafusion::catalog::TableProvider>,
 ) -> Vec<Arc<dyn spice_table::Index + Send + Sync>> {
-    let mut indexes: Vec<Arc<dyn spice_table::Index + Send + Sync>> = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-
-    spice_table::visit_provider_chain(
-        root,
-        crate::table_layers::layers(),
-        spice_table::LayerWalk::Read,
-        &mut |provider| {
-            if let Some(indexed) = provider.downcast_ref::<IndexLayer>() {
-                for index in indexed.get_all_indexes() {
-                    let ptr = Arc::as_ptr(&index).cast::<()>();
-                    if seen.insert(ptr) {
-                        indexes.push(index);
-                    }
-                }
-            }
-        },
-    );
-
-    indexes
+    root.downcast_ref::<SpiceTable>()
+        .map(|table| table.all_indexes(LayerWalk::Read))
+        .unwrap_or_default()
 }
 
 /// Walks the federated provider chain and collects indexes from **every** [`IndexLayer`]

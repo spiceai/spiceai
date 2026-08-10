@@ -30,14 +30,13 @@ use async_trait::async_trait;
 use data_accelerator_api::{BootstrapStatus, get_primary_keys_from_constraints};
 use data_components::cdc::ChangesStream;
 use datafusion::catalog::Session;
-use datafusion::common::Constraints;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::logical_expr::TableProviderFilterPushDown;
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::sql::TableReference;
 use datafusion::{
-    datasource::{TableProvider, TableType},
+    datasource::TableProvider,
     logical_expr::Expr,
 };
 use opentelemetry::KeyValue;
@@ -1367,7 +1366,18 @@ impl AcceleratedTable {
         Arc::clone(&self.accelerator)
     }
 
+    /// The schema this table presents to query planning.
+    ///
+    /// In caching mode the storage schema carries a hidden namespace column, so
+    /// what users see is not what the accelerator stores.
     #[must_use]
+    pub fn schema(&self) -> SchemaRef {
+        if let Some(s) = self.user_facing_schema.as_ref() {
+            return Arc::clone(s);
+        }
+        self.accelerator.schema()
+    }
+
     /// Presents this accelerated table as a layered [`SpiceTable`].
     ///
     /// The table beneath is this table's own accelerator, so the layer and its
@@ -1532,10 +1542,7 @@ impl TableLayer for AcceleratedTable {
 
 
     fn schema(&self, _below: &Arc<dyn TableProvider>) -> SchemaRef {
-        if let Some(s) = self.user_facing_schema.as_ref() {
-            return Arc::clone(s);
-        }
-        self.accelerator.schema()
+        AcceleratedTable::schema(self)
     }
 
 
@@ -2013,6 +2020,7 @@ impl TableLayer for AcceleratedTable {
     ) -> DataFusionResult<datafusion::catalog::ScanResult> {
         let plan = self
             .scan(
+                _below,
                 state,
                 args.projection().map(<[usize]>::to_vec).as_ref(),
                 args.filters().unwrap_or(&[]),
