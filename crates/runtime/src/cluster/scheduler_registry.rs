@@ -45,11 +45,19 @@ use runtime_metrics::cluster as cluster_metrics;
 
 const DEFAULT_TTL_MS: u64 = 30_000;
 
-/// Deadline for the membership read that gates a heartbeat. Must stay well
-/// below the heartbeat interval (`ttl / HEARTBEAT_DIVISOR`) so a slow store
-/// cannot delay a beat far enough for peers to consider this scheduler dead.
-/// `membership_check_timeout_is_below_the_heartbeat_interval` pins that.
-const MEMBERSHIP_CHECK_TIMEOUT: Duration = Duration::from_secs(2);
+/// Upper bound on the deadline for the membership read that gates a heartbeat.
+/// The effective deadline is derived from the scheduler's own heartbeat
+/// interval by [`membership_check_timeout`] and capped here, because `ttl_ms`
+/// is carried per entry: a fixed deadline could exceed the interval for a short
+/// TTL and delay a beat far enough for peers to reap a healthy scheduler.
+const MEMBERSHIP_CHECK_TIMEOUT_CAP: Duration = Duration::from_secs(2);
+
+/// Deadline for the membership read that gates a heartbeat, as a fraction of
+/// that scheduler's heartbeat interval so it always fits inside one beat.
+fn membership_check_timeout(ttl_ms: u64) -> Duration {
+    let interval = Duration::from_millis(ttl_ms.saturating_div(HEARTBEAT_DIVISOR).max(1));
+    (interval / 2).min(MEMBERSHIP_CHECK_TIMEOUT_CAP)
+}
 const DISCOVERY_INTERVAL: Duration = Duration::from_secs(5);
 const JOB_RECOVERY_INTERVAL: Duration = Duration::from_secs(10);
 const HEARTBEAT_DIVISOR: u64 = 3;
@@ -378,18 +386,18 @@ impl SchedulerRegistryRunner {
         // re-drive its jobs — the exact failure the fail-open behaviour exists
         // to prevent. A timeout is treated exactly like an error: heartbeat
         // anyway.
-        let membership =
-            match tokio::time::timeout(MEMBERSHIP_CHECK_TIMEOUT, self.cluster.read()).await {
-                Ok(result) => result,
-                Err(_elapsed) => {
-                    tracing::warn!(
-                        scheduler_id = %self.scheduler_id,
-                        timeout_ms = MEMBERSHIP_CHECK_TIMEOUT.as_millis(),
-                        "Timed out confirming cluster membership; heartbeating anyway"
-                    );
-                    return self.write_heartbeat().await;
-                }
-            };
+        let read_timeout = membership_check_timeout(self.entry.ttl_ms);
+        let membership = match tokio::time::timeout(read_timeout, self.cluster.read()).await {
+            Ok(result) => result,
+            Err(_elapsed) => {
+                tracing::warn!(
+                    scheduler_id = %self.scheduler_id,
+                    timeout_ms = read_timeout.as_millis(),
+                    "Timed out confirming cluster membership; heartbeating anyway"
+                );
+                return self.write_heartbeat().await;
+            }
+        };
         match membership {
             Ok(state) => {
                 let registered = state
@@ -713,16 +721,22 @@ mod tests {
         assert!(runner.superseded.load(Ordering::Relaxed));
     }
 
-    /// The membership read is on the heartbeat path, so its deadline must be
-    /// comfortably inside one heartbeat interval — otherwise a slow store
-    /// delays beats far enough for peers to reap a healthy scheduler.
+    /// The membership read sits on the heartbeat path, so its deadline must
+    /// stay inside one heartbeat interval for *any* `ttl_ms`, not just the
+    /// default: `ttl_ms` is carried per entry, and a short one would otherwise
+    /// leave a slow store able to delay beats until peers reap a healthy
+    /// scheduler.
     #[test]
-    fn membership_check_timeout_is_below_the_heartbeat_interval() {
-        let interval = Duration::from_millis(DEFAULT_TTL_MS.saturating_div(HEARTBEAT_DIVISOR));
-        assert!(
-            MEMBERSHIP_CHECK_TIMEOUT * 2 <= interval,
-            "membership read deadline {MEMBERSHIP_CHECK_TIMEOUT:?} leaves too little room in a {interval:?} heartbeat interval"
-        );
+    fn membership_check_timeout_stays_within_the_heartbeat_interval() {
+        for ttl_ms in [1, 10, 100, 1_000, DEFAULT_TTL_MS, 300_000] {
+            let interval = Duration::from_millis(ttl_ms.saturating_div(HEARTBEAT_DIVISOR).max(1));
+            let timeout = membership_check_timeout(ttl_ms);
+            assert!(
+                timeout < interval,
+                "ttl_ms={ttl_ms}: deadline {timeout:?} does not fit inside a {interval:?} heartbeat interval"
+            );
+            assert!(timeout <= MEMBERSHIP_CHECK_TIMEOUT_CAP);
+        }
     }
 
     /// A superseded incarnation must not delete the heartbeat key on the way
