@@ -40,34 +40,29 @@ use elasticsearch_datafusion_filter::{EsFilterSchema, classify_filter, translate
 
 use super::query_table::hits_to_record_batch;
 
-/// Classify a filter for the Elasticsearch search path.
-///
-/// The translated clause is injected into the Elasticsearch pre-filter (kNN `filter` / text
-/// `bool.filter`), which closes the top-N-then-filter hazard by making Elasticsearch apply the
-/// predicate *before* selecting the top-K candidates. Every pushdown is reported `Inexact` so
-/// `DataFusion` still re-checks each row above the scan — a conservative safety net given the
-/// search result schema and PK-join above the scan.
-fn classify_search_filter(schema: &EsFilterSchema, filter: &Expr) -> TableProviderFilterPushDown {
-    match classify_filter(schema, filter) {
-        TableProviderFilterPushDown::Unsupported => TableProviderFilterPushDown::Unsupported,
-        TableProviderFilterPushDown::Exact | TableProviderFilterPushDown::Inexact => {
-            TableProviderFilterPushDown::Inexact
-        }
-    }
-}
-
 /// Translate the pushable filters into a single non-scoring `bool.filter` clause, or `None` when
-/// nothing pushes. Filters that fail to translate are left for `DataFusion`'s above-scan re-check
-/// (every search-path pushdown is `Inexact`), so they are skipped rather than erroring.
-fn build_search_filter(schema: &EsFilterSchema, filters: &[Expr]) -> Option<serde_json::Value> {
-    let clauses: Vec<serde_json::Value> = filters
-        .iter()
-        .filter_map(|filter| translate_filter(schema, filter))
-        .collect();
+/// nothing pushes. Every filter reaching this point was reported pushable by
+/// `supports_filters_pushdown`, so a translation miss is an internal inconsistency. Surface it
+/// instead of silently dropping a predicate that `DataFusion` may no longer re-check.
+fn build_search_filter(
+    schema: &EsFilterSchema,
+    filters: &[Expr],
+) -> datafusion::error::Result<Option<serde_json::Value>> {
+    let mut clauses = Vec::with_capacity(filters.len());
+    for filter in filters {
+        let clause = translate_filter(schema, filter).ok_or_else(|| {
+            DataFusionError::External(Box::new(
+                elasticsearch_datafusion_filter::Error::PushableFilterNotTranslated {
+                    column: filter.to_string(),
+                },
+            ))
+        })?;
+        clauses.push(clause);
+    }
     if clauses.is_empty() {
-        None
+        Ok(None)
     } else {
-        Some(serde_json::json!({ "bool": { "filter": clauses } }))
+        Ok(Some(serde_json::json!({ "bool": { "filter": clauses } })))
     }
 }
 
@@ -131,7 +126,7 @@ impl TableProvider for ElasticsearchKnnTable {
     ) -> datafusion::error::Result<Vec<TableProviderFilterPushDown>> {
         Ok(filters
             .iter()
-            .map(|filter| classify_search_filter(&self.filter_schema, filter))
+            .map(|filter| classify_filter(&self.filter_schema, filter))
             .collect())
     }
 
@@ -162,7 +157,7 @@ impl TableProvider for ElasticsearchKnnTable {
             projection: projection.cloned(),
             query_text: self.query_text.clone(),
             embedder: self.embedder.clone(),
-            filter: build_search_filter(&self.filter_schema, filters),
+            filter: build_search_filter(&self.filter_schema, filters)?,
             properties: Arc::new(PlanProperties::new(
                 EquivalenceProperties::new(project_schema(&self.schema, projection)?),
                 Partitioning::UnknownPartitioning(1),
@@ -389,7 +384,7 @@ impl TableProvider for ElasticsearchTextSearchTable {
     ) -> datafusion::error::Result<Vec<TableProviderFilterPushDown>> {
         Ok(filters
             .iter()
-            .map(|filter| classify_search_filter(&self.filter_schema, filter))
+            .map(|filter| classify_filter(&self.filter_schema, filter))
             .collect())
     }
 
@@ -418,7 +413,7 @@ impl TableProvider for ElasticsearchTextSearchTable {
             source_schema: Arc::clone(&self.source_schema),
             projected_schema,
             projection: projection.cloned(),
-            filter: build_search_filter(&self.filter_schema, filters),
+            filter: build_search_filter(&self.filter_schema, filters)?,
             properties: Arc::new(PlanProperties::new(
                 EquivalenceProperties::new(project_schema(&self.schema, projection)?),
                 Partitioning::UnknownPartitioning(1),

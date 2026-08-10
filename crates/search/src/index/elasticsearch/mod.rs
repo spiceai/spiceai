@@ -622,6 +622,20 @@ pub struct ElasticsearchTextIndex {
 }
 
 impl ElasticsearchTextIndex {
+    /// Metadata fields returned by the search plan, excluding primary-key duplicates.
+    fn metadata_fields(&self) -> Vec<Field> {
+        self.metadata_columns
+            .iter()
+            .filter(|column| {
+                !self
+                    .primary_key
+                    .iter()
+                    .any(|field| field.name() == column.name())
+            })
+            .map(|column| Arc::unwrap_or_clone(column.field()))
+            .collect()
+    }
+
     /// Wrap a [`TableProvider`] so that its schema matches the normalized source schema
     /// used by the ES text index: type-cast where needed and mark all fields nullable.
     /// ES text search results never include dense_vector columns, so the base table
@@ -686,6 +700,7 @@ impl SearchIndex for ElasticsearchTextIndex {
 
     fn query_table_provider(&self, query: &str) -> Result<Arc<LogicalPlan>, DataFusionError> {
         let mut result_fields: Vec<Field> = self.primary_key.clone();
+        result_fields.extend(self.metadata_fields());
         result_fields.push(Field::new(
             SEARCH_SCORE_COLUMN_NAME,
             DataType::Float64,
@@ -1149,6 +1164,77 @@ mod write_maintenance_tests {
         assert_eq!(client.refresh_index_calls.load(Ordering::Relaxed), 0);
         assert_eq!(client.force_merge_calls.load(Ordering::Relaxed), 0);
         assert_eq!(client.put_settings_calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn text_index_exposes_and_filters_metadata() {
+        use datafusion::logical_expr::{LogicalPlan, TableProviderFilterPushDown, col, lit};
+
+        let metadata_columns: MetadataColumns = vec![
+            MetadataColumn::Filterable(Arc::new(Field::new("category", DataType::Int64, true))),
+            MetadataColumn::NonFilterable(Arc::new(Field::new(
+                "description",
+                DataType::Utf8,
+                true,
+            ))),
+        ]
+        .into();
+        let index = ElasticsearchTextIndex {
+            client: Arc::new(MockElasticsearch::default()),
+            es_index: "test-index".to_string(),
+            search_column_name: "body".to_string(),
+            search_fields: vec!["body".to_string()],
+            primary_key: vec![Field::new("id", DataType::Int64, false)],
+            source_schema: Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("body", DataType::Utf8, true),
+                Field::new("category", DataType::Int64, true),
+                Field::new("description", DataType::Utf8, true),
+            ])),
+            metadata_columns,
+            batch_write_rows: 1000,
+            write_maintenance: Arc::new(ElasticsearchIndexWriteMaintenance::default()),
+        };
+
+        let plan = index
+            .query_table_provider("query")
+            .expect("text search plan should build");
+        plan.schema()
+            .field_with_name("category")
+            .expect("filterable metadata should be returned");
+        plan.schema()
+            .field_with_name("description")
+            .expect("non-filterable metadata should be returned");
+
+        let LogicalPlan::TableScan(scan) = plan.as_ref() else {
+            panic!("expected a table scan");
+        };
+        let source = scan
+            .source
+            .downcast_ref::<DefaultTableSource>()
+            .expect("expected the default table source");
+        let table = source
+            .table_provider
+            .downcast_ref::<ElasticsearchTextSearchTable>()
+            .expect("expected an Elasticsearch text search table");
+        let filter = col("category").eq(lit(7_i64));
+        assert_eq!(
+            table
+                .supports_filters_pushdown(&[&filter])
+                .expect("filter classification should succeed"),
+            vec![TableProviderFilterPushDown::Exact]
+        );
+        let non_filterable = col("description").eq(lit("internal"));
+        assert_eq!(
+            table
+                .supports_filters_pushdown(&[&non_filterable])
+                .expect("filter classification should succeed"),
+            vec![TableProviderFilterPushDown::Unsupported]
+        );
+
+        let required = index.required_columns();
+        assert!(required.contains(&"category".to_string()));
+        assert!(required.contains(&"description".to_string()));
     }
 
     // ── Chunked warm-index fallback contract ─────────────────────────────────────

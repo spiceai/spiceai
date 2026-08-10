@@ -580,6 +580,31 @@ pub(crate) async fn ensure_index_with_text_mapping(
     }
     add_metadata_column_mappings(&mut properties, metadata_columns, "");
 
+    // Metadata fields must be mapped explicitly: filterable fields participate in SQL filter
+    // pushdown, while non-filterable fields remain available only through `_source`. Search fields
+    // retain their text mapping when a column is both searched and declared as metadata.
+    for column in metadata_columns.iter() {
+        let name = column.name().to_string();
+        if properties.contains_key(&name) {
+            continue;
+        }
+        let mut mapping = arrow_type_to_es_mapping(column.field().data_type());
+        if let Some(object) = mapping.as_object_mut() {
+            let indexable = matches!(column, MetadataColumn::Filterable(_));
+            object.insert("index".to_string(), serde_json::Value::Bool(indexable));
+            if !indexable {
+                let field_type = object
+                    .get("type")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                if field_type != "text" {
+                    object.insert("doc_values".to_string(), serde_json::Value::Bool(false));
+                }
+            }
+        }
+        properties.insert(name, mapping);
+    }
+
     let exists = client
         .index_exists(es_index)
         .await
