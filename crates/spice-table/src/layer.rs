@@ -33,6 +33,8 @@ limitations under the License.
 use std::{any::Any, borrow::Cow, fmt::Debug, sync::Arc};
 
 use async_trait::async_trait;
+use datafusion_federation::FederatedTableProviderAdaptor;
+
 use datafusion::{
     arrow::datatypes::SchemaRef,
     catalog::{ScanArgs, ScanResult, Session, TableProvider},
@@ -376,41 +378,64 @@ impl SpiceTable {
     }
 }
 
+/// Steps one level down from `current`, following `walk`.
+///
+/// Handles the two shapes a stack can present: a [`SpiceTable`] node, which asks
+/// its layer where the walk goes, and a `FederatedTableProviderAdaptor`, which
+/// datafusion-federation requires to stay *outermost* (its analyzer recovers the
+/// federated source by downcasting the scan's provider to it), so it cannot be
+/// wrapped in a layer and has to be stepped through here instead. That is the one
+/// foreign type this module names, in the one place it names it.
+#[must_use]
+fn step<'a>(
+    current: &'a Arc<dyn TableProvider>,
+    walk: LayerWalk,
+) -> Option<&'a Arc<dyn TableProvider>> {
+    if let Some(table) = current.downcast_ref::<SpiceTable>() {
+        return table.layer.route(walk, &table.below);
+    }
+    if let Some(adaptor) = current.downcast_ref::<FederatedTableProviderAdaptor>() {
+        // A write is not routed through federation, and an adaptor holding no
+        // physical provider is where the walk legitimately ends.
+        if walk == LayerWalk::Write {
+            return None;
+        }
+        return adaptor.table_provider.as_ref();
+    }
+    None
+}
+
 /// Finds a specific concrete [`TableProvider`] in the stack, following `walk`.
 ///
 /// Downcasting here does not reintroduce the dependency this module removes: a
 /// caller asking for a *particular* type already depends on it. What it no
 /// longer has to name is every wrapper in between.
 #[must_use]
-pub fn find_concrete<T: TableProvider + 'static>(
-    top: &dyn TableProvider,
+pub fn find_concrete<'a, T: TableProvider + 'static>(
+    top: &'a Arc<dyn TableProvider>,
     walk: LayerWalk,
-) -> Option<&T> {
-    if let Some(found) = top.downcast_ref::<T>() {
-        return Some(found);
-    }
-    let mut table = top.downcast_ref::<SpiceTable>()?;
+) -> Option<&'a T> {
+    let mut current = top;
     loop {
-        let next = table.layer.route(walk, &table.below)?;
-        if let Some(found) = next.downcast_ref::<T>() {
+        if let Some(found) = current.downcast_ref::<T>() {
             return Some(found);
         }
-        table = next.downcast_ref::<SpiceTable>()?;
+        current = step(current, walk)?;
     }
 }
 
 /// Finds a specific [`TableLayer`] in the stack, following `walk`.
 #[must_use]
-pub fn find_layer<T: TableLayer>(top: &dyn TableProvider, walk: LayerWalk) -> Option<&T> {
-    let mut table = top.downcast_ref::<SpiceTable>()?;
+pub fn find_layer<T: TableLayer>(top: &Arc<dyn TableProvider>, walk: LayerWalk) -> Option<&T> {
+    let mut current = top;
     loop {
-        if let Some(found) = table.layer_as::<T>() {
+        if let Some(found) = current
+            .downcast_ref::<SpiceTable>()
+            .and_then(SpiceTable::layer_as::<T>)
+        {
             return Some(found);
         }
-        table = table
-            .layer
-            .route(walk, &table.below)?
-            .downcast_ref::<SpiceTable>()?;
+        current = step(current, walk)?;
     }
 }
 
@@ -423,15 +448,10 @@ pub fn find_layer<T: TableLayer>(top: &dyn TableProvider, walk: LayerWalk) -> Op
 #[must_use]
 pub fn peel_to(top: &Arc<dyn TableProvider>, walk: LayerWalk) -> &Arc<dyn TableProvider> {
     let mut current = top;
-    loop {
-        let Some(table) = current.downcast_ref::<SpiceTable>() else {
-            return current;
-        };
-        let Some(next) = table.layer.route(walk, &table.below) else {
-            return current;
-        };
+    while let Some(next) = step(current, walk) {
         current = next;
     }
+    current
 }
 
 #[deny(clippy::missing_trait_methods)]

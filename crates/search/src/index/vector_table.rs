@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use spice_table::{LayerWalk, SpiceTable, TableLayer};
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
@@ -25,15 +26,15 @@ use async_trait::async_trait;
 
 use datafusion::{
     catalog::Session,
-    common::{Column, Constraints, JoinType},
-    datasource::{DefaultTableSource, TableProvider, TableType},
+    common::{Column, JoinType},
+    datasource::{DefaultTableSource, TableProvider},
     error::{DataFusionError, Result as DataFusionResult},
     execution::SessionState,
     logical_expr::{Expr, LogicalPlan},
     physical_plan::ExecutionPlan,
     sql::TableReference,
 };
-use datafusion_expr::{LogicalPlanBuilder, TableProviderFilterPushDown, ident};
+use datafusion_expr::{LogicalPlanBuilder, ident};
 
 use datafusion_optimizer_rules::physical_plan::EmptyHashJoinExecPhysicalOptimization;
 use itertools::Itertools;
@@ -50,6 +51,41 @@ pub struct VectorScanTableProvider {
 }
 
 impl VectorScanTableProvider {
+    /// The schema this layer presents: the table beneath, with the vector index's
+    /// own columns merged in.
+    #[must_use]
+    pub fn schema(&self) -> SchemaRef {
+        let mut fields_map = self
+            .table_provider
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| (f.name().clone(), Arc::clone(f)))
+            .collect::<HashMap<String, FieldRef>>();
+
+        // Only add if key not in base table (we chose base table over index columns in `scan` afterall).
+        for f in self.vector_index_list.schema().fields() {
+            if !fields_map.contains_key(f.name()) {
+                // Any field only present in vector index must be nullable since row may be in `self.table_provider` before `self.vector_index_list`.
+                fields_map.insert(
+                    f.name().clone(),
+                    Arc::new(Arc::unwrap_or_clone(Arc::clone(f)).with_nullable(true)),
+                );
+            }
+        }
+
+        let mut fields = fields_map.values().cloned().collect::<Vec<_>>();
+        fields.sort_unstable();
+        Arc::new(Schema::new(fields))
+    }
+
+    /// Presents this layer over the table it augments.
+    #[must_use]
+    pub fn into_table(self: Arc<Self>) -> Arc<SpiceTable> {
+        let below = Arc::clone(&self.table_provider);
+        SpiceTable::over(self, below)
+    }
+
     pub fn try_new(
         table_provider: Arc<dyn TableProvider>,
         index: &Arc<dyn VectorIndex>,
@@ -159,49 +195,33 @@ fn columns_missing_from(expr: &[Expr], schema: &Fields) -> Vec<String> {
 }
 
 #[async_trait]
-impl TableProvider for VectorScanTableProvider {
-    fn schema(&self) -> SchemaRef {
-        let mut fields_map = self
-            .table_provider
-            .schema()
-            .fields()
-            .iter()
-            .map(|f| (f.name().clone(), Arc::clone(f)))
-            .collect::<HashMap<String, FieldRef>>();
-
-        // Only add if key not in base table (we chose base table over index columns in `scan` afterall).
-        for f in self.vector_index_list.schema().fields() {
-            if !fields_map.contains_key(f.name()) {
-                // Any field only present in vector index must be nullable since row may be in `self.table_provider` before `self.vector_index_list`.
-                fields_map.insert(
-                    f.name().clone(),
-                    Arc::new(Arc::unwrap_or_clone(Arc::clone(f)).with_nullable(true)),
-                );
-            }
+impl TableLayer for VectorScanTableProvider {
+    /// Merges vector-index columns into the schema, so a walk whose query must
+    /// not see them stops here: CDC detection looks *for* this layer, and a
+    /// source bootstrap `SELECT` must never reference a synthetic column. Reads
+    /// and source peeling see past it — the columns it adds are the point of a
+    /// read, and the source walk exists to get beneath them.
+    fn route<'a>(
+        &'a self,
+        walk: LayerWalk,
+        below: &'a Arc<dyn TableProvider>,
+    ) -> Option<&'a Arc<dyn TableProvider>> {
+        match walk {
+            LayerWalk::Read | LayerWalk::Source | LayerWalk::Index => Some(below),
+            LayerWalk::CdcDetection | LayerWalk::Write | LayerWalk::RetentionDelete => None,
         }
-
-        let mut fields = fields_map.values().cloned().collect::<Vec<_>>();
-        fields.sort_unstable();
-        Arc::new(Schema::new(fields))
     }
 
-    fn supports_filters_pushdown(
-        &self,
-        filters: &[&Expr],
-    ) -> Result<Vec<TableProviderFilterPushDown>, DataFusionError> {
-        self.table_provider.supports_filters_pushdown(filters)
+    fn schema(&self, _below: &Arc<dyn TableProvider>) -> SchemaRef {
+        VectorScanTableProvider::schema(self)
     }
 
-    fn constraints(&self) -> Option<&Constraints> {
-        self.table_provider.constraints()
-    }
 
-    fn table_type(&self) -> TableType {
-        self.table_provider.table_type()
-    }
+
 
     async fn scan(
         &self,
+        _below: &Arc<dyn TableProvider>,
         state: &dyn Session,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],

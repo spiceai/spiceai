@@ -142,10 +142,10 @@ impl<E: TableProviderExplorer> SearchEngine<E> {
         let table_provider = self.df.get_table(tbl).await?;
         let mut embedding_columns: HashSet<String> = HashSet::default();
 
-        if let Some(embedding_table) = self
-            .explorer
-            .find_concrete::<EmbeddingTable>(&table_provider)
-        {
+        if let Some(embedding_table) = spice_table::find_layer::<EmbeddingTable>(
+            &table_provider,
+            spice_table::LayerWalk::Read,
+        ) {
             for c in embedding_table.get_embedding_columns() {
                 embedding_columns.insert(c);
             }
@@ -350,10 +350,10 @@ impl<E: TableProviderExplorer> SearchEngine<E> {
                 is_chunked,
             )))
         } else {
-            let Some(embedding_table) = self
-                .explorer
-                .find_concrete::<EmbeddingTable>(&table_provider)
-            else {
+            let Some(embedding_table) = spice_table::find_layer::<EmbeddingTable>(
+                &table_provider,
+                spice_table::LayerWalk::Read,
+            ) else {
                 return Err(Error::CannotVectorSearchDataset {
                     data_source: tbl.clone(),
                 });

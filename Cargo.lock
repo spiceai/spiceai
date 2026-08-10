@@ -19340,6 +19340,7 @@ version = "2.2.0-unstable"
 dependencies = [
  "async-trait",
  "datafusion",
+ "datafusion-federation",
  "tokio",
  "tracing",
 ]
