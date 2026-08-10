@@ -380,6 +380,15 @@ impl<
     pub fn as_provider(self: Arc<Self>) -> Arc<dyn CacheProvider<V> + Send + Sync> {
         self
     }
+
+    /// `(hits, total_requests)` as fed to the hit-ratio gauge.
+    #[cfg(test)]
+    pub(crate) fn hit_ratio_counters(&self) -> (u64, u64) {
+        (
+            self.hits.load(Ordering::Relaxed),
+            self.total_requests.load(Ordering::Relaxed),
+        )
+    }
 }
 
 impl<
@@ -412,17 +421,32 @@ impl<
 > CacheProvider<V> for LruCache<V, T, H>
 {
     async fn get_raw_key(&self, key: &u64) -> Option<V> {
+        let always_valid = |_: &V| true;
+        self.get_raw_key_validated(key, &always_valid).await
+    }
+
+    async fn get_raw_key_validated(
+        &self,
+        key: &u64,
+        is_valid: &(dyn for<'v> Fn(&'v V) -> bool + Send + Sync),
+    ) -> Option<V> {
         V::record_request();
         self.total_requests.fetch_add(1, Ordering::Relaxed);
 
-        if let Some(v) = self.backend.get(key).await {
+        // A value the caller cannot use is a miss, not a hit: counting it as a
+        // hit would make the hit ratio climb precisely when invalidation is
+        // doing its job.
+        let found = self.backend.get(key).await;
+        let usable = found.filter(|value| is_valid(value));
+
+        if usable.is_some() {
             V::record_hit();
             self.hits.fetch_add(1, Ordering::Relaxed);
-            Some(v)
         } else {
             V::record_miss();
-            None
         }
+
+        usable
     }
 
     async fn put_raw_key(&self, key: &u64, value: V) {
@@ -596,6 +620,7 @@ mod tests {
             Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)])),
             Arc::new(input_tables),
             std::time::Instant::now(),
+            std::time::Instant::now(),
             encoder,
         )
         .await
@@ -663,6 +688,50 @@ mod tests {
         (retrieved_len == result_len)
             .then_some(())
             .expect("retrieved and result should have same length");
+    }
+
+    /// A lookup that finds an entry but rejects it must be accounted as a miss.
+    ///
+    /// Counting it as a hit would make the hit-ratio gauge *rise* as
+    /// invalidation removes more results from circulation — the metric would
+    /// look best exactly when the cache is serving least.
+    #[tokio::test]
+    async fn test_rejected_value_is_counted_as_a_miss_not_a_hit() {
+        let cache: LruCache<CachedQueryResult, _, _> = LruCache::new(
+            1024 * 1024,
+            Duration::from_mins(1),
+            RandomState::default(),
+            CachingPolicy::Lru,
+            CacheEngine::Moka,
+        );
+        let key = CacheKey::Query("accounting", None).as_raw_key(cache.hasher());
+        cache
+            .put_raw_key(&key.as_u64(), create_test_cached_result().await)
+            .await;
+
+        // Served: one request, one hit.
+        let accept_all = |_: &CachedQueryResult| true;
+        assert!(
+            cache
+                .get_raw_key_validated(&key.as_u64(), &accept_all)
+                .await
+                .is_some()
+        );
+        assert_eq!(cache.hit_ratio_counters(), (1, 1));
+
+        // Found but rejected: a second request, still only one hit.
+        let reject_all = |_: &CachedQueryResult| false;
+        assert!(
+            cache
+                .get_raw_key_validated(&key.as_u64(), &reject_all)
+                .await
+                .is_none()
+        );
+        assert_eq!(
+            cache.hit_ratio_counters(),
+            (1, 2),
+            "a rejected entry must not be counted as a hit"
+        );
     }
 
     #[rstest]
@@ -1136,6 +1205,7 @@ mod tests {
             Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)])),
             Arc::new(different_input_tables),
             std::time::Instant::now(),
+            std::time::Instant::now(),
             encoder,
         )
         .await
@@ -1365,6 +1435,7 @@ mod tests {
                 fn record_item_count(_count: u64) {}
                 fn record_size(_size: u64) {}
                 fn record_max_size(_size: u64) {}
+                fn record_stale_rejection() {}
                 fn update_hit_ratio(_hits: u64, _total: u64) {}
                 fn publish_counters_at_zero() {}
 

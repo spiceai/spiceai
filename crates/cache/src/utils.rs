@@ -19,8 +19,9 @@ use std::{collections::HashSet, sync::Arc};
 use arrow::array::{RecordBatch, UInt16Array};
 use arrow::compute::filter_record_batch;
 use datafusion::{
-    execution::SendableRecordBatchStream, logical_expr::LogicalPlan,
-    physical_plan::stream::RecordBatchStreamAdapter, sql::TableReference,
+    common::tree_node::TreeNodeRecursion, execution::SendableRecordBatchStream,
+    logical_expr::LogicalPlan, physical_plan::stream::RecordBatchStreamAdapter,
+    sql::TableReference,
 };
 
 use crate::{CachedQueryResult, QueryResultsCacheProvider, RawCacheKey, Sizeable};
@@ -171,6 +172,15 @@ pub fn batches_to_cache(batches: &[RecordBatch]) -> Option<Vec<RecordBatch>> {
     Some(batches.to_vec())
 }
 
+/// Wraps `stream` so its results are stored in the cache once it has been
+/// drained.
+///
+/// `read_started_at` is when the query began, and is recorded on the entry so
+/// every later cache hit can check it — see
+/// [`QueryResultsCacheProvider::tables_invalidated_since`], which documents why
+/// the comparison is deliberately conservative. It must be the start of the
+/// read, not the moment the result is stored: an invalidation landing in
+/// between has to disqualify the entry too.
 #[must_use]
 #[expect(clippy::implicit_hasher)]
 pub fn to_cached_record_batch_stream(
@@ -178,6 +188,7 @@ pub fn to_cached_record_batch_stream(
     mut stream: SendableRecordBatchStream,
     raw_cache_key: RawCacheKey,
     input_tables: Arc<HashSet<TableReference>>,
+    read_started_at: std::time::Instant,
 ) -> SendableRecordBatchStream {
     let schema = stream.schema();
     let cache_schema = Arc::clone(&schema);
@@ -208,50 +219,60 @@ pub fn to_cached_record_batch_stream(
         // When an encoder is present, defer the size check until after encoding
         // so that compressed results that fit in the cache are not prematurely rejected.
         if records_size < cache_max_size || has_encoder {
-            match batches_to_cache(&records) {
-                // `batches_to_cache` only returns `None` when transient HTTP
-                // error responses (5xx/429) are present, which requires a
-                // non-empty result set — skip the write to avoid caching a
-                // partial result.
-                None => {
-                    tracing::debug!(
-                        "Transient HTTP error responses were present, skipping cache storage"
-                    );
-                }
-                // Cache the result, including genuinely empty (0-row / 0-batch)
-                // result sets. The schema is stored separately in
-                // `CachedQueryResult`, so an empty result round-trips with the
-                // correct schema, and caching it lets repeat queries that
-                // legitimately return no rows be served from cache instead of
-                // re-executing on every request.
-                Some(records_to_cache) => {
-                    let cached_at = std::time::Instant::now();
-                    let encoder = cache_provider.encoder();
+            if cache_provider.tables_invalidated_since(&input_tables, read_started_at) {
+                // Not the guard — correctness comes from the check every cache
+                // hit performs. This only avoids encoding and storing a result
+                // already known to be unservable.
+                tracing::debug!(
+                    "A table read by this query was invalidated while it ran, skipping cache storage"
+                );
+            } else {
+                match batches_to_cache(&records) {
+                    // `batches_to_cache` only returns `None` when transient HTTP
+                    // error responses (5xx/429) are present, which requires a
+                    // non-empty result set — skip the write to avoid caching a
+                    // partial result.
+                    None => {
+                        tracing::debug!(
+                            "Transient HTTP error responses were present, skipping cache storage"
+                        );
+                    }
+                    // Cache the result, including genuinely empty (0-row / 0-batch)
+                    // result sets. The schema is stored separately in
+                    // `CachedQueryResult`, so an empty result round-trips with the
+                    // correct schema, and caching it lets repeat queries that
+                    // legitimately return no rows be served from cache instead of
+                    // re-executing on every request.
+                    Some(records_to_cache) => {
+                        let cached_at = std::time::Instant::now();
+                        let encoder = cache_provider.encoder();
 
-                    match CachedQueryResult::from_batches(
-                        &records_to_cache,
-                        cache_schema,
-                        input_tables,
-                        cached_at,
-                        encoder,
-                    )
-                    .await
-                    {
-                        Ok(cached_result) => {
-                            // Check the actual (possibly encoded) size before caching
-                            let actual_size = cached_result.get_memory_size();
-                            if actual_size > cache_max_size {
-                                tracing::debug!(
-                                    actual_size,
-                                    cache_max_size,
-                                    "Encoded query result still exceeds cache max size, skipping"
-                                );
-                            } else if let Err(e) = cache_provider.put_raw_key(&raw_cache_key, cached_result).await {
-                                tracing::error!("Failed to cache query results: {e}");
+                        match CachedQueryResult::from_batches(
+                            &records_to_cache,
+                            cache_schema,
+                            input_tables,
+                            cached_at,
+                            read_started_at,
+                            encoder,
+                        )
+                        .await
+                        {
+                            Ok(cached_result) => {
+                                // Check the actual (possibly encoded) size before caching
+                                let actual_size = cached_result.get_memory_size();
+                                if actual_size > cache_max_size {
+                                    tracing::debug!(
+                                        actual_size,
+                                        cache_max_size,
+                                        "Encoded query result still exceeds cache max size, skipping"
+                                    );
+                                } else if let Err(e) = cache_provider.put_raw_key(&raw_cache_key, cached_result).await {
+                                    tracing::error!("Failed to cache query results: {e}");
+                                }
                             }
-                        }
-                        Err(e) => {
-                            tracing::error!("Failed to encode query results for caching: {e}");
+                            Err(e) => {
+                                tracing::error!("Failed to encode query results for caching: {e}");
+                            }
                         }
                     }
                 }
@@ -265,19 +286,30 @@ pub fn to_cached_record_batch_stream(
     ))
 }
 
+/// Collects every table the plan reads.
+///
+/// The set must be complete: it is what
+/// [`crate::TabledCacheProvider::invalidate_for_table`] matches on, so a table
+/// missing here yields a cache entry that no refresh and no DML can ever evict,
+/// and stale rows are served as fresh hits until `item_ttl` expires.
+///
+/// Traversal therefore uses [`LogicalPlan::apply_with_subqueries`] rather than
+/// walking [`LogicalPlan::inputs`]: subqueries in expressions (`IN (SELECT
+/// ...)`, `EXISTS (...)`, a scalar subquery in the select list) are held in the
+/// enclosing node's *expressions*, not among its inputs, so an `inputs()` walk
+/// never reaches them.
 #[must_use]
 pub fn get_logical_plan_input_tables(plan: &LogicalPlan) -> HashSet<TableReference> {
     let mut table_names: HashSet<TableReference> = HashSet::new();
-    let mut plan_stack = vec![plan];
 
-    while let Some(current_plan) = plan_stack.pop() {
+    // The closure is infallible, so the returned Result cannot be an error.
+    let _ = plan.apply_with_subqueries(|current_plan| {
         if let LogicalPlan::TableScan(source, ..) = current_plan {
             // Clones of TableReferences are cheap - all fields are Arcs
             table_names.insert(source.table_name.clone());
         }
-
-        plan_stack.extend(current_plan.inputs());
-    }
+        Ok(TreeNodeRecursion::Continue)
+    });
 
     table_names
 }
@@ -438,6 +470,174 @@ pub(crate) mod tests {
         ctx
     }
 
+    /// Regression test for #12671: a table referenced only inside a subquery
+    /// *expression* must still be recorded. These subqueries live in the
+    /// enclosing node's expressions rather than its inputs, so an
+    /// `inputs()`-only walk missed them, and the resulting cache entry could
+    /// never be evicted by a refresh or DML of that table.
+    #[rstest::rstest]
+    #[case::in_subquery("SELECT * FROM customer WHERE id IN (SELECT id FROM state)")]
+    #[case::not_in_subquery("SELECT * FROM customer WHERE id NOT IN (SELECT id FROM state)")]
+    #[case::exists(
+        "SELECT * FROM customer WHERE EXISTS (SELECT 1 FROM state WHERE state.id = customer.id)"
+    )]
+    #[case::not_exists(
+        "SELECT * FROM customer WHERE NOT EXISTS (SELECT 1 FROM state WHERE state.id = customer.id)"
+    )]
+    #[case::scalar_subquery_in_select_list(
+        "SELECT first_name, (SELECT max(sales_tax) FROM state) AS t FROM customer"
+    )]
+    #[case::scalar_subquery_in_predicate(
+        "SELECT * FROM customer WHERE id > (SELECT max(sales_tax) FROM state)"
+    )]
+    #[case::subquery_nested_under_conjunction(
+        "SELECT * FROM customer WHERE state = 'NY' AND id IN (SELECT id FROM state)"
+    )]
+    #[tokio::test]
+    async fn test_collect_table_names_expression_subqueries(#[case] sql: &str) {
+        let logical_plan = parse_sql_to_logical_plan(sql).await;
+
+        let table_names = get_logical_plan_input_tables(&logical_plan);
+
+        let expected: HashSet<TableReference> = HashSet::from(["customer".into(), "state".into()]);
+        assert_eq!(
+            table_names, expected,
+            "a table read only through a subquery expression must still be recorded, \
+             otherwise its cache entries can never be invalidated; sql={sql}"
+        );
+    }
+
+    /// Drains `sql`-less canned batches through the caching wrapper and reports
+    /// whether the result was stored.
+    async fn stored_after_drain(
+        provider: &Arc<QueryResultsCacheProvider>,
+        key: RawCacheKey,
+        input_tables: HashSet<TableReference>,
+        read_started_at: std::time::Instant,
+    ) -> bool {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let batch = RecordBatch::new_empty(Arc::clone(&schema));
+        let source = RecordBatchStreamAdapter::new(
+            Arc::clone(&schema),
+            futures::stream::iter(vec![Ok(batch)]),
+        );
+
+        let mut wrapped = to_cached_record_batch_stream(
+            Arc::clone(provider),
+            Box::pin(source),
+            key,
+            Arc::new(input_tables),
+            read_started_at,
+        );
+        while wrapped.next().await.is_some() {}
+
+        provider.run_pending_tasks().await;
+        provider
+            .get_raw_key(&key)
+            .await
+            .expect("cache access should succeed")
+            .is_some()
+    }
+
+    fn test_cache_provider() -> Arc<QueryResultsCacheProvider> {
+        Arc::new(
+            QueryResultsCacheProvider::try_new(
+                &spicepod::component::caching::SQLResultsCacheConfig {
+                    item_ttl: Some("10m".to_string()),
+                    ..Default::default()
+                },
+                Box::new([]),
+            )
+            .expect("valid cache provider"),
+        )
+    }
+
+    /// A query that read a table before it was invalidated must not store its
+    /// result afterwards. Invalidation can only remove entries that already
+    /// exist, so such a write recreates the entry the invalidation just removed
+    /// and serves data from the pre-invalidation snapshot.
+    #[tokio::test]
+    async fn to_cached_record_batch_stream_discards_result_invalidated_during_read() {
+        let provider = test_cache_provider();
+        let read_started_at = std::time::Instant::now();
+
+        provider
+            .invalidate_for_table(TableReference::bare("customer"))
+            .expect("invalidation should succeed");
+
+        assert!(
+            !stored_after_drain(
+                &provider,
+                RawCacheKey::new(1),
+                HashSet::from([TableReference::bare("customer")]),
+                read_started_at,
+            )
+            .await,
+            "a result whose table was invalidated mid-read must not be cached"
+        );
+    }
+
+    /// The qualification of the invalidated reference must not matter: `customer`
+    /// and `spice.public.customer` are the same physical table.
+    #[tokio::test]
+    async fn to_cached_record_batch_stream_gate_resolves_qualification() {
+        let provider = test_cache_provider();
+        let read_started_at = std::time::Instant::now();
+
+        provider
+            .invalidate_for_table(TableReference::bare("customer"))
+            .expect("invalidation should succeed");
+
+        assert!(
+            !stored_after_drain(
+                &provider,
+                RawCacheKey::new(2),
+                HashSet::from([TableReference::full(
+                    crate::SPICE_DEFAULT_CATALOG,
+                    crate::SPICE_DEFAULT_SCHEMA,
+                    "customer",
+                )]),
+                read_started_at,
+            )
+            .await,
+            "a differently-qualified reference to the invalidated table must also be gated"
+        );
+    }
+
+    /// The gate must not block ordinary caching: an unrelated invalidation, and
+    /// a table-less result, both still get stored.
+    #[tokio::test]
+    async fn to_cached_record_batch_stream_stores_unaffected_results() {
+        let provider = test_cache_provider();
+        let read_started_at = std::time::Instant::now();
+
+        provider
+            .invalidate_for_table(TableReference::bare("orders"))
+            .expect("invalidation should succeed");
+
+        assert!(
+            stored_after_drain(
+                &provider,
+                RawCacheKey::new(3),
+                HashSet::from([TableReference::bare("customer")]),
+                read_started_at,
+            )
+            .await,
+            "invalidating a different table must not block this write"
+        );
+
+        assert!(
+            stored_after_drain(
+                &provider,
+                RawCacheKey::new(4),
+                HashSet::new(),
+                read_started_at,
+            )
+            .await,
+            "a table-less result (e.g. SELECT 1) must still be cacheable"
+        );
+    }
+
     fn register_tables(ctx: &SessionContext) {
         let customer_schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int32, false),
@@ -530,6 +730,7 @@ pub(crate) mod tests {
             stream,
             raw_cache_key,
             Arc::new(HashSet::from(["local_table".into()])),
+            std::time::Instant::now(),
         );
 
         let output_batches = cached_stream
@@ -599,6 +800,7 @@ pub(crate) mod tests {
             stream,
             raw_cache_key,
             Arc::new(HashSet::from(["http_table".into()])),
+            std::time::Instant::now(),
         );
 
         let output_batches = cached_stream
@@ -670,6 +872,7 @@ pub(crate) mod tests {
             stream,
             raw_cache_key,
             Arc::new(HashSet::from(["http_table".into()])),
+            std::time::Instant::now(),
         );
 
         let output_batches = cached_stream
@@ -947,6 +1150,7 @@ pub(crate) mod tests {
             stream,
             raw_cache_key,
             Arc::new(HashSet::from(["test_table".into()])),
+            std::time::Instant::now(),
         );
 
         // Consume the stream to trigger caching.
@@ -1011,6 +1215,7 @@ pub(crate) mod tests {
             stream,
             raw_cache_key,
             Arc::new(HashSet::from(["local_table".into()])),
+            std::time::Instant::now(),
         );
 
         let output_batches = cached_stream
@@ -1074,6 +1279,7 @@ pub(crate) mod tests {
             stream,
             raw_cache_key,
             Arc::new(HashSet::from(["local_table".into()])),
+            std::time::Instant::now(),
         );
 
         let _output = cached_stream
@@ -1135,6 +1341,7 @@ pub(crate) mod tests {
             stream,
             raw_cache_key,
             Arc::new(HashSet::from(["test_table".into()])),
+            std::time::Instant::now(),
         );
 
         let _output = cached_stream
