@@ -393,11 +393,16 @@ impl SchedulerRegistryRunner {
             Err(other) => return Err(Error::ClusterState { source: other }),
         }
 
-        // Write our first heartbeat so peers see liveness on next discovery.
-        self.heartbeats
+        // Write our first heartbeat so peers see liveness on next discovery, and
+        // keep its version: without it, an incarnation whose reads fail from
+        // birth would have nothing to condition on and would skip every beat
+        // until it was reaped, which the unconditional write never did.
+        let version = self
+            .heartbeats
             .heartbeat(&self.scheduler_id, self.instance_id, now, self.entry.ttl_ms)
             .await
             .context(HeartbeatSnafu)?;
+        self.last_written_version.store(version.map(Arc::new));
         Ok(())
     }
 
@@ -582,8 +587,9 @@ impl SchedulerRegistryRunner {
     /// reconciles against membership instead of clobbering it. Read-only
     /// outages, where writes still succeed, no longer force either bad choice.
     ///
-    /// Returns `None` when there is nothing to condition on — only before this
-    /// incarnation's first successful write — in which case the beat is skipped.
+    /// Returns `None` only when no write by this incarnation has ever reported a
+    /// version — registration seeds one, so in practice this means the store does
+    /// not report versions at all — in which case the beat is skipped.
     fn cached_predicate(&self, reason: &str) -> Option<UpdateVersion> {
         let Some(version) = self.last_written_version.load_full() else {
             tracing::warn!(
@@ -914,6 +920,7 @@ mod tests {
     struct FailingBeatReads {
         inner: Arc<dyn ObjectStore>,
         failing: std::sync::atomic::AtomicBool,
+        beat_writes: std::sync::atomic::AtomicUsize,
     }
 
     impl std::fmt::Display for FailingBeatReads {
@@ -945,7 +952,12 @@ mod tests {
             payload: object_store::PutPayload,
             opts: object_store::PutOptions,
         ) -> object_store::Result<object_store::PutResult> {
-            self.inner.put_opts(location, payload, opts).await
+            let result = self.inner.put_opts(location, payload, opts).await;
+            if result.is_ok() && location.as_ref().contains("heartbeats/") {
+                self.beat_writes
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            result
         }
         async fn put_multipart_opts(
             &self,
@@ -1040,6 +1052,7 @@ mod tests {
         let wrapper = Arc::new(FailingBeatReads {
             inner: Arc::clone(&inner),
             failing: std::sync::atomic::AtomicBool::new(false),
+            beat_writes: std::sync::atomic::AtomicUsize::new(0),
         });
         let store: Arc<dyn ObjectStore> = Arc::clone(&wrapper) as Arc<dyn ObjectStore>;
         let cluster = Arc::new(ClusterStateStore::new(Arc::clone(&inner), ""));
@@ -1061,10 +1074,20 @@ mod tests {
         wrapper
             .failing
             .store(true, std::sync::atomic::Ordering::Relaxed);
+        let writes_before = wrapper
+            .beat_writes
+            .load(std::sync::atomic::Ordering::Relaxed);
         runner
             .send_heartbeat()
             .await
             .expect("a read outage must not fail the loop");
+        assert_eq!(
+            wrapper
+                .beat_writes
+                .load(std::sync::atomic::Ordering::Relaxed),
+            writes_before + 1,
+            "the beat must actually be written during a read outage, not merely left alone"
+        );
 
         let after = observer
             .read("test:50051")
@@ -1077,7 +1100,7 @@ mod tests {
         );
         assert!(
             after.last_heartbeat_ms >= before.last_heartbeat_ms,
-            "a read outage must not suppress the beat: {} < {}",
+            "the refreshed beat must not move backwards: {} < {}",
             after.last_heartbeat_ms,
             before.last_heartbeat_ms
         );
@@ -1096,6 +1119,7 @@ mod tests {
         let wrapper = Arc::new(FailingBeatReads {
             inner: Arc::clone(&inner),
             failing: std::sync::atomic::AtomicBool::new(false),
+            beat_writes: std::sync::atomic::AtomicUsize::new(0),
         });
         let store: Arc<dyn ObjectStore> = Arc::clone(&wrapper) as Arc<dyn ObjectStore>;
         let cluster = Arc::new(ClusterStateStore::new(Arc::clone(&inner), ""));
@@ -1160,6 +1184,7 @@ mod tests {
         let wrapper = Arc::new(FailingBeatReads {
             inner: Arc::clone(&inner),
             failing: std::sync::atomic::AtomicBool::new(false),
+            beat_writes: std::sync::atomic::AtomicUsize::new(0),
         });
         let store: Arc<dyn ObjectStore> = Arc::clone(&wrapper) as Arc<dyn ObjectStore>;
         let cluster = Arc::new(ClusterStateStore::new(Arc::clone(&inner), ""));
@@ -1204,14 +1229,68 @@ mod tests {
         );
     }
 
-    /// Before the first successful write there is nothing to condition on, so an
-    /// unreadable beat is skipped rather than overwritten blind.
+    /// Reads failing from the moment the process registers must not cost it its
+    /// liveness. The unconditional first write seeds a predicate, so the beat can
+    /// still be refreshed conditionally without ever having read the object.
     #[tokio::test]
-    async fn a_read_outage_before_any_write_skips_the_beat() {
+    async fn a_read_outage_from_birth_still_refreshes_the_heartbeat() {
         let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let wrapper = Arc::new(FailingBeatReads {
             inner: Arc::clone(&inner),
             failing: std::sync::atomic::AtomicBool::new(false),
+            beat_writes: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let store: Arc<dyn ObjectStore> = Arc::clone(&wrapper) as Arc<dyn ObjectStore>;
+        let cluster = Arc::new(ClusterStateStore::new(Arc::clone(&inner), ""));
+        let heartbeats = Arc::new(SchedulerHeartbeatStore::new(Arc::clone(&store), ""));
+        cluster.bootstrap().await.expect("bootstrap");
+        let observer = Arc::new(SchedulerHeartbeatStore::new(Arc::clone(&inner), ""));
+
+        let instance_id = Uuid::new_v4();
+        let runner = runner_over(&cluster, &heartbeats, &inner, instance_id);
+        runner.register_self().await.expect("register");
+
+        // Reads fail from here on, and this incarnation has never completed a
+        // conditional write — only the unconditional registration one.
+        wrapper
+            .failing
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let writes_before = wrapper
+            .beat_writes
+            .load(std::sync::atomic::Ordering::Relaxed);
+        runner
+            .send_heartbeat()
+            .await
+            .expect("a read outage from birth must not fail the loop");
+
+        assert_eq!(
+            wrapper
+                .beat_writes
+                .load(std::sync::atomic::Ordering::Relaxed),
+            writes_before + 1,
+            "the beat must be refreshed from the version the registration write reported"
+        );
+        let beat = observer
+            .read("test:50051")
+            .await
+            .expect("read")
+            .expect("present");
+        assert_eq!(
+            beat.instance_id, instance_id,
+            "the refreshed beat must belong to this incarnation"
+        );
+    }
+
+    /// A retained predicate that no longer matches must not be escalated into an
+    /// unconditional write: the beat has moved on, this incarnation cannot read
+    /// it, and so it skips rather than displacing whatever is there.
+    #[tokio::test]
+    async fn a_stale_predicate_does_not_displace_a_newer_beat() {
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let wrapper = Arc::new(FailingBeatReads {
+            inner: Arc::clone(&inner),
+            failing: std::sync::atomic::AtomicBool::new(false),
+            beat_writes: std::sync::atomic::AtomicUsize::new(0),
         });
         let store: Arc<dyn ObjectStore> = Arc::clone(&wrapper) as Arc<dyn ObjectStore>;
         let cluster = Arc::new(ClusterStateStore::new(Arc::clone(&inner), ""));
@@ -1242,7 +1321,7 @@ mod tests {
             .expect("present");
         assert_eq!(
             beat.instance_id, foreign,
-            "with no version to condition on the beat must be skipped, not written blind"
+            "a predicate that no longer matches must not be escalated to a blind write"
         );
     }
 

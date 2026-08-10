@@ -141,14 +141,16 @@ impl SchedulerHeartbeatStore {
         Path::from(format!("{}{}.json", self.prefix, scheduler_id))
     }
 
-    /// Writes (or overwrites) the heartbeat for a scheduler.
+    /// Writes (or overwrites) the heartbeat for a scheduler, returning the
+    /// version written where the store reports one. Callers keep that version so
+    /// a later write can stay conditional even if the object cannot be read.
     pub async fn heartbeat(
         &self,
         scheduler_id: &str,
         instance_id: Uuid,
         now_ms: u64,
         ttl_ms: u64,
-    ) -> Result<()> {
+    ) -> Result<Option<UpdateVersion>> {
         let beat = SchedulerHeartbeat {
             scheduler_id: scheduler_id.to_string(),
             instance_id,
@@ -173,7 +175,9 @@ impl SchedulerHeartbeatStore {
                 )
                 .await
             {
-                Ok(_) => return Ok(()),
+                Ok(result) => {
+                    return Ok(Self::usable_version_of(result.e_tag, result.version));
+                }
                 Err(source) => {
                     let Some(delay) = backoff.next_duration() else {
                         return Err(Error::RetryExhausted {
