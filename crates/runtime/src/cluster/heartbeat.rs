@@ -20,11 +20,14 @@ limitations under the License.
 //! so that the high-frequency write path does not contend with partition
 //! and membership writes against the single cluster document.
 //!
-//! Each heartbeat file carries the writer's `instance_id`. A heartbeat
-//! whose `instance_id` does not match the corresponding entry in
-//! `cluster.json` is treated as orphan and ignored — this lets a fresh
-//! process safely take over a crashed predecessor's `scheduler_id` even
-//! though the underlying object store has no conditional-delete primitive.
+//! Each heartbeat file carries the writer's `instance_id`. Because the key is
+//! shared by every incarnation of a `scheduler_id`, that id may differ from the
+//! one registered in `cluster.json` — during a takeover, or when an incarnation
+//! writes before noticing it has lost the id. A mismatch is therefore not
+//! evidence about the registered incarnation: only staleness is. Registration
+//! decides takeover from `cluster.json` plus the beat's staleness, which lets a
+//! fresh process claim a crashed predecessor's `scheduler_id` even though the
+//! underlying object store has no conditional-delete primitive.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -424,15 +427,39 @@ impl SchedulerHeartbeatStore {
         let all = self.list_all().await?;
         let mut alive = HashMap::with_capacity(all.len());
         for (id, beat) in all {
-            let Some(entry) = cluster_state.schedulers.get(&id) else {
-                continue;
-            };
-            if entry.instance_id != beat.instance_id {
+            // Only a registered id can be alive; the entry's `instance_id` is
+            // deliberately not compared against the beat's, for the reason below.
+            if !cluster_state.schedulers.contains_key(&id) {
                 continue;
             }
             if beat.is_stale(now_ms) {
                 continue;
             }
+            // A fresh beat whose `instance_id` differs from the registered entry
+            // is not evidence that the registered incarnation is dead. The key is
+            // shared by every incarnation of a scheduler id, so a takeover in
+            // progress — or a write by an incarnation that has lost the id but
+            // not yet noticed — moves it without saying anything about the
+            // registered process, which may still be running jobs.
+            //
+            // Reporting nobody in that case is the dangerous reading: callers
+            // treat an absent scheduler as dead and re-drive its jobs, so a
+            // clobbered key turns into duplicate distributed execution. Reporting
+            // it defers recovery instead, which is the safe direction.
+            //
+            // The cost is real and worth stating precisely: recovery resumes only
+            // once the key goes stale, which is `ttl_ms + CLOCK_SKEW_TOLERANCE_MS`
+            // after whoever holds it *stops writing* — not one TTL from the death,
+            // and not bounded at all while some incarnation keeps writing. What
+            // bounds it is the rule that an incarnation stops claiming a
+            // `scheduler_id` once it observes it is no longer the registered
+            // owner; without that guard a zombie writer can hold a dead entry
+            // "alive" indefinitely.
+            //
+            // The value is the beat as observed, so its `instance_id` may differ
+            // from the registered entry's. Callers must not infer instance
+            // identity from it — `reaper` compares against `cluster_state`
+            // directly, and declines to evict on exactly this mismatch.
             alive.insert(id, beat);
         }
         Ok(alive)
@@ -530,7 +557,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_alive_filters_orphan_instance_id() {
+    async fn list_alive_reports_an_id_whose_fresh_beat_belongs_to_another_instance() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let s = SchedulerHeartbeatStore::new(Arc::clone(&store), "");
         let cluster_id = Uuid::new_v4();
@@ -541,6 +568,26 @@ mod tests {
 
         let cluster = cluster_with(&[entry("a", cluster_id)]).await;
         let alive = s.list_alive(100_000, &cluster).await.expect("list");
+        assert!(
+            alive.contains_key("a"),
+            "a fresh beat from another incarnation is not evidence the registered \
+             one is dead; reporting nobody makes peers re-drive its running jobs"
+        );
+    }
+
+    /// The boundary of the rule above: a *stale* beat is dropped whoever wrote
+    /// it, so relaxing the mismatch filter did not make everything alive. This
+    /// holds on trunk too — it guards the change rather than demonstrating it.
+    #[tokio::test]
+    async fn list_alive_drops_an_id_whose_foreign_beat_has_gone_stale() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let s = SchedulerHeartbeatStore::new(Arc::clone(&store), "");
+        let cluster_id = Uuid::new_v4();
+        let other_id = Uuid::new_v4();
+        s.heartbeat("a", other_id, 1_000, 30_000).await.expect("a");
+
+        let cluster = cluster_with(&[entry("a", cluster_id)]).await;
+        let alive = s.list_alive(1_000_000, &cluster).await.expect("list");
         assert!(!alive.contains_key("a"));
     }
 

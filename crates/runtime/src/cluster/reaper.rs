@@ -19,10 +19,12 @@ limitations under the License.
 //! Heartbeat files are deliberately *not* deleted by the reaper. Object
 //! stores have no conditional-delete primitive, so deleting after a
 //! takeover would race the new process's freshly written heartbeat.
-//! Orphan heartbeats (those whose `instance_id` no longer matches any
-//! entry in `cluster.json`) are filtered out at read time by
-//! [`crate::cluster::heartbeat::SchedulerHeartbeatStore::list_alive`],
-//! so leaving them in place is harmless.
+//! A heartbeat whose `instance_id` does not match the registered entry is left
+//! in place and is *not* treated as proof that the registered incarnation is
+//! dead: [`crate::cluster::heartbeat::SchedulerHeartbeatStore::list_alive`]
+//! judges liveness by staleness alone, and this reaper declines to evict on a
+//! mismatch, because a beat written by another incarnation says nothing about
+//! whether this one is still running jobs.
 
 use std::sync::Arc;
 
