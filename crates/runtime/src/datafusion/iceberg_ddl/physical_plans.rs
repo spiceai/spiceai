@@ -36,7 +36,7 @@ use iceberg_datafusion::IcebergTableProvider;
 use spicepod::acceleration::Acceleration;
 
 use super::acceleration_options::DatasetOptions;
-use crate::accelerated_table::AcceleratedTable;
+use crate::accelerated::AcceleratedTable;
 use crate::cluster::ExecutorRegistry;
 use crate::datafusion::DataFusion;
 use data_components::RefreshableCatalogProvider;
@@ -763,10 +763,10 @@ async fn create_accelerated_iceberg_table(
     dataset_name: TableReference,
     partition_expr_sql: Option<&str>,
 ) -> Result<AcceleratedTable, DataFusionError> {
-    use crate::accelerated_table::refresh::Refresh;
+    use crate::accelerated::refresh::Refresh;
     use crate::component::dataset::TimeFormat;
     use crate::component::dataset::acceleration::RefreshMode;
-    use crate::federated_table::FederatedTable;
+    use crate::federated::FederatedTable;
 
     let df = datafusion.upgrade().ok_or_else(|| {
         DataFusionError::Execution(

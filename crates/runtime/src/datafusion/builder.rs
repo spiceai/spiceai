@@ -25,7 +25,7 @@ use super::{
     SPICE_RUNTIME_SCHEMA,
 };
 #[cfg(not(windows))]
-use crate::accelerated_table::AcceleratedTable;
+use crate::accelerated::AcceleratedTable;
 use crate::cluster::ExecutorRegistry;
 use crate::cluster::ResolvedClusterConfig;
 #[cfg(not(windows))]

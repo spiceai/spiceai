@@ -117,6 +117,7 @@ impl Catalog {
 #[must_use]
 pub fn table_selector(catalog: &CatalogSpec) -> TableSelector {
     TableSelector::new(catalog.include.clone(), catalog.exclude.clone())
+        .with_include_patterns(&catalog.orig_include)
 }
 
 pub struct CatalogBuilder {
@@ -408,19 +409,30 @@ mod tests {
         assert!(selector.selects_table("private", "secrets"));
     }
 
-    #[test]
-    fn test_try_from_maps_acceleration() {
-        let acceleration = spicepod_catalog::CatalogAcceleration {
+    fn cayenne_file_acceleration() -> spicepod_catalog::CatalogAcceleration {
+        spicepod_catalog::CatalogAcceleration {
             engine: spicepod_catalog::CatalogAccelerationEngine::Cayenne,
             refresh_mode: spicepod_catalog::CatalogRefreshMode::Changes,
             mode: spicepod::acceleration::Mode::File,
             params: Some(spicepod::param::Params::from_string_map(
                 [("cayenne_file_path".to_string(), "/data".to_string())].into(),
             )),
-        };
+        }
+    }
 
-        let builder = CatalogBuilder::try_from(spicepod_catalog(&[], &[], Some(acceleration)))
-            .expect("should build");
+    // Catalog acceleration is only supported for the `pg` provider, which
+    // exists only under the `postgres` feature. Each arm of that conditional
+    // gets its own test so the suite passes -- and asserts the behaviour the
+    // build actually has -- in both configurations.
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn test_try_from_maps_acceleration() {
+        let builder = CatalogBuilder::try_from(spicepod_catalog(
+            &[],
+            &[],
+            Some(cayenne_file_acceleration()),
+        ))
+        .expect("should build");
 
         let mapped = builder.acceleration.expect("acceleration should be mapped");
         assert_eq!(mapped.engine, CatalogAccelerationEngine::Cayenne);
@@ -438,17 +450,35 @@ mod tests {
         assert!(mapped.is_durable());
     }
 
+    // Without `postgres` there is no `pg` catalog connector compiled in, so no
+    // provider supports catalog acceleration and the config is rejected rather
+    // than silently no-oping.
+    #[cfg(not(feature = "postgres"))]
+    #[test]
+    fn test_try_from_rejects_acceleration_without_postgres_feature() {
+        // `CatalogBuilder` is not `Debug`; drop the success value so the
+        // failure message can render the error.
+        let result = CatalogBuilder::try_from(spicepod_catalog(
+            &[],
+            &[],
+            Some(cayenne_file_acceleration()),
+        ))
+        .map(|_| ());
+
+        assert!(
+            matches!(
+                result,
+                Err(crate::Error::ComponentError {
+                    source: crate::component::Error::CatalogAccelerationUnsupportedProvider { .. }
+                })
+            ),
+            "a 'pg' catalog acceleration must be rejected when the postgres feature is off, got: {result:?}"
+        );
+    }
+
     #[test]
     fn test_try_from_rejects_acceleration_for_unsupported_provider() {
-        let acceleration = spicepod_catalog::CatalogAcceleration {
-            engine: spicepod_catalog::CatalogAccelerationEngine::Cayenne,
-            refresh_mode: spicepod_catalog::CatalogRefreshMode::Changes,
-            mode: spicepod::acceleration::Mode::File,
-            params: Some(spicepod::param::Params::from_string_map(
-                [("cayenne_file_path".to_string(), "/data".to_string())].into(),
-            )),
-        };
-        let mut catalog = spicepod_catalog(&[], &[], Some(acceleration));
+        let mut catalog = spicepod_catalog(&[], &[], Some(cayenne_file_acceleration()));
         catalog.from = "mysql".to_string();
 
         let result = CatalogBuilder::try_from(catalog);
