@@ -18,49 +18,29 @@ limitations under the License.
 use std::sync::Arc;
 
 use crate::accelerated::AcceleratedTable;
-use crate::table_layers::TABLE_PROVIDER_LAYERS;
 use datafusion::datasource::TableProvider;
 use datafusion::error::DataFusionError;
-use spice_table::{
-    Index, IndexLayer, LayerWalk, find_concrete_table_provider_in,
-};
+use spice_table::{Index, LayerWalk, SpiceTable, find_concrete};
 use runtime_search::table_provider_explorer::TableProviderExplorer;
 
 /// Attempt to return a concrete [`TableProvider`] type from a given
 /// [`impl TableProvider`], stepping through every runtime wrapper layer that
-/// is read-transparent (including `AcceleratedTable`). See
-/// [`crate::table_layers`] for the layer table and
-/// [`find_concrete_table_provider_in`] to walk a restricted layer set.
+/// is read-transparent (including `AcceleratedTable`, which routes a read walk
+/// to its federated source). Use [`find_concrete`] directly to walk with a
+/// different [`LayerWalk`].
 pub fn find_concrete_table_provider<T: TableProvider + 'static>(
     tbl: &Arc<dyn TableProvider>,
 ) -> Option<&T> {
-    find_concrete_table_provider_in::<T>(tbl, TABLE_PROVIDER_LAYERS, LayerWalk::Read)
+    find_concrete::<T>(tbl.as_ref(), LayerWalk::Read)
 }
 
 pub fn find_index_in_table_provider<T: Index + 'static>(
     tbl: &Arc<dyn TableProvider>,
 ) -> Option<(Vec<&T>, Arc<dyn TableProvider>)> {
-    if let Some(accelerated_table) = find_concrete_table_provider::<AcceleratedTable>(tbl)
-        && let Some(indexes) =
-            find_index_in_table_provider::<T>(accelerated_table.get_accelerator_ref())
-    {
-        return Some(indexes);
-    }
-
-    let mut indexed_table_opt = find_concrete_table_provider::<IndexLayer>(tbl);
-    while let Some(indexed_table) = indexed_table_opt {
-        let indexes = indexed_table.get_indexes::<T>();
-        if !indexes.is_empty() {
-            return Some((indexes, Arc::clone(&indexed_table.underlying)));
-        }
-        indexed_table_opt =
-            find_concrete_table_provider::<IndexLayer>(&indexed_table.underlying);
-    }
-    None
+    tbl.downcast_ref::<SpiceTable>()?.find_index::<T>()
 }
 
-/// Runtime's implementation of [`TableProviderExplorer`] that knows how to
-/// unwrap `AcceleratedTable` and other runtime-specific wrappers.
+/// Runtime's implementation of [`TableProviderExplorer`].
 #[derive(Debug, Clone)]
 pub struct RuntimeTableProviderExplorer;
 
@@ -80,7 +60,7 @@ impl TableProviderExplorer for RuntimeTableProviderExplorer {
     }
 
     fn not_ready_error(&self, tbl: &Arc<dyn TableProvider>) -> Option<DataFusionError> {
-        find_concrete_table_provider::<AcceleratedTable>(tbl)?.not_ready_error()
+        spice_table::find_layer::<AcceleratedTable>(tbl.as_ref(), spice_table::LayerWalk::Read)?.not_ready_error()
     }
 }
 

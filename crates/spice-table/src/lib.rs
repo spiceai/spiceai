@@ -34,7 +34,7 @@ mod delete;
 mod layer;
 mod provider;
 pub use delete::{build_key_match_predicate, resolve_keys_matching_predicate};
-pub use layer::{LayerWalk, SpiceTable, TableLayer, find_concrete, peel_to};
+pub use layer::{LayerWalk, SpiceTable, TableLayer, find_concrete, find_layer, peel_to};
 pub use provider::IndexLayer;
 
 /// What a `TableSink` write window does to the rows already in the table.

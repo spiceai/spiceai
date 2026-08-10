@@ -2623,7 +2623,7 @@ impl RefreshTask {
     /// semantics) and emits the fallback warning below.
     #[cfg(not(windows))]
     fn cayenne_accelerator(&self) -> Option<&CayenneTableProvider> {
-        find_concrete::<CayenneTableProvider>(&self.accelerator, LayerWalk::Write)
+        find_concrete::<CayenneTableProvider>(self.accelerator.as_ref(), LayerWalk::Write)
     }
 
     /// Effective per-plan delete-key cap for this dataset: the process-global

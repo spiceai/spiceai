@@ -481,7 +481,7 @@ impl VectorSearchTableFunc {
         let tbl: &Arc<dyn TableProvider> =
             if let Some(es_index) = vector_index.as_any().downcast_ref::<ElasticsearchIndex>() {
                 let source_for_normalize = if let Some(acc) =
-                    find_concrete_table_provider::<AcceleratedTable>(tbl)
+                    spice_table::find_layer::<AcceleratedTable>(tbl.as_ref(), spice_table::LayerWalk::Read)
                     && let Some(fed) = acc.get_federated_table_ref().try_table_provider_sync_ref()
                 {
                     federated_tbl_storage = Arc::clone(fed);

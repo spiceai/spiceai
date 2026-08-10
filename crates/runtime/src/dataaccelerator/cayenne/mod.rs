@@ -2675,7 +2675,8 @@ fn wrap_with_native_vector_indexes(
     if indexes.is_empty() {
         provider
     } else {
-        Arc::new(IndexLayer::with_indexes(provider, indexes)) as Arc<dyn TableProvider>
+        spice_table::SpiceTable::over(Arc::new(IndexLayer::with_indexes(indexes)), provider)
+            as Arc<dyn TableProvider>
     }
 }
 

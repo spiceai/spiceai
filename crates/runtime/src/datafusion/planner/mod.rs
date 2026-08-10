@@ -286,8 +286,8 @@ async fn is_distributed_insert_table(session: &SessionState, table_name: &TableR
 }
 
 fn is_dual_write_table_provider(table_provider: &Arc<dyn TableProvider>) -> bool {
-    peel_table_provider_wrappers(table_provider)
-        .downcast_ref::<AcceleratedTable>()
+    let peeled = peel_table_provider_wrappers(table_provider);
+    spice_table::find_layer::<AcceleratedTable>(peeled.as_ref(), spice_table::LayerWalk::Read)
         .is_some_and(AcceleratedTable::is_dual_write)
 }
 

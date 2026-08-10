@@ -15,7 +15,7 @@ limitations under the License.
 */
 use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
-use spice_table::{Index, IndexLayer};
+use spice_table::{Index, IndexLayer, SpiceTable};
 use snafu::ResultExt;
 use spicepod::semantic::{Column, IndexStore, MetadataType};
 use std::path::PathBuf;
@@ -108,19 +108,28 @@ pub(crate) fn build_full_text_database_index(
     .boxed()
 }
 
-/// Registers `index` on `inner_table_provider`, reusing the existing [`IndexLayer`]
-/// chain when one is already present so multiple indexes compose onto a single provider.
+/// Registers `index` on `inner_table_provider`, reusing an index layer already at
+/// the top of the stack so several indexes compose onto one layer rather than
+/// stacking a layer apiece.
 fn register_index(
     inner_table_provider: &Arc<dyn TableProvider>,
     index: Arc<dyn Index + Send + Sync>,
-) -> IndexLayer {
-    let provider =
-        if let Some(idx_tbl) = inner_table_provider.downcast_ref::<IndexLayer>() {
-            idx_tbl.clone()
-        } else {
-            IndexLayer::new(Arc::clone(inner_table_provider))
-        };
-    provider.add_index(index)
+) -> Arc<SpiceTable> {
+    if let Some(table) = inner_table_provider.downcast_ref::<SpiceTable>()
+        && !table.layer().indexes().is_empty()
+    {
+        let mut indexes = table.layer().indexes().to_vec();
+        indexes.push(index);
+        return SpiceTable::over(
+            Arc::new(IndexLayer::with_indexes(indexes)),
+            Arc::clone(table.below()),
+        );
+    }
+
+    SpiceTable::over(
+        Arc::new(IndexLayer::with_indexes(vec![index])),
+        Arc::clone(inner_table_provider),
+    )
 }
 
 /// Adds a [`FullTextDatabaseIndex`] to a [`TableProvider`].
@@ -130,7 +139,7 @@ pub(crate) fn add_full_text_search_to_table(
     inner_table_provider: &Arc<dyn TableProvider>,
     columns: &[Column],
     tbl: &TableReference,
-) -> Result<IndexLayer, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<Arc<SpiceTable>, Box<dyn std::error::Error + Send + Sync>> {
     let index =
         build_full_text_database_index(Arc::clone(inner_table_provider), columns, tbl, None)?;
     Ok(register_index(
@@ -156,7 +165,7 @@ pub(crate) async fn add_elasticsearch_fts_to_table(
     columns: &[spicepod::semantic::Column],
     tbl: &datafusion::sql::TableReference,
     fts_params: &runtime_search::store_params::elasticsearch::ElasticsearchFtsConfig,
-) -> Result<IndexLayer, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<Arc<SpiceTable>, Box<dyn std::error::Error + Send + Sync>> {
     let index =
         build_elasticsearch_text_index(Arc::clone(&inner_table_provider), columns, tbl, fts_params)
             .await?;
@@ -191,7 +200,7 @@ pub(crate) async fn add_compound_fts_to_table(
     tbl: &datafusion::sql::TableReference,
     fts_params: &runtime_search::store_params::elasticsearch::ElasticsearchFtsConfig,
     on_zero_results: &crate::component::dataset::acceleration::ZeroResultsAction,
-) -> Result<IndexLayer, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<Arc<SpiceTable>, Box<dyn std::error::Error + Send + Sync>> {
     use crate::component::dataset::acceleration::ZeroResultsAction;
     use search::index::SearchIndex;
     use search::index::compound::{CompoundReadMode, CompoundSearchIndex};

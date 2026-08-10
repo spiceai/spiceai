@@ -28,7 +28,6 @@ use runtime_cluster::{ExecutorRegistry, PartitionValue};
 use runtime_datafusion::analyzer_rule::TablePartitionProvider;
 
 use crate::accelerated::AcceleratedTable;
-use crate::search::util::find_concrete_table_provider;
 
 /// Wraps an [`ExecutorRegistry`] with the `AcceleratedTable`-specific
 /// `should_partition` logic so it can be installed as a `TablePartitionProvider`.
@@ -53,7 +52,7 @@ impl AcceleratedPartitionProvider {
 /// federates the read to the source. [`find_concrete_table_provider`] already knows
 /// how to unwrap every such decorator.
 fn is_accelerated_table_provider(table_provider: &Arc<dyn TableProvider>) -> bool {
-    find_concrete_table_provider::<AcceleratedTable>(table_provider).is_some()
+    spice_table::find_layer::<AcceleratedTable>(table_provider.as_ref(), spice_table::LayerWalk::Read).is_some()
 }
 
 impl TablePartitionProvider for AcceleratedPartitionProvider {

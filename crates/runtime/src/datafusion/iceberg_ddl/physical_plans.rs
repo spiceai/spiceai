@@ -920,7 +920,8 @@ async fn build_registered_provider(
     )
     .await?;
 
-    let provider: Arc<dyn datafusion::datasource::TableProvider> = Arc::new(accelerated);
+    let provider: Arc<dyn datafusion::datasource::TableProvider> =
+        Arc::new(accelerated).into_table();
 
     Ok(provider)
 }

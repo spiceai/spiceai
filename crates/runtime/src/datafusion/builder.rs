@@ -1475,8 +1475,7 @@ fn is_cayenne_accelerated_table_provider(provider: &dyn TableProvider) -> bool {
         return true;
     }
 
-    provider
-        .downcast_ref::<AcceleratedTable>()
+    spice_table::find_layer::<AcceleratedTable>(provider, spice_table::LayerWalk::Read)
         .is_some_and(|table| is_cayenne_table_provider(table.get_accelerator().as_ref()))
 }
 

@@ -327,7 +327,6 @@ impl RuntimeBuilder {
         // wrappers defined here (the Iceberg cluster provider). Without this the
         // `LayerWalk::Read` index scan stops at those wrappers and misses the indexes
         // beneath them; `table_layers_are_installed_for_the_accelerated_table` guards it.
-        runtime_table::table_layers::install(crate::table_layers::TABLE_PROVIDER_LAYERS);
 
         // Initialize DataFusion tracer for span context propagation across async boundaries
         if let Err(e) = tracers::init_datafusion_tracer() {

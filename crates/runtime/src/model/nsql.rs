@@ -655,7 +655,7 @@ fn runtime_indexes_from_provider(
         return vec![];
     };
 
-    find_concrete_table_provider::<IndexLayer>(table_provider).map_or_else(
+    spice_table::find_layer::<IndexLayer>(table_provider.as_ref(), spice_table::LayerWalk::Index).map_or_else(
         Vec::new,
         |indexed_table| {
             indexed_table

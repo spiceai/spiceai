@@ -3794,7 +3794,7 @@ impl DataFusion {
             // Arrow accelerator).
             None => parent_table,
         };
-        let Some(parent_table) = parent_table.downcast_ref::<AcceleratedTable>() else {
+        let Some(parent_table) = spice_table::find_layer::<AcceleratedTable>(parent_table.as_ref(), spice_table::LayerWalk::Read) else {
             tracing::debug!(
                 "Could not synchronize refreshes with parent table {parent_table_reference}. Parent table is not an accelerated table."
             );
@@ -3903,7 +3903,7 @@ impl DataFusion {
         let table = self
             .get_accelerated_table_provider(dataset_name.to_string().as_str())
             .await?;
-        if let Some(accelerated_table) = table.downcast_ref::<AcceleratedTable>() {
+        if let Some(accelerated_table) = spice_table::find_layer::<AcceleratedTable>(table.as_ref(), spice_table::LayerWalk::Read) {
             let notifier = accelerated_table.refresher().on_complete_notification();
             accelerated_table.trigger_refresh(overrides).await.context(
                 UnableToTriggerRefreshSnafu {
@@ -4037,7 +4037,7 @@ impl DataFusion {
             .fail();
         }
 
-        if let Some(accelerated_table) = table.downcast_ref::<AcceleratedTable>() {
+        if let Some(accelerated_table) = spice_table::find_layer::<AcceleratedTable>(table.as_ref(), spice_table::LayerWalk::Read) {
             accelerated_table.update_refresh_sql(parsed).await.context(
                 UnableToTriggerRefreshSnafu {
                     dataset_name: dataset_name.to_string(),
@@ -4062,7 +4062,7 @@ impl DataFusion {
             .get_accelerated_table_provider(&dataset_name.to_string())
             .await?;
 
-        if let Some(accelerated_table) = table.downcast_ref::<AcceleratedTable>() {
+        if let Some(accelerated_table) = spice_table::find_layer::<AcceleratedTable>(table.as_ref(), spice_table::LayerWalk::Read) {
             accelerated_table
                 .update_partition_filters(filters)
                 .await
@@ -5003,7 +5003,7 @@ fn partition_expr_from_table_provider(table_provider: &Arc<dyn TableProvider>) -
         return partition_expr_from_table_provider(&poly.writer());
     }
 
-    if let Some(accelerated) = table_provider.downcast_ref::<AcceleratedTable>() {
+    if let Some(accelerated) = spice_table::find_layer::<AcceleratedTable>(table_provider.as_ref(), spice_table::LayerWalk::Read) {
         return partition_expr_from_table_provider(&accelerated.get_accelerator());
     }
 

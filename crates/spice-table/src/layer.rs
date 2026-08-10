@@ -30,7 +30,7 @@ limitations under the License.
 //! forget to forward. Navigation is a walk down [`SpiceTable`]s, needing no
 //! downcast and naming no wrapper type.
 
-use std::{borrow::Cow, fmt::Debug, sync::Arc};
+use std::{any::Any, borrow::Cow, fmt::Debug, sync::Arc};
 
 use async_trait::async_trait;
 use datafusion::{
@@ -84,7 +84,7 @@ pub enum LayerWalk {
 /// `below` is the fully-composed table underneath this layer: calling
 /// `below.scan(..)` runs every lower layer and then the base provider.
 #[async_trait]
-pub trait TableLayer: Send + Sync + Debug + 'static {
+pub trait TableLayer: Any + Send + Sync + Debug + 'static {
     /// A short name for diagnostics. Defaults to the implementing type.
     fn name(&self) -> &'static str {
         std::any::type_name::<Self>()
@@ -312,6 +312,30 @@ impl SpiceTable {
         }
     }
 
+    /// This node's layer as a concrete type, or `None` if it is another kind.
+    ///
+    /// Reaching a specific layer type is legitimate — a caller asking for one
+    /// already depends on it. What it no longer has to name is the layers in
+    /// between.
+    #[must_use]
+    pub fn layer_as<T: TableLayer>(&self) -> Option<&T> {
+        (self.layer.as_ref() as &dyn Any).downcast_ref::<T>()
+    }
+
+    /// The first layer reachable by `walk` that carries any index, together with
+    /// the table those indexes are bound to.
+    #[must_use]
+    pub fn first_indexed(&self, walk: LayerWalk) -> Option<&SpiceTable> {
+        let mut current = self;
+        loop {
+            if !current.layer.indexes().is_empty() {
+                return Some(current);
+            }
+            let next = current.layer.route(walk, &current.below)?;
+            current = next.downcast_ref::<SpiceTable>()?;
+        }
+    }
+
     /// Every index carried by any layer reachable by `walk`, outermost first.
     ///
     /// De-duplicated by identity: one index may be carried by more than one
@@ -359,16 +383,34 @@ impl SpiceTable {
 /// longer has to name is every wrapper in between.
 #[must_use]
 pub fn find_concrete<T: TableProvider + 'static>(
-    top: &Arc<dyn TableProvider>,
+    top: &dyn TableProvider,
     walk: LayerWalk,
 ) -> Option<&T> {
-    let mut current = top;
+    if let Some(found) = top.downcast_ref::<T>() {
+        return Some(found);
+    }
+    let mut table = top.downcast_ref::<SpiceTable>()?;
     loop {
-        if let Some(found) = current.downcast_ref::<T>() {
+        let next = table.layer.route(walk, &table.below)?;
+        if let Some(found) = next.downcast_ref::<T>() {
             return Some(found);
         }
-        let table = current.downcast_ref::<SpiceTable>()?;
-        current = table.layer.route(walk, &table.below)?;
+        table = next.downcast_ref::<SpiceTable>()?;
+    }
+}
+
+/// Finds a specific [`TableLayer`] in the stack, following `walk`.
+#[must_use]
+pub fn find_layer<T: TableLayer>(top: &dyn TableProvider, walk: LayerWalk) -> Option<&T> {
+    let mut table = top.downcast_ref::<SpiceTable>()?;
+    loop {
+        if let Some(found) = table.layer_as::<T>() {
+            return Some(found);
+        }
+        table = table
+            .layer
+            .route(walk, &table.below)?
+            .downcast_ref::<SpiceTable>()?;
     }
 }
 
