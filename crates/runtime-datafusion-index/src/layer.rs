@@ -154,6 +154,9 @@ pub trait TableLayer: Send + Sync + Debug + 'static {
         below.scan_with_args(state, args).await
     }
 
+    /// # Errors
+    ///
+    /// Propagates the error the layer beneath reports.
     fn supports_filters_pushdown(
         &self,
         below: &Arc<dyn TableProvider>,
@@ -332,10 +335,7 @@ impl SpiceTable {
 /// Returns `top` itself when it is not layered at all. Borrows into the stack:
 /// every node is already held as an `Arc` by the node above it.
 #[must_use]
-pub fn peel_to<'a>(
-    top: &'a Arc<dyn TableProvider>,
-    walk: LayerWalk,
-) -> &'a Arc<dyn TableProvider> {
+pub fn peel_to(top: &Arc<dyn TableProvider>, walk: LayerWalk) -> &Arc<dyn TableProvider> {
     let mut current = top;
     loop {
         let Some(table) = current.downcast_ref::<SpiceTable>() else {
