@@ -322,7 +322,7 @@ async fn test_cayenne_append_mode_with_pk_and_time_column() -> Result<(), anyhow
 /// The `partition_by` clause is the only difference from
 /// `test_cayenne_append_mode_with_pk_and_time_column`: it routes writes through
 /// the runtime cross-partition coordinator instead of the single-provider
-/// insert path, so this test fails before the fix and passes after.
+/// insert path, so it exercises the coordinator's manifest-preparation ordering.
 #[tokio::test]
 async fn test_cayenne_partitioned_append_on_conflict_upsert() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));

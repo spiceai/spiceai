@@ -459,7 +459,7 @@ impl DataSink for CayennePartitionedAppendSink {
         // sequence inside `prepared_on_conflict` and leaves `append_sequence`
         // None, and `prepare_deferred_manifest` reads that sequence from
         // `prepared_on_conflict`; moving the payload out first leaves the
-        // manifest with no reserved sequence. regression test for #12779
+        // manifest with no reserved sequence. See #12779.
         let mut prepared_on_conflicts = prepared
             .iter_mut()
             .map(PreparedStagedAppend::take_prepared_on_conflict)
