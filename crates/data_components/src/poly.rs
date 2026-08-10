@@ -17,20 +17,18 @@ limitations under the License.
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::{
-    catalog::Session,
-    common::{Constraints, Statistics},
-    datasource::{TableProvider, TableType},
+    datasource::TableProvider,
     error::Result as DataFusionResult,
-    logical_expr::{LogicalPlan, TableProviderFilterPushDown, dml::InsertOp},
-    physical_plan::ExecutionPlan,
+    logical_expr::{LogicalPlan, TableProviderFilterPushDown},
     prelude::Expr,
 };
+use spice_table::{LayerWalk, SpiceTable, TableLayer};
 use datafusion_federation::{
     FederatedTableProviderAdaptor, FederatedTableSource, FederationAnalyzerForLogicalPlan,
     FederationProvider,
 };
 use std::collections::HashMap;
-use std::{borrow::Cow, sync::Arc};
+use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub struct PolyTableProvider {
@@ -40,6 +38,14 @@ pub struct PolyTableProvider {
 }
 
 impl PolyTableProvider {
+    /// Presents this read/write split as a layered table, with the writer side
+    /// beneath so the layer and its `below` cannot disagree.
+    #[must_use]
+    pub fn into_table(self: Arc<Self>) -> Arc<SpiceTable> {
+        let write = Arc::clone(&self.write);
+        SpiceTable::over(self, write)
+    }
+
     pub fn new(write: Arc<dyn TableProvider>, fed: Arc<dyn TableProvider>) -> Self {
         PolyTableProvider {
             write,
@@ -110,73 +116,39 @@ impl FederationProvider for PolyTableProvider {
 }
 
 #[async_trait]
-impl TableProvider for PolyTableProvider {
-    fn schema(&self) -> SchemaRef {
+impl TableLayer for PolyTableProvider {
+    /// A read/write split around an accelerator: `below` is the writer side,
+    /// which is what composition runs against. Only the write walk steps through
+    /// — reads of an accelerated dataset reach the accelerator through the
+    /// accelerated table, not by peeling this layer.
+    fn route<'a>(
+        &'a self,
+        walk: LayerWalk,
+        below: &'a Arc<dyn TableProvider>,
+    ) -> Option<&'a Arc<dyn TableProvider>> {
+        match walk {
+            LayerWalk::Write => Some(below),
+            _ => None,
+        }
+    }
+
+    fn schema(&self, _below: &Arc<dyn TableProvider>) -> SchemaRef {
         let schema = self.write.schema().as_ref().clone();
         let mut metadata = schema.metadata().clone();
         metadata.extend(self.schema_metadata.clone());
         Arc::new(schema.with_metadata(metadata))
     }
-    fn constraints(&self) -> Option<&Constraints> {
-        self.write.constraints()
-    }
-    fn table_type(&self) -> TableType {
-        self.write.table_type()
-    }
-    fn statistics(&self) -> Option<Statistics> {
-        self.write.statistics()
-    }
-    fn get_logical_plan(&self) -> Option<Cow<'_, LogicalPlan>> {
-        self.write.get_logical_plan()
-    }
-    fn get_column_default(&self, column: &str) -> Option<&Expr> {
-        self.write.get_column_default(column)
-    }
 
     fn supports_filters_pushdown(
         &self,
+        _below: &Arc<dyn TableProvider>,
         filters: &[&Expr],
     ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
         self.fed.supports_filters_pushdown(filters)
     }
 
-    async fn scan(
-        &self,
-        state: &dyn Session,
-        projection: Option<&Vec<usize>>,
-        filters: &[Expr],
-        limit: Option<usize>,
-    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        self.write.scan(state, projection, filters, limit).await
-    }
 
-    async fn insert_into(
-        &self,
-        state: &dyn Session,
-        input: Arc<dyn ExecutionPlan>,
-        overwrite: InsertOp,
-    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        self.write.insert_into(state, input, overwrite).await
-    }
 
-    async fn delete_from(
-        &self,
-        state: &dyn Session,
-        filters: Vec<Expr>,
-    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        self.write.delete_from(state, filters).await
-    }
 
-    async fn update(
-        &self,
-        state: &dyn Session,
-        assignments: Vec<(String, Expr)>,
-        filters: Vec<Expr>,
-    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        self.write.update(state, assignments, filters).await
-    }
 
-    async fn truncate(&self, state: &dyn Session) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        self.write.truncate(state).await
-    }
 }

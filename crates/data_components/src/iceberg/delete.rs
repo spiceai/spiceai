@@ -28,19 +28,19 @@ limitations under the License.
 //! This uses Iceberg's merge-on-read strategy: the delete files are separate
 //! from data files, and the Iceberg reader filters them out at read time.
 
-use std::borrow::Cow;
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
+
+use spice_table::{LayerWalk, TableLayer};
 
 use arrow::array::{ArrayRef, RecordBatch, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef};
 use async_trait::async_trait;
-use datafusion::catalog::{ScanArgs, ScanResult, Session};
+use datafusion::catalog::Session;
 use datafusion::common::{
-    Constraints, DataFusionError, Result as DFResult, Statistics, ToDFSchema, tree_node::TreeNode,
+    DataFusionError, Result as DFResult, ToDFSchema, tree_node::TreeNode,
 };
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
-use datafusion::logical_expr::LogicalPlan;
 use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -381,71 +381,36 @@ impl Debug for IcebergDeletionProvider {
 }
 
 #[async_trait]
-impl datafusion::datasource::TableProvider for IcebergDeletionProvider {
-    fn schema(&self) -> ArrowSchemaRef {
-        self.inner.schema()
+impl TableLayer for IcebergDeletionProvider {
+    /// Deletion against an Iceberg table is this layer's own behaviour, so only a
+    /// read walk may see past it — anything that would route a delete around it
+    /// (retention especially) must stop here or the delete lands on the wrong
+    /// table.
+    fn route<'a>(
+        &'a self,
+        walk: LayerWalk,
+        below: &'a Arc<dyn datafusion::datasource::TableProvider>,
+    ) -> Option<&'a Arc<dyn datafusion::datasource::TableProvider>> {
+        match walk {
+            LayerWalk::Read => Some(below),
+            _ => None,
+        }
     }
 
-    fn constraints(&self) -> Option<&Constraints> {
-        self.inner.constraints()
-    }
 
-    fn table_type(&self) -> datafusion::datasource::TableType {
-        self.inner.table_type()
-    }
 
-    fn get_table_definition(&self) -> Option<&str> {
-        self.inner.get_table_definition()
-    }
 
-    fn get_logical_plan(&'_ self) -> Option<Cow<'_, LogicalPlan>> {
-        self.inner.get_logical_plan()
-    }
 
-    fn get_column_default(&self, column: &str) -> Option<&datafusion::logical_expr::Expr> {
-        self.inner.get_column_default(column)
-    }
 
-    fn supports_filters_pushdown(
-        &self,
-        filters: &[&datafusion::logical_expr::Expr],
-    ) -> DFResult<Vec<datafusion::logical_expr::TableProviderFilterPushDown>> {
-        self.inner.supports_filters_pushdown(filters)
-    }
 
-    fn statistics(&self) -> Option<Statistics> {
-        self.inner.statistics()
-    }
 
-    async fn scan(
-        &self,
-        state: &dyn Session,
-        projection: Option<&Vec<usize>>,
-        filters: &[datafusion::logical_expr::Expr],
-        limit: Option<usize>,
-    ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        self.inner.scan(state, projection, filters, limit).await
-    }
 
-    async fn scan_with_args<'a>(
-        &self,
-        state: &dyn Session,
-        args: ScanArgs<'a>,
-    ) -> DFResult<ScanResult> {
-        self.inner.scan_with_args(state, args).await
-    }
 
-    async fn insert_into(
-        &self,
-        state: &dyn Session,
-        input: Arc<dyn ExecutionPlan>,
-        overwrite: datafusion::logical_expr::dml::InsertOp,
-    ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        self.inner.insert_into(state, input, overwrite).await
-    }
+
 
     async fn delete_from(
         &self,
+        _below: &Arc<dyn datafusion::datasource::TableProvider>,
         state: &dyn Session,
         filters: Vec<datafusion::logical_expr::Expr>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {

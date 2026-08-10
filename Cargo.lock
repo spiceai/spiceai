@@ -6052,6 +6052,7 @@ dependencies = [
  "snafu",
  "snowflake-api",
  "spark-connect-rs",
+ "spice-table",
  "telemetry",
  "tempfile",
  "tiberius",
