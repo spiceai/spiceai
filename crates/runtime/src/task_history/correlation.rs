@@ -86,7 +86,7 @@ pub fn begin_task_trace(task_span: &Span, request_context: &RequestContext) -> S
     tracing::info_span!(target: TRACE_SPAN_TARGET, TRACE_SPAN_NAME, trace_id = %trace_id)
 }
 
-/// Records the trace id the client pinned — via `x-spice-trace-id` or W3C
+/// Records the trace id the client pinned — via `spice-trace-id` or W3C
 /// `traceparent` — on `span`, overriding the `trace_id` column of the
 /// `task_history` row, plus the `parent_span_id` column when the client sent a
 /// `traceparent` naming the span this task is a child of.
@@ -205,7 +205,7 @@ fn join_propagated_trace(task_span: &Span, request_context: &RequestContext) {
 /// The `traceparent` span this task is a child of, but only when that span
 /// belongs to `trace_id`.
 ///
-/// A caller that pins `x-spice-trace-id` while a proxy injects a `traceparent`
+/// A caller that pins `spice-trace-id` while a proxy injects a `traceparent`
 /// sends two different traces. A span id is only meaningful inside its own
 /// trace, so recording it under the pinned id would put an edge in the
 /// task-history tree — and in the context shipped to executors — that exists in

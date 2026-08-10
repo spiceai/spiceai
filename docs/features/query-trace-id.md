@@ -33,16 +33,16 @@ metadata *is* HTTP/2 headers.
 
 | Header             | Value                                      | Use when                                        |
 | ------------------ | ------------------------------------------ | ----------------------------------------------- |
-| `x-spice-trace-id` | 32 hexadecimal characters, not all zero    | The caller just wants an id it chose             |
+| `spice-trace-id` | 32 hexadecimal characters, not all zero    | The caller just wants an id it chose             |
 | `traceparent`      | W3C trace context, e.g. `00-{trace_id}-{span_id}-01` | The caller is part of a distributed trace |
 
 ```bash
 curl -X POST http://localhost:8090/v1/sql \
-  -H 'x-spice-trace-id: 4bf92f3577b34da6a3ce929d0e0e4736' \
+  -H 'spice-trace-id: 4bf92f3577b34da6a3ce929d0e0e4736' \
   -d 'SELECT * FROM taxi_trips LIMIT 10'
 ```
 
-A request carrying both uses `x-spice-trace-id`: a caller sets it knowing what it
+A request carrying both uses `spice-trace-id`: a caller sets it knowing what it
 wants correlated, whereas a `traceparent` is routinely injected by a proxy or APM
 agent that knows nothing about the request.
 
@@ -106,7 +106,7 @@ instead, on every query, with nothing to configure.
 | Where                            | Read it with                                                     |
 | -------------------------------- | ---------------------------------------------------------------- |
 | `FlightInfo.app_metadata`        | Any Flight SQL client; the only surface the JDBC driver exposes    |
-| `x-spice-trace-id` response metadata on `GetFlightInfo` and `DoGet` | A Flight client middleware or gRPC interceptor |
+| `spice-trace-id` response metadata on `GetFlightInfo` and `DoGet` | A Flight client middleware or gRPC interceptor |
 
 `app_metadata` is JSON so it can carry a second field later:
 
