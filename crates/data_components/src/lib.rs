@@ -411,6 +411,11 @@ impl Drop for RefreshingCatalogProvider {
 
 #[cfg(test)]
 mod tests {
+    use datafusion::catalog::Session;
+    use datafusion::datasource::TableType;
+    use datafusion::error::Result as DataFusionResult;
+    use datafusion::physical_plan::ExecutionPlan;
+    use datafusion::prelude::Expr;
     use super::*;
     use datafusion::arrow::datatypes::{DataType, Field};
     use datafusion::error::DataFusionError;

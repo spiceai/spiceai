@@ -552,15 +552,15 @@ mod tests {
     #[test]
     fn test_strip_index_wrapper_layers_unwraps_all_known_layers() {
         use data_components::MetadataEnrichedTableProvider;
-        use spice_table::IndexLayer;
+        use spice_table::{IndexLayer, SpiceTable};
 
         let mem_table: Arc<dyn TableProvider> = Arc::new(
             MemTable::try_new(create_test_schema(), vec![]).expect("mem table should be created"),
         );
 
-        // IndexLayer alone.
+        // An index layer alone.
         let wrapped: Arc<dyn TableProvider> =
-            Arc::new(IndexLayer::new(Arc::clone(&mem_table)));
+            SpiceTable::over(Arc::new(IndexLayer::new()), Arc::clone(&mem_table));
         assert!(
             strip_index_wrapper_layers(&wrapped)
                 .downcast_ref::<MemTable>()
@@ -568,20 +568,22 @@ mod tests {
             "stripping an IndexLayer must yield the underlying MemTable"
         );
 
-        // MetadataEnrichedTableProvider nested inside an IndexLayer (the shape
+        // A metadata layer nested inside an index layer (the shape
         // `table_provider_with_spicepod_metadata` produces).
-        let metadata_enriched: Arc<dyn TableProvider> =
+        let metadata_enriched: Arc<dyn TableProvider> = SpiceTable::over(
             Arc::new(MetadataEnrichedTableProvider::new(
-                Arc::clone(&mem_table),
+                &mem_table,
                 std::collections::HashMap::from([("key".to_string(), "value".to_string())]),
-            ));
+            )),
+            Arc::clone(&mem_table),
+        );
         let wrapped_with_metadata: Arc<dyn TableProvider> =
-            Arc::new(IndexLayer::new(metadata_enriched));
+            SpiceTable::over(Arc::new(IndexLayer::new()), metadata_enriched);
         assert!(
             strip_index_wrapper_layers(&wrapped_with_metadata)
                 .downcast_ref::<MemTable>()
                 .is_some(),
-            "stripping must peel through a nested MetadataEnrichedTableProvider layer"
+            "stripping must peel through a nested metadata layer"
         );
 
         // A provider with no wrapper layers is returned unchanged.

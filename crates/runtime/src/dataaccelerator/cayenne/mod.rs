@@ -3332,7 +3332,8 @@ impl DataAccelerator for CayenneAccelerator {
                 Arc::clone(&write_provider),
                 write_provider,
                 schema_metadata,
-            )) as Arc<dyn TableProvider>;
+            ))
+            .into_table() as Arc<dyn TableProvider>;
 
             Ok(wrap_with_native_vector_indexes(
                 table_provider,
@@ -3505,7 +3506,8 @@ impl DataAccelerator for CayenneAccelerator {
                 Arc::clone(&write_provider),
                 write_provider,
                 schema_metadata,
-            )) as Arc<dyn TableProvider>;
+            ))
+            .into_table() as Arc<dyn TableProvider>;
 
             Ok(wrap_with_native_vector_indexes(
                 table_provider,

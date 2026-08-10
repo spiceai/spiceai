@@ -115,16 +115,16 @@ mod tests {
     #[test]
     fn a_bare_provider_carries_no_layers() {
         let base = base_table();
-        assert!(find_concrete_table_provider::<EmbeddingTable>(&base).is_none());
-        assert!(spice_table::find_layer::<IndexLayer>(&base, LayerWalk::Index).is_none());
+        assert!(spice_table::find_layer::<EmbeddingTable>(base.as_ref(), LayerWalk::Read).is_none());
+        assert!(spice_table::find_layer::<IndexLayer>(base.as_ref(), LayerWalk::Index).is_none());
     }
 
     #[test]
     fn an_index_layer_is_discoverable_and_does_not_invent_others() {
         let wrapped = indexed(&base_table());
 
-        assert!(spice_table::find_layer::<IndexLayer>(&wrapped, LayerWalk::Index).is_some());
-        assert!(find_concrete_table_provider::<EmbeddingTable>(&wrapped).is_none());
+        assert!(spice_table::find_layer::<IndexLayer>(wrapped.as_ref(), LayerWalk::Index).is_some());
+        assert!(spice_table::find_layer::<EmbeddingTable>(wrapped.as_ref(), LayerWalk::Read).is_none());
     }
 
     /// A provider with no accelerator behind it has no load to wait on, so it

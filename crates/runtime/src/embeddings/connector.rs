@@ -36,7 +36,7 @@ use data_components::cdc::{ChangeEnvelope, ChangesStream, StreamError, replace_c
 use datafusion::datasource::TableProvider;
 use futures::StreamExt;
 use itertools::Itertools;
-use spice_table::{IndexLayer, LayerWalk, find_concrete, find_layer, peel_to};
+use spice_table::{IndexLayer, LayerWalk, find_layer, peel_to};
 use runtime_metrics::component::MetricsProvider;
 use search::generation::text_search::index::FullTextDatabaseIndex;
 use search::index::SearchIndex;
@@ -386,14 +386,14 @@ impl DataConnector for EmbeddingConnector {
             Some(stream)
 
         // `VectorScanTableProvider` is generally wrapped by a `IndexLayer` (as above), but in the case both [`Self`] and the [`FullTextConnector`] exist, the latter will unwrap the `IndexLayer` first. It will correctly handle indexing vector indexes as that point.
-        } else if let Some(vector_scan) = find_concrete::<VectorScanTableProvider>(table_provider.as_ref(), LayerWalk::CdcDetection) {
+        } else if let Some(vector_scan) = find_layer::<VectorScanTableProvider>(table_provider.as_ref(), LayerWalk::CdcDetection) {
             self.inner_connector.changes_stream(
                 Arc::new(FederatedTable::Immediate(Arc::clone(
                     &vector_scan.table_provider,
                 ))),
                 dataset,
             )
-        } else if let Some(embedding_table) = find_concrete::<EmbeddingTable>(table_provider.as_ref(), LayerWalk::CdcDetection) {
+        } else if let Some(embedding_table) = find_layer::<EmbeddingTable>(table_provider.as_ref(), LayerWalk::CdcDetection) {
             let embedding_table = Arc::new(embedding_table.clone());
             let underlying_table = Arc::clone(&embedding_table.base_table);
             let underlying_federated_table = Arc::new(FederatedTable::Immediate(underlying_table));
@@ -440,7 +440,7 @@ impl DataConnector for EmbeddingConnector {
         // above), but when a `FullTextConnector` also exists it peels that layer off before
         // delegating here, so the vector scan is what we see. Mirror `changes_stream`: hand
         // the scan's inner provider down and let the outer connector re-apply the indexes.
-        if let Some(vector_scan) = find_concrete::<VectorScanTableProvider>(table_provider.as_ref(), LayerWalk::CdcDetection) {
+        if let Some(vector_scan) = find_layer::<VectorScanTableProvider>(table_provider.as_ref(), LayerWalk::CdcDetection) {
             return self
                 .inner_connector
                 .append_stream(Arc::new(FederatedTable::Immediate(Arc::clone(
@@ -449,7 +449,7 @@ impl DataConnector for EmbeddingConnector {
         }
 
         let embedding_table = Arc::new(
-            find_concrete::<EmbeddingTable>(table_provider.as_ref(), LayerWalk::CdcDetection)?
+            find_layer::<EmbeddingTable>(table_provider.as_ref(), LayerWalk::CdcDetection)?
             .clone(),
         );
         let underlying_table = Arc::clone(&embedding_table.base_table);
@@ -792,7 +792,7 @@ mod tests {
             primary_key: vec!["id".to_string()],
         };
         Arc::new(FederatedTable::Immediate(
-            Arc::new(vector_scan) as Arc<dyn TableProvider>
+            Arc::new(vector_scan).into_table() as Arc<dyn TableProvider>
         ))
     }
 
@@ -831,7 +831,7 @@ mod tests {
             embedding_models: Arc::new(RwLock::new(EmbeddingModelStore::default())),
         };
         let federated_table = Arc::new(FederatedTable::Immediate(
-            Arc::new(embedding_table) as Arc<dyn TableProvider>
+            Arc::new(embedding_table).into_table() as Arc<dyn TableProvider>
         ));
 
         assert!(

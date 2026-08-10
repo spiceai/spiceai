@@ -71,7 +71,6 @@ use crate::{
         request_context_extension::get_current_datafusion,
         udf::{UserFunctionInfo, effective_user_function_volatility, user_function_infos},
     },
-    search::util::find_concrete_table_provider,
     tools::{SpiceModelTool, utils::tool_call_error_response},
 };
 use runtime_query_engine::query_engine::QueryEngine;
@@ -906,7 +905,7 @@ fn vector_search_contexts(
         return vec![];
     }
 
-    let embedding_table = table_provider.and_then(find_concrete_table_provider::<EmbeddingTable>);
+    let embedding_table = table_provider.and_then(|tbl| spice_table::find_layer::<EmbeddingTable>(tbl.as_ref(), spice_table::LayerWalk::Read));
 
     configured_vector_search_columns(app_context)
         .into_iter()

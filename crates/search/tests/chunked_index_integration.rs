@@ -50,7 +50,7 @@ use datafusion::{
     prelude::SessionContext,
 };
 use runtime_datafusion_index::analyzer::{IndexTableScanExtensionPlanner, IndexTableScanOptimizerRule};
-use spice_table::{Index, IndexLayer};
+use spice_table::{Index, IndexLayer, SpiceTable};
 use search::index::{
     SearchIndex,
     chunking::{CHUNKED_INDEX_CHUNK_KEY, ChunkedSearchIndex},
@@ -329,9 +329,11 @@ async fn chunked_index_emits_bounded_intermediate_batches_to_inner() {
     let schema = input.schema();
     let mem_table = Arc::new(MemTable::try_new(schema, vec![vec![input]]).expect("valid table"));
 
-    let indexed = Arc::new(
-        IndexLayer::new(mem_table as Arc<dyn TableProvider>)
-            .add_index(chunked_index as Arc<dyn Index + Send + Sync>),
+    let indexed = SpiceTable::over(
+        Arc::new(
+            IndexLayer::new().add_index(chunked_index as Arc<dyn Index + Send + Sync>),
+        ),
+        mem_table as Arc<dyn TableProvider>,
     );
 
     ctx.register_table("docs", indexed as Arc<dyn TableProvider>)

@@ -556,15 +556,18 @@ impl ExecutionPlan for IcebergCreateTableExec {
                             "Table '{table_name}' already exists and acceleration was registered"
                         );
                     } else {
+                        let inner = provider;
                         let deletion_provider =
                             data_components::iceberg::delete::IcebergDeletionProvider::new(
                                 Arc::clone(&catalog),
                                 namespace.clone(),
                                 table_name.clone(),
-                                provider,
+                                Arc::clone(&inner),
                             );
-                        schema_provider
-                            .register_table(table_name.clone(), Arc::new(deletion_provider))?;
+                        schema_provider.register_table(
+                            table_name.clone(),
+                            spice_table::SpiceTable::over(Arc::new(deletion_provider), inner),
+                        )?;
                         message = format!("Table '{table_name}' already exists");
                     }
 
@@ -635,10 +638,10 @@ impl ExecutionPlan for IcebergCreateTableExec {
                             Arc::clone(&catalog),
                             namespace.clone(),
                             table_name.clone(),
-                            raw_provider,
+                            Arc::clone(&raw_provider),
                         );
                     let adapted: Arc<dyn datafusion::datasource::TableProvider> =
-                        Arc::new(deletion_provider);
+                        spice_table::SpiceTable::over(Arc::new(deletion_provider), raw_provider);
                     schema_provider.register_table(table_name.clone(), adapted)?;
                     Ok(())
                 };

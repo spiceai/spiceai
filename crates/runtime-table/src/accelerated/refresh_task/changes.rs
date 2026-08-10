@@ -59,7 +59,6 @@ use runtime_datafusion::error::{find_datafusion_root, format_datafusion_error};
 use runtime_datafusion::execution_plan::schema_cast::SchemaCastScanExec;
 use spice_table::{LayerWalk, SpiceTable, find_concrete};
 use runtime_metrics::acceleration as metrics;
-use runtime_search::embeddings::table::EmbeddingTable;
 use runtime_status as status;
 use runtime_table_partition::provider::PartitionTableProvider;
 #[cfg(test)]
@@ -2623,7 +2622,7 @@ impl RefreshTask {
     /// semantics) and emits the fallback warning below.
     #[cfg(not(windows))]
     fn cayenne_accelerator(&self) -> Option<&CayenneTableProvider> {
-        find_concrete::<CayenneTableProvider>(&self.accelerator, LayerWalk::Write)
+        find_concrete::<CayenneTableProvider>(self.accelerator.as_ref(), LayerWalk::Write)
     }
 
     /// Effective per-plan delete-key cap for this dataset: the process-global
@@ -3767,6 +3766,7 @@ fn handle_stream_error(err: &cdc::StreamError, dataset_name: &TableReference) ->
 
 #[cfg(test)]
 mod tests {
+    use spice_table::IndexLayer;
     use super::*;
     use arrow::array::{ArrayRef, Int32Array, ListArray, StringArray, StructArray};
     use arrow::datatypes::{DataType, Field, Schema};
@@ -4789,9 +4789,10 @@ mod tests {
             MemTable::try_new(Arc::clone(&schema), vec![vec![initial.clone()]])
                 .expect("mem table should be created"),
         );
-        let wrapped = Arc::new(IndexLayer::new(
-            Arc::clone(&table) as Arc<dyn TableProvider>
-        )) as Arc<dyn TableProvider>;
+        let wrapped = SpiceTable::over(
+            Arc::new(IndexLayer::new()),
+            Arc::clone(&table) as Arc<dyn TableProvider>,
+        ) as Arc<dyn TableProvider>;
 
         let deleted = delete_matching_rows_from_arrow_provider(&wrapped, &initial)
             .await

@@ -98,8 +98,7 @@ async fn test_refresh_max_timestamp_df() -> anyhow::Result<()> {
                 .await
                 .expect("Failed to create external table");
 
-            accelerated_table
-                .downcast_ref::<PolyTableProvider>()
+            spice_table::find_layer::<PolyTableProvider>(accelerated_table.as_ref(), spice_table::LayerWalk::Write)
                 .expect("Expected PolyTableProvider");
 
             let mut state = SessionStateBuilder::new()
@@ -195,8 +194,7 @@ async fn test_accelerator_table_provider() -> anyhow::Result<()> {
                 .await
                 .expect("Failed to create external table");
 
-            accelerated_table
-                .downcast_ref::<PolyTableProvider>()
+            spice_table::find_layer::<PolyTableProvider>(accelerated_table.as_ref(), spice_table::LayerWalk::Write)
                 .expect("Expected PolyTableProvider");
 
             let table_provider = accelerator_table_provider(&accelerated_table);

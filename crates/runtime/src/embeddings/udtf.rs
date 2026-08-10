@@ -72,7 +72,7 @@ use snafu::ResultExt;
 
 use crate::datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
 use crate::{
-    datafusion::DataFusion, model::EmbeddingModelStore, search::util::find_concrete_table_provider,
+    datafusion::DataFusion, model::EmbeddingModelStore,
 };
 
 use runtime_request_context::{AsyncMarker, RequestContext};
@@ -546,7 +546,7 @@ impl TableFunctionImpl for VectorSearchTableFunc {
 
         // If an embedding column is defined, fallback to JIT or.
         let embedding_table_provider =
-            find_concrete_table_provider::<EmbeddingTable>(&table_provider).ok_or_else(|| {
+            spice_table::find_layer::<EmbeddingTable>(table_provider.as_ref(), spice_table::LayerWalk::Read).ok_or_else(|| {
                 DataFusionError::Plan(format!(
                     "Table '{}' does not have an embedding index.",
                     args.tbl.clone()

@@ -31,16 +31,12 @@ limitations under the License.
 //! the inner scan unchanged, so non-distributed plans are unaffected.
 
 use spice_table::{LayerWalk, SpiceTable, TableLayer};
-use std::borrow::Cow;
 use std::sync::Arc;
 
-use arrow_schema::SchemaRef as ArrowSchemaRef;
 use async_trait::async_trait;
 use datafusion::catalog::{ScanArgs, ScanResult, Session, TableProvider};
-use datafusion::common::{Constraints, Result as DFResult, Statistics};
-use datafusion::datasource::TableType;
-use datafusion::logical_expr::dml::InsertOp;
-use datafusion::logical_expr::{Expr, LogicalPlan, TableProviderFilterPushDown};
+use datafusion::common::Result as DFResult;
+use datafusion::logical_expr::Expr;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::sql::TableReference;
 use iceberg_datafusion::physical_plan::IcebergTableScan;
@@ -158,6 +154,7 @@ impl TableLayer for IcebergClusterTableProvider {
         let projection = args.projection().map(<[usize]>::to_vec);
         let plan = self
             .scan(
+                _below,
                 state,
                 projection.as_ref(),
                 args.filters().unwrap_or(&[]),

@@ -2639,7 +2639,7 @@ fn accelerator_df(
 }
 
 pub fn accelerator_table_provider(accelerator: &Arc<dyn TableProvider>) -> Arc<dyn TableProvider> {
-    match spice_table::find_layer::<PolyTableProvider>(accelerator, spice_table::LayerWalk::Write) {
+    match spice_table::find_layer::<PolyTableProvider>(accelerator.as_ref(), spice_table::LayerWalk::Write) {
         Some(poly) => match poly
             .get_federated_table_provider()
             .downcast_ref::<FederatedTableProviderAdaptor>()
@@ -2859,6 +2859,7 @@ fn schema_evolution_mismatch_refresh_message(
 
 #[cfg(test)]
 mod tests {
+    use spice_table::IndexLayer;
     use super::*;
     use crate::federated::FederatedTable;
     use arrow::array::{
@@ -2915,19 +2916,24 @@ mod tests {
         );
         let index: Arc<dyn spice_table::Index + Send + Sync> =
             Arc::new(TestRefreshIndex);
-        let indexed_provider: Arc<dyn TableProvider> = Arc::new(
-            IndexLayer::with_indexes(mem_table, vec![Arc::clone(&index)]),
+        let indexed_provider: Arc<dyn TableProvider> = SpiceTable::over(
+            Arc::new(IndexLayer::with_indexes(vec![Arc::clone(&index)])),
+            mem_table,
         );
 
         let wrapped = table_provider_with_existing_metadata(indexed_provider);
-        let indexed = wrapped
-            .downcast_ref::<IndexLayer>()
-            .expect("indexed provider should remain the outer provider");
-        assert_eq!(indexed.get_all_indexes().len(), 1);
+        let index_node = wrapped
+            .downcast_ref::<SpiceTable>()
+            .and_then(|table| table.find_node::<IndexLayer>(LayerWalk::Index))
+            .expect("the index layer should remain the outermost layer");
+        assert_eq!(index_node.layer().indexes().len(), 1);
         assert!(
-            indexed
-                .get_underlying()
-                .is::<MetadataEnrichedTableProvider>()
+            spice_table::find_layer::<MetadataEnrichedTableProvider>(
+                index_node.below().as_ref(),
+                LayerWalk::Read
+            )
+            .is_some(),
+            "enrichment should sit below the index layer"
         );
 
         let wrapped_schema = wrapped.schema();
@@ -2957,10 +2963,10 @@ mod tests {
         let mem_table: Arc<dyn TableProvider> = Arc::new(
             MemTable::try_new(schema, vec![vec![batch]]).expect("mem table should be created"),
         );
-        Arc::new(IndexLayer::with_indexes(
+        SpiceTable::over(
+            Arc::new(IndexLayer::with_indexes(vec![Arc::new(TestRefreshIndex)])),
             mem_table,
-            vec![Arc::new(TestRefreshIndex)],
-        ))
+        )
     }
 
     /// An index nested under a metadata-enrichment layer must still receive
@@ -2968,7 +2974,6 @@ mod tests {
     /// silently drops the index writes for the whole refresh.
     #[test]
     fn collect_indexes_finds_indexes_under_metadata_enrichment() {
-        crate::table_layers::install_for_tests();
         let enriched: Arc<dyn TableProvider> = data_components::metadata_enriched_table_provider(
             indexed_mem_table(),
             std::collections::HashMap::from([("table_meta".to_string(), "value".to_string())]),
@@ -2978,14 +2983,13 @@ mod tests {
         assert_eq!(
             collect_indexes_from_provider(&enriched).len(),
             1,
-            "an index below a MetadataEnrichedTableProvider layer must be collected"
+            "an index below a metadata-enrichment layer must be collected"
         );
     }
 
     /// Same requirement for a vector-scan layer above the indexed provider.
     #[test]
     fn collect_indexes_finds_indexes_under_vector_scan() {
-        crate::table_layers::install_for_tests();
         let plan = datafusion::logical_expr::LogicalPlanBuilder::empty(false)
             .build()
             .expect("empty logical plan should build");
@@ -2994,7 +2998,8 @@ mod tests {
                 table_provider: indexed_mem_table(),
                 vector_index_list: Arc::new(plan),
                 primary_key: vec![],
-            });
+            })
+            .into_table();
 
         assert_eq!(
             collect_indexes_from_provider(&vector_scan).len(),

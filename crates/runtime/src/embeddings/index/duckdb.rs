@@ -23,7 +23,7 @@ use datafusion_table_providers::{
     duckdb::{TableDefinition, write::DuckDBTableWriter},
     sql::db_connection_pool::duckdbpool::DuckDbConnectionPool,
 };
-use spice_table::{Index, IndexLayer};
+use spice_table::{Index, IndexLayer, SpiceTable};
 use runtime_secrets::{Secrets, get_params_with_secrets};
 use search::{generation::util::get_primary_keys, index::duckdb::DuckDBVectorIndex};
 use snafu::prelude::*;
@@ -184,12 +184,16 @@ pub(crate) async fn wrap_accelerator_with_duckdb_vector_indexes(
     // in the TableDefinition configuration.
     table_definition.add_ignored_index_prefix("__spice_vss_");
 
-    let mut provider =
-        if let Some(indexed) = accelerator_provider.downcast_ref::<IndexLayer>() {
-            indexed.clone()
-        } else {
-            IndexLayer::new(Arc::clone(&accelerator_provider))
-        };
+    // Reuse an index layer already at the top of the accelerator's stack so the
+    // vector indexes join the ones already registered, rather than stacking a
+    // second layer that discovery would have to find separately.
+    let (mut provider, below) = match accelerator_provider.downcast_ref::<SpiceTable>() {
+        Some(table) if !table.layer().indexes().is_empty() => (
+            IndexLayer::with_indexes(table.layer().indexes().to_vec()),
+            Arc::clone(table.below()),
+        ),
+        _ => (IndexLayer::new(), Arc::clone(&accelerator_provider)),
+    };
 
     for (column, config) in embedding_columns {
         let vector_index = try_from_table(
@@ -220,7 +224,7 @@ pub(crate) async fn wrap_accelerator_with_duckdb_vector_indexes(
         provider = provider.add_index(Arc::new(vector_index) as Arc<dyn Index>);
     }
 
-    Ok(Arc::new(provider))
+    Ok(SpiceTable::over(Arc::new(provider), below) as Arc<dyn TableProvider>)
 }
 
 #[must_use]
@@ -263,11 +267,13 @@ fn normalized_duckdb_vector_param_name(key: &str) -> Option<&'static str> {
 fn duckdb_writer_context(
     provider: &Arc<dyn TableProvider>,
 ) -> Option<(Arc<DuckDbConnectionPool>, Arc<TableDefinition>)> {
-    if let Some(indexed) = provider.downcast_ref::<IndexLayer>() {
-        return duckdb_writer_context(&indexed.underlying);
+    if let Some(layered) = provider.downcast_ref::<SpiceTable>() {
+        return duckdb_writer_context(layered.below());
     }
 
-    if let Some(poly) = provider.downcast_ref::<PolyTableProvider>() {
+    if let Some(poly) =
+        spice_table::find_layer::<PolyTableProvider>(provider.as_ref(), spice_table::LayerWalk::Write)
+    {
         let writer = poly.writer();
         return duckdb_writer_context(&writer);
     }

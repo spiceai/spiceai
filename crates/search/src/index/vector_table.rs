@@ -732,7 +732,7 @@ mod tests {
         )
         .expect("could not make 'VectorScanTableProvider'");
 
-        let provider: Arc<dyn TableProvider> = Arc::new(p);
+        let provider: Arc<dyn TableProvider> = Arc::new(p).into_table();
 
         test_explain(
             Arc::clone(&provider),
@@ -799,7 +799,7 @@ mod tests {
         )
         .expect("could not make 'VectorScanTableProvider'");
 
-        let provider: Arc<dyn TableProvider> = Arc::new(p);
+        let provider: Arc<dyn TableProvider> = Arc::new(p).into_table();
 
         // Schema-sufficient: every selected column is in the base table. The bare
         // `LIMIT` (no `ORDER BY`) lets DataFusion fold the limit into the outer
@@ -857,7 +857,7 @@ mod tests {
         )
         .expect("could not make 'VectorScanTableProvider'");
 
-        let provider: Arc<dyn TableProvider> = Arc::new(p);
+        let provider: Arc<dyn TableProvider> = Arc::new(p).into_table();
 
         test_explain(
             Arc::clone(&provider),
@@ -965,7 +965,7 @@ mod tests {
         )
         .expect("could not make 'VectorScanTableProvider'");
 
-        let provider: Arc<dyn TableProvider> = Arc::new(p);
+        let provider: Arc<dyn TableProvider> = Arc::new(p).into_table();
 
         test_explain(
             Arc::clone(&provider),

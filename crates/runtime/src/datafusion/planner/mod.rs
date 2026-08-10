@@ -46,7 +46,6 @@ mod update;
 
 use std::sync::Arc;
 
-use data_components::MetadataEnrichedTableProvider;
 use datafusion::catalog::TableProvider;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::SessionState;
@@ -311,8 +310,8 @@ pub(crate) fn peel_table_provider_wrappers(
             continue;
         }
 
-        if let Some(enriched) = current.downcast_ref::<MetadataEnrichedTableProvider>() {
-            current = Arc::clone(enriched.get_inner_ref());
+        if let Some(layered) = current.downcast_ref::<spice_table::SpiceTable>() {
+            current = Arc::clone(layered.below());
             continue;
         }
 
@@ -334,7 +333,8 @@ mod tests {
     use datafusion::catalog::TableProvider;
     use datafusion::datasource::MemTable;
 
-    use super::{MetadataEnrichedTableProvider, peel_table_provider_wrappers};
+    use super::peel_table_provider_wrappers;
+    use data_components::MetadataEnrichedTableProvider;
 
     fn mem_table() -> Arc<dyn TableProvider> {
         let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
@@ -344,7 +344,10 @@ mod tests {
     fn enrich(inner: Arc<dyn TableProvider>) -> Arc<dyn TableProvider> {
         let mut metadata = HashMap::new();
         metadata.insert("source_owner".to_string(), "analytics".to_string());
-        Arc::new(MetadataEnrichedTableProvider::new(inner, metadata))
+        spice_table::SpiceTable::over(
+            Arc::new(MetadataEnrichedTableProvider::new(&inner, metadata)),
+            inner,
+        )
     }
 
     #[test]
@@ -357,10 +360,12 @@ mod tests {
         let inner = mem_table();
         let wrapped = enrich(Arc::clone(&inner));
         assert!(
-            wrapped
-                .downcast_ref::<MetadataEnrichedTableProvider>()
-                .is_some(),
-            "precondition: provider is wrapped in MetadataEnrichedTableProvider"
+            spice_table::find_layer::<MetadataEnrichedTableProvider>(
+                wrapped.as_ref(),
+                spice_table::LayerWalk::Read
+            )
+            .is_some(),
+            "precondition: provider carries a metadata-enrichment layer"
         );
 
         let peeled = peel_table_provider_wrappers(&wrapped);

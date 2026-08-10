@@ -17,7 +17,7 @@ limitations under the License.
 use std::sync::Arc;
 
 use data_components::cdc::{ChangeEnvelope, StreamError, replace_change_batch_data};
-use spice_table::{Index, IndexLayer};
+use spice_table::{Index, LayerWalk, SpiceTable};
 
 /// A newtype wrapper around a vector of indexes to prevent cloning the vector for each item in a stream.
 pub struct Indexes(Vec<Arc<dyn Index + Send + Sync>>);
@@ -28,9 +28,11 @@ impl Indexes {
     }
 }
 
-impl From<Arc<IndexLayer>> for Indexes {
-    fn from(indexed_table: Arc<IndexLayer>) -> Self {
-        Self(indexed_table.get_all_indexes())
+impl From<Arc<SpiceTable>> for Indexes {
+    /// Collects the indexes carried anywhere in the table's stack, so a change
+    /// stream maintains every one of them and not just the outermost layer's.
+    fn from(table: Arc<SpiceTable>) -> Self {
+        Self(table.all_indexes(LayerWalk::Index))
     }
 }
 
@@ -216,7 +218,7 @@ mod tests {
     async fn test_index_change_envelope_success_no_indexes() {
         let envelope = create_test_change_envelope();
         let table_provider = Arc::new(MockTableProvider);
-        let embedding_table = Arc::new(IndexLayer::new(table_provider));
+        let embedding_table = SpiceTable::over(Arc::new(IndexLayer::new()), table_provider);
 
         let result = index_change_envelope(Ok(envelope), Arc::new(embedding_table.into())).await;
 
@@ -245,10 +247,7 @@ mod tests {
         let envelope = create_test_change_envelope();
         let table_provider = Arc::new(MockTableProvider);
         let index = Arc::new(MockIndex::new("test_index").with_added_column());
-        let embedding_table = Arc::new(IndexLayer::with_indexes(
-            table_provider,
-            vec![index],
-        ));
+        let embedding_table = SpiceTable::over(Arc::new(IndexLayer::with_indexes(vec![index])), table_provider);
 
         let result = index_change_envelope(Ok(envelope), Arc::new(embedding_table.into())).await;
 
@@ -277,10 +276,7 @@ mod tests {
         let table_provider = Arc::new(MockTableProvider);
         let index1 = Arc::new(MockIndex::new("index1"));
         let index2 = Arc::new(MockIndex::new("index2"));
-        let embedding_table = Arc::new(IndexLayer::with_indexes(
-            table_provider,
-            vec![index1, index2],
-        ));
+        let embedding_table = SpiceTable::over(Arc::new(IndexLayer::with_indexes(vec![index1, index2])), table_provider);
 
         let result = index_change_envelope(Ok(envelope), Arc::new(embedding_table.into())).await;
 
@@ -299,7 +295,7 @@ mod tests {
     #[tokio::test]
     async fn test_index_change_envelope_input_stream_error() {
         let table_provider = Arc::new(MockTableProvider);
-        let embedding_table = Arc::new(IndexLayer::new(table_provider));
+        let embedding_table = SpiceTable::over(Arc::new(IndexLayer::new()), table_provider);
         let input_error = StreamError::External("Input stream error".to_string());
 
         let result =
@@ -318,10 +314,7 @@ mod tests {
         let envelope = create_test_change_envelope();
         let table_provider = Arc::new(MockTableProvider);
         let failing_index = Arc::new(MockIndex::new("failing_index").with_failure());
-        let embedding_table = Arc::new(IndexLayer::with_indexes(
-            table_provider,
-            vec![failing_index],
-        ));
+        let embedding_table = SpiceTable::over(Arc::new(IndexLayer::with_indexes(vec![failing_index])), table_provider);
 
         let result = index_change_envelope(Ok(envelope), Arc::new(embedding_table.into())).await;
 
@@ -343,10 +336,7 @@ mod tests {
 
         let table_provider = Arc::new(MockTableProvider);
         let index = Arc::new(MockIndex::new("test_index"));
-        let embedding_table = Arc::new(IndexLayer::with_indexes(
-            table_provider,
-            vec![index],
-        ));
+        let embedding_table = SpiceTable::over(Arc::new(IndexLayer::with_indexes(vec![index])), table_provider);
 
         let result = index_change_envelope(Ok(envelope), Arc::new(embedding_table.into())).await;
 
@@ -379,10 +369,7 @@ mod tests {
 
         let table_provider = Arc::new(MockTableProvider);
         let index = Arc::new(MockIndex::new("test_index").with_added_column());
-        let embedding_table = Arc::new(IndexLayer::with_indexes(
-            table_provider,
-            vec![index],
-        ));
+        let embedding_table = SpiceTable::over(Arc::new(IndexLayer::with_indexes(vec![index])), table_provider);
 
         let result = index_change_envelope(Ok(envelope), Arc::new(embedding_table.into())).await;
 

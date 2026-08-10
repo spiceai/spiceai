@@ -80,7 +80,7 @@ impl AvoidDerivedVectorColumnOnIndexRule {
             .filter(|table| !table.layer().indexes().is_empty())?;
 
         let _vector_scan_table = spice_table::find_layer::<VectorScanTableProvider>(
-            indexed_table.below(),
+            indexed_table.below().as_ref(),
             spice_table::LayerWalk::Read,
         )?;
 

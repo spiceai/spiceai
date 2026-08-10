@@ -392,7 +392,9 @@ impl TableLayer for IcebergDeletionProvider {
         below: &'a Arc<dyn datafusion::datasource::TableProvider>,
     ) -> Option<&'a Arc<dyn datafusion::datasource::TableProvider>> {
         match walk {
-            LayerWalk::Read => Some(below),
+            // Index discovery has to reach an index attached beneath this layer;
+            // deletion adds no columns and carries no index of its own.
+            LayerWalk::Read | LayerWalk::Index => Some(below),
             _ => None,
         }
     }

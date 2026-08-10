@@ -79,7 +79,7 @@ use cache::result::embeddings::CachedEmbeddingResult;
 use cache::result::query::QueryResult;
 use cache::result::search::CachedSearchResult;
 use cache::{CacheProvider, Caching, QueryResultsCacheProvider, key::RawCacheKey};
-use data_components::{MetadataEnrichedTableProvider, poly::PolyTableProvider};
+use data_components::poly::PolyTableProvider;
 use datafusion::catalog::CatalogProvider;
 use datafusion::catalog::SchemaProvider;
 use datafusion::common::{Constraint, Constraints, ToDFSchema};
@@ -4084,13 +4084,16 @@ impl DataFusion {
             .await
             .map_err(find_datafusion_root)
             .context(UnableToGetTableSnafu)?;
-        // Peel the wrappers that can sit between the catalog entry and the
-        // underlying `AcceleratedTable` so callers can downcast to it.
-        // PolyTableProvider-backed accelerators are wrapped in a
-        // `FederatedTableProviderAdaptor`, and datasets that declare table- or
-        // column-level metadata are wrapped in a `MetadataEnrichedTableProvider`
-        // by `register_accelerated_table`. The two can nest in either order, so
-        // loop until neither wrapper matches.
+        // Peel what registration stacks between the catalog entry and the
+        // accelerated table, so callers reach it. A `PolyTableProvider`-backed
+        // accelerator sits inside a `FederatedTableProviderAdaptor`, and a
+        // dataset declaring table- or column-level metadata gains a metadata
+        // layer; the two nest in either order, so loop.
+        //
+        // Stops *at* the accelerated table rather than peeling to its
+        // accelerator: that is the thing callers are looking for, and peeling
+        // past it makes an accelerated dataset look unaccelerated (refresh then
+        // reports "Table is not accelerated").
         loop {
             if let Some(adaptor) = table.downcast_ref::<FederatedTableProviderAdaptor>() {
                 if let Some(nested_table) = adaptor.table_provider.clone() {
@@ -4103,8 +4106,11 @@ impl DataFusion {
                 .fail();
             }
 
-            if let Some(enriched) = table.downcast_ref::<MetadataEnrichedTableProvider>() {
-                let inner = Arc::clone(enriched.get_inner_ref());
+            if let Some(layered) = table.downcast_ref::<spice_table::SpiceTable>() {
+                if layered.layer_as::<AcceleratedTable>().is_some() {
+                    break;
+                }
+                let inner = Arc::clone(layered.below());
                 table = inner;
                 continue;
             }
@@ -4999,7 +5005,9 @@ fn partition_expr_from_table_provider(table_provider: &Arc<dyn TableProvider>) -
         };
     }
 
-    if let Some(poly) = table_provider.downcast_ref::<PolyTableProvider>() {
+    if let Some(poly) =
+        spice_table::find_layer::<PolyTableProvider>(table_provider.as_ref(), spice_table::LayerWalk::Write)
+    {
         return partition_expr_from_table_provider(&poly.writer());
     }
 
@@ -5007,8 +5015,8 @@ fn partition_expr_from_table_provider(table_provider: &Arc<dyn TableProvider>) -
         return partition_expr_from_table_provider(&accelerated.get_accelerator());
     }
 
-    if let Some(enriched) = table_provider.downcast_ref::<MetadataEnrichedTableProvider>() {
-        return partition_expr_from_table_provider(enriched.get_inner_ref());
+    if let Some(layered) = table_provider.downcast_ref::<spice_table::SpiceTable>() {
+        return partition_expr_from_table_provider(layered.below());
     }
 
     if let Some(adaptor) = table_provider.downcast_ref::<FederatedTableProviderAdaptor>()
@@ -5621,8 +5629,8 @@ mod tests {
     async fn test_get_accelerated_table_provider_peels_metadata_wrapper() {
         // Regression test: when a dataset declares table- or column-level
         // metadata, `register_accelerated_table` registers the AcceleratedTable
-        // behind a `MetadataEnrichedTableProvider`. `get_accelerated_table_provider`
-        // must peel that wrapper so callers (e.g. the
+        // behind a metadata-enrichment layer. `get_accelerated_table_provider`
+        // must peel that layer so callers (e.g. the
         // `/v1/datasets/{name}/acceleration/refresh` handler) can downcast to the
         // inner provider; otherwise refresh wrongly reports "Table is not
         // accelerated". Here a MemTable stands in for the inner AcceleratedTable —
@@ -5647,10 +5655,12 @@ mod tests {
         let wrapped =
             table_provider_with_spicepod_metadata(Arc::clone(&inner), &table_metadata, &[]);
         assert!(
-            wrapped
-                .downcast_ref::<MetadataEnrichedTableProvider>()
-                .is_some(),
-            "precondition: provider should be wrapped in MetadataEnrichedTableProvider"
+            spice_table::find_layer::<data_components::MetadataEnrichedTableProvider>(
+                wrapped.as_ref(),
+                spice_table::LayerWalk::Read
+            )
+            .is_some(),
+            "precondition: provider should carry a metadata-enrichment layer"
         );
 
         df.ctx
@@ -5664,7 +5674,7 @@ mod tests {
 
         assert!(
             resolved.is::<MemTable>(),
-            "get_accelerated_table_provider must peel MetadataEnrichedTableProvider to reach the inner provider"
+            "get_accelerated_table_provider must peel the metadata layer to reach the inner provider"
         );
     }
 

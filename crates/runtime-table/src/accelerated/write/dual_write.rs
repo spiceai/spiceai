@@ -519,7 +519,7 @@ pub fn extract_cayenne_write_target(
     }
 
     if let Some(poly) =
-        spice_table::find_layer::<PolyTableProvider>(table_provider, spice_table::LayerWalk::Write)
+        spice_table::find_layer::<PolyTableProvider>(table_provider.as_ref(), spice_table::LayerWalk::Write)
     {
         let writer = poly.writer();
         return extract_cayenne_write_target(&writer);

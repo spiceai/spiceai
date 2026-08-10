@@ -324,6 +324,23 @@ impl SpiceTable {
         (self.layer.as_ref() as &dyn Any).downcast_ref::<T>()
     }
 
+    /// The first node reachable by `walk` whose layer is a `T`.
+    ///
+    /// Returns the node rather than the layer, so a caller can also inspect what
+    /// the layer sits on — which is how "this layer is below that one" is
+    /// expressed.
+    #[must_use]
+    pub fn find_node<T: TableLayer>(&self, walk: LayerWalk) -> Option<&SpiceTable> {
+        let mut current = self;
+        loop {
+            if current.layer_as::<T>().is_some() {
+                return Some(current);
+            }
+            let next = current.layer.route(walk, &current.below)?;
+            current = next.downcast_ref::<SpiceTable>()?;
+        }
+    }
+
     /// The first layer reachable by `walk` that carries any index, together with
     /// the table those indexes are bound to.
     #[must_use]
@@ -388,7 +405,7 @@ impl SpiceTable {
 /// foreign type this module names, in the one place it names it.
 #[must_use]
 fn step<'a>(
-    current: &'a Arc<dyn TableProvider>,
+    current: &'a dyn TableProvider,
     walk: LayerWalk,
 ) -> Option<&'a Arc<dyn TableProvider>> {
     if let Some(table) = current.downcast_ref::<SpiceTable>() {
@@ -411,22 +428,22 @@ fn step<'a>(
 /// caller asking for a *particular* type already depends on it. What it no
 /// longer has to name is every wrapper in between.
 #[must_use]
-pub fn find_concrete<'a, T: TableProvider + 'static>(
-    top: &'a Arc<dyn TableProvider>,
+pub fn find_concrete<T: TableProvider + 'static>(
+    top: &dyn TableProvider,
     walk: LayerWalk,
-) -> Option<&'a T> {
+) -> Option<&T> {
     let mut current = top;
     loop {
         if let Some(found) = current.downcast_ref::<T>() {
             return Some(found);
         }
-        current = step(current, walk)?;
+        current = step(current, walk)?.as_ref();
     }
 }
 
 /// Finds a specific [`TableLayer`] in the stack, following `walk`.
 #[must_use]
-pub fn find_layer<T: TableLayer>(top: &Arc<dyn TableProvider>, walk: LayerWalk) -> Option<&T> {
+pub fn find_layer<T: TableLayer>(top: &dyn TableProvider, walk: LayerWalk) -> Option<&T> {
     let mut current = top;
     loop {
         if let Some(found) = current
@@ -435,7 +452,7 @@ pub fn find_layer<T: TableLayer>(top: &Arc<dyn TableProvider>, walk: LayerWalk) 
         {
             return Some(found);
         }
-        current = step(current, walk)?;
+        current = step(current, walk)?.as_ref();
     }
 }
 
@@ -448,7 +465,7 @@ pub fn find_layer<T: TableLayer>(top: &Arc<dyn TableProvider>, walk: LayerWalk) 
 #[must_use]
 pub fn peel_to(top: &Arc<dyn TableProvider>, walk: LayerWalk) -> &Arc<dyn TableProvider> {
     let mut current = top;
-    while let Some(next) = step(current, walk) {
+    while let Some(next) = step(current.as_ref(), walk) {
         current = next;
     }
     current

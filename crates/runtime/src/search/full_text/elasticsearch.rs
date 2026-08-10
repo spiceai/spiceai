@@ -25,7 +25,6 @@ use async_trait::async_trait;
 use data_components::cdc::ChangesStream;
 use datafusion::datasource::TableProvider;
 use futures::StreamExt;
-use spice_table::IndexLayer;
 use tokio::sync::RwLock;
 
 use crate::accelerated::{self, AcceleratedTable};
@@ -130,10 +129,14 @@ impl ElasticsearchFullTextConnector {
         F: Fn(&Arc<dyn DataConnector>, Arc<FederatedTable>) -> Option<ChangesStream>,
     {
         let table_provider = federated_table.try_table_provider_sync()?;
-        let indexed_table = find_concrete_table_provider::<IndexLayer>(&table_provider)?;
+        let indexed_table = table_provider
+            .downcast_ref::<spice_table::SpiceTable>()?
+            .first_indexed(spice_table::LayerWalk::Index)?;
 
-        let indexes = Indexes::new(indexed_table.get_all_indexes());
-        let underlying_table = Arc::new(FederatedTable::Immediate(indexed_table.get_underlying()));
+        let indexes = Indexes::new(indexed_table.layer().indexes().to_vec());
+        let underlying_table = Arc::new(FederatedTable::Immediate(Arc::clone(
+            indexed_table.below(),
+        )));
 
         let stream = f(&self.inner_connector, underlying_table)?;
         Some(
