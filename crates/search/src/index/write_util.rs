@@ -328,7 +328,10 @@ pub fn create_embedding_array(
             builder.values().append_slice(embedding);
             builder.append(true);
         } else {
-            builder.values().append_nulls(expected_dim);
+            // A null fixed-size-list slot still occupies `dimension` values in
+            // Arrow's child array. The child field is non-nullable, so use
+            // placeholder values and represent nullness only in the parent.
+            builder.values().append_value_n(0.0, expected_dim);
             builder.append(false);
         }
     }
@@ -382,7 +385,7 @@ mod tests {
                 builder.values().append_slice(&embedding);
                 builder.append(true);
             } else {
-                builder.values().append_nulls(dim as usize);
+                builder.values().append_value_n(0.0, dim as usize);
                 builder.append(false);
             }
         }
@@ -452,6 +455,11 @@ mod tests {
         assert!(!list_array.is_null(0));
         assert!(list_array.is_null(1));
         assert!(!list_array.is_null(2));
+        assert_eq!(
+            list_array.values().null_count(),
+            0,
+            "null vectors must not put nulls in a non-nullable child array"
+        );
 
         // Check first embedding values
         let first_values = list_array.value(0);

@@ -483,7 +483,8 @@ fn create_embedding_array(
                 });
             }
             None => {
-                builder.values().append_nulls(expected);
+                // Nullness belongs to the list slot; the child field is non-nullable.
+                builder.values().append_value_n(0.0, expected);
                 builder.append(false);
             }
         }
