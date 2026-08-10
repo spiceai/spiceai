@@ -146,13 +146,19 @@ pub fn set_global_pk_keyset_bytes(bytes: u64) {
 /// The installed ceiling, or `None` when unset.
 #[must_use]
 pub fn global_pk_keyset_total() -> Option<u64> {
-    GLOBAL_PK_KEYSET_BUDGET.read().as_ref().map(PkKeysetBudget::total)
+    GLOBAL_PK_KEYSET_BUDGET
+        .read()
+        .as_ref()
+        .map(PkKeysetBudget::total)
 }
 
 /// Aggregate keyset bytes currently reserved across every table.
 #[must_use]
 pub fn global_pk_keyset_used() -> Option<u64> {
-    GLOBAL_PK_KEYSET_BUDGET.read().as_ref().map(PkKeysetBudget::used)
+    GLOBAL_PK_KEYSET_BUDGET
+        .read()
+        .as_ref()
+        .map(PkKeysetBudget::used)
 }
 
 /// Reserve `bytes` against the aggregate ceiling, returning whether it fit.
