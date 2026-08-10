@@ -484,25 +484,18 @@ impl SchedulerRegistryRunner {
             }
         };
 
-        // The heartbeat object is keyed by scheduler id alone, so a superseded
-        // incarnation deleting it would remove the *successor's* liveness and
-        // make it look orphaned until its next tick — the same false-orphan
-        // window this change exists to close. The object store has no
-        // conditional delete, so only delete when we just removed our own
-        // membership entry, which proves we still owned the id. Otherwise
-        // leave it: with our entry gone the stale object is inert, and it is
-        // overwritten by whoever owns the id next.
-        if owned_the_entry {
-            if let Err(err) = self.heartbeats.delete(&self.scheduler_id).await {
-                tracing::warn!("Failed to delete heartbeat on shutdown: {err}");
-            }
-        } else {
-            tracing::debug!(
-                scheduler_id = %self.scheduler_id,
-                instance_id = %self.instance_id,
-                "Not deleting the heartbeat: this incarnation no longer owns the scheduler id"
-            );
-        }
+        // Deliberately do not delete the heartbeat object. It is keyed by
+        // scheduler id alone, and there is no conditional delete, so any
+        // delete races a successor: between the mutation above committing and
+        // the delete landing, a successor can register and publish its
+        // heartbeat, and this process would then erase the new incarnation's
+        // liveness — the false-orphan window this change exists to close.
+        //
+        // Removing the membership entry is sufficient. `list_alive` only
+        // reports a heartbeat that matches a registered entry, so with the
+        // entry gone the object is inert, and whoever takes the id next
+        // overwrites it.
+        let _ = owned_the_entry;
     }
 }
 
@@ -603,8 +596,14 @@ mod tests {
         runner.shutdown().await;
         let snap = cluster.read().await.expect("read");
         assert!(!snap.schedulers.contains_key("test:50051"));
-        let beat = heartbeats.read("test:50051").await.expect("read hb");
-        assert!(beat.is_none());
+        // Shutdown removes membership and deliberately leaves the heartbeat
+        // object alone: deleting a key shared with a possible successor races
+        // that successor. With no registered entry the object is inert.
+        let alive = heartbeats
+            .list_alive(1_000, &snap)
+            .await
+            .expect("list alive");
+        assert!(!alive.contains_key("test:50051"));
     }
 
     /// A superseded incarnation must stop claiming the shared heartbeat key.
