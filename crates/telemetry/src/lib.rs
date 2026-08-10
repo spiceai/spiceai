@@ -1982,25 +1982,29 @@ pub mod cayenne {
             .add(pages, &[]);
     }
 
-    // METRIC 3 — inline admission flips. One increment each time a CDC batch that
+    // METRIC 3 — inline admission flips. One increment each time a write that
     // could have updated the inline memtable instead fell back to a Vortex staged
     // write, labeled by `table` and the `reason` it could not inline:
-    // `rows_cap` / `bytes_cap` (the inline buffer overflowed its row or byte cap) or
+    // `rows_cap` / `bytes_cap` (the inline buffer overflowed its row or byte cap),
     // `blocking_config` (the table's shape — partition column or retention delete
-    // filters — bars inlining outright).
+    // filters — bars inlining outright), or, on the whole-table-replace path,
+    // `ipc_bytes_cap` (the serialized payload exceeded the entry cap even though the
+    // in-memory buffer fit) / `admission_busy` (a sibling partition holds the
+    // context's single inline-admission slot).
 
     static INLINE_FALLBACKS: OnceLock<Counter<u64>> = OnceLock::new();
 
-    /// Counts inline-admission fallbacks: a CDC batch that could not update the inline
+    /// Counts inline-admission fallbacks: a write that could not use the inline
     /// memtable and fell back to a staged Vortex write. `dimensions` should carry
-    /// `table` and `reason` (`rows_cap` | `bytes_cap` | `blocking_config`).
+    /// `table` and `reason` (`rows_cap` | `bytes_cap` | `blocking_config` |
+    /// `ipc_bytes_cap` | `admission_busy`).
     pub fn track_inline_fallback(dimensions: &[KeyValue]) {
         INLINE_FALLBACKS
         .get_or_init(|| {
             operational_meter()
                 .u64_counter("cayenne_inline_fallback_total")
                 .with_description(
-                    "CDC batches that fell back from the inline memtable to a staged Vortex write, by reason (rows_cap | bytes_cap | blocking_config).",
+                    "Writes that fell back from the inline memtable to a staged Vortex write, by reason (rows_cap | bytes_cap | blocking_config | ipc_bytes_cap | admission_busy).",
                 )
                 .build()
         })
