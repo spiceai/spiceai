@@ -59,6 +59,17 @@ const CONNECTION_CONTEXT_FILTER_REPLACEMENT: &str = "compute_context=<CONNECTION
 const ENDPOINT_CONTEXT_FILTER_PATTERN: &str = r"compute_context=(?:url=|sc://)\S+";
 const ENDPOINT_CONTEXT_FILTER_REPLACEMENT: &str = CONNECTION_CONTEXT_FILTER_REPLACEMENT;
 
+/// Redact the scan counters `CayenneAccelerationExec` surfaces in its plan display.
+/// `snapshots_scanned`/`files_scanned` report read amplification, which depends on
+/// ingestion batching and how far compaction has progressed when the query runs —
+/// state that varies run to run, not plan structure. Left in the snapshot, the
+/// explain check fails whenever the accelerator happens to hold a different file
+/// count (e.g. `files_scanned=30` vs `=35`) even though the plan is identical.
+const CAYENNE_SCAN_COUNTERS_FILTER_PATTERN: &str =
+    r"CayenneAccelerationExec: snapshots_scanned=\d+, files_scanned=\d+";
+const CAYENNE_SCAN_COUNTERS_FILTER_REPLACEMENT: &str =
+    "CayenneAccelerationExec: snapshots_scanned=<N>, files_scanned=<N>";
+
 /// Queries temporarily excluded from explain-plan snapshot validation because their
 /// plans are not yet stable enough to snapshot deterministically.
 const EXPLAIN_SNAPSHOT_SKIP_LIST: &[&str] = &["chbench_q5"];
@@ -85,6 +96,10 @@ fn build_explain_filters(temp_dir: &std::path::Path) -> Vec<(String, &'static st
         (
             ENDPOINT_CONTEXT_FILTER_PATTERN.to_string(),
             ENDPOINT_CONTEXT_FILTER_REPLACEMENT,
+        ),
+        (
+            CAYENNE_SCAN_COUNTERS_FILTER_PATTERN.to_string(),
+            CAYENNE_SCAN_COUNTERS_FILTER_REPLACEMENT,
         ),
         (r"required_guarantees=\[[^\]]*\]".to_string(), "required_guarantees=[N]"),
         (r"partition_sizes=\[[^\]]*\]".to_string(), "partition_sizes=[<redacted>]"),
@@ -544,6 +559,37 @@ mod tests {
         // The `host=` form stays the other pattern's job; this one must not half-match
         // it and leave a partially-redacted context behind.
         let input = "VirtualExecutionPlan name=mysql compute_context=host=db,port=3306,db=tpch,user=root base_sql=SELECT 1";
+        assert_eq!(regex.replace_all(input, replacement), input);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_cayenne_scan_counters_filter() -> Result<(), String> {
+        let regex = regex::Regex::new(super::CAYENNE_SCAN_COUNTERS_FILTER_PATTERN)
+            .map_err(|e| format!("{e}"))?;
+        let replacement = super::CAYENNE_SCAN_COUNTERS_FILTER_REPLACEMENT;
+
+        // Different file counts must redact to the identical token.
+        let input = "|               |   CayenneAccelerationExec: snapshots_scanned=1, files_scanned=30   |";
+        let expected =
+            "|               |   CayenneAccelerationExec: snapshots_scanned=<N>, files_scanned=<N>   |";
+        assert_eq!(regex.replace_all(input, replacement), expected);
+
+        let input = "|               |   CayenneAccelerationExec: snapshots_scanned=1, files_scanned=35   |";
+        assert_eq!(regex.replace_all(input, replacement), expected);
+
+        // A not-yet-refreshed accelerator reports zero for both counters.
+        let input = "CayenneAccelerationExec: snapshots_scanned=0, files_scanned=0";
+        let expected = "CayenneAccelerationExec: snapshots_scanned=<N>, files_scanned=<N>";
+        assert_eq!(regex.replace_all(input, replacement), expected);
+
+        // Idempotent: an already-redacted snapshot is left unchanged.
+        let input = "CayenneAccelerationExec: snapshots_scanned=<N>, files_scanned=<N>";
+        assert_eq!(regex.replace_all(input, replacement), input);
+
+        // Other operators' counters are not this filter's job.
+        let input = "DataSourceExec: file_groups={16 groups: [<redacted>]}, projection=[o_orderkey]";
         assert_eq!(regex.replace_all(input, replacement), input);
 
         Ok(())
