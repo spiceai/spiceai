@@ -17,7 +17,7 @@ limitations under the License.
 use std::{
     collections::{HashMap, HashSet},
     num::NonZeroUsize,
-    sync::{Arc, OnceLock, RwLock},
+    sync::{Arc, OnceLock, RwLock, atomic::AtomicU64},
 };
 
 use super::{
@@ -1251,6 +1251,8 @@ impl DataFusionBuilder {
             SPICE_DEFAULT_CATALOG,
         )));
 
+        let total_memory = crate::resource_monitor::get_total_memory();
+
         DataFusion {
             runtime_status: self.status,
             ctx: Arc::new(ctx),
@@ -1286,7 +1288,7 @@ impl DataFusionBuilder {
             query_memory_pool_bytes,
             mem_tier_budget_bytes,
             cayenne_workload: self.cayenne_workload,
-            total_memory: crate::resource_monitor::get_total_memory(),
+            current_total_memory: Arc::new(AtomicU64::new(total_memory)),
             io_runtime: self.io_runtime,
             metrics: self.metrics,
             resource_monitor: self.resource_monitor,

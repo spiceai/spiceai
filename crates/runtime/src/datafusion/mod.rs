@@ -15,7 +15,10 @@ limitations under the License.
 */
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{
+    Arc, OnceLock, RwLock,
+    atomic::{AtomicU64, Ordering},
+};
 use std::time::Duration;
 
 use crate::accelerated::refresh::{self, RefreshOverrides};
@@ -859,10 +862,11 @@ pub struct DataFusion {
     // Spicepod in the Runtime builder. Retained so `spiced` can decide which
     // dedicated thread pools are worth bringing up without re-reading the app.
     cayenne_workload: crate::builder::CayenneWorkload,
-    // Cgroup-aware total memory, captured once at build time. `get_total_memory`
-    // rebuilds a sysinfo System on every call, so the budget installers read this
-    // rather than re-probing.
-    total_memory: u64,
+    // Current cgroup-aware total memory. Seeded at build time and refreshed by the
+    // app-reload budget publication, so the Cayenne re-partition sampler closes its
+    // loop around the same limit the DuckDB planner just used without probing
+    // sysinfo every two seconds.
+    current_total_memory: Arc<AtomicU64>,
     pub(crate) io_runtime: Handle,
     metrics: Option<Metrics>,
     resource_monitor: Option<crate::resource_monitor::ResourceMonitor>,
@@ -1611,9 +1615,10 @@ impl DataFusion {
         // compute memory pressure (so the control loop closes on memory, not just
         // ingest/query behavior). Mirrors the encode budget: injected here so the
         // cayenne crate needs no runtime-specific resource detection of its own.
-        // Read from the value captured at build time rather than re-probing:
-        // `get_total_memory` rebuilds a sysinfo System on every call.
-        let memory_budget = self.total_memory;
+        // Read the build-time seed rather than re-probing: `get_total_memory`
+        // rebuilds a sysinfo System on every call. App reloads refresh this shared
+        // value and the Cayenne tuner together.
+        let memory_budget = self.current_total_memory.load(Ordering::Relaxed);
         cayenne::set_global_memory_budget(memory_budget);
         tracing::info!(
             memory_budget,
@@ -1663,7 +1668,7 @@ impl DataFusion {
                 mem_tier_budget_bytes,
                 query_memory_pool_bytes = self.query_memory_pool_bytes,
                 compaction_memory_bytes = self.compaction_memory_bytes.unwrap_or(0),
-                total_memory = self.total_memory,
+                total_memory = memory_budget,
                 "Cayenne global in-memory CDC tier byte budget active (coordinated with the query + compaction pools so their sum stays within host RAM)"
             );
         }
@@ -1682,7 +1687,7 @@ impl DataFusion {
                 .as_ref()
                 .map(|env| Arc::downgrade(&env.memory_pool)),
             self.mem_tier_budget_bytes,
-            self.total_memory,
+            Arc::clone(&self.current_total_memory),
         );
     }
 
@@ -1745,7 +1750,7 @@ impl DataFusion {
             std::sync::Weak<dyn datafusion::execution::memory_pool::MemoryPool>,
         >,
         static_ceiling_bytes: Option<u64>,
-        total_memory: u64,
+        current_total_memory: Arc<AtomicU64>,
     ) {
         // Short enough to react to a query-pool spike ahead of the slower per-table
         // controller tick, long enough that the sampling overhead is negligible.
@@ -1777,13 +1782,13 @@ impl DataFusion {
                 // bulk-written has no tier to resize, but still needs the gauges
                 // below — they are general memory observability, not CDC-specific.
                 if let Some(ceiling) = static_ceiling_bytes {
-                    let dynamic = builder::coordinated_mem_tier_budget(
-                        total_memory,
+                    let dynamic = Self::sampled_mem_tier_budget(
+                        &current_total_memory,
                         pool_used,
                         compaction_used,
                         crate::accelerator_memory_budget::duckdb_total_reservation_bytes(),
-                    )
-                    .min(ceiling);
+                        ceiling,
+                    );
                     cayenne::update_global_mem_tier_total(dynamic);
                 }
                 // Publish what this loop already measures. These are the numbers
@@ -1806,6 +1811,22 @@ impl DataFusion {
                 }
             }
         });
+    }
+
+    fn sampled_mem_tier_budget(
+        current_total_memory: &AtomicU64,
+        pool_used: u64,
+        compaction_used: u64,
+        external_reservation: u64,
+        static_ceiling: u64,
+    ) -> u64 {
+        builder::coordinated_mem_tier_budget(
+            current_total_memory.load(Ordering::Relaxed),
+            pool_used,
+            compaction_used,
+            external_reservation,
+        )
+        .min(static_ceiling)
     }
 
     /// What the pod's Cayenne accelerations demand of the host (classified from the
@@ -1847,6 +1868,12 @@ impl DataFusion {
     pub(crate) fn applied_query_memory_limit(&self) -> u64 {
         self.query_memory_pool_bytes
             .saturating_add(self.compaction_memory_bytes.unwrap_or(0))
+    }
+
+    /// The cgroup-aware memory ceiling shared by reload planning and the Cayenne
+    /// re-partition sampler. Reloads update the same atomic the sampler reads.
+    pub(crate) fn current_total_memory(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.current_total_memory)
     }
 
     async fn get_table_provider(
@@ -5404,6 +5431,27 @@ mod tests {
     use crate::builder::RuntimeBuilder;
 
     use super::*;
+
+    #[test]
+    fn mem_tier_sampler_uses_refreshed_total_memory() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let current_total_memory = AtomicU64::new(16 * GIB);
+
+        let before =
+            DataFusion::sampled_mem_tier_budget(&current_total_memory, GIB, 0, 0, u64::MAX);
+        current_total_memory.store(8 * GIB, Ordering::Relaxed);
+        let after = DataFusion::sampled_mem_tier_budget(&current_total_memory, GIB, 0, 0, u64::MAX);
+
+        assert!(
+            after < before,
+            "the sampler must shrink its budget after the shared cgroup ceiling shrinks"
+        );
+        assert_eq!(
+            after,
+            builder::coordinated_mem_tier_budget(8 * GIB, GIB, 0, 0),
+            "the sampler must plan from the refreshed ceiling"
+        );
+    }
 
     #[test]
     fn accelerated_sink_dataset_writes_to_accelerator_only() {

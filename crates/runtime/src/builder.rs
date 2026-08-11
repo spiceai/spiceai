@@ -53,7 +53,10 @@ use std::{
     collections::HashMap,
     net::SocketAddr,
     str::FromStr,
-    sync::{Arc, LazyLock},
+    sync::{
+        Arc, LazyLock,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 use telemetry::timing::TimeMeasurement;
@@ -804,6 +807,7 @@ impl RuntimeBuilder {
         let duckdb_budget_context = DuckDbBudgetContext {
             query_pool_ceiling_bytes: df.applied_query_memory_limit(),
             dedicated_thread_pools_enabled,
+            current_total_memory: df.current_total_memory(),
         };
 
         let datasets_health_monitor = if self.datasets_health_monitor_enabled {
@@ -1604,7 +1608,7 @@ enum QueryPoolSizing {
 /// The query-side terms of the coordinated `DuckDB` memory budget, carried by the
 /// [`Runtime`] so a reload can re-split it for the acceleration set the new app
 /// declares (see [`DuckDbBudgetContext::publish_for`]).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) struct DuckDbBudgetContext {
     /// The query memory limit the pools were built with — queries plus the carved
     /// compaction pool. Fixed for the life of the process.
@@ -1613,6 +1617,10 @@ pub(crate) struct DuckDbBudgetContext {
     /// reload cannot bring the in-memory CDC tier into play; what Cayenne the app
     /// declares is read from the app being applied.
     dedicated_thread_pools_enabled: bool,
+    /// Cgroup-aware total shared with the Cayenne re-partition sampler. Reload
+    /// publication refreshes it; the sampler reads it without a repeated sysinfo
+    /// probe on its two-second interval.
+    current_total_memory: Arc<AtomicU64>,
 }
 
 impl DuckDbBudgetContext {
@@ -1631,16 +1639,21 @@ impl DuckDbBudgetContext {
     /// floor and warns that a restart is what re-splits it, rather than publishing a
     /// cap that fits nowhere.
     pub(crate) fn publish_for(&self, app: &Arc<App>) {
+        // Probed per re-plan, not carried from the build: a cgroup limit can be
+        // resized in place, and every coordinated consumer has to use the memory
+        // available now. The Cayenne pressure tuner and re-partition sampler share
+        // this refresh rather than retaining their startup ceiling.
+        let total_memory = crate::resource_monitor::get_total_memory();
+        self.current_total_memory
+            .store(total_memory, Ordering::Relaxed);
+        cayenne::set_global_memory_budget(total_memory);
+
         let inputs = duckdb_budget_inputs(Some(app));
         if inputs.is_empty() {
             crate::accelerator_memory_budget::retire_duckdb_cap();
             return;
         }
 
-        // Probed per re-plan, not carried from the build: a cgroup limit can be
-        // resized in place, and a budget that exists to prevent an OOM kill has to
-        // split the memory available now.
-        let total_memory = crate::resource_monitor::get_total_memory();
         let duckdb_default_per_instance = *DUCKDB_HOST_DEFAULT_BYTES;
         // The region the pool and the DuckDB instances come out of shrinks around the
         // Cayenne caches the app declares, so it is measured from the app being
