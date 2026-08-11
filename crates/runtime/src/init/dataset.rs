@@ -326,6 +326,24 @@ impl Runtime {
             .await
     }
 
+    /// The acceleration checkpoint schema for the dataset named `table_ref`, or `None` when
+    /// there is no such dataset or no persisted checkpoint. The OpenTelemetry ingest uses this
+    /// to build a metric batch against the stored (wide) schema when the dataset is not yet
+    /// registered — e.g. a `sink` dataset parked until its first write after a restart — so a
+    /// data point that omits a NULL dimension still materializes every stored column instead
+    /// of a narrower batch the write would reject.
+    pub async fn accelerated_checkpoint_schema(
+        self: &Arc<Self>,
+        table_ref: &TableReference,
+    ) -> Option<arrow_schema::SchemaRef> {
+        let app = self.read_app().await?;
+        let dataset = Arc::clone(self)
+            .get_valid_datasets(&app, LogErrors(false))
+            .into_iter()
+            .find(|ds| &ds.name == table_ref)?;
+        crate::dataconnector::sink::accelerated_checkpoint_schema(&dataset).await
+    }
+
     #[expect(clippy::result_large_err)]
     fn datasets_iter(self: Arc<Self>, app: &Arc<App>) -> impl Iterator<Item = Result<Dataset>> {
         app.datasets
