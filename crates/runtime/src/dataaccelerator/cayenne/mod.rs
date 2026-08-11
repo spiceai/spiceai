@@ -54,8 +54,8 @@ use crate::dataaccelerator::{FilePathError, snapshots::download_snapshot_if_need
 use crate::parameters::ParameterSpec;
 use crate::spice_data_base_path;
 use runtime_acceleration::snapshot::{AccelerationEngine, AccelerationLayout};
-use spice_table::{Index, IndexLayer};
 use search::index::native_vector::NativeVectorIndex;
+use spice_table::{Index, IndexLayer};
 use spicepod::acceleration as spicepod_acceleration;
 
 /// Metadata key to identify the accelerator type in the schema metadata.

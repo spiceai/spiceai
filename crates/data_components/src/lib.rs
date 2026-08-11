@@ -130,7 +130,10 @@ impl MetadataEnrichedTableProvider {
     ///
     /// Keys in `extra_metadata` will overwrite any pre-existing schema metadata with the same key.
     #[must_use]
-    pub fn new<S>(inner: &Arc<dyn TableProvider>, extra_metadata: HashMap<String, String, S>) -> Self
+    pub fn new<S>(
+        inner: &Arc<dyn TableProvider>,
+        extra_metadata: HashMap<String, String, S>,
+    ) -> Self
     where
         S: BuildHasher,
     {
@@ -175,7 +178,6 @@ impl MetadataEnrichedTableProvider {
         let schema = Arc::new(Schema::new_with_metadata(fields, metadata));
         Self { schema }
     }
-
 }
 
 /// Wrap `provider` with schema metadata while preserving federation pushdown when possible.
@@ -242,6 +244,8 @@ impl TableLayer for MetadataEnrichedTableProvider {
         walk: LayerWalk,
         below: &'a Arc<dyn TableProvider>,
     ) -> Option<&'a Arc<dyn TableProvider>> {
+        // Exhaustive on purpose: a wildcard would answer a future walk kind
+        // for this layer without anyone deciding what it should say.
         match walk {
             LayerWalk::Read
             | LayerWalk::CdcDetection
@@ -411,15 +415,15 @@ impl Drop for RefreshingCatalogProvider {
 
 #[cfg(test)]
 mod tests {
-    use datafusion::catalog::Session;
-    use datafusion::datasource::TableType;
-    use datafusion::error::Result as DataFusionResult;
-    use datafusion::physical_plan::ExecutionPlan;
-    use datafusion::prelude::Expr;
     use super::*;
     use datafusion::arrow::datatypes::{DataType, Field};
+    use datafusion::catalog::Session;
+    use datafusion::datasource::TableType;
     use datafusion::error::DataFusionError;
+    use datafusion::error::Result as DataFusionResult;
     use datafusion::logical_expr::{LogicalPlan, TableSource};
+    use datafusion::physical_plan::ExecutionPlan;
+    use datafusion::prelude::Expr;
     use datafusion_federation::{
         FederatedTableProviderAdaptor, FederatedTableSource, FederationAnalyzerForLogicalPlan,
         FederationProvider,

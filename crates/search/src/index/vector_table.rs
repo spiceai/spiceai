@@ -81,7 +81,13 @@ impl VectorScanTableProvider {
 
         let mut fields = fields_map.values().cloned().collect::<Vec<_>>();
         fields.sort_unstable();
-        Arc::new(Schema::new(fields))
+        // Carry the base's schema-level metadata: spicepod table metadata is
+        // enriched onto the table beneath this layer, so building a bare schema
+        // here drops it from everything that reads the dataset's schema.
+        Arc::new(Schema::new_with_metadata(
+            fields,
+            base.schema().metadata().clone(),
+        ))
     }
 
     /// Presents this layer over the table it augments.
@@ -216,11 +222,7 @@ impl VectorScanTableProvider {
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         let columns_requested = self.columns_projected(below, projection)?;
 
-        if Self::schema_is_sufficient(
-            below.schema().fields(),
-            &columns_requested,
-            filters,
-        ) {
+        if Self::schema_is_sufficient(below.schema().fields(), &columns_requested, filters) {
             let mut builder = Self::apply_proj_and_filter(
                 LogicalPlanBuilder::scan(
                     "base_table",
@@ -333,6 +335,8 @@ impl TableLayer for VectorScanTableProvider {
         walk: LayerWalk,
         below: &'a Arc<dyn TableProvider>,
     ) -> Option<&'a Arc<dyn TableProvider>> {
+        // Exhaustive on purpose: a wildcard would answer a future walk kind
+        // for this layer without anyone deciding what it should say.
         match walk {
             LayerWalk::Read | LayerWalk::Source | LayerWalk::Index => Some(below),
             LayerWalk::CdcDetection | LayerWalk::Write | LayerWalk::RetentionDelete => None,
@@ -342,10 +346,6 @@ impl TableLayer for VectorScanTableProvider {
     fn schema(&self, below: &Arc<dyn TableProvider>) -> SchemaRef {
         self.schema_over(below)
     }
-
-
-
-
 
     async fn scan_with_args<'a>(
         &self,

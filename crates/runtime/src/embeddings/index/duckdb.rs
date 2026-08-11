@@ -23,10 +23,10 @@ use datafusion_table_providers::{
     duckdb::{TableDefinition, write::DuckDBTableWriter},
     sql::db_connection_pool::duckdbpool::DuckDbConnectionPool,
 };
-use spice_table::{Index, IndexLayer, SpiceTable};
 use runtime_secrets::{Secrets, get_params_with_secrets};
 use search::{generation::util::get_primary_keys, index::duckdb::DuckDBVectorIndex};
 use snafu::prelude::*;
+use spice_table::{Index, IndexLayer, SpiceTable};
 use spicepod::{param::Params, semantic::ColumnLevelEmbeddingConfig, vector::VectorStore};
 use tokio::sync::RwLock;
 
@@ -271,9 +271,10 @@ fn duckdb_writer_context(
         return duckdb_writer_context(layered.below());
     }
 
-    if let Some(poly) =
-        spice_table::find_layer::<PolyTableProvider>(provider.as_ref(), spice_table::LayerWalk::Write)
-    {
+    if let Some(poly) = spice_table::find_layer::<PolyTableProvider>(
+        provider.as_ref(),
+        spice_table::LayerWalk::Write,
+    ) {
         let writer = poly.writer();
         return duckdb_writer_context(&writer);
     }

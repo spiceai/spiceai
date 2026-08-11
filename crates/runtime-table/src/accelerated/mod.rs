@@ -35,10 +35,7 @@ use datafusion::logical_expr::TableProviderFilterPushDown;
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::sql::TableReference;
-use datafusion::{
-    datasource::TableProvider,
-    logical_expr::Expr,
-};
+use datafusion::{datasource::TableProvider, logical_expr::Expr};
 use opentelemetry::KeyValue;
 use refresh::RefreshOverrides;
 use runtime_acceleration::dataset_checkpoint::DatasetCheckpointer;
@@ -54,6 +51,7 @@ use runtime_datafusion::is_spice_internal_dataset;
 use runtime_status as status;
 use runtime_udfs_api::deny_spice_specific_functions;
 
+use datafusion::catalog::{ScanArgs, ScanResult};
 use runtime_metrics::acceleration as metrics;
 use snafu::prelude::*;
 use spicepod::metric::Metrics;
@@ -61,7 +59,6 @@ use synchronized_table::SynchronizedTable;
 use tokio::runtime::Handle;
 use tokio::sync::{Mutex, Notify, RwLock, Semaphore, mpsc};
 use tokio::task::JoinHandle;
-use datafusion::catalog::{ScanArgs, ScanResult};
 
 pub mod caching;
 pub mod federation;
@@ -1389,6 +1386,7 @@ impl AcceleratedTable {
         SpiceTable::over(self, accelerator)
     }
 
+    #[must_use]
     pub fn get_accelerator_ref(&self) -> &Arc<dyn TableProvider> {
         &self.accelerator
     }
@@ -1813,6 +1811,8 @@ impl TableLayer for AcceleratedTable {
         walk: LayerWalk,
         _below: &'a Arc<dyn TableProvider>,
     ) -> Option<&'a Arc<dyn TableProvider>> {
+        // Exhaustive on purpose: a wildcard would answer a future walk kind
+        // for this layer without anyone deciding what it should say.
         match walk {
             LayerWalk::Read | LayerWalk::Source | LayerWalk::CdcDetection => {
                 self.federated.try_table_provider_sync_ref()
@@ -1823,12 +1823,9 @@ impl TableLayer for AcceleratedTable {
         }
     }
 
-
     fn schema(&self, _below: &Arc<dyn TableProvider>) -> SchemaRef {
         AcceleratedTable::schema(self)
     }
-
-
 
     fn supports_filters_pushdown(
         &self,
@@ -1864,7 +1861,6 @@ impl TableLayer for AcceleratedTable {
             }
         }
     }
-
 
     async fn insert_into(
         &self,
@@ -2027,11 +2023,11 @@ impl TableLayer for AcceleratedTable {
         }
     }
 
-
-
-
-
-    async fn truncate(&self, _below: &Arc<dyn TableProvider>, state: &dyn Session) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+    async fn truncate(
+        &self,
+        _below: &Arc<dyn TableProvider>,
+        state: &dyn Session,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         if self.refresh_mode == RefreshMode::Snapshot {
             return Err(datafusion::error::DataFusionError::Execution(format!(
                 "truncate on accelerated table {} is not permitted when refresh_mode is 'snapshot'; the accelerator is driven exclusively from the snapshot store",

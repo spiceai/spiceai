@@ -20,8 +20,8 @@ use std::sync::Arc;
 use crate::accelerated::AcceleratedTable;
 use datafusion::datasource::TableProvider;
 use datafusion::error::DataFusionError;
-use spice_table::{Index, LayerWalk, find_concrete};
 use runtime_search::table_provider_explorer::TableProviderExplorer;
+use spice_table::{Index, LayerWalk, find_concrete};
 
 /// Attempt to return a concrete [`TableProvider`] type from a given
 /// [`impl TableProvider`], stepping through every runtime wrapper layer that
@@ -67,7 +67,8 @@ impl TableProviderExplorer for RuntimeTableProviderExplorer {
     }
 
     fn not_ready_error(&self, tbl: &Arc<dyn TableProvider>) -> Option<DataFusionError> {
-        spice_table::find_layer::<AcceleratedTable>(tbl.as_ref(), spice_table::LayerWalk::Read)?.not_ready_error()
+        spice_table::find_layer::<AcceleratedTable>(tbl.as_ref(), spice_table::LayerWalk::Read)?
+            .not_ready_error()
     }
 }
 
@@ -122,7 +123,9 @@ mod tests {
     #[test]
     fn a_bare_provider_carries_no_layers() {
         let base = base_table();
-        assert!(spice_table::find_layer::<EmbeddingTable>(base.as_ref(), LayerWalk::Read).is_none());
+        assert!(
+            spice_table::find_layer::<EmbeddingTable>(base.as_ref(), LayerWalk::Read).is_none()
+        );
         assert!(spice_table::find_layer::<IndexLayer>(base.as_ref(), LayerWalk::Index).is_none());
     }
 
@@ -130,8 +133,12 @@ mod tests {
     fn an_index_layer_is_discoverable_and_does_not_invent_others() {
         let wrapped = indexed(&base_table());
 
-        assert!(spice_table::find_layer::<IndexLayer>(wrapped.as_ref(), LayerWalk::Index).is_some());
-        assert!(spice_table::find_layer::<EmbeddingTable>(wrapped.as_ref(), LayerWalk::Read).is_none());
+        assert!(
+            spice_table::find_layer::<IndexLayer>(wrapped.as_ref(), LayerWalk::Index).is_some()
+        );
+        assert!(
+            spice_table::find_layer::<EmbeddingTable>(wrapped.as_ref(), LayerWalk::Read).is_none()
+        );
     }
 
     /// A provider with no accelerator behind it has no load to wait on, so it
@@ -141,7 +148,9 @@ mod tests {
     fn not_ready_error_is_none_without_an_accelerated_table() {
         let base = base_table();
         assert!(
-            RuntimeTableProviderExplorer.not_ready_error(&base).is_none(),
+            RuntimeTableProviderExplorer
+                .not_ready_error(&base)
+                .is_none(),
             "a non-accelerated provider must be scannable"
         );
 

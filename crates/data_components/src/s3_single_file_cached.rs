@@ -518,7 +518,10 @@ mod tests {
         extra_metadata.insert("schema.key".to_string(), "value".to_string());
         let inner = Arc::new(cached_table) as Arc<dyn TableProvider>;
         let wrapped: Arc<dyn TableProvider> = spice_table::SpiceTable::over(
-            Arc::new(crate::MetadataEnrichedTableProvider::new(&inner, extra_metadata)),
+            Arc::new(crate::MetadataEnrichedTableProvider::new(
+                &inner,
+                extra_metadata,
+            )),
             inner,
         );
 
@@ -593,7 +596,10 @@ mod tests {
         extra_metadata.insert("schema.key".to_string(), "value".to_string());
         let inner = Arc::new(cached_table) as Arc<dyn TableProvider>;
         let wrapped: Arc<dyn TableProvider> = spice_table::SpiceTable::over(
-            Arc::new(crate::MetadataEnrichedTableProvider::new(&inner, extra_metadata)),
+            Arc::new(crate::MetadataEnrichedTableProvider::new(
+                &inner,
+                extra_metadata,
+            )),
             inner,
         );
 

@@ -17,18 +17,14 @@ limitations under the License.
 //! A dataset's provider as a stack of layers over a base provider.
 //!
 //! A Spice dataset is a connector's own [`TableProvider`] with capabilities
-//! stacked on top: indexes, embeddings, vector scans, spicepod metadata. Those
-//! capabilities used to be individual `TableProvider` wrappers, which meant
-//! every one of them owed all fourteen `TableProvider` methods (almost always
-//! forwarding), and seeing through the stack meant downcasting to each wrapper
-//! type in turn — so any crate that walked the stack had to depend on every
-//! wrapper it might encounter.
+//! stacked on top: indexes, embeddings, vector scans, spicepod metadata.
 //!
-//! Here, [`SpiceTable`] is the only [`TableProvider`], and it implements those
-//! fourteen methods once. A [`TableLayer`] declares just the behaviour it
-//! changes; every method defaults to the layer beneath it, so a layer cannot
-//! forget to forward. Navigation is a walk down [`SpiceTable`]s, needing no
-//! downcast and naming no wrapper type.
+//! [`SpiceTable`] is the only [`TableProvider`] Spice puts around a connector's
+//! provider, and it implements all fourteen `TableProvider` methods once. A
+//! [`TableLayer`] declares just the behaviour it changes; every method defaults
+//! to the layer beneath, so a layer cannot forget to forward. Navigation walks
+//! down [`SpiceTable`]s, so a crate that walks a stack depends on none of the
+//! capabilities in it.
 
 use std::{any::Any, borrow::Cow, fmt::Debug, sync::Arc};
 
@@ -106,6 +102,12 @@ pub trait TableLayer: Any + Send + Sync + Debug + 'static {
     ///
     /// Because the layer answers, no caller has to name a router's type or know
     /// it has two sides.
+    ///
+    /// Implementations match on `walk` **exhaustively**, never with a wildcard
+    /// arm. A wildcard hands every future walk kind an answer nobody considered,
+    /// in whichever direction that layer happened to default — which is the
+    /// silent-wrong-answer failure this trait exists to remove. An exhaustive
+    /// match makes adding a walk a compile error at every layer that must decide.
     fn route<'a>(
         &'a self,
         walk: LayerWalk,
@@ -114,7 +116,6 @@ pub trait TableLayer: Any + Send + Sync + Debug + 'static {
         let _ = walk;
         Some(below)
     }
-
 
     fn schema(&self, below: &Arc<dyn TableProvider>) -> SchemaRef {
         below.schema()
@@ -132,7 +133,10 @@ pub trait TableLayer: Any + Send + Sync + Debug + 'static {
         below.get_table_definition()
     }
 
-    fn get_logical_plan<'a>(&'a self, below: &'a Arc<dyn TableProvider>) -> Option<Cow<'a, LogicalPlan>> {
+    fn get_logical_plan<'a>(
+        &'a self,
+        below: &'a Arc<dyn TableProvider>,
+    ) -> Option<Cow<'a, LogicalPlan>> {
         below.get_logical_plan()
     }
 
@@ -165,7 +169,7 @@ pub trait TableLayer: Any + Send + Sync + Debug + 'static {
     /// path. `SpiceTable` funnels both into this, so that cannot happen.
     ///
     /// Takes `ScanArgs`/`ScanResult` rather than loose parameters so that
-    /// whatever DataFusion adds to them passes through untouched instead of
+    /// whatever `DataFusion` adds to them passes through untouched instead of
     /// being dropped in translation.
     async fn scan_with_args<'a>(
         &self,
@@ -266,7 +270,6 @@ impl SpiceTable {
         &self.below
     }
 
-
     /// The base provider the stack terminates at.
     #[must_use]
     pub fn base_provider(&self) -> &Arc<dyn TableProvider> {
@@ -276,8 +279,6 @@ impl SpiceTable {
         }
         &current.below
     }
-
-
 
     /// The indexes this node's layer carries, or empty when it carries none.
     ///
@@ -292,17 +293,12 @@ impl SpiceTable {
 
     /// This node's layer as a concrete type, or `None` if it is another kind.
     ///
-    /// Reaching a specific layer type is legitimate — a caller asking for one
-    /// already depends on it. What it no longer has to name is the layers in
-    /// between.
+    /// Reaching a specific layer type is legitimate: a caller asking for one
+    /// already depends on it. What it does not name is the layers in between.
     #[must_use]
     pub fn layer_as<T: TableLayer>(&self) -> Option<&T> {
         (self.layer.as_ref() as &dyn Any).downcast_ref::<T>()
     }
-
-
-
-
 }
 
 /// Steps one level down from `current`, following `walk`.
@@ -313,11 +309,7 @@ impl SpiceTable {
 /// federated source by downcasting the scan's provider to it), so it cannot be
 /// wrapped in a layer and has to be stepped through here instead. That is the one
 /// foreign type this module names, in the one place it names it.
-#[must_use]
-fn step<'a>(
-    current: &'a dyn TableProvider,
-    walk: LayerWalk,
-) -> Option<&'a Arc<dyn TableProvider>> {
+fn step(current: &dyn TableProvider, walk: LayerWalk) -> Option<&Arc<dyn TableProvider>> {
     if let Some(table) = current.downcast_ref::<SpiceTable>() {
         return table.layer.route(walk, &table.below);
     }
@@ -351,7 +343,6 @@ pub fn find_concrete<T: TableProvider + 'static>(
     }
 }
 
-
 /// The layered nodes reachable from `top` by `walk`, outermost first.
 ///
 /// The single traversal primitive: every "find the layer that…" and "collect
@@ -376,10 +367,13 @@ impl<'a> Iterator for Nodes<'a> {
 
     fn next(&mut self) -> Option<Self::Item> {
         while let Some(current) = self.current {
-            self.current = step(current, self.walk).map(Arc::as_ref);
+            // A layered node answers for itself, so route straight off it rather
+            // than downcasting the same pointer a second time inside `step`.
             if let Some(node) = current.downcast_ref::<SpiceTable>() {
+                self.current = node.layer.route(self.walk, &node.below).map(Arc::as_ref);
                 return Some(node);
             }
+            self.current = step(current, self.walk).map(Arc::as_ref);
         }
         None
     }
@@ -483,17 +477,14 @@ impl TableProvider for SpiceTable {
         state: &dyn Session,
         args: ScanArgs<'a>,
     ) -> DataFusionResult<ScanResult> {
-        self.layer
-            .scan_with_args(&self.below, state, args)
-            .await
+        self.layer.scan_with_args(&self.below, state, args).await
     }
 
     fn supports_filters_pushdown(
         &self,
         filters: &[&Expr],
     ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
-        self.layer
-            .supports_filters_pushdown(&self.below, filters)
+        self.layer.supports_filters_pushdown(&self.below, filters)
     }
 
     fn statistics(&self) -> Option<Statistics> {
@@ -516,9 +507,7 @@ impl TableProvider for SpiceTable {
         state: &dyn Session,
         filters: Vec<Expr>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        self.layer
-            .delete_from(&self.below, state, filters)
-            .await
+        self.layer.delete_from(&self.below, state, filters).await
     }
 
     async fn update(
@@ -596,7 +585,6 @@ mod tests {
             }
             Some(below)
         }
-
     }
 
     /// Stands in for an accelerated table: two sides, and the walk decides which
@@ -687,7 +675,11 @@ mod tests {
     #[test]
     fn peel_returns_an_unlayered_provider_unchanged() {
         let plain = base();
-        assert!(peel_to(&plain, LayerWalk::Read).downcast_ref::<MemTable>().is_some());
+        assert!(
+            peel_to(&plain, LayerWalk::Read)
+                .downcast_ref::<MemTable>()
+                .is_some()
+        );
     }
 
     #[test]
@@ -718,7 +710,10 @@ mod tests {
     #[test]
     fn find_index_returns_the_table_the_index_is_bound_to() {
         let bottom = SpiceTable::over(TestLayer::indexed("bottom"), base());
-        let top = SpiceTable::over(TestLayer::indexed("top"), Arc::clone(&bottom) as Arc<dyn TableProvider>);
+        let top = SpiceTable::over(
+            TestLayer::indexed("top"),
+            Arc::clone(&bottom) as Arc<dyn TableProvider>,
+        );
 
         let top: Arc<dyn TableProvider> = top;
         let (found, bound) = nodes(top.as_ref(), LayerWalk::Index)
@@ -760,7 +755,10 @@ mod tests {
     #[test]
     fn defaulted_methods_delegate_through_the_stack() {
         let base_table = base();
-        let top = SpiceTable::over(TestLayer::marker(), SpiceTable::over(TestLayer::marker(), Arc::clone(&base_table)));
+        let top = SpiceTable::over(
+            TestLayer::marker(),
+            SpiceTable::over(TestLayer::marker(), Arc::clone(&base_table)),
+        );
         assert_eq!(top.schema(), base_table.schema());
         assert_eq!(top.table_type(), base_table.table_type());
     }
@@ -790,7 +788,10 @@ mod tests {
 
     #[test]
     fn rebuild_base_replaces_the_base_and_keeps_every_layer() {
-        let top = SpiceTable::over(TestLayer::indexed("top"), SpiceTable::over(TestLayer::marker(), base()));
+        let top = SpiceTable::over(
+            TestLayer::indexed("top"),
+            SpiceTable::over(TestLayer::marker(), base()),
+        );
 
         let replacement = base();
         let top: Arc<dyn TableProvider> = top;

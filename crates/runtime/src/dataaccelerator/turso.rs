@@ -752,7 +752,8 @@ impl DataAccelerator for TursoAccelerator {
             cmd.constraints.clone(),
         );
 
-        let table_provider = Arc::new(PolyTableProvider::new(write_provider, fed_provider)).into_table();
+        let table_provider =
+            Arc::new(PolyTableProvider::new(write_provider, fed_provider)).into_table();
 
         Ok(table_provider)
     }

@@ -46,9 +46,9 @@ use datafusion_expr::{LogicalPlanBuilder, ScalarUDF, binary_expr, cast, col};
 use datafusion_functions_json::udfs::json_get_udf;
 use futures::future::{join_all, try_join_all};
 use llms::embeddings::Embed;
-use spice_table::Index;
 use runtime_table_partition::insert::partition_batch;
 use snafu::ResultExt;
+use spice_table::Index;
 
 use crate::SEARCH_SCORE_COLUMN_NAME;
 use crate::index::s3_vectors::compute_query::EmbedQuery;

@@ -31,9 +31,9 @@ use crate::component::{
 use crate::dataconnector::{DataConnector, DataConnectorError, DataConnectorResult};
 use crate::federated::FederatedTable;
 use crate::search::full_text::table::add_full_text_search_to_table;
-use spice_table::LayerWalk;
 use futures::StreamExt;
 use runtime_metrics::component::MetricsProvider;
+use spice_table::LayerWalk;
 
 /// A [`DataConnector`] middleware that, for [`Dataset`]s needing full text search capabilies, creates a [`IndexLayer`] using the underlying [`TableProvider`]s and a [`FullTextDatabaseIndex`](search::generation::text_search::index::FullTextDatabaseIndex). If no full text search capabilities are needed it is not unnecessarily nested.
 #[derive(Debug)]
@@ -238,9 +238,9 @@ mod tests {
     use arrow::util::pretty::pretty_format_batches;
     use datafusion::datasource::MemTable;
     use futures::TryStreamExt;
-    use spice_table::{Index, WriteWindow};
     use search::index::SearchIndex;
     use search::index::compound::CompoundReadMode;
+    use spice_table::{Index, WriteWindow};
 
     fn test_table() -> Arc<dyn TableProvider> {
         let batch = record_batch!(("id", Int32, [1]), ("content", Utf8, ["seed"]))

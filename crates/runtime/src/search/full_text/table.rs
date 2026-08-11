@@ -15,8 +15,8 @@ limitations under the License.
 */
 use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
-use spice_table::{Index, IndexLayer, SpiceTable};
 use snafu::ResultExt;
+use spice_table::{Index, IndexLayer, SpiceTable};
 use spicepod::semantic::{Column, IndexStore, MetadataType};
 use std::path::PathBuf;
 use std::str::FromStr;

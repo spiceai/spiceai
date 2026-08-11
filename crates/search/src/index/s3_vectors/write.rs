@@ -22,9 +22,9 @@ use arrow_json::{EncoderOptions, writer::make_encoder};
 use arrow_schema::Field;
 use data_components::s3_vectors::S3VectorsTable;
 use itertools::Itertools;
-use spice_table::Index;
 use serde_json::Value;
 use snafu::{ResultExt, Snafu};
+use spice_table::Index;
 
 use crate::index::write_util::{
     self, embed_column, extract_and_format_primary_key, sort_columns_alphabetically,

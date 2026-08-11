@@ -31,8 +31,8 @@ use datafusion::{
 use datafusion_expr::ident;
 use futures::future::try_join_all;
 use itertools::Itertools;
-use spice_table::{Index, WriteWindow, build_key_match_predicate};
 use snafu::{ResultExt, Snafu};
+use spice_table::{Index, WriteWindow, build_key_match_predicate};
 use util::{arrow::repeat, convert_string_arrow_to_iterator};
 
 /// Additional primary key column to uniquely identify chunks within a single database row.

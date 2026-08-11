@@ -102,7 +102,7 @@ impl OptimizerRule for IndexTableScanOptimizerRule {
                 let underlying = Arc::clone(&default_source.table_provider);
                 let Some(indexes) = underlying
                     .downcast_ref::<SpiceTable>()
-                    .map(|table| table.indexes())
+                    .map(spice_table::SpiceTable::indexes)
                     .filter(|indexes| !indexes.is_empty())
                 else {
                     return Ok(Transformed::no(LogicalPlan::TableScan(table_scan)));
@@ -786,7 +786,8 @@ mod test {
         index: Arc<dyn Index + Send + Sync>,
         table: Arc<dyn TableProvider>,
     ) -> Arc<dyn TableProvider> {
-        (SpiceTable::over(Arc::new(IndexLayer::new().add_index(index)), table)) as Arc<dyn TableProvider>
+        (SpiceTable::over(Arc::new(IndexLayer::new().add_index(index)), table))
+            as Arc<dyn TableProvider>
     }
 
     fn test_one_row_batch() -> RecordBatch {
@@ -910,15 +911,17 @@ mod test {
         let table = mem_table_from_batches(vec![test_one_row_batch()]);
 
         // build an IndexedTableProvider with *two* indexes, in order
-        let provider = SpiceTable::over(Arc::new(IndexLayer::new()
-            .add_index(Arc::clone(&idx1) as Arc<dyn Index + Send + Sync>)
-            .add_index(Arc::clone(&idx2) as Arc<dyn Index + Send + Sync>)), table);
+        let provider = SpiceTable::over(
+            Arc::new(
+                IndexLayer::new()
+                    .add_index(Arc::clone(&idx1) as Arc<dyn Index + Send + Sync>)
+                    .add_index(Arc::clone(&idx2) as Arc<dyn Index + Send + Sync>),
+            ),
+            table,
+        );
 
-        ctx.register_table(
-            "pipeline_idx_table",
-            provider as Arc<dyn TableProvider>,
-        )
-        .expect("valid table");
+        ctx.register_table("pipeline_idx_table", provider as Arc<dyn TableProvider>)
+            .expect("valid table");
 
         let df = ctx.table("pipeline_idx_table").await.expect("valid");
         let results = df.collect().await.expect("should complete");
@@ -947,14 +950,15 @@ mod test {
         let bad_idx = Arc::new(TestIndex::new(vec!["id".to_string()], Some(|_| Ok(vec![]))));
 
         let table = mem_table(); // empty batch is fine; the error is from the index
-        let provider = SpiceTable::over(Arc::new(IndexLayer::new()
-            .add_index(Arc::clone(&bad_idx) as Arc<dyn Index + Send + Sync>)), table);
+        let provider = SpiceTable::over(
+            Arc::new(
+                IndexLayer::new().add_index(Arc::clone(&bad_idx) as Arc<dyn Index + Send + Sync>),
+            ),
+            table,
+        );
 
-        ctx.register_table(
-            "zero_batches_idx_table",
-            provider as Arc<dyn TableProvider>,
-        )
-        .expect("valid table");
+        ctx.register_table("zero_batches_idx_table", provider as Arc<dyn TableProvider>)
+            .expect("valid table");
 
         let df = ctx.table("zero_batches_idx_table").await.expect("valid");
         let err = df
@@ -982,8 +986,12 @@ mod test {
         ));
 
         let table = mem_table(); // any input works
-        let provider = SpiceTable::over(Arc::new(IndexLayer::new()
-            .add_index(Arc::clone(&bad_idx) as Arc<dyn Index + Send + Sync>)), table);
+        let provider = SpiceTable::over(
+            Arc::new(
+                IndexLayer::new().add_index(Arc::clone(&bad_idx) as Arc<dyn Index + Send + Sync>),
+            ),
+            table,
+        );
 
         ctx.register_table(
             "multi_batches_idx_table",
@@ -1014,15 +1022,17 @@ mod test {
         ));
 
         let table = mem_table_from_batches(vec![test_one_row_batch()]);
-        let provider = SpiceTable::over(Arc::new(IndexLayer::new()
-            .add_index(Arc::clone(&pass_through) as Arc<dyn Index + Send + Sync>)
-            .add_index(Arc::clone(&failing) as Arc<dyn Index + Send + Sync>)), table);
+        let provider = SpiceTable::over(
+            Arc::new(
+                IndexLayer::new()
+                    .add_index(Arc::clone(&pass_through) as Arc<dyn Index + Send + Sync>)
+                    .add_index(Arc::clone(&failing) as Arc<dyn Index + Send + Sync>),
+            ),
+            table,
+        );
 
-        ctx.register_table(
-            "late_fail_idx_table",
-            provider as Arc<dyn TableProvider>,
-        )
-        .expect("valid table");
+        ctx.register_table("late_fail_idx_table", provider as Arc<dyn TableProvider>)
+            .expect("valid table");
 
         let df = ctx.table("late_fail_idx_table").await.expect("valid");
         let err = df
@@ -1061,13 +1071,12 @@ mod test {
         ));
 
         let table = mem_table_from_batches(vec![one_row_batch()]);
-        let provider = SpiceTable::over(Arc::new(IndexLayer::new()
-            .add_index(Arc::clone(&idx) as Arc<dyn Index + Send + Sync>)), table);
-        ctx.register_table(
-            "schema_change_type",
-            provider as Arc<dyn TableProvider>,
-        )
-        .expect("valid");
+        let provider = SpiceTable::over(
+            Arc::new(IndexLayer::new().add_index(Arc::clone(&idx) as Arc<dyn Index + Send + Sync>)),
+            table,
+        );
+        ctx.register_table("schema_change_type", provider as Arc<dyn TableProvider>)
+            .expect("valid");
 
         let df = ctx.table("schema_change_type").await.expect("valid");
         let err = df
@@ -1111,14 +1120,15 @@ mod test {
         ));
 
         let table = mem_table_from_batches(vec![one_row_batch()]);
-        let provider = SpiceTable::over(Arc::new(IndexLayer::new()
-            .add_index(Arc::clone(&idx_add) as Arc<dyn Index + Send + Sync>)), table);
+        let provider = SpiceTable::over(
+            Arc::new(
+                IndexLayer::new().add_index(Arc::clone(&idx_add) as Arc<dyn Index + Send + Sync>),
+            ),
+            table,
+        );
 
-        ctx.register_table(
-            "schema_change_add",
-            provider as Arc<dyn TableProvider>,
-        )
-        .expect("valid");
+        ctx.register_table("schema_change_add", provider as Arc<dyn TableProvider>)
+            .expect("valid");
 
         let df = ctx.table("schema_change_add").await.expect("valid");
         let err = df
@@ -1177,14 +1187,13 @@ mod test {
         ));
 
         let table = mem_table_from_batches(vec![one_row_batch()]);
-        let provider = SpiceTable::over(Arc::new(IndexLayer::new()
-            .add_index(Arc::clone(&idx) as Arc<dyn Index + Send + Sync>)), table);
+        let provider = SpiceTable::over(
+            Arc::new(IndexLayer::new().add_index(Arc::clone(&idx) as Arc<dyn Index + Send + Sync>)),
+            table,
+        );
 
-        ctx.register_table(
-            "field_meta_diff_table",
-            provider as Arc<dyn TableProvider>,
-        )
-        .expect("valid");
+        ctx.register_table("field_meta_diff_table", provider as Arc<dyn TableProvider>)
+            .expect("valid");
 
         let df = ctx.table("field_meta_diff_table").await.expect("valid");
         // Must succeed — field-level metadata differences are benign.
@@ -1224,14 +1233,13 @@ mod test {
         ));
 
         let table = mem_table_from_batches(vec![one_row_batch()]);
-        let provider = SpiceTable::over(Arc::new(IndexLayer::new()
-            .add_index(Arc::clone(&idx) as Arc<dyn Index + Send + Sync>)), table);
+        let provider = SpiceTable::over(
+            Arc::new(IndexLayer::new().add_index(Arc::clone(&idx) as Arc<dyn Index + Send + Sync>)),
+            table,
+        );
 
-        ctx.register_table(
-            "metadata_diff_table",
-            provider as Arc<dyn TableProvider>,
-        )
-        .expect("valid");
+        ctx.register_table("metadata_diff_table", provider as Arc<dyn TableProvider>)
+            .expect("valid");
 
         let df = ctx.table("metadata_diff_table").await.expect("valid");
         // Must succeed — metadata-only differences are benign.

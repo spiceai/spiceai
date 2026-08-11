@@ -74,14 +74,16 @@ use runtime_datafusion::refresh_scan::get_data;
 use runtime_datafusion::refresh_sql;
 use runtime_datafusion::schema_provider::ensure_schema_exists;
 use runtime_datafusion::session_config::get_df_default_config;
-use spice_table::{LayerWalk, SpiceTable};
-use runtime_datafusion_index::analyzer::{IndexTableScanExtensionPlanner, IndexTableScanOptimizerRule};
+use runtime_datafusion_index::analyzer::{
+    IndexTableScanExtensionPlanner, IndexTableScanOptimizerRule,
+};
 use runtime_metrics::acceleration as metrics;
 use runtime_metrics::telemetry::track_bytes_processed;
 use runtime_object_store::registry::default_runtime_env;
 use runtime_request_context::{AsyncMarker, RequestContext};
 use runtime_status as status;
 use snafu::{OptionExt, ResultExt};
+use spice_table::{LayerWalk, SpiceTable};
 use spicepod::metric::Metrics;
 use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
@@ -148,10 +150,7 @@ fn metadata_enriched_table_provider_preserving_indexes(
         metadata_enriched_table_provider(base, table_metadata.clone(), field_metadata.clone())
     };
 
-    match provider.downcast_ref::<SpiceTable>() {
-        Some(_) => spice_table::rebuild_base(&provider, &enrich),
-        None => enrich(provider),
-    }
+    spice_table::rebuild_base(&provider, &enrich)
 }
 
 #[derive(Debug, Clone, Default)]
@@ -2642,7 +2641,10 @@ fn accelerator_df(
 }
 
 pub fn accelerator_table_provider(accelerator: &Arc<dyn TableProvider>) -> Arc<dyn TableProvider> {
-    match spice_table::find_layer::<PolyTableProvider>(accelerator.as_ref(), spice_table::LayerWalk::Write) {
+    match spice_table::find_layer::<PolyTableProvider>(
+        accelerator.as_ref(),
+        spice_table::LayerWalk::Write,
+    ) {
         Some(poly) => match poly
             .get_federated_table_provider()
             .downcast_ref::<FederatedTableProviderAdaptor>()
@@ -2862,7 +2864,6 @@ fn schema_evolution_mismatch_refresh_message(
 
 #[cfg(test)]
 mod tests {
-    use spice_table::IndexLayer;
     use super::*;
     use crate::federated::FederatedTable;
     use arrow::array::{
@@ -2878,6 +2879,7 @@ mod tests {
     use datafusion::physical_plan::memory::MemoryStream;
     use datafusion::prelude::SessionContext;
     use runtime_acceleration::dataupdate::{StreamingDataUpdate, UpdateType};
+    use spice_table::IndexLayer;
     use std::sync::Arc;
     use tokio::sync::Mutex;
 
@@ -2917,15 +2919,15 @@ mod tests {
             MemTable::try_new(Arc::clone(&schema), vec![vec![batch]])
                 .expect("mem table should be created"),
         );
-        let index: Arc<dyn spice_table::Index + Send + Sync> =
-            Arc::new(TestRefreshIndex);
+        let index: Arc<dyn spice_table::Index + Send + Sync> = Arc::new(TestRefreshIndex);
         let indexed_provider: Arc<dyn TableProvider> = SpiceTable::over(
             Arc::new(IndexLayer::with_indexes(vec![Arc::clone(&index)])),
             mem_table,
         );
 
         let wrapped = table_provider_with_existing_metadata(indexed_provider);
-        let index_node = spice_table::nodes(wrapped.as_ref(), LayerWalk::Index).find(|node| node.layer_as::<IndexLayer>().is_some())
+        let index_node = spice_table::nodes(wrapped.as_ref(), LayerWalk::Index)
+            .find(|node| node.layer_as::<IndexLayer>().is_some())
             .expect("the index layer should remain the outermost layer");
         assert_eq!(index_node.indexes().len(), 1);
         assert!(

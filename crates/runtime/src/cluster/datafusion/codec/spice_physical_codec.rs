@@ -204,12 +204,13 @@ impl PhysicalExtensionCodec for SpicePhysicalCodec {
                 })?;
                 // Locate the cluster provider through ALL known runtime wrappers
                 // (FederatedTableProviderAdaptor, MetadataEnrichedTableProvider,
-                // EmbeddingTable, IndexedTableProvider, AcceleratedTable, …), not
+                // EmbeddingTable, IndexLayer, AcceleratedTable, …), not
                 // just the federation/metadata pair — an Iceberg dataset with
                 // embeddings or a search index is wrapped further.
-                let Some(cluster) =
-                    spice_table::find_layer::<IcebergClusterTableProvider>(provider.as_ref(), spice_table::LayerWalk::Read)
-                else {
+                let Some(cluster) = spice_table::find_layer::<IcebergClusterTableProvider>(
+                    provider.as_ref(),
+                    spice_table::LayerWalk::Read,
+                ) else {
                     return exec_err!(
                         "registered provider for {table_ref} is not an IcebergClusterTableProvider; \
                          distributed Iceberg scans require the Iceberg data connector"

@@ -37,9 +37,7 @@ use arrow::array::{ArrayRef, RecordBatch, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef};
 use async_trait::async_trait;
 use datafusion::catalog::Session;
-use datafusion::common::{
-    DataFusionError, Result as DFResult, ToDFSchema, tree_node::TreeNode,
-};
+use datafusion::common::{DataFusionError, Result as DFResult, ToDFSchema, tree_node::TreeNode};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
@@ -391,24 +389,21 @@ impl TableLayer for IcebergDeletionProvider {
         walk: LayerWalk,
         below: &'a Arc<dyn datafusion::datasource::TableProvider>,
     ) -> Option<&'a Arc<dyn datafusion::datasource::TableProvider>> {
+        // Exhaustive on purpose: a wildcard would answer a future walk kind
+        // for this layer without anyone deciding what it should say.
         match walk {
-            // Index discovery has to reach an index attached beneath this layer;
-            // deletion adds no columns and carries no index of its own.
+            // Deletion adds no columns and carries no index of its own, so read
+            // discovery and index discovery both reach past it.
             LayerWalk::Read | LayerWalk::Index => Some(below),
-            _ => None,
+            // Everything else stops: a delete routed around this layer would run
+            // against the Iceberg table without its deletion semantics, and a
+            // source or CDC walk has no business below an Iceberg delete.
+            LayerWalk::CdcDetection
+            | LayerWalk::Source
+            | LayerWalk::Write
+            | LayerWalk::RetentionDelete => None,
         }
     }
-
-
-
-
-
-
-
-
-
-
-
 
     async fn delete_from(
         &self,

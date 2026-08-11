@@ -49,12 +49,14 @@ use datafusion::{
     physical_planner::{DefaultPhysicalPlanner, PhysicalPlanner},
     prelude::SessionContext,
 };
-use runtime_datafusion_index::analyzer::{IndexTableScanExtensionPlanner, IndexTableScanOptimizerRule};
-use spice_table::{Index, IndexLayer, SpiceTable};
+use runtime_datafusion_index::analyzer::{
+    IndexTableScanExtensionPlanner, IndexTableScanOptimizerRule,
+};
 use search::index::{
     SearchIndex,
     chunking::{CHUNKED_INDEX_CHUNK_KEY, ChunkedSearchIndex},
 };
+use spice_table::{Index, IndexLayer, SpiceTable};
 
 /// A chunker that always produces exactly `n` evenly-spaced chunks per non-empty input row,
 /// regardless of content. Deterministic chunk counts make the assertions in this test crisp.
@@ -330,9 +332,7 @@ async fn chunked_index_emits_bounded_intermediate_batches_to_inner() {
     let mem_table = Arc::new(MemTable::try_new(schema, vec![vec![input]]).expect("valid table"));
 
     let indexed = SpiceTable::over(
-        Arc::new(
-            IndexLayer::new().add_index(chunked_index as Arc<dyn Index + Send + Sync>),
-        ),
+        Arc::new(IndexLayer::new().add_index(chunked_index as Arc<dyn Index + Send + Sync>)),
         mem_table as Arc<dyn TableProvider>,
     );
 

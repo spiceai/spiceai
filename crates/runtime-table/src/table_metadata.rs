@@ -82,8 +82,8 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use data_components::MetadataEnrichedTableProvider;
     use datafusion::datasource::{MemTable, TableProvider};
-    use spice_table::{IndexLayer, LayerWalk, SpiceTable};
     use runtime_search::embeddings::table::EmbeddingTable;
+    use spice_table::{IndexLayer, LayerWalk, SpiceTable};
     use spicepod::semantic::Column;
 
     use super::table_provider_with_spicepod_metadata;
@@ -125,8 +125,11 @@ mod tests {
             &columns,
         );
 
-        let embedding_node = spice_table::nodes(wrapped.as_ref(), LayerWalk::Read).find(|node| node.layer_as::<EmbeddingTable>().is_some())
-            .expect("metadata wrap must keep the embedding layer discoverable for the changes stream");
+        let embedding_node = spice_table::nodes(wrapped.as_ref(), LayerWalk::Read)
+            .find(|node| node.layer_as::<EmbeddingTable>().is_some())
+            .expect(
+                "metadata wrap must keep the embedding layer discoverable for the changes stream",
+            );
 
         // Metadata enrichment is pushed *below* the embedding layer, not stacked on
         // top of it, so the source-facing schema carries no synthetic columns.
@@ -231,23 +234,19 @@ mod tests {
         // layer to `EmbeddingConnector::changes_stream`, which looks for the embedding
         // layer; if the metadata wrap hides it there, no changes stream is attached and
         // `refresh_mode: changes` fails with "a changes stream is required".
-        let indexed = SpiceTable::over(
-            Arc::new(IndexLayer::new()),
-            embedding_table_over_memtable(),
-        ) as Arc<dyn TableProvider>;
+        let indexed = SpiceTable::over(Arc::new(IndexLayer::new()), embedding_table_over_memtable())
+            as Arc<dyn TableProvider>;
 
         let (table_metadata, columns) = spicepod_metadata_fixture();
         let wrapped = table_provider_with_spicepod_metadata(indexed, &table_metadata, &columns);
 
-        let index_node = spice_table::nodes(wrapped.as_ref(), LayerWalk::Index).find(|node| node.layer_as::<IndexLayer>().is_some())
+        let index_node = spice_table::nodes(wrapped.as_ref(), LayerWalk::Index)
+            .find(|node| node.layer_as::<IndexLayer>().is_some())
             .expect("the index layer must remain discoverable for the index analyzer");
 
         assert!(
-            spice_table::find_layer::<EmbeddingTable>(
-                index_node.below().as_ref(),
-                LayerWalk::Read
-            )
-            .is_some(),
+            spice_table::find_layer::<EmbeddingTable>(index_node.below().as_ref(), LayerWalk::Read)
+                .is_some(),
             "an embedding layer nested under an index layer must stay discoverable"
         );
     }
@@ -261,15 +260,14 @@ mod tests {
         // `EmbeddingConnector::changes_stream`, which downcasts to
         // `VectorScanTableProvider` to reach the raw source; if the metadata wrap hides
         // it there, `refresh_mode: changes` fails with "a changes stream is required".
-        let indexed = SpiceTable::over(
-            Arc::new(IndexLayer::new()),
-            vector_scan_over_memtable(),
-        ) as Arc<dyn TableProvider>;
+        let indexed = SpiceTable::over(Arc::new(IndexLayer::new()), vector_scan_over_memtable())
+            as Arc<dyn TableProvider>;
 
         let (table_metadata, columns) = spicepod_metadata_fixture();
         let wrapped = table_provider_with_spicepod_metadata(indexed, &table_metadata, &columns);
 
-        let index_node = spice_table::nodes(wrapped.as_ref(), LayerWalk::Index).find(|node| node.layer_as::<IndexLayer>().is_some())
+        let index_node = spice_table::nodes(wrapped.as_ref(), LayerWalk::Index)
+            .find(|node| node.layer_as::<IndexLayer>().is_some())
             .expect("the index layer must remain discoverable for the index analyzer");
 
         let vector_node = spice_table::nodes(index_node.below().as_ref(), LayerWalk::Read)
@@ -288,6 +286,19 @@ mod tests {
             )
             .is_some(),
             "metadata enrichment should be pushed below the vector-scan layer"
+        );
+
+        // Reaching the enrichment layer is not enough: the vector-scan layer
+        // rebuilds its schema from the table beneath, so it has to carry that
+        // table's schema-level metadata forward or the dataset exposes none.
+        assert_eq!(
+            wrapped
+                .schema()
+                .metadata()
+                .get("source_owner")
+                .map(String::as_str),
+            Some("analytics"),
+            "a vector-enabled dataset must still expose its spicepod table metadata"
         );
     }
 }

@@ -40,8 +40,8 @@ use futures::future::try_join_all;
 use itertools::Itertools;
 use llms::embeddings::Embed;
 use parking_lot::RwLock;
-use spice_table::Index;
 use snafu::{ResultExt, Snafu, ensure};
+use spice_table::Index;
 
 use crate::index::{
     SearchIndex, VectorIndex, embedding_col,

@@ -22,11 +22,11 @@ use datafusion::{
     logical_expr::{LogicalPlan, TableProviderFilterPushDown},
     prelude::Expr,
 };
-use spice_table::{LayerWalk, SpiceTable, TableLayer};
 use datafusion_federation::{
     FederatedTableProviderAdaptor, FederatedTableSource, FederationAnalyzerForLogicalPlan,
     FederationProvider,
 };
+use spice_table::{LayerWalk, SpiceTable, TableLayer};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -136,9 +136,18 @@ impl TableLayer for PolyTableProvider {
         walk: LayerWalk,
         below: &'a Arc<dyn TableProvider>,
     ) -> Option<&'a Arc<dyn TableProvider>> {
+        // Exhaustive on purpose: a wildcard would answer a future walk kind
+        // for this layer without anyone deciding what it should say.
         match walk {
             LayerWalk::Write => Some(below),
-            _ => None,
+            // Reads of an accelerated dataset reach the accelerator through the
+            // accelerated table, not by peeling this split, so every other walk
+            // stops here rather than landing on one arbitrary side.
+            LayerWalk::Read
+            | LayerWalk::CdcDetection
+            | LayerWalk::Source
+            | LayerWalk::RetentionDelete
+            | LayerWalk::Index => None,
         }
     }
 
@@ -156,9 +165,4 @@ impl TableLayer for PolyTableProvider {
     ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
         self.fed.supports_filters_pushdown(filters)
     }
-
-
-
-
-
 }

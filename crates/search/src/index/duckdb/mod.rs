@@ -31,8 +31,8 @@ use datafusion_table_providers::{
 };
 use futures::future::try_join_all;
 use llms::embeddings::Embed;
-use spice_table::Index;
 use snafu::ResultExt;
+use spice_table::Index;
 
 use crate::{
     SEARCH_SCORE_COLUMN_NAME,

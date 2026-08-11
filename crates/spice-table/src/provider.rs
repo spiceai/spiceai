@@ -95,12 +95,21 @@ impl TableLayer for IndexLayer {
         walk: LayerWalk,
         below: &'a Arc<dyn TableProvider>,
     ) -> Option<&'a Arc<dyn TableProvider>> {
+        // Exhaustive on purpose: a wildcard would answer a future walk kind
+        // for this layer without anyone deciding what it should say.
         match walk {
+            // An index layer is what CDC detection looks *for*, so detection must
+            // stop here rather than see past it.
             LayerWalk::CdcDetection => None,
-            _ => Some(below),
+            // An index adds no columns and rewrites no write, so everything else
+            // reaches the table beneath.
+            LayerWalk::Read
+            | LayerWalk::Source
+            | LayerWalk::Write
+            | LayerWalk::RetentionDelete
+            | LayerWalk::Index => Some(below),
         }
     }
-
 
     /// The layer is replaced by the indexed `LogicalPlan` during indexing, so
     /// the table beneath it must not supply one.

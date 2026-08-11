@@ -36,12 +36,12 @@ use data_components::cdc::{ChangeEnvelope, ChangesStream, StreamError, replace_c
 use datafusion::datasource::TableProvider;
 use futures::StreamExt;
 use itertools::Itertools;
-use spice_table::{IndexLayer, LayerWalk, find_layer, peel_to};
 use runtime_metrics::component::MetricsProvider;
 use search::generation::text_search::index::FullTextDatabaseIndex;
 use search::index::SearchIndex;
 use search::index::VectorScanTableProvider;
 use search::index::compound::CompoundSearchIndex;
+use spice_table::{IndexLayer, LayerWalk, find_layer, peel_to};
 use spicepod::component::embeddings::ColumnEmbeddingConfig;
 use spicepod::semantic::Column;
 #[cfg(feature = "duckdb")]
@@ -346,8 +346,8 @@ impl DataConnector for EmbeddingConnector {
         dataset: &Dataset,
     ) -> Option<ChangesStream> {
         let table_provider = federated_table.try_table_provider_sync()?;
-        if let Some(indexed_table) = find_layer::<IndexLayer>(table_provider.as_ref(), LayerWalk::CdcDetection)
-        .cloned()
+        if let Some(indexed_table) =
+            find_layer::<IndexLayer>(table_provider.as_ref(), LayerWalk::CdcDetection).cloned()
         {
             let underlying_federated_table =
                 underlying_federated_table_for_indexed_table(&table_provider);
@@ -386,14 +386,18 @@ impl DataConnector for EmbeddingConnector {
             Some(stream)
 
         // `VectorScanTableProvider` is generally wrapped by a `IndexLayer` (as above), but in the case both [`Self`] and the [`FullTextConnector`] exist, the latter will unwrap the `IndexLayer` first. It will correctly handle indexing vector indexes as that point.
-        } else if let Some(vector_scan) = find_layer::<VectorScanTableProvider>(table_provider.as_ref(), LayerWalk::CdcDetection) {
+        } else if let Some(vector_scan) =
+            find_layer::<VectorScanTableProvider>(table_provider.as_ref(), LayerWalk::CdcDetection)
+        {
             self.inner_connector.changes_stream(
                 Arc::new(FederatedTable::Immediate(Arc::clone(
                     &vector_scan.table_provider,
                 ))),
                 dataset,
             )
-        } else if let Some(embedding_table) = find_layer::<EmbeddingTable>(table_provider.as_ref(), LayerWalk::CdcDetection) {
+        } else if let Some(embedding_table) =
+            find_layer::<EmbeddingTable>(table_provider.as_ref(), LayerWalk::CdcDetection)
+        {
             let embedding_table = Arc::new(embedding_table.clone());
             let underlying_table = Arc::clone(&embedding_table.base_table);
             let underlying_federated_table = Arc::new(FederatedTable::Immediate(underlying_table));
@@ -418,8 +422,8 @@ impl DataConnector for EmbeddingConnector {
     fn append_stream(&self, federated_table: Arc<FederatedTable>) -> Option<ChangesStream> {
         let table_provider = federated_table.try_table_provider_sync()?;
 
-        if let Some(indexed_table) = find_layer::<IndexLayer>(table_provider.as_ref(), LayerWalk::CdcDetection)
-        .cloned()
+        if let Some(indexed_table) =
+            find_layer::<IndexLayer>(table_provider.as_ref(), LayerWalk::CdcDetection).cloned()
         {
             let indexed_table = Arc::new(indexed_table);
             let underlying_federated_table =
@@ -440,7 +444,9 @@ impl DataConnector for EmbeddingConnector {
         // above), but when a `FullTextConnector` also exists it peels that layer off before
         // delegating here, so the vector scan is what we see. Mirror `changes_stream`: hand
         // the scan's inner provider down and let the outer connector re-apply the indexes.
-        if let Some(vector_scan) = find_layer::<VectorScanTableProvider>(table_provider.as_ref(), LayerWalk::CdcDetection) {
+        if let Some(vector_scan) =
+            find_layer::<VectorScanTableProvider>(table_provider.as_ref(), LayerWalk::CdcDetection)
+        {
             return self
                 .inner_connector
                 .append_stream(Arc::new(FederatedTable::Immediate(Arc::clone(
@@ -449,8 +455,7 @@ impl DataConnector for EmbeddingConnector {
         }
 
         let embedding_table = Arc::new(
-            find_layer::<EmbeddingTable>(table_provider.as_ref(), LayerWalk::CdcDetection)?
-            .clone(),
+            find_layer::<EmbeddingTable>(table_provider.as_ref(), LayerWalk::CdcDetection)?.clone(),
         );
         let underlying_table = Arc::clone(&embedding_table.base_table);
         let underlying_federated_table = Arc::new(FederatedTable::Immediate(underlying_table));
@@ -792,7 +797,7 @@ mod tests {
             primary_key: vec!["id".to_string()],
         };
         Arc::new(FederatedTable::Immediate(
-            Arc::new(vector_scan).into_table() as Arc<dyn TableProvider>
+            Arc::new(vector_scan).into_table() as Arc<dyn TableProvider>,
         ))
     }
 
@@ -831,7 +836,7 @@ mod tests {
             embedding_models: Arc::new(RwLock::new(EmbeddingModelStore::default())),
         };
         let federated_table = Arc::new(FederatedTable::Immediate(
-            Arc::new(embedding_table).into_table() as Arc<dyn TableProvider>
+            Arc::new(embedding_table).into_table() as Arc<dyn TableProvider>,
         ));
 
         assert!(

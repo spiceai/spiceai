@@ -26,8 +26,8 @@ use async_trait::async_trait;
 use datafusion::datasource::{DefaultTableSource, TableProvider};
 use datafusion::error::DataFusionError;
 use datafusion::logical_expr::{LogicalPlan, LogicalPlanBuilder};
-use spice_table::{Index, WriteWindow};
 use snafu::{ResultExt, ensure};
+use spice_table::{Index, WriteWindow};
 use tantivy::merge_policy::LogMergePolicy;
 use tantivy::schema::{
     DocParsingError, FieldEntry, FieldType, IndexRecordOption, Schema, SchemaBuilder,

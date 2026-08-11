@@ -732,7 +732,11 @@ impl EmbeddingTable {
     ///     - Any projection index >=6 is an embedding column.
     ///
     /// The order of the additionally-generated embedding columns in [`Self::Schema`] is alphabetical.
-    fn columns_to_embed(&self, base: &Arc<dyn TableProvider>, projection: Option<&Vec<usize>>) -> Vec<String> {
+    fn columns_to_embed(
+        &self,
+        base: &Arc<dyn TableProvider>,
+        projection: Option<&Vec<usize>>,
+    ) -> Vec<String> {
         // Order of embedding columns in [`Self::Schema`] is alphabetical.
         match projection {
             None => self.get_additional_embedding_columns_sorted(),
@@ -827,7 +831,6 @@ impl EmbeddingTable {
     }
 }
 
-#[deny(clippy::missing_trait_methods)]
 impl EmbeddingTable {
     /// Builds the plan for a scan of this layer.
     ///
@@ -898,7 +901,7 @@ impl EmbeddingTable {
             }
         };
 
-        let projected_schema = project_schema(&self.schema_over(below), projection)?;
+        let projected_schema = project_schema(schema, projection)?;
         let base_plan = self
             .base_table
             .scan(state, projection_for_base_table.as_ref(), filters, limit)
@@ -926,6 +929,8 @@ impl TableLayer for EmbeddingTable {
         walk: LayerWalk,
         below: &'a Arc<dyn TableProvider>,
     ) -> Option<&'a Arc<dyn TableProvider>> {
+        // Exhaustive on purpose: a wildcard would answer a future walk kind
+        // for this layer without anyone deciding what it should say.
         match walk {
             LayerWalk::Read | LayerWalk::Source | LayerWalk::Index | LayerWalk::RetentionDelete => {
                 Some(below)
@@ -934,11 +939,10 @@ impl TableLayer for EmbeddingTable {
         }
     }
 
-
-
-
-
-    fn get_logical_plan<'a>(&'a self, _below: &'a Arc<dyn TableProvider>) -> Option<Cow<'a, LogicalPlan>> {
+    fn get_logical_plan<'a>(
+        &'a self,
+        _below: &'a Arc<dyn TableProvider>,
+    ) -> Option<Cow<'a, LogicalPlan>> {
         // EmbeddingTable augments the base table's schema with computed
         // embedding columns. The base table's logical plan does not represent
         // those columns, so forwarding it would cause `LogicalPlanBuilder::scan`
@@ -950,7 +954,6 @@ impl TableLayer for EmbeddingTable {
     fn schema(&self, below: &Arc<dyn TableProvider>) -> SchemaRef {
         self.schema_over(below)
     }
-
 
     /// Any filter in [`filters`] can still be exact
     fn supports_filters_pushdown(

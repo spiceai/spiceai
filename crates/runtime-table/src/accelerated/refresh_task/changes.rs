@@ -57,13 +57,13 @@ use runtime_component::schema_evolution::{
 };
 use runtime_datafusion::error::{find_datafusion_root, format_datafusion_error};
 use runtime_datafusion::execution_plan::schema_cast::SchemaCastScanExec;
-use spice_table::{LayerWalk, SpiceTable, find_concrete};
 use runtime_metrics::acceleration as metrics;
 use runtime_status as status;
 use runtime_table_partition::provider::PartitionTableProvider;
 #[cfg(test)]
 use snafu::OptionExt;
 use snafu::ResultExt;
+use spice_table::{LayerWalk, SpiceTable, find_concrete};
 use std::collections::{HashMap, VecDeque};
 use std::hash::BuildHasherDefault;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -3092,7 +3092,11 @@ async fn delete_matching_rows_from_arrow_provider(
     // Peel any layers stacked on the accelerator to reach the provider that
     // actually holds the rows.
     if let Some(table) = provider.downcast_ref::<SpiceTable>() {
-        return Box::pin(delete_matching_rows_from_arrow_provider(table.below(), rows)).await;
+        return Box::pin(delete_matching_rows_from_arrow_provider(
+            table.below(),
+            rows,
+        ))
+        .await;
     }
 
     if let Some(table) = provider.downcast_ref::<MemTable>() {
@@ -3766,7 +3770,6 @@ fn handle_stream_error(err: &cdc::StreamError, dataset_name: &TableReference) ->
 
 #[cfg(test)]
 mod tests {
-    use spice_table::IndexLayer;
     use super::*;
     use arrow::array::{ArrayRef, Int32Array, ListArray, StringArray, StructArray};
     use arrow::datatypes::{DataType, Field, Schema};
@@ -3774,6 +3777,7 @@ mod tests {
     use data_components::arrow::write::MemTable;
     use data_components::cdc::changes_schema;
     use datafusion::datasource::TableProvider;
+    use spice_table::IndexLayer;
 
     use std::sync::Arc;
 

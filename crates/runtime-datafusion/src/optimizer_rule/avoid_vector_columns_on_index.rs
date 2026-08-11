@@ -32,8 +32,8 @@ use datafusion::{
     sql::TableReference,
 };
 use runtime_datafusion_index::analyzer::IndexTableScanNode;
-use spice_table::{Index, SpiceTable};
 use search::index::{VectorScanTableProvider, derived_columns_from_vector_index};
+use spice_table::{Index, SpiceTable};
 
 /// An [`OptimizerRule`] that, for any [`LogicalPlan`] with a [`IndexTableScanNode`] extension node, find all
 /// [`VectorIndex`] derived columns and remove them from the underlying [`VectorScanTableProvider`] projection.

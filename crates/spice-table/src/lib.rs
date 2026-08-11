@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! The table a Spice dataset presents to DataFusion.
+//! The table a Spice dataset presents to `DataFusion`.
 //!
 //! A dataset is a connector's own [`TableProvider`] with capabilities stacked
 //! on top — indexes, embeddings, vector scans, spicepod metadata, acceleration.
@@ -34,7 +34,10 @@ mod delete;
 mod layer;
 mod provider;
 pub use delete::{build_key_match_predicate, resolve_keys_matching_predicate};
-pub use layer::{LayerWalk, Nodes, SpiceTable, TableLayer, find_concrete, find_layer, nodes, peel_to, rebuild_base};
+pub use layer::{
+    LayerWalk, Nodes, SpiceTable, TableLayer, find_concrete, find_layer, nodes, peel_to,
+    rebuild_base,
+};
 pub use provider::IndexLayer;
 
 /// What a `TableSink` write window does to the rows already in the table.

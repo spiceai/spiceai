@@ -252,7 +252,10 @@ mod tests {
         let envelope = create_test_change_envelope();
         let table_provider = Arc::new(MockTableProvider);
         let index = Arc::new(MockIndex::new("test_index").with_added_column());
-        let embedding_table = SpiceTable::over(Arc::new(IndexLayer::with_indexes(vec![index])), table_provider);
+        let embedding_table = SpiceTable::over(
+            Arc::new(IndexLayer::with_indexes(vec![index])),
+            table_provider,
+        );
 
         let result = index_change_envelope(Ok(envelope), Arc::new(embedding_table.into())).await;
 
@@ -281,7 +284,10 @@ mod tests {
         let table_provider = Arc::new(MockTableProvider);
         let index1 = Arc::new(MockIndex::new("index1"));
         let index2 = Arc::new(MockIndex::new("index2"));
-        let embedding_table = SpiceTable::over(Arc::new(IndexLayer::with_indexes(vec![index1, index2])), table_provider);
+        let embedding_table = SpiceTable::over(
+            Arc::new(IndexLayer::with_indexes(vec![index1, index2])),
+            table_provider,
+        );
 
         let result = index_change_envelope(Ok(envelope), Arc::new(embedding_table.into())).await;
 
@@ -319,7 +325,10 @@ mod tests {
         let envelope = create_test_change_envelope();
         let table_provider = Arc::new(MockTableProvider);
         let failing_index = Arc::new(MockIndex::new("failing_index").with_failure());
-        let embedding_table = SpiceTable::over(Arc::new(IndexLayer::with_indexes(vec![failing_index])), table_provider);
+        let embedding_table = SpiceTable::over(
+            Arc::new(IndexLayer::with_indexes(vec![failing_index])),
+            table_provider,
+        );
 
         let result = index_change_envelope(Ok(envelope), Arc::new(embedding_table.into())).await;
 
@@ -341,7 +350,10 @@ mod tests {
 
         let table_provider = Arc::new(MockTableProvider);
         let index = Arc::new(MockIndex::new("test_index"));
-        let embedding_table = SpiceTable::over(Arc::new(IndexLayer::with_indexes(vec![index])), table_provider);
+        let embedding_table = SpiceTable::over(
+            Arc::new(IndexLayer::with_indexes(vec![index])),
+            table_provider,
+        );
 
         let result = index_change_envelope(Ok(envelope), Arc::new(embedding_table.into())).await;
 
@@ -374,7 +386,10 @@ mod tests {
 
         let table_provider = Arc::new(MockTableProvider);
         let index = Arc::new(MockIndex::new("test_index").with_added_column());
-        let embedding_table = SpiceTable::over(Arc::new(IndexLayer::with_indexes(vec![index])), table_provider);
+        let embedding_table = SpiceTable::over(
+            Arc::new(IndexLayer::with_indexes(vec![index])),
+            table_provider,
+        );
 
         let result = index_change_envelope(Ok(envelope), Arc::new(embedding_table.into())).await;
 

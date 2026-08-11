@@ -36,13 +36,13 @@ use {
     crate::embeddings::construct_chunker,
     arrow_schema::{Schema, SchemaRef},
     chunking::ChunkingConfig,
-    spice_table::{Index, IndexLayer},
     runtime_search::embeddings::warm_index::with_memory_warm_index,
     search::index::{
         SearchIndex, VectorIndex, VectorScanTableProvider, chunking::ChunkedSearchIndex,
     },
     search::metadata::MetadataColumn,
     snafu::ResultExt,
+    spice_table::{Index, IndexLayer},
     spicepod::component::embeddings::EmbeddingChunkConfig,
     spicepod::semantic::MetadataType,
 };
@@ -224,15 +224,14 @@ async fn wrap_table_as_index_s3(
         .collect();
     // Reuse an index layer already at the top of the stack so several indexes
     // compose onto one layer rather than stacking a layer apiece.
-    let (mut provider, layer_below) = match inner_table_provider
-        .downcast_ref::<spice_table::SpiceTable>()
-    {
-        Some(table) if !table.indexes().is_empty() => (
-            IndexLayer::with_indexes(table.indexes().to_vec()),
-            Arc::clone(table.below()),
-        ),
-        _ => (IndexLayer::new(), Arc::clone(&inner_table_provider)),
-    };
+    let (mut provider, mut layer_below) =
+        match inner_table_provider.downcast_ref::<spice_table::SpiceTable>() {
+            Some(table) if !table.indexes().is_empty() => (
+                IndexLayer::with_indexes(table.indexes().to_vec()),
+                Arc::clone(table.below()),
+            ),
+            _ => (IndexLayer::new(), Arc::clone(&inner_table_provider)),
+        };
     for (column, config) in embedding_columns {
         let chunking = config.chunking.as_ref().filter(|cfg| cfg.enabled);
         let (columns, index_schema) = if chunking.is_some() {
@@ -294,10 +293,9 @@ async fn wrap_table_as_index_s3(
             )
             .await?;
         } else {
-            layer_below = Arc::new(
-                VectorScanTableProvider::try_new(layer_below, &vector_index).boxed()?,
-            )
-            .into_table() as Arc<dyn TableProvider>;
+            layer_below =
+                Arc::new(VectorScanTableProvider::try_new(layer_below, &vector_index).boxed()?)
+                    .into_table() as Arc<dyn TableProvider>;
             provider = provider.add_index(vector_index as Arc<dyn Index>);
         }
     }
@@ -437,15 +435,14 @@ async fn wrap_table_as_index_elasticsearch(
 
     // Reuse an index layer already at the top of the stack so several indexes
     // compose onto one layer rather than stacking a layer apiece.
-    let (mut provider, layer_below) = match inner_table_provider
-        .downcast_ref::<spice_table::SpiceTable>()
-    {
-        Some(table) if !table.indexes().is_empty() => (
-            IndexLayer::with_indexes(table.indexes().to_vec()),
-            Arc::clone(table.below()),
-        ),
-        _ => (IndexLayer::new(), Arc::clone(&inner_table_provider)),
-    };
+    let (mut provider, mut layer_below) =
+        match inner_table_provider.downcast_ref::<spice_table::SpiceTable>() {
+            Some(table) if !table.indexes().is_empty() => (
+                IndexLayer::with_indexes(table.indexes().to_vec()),
+                Arc::clone(table.below()),
+            ),
+            _ => (IndexLayer::new(), Arc::clone(&inner_table_provider)),
+        };
 
     let Some(embed_udf) = ctx.state().scalar_functions().get(EMBED_UDF_NAME).cloned() else {
         return Err(Box::from(format!(
@@ -506,10 +503,9 @@ async fn wrap_table_as_index_elasticsearch(
             layer_below = b;
             p
         } else {
-            layer_below = Arc::new(
-                VectorScanTableProvider::try_new(layer_below, &vector_index).boxed()?,
-            )
-            .into_table() as Arc<dyn TableProvider>;
+            layer_below =
+                Arc::new(VectorScanTableProvider::try_new(layer_below, &vector_index).boxed()?)
+                    .into_table() as Arc<dyn TableProvider>;
             provider.add_index(vector_index as Arc<dyn Index>)
         };
     }

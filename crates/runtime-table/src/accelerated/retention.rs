@@ -32,9 +32,9 @@ use datafusion::{
 };
 use runtime_component::dataset::TimeFormat;
 use runtime_datafusion::{is_spice_internal_dataset, session_config::get_df_default_config};
-use spice_table::{Index, LayerWalk, peel_to, resolve_keys_matching_predicate};
 use runtime_object_store::registry::default_runtime_env;
 use search::index::compound::{CompoundSearchIndex, CompoundVectorIndex};
+use spice_table::{Index, LayerWalk, peel_to, resolve_keys_matching_predicate};
 use tokio::runtime::Handle;
 use tokio::sync::Mutex;
 

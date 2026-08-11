@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! DataFusion optimizer machinery that turns an indexed [`spice_table::SpiceTable`]
+//! `DataFusion` optimizer machinery that turns an indexed [`spice_table::SpiceTable`]
 //! scan into an index-served plan.
 
 use snafu::prelude::*;

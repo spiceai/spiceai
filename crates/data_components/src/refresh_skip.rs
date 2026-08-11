@@ -106,7 +106,10 @@ pub async fn should_skip_refresh_for_table_provider(
     // Peel any layer stacked on the provider so the refresh-skip provider
     // beneath is still reached.
     if let Some(table) = any.downcast_ref::<spice_table::SpiceTable>() {
-        return Box::pin(should_skip_refresh_for_table_provider(table.below().as_ref())).await;
+        return Box::pin(should_skip_refresh_for_table_provider(
+            table.below().as_ref(),
+        ))
+        .await;
     }
 
     if let Some(adaptor) = any.downcast_ref::<FederatedTableProviderAdaptor>()
@@ -137,7 +140,10 @@ pub async fn reset_refresh_skip_state_for_table_provider(
     }
 
     if let Some(table) = any.downcast_ref::<spice_table::SpiceTable>() {
-        Box::pin(reset_refresh_skip_state_for_table_provider(table.below().as_ref())).await;
+        Box::pin(reset_refresh_skip_state_for_table_provider(
+            table.below().as_ref(),
+        ))
+        .await;
         return;
     }
 

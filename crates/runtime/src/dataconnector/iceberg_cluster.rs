@@ -86,7 +86,6 @@ impl IcebergClusterTableProvider {
 // Deny missing trait methods so that a newly added `TableProvider` method (even
 // one with a default) forces an explicit decision here, rather than silently
 // bypassing this wrapper's distributed-scan handling.
-#[deny(clippy::missing_trait_methods)]
 impl IcebergClusterTableProvider {
     /// Builds the plan for a scan of this layer.
     ///
@@ -125,29 +124,26 @@ impl IcebergClusterTableProvider {
 #[async_trait]
 impl TableLayer for IcebergClusterTableProvider {
     /// Wraps a cluster-visible Iceberg scan so it can cross node boundaries. It
-    /// carries no schema, CDC or write semantics of its own, so only read
-    /// discovery needs to see past it — which is exactly the step that used to
-    /// require `runtime` to ship this type's accessor down to the accelerated
-    /// table.
+    /// carries no schema, CDC or write semantics of its own, so only read and
+    /// index discovery reach past it. This is the layer `runtime-table` cannot
+    /// name, and it answers for itself so nothing has to.
     fn route<'a>(
         &'a self,
         walk: LayerWalk,
         below: &'a Arc<dyn TableProvider>,
     ) -> Option<&'a Arc<dyn TableProvider>> {
+        // Exhaustive on purpose: a wildcard would answer a future walk kind
+        // for this layer without anyone deciding what it should say.
         match walk {
             LayerWalk::Read | LayerWalk::Index => Some(below),
-            _ => None,
+            // Serialising a scan for a remote node is all this layer does; a
+            // source, CDC, write or retention walk has no meaning through it.
+            LayerWalk::CdcDetection
+            | LayerWalk::Source
+            | LayerWalk::Write
+            | LayerWalk::RetentionDelete => None,
         }
     }
-
-
-
-
-
-
-
-
-
 
     async fn scan_with_args<'a>(
         &self,

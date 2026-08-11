@@ -142,7 +142,8 @@ impl<E: TableProviderExplorer> SearchEngine<E> {
         let table_provider = self.df.get_table(tbl).await?;
         let mut embedding_columns: HashSet<String> = HashSet::default();
 
-        if let Some(embedding_table) = spice_table::find_layer::<EmbeddingTable>(table_provider.as_ref(),
+        if let Some(embedding_table) = spice_table::find_layer::<EmbeddingTable>(
+            table_provider.as_ref(),
             spice_table::LayerWalk::Read,
         ) {
             for c in embedding_table.get_embedding_columns() {
@@ -218,8 +219,9 @@ impl<E: TableProviderExplorer> SearchEngine<E> {
         #[cfg(feature = "elasticsearch")]
         {
             use search::index::compound::CompoundSearchIndex;
-            if let Some((compounds, _)) =
-                self.explorer.find_index::<CompoundSearchIndex>(&base_table_provider)
+            if let Some((compounds, _)) = self
+                .explorer
+                .find_index::<CompoundSearchIndex>(&base_table_provider)
                 && let Some(compound) = compounds
                     .into_iter()
                     .find(|c| Arc::new((*c).clone()).as_vector_index().is_none())
@@ -349,7 +351,8 @@ impl<E: TableProviderExplorer> SearchEngine<E> {
                 is_chunked,
             )))
         } else {
-            let Some(embedding_table) = spice_table::find_layer::<EmbeddingTable>(table_provider.as_ref(),
+            let Some(embedding_table) = spice_table::find_layer::<EmbeddingTable>(
+                table_provider.as_ref(),
                 spice_table::LayerWalk::Read,
             ) else {
                 return Err(Error::CannotVectorSearchDataset {

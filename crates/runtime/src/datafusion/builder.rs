@@ -2523,7 +2523,9 @@ mod tests {
         ))
         .into_table();
 
-        assert!(super::is_cayenne_accelerated_table_provider(provider.as_ref()));
+        assert!(super::is_cayenne_accelerated_table_provider(
+            provider.as_ref()
+        ));
     }
 
     /// Builds a full `DataFusion` instance and verifies the analyzer rules on
