@@ -295,7 +295,7 @@ async fn commit_overwrite_clears_all_per_snapshot_state() {
 
     let new_snapshot = uuid::Uuid::now_v7().to_string();
     catalog
-        .commit_overwrite(&table_id, &new_snapshot)
+        .commit_overwrite(&table_id, &new_snapshot, None)
         .await
         .expect("commit_overwrite happy path");
 
@@ -328,6 +328,105 @@ async fn commit_overwrite_clears_all_per_snapshot_state() {
 }
 
 // ============================================================================
+// Test 1b — inlined overwrite: the replacement rows are inserted by the SAME
+// transaction that clears the old inline corpus, so the table never observes
+// the new snapshot paired with the old rows (or with none at all).
+// ============================================================================
+#[tokio::test]
+async fn commit_overwrite_replaces_inlined_corpus_atomically() {
+    let (catalog, tmp) = fresh_catalog().await;
+    let (table_id, old_snapshot) =
+        create_test_table(&catalog, &tmp, "overwrite_replaces_inlined").await;
+
+    plant_full_pre_overwrite_state(&catalog, &table_id, &old_snapshot).await;
+    let before = probe_state(&catalog, &table_id, "overwrite_replaces_inlined").await;
+    assert_eq!(before.inlined_records, 3, "pre: 3 inlined records planted");
+
+    // The overwrite's own rows: a different row count and payload from the
+    // planted corpus, so a stale read is distinguishable from a correct one.
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(Int64Array::from(vec![10_i64, 20, 30, 40, 50]))],
+    )
+    .expect("batch");
+    let mut ipc = Vec::new();
+    {
+        let mut writer = StreamWriter::try_new(&mut ipc, &schema).expect("ipc writer");
+        writer.write(&batch).expect("write");
+        writer.finish().expect("finish");
+    }
+    let replacement = InlinedData {
+        inlined_id: uuid::Uuid::now_v7().to_string(),
+        table_id: table_id.clone(),
+        partition_key: None,
+        data_ipc: ipc,
+        record_count: 5,
+        sequence_number: 99,
+        created_at: String::new(),
+    };
+
+    let new_snapshot = uuid::Uuid::now_v7().to_string();
+    catalog
+        .commit_overwrite(&table_id, &new_snapshot, Some(&replacement))
+        .await
+        .expect("commit_overwrite with inline payload");
+
+    let after = probe_state(&catalog, &table_id, "overwrite_replaces_inlined").await;
+    assert_eq!(
+        after.inlined_records, 5,
+        "post: exactly the replacement rows remain — the old corpus was cleared and the new \
+         one inserted in the same transaction"
+    );
+    assert_eq!(after.current_snapshot_id, new_snapshot);
+    // Every other per-snapshot table is cleared exactly as on the file-backed path;
+    // carrying an inline payload must not preserve state keyed on the old snapshot.
+    assert_eq!(after.delete_files, 0);
+    assert_eq!(after.insert_records, 0);
+    assert_eq!(after.snapshot_sequences, 0);
+    assert_eq!(after.inlined_deletes, 0);
+    assert!(!after.has_table_stats);
+
+    // The surviving row is the replacement, not a survivor of the clear.
+    let rows = catalog
+        .get_inlined_data(&table_id)
+        .await
+        .expect("get_inlined_data");
+    assert_eq!(
+        rows.len(),
+        1,
+        "exactly one inline entry after the overwrite"
+    );
+    assert_eq!(rows[0].inlined_id, replacement.inlined_id);
+    assert_eq!(rows[0].sequence_number, 99);
+    assert_eq!(rows[0].data_ipc, replacement.data_ipc);
+
+    // A second inlined overwrite replaces the first — the tier must not accumulate
+    // one entry per refresh, which is what makes this safe to run on a schedule.
+    let second = InlinedData {
+        inlined_id: uuid::Uuid::now_v7().to_string(),
+        sequence_number: 120,
+        record_count: 2,
+        ..replacement.clone()
+    };
+    let third_snapshot = uuid::Uuid::now_v7().to_string();
+    catalog
+        .commit_overwrite(&table_id, &third_snapshot, Some(&second))
+        .await
+        .expect("second inlined overwrite");
+    let rows = catalog
+        .get_inlined_data(&table_id)
+        .await
+        .expect("get_inlined_data");
+    assert_eq!(
+        rows.len(),
+        1,
+        "each overwrite leaves exactly one inline entry"
+    );
+    assert_eq!(rows[0].inlined_id, second.inlined_id);
+}
+
+// ============================================================================
 // Test 2 — atomicity: commit_overwrite_in_txn against a transaction that
 // is rolled back must leave EVERY side table at its pre-call state.
 // Without bundling, a partial clear would persist any rows that the
@@ -349,7 +448,7 @@ async fn commit_overwrite_in_txn_rolls_back_atomically() {
             .expect("begin_transaction");
         let bogus_new_snapshot = uuid::Uuid::now_v7().to_string();
         catalog
-            .commit_overwrite_in_txn(&mut *txn, &table_id, &bogus_new_snapshot)
+            .commit_overwrite_in_txn(&mut *txn, &table_id, &bogus_new_snapshot, None)
             .await
             .expect("commit_overwrite_in_txn against borrowed txn");
 
@@ -380,7 +479,7 @@ async fn commit_overwrite_in_txn_rejects_invalid_uuid() {
         .expect("begin_transaction");
 
     let bad_table_id = catalog
-        .commit_overwrite_in_txn(&mut *txn, "'; DROP TABLE cayenne_table; --", "1234")
+        .commit_overwrite_in_txn(&mut *txn, "'; DROP TABLE cayenne_table; --", "1234", None)
         .await;
     assert!(
         bad_table_id.is_err(),
@@ -389,7 +488,7 @@ async fn commit_overwrite_in_txn_rejects_invalid_uuid() {
 
     let valid_table = uuid::Uuid::now_v7().to_string();
     let bad_snapshot = catalog
-        .commit_overwrite_in_txn(&mut *txn, &valid_table, "not-a-uuid")
+        .commit_overwrite_in_txn(&mut *txn, &valid_table, "not-a-uuid", None)
         .await;
     assert!(
         bad_snapshot.is_err(),
@@ -419,7 +518,7 @@ async fn commit_overwrite_isolated_by_table_id() {
 
     let new_snap_a = uuid::Uuid::now_v7().to_string();
     catalog
-        .commit_overwrite(&table_a, &new_snap_a)
+        .commit_overwrite(&table_a, &new_snap_a, None)
         .await
         .expect("commit_overwrite table_a");
 
@@ -454,7 +553,7 @@ async fn commit_overwrite_succeeds_on_empty_pre_state() {
     // No state planted — fresh table.
     let new_snapshot = uuid::Uuid::now_v7().to_string();
     catalog
-        .commit_overwrite(&table_id, &new_snapshot)
+        .commit_overwrite(&table_id, &new_snapshot, None)
         .await
         .expect("commit_overwrite on empty pre-state");
 
@@ -509,7 +608,7 @@ async fn commit_overwrite_clears_inlined_state_unlike_commit_compaction() {
         .await
         .expect("commit_compaction");
     catalog
-        .commit_overwrite(&overwrite_id, &new_overwrite_snap)
+        .commit_overwrite(&overwrite_id, &new_overwrite_snap, None)
         .await
         .expect("commit_overwrite");
 
@@ -587,11 +686,11 @@ async fn two_commit_overwrites_in_one_txn_both_apply() {
             .await
             .expect("begin_transaction");
         catalog
-            .commit_overwrite_in_txn(&mut *txn, &table_a, &new_a)
+            .commit_overwrite_in_txn(&mut *txn, &table_a, &new_a, None)
             .await
             .expect("commit_overwrite_in_txn table_a");
         catalog
-            .commit_overwrite_in_txn(&mut *txn, &table_b, &new_b)
+            .commit_overwrite_in_txn(&mut *txn, &table_b, &new_b, None)
             .await
             .expect("commit_overwrite_in_txn table_b");
         txn.commit().await.expect("shared txn commit");
@@ -646,14 +745,14 @@ async fn commit_overwrite_in_txn_partial_failure_rolls_back_full_bundle() {
         // committed yet).
         let new_a = uuid::Uuid::now_v7().to_string();
         catalog
-            .commit_overwrite_in_txn(&mut *txn, &table_a, &new_a)
+            .commit_overwrite_in_txn(&mut *txn, &table_a, &new_a, None)
             .await
             .expect("first call lands");
 
         // Second call against the same txn with an invalid UUID is
         // rejected at validation; the txn is still alive but tainted.
         let bad = catalog
-            .commit_overwrite_in_txn(&mut *txn, "not-a-uuid", "also-not-a-uuid")
+            .commit_overwrite_in_txn(&mut *txn, "not-a-uuid", "also-not-a-uuid", None)
             .await;
         assert!(bad.is_err(), "invalid UUID call must be rejected");
 

@@ -30,6 +30,30 @@ on:
 # for every PR and would serialise unrelated PRs against each other; the PR number is
 # the correct key. A `merge_group` event carries no `pull_request`, and its `github.ref`
 # is the unique `gh-readonly-queue/...` branch, so it falls through to a group of its own.
+#
+# DO NOT RE-RUN THIS CHECK TO CLEAR A FAILURE — toggle a label instead:
+#
+#   gh pr edit <N> --repo spiceai/spiceai --add-label area/quality
+#   gh pr edit <N> --repo spiceai/spiceai --remove-label area/quality
+#
+# Re-running a run of this workflow replays the `pull_request_target` event payload as it
+# was frozen when the run was first created, so the action re-reads the PR's labels, title
+# and assignees *as they were then*. A re-run therefore cannot observe the metadata fix
+# that discharged the failure — it can only reproduce it — and because the re-run's
+# check-run is the newest one on the SHA, the stale `failure` sorts on top of the genuine
+# `success` that followed the fix. On 2026-08-08 that took four PRs red in one 17-second
+# burst of re-runs, every one of which already carried an assignee and both required label
+# prefixes. It is also self-perpetuating for any automation that sweeps for red required
+# checks and re-runs them: the sweep sees red, re-runs, gets red, and the PR never recovers.
+#
+# The reflex is normally right, which is what makes this trap worth naming: lint, build and
+# test re-read the tree, so re-running them is correct. This gate reads *mutable PR
+# metadata* rather than commit content, so for it a re-run is not idempotent — it is a time
+# machine. The label toggle above mints a new check-run against the PR's current state,
+# which is the whole reason `labeled` and `unlabeled` are in the trigger list.
+#
+# The durable fix is for the action to read the PR from the API rather than the event
+# payload — tracked in #12805, which belongs in `spiceai/pulls-with-spice-action`.
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: false
