@@ -2392,6 +2392,7 @@ async fn an_unusable_existing_identity_refuses_to_redeem_the_key() {
     let mut identity = IdentityStore::load_optional(&config.identity_path)
         .expect("load identity")
         .expect("identity exists");
+    let gateway_addr = identity.gateway_addr.clone();
     identity.gateway_addr.clear();
     IdentityStore::store(&config.identity_path, &identity).expect("store unusable identity");
     let requests_before_recovery = harness.cloud.enroll_requests.lock().await.len();
@@ -2420,6 +2421,31 @@ async fn an_unusable_existing_identity_refuses_to_redeem_the_key() {
         harness.cloud.enroll_requests.lock().await.len(),
         requests_before_recovery,
         "an unusable identity must not cause implicit re-enrollment"
+    );
+
+    identity.gateway_addr = gateway_addr;
+    identity.private_key_pem = KeyPair::generate()
+        .expect("generate a mismatched identity key")
+        .serialize_pem();
+    IdentityStore::store(&config.identity_path, &identity)
+        .expect("store identity with mismatched credentials");
+
+    let err = enroll_now(
+        &config,
+        &token_authority(SECOND_ENROLLMENT_KEY),
+        test_retry(),
+    )
+    .await
+    .expect_err("mismatched identity credentials must fail closed");
+    assert!(
+        err.to_string()
+            .contains("certificate and private key do not match"),
+        "unexpected mismatch error: {err}"
+    );
+    assert_eq!(
+        harness.cloud.enroll_requests.lock().await.len(),
+        requests_before_recovery,
+        "mismatched identity credentials must not cause implicit re-enrollment"
     );
 }
 

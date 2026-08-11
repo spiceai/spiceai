@@ -1,3 +1,6 @@
+def token_syntax_pattern:
+  "(^|[[:space:];|&])[$`'\"\\\\]*--token[`'\"\\\\]*($|[=$[:space:];|&])";
+
 def token_matches($command):
   [
     range(0; $command | length) as $index
@@ -14,7 +17,7 @@ def embedded_token_syntax($command):
   [
     $command[]
     | select((. == "--token" or startswith("--token=")) | not)
-    | select(test("(^|[[:space:];|&])--token($|[=[:space:];|&])"))
+    | select(test(token_syntax_pattern))
   ];
 
 (. // {}) as $values

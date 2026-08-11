@@ -1,10 +1,13 @@
+def token_syntax_pattern:
+  "(^|[[:space:];|&])[$`'\"\\\\]*--token[`'\"\\\\]*($|[=$[:space:];|&])";
+
 def contains_token($container):
   (($container.command // []) + ($container.args // [])) as $command
   | ([$command[]? | select(. == "--token" or startswith("--token="))] | length > 0)
     or ([
       $command[]?
       | select((. == "--token" or startswith("--token=")) | not)
-      | select(test("(^|[[:space:];|&])--token($|[=[:space:];|&])"))
+      | select(test(token_syntax_pattern))
     ] | length > 0);
 
 def referenced_secret_names($pod):

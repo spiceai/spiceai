@@ -40,8 +40,7 @@ rand = { workspace = true }
 # Client-side keypair + PKCS#10 CSR generation for the enrollment flow.
 # Pin the aws_lc_rs backend (matching `crates/runtime`, which forces it via
 # feature unification in the spiced build) so key generation uses the same
-# backend in every build target; cert *parsing* / signing (x509-parser) is
-# only pulled in for the integration test server.
+# backend in every build target.
 rcgen = { version = "0.14", default-features = false, features = ["pem", "aws_lc_rs"] }
 # Out-of-band HTTPS enroll/renew against the cloud control plane.
 reqwest = { workspace = true }
@@ -54,6 +53,9 @@ tokio-stream = { workspace = true }
 tonic = { workspace = true }
 tonic-prost = "0.14"
 tracing = { workspace = true }
+# Parse the stored client leaf before honoring existing-identity precedence;
+# the leaf's public key must match the persisted private key.
+x509-parser = "0.18"
 # Enrollment operation IDs (`Idempotency-Key`) for retry-safe enrollment.
 uuid = { workspace = true, features = ["v4"] }
 # Key material and decrypted secret values are held in `Zeroizing` so a freed

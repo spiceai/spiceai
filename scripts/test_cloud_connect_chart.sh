@@ -108,6 +108,14 @@ expect_rejected "a shell-form token command" \
   --set-json "command=[\"/bin/sh\",\"-c\",\"spiced --token ${TEST_ENROLLMENT_KEY}\"]"
 expect_rejected "an env-wrapped shell-form token command" \
   --set-json "command=[\"/usr/bin/env\",\"sh\",\"-c\",\"spiced --token ${TEST_ENROLLMENT_KEY}\"]"
+expect_rejected "a quoted shell-form token command" \
+  --set-json 'command=["/bin/sh","-c","spiced '\''--token'\'' $(SPICE_ENROLL_KEY)"]'
+expect_rejected "a backslash-escaped shell-form token command" \
+  --set-json 'command=["/bin/sh","-c","spiced \\--token $(SPICE_ENROLL_KEY)"]'
+expect_rejected "an ANSI-C-quoted shell-form token command" \
+  --set-json 'command=["/bin/bash","-c","spiced $'\''--token'\'' $(SPICE_ENROLL_KEY)"]'
+expect_rejected "a quote-adjacent shell-form token command" \
+  --set-json 'command=["/bin/sh","-c","spiced '\''--token'\''$(SPICE_ENROLL_KEY)"]'
 expect_rejected "mixed direct and shell-form token commands" \
   --set-json 'command=["/bin/sh","-c","spiced --token literal","--token","$(SPICE_ENROLL_KEY)"]'
 expect_rejected "--token with no value" \
@@ -232,6 +240,30 @@ if printf '%s' "${wrapped_shell_token_values}" | jq -f "${TRANSITION_FILTER}" >/
 else
   pass "transition rejects env-wrapped shell-form token syntax before upgrade"
 fi
+quoted_shell_token_values='{"command":["/bin/sh","-c","spiced '\''--token'\'' $(ENROLLMENT)"],"additionalEnv":[{"name":"ENROLLMENT","valueFrom":{"secretKeyRef":{"name":"secret","key":"token"}}}]}'
+if printf '%s' "${quoted_shell_token_values}" | jq -f "${TRANSITION_FILTER}" >/dev/null 2>&1; then
+  fail "transition accepted quoted shell-form token syntax"
+else
+  pass "transition rejects quoted shell-form token syntax before upgrade"
+fi
+escaped_shell_token_values='{"command":["/bin/sh","-c","spiced \\--token $(ENROLLMENT)"],"additionalEnv":[{"name":"ENROLLMENT","valueFrom":{"secretKeyRef":{"name":"secret","key":"token"}}}]}'
+if printf '%s' "${escaped_shell_token_values}" | jq -f "${TRANSITION_FILTER}" >/dev/null 2>&1; then
+  fail "transition accepted backslash-escaped shell-form token syntax"
+else
+  pass "transition rejects backslash-escaped shell-form token syntax before upgrade"
+fi
+ansi_quoted_shell_token_values='{"command":["/bin/bash","-c","spiced $'\''--token'\'' $(ENROLLMENT)"],"additionalEnv":[{"name":"ENROLLMENT","valueFrom":{"secretKeyRef":{"name":"secret","key":"token"}}}]}'
+if printf '%s' "${ansi_quoted_shell_token_values}" | jq -f "${TRANSITION_FILTER}" >/dev/null 2>&1; then
+  fail "transition accepted ANSI-C-quoted shell-form token syntax"
+else
+  pass "transition rejects ANSI-C-quoted shell-form token syntax before upgrade"
+fi
+adjacent_quoted_shell_token_values='{"command":["/bin/sh","-c","spiced '\''--token'\''$(ENROLLMENT)"],"additionalEnv":[{"name":"ENROLLMENT","valueFrom":{"secretKeyRef":{"name":"secret","key":"token"}}}]}'
+if printf '%s' "${adjacent_quoted_shell_token_values}" | jq -f "${TRANSITION_FILTER}" >/dev/null 2>&1; then
+  fail "transition accepted quote-adjacent shell-form token syntax"
+else
+  pass "transition rejects quote-adjacent shell-form token syntax before upgrade"
+fi
 mixed_token_values='{"command":["/bin/sh","-c","spiced --token literal","--token","$(ENROLLMENT)"],"additionalEnv":[{"name":"ENROLLMENT","valueFrom":{"secretKeyRef":{"name":"secret","key":"token"}}}]}'
 if printf '%s' "${mixed_token_values}" | jq -f "${TRANSITION_FILTER}" >/dev/null 2>&1; then
   fail "transition accepted mixed direct and shell-form token syntax"
@@ -291,6 +323,34 @@ if printf '%s' "${wrapped_token_workload}" \
   fail "structured workload validation missed residual env-wrapped token syntax"
 else
   pass "structured workload validation detects env-wrapped token syntax"
+fi
+quoted_token_workload='{"spec":{"template":{"spec":{"containers":[{"command":["/bin/sh","-c","spiced '\''--token'\'' $(KEY)"]}]}}}}'
+if printf '%s' "${quoted_token_workload}" \
+  | jq -e --arg secret spice-cloud-connect -f "${WORKLOAD_FILTER}" >/dev/null; then
+  fail "structured workload validation missed quoted token syntax"
+else
+  pass "structured workload validation detects quoted token syntax"
+fi
+escaped_token_workload='{"spec":{"template":{"spec":{"containers":[{"command":["/bin/sh","-c","spiced \\--token $(KEY)"]}]}}}}'
+if printf '%s' "${escaped_token_workload}" \
+  | jq -e --arg secret spice-cloud-connect -f "${WORKLOAD_FILTER}" >/dev/null; then
+  fail "structured workload validation missed backslash-escaped token syntax"
+else
+  pass "structured workload validation detects backslash-escaped token syntax"
+fi
+ansi_quoted_token_workload='{"spec":{"template":{"spec":{"containers":[{"command":["/bin/bash","-c","spiced $'\''--token'\'' $(KEY)"]}]}}}}'
+if printf '%s' "${ansi_quoted_token_workload}" \
+  | jq -e --arg secret spice-cloud-connect -f "${WORKLOAD_FILTER}" >/dev/null; then
+  fail "structured workload validation missed ANSI-C-quoted token syntax"
+else
+  pass "structured workload validation detects ANSI-C-quoted token syntax"
+fi
+adjacent_quoted_token_workload='{"spec":{"template":{"spec":{"containers":[{"command":["/bin/sh","-c","spiced '\''--token'\''$(KEY)"]}]}}}}'
+if printf '%s' "${adjacent_quoted_token_workload}" \
+  | jq -e --arg secret spice-cloud-connect -f "${WORKLOAD_FILTER}" >/dev/null; then
+  fail "structured workload validation missed quote-adjacent token syntax"
+else
+  pass "structured workload validation detects quote-adjacent token syntax"
 fi
 incidental_token_workload='{"spec":{"template":{"spec":{"containers":[{"command":["spiced","--set-runtime","debug.flag=--token"]}]}}}}'
 if printf '%s' "${incidental_token_workload}" \

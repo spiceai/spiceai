@@ -81,6 +81,15 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end }}
 
 {{/*
+Canonical boundary detector for direct, quoted, and backslash-escaped
+`--token` shell syntax. Keep the same expression in the two transition jq
+filters under deploy/chart/examples/cloud-connect/.
+*/}}
+{{- define "spiceai.cloudConnectTokenSyntaxPattern" -}}
+(^|[[:space:];|&])[$`'"\\]*--token[`'"\\]*($|[=$[:space:];|&])
+{{- end -}}
+
+{{/*
 Whether the container command carries Cloud Connect `--token` syntax. Exact
 two-element (`--token`, `$(VAR)`) and single-element (`--token=$(VAR)`) forms
 are validated below; token syntax embedded in any other argument is detected
@@ -89,8 +98,9 @@ here and rejected there. The boundary excludes values such as
 */}}
 {{- define "spiceai.cloudConnectTokenBootstrap" -}}
 {{- $found := false -}}
+{{- $tokenSyntaxPattern := include "spiceai.cloudConnectTokenSyntaxPattern" . -}}
 {{- range .Values.command -}}
-{{- if or (eq . "--token") (hasPrefix "--token=" .) (regexMatch "(^|[[:space:];|&])--token($|[=[:space:];|&])" .) -}}
+{{- if or (eq . "--token") (hasPrefix "--token=" .) (regexMatch $tokenSyntaxPattern .) -}}
 {{- $found = true -}}
 {{- end -}}
 {{- end -}}
@@ -114,10 +124,11 @@ survive a pod replacement, so a command carrying `--token` requires:
 {{- if include "spiceai.cloudConnectTokenBootstrap" . -}}
 {{- $hasDirectTokenArg := false -}}
 {{- $hasUnsupportedTokenSyntax := false -}}
+{{- $tokenSyntaxPattern := include "spiceai.cloudConnectTokenSyntaxPattern" . -}}
 {{- range .Values.command -}}
 {{- if or (eq . "--token") (hasPrefix "--token=" .) -}}
 {{- $hasDirectTokenArg = true -}}
-{{- else if regexMatch "(^|[[:space:];|&])--token($|[=[:space:];|&])" . -}}
+{{- else if regexMatch $tokenSyntaxPattern . -}}
 {{- $hasUnsupportedTokenSyntax = true -}}
 {{- end -}}
 {{- end -}}

@@ -17129,6 +17129,7 @@ dependencies = [
  "tonic-prost-build",
  "tracing",
  "uuid 1.23.2",
+ "x509-parser 0.18.1",
  "zeroize",
 ]
 

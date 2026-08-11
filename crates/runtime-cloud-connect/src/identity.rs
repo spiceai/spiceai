@@ -37,7 +37,7 @@ limitations under the License.
 use std::path::{Path, PathBuf};
 
 use base64::Engine as _;
-use rcgen::{CertificateParams, DnType, ExtendedKeyUsagePurpose, KeyPair};
+use rcgen::{CertificateParams, DnType, ExtendedKeyUsagePurpose, KeyPair, PublicKeyData};
 use serde::{Deserialize, Serialize};
 use snafu::{ResultExt, Snafu};
 use zeroize::Zeroizing;
@@ -219,6 +219,26 @@ impl Identity {
         }
         if self.private_key_pem.trim().is_empty() {
             return Some("the client identity private key is empty");
+        }
+        let Ok(certificate_pem) = pem::parse(&self.identity_cert_pem) else {
+            return Some("the client identity certificate is not valid PEM");
+        };
+        if certificate_pem.tag() != "CERTIFICATE" {
+            return Some("the client identity certificate has an invalid PEM label");
+        }
+        let Ok((remaining, certificate)) =
+            x509_parser::prelude::parse_x509_certificate(certificate_pem.contents())
+        else {
+            return Some("the client identity certificate is not valid X.509");
+        };
+        if !remaining.is_empty() {
+            return Some("the client identity certificate has trailing DER data");
+        }
+        let Ok(private_key) = KeyPair::from_pem(&self.private_key_pem) else {
+            return Some("the client identity private key is not valid PKCS key material");
+        };
+        if certificate.public_key().raw != private_key.subject_public_key_info().as_slice() {
+            return Some("the client identity certificate and private key do not match");
         }
         if self.gateway_addr.trim().is_empty()
             && gateway_override.is_none_or(|endpoint| endpoint.trim().is_empty())
@@ -887,14 +907,16 @@ mod tests {
     use super::*;
 
     fn sample_identity() -> Identity {
+        let key_pair = KeyPair::generate().expect("generate sample identity key");
+        let certificate = CertificateParams::new(Vec::<String>::new())
+            .expect("build sample identity certificate parameters")
+            .self_signed(&key_pair)
+            .expect("sign sample identity certificate");
         Identity {
             identifier: "inst_test".to_string(),
-            identity_cert_pem: "-----BEGIN CERTIFICATE-----\nMOCK\n-----END CERTIFICATE-----\n"
-                .to_string(),
-            private_key_pem: "-----BEGIN PRIVATE KEY-----\nMOCK\n-----END PRIVATE KEY-----\n"
-                .to_string(),
-            public_key_pem: "-----BEGIN PUBLIC KEY-----\nMOCK\n-----END PUBLIC KEY-----\n"
-                .to_string(),
+            identity_cert_pem: certificate.pem(),
+            private_key_pem: key_pair.serialize_pem(),
+            public_key_pem: key_pair.public_key_pem(),
             ca_bundle_pem: "-----BEGIN CERTIFICATE-----\nMOCKCA\n-----END CERTIFICATE-----\n"
                 .to_string(),
             gateway_addr: "gateway.test.spice.ai:443".to_string(),
@@ -907,6 +929,44 @@ mod tests {
             enc_previous_private_key_pem: String::new(),
             cache_key_b64: String::new(),
         }
+    }
+
+    #[test]
+    fn reconnect_validation_accepts_a_matching_certificate_and_private_key() {
+        assert_eq!(sample_identity().reconnect_validation_error(None), None);
+    }
+
+    #[test]
+    fn reconnect_validation_rejects_malformed_certificate_and_private_key() {
+        let mut identity = sample_identity();
+        identity.identity_cert_pem =
+            "-----BEGIN CERTIFICATE-----\nnot-a-certificate\n-----END CERTIFICATE-----\n"
+                .to_string();
+        assert_eq!(
+            identity.reconnect_validation_error(None),
+            Some("the client identity certificate is not valid PEM")
+        );
+
+        let mut identity = sample_identity();
+        identity.private_key_pem =
+            "-----BEGIN PRIVATE KEY-----\nnot-a-private-key\n-----END PRIVATE KEY-----\n"
+                .to_string();
+        assert_eq!(
+            identity.reconnect_validation_error(None),
+            Some("the client identity private key is not valid PKCS key material")
+        );
+    }
+
+    #[test]
+    fn reconnect_validation_rejects_a_mismatched_private_key() {
+        let mut identity = sample_identity();
+        identity.private_key_pem = KeyPair::generate()
+            .expect("generate mismatched private key")
+            .serialize_pem();
+        assert_eq!(
+            identity.reconnect_validation_error(None),
+            Some("the client identity certificate and private key do not match")
+        );
     }
 
     #[test]
