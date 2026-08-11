@@ -473,14 +473,20 @@ impl PostgresSchemaProvider {
     ) -> Result<()> {
         let table_names = self.list_tables().await?;
 
-        // The bulk query describes every relation in the namespace, so it is the
-        // cheaper option only when every relation is wanted. Under a filter that
-        // keeps a few tables out of thousands, one selective query per selected
-        // table transfers far less than one query returning them all; with
-        // nothing selected, every row it returns is discarded.
+        // The bulk query describes every relation in the namespace, whatever the
+        // filter selects, so choosing it trades round trips for rows: one query
+        // carrying all of them against one query per selected table. Which is
+        // cheaper depends on how many are wanted -- near-total selection favours
+        // the single query even though it over-fetches slightly, while a
+        // handful out of thousands does not, and selecting nothing makes every
+        // row it returns discarded.
         //
-        // Resolving only the selected relations would remove the compromise, but
-        // that needs the source query to take their names.
+        // Rather than guess where the crossover lies, take the single query only
+        // where it cannot over-fetch at all, and resolve individually otherwise.
+        // That gives up the saving for a schema with one excluded table, which
+        // is the cost of not encoding a threshold here. Having the source query
+        // accept the selected names would remove the trade rather than pick a
+        // side of it.
         let all_selected =
             schema_is_fully_selected(&self.schema_name, &table_names, &self.selector);
 
@@ -608,11 +614,13 @@ enum SchemaRefreshOutcome {
 /// Whether every relation discovered in `schema_name` is selected.
 ///
 /// Decides between resolving the schema's columns in one query and resolving
-/// each selected table's individually. The bulk query describes every relation
-/// in the namespace, so it is only the cheaper option when every relation is
-/// wanted: under a filter keeping a few tables out of thousands, the selective
-/// per-table queries transfer far less, and with nothing selected every row it
-/// returns is discarded.
+/// each selected table's individually.
+///
+/// The single query describes every relation in the namespace regardless of the
+/// filter, so it is chosen only when nothing is filtered out and it therefore
+/// cannot fetch rows no one wants. Where some relations are excluded, whether it
+/// still wins depends on how many -- a threshold this deliberately does not
+/// guess.
 ///
 /// An empty schema is not "fully selected" -- there is nothing to resolve, so
 /// nothing to save.
@@ -1011,11 +1019,10 @@ mod tests {
     /// wanted, so the decision is pinned rather than left to inspection.
     ///
     /// The bulk query returns every relation in the namespace. Under a filter
-    /// that keeps most of them out, it would transfer thousands of table schemas
-    /// to build a handful of providers, where the per-table path fetches exactly
-    /// the ones asked for; with nothing selected, it would transfer the whole
-    /// namespace to build none. Neither shows up in the resulting catalog, which
-    /// is why it is asserted here.
+    /// that keeps most of them out it would transfer thousands of table schemas
+    /// to build a handful of providers, and with nothing selected it would
+    /// transfer the whole namespace to build none. Neither shows up in the
+    /// resulting catalog, which is why it is asserted here.
     #[test]
     fn schema_is_fully_selected_gates_the_bulk_query() {
         let tables = vec!["orders".to_string(), "lineitem".to_string()];
