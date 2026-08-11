@@ -1139,6 +1139,13 @@ impl ChangeBatch {
     /// a caller can retract from this batch alone; pairing each row with its `op`
     /// still tells it which rows are *meant* to retract.
     ///
+    /// So `op` is the only authority on what a row is. Do NOT infer the operation
+    /// from this batch: an all-null row means "the source sent no prior values"
+    /// *or* "every prior value was NULL", and the two are indistinguishable here
+    /// once the struct's validity has been pushed into the columns. `op` is
+    /// non-nullable in both change schemas precisely so this question never has
+    /// to be answered from the before-image.
+    ///
     /// Every field is reported nullable regardless of how the table declares it:
     /// a before-image is absent on insert, and a source may send only the key
     /// columns (`PostgreSQL` under `REPLICA IDENTITY DEFAULT` does exactly that),

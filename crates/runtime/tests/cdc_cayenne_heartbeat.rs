@@ -32,6 +32,7 @@ limitations under the License.
 //! tier, never because a heartbeat arrived.
 
 #![cfg(not(windows))]
+#![recursion_limit = "256"]
 #![allow(clippy::expect_used)]
 
 use std::sync::Arc;
