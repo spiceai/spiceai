@@ -706,6 +706,9 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
 ///
 /// Shared with [`crate::secret_cache`]: both files hold secret material and need
 /// the same guarantees — never world-readable, never observed half-written.
+/// The file contents and parent directory entry are both synchronized before
+/// success is reported, so a successful enrollment remains durable across a
+/// power loss after the atomic rename.
 #[cfg(unix)]
 pub(crate) fn atomic_write_owner_only(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write as _;
@@ -734,7 +737,8 @@ pub(crate) fn atomic_write_owner_only(path: &Path, bytes: &[u8]) -> std::io::Res
         file.sync_all()?;
         drop(file);
 
-        std::fs::rename(&tmp_path, path)
+        std::fs::rename(&tmp_path, path)?;
+        sync_parent_directory(path)
     })();
 
     if result.is_err() {
@@ -763,12 +767,29 @@ pub(crate) fn atomic_write_owner_only(path: &Path, bytes: &[u8]) -> std::io::Res
         file.write_all(bytes)?;
         file.sync_all()?;
         drop(file);
-        promote_temp(&tmp_path, path)
+        promote_temp(&tmp_path, path)?;
+        sync_parent_directory(path)
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(&tmp_path);
     }
     result
+}
+
+/// Synchronize the directory entry containing `path` after a rename, hard
+/// link, or removal. Synchronizing only the file contents does not make the
+/// directory metadata durable across power loss.
+#[cfg(unix)]
+pub(crate) fn sync_parent_directory(path: &Path) -> std::io::Result<()> {
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::File::open(dir)?.sync_all()
+}
+
+/// Windows does not expose a portable directory handle through `std::fs` that
+/// can be synchronized. File contents are still flushed before promotion.
+#[cfg(not(unix))]
+pub(crate) fn sync_parent_directory(_path: &Path) -> std::io::Result<()> {
+    Ok(())
 }
 
 /// Promote a freshly-written temp file into its final location on non-Unix
@@ -921,6 +942,17 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert!(leftovers.is_empty(), "temporary writes must be cleaned up");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_sync_surfaces_an_unopenable_parent() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join("missing-parent/identity.json");
+
+        let err = sync_parent_directory(&path).expect_err("missing parent cannot be synced");
+
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
     }
 
     #[test]

@@ -74,8 +74,8 @@ pub const RENEWAL_GRACE: Duration = Duration::from_hours(30 * 24);
 /// nobody is watching a prompt.
 pub const HEADLESS_RETRY_DEADLINE: Duration = Duration::from_mins(10);
 
-/// The retry deadline for interactive `spice connect` flows, where a
-/// person is waiting on the terminal.
+/// The retry deadline for interactive authenticated callers, where a person
+/// is waiting on the terminal.
 pub const INTERACTIVE_RETRY_DEADLINE: Duration = Duration::from_mins(2);
 
 /// Full-jitter backoff base: the first retry window.
@@ -94,8 +94,8 @@ pub fn past_renewal_grace(identity: &Identity) -> bool {
 
 /// A logged-in Spice Cloud session's bearer token, wrapped so it cannot
 /// leak through `Debug` and is wiped on drop. Constructed by callers that
-/// own a login session (the `spice connect` transaction); this crate only
-/// ever places it in the one `Authorization` header that uses it.
+/// own a login session; this crate only ever places it in the one
+/// `Authorization` header that uses it.
 #[derive(Clone)]
 pub struct SessionToken(Zeroizing<String>);
 
@@ -796,7 +796,7 @@ impl RetryPolicy {
     pub const HEADLESS: Self = Self {
         deadline: HEADLESS_RETRY_DEADLINE,
     };
-    /// The interactive `spice connect` policy.
+    /// The interactive authenticated-caller policy.
     pub const INTERACTIVE: Self = Self {
         deadline: INTERACTIVE_RETRY_DEADLINE,
     };

@@ -114,17 +114,21 @@ survive a pod replacement, so a command carrying `--token` requires:
 {{- fail "Cloud Connect --token bootstrap requires one replica and persistent Spice identity storage. Set replicaCount: 1 and stateful.enabled: true, and set SPICE_CONFIG_DIR beneath stateful.mountPath. See deploy/chart/examples/cloud-connect/." -}}
 {{- end -}}
 {{- $mount := clean (.Values.stateful.mountPath | default "") -}}
+{{- $configDirCount := 0 -}}
 {{- $configDirOk := false -}}
 {{- range .Values.additionalEnv -}}
-{{- if and (eq (get . "name") "SPICE_CONFIG_DIR") (get . "value") -}}
+{{- if eq (get . "name") "SPICE_CONFIG_DIR" -}}
+{{- $configDirCount = add1 $configDirCount -}}
+{{- if get . "value" -}}
 {{- $configDir := clean (get . "value") -}}
 {{- if and (ne $mount ".") (hasPrefix (printf "%s/" $mount) $configDir) -}}
 {{- $configDirOk = true -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}
-{{- if not $configDirOk -}}
-{{- fail "Cloud Connect --token bootstrap requires one replica and persistent Spice identity storage. Add an additionalEnv entry setting SPICE_CONFIG_DIR to a path beneath stateful.mountPath (for example /data/.spice under mountPath /data). See deploy/chart/examples/cloud-connect/." -}}
+{{- end -}}
+{{- if or (ne $configDirCount 1) (not $configDirOk) -}}
+{{- fail "Cloud Connect --token bootstrap requires one replica and persistent Spice identity storage. Add exactly one additionalEnv entry setting SPICE_CONFIG_DIR to a path beneath stateful.mountPath (for example /data/.spice under mountPath /data). See deploy/chart/examples/cloud-connect/." -}}
 {{- end -}}
 {{- $cmd := .Values.command -}}
 {{- $tokenArgCount := 0 -}}

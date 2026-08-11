@@ -199,9 +199,9 @@ impl CloudConnectConfig {
 
     /// Returns a config bootstrap from the environment.
     ///
-    /// Enrollment is driven explicitly (a `--token` bootstrap, or the
-    /// `spice connect` transaction); this config only locates state on disk
-    /// and the endpoints. The enroll endpoint defaults to
+    /// Enrollment is driven explicitly (a `--token` bootstrap, or a
+    /// caller-provided authenticated-session authority); this config only
+    /// locates state on disk and the endpoints. The enroll endpoint defaults to
     /// [`DEFAULT_ENDPOINT`]; override via the `SPICE_CLOUD_ENDPOINT` env
     /// var. The gateway (stream) endpoint normally comes from the enroll
     /// response; the `SPICE_CLOUD_GATEWAY_ENDPOINT` env var overrides it.

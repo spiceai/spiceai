@@ -24,7 +24,7 @@ limitations under the License.
 //!    one [`enroll::EnrollmentAuthority`]: a one-time `spice-enroll-`
 //!    enrollment key (`spiced --token`, parsed by
 //!    [`enrollment_key::EnrollmentKey`]), or a logged-in session enrolling
-//!    directly (the `spice connect` transaction).
+//!    directly through a caller-provided authenticated-session authority.
 //! 2. **State plane (out-of-band enroll)**: [`enroll::enroll_now`] loads or
 //!    creates the per-directory [`draft::EnrollmentDraft`] — provisional
 //!    ECDSA P-256 + X25519 key material and a stable enrollment operation

@@ -229,8 +229,19 @@ impl EnrollmentDraft {
         }
 
         match published {
-            Ok(()) => Ok(draft),
+            Ok(()) => {
+                crate::identity::sync_parent_directory(path).context(IoSnafu {
+                    path: path.to_path_buf(),
+                })?;
+                Ok(draft)
+            }
             Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {
+                // The losing writer removed its candidate from the same
+                // directory. Synchronize that final directory state before
+                // accepting and loading the winning operation.
+                crate::identity::sync_parent_directory(path).context(IoSnafu {
+                    path: path.to_path_buf(),
+                })?;
                 let contents = std::fs::read_to_string(path).context(IoSnafu {
                     path: path.to_path_buf(),
                 })?;

@@ -96,6 +96,8 @@ expect_rejected "SPICE_CONFIG_DIR escapes the stateful volume through traversal"
   --set-json 'additionalEnv=[{"name":"SPICE_ENROLL_KEY","valueFrom":{"secretKeyRef":{"name":"spice-cloud-connect","key":"enroll-key"}}},{"name":"SPICE_CONFIG_DIR","value":"/data/../var/lib/spice"}]'
 expect_rejected "SPICE_CONFIG_DIR missing entirely" \
   --set-json 'additionalEnv=[{"name":"SPICE_ENROLL_KEY","valueFrom":{"secretKeyRef":{"name":"spice-cloud-connect","key":"enroll-key"}}}]'
+expect_rejected "duplicate SPICE_CONFIG_DIR entries" \
+  --set-json 'additionalEnv=[{"name":"SPICE_ENROLL_KEY","valueFrom":{"secretKeyRef":{"name":"spice-cloud-connect","key":"enroll-key"}}},{"name":"SPICE_CONFIG_DIR","value":"/data/.spice"},{"name":"SPICE_CONFIG_DIR","value":"/var/lib/spice"}]'
 expect_rejected "a literal enrollment key in command" \
   --set-json "command=[\"/usr/local/bin/spiced\",\"--token\",\"${TEST_ENROLLMENT_KEY}\",\"--http\",\"0.0.0.0:8090\"]"
 expect_rejected "a literal enrollment key in --token= form" \

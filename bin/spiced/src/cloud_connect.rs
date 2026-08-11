@@ -122,10 +122,9 @@ pub(crate) fn is_configured(token_supplied: bool) -> bool {
         .exists()
 }
 
-/// Read the optional `cloud-endpoint` override file written by
-/// `spice connect <code> --endpoint <url>`. This overrides the cloud
-/// **enroll** endpoint (state plane); the gateway (stream) address comes
-/// from the enroll response.
+/// Read the optional instance-local `cloud-endpoint` override file. This
+/// overrides the cloud **enroll** endpoint (state plane); the gateway (stream)
+/// address comes from the enroll response.
 fn read_endpoint_override(config_dir: &Path) -> Option<String> {
     let path = config_dir.join("cloud-endpoint");
     std::fs::read_to_string(path)
