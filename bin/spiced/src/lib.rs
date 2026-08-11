@@ -16,7 +16,7 @@ limitations under the License.
 
 #![allow(clippy::missing_errors_doc)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -97,7 +97,7 @@ use connector_snowflake as _;
 #[cfg(feature = "spark")]
 use connector_spark as _;
 use connector_spiceai as _;
-use opentelemetry::{KeyValue, global};
+use opentelemetry::{Key, KeyValue, global};
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::metrics::SdkMeterProvider;
 use opentelemetry_sdk::metrics::periodic_reader_with_async_runtime::PeriodicReader;
@@ -1458,7 +1458,7 @@ fn init_metrics(
     if let Some(registry) = registry {
         let prometheus_exporter = opentelemetry_prometheus::exporter()
             .with_registry(registry)
-            .without_scope_info()
+            .with_resource_selector(HashSet::from([Key::new("service.instance.id")]))
             .without_units()
             .without_counter_suffixes()
             .without_target_info()

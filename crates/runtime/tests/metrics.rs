@@ -37,7 +37,7 @@ use std::{
 use app::AppBuilder;
 use cache::{metrics::CacheMetrics, result::query::CachedQueryResult};
 use futures::StreamExt;
-use opentelemetry::global;
+use opentelemetry::{Key, KeyValue, global};
 use opentelemetry_sdk::{Resource, metrics::SdkMeterProvider};
 use runtime::{Runtime, datafusion::query::QueryBuilder};
 use spicepod::component::runtime::{Query, Runtime as SpicepodRuntime, TaskHistory};
@@ -110,7 +110,9 @@ fn install_prometheus_meter_provider() -> prometheus::Registry {
 
     let exporter = opentelemetry_prometheus::exporter()
         .with_registry(registry.clone())
-        .without_scope_info()
+        .with_resource_selector(std::collections::HashSet::from([Key::new(
+            "service.instance.id",
+        )]))
         .without_units()
         .without_counter_suffixes()
         .without_target_info()
@@ -118,7 +120,14 @@ fn install_prometheus_meter_provider() -> prometheus::Registry {
         .expect("to build the prometheus exporter");
 
     let provider = SdkMeterProvider::builder()
-        .with_resource(Resource::builder().build())
+        .with_resource(
+            Resource::builder()
+                .with_attributes([KeyValue::new(
+                    "service.instance.id",
+                    "metrics-test-instance",
+                )])
+                .build(),
+        )
         .with_reader(exporter)
         .build();
     global::set_meter_provider(provider);
@@ -238,6 +247,56 @@ fn memory_gauges_are_exported_to_the_operator_metrics_pipeline() {
         "memory gauges {missing:?} were recorded but not exported to the Prometheus registry \
          (a gauge on the anonymous-telemetry meter never reaches /metrics); reported: {:?}",
         sorted(&reported)
+    );
+}
+
+#[test]
+fn process_cpu_time_is_exported_with_paired_modes_and_lifecycle_identity() {
+    let registry = &*PROMETHEUS;
+    telemetry::register_process_cpu_time_seconds();
+
+    let metric = registry
+        .gather()
+        .into_iter()
+        .find(|family| family.name() == "spiced_process_cpu_time_seconds")
+        .expect("process CPU time metric is exported");
+
+    assert_eq!(
+        metric.help(),
+        "CPU seconds used by spiced and its threads; excludes child processes, sidecars, cgroup peers, requests, and limits."
+    );
+    assert_eq!(
+        metric.get_field_type(),
+        prometheus::proto::MetricType::COUNTER
+    );
+    assert_eq!(metric.get_metric().len(), 2);
+
+    let modes: HashSet<(&str, &str)> = metric
+        .get_metric()
+        .iter()
+        .map(|sample| {
+            let cpu_mode = sample
+                .get_label()
+                .iter()
+                .find(|label| label.name() == "cpu_mode")
+                .expect("process CPU time sample has cpu_mode label")
+                .value();
+            let service_instance_id = sample
+                .get_label()
+                .iter()
+                .find(|label| label.name() == "service_instance_id")
+                .expect("process CPU time sample has lifecycle identity label")
+                .value();
+            (cpu_mode, service_instance_id)
+        })
+        .collect();
+
+    assert_eq!(
+        modes,
+        HashSet::from([
+            ("user", "metrics-test-instance"),
+            ("system", "metrics-test-instance"),
+        ])
     );
 }
 

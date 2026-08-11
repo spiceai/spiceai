@@ -378,14 +378,22 @@ pub fn register_process_cpu_time_seconds() {
 
 fn warn_process_cpu_time_collection_failure(error: &str) {
     let mut last_warning = PROCESS_CPU_TIME_LAST_WARNING.lock();
-    if last_warning.is_none_or(|last| last.elapsed() >= Duration::from_mins(1)) {
+    let now = Instant::now();
+    if should_warn_process_cpu_time_collection_failure(last_warning.as_ref(), now) {
         tracing::warn!(
             metric = "spiced_process_cpu_time_seconds",
             error,
             "Process CPU metric collection failed; omitted paired observations"
         );
-        *last_warning = Some(Instant::now());
+        *last_warning = Some(now);
     }
+}
+
+fn should_warn_process_cpu_time_collection_failure(
+    last_warning: Option<&Instant>,
+    now: Instant,
+) -> bool {
+    last_warning.is_none_or(|last| now.duration_since(*last) >= Duration::from_mins(1))
 }
 
 fn process_cpu_time_seconds() -> Result<(f64, f64), String> {
@@ -421,6 +429,55 @@ fn timeval_to_seconds(time: libc::timeval) -> Result<f64, String> {
         ));
     }
     Ok(time.tv_sec as f64 + time.tv_usec as f64 / 1_000_000.0)
+}
+
+#[cfg(test)]
+mod process_cpu_time_tests {
+    use super::*;
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn timeval_conversion_preserves_seconds_and_microseconds() {
+        let seconds = timeval_to_seconds(libc::timeval {
+            tv_sec: 42,
+            tv_usec: 700_000,
+        })
+        .expect("valid timeval converts to seconds");
+
+        assert!((seconds - 42.7).abs() < f64::EPSILON);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn timeval_conversion_rejects_invalid_values() {
+        let negative_seconds = timeval_to_seconds(libc::timeval {
+            tv_sec: -1,
+            tv_usec: 0,
+        });
+        let invalid_microseconds = timeval_to_seconds(libc::timeval {
+            tv_sec: 0,
+            tv_usec: 1_000_000,
+        });
+
+        negative_seconds.expect_err("negative seconds are invalid");
+        invalid_microseconds.expect_err("microseconds outside one second are invalid");
+    }
+
+    #[test]
+    fn process_cpu_time_failure_warning_is_limited_to_one_per_minute() {
+        let now = Instant::now();
+        let later = now + Duration::from_mins(1);
+
+        assert!(should_warn_process_cpu_time_collection_failure(None, now));
+        assert!(!should_warn_process_cpu_time_collection_failure(
+            Some(&now),
+            now
+        ));
+        assert!(should_warn_process_cpu_time_collection_failure(
+            Some(&now),
+            later
+        ));
+    }
 }
 
 /// Records the process's resident set size — the number the kernel's OOM
