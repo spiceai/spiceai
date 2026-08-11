@@ -119,7 +119,7 @@ pub mod metrics_reader;
 mod metrics_server;
 pub mod model;
 mod object_store_state;
-mod opentelemetry;
+pub mod opentelemetry;
 pub mod otel_push_exporter;
 // Host/container resource introspection lives in `runtime-resources`; it names
 // nothing from the runtime. Re-exported so `crate::resource_monitor::…` resolves.
