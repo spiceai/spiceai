@@ -17,8 +17,10 @@
 #
 # Idempotent: re-running against an already-transitioned release re-applies
 # the same connected values and treats an already-deleted Secret as success.
-# The installed command and environment arrays are filtered so every custom
-# entry other than the token argument and its matching env remains installed.
+# If another Secret has since reused the remembered name, the rerun refuses to
+# delete it unless SPICE_SECRET_NAME explicitly confirms that exact name. The
+# installed command and environment arrays are filtered so every custom entry
+# other than the token argument and its matching env remains installed.
 #
 # Usage:
 #   transition-to-connected.sh <release> [namespace]
@@ -26,7 +28,9 @@
 # Environment:
 #   SPICE_CHART        Chart path or name (default: deploy/chart)
 #   SPICE_SECRET_NAME  Optional expected bootstrap Secret name. Normally
-#                      derived from the installed secretKeyRef.
+#                      derived from the installed secretKeyRef; on a token-free
+#                      rerun, explicitly setting it confirms deletion if a
+#                      Secret has reused the remembered name.
 #   SPICE_WAIT_TIMEOUT Per-step wait budget as positive integer seconds
 #                      with an `s` suffix (default: 600s)
 
@@ -100,6 +104,24 @@ SECRET_NAME="${DERIVED_SECRET_NAME:-${REQUESTED_SECRET_NAME}}"
 if [ -z "${SECRET_NAME}" ]; then
   echo "error: the installed release has no token Secret reference or recovery marker; set SPICE_SECRET_NAME to the exact bootstrap Secret name before retrying; no upgrade was performed" >&2
   exit 1
+fi
+HAD_TOKEN_REFERENCE="$(jq -r '.hadTokenReference' "${TRANSITION_PLAN}")"
+case "${HAD_TOKEN_REFERENCE}" in
+  true|false) ;;
+  *)
+    echo "error: the derived connected-values plan has no valid token-reference provenance; no upgrade was performed" >&2
+    exit 1
+    ;;
+esac
+if [ "${HAD_TOKEN_REFERENCE}" = false ] && [ -z "${REQUESTED_SECRET_NAME}" ]; then
+  if ! EXISTING_SECRET="$(kubectl -n "${NAMESPACE}" get secret "${SECRET_NAME}" --ignore-not-found -o name)"; then
+    echo "error: failed to verify whether the remembered Secret name '${SECRET_NAME}' currently exists; not deleting any Secret and no upgrade was performed" >&2
+    exit 1
+  fi
+  if [ -n "${EXISTING_SECRET}" ]; then
+    echo "error: the release is already token-free, so its remembered Secret name '${SECRET_NAME}' cannot authorize deletion of a currently existing Secret; set SPICE_SECRET_NAME='${SECRET_NAME}' to explicitly confirm that deletion, or remove/rename the unrelated Secret; no upgrade was performed" >&2
+    exit 1
+  fi
 fi
 
 log "step 2/4: upgrading '${RELEASE}' with token-free installed values (removes --token and the ${SECRET_NAME} Secret reference, keeps all other values)"

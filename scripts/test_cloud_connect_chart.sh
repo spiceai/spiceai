@@ -195,7 +195,10 @@ if transition_plan="$(printf '%s' "${installed_values}" | jq -f "${TRANSITION_FI
   else
     fail "transition dropped a custom command or environment value: ${connected_values}"
   fi
-  if printf '%s' "${transition_plan}" | jq -e '.bootstrapSecretName == "spice-cloud-connect"' >/dev/null; then
+  if printf '%s' "${transition_plan}" | jq -e '
+    .bootstrapSecretName == "spice-cloud-connect"
+    and .hadTokenReference == true
+  ' >/dev/null; then
     pass "transition derives the exact installed Secret name"
   else
     fail "transition did not derive the installed Secret name: ${transition_plan}"
@@ -203,7 +206,10 @@ if transition_plan="$(printf '%s' "${installed_values}" | jq -f "${TRANSITION_FI
   second_plan="$(printf '%s' "${connected_values}" | jq -f "${TRANSITION_FILTER}")"
   second_values="$(printf '%s' "${second_plan}" | jq '.values')"
   if [ "$(printf '%s' "${connected_values}" | jq -S -c .)" = "$(printf '%s' "${second_values}" | jq -S -c .)" ] \
-    && printf '%s' "${second_plan}" | jq -e '.bootstrapSecretName == "spice-cloud-connect"' >/dev/null; then
+    && printf '%s' "${second_plan}" | jq -e '
+      .bootstrapSecretName == "spice-cloud-connect"
+      and .hadTokenReference == false
+    ' >/dev/null; then
     pass "connected-value filtering is idempotent"
   else
     fail "connected-value filtering changed an already-connected release or forgot its Secret: ${second_plan}"
@@ -399,6 +405,68 @@ elif echo "${output}" | grep -q "set SPICE_SECRET_NAME to the exact bootstrap Se
   pass "transition refuses to guess a Secret for an unmarked token-free release"
 else
   fail "transition did not fail safely for an unmarked token-free release: ${output}"
+fi
+TRANSITION_TEST_INSTALLED_VALUES="${connected_values}"
+kubectl() {
+  if printf '%s\n' "$*" | grep -q ' wait '; then
+    return 0
+  fi
+  if printf '%s\n' "$*" | grep -q ' get secret spice-cloud-connect --ignore-not-found -o name'; then
+    printf '%s\n' 'secret/spice-cloud-connect'
+    return 0
+  fi
+  return 99
+}
+export -f kubectl
+if output="$(bash "${TRANSITION}" test default 2>&1)"; then
+  fail "a token-free rerun deleted a Secret using only its remembered name"
+elif echo "${output}" | grep -q "remembered Secret name 'spice-cloud-connect' cannot authorize deletion"; then
+  pass "a token-free recovery marker cannot delete a newly same-named Secret"
+else
+  fail "token-free Secret provenance failed for the wrong reason: ${output}"
+fi
+kubectl() {
+  if printf '%s\n' "$*" | grep -q ' wait '; then
+    return 0
+  fi
+  return 99
+}
+export -f kubectl
+if output="$(bash "${TRANSITION}" test default 2>&1)"; then
+  fail "a token-free rerun continued when Secret provenance could not be checked"
+elif echo "${output}" | grep -q "failed to verify whether the remembered Secret name 'spice-cloud-connect' currently exists"; then
+  pass "a failed Secret provenance lookup prevents upgrade and deletion"
+else
+  fail "failed Secret provenance lookup was not fail-closed: ${output}"
+fi
+helm() {
+  if [ "${1:-} ${2:-}" = "get values" ]; then
+    printf '%s\n' "${TRANSITION_TEST_INSTALLED_VALUES}"
+  elif [ "${1:-}" = "upgrade" ]; then
+    echo "MOCK_HELM_UPGRADE_REACHED" >&2
+    return 99
+  else
+    return 99
+  fi
+}
+kubectl() {
+  if printf '%s\n' "$*" | grep -q ' wait '; then
+    return 0
+  fi
+  if printf '%s\n' "$*" | grep -q ' get secret spice-cloud-connect --ignore-not-found -o name'; then
+    printf '%s\n' 'secret/spice-cloud-connect'
+    return 0
+  fi
+  return 99
+}
+export -f helm kubectl
+if output="$(SPICE_SECRET_NAME=spice-cloud-connect bash "${TRANSITION}" test default 2>&1)"; then
+  fail "the explicit Secret confirmation mock unexpectedly completed the transition"
+elif echo "${output}" | grep -q 'MOCK_HELM_UPGRADE_REACHED' \
+  && ! echo "${output}" | grep -q 'cannot authorize deletion'; then
+  pass "an exact SPICE_SECRET_NAME explicitly authorizes a token-free rerun"
+else
+  fail "an exact SPICE_SECRET_NAME did not pass the provenance guard: ${output}"
 fi
 unset -f helm kubectl
 unset TRANSITION_TEST_INSTALLED_VALUES

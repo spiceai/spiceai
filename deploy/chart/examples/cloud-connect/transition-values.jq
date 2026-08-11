@@ -41,7 +41,8 @@ def embedded_token_syntax($command):
           bootstrapSecretName: $remembered_secret
         })
       },
-      bootstrapSecretName: $remembered_secret
+      bootstrapSecretName: $remembered_secret,
+      hadTokenReference: false
     }
   else
     $matches[0] as $match
@@ -74,7 +75,8 @@ def embedded_token_syntax($command):
                   bootstrapSecretName: $installed_secret
                 })
               },
-              bootstrapSecretName: $installed_secret
+              bootstrapSecretName: $installed_secret,
+              hadTokenReference: true
             }
               end
           end
