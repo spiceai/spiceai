@@ -104,8 +104,9 @@ survive a pod replacement, so a command carrying `--token` requires:
     workload and is accepted),
   - stateful persistent storage,
   - SPICE_CONFIG_DIR set to a literal path beneath the stateful mountPath,
-  - the token argument to be an env expansion `$(VAR)` (normally from a
-    Secret) — never a literal key baked into a chart value.
+  - exactly one token argument expanding `$(VAR)`, with exactly one matching
+    `additionalEnv` entry backed by a non-empty Secret name and key — never a
+    literal key baked into a chart value or environment value.
 */}}
 {{- define "spiceai.validateCloudConnectBootstrap" -}}
 {{- if include "spiceai.cloudConnectTokenBootstrap" . -}}
@@ -126,8 +127,11 @@ survive a pod replacement, so a command carrying `--token` requires:
 {{- fail "Cloud Connect --token bootstrap requires one replica and persistent Spice identity storage. Add an additionalEnv entry setting SPICE_CONFIG_DIR to a path beneath stateful.mountPath (for example /data/.spice under mountPath /data). See deploy/chart/examples/cloud-connect/." -}}
 {{- end -}}
 {{- $cmd := .Values.command -}}
+{{- $tokenArgCount := 0 -}}
+{{- $tokenEnvName := "" -}}
 {{- range $i, $arg := $cmd -}}
 {{- if eq $arg "--token" -}}
+{{- $tokenArgCount = add1 $tokenArgCount -}}
 {{- $next := "" -}}
 {{- if lt (add1 $i) (len $cmd) -}}
 {{- $next = index $cmd (add1 $i) -}}
@@ -135,13 +139,34 @@ survive a pod replacement, so a command carrying `--token` requires:
 {{- if not (regexMatch "^\\$\\([A-Za-z_][A-Za-z0-9_]*\\)$" $next) -}}
 {{- fail "Cloud Connect --token must expand an environment variable (for example \"$(SPICE_ENROLL_KEY)\" from a Kubernetes Secret) — no chart value accepts a literal enrollment key. See deploy/chart/examples/cloud-connect/." -}}
 {{- end -}}
+{{- $tokenEnvName = trimSuffix ")" (trimPrefix "$(" $next) -}}
 {{- end -}}
 {{- if hasPrefix "--token=" $arg -}}
+{{- $tokenArgCount = add1 $tokenArgCount -}}
 {{- $value := trimPrefix "--token=" $arg -}}
 {{- if not (regexMatch "^\\$\\([A-Za-z_][A-Za-z0-9_]*\\)$" $value) -}}
 {{- fail "Cloud Connect --token must expand an environment variable (for example \"$(SPICE_ENROLL_KEY)\" from a Kubernetes Secret) — no chart value accepts a literal enrollment key. See deploy/chart/examples/cloud-connect/." -}}
 {{- end -}}
+{{- $tokenEnvName = trimSuffix ")" (trimPrefix "$(" $value) -}}
 {{- end -}}
+{{- end -}}
+{{- if ne $tokenArgCount 1 -}}
+{{- fail "Cloud Connect --token bootstrap requires exactly one --token argument. See deploy/chart/examples/cloud-connect/." -}}
+{{- end -}}
+{{- $matchingEnvCount := 0 -}}
+{{- $secretEnvCount := 0 -}}
+{{- range .Values.additionalEnv -}}
+{{- if eq (get . "name") $tokenEnvName -}}
+{{- $matchingEnvCount = add1 $matchingEnvCount -}}
+{{- $valueFrom := (get . "valueFrom") | default dict -}}
+{{- $secretKeyRef := (get $valueFrom "secretKeyRef") | default dict -}}
+{{- if and (not (hasKey . "value")) (get $secretKeyRef "name") (get $secretKeyRef "key") -}}
+{{- $secretEnvCount = add1 $secretEnvCount -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- if or (ne $matchingEnvCount 1) (ne $secretEnvCount 1) -}}
+{{- fail (printf "Cloud Connect --token environment variable %s requires exactly one matching additionalEnv entry backed by valueFrom.secretKeyRef with a non-empty name and key; literal env values are forbidden. See deploy/chart/examples/cloud-connect/." $tokenEnvName) -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}

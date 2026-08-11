@@ -42,7 +42,10 @@ limitations under the License.
 //! HTTP status contract (both endpoints): 4xx responses other than 408/429
 //! are authoritative rejections ([`Error::Denied`]) — retrying the same
 //! request cannot succeed — while 408, 429, 5xx, and transport failures
-//! are transient ([`Error::Unavailable`]) and retried with backoff.
+//! are transient and retried with backoff. Successful response bodies that
+//! cannot be read or decoded are also retryable because an unframed partial
+//! body is indistinguishable from response loss; decoded-but-invalid response
+//! fields are terminal under the operation's idempotency key.
 
 use std::time::Duration;
 
@@ -220,6 +223,12 @@ pub enum Error {
     #[snafu(display("Failed to reach the Spice Cloud endpoint {url}: {source}"))]
     Http { url: String, source: reqwest::Error },
 
+    #[snafu(display("Failed to read the Spice Cloud response from {url}: {source}"))]
+    ResponseBody { url: String, source: reqwest::Error },
+
+    #[snafu(display("Failed to decode the Spice Cloud response from {url}: {reason}"))]
+    ResponseDecode { url: String, reason: String },
+
     #[snafu(display(
         "Failed to reach the Spice Cloud endpoint {url}: its TLS certificate was rejected as \
          outside its validity period, which almost always means this host's clock is wrong: \
@@ -271,8 +280,11 @@ impl Error {
 
     /// `true` when retrying the same enrollment operation cannot produce a
     /// different outcome. A denied request is authoritative, while a malformed
-    /// successful response is committed under the operation's idempotency key
-    /// and will therefore replay the same unusable body.
+    /// decoded successful response with invalid required fields is committed
+    /// under the operation's idempotency key and will therefore replay the same
+    /// unusable semantics. Body transport and JSON decode failures remain
+    /// retryable because an unframed partial body is indistinguishable from
+    /// response loss.
     #[must_use]
     pub fn is_terminal_enrollment_failure(&self) -> bool {
         matches!(self, Error::Denied { .. } | Error::InvalidResponse { .. })
@@ -300,7 +312,7 @@ impl Error {
 /// cloud `instances` registry row. `fingerprint` is the stable machine
 /// identity: re-enrolling the same host lands on its existing row instead
 /// of minting a duplicate.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct InstanceFacts {
     pub fingerprint: String,
     pub hostname: String,
@@ -678,13 +690,20 @@ impl EnrollClient {
 
         let status = response.status();
         if status.is_success() {
-            return response
-                .json::<Resp>()
+            let body = response
+                .bytes()
                 .await
-                .map_err(|source| Error::InvalidResponse {
+                .map_err(|source| Error::ResponseBody {
                     url: url.to_string(),
-                    reason: format!("failed to decode response body: {source}"),
-                });
+                    source,
+                })?;
+            return serde_json::from_slice::<Resp>(&body).map_err(|source| {
+                let reason = format!("failed to decode response body: {source}");
+                Error::ResponseDecode {
+                    url: url.to_string(),
+                    reason: redact_sensitive(&reason, sensitive),
+                }
+            });
         }
 
         let retry_after = parse_retry_after(response.headers());
@@ -914,6 +933,9 @@ pub enum EnrollNowError {
 fn denial_remediation(source: &Error) -> &'static str {
     match source {
         Error::Denied { code, .. } => code.remediation(),
+        Error::InvalidResponse { .. } => {
+            "Spice Cloud returned unusable data for this pending operation. Preserve enrollment-draft.json and contact Spice Cloud support before removing it or starting a new enrollment"
+        }
         _ => "Fix the reported problem and retry",
     }
 }
@@ -970,7 +992,8 @@ pub enum EnrollNowOutcome {
 ///    function returning.
 ///
 /// The enrollment key is never persisted anywhere by this flow; only the
-/// provisional key material and the operation ID are (in the draft).
+/// provisional key material, operation ID, and non-secret retry-stable request
+/// facts are (in the draft).
 ///
 /// # Errors
 ///
@@ -1035,10 +1058,13 @@ pub async fn enroll_now(
         });
     }
 
+    let facts = InstanceFacts::gather(&config.runtime_version);
     let config_dir = config.config_dir.clone();
+    let draft_facts = facts.clone();
+    let draft_region = config.instance_region.clone();
     let draft = tokio::task::spawn_blocking({
         let config_dir = config_dir.clone();
-        move || EnrollmentDraft::load_or_create(&config_dir)
+        move || EnrollmentDraft::load_or_create(&config_dir, &draft_facts, draft_region.as_deref())
     })
     .await
     .unwrap_or_else(|join| {
@@ -1050,7 +1076,6 @@ pub async fn enroll_now(
     .context(DraftSnafu)?;
 
     let client = EnrollClient::new(config).context(ClientSnafu)?;
-    let facts = InstanceFacts::gather(&config.runtime_version);
     let material = draft.material();
 
     let outcome = retry_until_deadline(retry, || {
@@ -1058,8 +1083,8 @@ pub async fn enroll_now(
             authority,
             &draft.enrollment_operation_id,
             &material,
-            &facts,
-            config.instance_region.as_deref(),
+            &draft.instance,
+            draft.region.as_deref(),
         )
     })
     .await?;
@@ -1174,11 +1199,11 @@ pub(crate) fn parse_not_after(url: &str, value: &str) -> Result<u64> {
     let parsed =
         chrono::DateTime::parse_from_rfc3339(value).map_err(|source| Error::InvalidResponse {
             url: url.to_string(),
-            reason: format!("invalid not_after timestamp {value:?}: {source}"),
+            reason: format!("invalid not_after timestamp: {source}"),
         })?;
     u64::try_from(parsed.timestamp()).map_err(|_| Error::InvalidResponse {
         url: url.to_string(),
-        reason: format!("not_after timestamp {value:?} is before the Unix epoch"),
+        reason: "not_after timestamp is before the Unix epoch".to_string(),
     })
 }
 
@@ -1353,6 +1378,179 @@ mod tests {
         assert!(
             skew.to_string().contains("clock"),
             "the message must name the clock: {skew}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_truncated_success_body_is_retryable_response_loss() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let address = listener.local_addr().expect("test server address");
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept request");
+            let mut request = [0_u8; 4096];
+            let _ = socket.read(&mut request).await.expect("read request");
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 128\r\nConnection: close\r\n\r\n{\"instance_id\":\"partial",
+                )
+                .await
+                .expect("write truncated response");
+        });
+
+        let base = format!("http://{address}");
+        let url = format!("{base}/truncated");
+        let client = EnrollClient::new(&test_config(&base)).expect("client");
+        let request = client.http.get(&url);
+        let err = client
+            .send::<serde_json::Value>(&url, request, None)
+            .await
+            .expect_err("a short body must fail");
+        server.await.expect("test server task");
+
+        assert!(matches!(err, Error::ResponseBody { .. }), "{err}");
+        assert!(
+            !err.is_terminal_enrollment_failure(),
+            "an incomplete response can succeed when the operation is replayed"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unframed_partial_success_body_is_retryable_response_loss() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let address = listener.local_addr().expect("test server address");
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept request");
+            let mut request = [0_u8; 4096];
+            let _ = socket.read(&mut request).await.expect("read request");
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"instance_id\":\"partial",
+                )
+                .await
+                .expect("write unframed partial response");
+        });
+
+        let base = format!("http://{address}");
+        let url = format!("{base}/unframed-partial");
+        let client = EnrollClient::new(&test_config(&base)).expect("client");
+        let request = client.http.get(&url);
+        let Err(err) = client.send::<EnrollResponseWire>(&url, request, None).await else {
+            panic!("an incomplete JSON body must fail");
+        };
+        server.await.expect("test server task");
+
+        assert!(matches!(err, Error::ResponseDecode { .. }), "{err}");
+        assert!(
+            !err.is_terminal_enrollment_failure(),
+            "an unframed partial response must replay within the retry budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_success_decode_error_redacts_the_enrollment_authority() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let token = format!("spice-enroll-{}", "S".repeat(32));
+        let body = serde_json::to_string(&token).expect("encode echoed token");
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let address = listener.local_addr().expect("test server address");
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept request");
+            let mut request = [0_u8; 4096];
+            let _ = socket.read(&mut request).await.expect("read request");
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("write echoed response");
+        });
+
+        let base = format!("http://{address}");
+        let url = format!("{base}/echo");
+        let client = EnrollClient::new(&test_config(&base)).expect("client");
+        let request = client.http.get(&url);
+        let Err(err) = client
+            .send::<EnrollResponseWire>(&url, request, Some(&token))
+            .await
+        else {
+            panic!("a string is not an enrollment response");
+        };
+        server.await.expect("test server task");
+
+        let rendered = err.to_string();
+        assert!(!rendered.contains(&token), "decode error leaked the key");
+        assert!(rendered.contains("[REDACTED]"), "{rendered}");
+        assert!(matches!(err, Error::ResponseDecode { .. }));
+    }
+
+    #[tokio::test]
+    async fn a_success_semantic_error_never_reproduces_the_enrollment_authority() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let token = format!("spice-enroll-{}", "A".repeat(32));
+        let body = serde_json::json!({
+            "instance_id": "inst_test",
+            "identity_cert_pem": "certificate",
+            "ca_bundle_pem": "ca",
+            "gateway_addr": "gateway.test:443",
+            "not_after": token.clone(),
+            "organization": {"id": 42, "name": "acme"}
+        })
+        .to_string();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let address = listener.local_addr().expect("test server address");
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept request");
+            let mut request = [0_u8; 4096];
+            let _ = socket.read(&mut request).await.expect("read request");
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("write semantic-error response");
+        });
+
+        let base = format!("http://{address}");
+        let client = EnrollClient::new(&test_config(&base)).expect("client");
+        let authority = EnrollmentAuthority::Token {
+            key: EnrollmentKey::parse(&token).expect("valid enrollment key"),
+            expected_org: None,
+        };
+        let material = IdentityStore::generate_enrollment().expect("enrollment material");
+        let Err(err) = client
+            .enroll(&authority, "test-operation", &material, &test_facts(), None)
+            .await
+        else {
+            panic!("the echoed authority is not a timestamp");
+        };
+        server.await.expect("test server task");
+
+        let rendered = EnrollNowError::Rejected { source: err }.to_string();
+        assert!(
+            !rendered.contains(&token),
+            "semantic response error leaked the key: {rendered}"
+        );
+        assert!(
+            rendered.contains("invalid not_after timestamp"),
+            "{rendered}"
         );
     }
 
@@ -1563,6 +1761,34 @@ mod tests {
         }
     }
 
+    #[test]
+    fn retry_after_accepts_a_future_http_date() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        let future = chrono::Utc::now() + chrono::TimeDelta::minutes(5);
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            reqwest::header::HeaderValue::from_str(&future.to_rfc2822())
+                .expect("valid HTTP-date header"),
+        );
+
+        let parsed = parse_retry_after(&headers).expect("future date is retryable");
+        assert!(
+            (Duration::from_secs(295)..=Duration::from_mins(5)).contains(&parsed),
+            "unexpected date delta: {parsed:?}"
+        );
+    }
+
+    #[test]
+    fn retry_after_ignores_a_past_http_date() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            reqwest::header::HeaderValue::from_static("Sat, 01 Jan 2000 00:00:00 +0000"),
+        );
+
+        assert!(parse_retry_after(&headers).is_none());
+    }
+
     /// The retry loop, driven with paused time: transient failures back off
     /// (never busy-spin), a denial stops immediately, and the deadline
     /// bounds the whole thing.
@@ -1645,7 +1871,16 @@ mod tests {
         )
         .await;
 
-        assert!(matches!(result, Err(EnrollNowError::Rejected { .. })));
+        let rendered = result
+            .as_ref()
+            .expect_err("semantic response failure is terminal")
+            .to_string();
+        assert!(matches!(&result, Err(EnrollNowError::Rejected { .. })));
+        assert!(
+            rendered.contains("Preserve enrollment-draft.json")
+                && rendered.contains("contact Spice Cloud support"),
+            "terminal semantic failures need operation-safe remediation: {rendered}"
+        );
         assert_eq!(
             attempts.load(std::sync::atomic::Ordering::SeqCst),
             1,

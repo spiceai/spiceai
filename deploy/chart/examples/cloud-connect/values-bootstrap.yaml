@@ -17,7 +17,8 @@
 #   helm install spiceai deploy/chart -f deploy/chart/examples/cloud-connect/values-bootstrap.yaml
 #
 # After the pod is Ready, run phase 2 to drop the key from the pod spec and
-# delete the Secret (the key is single-use and already consumed):
+# delete the Secret (the key is single-use and already consumed). The phase-1
+# pod retains the expanded value in its argv/spec until this replacement:
 #   deploy/chart/examples/cloud-connect/transition-to-connected.sh spiceai
 #
 # Normal restarts and upgrades use values-connected.yaml only.

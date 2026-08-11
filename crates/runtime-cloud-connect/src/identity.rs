@@ -717,22 +717,12 @@ pub(crate) fn atomic_write_owner_only(path: &Path, bytes: &[u8]) -> std::io::Res
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("identity.json");
-    let tmp_path = dir.join(format!(".{file_name}.tmp"));
+    let tmp_path = dir.join(format!(".{file_name}.{}.tmp", uuid::Uuid::new_v4()));
 
-    // `OpenOptions::mode` only applies to *newly created* files. If a stale
-    // `.<file>.tmp` from a previous crashed run still exists with broader
-    // permissions, `create(true).truncate(true)` would reuse it and then
-    // `rename` would publish the private key under those wider permissions.
-    // Defend against that by removing any stale temp first, refusing to
-    // reuse an existing inode (`create_new`), and explicitly enforcing
-    // `0o600` on the opened file before writing the sensitive bytes.
-    if let Err(err) = std::fs::remove_file(&tmp_path)
-        && err.kind() != std::io::ErrorKind::NotFound
-    {
-        return Err(err);
-    }
-
-    {
+    // Every writer owns a distinct temp inode. Concurrent processes may safely
+    // promote complete files to the same destination without truncating or
+    // deleting one another's in-progress write.
+    let result = (|| {
         let mut file = std::fs::OpenOptions::new()
             .create_new(true)
             .write(true)
@@ -742,9 +732,15 @@ pub(crate) fn atomic_write_owner_only(path: &Path, bytes: &[u8]) -> std::io::Res
         file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
         file.write_all(bytes)?;
         file.sync_all()?;
-    }
+        drop(file);
 
-    std::fs::rename(&tmp_path, path)
+        std::fs::rename(&tmp_path, path)
+    })();
+
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+    result
 }
 
 /// As the Unix variant, minus the permission enforcement: Windows ACLs are not
@@ -758,13 +754,21 @@ pub(crate) fn atomic_write_owner_only(path: &Path, bytes: &[u8]) -> std::io::Res
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("identity.json");
-    let tmp_path = dir.join(format!(".{file_name}.tmp"));
-    {
-        let mut file = std::fs::File::create(&tmp_path)?;
+    let tmp_path = dir.join(format!(".{file_name}.{}.tmp", uuid::Uuid::new_v4()));
+    let result = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&tmp_path)?;
         file.write_all(bytes)?;
         file.sync_all()?;
+        drop(file);
+        promote_temp(&tmp_path, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
     }
-    promote_temp(&tmp_path, path)
+    result
 }
 
 /// Promote a freshly-written temp file into its final location on non-Unix
@@ -783,13 +787,12 @@ fn promote_temp(tmp_path: &Path, path: &Path) -> std::io::Result<()> {
             return Err(err);
         }
 
-        let backup_path = path.with_extension("bak");
-        // Clear any stale backup so the rename below can't fail on a leftover.
-        if let Err(rm_err) = std::fs::remove_file(&backup_path)
-            && rm_err.kind() != std::io::ErrorKind::NotFound
-        {
-            return Err(rm_err);
-        }
+        let dir = path.parent().unwrap_or_else(|| Path::new("."));
+        let file_name = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("identity.json");
+        let backup_path = dir.join(format!(".{file_name}.{}.bak", uuid::Uuid::new_v4()));
         std::fs::rename(path, &backup_path)?;
         match std::fs::rename(tmp_path, path) {
             Ok(()) => {
@@ -873,6 +876,51 @@ mod tests {
         assert_eq!(loaded.public_key_pem, identity.public_key_pem);
         assert_eq!(loaded.ca_bundle_pem, identity.ca_bundle_pem);
         assert_eq!(loaded.gateway_addr, identity.gateway_addr);
+    }
+
+    /// Exercise the write primitive directly, outside [`write_lock`], to model
+    /// separate `spiced` processes sharing a persistent config directory.
+    /// Each promotion must publish one complete payload and must not remove or
+    /// truncate another writer's in-progress temp file.
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_atomic_writers_publish_one_complete_file() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join("identity.json");
+        let first = vec![b'a'; 128 * 1024];
+        let second = vec![b'b'; 128 * 1024];
+        let barrier = std::sync::Barrier::new(3);
+
+        std::thread::scope(|scope| {
+            let first_writer = scope.spawn(|| {
+                barrier.wait();
+                atomic_write_owner_only(&path, &first).expect("first atomic write");
+            });
+            let second_writer = scope.spawn(|| {
+                barrier.wait();
+                atomic_write_owner_only(&path, &second).expect("second atomic write");
+            });
+            barrier.wait();
+            first_writer.join().expect("first writer thread");
+            second_writer.join().expect("second writer thread");
+        });
+
+        let published = std::fs::read(&path).expect("read published file");
+        assert!(
+            published == first || published == second,
+            "the destination must equal one complete writer payload"
+        );
+        let leftovers = std::fs::read_dir(dir.path())
+            .expect("read tempdir")
+            .filter_map(std::result::Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".identity.json.")
+            })
+            .collect::<Vec<_>>();
+        assert!(leftovers.is_empty(), "temporary writes must be cleaned up");
     }
 
     #[test]

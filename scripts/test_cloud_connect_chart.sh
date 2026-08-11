@@ -7,7 +7,8 @@
 #  - values-connected.yaml renders with no token or Secret reference left.
 #  - Template validation FAILS (before rendering) for every invalid shape:
 #    more than one replica, non-persistent storage, SPICE_CONFIG_DIR missing
-#    or off the volume, and a literal enrollment key in `command`.
+#    or off the volume, a literal enrollment key, or a token expansion that
+#    is not backed by exactly one Kubernetes Secret environment entry.
 #
 # Run from the repository root: scripts/test_cloud_connect_chart.sh
 # Requires: helm.
@@ -101,6 +102,14 @@ expect_rejected "a literal enrollment key in --token= form" \
   --set-json "command=[\"/usr/local/bin/spiced\",\"--token=${TEST_ENROLLMENT_KEY}\",\"--http\",\"0.0.0.0:8090\"]"
 expect_rejected "--token with no value" \
   --set-json 'command=["/usr/local/bin/spiced","--http","0.0.0.0:8090","--token"]'
+expect_rejected "an undefined token environment variable" \
+  --set-json 'command=["/usr/local/bin/spiced","--token","$(MISSING)","--http","0.0.0.0:8090"]'
+expect_rejected "a literal token environment value" \
+  --set-json "additionalEnv=[{\"name\":\"SPICE_ENROLL_KEY\",\"value\":\"${TEST_ENROLLMENT_KEY}\"},{\"name\":\"SPICE_CONFIG_DIR\",\"value\":\"/data/.spice\"}]"
+expect_rejected "a token Secret reference with no key" \
+  --set-json 'additionalEnv=[{"name":"SPICE_ENROLL_KEY","valueFrom":{"secretKeyRef":{"name":"spice-cloud-connect"}}},{"name":"SPICE_CONFIG_DIR","value":"/data/.spice"}]'
+expect_rejected "duplicate token environment entries" \
+  --set-json 'additionalEnv=[{"name":"SPICE_ENROLL_KEY","valueFrom":{"secretKeyRef":{"name":"spice-cloud-connect","key":"enroll-key"}}},{"name":"SPICE_ENROLL_KEY","valueFrom":{"secretKeyRef":{"name":"another-secret","key":"enroll-key"}}},{"name":"SPICE_CONFIG_DIR","value":"/data/.spice"}]'
 
 # --- A chart with no --token keeps rendering with any replica count ---
 if render --set replicaCount=3 >/dev/null; then
@@ -114,6 +123,27 @@ if grep -rq 'spice-enroll-[A-Za-z0-9_-]' "${EXAMPLES}"/*.yaml; then
   fail "an example values file contains a literal enrollment key"
 else
   pass "example values files contain no literal enrollment key"
+fi
+
+# --- The phase transition preserves installed values and rejects timeout
+#     formats its arithmetic cannot interpret before invoking cluster tools. ---
+TRANSITION="${EXAMPLES}/transition-to-connected.sh"
+if bash -n "${TRANSITION}"; then
+  pass "transition script has valid shell syntax"
+else
+  fail "transition script has invalid shell syntax"
+fi
+if grep -q -- '--reuse-values' "${TRANSITION}"; then
+  pass "transition preserves installed Helm values"
+else
+  fail "transition would reset installed Helm values"
+fi
+if output="$(SPICE_WAIT_TIMEOUT=10m bash "${TRANSITION}" test default 2>&1)"; then
+  fail "transition accepted an unsupported timeout format"
+elif echo "${output}" | grep -q "positive integer seconds"; then
+  pass "transition rejects unsupported timeout formats before cluster access"
+else
+  fail "transition timeout rejection was not actionable: ${output}"
 fi
 
 echo

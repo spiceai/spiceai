@@ -368,8 +368,11 @@ pub struct Args {
     /// NOT redeemed. Without this flag, an existing identity alone
     /// reconnects the instance; a `spiced` with no identity never connects
     /// to the cloud. The value is visible to same-host process listings for
-    /// the duration of the one-time bootstrap; it is single-use,
-    /// short-lived, and never written to any file.
+    /// the full lifetime of the phase-1 process (the operating system retains
+    /// its original argv even after this field is dropped); it is single-use,
+    /// short-lived, and never written by spiced to any file. Container and
+    /// pod deployments should be recreated without this flag immediately
+    /// after the runtime becomes ready.
     #[arg(
         long,
         value_name = "ENROLLMENT_KEY",

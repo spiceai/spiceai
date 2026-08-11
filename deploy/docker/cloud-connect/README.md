@@ -56,9 +56,12 @@ identity; after that, a fresh enrollment key is needed.
   above one replica. Multi-replica enrollment belongs to the Spice
   Kubernetes operator.
 - The key is interpolated by Compose from the host environment (or an
-  `.env` file) and is visible in the container's argv during the one-time
-  bootstrap; it is single-use, consumed before readiness, and step 2 removes
-  it. Never write the key into a compose file.
+  `.env` file), and the container runtime retains it in the phase-1
+  container's argv/config for that container's full lifetime. `spiced`
+  consumes the key before readiness and drops its in-memory copy, but cannot
+  scrub the already-created container metadata. Recreate from the base file
+  promptly after readiness; step 2 removes it. Never write the key into a
+  compose file.
 - The `init-volume` service exists because the runtime image is `FROM
   scratch` and runs as uid 65534: a freshly created named volume is
   root-owned, so it is handed to the runtime user before first write.

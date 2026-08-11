@@ -1792,11 +1792,12 @@ async fn enroll_with_key(
 async fn enrollment_issues_identity_and_streams_over_mtls() {
     let harness = Harness::new(24 * 60 * 60).await;
     let dir = tempfile::tempdir().unwrap();
-    let config = harness.config(
+    let mut config = harness.config(
         dir.path().join("identity.json"),
         dir.path().to_path_buf(),
         Duration::from_hours(12),
     );
+    config.instance_region = Some("us-west-2".to_string());
 
     let (runtime, _rt_state) = E2eRuntime::new();
     let (handle, identity) = enroll(&harness, &config, runtime).await;
@@ -2056,11 +2057,12 @@ async fn response_loss_replay_does_not_create_a_second_instance() {
 async fn a_new_enrollment_key_recovers_the_pending_operation() {
     let harness = Harness::new(24 * 60 * 60).await;
     let dir = tempfile::tempdir().unwrap();
-    let config = harness.config(
+    let mut config = harness.config(
         dir.path().join("identity.json"),
         dir.path().to_path_buf(),
         Duration::from_hours(12),
     );
+    config.instance_region = Some("us-west-2".to_string());
 
     // Phase 1: every processed attempt loses its response until the tight
     // retry budget expires — the operation and instance exist server-side,
@@ -2096,6 +2098,12 @@ async fn a_new_enrollment_key_recovers_the_pending_operation() {
     *harness.cloud.drop_responses.lock().await = 0;
     harness.cloud.expire_token(ENROLLMENT_KEY).await;
 
+    // Model a replacement container and image upgrade. The pending draft owns
+    // the canonical non-authority request, so a changed runtime version or
+    // region cannot turn the same operation into an idempotency mismatch.
+    config.runtime_version = "v9.9.9-replacement".to_string();
+    config.instance_region = Some("eu-west-1".to_string());
+
     // Phase 2: a fresh key with the same directory (same draft, same
     // operation) recovers the SAME instance.
     let outcome = enroll_now(
@@ -2118,6 +2126,17 @@ async fn a_new_enrollment_key_recovers_the_pending_operation() {
         "recovery must not create a sibling instance"
     );
     assert!(config.identity_path.exists());
+    let requests = harness.cloud.enroll_requests.lock().await.clone();
+    let first = &requests.first().expect("phase 1 request").0;
+    let recovered = &requests.last().expect("phase 2 request").0;
+    for field in ["csr_pem", "enc_pubkey_pem", "instance", "region"] {
+        assert_eq!(
+            first[field], recovered[field],
+            "{field} must be replayed from the pending draft"
+        );
+    }
+    assert_eq!(recovered["instance"]["runtime_version"], "v0.0.0-e2e");
+    assert_eq!(recovered["region"], "us-west-2");
     assert!(
         !runtime_cloud_connect::EnrollmentDraft::path_in(dir.path()).exists(),
         "success promotes the draft away"
@@ -2301,8 +2320,12 @@ async fn an_existing_identity_wins_without_redeeming_the_key() {
 
     // Simulate cleanup failing after promotion. Reusing the identity must
     // scrub this provisional private material without contacting the cloud.
-    runtime_cloud_connect::EnrollmentDraft::load_or_create(dir.path())
-        .expect("create a stale enrollment draft");
+    runtime_cloud_connect::EnrollmentDraft::load_or_create(
+        dir.path(),
+        &runtime_cloud_connect::enroll::InstanceFacts::gather(&config.runtime_version),
+        config.instance_region.as_deref(),
+    )
+    .expect("create a stale enrollment draft");
     assert!(
         runtime_cloud_connect::EnrollmentDraft::path_in(dir.path()).exists(),
         "test setup must leave a stale draft"

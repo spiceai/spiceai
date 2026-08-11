@@ -24,7 +24,8 @@
 # Environment:
 #   SPICE_CHART        Chart path or name (default: deploy/chart)
 #   SPICE_SECRET_NAME  Bootstrap Secret name (default: spice-cloud-connect)
-#   SPICE_WAIT_TIMEOUT Per-step wait budget (default: 600s)
+#   SPICE_WAIT_TIMEOUT Per-step wait budget as positive integer seconds
+#                      with an `s` suffix (default: 600s)
 
 set -euo pipefail
 
@@ -33,6 +34,23 @@ NAMESPACE="${2:-default}"
 CHART="${SPICE_CHART:-deploy/chart}"
 SECRET_NAME="${SPICE_SECRET_NAME:-spice-cloud-connect}"
 WAIT_TIMEOUT="${SPICE_WAIT_TIMEOUT:-600s}"
+case "${WAIT_TIMEOUT}" in
+  *s) WAIT_SECONDS="${WAIT_TIMEOUT%s}" ;;
+  *)
+    echo "error: SPICE_WAIT_TIMEOUT must be positive integer seconds with an 's' suffix (for example 600s)" >&2
+    exit 1
+    ;;
+esac
+case "${WAIT_SECONDS}" in
+  ''|*[!0-9]*)
+    echo "error: SPICE_WAIT_TIMEOUT must be positive integer seconds with an 's' suffix (for example 600s)" >&2
+    exit 1
+    ;;
+esac
+if [ "${WAIT_SECONDS}" -eq 0 ]; then
+  echo "error: SPICE_WAIT_TIMEOUT must be positive integer seconds with an 's' suffix (for example 600s)" >&2
+  exit 1
+fi
 VALUES_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SELECTOR="app=${RELEASE}"
 
@@ -55,6 +73,7 @@ kubectl -n "${NAMESPACE}" wait --for=condition=Ready pod -l "${SELECTOR}" --time
 log "step 2/4: upgrading '${RELEASE}' to the connected values (removes --token and the ${SECRET_NAME} Secret reference, keeps the volume)"
 helm upgrade "${RELEASE}" "${CHART}" \
   --namespace "${NAMESPACE}" \
+  --reuse-values \
   -f "${VALUES_DIR}/values-connected.yaml" \
   --wait --timeout "${WAIT_TIMEOUT}"
 
@@ -72,7 +91,7 @@ if kubectl -n "${NAMESPACE}" get "${WORKLOAD}" -o yaml | grep -qE -- "--token|${
 fi
 
 log "step 3/4: verifying the replacement pod reconnects from the stored identity"
-deadline=$(( $(date +%s) + ${WAIT_TIMEOUT%s} ))
+deadline=$(( $(date +%s) + WAIT_SECONDS ))
 until kubectl -n "${NAMESPACE}" logs -l "${SELECTOR}" --tail=-1 2>/dev/null \
   | grep -q "Cloud Connect: stream established"; do
   if [ "$(date +%s)" -ge "${deadline}" ]; then

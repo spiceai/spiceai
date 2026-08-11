@@ -17,8 +17,9 @@ limitations under the License.
 //! The persisted enrollment draft: what makes enrollment retry-safe.
 //!
 //! `<config-dir>/enrollment-draft.json` (owner-only, `0600` on Unix) holds
-//! the provisional identity keypair, CSR, encryption keypair, and the
-//! enrollment operation ID that rides every attempt as `Idempotency-Key`.
+//! the provisional identity keypair, CSR, encryption keypair, the enrollment
+//! operation ID that rides every attempt as `Idempotency-Key`, and the
+//! non-secret request facts that must remain byte-for-byte stable on replay.
 //! It **never** contains the enrollment key — the key is single-use bearer
 //! material whose lifetime is one process's argument, while the draft is
 //! what lets a *lost response* be replayed safely: the cloud stores the
@@ -38,13 +39,14 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use snafu::{ResultExt, Snafu};
 
+use crate::enroll::InstanceFacts;
 use crate::identity::{EnrollmentMaterial, IdentityStore};
 
 /// File name (relative to `$SPICE_CONFIG_DIR`) of the enrollment draft.
 pub const ENROLLMENT_DRAFT_FILE: &str = "enrollment-draft.json";
 
 /// Current schema of the draft file.
-const DRAFT_SCHEMA_VERSION: u32 = 1;
+const DRAFT_SCHEMA_VERSION: u32 = 2;
 
 /// Errors reading, writing, or generating an enrollment draft.
 #[derive(Debug, Snafu)]
@@ -65,12 +67,12 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "The enrollment draft at {} was written by a newer runtime (schema {found}, this \
-         runtime understands {DRAFT_SCHEMA_VERSION}). Upgrade spiced, or remove the file to \
-         start a fresh enrollment. See: https://spiceai.org/docs",
+        "The enrollment draft at {} uses unsupported schema {found} (this runtime requires \
+         schema {DRAFT_SCHEMA_VERSION}). Upgrade spiced, or remove the file to start a fresh \
+         enrollment. See: https://spiceai.org/docs",
         path.display()
     ))]
-    SchemaTooNew { path: PathBuf, found: u32 },
+    UnsupportedSchema { path: PathBuf, found: u32 },
 
     #[snafu(display("Failed to generate enrollment key material: {source}"))]
     Material { source: crate::identity::Error },
@@ -103,6 +105,14 @@ pub struct EnrollmentDraft {
     pub enc_private_key_pem: String,
     /// PEM SPKI (RFC 8410) X25519 public key; sent as `enc_pubkey_pem`.
     pub enc_public_key_pem: String,
+    /// Non-secret host facts sent on the first request. Persisted so a
+    /// container replacement or runtime upgrade replays the exact request
+    /// instead of recomputing a different hostname, fingerprint, or version.
+    pub instance: InstanceFacts,
+    /// Operator-declared location label sent on the first request. A later
+    /// process reuses this value even if its command-line configuration
+    /// changed while the operation was pending.
+    pub region: Option<String>,
 }
 
 impl std::fmt::Debug for EnrollmentDraft {
@@ -115,6 +125,8 @@ impl std::fmt::Debug for EnrollmentDraft {
             .field("csr_pem", &"[CERTIFICATE REQUEST]")
             .field("enc_private_key_pem", &"[REDACTED]")
             .field("enc_public_key_pem", &"[PUBLIC KEY]")
+            .field("instance", &self.instance)
+            .field("region", &self.region)
             .finish()
     }
 }
@@ -139,11 +151,17 @@ impl EnrollmentDraft {
     /// Returns an error when an existing file cannot be read or parsed, when
     /// its schema is newer than this runtime understands, when key material
     /// cannot be generated, or when a fresh draft cannot be persisted.
-    pub fn load_or_create(config_dir: &Path) -> Result<Self> {
+    pub fn load_or_create(
+        config_dir: &Path,
+        instance: &InstanceFacts,
+        region: Option<&str>,
+    ) -> Result<Self> {
         let path = Self::path_in(config_dir);
         match std::fs::read_to_string(&path) {
             Ok(contents) => Self::parse_at(&path, &contents),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Self::create_at(&path),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                Self::create_at(&path, instance, region)
+            }
             Err(source) => Err(Error::Io { path, source }),
         }
     }
@@ -152,8 +170,8 @@ impl EnrollmentDraft {
         let draft = serde_json::from_str::<Self>(contents).context(ParseSnafu {
             path: path.to_path_buf(),
         })?;
-        if draft.schema_version > DRAFT_SCHEMA_VERSION {
-            return Err(Error::SchemaTooNew {
+        if draft.schema_version != DRAFT_SCHEMA_VERSION {
+            return Err(Error::UnsupportedSchema {
                 path: path.to_path_buf(),
                 found: draft.schema_version,
             });
@@ -163,7 +181,7 @@ impl EnrollmentDraft {
 
     /// Generate a fresh draft and persist it at `path` before returning it,
     /// so the operation ID is durable before the first request that uses it.
-    fn create_at(path: &Path) -> Result<Self> {
+    fn create_at(path: &Path, instance: &InstanceFacts, region: Option<&str>) -> Result<Self> {
         let material = IdentityStore::generate_enrollment().context(MaterialSnafu)?;
         let draft = Self {
             schema_version: DRAFT_SCHEMA_VERSION,
@@ -173,6 +191,8 @@ impl EnrollmentDraft {
             csr_pem: material.csr_pem,
             enc_private_key_pem: material.enc_private_key_pem,
             enc_public_key_pem: material.enc_public_key_pem,
+            instance: instance.clone(),
+            region: region.map(str::to_string),
         };
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).context(IoSnafu {
@@ -255,14 +275,34 @@ impl EnrollmentDraft {
 mod tests {
     use super::*;
 
+    fn test_instance(runtime_version: &str) -> InstanceFacts {
+        InstanceFacts {
+            fingerprint: "f".repeat(64),
+            hostname: "draft-test".to_string(),
+            os: "linux".to_string(),
+            arch: "x86_64".to_string(),
+            runtime_version: runtime_version.to_string(),
+        }
+    }
+
+    fn load_or_create(config_dir: &Path) -> Result<EnrollmentDraft> {
+        EnrollmentDraft::load_or_create(
+            config_dir,
+            &test_instance("v2.2.0-test"),
+            Some("us-west-2"),
+        )
+    }
+
     #[test]
     fn creates_and_persists_a_fresh_draft() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let draft = EnrollmentDraft::load_or_create(dir.path()).expect("create");
+        let draft = load_or_create(dir.path()).expect("create");
 
         assert_eq!(draft.schema_version, DRAFT_SCHEMA_VERSION);
         assert!(!draft.enrollment_operation_id.is_empty());
         assert!(draft.csr_pem.contains("CERTIFICATE REQUEST"));
+        assert_eq!(draft.instance.runtime_version, "v2.2.0-test");
+        assert_eq!(draft.region.as_deref(), Some("us-west-2"));
         assert!(EnrollmentDraft::path_in(dir.path()).exists());
     }
 
@@ -272,8 +312,13 @@ mod tests {
         // a new key) must reuse the operation ID and keypair, so the cloud
         // can replay the operation instead of creating a sibling instance.
         let dir = tempfile::tempdir().expect("tempdir");
-        let first = EnrollmentDraft::load_or_create(dir.path()).expect("create");
-        let second = EnrollmentDraft::load_or_create(dir.path()).expect("reload");
+        let first = load_or_create(dir.path()).expect("create");
+        let second = EnrollmentDraft::load_or_create(
+            dir.path(),
+            &test_instance("v9.9.9-replacement"),
+            Some("eu-west-1"),
+        )
+        .expect("reload");
 
         assert_eq!(
             first.enrollment_operation_id,
@@ -281,14 +326,16 @@ mod tests {
         );
         assert_eq!(first.public_key_pem, second.public_key_pem);
         assert_eq!(first.csr_pem, second.csr_pem);
+        assert_eq!(first.instance, second.instance);
+        assert_eq!(first.region, second.region);
     }
 
     #[test]
     fn distinct_directories_get_distinct_operations() {
         let a = tempfile::tempdir().expect("tempdir");
         let b = tempfile::tempdir().expect("tempdir");
-        let draft_a = EnrollmentDraft::load_or_create(a.path()).expect("a");
-        let draft_b = EnrollmentDraft::load_or_create(b.path()).expect("b");
+        let draft_a = load_or_create(a.path()).expect("a");
+        let draft_b = load_or_create(b.path()).expect("b");
         assert_ne!(
             draft_a.enrollment_operation_id,
             draft_b.enrollment_operation_id
@@ -302,7 +349,7 @@ mod tests {
         std::fs::create_dir_all(dir.path()).expect("mkdir");
         std::fs::write(&path, "{not json").expect("write corrupt draft");
 
-        let err = EnrollmentDraft::load_or_create(dir.path()).expect_err("must refuse");
+        let err = load_or_create(dir.path()).expect_err("must refuse");
         assert!(matches!(err, Error::Parse { .. }), "{err}");
         assert_eq!(
             std::fs::read_to_string(path).expect("corrupt draft remains"),
@@ -320,7 +367,7 @@ mod tests {
                 .map(|_| {
                     scope.spawn(|| {
                         barrier.wait();
-                        EnrollmentDraft::load_or_create(dir.path()).expect("create or load")
+                        load_or_create(dir.path()).expect("create or load")
                     })
                 })
                 .collect();
@@ -338,6 +385,8 @@ mod tests {
             );
             assert_eq!(draft.public_key_pem, winner.public_key_pem);
             assert_eq!(draft.enc_public_key_pem, winner.enc_public_key_pem);
+            assert_eq!(draft.instance, winner.instance);
+            assert_eq!(draft.region, winner.region);
         }
         let files = std::fs::read_dir(dir.path())
             .expect("read config dir")
@@ -358,17 +407,19 @@ mod tests {
             "csr_pem": "c",
             "enc_private_key_pem": "ek",
             "enc_public_key_pem": "ep",
+            "instance": test_instance("v3.0.0"),
+            "region": null,
         });
         std::fs::write(&path, newer.to_string()).expect("write newer draft");
 
-        let err = EnrollmentDraft::load_or_create(dir.path()).expect_err("must refuse");
-        assert!(matches!(err, Error::SchemaTooNew { .. }), "{err}");
+        let err = load_or_create(dir.path()).expect_err("must refuse");
+        assert!(matches!(err, Error::UnsupportedSchema { .. }), "{err}");
     }
 
     #[test]
     fn delete_is_idempotent() {
         let dir = tempfile::tempdir().expect("tempdir");
-        EnrollmentDraft::load_or_create(dir.path()).expect("create");
+        load_or_create(dir.path()).expect("create");
         assert!(EnrollmentDraft::path_in(dir.path()).exists());
         EnrollmentDraft::delete(dir.path()).expect("delete");
         assert!(!EnrollmentDraft::path_in(dir.path()).exists());
@@ -380,7 +431,7 @@ mod tests {
     fn the_draft_is_owner_only() {
         use std::os::unix::fs::PermissionsExt as _;
         let dir = tempfile::tempdir().expect("tempdir");
-        EnrollmentDraft::load_or_create(dir.path()).expect("create");
+        load_or_create(dir.path()).expect("create");
         let mode = std::fs::metadata(EnrollmentDraft::path_in(dir.path()))
             .expect("metadata")
             .permissions()
@@ -395,7 +446,7 @@ mod tests {
         // carry the key. The field list is the contract — a `token` field
         // appearing here must fail this test.
         let dir = tempfile::tempdir().expect("tempdir");
-        EnrollmentDraft::load_or_create(dir.path()).expect("create");
+        load_or_create(dir.path()).expect("create");
         let raw = std::fs::read_to_string(EnrollmentDraft::path_in(dir.path())).expect("read");
         let value: serde_json::Value = serde_json::from_str(&raw).expect("valid json");
         let object = value.as_object().expect("draft is an object");
@@ -408,8 +459,10 @@ mod tests {
                 "enc_private_key_pem",
                 "enc_public_key_pem",
                 "enrollment_operation_id",
+                "instance",
                 "private_key_pem",
                 "public_key_pem",
+                "region",
                 "schema_version",
             ],
             "the draft's field list changed; verify no field can carry the enrollment key"
@@ -420,7 +473,7 @@ mod tests {
     #[test]
     fn debug_redacts_private_key_material() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let draft = EnrollmentDraft::load_or_create(dir.path()).expect("create");
+        let draft = load_or_create(dir.path()).expect("create");
         let private_key = draft.private_key_pem.clone();
         let enc_private_key = draft.enc_private_key_pem.clone();
 
