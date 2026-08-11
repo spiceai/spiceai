@@ -476,9 +476,8 @@ impl PostgresSchemaProvider {
         // The bulk query describes every relation in the namespace, so it is the
         // cheaper option only when every relation is wanted. Under a filter that
         // keeps a few tables out of thousands, one selective query per selected
-        // table transfers far less than one query returning them all -- and with
-        // nothing selected it would be pure waste, since the old path issued no
-        // schema query at all.
+        // table transfers far less than one query returning them all; with
+        // nothing selected, every row it returns is discarded.
         //
         // Resolving only the selected relations would remove the compromise, but
         // that needs the source query to take their names.
@@ -612,8 +611,8 @@ enum SchemaRefreshOutcome {
 /// each selected table's individually. The bulk query describes every relation
 /// in the namespace, so it is only the cheaper option when every relation is
 /// wanted: under a filter keeping a few tables out of thousands, the selective
-/// per-table queries transfer far less, and with nothing selected the bulk query
-/// would be pure waste.
+/// per-table queries transfer far less, and with nothing selected every row it
+/// returns is discarded.
 ///
 /// An empty schema is not "fully selected" -- there is nothing to resolve, so
 /// nothing to save.
@@ -1014,9 +1013,9 @@ mod tests {
     /// The bulk query returns every relation in the namespace. Under a filter
     /// that keeps most of them out, it would transfer thousands of table schemas
     /// to build a handful of providers, where the per-table path fetches exactly
-    /// the ones asked for -- and with nothing selected it would issue a query the
-    /// old path did not issue at all. Neither shows up in the resulting catalog,
-    /// which is why it is asserted here.
+    /// the ones asked for; with nothing selected, it would transfer the whole
+    /// namespace to build none. Neither shows up in the resulting catalog, which
+    /// is why it is asserted here.
     #[test]
     fn schema_is_fully_selected_gates_the_bulk_query() {
         let tables = vec!["orders".to_string(), "lineitem".to_string()];
