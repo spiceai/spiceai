@@ -37,7 +37,7 @@ use tokio_stream::wrappers::BroadcastStream;
 use util::RetryError;
 
 use data_components::index_maintenance::perform_index_maintenance;
-use runtime_datafusion_index::{Index, WriteWindow};
+use spice_table::{Index, WriteWindow};
 
 use crate::accelerated::{
     refresh_task::retry_from_df_error,

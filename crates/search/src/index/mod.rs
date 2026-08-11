@@ -23,7 +23,7 @@ use datafusion::{
     error::DataFusionError,
     logical_expr::{Expr, LogicalPlan, ident},
 };
-use runtime_datafusion_index::Index;
+use spice_table::Index;
 
 pub mod chunking;
 pub mod compound;
