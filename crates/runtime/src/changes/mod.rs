@@ -31,10 +31,15 @@ impl Indexes {
 impl From<Arc<SpiceTable>> for Indexes {
     /// Collects the indexes carried anywhere in the table's stack, so a change
     /// stream maintains every one of them and not just the outermost layer's.
+    ///
+    /// Deduplicates by pointer identity: the walk reaches both sides of a router,
+    /// and maintaining one index twice would apply every change to it twice.
     fn from(table: Arc<SpiceTable>) -> Self {
+        let mut seen = std::collections::HashSet::new();
         Self(
             spice_table::nodes(table.as_ref(), LayerWalk::Index)
                 .flat_map(SpiceTable::indexes)
+                .filter(|index| seen.insert(Arc::as_ptr(index).cast::<()>()))
                 .map(Arc::clone)
                 .collect(),
         )

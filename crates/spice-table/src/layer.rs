@@ -117,6 +117,27 @@ pub trait TableLayer: Any + Send + Sync + Debug + 'static {
         Some(below)
     }
 
+    /// A second sub-stack `walk` must also reach, when this layer has one.
+    ///
+    /// Almost every layer sits over exactly one table, so the default is `None`
+    /// and [`route`](TableLayer::route) alone describes the walk. A **router**
+    /// owns two, and for a walk that either side can answer, naming only one is
+    /// a silent half-answer: an external vector or full-text index attaches to
+    /// an accelerated dataset's *source* side while a native one attaches to its
+    /// *accelerator*, so index discovery that saw a single side would report
+    /// "no index" for a dataset that has one.
+    ///
+    /// [`nodes`] visits this sub-stack after the one `route` names, so a caller
+    /// that takes the first match still prefers the primary side.
+    fn route_secondary<'a>(
+        &'a self,
+        walk: LayerWalk,
+        below: &'a Arc<dyn TableProvider>,
+    ) -> Option<&'a Arc<dyn TableProvider>> {
+        let _ = (walk, below);
+        None
+    }
+
     fn schema(&self, below: &Arc<dyn TableProvider>) -> SchemaRef {
         below.schema()
     }
@@ -341,12 +362,24 @@ pub fn find_concrete<T: TableProvider + 'static>(
     top: &dyn TableProvider,
     walk: LayerWalk,
 ) -> Option<&T> {
-    let mut current = top;
+    // Mirrors `nodes`: a router's second sub-stack is searched too, so this and
+    // a fold over `nodes` can never disagree about what a walk reaches.
+    let mut pending: Vec<&dyn TableProvider> = Vec::new();
+    let mut current = Some(top);
     loop {
-        if let Some(found) = current.downcast_ref::<T>() {
+        let Some(node) = current else {
+            current = Some(pending.pop()?);
+            continue;
+        };
+        if let Some(found) = node.downcast_ref::<T>() {
             return Some(found);
         }
-        current = step(current, walk)?.as_ref();
+        if let Some(table) = node.downcast_ref::<SpiceTable>()
+            && let Some(other) = table.layer.route_secondary(walk, &table.below)
+        {
+            pending.push(other.as_ref());
+        }
+        current = step(node, walk).map(Arc::as_ref);
     }
 }
 
@@ -359,6 +392,7 @@ pub fn find_concrete<T: TableProvider + 'static>(
 pub fn nodes(top: &dyn TableProvider, walk: LayerWalk) -> Nodes<'_> {
     Nodes {
         current: Some(top),
+        pending: Vec::new(),
         walk,
     }
 }
@@ -366,6 +400,9 @@ pub fn nodes(top: &dyn TableProvider, walk: LayerWalk) -> Nodes<'_> {
 /// Iterator over the layered nodes of a stack. See [`nodes`].
 pub struct Nodes<'a> {
     current: Option<&'a dyn TableProvider>,
+    /// Sub-stacks a router offered via [`TableLayer::route_secondary`], walked
+    /// once the one [`TableLayer::route`] named is exhausted.
+    pending: Vec<&'a dyn TableProvider>,
     walk: LayerWalk,
 }
 
@@ -373,16 +410,22 @@ impl<'a> Iterator for Nodes<'a> {
     type Item = &'a SpiceTable;
 
     fn next(&mut self) -> Option<Self::Item> {
-        while let Some(current) = self.current {
+        loop {
+            let Some(current) = self.current else {
+                self.current = Some(self.pending.pop()?);
+                continue;
+            };
             // A layered node answers for itself, so route straight off it rather
             // than downcasting the same pointer a second time inside `step`.
             if let Some(node) = current.downcast_ref::<SpiceTable>() {
+                if let Some(other) = node.layer.route_secondary(self.walk, &node.below) {
+                    self.pending.push(other.as_ref());
+                }
                 self.current = node.layer.route(self.walk, &node.below).map(Arc::as_ref);
                 return Some(node);
             }
             self.current = step(current, self.walk).map(Arc::as_ref);
         }
-        None
     }
 }
 
@@ -541,7 +584,7 @@ mod tests {
     use std::any::Any;
 
     #[derive(Debug)]
-    struct TestIndex(&'static str);
+    pub(super) struct TestIndex(pub(super) &'static str);
 
     impl Index for TestIndex {
         fn name(&self) -> &'static str {
@@ -556,13 +599,13 @@ mod tests {
     }
 
     #[derive(Debug, Default)]
-    struct TestLayer {
+    pub(super) struct TestLayer {
         opaque_to: Vec<LayerWalk>,
         indexes: Vec<Arc<dyn Index + Send + Sync>>,
     }
 
     impl TestLayer {
-        fn marker() -> Arc<dyn TableLayer> {
+        pub(super) fn marker() -> Arc<dyn TableLayer> {
             Arc::new(Self::default())
         }
 
@@ -573,7 +616,7 @@ mod tests {
             })
         }
 
-        fn indexed(name: &'static str) -> Arc<dyn TableLayer> {
+        pub(super) fn indexed(name: &'static str) -> Arc<dyn TableLayer> {
             Arc::new(Self {
                 indexes: vec![Arc::new(TestIndex(name))],
                 ..Self::default()
@@ -619,6 +662,21 @@ mod tests {
                 LayerWalk::Write | LayerWalk::RetentionDelete | LayerWalk::Index => Some(below),
             }
         }
+
+        fn route_secondary<'a>(
+            &'a self,
+            walk: LayerWalk,
+            _below: &'a Arc<dyn TableProvider>,
+        ) -> Option<&'a Arc<dyn TableProvider>> {
+            match walk {
+                LayerWalk::Index => self.source.as_ref(),
+                LayerWalk::Read
+                | LayerWalk::Source
+                | LayerWalk::CdcDetection
+                | LayerWalk::Write
+                | LayerWalk::RetentionDelete => None,
+            }
+        }
     }
 
     pub(super) fn layered_marker() -> Arc<dyn TableProvider> {
@@ -639,7 +697,7 @@ mod tests {
             .is_some_and(|table| Arc::ptr_eq(reached, table.below()))
     }
 
-    fn base() -> Arc<dyn TableProvider> {
+    pub(super) fn base() -> Arc<dyn TableProvider> {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
         Arc::new(MemTable::try_new(schema, vec![vec![]]).expect("mem table"))
     }
@@ -826,6 +884,9 @@ mod tests {
 
 #[cfg(test)]
 mod router_tests {
+    use datafusion::arrow::datatypes::Schema;
+    use datafusion::datasource::empty::EmptyTable;
+
     use super::tests::*;
     use super::*;
 
@@ -870,6 +931,80 @@ mod router_tests {
         assert!(
             Arc::ptr_eq(reached, &router),
             "an unresolved side must stop the walk at the router"
+        );
+    }
+
+    /// An index-carrying layer, built the way production builds one.
+    fn indexes_named(name: &'static str) -> Arc<dyn TableLayer> {
+        Arc::new(crate::IndexLayer::with_indexes(vec![Arc::new(TestIndex(
+            name,
+        ))]))
+    }
+
+    /// Regression test: an index attached to a router's *other* side must still
+    /// be discovered. An external vector or full-text index hangs off an
+    /// accelerated dataset's source while a native one hangs off its
+    /// accelerator, so a walk that followed only `route` would answer "no index"
+    /// for a dataset that has one.
+    #[test]
+    fn index_discovery_sees_both_sides_of_a_router() {
+        let source = SpiceTable::over(indexes_named("on_source"), base());
+        let accelerator = SpiceTable::over(indexes_named("on_accelerator"), base());
+        let router: Arc<dyn TableProvider> = SpiceTable::over(
+            Arc::new(TestRouter {
+                source: Some(source),
+            }),
+            accelerator,
+        );
+
+        let found: Vec<&str> = nodes(router.as_ref(), LayerWalk::Index)
+            .flat_map(SpiceTable::indexes)
+            .map(|index| index.name())
+            .collect();
+
+        assert_eq!(
+            found,
+            vec!["on_accelerator", "on_source"],
+            "both sides must be reached, the side `route` names first"
+        );
+    }
+
+    /// A router with an unresolved source offers no second side, and the walk
+    /// still covers the side it has.
+    #[test]
+    fn index_discovery_tolerates_a_router_with_no_second_side() {
+        let accelerator = SpiceTable::over(indexes_named("on_accelerator"), base());
+        let router: Arc<dyn TableProvider> =
+            SpiceTable::over(Arc::new(TestRouter { source: None }), accelerator);
+
+        let found: Vec<&str> = nodes(router.as_ref(), LayerWalk::Index)
+            .flat_map(SpiceTable::indexes)
+            .map(|index| index.name())
+            .collect();
+
+        assert_eq!(found, vec!["on_accelerator"]);
+    }
+
+    /// `find_concrete` must reach the same set of tables a fold over `nodes`
+    /// does, or the two disagree about what a walk can see.
+    #[test]
+    fn find_concrete_also_searches_a_router_second_side() {
+        let source: Arc<dyn TableProvider> = Arc::new(EmptyTable::new(Arc::new(Schema::empty())));
+        let accelerator = SpiceTable::over(TestLayer::marker(), base());
+        let router: Arc<dyn TableProvider> = SpiceTable::over(
+            Arc::new(TestRouter {
+                source: Some(Arc::clone(&source)),
+            }),
+            accelerator,
+        );
+
+        assert!(
+            find_concrete::<EmptyTable>(router.as_ref(), LayerWalk::Index).is_some(),
+            "a table on the router's second side must be findable"
+        );
+        assert!(
+            find_concrete::<EmptyTable>(router.as_ref(), LayerWalk::Write).is_none(),
+            "a walk that means one side must not reach the other"
         );
     }
 }

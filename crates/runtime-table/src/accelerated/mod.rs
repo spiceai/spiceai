@@ -1823,6 +1823,30 @@ impl TableLayer for AcceleratedTable {
         }
     }
 
+    /// Index discovery is the one walk both sides can answer, so it gets both.
+    ///
+    /// An external vector or full-text index (S3 Vectors, Elasticsearch) attaches
+    /// to the *source* side, because the embedding connector wraps the source
+    /// connector; the `DuckDB` vector engine attaches to the *accelerator*. A walk
+    /// that saw only the side `route` names would report "no index" for a dataset
+    /// that has one. Every other walk means exactly one of the two tables, so it
+    /// has no second side.
+    fn route_secondary<'a>(
+        &'a self,
+        walk: LayerWalk,
+        _below: &'a Arc<dyn TableProvider>,
+    ) -> Option<&'a Arc<dyn TableProvider>> {
+        // Exhaustive on purpose: see `route`.
+        match walk {
+            LayerWalk::Index => self.federated.try_table_provider_sync_ref(),
+            LayerWalk::Read
+            | LayerWalk::Source
+            | LayerWalk::CdcDetection
+            | LayerWalk::Write
+            | LayerWalk::RetentionDelete => None,
+        }
+    }
+
     fn schema(&self, _below: &Arc<dyn TableProvider>) -> SchemaRef {
         AcceleratedTable::schema(self)
     }
