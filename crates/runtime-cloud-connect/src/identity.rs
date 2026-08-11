@@ -436,6 +436,10 @@ impl IdentityStore {
     /// Returns an error if the file exists but cannot be read (for any reason
     /// other than not-found) or its contents fail to parse as an [`Identity`].
     pub fn load_optional(path: &Path) -> Result<Option<Identity>> {
+        #[cfg(not(unix))]
+        cleanup_stale_identity_backups(path).context(IoSnafu {
+            path: path.to_path_buf(),
+        })?;
         match std::fs::read_to_string(path) {
             Ok(s) => {
                 let identity: Identity = serde_json::from_str(&s).context(ParseSnafu {
@@ -753,6 +757,7 @@ pub(crate) fn atomic_write_owner_only(path: &Path, bytes: &[u8]) -> std::io::Res
 #[cfg(not(unix))]
 pub(crate) fn atomic_write_owner_only(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write as _;
+    cleanup_stale_identity_backups(path)?;
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     let file_name = path
         .file_name()
@@ -792,6 +797,51 @@ pub(crate) fn sync_parent_directory(_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Remove stale non-Unix replacement backups once the canonical identity is
+/// present. A failed cleanup is fail-closed: backups contain the complete old
+/// credential, so silently accumulating them is not acceptable. If the
+/// canonical identity is absent, preserve the backup and return an error — it
+/// may be the only recoverable identity after an interrupted rollback.
+#[cfg(any(not(unix), test))]
+fn cleanup_stale_identity_backups(path: &Path) -> std::io::Result<()> {
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("identity.json");
+    let prefix = format!(".{file_name}.");
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err),
+    };
+
+    for entry in entries {
+        let entry = entry?;
+        let entry_name = entry.file_name();
+        let Some(entry_name) = entry_name.to_str() else {
+            continue;
+        };
+        let is_backup = Path::new(entry_name)
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("bak"));
+        if !entry_name.starts_with(&prefix) || !is_backup {
+            continue;
+        }
+        if !path.exists() {
+            return Err(std::io::Error::other(
+                "A stale identity backup exists without the canonical identity; restore or remove the backup before retrying",
+            ));
+        }
+        match std::fs::remove_file(entry.path()) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(())
+}
+
 /// Promote a freshly-written temp file into its final location on non-Unix
 /// platforms, where `std::fs::rename` does **not** atomically replace an
 /// existing destination (it errors if the target already exists). A rotated
@@ -817,8 +867,9 @@ fn promote_temp(tmp_path: &Path, path: &Path) -> std::io::Result<()> {
         std::fs::rename(path, &backup_path)?;
         match std::fs::rename(tmp_path, path) {
             Ok(()) => {
-                // Promotion succeeded; drop the backup (best-effort).
-                let _ = std::fs::remove_file(&backup_path);
+                // Promotion succeeded; the old credential must not remain on
+                // disk under a backup name.
+                std::fs::remove_file(&backup_path)?;
             }
             Err(promote_err) => {
                 // Roll the original file back into place so we don't leave the
@@ -942,6 +993,32 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert!(leftovers.is_empty(), "temporary writes must be cleaned up");
+    }
+
+    #[test]
+    fn stale_identity_backups_are_removed_only_when_the_identity_is_present() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join("identity.json");
+        let backup = dir.path().join(".identity.json.interrupted.bak");
+        std::fs::write(&path, "current identity").expect("write identity");
+        std::fs::write(&backup, "stale private credential").expect("write stale backup");
+
+        cleanup_stale_identity_backups(&path).expect("remove stale backup");
+
+        assert!(!backup.exists(), "stale credential backup must be removed");
+    }
+
+    #[test]
+    fn an_orphaned_identity_backup_is_preserved_for_recovery() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join("identity.json");
+        let backup = dir.path().join(".identity.json.interrupted.bak");
+        std::fs::write(&backup, "only recoverable identity").expect("write backup");
+
+        cleanup_stale_identity_backups(&path)
+            .expect_err("an orphaned backup must stop identity creation");
+
+        assert!(backup.exists(), "the only recoverable identity must remain");
     }
 
     #[cfg(unix)]

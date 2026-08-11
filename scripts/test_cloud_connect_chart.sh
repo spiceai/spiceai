@@ -11,7 +11,7 @@
 #    is not backed by exactly one Kubernetes Secret environment entry.
 #
 # Run from the repository root: scripts/test_cloud_connect_chart.sh
-# Requires: helm.
+# Requires: helm and jq.
 
 set -euo pipefail
 
@@ -269,6 +269,15 @@ if printf '%s' "${secret_ref_workload}" \
 else
   pass "structured workload validation detects the exact Secret reference"
 fi
+secret_bearing_workload='{"spec":{"template":{"spec":{"imagePullSecrets":[{"name":"pull-secret"}],"containers":[{"command":["spiced"],"envFrom":[{"secretRef":{"name":"envfrom-secret"}}]}],"initContainers":[{"name":"init","env":[{"name":"INIT","valueFrom":{"secretKeyRef":{"name":"init-secret","key":"value"}}}]}],"volumes":[{"name":"direct","secret":{"secretName":"volume-secret"}},{"name":"projected","projected":{"sources":[{"secret":{"name":"projected-secret"}}]}}]}}}}'
+for referenced_secret in pull-secret envfrom-secret init-secret volume-secret projected-secret; do
+  if printf '%s' "${secret_bearing_workload}" \
+    | jq -e --arg secret "${referenced_secret}" -f "${WORKLOAD_FILTER}" >/dev/null; then
+    fail "structured workload validation missed ${referenced_secret}"
+  else
+    pass "structured workload validation detects ${referenced_secret}"
+  fi
+done
 token_workload='{"spec":{"template":{"spec":{"containers":[{"command":["/bin/sh","-c","spiced --token $(KEY)"]}]}}}}'
 if printf '%s' "${token_workload}" \
   | jq -e --arg secret spice-cloud-connect -f "${WORKLOAD_FILTER}" >/dev/null; then
