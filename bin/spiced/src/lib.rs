@@ -1114,6 +1114,7 @@ pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
     // runtime was built), so by now the signal it leaves behind is the
     // durable identity — this is only the belt-and-braces activation hint.
     let cloud_connect_token_supplied = args.token.is_some();
+    let runtime_overrides = args.set_runtime.clone();
 
     let server_thread = tokio::spawn(async move {
         Box::pin(cloned_rt.start_servers(args.runtime, tls_config, endpoint_auth)).await
@@ -1122,10 +1123,10 @@ pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
     // Restore control-plane-delivered secrets from the local cache and register
     // their store BEFORE loading components. Component initialization is what
     // resolves `${ secrets:… }`, so a store installed after this point would
-    // arrive too late for every component that referenced one — and since a
-    // deployment applies by restarting, that is the normal path, not an edge
-    // case. Local files only, no control-plane round trip, so this neither
-    // blocks nor fails when the gateway is unreachable.
+    // arrive too late for every component that referenced one — and a
+    // deployment that delivers secrets applies by restarting, so that is the
+    // path they arrive by. Local files only, no control-plane round trip, so
+    // this neither blocks nor fails when the gateway is unreachable.
     let delivered_secrets = cloud_connect::restore_delivered_secrets(
         env!("CARGO_PKG_VERSION"),
         &rt,
@@ -1152,6 +1153,7 @@ pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
         delivered_secrets,
         running_deployment,
         cloud_connect_metrics,
+        runtime_overrides,
     )
     .await;
 
@@ -1306,9 +1308,9 @@ pub async fn build_app(args: &Args) -> Result<AppBundle> {
     }
 
     // A cloud-managed instance serves what its last deployment persisted, not
-    // the instance directory's `spicepod.yaml`: a deployment applies by writing
-    // that file and restarting, so reading anything else here would drop every
-    // deployment on the floor at the moment it was meant to take effect.
+    // the instance directory's `spicepod.yaml`: every deployment writes that
+    // file, so reading anything else here would drop every deployment on the
+    // floor at the moment it was meant to take effect.
     let mut deployment_note = None;
     let cloud_managed_spicepod = cloud_connect::cloud_managed_spicepod(args.token.is_some())
         .await
@@ -1647,7 +1649,7 @@ fn parse_set_string(s: &str) -> Result<(String, String), String> {
 
 fn apply_overrides(
     runtime_config: SpicepodRuntime,
-    overrides: &Vec<(String, String)>,
+    overrides: &[(String, String)],
 ) -> Result<SpicepodRuntime> {
     if overrides.is_empty() {
         return Ok(runtime_config);
