@@ -106,8 +106,26 @@ pub static DOCUMENTATION: LazyLock<Documentation> = LazyLock::new(|| {
 }
 });
 
-pub static SIGNATURE: LazyLock<Signature> =
-    LazyLock::new(|| Signature::variadic_any(Volatility::Stable));
+/// Signature for the scalar documentation stub used when `rrf` is nested in
+/// another table function, such as `rerank`.
+pub static SIGNATURE: LazyLock<Signature> = LazyLock::new(|| {
+    let param_names = vec![
+        "query".to_string(),
+        "k".to_string(),
+        "limit".to_string(),
+        "join_key".to_string(),
+        "time_column".to_string(),
+        "recency_decay".to_string(),
+        "decay_constant".to_string(),
+        "decay_scale_secs".to_string(),
+        "decay_window_secs".to_string(),
+        "rank_weight".to_string(),
+    ];
+    match Signature::user_defined(Volatility::Stable).with_parameter_names(param_names) {
+        Ok(signature) => signature,
+        Err(_) => Signature::variadic_any(Volatility::Stable),
+    }
+});
 
 macro_rules! extract_scalar_base {
     ($map:expr, $key:literal, $datatype:expr, $pattern:pat => $value:expr) => {
@@ -1517,6 +1535,46 @@ mod tests {
             parsed.rrf_subquery_arguments[0].rank_weight,
             Some(2.5),
             "rank_weight should be 2.5"
+        );
+    }
+
+    #[test]
+    fn scalar_stub_declares_named_arguments() {
+        let parameter_names = SIGNATURE
+            .parameter_names
+            .as_ref()
+            .expect("rrf scalar stub should declare named parameters");
+        assert!(parameter_names.iter().any(|name| name == "join_key"));
+        assert!(parameter_names.iter().any(|name| name == "rank_weight"));
+    }
+
+    #[tokio::test]
+    async fn nested_rrf_named_arguments_do_not_fail_signature_validation() {
+        let ctx = SessionContext::new();
+        let stub = |name| {
+            create_udf(
+                name,
+                vec![],
+                DataType::Utf8,
+                Volatility::Stable,
+                Arc::new(|_| Ok(ColumnarValue::Scalar(ScalarValue::Utf8(None)))),
+            )
+        };
+        ctx.register_udf(stub("vector_search"));
+        ctx.register_udf(stub("text_search"));
+        ctx.register_udf(ReciprocalRankFusion::from_ctx(&ctx).into());
+
+        let error = ctx
+            .state()
+            .create_logical_plan(
+                "SELECT rrf(vector_search('foo', 'query'), text_search('foo', 'query'), join_key => 'id')",
+            )
+            .await
+            .expect_err("the scalar documentation stub must not be executable");
+        assert!(
+            !error
+                .to_string()
+                .contains("does not support named arguments")
         );
     }
 
