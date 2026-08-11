@@ -417,12 +417,13 @@ pub trait RuntimeHandle: Send + Sync + 'static {
     /// Persist a cloud-managed spicepod as the configuration this instance
     /// starts on.
     ///
-    /// Applying is **not** a hot reload: the spicepod is validated, persisted,
-    /// and made live by a restart ([`PostApply::ExitToApply`]), so a change to
-    /// any section takes effect by one path instead of some sections reloading
-    /// and the rest waiting for an operator. Redelivering a deployment the
-    /// instance is already serving must return [`PostApply::Nothing`] —
-    /// restarting for it would make a redelivery a restart loop.
+    /// The spicepod is validated and persisted, and how it becomes live is the
+    /// handle's to decide: one that reconciled the change into the running
+    /// process returns [`PostApply::Nothing`] and reports the deployment as
+    /// live, one that cannot returns [`PostApply::ExitToApply`] and is restarted
+    /// onto the file it persisted. Redelivering a deployment the instance is
+    /// already serving must return [`PostApply::Nothing`] — restarting for it
+    /// would make a redelivery a restart loop.
     ///
     /// The default implementation writes the YAML to
     /// `config_dir/spicepod-cloud-managed.yml` via `tokio::fs` so the
