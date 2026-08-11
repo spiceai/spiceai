@@ -85,7 +85,7 @@ use crate::cluster::{
 use crate::extension::Extension;
 use crate::udtfs::ListUDFTableFunc;
 use runtime_async::cancellable_task::{CancellableTaskHandle, spawn_cancellable_task};
-pub mod accelerated_table;
+pub use runtime_table::accelerated;
 pub(crate) mod accelerator_memory_budget;
 pub mod auth;
 pub mod builder;
@@ -103,7 +103,7 @@ pub mod embeddings;
 pub mod execution_plan;
 pub mod executor_table;
 pub mod extension;
-pub mod federated_table;
+pub use runtime_table::federated;
 pub mod flight;
 mod http;
 
@@ -609,7 +609,7 @@ pub struct Runtime {
 
     autoload_extensions: Arc<HashMap<String, Box<dyn ExtensionFactory>>>,
     extensions: Arc<RwLock<HashMap<String, Arc<dyn Extension>>>>,
-    spaced_tracer: Arc<tracers::SpacedTracer>,
+    spaced_tracer: Arc<util::tracers::SpacedTracer>,
 
     status: Arc<status::RuntimeStatus>,
     tasks: Arc<RwLock<HashMap<String, CancellableTaskHandle>>>,

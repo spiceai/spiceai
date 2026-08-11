@@ -55,6 +55,20 @@ pub struct CayenneContext {
     session_config: SessionConfig,
     /// Shared semaphore for limiting concurrent file writes / uploads across all partitions.
     upload_semaphore: Arc<Semaphore>,
+    /// Bounds concurrent inline-admission attempts on the OVERWRITE path across
+    /// every table sharing this context — i.e. across the partition children of a
+    /// partitioned dataset, whose overwrites all run at once under one
+    /// coordinator. Exactly one slot, so the host-memory the runtime reserves for
+    /// a single buffered admission (`inline_max_buffer_bytes`) plus its
+    /// serialized blob (`inline_max_bytes`) per acceleration is TRUE rather than
+    /// merely bigger.
+    ///
+    /// Acquired with `try_acquire`, never awaited: partition children are coupled
+    /// writers fed by one routing demux, so parking here would stall the router
+    /// and starve the slot-holding sibling of input — the hold-and-wait deadlock
+    /// of spiceai/spiceai#11818. A child that cannot take the slot writes Vortex
+    /// files instead, which is what every overwrite did before inlining existed.
+    overwrite_inline_admission: Arc<Semaphore>,
     /// Shared `RuntimeEnv` from the main Spice runtime.
     ///
     /// Cayenne uses this `RuntimeEnv` for all internal `SessionContext`
@@ -292,6 +306,7 @@ impl CayenneContext {
             dataset: dataset.to_string(),
             session_config: SessionConfig::default(),
             upload_semaphore: Arc::new(Semaphore::new(config.upload_concurrency.max(1))),
+            overwrite_inline_admission: Arc::new(Semaphore::new(1)),
             runtime_env,
             live_actuators,
             ingest_stats: Arc::new(IngestStats::new()),
@@ -753,6 +768,19 @@ impl CayenneContext {
         &self.upload_semaphore
     }
 
+    /// Claim the single inline-admission slot for an overwrite, or `None` when a
+    /// sibling table on this context already holds it. Never blocks — see
+    /// [`Self::overwrite_inline_admission`]. The permit is held until the
+    /// overwrite commits and publishes, because the buffered batches and the
+    /// serialized blob stay resident for that whole span.
+    pub(crate) fn try_acquire_overwrite_inline_admission(
+        &self,
+    ) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        Arc::clone(&self.overwrite_inline_admission)
+            .try_acquire_owned()
+            .ok()
+    }
+
     /// Record one CDC write's measurements into the rolling ingest accounting.
     /// Always on (cheap: a few atomics + a short-held mutex per *batch*); feeds
     /// the dynamic controller and observability. The inter-batch arrival interval
@@ -919,9 +947,11 @@ impl CayenneContext {
         if !self.dynamic_tuning {
             return None;
         }
-        // Detect the environment (cgroup-aware memory usage) and fold it in, so
-        // the loop closes on memory as well as ingest/query behavior.
-        tuning::sample_mem_pressure(&self.ingest_stats);
+        // Memory pressure is sampled once per tick by `observe_environment`, which
+        // the same tick body runs first: re-sampling here would re-read the cgroup
+        // files microseconds later for no new information, and would let the
+        // controller act on a different reading than the one the tick already
+        // exported as a gauge.
         let now = std::time::Instant::now();
         let since_last = (*self.last_adjust.lock()).map_or(std::time::Duration::MAX, |t| {
             now.saturating_duration_since(t)

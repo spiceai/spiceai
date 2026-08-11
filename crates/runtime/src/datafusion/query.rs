@@ -1056,6 +1056,7 @@ impl Query {
             self.query_id,
             sql_preview.as_ref(),
             request_context.protocol(),
+            Arc::from(request_context.cache_namespace().storage_id()),
             query_cancel_token.clone(),
         );
         let query_id_str: Arc<str> = Arc::from(self.query_id.to_string());
@@ -1548,6 +1549,7 @@ impl Query {
                         res_stream,
                         cache_manager.raw_cache_key,
                         datasets,
+                        query_start,
                     )
                 } else {
                     res_stream
@@ -3072,11 +3074,20 @@ mod tests {
         assert_eq!(cached_query.cache_status, CacheStatus::CacheHit);
         let registry = df.query_cancel_registry();
         assert!(
-            registry.list().iter().any(|info| info.query_id == query_id),
+            registry
+                .list_all()
+                .iter()
+                .any(|info| info.query_id == query_id),
             "cached query should remain registered while its stream is alive"
         );
 
-        assert!(registry.cancel(query_id));
+        let owner = registry
+            .list_all()
+            .into_iter()
+            .find(|info| info.query_id == query_id)
+            .map(|info| info.owner)
+            .expect("the registered query should expose its owning scope");
+        assert!(registry.cancel_owned(query_id, &owner));
         assert!(cancel_token.is_cancelled());
         let cancellation = cached_query
             .data
@@ -3089,7 +3100,10 @@ mod tests {
         );
         assert!(cached_query.data.next().await.is_none());
         assert!(
-            registry.list().iter().all(|info| info.query_id != query_id),
+            registry
+                .list_all()
+                .iter()
+                .all(|info| info.query_id != query_id),
             "cached query should be deregistered after the stream terminates"
         );
     }
@@ -3226,7 +3240,11 @@ mod tests {
         // a fixed sleep (which is flaky under slow CI). Bounded fallback (~5s).
         let registry = df.query_cancel_registry();
         for _ in 0..500 {
-            if registry.list().iter().any(|info| info.query_id == query_id) {
+            if registry
+                .list_all()
+                .iter()
+                .any(|info| info.query_id == query_id)
+            {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;

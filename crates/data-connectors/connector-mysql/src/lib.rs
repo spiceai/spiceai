@@ -612,7 +612,7 @@ impl DataConnector for MySQL {
 
     fn changes_stream(
         &self,
-        federated_table: Arc<runtime::federated_table::FederatedTable>,
+        federated_table: Arc<runtime::federated::FederatedTable>,
         dataset: &Dataset,
     ) -> Option<data_components::cdc::ChangesStream> {
         Some(replication::build_changes_stream(

@@ -27,7 +27,7 @@ use datafusion_expr::TableScan;
 use runtime_cluster::{ExecutorRegistry, PartitionValue};
 use runtime_datafusion::analyzer_rule::TablePartitionProvider;
 
-use crate::accelerated_table::AcceleratedTable;
+use crate::accelerated::AcceleratedTable;
 use crate::search::util::find_concrete_table_provider;
 
 /// Wraps an [`ExecutorRegistry`] with the `AcceleratedTable`-specific

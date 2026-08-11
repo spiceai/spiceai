@@ -136,9 +136,11 @@ impl JobStore {
         &self,
         request: SubmitQueryRequest,
         read_only: bool,
+        owner: String,
     ) -> Result<JobState> {
         let job_id = Self::generate_job_id();
         let mut state = JobState::new_pending(job_id, request.sql, request.parameters)
+            .with_owner(owner)
             .with_timeout_seconds(request.timeout_seconds)
             .with_maximum_size(request.maximum_size);
         state.read_only = read_only;
@@ -146,8 +148,24 @@ impl JobStore {
         Ok(state)
     }
 
-    /// Gets the current state of a job.
+    /// Gets the current state of a job, refusing one whose results expired.
     pub async fn get_job(&self, job_id: &str) -> Result<JobState> {
+        let state = self.get_job_ignoring_expiry(job_id).await?;
+        if state.is_expired() {
+            return Err(super::error::Error::JobResultsExpired {
+                job_id: job_id.to_string(),
+            });
+        }
+        Ok(state)
+    }
+
+    /// Gets the current state of a job without applying the expiry check.
+    ///
+    /// Callers that authorize by owner use this so ownership is resolved
+    /// before expiry: otherwise an expired job answers a non-owner with
+    /// `JobResultsExpired` while a missing one answers `JobNotFound`, which
+    /// tells a caller that someone else's job id exists.
+    pub async fn get_job_ignoring_expiry(&self, job_id: &str) -> Result<JobState> {
         let path = self.job_state_path(job_id);
         let result = self.store.get(&path).await.map_err(|e| match e {
             ObjectStoreError::NotFound { .. } => super::error::Error::JobNotFound {
@@ -167,13 +185,6 @@ impl JobStore {
 
         // Store the version for conditional writes
         state.version = Some(version);
-
-        // Check if expired
-        if state.is_expired() {
-            return Err(super::error::Error::JobResultsExpired {
-                job_id: job_id.to_string(),
-            });
-        }
 
         Ok(state)
     }
@@ -750,6 +761,10 @@ mod tests {
 
     use crate::http::v1::queries::SubmitQueryRequest;
 
+    fn test_owner() -> String {
+        crate::jobs::PUBLIC_JOB_OWNER.to_string()
+    }
+
     fn make_request(sql: impl Into<String>) -> SubmitQueryRequest {
         SubmitQueryRequest {
             sql: sql.into(),
@@ -765,7 +780,7 @@ mod tests {
         let job_store = JobStore::new(store, "test", "node-1");
 
         let state = job_store
-            .create_job(make_request("SELECT 1"), false)
+            .create_job(make_request("SELECT 1"), false, test_owner())
             .await
             .expect("to create job");
 
@@ -785,7 +800,7 @@ mod tests {
 
         // Create job
         let state = job_store
-            .create_job(make_request("SELECT * FROM test"), false)
+            .create_job(make_request("SELECT * FROM test"), false, test_owner())
             .await
             .expect("to create job");
         let job_id = state.job_id.clone();
@@ -828,7 +843,7 @@ mod tests {
         let job_store = JobStore::new(store, "test", "node-1");
 
         let state = job_store
-            .create_job(make_request("SELECT 1"), false)
+            .create_job(make_request("SELECT 1"), false, test_owner())
             .await
             .expect("to create job");
 
@@ -876,7 +891,11 @@ mod tests {
             let job_store = JobStore::new(store, "test", "node-1");
 
             let state = job_store
-                .create_job(make_request("SELECT * FROM test WHERE 1=0"), false)
+                .create_job(
+                    make_request("SELECT * FROM test WHERE 1=0"),
+                    false,
+                    test_owner(),
+                )
                 .await
                 .expect("to create job");
 
@@ -909,7 +928,7 @@ mod tests {
             let job_store = JobStore::new(store, "test", "node-1").with_chunk_size(100);
 
             let state = job_store
-                .create_job(make_request("SELECT * FROM test"), false)
+                .create_job(make_request("SELECT * FROM test"), false, test_owner())
                 .await
                 .expect("to create job");
 
@@ -948,7 +967,7 @@ mod tests {
             let job_store = JobStore::new(store, "test", "node-1").with_chunk_size(100);
 
             let state = job_store
-                .create_job(make_request("SELECT * FROM test"), false)
+                .create_job(make_request("SELECT * FROM test"), false, test_owner())
                 .await
                 .expect("to create job");
 
@@ -987,7 +1006,7 @@ mod tests {
             let job_store = JobStore::new(store, "test", "node-1").with_chunk_size(2);
 
             let state = job_store
-                .create_job(make_request("SELECT * FROM test"), false)
+                .create_job(make_request("SELECT * FROM test"), false, test_owner())
                 .await
                 .expect("to create job");
 
@@ -1049,7 +1068,7 @@ mod tests {
             let job_store = JobStore::new(store, "test", "node-1").with_chunk_size(2);
 
             let state = job_store
-                .create_job(make_request("SELECT * FROM test"), false)
+                .create_job(make_request("SELECT * FROM test"), false, test_owner())
                 .await
                 .expect("to create job");
 
@@ -1090,7 +1109,7 @@ mod tests {
             let job_store = JobStore::new(store, "test", "node-1");
 
             let state = job_store
-                .create_job(make_request("SELECT * FROM test"), false)
+                .create_job(make_request("SELECT * FROM test"), false, test_owner())
                 .await
                 .expect("to create job");
 
@@ -1119,7 +1138,7 @@ mod tests {
             let job_store = JobStore::new(store, "test", "node-1");
 
             let state = job_store
-                .create_job(make_request("SELECT * FROM test"), false)
+                .create_job(make_request("SELECT * FROM test"), false, test_owner())
                 .await
                 .expect("to create job");
 
@@ -1167,6 +1186,7 @@ mod tests {
                 .create_job(
                     make_request_with_maximum_size("SELECT * FROM test", Some(10_000)),
                     false,
+                    test_owner(),
                 )
                 .await
                 .expect("to create job");
@@ -1203,6 +1223,7 @@ mod tests {
                 .create_job(
                     make_request_with_maximum_size("SELECT * FROM test", Some(1)),
                     false,
+                    test_owner(),
                 )
                 .await
                 .expect("to create job");
@@ -1246,6 +1267,7 @@ mod tests {
                 .create_job(
                     make_request_with_maximum_size("SELECT * FROM test", Some(1)),
                     false,
+                    test_owner(),
                 )
                 .await
                 .expect("to create job");
@@ -1281,6 +1303,7 @@ mod tests {
                 .create_job(
                     make_request_with_maximum_size("SELECT * FROM test", None),
                     false,
+                    test_owner(),
                 )
                 .await
                 .expect("to create job");
@@ -1317,7 +1340,7 @@ mod tests {
             let job_store = JobStore::new(store, "test", "node-1");
 
             let state = job_store
-                .create_job(make_request("SELECT 1"), false)
+                .create_job(make_request("SELECT 1"), false, test_owner())
                 .await
                 .expect("to create job");
 
@@ -1334,7 +1357,7 @@ mod tests {
             let job_store = JobStore::new(store, "test", "node-1");
 
             let created = job_store
-                .create_job(make_request("SELECT 1"), false)
+                .create_job(make_request("SELECT 1"), false, test_owner())
                 .await
                 .expect("to create job");
 
@@ -1357,7 +1380,7 @@ mod tests {
 
             // Create job
             let created = job_store
-                .create_job(make_request("SELECT 1"), false)
+                .create_job(make_request("SELECT 1"), false, test_owner())
                 .await
                 .expect("to create job");
             let job_id = created.job_id.clone();
@@ -1407,7 +1430,7 @@ mod tests {
 
             // Create job
             let created = job_store
-                .create_job(make_request("SELECT 1"), false)
+                .create_job(make_request("SELECT 1"), false, test_owner())
                 .await
                 .expect("to create job");
             let job_id = created.job_id.clone();
@@ -1440,7 +1463,7 @@ mod tests {
 
             // Create job
             let created = job_store
-                .create_job(make_request("SELECT 1"), false)
+                .create_job(make_request("SELECT 1"), false, test_owner())
                 .await
                 .expect("to create job");
             let job_id = created.job_id.clone();
@@ -1477,7 +1500,7 @@ mod tests {
 
             // Create first job and write chunks
             let state1 = job_store
-                .create_job(make_request("SELECT * FROM test"), false)
+                .create_job(make_request("SELECT * FROM test"), false, test_owner())
                 .await
                 .expect("to create first job");
 
