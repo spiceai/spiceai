@@ -41,7 +41,7 @@ stateful:
 # leaves the process unready instead of restarting it mid-operation.
 startupProbe:
   periodSeconds: 10
-  failureThreshold: 66
+  failureThreshold: 67
 
 command:
   - /usr/local/bin/spiced

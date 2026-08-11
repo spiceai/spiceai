@@ -24,10 +24,11 @@ curl -fsS http://localhost:8090/v1/ready
 
 Terminal enrollment failures (an invalid, expired, or consumed key) exit the
 container with code 1; transient failures are retried with backoff for up to
-ten minutes while the container stays unready. A restart during bootstrap is
-safe: an existing identity always wins and the key is not redeemed again,
-and if an attempt's response was lost the retried enrollment resumes the
-same operation instead of enrolling a sibling instance.
+ten minutes while the container stays unready. The bootstrap overlay disables
+automatic restarts so a terminal failure or exhausted retry window remains
+visible. After correcting the cause, explicitly rerun the bootstrap command;
+an existing identity wins without redeeming the key again, and a persisted
+draft resumes the same operation instead of enrolling a sibling instance.
 
 ## 2. Drop the key
 
@@ -38,8 +39,9 @@ leaves the container's argv:
 docker compose up -d
 ```
 
-The container now starts with no key and no flag — the stored identity alone
-reconnects it. Prove it survives replacement:
+The container now starts with no key and no flag, restores the base service's
+`unless-stopped` restart policy, and reconnects from the stored identity alone.
+Prove it survives replacement:
 
 ```console
 docker compose down && docker compose up -d

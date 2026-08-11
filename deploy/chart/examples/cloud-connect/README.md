@@ -62,8 +62,8 @@ example with `--reuse-values` or a maintained connected values file).
 ## Guardrails
 
 One enrollment key enrolls exactly one identity, so `helm template` fails —
-before anything renders — unless direct Cloud Connect explicitly uses
-`cloudConnect.mode: bootstrap` with:
+before anything renders — when `cloudConnect.mode: bootstrap` has any of
+these unsafe settings:
 
 - `replicaCount` other than 1 (scaling a direct `--token` deployment above
   one replica is unsupported; multi-replica enrollment belongs to the
@@ -73,7 +73,9 @@ before anything renders — unless direct Cloud Connect explicitly uses
 - a literal enrollment key in `command`, an undefined token environment
   variable, or a literal/ambiguous matching environment entry — the token
   argument must expand exactly one Secret-backed environment variable
-  (`"$(SPICE_ENROLL_KEY)"`). No chart value accepts a literal key.
+  (`"$(SPICE_ENROLL_KEY)"`). No chart value accepts a literal key,
+- a startup probe other than the local HTTP `/health` check on port 8090, or
+  less than 660 seconds before its failure threshold can restart `spiced`.
 
 The chart deliberately supports only a direct command-array token option; it
 does not attempt to interpret arbitrary `sh -c` programs or custom entrypoint

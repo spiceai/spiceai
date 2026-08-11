@@ -84,8 +84,10 @@ pub enum Error {
 
     #[snafu(display(
         "The enrollment draft at {} uses unsupported schema {found} (this runtime requires \
-         schema {DRAFT_SCHEMA_VERSION}). Upgrade spiced, or remove the file to start a fresh \
-         enrollment. See: https://spiceai.org/docs",
+         schema {DRAFT_SCHEMA_VERSION}). Upgrade spiced to a version that supports this draft, \
+         or contact Spice Cloud support to recover the pending enrollment. Do not delete the \
+         draft because it may identify an enrollment already committed by Spice Cloud. \
+         See: https://spiceai.org/docs",
         path.display()
     ))]
     UnsupportedSchema { path: PathBuf, found: u32 },
@@ -566,7 +568,17 @@ mod tests {
         std::fs::write(&path, newer.to_string()).expect("write newer draft");
 
         let err = load_or_create(dir.path()).expect_err("must refuse");
-        assert!(matches!(err, Error::UnsupportedSchema { .. }), "{err}");
+        assert!(matches!(&err, Error::UnsupportedSchema { .. }), "{err}");
+        let message = err.to_string();
+        assert!(message.contains("contact Spice Cloud support"), "{message}");
+        assert!(
+            message.contains("Do not delete the draft"),
+            "unsupported drafts must preserve retry identity: {message}"
+        );
+        assert!(
+            path.exists(),
+            "refusing an unsupported schema must preserve its retry identity"
+        );
     }
 
     #[test]

@@ -49,9 +49,12 @@ if output="$(render -f "${EXAMPLES}/values-bootstrap.yaml")"; then
   echo "${output}" | grep -q 'kind: StatefulSet' \
     && pass "bootstrap renders a StatefulSet (persistent identity)" \
     || fail "bootstrap did not render a StatefulSet"
-  echo "${output}" | grep -q 'failureThreshold: 66' \
+  echo "${output}" | grep -q 'failureThreshold: 67' \
     && pass "startup probe outlives the ten-minute enrollment retry budget" \
     || fail "startup probe can restart spiced before enrollment exhausts its retry budget"
+  echo "${output}" | sed -n '/^[[:space:]]*startupProbe:$/,/^[[:space:]]*volumeMounts:$/p' | grep -q 'path: /health' \
+    && pass "startup probe remains enrollment-dependent" \
+    || fail "startup probe does not use the local enrollment-dependent health endpoint"
   echo "${output}" | grep -q 'spice-enroll-' \
     && fail "a literal enrollment key leaked into the rendering" \
     || pass "no literal enrollment key anywhere in the rendering"
@@ -101,6 +104,22 @@ expect_rejected "replicaCount zero" --set replicaCount=0
 expect_rejected "non-persistent storage" --set stateful.enabled=false
 expect_rejected "startup probe shorter than the enrollment retry window" \
   --set startupProbe.failureThreshold=60
+expect_rejected "startup probe whose final failure occurs before 660 seconds" \
+  --set startupProbe.failureThreshold=66
+expect_rejected "an exec startup probe that can succeed before enrollment" \
+  --set-json 'startupProbe.exec={"command":["true"]}'
+expect_rejected "a TCP startup probe that bypasses the required health check" \
+  --set-json 'startupProbe.tcpSocket={"port":8090}'
+expect_rejected "a gRPC startup probe that bypasses the required health check" \
+  --set-json 'startupProbe.grpc={"port":8090}'
+expect_rejected "a remote startup probe that can succeed before enrollment" \
+  --set startupProbe.httpGet.host=example.invalid
+expect_rejected "a startup probe on the wrong health path" \
+  --set startupProbe.httpGet.path=/v1/ready
+expect_rejected "a startup probe on the wrong HTTP port" \
+  --set startupProbe.httpGet.port=8091
+expect_rejected "an HTTPS startup probe that cannot observe the HTTP listener" \
+  --set startupProbe.httpGet.scheme=HTTPS
 expect_rejected "SPICE_CONFIG_DIR off the stateful volume" \
   --set-json 'additionalEnv=[{"name":"SPICE_ENROLL_KEY","valueFrom":{"secretKeyRef":{"name":"spice-cloud-connect","key":"enroll-key"}}},{"name":"SPICE_CONFIG_DIR","value":"/var/lib/spice"}]'
 expect_rejected "SPICE_CONFIG_DIR escapes the stateful volume through traversal" \
@@ -162,7 +181,7 @@ if output="$(render \
   --set-json 'command=["spiced","--token","$(SPICE_ENROLL_KEY)"]' \
   --set-json 'additionalEnv=[{"name":"SPICE_ENROLL_KEY","valueFrom":{"secretKeyRef":{"name":"custom-enroll","key":"token"}}},{"name":"SPICE_CONFIG_DIR","value":"/data/.spice"}]')"; then
   fail "a custom token bootstrap rendered with the chart's 30-second startup probe"
-elif echo "${output}" | grep -q "startup-probe budget of at least 660 seconds"; then
+elif echo "${output}" | grep -q "requires at least 660 seconds"; then
   pass "custom token bootstraps reject the chart's short default startup probe"
 else
   fail "custom token bootstrap failed for the wrong reason: ${output}"
@@ -185,6 +204,26 @@ if grep -rq 'spice-enroll-[A-Za-z0-9_-]' "${EXAMPLES}"/*.yaml; then
   fail "an example values file contains a literal enrollment key"
 else
   pass "example values files contain no literal enrollment key"
+fi
+
+# --- Docker bootstrap must not inherit its steady-state restart loop ---
+COMPOSE_BOOTSTRAP="deploy/docker/cloud-connect/compose.bootstrap.yaml"
+if grep -Eq '^[[:space:]]+restart: "no"$' "${COMPOSE_BOOTSTRAP}"; then
+  pass "Docker bootstrap disables automatic restarts"
+else
+  fail "Docker bootstrap inherits the steady-state automatic restart policy"
+fi
+if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
+  if merged_restart="$(SPICE_ENROLL_KEY="${TEST_ENROLLMENT_KEY}" docker compose \
+    -f deploy/docker/cloud-connect/compose.yaml \
+    -f "${COMPOSE_BOOTSTRAP}" config --format json | jq -r '.services.spiced.restart')" \
+    && [ "${merged_restart}" = "no" ]; then
+    pass "Docker Compose merge applies the bootstrap restart override"
+  else
+    fail "Docker Compose merge kept restart policy ${merged_restart:-unknown} during bootstrap"
+  fi
+else
+  pass "Docker Compose merge check skipped because the CLI is unavailable"
 fi
 
 # --- The phase transition preserves installed values and rejects timeout

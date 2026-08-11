@@ -187,12 +187,18 @@ security policy by interpreting arbitrary shell programs or entrypoints.
 {{- end -}}
 {{- end -}}
 {{- if eq $mode "bootstrap" -}}
-{{- $startupPeriodSeconds := int (.Values.startupProbe.periodSeconds | default 10) -}}
-{{- $startupFailureThreshold := int (.Values.startupProbe.failureThreshold | default 3) -}}
-{{- $startupInitialDelaySeconds := int (.Values.startupProbe.initialDelaySeconds | default 0) -}}
-{{- $startupBudgetSeconds := add $startupInitialDelaySeconds (mul $startupPeriodSeconds $startupFailureThreshold) -}}
+{{- $startupProbe := .Values.startupProbe | default dict -}}
+{{- $startupHttpGet := (get $startupProbe "httpGet") | default dict -}}
+{{- $startupHttpScheme := upper (get $startupHttpGet "scheme" | default "HTTP") -}}
+{{- if or (get $startupProbe "exec") (get $startupProbe "tcpSocket") (get $startupProbe "grpc") (ne (get $startupHttpGet "path") "/health") (ne (toString (get $startupHttpGet "port")) "8090") (get $startupHttpGet "host") (ne $startupHttpScheme "HTTP") -}}
+{{- fail "Cloud Connect --token bootstrap requires the local HTTP startup probe at /health on port 8090; exec, TCP, gRPC, HTTPS, and remote-host probes can succeed too early or never observe runtime health. See deploy/chart/examples/cloud-connect/." -}}
+{{- end -}}
+{{- $startupPeriodSeconds := int (get $startupProbe "periodSeconds" | default 10) -}}
+{{- $startupFailureThreshold := int (get $startupProbe "failureThreshold" | default 3) -}}
+{{- $startupInitialDelaySeconds := int (get $startupProbe "initialDelaySeconds" | default 0) -}}
+{{- $startupBudgetSeconds := add $startupInitialDelaySeconds (mul $startupPeriodSeconds (sub $startupFailureThreshold 1)) -}}
 {{- if lt $startupBudgetSeconds 660 -}}
-{{- fail "Cloud Connect --token bootstrap requires a startup-probe budget of at least 660 seconds so Kubernetes cannot restart spiced during its ten-minute enrollment retry window. Increase startupProbe.failureThreshold, periodSeconds, or initialDelaySeconds. See deploy/chart/examples/cloud-connect/." -}}
+{{- fail "Cloud Connect --token bootstrap requires at least 660 seconds before the failure-threshold probe can restart spiced, so its ten-minute enrollment retry window can finish. Increase startupProbe.failureThreshold, periodSeconds, or initialDelaySeconds. See deploy/chart/examples/cloud-connect/." -}}
 {{- end -}}
 {{- $cmd := .Values.command -}}
 {{- $tokenArgCount := 0 -}}
