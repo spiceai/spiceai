@@ -275,6 +275,59 @@ mod login {
             .assert()
             .failure();
     }
+
+    /// Standalone `spice login --key` keeps its credential-store behavior: the
+    /// key lands in the working directory's `.env`, owner-readable only, with
+    /// the same success line as always.
+    #[test]
+    fn test_login_with_key_writes_env_credentials() {
+        let temp_dir = TempDir::new().expect("temp dir should be creatable");
+
+        let mut cmd = spice_cmd();
+        cmd.current_dir(temp_dir.path())
+            .args(["login", "--key", "sk_test_abc123"])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains(
+                "Successfully logged in to Spice.ai with API key",
+            ));
+
+        let env_path = temp_dir.path().join(".env");
+        let contents = fs::read_to_string(&env_path).expect(".env should be written");
+        assert!(
+            contents.contains("SPICE_SPICEAI_API_KEY=sk_test_abc123"),
+            "the key must be stored under its credential variable: {contents}"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&env_path)
+                .expect(".env metadata should be readable")
+                .permissions()
+                .mode();
+            assert_eq!(
+                mode & 0o777,
+                0o600,
+                "the credential file must stay owner-only"
+            );
+        }
+    }
+
+    /// Provider regression guard: the `SharePoint` and ABFS logins keep their
+    /// OAuth device-code flows and vocabulary — their help still asks for the
+    /// Azure AD tenant/client pair rather than anything session-based.
+    #[test]
+    fn test_provider_device_flow_help_unchanged() {
+        for provider in ["sharepoint", "abfs"] {
+            let mut cmd = spice_cmd();
+            cmd.args(["login", provider, "--help"])
+                .assert()
+                .success()
+                .stdout(predicate::str::contains("--tenant-id"))
+                .stdout(predicate::str::contains("--client-id"));
+        }
+    }
 }
 
 // ============================================================================
