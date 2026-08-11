@@ -28,7 +28,7 @@ limitations under the License.
 //! The beta surface supports scalar and complex Arrow types, including lists,
 //! structs, decimals, and timestamps with timezones.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Formatter};
 use std::hash::Hash;
 use std::sync::{
@@ -57,7 +57,7 @@ use datafusion::scalar::ScalarValue;
 use datafusion::sql::{
     TableReference,
     parser::DFParser,
-    sqlparser::{ast, dialect::PostgreSqlDialect},
+    sqlparser::{ast, ast::VisitMut, dialect::PostgreSqlDialect},
 };
 use snafu::{ResultExt, Snafu};
 use spicepod::component::function::{
@@ -515,7 +515,14 @@ impl TableProvider for SqlTableProvider {
         )
         .await?;
 
-        let (session_state, plan) = ctx.sql(&self.body).await?.into_parts();
+        // Search UDTFs require their query argument to be a literal while the
+        // SQL planner is constructing the logical plan. The regular args
+        // table cannot satisfy that requirement: its values are only made
+        // literal by `inline_args_into_plan`, after this planning step.
+        // Rewrite search-query argument positions before planning, preserving
+        // the args table for all other references in the body.
+        let body = inline_search_query_args(&self.body, self.arg_schema.as_ref(), &self.args)?;
+        let (session_state, plan) = ctx.sql(&body).await?.into_parts();
         let inlined_plan = inline_args_into_plan(plan, self.arg_schema.as_ref(), &self.args)?;
         let mut df = DataFrame::new(session_state, inlined_plan);
         validate_output_schema(&self.name, df.schema().as_arrow(), self.schema.as_ref())
@@ -645,6 +652,100 @@ fn validate_table_body_syntax(body: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Substitute SQL table-function arguments used as the query text of search
+/// UDTFs before DataFusion plans the body. Search UDTFs inspect their argument
+/// expressions during table-function construction, so the later logical-plan
+/// argument inliner is too late for these positions.
+fn inline_search_query_args(
+    body: &str,
+    schema: &Schema,
+    values: &[ScalarValue],
+) -> DataFusionResult<String> {
+    let mut statements = DFParser::parse_sql_with_dialect(body, &PostgreSqlDialect {})?;
+    let arg_values: HashMap<String, ScalarValue> = schema
+        .fields()
+        .iter()
+        .zip(values)
+        .map(|(field, value)| (field.name().to_ascii_lowercase(), value.clone()))
+        .collect();
+
+    struct SearchQueryArgRewriter<'a> {
+        values: &'a HashMap<String, ScalarValue>,
+    }
+
+    impl VisitMut for SearchQueryArgRewriter<'_> {
+        type Break = ();
+
+        fn pre_visit_expr(&mut self, expr: &mut ast::Expr) -> std::ops::ControlFlow<Self::Break> {
+            let ast::Expr::Function(function) = expr else {
+                return std::ops::ControlFlow::Continue(());
+            };
+            let function_name = function.name.to_string();
+            if !function_name.rsplit('.').next().is_some_and(|name| {
+                name.eq_ignore_ascii_case("vector_search")
+                    || name.eq_ignore_ascii_case("text_search")
+            }) {
+                return std::ops::ControlFlow::Continue(());
+            }
+
+            let ast::FunctionArguments::List(arguments) = &mut function.args else {
+                return std::ops::ControlFlow::Continue(());
+            };
+            let mut positional_index = 0;
+            for argument in &mut arguments.args {
+                let (name, value) = match argument {
+                    ast::FunctionArg::Named { name, arg, .. } => (Some(name.value.as_str()), arg),
+                    ast::FunctionArg::ExprNamed { name, arg, .. } => {
+                        let name = match name {
+                            ast::Expr::Identifier(identifier) => Some(identifier.value.as_str()),
+                            _ => None,
+                        };
+                        (name, arg)
+                    }
+                    ast::FunctionArg::Unnamed(arg) => {
+                        let index = positional_index;
+                        positional_index += 1;
+                        if index != 1 {
+                            continue;
+                        }
+                        (Some("query"), arg)
+                    }
+                };
+                if name.is_none_or(|name| !name.eq_ignore_ascii_case("query")) {
+                    continue;
+                }
+                let ast::FunctionArgExpr::Expr(ast::Expr::Identifier(identifier)) = value else {
+                    continue;
+                };
+                let Some(scalar) = self.values.get(&identifier.value.to_ascii_lowercase()) else {
+                    continue;
+                };
+                let ScalarValue::Utf8(Some(query)) = scalar else {
+                    continue;
+                };
+                *value = ast::FunctionArgExpr::Expr(ast::Expr::Value(ast::ValueWithSpan::from(
+                    ast::Value::SingleQuotedString(query.clone()),
+                )));
+            }
+            std::ops::ControlFlow::Continue(())
+        }
+    }
+
+    let mut rewriter = SearchQueryArgRewriter {
+        values: &arg_values,
+    };
+    for statement in &mut statements {
+        if let datafusion::sql::parser::Statement::Statement(statement) = statement {
+            statement.visit(&mut rewriter);
+        }
+    }
+    Ok(statements
+        .into_iter()
+        .map(|statement| statement.to_string())
+        .collect::<Vec<_>>()
+        .join("; "))
 }
 
 fn table_arg_values(
@@ -1560,6 +1661,21 @@ mod tests {
             .await
             .expect("projected query runs");
         assert_eq!(projected[0].num_columns(), 1);
+    }
+
+    #[test]
+    fn search_query_arguments_are_inlined_before_sql_planning() {
+        let schema = Schema::new(vec![Field::new("q", DataType::Utf8, true)]);
+        let body = "SELECT * FROM rrf(vector_search(docs, q), text_search(docs, q))";
+        let rewritten = inline_search_query_args(
+            body,
+            &schema,
+            &[ScalarValue::Utf8(Some("hybrid search".to_string()))],
+        )
+        .expect("rewrites search query arguments");
+
+        assert!(rewritten.contains("vector_search(docs, 'hybrid search')"));
+        assert!(rewritten.contains("text_search(docs, 'hybrid search')"));
     }
 
     #[tokio::test]
