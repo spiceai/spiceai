@@ -29,6 +29,9 @@ limitations under the License.
 //!
 //! Lifecycle:
 //! - Created (and persisted) before the first enrollment request.
+//! - First publication is serialized by a persistent advisory lock file. The
+//!   operating system releases lock ownership if a creator exits, so a later
+//!   process can recover without replacing an in-progress operation.
 //! - Reused verbatim by every retry — including a later process presenting
 //!   a **new** key after the first one expired mid-retry, which the cloud
 //!   consumes against the existing operation rather than a new instance.
@@ -45,14 +48,18 @@ use crate::identity::{EnrollmentMaterial, IdentityStore};
 /// File name (relative to `$SPICE_CONFIG_DIR`) of the enrollment draft.
 pub const ENROLLMENT_DRAFT_FILE: &str = "enrollment-draft.json";
 
-/// A portable create-if-absent claim that serializes first publication.
-const ENROLLMENT_DRAFT_CLAIM_FILE: &str = ".enrollment-draft.claim";
+/// The stable advisory lock file that serializes first publication.
+///
+/// This inode is deliberately persistent. Unlinking an advisory lock file can
+/// let a new process lock a replacement inode while another process still
+/// owns the original, defeating serialization.
+const ENROLLMENT_DRAFT_LOCK_FILE: &str = ".enrollment-draft.lock";
 
 #[cfg(not(test))]
-const CLAIM_WAIT_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+const LOCK_WAIT_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
 #[cfg(test)]
-const CLAIM_WAIT_BUDGET: std::time::Duration = std::time::Duration::from_millis(250);
-const CLAIM_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
+const LOCK_WAIT_BUDGET: std::time::Duration = std::time::Duration::from_millis(250);
+const LOCK_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
 
 /// Current schema of the draft file.
 const DRAFT_SCHEMA_VERSION: u32 = 2;
@@ -87,7 +94,7 @@ pub enum Error {
     Material { source: crate::identity::Error },
 
     #[snafu(display(
-        "Another process is still publishing the enrollment draft at {}. Wait for that process to finish and retry. If no spiced process is enrolling, remove the stale claim file and retry",
+        "Another live process is still publishing the enrollment draft protected by {}. Wait for that process to finish and retry",
         path.display()
     ))]
     CreationInProgress { path: PathBuf },
@@ -153,8 +160,8 @@ impl EnrollmentDraft {
         config_dir.join(ENROLLMENT_DRAFT_FILE)
     }
 
-    fn claim_path(path: &Path) -> PathBuf {
-        path.with_file_name(ENROLLMENT_DRAFT_CLAIM_FILE)
+    fn lock_path(path: &Path) -> PathBuf {
+        path.with_file_name(ENROLLMENT_DRAFT_LOCK_FILE)
     }
 
     /// Load the persisted draft for `config_dir`, or create, persist, and
@@ -199,11 +206,7 @@ impl EnrollmentDraft {
     }
 
     fn load_published(path: &Path, contents: &str) -> Result<Self> {
-        let draft = Self::parse_at(path, contents)?;
-        Self::remove_claim(path).context(IoSnafu {
-            path: Self::claim_path(path),
-        })?;
-        Ok(draft)
+        Self::parse_at(path, contents)
     }
 
     /// Generate a fresh draft and persist it at `path` before returning it,
@@ -215,152 +218,88 @@ impl EnrollmentDraft {
             })?;
         }
 
-        let claim_path = Self::claim_path(path);
-        match Self::create_claim(&claim_path) {
-            Ok(()) => Self::publish_claimed(path, &claim_path, instance, region),
-            Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {
-                Self::wait_for_publication(path, &claim_path, instance, region)
-            }
-            Err(source) => Err(Error::Io {
-                path: claim_path,
-                source,
-            }),
-        }
+        let lock_path = Self::lock_path(path);
+        let publication_lock = Self::acquire_publication_lock(&lock_path)?;
+        Self::publish_locked(path, &publication_lock, instance, region)
     }
 
-    /// Atomically claim first publication without relying on hard-link support.
-    /// `create_new` maps to the portable create-if-absent primitive offered by
-    /// local and network filesystems; the winner then publishes complete JSON
-    /// through the existing atomic rename path.
-    fn create_claim(claim_path: &Path) -> std::io::Result<()> {
+    fn acquire_publication_lock(lock_path: &Path) -> Result<std::fs::File> {
         #[cfg(unix)]
         use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 
         let mut options = std::fs::OpenOptions::new();
-        options.create_new(true).write(true);
+        options.create(true).read(true).write(true);
         #[cfg(unix)]
         options.mode(0o600);
-        let file = options.open(claim_path)?;
-        let result = (|| {
-            #[cfg(unix)]
-            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-            file.sync_all()?;
-            crate::identity::sync_parent_directory(claim_path)
-        })();
-        if result.is_err() {
-            let _ = std::fs::remove_file(claim_path);
-            let _ = crate::identity::sync_parent_directory(claim_path);
-        }
-        result
-    }
-
-    fn publish_claimed(
-        path: &Path,
-        claim_path: &Path,
-        instance: &InstanceFacts,
-        region: Option<&str>,
-    ) -> Result<Self> {
-        let published = (|| {
-            // `load_or_create` observed NotFound before entering `create_at`,
-            // but another process may have published and released its claim
-            // before this process acquired the next claim. Re-read while the
-            // claim is ours so a delayed creator can never replace the durable
-            // winner through the atomic rename below.
-            match std::fs::read_to_string(path) {
-                Ok(contents) => return Self::parse_at(path, &contents),
-                Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
-                Err(source) => {
-                    return Err(Error::Io {
-                        path: path.to_path_buf(),
-                        source,
-                    });
-                }
-            }
-
-            let material = IdentityStore::generate_enrollment().context(MaterialSnafu)?;
-            let draft = Self {
-                schema_version: DRAFT_SCHEMA_VERSION,
-                enrollment_operation_id: uuid::Uuid::new_v4().to_string(),
-                private_key_pem: material.private_key_pem,
-                public_key_pem: material.public_key_pem,
-                csr_pem: material.csr_pem,
-                enc_private_key_pem: material.enc_private_key_pem,
-                enc_public_key_pem: material.enc_public_key_pem,
-                instance: instance.clone(),
-                region: region.map(str::to_string),
-            };
-            let bytes = serde_json::to_vec_pretty(&draft).context(SerializeSnafu)?;
-            crate::identity::atomic_write_owner_only(path, &bytes).context(IoSnafu {
-                path: path.to_path_buf(),
+        let file = options.open(lock_path).context(IoSnafu {
+            path: lock_path.to_path_buf(),
+        })?;
+        #[cfg(unix)]
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .context(IoSnafu {
+                path: lock_path.to_path_buf(),
             })?;
-            Ok(draft)
-        })();
+        file.sync_all().context(IoSnafu {
+            path: lock_path.to_path_buf(),
+        })?;
+        crate::identity::sync_parent_directory(lock_path).context(IoSnafu {
+            path: lock_path.to_path_buf(),
+        })?;
 
-        let claim_cleanup = Self::remove_claim(path);
-        match (published, claim_cleanup) {
-            (Ok(draft), Ok(())) => Ok(draft),
-            (Ok(_), Err(source)) => Err(Error::Io {
-                path: claim_path.to_path_buf(),
-                source,
-            }),
-            (Err(error), Ok(())) => Err(error),
-            (Err(error), Err(source)) => {
-                tracing::warn!(
-                    "Cloud Connect: failed to remove enrollment draft claim {} after publication failed: {source}",
-                    claim_path.display()
-                );
-                Err(error)
-            }
-        }
-    }
-
-    fn wait_for_publication(
-        path: &Path,
-        claim_path: &Path,
-        instance: &InstanceFacts,
-        region: Option<&str>,
-    ) -> Result<Self> {
-        let deadline = std::time::Instant::now() + CLAIM_WAIT_BUDGET;
+        let deadline = std::time::Instant::now() + LOCK_WAIT_BUDGET;
         loop {
-            match std::fs::read_to_string(path) {
-                Ok(contents) => return Self::load_published(path, &contents),
-                Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
-                Err(source) => {
-                    return Err(Error::Io {
-                        path: path.to_path_buf(),
-                        source,
-                    });
-                }
-            }
-
-            match std::fs::metadata(claim_path) {
-                Ok(_) => {}
-                Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
-                    return Self::create_at(path, instance, region);
-                }
-                Err(source) => {
-                    return Err(Error::Io {
-                        path: claim_path.to_path_buf(),
-                        source,
-                    });
-                }
+            if fs4::fs_std::FileExt::try_lock_exclusive(&file).context(IoSnafu {
+                path: lock_path.to_path_buf(),
+            })? {
+                return Ok(file);
             }
             if std::time::Instant::now() >= deadline {
                 return Err(Error::CreationInProgress {
-                    path: claim_path.to_path_buf(),
+                    path: lock_path.to_path_buf(),
                 });
             }
-            std::thread::sleep(CLAIM_POLL_INTERVAL);
+            std::thread::sleep(LOCK_POLL_INTERVAL);
         }
     }
 
-    fn remove_claim(path: &Path) -> std::io::Result<()> {
-        let claim_path = Self::claim_path(path);
-        match std::fs::remove_file(&claim_path) {
-            Ok(()) => crate::identity::sync_parent_directory(&claim_path),
-            Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(source) => Err(source),
+    fn publish_locked(
+        path: &Path,
+        _publication_lock: &std::fs::File,
+        instance: &InstanceFacts,
+        region: Option<&str>,
+    ) -> Result<Self> {
+        // `load_or_create` observed NotFound before entering `create_at`, but
+        // another process may have published before this process acquired the
+        // lock. Re-read while locked so a delayed creator cannot replace the
+        // durable winner through the atomic rename below.
+        match std::fs::read_to_string(path) {
+            Ok(contents) => return Self::parse_at(path, &contents),
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(Error::Io {
+                    path: path.to_path_buf(),
+                    source,
+                });
+            }
         }
+
+        let material = IdentityStore::generate_enrollment().context(MaterialSnafu)?;
+        let draft = Self {
+            schema_version: DRAFT_SCHEMA_VERSION,
+            enrollment_operation_id: uuid::Uuid::new_v4().to_string(),
+            private_key_pem: material.private_key_pem,
+            public_key_pem: material.public_key_pem,
+            csr_pem: material.csr_pem,
+            enc_private_key_pem: material.enc_private_key_pem,
+            enc_public_key_pem: material.enc_public_key_pem,
+            instance: instance.clone(),
+            region: region.map(str::to_string),
+        };
+        let bytes = serde_json::to_vec_pretty(&draft).context(SerializeSnafu)?;
+        crate::identity::atomic_write_owner_only(path, &bytes).context(IoSnafu {
+            path: path.to_path_buf(),
+        })?;
+        Ok(draft)
     }
 
     /// Remove the draft for `config_dir`. A missing file is success.
@@ -378,9 +317,7 @@ impl EnrollmentDraft {
             Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
             Err(source) => return Err(Error::Io { path, source }),
         }
-        Self::remove_claim(&path).context(IoSnafu {
-            path: Self::claim_path(&path),
-        })
+        Ok(())
     }
 
     /// This draft's key material, in the shape the enroll request and
@@ -518,7 +455,16 @@ mod tests {
             .expect("read config dir")
             .collect::<std::result::Result<Vec<_>, _>>()
             .expect("read entries");
-        assert_eq!(files.len(), 1, "candidate files must be cleaned up");
+        let mut file_names = files
+            .into_iter()
+            .map(|entry| entry.file_name())
+            .collect::<Vec<_>>();
+        file_names.sort_unstable();
+        assert_eq!(
+            file_names,
+            vec![ENROLLMENT_DRAFT_LOCK_FILE, ENROLLMENT_DRAFT_FILE],
+            "only the durable draft and stable publication lock should remain"
+        );
     }
 
     #[test]
@@ -551,12 +497,11 @@ mod tests {
     }
 
     #[test]
-    fn a_published_draft_cleans_a_stale_claim() {
+    fn a_published_draft_reloads_with_a_persistent_lock() {
         let dir = tempfile::tempdir().expect("tempdir");
         let winner = load_or_create(dir.path()).expect("create draft");
         let path = EnrollmentDraft::path_in(dir.path());
-        let claim_path = EnrollmentDraft::claim_path(&path);
-        EnrollmentDraft::create_claim(&claim_path).expect("recreate stale claim");
+        let lock_path = EnrollmentDraft::lock_path(&path);
 
         let loaded = load_or_create(dir.path()).expect("load published draft");
         assert_eq!(
@@ -564,23 +509,43 @@ mod tests {
             winner.enrollment_operation_id
         );
         assert!(
-            !claim_path.exists(),
-            "published state makes the claim stale"
+            lock_path.exists(),
+            "the stable lock inode must remain for later creators"
         );
     }
 
     #[test]
-    fn an_orphaned_claim_fails_closed_with_recovery_guidance() {
+    fn an_abandoned_publication_lock_is_reclaimed_automatically() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = EnrollmentDraft::path_in(dir.path());
-        let claim_path = EnrollmentDraft::claim_path(&path);
-        EnrollmentDraft::create_claim(&claim_path).expect("create orphaned claim");
+        let lock_path = EnrollmentDraft::lock_path(&path);
+        let abandoned =
+            EnrollmentDraft::acquire_publication_lock(&lock_path).expect("acquire lock");
+        drop(abandoned);
 
-        let error = load_or_create(dir.path()).expect_err("orphaned claim must fail closed");
+        let draft = load_or_create(dir.path()).expect("reclaim abandoned lock");
+        assert!(!draft.enrollment_operation_id.is_empty());
+        assert!(path.exists(), "the recovered creator publishes the draft");
+        assert!(lock_path.exists(), "the stable lock inode remains in place");
+    }
+
+    #[test]
+    fn a_live_publication_lock_serializes_creators() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = EnrollmentDraft::path_in(dir.path());
+        let lock_path = EnrollmentDraft::lock_path(&path);
+        let active = EnrollmentDraft::acquire_publication_lock(&lock_path).expect("acquire lock");
+
+        let error = load_or_create(dir.path()).expect_err("live creator owns publication");
         assert!(matches!(error, Error::CreationInProgress { .. }), "{error}");
-        assert!(error.to_string().contains("remove the stale claim file"));
-        assert!(!path.exists(), "a loser must not invent another operation");
-        assert!(claim_path.exists(), "recovery remains an explicit action");
+        assert!(error.to_string().contains("Another live process"));
+        assert!(
+            !path.exists(),
+            "a contender must not publish a new operation"
+        );
+
+        drop(active);
+        load_or_create(dir.path()).expect("publish after active creator exits");
     }
 
     #[test]
@@ -611,7 +576,12 @@ mod tests {
         assert!(EnrollmentDraft::path_in(dir.path()).exists());
         EnrollmentDraft::delete(dir.path()).expect("delete");
         assert!(!EnrollmentDraft::path_in(dir.path()).exists());
+        assert!(
+            EnrollmentDraft::lock_path(&EnrollmentDraft::path_in(dir.path())).exists(),
+            "delete retains the stable lock inode"
+        );
         EnrollmentDraft::delete(dir.path()).expect("second delete is a no-op");
+        load_or_create(dir.path()).expect("the persistent lock permits re-enrollment");
     }
 
     #[cfg(unix)]
@@ -630,14 +600,14 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn the_publication_claim_is_owner_only() {
+    fn the_publication_lock_is_owner_only() {
         use std::os::unix::fs::PermissionsExt as _;
         let dir = tempfile::tempdir().expect("tempdir");
         let path = EnrollmentDraft::path_in(dir.path());
-        let claim_path = EnrollmentDraft::claim_path(&path);
-        EnrollmentDraft::create_claim(&claim_path).expect("create claim");
-        let mode = std::fs::metadata(claim_path)
-            .expect("claim metadata")
+        let lock_path = EnrollmentDraft::lock_path(&path);
+        EnrollmentDraft::acquire_publication_lock(&lock_path).expect("acquire lock");
+        let mode = std::fs::metadata(lock_path)
+            .expect("lock metadata")
             .permissions()
             .mode()
             & 0o777;
