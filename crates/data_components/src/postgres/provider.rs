@@ -482,11 +482,17 @@ impl PostgresSchemaProvider {
         // row it returns discarded.
         //
         // Rather than guess where the crossover lies, take the single query only
-        // where it cannot over-fetch at all, and resolve individually otherwise.
-        // That gives up the saving for a schema with one excluded table, which
-        // is the cost of not encoding a threshold here. Having the source query
-        // accept the selected names would remove the trade rather than pick a
-        // side of it.
+        // where the filter withholds nothing, and resolve individually
+        // otherwise. That gives up the saving for a schema with one excluded
+        // table, which is the cost of not encoding a threshold here.
+        //
+        // This bounds the over-fetch but does not remove it: the single query
+        // describes every `r`/`v`/`m`/`p`/`f` relation in the namespace, while
+        // discovery excludes inheritance children and relations the role cannot
+        // read. A schema whose tables are mostly partition leaves is therefore
+        // still over-fetched even when nothing is filtered. Having the source
+        // query take the discovered names -- see #12894 -- would settle both,
+        // since it would return exactly the relations that will be used.
         let all_selected =
             schema_is_fully_selected(&self.schema_name, &table_names, &self.selector);
 
@@ -617,10 +623,14 @@ enum SchemaRefreshOutcome {
 /// each selected table's individually.
 ///
 /// The single query describes every relation in the namespace regardless of the
-/// filter, so it is chosen only when nothing is filtered out and it therefore
-/// cannot fetch rows no one wants. Where some relations are excluded, whether it
-/// still wins depends on how many -- a threshold this deliberately does not
-/// guess.
+/// filter, so it is chosen only when nothing is filtered out. Where some
+/// relations are excluded, whether it still wins depends on how many -- a
+/// threshold this deliberately does not guess.
+///
+/// Note this bounds the over-fetch rather than removing it. The single query's
+/// relation set is wider than discovery's, which excludes inheritance children
+/// and relations the role cannot read, so a schema of partition leaves is
+/// over-fetched even under this gate (#12894).
 ///
 /// An empty schema is not "fully selected" -- there is nothing to resolve, so
 /// nothing to save.
