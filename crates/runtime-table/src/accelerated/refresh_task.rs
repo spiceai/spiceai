@@ -2249,7 +2249,11 @@ impl RefreshTask {
         }
     }
 
-    async fn get_dataset_names(&self) -> Vec<TableReference> {
+    /// Returns this dataset's name plus the name of every synchronized
+    /// (e.g. `localpod:`) child dataset currently attached to the sink.
+    /// A refresh rewrites all of these tables, so anything derived from one of
+    /// them (metrics labels, cached query results) must cover the whole set.
+    pub(crate) async fn get_dataset_names(&self) -> Vec<TableReference> {
         let mut dataset_names = vec![self.dataset_name.clone()];
         for synchronized_table in self.sink.read().await.synchronized_tables() {
             dataset_names.push(synchronized_table.child_dataset_name());
