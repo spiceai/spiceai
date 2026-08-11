@@ -297,9 +297,11 @@ impl BrowserLogin {
 /// Persist the credential the browser flow produced and build the session.
 ///
 /// This is the persistence `spice login` has always performed —
-/// `SPICE_SPICEAI_TOKEN` and `SPICE_SPICEAI_API_KEY` written to the chosen
-/// store — so an inline login leaves the machine in the same state a
-/// standalone `spice login` would. Taking a [`CredentialStore`] (not a
+/// `SPICE_SPICEAI_TOKEN` and, when the auth context supplies one,
+/// `SPICE_SPICEAI_API_KEY` written to the chosen store — so an inline login
+/// leaves the machine in the same state a standalone `spice login` would.
+/// Omitting a missing API key preserves any valid key already in the store.
+/// Taking a [`CredentialStore`] (not a
 /// [`LoginOutput`]) makes the persistence policy explicit at every call site
 /// and leaves no path that could print the secrets instead of storing them.
 ///
@@ -313,11 +315,14 @@ pub(super) fn establish_session(
     context: SpiceAuthContext,
     store: CredentialStore,
 ) -> Result<AuthenticatedSession> {
-    let api_key = context.app_api_key.clone().unwrap_or_default();
-    store.save(
-        "SPICEAI",
-        &[("TOKEN", &access_token), ("API_KEY", &api_key)],
-    )?;
+    match context.app_api_key.as_deref() {
+        Some(api_key) => {
+            store.save("SPICEAI", &[("TOKEN", &access_token), ("API_KEY", api_key)])?;
+        }
+        None => {
+            store.save("SPICEAI", &[("TOKEN", &access_token)])?;
+        }
+    }
 
     Ok(AuthenticatedSession {
         access_token,
@@ -523,6 +528,20 @@ mod tests {
             assert_eq!(session.username(), "jane");
             assert_eq!(session.org_name(), "acme");
             assert_eq!(session.access_token(), "tok_live_123");
+
+            let context_without_api_key = SpiceAuthContext {
+                username: "jane".to_string(),
+                email: "jane@example.com".to_string(),
+                org_name: "acme".to_string(),
+                app_name: Some("retail-analytics".to_string()),
+                app_api_key: None,
+            };
+            establish_session(
+                "tok_refreshed_789".to_string(),
+                context_without_api_key,
+                CredentialStore::EnvFile,
+            )
+            .expect("a missing API key should not prevent token persistence");
             return;
         }
 
@@ -548,9 +567,9 @@ mod tests {
         let env = std::fs::read_to_string(scratch.path().join(".env"))
             .expect(".env should be written in the child's working directory");
         assert!(
-            env.contains("SPICE_SPICEAI_TOKEN=tok_live_123")
+            env.contains("SPICE_SPICEAI_TOKEN=tok_refreshed_789")
                 && env.contains("SPICE_SPICEAI_API_KEY=key_live_456"),
-            "the credential pair must be persisted: {env}"
+            "a token refresh without an API key must preserve the stored key: {env}"
         );
     }
 
