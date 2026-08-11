@@ -183,6 +183,95 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+/// The LSN an acceleration's contents are complete as of, as recorded locally.
+///
+/// `PostgreSQL` CDC has historically kept no client-side position at all — it
+/// relied on the slot's server-tracked `confirmed_flush_lsn`, which is precisely
+/// what disappears when a slot is dropped or invalidated. Recording the position
+/// locally (the same thing `MySQL` does with `spice_sys_mysql_binlog`) is what
+/// lets startup *compute* whether the source can still supply the missing
+/// changes instead of inferring it from slot and publication state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AppliedLsn {
+    /// Every change committed at or before this LSN is durably reflected in the
+    /// acceleration.
+    pub lsn: u64,
+}
+
+/// Whether the acceleration must be rebuilt from the source rather than resumed.
+///
+/// The whole gap decision, as arithmetic rather than inference:
+///
+/// * `watermark` — the LSN the acceleration's contents are complete as of, or
+///   `None` when it has never been loaded.
+/// * `slot_restart_lsn` — the earliest LSN the slot can still stream from, or
+///   `None` when the slot does not exist.
+///
+/// A watermark the slot cannot reach is a gap nothing can fill: the changes in
+/// between are gone from the source's log, so a row deleted there would never be
+/// deleted here. Rebuilding re-reads the table; resuming would keep it forever.
+#[must_use]
+pub fn needs_rebuild(watermark: Option<AppliedLsn>, slot_restart_lsn: Option<u64>) -> bool {
+    match watermark {
+        // Never loaded, so there is nothing to be inconsistent with — a first
+        // bootstrap, not a gap. Also every ephemeral acceleration, whose store
+        // records nothing because it boots empty and re-snapshots each start.
+        None => false,
+        // A gap when there is no slot at all, or when the slot's earliest
+        // retained position is already past the watermark.
+        Some(watermark) => slot_restart_lsn.is_none_or(|earliest| earliest > watermark.lsn),
+    }
+}
+
+/// Durable, client-side record of how far a dataset's acceleration has been
+/// advanced, so a restart can tell a resumable gap from an unfillable one.
+///
+/// Mirrors `mysql_replication::PositionStore`: implemented on the runtime side
+/// over a `spice_sys` sidecar table (the replication layer cannot reach the
+/// accelerator's own store), and supplied per dataset on
+/// [`ReplicationStreamInput`].
+#[async_trait::async_trait]
+pub trait AppliedLsnStore: Send + Sync {
+    /// The recorded position, or `None` when this acceleration has never been
+    /// loaded — a first bootstrap, not a gap.
+    async fn load(
+        &self,
+    ) -> std::result::Result<Option<AppliedLsn>, Box<dyn std::error::Error + Send + Sync>>;
+    /// Record `applied` as durably reflected in the acceleration. Called only
+    /// after the corresponding changes are durable, never before.
+    async fn save(
+        &self,
+        applied: AppliedLsn,
+    ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>;
+    /// Forget the recorded position, so the next start treats the acceleration
+    /// as never loaded.
+    async fn clear(&self) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>;
+}
+
+/// An [`AppliedLsnStore`] that persists nothing, for an acceleration that does
+/// not survive a restart. There is no state a resumed position could be
+/// consistent with — such an accelerator boots empty and re-snapshots every
+/// start — so recording one would only invite a resume that skipped its rows.
+pub struct NoopAppliedLsnStore;
+
+#[async_trait::async_trait]
+impl AppliedLsnStore for NoopAppliedLsnStore {
+    async fn load(
+        &self,
+    ) -> std::result::Result<Option<AppliedLsn>, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(None)
+    }
+    async fn save(
+        &self,
+        _applied: AppliedLsn,
+    ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Ok(())
+    }
+    async fn clear(&self) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Ok(())
+    }
+}
+
 /// Input required to start a replication stream for a single dataset.
 pub struct ReplicationStreamInput {
     /// Dataset name as it will appear in `ChangeBatch` commits.
@@ -210,6 +299,13 @@ pub struct ReplicationStreamInput {
     /// connector maps the dataset's `on_schema_change`); [`start_replication_stream`]
     /// consumes it as-is, and [`start_replication_stream_with_policy`] overrides it.
     pub policy: SchemaEvolutionPolicy,
+    /// Where this dataset's applied-LSN watermark is read and written.
+    ///
+    /// Supplied by the connector: a `spice_sys`-backed store for an acceleration
+    /// that survives restarts, [`NoopAppliedLsnStore`] for one that does not.
+    /// Startup compares the loaded watermark against what the slot can still
+    /// supply to decide between resuming and rebuilding.
+    pub applied_lsn_store: Arc<dyn AppliedLsnStore>,
 }
 
 /// Starts the bootstrap+WAL replication stream.
@@ -289,4 +385,53 @@ fn stream_error(err: &Error) -> StreamError {
 )]
 pub(crate) fn err_to_stream(err: Error) -> StreamError {
     stream_error(&err)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AppliedLsn, needs_rebuild};
+
+    /// The gap decision is the correctness hinge of the rebuild path: a wrong
+    /// `false` resumes over rows the source has deleted (silent divergence, the
+    /// bug this exists to fix), while a wrong `true` costs a needless re-read of
+    /// the table. Each case is asserted individually rather than trusting the
+    /// comparison to read correctly.
+    #[test]
+    fn a_watermark_the_slot_cannot_reach_is_the_only_thing_that_forces_a_rebuild() {
+        let at = |lsn| Some(AppliedLsn { lsn });
+
+        // Never loaded: a first bootstrap, not a gap. Snapshot-and-append is
+        // exactly right, and this is also every ephemeral acceleration (whose
+        // store records nothing because it boots empty).
+        assert!(!needs_rebuild(None, Some(100)));
+        assert!(
+            !needs_rebuild(None, None),
+            "a first load with no slot yet is still a first load"
+        );
+
+        // The slot still holds WAL from at or before the watermark, so the gap is
+        // replayable: resume.
+        assert!(!needs_rebuild(at(100), Some(100)), "exactly reachable");
+        assert!(
+            !needs_rebuild(at(100), Some(40)),
+            "slot reaches further back"
+        );
+
+        // The slot's earliest position is past the watermark: the changes in
+        // between are gone from the source's log and cannot be replayed.
+        assert!(
+            needs_rebuild(at(100), Some(101)),
+            "one byte past is still a gap"
+        );
+        assert!(needs_rebuild(at(100), Some(u64::MAX)));
+
+        // No slot at all reaches nothing.
+        assert!(needs_rebuild(at(100), None));
+
+        // An unreadable watermark is reported by the caller as position 0, which
+        // must resolve to a rebuild against any real slot position rather than
+        // being mistaken for "never loaded".
+        assert!(needs_rebuild(at(0), Some(1)));
+        assert!(needs_rebuild(at(0), None));
+    }
 }

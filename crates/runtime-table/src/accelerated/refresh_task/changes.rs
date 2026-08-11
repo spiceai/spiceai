@@ -51,6 +51,7 @@ use datafusion::{execution::context::SessionContext, physical_plan::collect};
 use futures::{StreamExt, stream};
 use runtime_acceleration::dataupdate::StreamingDataUpdateExecutionPlan;
 use runtime_component::dataset::OnSchemaChange;
+use runtime_component::dataset::acceleration::RefreshMode;
 use runtime_component::schema_evolution::{
     SCHEMA_EVOLUTION_APPLIED, SCHEMA_EVOLUTION_DETECTED, SCHEMA_EVOLUTION_FAILED,
     emit_schema_evolution_event, evolution_allowed, schema_evolution_labels, widening_plan_kind,
@@ -389,6 +390,10 @@ impl CdcInsertPlanCache {
 struct ApplyContext<'a> {
     refresh_sql: Option<&'a str>,
     dataset_name: &'a TableReference,
+    /// The dataset's refresh configuration, needed to rebuild the accelerator
+    /// through the full-refresh path when the source reports its change history
+    /// is gone (see [`RefreshTask::rebuild_from_source`]).
+    refresh: &'a Arc<RwLock<Refresh>>,
     /// Prebuilt per-dataset metric labels reused by hot record sites in the apply loop
     /// (see [`DatasetMetricLabels`]).
     metric_labels: &'a DatasetMetricLabels,
@@ -1278,6 +1283,7 @@ impl RefreshTask {
                             let mut context = ApplyContext {
                                 refresh_sql: sql.as_deref(),
                                 dataset_name: &dataset_name,
+                                refresh: &refresh,
                                 metric_labels: &metric_labels,
                                 caching: caching.as_ref(),
                                 ready_sender: ready_sender.as_ref(),
@@ -1530,6 +1536,7 @@ impl RefreshTask {
             let mut apply_context = ApplyContext {
                 refresh_sql: sql.as_deref(),
                 dataset_name: &dataset_name,
+                refresh: &refresh,
                 metric_labels: &metric_labels,
                 caching: caching.as_ref(),
                 ready_sender: ready_sender.as_ref(),
@@ -1588,6 +1595,7 @@ impl RefreshTask {
                 let mut context = ApplyContext {
                     refresh_sql: sql.as_deref(),
                     dataset_name: &dataset_name,
+                    refresh: &refresh,
                     metric_labels: &metric_labels,
                     caching: caching.as_ref(),
                     ready_sender: ready_sender.as_ref(),
@@ -1811,6 +1819,55 @@ impl RefreshTask {
             .await;
     }
 
+    /// Re-read the source into the accelerator as one atomic replacement, in
+    /// answer to [`cdc::ChangeEnvelope::history_unavailable`]. Returns `false`
+    /// when the rebuild failed and the stream must stop.
+    ///
+    /// This is deliberately the ordinary `refresh_mode: full` path — one
+    /// `RefreshTask::run` with the mode overridden to
+    /// [`RefreshMode::Full`] — so the replacement is the same atomic
+    /// overwrite (`InsertOp::Overwrite`) a full refresh performs, and readers
+    /// keep seeing the pre-rebuild table until it swaps. Clearing the table and
+    /// letting the change stream refill it would be visible to queries as an
+    /// empty, then partially-filled, table.
+    ///
+    /// The changes that follow this rebuild may predate the re-read, since the
+    /// source resumes from wherever its log still starts. That is safe: the log
+    /// is ordered and complete from that point, so replaying it converges on the
+    /// source's current state — transiently stale, exactly like ordinary CDC
+    /// catch-up lag. What could *not* converge, and is what this exists to fix,
+    /// is a row deleted at the source while the history was gone: no change row
+    /// for it will ever arrive, so only re-reading the table removes it.
+    async fn rebuild_from_source(&self, context: &ApplyContext<'_>) -> bool {
+        let mut refresh = context.refresh.read().await.clone();
+        refresh.mode = RefreshMode::Full;
+
+        tracing::warn!(
+            "Dataset {}: the source can no longer supply the changes needed to continue, so the acceleration is being rebuilt from the source. This re-reads the table.",
+            context.dataset_name,
+        );
+
+        if let Err(e) = self.run(refresh).await {
+            let error_message = format!(
+                "Failed to rebuild the acceleration for {} from the source after its change history became unavailable: {e}",
+                context.dataset_name,
+            );
+            tracing::error!("{error_message}");
+            self.set_refresh_status(
+                context.refresh_sql,
+                status::ComponentStatus::error_with_message(error_message),
+            )
+            .await;
+            return false;
+        }
+
+        tracing::info!(
+            "Dataset {}: rebuilt the acceleration from the source; resuming change streaming.",
+            context.dataset_name,
+        );
+        true
+    }
+
     async fn run_finalize_side_effects(
         &self,
         context: &mut ApplyContext<'_>,
@@ -1900,6 +1957,14 @@ impl RefreshTask {
         // offsets) require this ordering.
         let any_ready = envelopes.iter().any(cdc::ChangeEnvelope::is_dataset_ready);
 
+        // Read before the heartbeat retain below, for the same reason `any_ready`
+        // is: the signal rides a zero-row, no-op-committer envelope (see
+        // `cdc::build_history_unavailable_envelope`), so the retain would
+        // otherwise strip it and the rebuild would never happen.
+        let history_unavailable = envelopes
+            .iter()
+            .any(cdc::ChangeEnvelope::history_unavailable);
+
         // Strip zero-row readiness heartbeats from the write/durability path
         // (#12007). Lag-based readiness (#11777) makes CDC connectors emit a
         // heartbeat roughly every second on a caught-up source; the heartbeat's
@@ -1917,6 +1982,15 @@ impl RefreshTask {
         // envelope persisting the initial resume token) are not heartbeats
         // under that predicate and keep durability-then-commit ordering.
         envelopes.retain(|env| !env.is_no_op_heartbeat());
+
+        // The source has lost the history that explains what changed while it was
+        // away, so nothing in this burst — or after it — can be applied on top of
+        // the accelerator's current contents. Re-read the source into the
+        // accelerator as one atomic replacement first; the changes that follow
+        // then converge on top of it (see `rebuild_from_source`).
+        if history_unavailable && !self.rebuild_from_source(context).await {
+            return false;
+        }
 
         // Readiness-only run: every envelope was a heartbeat. Honor the ready
         // flag and stop — there is nothing to write and nothing to commit, so
@@ -1963,14 +2037,14 @@ impl RefreshTask {
         };
         record_cdc_fixed_cost(context.metric_labels, "decode", decode_start);
 
-        // Readiness was already folded into `any_ready` before the heartbeat
-        // retain, so the per-envelope flag is spent here.
+        // Readiness and the history-unavailable signal were both folded in before
+        // the heartbeat retain, so their per-envelope flags are spent here.
         let (committers, batches): (
             Vec<Box<dyn cdc::CommitChange + Send + Sync>>,
             Vec<ChangeBatch>,
         ) = parts
             .into_iter()
-            .map(|(committer, batch, _is_ready)| (committer, batch))
+            .map(|(committer, batch, _is_ready, _history_unavailable)| (committer, batch))
             .unzip();
 
         // Mixed-schema runs (mid-stream schema evolution): `concat_change_batches`
@@ -6274,8 +6348,13 @@ mod tests {
         let mut pending_commit = None;
         let write_ctx = SessionContext::new();
         let write_session_state = write_ctx.state();
+        // Only consulted when a source reports its history is unavailable, which
+        // these cases never do; the default carries `RefreshMode::Full`, which is
+        // what a rebuild would override it to anyway.
+        let refresh = Arc::new(RwLock::new(Refresh::default()));
         let mut context = ApplyContext {
             refresh_sql: None,
+            refresh: &refresh,
             dataset_name: &dataset_name,
             metric_labels: &metric_labels,
             caching: None,
@@ -6522,8 +6601,13 @@ mod tests {
         let mut pending_commit = None;
         let write_ctx = SessionContext::new();
         let write_session_state = write_ctx.state();
+        // Only consulted when a source reports its history is unavailable, which
+        // these cases never do; the default carries `RefreshMode::Full`, which is
+        // what a rebuild would override it to anyway.
+        let refresh = Arc::new(RwLock::new(Refresh::default()));
         let mut context = ApplyContext {
             refresh_sql: None,
+            refresh: &refresh,
             dataset_name: &dataset_name,
             metric_labels: &metric_labels,
             caching: None,
@@ -6581,8 +6665,13 @@ mod tests {
         let mut pending_commit = None;
         let write_ctx = SessionContext::new();
         let write_session_state = write_ctx.state();
+        // Only consulted when a source reports its history is unavailable, which
+        // these cases never do; the default carries `RefreshMode::Full`, which is
+        // what a rebuild would override it to anyway.
+        let refresh = Arc::new(RwLock::new(Refresh::default()));
         let mut context = ApplyContext {
             refresh_sql: None,
+            refresh: &refresh,
             dataset_name: &dataset_name,
             metric_labels: &metric_labels,
             caching: None,

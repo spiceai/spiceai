@@ -198,7 +198,8 @@ impl EmbeddingConnector {
         // this wrapper sits between a (possibly multiplexed) source and the
         // accelerator, so it must build the deferred rows before augmenting them.
         // Offload the synchronous build so a large burst can't stall this worker.
-        let (change_committer, batch, is_dataset_ready) = envelope.into_parts_offloaded().await?;
+        let (change_committer, batch, is_dataset_ready, history_unavailable) =
+            envelope.into_parts_offloaded().await?;
         let data_batch = batch.data_batch();
 
         let embeddings = compute_additional_embedding_columns(
@@ -226,10 +227,13 @@ impl EmbeddingConnector {
         let new_change_batch = replace_change_batch_data(&embedded_batch, &batch)
             .map_err(|e| StreamError::Arrow(e.to_string()))?;
 
-        Ok(ChangeEnvelope::new(
+        // `from_parts` rather than `new`, so every envelope flag survives this
+        // wrapper — see the same forwarding in `crate::changes`.
+        Ok(ChangeEnvelope::from_parts(
             change_committer,
             new_change_batch,
             is_dataset_ready,
+            history_unavailable,
         ))
     }
 }

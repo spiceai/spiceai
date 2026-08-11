@@ -28,8 +28,9 @@ use std::time::Duration;
 use async_stream::try_stream;
 use data_components::cdc::{ChangesStream, InitialSnapshotMode, StreamError};
 use data_components::postgres_replication::{
-    PgOutputFormat, ReplicationMetrics, ReplicationMetricsCollector, ReplicationParams,
-    ReplicationStreamInput, SchemaEvolutionPolicy, config, start_replication_stream,
+    AppliedLsn, AppliedLsnStore, NoopAppliedLsnStore, PgOutputFormat, ReplicationMetrics,
+    ReplicationMetricsCollector, ReplicationParams, ReplicationStreamInput, SchemaEvolutionPolicy,
+    config, start_replication_stream,
 };
 use datafusion::sql::TableReference;
 use futures::StreamExt;
@@ -53,6 +54,56 @@ const MAX_BOOTSTRAP_BATCH_SIZE: usize = 1_048_576;
 // the bootstrap-batch ceiling — a bounded, backpressure-preserving queue in
 // front of the accelerator prefetch, not an unbounded buffer.
 const MAX_MEMBER_CHANNEL_CAPACITY: usize = 1_048_576;
+
+/// [`AppliedLsnStore`] over the accelerator's `spice_sys_postgres_replication`
+/// sidecar.
+///
+/// The payload is a single `{"lsn": <u64>}` object rather than the bare number,
+/// so the record can gain fields (a slot identity, a snapshot as-of marker)
+/// without a migration.
+struct SidecarAppliedLsnStore {
+    blobs: Arc<dyn runtime::dataaccelerator::spice_sys::postgres_replication::WatermarkBlobStore>,
+}
+
+/// Serialized form of [`AppliedLsn`] in the sidecar.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct StoredAppliedLsn {
+    lsn: u64,
+}
+
+#[async_trait::async_trait]
+impl AppliedLsnStore for SidecarAppliedLsnStore {
+    async fn load(
+        &self,
+    ) -> std::result::Result<Option<AppliedLsn>, Box<dyn std::error::Error + Send + Sync>> {
+        let Some(checkpoint) = self.blobs.get().await? else {
+            return Ok(None);
+        };
+        // A row that exists but cannot be parsed is surfaced, not swallowed:
+        // treating corruption as "no watermark" would silently resume as if this
+        // were a first load, and the caller's fallback for an unreadable
+        // watermark is a rebuild — the safe direction.
+        let stored: StoredAppliedLsn = serde_json::from_str(&checkpoint.data)?;
+        Ok(Some(AppliedLsn { lsn: stored.lsn }))
+    }
+
+    async fn save(
+        &self,
+        applied: AppliedLsn,
+    ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let payload = serde_json::to_string(&StoredAppliedLsn { lsn: applied.lsn })?;
+        self.blobs.upsert(&payload).await?;
+        Ok(())
+    }
+
+    async fn clear(&self) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // The sidecar exposes upsert-only semantics, so "forget" is recorded as a
+        // zero watermark: it precedes every real LSN, so the comparison against
+        // what the slot can supply resolves to a rebuild, which is what clearing
+        // is for.
+        self.save(AppliedLsn { lsn: 0 }).await
+    }
+}
 
 pub fn build_changes_stream(
     params: &Parameters,
@@ -97,6 +148,11 @@ pub fn build_changes_stream(
              will run on every start, including replication-slot resume"
         );
     }
+
+    // Resolving the watermark store needs to await, so it happens inside the
+    // stream below; clone the dataset handle it needs (cheap — `Dataset` is an
+    // `Arc`-bound wrapper over its spec).
+    let dataset_for_watermark = dataset.clone();
 
     // Prefer the dataset's explicitly-declared acceleration `primary_key` —
     // that's what the accelerator write path uses for upsert/delete, and it's
@@ -227,6 +283,28 @@ pub fn build_changes_stream(
             Err(StreamError::External(msg))?;
         }
 
+        // Where this dataset's applied-LSN watermark lives. An ephemeral
+        // acceleration gets the no-op store: it boots empty and re-snapshots
+        // every start, so a recorded position would describe rows the restart
+        // already threw away, and resuming on it would skip everything before it.
+        //
+        // A durable acceleration with no reachable store also records nothing,
+        // which reads as "never loaded" — correct, since an acceleration that
+        // cannot persist a watermark cannot have persisted the rows one would
+        // describe.
+        let applied_lsn_store: Arc<dyn AppliedLsnStore> = if ephemeral {
+            Arc::new(NoopAppliedLsnStore)
+        } else {
+            match runtime::dataaccelerator::spice_sys::postgres_replication::init_watermark_store(
+                &dataset_for_watermark,
+            )
+            .await
+            {
+                Some(blobs) => Arc::new(SidecarAppliedLsnStore { blobs }),
+                None => Arc::new(NoopAppliedLsnStore),
+            }
+        };
+
         let input = ReplicationStreamInput {
             dataset_name: dataset_name.clone(),
             params: params_for_stream,
@@ -236,6 +314,7 @@ pub fn build_changes_stream(
             table_name,
             metrics,
             policy: schema_evolution_policy,
+            applied_lsn_store,
         };
 
         let mut inner = start_replication_stream(input);

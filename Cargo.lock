@@ -4757,6 +4757,8 @@ dependencies = [
  "runtime-api-types",
  "runtime-metrics",
  "secrecy",
+ "serde",
+ "serde_json",
  "snafu",
  "tokio",
  "tokio-postgres",
