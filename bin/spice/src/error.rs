@@ -250,6 +250,11 @@ pub enum Error {
     /// Enrollment against the Spice Cloud control plane failed.
     #[snafu(display("Failed to enroll with Spice Cloud: {message}"))]
     CloudConnectEnroll { message: String },
+
+    /// A command already emitted its complete structured status document, but
+    /// one or more probes were unavailable and therefore require exit code 1.
+    #[snafu(display("One or more status probes were unavailable"))]
+    ReportedStatusFailure,
 }
 
 impl Error {

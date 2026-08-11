@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "observed_at": "2026-08-11T12:00:00Z",
+  "directory": "/srv/edge-analytics",
+  "connection": {
+    "state": "enrolled_offline",
+    "instance_id": "inst_edge",
+    "organization": "acme",
+    "project": "edge-analytics",
+    "identity_path": "/srv/edge-analytics/.spice/identity.json",
+    "identity_expires_at": null,
+    "gateway": "gateway.example:443",
+    "new_project_url": null,
+    "monitor_url": "https://spice.ai/acme/edge-analytics/monitor",
+    "diagnostic": null
+  },
+  "service": {
+    "installed": true,
+    "state": "running",
+    "scope": "user",
+    "supervisor": "systemd",
+    "starts": "boot_without_login",
+    "start_remediation": null,
+    "owner": {
+      "name": "edge",
+      "uid": 1000
+    },
+    "name": "spiced-cloud-connect-edge-analytics-59e8c853e76c15ba.service",
+    "working_directory": "/srv/edge-analytics",
+    "definition_path": "/home/edge/.config/systemd/user/spiced-cloud-connect-edge-analytics-59e8c853e76c15ba.service",
+    "runtime_path": "/home/edge/.local/share/spice/cloud-connect/edge-analytics-59e8c853e76c15ba/spiced",
+    "log_source": "journald:spiced-cloud-connect-edge-analytics-59e8c853e76c15ba.service",
+    "diagnostic": null
+  },
+  "deployment": {
+    "desired_path": "/srv/edge-analytics/.spice/cloud-managed-spicepod.yaml",
+    "delivered_secrets": [
+      "database_password"
+    ],
+    "restart_required": [],
+    "diagnostic": null
+  }
+}

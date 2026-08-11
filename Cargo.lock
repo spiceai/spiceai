@@ -19245,6 +19245,7 @@ dependencies = [
  "dirs",
  "dotenv 2.2.0-unstable",
  "flate2",
+ "fs2",
  "fundu",
  "futures",
  "gethostname",

@@ -576,7 +576,7 @@ fn write_daemon_plist(path: &Path, plist: &str) -> Result<()> {
                  uid {uid} gid {gid} with mode {mode:04o}. launchd silently refuses to load a \
                  daemon that is not owned by root:wheel and writable only by root. Fix it with \
                  `sudo chown root:wheel {plist_path}` and `sudo chmod 644 {plist_path}`, then \
-                 re-run `sudo spice connect --install`.",
+                 re-run `spice connect service install`.",
                 plist_path = path.display(),
                 uid = meta.uid(),
                 gid = meta.gid(),
@@ -647,7 +647,7 @@ fn verify_staged_runtime_executes(
              was installed and any service already on this host keeps the runtime it has.\
              {quarantine} Check the binary with `codesign --verify {source}` and \
              `spctl --assess --type execute {source}`, then re-run \
-             `sudo spice connect --install`.",
+             `spice connect service install`.",
             source = source.display(),
         ),
     })
@@ -888,7 +888,7 @@ mod tests {
 
     #[test]
     fn label_is_deterministic_for_the_same_directory() {
-        // Re-running `--install` must land on the same job rather than adding a
+        // Reinstalling must land on the same job rather than adding a
         // second one.
         let dir = Path::new("/opt/edge-1");
         assert_eq!(job_label_for_dir(dir), job_label_for_dir(dir));

@@ -333,10 +333,15 @@ fn main() {
     // Run the CLI
     let machine = cli.machine;
     if let Err(e) = run_cli(cli) {
-        if machine {
-            write_machine_error(&e);
-        } else {
-            tracing::error!("{e}");
+        // Status commands already emitted a complete table or JSON document.
+        // Printing a second free-form error would corrupt JSON stdout and make
+        // automation unable to inspect the partial snapshot.
+        if !matches!(e, spice::error::Error::ReportedStatusFailure) {
+            if machine {
+                write_machine_error(&e);
+            } else {
+                tracing::error!("{e}");
+            }
         }
         std::process::exit(exit_code_for(&e));
     }
@@ -683,7 +688,6 @@ fn apply_machine_mode(command: &mut Commands) {
         | Commands::Upgrade(_)
         | Commands::Run(_)
         | Commands::Add(_)
-        | Commands::Connect(_)
         | Commands::Validate(_)
         | Commands::Dataset(_)
         | Commands::Catalog(_)
@@ -704,6 +708,11 @@ fn apply_machine_mode(command: &mut Commands) {
         | Commands::Cluster(_)
         | Commands::Completions(_)
         | Commands::Feedback(_) => {}
+        Commands::Connect(args) => {
+            if let Some(output) = args.output_mut() {
+                *output = OutputFormat::Json;
+            }
+        }
     }
 }
 
@@ -821,6 +830,7 @@ fn machine_error_code(error: &spice::error::Error) -> &'static str {
         spice::error::Error::NoModelsConfigured => "no_models_configured",
         spice::error::Error::CloudConnectIo { .. } => "cloud_connect_io",
         spice::error::Error::CloudConnectEnroll { .. } => "cloud_connect_enroll",
+        spice::error::Error::ReportedStatusFailure => "status_unavailable",
     }
 }
 
@@ -850,6 +860,7 @@ fn is_json_output(cmd: &mut Commands) -> bool {
         }) => *output == OutputFormat::Json,
         // Cloud commands answer for themselves, from the one match in cloud::mod.
         Commands::Cloud(a) => a.command.produces_json(),
+        Commands::Connect(args) => args.produces_json(),
         _ => false,
     }
 }

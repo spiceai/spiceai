@@ -905,7 +905,7 @@ impl RuntimeHandle for SpicedRuntimeHandle {
 
         if !self.supervisor.is_supervised() {
             tracing::error!(
-                "Spice Cloud Connect: exiting to apply a deployment with no process supervisor detected — nothing will restart this instance. Install the service with `sudo spice connect --install`, or run spiced under a supervisor. See: https://spiceai.org/docs"
+                "Spice Cloud Connect: exiting to apply a deployment with no process supervisor detected — nothing will restart this instance. Install the service with `spice connect service install`, or run spiced under a supervisor. See: https://spiceai.org/docs"
             );
         }
         tracing::info!("Spice Cloud Connect: exiting to apply the deployment");

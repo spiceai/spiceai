@@ -117,7 +117,7 @@ impl Supervisor {
             Self::Undetected => Some(
                 "No process supervisor detected: a deployment exits this process to apply, so it \
                  will stop this instance instead of restarting it. Install the service with \
-                 `sudo spice connect --install`, or run spiced under your own supervisor \
+                 `spice connect service install`, or run spiced under your own supervisor \
                  (systemd, or a container with a restart policy). See: https://spiceai.org/docs",
             ),
         }
@@ -181,7 +181,7 @@ mod tests {
             .caveat()
             .expect("an unsupervised host is told so");
         assert!(
-            caveat.contains("spice connect --install"),
+            caveat.contains("spice connect service install"),
             "the warning must name the fix: {caveat}"
         );
     }

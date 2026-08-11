@@ -150,7 +150,7 @@ pub(super) fn install(
     std::fs::write(&path, unit).map_err(|e| Error::CloudConnectIo {
         message: format!(
             "write systemd unit {}: {e}. The identity is staged at {} — fix the problem \
-             and re-run `sudo spice connect --install` to finish.",
+             and re-run `spice connect service install` to finish.",
             path.display(),
             config_dir.display()
         ),

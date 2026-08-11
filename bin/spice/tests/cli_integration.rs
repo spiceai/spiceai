@@ -859,9 +859,89 @@ mod connect {
             // unreleased, so there is no alias to carry and no help text
             // should still teach the old name.
             .stdout(predicate::str::contains("forget").not())
-            .stdout(predicate::str::contains("--install"))
+            .stdout(predicate::str::contains("service"))
+            .stdout(predicate::str::contains("--install").not())
             .stdout(predicate::str::contains("--region"))
             .stdout(predicate::str::contains("SPICE_CONNECT_ADOPT_REGION"));
+    }
+
+    #[test]
+    fn test_connect_service_grammar_and_hidden_alias() {
+        for group in ["service", "svc"] {
+            spice_cmd()
+                .arg("connect")
+                .arg(group)
+                .assert()
+                .success()
+                .stdout(predicate::str::contains("install"))
+                .stdout(predicate::str::contains("uninstall"))
+                .stdout(predicate::str::contains("restart"))
+                .stdout(predicate::str::contains("status"))
+                .stdout(predicate::str::contains("logs"));
+        }
+
+        spice_cmd()
+            .arg("connect")
+            .arg("--help")
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("svc").not());
+    }
+
+    #[test]
+    fn test_connect_service_log_bounds_and_removed_aliases() {
+        spice_cmd()
+            .arg("connect")
+            .arg("service")
+            .arg("logs")
+            .arg("--number")
+            .arg("100001")
+            .assert()
+            .code(2)
+            .stderr(predicate::str::contains("100000"));
+
+        for removed in ["--tail", "--install"] {
+            spice_cmd()
+                .arg("connect")
+                .arg("service")
+                .arg("logs")
+                .arg(removed)
+                .assert()
+                .code(2);
+        }
+    }
+
+    #[test]
+    fn test_connect_full_and_filtered_json_share_the_service_value() {
+        let dir = TempDir::new().expect("create temp config dir");
+        let full = spice_cmd()
+            .env("SPICE_CONFIG_DIR", dir.path())
+            .arg("connect")
+            .arg("status")
+            .arg("--output")
+            .arg("json")
+            .output()
+            .expect("run full status");
+        assert!(full.status.success(), "full status failed: {full:?}");
+        let full: serde_json::Value =
+            serde_json::from_slice(&full.stdout).expect("full status stdout is JSON only");
+
+        let filtered = spice_cmd()
+            .env("SPICE_CONFIG_DIR", dir.path())
+            .arg("connect")
+            .arg("svc")
+            .arg("status")
+            .arg("-o")
+            .arg("json")
+            .output()
+            .expect("run filtered status");
+        assert!(
+            filtered.status.success(),
+            "filtered status failed: {filtered:?}"
+        );
+        let filtered: serde_json::Value =
+            serde_json::from_slice(&filtered.stdout).expect("filtered status stdout is JSON only");
+        assert_eq!(full["service"], filtered["service"]);
     }
 
     /// `forget` is gone from the arg surface, not merely from the help text:
@@ -896,6 +976,7 @@ mod connect {
             .env("SPICE_CONFIG_DIR", config_dir)
             .arg("connect")
             .arg("remove")
+            .arg("--yes")
             .assert()
             .success();
         assert!(!config_dir.join("pending-adopt-code").exists());
@@ -1227,6 +1308,7 @@ mod connect {
             .env("SPICE_CONFIG_DIR", config_dir)
             .arg("connect")
             .arg("remove")
+            .arg("--yes")
             .assert()
             .success()
             .stdout(predicate::str::contains("identity cleared"));
@@ -1249,6 +1331,7 @@ mod connect {
             .env("SPICE_CONFIG_DIR", config_dir)
             .arg("connect")
             .arg("remove")
+            .arg("--yes")
             .assert()
             .success()
             .stdout(predicate::str::contains("identity cleared"));
@@ -1328,7 +1411,7 @@ mod connect {
             .stdout(predicate::str::contains("instance id: inst_cli_test"))
             .stdout(predicate::str::contains("region:      on-prem-syd"))
             .stdout(predicate::str::contains("unattached"))
-            .stdout(predicate::str::contains("sudo spice connect --install"))
+            .stdout(predicate::str::contains("spice connect service install"))
             .stdout(predicate::str::contains("spiced --cloud-connect"));
         server.join().expect("mock served the enroll request");
     }
@@ -1539,37 +1622,6 @@ mod connect {
             .assert()
             .failure()
             .stdout(predicate::str::contains("--cloud-region requires --cloud"));
-    }
-
-    /// `--install` preflights **before** the enroll, so a host that cannot take
-    /// a service fails with nothing staged and the code still redeemable.
-    /// Non-root (or non-systemd) is the reachable case in a test.
-    #[cfg(unix)]
-    #[test]
-    fn test_connect_install_preflight_runs_before_enroll() {
-        let dir = TempDir::new().expect("create temp config dir");
-        let config_dir = dir.path();
-        let home = TempDir::new().expect("create temp home");
-        install_fake_spiced(home.path());
-        // No endpoint is served: reaching the enroll at all would hang or fail
-        // differently, so a clean preflight failure proves the ordering.
-        spice_cmd()
-            .env("HOME", home.path())
-            .env("SPICE_CONFIG_DIR", config_dir)
-            .arg("connect")
-            .arg("SPICE-ADOPT-AAAAA-BBBBB")
-            .arg("--install")
-            .assert()
-            .failure()
-            .stdout(predicate::str::contains(
-                "Failed to install the Spice Cloud Connect service",
-            ));
-
-        assert!(
-            !config_dir.join("pending-adopt-code").exists(),
-            "a failed preflight must stage nothing — the code stays valid"
-        );
-        assert!(!config_dir.join("identity.json").exists());
     }
 
     /// With no code, no staged state, and no login, the error must name both
