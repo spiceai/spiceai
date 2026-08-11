@@ -808,6 +808,9 @@ impl RuntimeBuilder {
             query_pool_ceiling_bytes: df.applied_query_memory_limit(),
             dedicated_thread_pools_enabled,
             current_total_memory: df.current_total_memory(),
+            cayenne_reservation_high_water_bytes: Arc::new(AtomicU64::new(
+                cayenne_reservation_bytes,
+            )),
         };
 
         let datasets_health_monitor = if self.datasets_health_monitor_enabled {
@@ -1621,9 +1624,21 @@ pub(crate) struct DuckDbBudgetContext {
     /// publication refreshes it; the sampler reads it without a repeated sysinfo
     /// probe on its two-second interval.
     current_total_memory: Arc<AtomicU64>,
+    /// Largest off-pool Cayenne reservation observed by this runtime. Unchanged
+    /// tables retain the settings and caches they were created with when
+    /// start-time-only `runtime.params` change, so their aggregate reservation must
+    /// not fall during the process lifetime.
+    cayenne_reservation_high_water_bytes: Arc<AtomicU64>,
 }
 
 impl DuckDbBudgetContext {
+    fn retained_cayenne_reservation_bytes(&self, app: &Arc<App>) -> u64 {
+        let current = estimate_cayenne_reservation_bytes(Some(app), &app.runtime.params);
+        self.cayenne_reservation_high_water_bytes
+            .fetch_max(current, Ordering::Relaxed)
+            .max(current)
+    }
+
     /// Re-plans the coordinated `DuckDB` budget for `app` and publishes it, so every
     /// `DuckDB` instance created from `app` is capped for the acceleration set `app`
     /// declares. Call before anything initializes those accelerators; an instance
@@ -1656,15 +1671,15 @@ impl DuckDbBudgetContext {
 
         let duckdb_default_per_instance = *DUCKDB_HOST_DEFAULT_BYTES;
         // The region the pool and the DuckDB instances come out of shrinks around the
-        // Cayenne caches the app declares, so it is measured from the app being
-        // applied — a reload that adds Cayenne tables reserves for them here rather
-        // than handing that memory to DuckDB.
+        // Cayenne caches the app declares, so new tables are measured from the app
+        // being applied. The retained high-water also covers unchanged tables whose
+        // start-time-only settings and cache ceilings remain in effect.
         let cayenne_cdc_active =
             self.dedicated_thread_pools_enabled && cayenne_workload(Some(app)).uses_cdc_tier();
         let base_query_budget = crate::datafusion::builder::effective_query_memory_limit(
             None,
             cayenne_cdc_active,
-            estimate_cayenne_reservation_bytes(Some(app), &app.runtime.params),
+            self.retained_cayenne_reservation_bytes(app),
             None,
         );
         let plan = crate::accelerator_memory_budget::plan(
@@ -2361,6 +2376,60 @@ mod test {
                 .fold(builder, app::AppBuilder::with_view)
                 .build(),
         )
+    }
+
+    /// A reload can change start-time-only `runtime.params` without recreating an
+    /// unchanged `Cayenne` table. Its earlier cache ceilings therefore remain part
+    /// of the coordinated memory reservation even when the new value is smaller.
+    #[cfg(not(windows))]
+    #[test]
+    fn cayenne_reservation_high_water_retains_start_time_settings() {
+        use spicepod::acceleration::RefreshMode;
+
+        let mut acceleration = cayenne_test_accel("cayenne", true);
+        acceleration.refresh_mode = Some(RefreshMode::Changes);
+        let dataset = cayenne_test_dataset("cdc_table", acceleration);
+        let app_with_coalesce = |bytes: &str| {
+            Arc::new(
+                app::AppBuilder::new("cayenne-reload-reservation-test")
+                    .with_runtime_params(HashMap::from([(
+                        "cdc_max_coalesced_bytes".to_string(),
+                        bytes.to_string(),
+                    )]))
+                    .with_dataset(dataset.clone())
+                    .build(),
+            )
+        };
+
+        let initial_app = app_with_coalesce("536870912");
+        let smaller_app = app_with_coalesce("1");
+        let larger_app = app_with_coalesce("1073741824");
+        let initial_reservation =
+            estimate_cayenne_reservation_bytes(Some(&initial_app), &initial_app.runtime.params);
+        let smaller_reservation =
+            estimate_cayenne_reservation_bytes(Some(&smaller_app), &smaller_app.runtime.params);
+        let larger_reservation =
+            estimate_cayenne_reservation_bytes(Some(&larger_app), &larger_app.runtime.params);
+        assert!(smaller_reservation < initial_reservation);
+        assert!(initial_reservation < larger_reservation);
+
+        let context = DuckDbBudgetContext {
+            query_pool_ceiling_bytes: 0,
+            dedicated_thread_pools_enabled: true,
+            current_total_memory: Arc::new(AtomicU64::new(0)),
+            cayenne_reservation_high_water_bytes: Arc::new(AtomicU64::new(initial_reservation)),
+        };
+
+        assert_eq!(
+            context.retained_cayenne_reservation_bytes(&smaller_app),
+            initial_reservation,
+            "a smaller start-time-only value must not release memory to DuckDB"
+        );
+        assert_eq!(
+            context.retained_cayenne_reservation_bytes(&larger_app),
+            larger_reservation,
+            "new tables with larger reservations must raise the high-water mark"
+        );
     }
 
     /// A view carries its own `acceleration` block and reaches the same
