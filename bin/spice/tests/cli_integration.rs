@@ -842,6 +842,89 @@ mod connect {
         .to_string()
     }
 
+    /// Release tests use the system trust store. The general enroll fixture's
+    /// placeholder CA text deliberately is not a certificate and therefore
+    /// cannot be installed as a custom release root.
+    fn enroll_ok_body_without_ca() -> String {
+        serde_json::json!({
+            "instance_id": "inst_cli_test",
+            "identity_cert_pem": "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n",
+            "ca_bundle_pem": "",
+            "gateway_addr": "127.0.0.1:443",
+            "not_after": "2030-01-01T00:00:00Z",
+        })
+        .to_string()
+    }
+
+    #[cfg(unix)]
+    fn write_test_service_manifest(config_dir: &std::path::Path, health_url: &str) {
+        use sha2::{Digest as _, Sha256};
+        use std::fmt::Write as _;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = std::fs::canonicalize(config_dir).expect("canonical instance directory");
+        let path = directory.to_str().expect("UTF-8 instance directory");
+        let digest = Sha256::digest(path.as_bytes());
+        let mut short = String::with_capacity(16);
+        for byte in digest.iter().take(8) {
+            write!(short, "{byte:02x}").expect("format service digest");
+        }
+        let mut fragment = String::new();
+        let mut pending_dash = false;
+        for character in directory
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .unwrap_or_default()
+            .chars()
+        {
+            if character.is_ascii_alphanumeric() {
+                if pending_dash && !fragment.is_empty() && fragment.len() < 32 {
+                    fragment.push('-');
+                }
+                pending_dash = false;
+                if fragment.len() < 32 {
+                    fragment.push(character.to_ascii_lowercase());
+                }
+            } else {
+                pending_dash = true;
+            }
+            if fragment.len() >= 32 {
+                break;
+            }
+        }
+        let stem = if fragment.is_empty() {
+            short
+        } else {
+            format!("{fragment}-{short}")
+        };
+        let manifest = serde_json::json!({
+            "schema_version": 1,
+            "directory": directory,
+            "name": format!("spiced-cloud-connect-{stem}.service"),
+            "scope": "user",
+            "backend": "systemd",
+            "owner": {
+                "name": "test-owner",
+                "uid": nix::unistd::Uid::effective().as_raw(),
+            },
+            "definition_path": config_dir.join("definition.service"),
+            "runtime_path": config_dir.join("spiced"),
+            "log_source": "journald:test",
+            "runtime_sha256": "a".repeat(64),
+            "runtime_version": "v2.2.0",
+            "health_url": health_url,
+            "state": "installed",
+        });
+        let manifest_path = config_dir.join("service.json");
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).expect("serialize test manifest"),
+        )
+        .expect("write test manifest");
+        std::fs::set_permissions(&manifest_path, std::fs::Permissions::from_mode(0o600))
+            .expect("set owner-only manifest permissions");
+    }
+
     #[test]
     fn test_connect_help() {
         let mut cmd = spice_cmd();
@@ -886,10 +969,60 @@ mod connect {
             .assert()
             .success()
             .stdout(predicate::str::contains("svc").not());
+
+        let dir = TempDir::new().expect("create instance directory");
+        spice_cmd()
+            .arg("connect")
+            .arg("service")
+            .arg("install")
+            .arg("--org")
+            .arg("acme")
+            .arg("--project")
+            .arg("edge")
+            .arg("--token")
+            .arg("secret")
+            .arg("--region")
+            .arg("on-prem-syd")
+            .arg("--dir")
+            .arg(dir.path())
+            .arg("--help")
+            .assert()
+            .success();
+        for action in ["uninstall", "start", "stop", "restart"] {
+            spice_cmd()
+                .arg("connect")
+                .arg("service")
+                .arg(action)
+                .arg("--dir")
+                .arg(dir.path())
+                .arg("--help")
+                .assert()
+                .success();
+        }
+        spice_cmd()
+            .env("SPICE_CONFIG_DIR", dir.path())
+            .arg("connect")
+            .arg("status")
+            .arg("--endpoint")
+            .arg("http://127.0.0.1:8090")
+            .arg("--output")
+            .arg("json")
+            .assert()
+            .success();
     }
 
     #[test]
     fn test_connect_service_log_bounds_and_removed_aliases() {
+        spice_cmd()
+            .arg("connect")
+            .arg("service")
+            .arg("logs")
+            .arg("--number")
+            .arg("100000")
+            .assert()
+            .code(1)
+            .stdout(predicate::str::contains("No Spice Cloud Connect service"));
+
         spice_cmd()
             .arg("connect")
             .arg("service")
@@ -908,6 +1041,19 @@ mod connect {
                 .arg(removed)
                 .assert()
                 .code(2);
+        }
+
+        for unrelated in ["--yes", "--endpoint"] {
+            let mut command = spice_cmd();
+            command
+                .arg("connect")
+                .arg("service")
+                .arg("status")
+                .arg(unrelated);
+            if unrelated == "--endpoint" {
+                command.arg("http://127.0.0.1:8090");
+            }
+            command.assert().code(2);
         }
     }
 
@@ -942,6 +1088,137 @@ mod connect {
         let filtered: serde_json::Value =
             serde_json::from_slice(&filtered.stdout).expect("filtered status stdout is JSON only");
         assert_eq!(full["service"], filtered["service"]);
+    }
+
+    #[test]
+    fn test_connect_service_partial_failure_keeps_json_stdout_clean() {
+        let dir = TempDir::new().expect("create temp config dir");
+        std::fs::write(dir.path().join("service.json"), b"{").expect("write malformed manifest");
+
+        let output = spice_cmd()
+            .env("SPICE_CONFIG_DIR", dir.path())
+            .arg("connect")
+            .arg("service")
+            .arg("status")
+            .arg("--output")
+            .arg("json")
+            .output()
+            .expect("run partial status");
+        assert_eq!(output.status.code(), Some(1), "partial status must exit 1");
+        assert!(
+            output.stderr.is_empty(),
+            "structured diagnostics belong in JSON, not stderr: {:?}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let document: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("stdout contains only valid JSON");
+        assert_eq!(document["service"]["state"], "unavailable");
+        assert_eq!(
+            document["service"]["diagnostic"]["code"],
+            "service_manifest_invalid"
+        );
+
+        let missing = dir.path().join("missing-instance");
+        let output = spice_cmd()
+            .env_remove("SPICE_CONFIG_DIR")
+            .arg("connect")
+            .arg("status")
+            .arg("--dir")
+            .arg(&missing)
+            .arg("--output")
+            .arg("json")
+            .output()
+            .expect("inspect a missing instance directory");
+        assert_eq!(output.status.code(), Some(1));
+        let document: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("stdout contains only valid JSON");
+        assert_eq!(
+            document["service"]["diagnostic"]["code"],
+            "instance_directory_unavailable"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_connect_status_localizes_supervisor_failure_from_live_connection() {
+        let dir = TempDir::new().expect("create temp config dir");
+        let config_dir = dir.path();
+        let home = TempDir::new().expect("create temp home");
+        install_fake_spiced(home.path());
+        let (enroll_endpoint, enroll_server) = spawn_one_shot_http(200, &enroll_ok_body());
+        spice_cmd()
+            .env("HOME", home.path())
+            .env("SPICE_CONFIG_DIR", config_dir)
+            .arg("connect")
+            .arg("SPICE-ADOPT-AAAAA-BBBBB")
+            .arg("--endpoint")
+            .arg(&enroll_endpoint)
+            .assert()
+            .success();
+        enroll_server.join().expect("mock served enroll");
+
+        let (health_endpoint, health_server) =
+            spawn_one_shot_http(200, r#"[{"name":"cloud_connect","status":"Ready"}]"#);
+        write_test_service_manifest(config_dir, &format!("{health_endpoint}/health"));
+        let output = spice_cmd()
+            .env("SPICE_CONFIG_DIR", config_dir)
+            .arg("connect")
+            .arg("status")
+            .arg("--output")
+            .arg("json")
+            .output()
+            .expect("inspect status");
+        health_server.join().expect("mock served health probe");
+
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "the supervisor section remains unavailable"
+        );
+        let status: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("status stdout is valid JSON");
+        assert_eq!(status["service"]["state"], "unavailable");
+        assert_eq!(status["connection"]["state"], "connected");
+        assert!(status["connection"]["diagnostic"].is_null());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_connect_status_reports_runtime_lock_read_failure() {
+        let dir = TempDir::new().expect("create temp config dir");
+        let config_dir = dir.path();
+        let home = TempDir::new().expect("create temp home");
+        install_fake_spiced(home.path());
+        let (endpoint, server) = spawn_one_shot_http(200, &enroll_ok_body());
+        spice_cmd()
+            .env("HOME", home.path())
+            .env("SPICE_CONFIG_DIR", config_dir)
+            .arg("connect")
+            .arg("SPICE-ADOPT-AAAAA-BBBBB")
+            .arg("--endpoint")
+            .arg(&endpoint)
+            .assert()
+            .success();
+        server.join().expect("mock served enroll");
+        std::fs::create_dir(config_dir.join("runtime.lock"))
+            .expect("replace runtime lock file with a directory");
+
+        let output = spice_cmd()
+            .env("SPICE_CONFIG_DIR", config_dir)
+            .arg("connect")
+            .arg("status")
+            .arg("--output")
+            .arg("json")
+            .output()
+            .expect("inspect status");
+        assert_eq!(output.status.code(), Some(1));
+        let status: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("status stdout is valid JSON");
+        assert_eq!(status["connection"]["state"], "unavailable");
+        assert_eq!(
+            status["connection"]["diagnostic"]["code"],
+            "runtime_lock_unavailable"
+        );
     }
 
     /// `forget` is gone from the arg surface, not merely from the help text:
@@ -1029,7 +1306,7 @@ mod connect {
             .arg("status")
             .assert()
             .success()
-            .stdout(predicate::str::contains("adopted"))
+            .stdout(predicate::str::contains("enrolled, offline"))
             .stdout(predicate::str::contains("inst_cli_test"));
     }
 
@@ -1081,7 +1358,7 @@ mod connect {
             .arg(instance_dir.path())
             .assert()
             .success()
-            .stdout(predicate::str::contains("adopted"));
+            .stdout(predicate::str::contains("enrolled, offline"));
     }
 
     /// `--app-name`/`--create` ride the enroll request and the attached app
@@ -1340,6 +1617,105 @@ mod connect {
             !cache.exists(),
             "the delivered-secrets cache must not survive a remove"
         );
+    }
+
+    /// A transient release failure must retain every credential/recovery file
+    /// needed to retry the exact same-instance release. Clearing the identity
+    /// here would make the Cloud registry row permanently unreleasable from
+    /// this host.
+    #[cfg(unix)]
+    #[test]
+    fn test_connect_remove_retains_state_on_transient_release_failure() {
+        let dir = TempDir::new().expect("create temp config dir");
+        let config_dir = dir.path();
+        let home = TempDir::new().expect("create temp home");
+        install_fake_spiced(home.path());
+        let (enroll_endpoint, enroll_server) =
+            spawn_one_shot_http(200, &enroll_ok_body_without_ca());
+        spice_cmd()
+            .env("HOME", home.path())
+            .env("SPICE_CONFIG_DIR", config_dir)
+            .arg("connect")
+            .arg("SPICE-ADOPT-AAAAA-BBBBB")
+            .arg("--endpoint")
+            .arg(&enroll_endpoint)
+            .assert()
+            .success();
+        enroll_server.join().expect("mock served enroll");
+
+        let cache = config_dir.join("secrets-cache.json");
+        std::fs::write(&cache, r#"{"format_version":1}"#).expect("stage recovery cache");
+        let (release_endpoint, release_server) =
+            spawn_one_shot_http(503, r#"{"error":"try again"}"#);
+        spice_cmd()
+            .env("SPICE_CONFIG_DIR", config_dir)
+            .arg("connect")
+            .arg("remove")
+            .arg("--yes")
+            .arg("--endpoint")
+            .arg(&release_endpoint)
+            .assert()
+            .failure()
+            .stdout(predicate::str::contains("retained"))
+            .stdout(predicate::str::contains("remove --yes"));
+        release_server.join().expect("mock served release");
+
+        assert!(
+            config_dir.join("identity.json").exists(),
+            "identity must remain available for release retry"
+        );
+        assert!(
+            cache.exists(),
+            "recovery state must remain until release is confirmed"
+        );
+        assert!(
+            config_dir.join("cloud-endpoint").exists(),
+            "the enrolled endpoint remains part of recoverable state"
+        );
+    }
+
+    /// A 404 from the identity-authorized release endpoint means this exact
+    /// instance is already absent and is the only rejection that confirms the
+    /// local identity can be cleared safely.
+    #[cfg(unix)]
+    #[test]
+    fn test_connect_remove_clears_state_after_same_instance_404() {
+        let dir = TempDir::new().expect("create temp config dir");
+        let config_dir = dir.path();
+        let home = TempDir::new().expect("create temp home");
+        install_fake_spiced(home.path());
+        let (enroll_endpoint, enroll_server) =
+            spawn_one_shot_http(200, &enroll_ok_body_without_ca());
+        spice_cmd()
+            .env("HOME", home.path())
+            .env("SPICE_CONFIG_DIR", config_dir)
+            .arg("connect")
+            .arg("SPICE-ADOPT-AAAAA-BBBBB")
+            .arg("--endpoint")
+            .arg(&enroll_endpoint)
+            .assert()
+            .success();
+        enroll_server.join().expect("mock served enroll");
+
+        let cache = config_dir.join("secrets-cache.json");
+        std::fs::write(&cache, r#"{"format_version":1}"#).expect("stage recovery cache");
+        let (release_endpoint, release_server) =
+            spawn_one_shot_http(404, r#"{"error":"instance not found"}"#);
+        spice_cmd()
+            .env("SPICE_CONFIG_DIR", config_dir)
+            .arg("connect")
+            .arg("remove")
+            .arg("--yes")
+            .arg("--endpoint")
+            .arg(&release_endpoint)
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("already absent"));
+        release_server.join().expect("mock served release");
+
+        assert!(!config_dir.join("identity.json").exists());
+        assert!(!cache.exists());
+        assert!(!config_dir.join("cloud-endpoint").exists());
     }
 
     /// `status` reports which secrets were delivered, by name, from the cache's

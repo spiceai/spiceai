@@ -38,9 +38,10 @@ limitations under the License.
 //! moment the customer is decommissioning the host, when the stream may already
 //! be down.
 //!
-//! Release is best-effort by design: the caller clears local state either way.
-//! Reachable, the registry row moves to the terminal `removed` status;
-//! unreachable, the row reads `disconnected` until it is deleted in the portal.
+//! Local removal treats release as a confirmation boundary. The caller clears
+//! identity and recovery state only after success or an authoritative
+//! same-instance absence response; transient failures retain the credential so
+//! the release can be retried.
 
 use std::time::Duration;
 
@@ -151,9 +152,8 @@ struct ReleaseResponseWire {
 /// the not-found a cross-org or already-deleted instance gets),
 /// [`Error::ProofOfPossession`] when the stored private key cannot sign the
 /// request, and the transport variants when the cloud cannot be reached. A
-/// caller performing a `spice connect remove` treats **every** error as
-/// non-fatal: local state is cleared regardless, and the portal-side delete
-/// stays authoritative.
+/// caller performing `spice connect remove` retains local identity and recovery
+/// state on these errors so the exact release remains retryable.
 pub async fn release(
     enroll_endpoint: &str,
     identity: &Identity,

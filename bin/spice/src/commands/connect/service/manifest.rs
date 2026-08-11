@@ -59,7 +59,7 @@ pub(crate) enum Error {
     Invalid { path: PathBuf, reason: String },
 
     #[snafu(display(
-        "Service name collision for {name}: {reason}. No service files were changed."
+        "service_name_collision: Service name collision for {name}: {reason}. No service files were changed."
     ))]
     Collision { name: String, reason: String },
 }
@@ -158,6 +158,41 @@ pub(crate) fn load_validated(
 }
 
 fn validate_manifest(path: &Path, directory: &Path, manifest: &ServiceManifest) -> Result<()> {
+    let canonical = validate_manifest_fields(path, directory, manifest)?;
+    validate_owned_directory(path, "instance directory", &canonical, manifest.owner.uid)?;
+    if let Some(config_dir) = path.parent() {
+        validate_owned_directory(
+            path,
+            "configuration directory",
+            config_dir,
+            manifest.owner.uid,
+        )?;
+    }
+    for (label, owned_path) in [
+        ("definition_path", &manifest.definition_path),
+        ("runtime_path", &manifest.runtime_path),
+    ] {
+        validate_owned_asset(path, label, owned_path, manifest)?;
+    }
+    Ok(())
+}
+
+/// Validate the non-secret backend plan before it is allowed to mutate the
+/// host. Native backends remain responsible for validating any pre-existing
+/// definition with the planned name during their read-only planning phase.
+pub(crate) fn validate_install_plan(
+    config_dir: &Path,
+    directory: &Path,
+    manifest: &ServiceManifest,
+) -> Result<()> {
+    validate_manifest_fields(&config_dir.join(MANIFEST_FILE), directory, manifest).map(|_| ())
+}
+
+fn validate_manifest_fields(
+    path: &Path,
+    directory: &Path,
+    manifest: &ServiceManifest,
+) -> Result<PathBuf> {
     if manifest.schema_version != SCHEMA_VERSION {
         return Err(Error::Invalid {
             path: path.to_path_buf(),
@@ -204,8 +239,123 @@ fn validate_manifest(path: &Path, directory: &Path, manifest: &ServiceManifest) 
                 reason: format!("{label} must be absolute: {}", owned_path.display()),
             });
         }
-        validate_owned_asset(path, label, owned_path, manifest)?;
     }
+
+    if manifest.owner.name.is_empty() || manifest.owner.name.chars().any(char::is_control) {
+        return Err(Error::Invalid {
+            path: path.to_path_buf(),
+            reason: "owner name must be non-empty and contain no control characters".to_string(),
+        });
+    }
+    if manifest.log_source.is_empty() || manifest.log_source.chars().any(char::is_control) {
+        return Err(Error::Invalid {
+            path: path.to_path_buf(),
+            reason: "log_source must be non-empty and contain no control characters".to_string(),
+        });
+    }
+    if manifest.runtime_version.is_empty() || manifest.runtime_version.chars().any(char::is_control)
+    {
+        return Err(Error::Invalid {
+            path: path.to_path_buf(),
+            reason: "runtime_version must be non-empty and contain no control characters"
+                .to_string(),
+        });
+    }
+    if manifest.runtime_sha256.len() != 64
+        || !manifest
+            .runtime_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(Error::Invalid {
+            path: path.to_path_buf(),
+            reason: "runtime_sha256 must contain exactly 64 lowercase hexadecimal characters"
+                .to_string(),
+        });
+    }
+    if let Some(health_url) = manifest.health_url.as_deref() {
+        validate_local_health_url(path, health_url)?;
+    }
+    Ok(canonical)
+}
+
+fn validate_local_health_url(manifest_path: &Path, health_url: &str) -> Result<()> {
+    let url = reqwest::Url::parse(health_url).map_err(|source| Error::Invalid {
+        path: manifest_path.to_path_buf(),
+        reason: format!("health_url is invalid: {source}"),
+    })?;
+    let host = url.host_str().unwrap_or_default().trim_matches(['[', ']']);
+    let is_loopback = host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback());
+    if !matches!(url.scheme(), "http" | "https")
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || !is_loopback
+    {
+        return Err(Error::Invalid {
+            path: manifest_path.to_path_buf(),
+            reason: "health_url must be an HTTP(S) loopback URL without credentials".to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_owned_directory(
+    manifest_path: &Path,
+    label: &str,
+    directory: &Path,
+    expected_uid: u32,
+) -> Result<()> {
+    let metadata = std::fs::symlink_metadata(directory).map_err(|source| Error::Inspect {
+        path: directory.to_path_buf(),
+        source,
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(Error::Invalid {
+            path: manifest_path.to_path_buf(),
+            reason: format!(
+                "{label} is not a real, non-symlink directory: {}",
+                directory.display()
+            ),
+        });
+    }
+    validate_owned_directory_metadata(manifest_path, label, directory, &metadata, expected_uid)
+}
+
+#[cfg(unix)]
+fn validate_owned_directory_metadata(
+    manifest_path: &Path,
+    label: &str,
+    directory: &Path,
+    metadata: &std::fs::Metadata,
+    expected_uid: u32,
+) -> Result<()> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    let mode = metadata.permissions().mode() & 0o777;
+    if metadata.uid() != expected_uid || mode & 0o022 != 0 {
+        return Err(Error::Invalid {
+            path: manifest_path.to_path_buf(),
+            reason: format!(
+                "{label} {} has uid {} mode {mode:04o}; expected uid {expected_uid} and no group/world write bits",
+                directory.display(),
+                metadata.uid()
+            ),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_owned_directory_metadata(
+    _manifest_path: &Path,
+    _label: &str,
+    _directory: &Path,
+    _metadata: &std::fs::Metadata,
+    _expected_uid: u32,
+) -> Result<()> {
     Ok(())
 }
 

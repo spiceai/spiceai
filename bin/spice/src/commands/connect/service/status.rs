@@ -38,9 +38,30 @@ pub(crate) async fn collect(
     directory: &Path,
     backend: &dyn ServiceBackend,
 ) -> ConnectStatus {
-    let canonical_directory = std::fs::canonicalize(directory).unwrap_or_else(|_| directory.into());
+    let (canonical_directory, directory_diagnostic) = match std::fs::canonicalize(directory) {
+        Ok(canonical) => (canonical, None),
+        Err(error) => (
+            directory.to_path_buf(),
+            Some(Diagnostic::new(
+                "instance_directory_unavailable",
+                format!(
+                    "Failed to resolve instance directory {}: {error}",
+                    directory.display()
+                ),
+                "Restore access to the instance directory and retry `spice connect status`.",
+            )),
+        ),
+    };
     let identity_path = config_dir.join(runtime_cloud_connect::config::IDENTITY_FILE);
-    let (service, manifest) = collect_service(config_dir, &canonical_directory, backend);
+    let (service, manifest) = directory_diagnostic.map_or_else(
+        || collect_service(config_dir, &canonical_directory, backend),
+        |diagnostic| {
+            (
+                ServiceStatus::unavailable(canonical_directory.clone(), diagnostic),
+                None,
+            )
+        },
+    );
     let connection = collect_connection(
         context,
         config_dir,
@@ -195,29 +216,69 @@ async fn collect_connection(
     };
 
     let service_expected_running = service.state == ServiceState::Running;
-    let foreground_owned =
-        runtime_lock_is_held(&config_dir.join(RUNTIME_LOCK_FILE)).unwrap_or(false);
-    let status_url = if service_expected_running {
+    let foreground_owned = match runtime_lock_is_held(&config_dir.join(RUNTIME_LOCK_FILE)) {
+        Ok(held) => held,
+        Err(error) => {
+            let lock_path = config_dir.join(RUNTIME_LOCK_FILE);
+            status.state = ConnectionState::Unavailable;
+            status.diagnostic = Some(Diagnostic::new(
+                "runtime_lock_unavailable",
+                format!(
+                    "Failed to inspect local runtime ownership at {}: {error}",
+                    lock_path.display()
+                ),
+                "Restore owner access to runtime.lock and retry `spice connect status`.",
+            ));
+            return status;
+        }
+    };
+    let service_probe = service.installed
+        && matches!(
+            service.state,
+            ServiceState::Running | ServiceState::Unavailable
+        );
+    let service_status_url = if service_probe {
         manifest.and_then(|manifest| manifest.health_url.as_deref())
-    } else if foreground_owned {
-        Some(context.http_endpoint())
     } else {
         None
+    };
+    if service_expected_running && service_status_url.is_none() {
+        status.state = ConnectionState::Unavailable;
+        status.diagnostic = Some(Diagnostic::new(
+            "runtime_status_url_unavailable",
+            "The installed service reports running, but service.json has no local health URL.",
+            "Reinstall the service to record its health URL, then retry `spice connect status`.",
+        ));
+        return status;
+    }
+
+    let foreground_can_own_runtime =
+        !service.installed || matches!(service.state, ServiceState::Stopped | ServiceState::Failed);
+    let (status_url, service_owned) = if let Some(url) = service_status_url {
+        (Some(url), true)
+    } else if foreground_owned && foreground_can_own_runtime {
+        (Some(context.http_endpoint()), false)
+    } else {
+        (None, false)
     };
 
     if let Some(url) = status_url {
         match runtime_cloud_stream_is_connected(context, url).await {
             Ok(true) => status.state = ConnectionState::Connected,
-            Ok(false) => {}
-            Err(message) if service_expected_running => {
+            Err(message) => {
                 status.state = ConnectionState::Unavailable;
+                let remediation = if service_owned {
+                    "Check `spice connect service logs` and retry `spice connect status`."
+                } else {
+                    "Check the foreground runtime output and retry `spice connect status`."
+                };
                 status.diagnostic = Some(Diagnostic::new(
                     "runtime_status_unavailable",
                     message,
-                    "Check `spice connect service logs` and retry `spice connect status`.",
+                    remediation,
                 ));
             }
-            Err(_) => {}
+            Ok(false) => {}
         }
     }
     status
@@ -448,8 +509,16 @@ mod tests {
     }
 
     impl ServiceBackend for FakeBackend {
-        fn install(&self, _request: &InstallRequest) -> BackendResult<ServiceManifest> {
+        fn plan_install(&self, _request: &InstallRequest) -> BackendResult<ServiceManifest> {
             Err(BackendFailure::new("unused", "unused", "unused"))
+        }
+
+        fn install(
+            &self,
+            _request: &InstallRequest,
+            _manifest: &ServiceManifest,
+        ) -> BackendResult<()> {
+            Ok(())
         }
 
         fn uninstall(&self, _manifest: &ServiceManifest) -> BackendResult<()> {
@@ -560,6 +629,30 @@ mod tests {
             Some("supervisor_query_failed")
         );
         assert!(status.installed);
+    }
+
+    #[test]
+    fn runtime_lock_probe_observes_ownership_not_stale_contents() {
+        let directory = tempfile::TempDir::new().expect("create lock directory");
+        let path = directory.path().join(RUNTIME_LOCK_FILE);
+        let owner = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("create runtime lock");
+
+        owner.lock_exclusive().expect("acquire runtime lock");
+        assert!(
+            runtime_lock_is_held(&path).expect("probe owned runtime lock"),
+            "an active OS lock, not file contents, identifies the runtime owner"
+        );
+        owner.unlock().expect("release runtime lock");
+        assert!(
+            !runtime_lock_is_held(&path).expect("probe released runtime lock"),
+            "stale runtime.lock contents must not imply ownership"
+        );
     }
 
     #[test]

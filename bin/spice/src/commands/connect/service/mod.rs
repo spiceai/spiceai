@@ -34,7 +34,7 @@ use crate::output::{OutputFormat, write_json};
 
 use backend::{InstallRequest, LogRequest};
 pub(crate) use backend::{PlatformBackend, ServiceBackend};
-use manifest::{ServiceManifest, load_validated};
+use manifest::{ManifestState, ServiceManifest, load_validated};
 
 /// Arguments below the public `service` group.
 #[derive(Args)]
@@ -184,15 +184,7 @@ pub(crate) async fn execute(
                 config_directory: config_dir.to_path_buf(),
                 source_runtime,
             };
-            let installed = backend.install(&request).map_err(backend_error)?;
-            if let Some(existing) =
-                load_validated(config_dir, &request.directory).map_err(manifest_error)?
-            {
-                existing
-                    .ensure_same_service(&installed)
-                    .map_err(manifest_error)?;
-            }
-            manifest::write(config_dir, &installed).map_err(manifest_error)?;
+            install_exact(config_dir, &request, backend)?;
             println!("Spice Cloud Connect service: installed and running");
             Ok(())
         }
@@ -210,13 +202,13 @@ pub(crate) async fn execute(
             Ok(())
         }
         ServiceCommand::Start => with_manifest(config_dir, directory, |manifest| {
-            backend.start(manifest).map_err(backend_error)
+            backend.start(manifest).map_err(Error::from)
         }),
         ServiceCommand::Stop => with_manifest(config_dir, directory, |manifest| {
-            backend.stop(manifest).map_err(backend_error)
+            backend.stop(manifest).map_err(Error::from)
         }),
         ServiceCommand::Restart => with_manifest(config_dir, directory, |manifest| {
-            backend.restart(manifest).map_err(backend_error)
+            backend.restart(manifest).map_err(Error::from)
         }),
         ServiceCommand::Status(args) => {
             let snapshot = status::collect(context, config_dir, directory, backend).await;
@@ -240,9 +232,27 @@ pub(crate) async fn execute(
                         follow: args.follow,
                     },
                 )
-                .map_err(backend_error)
+                .map_err(Error::from)
         }),
     }
+}
+
+fn install_exact(
+    config_dir: &Path,
+    request: &InstallRequest,
+    backend: &dyn ServiceBackend,
+) -> Result<ServiceManifest> {
+    let installed = backend.plan_install(request).map_err(Error::from)?;
+    manifest::validate_install_plan(config_dir, &request.directory, &installed)
+        .map_err(Error::from)?;
+    if let Some(existing) = load_validated(config_dir, &request.directory).map_err(Error::from)? {
+        existing
+            .ensure_same_service(&installed)
+            .map_err(Error::from)?;
+    }
+    backend.install(request, &installed).map_err(Error::from)?;
+    manifest::write(config_dir, &installed).map_err(Error::from)?;
+    Ok(installed)
 }
 
 /// The shared uninstall primitive used both by `service uninstall` and the
@@ -253,11 +263,14 @@ pub(crate) fn uninstall_exact(
     backend: &dyn ServiceBackend,
 ) -> Result<Option<ServiceManifest>> {
     let canonical = canonical_directory(directory)?;
-    let Some(manifest) = load_validated(config_dir, &canonical).map_err(manifest_error)? else {
+    let Some(manifest) = load_validated(config_dir, &canonical).map_err(Error::from)? else {
         return Ok(None);
     };
-    backend.uninstall(&manifest).map_err(backend_error)?;
-    manifest::remove(config_dir).map_err(manifest_error)?;
+    if manifest.state == ManifestState::Uninstalled {
+        return Ok(None);
+    }
+    backend.uninstall(&manifest).map_err(Error::from)?;
+    manifest::remove(config_dir).map_err(Error::from)?;
     Ok(Some(manifest))
 }
 
@@ -281,13 +294,21 @@ fn with_manifest(
 ) -> Result<()> {
     let canonical = canonical_directory(directory)?;
     let manifest = load_validated(config_dir, &canonical)
-        .map_err(manifest_error)?
+        .map_err(Error::from)?
         .ok_or_else(|| Error::InvalidArgument {
             message: format!(
                 "No Spice Cloud Connect service is installed for {}. Run `spice connect service install` first.",
                 canonical.display()
             ),
         })?;
+    if manifest.state == ManifestState::Uninstalled {
+        return Err(Error::InvalidArgument {
+            message: format!(
+                "No Spice Cloud Connect service is installed for {}. Run `spice connect service install` first.",
+                canonical.display()
+            ),
+        });
+    }
     operation(&manifest)
 }
 
@@ -300,15 +321,19 @@ fn canonical_directory(directory: &Path) -> Result<PathBuf> {
     })
 }
 
-fn backend_error(error: backend::BackendFailure) -> Error {
-    Error::CloudConnectIo {
-        message: format!("{} {}", error.message, error.remediation),
+impl From<backend::BackendFailure> for Error {
+    fn from(error: backend::BackendFailure) -> Self {
+        Self::CloudConnectIo {
+            message: format!("{} {}", error.message, error.remediation),
+        }
     }
 }
 
-fn manifest_error(error: manifest::Error) -> Error {
-    Error::CloudConnectIo {
-        message: error.to_string(),
+impl From<manifest::Error> for Error {
+    fn from(error: manifest::Error) -> Self {
+        Self::CloudConnectIo {
+            message: error.to_string(),
+        }
     }
 }
 
@@ -325,4 +350,144 @@ fn print_action_help() {
     println!("  restart    Restart an installed service");
     println!("  status     Show normalized service status");
     println!("  logs       Read or follow service logs");
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use super::backend::{BackendFailure, BackendStatus, Result as BackendResult};
+    use super::manifest::{ManifestState, service_name_for_dir};
+    use super::model::{SCHEMA_VERSION, ServiceOwner, ServiceScope, ServiceSupervisor};
+    use super::*;
+
+    struct MutationSentinelBackend {
+        plan: ServiceManifest,
+        mutated: AtomicBool,
+        uninstalled: AtomicBool,
+    }
+
+    impl ServiceBackend for MutationSentinelBackend {
+        fn plan_install(&self, _request: &InstallRequest) -> BackendResult<ServiceManifest> {
+            Ok(self.plan.clone())
+        }
+
+        fn install(
+            &self,
+            _request: &InstallRequest,
+            _manifest: &ServiceManifest,
+        ) -> BackendResult<()> {
+            self.mutated.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn uninstall(&self, _manifest: &ServiceManifest) -> BackendResult<()> {
+            self.uninstalled.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn start(&self, _manifest: &ServiceManifest) -> BackendResult<()> {
+            Ok(())
+        }
+
+        fn stop(&self, _manifest: &ServiceManifest) -> BackendResult<()> {
+            Ok(())
+        }
+
+        fn restart(&self, _manifest: &ServiceManifest) -> BackendResult<()> {
+            Ok(())
+        }
+
+        fn status(&self, _manifest: &ServiceManifest) -> BackendResult<BackendStatus> {
+            Err(BackendFailure::new("unused", "unused", "unused"))
+        }
+
+        fn logs(&self, _manifest: &ServiceManifest, _request: LogRequest) -> BackendResult<()> {
+            Ok(())
+        }
+    }
+
+    fn test_manifest(directory: &Path, scope: ServiceScope) -> ServiceManifest {
+        let name = match service_name_for_dir(directory, ServiceSupervisor::Systemd) {
+            Ok(name) => name,
+            Err(error) => panic!("derive service name: {error}"),
+        };
+        ServiceManifest {
+            schema_version: SCHEMA_VERSION,
+            directory: directory.to_path_buf(),
+            name,
+            scope,
+            backend: ServiceSupervisor::Systemd,
+            owner: ServiceOwner {
+                name: "test-owner".to_string(),
+                uid: nix::unistd::Uid::effective().as_raw(),
+            },
+            definition_path: directory.join("definition.service"),
+            runtime_path: directory.join("spiced"),
+            log_source: "journald:test".to_string(),
+            runtime_sha256: "a".repeat(64),
+            runtime_version: "v2.2.0".to_string(),
+            health_url: Some("http://127.0.0.1:8090/health".to_string()),
+            state: ManifestState::Installed,
+        }
+    }
+
+    #[test]
+    fn manifest_collision_is_rejected_before_backend_mutation() {
+        let instance = tempfile::TempDir::new().expect("create instance directory");
+        let directory = std::fs::canonicalize(instance.path()).expect("canonical directory");
+        let config_dir = directory.join(".spice");
+        let existing = test_manifest(&directory, ServiceScope::User);
+        manifest::write(&config_dir, &existing).expect("write existing manifest");
+
+        let backend = MutationSentinelBackend {
+            plan: test_manifest(&directory, ServiceScope::System),
+            mutated: AtomicBool::new(false),
+            uninstalled: AtomicBool::new(false),
+        };
+        let request = InstallRequest {
+            directory,
+            config_directory: config_dir.clone(),
+            source_runtime: instance.path().join("source-spiced"),
+        };
+
+        let error = install_exact(&config_dir, &request, &backend)
+            .expect_err("different service ownership must collide");
+        assert!(
+            error.to_string().contains("service_name_collision"),
+            "{error}"
+        );
+        assert!(
+            !backend.mutated.load(Ordering::SeqCst),
+            "collision must be detected before backend mutation"
+        );
+    }
+
+    #[test]
+    fn shared_uninstall_removes_only_service_state() {
+        let instance = tempfile::TempDir::new().expect("create instance directory");
+        let directory = std::fs::canonicalize(instance.path()).expect("canonical directory");
+        let config_dir = directory.join(".spice");
+        let existing = test_manifest(&directory, ServiceScope::User);
+        manifest::write(&config_dir, &existing).expect("write existing manifest");
+        let identity_path = config_dir.join(runtime_cloud_connect::config::IDENTITY_FILE);
+        std::fs::write(&identity_path, b"identity-owned-by-connect-remove")
+            .expect("write identity sentinel");
+        let backend = MutationSentinelBackend {
+            plan: existing,
+            mutated: AtomicBool::new(false),
+            uninstalled: AtomicBool::new(false),
+        };
+
+        let removed = uninstall_exact(&config_dir, &directory, &backend)
+            .expect("uninstall exact service")
+            .expect("installed service was removed");
+        assert!(backend.uninstalled.load(Ordering::SeqCst));
+        assert_eq!(removed.directory, directory);
+        assert!(!config_dir.join(manifest::MANIFEST_FILE).exists());
+        assert_eq!(
+            std::fs::read(identity_path).expect("read retained identity sentinel"),
+            b"identity-owned-by-connect-remove"
+        );
+    }
 }

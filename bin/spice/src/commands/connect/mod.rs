@@ -95,7 +95,7 @@ pub struct ConnectArgs {
     /// presented to. Defaults to `https://api.spice.ai`. Also
     /// configurable via `SPICE_CLOUD_ENDPOINT`. The gateway (stream)
     /// address is issued by the enroll response, not configured here.
-    #[arg(long, value_name = "URL", global = true)]
+    #[arg(long, value_name = "URL")]
     pub endpoint: Option<String>,
 
     /// The instance directory: per-instance Cloud Connect state (the
@@ -147,11 +147,6 @@ pub struct ConnectArgs {
     #[arg(long, requires = "app_name")]
     pub create: bool,
 
-    /// Skip the confirmation prompt. Applies to `remove`, which otherwise
-    /// asks before stopping and uninstalling a service.
-    #[arg(long, short = 'y', global = true)]
-    pub yes: bool,
-
     /// The global `--cloud-region`, forwarded by the dispatcher rather than
     /// declared here (the flag is global; clap would reject a second definition
     /// of the same name).
@@ -173,7 +168,7 @@ pub enum ConnectCommand {
     /// Release this instance: report the release to Spice Cloud, uninstall an
     /// installed service, and clear the local identity. spiced will continue
     /// running unmanaged after the next restart.
-    Remove,
+    Remove(ConnectRemoveArgs),
 
     /// Manage the persistent service for this instance directory.
     #[command(alias = "svc")]
@@ -182,9 +177,24 @@ pub enum ConnectCommand {
 
 #[derive(Args)]
 pub struct ConnectStatusArgs {
+    /// Override the persisted Spice Cloud endpoint for this inspection.
+    #[arg(long, value_name = "URL")]
+    pub endpoint: Option<String>,
+
     /// Output format.
     #[arg(long, short = 'o', default_value = "table")]
     pub output: OutputFormat,
+}
+
+#[derive(Args)]
+pub struct ConnectRemoveArgs {
+    /// Override the Spice Cloud endpoint used to release this instance.
+    #[arg(long, value_name = "URL")]
+    pub endpoint: Option<String>,
+
+    /// Skip the confirmation prompt.
+    #[arg(long, short = 'y')]
+    pub yes: bool,
 }
 
 impl ConnectArgs {
@@ -219,13 +229,17 @@ pub async fn execute(ctx: &RuntimeContext, args: ConnectArgs) -> Result<()> {
         reject_cloud_region(args.cloud_region.as_deref())?;
         return match cmd {
             ConnectCommand::Status(status_args) => {
+                // Status is intentionally local-only. The endpoint flag is
+                // retained as part of the stable public grammar for callers
+                // that share connect/remove argument construction.
+                let _ = status_args.endpoint;
                 print_status(ctx, &config_dir, status_args.output).await
             }
-            ConnectCommand::Remove => {
+            ConnectCommand::Remove(remove_args) => {
                 remove_identity(
                     &config_dir,
-                    args.endpoint.as_deref(),
-                    args.yes,
+                    remove_args.endpoint.as_deref(),
+                    remove_args.yes,
                     &service::PlatformBackend,
                 )
                 .await
@@ -437,12 +451,10 @@ fn read_staged_code(config_dir: &Path) -> Result<Option<String>> {
 
 /// Enroll this host with Spice Cloud and exit.
 ///
-/// Sequence: preflight the service install (so a host that cannot be installed
-/// on fails with the code unspent), stage the code when it is stageable,
-/// install the runtime if missing, complete the HTTPS enroll (identity issued
-/// and persisted, registry row created cloud-side, app attached and region
-/// recorded when requested), optionally install the service, and print the next
-/// steps.
+/// Sequence: stage the code when it is stageable, install the runtime if
+/// missing, complete the HTTPS enroll (identity issued and persisted, registry
+/// row created cloud-side, app attached and region recorded when requested),
+/// and print the foreground and persistent-service continuations.
 async fn enroll_instance(
     ctx: &RuntimeContext,
     credential: Credential,

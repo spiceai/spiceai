@@ -87,7 +87,12 @@ pub(crate) struct LogRequest {
 
 /// Exact-directory service lifecycle contract.
 pub(crate) trait ServiceBackend {
-    fn install(&self, request: &InstallRequest) -> Result<ServiceManifest>;
+    /// Resolve every owned path and validate any pre-existing native
+    /// definition without changing the host.
+    fn plan_install(&self, request: &InstallRequest) -> Result<ServiceManifest>;
+    /// Apply a plan only after the shared layer has rejected manifest/name
+    /// collisions.
+    fn install(&self, request: &InstallRequest, manifest: &ServiceManifest) -> Result<()>;
     fn uninstall(&self, manifest: &ServiceManifest) -> Result<()>;
     fn start(&self, manifest: &ServiceManifest) -> Result<()>;
     fn stop(&self, manifest: &ServiceManifest) -> Result<()>;
@@ -115,12 +120,16 @@ impl PlatformBackend {
 }
 
 impl ServiceBackend for PlatformBackend {
-    fn install(&self, request: &InstallRequest) -> Result<ServiceManifest> {
+    fn plan_install(&self, request: &InstallRequest) -> Result<ServiceManifest> {
         let _ = (
             &request.directory,
             &request.config_directory,
             &request.source_runtime,
         );
+        Err(Self::unavailable("install"))
+    }
+
+    fn install(&self, _request: &InstallRequest, _manifest: &ServiceManifest) -> Result<()> {
         Err(Self::unavailable("install"))
     }
 
