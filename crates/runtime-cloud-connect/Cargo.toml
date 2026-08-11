@@ -30,6 +30,9 @@ chrono = { workspace = true }
 getrandom = { version = "0.3", features = ["std"] }
 dirs = "6"
 gethostname = { workspace = true }
+# Advisory locks distinguish abandoned secret-bearing atomic-write temp files
+# from live concurrent writers before reclamation.
+fs4 = { workspace = true }
 # PEM → DER decoding for the renewal proof-of-possession signature (the
 # private key and CSR are held as PEM; the signer takes raw DER bytes).
 pem = { workspace = true }
@@ -44,6 +47,7 @@ rand = { workspace = true }
 rcgen = { version = "0.14", default-features = false, features = ["pem", "aws_lc_rs"] }
 # Out-of-band HTTPS enroll/renew against the cloud control plane.
 reqwest = { workspace = true }
+spice-cloud-client = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }

@@ -726,6 +726,99 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     })
 }
 
+/// A newly-created writer gets ample time to acquire its advisory lock before
+/// another process may consider its temp file abandoned. The lock remains the
+/// authoritative liveness signal after this age; time alone never authorizes
+/// deletion of an active writer.
+const ABANDONED_TEMP_MIN_AGE: std::time::Duration = std::time::Duration::from_hours(1);
+
+/// Reclaim secret-bearing temp files left by a process that exited before
+/// promotion.
+///
+/// Temp names are unique per writer. Each live writer holds an exclusive
+/// advisory lock from creation through rename, so cleanup removes only an old
+/// exact-name match whose lock can be acquired. This bounds credential debris
+/// without allowing concurrent writers to delete one another's files.
+fn cleanup_abandoned_atomic_temps(
+    path: &Path,
+    minimum_age: std::time::Duration,
+) -> std::io::Result<()> {
+    cleanup_abandoned_atomic_temps_with(path, minimum_age, |_, _| Ok(()))
+}
+
+fn cleanup_abandoned_atomic_temps_with<F>(
+    path: &Path,
+    minimum_age: std::time::Duration,
+    before_remove: F,
+) -> std::io::Result<()>
+where
+    F: Fn(&std::fs::File, &Path) -> std::io::Result<()>,
+{
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("identity.json");
+    let prefix = format!(".{file_name}.");
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+
+    for entry in entries {
+        let entry = entry?;
+        let entry_name = entry.file_name();
+        let Some(entry_name) = entry_name.to_str() else {
+            continue;
+        };
+        let is_temp = Path::new(entry_name)
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("tmp"));
+        if !entry_name.starts_with(&prefix)
+            || !is_temp
+            || entry_name.len() <= prefix.len() + ".tmp".len()
+            || !entry.file_type()?.is_file()
+        {
+            continue;
+        }
+
+        let old_enough = entry
+            .metadata()?
+            .modified()?
+            .elapsed()
+            .is_ok_and(|age| age >= minimum_age);
+        if !old_enough {
+            continue;
+        }
+
+        let file = match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(entry.path())
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        if !fs4::fs_std::FileExt::try_lock_exclusive(&file)? {
+            continue;
+        }
+        // Keep the lock through unlink: acquiring it establishes that no live
+        // writer owns this inode, and releasing it before removal would split
+        // that liveness decision from the destructive action.
+        before_remove(&file, &entry.path())?;
+        let removal = std::fs::remove_file(entry.path());
+        drop(file);
+        match removal {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
 /// Atomically write `bytes` to `path` with owner-only permissions.
 ///
 /// Shared with [`crate::secret_cache`]: both files hold secret material and need
@@ -739,6 +832,7 @@ pub(crate) fn atomic_write_owner_only(path: &Path, bytes: &[u8]) -> std::io::Res
     use std::os::unix::fs::OpenOptionsExt as _;
     use std::os::unix::fs::PermissionsExt as _;
 
+    cleanup_abandoned_atomic_temps(path, ABANDONED_TEMP_MIN_AGE)?;
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     let file_name = path
         .file_name()
@@ -752,16 +846,20 @@ pub(crate) fn atomic_write_owner_only(path: &Path, bytes: &[u8]) -> std::io::Res
     let result = (|| {
         let mut file = std::fs::OpenOptions::new()
             .create_new(true)
+            .read(true)
             .write(true)
             .mode(0o600)
             .open(&tmp_path)?;
+        fs4::fs_std::FileExt::lock_exclusive(&file)?;
         // Re-assert mode in case umask/file-creation flags interfered.
         file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
         file.write_all(bytes)?;
         file.sync_all()?;
-        drop(file);
-
         std::fs::rename(&tmp_path, path)?;
+        // The unique temp name no longer exists, so cleanup cannot target this
+        // inode. Release the lock before publishing success (especially on
+        // Windows, where range locks are mandatory for readers).
+        drop(file);
         sync_parent_directory(path)
     })();
 
@@ -778,6 +876,7 @@ pub(crate) fn atomic_write_owner_only(path: &Path, bytes: &[u8]) -> std::io::Res
 pub(crate) fn atomic_write_owner_only(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write as _;
     cleanup_stale_identity_backups(path)?;
+    cleanup_abandoned_atomic_temps(path, ABANDONED_TEMP_MIN_AGE)?;
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     let file_name = path
         .file_name()
@@ -787,12 +886,14 @@ pub(crate) fn atomic_write_owner_only(path: &Path, bytes: &[u8]) -> std::io::Res
     let result = (|| {
         let mut file = std::fs::OpenOptions::new()
             .create_new(true)
+            .read(true)
             .write(true)
             .open(&tmp_path)?;
+        fs4::fs_std::FileExt::lock_exclusive(&file)?;
         file.write_all(bytes)?;
         file.sync_all()?;
-        drop(file);
         promote_temp(&tmp_path, path)?;
+        drop(file);
         sync_parent_directory(path)
     })();
     if result.is_err() {
@@ -1053,6 +1154,59 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert!(leftovers.is_empty(), "temporary writes must be cleaned up");
+    }
+
+    #[test]
+    fn abandoned_atomic_temp_cleanup_preserves_a_locked_writer() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join("identity.json");
+        let active_temp = dir.path().join(".identity.json.active.tmp");
+        let abandoned_temp = dir.path().join(".identity.json.abandoned.tmp");
+        let unrelated = dir.path().join(".different.json.abandoned.tmp");
+        let active = std::fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&active_temp)
+            .expect("create active temp");
+        fs4::fs_std::FileExt::lock_exclusive(&active).expect("lock active temp");
+        std::fs::write(&abandoned_temp, "abandoned private credential")
+            .expect("write abandoned temp");
+        std::fs::write(&unrelated, "unrelated").expect("write unrelated temp");
+
+        let observed_locked_removal = std::cell::Cell::new(false);
+        cleanup_abandoned_atomic_temps_with(&path, std::time::Duration::ZERO, |_, candidate| {
+            let contender = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(candidate)?;
+            assert!(
+                !fs4::fs_std::FileExt::try_lock_exclusive(&contender)?,
+                "the cleanup lock must remain held through removal"
+            );
+            observed_locked_removal.set(true);
+            Ok(())
+        })
+        .expect("clean abandoned temps");
+
+        assert!(active_temp.exists(), "a live writer must not be deleted");
+        assert!(
+            !abandoned_temp.exists(),
+            "an unlocked abandoned credential must be reclaimed"
+        );
+        assert!(unrelated.exists(), "cleanup must stay scoped to one target");
+        assert!(
+            observed_locked_removal.get(),
+            "the abandoned temp must be inspected while its cleanup lock is held"
+        );
+
+        drop(active);
+        cleanup_abandoned_atomic_temps(&path, std::time::Duration::ZERO)
+            .expect("clean released temp");
+        assert!(
+            !active_temp.exists(),
+            "a writer temp becomes reclaimable after its process releases the lock"
+        );
     }
 
     #[test]

@@ -497,7 +497,11 @@ impl EnrollClient {
     pub(crate) fn new(config: &CloudConnectConfig) -> Result<Self> {
         let mut builder = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
-            .connect_timeout(Duration::from_secs(10));
+            .connect_timeout(Duration::from_secs(10))
+            // Enrollment authorities ride in either the request body or an
+            // Authorization header. A 307/308 preserves the body, so header
+            // sanitization alone cannot prevent a cross-origin disclosure.
+            .redirect(spice_cloud_client::redirect::same_origin_redirect_policy());
         if let Some(ref ca_pem) = config.ca_cert_pem {
             for cert in
                 reqwest::Certificate::from_pem_bundle(ca_pem.as_bytes()).context(CaCertSnafu)?
@@ -646,6 +650,15 @@ impl EnrollClient {
             identity_cert_pem: wire.identity_cert_pem,
             not_after_unix,
         })
+    }
+
+    /// Classify a syntactically successful renewal response whose issued
+    /// credential cannot be used with the key material sent in the request.
+    pub(crate) fn invalid_renew_response(&self, reason: &'static str) -> Error {
+        Error::InvalidResponse {
+            url: self.renew_url.clone(),
+            reason: format!("issued identity cannot reconnect: {reason}"),
+        }
     }
 
     /// Send a prepared request and decode/classify the response.
@@ -1110,6 +1123,21 @@ pub async fn enroll_now(
         cache_key_b64: String::new(),
     };
     identity.ensure_cache_key();
+
+    // Required strings are checked while decoding the HTTP response, but a
+    // non-empty certificate can still be malformed or belong to another key.
+    // Fail before promotion so an unusable credential never replaces the
+    // retryable draft. The operation is already committed under its
+    // idempotency key, making this a terminal response error with support
+    // guidance rather than an instruction to discard the draft.
+    if let Some(reason) = identity.reconnect_validation_error(config.gateway_endpoint.as_deref()) {
+        return Err(EnrollNowError::Rejected {
+            source: Error::InvalidResponse {
+                url: client.enroll_url.clone(),
+                reason: format!("issued identity cannot reconnect: {reason}"),
+            },
+        });
+    }
 
     let to_store = identity.clone();
     let store_path = config.identity_path.clone();
@@ -2026,6 +2054,93 @@ mod tests {
             os: "o".to_string(),
             arch: "a".to_string(),
             runtime_version: "v".to_string(),
+        }
+    }
+
+    async fn assert_cross_origin_enrollment_redirect_is_refused(status: &str) {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let expected_status = status[..3].parse::<u16>().expect("HTTP status code");
+        let collector = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind redirect collector");
+        let collector_address = collector.local_addr().expect("collector address");
+        let collector_task = tokio::spawn(async move {
+            let accepted = tokio::time::timeout(Duration::from_secs(1), collector.accept()).await;
+            let Ok(Ok((mut socket, _))) = accepted else {
+                return None;
+            };
+            let mut request = vec![0_u8; 16 * 1024];
+            let bytes = socket
+                .read(&mut request)
+                .await
+                .expect("read redirected request");
+            socket
+                .write_all(
+                    b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .expect("answer redirected request");
+            Some(String::from_utf8_lossy(&request[..bytes]).into_owned())
+        });
+
+        let origin = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind redirect origin");
+        let origin_address = origin.local_addr().expect("origin address");
+        let response = format!(
+            "HTTP/1.1 {status}\r\nLocation: http://{collector_address}/collect\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        let origin_task = tokio::spawn(async move {
+            let (mut socket, _) = origin.accept().await.expect("accept enroll request");
+            let mut request = vec![0_u8; 16 * 1024];
+            let _ = socket
+                .read(&mut request)
+                .await
+                .expect("read enroll request");
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("write redirect");
+        });
+
+        let base = format!("http://{origin_address}");
+        let client = EnrollClient::new(&test_config(&base)).expect("client");
+        let authority = EnrollmentAuthority::Token {
+            key: test_key(),
+            expected_org: None,
+        };
+        let material = IdentityStore::generate_enrollment().expect("enrollment material");
+        let error = client
+            .enroll(
+                &authority,
+                "redirect-operation",
+                &material,
+                &test_facts(),
+                None,
+            )
+            .await
+            .expect_err("cross-origin redirect must remain a terminal 3xx response");
+        origin_task.await.expect("redirect origin task");
+        let leaked_request = collector_task.await.expect("redirect collector task");
+
+        assert!(
+            leaked_request.is_none(),
+            "the enrollment authority crossed origins: {leaked_request:?}"
+        );
+        assert!(matches!(error, Error::Denied { status, .. } if status == expected_status));
+    }
+
+    #[tokio::test]
+    async fn enrollment_authority_never_follows_cross_origin_redirects() {
+        for status in [
+            "301 Moved Permanently",
+            "302 Found",
+            "303 See Other",
+            "307 Temporary Redirect",
+            "308 Permanent Redirect",
+        ] {
+            assert_cross_origin_enrollment_redirect_is_refused(status).await;
         }
     }
 

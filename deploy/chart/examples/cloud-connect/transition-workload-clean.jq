@@ -21,6 +21,7 @@ def referenced_secret_names($pod):
     (
       $pod.volumes[]?
       | .secret.secretName?,
+        .csi.nodePublishSecretRef.name?,
         .projected.sources[]?.secret.name?,
         .azureFile.secretName?,
         .cephfs.secretRef.name?,

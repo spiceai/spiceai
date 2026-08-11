@@ -252,6 +252,9 @@ struct CloudMock {
     /// While > 0, an enroll request is refused 503 BEFORE any processing —
     /// a plain transient outage. Decremented per use.
     unavailable_responses: Arc<Mutex<u32>>,
+    /// When set, enrollment returns a valid X.509 leaf for a different key
+    /// than the submitted CSR, modeling an unusable committed response.
+    issue_mismatched_enroll_certificate: Arc<AtomicBool>,
     /// The public key pinned at the last enroll/renew — the only key whose
     /// PoP signature authorizes a rotation (mirrors the cloud's pinning).
     pinned_point: Arc<Mutex<Option<Vec<u8>>>>,
@@ -294,6 +297,7 @@ impl CloudMock {
             instances_created: Arc::new(Mutex::new(0)),
             drop_responses: Arc::new(Mutex::new(0)),
             unavailable_responses: Arc::new(Mutex::new(0)),
+            issue_mismatched_enroll_certificate: Arc::new(AtomicBool::new(false)),
             pinned_point: Arc::new(Mutex::new(None)),
             stored_region: Arc::new(Mutex::new(None)),
             enroll_requests: Arc::new(Mutex::new(Vec::new())),
@@ -513,9 +517,20 @@ async fn mock_enroll(
         org
     };
 
-    let Ok((leaf_pem, point)) = mock.ca.sign_csr(csr_pem) else {
+    let Ok((mut leaf_pem, point)) = mock.ca.sign_csr(csr_pem) else {
         return error_json(StatusCode::BAD_REQUEST, "invalid_request", "Malformed CSR");
     };
+    if mock
+        .issue_mismatched_enroll_certificate
+        .load(Ordering::SeqCst)
+    {
+        let unrelated_key = KeyPair::generate().expect("generate mismatched response key");
+        leaf_pem = CertificateParams::new(Vec::<String>::new())
+            .expect("build mismatched response certificate")
+            .self_signed(&unrelated_key)
+            .expect("sign mismatched response certificate")
+            .pem();
+    }
     *mock.pinned_point.lock().await = Some(point);
 
     // Create the instance registry row.
@@ -2002,6 +2017,53 @@ async fn a_terminal_rejection_persists_no_identity_and_is_not_retried() {
     assert!(
         !message.contains(unknown),
         "the error must not echo the key: {message}"
+    );
+}
+
+/// A 200 response is not enrollment success unless the issued leaf is usable
+/// with the locally-generated private key. Preserve the operation draft so
+/// support can diagnose/recover the committed response; never promote the bad
+/// credential into `identity.json`.
+#[tokio::test]
+async fn a_mismatched_issued_certificate_is_rejected_before_persistence() {
+    let harness = Harness::new(24 * 60 * 60).await;
+    harness
+        .cloud
+        .issue_mismatched_enroll_certificate
+        .store(true, Ordering::SeqCst);
+    let dir = tempfile::tempdir().unwrap();
+    let config = harness.config(
+        dir.path().join("identity.json"),
+        dir.path().to_path_buf(),
+        Duration::from_hours(12),
+    );
+
+    let err = enroll_now(&config, &token_authority(ENROLLMENT_KEY), test_retry())
+        .await
+        .expect_err("a leaf for another private key must be rejected");
+
+    assert!(
+        matches!(err, runtime_cloud_connect::EnrollNowError::Rejected { .. }),
+        "unexpected error: {err}"
+    );
+    let message = err.to_string();
+    assert!(
+        message.contains("certificate and private key do not match"),
+        "unexpected validation error: {message}"
+    );
+    assert!(message.contains("contact Spice Cloud support"), "{message}");
+    assert!(
+        !config.identity_path.exists(),
+        "an unusable issued credential must not become durable"
+    );
+    assert!(
+        runtime_cloud_connect::EnrollmentDraft::path_in(dir.path()).exists(),
+        "the committed operation draft must survive for recovery"
+    );
+    assert_eq!(
+        *harness.cloud.instances_created.lock().await,
+        1,
+        "the response was committed server-side before validation"
     );
 }
 

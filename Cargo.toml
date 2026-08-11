@@ -269,6 +269,7 @@ duration-parse = { path = "crates/duration-parse" }
 duckdb = "1.10505" # 1.10505.x corresponds to DuckDB v1.5.5
 dyn-hash = "1.0.0"
 encoding_rs = "0.8.34"
+fs4 = "0.13.1"
 fundu = "2.0.1"
 futures = "0.3.32"
 gethostname = "1.1.0"

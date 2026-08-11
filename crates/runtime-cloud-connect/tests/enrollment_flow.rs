@@ -47,6 +47,10 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use axum::{Json, Router, extract::State, http::StatusCode, routing::post};
+use rcgen::{
+    BasicConstraints, CertificateParams, CertificateSigningRequestParams, DnType, IsCa, Issuer,
+    KeyPair, KeyUsagePurpose,
+};
 use runtime_cloud_connect::config::CloudConnectConfig;
 use runtime_cloud_connect::handlers::{
     ApplyOutcome, Capability, CommandError, RuntimeHandle, SpicepodDeployment,
@@ -223,6 +227,42 @@ struct EnrollMockState {
     gateway_addr: String,
     /// When set, every request is rejected with this (status, code, error).
     reject: Option<(u16, &'static str, &'static str)>,
+    ca: Arc<EnrollCa>,
+}
+
+struct EnrollCa {
+    certificate_pem: String,
+    issuer: Issuer<'static, KeyPair>,
+}
+
+impl EnrollCa {
+    fn new() -> Self {
+        let key = KeyPair::generate().expect("generate enrollment test CA key");
+        let mut parameters = CertificateParams::default();
+        parameters
+            .distinguished_name
+            .push(DnType::CommonName, "Cloud Connect Flow Test CA");
+        parameters.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        parameters.key_usages = vec![
+            KeyUsagePurpose::KeyCertSign,
+            KeyUsagePurpose::DigitalSignature,
+        ];
+        let certificate = parameters
+            .self_signed(&key)
+            .expect("self-sign enrollment test CA");
+        Self {
+            certificate_pem: certificate.pem(),
+            issuer: Issuer::new(parameters, key),
+        }
+    }
+
+    fn sign_csr(&self, csr_pem: &str) -> String {
+        CertificateSigningRequestParams::from_pem(csr_pem)
+            .expect("parse enrollment CSR")
+            .signed_by(&self.issuer)
+            .expect("sign enrollment CSR")
+            .pem()
+    }
 }
 
 fn not_after_in(hours: i64) -> String {
@@ -233,21 +273,22 @@ async fn enroll_handler(
     State(state): State<EnrollMockState>,
     Json(body): Json<Value>,
 ) -> (StatusCode, Json<Value>) {
-    state.requests.lock().await.push(body);
+    state.requests.lock().await.push(body.clone());
     if let Some((status, code, error)) = state.reject {
         return (
             StatusCode::from_u16(status).expect("valid status"),
             Json(serde_json::json!({ "code": code, "error": error, "retryable": false })),
         );
     }
+    let identity_certificate = state
+        .ca
+        .sign_csr(body["csr_pem"].as_str().expect("CSR is a string"));
     (
         StatusCode::OK,
         Json(serde_json::json!({
             "instance_id": ASSIGNED_ID,
-            "identity_cert_pem":
-                "-----BEGIN CERTIFICATE-----\nUNIT-TEST\n-----END CERTIFICATE-----\n",
-            "ca_bundle_pem":
-                "-----BEGIN CERTIFICATE-----\nUNIT-TEST-CA\n-----END CERTIFICATE-----\n",
+            "identity_cert_pem": identity_certificate,
+            "ca_bundle_pem": state.ca.certificate_pem.clone(),
             "gateway_addr": state.gateway_addr,
             "not_after": not_after_in(24),
             "organization": {"id": 7, "name": "unit-org"},
@@ -268,6 +309,7 @@ async fn spawn_enroll_server(
         requests: Arc::clone(&requests),
         gateway_addr,
         reject,
+        ca: Arc::new(EnrollCa::new()),
     };
     let app = Router::new()
         .route("/v1/cloud-connect/enroll", post(enroll_handler))
@@ -358,12 +400,13 @@ async fn pre_runtime_enroll_persists_identity_and_connects() {
         .expect("load identity")
         .expect("identity present");
     assert_eq!(identity.identifier, ASSIGNED_ID);
-    assert!(identity.identity_cert_pem.contains("UNIT-TEST"));
+    assert!(identity.identity_cert_pem.contains("BEGIN CERTIFICATE"));
     assert!(identity.public_key_pem.contains("PUBLIC KEY"));
     assert!(identity.private_key_pem.contains("PRIVATE KEY"));
     assert_eq!(identity.gateway_addr, gateway_addr.to_string());
-    assert!(
-        identity.ca_bundle_pem.contains("UNIT-TEST-CA"),
+    assert_eq!(
+        identity.ca_bundle_pem.matches("BEGIN CERTIFICATE").count(),
+        1,
         "enroll ca_bundle_pem should be persisted into identity.json"
     );
     assert!(

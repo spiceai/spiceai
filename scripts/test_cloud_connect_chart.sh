@@ -307,8 +307,8 @@ if printf '%s' "${secret_ref_workload}" \
 else
   pass "structured workload validation detects the exact Secret reference"
 fi
-secret_bearing_workload='{"spec":{"template":{"spec":{"imagePullSecrets":[{"name":"pull-secret"}],"containers":[{"command":["spiced"],"envFrom":[{"secretRef":{"name":"envfrom-secret"}}]}],"initContainers":[{"name":"init","env":[{"name":"INIT","valueFrom":{"secretKeyRef":{"name":"init-secret","key":"value"}}}]}],"volumes":[{"name":"direct","secret":{"secretName":"volume-secret"}},{"name":"projected","projected":{"sources":[{"secret":{"name":"projected-secret"}}]}}]}}}}'
-for referenced_secret in pull-secret envfrom-secret init-secret volume-secret projected-secret; do
+secret_bearing_workload='{"spec":{"template":{"spec":{"imagePullSecrets":[{"name":"pull-secret"}],"containers":[{"command":["spiced"],"envFrom":[{"secretRef":{"name":"envfrom-secret"}}]}],"initContainers":[{"name":"init","env":[{"name":"INIT","valueFrom":{"secretKeyRef":{"name":"init-secret","key":"value"}}}]}],"volumes":[{"name":"direct","secret":{"secretName":"volume-secret"}},{"name":"projected","projected":{"sources":[{"secret":{"name":"projected-secret"}}]}},{"name":"csi","csi":{"driver":"secrets-store.csi.k8s.io","nodePublishSecretRef":{"name":"csi-secret"}}}]}}}}'
+for referenced_secret in pull-secret envfrom-secret init-secret volume-secret projected-secret csi-secret; do
   if printf '%s' "${secret_bearing_workload}" \
     | jq -e --arg secret "${referenced_secret}" -f "${WORKLOAD_FILTER}" >/dev/null; then
     fail "structured workload validation missed ${referenced_secret}"
@@ -442,8 +442,61 @@ fi
 helm() {
   if [ "${1:-} ${2:-}" = "get values" ]; then
     printf '%s\n' "${TRANSITION_TEST_INSTALLED_VALUES}"
+    return 0
   elif [ "${1:-}" = "upgrade" ]; then
-    echo "MOCK_HELM_UPGRADE_REACHED" >&2
+    return 0
+  fi
+  return 99
+}
+kubectl() {
+  arguments="$*"
+  if printf '%s\n' "${arguments}" | grep -q ' get secret spice-cloud-connect --ignore-not-found -o name'; then
+    # Absent at the provenance check. If the script later calls delete, the
+    # mock models a newly-created same-name Secret and fails loudly.
+    return 0
+  fi
+  if printf '%s\n' "${arguments}" | grep -q ' delete secret spice-cloud-connect '; then
+    echo 'MOCK_UNAUTHORIZED_DELETE_REACHED' >&2
+    return 99
+  fi
+  if printf '%s\n' "${arguments}" | grep -q ' get statefulset/test -o json'; then
+    printf '%s\n' '{"spec":{"template":{"spec":{"containers":[{"command":["spiced","--http","0.0.0.0:8090"]}]}}}}'
+    return 0
+  fi
+  if printf '%s\n' "${arguments}" | grep -q ' get statefulset -l app=test -o name'; then
+    printf '%s\n' 'statefulset/test'
+    return 0
+  fi
+  if printf '%s\n' "${arguments}" | grep -q ' logs -l app=test '; then
+    printf '%s\n' 'Cloud Connect: stream established'
+    return 0
+  fi
+  if printf '%s\n' "${arguments}" | grep -q ' wait \| rollout status '; then
+    return 0
+  fi
+  return 99
+}
+export -f helm kubectl
+TRANSITION_TEST_INSTALLED_VALUES="${connected_values}"
+if output="$(bash "${TRANSITION}" test default 2>&1)" \
+  && ! echo "${output}" | grep -q 'MOCK_UNAUTHORIZED_DELETE_REACHED' \
+  && echo "${output}" | grep -q "was already absent; no deletion was authorized"; then
+  pass "a token-free absent-Secret rerun cannot delete a same-name Secret created during rollout"
+else
+  fail "an absent token-free Secret remained a deletion target: ${output}"
+fi
+helm() {
+  if [ "${1:-} ${2:-}" = "get values" ]; then
+    printf '%s\n' "${TRANSITION_TEST_INSTALLED_VALUES}"
+  elif [ "${1:-}" = "upgrade" ]; then
+    previous=''
+    for argument in "$@"; do
+      if [ "${previous}" = '-f' ] \
+        && jq -e '.cloudConnect.bootstrapSecretName == "spice-cloud-connect"' "${argument}" >/dev/null; then
+        echo "MOCK_RECOVERY_MARKER_PERSISTED" >&2
+      fi
+      previous="${argument}"
+    done
     return 99
   else
     return 99
@@ -460,13 +513,14 @@ kubectl() {
   return 99
 }
 export -f helm kubectl
+TRANSITION_TEST_INSTALLED_VALUES='{"command":["spiced","--http","0.0.0.0:8090"],"additionalEnv":[]}'
 if output="$(SPICE_SECRET_NAME=spice-cloud-connect bash "${TRANSITION}" test default 2>&1)"; then
   fail "the explicit Secret confirmation mock unexpectedly completed the transition"
-elif echo "${output}" | grep -q 'MOCK_HELM_UPGRADE_REACHED' \
+elif echo "${output}" | grep -q 'MOCK_RECOVERY_MARKER_PERSISTED' \
   && ! echo "${output}" | grep -q 'cannot authorize deletion'; then
-  pass "an exact SPICE_SECRET_NAME explicitly authorizes a token-free rerun"
+  pass "an exact SPICE_SECRET_NAME authorizes a token-free rerun and persists its recovery marker"
 else
-  fail "an exact SPICE_SECRET_NAME did not pass the provenance guard: ${output}"
+  fail "an exact SPICE_SECRET_NAME did not persist its recovery marker: ${output}"
 fi
 unset -f helm kubectl
 unset TRANSITION_TEST_INSTALLED_VALUES

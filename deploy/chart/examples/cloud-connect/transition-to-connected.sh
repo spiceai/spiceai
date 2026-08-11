@@ -90,10 +90,6 @@ if ! helm get values "${RELEASE}" --namespace "${NAMESPACE}" -o json \
   echo "error: failed to derive token-free connected values from the installed Helm release; no upgrade was performed" >&2
   exit 1
 fi
-if ! jq '.values' "${TRANSITION_PLAN}" >"${CONNECTED_OVERRIDES}"; then
-  echo "error: the derived connected-values plan is invalid; no upgrade was performed" >&2
-  exit 1
-fi
 DERIVED_SECRET_NAME="$(jq -r '.bootstrapSecretName // empty' "${TRANSITION_PLAN}")"
 if [ -n "${REQUESTED_SECRET_NAME}" ] && [ -n "${DERIVED_SECRET_NAME}" ] \
   && [ "${REQUESTED_SECRET_NAME}" != "${DERIVED_SECRET_NAME}" ]; then
@@ -106,6 +102,7 @@ if [ -z "${SECRET_NAME}" ]; then
   exit 1
 fi
 HAD_TOKEN_REFERENCE="$(jq -r '.hadTokenReference' "${TRANSITION_PLAN}")"
+DELETE_SECRET=true
 case "${HAD_TOKEN_REFERENCE}" in
   true|false) ;;
   *)
@@ -122,6 +119,16 @@ if [ "${HAD_TOKEN_REFERENCE}" = false ] && [ -z "${REQUESTED_SECRET_NAME}" ]; th
     echo "error: the release is already token-free, so its remembered Secret name '${SECRET_NAME}' cannot authorize deletion of a currently existing Secret; set SPICE_SECRET_NAME='${SECRET_NAME}' to explicitly confirm that deletion, or remove/rename the unrelated Secret; no upgrade was performed" >&2
     exit 1
   fi
+  # This recovery run found no Secret and has no explicit deletion
+  # authorization. Treat absence as success and never let a same-named Secret
+  # created during the rollout become a step-4 deletion target.
+  DELETE_SECRET=false
+fi
+if ! jq --arg secret "${SECRET_NAME}" \
+  '.values | .cloudConnect.bootstrapSecretName = $secret' \
+  "${TRANSITION_PLAN}" >"${CONNECTED_OVERRIDES}"; then
+  echo "error: the derived connected-values plan is invalid; no upgrade was performed" >&2
+  exit 1
 fi
 
 log "step 2/4: upgrading '${RELEASE}' with token-free installed values (removes --token and the ${SECRET_NAME} Secret reference, keeps all other values)"
@@ -172,7 +179,11 @@ until kubectl -n "${NAMESPACE}" logs -l "${SELECTOR}" --tail=-1 2>/dev/null \
 done
 kubectl -n "${NAMESPACE}" wait --for=condition=Ready pod -l "${SELECTOR}" --timeout="${WAIT_TIMEOUT}"
 
-log "step 4/4: deleting the single-use bootstrap Secret '${SECRET_NAME}'"
-kubectl -n "${NAMESPACE}" delete secret "${SECRET_NAME}" --ignore-not-found
+if [ "${DELETE_SECRET}" = true ]; then
+  log "step 4/4: deleting the single-use bootstrap Secret '${SECRET_NAME}'"
+  kubectl -n "${NAMESPACE}" delete secret "${SECRET_NAME}" --ignore-not-found
+else
+  log "step 4/4: bootstrap Secret '${SECRET_NAME}' was already absent; no deletion was authorized or attempted"
+fi
 
 log "done: '${RELEASE}' runs from its stored identity; preserve its connected installed values with --reuse-values or a maintained custom values file on future upgrades"

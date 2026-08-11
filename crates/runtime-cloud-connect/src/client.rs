@@ -255,7 +255,7 @@ impl ClientDriver {
         {
             match self.renew_once(enroll_client).await {
                 Ok(()) => {}
-                Err(err) if err.is_credential_rejection() => {
+                Err(err) if renewal_rejection_revokes_identity(&err) => {
                     // A 401 is the cloud's credential revocation signal. It
                     // is the sole response that proves the local identity is
                     // dead; other terminal request errors must preserve it.
@@ -372,6 +372,11 @@ impl ClientDriver {
         // a payload sealed moments before this point is still addressed to it and
         // cannot be re-sealed in flight.
         rotated.rotate_encryption_key(material.enc_private_key_pem, material.enc_public_key_pem);
+        if let Some(reason) =
+            rotated.reconnect_validation_error(self.config.gateway_endpoint.as_deref())
+        {
+            return Err(client.invalid_renew_response(reason));
+        }
         // The cloud has already pinned the new public key: even if
         // persistence fails, the rotated identity must be used in memory
         // (the old key can no longer renew). Persistence logs the failure;
@@ -707,11 +712,10 @@ impl ClientDriver {
                 () = sleep_or_never(renew_delay) => {
                     match self.renew_once(enroll_client).await {
                         Ok(()) => {}
-                        Err(err) if err.is_authoritative_rejection() => {
-                            // The cloud refusing renewal IS the revocation
-                            // (DR-025): the identity is dead, so clear it and
-                            // leave the stream — the outer loop decides whether
-                            // a staged code allows re-enrollment.
+                        Err(err) if renewal_rejection_revokes_identity(&err) => {
+                            // A 401 is the credential revocation signal. Other
+                            // terminal request failures preserve the identity:
+                            // they do not prove its key material is dead.
                             tracing::error!(
                                 "Cloud Connect: identity renewal was refused: {err}; clearing the local identity"
                             );
@@ -1710,6 +1714,14 @@ fn next_backoff(prev: Duration) -> Duration {
     (prev * 2).min(MAX_BACKOFF)
 }
 
+/// Whether a renewal failure proves the durable credential is revoked.
+///
+/// Keep this predicate shared by pre-connect and in-stream renewal paths:
+/// ordinary 4xx request rejection must never erase a still-usable identity.
+fn renewal_rejection_revokes_identity(error: &enroll::Error) -> bool {
+    error.is_credential_rejection()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1740,6 +1752,121 @@ mod tests {
     fn backoff_caps_at_max() {
         let d = next_backoff(Duration::from_mins(2));
         assert_eq!(d, MAX_BACKOFF);
+    }
+
+    #[test]
+    fn only_unauthorized_renewal_revokes_the_identity() {
+        for (status, expected) in [(401, true), (400, false), (403, false), (409, false)] {
+            let error = enroll::Error::Denied {
+                status,
+                code: enroll::DenialCode::Other,
+                message: "renewal refused".to_string(),
+            };
+            assert_eq!(renewal_rejection_revokes_identity(&error), expected);
+        }
+
+        let malformed = enroll::Error::InvalidResponse {
+            url: "https://api.spice.ai/v1/cloud-connect/renew".to_string(),
+            reason: "certificate and private key do not match".to_string(),
+        };
+        assert!(!renewal_rejection_revokes_identity(&malformed));
+    }
+
+    #[tokio::test]
+    async fn mismatched_renewed_certificate_preserves_the_current_identity() {
+        let unrelated_key = rcgen::KeyPair::generate().expect("generate unrelated response key");
+        let unrelated_certificate = rcgen::CertificateParams::new(Vec::<String>::new())
+            .expect("build unrelated response certificate")
+            .self_signed(&unrelated_key)
+            .expect("sign unrelated response certificate")
+            .pem();
+        let response_certificate = Arc::new(unrelated_certificate);
+        let app = axum::Router::new().route(
+            "/v1/cloud-connect/renew",
+            axum::routing::post(move || {
+                let certificate = Arc::clone(&response_certificate);
+                async move {
+                    axum::Json(serde_json::json!({
+                        "identity_cert_pem": certificate.as_str(),
+                        "not_after": (chrono::Utc::now() + chrono::Duration::hours(24)).to_rfc3339(),
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind renewal server");
+        let address = listener.local_addr().expect("renewal server address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve mismatched renewal response");
+        });
+
+        let dir = tempfile::tempdir().expect("create identity directory");
+        let identity_path = dir.path().join("identity.json");
+        let current_key = rcgen::KeyPair::generate().expect("generate current identity key");
+        let current_certificate = rcgen::CertificateParams::new(Vec::<String>::new())
+            .expect("build current identity certificate")
+            .self_signed(&current_key)
+            .expect("sign current identity certificate")
+            .pem();
+        let mut current = Identity {
+            identifier: "inst_renew_validation".to_string(),
+            identity_cert_pem: current_certificate,
+            private_key_pem: current_key.serialize_pem(),
+            public_key_pem: current_key.public_key_pem(),
+            ca_bundle_pem: String::new(),
+            gateway_addr: "gateway.test:443".to_string(),
+            not_after_unix: Some(now_unix().saturating_add(60)),
+            enc_private_key_pem: "old encryption private key".to_string(),
+            enc_public_key_pem: "old encryption public key".to_string(),
+            enc_previous_private_key_pem: String::new(),
+            cache_key_b64: String::new(),
+            app_id: None,
+        };
+        current.ensure_cache_key();
+        IdentityStore::store(&identity_path, &current).expect("store current identity");
+        let before = std::fs::read(&identity_path).expect("read current identity bytes");
+        let config = CloudConnectConfig {
+            enroll_endpoint: format!("http://{address}"),
+            gateway_endpoint: None,
+            ca_cert_pem: None,
+            insecure: true,
+            identity_path: identity_path.clone(),
+            config_dir: dir.path().to_path_buf(),
+            instance_region: None,
+            runtime_version: "v0-test".to_string(),
+            heartbeat_interval: Duration::from_secs(30),
+            telemetry_interval: Duration::from_mins(1),
+            metrics_interval: Duration::from_secs(30),
+            renewal_lead: Duration::from_hours(12),
+            query_deadline: Duration::from_mins(1),
+        };
+        let enroll_client = EnrollClient::new(&config).expect("renewal client");
+        let runtime: Arc<dyn RuntimeHandle> = Arc::new(crate::handlers::NoopRuntimeHandle);
+        let mut driver = ClientDriver::new(
+            config,
+            runtime,
+            crate::shutdown::Shutdown::new(),
+            Some(current.clone()),
+        );
+
+        let error = driver
+            .renew_once(&enroll_client)
+            .await
+            .expect_err("a renewed leaf for another key must be rejected");
+
+        assert!(matches!(error, enroll::Error::InvalidResponse { .. }));
+        let retained = driver.identity.expect("current in-memory identity remains");
+        assert_eq!(retained.private_key_pem, current.private_key_pem);
+        assert_eq!(retained.identity_cert_pem, current.identity_cert_pem);
+        assert_eq!(
+            std::fs::read(&identity_path).expect("read retained identity bytes"),
+            before,
+            "a bad renewal response must not change the durable identity"
+        );
+        server.abort();
     }
 
     fn identity_with_not_after(not_after_unix: Option<u64>) -> Identity {
