@@ -473,52 +473,29 @@ impl PostgresSchemaProvider {
     ) -> Result<()> {
         let table_names = self.list_tables().await?;
 
-        // The bulk query describes every relation in the namespace, whatever the
-        // filter selects, so choosing it trades round trips for rows: one query
-        // carrying all of them against one query per selected table. Which is
-        // cheaper depends on how many are wanted -- near-total selection favours
-        // the single query even though it over-fetches slightly, while a
-        // handful out of thousands does not, and selecting nothing makes every
-        // row it returns discarded.
-        //
-        // Rather than guess where the crossover lies, take the single query only
-        // where the filter withholds nothing, and resolve individually
-        // otherwise. That gives up the saving for a schema with one excluded
-        // table, which is the cost of not encoding a threshold here.
-        //
-        // This bounds the over-fetch but does not remove it: the single query
-        // describes every `r`/`v`/`m`/`p`/`f` relation in the namespace, while
-        // discovery excludes inheritance children and relations the role cannot
-        // read. A schema whose tables are mostly partition leaves is therefore
-        // still over-fetched even when nothing is filtered. Having the source
-        // query take the discovered names -- see #12894 -- would settle both,
-        // since it would return exactly the relations that will be used.
-        let all_selected =
-            schema_is_fully_selected(&self.schema_name, &table_names, &self.selector);
+        // The tables this schema will actually register: resolved in one query
+        // rather than one per table, and named so the query describes exactly
+        // these and nothing else.
+        let selected: Vec<String> = table_names
+            .iter()
+            .filter(|table| self.selector.selects_table(&self.schema_name, table))
+            .cloned()
+            .collect();
 
-        // The map is advisory: an entry lets a table skip its own schema query,
-        // and its absence means that table resolves individually. A failure here
-        // is therefore not fatal -- an empty map resolves every table
-        // individually -- and relations the catalog query cannot describe are
-        // absent for the same reason.
-        let schemas = if all_selected {
-            match self.list_column_schemas().await {
-                Ok(schemas) => schemas,
-                Err(e) => {
-                    tracing::warn!(
-                        schema = %self.schema_name,
-                        error = %e,
-                        "Failed to resolve schemas for this PostgreSQL schema in one query, falling back to per-table resolution"
-                    );
-                    HashMap::new()
-                }
+        // Advisory: an entry lets a table skip its own schema query, and its
+        // absence means that table resolves individually. A failure here is
+        // therefore not fatal, and relations the catalog query cannot describe
+        // are absent for the same reason.
+        let schemas = match self.list_column_schemas(&selected).await {
+            Ok(schemas) => schemas,
+            Err(e) => {
+                tracing::warn!(
+                    schema = %self.schema_name,
+                    error = %e,
+                    "Failed to resolve this PostgreSQL schema's table schemas in one query, falling back to per-table resolution"
+                );
+                HashMap::new()
             }
-        } else {
-            tracing::debug!(
-                schema = %self.schema_name,
-                "Some of this schema's tables are filtered out, resolving each selected table's schema individually"
-            );
-            HashMap::new()
         };
 
         let tables = build_table_providers_for_schema(
@@ -549,7 +526,10 @@ impl PostgresSchemaProvider {
     /// columns". Relations the catalog query does not describe are absent, as is
     /// every table on Redshift, where the per-table `SHOW COLUMNS` cannot be
     /// batched.
-    async fn list_column_schemas(&self) -> Result<HashMap<String, SchemaRef>> {
+    async fn list_column_schemas(
+        &self,
+        relations: &[String],
+    ) -> Result<HashMap<String, SchemaRef>> {
         // Taken through `DbConnectionPool::connect`, not `connect_direct`: only
         // that path applies the pool's `unsupported_type_action`. A connection
         // without it rejects any column type the mapping does not support, so a
@@ -567,7 +547,7 @@ impl PostgresSchemaProvider {
             .downcast_ref::<PostgresConnection>()
             .context(UnexpectedConnectionTypeSnafu)?;
 
-        conn.get_schemas_in(&self.schema_name)
+        conn.get_schemas_in(&self.schema_name, relations)
             .await
             .map_err(|e| Error::SchemaResolutionFailed {
                 source: Box::new(e),
@@ -617,34 +597,6 @@ enum SchemaRefreshOutcome {
     /// for this cycle.
     Skip,
 }
-/// Whether every relation discovered in `schema_name` is selected.
-///
-/// Decides between resolving the schema's columns in one query and resolving
-/// each selected table's individually.
-///
-/// The single query describes every relation in the namespace regardless of the
-/// filter, so it is chosen only when nothing is filtered out. Where some
-/// relations are excluded, whether it still wins depends on how many -- a
-/// threshold this deliberately does not guess.
-///
-/// Note this bounds the over-fetch rather than removing it. The single query's
-/// relation set is wider than discovery's, which excludes inheritance children
-/// and relations the role cannot read, so a schema of partition leaves is
-/// over-fetched even under this gate (#12894).
-///
-/// An empty schema is not "fully selected" -- there is nothing to resolve, so
-/// nothing to save.
-fn schema_is_fully_selected(
-    schema_name: &str,
-    table_names: &[String],
-    selector: &TableSelector,
-) -> bool {
-    !table_names.is_empty()
-        && table_names
-            .iter()
-            .all(|table| selector.selects_table(schema_name, table))
-}
-
 /// Decide the outcome for a schema from whether its table refresh succeeded and
 /// whether a previously discovered entry exists. A successful refresh always
 /// installs the new schema; a failure keeps the last-known-good entry when one
@@ -818,8 +770,7 @@ impl SchemaProvider for PostgresSchemaProvider {
 mod tests {
     use super::{
         CommentMap, ForeignKeyConstraint, ForeignKeyMap, SchemaRefreshOutcome, TableComments,
-        build_table_providers_for_schema, foreign_key_target, schema_is_fully_selected,
-        schema_refresh_outcome,
+        build_table_providers_for_schema, foreign_key_target, schema_refresh_outcome,
     };
     use crate::{
         DESCRIPTION_METADATA_KEY, FOREIGN_KEYS_METADATA_KEY, Read, SOURCE_TYPE_METADATA_KEY,
@@ -1025,48 +976,6 @@ mod tests {
     /// and sending none down it would restore the per-table round trip the bulk
     /// query was added to remove. Neither is visible in the resulting catalog,
     /// so the paths are recorded and asserted rather than inferred.
-    /// Resolving a schema in one query is only cheaper when the whole schema is
-    /// wanted, so the decision is pinned rather than left to inspection.
-    ///
-    /// The bulk query returns every relation in the namespace. Under a filter
-    /// that keeps most of them out it would transfer thousands of table schemas
-    /// to build a handful of providers, and with nothing selected it would
-    /// transfer the whole namespace to build none. Neither shows up in the
-    /// resulting catalog, which is why it is asserted here.
-    #[test]
-    fn schema_is_fully_selected_gates_the_bulk_query() {
-        let tables = vec!["orders".to_string(), "lineitem".to_string()];
-
-        assert!(
-            schema_is_fully_selected("public", &tables, &TableSelector::select_all()),
-            "an unfiltered schema should resolve its columns in one query"
-        );
-
-        let narrow = TableSelector::new(Some(make_globset(&["public.orders"])), None);
-        assert!(
-            !schema_is_fully_selected("public", &tables, &narrow),
-            "a filter keeping tables out must not pull the whole namespace"
-        );
-
-        let none = TableSelector::new(Some(make_globset(&["public.nothing"])), None);
-        assert!(
-            !schema_is_fully_selected("public", &tables, &none),
-            "selecting nothing must not issue a schema query at all"
-        );
-
-        assert!(
-            !schema_is_fully_selected("public", &[], &TableSelector::select_all()),
-            "an empty schema has nothing to resolve, so nothing to save"
-        );
-
-        // `exclude` withholds tables just as a narrow `include` does.
-        let excluded = TableSelector::new(None, Some(make_globset(&["public.lineitem"])));
-        assert!(
-            !schema_is_fully_selected("public", &tables, &excluded),
-            "an exclude that removes a table must also fall back"
-        );
-    }
-
     #[tokio::test]
     async fn test_build_table_providers_uses_a_resolved_schema_only_where_one_exists() {
         let table_creator = Arc::new(MockRead::new(HashSet::new()));
