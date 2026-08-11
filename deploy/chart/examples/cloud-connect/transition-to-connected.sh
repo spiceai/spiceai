@@ -96,7 +96,11 @@ if [ -n "${REQUESTED_SECRET_NAME}" ] && [ -n "${DERIVED_SECRET_NAME}" ] \
   echo "error: SPICE_SECRET_NAME '${REQUESTED_SECRET_NAME}' does not match the installed token secretKeyRef '${DERIVED_SECRET_NAME}'; no upgrade was performed" >&2
   exit 1
 fi
-SECRET_NAME="${DERIVED_SECRET_NAME:-${REQUESTED_SECRET_NAME:-spice-cloud-connect}}"
+SECRET_NAME="${DERIVED_SECRET_NAME:-${REQUESTED_SECRET_NAME}}"
+if [ -z "${SECRET_NAME}" ]; then
+  echo "error: the installed release has no token Secret reference or recovery marker; set SPICE_SECRET_NAME to the exact bootstrap Secret name before retrying; no upgrade was performed" >&2
+  exit 1
+fi
 
 log "step 2/4: upgrading '${RELEASE}' with token-free installed values (removes --token and the ${SECRET_NAME} Secret reference, keeps all other values)"
 helm upgrade "${RELEASE}" "${CHART}" \

@@ -104,6 +104,8 @@ expect_rejected "a literal enrollment key in --token= form" \
   --set-json "command=[\"/usr/local/bin/spiced\",\"--token=${TEST_ENROLLMENT_KEY}\",\"--http\",\"0.0.0.0:8090\"]"
 expect_rejected "a shell-form token command" \
   --set-json "command=[\"/bin/sh\",\"-c\",\"spiced --token ${TEST_ENROLLMENT_KEY}\"]"
+expect_rejected "an env-wrapped shell-form token command" \
+  --set-json "command=[\"/usr/bin/env\",\"sh\",\"-c\",\"spiced --token ${TEST_ENROLLMENT_KEY}\"]"
 expect_rejected "mixed direct and shell-form token commands" \
   --set-json 'command=["/bin/sh","-c","spiced --token literal","--token","$(SPICE_ENROLL_KEY)"]'
 expect_rejected "--token with no value" \
@@ -209,6 +211,12 @@ if printf '%s' "${shell_token_values}" | jq -f "${TRANSITION_FILTER}" >/dev/null
 else
   pass "transition rejects installed shell-form token syntax before upgrade"
 fi
+wrapped_shell_token_values='{"command":["/usr/bin/env","sh","-c","spiced --token $(ENROLLMENT)"],"additionalEnv":[{"name":"ENROLLMENT","valueFrom":{"secretKeyRef":{"name":"secret","key":"token"}}}]}'
+if printf '%s' "${wrapped_shell_token_values}" | jq -f "${TRANSITION_FILTER}" >/dev/null 2>&1; then
+  fail "transition accepted env-wrapped shell-form token syntax"
+else
+  pass "transition rejects env-wrapped shell-form token syntax before upgrade"
+fi
 mixed_token_values='{"command":["/bin/sh","-c","spiced --token literal","--token","$(ENROLLMENT)"],"additionalEnv":[{"name":"ENROLLMENT","valueFrom":{"secretKeyRef":{"name":"secret","key":"token"}}}]}'
 if printf '%s' "${mixed_token_values}" | jq -f "${TRANSITION_FILTER}" >/dev/null 2>&1; then
   fail "transition accepted mixed direct and shell-form token syntax"
@@ -253,6 +261,13 @@ if printf '%s' "${token_workload}" \
 else
   pass "structured workload validation detects residual token syntax"
 fi
+wrapped_token_workload='{"spec":{"template":{"spec":{"containers":[{"command":["/usr/bin/env","sh","-c","spiced --token $(KEY)"]}]}}}}'
+if printf '%s' "${wrapped_token_workload}" \
+  | jq -e --arg secret spice-cloud-connect -f "${WORKLOAD_FILTER}" >/dev/null; then
+  fail "structured workload validation missed residual env-wrapped token syntax"
+else
+  pass "structured workload validation detects env-wrapped token syntax"
+fi
 incidental_token_workload='{"spec":{"template":{"spec":{"containers":[{"command":["spiced","--set-runtime","debug.flag=--token"]}]}}}}'
 if printf '%s' "${incidental_token_workload}" \
   | jq -e --arg secret spice-cloud-connect -f "${WORKLOAD_FILTER}" >/dev/null; then
@@ -292,6 +307,14 @@ elif echo "${output}" | grep -q "does not match the installed token secretKeyRef
   pass "transition rejects a mismatched SPICE_SECRET_NAME before upgrade"
 else
   fail "transition did not report the expected Secret-name mismatch: ${output}"
+fi
+TRANSITION_TEST_INSTALLED_VALUES='{"command":["spiced","--http","0.0.0.0:8090"],"additionalEnv":[]}'
+if output="$(bash "${TRANSITION}" test default 2>&1)"; then
+  fail "transition guessed a Secret name for an unmarked token-free release"
+elif echo "${output}" | grep -q "set SPICE_SECRET_NAME to the exact bootstrap Secret name"; then
+  pass "transition refuses to guess a Secret for an unmarked token-free release"
+else
+  fail "transition did not fail safely for an unmarked token-free release: ${output}"
 fi
 unset -f helm kubectl
 unset TRANSITION_TEST_INSTALLED_VALUES

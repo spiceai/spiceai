@@ -10,18 +10,12 @@ def token_matches($command):
       end
   ];
 
-def shell_command($command):
-  (($command[0] // "") | test("(^|/)(sh|bash|dash|ash|zsh)$"));
-
 def embedded_token_syntax($command):
-  if shell_command($command) then
-    [
-      $command[]
-      | select(test("(^|[[:space:];|&])--token($|[=[:space:];|&])"))
-    ]
-  else
-    []
-  end;
+  [
+    $command[]
+    | select((. == "--token" or startswith("--token=")) | not)
+    | select(test("(^|[[:space:];|&])--token($|[=[:space:];|&])"))
+  ];
 
 (. // {}) as $values
 | ($values.command // []) as $command

@@ -81,26 +81,16 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end }}
 
 {{/*
-Whether the container is launched through a supported POSIX shell. Token-like
-text embedded in a direct `spiced` argument is not a CLI argument; shell script
-text is parsed again and therefore needs separate validation.
-*/}}
-{{- define "spiceai.cloudConnectShellCommand" -}}
-{{- $command := .Values.command | default list -}}
-{{- if and (gt (len $command) 0) (regexMatch "(^|/)(sh|bash|dash|ash|zsh)$" (index $command 0)) }}true{{ end -}}
-{{- end -}}
-
-{{/*
 Whether the container command carries Cloud Connect `--token` syntax. Exact
 two-element (`--token`, `$(VAR)`) and single-element (`--token=$(VAR)`) forms
-are validated below; token syntax in an actual shell command is detected here
-and rejected there.
+are validated below; token syntax embedded in any other argument is detected
+here and rejected there. The boundary excludes values such as
+`debug.flag=--token`, which are not separate CLI arguments.
 */}}
 {{- define "spiceai.cloudConnectTokenBootstrap" -}}
 {{- $found := false -}}
-{{- $shellCommand := eq (include "spiceai.cloudConnectShellCommand" .) "true" -}}
 {{- range .Values.command -}}
-{{- if or (eq . "--token") (hasPrefix "--token=" .) (and $shellCommand (regexMatch "(^|[[:space:];|&])--token($|[=[:space:];|&])" .)) -}}
+{{- if or (eq . "--token") (hasPrefix "--token=" .) (regexMatch "(^|[[:space:];|&])--token($|[=[:space:];|&])" .) -}}
 {{- $found = true -}}
 {{- end -}}
 {{- end -}}
@@ -124,11 +114,10 @@ survive a pod replacement, so a command carrying `--token` requires:
 {{- if include "spiceai.cloudConnectTokenBootstrap" . -}}
 {{- $hasDirectTokenArg := false -}}
 {{- $hasUnsupportedTokenSyntax := false -}}
-{{- $shellCommand := eq (include "spiceai.cloudConnectShellCommand" .) "true" -}}
 {{- range .Values.command -}}
-{{- if and (not $shellCommand) (or (eq . "--token") (hasPrefix "--token=" .)) -}}
+{{- if or (eq . "--token") (hasPrefix "--token=" .) -}}
 {{- $hasDirectTokenArg = true -}}
-{{- else if and $shellCommand (regexMatch "(^|[[:space:];|&])--token($|[=[:space:];|&])" .) -}}
+{{- else if regexMatch "(^|[[:space:];|&])--token($|[=[:space:];|&])" . -}}
 {{- $hasUnsupportedTokenSyntax = true -}}
 {{- end -}}
 {{- end -}}

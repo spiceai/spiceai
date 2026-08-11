@@ -1,16 +1,11 @@
-def shell_command($command):
-  (($command[0] // "") | test("(^|/)(sh|bash|dash|ash|zsh)$"));
-
 def contains_token($container):
   (($container.command // []) + ($container.args // [])) as $command
   | ([$command[]? | select(. == "--token" or startswith("--token="))] | length > 0)
-    or (
-      shell_command($command)
-      and ([
-        $command[]?
-        | select(test("(^|[[:space:];|&])--token($|[=[:space:];|&])"))
-      ] | length > 0)
-    );
+    or ([
+      $command[]?
+      | select((. == "--token" or startswith("--token=")) | not)
+      | select(test("(^|[[:space:];|&])--token($|[=[:space:];|&])"))
+    ] | length > 0);
 
 (
   [
