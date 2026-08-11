@@ -803,8 +803,7 @@ impl RuntimeBuilder {
         // second time — is fixed input to that re-split.
         let duckdb_budget_context = DuckDbBudgetContext {
             query_pool_ceiling_bytes: df.applied_query_memory_limit(),
-            cayenne_cdc_active,
-            cayenne_reservation_bytes,
+            dedicated_thread_pools_enabled,
         };
 
         let datasets_health_monitor = if self.datasets_health_monitor_enabled {
@@ -1610,8 +1609,10 @@ pub(crate) struct DuckDbBudgetContext {
     /// The query memory limit the pools were built with — queries plus the carved
     /// compaction pool. Fixed for the life of the process.
     query_pool_ceiling_bytes: u64,
-    cayenne_cdc_active: bool,
-    cayenne_reservation_bytes: u64,
+    /// Whether the dedicated Cayenne thread pools are running. Start-time only, so a
+    /// reload cannot bring the in-memory CDC tier into play; what Cayenne the app
+    /// declares is read from the app being applied.
+    dedicated_thread_pools_enabled: bool,
 }
 
 impl DuckDbBudgetContext {
@@ -1641,10 +1642,16 @@ impl DuckDbBudgetContext {
         // split the memory available now.
         let total_memory = crate::resource_monitor::get_total_memory();
         let duckdb_default_per_instance = *DUCKDB_HOST_DEFAULT_BYTES;
+        // The region the pool and the DuckDB instances come out of shrinks around the
+        // Cayenne caches the app declares, so it is measured from the app being
+        // applied — a reload that adds Cayenne tables reserves for them here rather
+        // than handing that memory to DuckDB.
+        let cayenne_cdc_active =
+            self.dedicated_thread_pools_enabled && cayenne_workload(Some(app)).uses_cdc_tier();
         let base_query_budget = crate::datafusion::builder::effective_query_memory_limit(
             None,
-            self.cayenne_cdc_active,
-            self.cayenne_reservation_bytes,
+            cayenne_cdc_active,
+            estimate_cayenne_reservation_bytes(Some(app), &app.runtime.params),
             None,
         );
         let plan = crate::accelerator_memory_budget::plan(
