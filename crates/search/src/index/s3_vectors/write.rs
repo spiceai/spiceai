@@ -46,6 +46,25 @@ pub enum Error {
     },
 
     #[snafu(display(
+        "Cannot write to '{index}' index: failed to encode metadata column '{column}': {source}."
+    ))]
+    MetadataColumnEncoding {
+        index: String,
+        column: String,
+        source: arrow::error::ArrowError,
+    },
+
+    #[snafu(display(
+        "Cannot write to '{index}' index: failed to convert metadata column '{column}' at row {row} to JSON: {source}."
+    ))]
+    MetadataValueJson {
+        index: String,
+        column: String,
+        row: usize,
+        source: serde_json::Error,
+    },
+
+    #[snafu(display(
         "Cannot write to '{index}' index, as provided data has mismatch lengths. {mismatch_source} has {mismatch_length} rows, whilst primary key column '{}' has {len} rows. {mismatch_source} != {len}.", primary_key_columns.iter().map(|f| f.name().clone()).join(", ")
     ))]
     LengthMismatch {
@@ -59,7 +78,8 @@ pub enum Error {
     #[snafu(display("Cannot write to '{index}' index: {source}"))]
     CannotWriteIndex {
         index: String,
-        source: data_components::s3_vectors::Error,
+        #[snafu(source(from(data_components::s3_vectors::Error, Box::new)))]
+        source: Box<data_components::s3_vectors::Error>,
     },
 }
 
@@ -127,8 +147,7 @@ async fn process_single_batch(
             .filter(|c| *c != embedding_col(&index.search_column()))
             .collect::<Vec<_>>(),
         &record,
-    )
-    .map_err(|e| Error::from(*e))?;
+    )?;
     let primary_key = extract_and_format_primary_key(index.name(), &index.primary_key, &record)
         .map_err(|e| Error::from(*e))?;
 
@@ -194,7 +213,7 @@ pub fn extract_and_format_metadata(
     index_name: &str,
     metadata_columns: &[String],
     record: &RecordBatch,
-) -> Result<HashMap<String, Vec<Option<Value>>>, Box<write_util::Error>> {
+) -> Result<HashMap<String, Vec<Option<Value>>>, Error> {
     let schema = record.schema();
     let mut metadata_projection = vec![];
     for name in metadata_columns {
@@ -204,36 +223,44 @@ pub fn extract_and_format_metadata(
                 column: name,
             }
             .fail()
-            .map_err(Box::from);
+            .map_err(Error::from);
         };
         metadata_projection.push(idx);
     }
 
     let encoder_options = EncoderOptions::default();
-    let metadata: HashMap<String, Vec<Option<Value>>> = metadata_projection
-        .iter()
-        .filter_map(|i| {
-            let c = record.column(*i);
-            let field = Arc::new(schema.field(*i).clone());
-            let name = field.name();
+    let mut metadata = HashMap::with_capacity(metadata_projection.len());
+    for i in metadata_projection {
+        let column = record.column(i);
+        let field = Arc::new(schema.field(i).clone());
+        let name = field.name().clone();
+        let mut encoder = make_encoder(&field, column, &encoder_options).context(
+            MetadataColumnEncodingSnafu {
+                index: index_name.to_string(),
+                column: name.clone(),
+            },
+        )?;
 
-            let mut encoder = make_encoder(&field, c, &encoder_options).ok()?;
-
-            let mut values = vec![];
-            let mut value = Vec::new();
-            for row in 0..c.len() {
-                if encoder.is_null(row) {
-                    values.push(None);
-                } else {
-                    encoder.encode(row, &mut value);
-                    values.push(serde_json::from_slice(&value).ok());
-                    value.clear();
-                }
+        let mut values = Vec::with_capacity(column.len());
+        let mut value = Vec::new();
+        for row in 0..column.len() {
+            if encoder.is_null(row) {
+                values.push(None);
+            } else {
+                encoder.encode(row, &mut value);
+                let metadata_value =
+                    serde_json::from_slice(&value).context(MetadataValueJsonSnafu {
+                        index: index_name.to_string(),
+                        column: name.clone(),
+                        row,
+                    })?;
+                values.push(Some(metadata_value));
+                value.clear();
             }
+        }
 
-            Some((name.clone(), values))
-        })
-        .collect();
+        metadata.insert(name, values);
+    }
     Ok(metadata)
 }
 
@@ -286,6 +313,8 @@ fn filter_zero_vectors(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::array::{Int32Array, UnionArray};
+    use arrow_schema::{DataType, Schema, UnionFields, UnionMode};
 
     #[test]
     fn test_filter_zero_vectors() {
@@ -373,5 +402,47 @@ mod tests {
         assert_eq!(filtered_embeddings[1], Some(vec![3.0, 4.0]));
         assert_eq!(filtered_keys[0], Some("key1".to_string()));
         assert_eq!(filtered_keys[1], Some("key4".to_string()));
+    }
+
+    #[test]
+    fn configured_metadata_column_with_unsupported_json_type_fails() {
+        let union_fields = vec![(
+            0_i8,
+            Arc::new(Field::new("integer", DataType::Int32, false)),
+        )]
+        .into_iter()
+        .collect::<UnionFields>();
+        let union_array = UnionArray::try_new(
+            union_fields.clone(),
+            vec![0_i8].into(),
+            None,
+            vec![Arc::new(Int32Array::from(vec![1_i32]))],
+        )
+        .expect("union array should be valid");
+        let field = Field::new(
+            "filterable_metadata",
+            DataType::Union(union_fields, UnionMode::Sparse),
+            false,
+        );
+        let record = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![field])),
+            vec![Arc::new(union_array)],
+        )
+        .expect("record batch should be valid");
+
+        let error = extract_and_format_metadata(
+            "test_index",
+            &["filterable_metadata".to_string()],
+            &record,
+        )
+        .expect_err("unsupported metadata must fail indexing instead of being omitted");
+
+        match error {
+            Error::MetadataColumnEncoding { index, column, .. } => {
+                assert_eq!(index, "test_index");
+                assert_eq!(column, "filterable_metadata");
+            }
+            other => panic!("expected metadata encoding error, got {other}"),
+        }
     }
 }

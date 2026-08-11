@@ -135,8 +135,32 @@ impl CloudConnect for MockServer {
     }
 }
 
+/// What the last apply wrote, as the handle saw it.
+#[derive(Clone)]
+struct AppliedSpicepod {
+    path: PathBuf,
+    spicepod_yaml: String,
+    app_id: Option<String>,
+}
+
 struct CapturedRuntime {
-    applied: Arc<Mutex<Option<(PathBuf, String)>>>,
+    applied: Arc<Mutex<Option<AppliedSpicepod>>>,
+}
+
+struct AttachmentRuntime {
+    applied: Arc<Mutex<Vec<Option<String>>>>,
+}
+
+#[async_trait]
+impl RuntimeHandle for AttachmentRuntime {
+    fn supports(&self, capability: Capability) -> bool {
+        capability == Capability::AttachApp
+    }
+
+    async fn attach_app(&self, app_id: Option<&str>) -> Result<serde_json::Value, CommandError> {
+        self.applied.lock().await.push(app_id.map(str::to_string));
+        Ok(serde_json::json!({ "app_id": app_id }))
+    }
 }
 
 #[async_trait]
@@ -156,7 +180,11 @@ impl RuntimeHandle for CapturedRuntime {
             .map_err(|e| CommandError::failed(e.to_string()))?;
         std::fs::write(&path, deployment.spicepod_yaml)
             .map_err(|e| CommandError::failed(e.to_string()))?;
-        *self.applied.lock().await = Some((path.clone(), deployment.spicepod_yaml.to_string()));
+        *self.applied.lock().await = Some(AppliedSpicepod {
+            path: path.clone(),
+            spicepod_yaml: deployment.spicepod_yaml.to_string(),
+            app_id: deployment.app_id.map(str::to_string),
+        });
         // `settled`, not `exit_to_apply`: this handle has no process to restart,
         // and asking the client to exit would take the test process with it.
         Ok(ApplyOutcome::settled(
@@ -270,7 +298,9 @@ fn enroll_config(
         runtime_version: "v0.0.0-test".to_string(),
         heartbeat_interval: Duration::from_secs(30),
         telemetry_interval: Duration::from_mins(1),
+        metrics_interval: Duration::from_secs(30),
         renewal_lead: Duration::from_mins(1),
+        query_deadline: Duration::from_mins(1),
     }
 }
 
@@ -472,6 +502,7 @@ async fn apply_spicepod_writes_file_and_acks() {
             proto::ApplySpicepod {
                 spicepod_yaml: yaml.to_string(),
                 sealed_secret_payload: None,
+                app_id: "4002".to_string(),
             },
         )),
     };
@@ -491,6 +522,7 @@ async fn apply_spicepod_writes_file_and_acks() {
         ca_bundle_pem: String::new(),
         gateway_addr: addr.to_string(),
         not_after_unix: None,
+        app_id: None,
         enc_private_key_pem: String::new(),
         enc_public_key_pem: String::new(),
         enc_previous_private_key_pem: String::new(),
@@ -519,7 +551,9 @@ async fn apply_spicepod_writes_file_and_acks() {
         runtime_version: "v0.0.0-test".to_string(),
         heartbeat_interval: Duration::from_secs(30),
         telemetry_interval: Duration::from_mins(1),
+        metrics_interval: Duration::from_secs(30),
         renewal_lead: Duration::from_hours(12),
+        query_deadline: Duration::from_mins(1),
     };
 
     let handle = runtime_cloud_connect::CloudConnect::start(config, runtime)
@@ -540,9 +574,12 @@ async fn apply_spicepod_writes_file_and_acks() {
         "runtime should have received ApplySpicepod within 5s"
     );
 
-    let (written_path, written_yaml) = captured.lock().await.clone().unwrap();
-    assert_eq!(written_yaml, yaml);
-    assert!(written_path.exists(), "file should be on disk");
+    let written = captured.lock().await.clone().unwrap();
+    assert_eq!(written.spicepod_yaml, yaml);
+    assert!(written.path.exists(), "file should be on disk");
+    // The runtime has no other way to learn its app, and withholds metrics
+    // entirely until this arrives.
+    assert_eq!(written.app_id.as_deref(), Some("4002"));
 
     // Server should see the CommandResult for the apply. Poll for it with a
     // bounded timeout instead of a fixed sleep so the assertion does not race
@@ -575,6 +612,104 @@ async fn apply_spicepod_writes_file_and_acks() {
         result.message
     );
     drop(s);
+
+    handle.shutdown().await;
+}
+
+#[tokio::test]
+async fn attach_app_applies_complete_state_and_rejects_empty_ids() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let identity_path = dir.path().join("identity.json");
+    let commands = [Some("4002"), None, Some("3387"), Some("")]
+        .into_iter()
+        .enumerate()
+        .map(|(index, app_id)| proto::ControlMessage {
+            command_id: format!("cmd-attach-{index}"),
+            target: None,
+            body: Some(proto::control_message::Body::AttachApp(proto::AttachApp {
+                app_id: app_id.map(str::to_string),
+            })),
+        })
+        .collect();
+    let mock = MockServer::new(commands);
+    let mock_state = Arc::clone(&mock.state);
+    let addr = spawn_server(mock).await;
+    IdentityStore::store(
+        &identity_path,
+        &runtime_cloud_connect::identity::Identity {
+            identifier: "inst_attachment".to_string(),
+            identity_cert_pem: "CERT".to_string(),
+            private_key_pem: "KEY".to_string(),
+            public_key_pem: "PUB".to_string(),
+            ca_bundle_pem: String::new(),
+            gateway_addr: addr.to_string(),
+            not_after_unix: None,
+            app_id: None,
+            enc_private_key_pem: String::new(),
+            enc_public_key_pem: String::new(),
+            enc_previous_private_key_pem: String::new(),
+            cache_key_b64: String::new(),
+        },
+    )
+    .expect("store identity");
+
+    let applied = Arc::new(Mutex::new(Vec::new()));
+    let runtime: Arc<dyn RuntimeHandle> = Arc::new(AttachmentRuntime {
+        applied: Arc::clone(&applied),
+    });
+    let config = CloudConnectConfig {
+        enroll_endpoint: "http://127.0.0.1:9".to_string(),
+        gateway_endpoint: None,
+        ca_cert_pem: None,
+        insecure: true,
+        identity_path,
+        config_dir: dir.path().to_path_buf(),
+        adoption_code: None,
+        pending_adopt_code_path: None,
+        adopt_app_name: None,
+        adopt_create_app: false,
+        instance_region: None,
+        runtime_version: "v0.0.0-test".to_string(),
+        heartbeat_interval: Duration::from_secs(30),
+        telemetry_interval: Duration::from_mins(1),
+        metrics_interval: Duration::from_secs(30),
+        renewal_lead: Duration::from_hours(12),
+        query_deadline: Duration::from_mins(1),
+    };
+    let handle = runtime_cloud_connect::CloudConnect::start(config, runtime)
+        .await
+        .expect("start")
+        .expect("started");
+
+    for _ in 0..50 {
+        if mock_state
+            .lock()
+            .await
+            .last_result
+            .as_ref()
+            .is_some_and(|result| result.command_id == "cmd-attach-3")
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        applied.lock().await.as_slice(),
+        [Some("4002".to_string()), None, Some("3387".to_string())]
+    );
+    let state = mock_state.lock().await;
+    assert_eq!(
+        state
+            .last_hello
+            .as_ref()
+            .expect("server saw Hello")
+            .capabilities,
+        ["attach_app".to_string()]
+    );
+    let result = state.last_result.as_ref().expect("server saw a result");
+    assert_eq!(result.command_id, "cmd-attach-3");
+    assert_eq!(result.code, proto::ResultCode::InvalidArgument as i32);
+    drop(state);
 
     handle.shutdown().await;
 }
@@ -643,6 +778,7 @@ async fn unknown_command_is_nacked_rather_than_dropped() {
         ca_bundle_pem: String::new(),
         gateway_addr: addr.to_string(),
         not_after_unix: None,
+        app_id: None,
         enc_private_key_pem: String::new(),
         enc_public_key_pem: String::new(),
         enc_previous_private_key_pem: String::new(),
@@ -663,7 +799,9 @@ async fn unknown_command_is_nacked_rather_than_dropped() {
         runtime_version: "v0.0.0-test".to_string(),
         heartbeat_interval: Duration::from_secs(30),
         telemetry_interval: Duration::from_mins(1),
+        metrics_interval: Duration::from_secs(30),
         renewal_lead: Duration::from_hours(12),
+        query_deadline: Duration::from_mins(1),
         adopt_app_name: None,
         adopt_create_app: false,
     };

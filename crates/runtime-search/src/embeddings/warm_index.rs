@@ -35,11 +35,12 @@ use search::metadata::MetadataColumns;
 /// [`ZeroResultsAction::UseSource`] falls back to the engine index, while
 /// [`ZeroResultsAction::ReturnEmpty`] serves the (possibly empty) in-memory result as-is.
 ///
-/// `on_zero_results` is `None` when the table has no enabled acceleration. The in-memory
-/// index starts empty on every process start and is only ever filled by the acceleration
-/// write path, so without acceleration nothing hydrates it — serving reads from it would
-/// narrow searches to whatever rows happened to be scanned since startup, or to nothing
-/// at all. The engine index is then returned unchanged.
+/// `on_zero_results` is `None` when the table's acceleration cannot keep a warm index
+/// complete — see [`crate::embeddings::warm_index_on_zero_results`] for the cases and why
+/// each one disqualifies the tier. The in-memory index starts empty on every process start
+/// and is only ever filled by the acceleration write path, so where it cannot be filled in
+/// full, serving reads from it would narrow searches to whatever subset it happens to hold,
+/// or to nothing at all. The engine index is then returned unchanged.
 ///
 /// The warm index is an optimization: when a compatible in-memory index cannot be built
 /// (e.g. the engine's distance metric has no in-memory equivalent), the engine index is
@@ -65,9 +66,12 @@ pub fn with_memory_warm_index(
     let read_mode = match on_zero_results {
         Some(ZeroResultsAction::ReturnEmpty) => CompoundReadMode::PrimaryOnly,
         Some(ZeroResultsAction::UseSource) => CompoundReadMode::FallbackToSecondary,
+        // `None` covers every reason the acceleration cannot keep a warm tier complete —
+        // no enabled acceleration, or an accelerator that keeps its rows across a restart —
+        // so this cannot name one. `warm_index_on_zero_results` logs which it was.
         None => {
             tracing::debug!(
-                "Not adding an in-memory warm vector index for table {tbl}: the table is not accelerated, so nothing would populate it. Searches will be served by the vector engine directly."
+                "Not adding an in-memory warm vector index for table {tbl}: the acceleration configuration cannot keep it complete. Searches will be served by the vector engine directly."
             );
             return engine_index;
         }

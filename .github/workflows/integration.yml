@@ -62,6 +62,10 @@ jobs:
   # steps on GitHub-hosted runners; the full suite runs only on non-PR events.
   check_changes:
     runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || 'spiceai-dev-runners' }}
+    # A full-history checkout (`fetch-depth: 0`) and a path diff. Sized for a
+    # cold runner having to clone from scratch, not the ~1 min a warm
+    # self-hosted workspace takes.
+    timeout-minutes: 45
     outputs:
       # Always treat a manual workflow_dispatch run as having relevant changes so the
       # tests run even when no relevant files changed.
@@ -86,6 +90,8 @@ jobs:
     name: Build Test Binary
     needs: check_changes
     runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || 'spiceai-dev-runners' }}
+    # Slowest observed success in the 2026-07-25..08-08 window: 125 min.
+    timeout-minutes: 300
     steps:
       - name: Pull request passthrough
         if: ${{ github.event_name == 'pull_request' }}
@@ -256,6 +262,8 @@ jobs:
     permissions:
       contents: write
     runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || 'spiceai-dev-runners' }}
+    # Slowest observed success in the 2026-07-25..08-08 window: 19 min.
+    timeout-minutes: 180
     strategy:
       fail-fast: false
       matrix:
@@ -444,6 +452,8 @@ jobs:
   upload-integration-snapshots:
     name: Upload Integration Snapshots
     if: github.event.inputs.update_snapshots == 'always'
+    # A checkout, a commit and a push.
+    timeout-minutes: 60
     needs:
       - test
     permissions:
@@ -493,6 +503,8 @@ jobs:
   test-aws-sdk:
     name: AWS SDK Integration Tests
     needs: [build, check_changes]
+    # Slowest observed success in the 2026-07-25..08-08 window: 2 min.
+    timeout-minutes: 60
     if: needs.check_changes.outputs.relevant_changes == 'true'
     permissions: read-all
     runs-on: spiceai-dev-runners
@@ -553,6 +565,8 @@ jobs:
   test-aws-sdk-credential-bridge:
     name: AWS SDK Credential Bridge Integration Tests
     needs: [build, check_changes]
+    # Slowest observed success in the 2026-07-25..08-08 window: 1 min.
+    timeout-minutes: 60
     if: needs.check_changes.outputs.relevant_changes == 'true'
     permissions: read-all
     runs-on: spiceai-dev-runners
@@ -617,6 +631,8 @@ jobs:
   test-snapshot-refresh:
     name: Snapshot Refresh Mode Integration Tests
     needs: [build, check_changes]
+    # Slowest observed success in the 2026-07-25..08-08 window: 4 min.
+    timeout-minutes: 60
     if: needs.check_changes.outputs.relevant_changes == 'true'
     permissions: read-all
     runs-on: spiceai-dev-runners
@@ -675,6 +691,8 @@ jobs:
   test-data-components:
     name: Data Components Integration Tests
     needs: [build, check_changes]
+    # Slowest observed success in the 2026-07-25..08-08 window: 1 min.
+    timeout-minutes: 60
     if: needs.check_changes.outputs.relevant_changes == 'true'
     permissions: read-all
     runs-on: spiceai-dev-runners
@@ -726,6 +744,8 @@ jobs:
   test-runtime-partition:
     name: Partition Table Integration Tests
     needs: [build, check_changes]
+    # Slowest observed success in the 2026-07-25..08-08 window: 4 min.
+    timeout-minutes: 60
     if: needs.check_changes.outputs.relevant_changes == 'true'
     runs-on: spiceai-dev-runners
     steps:

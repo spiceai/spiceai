@@ -14,7 +14,6 @@ arrow = { workspace = true }
 arrow_tools = { path = "../arrow_tools" }
 datafusion-ddl = { path = "../datafusion-ddl" }
 datafusion-dml = { path = "../datafusion-dml" }
-regex = "1.12.3"
 arrow-flight = { workspace = true }
 arrow-ipc = { workspace = true }
 arrow-schema = { workspace = true }
@@ -122,6 +121,9 @@ criterion = { version = "0.7", features = ["html_reports", "async_tokio"] }
 datafusion-federation.workspace = true
 datafusion-functions-aggregate = { workspace = true }
 datafusion-functions = { workspace = true }
+# Compiles the `include`/`exclude` patterns the catalog-selector tests feed to
+# `data_components::catalog_filter::TableSelector`.
+globset = { workspace = true }
 insta = { workspace = true, features = ["json"] }
 paste.workspace = true
 rstest = "0.26.1"

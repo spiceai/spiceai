@@ -634,12 +634,29 @@ async fn acceleration_connection(
                     .and_then(|a| a.params.get("cayenne_metastore"))
                     .map_or("sqlite", String::as_str);
                 if metastore_type == "turso" {
-                    let pool = super::turso::TursoConnectionPool::new(&metadata_db_path)
+                    // Take the pool from the registered accelerator's path-keyed cache
+                    // rather than constructing one. `cayenne.db` is opened by every
+                    // sidecar of every Cayenne dataset in the pod, and the lock that
+                    // serializes their DDL against each other's `BEGIN CONCURRENT`
+                    // writes lives on the pool instance — a pool of our own would hold
+                    // a lock no other sidecar observes.
+                    let turso_engine = registry
+                        .get_accelerator_engine(Engine::Turso)
                         .await
-                        .map_err(|e| Error::CayennePool {
-                            source: Box::new(e),
+                        .context(AcceleratorEngineUnavailableSnafu {
+                            engine: Engine::Turso,
                         })?;
-                    return Ok(AccelerationConnection::Turso(Arc::new(pool)));
+                    let turso_accelerator = turso_engine
+                        .as_any()
+                        .downcast_ref::<TursoAccelerator>()
+                        .context(DowncastFailedSnafu {
+                            target: "TursoAccelerator",
+                        })?;
+                    let pool = turso_accelerator
+                        .get_shared_pool_for_path(&metadata_db_path)
+                        .await
+                        .context(TursoConnectionSnafu)?;
+                    return Ok(AccelerationConnection::Turso(pool));
                 }
             }
 
@@ -748,5 +765,133 @@ mod tests {
         assert!(!is_shutdown_cancellation(boxed.as_ref()));
 
         assert!(!is_shutdown_cancellation(&Error::NoAccelerationConnection));
+    }
+
+    #[cfg(all(not(windows), feature = "sqlite", feature = "turso"))]
+    mod cayenne_turso_metastore {
+        use super::super::{
+            AccelerationConnection, AccelerationSource, AcceleratorEngineRegistry, OpenOption,
+            acceleration_connection,
+        };
+        use crate::component::dataset::acceleration::{Acceleration, Engine, Mode};
+        use datafusion::sql::TableReference;
+        use std::sync::Arc;
+
+        struct MockSource {
+            name: TableReference,
+            acceleration: Option<Acceleration>,
+        }
+
+        impl MockSource {
+            fn cayenne_with_turso_metastore(name: &str, metadata_dir: &str) -> Self {
+                let mut acceleration = Acceleration {
+                    engine: Engine::Cayenne,
+                    mode: Mode::File,
+                    ..Default::default()
+                };
+                acceleration
+                    .params
+                    .insert("cayenne_metadata_dir".to_string(), metadata_dir.to_string());
+                acceleration
+                    .params
+                    .insert("cayenne_metastore".to_string(), "turso".to_string());
+
+                Self {
+                    name: TableReference::bare(name.to_string()),
+                    acceleration: Some(acceleration),
+                }
+            }
+        }
+
+        impl AccelerationSource for MockSource {
+            fn clone_arc(&self) -> Arc<dyn AccelerationSource> {
+                Arc::new(Self {
+                    name: self.name.clone(),
+                    acceleration: self.acceleration.clone(),
+                })
+            }
+
+            fn is_file_accelerated(&self) -> bool {
+                true
+            }
+
+            fn app(&self) -> Arc<app::App> {
+                unimplemented!("acceleration_connection does not consult the app")
+            }
+
+            fn secrets(&self) -> Arc<tokio::sync::RwLock<crate::secrets::Secrets>> {
+                unimplemented!("acceleration_connection does not consult secrets")
+            }
+
+            fn acceleration(&self) -> Option<&Acceleration> {
+                self.acceleration.as_ref()
+            }
+
+            fn name(&self) -> &TableReference {
+                &self.name
+            }
+
+            fn connector_name(&self) -> Option<&str> {
+                None
+            }
+
+            fn time_column(&self) -> Option<&str> {
+                None
+            }
+
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+        }
+
+        /// Both `spice_sys` sidecars of one Cayenne dataset — the dataset checkpoint
+        /// and the checkpoint store — open the same `cayenne.db`, and both do DDL and
+        /// DML on it. The lock that stops one sidecar's `CREATE TABLE` from landing
+        /// inside the other's open `BEGIN CONCURRENT` write lives on the pool
+        /// instance, so serialization only happens if they are handed the same pool.
+        ///
+        /// Before #12727 this branch constructed a pool per call, so each sidecar took
+        /// a lock the others could not observe and the gate excluded nothing.
+        #[tokio::test]
+        async fn two_connections_for_one_dataset_share_a_pool() {
+            let metadata_dir = std::env::temp_dir().join("spice_cayenne_turso_metastore_12727");
+            let _ = std::fs::remove_dir_all(&metadata_dir);
+            std::fs::create_dir_all(&metadata_dir).expect("metadata directory should be creatable");
+            let metadata_dir = metadata_dir.to_string_lossy().to_string();
+
+            let source = MockSource::cayenne_with_turso_metastore("orders", &metadata_dir);
+
+            let registry = Arc::new(AcceleratorEngineRegistry::new());
+            registry.register_all().await;
+
+            let first = acceleration_connection(
+                &source,
+                Arc::clone(&registry),
+                OpenOption::CreateIfNotExists,
+            )
+            .await
+            .expect("the first sidecar should open the Turso metastore");
+            let second = acceleration_connection(
+                &source,
+                Arc::clone(&registry),
+                OpenOption::CreateIfNotExists,
+            )
+            .await
+            .expect("the second sidecar should open the Turso metastore");
+
+            let AccelerationConnection::Turso(first) = &first else {
+                panic!("`cayenne_metastore: turso` must connect through Turso");
+            };
+            let AccelerationConnection::Turso(second) = &second else {
+                panic!("`cayenne_metastore: turso` must connect through Turso");
+            };
+
+            assert!(
+                Arc::ptr_eq(first, second),
+                "both sidecars must share one pool over `cayenne.db`, or the schema lock serializes nothing"
+            );
+
+            let _ = std::fs::remove_dir_all(&metadata_dir);
+        }
     }
 }

@@ -717,7 +717,7 @@ pub(crate) async fn try_wrap_view_accelerator_with_hnsw(
 /// into its schema (which would make the source's bootstrap `SELECT` reference a column
 /// that does not exist in the source table). A metadata-enrichment layer can sit between
 /// the `IndexLayer` and its inner provider, so it is peeled too — see
-/// [`LayerWalk::Source`] and the layer table in [`crate::table_layers`].
+/// [`LayerWalk::Source`], which each layer answers for itself.
 ///
 /// This always resolves to a source provider (never `None`): the caller re-applies the
 /// index writes over the returned stream, so a missing source table would otherwise

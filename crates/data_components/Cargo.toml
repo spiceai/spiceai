@@ -199,7 +199,6 @@ aws-smithy-types = { workspace = true }
 brotli = "8.0.2"
 chrono = { workspace = true }
 criterion = { version = "0.7", features = ["async_tokio", "html_reports"] }
-ctor = "0.8.0"
 flate2 = "1.1.5"
 iceberg-storage-opendal.workspace = true
 iceberg_test_utils = { workspace = true, features = ["tests"] }
