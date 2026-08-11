@@ -428,7 +428,7 @@ fn timeval_to_seconds(time: libc::timeval) -> Result<f64, String> {
             time.tv_sec, time.tv_usec
         ));
     }
-    Ok(time.tv_sec as f64 + time.tv_usec as f64 / 1_000_000.0)
+    Ok(time.tv_sec as f64 + f64::from(time.tv_usec) / 1_000_000.0)
 }
 
 #[cfg(test)]
