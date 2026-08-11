@@ -17,7 +17,7 @@ snafu.workspace = true
 cpu-budget = { path = "../cpu-budget" }
 
 [target.'cfg(unix)'.dependencies]
-libc = "0.2"
+libc.workspace = true
 
 [lints]
 workspace = true

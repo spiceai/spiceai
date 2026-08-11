@@ -90,14 +90,14 @@ aegis = { version = "0.9.3", default-features = false, features = [
 # per call, measured), so the plain-fsync ordering tier needs a direct
 # libc::fsync. See the module docs for the durability rationale.
 [target.'cfg(target_os = "macos")'.dependencies]
-libc = "0.2"
+libc.workspace = true
 
 # Linux compaction page-cache hygiene (`provider/fadvise_tier.rs`):
 # `sync_file_range` + `posix_fadvise(POSIX_FADV_DONTNEED)` are Linux-only and
 # not exposed by std. Keeps a background compaction from evicting the hot query
 # working set. See the module docs.
 [target.'cfg(target_os = "linux")'.dependencies]
-libc = "0.2"
+libc.workspace = true
 
 [features]
 default = []
@@ -141,7 +141,7 @@ tokio-stream = { workspace = true }
 # already depends on libc for `target_os = "linux"`, but a bench is a separate
 # crate and must name the dep itself.
 [target.'cfg(target_os = "linux")'.dev-dependencies]
-libc = "0.2"
+libc.workspace = true
 
 # `loom` model-checks the `StructuralVersion` seqlock's memory orderings
 # (`provider/structural_version.rs`). Gated on `cfg(cayenne_loom)` so it is

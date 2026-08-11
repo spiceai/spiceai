@@ -54,7 +54,7 @@ crash-handler.workspace = true
 event_stream = { path = "../../crates/event_stream" }
 repl = { path = "../../crates/repl" }
 futures.workspace = true
-libc = "0.2"
+libc.workspace = true
 mimalloc = { version = "0.1.48", optional = true }
 opentelemetry.workspace = true
 opentelemetry-http.workspace = true
