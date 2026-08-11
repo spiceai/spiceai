@@ -716,7 +716,7 @@ struct SnapshotFilesForScan {
 }
 
 /// Serialize one or more `RecordBatch`es to Arrow IPC stream bytes.
-fn serialize_batches_to_ipc(
+pub(super) fn serialize_batches_to_ipc(
     batches: &[RecordBatch],
 ) -> std::result::Result<Vec<u8>, arrow::error::ArrowError> {
     let mut buf = Vec::new();
@@ -2195,6 +2195,22 @@ pub struct CayenneTableProvider {
     pk_constraints: Option<Constraints>,
 }
 
+/// The inline corpus an overwrite commits alongside its snapshot flip, as the
+/// in-memory visibility state needs to describe it. Both values come from the
+/// single `cayenne_inlined_data` row [`CayenneCatalog::commit_overwrite_in_txn`]
+/// inserts, so the in-memory counters end up describing exactly what the catalog
+/// holds.
+///
+/// [`CayenneCatalog`]: crate::CayenneCatalog
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct InlinedOverwritePublish {
+    /// Rows in the inline entry — the whole table's contents on this path.
+    pub(crate) row_count: i64,
+    /// Sequence assigned to the entry; the inline visibility watermark must
+    /// reach it before a scan will materialize the entry.
+    pub(crate) sequence_number: i64,
+}
+
 /// Prebuilt in-memory state for publishing a cloned append snapshot. Building
 /// the `ListingTable` is the only fallible step and happens before the catalog
 /// commit; applying this value under the caller-held listing fence is infallible.
@@ -2978,6 +2994,14 @@ impl CayenneTableProvider {
     pub(crate) fn metadata_catalog(&self) -> &Arc<dyn MetadataCatalog> {
         &self.catalog
     }
+
+    /// The shared per-table context (Vortex format + caches + resolved config).
+    /// Exposed for sibling `provider::*` modules that drive a write path from
+    /// outside this one.
+    pub(super) fn context(&self) -> &Arc<CayenneContext> {
+        &self.context
+    }
+
     /// Returns the name of this table.
     #[must_use]
     pub fn table_name(&self) -> &str {
@@ -3448,13 +3472,149 @@ impl CayenneTableProvider {
     /// the table *before* the fence and performs no I/O), so the fence guards only
     /// the in-memory pointer swaps — never an `.await` that touches disk or the
     /// metastore.
-    pub(crate) async fn publish_overwrite_snapshot(&self, new_snapshot_id: &str) -> Result<()> {
+    ///
+    /// `inlined_rows` is `Some(..)` when the overwrite's contents were committed
+    /// to the metastore inline tier rather than to Vortex files under
+    /// `new_snapshot_id` (whose directory is then empty). It re-seeds the inline
+    /// counters that [`Self::invalidate_inlined_cache`] zeroes, so the flip lands
+    /// on the exact corpus the catalog holds.
+    pub(crate) async fn publish_overwrite_snapshot(
+        &self,
+        new_snapshot_id: &str,
+        inlined_rows: Option<InlinedOverwritePublish>,
+    ) -> Result<()> {
         // Build the new listing table BEFORE acquiring the fence (synchronous, no
         // I/O), then flip every visibility-affecting pointer atomically below.
         let new_listing_table = self.build_overwrite_listing_table(new_snapshot_id)?;
         let _fence = self.listing_fence.write().await;
-        self.publish_overwrite_snapshot_fenced(new_snapshot_id, new_listing_table);
+        self.publish_overwrite_snapshot_fenced(new_snapshot_id, new_listing_table, inlined_rows);
         Ok(())
+    }
+
+    /// Make an inlined overwrite's replacement rows readable BEFORE its catalog
+    /// transaction runs. Called from [`Self::begin_overwrite`], under the
+    /// per-table write lock, once the payload is built and its sequence reserved.
+    ///
+    /// # Why this cannot wait for the publish
+    ///
+    /// The overwrite's catalog transaction and its in-memory publish are two
+    /// separate atomic units: the transaction clears the old inline corpus,
+    /// inserts the replacement row and flips the durable snapshot pointer, and
+    /// only later does [`Self::publish_overwrite_snapshot`] move the in-memory
+    /// pointers under the listing fence. A scan (which holds
+    /// `listing_fence.read()`) can land between them. Left alone it would pair
+    /// the PRE-overwrite in-memory state — whose inline visibility watermark
+    /// still sits below the new row's sequence — with a catalog that now holds
+    /// only that new row: the row is skipped as unpublished, the inline view
+    /// comes back empty, and if the pre-overwrite snapshot was itself inlined its
+    /// directory is empty too. The scan then reports an EMPTY TABLE.
+    ///
+    /// # Why publishing early is safe
+    ///
+    /// * The watermark only ever admits rows. Every pre-overwrite entry carries a
+    ///   sequence strictly below the old watermark, so raising it hides nothing;
+    ///   before the transaction commits a scan still sees the whole old corpus.
+    /// * `durable_inlined_row_count` gates a fast path that returns an empty view
+    ///   without reading the catalog. Raising it (a saturating max — never a
+    ///   store, which could shrink a larger pre-overwrite corpus to the
+    ///   replacement's size) can only force a full read, which is always correct.
+    /// * The structural-epoch bump invalidates any materialized view, so every
+    ///   read in the window goes to the catalog — and the catalog is only ever in
+    ///   one of two states, because the clear, the insert and the pointer flip
+    ///   are one transaction. Before it: the old rows. After it: the replacement.
+    ///
+    /// `inlined_row_count` is deliberately NOT raised. It gates whether a scan
+    /// consults the inline tier at all, and leaving it at the pre-overwrite value
+    /// is what keeps a file-backed predecessor correct: such a table has no
+    /// inline rows, so the window skips the tier entirely and reads its (still
+    /// current) file directory rather than mixing those files with the
+    /// replacement rows. [`Self::publish_overwrite_snapshot`] sets it, together
+    /// with the directory swap, under the fence.
+    ///
+    /// If the transaction fails or is rolled back all three are harmless
+    /// over-approximations: a raised watermark has nothing to admit, an inflated
+    /// count forces a full read, a bumped epoch forces one rebuild.
+    pub(super) fn prepublish_inlined_overwrite(&self, inlined_rows: InlinedOverwritePublish) {
+        self.durable_inlined_row_count
+            .fetch_max(inlined_rows.row_count, Ordering::Relaxed);
+        self.published_inlined_seq
+            .fetch_max(inlined_rows.sequence_number, Ordering::Release);
+        self.bump_inlined_structural_epoch();
+    }
+
+    /// Whether an overwrite of this table may be inlined at all.
+    ///
+    /// Four shapes are refused, and each keeps the Vortex path every overwrite
+    /// used before inlining existed:
+    ///
+    /// * **A mem-tier seal shadow.** Inlining an overwrite advances the inline
+    ///   watermark ahead of the commit (see
+    ///   [`Self::prepublish_inlined_overwrite`]), which exposes EVERY durable
+    ///   `cayenne_inlined_data` row at or below the new sequence. That is exactly
+    ///   the overwrite's own row — unless a seal has written the RAM tier's
+    ///   contents to the inline tier at a sequence deliberately kept ABOVE the
+    ///   watermark while the very same rows stay live in the tier
+    ///   (`seal_mem_tier_durable`), in which case exposing it would serve them
+    ///   twice. The tier is reachable only under `cdc_durability: memory`, which
+    ///   the whole-table-replace refresh profile never selects, so this bites only
+    ///   on a hand-issued overwrite against a CDC table.
+    /// * **A partition column**, and
+    /// * **retention delete filters** — the same two conditions
+    ///   `InlineMutationPolicy::from_blocking_conditions` bars the CDC write path
+    ///   on, for the same reasons: an inline entry carries no partition key, and
+    ///   retention filters do not reach into the inline corpus. This is the
+    ///   single-provider partition-aware shape.
+    /// * **A coupled writer** — the child table of a partitioned *dataset*. Each
+    ///   child carries `partition_column: None`, so the check above does not
+    ///   reach it, and every child shares one context and therefore the one
+    ///   `try_acquire`-only inline-admission slot
+    ///   ([`CayenneContext::try_acquire_overwrite_inline_admission`]). The
+    ///   children write concurrently under a single routing demux, so exactly one
+    ///   of them would take the slot and inline while its siblings fell back to
+    ///   Vortex — leaving a whole-table replace split across both tiers, with the
+    ///   inlined partition picked by whichever child happened to reach admission
+    ///   first. Widening the slot to admit them all is not the alternative:
+    ///   awaiting it reintroduces the demux hold-and-wait deadlock of
+    ///   spiceai/spiceai#11818, and one permit per child would multiply the
+    ///   buffered-admission memory reservation by a partition count that is not
+    ///   statically bounded (time-based partitions grow indefinitely). Little is
+    ///   given up: a child is already clamped to `write_concurrency = 1`, so a
+    ///   refresh leaves one file per partition and the next overwrite replaces
+    ///   it — not the growing pile of tiny files inlining exists to prevent.
+    pub(super) fn inline_overwrite_admissible(&self) -> bool {
+        self.mem_tier.is_empty()
+            && !self.mem_tier_shadow_present.load(Ordering::Acquire)
+            && self.table_metadata.partition_column.is_none()
+            && !self.context().is_coupled_writer()
+            && !self.has_retention_delete_filters()
+    }
+
+    /// Materialize the pre-overwrite inline view into the cache so a scan that
+    /// lands between an overwrite's commit and its publish is served from memory
+    /// rather than from the just-cleared catalog.
+    ///
+    /// The mirror of [`Self::prepublish_inlined_overwrite`] for an overwrite that
+    /// does NOT inline: its transaction clears the inline corpus and puts nothing
+    /// back, so a rebuild inside the window returns an empty view. Paired with a
+    /// pre-overwrite snapshot that was itself inlined — an empty directory — that
+    /// is again an empty table. A cache entry stamped with the current generation
+    /// keeps the window on the complete pre-overwrite corpus instead; the caller
+    /// holds the per-table write lock, so nothing can invalidate it before
+    /// [`Self::publish_overwrite_snapshot`] swaps corpus and directory together.
+    ///
+    /// Best-effort: a failure to read leaves the window on the (pre-existing)
+    /// rebuild path rather than failing the overwrite.
+    pub(super) async fn warm_inlined_cache_for_overwrite(&self) {
+        if self.cached_inlined_row_count() <= 0 {
+            return;
+        }
+        if let Err(error) = self.read_inlined_batches().await {
+            tracing::warn!(
+                table = self.table_metadata.table_name.as_str(),
+                %error,
+                "Failed to materialize the inline view before an overwrite commit; a scan between the commit and the publish may miss inline rows"
+            );
+        }
     }
 
     /// Build the new snapshot's listing table for an overwrite publish
@@ -3483,6 +3643,7 @@ impl CayenneTableProvider {
         &self,
         new_snapshot_id: &str,
         new_listing_table: Arc<ListingTable>,
+        inlined_rows: Option<InlinedOverwritePublish>,
     ) {
         // No scan-view seqlock bracket needed: the caller holds `listing_fence.write()`
         // and every step here is synchronous, while a scan-view capture holds
@@ -3498,6 +3659,23 @@ impl CayenneTableProvider {
         // `inlined_generation`; bump it here, under the fence, so a scan never pairs
         // the new snapshot with stale pre-overwrite inline batches.
         self.invalidate_inlined_cache();
+        // An inlined overwrite committed replacement rows in that same transaction,
+        // so re-seed the counters the clear just zeroed to describe them. Ordering
+        // mirrors `publish_inlined_mutation`: counts and watermark first, then a
+        // `Release` structural bump publishes them, so a reader that observes the
+        // new epoch also observes the new corpus (and full-rebuilds against it — the
+        // corpus was replaced, so the append-only delta path must not be taken).
+        // The watermark was already advanced by `prepublish_inlined_overwrite`; the
+        // `fetch_max` here is what makes the two orderings agree on the same value.
+        if let Some(inlined) = inlined_rows {
+            self.inlined_row_count
+                .store(inlined.row_count, Ordering::Relaxed);
+            self.durable_inlined_row_count
+                .store(inlined.row_count, Ordering::Relaxed);
+            self.published_inlined_seq
+                .fetch_max(inlined.sequence_number, Ordering::Release);
+            self.bump_inlined_structural_epoch();
+        }
         self.mark_maintained_aggregates_stale();
         // `update_current_snapshot_id` above already cleared the sorted-output
         // attestation; the overwrite rebinds to a non-sorted snapshot, so it stays cleared.
@@ -14120,6 +14298,26 @@ impl CayenneTableProvider {
         });
     }
 
+    /// Ask the debounced maintenance loop to drain the metastore WAL, without
+    /// queueing any other work.
+    ///
+    /// Every maintenance pass ends in `catalog.checkpoint_wal()`, but a write
+    /// that contributes no stats, no listing refresh and no retention never
+    /// schedules a pass at all. An inlined overwrite is exactly that shape: it
+    /// writes an Arrow IPC blob straight into the metastore and touches no
+    /// files. With the inline auto-checkpoint disabled by default the background
+    /// tick is the ONLY WAL drain, so a table refreshed on a schedule would grow
+    /// its WAL by one blob per refresh, unboundedly. Scheduled AFTER the commit,
+    /// never inside the transaction — a checkpoint there would land an fsync in
+    /// the commit's WAL-write-locked window.
+    pub(crate) fn schedule_wal_checkpoint(&self) {
+        self.post_write_maintenance
+            .state
+            .lock()
+            .wal_checkpoint_requested = true;
+        self.spawn_post_write_maintenance_loop();
+    }
+
     pub(crate) fn schedule_post_write_maintenance(
         &self,
         stats: Option<Arc<ColumnStatsAccumulator>>,
@@ -14147,6 +14345,13 @@ impl CayenneTableProvider {
                 .saturating_add(live_rows_delta);
         }
 
+        self.spawn_post_write_maintenance_loop();
+    }
+
+    /// Start the debounced maintenance loop unless one is already running.
+    /// Callers queue their work into `post_write_maintenance.state` first, so a
+    /// loop that is already scheduled picks it up on its next pass.
+    fn spawn_post_write_maintenance_loop(&self) {
         if self
             .post_write_maintenance
             .scheduled
@@ -17010,7 +17215,10 @@ impl CayenneTableProvider {
                     &cold_files,
                 )
                 .await?;
-            self.publish_overwrite_snapshot_fenced(&new_snapshot_id, new_listing_table);
+            // Cold graduation's content is the registered cold files; the overwrite
+            // clear drops the warm tier's inline corpus with nothing to replace it,
+            // so there are no inline rows to republish.
+            self.publish_overwrite_snapshot_fenced(&new_snapshot_id, new_listing_table, None);
             // The third publication step, under the same fence: hand the manifest
             // this commit just wrote to the scan path as the cold half of the new
             // snapshot. Every subsequent capture then resolves both halves with no
@@ -18965,6 +19173,7 @@ impl CayenneTableProvider {
         maintained_aggregate_epoch: Option<u64>,
     ) -> Arc<dyn ExecutionPlan> {
         let overlay = self.optimizer_stats_overlay_for_schema(&plan.schema());
+        let table_name = self.table_metadata.table_name.as_str();
         if let Some(epoch) = maintained_aggregate_epoch {
             Arc::new(
                 CayenneAccelerationExec::with_guard_and_maintained_aggregates(
@@ -18973,12 +19182,14 @@ impl CayenneTableProvider {
                     Arc::clone(&self.maintained_aggregates),
                     epoch,
                 )
-                .with_optimizer_column_overlay(overlay),
+                .with_optimizer_column_overlay(overlay)
+                .with_table_name(table_name),
             )
         } else {
             Arc::new(
                 CayenneAccelerationExec::with_guard(plan, scan_guard)
-                    .with_optimizer_column_overlay(overlay),
+                    .with_optimizer_column_overlay(overlay)
+                    .with_table_name(table_name),
             )
         }
     }
@@ -19595,6 +19806,26 @@ impl CayenneTableProvider {
         // racing delta that already snapshotted the queue cannot mis-store.
         self.pending_tombstone_deltas.lock().drain_through(u64::MAX);
         self.bump_inlined_structural_epoch();
+    }
+
+    /// Discard the materialized inline view WITHOUT touching the generation, the
+    /// structural epoch, the watermark or any row count — the state a freshly
+    /// opened provider starts in, reproduced on a running one.
+    ///
+    /// Tests use it to force the next inline read down the metastore rebuild path,
+    /// which is where an overwrite's commit/publish window is observable: while the
+    /// cache holds a view stamped with the current generation, every read is served
+    /// from memory and the window is invisible.
+    #[cfg(test)]
+    pub(crate) fn drop_inlined_cache_for_test(&self) {
+        self.inlined_cache.store(Arc::new(InlinedCache {
+            generation: u64::MAX,
+            structural_epoch: u64::MAX,
+            materialized_through_sequence: i64::MIN,
+            tombstone_delta_seq: 0,
+            batches: Arc::new(Vec::new()),
+            view: Arc::new(Vec::new()),
+        }));
     }
 
     /// Get the current snapshot ID.
@@ -20951,6 +21182,54 @@ impl CayenneTableProvider {
         })
     }
 
+    /// Adapt inline batches decoded from the corpus to the live table schema.
+    ///
+    /// An inline entry is Arrow IPC frozen at the schema that was live when it was
+    /// written, so a widening schema evolution leaves the corpus a width behind.
+    /// [`Self::evolve_schema_live`] keeps its own swap safe by flushing the corpus
+    /// first, but the open-time evolution in `try_widening_schema_evolution`
+    /// commits the evolved schema straight to the metastore, so a provider can open
+    /// onto a corpus written under a narrower one. Reading it unadapted resolves
+    /// live-schema column indices against that narrower batch.
+    ///
+    /// Adapting here — the decode both cache paths share — gives the corpus the
+    /// treatment old Vortex files already get in the opener: missing nullable
+    /// columns null-filled, widened columns cast. Both are the truth for a row
+    /// written before the widening, which is why `classify` admits only added
+    /// *nullable* columns and lossless casts into a widening plan.
+    ///
+    /// A corpus already at the live width (the overwhelmingly common case) short-
+    /// circuits on a field comparison and is returned untouched.
+    fn adapt_inlined_batches_to_live_schema(
+        &self,
+        batches: Vec<RecordBatch>,
+    ) -> Result<Vec<RecordBatch>> {
+        let live_schema = self.table_schema();
+        if batches
+            .iter()
+            .all(|batch| batch.schema_ref().fields() == live_schema.fields())
+        {
+            return Ok(batches);
+        }
+
+        batches
+            .into_iter()
+            .map(|batch| {
+                arrow_tools::record_batch::try_cast_to(batch, Arc::clone(&live_schema)).map_err(
+                    |e| super::Error::DataValidation {
+                        table: self.table_metadata.table_name.clone(),
+                        message: format!(
+                            "Inlined rows were written under an earlier schema that cannot be \
+                             read under the current one: {e}. Set 'on_schema_change: \
+                             drop_and_recreate' to rebuild the acceleration on an incompatible \
+                             schema change. See: https://spiceai.org/docs/components/data-accelerators"
+                        ),
+                    },
+                )
+            })
+            .collect()
+    }
+
     /// Decode one inline-data entry's IPC blob and apply the deletion-map filter,
     /// returning its per-entry view. Shared by the full-rebuild and delta paths so
     /// the two never diverge in how an entry is materialized.
@@ -20961,6 +21240,7 @@ impl CayenneTableProvider {
     ) -> Result<InlinedViewEntry> {
         let entry_batches = deserialize_ipc_to_batch(&entry.data_ipc)
             .map_err(|e| super::Error::Arrow { source: e })?;
+        let entry_batches = self.adapt_inlined_batches_to_live_schema(entry_batches)?;
         // Pre-filter stats are a conservative superset: tombstone removal can only
         // shrink row ranges, never widen min/max.
         let statistics = Arc::new(super::file_pruning::statistics_from_record_batches(
@@ -25087,6 +25367,10 @@ impl CayenneTableProvider {
 
         for entry in inlined_data {
             let batches = deserialize_ipc_to_batch(&entry.data_ipc)?;
+            // Same widening-evolution adaptation the cached read path applies: a
+            // DELETE predicate naming an added column must resolve against rows
+            // written before it existed.
+            let batches = self.adapt_inlined_batches_to_live_schema(batches)?;
             let mut rewritten_batches = Vec::with_capacity(batches.len());
             let mut original_rows = 0_usize;
             let mut remaining_rows = 0_usize;
@@ -31081,7 +31365,7 @@ mod tests {
             *provider.test_pre_publish_hook.lock() = Some(Box::new(move || {
                 Box::pin(async move {
                     provider_in_hook
-                        .publish_overwrite_snapshot(&overwrite_id)
+                        .publish_overwrite_snapshot(&overwrite_id, None)
                         .await
                         .expect("mid-pass overwrite publish");
                     fired.store(true, Ordering::SeqCst);
@@ -38535,7 +38819,7 @@ mod tests {
             *provider.test_pre_publish_hook.lock() = Some(Box::new(move || {
                 Box::pin(async move {
                     provider_in_hook
-                        .publish_overwrite_snapshot(&overwrite_id)
+                        .publish_overwrite_snapshot(&overwrite_id, None)
                         .await
                         .expect("mid-pass overwrite publish");
                     fired.store(true, Ordering::SeqCst);

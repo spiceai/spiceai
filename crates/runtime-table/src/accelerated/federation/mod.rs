@@ -31,9 +31,11 @@ impl AcceleratedTable {
     #[must_use]
     fn create_federated_table_source(&self) -> Option<Arc<dyn FederatedTableSource>> {
         let accelerated_table_federation_provider = Arc::new(
-            self.accelerator
-                .downcast_ref::<PolyTableProvider>()?
-                .clone(),
+            spice_table::find_layer::<PolyTableProvider>(
+                self.accelerator.as_ref(),
+                spice_table::LayerWalk::Write,
+            )?
+            .clone(),
         );
 
         let remote_table_name = (accelerated_table_federation_provider
@@ -63,9 +65,9 @@ impl AcceleratedTable {
         match Arc::clone(&self).create_federated_table_source() {
             Some(table_source) => Arc::new(FederatedTableProviderAdaptor::new_with_provider(
                 table_source,
-                self,
+                self.into_table(),
             )),
-            None => self,
+            None => self.into_table(),
         }
     }
 }

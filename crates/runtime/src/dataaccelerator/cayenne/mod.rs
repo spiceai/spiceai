@@ -54,8 +54,8 @@ use crate::dataaccelerator::{FilePathError, snapshots::download_snapshot_if_need
 use crate::parameters::ParameterSpec;
 use crate::spice_data_base_path;
 use runtime_acceleration::snapshot::{AccelerationEngine, AccelerationLayout};
-use runtime_datafusion_index::{Index, IndexedTableProvider};
 use search::index::native_vector::NativeVectorIndex;
+use spice_table::{Index, IndexLayer};
 use spicepod::acceleration as spicepod_acceleration;
 
 /// Metadata key to identify the accelerator type in the schema metadata.
@@ -832,6 +832,21 @@ impl RefreshWriteProfile {
     pub(crate) const fn uses_cdc_tier(self) -> bool {
         matches!(self, RefreshWriteProfile::SmallWrite)
     }
+
+    /// Whether a table on this profile keeps small writes in the metastore inline
+    /// tier instead of turning them into tiny Vortex files.
+    ///
+    /// True for the two profiles whose writes are small by shape: a CDC-style
+    /// stream of deltas, and a whole-table replace of a table small enough to fit
+    /// the admission caps. The whole-table replace is the one that most needs it —
+    /// nothing accumulates across its refreshes, so its background compactor is
+    /// off and the tiny files one refresh writes would never be merged.
+    pub(crate) const fn inlines_small_writes(self) -> bool {
+        matches!(
+            self,
+            RefreshWriteProfile::SmallWrite | RefreshWriteProfile::BulkOverwrite
+        )
+    }
 }
 
 fn apply_refresh_mode_defaults(
@@ -872,9 +887,16 @@ fn apply_refresh_mode_defaults(
             // table that also takes `INSERT`s still consolidates; an operator can
             // also set `cayenne_compaction_background_interval_ms` explicitly.
             config.compaction_background_interval_ms = 0;
-            config.inline_max_rows = 0;
-            config.inline_max_bytes = 0;
-            config.inline_max_buffer_bytes = 0;
+            // Same static admission caps as a CDC delta, for the same reason and
+            // then some: a refresh that fits them becomes ONE metastore row
+            // instead of `write_concurrency` tiny Vortex files that — with the
+            // background compactor off, above — nothing would ever merge. The
+            // `inline_flush_*` memtable caps are deliberately left at their
+            // defaults: a whole-table replace leaves exactly one inline entry, so
+            // the flush caps never bind.
+            config.inline_max_rows = SMALL_WRITE_INLINE_MAX_ROWS;
+            config.inline_max_bytes = SMALL_WRITE_INLINE_MAX_BYTES;
+            config.inline_max_buffer_bytes = SMALL_WRITE_INLINE_MAX_BUFFER_BYTES;
         }
         RefreshWriteProfile::BulkAppend => {
             config.inline_max_rows = 0;
@@ -2615,7 +2637,7 @@ fn validate_datalake_table_options(
 
 /// Build a [`NativeVectorIndex`] for each `FixedSizeList<Float32, N>` column in
 /// the schema. These indexes are attached to the accelerated table via
-/// [`IndexedTableProvider`] so the search engine's `get_vector_index()` can
+/// [`IndexLayer`] so the search engine's `get_vector_index()` can
 /// discover them and route `vector_search()` queries through the SIMD distance
 /// UDFs rather than the on-the-fly `embed()` fallback.
 ///
@@ -2627,7 +2649,7 @@ fn validate_datalake_table_options(
 /// additional spicepod configuration.
 ///
 /// Empty schemas and schemas without vector columns return an empty vec — the
-/// caller should skip the `IndexedTableProvider` wrap in that case.
+/// caller should skip the `IndexLayer` wrap in that case.
 fn native_vector_indexes_for_schema(
     schema: &Schema,
     table_name: &str,
@@ -2669,7 +2691,7 @@ fn native_vector_indexes_for_schema(
         .collect()
 }
 
-/// Wrap a table provider in [`IndexedTableProvider`] when the schema has at
+/// Wrap a table provider in [`IndexLayer`] when the schema has at
 /// least one vector column.
 fn wrap_with_native_vector_indexes(
     provider: Arc<dyn TableProvider>,
@@ -2681,7 +2703,8 @@ fn wrap_with_native_vector_indexes(
     if indexes.is_empty() {
         provider
     } else {
-        Arc::new(IndexedTableProvider::with_indexes(provider, indexes)) as Arc<dyn TableProvider>
+        spice_table::SpiceTable::over(Arc::new(IndexLayer::with_indexes(indexes)), provider)
+            as Arc<dyn TableProvider>
     }
 }
 
@@ -3337,7 +3360,8 @@ impl DataAccelerator for CayenneAccelerator {
                 Arc::clone(&write_provider),
                 write_provider,
                 schema_metadata,
-            )) as Arc<dyn TableProvider>;
+            ))
+            .into_table() as Arc<dyn TableProvider>;
 
             Ok(wrap_with_native_vector_indexes(
                 table_provider,
@@ -3510,7 +3534,8 @@ impl DataAccelerator for CayenneAccelerator {
                 Arc::clone(&write_provider),
                 write_provider,
                 schema_metadata,
-            )) as Arc<dyn TableProvider>;
+            ))
+            .into_table() as Arc<dyn TableProvider>;
 
             Ok(wrap_with_native_vector_indexes(
                 table_provider,
@@ -5058,10 +5083,11 @@ mod tests {
         let app = Arc::new(AppBuilder::new("test").build());
         let rt = Arc::new(crate::Runtime::builder().build().await);
 
+        // The bulk-APPEND profile only. `full` (and an unset mode, which the
+        // connector default resolves to `full`) is the bulk-OVERWRITE profile and
+        // does inline — see `test_full_refresh_disables_background_compaction`.
         for (table_name, refresh_mode) in [
             ("append_manual_load", Some(RefreshMode::Append)),
-            ("default_load", None),
-            ("full_load", Some(RefreshMode::Full)),
             ("snapshot_load", Some(RefreshMode::Snapshot)),
             ("disabled_load", Some(RefreshMode::Disabled)),
         ] {
@@ -5313,8 +5339,20 @@ mod tests {
             "full refresh must not spawn a background compactor"
         );
         assert_eq!(
-            config.inline_max_rows, 0,
-            "inlining stays off for a whole-table replace"
+            config.inline_max_rows, SMALL_WRITE_INLINE_MAX_ROWS,
+            "a whole-table replace small enough to be admitted must inline: with the background \
+             compactor off, the tiny Vortex files it would otherwise write are never merged"
+        );
+        assert_eq!(config.inline_max_bytes, SMALL_WRITE_INLINE_MAX_BYTES);
+        assert_eq!(
+            config.inline_max_buffer_bytes,
+            SMALL_WRITE_INLINE_MAX_BUFFER_BYTES
+        );
+        assert_eq!(
+            config.inline_flush_max_rows,
+            cayenne::metadata::DEFAULT_INLINE_FLUSH_MAX_ROWS,
+            "the cumulative flush caps stay at their defaults — a replace leaves one entry, so \
+             the flush gate never binds"
         );
 
         // An explicit interval still wins: a pod that mixes in-place writes with
@@ -5619,9 +5657,18 @@ mod tests {
             CayenneAccelerator::get_vortex_config("full_partial_override", &large_write_dataset)
                 .await;
 
+        // Bulk-overwrite inlines too, on the same static caps as small-write, so
+        // the un-overridden knobs keep those defaults rather than the zeros that
+        // meant "this profile never inlines".
         assert_eq!(large_write_config.inline_max_rows, 321);
-        assert_eq!(large_write_config.inline_max_bytes, 0);
-        assert_eq!(large_write_config.inline_max_buffer_bytes, 0);
+        assert_eq!(
+            large_write_config.inline_max_bytes,
+            SMALL_WRITE_INLINE_MAX_BYTES
+        );
+        assert_eq!(
+            large_write_config.inline_max_buffer_bytes,
+            SMALL_WRITE_INLINE_MAX_BUFFER_BYTES
+        );
     }
 
     #[tokio::test]

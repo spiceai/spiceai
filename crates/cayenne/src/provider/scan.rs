@@ -29,7 +29,9 @@ use datafusion_common::{DataFusionError, Statistics, stats::Precision};
 use datafusion_datasource::file_groups::FileGroup;
 use datafusion_datasource::file_scan_config::FileScanConfig;
 use datafusion_datasource::source::DataSourceExec;
-use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
+use datafusion_execution::memory_pool::{
+    MemoryConsumer, MemoryLimit, MemoryPool, MemoryReservation,
+};
 use datafusion_execution::{SendableRecordBatchStream, TaskContext};
 use datafusion_physical_expr::expressions::{Column, DynamicFilterPhysicalExpr};
 use datafusion_physical_expr::{Distribution, OrderingRequirements, PhysicalExpr};
@@ -121,6 +123,11 @@ pub struct CayenneAccelerationExec {
     /// column stats the Cayenne base+delta `UnionExec` drops to
     /// `Precision::Absent` via `DataFusion`'s generic `col_stats_union`
     optimizer_column_overlay: Option<Arc<Statistics>>,
+    /// The dataset this scan reads, carried only so a query-pool refusal can
+    /// name it (see [`scan_memory_refusal`]). `None` on plans built outside the
+    /// table provider's `scan()`, which costs the message a name and nothing
+    /// else — no execution behaviour reads this.
+    table_name: Option<Arc<str>>,
 }
 
 impl CayenneAccelerationExec {
@@ -134,6 +141,7 @@ impl CayenneAccelerationExec {
             maintained_aggregates: None,
             maintained_aggregate_epoch: 0,
             optimizer_column_overlay: None,
+            table_name: None,
         }
     }
 
@@ -148,6 +156,7 @@ impl CayenneAccelerationExec {
             maintained_aggregates: None,
             maintained_aggregate_epoch: 0,
             optimizer_column_overlay: None,
+            table_name: None,
         }
     }
 
@@ -166,6 +175,7 @@ impl CayenneAccelerationExec {
             maintained_aggregates: Some(maintained_aggregates),
             maintained_aggregate_epoch,
             optimizer_column_overlay: None,
+            table_name: None,
         }
     }
 
@@ -187,6 +197,7 @@ impl CayenneAccelerationExec {
             maintained_aggregates: Some(maintained_aggregates),
             maintained_aggregate_epoch,
             optimizer_column_overlay: None,
+            table_name: None,
         }
     }
 
@@ -202,6 +213,15 @@ impl CayenneAccelerationExec {
         overlay: Option<Arc<Statistics>>,
     ) -> Self {
         self.optimizer_column_overlay = overlay;
+        self
+    }
+
+    /// Records the dataset this scan reads, so a query-pool refusal can name it
+    /// rather than leaving an operator to work out which of their datasets ran
+    /// out of memory. Diagnostic only — nothing on the execution path reads it.
+    #[must_use]
+    pub(crate) fn with_table_name(mut self, table_name: impl Into<Arc<str>>) -> Self {
+        self.table_name = Some(table_name.into());
         self
     }
 
@@ -228,6 +248,7 @@ impl CayenneAccelerationExec {
             maintained_aggregates: self.maintained_aggregates.clone(),
             maintained_aggregate_epoch: self.maintained_aggregate_epoch,
             optimizer_column_overlay: self.optimizer_column_overlay.clone(),
+            table_name: self.table_name.clone(),
         }
     }
 
@@ -925,7 +946,8 @@ impl ExecutionPlan for CayenneAccelerationExec {
             let accounted = MemoryAccountedScanStream::new(
                 Box::pin(RecordBatchStreamAdapter::new(Arc::clone(&schema), mapped)),
                 schema,
-                format!("cayenne_scan[partition={partition}]"),
+                self.table_name.clone(),
+                partition,
                 &context,
             );
             return Ok(Box::pin(accounted));
@@ -1022,7 +1044,7 @@ impl ExecutionPlan for CayenneAccelerationExec {
 
 /// Charges a scan's materialized batches against the `DataFusion` memory pool.
 ///
-/// Reading Cayenne means canonicalizing Vortex's compressed encodings (RunEnd,
+/// Reading Cayenne means canonicalizing Vortex's compressed encodings (`RunEnd`,
 /// Constant, dictionary) into flat Arrow, and that expansion is the single
 /// largest allocator in the process at scale: a SF-1000 heap profile put ~50 GiB
 /// under `vortex_buffer::BufferMut::with_capacity_preferred_aligned`, reached
@@ -1051,7 +1073,10 @@ impl ExecutionPlan for CayenneAccelerationExec {
 ///
 /// Over budget returns `ResourcesExhausted` before the decode runs, so a scan
 /// that cannot fit fails without allocating. That is a deliberate behaviour
-/// change: a query that used to drift toward an OOM kill now errors.
+/// change: a query that used to drift toward an OOM kill now errors — so the
+/// refusal has to say which dataset it was, what it needed, and which of the
+/// two remedies applies (raise the limit, or run against less concurrent work).
+/// [`scan_memory_refusal`] builds that message and logs it.
 ///
 /// # What this does NOT bound
 ///
@@ -1099,6 +1124,96 @@ struct MemoryAccountedScanStream<S> {
     /// batch already handed downstream. Keeps the charge in place across a
     /// `Pending`, which is exactly when Vortex is expanding buffers.
     decode_charged: bool,
+    /// The dataset being scanned, and which of its output partitions this
+    /// stream is. Diagnostic only: a refusal that cannot name the dataset
+    /// leaves an operator to guess which one exhausted the pool.
+    table_name: Option<Arc<str>>,
+    partition: usize,
+    /// The pool this stream reserves from, kept so a refusal can read back the
+    /// limit and what else is holding it. `MemoryReservation` does not expose
+    /// its pool, and those two numbers are what separate "this scan can never
+    /// fit" from "this scan cannot fit right now".
+    pool: Arc<dyn MemoryPool>,
+}
+
+/// Explains a query-pool refusal in terms an operator can act on, and logs it.
+///
+/// The pool's own error reports the reservation name and the byte counts, but
+/// not which dataset asked for them and not what to change. The two ways a scan
+/// can be refused also want opposite advice, and the pool's limit is what
+/// separates them:
+///
+/// - `needed > limit` — the batch does not fit even an empty pool, so waiting or
+///   shedding concurrent queries changes nothing; the limit itself has to move,
+///   or the query has to read narrower batches.
+/// - `needed <= limit` — it fits on its own but not beside what is reserved right
+///   now, so draining concurrent work is a real remedy.
+///
+/// The pool counters are read after the failure, so they are a snapshot of a
+/// moving value rather than the exact state at the moment of refusal — close
+/// enough to tell an operator which of the two situations they are in, which is
+/// all they are used for.
+///
+/// Call this only once the caller's own reservation has been released, so
+/// `pool.reserved()` is exactly what OTHER work holds. Both call sites free
+/// before returning the error, which is also what makes `needed` the batch's
+/// whole size rather than a delta over a charge still standing.
+fn scan_memory_refusal(
+    table_name: Option<&str>,
+    partition: usize,
+    needed: usize,
+    pool: &Arc<dyn MemoryPool>,
+    source: &DataFusionError,
+) -> DataFusionError {
+    // What a retry against a quieter runtime would get back.
+    let others = pool.reserved();
+    let needed_h = util::human_readable_bytes(needed);
+    let others_h = util::human_readable_bytes(others);
+
+    let detail = match pool.memory_limit() {
+        MemoryLimit::Finite(limit) if needed > limit => {
+            let limit_h = util::human_readable_bytes(limit);
+            format!(
+                "Reading one batch of it needs {needed_h}, more than the entire {limit_h} query memory pool, so this scan cannot run at this limit however idle the runtime is. \
+                 Raise runtime.query.memory_limit above {needed_h}, or read narrower batches by selecting fewer columns or filtering more selectively."
+            )
+        }
+        MemoryLimit::Finite(limit) => {
+            let limit_h = util::human_readable_bytes(limit);
+            let available_h = util::human_readable_bytes(limit.saturating_sub(others));
+            format!(
+                "Reading one batch of it needs {needed_h}, which fits the {limit_h} query memory pool on its own but not alongside the {others_h} other queries are holding right now ({available_h} free). \
+                 Retry when the runtime is less busy, lower the query concurrency, or raise runtime.query.memory_limit."
+            )
+        }
+        MemoryLimit::Infinite | MemoryLimit::Unknown => format!(
+            "Reading one batch of it needs {needed_h}, and the query memory pool refused it with {others_h} held by other queries running now. \
+             Retry when the runtime is less busy, lower the query concurrency, or raise runtime.query.memory_limit."
+        ),
+    };
+
+    let message = match table_name {
+        Some(name) => format!(
+            "Failed to scan dataset {name} (cayenne): Out of query memory. {detail} For details, visit: https://spiceai.org/docs/reference/memory"
+        ),
+        None => format!(
+            "Failed to scan a Cayenne-accelerated dataset: Out of query memory. {detail} For details, visit: https://spiceai.org/docs/reference/memory"
+        ),
+    };
+
+    // The error reaches whoever ran the query; this reaches whoever operates the
+    // runtime, who is the one who can act on the limit. `source` carries the
+    // pool's own byte-level accounting and stays out of the user-facing text.
+    tracing::warn!(
+        table = table_name.unwrap_or("unknown"),
+        partition,
+        needed_bytes = needed,
+        held_by_others_bytes = others,
+        error = %source,
+        "{message}"
+    );
+
+    DataFusionError::ResourcesExhausted(message)
 }
 
 /// First-poll charge, before any batch has been measured.
@@ -1117,16 +1232,30 @@ struct MemoryAccountedScanStream<S> {
 const INITIAL_BATCH_ESTIMATE_BYTES: usize = 1024 * 1024;
 
 impl<S> MemoryAccountedScanStream<S> {
-    fn new(inner: S, schema: SchemaRef, consumer_name: String, context: &Arc<TaskContext>) -> Self {
+    fn new(
+        inner: S,
+        schema: SchemaRef,
+        table_name: Option<Arc<str>>,
+        partition: usize,
+        context: &Arc<TaskContext>,
+    ) -> Self {
+        let consumer_name = match table_name.as_deref() {
+            Some(table) => format!("cayenne_scan[{table}, partition={partition}]"),
+            None => format!("cayenne_scan[partition={partition}]"),
+        };
+        let pool = Arc::clone(context.memory_pool());
         // Infallible: `register` hands back a zero-sized reservation and the
         // pool only refuses later, at `try_grow`.
-        let reservation = Some(MemoryConsumer::new(consumer_name).register(context.memory_pool()));
+        let reservation = Some(MemoryConsumer::new(consumer_name).register(&pool));
         Self {
             inner,
             schema,
             reservation,
             estimate: INITIAL_BATCH_ESTIMATE_BYTES,
             decode_charged: false,
+            table_name,
+            partition,
+            pool,
         }
     }
 }
@@ -1150,13 +1279,25 @@ where
             // now reserves for itself, so keeping its bytes here would
             // double-count them.
             let estimate = self.estimate;
+            let mut refused = None;
             if let Some(reservation) = self.reservation.as_mut() {
                 reservation.free();
                 if let Err(e) = reservation.try_grow(estimate) {
                     // Refused before the decode runs, so this returns without
-                    // having allocated the batch.
-                    return std::task::Poll::Ready(Some(Err(e)));
+                    // having allocated the batch. `free()` above means this
+                    // stream now holds nothing, so everything reserved belongs
+                    // to other work.
+                    refused = Some(e);
                 }
+            }
+            if let Some(e) = refused {
+                return std::task::Poll::Ready(Some(Err(scan_memory_refusal(
+                    self.table_name.as_deref(),
+                    self.partition,
+                    estimate,
+                    &self.pool,
+                    &e,
+                ))));
             }
             self.decode_charged = true;
         }
@@ -1172,6 +1313,7 @@ where
                 // size. Settle the estimate to the truth now that it is known.
                 let actual = batch.get_array_memory_size();
                 self.estimate = self.estimate.max(actual);
+                let mut refused = None;
                 if let Some(reservation) = self.reservation.as_mut()
                     && let Err(e) = reservation.try_resize(actual)
                 {
@@ -1181,10 +1323,21 @@ where
                     // pre-charge, so a stream that is polled again after an error
                     // would decode against a reservation held for a batch that no
                     // longer exists. Most consumers abort on first error, but the
-                    // accounting must not depend on that.
+                    // accounting must not depend on that. Freeing first is also
+                    // what lets the refusal below attribute the whole remaining
+                    // reservation to other work.
                     reservation.free();
                     self.decode_charged = false;
-                    return std::task::Poll::Ready(Some(Err(e)));
+                    refused = Some(e);
+                }
+                if let Some(e) = refused {
+                    return std::task::Poll::Ready(Some(Err(scan_memory_refusal(
+                        self.table_name.as_deref(),
+                        self.partition,
+                        actual,
+                        &self.pool,
+                        &e,
+                    ))));
                 }
                 // The charge now covers the in-flight batch; the next poll
                 // releases it and re-charges for the following decode.
@@ -1254,7 +1407,8 @@ mod tests {
         let mut stream = MemoryAccountedScanStream::new(
             Box::pin(inner),
             Arc::clone(&schema),
-            "cayenne_scan[test]".to_string(),
+            Some(Arc::from("test_table")),
+            0,
             &context,
         );
 
@@ -1309,7 +1463,8 @@ mod tests {
         let mut stream = MemoryAccountedScanStream::new(
             Box::pin(inner),
             Arc::clone(&schema),
-            "cayenne_scan[test]".to_string(),
+            Some(Arc::from("test_table")),
+            0,
             &context,
         );
 
@@ -1371,7 +1526,8 @@ mod tests {
         let mut stream = MemoryAccountedScanStream::new(
             Box::pin(counted),
             Arc::clone(&schema),
-            "cayenne_scan[test]".to_string(),
+            Some(Arc::from("test_table")),
+            0,
             &context,
         );
 
@@ -1429,7 +1585,8 @@ mod tests {
         let mut stream = MemoryAccountedScanStream::new(
             Box::pin(inner),
             Arc::clone(&schema),
-            "cayenne_scan[test]".to_string(),
+            Some(Arc::from("test_table")),
+            0,
             &context,
         );
 
@@ -1464,12 +1621,14 @@ mod tests {
         use datafusion_execution::memory_pool::GreedyMemoryPool;
         use datafusion_execution::runtime_env::RuntimeEnvBuilder;
 
-        let pool: Arc<dyn datafusion_execution::memory_pool::MemoryPool> =
-            Arc::new(GreedyMemoryPool::new(1024));
-        assert!(
-            INITIAL_BATCH_ESTIMATE_BYTES > 1024,
-            "the pool must be smaller than the pre-poll charge for this to prove anything"
-        );
+        const POOL_BYTES: usize = 1024;
+        const {
+            assert!(
+                INITIAL_BATCH_ESTIMATE_BYTES > POOL_BYTES,
+                "the pool must be smaller than the pre-poll charge for this to prove anything"
+            );
+        }
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(POOL_BYTES));
         let runtime = RuntimeEnvBuilder::new()
             .with_memory_pool(Arc::clone(&pool))
             .build_arc()
@@ -1496,6 +1655,126 @@ mod tests {
             pool.reserved(),
             0,
             "a memory-only scan must not reserve - cayenne:mem_tier already mirrors those bytes"
+        );
+    }
+
+    /// A refusal must name the dataset and tell the operator which remedy
+    /// applies. "Resources exhausted" alone leaves them with neither: not which
+    /// of their datasets ran out, and not whether raising
+    /// `runtime.query.memory_limit` or shedding concurrent queries is the fix.
+    ///
+    /// This is the batch-does-not-fit-at-all case: nothing else holds the pool,
+    /// so no amount of waiting helps and the message must not suggest it.
+    #[tokio::test]
+    async fn a_batch_larger_than_the_whole_pool_says_the_limit_must_move() {
+        use datafusion_execution::memory_pool::GreedyMemoryPool;
+        use datafusion_execution::runtime_env::RuntimeEnvBuilder;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1024));
+        let runtime = RuntimeEnvBuilder::new()
+            .with_memory_pool(Arc::clone(&pool))
+            .build_arc()
+            .expect("runtime env");
+        let context = Arc::new(TaskContext::default().with_runtime(runtime));
+
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(
+                (0..4096_i64).collect::<Vec<_>>(),
+            ))],
+        )
+        .expect("batch");
+        let mut stream = MemoryAccountedScanStream::new(
+            Box::pin(futures::stream::iter(vec![Ok(batch)])),
+            Arc::clone(&schema),
+            Some(Arc::from("orders")),
+            3,
+            &context,
+        );
+
+        let err = stream
+            .next()
+            .await
+            .expect("one item")
+            .expect_err("a batch larger than the pool must be refused")
+            .to_string();
+
+        assert!(
+            err.contains("dataset orders"),
+            "the refusal must name the dataset that ran out, got: {err}"
+        );
+        assert!(
+            err.contains("runtime.query.memory_limit"),
+            "the refusal must name the knob that fixes it, got: {err}"
+        );
+        assert!(
+            err.contains("however idle the runtime is"),
+            "a batch bigger than the whole pool must not be blamed on concurrent queries, got: {err}"
+        );
+        assert!(
+            !err.contains("Retry when the runtime is less busy"),
+            "retrying cannot help when the batch exceeds the whole pool, got: {err}"
+        );
+    }
+
+    /// The other refusal: the batch would fit an empty pool, so what is missing
+    /// is not headroom in the config but headroom right now. Waiting or reducing
+    /// concurrency IS the fix here, and the message must say so — the same
+    /// `ResourcesExhausted` with the opposite remedy.
+    #[tokio::test]
+    async fn a_batch_that_fits_alone_blames_the_concurrent_queries() {
+        use datafusion_execution::memory_pool::GreedyMemoryPool;
+        use datafusion_execution::runtime_env::RuntimeEnvBuilder;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        // Twice the pre-poll charge, so the estimate fits the empty pool...
+        let pool: Arc<dyn MemoryPool> =
+            Arc::new(GreedyMemoryPool::new(INITIAL_BATCH_ESTIMATE_BYTES * 2));
+        let runtime = RuntimeEnvBuilder::new()
+            .with_memory_pool(Arc::clone(&pool))
+            .build_arc()
+            .expect("runtime env");
+        let context = Arc::new(TaskContext::default().with_runtime(runtime));
+
+        // ...but another consumer holds all but a sliver of it, so the scan's
+        // charge is refused for lack of room rather than lack of limit.
+        let squatter = MemoryConsumer::new("another_query").register(&pool);
+        squatter
+            .try_grow(INITIAL_BATCH_ESTIMATE_BYTES + (INITIAL_BATCH_ESTIMATE_BYTES / 2))
+            .expect("the squatter must fit, or this tests the wrong branch");
+
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![1_i64]))],
+        )
+        .expect("batch");
+        let mut stream = MemoryAccountedScanStream::new(
+            Box::pin(futures::stream::iter(vec![Ok(batch)])),
+            Arc::clone(&schema),
+            Some(Arc::from("orders")),
+            3,
+            &context,
+        );
+
+        let err = stream
+            .next()
+            .await
+            .expect("one item")
+            .expect_err("a full pool must refuse the charge")
+            .to_string();
+
+        assert!(
+            err.contains("dataset orders"),
+            "the refusal must name the dataset that ran out, got: {err}"
+        );
+        assert!(
+            err.contains("Retry when the runtime is less busy"),
+            "a batch that fits the pool alone must point at the concurrent load, got: {err}"
+        );
+        assert!(
+            !err.contains("however idle the runtime is"),
+            "this batch does fit an idle runtime, so the message must not claim otherwise: {err}"
         );
     }
 

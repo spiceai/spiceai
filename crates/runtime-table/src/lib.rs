@@ -30,7 +30,6 @@ pub mod accelerated;
 pub mod federated;
 pub mod filter_converter;
 pub mod refresh_source;
-pub mod table_layers;
 pub mod table_metadata;
 
 pub use accelerated::*;
