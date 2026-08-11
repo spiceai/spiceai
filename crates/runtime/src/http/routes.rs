@@ -582,7 +582,8 @@ async fn track_metrics(
             // the streaming response, not just the response future.
             let cancel_guard = request_context.cancellation_token().clone().drop_guard();
             let response = next.run(req).await;
-            let (parts, body) = response.into_parts();
+            let (mut parts, body) = response.into_parts();
+            runtime_request_context::attach_trace_id(&mut parts.headers, &request_context);
             let body = axum::body::Body::new(util::cancel_guard_body::CancelGuardBody::new(
                 body,
                 cancel_guard,
