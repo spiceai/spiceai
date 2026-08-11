@@ -1839,6 +1839,16 @@ impl DataFusion {
         self.compaction_memory_bytes
     }
 
+    /// The query memory limit this instance was built with, before the compaction
+    /// pool was carved out of it — what queries and compaction together hold, and so
+    /// the query-side ceiling the coordinated `DuckDB` budget re-splits against on a
+    /// reload. The pools are sized once here and are not resizable.
+    #[must_use]
+    pub(crate) fn applied_query_memory_limit(&self) -> u64 {
+        self.query_memory_pool_bytes
+            .saturating_add(self.compaction_memory_bytes.unwrap_or(0))
+    }
+
     async fn get_table_provider(
         &self,
         table_reference: &TableReference,

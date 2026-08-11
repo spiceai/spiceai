@@ -521,13 +521,13 @@ impl RuntimeBuilder {
         // applies, so the projected base matches the pool it will build.
         let cayenne_cdc_active = dedicated_thread_pools_enabled && cayenne_workload.uses_cdc_tier();
         let duckdb_budget_inputs = duckdb_budget_inputs(self.app.as_ref());
-        let (duckdb_query_pool_cap, query_pool_ceiling_bytes) = if duckdb_budget_inputs.is_empty() {
+        let duckdb_query_pool_cap = if duckdb_budget_inputs.is_empty() {
             // No DuckDB accelerators (or the duckdb feature isn't compiled in): skip
             // the cgroup/host memory probes and the planner entirely — the plan would
             // NoOp anyway. Publish an empty budget so no reservation from a runtime
             // built earlier in this process survives.
             crate::accelerator_memory_budget::clear_duckdb_budget();
-            (None, memory_limit)
+            None
         } else {
             let total_memory = crate::resource_monitor::get_total_memory();
             let duckdb_default_per_instance = *DUCKDB_HOST_DEFAULT_BYTES;
@@ -555,18 +555,7 @@ impl RuntimeBuilder {
                 &duckdb_budget_inputs,
                 QueryPoolSizing::Sizing,
             );
-            (
-                plan.query_pool_cap_bytes,
-                Some(plan.effective_query_pool_bytes),
-            )
-        };
-        // A reload re-splits this budget for the acceleration set the new app
-        // declares; the query pool it is split against is built once below and is
-        // not resizable, so the ceiling in effect is fixed input to that re-split.
-        let duckdb_budget_context = DuckDbBudgetContext {
-            query_pool_ceiling_bytes,
-            cayenne_cdc_active,
-            cayenne_reservation_bytes,
+            plan.query_pool_cap_bytes
         };
 
         #[cfg(not(windows))]
@@ -807,6 +796,16 @@ impl RuntimeBuilder {
 
         let df = Arc::new(df);
         df.set_self_ref();
+
+        // A reload re-splits this budget for the acceleration set the new app
+        // declares. The query pool is sized once, just now, and is not resizable, so
+        // the limit it was built with — read from the instance rather than derived a
+        // second time — is fixed input to that re-split.
+        let duckdb_budget_context = DuckDbBudgetContext {
+            query_pool_ceiling_bytes: df.applied_query_memory_limit(),
+            cayenne_cdc_active,
+            cayenne_reservation_bytes,
+        };
 
         let datasets_health_monitor = if self.datasets_health_monitor_enabled {
             let is_task_history_enabled = spicepod_rt.task_history.enabled;
@@ -1608,10 +1607,9 @@ enum QueryPoolSizing {
 /// declares (see [`DuckDbBudgetContext::publish_for`]).
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct DuckDbBudgetContext {
-    /// The query-pool ceiling in effect. `None` when nothing narrowed it: the build
-    /// configured no `DuckDB` accelerator and no explicit `runtime.query.memory_limit`,
-    /// so the pool took its default for this host.
-    query_pool_ceiling_bytes: Option<u64>,
+    /// The query memory limit the pools were built with — queries plus the carved
+    /// compaction pool. Fixed for the life of the process.
+    query_pool_ceiling_bytes: u64,
     cayenne_cdc_active: bool,
     cayenne_reservation_bytes: u64,
 }
@@ -1653,7 +1651,7 @@ impl DuckDbBudgetContext {
             total_memory,
             duckdb_default_per_instance,
             base_query_budget,
-            Some(self.query_pool_ceiling_bytes.unwrap_or(base_query_budget)),
+            Some(self.query_pool_ceiling_bytes),
             &inputs,
         );
         // A reload that leaves the budget where it was repeats guidance the operator
