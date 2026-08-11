@@ -2164,58 +2164,61 @@ impl DataFusion {
         table_reference: TableReference,
         schema: SchemaRef,
     ) -> Result<()> {
-        let pending_sink_registrations = self.pending_sink_tables.read().await;
-
-        let mut pending_registration = None;
-        for pending_sink_registration in pending_sink_registrations.iter() {
-            if pending_sink_registration.dataset.name == table_reference {
-                pending_registration = Some(pending_sink_registration);
-                break;
-            }
-        }
-
-        let Some(pending_registration) = pending_registration else {
-            return Ok(());
+        // Claim the pending registration by removing it under the write lock, so exactly one
+        // caller registers a given pending sink. Concurrent OpenTelemetry exports for the same
+        // metric would otherwise both find it under a shared read lock and both register it;
+        // worse, the second caller's removal pass — no longer finding the entry the first
+        // already removed — used to fall back to index 0 and evict an unrelated pending
+        // dataset, leaving it permanently unregistered ("Table ... not registered" on every
+        // later write). A caller that finds nothing to claim was beaten to it (or the dataset
+        // is not a pending sink) and has nothing to do.
+        let pending_registration = {
+            let mut pending_sink_registrations = self.pending_sink_tables.write().await;
+            let Some(idx) = pending_sink_registrations
+                .iter()
+                .position(|registration| registration.dataset.name == table_reference)
+            else {
+                return Ok(());
+            };
+            pending_sink_registrations.remove(idx)
         };
 
         let sink_connector = Arc::new(SinkConnector::new(schema)) as Arc<dyn DataConnector>;
-        let read_provider = sink_connector
-            .read_provider(&pending_registration.dataset)
+        let registration = async {
+            let read_provider = sink_connector
+                .read_provider(&pending_registration.dataset)
+                .await
+                .context(UnableToResolveTableProviderSnafu)?;
+            let federated_table = FederatedTable::new_unchecked(read_provider);
+
+            tracing::info!(
+                "Dataset {} loading data...",
+                pending_registration.dataset.name
+            );
+            self.register_accelerated_table(
+                Arc::clone(&pending_registration.dataset),
+                Arc::clone(&sink_connector),
+                federated_table,
+                Arc::clone(&pending_registration.secrets),
+                BootstrapStatus::none(), // Sink datasets don't bootstrap from snapshots
+                None,                    // Sink datasets are not partition-scoped
+            )
             .await
-            .context(UnableToResolveTableProviderSnafu)?;
-        let federated_table = FederatedTable::new_unchecked(read_provider);
+        }
+        .await;
 
-        tracing::info!(
-            "Dataset {} loading data...",
-            pending_registration.dataset.name
-        );
-        self.register_accelerated_table(
-            Arc::clone(&pending_registration.dataset),
-            sink_connector,
-            federated_table,
-            Arc::clone(&pending_registration.secrets),
-            BootstrapStatus::none(), // Sink datasets don't bootstrap from snapshots
-            None,                    // Sink datasets are not partition-scoped
-        )
-        .await?;
-
-        drop(pending_sink_registrations);
-
-        let mut pending_sink_registrations = self.pending_sink_tables.write().await;
-        let mut pending_registration_idx = Some(0);
-        for (pending_sink_registration_idx, pending_sink_registration) in
-            pending_sink_registrations.iter().enumerate()
-        {
-            if pending_sink_registration.dataset.name == table_reference {
-                pending_registration_idx = Some(pending_sink_registration_idx);
-                break;
+        match registration {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                // Registration failed after we claimed the entry: return it to the queue so a
+                // later write retries it, rather than leaving the dataset unregistered.
+                self.pending_sink_tables
+                    .write()
+                    .await
+                    .push(pending_registration);
+                Err(e)
             }
         }
-        if let Some(pending_registration_idx) = pending_registration_idx {
-            pending_sink_registrations.remove(pending_registration_idx);
-        }
-
-        Ok(())
     }
 
     pub async fn write_data(

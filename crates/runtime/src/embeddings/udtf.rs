@@ -868,6 +868,11 @@ impl TableProvider for VectorSearchUDTFProvider {
             base_expr.push(ident(embedding_col_name.clone()));
         }
 
+        // Rows with NULL embeddings cannot participate in vector search. Exclude
+        // them before scoring and limiting so a caller's outer `ORDER BY _score
+        // DESC` cannot promote NULL scores ahead of real matches.
+        scan = scan.filter(ident(embedding_col_name.clone()).is_not_null())?;
+
         // Pick the scoring expression based on the requested distance metric.
         // In all cases the result is monotonically increasing with similarity
         // (higher == more similar) so the downstream `ORDER BY _score DESC` is correct.
