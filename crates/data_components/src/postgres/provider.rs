@@ -667,8 +667,8 @@ async fn build_table_providers_for_schema(
 
         let table_ref = TableReference::partial(schema_name.to_owned(), table_name.clone());
 
-        // A schema resolved in bulk skips this table's own schema query; without
-        // one, the provider resolves it as it always did.
+        // A resolved schema lets this table skip its own schema query; without
+        // one, the provider resolves the schema itself.
         let provider = match schemas.get(&table_name) {
             Some(schema) => {
                 table_creator

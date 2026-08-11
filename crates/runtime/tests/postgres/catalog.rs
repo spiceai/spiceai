@@ -45,8 +45,6 @@ use data_components::RefreshableCatalogProvider;
 use data_components::catalog_filter::TableSelector;
 use data_components::postgres::provider::PostgresCatalogProvider;
 use datafusion_table_providers::UnsupportedTypeAction;
-use datafusion_table_providers::sql::db_connection_pool::DbConnectionPool;
-use datafusion_table_providers::sql::db_connection_pool::dbconnection::postgresconn::PostgresConnection;
 use datafusion_table_providers::sql::db_connection_pool::postgrespool::PostgresConnectionPool;
 use datafusion_table_providers::util::secrets::to_secret_map;
 
