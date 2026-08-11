@@ -23,12 +23,14 @@ use std::{
 #[cfg(feature = "http")]
 pub mod cancel_guard_body;
 pub mod fibonacci_backoff;
+pub mod glob;
 pub mod home_dir;
 pub mod levenshtein;
 pub mod retry_strategy;
 #[cfg(feature = "datafusion")]
 pub mod security;
 pub mod topological_ordering;
+pub mod tracers;
 pub use backoff::Error as RetryError;
 pub use backoff::ExponentialBackoff;
 pub use backoff::future::retry;

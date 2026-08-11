@@ -24,12 +24,13 @@ use crate::Sizeable;
 use crate::TabledCacheProvider;
 use crate::backend::{CacheBackend, MokaBackend};
 use crate::key::PassthroughHashBuilder;
-use crate::metrics::CacheMetrics;
+use crate::metrics::{CacheMetrics, EvictionReason};
 use crate::{CacheProvider, get_hash_builder};
 use async_trait::async_trait;
 use byte_unit::Byte;
 use datafusion::sql::TableReference;
 use moka::future::Cache;
+use moka::notification::RemovalCause;
 use snafu::ResultExt;
 use spicepod::component::caching::{CacheConfig, CacheEngine, CachingPolicy};
 use std::fmt::Display;
@@ -242,6 +243,27 @@ pub fn build_from_config<V: Sizeable + CacheMetrics + Clone + Send + Sync + 'sta
     )))
 }
 
+/// Maps moka's removal cause onto the reason reported on `*_cache_evictions`,
+/// or `None` for a removal that did not take an entry out of the cache.
+///
+/// `moka`'s own `RemovalCause::was_evicted` covers only `Expired` and `Size`,
+/// which leaves out the cause that dominates an accelerated deployment:
+/// `invalidate_entries_if` — how a refresh or a DML write drops the entries
+/// referencing a table — delivers `Explicit`. An entry removed that way is just
+/// as gone as one reclaimed under size pressure, and a query that would have
+/// been served from it now misses, so it belongs on the counter.
+///
+/// `Replaced` is the one cause that is not an eviction: the key stays cached and
+/// only its value was rewritten, so nothing was lost.
+fn eviction_reason(cause: RemovalCause) -> Option<EvictionReason> {
+    match cause {
+        RemovalCause::Size => Some(EvictionReason::Size),
+        RemovalCause::Expired => Some(EvictionReason::Expired),
+        RemovalCause::Explicit => Some(EvictionReason::Invalidated),
+        RemovalCause::Replaced => None,
+    }
+}
+
 // Build the Moka cache (used for Moka backend or for table invalidation support)
 fn build_moka_cache<
     V: Sizeable + CacheMetrics + Clone + Send + Sync + 'static,
@@ -277,8 +299,8 @@ fn build_moka_cache<
         .eviction_policy(moka_eviction_policy)
         .support_invalidation_closures()
         .eviction_listener(|_key, _value, cause| {
-            if cause.was_evicted() {
-                V::record_eviction();
+            if let Some(reason) = eviction_reason(cause) {
+                V::record_eviction(reason);
             }
         })
         .build_with_hasher(PassthroughHashBuilder::new(hasher))
@@ -362,6 +384,15 @@ impl<
     pub fn as_provider(self: Arc<Self>) -> Arc<dyn CacheProvider<V> + Send + Sync> {
         self
     }
+
+    /// `(hits, total_requests)` as fed to the hit-ratio gauge.
+    #[cfg(test)]
+    pub(crate) fn hit_ratio_counters(&self) -> (u64, u64) {
+        (
+            self.hits.load(Ordering::Relaxed),
+            self.total_requests.load(Ordering::Relaxed),
+        )
+    }
 }
 
 impl<
@@ -394,17 +425,32 @@ impl<
 > CacheProvider<V> for LruCache<V, T, H>
 {
     async fn get_raw_key(&self, key: &u64) -> Option<V> {
+        let always_valid = |_: &V| true;
+        self.get_raw_key_validated(key, &always_valid).await
+    }
+
+    async fn get_raw_key_validated(
+        &self,
+        key: &u64,
+        is_valid: &(dyn for<'v> Fn(&'v V) -> bool + Send + Sync),
+    ) -> Option<V> {
         V::record_request();
         self.total_requests.fetch_add(1, Ordering::Relaxed);
 
-        if let Some(v) = self.backend.get(key).await {
+        // A value the caller cannot use is a miss, not a hit: counting it as a
+        // hit would make the hit ratio climb precisely when invalidation is
+        // doing its job.
+        let found = self.backend.get(key).await;
+        let usable = found.filter(|value| is_valid(value));
+
+        if usable.is_some() {
             V::record_hit();
             self.hits.fetch_add(1, Ordering::Relaxed);
-            Some(v)
         } else {
             V::record_miss();
-            None
         }
+
+        usable
     }
 
     async fn put_raw_key(&self, key: &u64, value: V) {
@@ -538,8 +584,14 @@ impl<
                         }
                     }
 
+                    // Nothing counts these for us: the eviction listener belongs
+                    // to the moka cache, which this engine does not have, so a
+                    // removal here is only observable if it is recorded at the
+                    // call site.
                     for key in keys_to_remove {
-                        backend.remove(&key).await;
+                        if backend.remove(&key).await.is_some() {
+                            V::record_eviction(EvictionReason::Invalidated);
+                        }
                     }
                 });
             })
@@ -589,6 +641,7 @@ mod tests {
             vec![record_batch],
             Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)])),
             Arc::new(input_tables),
+            std::time::Instant::now(),
             std::time::Instant::now(),
             encoder,
         )
@@ -657,6 +710,50 @@ mod tests {
         (retrieved_len == result_len)
             .then_some(())
             .expect("retrieved and result should have same length");
+    }
+
+    /// A lookup that finds an entry but rejects it must be accounted as a miss.
+    ///
+    /// Counting it as a hit would make the hit-ratio gauge *rise* as
+    /// invalidation removes more results from circulation — the metric would
+    /// look best exactly when the cache is serving least.
+    #[tokio::test]
+    async fn test_rejected_value_is_counted_as_a_miss_not_a_hit() {
+        let cache: LruCache<CachedQueryResult, _, _> = LruCache::new(
+            1024 * 1024,
+            Duration::from_mins(1),
+            RandomState::default(),
+            CachingPolicy::Lru,
+            CacheEngine::Moka,
+        );
+        let key = CacheKey::Query("accounting", None).as_raw_key(cache.hasher());
+        cache
+            .put_raw_key(&key.as_u64(), create_test_cached_result().await)
+            .await;
+
+        // Served: one request, one hit.
+        let accept_all = |_: &CachedQueryResult| true;
+        assert!(
+            cache
+                .get_raw_key_validated(&key.as_u64(), &accept_all)
+                .await
+                .is_some()
+        );
+        assert_eq!(cache.hit_ratio_counters(), (1, 1));
+
+        // Found but rejected: a second request, still only one hit.
+        let reject_all = |_: &CachedQueryResult| false;
+        assert!(
+            cache
+                .get_raw_key_validated(&key.as_u64(), &reject_all)
+                .await
+                .is_none()
+        );
+        assert_eq!(
+            cache.hit_ratio_counters(),
+            (1, 2),
+            "a rejected entry must not be counted as a hit"
+        );
     }
 
     #[rstest]
@@ -1134,6 +1231,7 @@ mod tests {
             Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)])),
             Arc::new(different_input_tables),
             std::time::Instant::now(),
+            std::time::Instant::now(),
             encoder,
         )
         .await
@@ -1206,8 +1304,10 @@ mod tests {
         fn record_item_count(_count: u64) {}
         fn record_size(_size: u64) {}
         fn record_max_size(_size: u64) {}
-        fn record_eviction() {}
+        fn record_eviction(_reason: EvictionReason) {}
+        fn record_stale_rejection() {}
         fn update_hit_ratio(_hits: u64, _total: u64) {}
+        fn publish_counters_at_zero() {}
     }
 
     #[cfg(feature = "pingora")]
@@ -1446,6 +1546,156 @@ mod tests {
         assert!(
             cache.get_raw_key(&raw_cache_key).await.is_none(),
             "search result should be removed after table invalidation"
+        );
+    }
+
+    /// Regression test for #12687.
+    ///
+    /// A refresh drops its table's entries through `invalidate_entries_if`, which
+    /// moka reports as `Explicit` — the dominant removal cause on an accelerated
+    /// dataset. `RemovalCause::was_evicted` covers only `Expired` and `Size`, so
+    /// the mapping has to name `Explicit` itself for that removal to be counted.
+    #[test]
+    fn invalidation_is_an_eviction_but_a_replaced_value_is_not() {
+        assert_eq!(
+            eviction_reason(RemovalCause::Explicit),
+            Some(EvictionReason::Invalidated),
+            "a refresh or DML invalidation removes the entry, so it must be counted"
+        );
+        assert_eq!(
+            eviction_reason(RemovalCause::Size),
+            Some(EvictionReason::Size),
+            "size pressure must stay separable from invalidation"
+        );
+        assert_eq!(
+            eviction_reason(RemovalCause::Expired),
+            Some(EvictionReason::Expired)
+        );
+        assert_eq!(
+            eviction_reason(RemovalCause::Replaced),
+            None,
+            "a replaced value leaves the key cached, so nothing was evicted"
+        );
+    }
+
+    /// A cached value whose eviction reports are counted in-process, so a test
+    /// can assert what the cache actually reported without standing up an
+    /// `OpenTelemetry` pipeline. [`CacheMetrics`] is implemented on the type
+    /// rather than on an instance, so each test needs its own type to keep a
+    /// count only it can move.
+    macro_rules! counting_value {
+        ($name:ident, $counter:ident) => {
+            static $counter: AtomicU64 = AtomicU64::new(0);
+
+            #[derive(Clone)]
+            struct $name(CachedQueryResult);
+
+            impl Sizeable for $name {
+                fn get_memory_size(&self) -> usize {
+                    self.0.get_memory_size()
+                }
+            }
+
+            impl AsTableRefs for $name {
+                fn as_table_refs(&self) -> Arc<HashSet<TableReference>> {
+                    self.0.as_table_refs()
+                }
+            }
+
+            impl CacheMetrics for $name {
+                fn record_hit() {}
+                fn record_miss() {}
+                fn record_request() {}
+                fn record_item_count(_count: u64) {}
+                fn record_size(_size: u64) {}
+                fn record_max_size(_size: u64) {}
+                fn record_stale_rejection() {}
+                fn update_hit_ratio(_hits: u64, _total: u64) {}
+                fn publish_counters_at_zero() {}
+
+                fn record_eviction(reason: EvictionReason) {
+                    if reason == EvictionReason::Invalidated {
+                        $counter.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+        };
+    }
+
+    counting_value!(MokaCountedValue, MOKA_INVALIDATIONS);
+
+    /// Regression test for #12687: a refresh drops its table's entries through
+    /// `invalidate_entries_if`, which moka reports as `Explicit`. The removal that
+    /// dominates an accelerated dataset has to reach the eviction counter.
+    #[tokio::test]
+    async fn moka_invalidation_is_reported_as_an_eviction() {
+        let cache: LruCache<MokaCountedValue, _, _> = LruCache::new(
+            1024 * 1024,
+            Duration::from_mins(1),
+            RandomState::default(),
+            CachingPolicy::Lru,
+            CacheEngine::Moka,
+        );
+
+        let table_ref = TableReference::bare("counted_table");
+        let key = CacheKey::Query("counted_query", None).as_raw_key(cache.hasher());
+        let value = MokaCountedValue(create_test_cached_result_with_table(table_ref.clone()).await);
+        cache.put_raw_key(&key.as_u64(), value).await;
+
+        cache
+            .invalidate_for_table(table_ref)
+            .await
+            .expect("should invalidate cache");
+        cache.checkpoint().await;
+
+        assert!(
+            cache.get_raw_key(&key.as_u64()).await.is_none(),
+            "the entry must actually be gone, or the count below proves nothing"
+        );
+        assert_eq!(
+            MOKA_INVALIDATIONS.load(Ordering::Relaxed),
+            1,
+            "invalidating the entry's table must report one eviction"
+        );
+    }
+
+    #[cfg(feature = "pingora")]
+    counting_value!(PingoraCountedValue, PINGORA_INVALIDATIONS);
+
+    /// The Pingora engine has no moka cache, so its invalidation removes each key
+    /// directly and never reaches an eviction listener. Without an explicit
+    /// record at that call site the removal is invisible on every engine build.
+    #[cfg(feature = "pingora")]
+    #[tokio::test]
+    async fn pingora_invalidation_is_reported_as_an_eviction() {
+        let cache: LruCache<PingoraCountedValue, _, _> = LruCache::new(
+            1024 * 1024,
+            Duration::from_mins(1),
+            RandomState::default(),
+            CachingPolicy::Lru,
+            CacheEngine::Pingora,
+        );
+
+        let table_ref = TableReference::bare("counted_table");
+        let key = CacheKey::Query("counted_query", None).as_raw_key(cache.hasher());
+        let value =
+            PingoraCountedValue(create_test_cached_result_with_table(table_ref.clone()).await);
+        cache.put_raw_key(&key.as_u64(), value).await;
+
+        cache
+            .invalidate_for_table(table_ref)
+            .await
+            .expect("should invalidate cache");
+        cache.checkpoint().await;
+
+        assert!(
+            cache.get_raw_key(&key.as_u64()).await.is_none(),
+            "the entry must actually be gone, or the count below proves nothing"
+        );
+        assert_eq!(
+            PINGORA_INVALIDATIONS.load(Ordering::Relaxed),
+            1,
+            "the Pingora removal path must report the eviction itself"
         );
     }
 }

@@ -45,7 +45,7 @@ use runtime::dataaccelerator::spice_sys::{
     OpenOption,
     mysql_binlog::{MySqlBinlogCheckpoint, MySqlBinlogSys},
 };
-use runtime::federated_table::FederatedTable;
+use runtime::federated::FederatedTable;
 use runtime::parameters::Parameters;
 use runtime_metrics::component::{MetricSpec, MetricType, ObserveMetricCallback};
 use std::collections::hash_map::DefaultHasher;

@@ -367,6 +367,17 @@ async fn start_runtime(catalog: Catalog) -> Result<Arc<Runtime>, anyhow::Error> 
     Ok(rt)
 }
 
+/// How long a synthesized dataset gets to bootstrap -- or, after a restart, to
+/// come back -- before [`wait_for_table_ready`] gives up.
+const TABLE_READY_TIMEOUT: Duration = Duration::from_mins(2);
+
+/// Interval between readiness polls. Every poll is a full `COUNT(*)` through the
+/// runtime and emits several `task_history` log lines, so a wait that runs to
+/// its timeout writes thousands of lines that bury the failure they surround
+/// (#12729). Half a second still resolves a two-minute budget finely, and is
+/// well below the granularity any assertion here depends on.
+const TABLE_READY_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
 /// Poll until `SELECT COUNT(*) FROM {CATALOG_NAME}.public.{table}` returns a
 /// non-zero count -- the synthesized dataset bootstraps in the background
 /// (fire-and-forget, same as any spicepod-declared dataset), so this can't
@@ -378,36 +389,94 @@ async fn start_runtime(catalog: Catalog) -> Result<Arc<Runtime>, anyhow::Error> 
 /// has loaded any data -- so `num_rows() > 0` is always true and would let the
 /// exact-count assertions downstream race the bootstrap. Every table this waits
 /// on is seeded non-empty, so `n > 0` is the correct "data present" condition.
-async fn wait_for_table_ready(rt: &Arc<Runtime>, table: &str) -> Result<(), anyhow::Error> {
-    let ready = wait_until_true(Duration::from_mins(2), || {
-        let rt = Arc::clone(rt);
-        async move {
-            query_i64(
-                &rt,
-                &format!("SELECT COUNT(*) AS n FROM {CATALOG_NAME}.public.{table}"),
-            )
-            .await
-            .is_some_and(|n| n > 0)
+///
+/// `phase` names the call site, because several tests wait on the same table
+/// more than once -- `test_catalog_acceleration_reuses_slot_across_restart`
+/// waits either side of a restart -- and one shared message does not say which
+/// of them ran out of time.
+///
+/// The timeout also reports the last thing it observed. A poll whose query
+/// *errored* (the table is not registered at all) and one that *returned zero*
+/// (registered, but no rows arrived) have completely different causes, and
+/// collapsing both into "never became queryable" leaves the reader unable to
+/// tell them apart without the full job log.
+async fn wait_for_table_ready(
+    rt: &Arc<Runtime>,
+    table: &str,
+    phase: &str,
+) -> Result<(), anyhow::Error> {
+    let sql = format!("SELECT COUNT(*) AS n FROM {CATALOG_NAME}.public.{table}");
+    let started = std::time::Instant::now();
+    let mut last: Option<Result<i64, String>> = None;
+
+    // Every wait inside the loop is bounded by what is left of the budget, so
+    // the deadline holds even when a poll never returns. A bare
+    // `query_count(..).await` would be unbounded: the loop condition is only
+    // evaluated between polls, so one stalled query -- the failure this
+    // diagnostic exists to describe -- would hang the test past its two minutes
+    // and past the point of emitting anything at all.
+    while let Some(remaining) = TABLE_READY_TIMEOUT.checked_sub(started.elapsed()) {
+        match tokio::time::timeout(remaining, query_count(rt, &sql)).await {
+            Ok(Ok(n)) if n > 0 => return Ok(()),
+            Ok(outcome) => last = Some(outcome),
+            // The budget is spent, so there is nothing left to poll with. Record
+            // the stall as the observation -- it is a distinct cause from a poll
+            // that ran and reported, and the one a bare await would have lost.
+            Err(_) => {
+                last = Some(Err(format!("poll did not return within {remaining:?}")));
+                break;
+            }
         }
-    })
-    .await;
-    anyhow::ensure!(
-        ready,
-        "accelerated table {CATALOG_NAME}.public.{table} never became queryable"
-    );
-    Ok(())
+        // Capped for the same reason: a sleep that outlives the budget would
+        // push the report past the deadline it is reporting on.
+        let left = TABLE_READY_TIMEOUT.saturating_sub(started.elapsed());
+        if left.is_zero() {
+            break;
+        }
+        tokio::time::sleep(TABLE_READY_POLL_INTERVAL.min(left)).await;
+    }
+
+    let observed = match last {
+        Some(Ok(n)) => format!("last poll returned {n} rows"),
+        Some(Err(error)) => format!("last poll could not run: {error}"),
+        // Defensive: the loop records an outcome on every path out, including a
+        // poll that timed out, so this stands only if the budget was already
+        // spent before the first poll began.
+        None => "no poll completed".to_string(),
+    };
+    anyhow::bail!(
+        "accelerated table {CATALOG_NAME}.public.{table} never became queryable during \
+         '{phase}' after {elapsed:?}: {observed}",
+        elapsed = started.elapsed()
+    )
+}
+
+/// Run `sql` (expected to select a single `BIGINT`/`COUNT(*)`-shaped column)
+/// and return the scalar value, keeping the reason on failure so a caller that
+/// polls can report *why* it never saw a value rather than only that it didn't.
+async fn query_count(rt: &Arc<Runtime>, sql: &str) -> Result<i64, String> {
+    let batches = run_query(rt, sql).await.map_err(|e| e.to_string())?;
+    let batch = batches
+        .first()
+        .ok_or_else(|| "query returned no record batches".to_string())?;
+    if batch.num_rows() == 0 {
+        return Err("query returned an empty record batch".to_string());
+    }
+    let column = batch
+        .columns()
+        .first()
+        .ok_or_else(|| "query returned no columns".to_string())?;
+    column
+        .as_any()
+        .downcast_ref::<arrow::array::Int64Array>()
+        .map(|values| values.value(0))
+        .ok_or_else(|| format!("count column is {:?}, expected Int64", column.data_type()))
 }
 
 /// Run `sql` (expected to select a single `BIGINT`/`COUNT(*)`-shaped column)
 /// and return the scalar value, or `None` if the query itself failed.
 async fn query_i64(rt: &Arc<Runtime>, sql: &str) -> Option<i64> {
-    let batches = run_query(rt, sql).await.ok()?;
-    let batch = batches.first()?;
-    batch
-        .column(0)
-        .as_any()
-        .downcast_ref::<arrow::array::Int64Array>()
-        .map(|arr| arr.value(0))
+    query_count(rt, sql).await.ok()
 }
 
 /// Run `sql` (expected to select a single `TEXT`-shaped column) and return
@@ -448,8 +517,8 @@ async fn test_catalog_acceleration_bootstraps_tables_with_primary_key() -> Resul
 
             let rt = start_runtime(accelerated_pg_catalog(port)).await?;
 
-            wait_for_table_ready(&rt, "orders").await?;
-            wait_for_table_ready(&rt, "items").await?;
+            wait_for_table_ready(&rt, "orders", "bootstrap").await?;
+            wait_for_table_ready(&rt, "items", "bootstrap").await?;
 
             let orders_count = run_query(
                 &rt,
@@ -550,7 +619,7 @@ async fn test_catalog_acceleration_excludes_views_and_still_loads() -> Result<()
             let rt = start_runtime(accelerated_pg_catalog(port)).await?;
 
             // The eligible base table accelerates and becomes queryable.
-            wait_for_table_ready(&rt, "orders").await?;
+            wait_for_table_ready(&rt, "orders", "bootstrap").await?;
 
             // The view and materialized view are absent from the catalog's
             // namespace (not replicated), so querying them fails.
@@ -598,7 +667,7 @@ async fn test_catalog_acceleration_respects_exclude_filter() -> Result<(), anyho
 
             let rt = start_runtime(accelerated_pg_catalog_excluding_items(port)).await?;
 
-            wait_for_table_ready(&rt, "orders").await?;
+            wait_for_table_ready(&rt, "orders", "bootstrap").await?;
 
             let items_result = run_query(
                 &rt,
@@ -727,8 +796,8 @@ async fn test_catalog_acceleration_converges_after_source_mutation() -> Result<(
 
             let rt = start_runtime(accelerated_pg_catalog(port)).await?;
 
-            wait_for_table_ready(&rt, "orders").await?;
-            wait_for_table_ready(&rt, "items").await?;
+            wait_for_table_ready(&rt, "orders", "bootstrap").await?;
+            wait_for_table_ready(&rt, "items", "bootstrap").await?;
 
             // Insert a new order, update an existing order's customer, and
             // delete an item -- one of each change type CDC must apply.
@@ -802,7 +871,7 @@ async fn test_catalog_acceleration_replica_identity_matrix() -> Result<(), anyho
 
             // Eligible tables (each seeded with 2 rows) become queryable.
             for table in ["ri_default", "ri_using_index", "ri_full"] {
-                wait_for_table_ready(&rt, table).await?;
+                wait_for_table_ready(&rt, table, "bootstrap").await?;
                 let count = query_i64(
                     &rt,
                     &format!("SELECT COUNT(*) AS n FROM {CATALOG_NAME}.public.{table}"),
@@ -860,7 +929,7 @@ async fn test_catalog_acceleration_using_index_cdc_converges() -> Result<(), any
 
             let rt = start_runtime(accelerated_pg_catalog(port)).await?;
 
-            wait_for_table_ready(&rt, "ri_using_index").await?;
+            wait_for_table_ready(&rt, "ri_using_index", "bootstrap").await?;
 
             // Mutate keyed by the identity column `uid`: insert uid 30, update
             // uid 10's non-key column, delete uid 20. Starting from 2 rows, the
@@ -925,7 +994,7 @@ async fn test_catalog_acceleration_respects_include_filter() -> Result<(), anyho
 
             let rt = start_runtime(accelerated_pg_catalog_including_only_orders(port)).await?;
 
-            wait_for_table_ready(&rt, "orders").await?;
+            wait_for_table_ready(&rt, "orders", "bootstrap").await?;
 
             let items_result = run_query(
                 &rt,
@@ -1071,7 +1140,7 @@ async fn test_catalog_acceleration_releases_the_slot_when_the_acceleration_is_no
             let expected_slot = catalog_slot_name(CATALOG_NAME);
 
             let rt = start_runtime(accelerated_pg_catalog(port)).await?;
-            wait_for_table_ready(&rt, "orders").await?;
+            wait_for_table_ready(&rt, "orders", "bootstrap").await?;
             anyhow::ensure!(
                 replication_slot_names(port).await? == vec![expected_slot.clone()],
                 "the catalog should hold exactly one slot while running"
@@ -1143,7 +1212,7 @@ async fn test_catalog_acceleration_reuses_slot_across_restart() -> Result<(), an
 
             // First run: bootstrap + stream.
             let rt = start_runtime(durable_accelerated_pg_catalog(port, data_dir.path())).await?;
-            wait_for_table_ready(&rt, "orders").await?;
+            wait_for_table_ready(&rt, "orders", "bootstrap before shutdown").await?;
 
             // Exactly one slot, named deterministically from the catalog (with no
             // instance component).
@@ -1189,7 +1258,7 @@ async fn test_catalog_acceleration_reuses_slot_across_restart() -> Result<(), an
 
             // Restart with the SAME catalog config -> same deterministic slot.
             let rt = start_runtime(durable_accelerated_pg_catalog(port, data_dir.path())).await?;
-            wait_for_table_ready(&rt, "orders").await?;
+            wait_for_table_ready(&rt, "orders", "after restart").await?;
 
             // Still exactly one slot, same name: the restart REUSED it. An
             // instance-dependent name would have left the first orphaned and
@@ -1254,7 +1323,7 @@ async fn test_catalog_acceleration_fails_loud_when_slot_already_active() -> Resu
 
             // Instance A acquires and actively holds the slot.
             let rt_a = start_runtime(accelerated_pg_catalog(port)).await?;
-            wait_for_table_ready(&rt_a, "orders").await?;
+            wait_for_table_ready(&rt_a, "orders", "instance A bootstrap").await?;
             anyhow::ensure!(
                 matches!(slot_active(port, &expected_slot).await?, Some(true)),
                 "instance A should hold the slot active"

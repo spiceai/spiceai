@@ -53,7 +53,7 @@ use futures::TryStreamExt;
 use runtime_request_context::{AsyncMarker, RequestContext};
 
 use super::{Error as QueryError, QueryBuilder, ResultsCacheMode};
-use crate::accelerated_table::{
+use crate::accelerated::{
     AcceleratedTable,
     write::{CayenneWriteTarget, dual_write::extract_cayenne_write_target},
 };

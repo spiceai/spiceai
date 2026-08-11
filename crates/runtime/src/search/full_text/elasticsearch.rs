@@ -28,7 +28,7 @@ use futures::StreamExt;
 use runtime_datafusion_index::IndexedTableProvider;
 use tokio::sync::RwLock;
 
-use crate::accelerated_table::{self, AcceleratedTable};
+use crate::accelerated::{self, AcceleratedTable};
 use crate::changes::{Indexes, index_change_envelope};
 use crate::component::{
     ComponentInitialization,
@@ -38,7 +38,7 @@ use crate::component::{
     },
 };
 use crate::dataconnector::{DataConnector, DataConnectorError, DataConnectorResult};
-use crate::federated_table::FederatedTable;
+use crate::federated::FederatedTable;
 use crate::search::full_text::table::add_compound_fts_to_table;
 use crate::search::util::find_concrete_table_provider;
 use runtime_metrics::component::MetricsProvider;
@@ -229,7 +229,7 @@ impl DataConnector for ElasticsearchFullTextConnector {
     async fn on_accelerator_setup(
         &self,
         dataset: &Dataset,
-        builder: &mut accelerated_table::Builder,
+        builder: &mut accelerated::Builder,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.inner_connector
             .on_accelerator_setup(dataset, builder)

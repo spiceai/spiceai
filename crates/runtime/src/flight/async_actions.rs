@@ -261,7 +261,7 @@ pub async fn handle_submit_async_query(body: &[u8]) -> Result<Vec<u8>, Status> {
     let _ = super::check_read_only_sql(&context, &datafusion, &request.sql, None).await?;
 
     let state = executor
-        .submit(request, read_only)
+        .submit(request, read_only, crate::jobs::current_job_owner().await)
         .await
         .map_err(|e| Status::internal(format!("Failed to submit query: {e}")))?;
 
@@ -285,7 +285,10 @@ pub async fn handle_get_async_query_status(body: &[u8]) -> Result<Vec<u8>, Statu
     })?;
 
     let state = executor
-        .get_status(request.query_id.as_str())
+        .get_status(
+            request.query_id.as_str(),
+            &crate::jobs::current_job_owner().await,
+        )
         .await
         .map_err(|e| Status::not_found(format!("Query not found: {e}")))?;
 
@@ -307,8 +310,9 @@ pub async fn handle_get_async_query_result(body: &[u8]) -> Result<Vec<u8>, Statu
     })?;
 
     // Check job status first
+    let caller = crate::jobs::current_job_owner().await;
     let state = executor
-        .get_status(request.query_id.as_str())
+        .get_status(request.query_id.as_str(), &caller)
         .await
         .map_err(|e| Status::not_found(format!("Query not found: {e}")))?;
 
@@ -334,7 +338,7 @@ pub async fn handle_get_async_query_result(body: &[u8]) -> Result<Vec<u8>, Statu
 
     // Get the result chunk
     let batches = executor
-        .get_chunk(request.query_id.as_str(), request.chunk_index)
+        .get_chunk(request.query_id.as_str(), request.chunk_index, &caller)
         .await
         .map_err(|e| match &e {
             crate::jobs::Error::NoRowsReturned { .. }
@@ -355,14 +359,32 @@ pub async fn handle_cancel_async_query(body: &[u8]) -> Result<Vec<u8>, Status> {
     let executor = get_job_executor(&context)
         .ok_or_else(|| Status::unavailable("Async queries are only available in cluster mode"))?;
 
+    // Cancellation is a write. `POST /v1/queries/{id}/cancel` refuses a
+    // read-only principal, and this action must refuse it identically.
+    if super::is_auth_read_only(&context) {
+        return Err(Status::permission_denied(
+            "API key does not allow write access",
+        ));
+    }
+
     let request: CancelAsyncQueryRequest = serde_json::from_slice(body).map_err(|e| {
         Status::invalid_argument(format!("Failed to parse CancelAsyncQueryRequest: {e}"))
     })?;
 
     let state = executor
-        .cancel(request.query_id.as_str())
+        .cancel(
+            request.query_id.as_str(),
+            &crate::jobs::current_job_owner().await,
+        )
         .await
-        .map_err(|e| Status::internal(format!("Failed to cancel query: {e}")))?;
+        .map_err(|e| match &e {
+            // Mirrors the other async actions, and `POST
+            // /v1/queries/{id}/cancel`, so a job this caller cannot see reads
+            // as missing over both protocols instead of as a server error.
+            crate::jobs::Error::JobNotFound { .. }
+            | crate::jobs::Error::JobResultsExpired { .. } => Status::not_found(e.to_string()),
+            _ => Status::internal(format!("Failed to cancel query: {e}")),
+        })?;
 
     let response = CancelAsyncQueryResponse {
         query_id: QueryId::new(state.job_id),

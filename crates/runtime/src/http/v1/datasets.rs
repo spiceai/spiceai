@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use crate::{
     LogErrors, Runtime,
-    accelerated_table::refresh::RefreshOverrides,
+    accelerated::refresh::RefreshOverrides,
     component::dataset::Dataset,
     datafusion::{
         SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA,

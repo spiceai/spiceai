@@ -2190,15 +2190,16 @@ mod accelerator_compat_tests {
                 .expect("scan successful");
 
             let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
-            // Arrow and Vortex don't support filter pushdown at the TableProvider level
+            // Arrow returns everything: no filter pushdown at the TableProvider
+            // level. Cayenne holds these 10 rows in its inline tier — small
+            // writes inline on this refresh profile — and that tier evaluates the
+            // predicate during the scan, so it returns exactly the matching rows.
+            // Its Vortex path would return all 10; pushdown there only happens via
+            // DataFusion's physical optimizer on a SQL query.
             // (when calling scan() directly). Filter pushdown for Vortex only works via
             // DataFusion's physical optimizer when running SQL queries.
             // IDs are 0-9, so id > 5 gives IDs 6,7,8,9 = 4 rows
-            let expected_rows = if engine == Engine::Arrow || engine == Engine::Cayenne {
-                10
-            } else {
-                4
-            };
+            let expected_rows = if engine == Engine::Arrow { 10 } else { 4 };
             assert_eq!(
                 total_rows, expected_rows,
                 "{:?}: should have {} rows with id > 5",
@@ -2218,12 +2219,13 @@ mod accelerator_compat_tests {
                 .expect("scan successful");
 
             let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
-            // Arrow and Vortex don't support filter pushdown at the TableProvider level
-            let expected_rows = if engine == Engine::Arrow || engine == Engine::Cayenne {
-                10
-            } else {
-                3
-            };
+            // Arrow returns everything: no filter pushdown at the TableProvider
+            // level. Cayenne holds these 10 rows in its inline tier — small
+            // writes inline on this refresh profile — and that tier evaluates the
+            // predicate during the scan, so it returns exactly the matching rows.
+            // Its Vortex path would return all 10; pushdown there only happens via
+            // DataFusion's physical optimizer on a SQL query.
+            let expected_rows = if engine == Engine::Arrow { 10 } else { 3 };
             assert_eq!(
                 total_rows, expected_rows,
                 "{:?}: should have {} rows with id < 3",
@@ -2242,12 +2244,13 @@ mod accelerator_compat_tests {
                 .expect("scan successful");
 
             let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
-            // Arrow and Vortex don't support filter pushdown at the TableProvider level
-            let expected_rows = if engine == Engine::Arrow || engine == Engine::Cayenne {
-                10
-            } else {
-                1
-            };
+            // Arrow returns everything: no filter pushdown at the TableProvider
+            // level. Cayenne holds these 10 rows in its inline tier — small
+            // writes inline on this refresh profile — and that tier evaluates the
+            // predicate during the scan, so it returns exactly the matching rows.
+            // Its Vortex path would return all 10; pushdown there only happens via
+            // DataFusion's physical optimizer on a SQL query.
+            let expected_rows = if engine == Engine::Arrow { 10 } else { 1 };
             assert_eq!(
                 total_rows, expected_rows,
                 "{:?}: should have {} row with id = 5",
@@ -2268,12 +2271,13 @@ mod accelerator_compat_tests {
                 .expect("scan successful");
 
             let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
-            // Arrow and Vortex don't support filter pushdown at the TableProvider level
-            let expected_rows = if engine == Engine::Arrow || engine == Engine::Cayenne {
-                10
-            } else {
-                3
-            };
+            // Arrow returns everything: no filter pushdown at the TableProvider
+            // level. Cayenne holds these 10 rows in its inline tier — small
+            // writes inline on this refresh profile — and that tier evaluates the
+            // predicate during the scan, so it returns exactly the matching rows.
+            // Its Vortex path would return all 10; pushdown there only happens via
+            // DataFusion's physical optimizer on a SQL query.
+            let expected_rows = if engine == Engine::Arrow { 10 } else { 3 };
             assert_eq!(
                 total_rows, expected_rows,
                 "{:?}: should have {} rows with id > 3 AND id < 7",
