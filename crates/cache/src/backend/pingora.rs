@@ -165,7 +165,13 @@ where
         }
 
         shard.remove(&key);
-        self.cache.remove(key);
+        let removed = self.cache.remove(key);
+        // Both removals happened under the hold; only the value's destructor is
+        // deferred past it. Dropping a large value inside the hold would block
+        // every reader and writer mapped to this shard, and a destructor that
+        // re-entered the cache would deadlock on the non-reentrant lock.
+        drop(shard);
+        drop(removed);
         true
     }
 
