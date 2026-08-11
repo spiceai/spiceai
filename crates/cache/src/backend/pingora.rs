@@ -380,8 +380,10 @@ mod tests {
         fn record_item_count(_count: u64) {}
         fn record_size(_size: u64) {}
         fn record_max_size(_size: u64) {}
-        fn record_eviction() {}
+        fn record_eviction(_reason: EvictionReason) {}
+        fn record_stale_rejection() {}
         fn update_hit_ratio(_hits: u64, _total: u64) {}
+        fn publish_counters_at_zero() {}
     }
 
     /// A test value whose evictions are counted in-process, so a test can assert
@@ -408,9 +410,11 @@ mod tests {
                 fn record_item_count(_count: u64) {}
                 fn record_size(_size: u64) {}
                 fn record_max_size(_size: u64) {}
+                fn record_stale_rejection() {}
                 fn update_hit_ratio(_hits: u64, _total: u64) {}
+                fn publish_counters_at_zero() {}
 
-                fn record_eviction() {
+                fn record_eviction(_reason: EvictionReason) {
                     $counter.fetch_add(1, Ordering::Relaxed);
                 }
             }
