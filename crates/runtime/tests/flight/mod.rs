@@ -52,6 +52,7 @@ mod do_put;
 mod prepared_statements;
 mod statement_substrait_plan;
 mod statement_update;
+mod trace_id;
 
 async fn start_spice_test_app(
     flight_auth: Option<Arc<dyn FlightBasicAuth + Send + Sync>>,

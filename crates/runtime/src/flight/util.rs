@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use bytes::Bytes;
 use cache::result::CacheStatus;
 use tonic::{
     Response,
@@ -23,6 +24,19 @@ use tonic::{
 use runtime_request_context::{AsyncMarker, Protocol, RequestContext};
 
 use crate::datafusion::request_context_extension::DataFusionContextExtension;
+
+/// The trace id as a `FlightInfo.app_metadata` payload:
+/// `{"trace_id":"<32 hex characters>"}`.
+///
+/// `app_metadata` is the one place a Flight SQL JDBC caller can read it — the
+/// driver surfaces it as
+/// `ArrowFlightJdbcFlightStreamResultSet.getAppMetadata()`, and surfaces
+/// neither response metadata nor per-message `app_metadata`. JSON so a second
+/// field can be added without breaking a client that already parses this one.
+#[must_use]
+pub(crate) fn trace_id_app_metadata(trace_id: &str) -> Bytes {
+    Bytes::from(serde_json::json!({ "trace_id": trace_id }).to_string())
+}
 
 pub fn attach_cache_metadata<T>(
     response: &mut Response<T>,
