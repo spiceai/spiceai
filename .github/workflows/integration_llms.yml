@@ -44,6 +44,8 @@ jobs:
   setup-matrix:
     name: Setup strategy matrix
     runs-on: spiceai-dev-runners
+    # Evaluates one inline script.
+    timeout-minutes: 15
     outputs:
       matrix: ${{ steps.setup-matrix.outputs.result }}
 
@@ -88,6 +90,11 @@ jobs:
   build:
     name: Build Test Binary
     runs-on: spiceai-macos
+    # Slowest observed success in the 2026-07-25..08-08 window: 17 min, but
+    # every sample had a warm sccache. Sized against the other macOS workspace
+    # builds (pr.yml peaks at 117 min) so a cold cache cannot turn a passing
+    # build into a red one.
+    timeout-minutes: 300
     env:
       HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
       TEST_BINARY_OBJECT_KEY: test_binaries/${{ github.run_id }}/llms_integration_test
@@ -146,6 +153,8 @@ jobs:
   test:
     runs-on: ${{ matrix.target.runner }}
     needs: [build, setup-matrix]
+    # Slowest observed success in the 2026-07-25..08-08 window: 4 min.
+    timeout-minutes: 90
     env:
       HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
       TEST_BINARY_OBJECT_KEY: test_binaries/${{ github.run_id }}/llms_integration_test
@@ -200,6 +209,10 @@ jobs:
           SPICE_BEDROCK_ACCESS_KEY: ${{ secrets.AWS_BEDROCK_KEY }}
           SPICE_BEDROCK_SECRET_KEY: ${{ secrets.AWS_BEDROCK_SECRET }}
         run: |
+          # The spiceio setup action exports AWS_ENDPOINT_URL for sccache; the AWS SDK
+          # honours it for every service, so leaving it set sends this suite's Bedrock
+          # calls to the local build cache instead of AWS.
+          unset AWS_ENDPOINT_URL
           if [ "${{ matrix.target.needs_env }}" == "true" ]; then
             if [ -z "$SPICE_OPENAI_API_KEY" ]; then
               echo "Error: 'SPICE_OPENAI_API_KEY' is not defined."

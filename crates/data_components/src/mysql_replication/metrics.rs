@@ -68,6 +68,12 @@ pub struct MetricsCollector {
     /// member holds the shared resume position back, so this is the
     /// unambiguous signal for *which* dataset stalled the group.
     member_attached: AtomicU64,
+    /// Cumulative seconds the shared dump's pump spent blocked delivering
+    /// committed changes into this dataset's channel because its sink was not
+    /// draining. The pump reads the dump socket for the whole group, so this is
+    /// also the time the socket went undrained — the source aborts the dump once
+    /// that passes its `net_write_timeout`.
+    member_send_stalled_seconds: AtomicU64,
 }
 
 impl MetricsCollector {
@@ -168,6 +174,12 @@ impl MetricsCollector {
     /// pinning the shared resume position).
     pub fn mark_member_detached(&self) {
         self.member_attached.store(0, Ordering::Relaxed);
+    }
+
+    /// Accrue another stall interval spent waiting on this dataset's channel.
+    pub fn add_send_stalled(&self, secs: u64) {
+        self.member_send_stalled_seconds
+            .fetch_add(secs, Ordering::Relaxed);
     }
 }
 
@@ -307,6 +319,14 @@ impl Metrics {
     #[must_use]
     pub fn member_attached(&self) -> u64 {
         self.collector.member_attached.load(Ordering::Relaxed)
+    }
+    /// Cumulative seconds the shared dump's pump waited on this dataset's
+    /// channel, i.e. seconds the dump socket went undrained on its behalf.
+    #[must_use]
+    pub fn member_send_stalled_seconds_total(&self) -> u64 {
+        self.collector
+            .member_send_stalled_seconds
+            .load(Ordering::Relaxed)
     }
 }
 

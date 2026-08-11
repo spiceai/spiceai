@@ -25,7 +25,9 @@ use crate::manifest;
 use clap::{Args, Subcommand};
 use spice_cloud_client::redirect::same_origin_redirect_policy;
 
-pub use auth_config::{merge_auth_config, store_keychain};
+pub use auth_config::{
+    env_file_path, env_file_vars, merge_auth_config, read_env_var, store_keychain,
+};
 
 /// Credential storage backend for `spice login`.
 #[derive(Debug, Clone, Default, clap::ValueEnum)]
@@ -218,58 +220,14 @@ async fn login_spiceai(
     let client = credentialed_client()?;
     let exchange_url = format!("{base_url}/auth/token/exchange");
 
-    let access_token = loop {
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-
-        let response = client
-            .post(&exchange_url)
-            .header("Content-Type", "application/json")
-            .json(&serde_json::json!({ "code": auth_code }))
-            .send()
-            .await;
-
-        let response = match response {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::error!("Error exchanging auth code with spice.ai: {e}");
-                continue;
-            }
-        };
-
-        // A 3xx here means the redirect policy refused to follow it, so this is the
-        // redirecting origin's own response, not the target's. Fail instead of parsing it:
-        // retrying cannot make a redirect succeed, and an unchecked body could otherwise be
-        // read as a token or as "still pending".
-        let status = response.status();
-        if status.is_redirection() {
-            return Err(crate::error::Error::InvalidResponse {
-                message: format!(
-                    "The Spice.ai token exchange answered {status}. The redirect was not \
-                     followed because it leaves the origin the auth code was issued for."
-                ),
-            });
-        }
-
-        let body: serde_json::Value = match response.json().await {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::error!("Error parsing exchange response: {e}");
-                continue;
-            }
-        };
-
-        if body["access_denied"].as_bool().unwrap_or(false) {
-            return Err(crate::error::Error::InvalidArgument {
-                message: "Access denied".to_string(),
-            });
-        }
-
-        if let Some(token) = body["access_token"].as_str()
-            && !token.is_empty()
-        {
-            break token.to_string();
-        }
-    };
+    let access_token = poll_for_access_token(
+        &client,
+        &exchange_url,
+        &auth_code,
+        LOGIN_POLL_TIMEOUT,
+        LOGIN_POLL_INTERVAL,
+    )
+    .await?;
 
     // Try to read the Spicepod manifest for preferred org/app.
     let (org_name, app_name) = read_spicepod_metadata();
@@ -315,6 +273,191 @@ async fn login_spiceai(
     }
 
     Ok(())
+}
+
+/// How long the Spice.ai browser flow waits for the user before giving up.
+///
+/// Matches the Spice Cloud device flow in [`crate::commands::cloud`]; the
+/// Microsoft device-code flow in [`providers`] bounds itself the same way, off
+/// the `expires_in` its authorization server returns.
+const LOGIN_POLL_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(5);
+
+/// How long to wait between token-exchange attempts.
+const LOGIN_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// What one token-exchange attempt tells the poll loop to do next.
+#[derive(PartialEq, Eq)]
+enum ExchangeOutcome {
+    /// The exchange carried a usable access token.
+    Token(String),
+    /// The authorization was refused. Waiting cannot change that.
+    Denied,
+    /// The user has not finished authorizing in the browser yet.
+    Pending,
+    /// Re-sending this identical request cannot succeed.
+    Permanent(String),
+    /// A blip that repeating may clear, until the deadline runs out.
+    Transient(String),
+}
+
+/// Redacts the token. This type carries a live credential, so it must not be
+/// the reason one reaches a log line or an assertion message.
+impl std::fmt::Debug for ExchangeOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Token(_) => f.write_str("Token(<redacted>)"),
+            Self::Denied => f.write_str("Denied"),
+            Self::Pending => f.write_str("Pending"),
+            Self::Permanent(message) => write!(f, "Permanent({message})"),
+            Self::Transient(message) => write!(f, "Transient({message})"),
+        }
+    }
+}
+
+/// Classify the HTTP status of a token-exchange attempt.
+///
+/// Returns `None` for a success status that can carry a body, meaning the body
+/// decides the outcome.
+fn classify_exchange_status(status: reqwest::StatusCode) -> Option<ExchangeOutcome> {
+    // A 204 promises no content, so there is no body to decide anything and no
+    // status a token could arrive under. Read it the same way as a 200 whose body
+    // carries no token -- the user has not finished authorizing yet -- rather than
+    // letting it reach `json()` and be reported as an unparseable success, which
+    // would put a parse error in the debug log and in the timeout's last error.
+    if status == reqwest::StatusCode::NO_CONTENT {
+        return Some(ExchangeOutcome::Pending);
+    }
+
+    if status.is_success() {
+        return None;
+    }
+
+    // A server that is briefly unhappy, or is asking us to back off, can still
+    // become happy while the user is authorizing.
+    if status.is_server_error()
+        || status == reqwest::StatusCode::REQUEST_TIMEOUT
+        || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+    {
+        return Some(ExchangeOutcome::Transient(format!(
+            "the exchange endpoint returned {status}"
+        )));
+    }
+
+    // The auth code is minted locally, so the exchange answers 404 until the
+    // browser authorization for it exists -- including on the first poll, which
+    // races the browser. A base URL that does not serve the exchange answers the
+    // same way, which is why this reports a reason rather than only pending: the
+    // deadline bounds either, and its error has to name both.
+    if status == reqwest::StatusCode::NOT_FOUND {
+        return Some(ExchangeOutcome::Transient(format!(
+            "the exchange endpoint has no authorization for this code ({status}); \
+             a SPICE_BASE_URL pointing at the wrong deployment answers the same way"
+        )));
+    }
+
+    // Anything else is the endpoint rejecting this exact request: a 4xx, or a
+    // redirect the client declines to follow because it leaves the origin the
+    // credential was minted for. Neither is cleared by sending it again.
+    Some(ExchangeOutcome::Permanent(format!(
+        "the exchange endpoint returned {status}"
+    )))
+}
+
+/// Classify the body of a successful token-exchange response.
+fn classify_exchange_body(body: &serde_json::Value) -> ExchangeOutcome {
+    if body["access_denied"].as_bool().unwrap_or(false) {
+        return ExchangeOutcome::Denied;
+    }
+
+    match body["access_token"].as_str() {
+        Some(token) if !token.is_empty() => ExchangeOutcome::Token(token.to_string()),
+        // No token yet: the user has not finished in the browser.
+        _ => ExchangeOutcome::Pending,
+    }
+}
+
+/// Poll the Spice.ai token exchange until it yields a token, refuses, or
+/// `timeout` elapses.
+///
+/// # Errors
+///
+/// Returns an error if the authorization is refused, if the endpoint reports a
+/// failure that repeating cannot clear, or if `timeout` elapses first.
+async fn poll_for_access_token(
+    client: &reqwest::Client,
+    exchange_url: &str,
+    auth_code: &str,
+    timeout: std::time::Duration,
+    interval: std::time::Duration,
+) -> Result<String> {
+    let start = std::time::Instant::now();
+    // Kept so an endpoint that only ever fails reports *why* it timed out,
+    // rather than logging the same line once a second for the whole deadline.
+    let mut last_transient: Option<String> = None;
+
+    loop {
+        if start.elapsed() > timeout {
+            let detail = last_transient
+                .take()
+                .map(|message| format!(" Last error: {message}."))
+                .unwrap_or_default();
+            return Err(crate::error::Error::InvalidArgument {
+                message: format!("Authentication timed out. Please try again.{detail}"),
+            });
+        }
+
+        tokio::time::sleep(interval).await;
+
+        let response = client
+            .post(exchange_url)
+            .header("Content-Type", "application/json")
+            .json(&serde_json::json!({ "code": auth_code }))
+            .send()
+            .await;
+
+        let outcome = match response {
+            Ok(response) => {
+                // Read the status out before the body: `json()` consumes the
+                // response, so it cannot borrow it in a match scrutinee.
+                let status = response.status();
+                match classify_exchange_status(status) {
+                    Some(outcome) => outcome,
+                    None => match response.json::<serde_json::Value>().await {
+                        Ok(body) => classify_exchange_body(&body),
+                        // A success status carrying a body we cannot read is
+                        // more likely an interposed proxy than a decided
+                        // answer, so it stays retriable and the deadline
+                        // bounds it.
+                        Err(e) => ExchangeOutcome::Transient(format!(
+                            "could not parse the exchange response: {e}"
+                        )),
+                    },
+                }
+            }
+            Err(e) => ExchangeOutcome::Transient(format!("could not reach the exchange: {e}")),
+        };
+
+        match outcome {
+            ExchangeOutcome::Token(token) => return Ok(token),
+            ExchangeOutcome::Denied => {
+                return Err(crate::error::Error::InvalidArgument {
+                    message: "Access denied".to_string(),
+                });
+            }
+            ExchangeOutcome::Permanent(message) => {
+                return Err(crate::error::Error::InvalidArgument {
+                    message: format!("Authentication failed: {message}."),
+                });
+            }
+            ExchangeOutcome::Transient(message) => {
+                tracing::debug!("Retrying the spice.ai token exchange: {message}");
+                last_transient = Some(message);
+            }
+            // A healthy "not yet" supersedes an earlier blip: if the deadline
+            // runs out from here, it is the user who did not finish.
+            ExchangeOutcome::Pending => last_transient = None,
+        }
+    }
 }
 
 /// Build the HTTP client for the credential-bearing calls `spice login` makes.
@@ -467,9 +610,278 @@ async fn get_spice_auth_context(
 
 #[cfg(test)]
 mod tests {
-    use super::credentialed_client;
+    use super::{
+        ExchangeOutcome, classify_exchange_body, classify_exchange_status, credentialed_client,
+        poll_for_access_token,
+    };
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::{TcpListener, TcpStream};
+    use std::time::Duration;
+
+    /// Long enough that a bounded loop still polls several times, short enough
+    /// that an unbounded one is unmistakable.
+    const TEST_TIMEOUT_MS: u64 = 600;
+    const TEST_TIMEOUT: Duration = Duration::from_millis(TEST_TIMEOUT_MS);
+    const TEST_INTERVAL: Duration = Duration::from_millis(20);
+
+    fn status(code: u16) -> reqwest::StatusCode {
+        reqwest::StatusCode::from_u16(code).expect("code should be a valid HTTP status")
+    }
+
+    async fn poll_against(server: &wiremock::MockServer) -> (crate::error::Result<String>, u64) {
+        let url = format!("{}/auth/token/exchange", server.uri());
+        let client = reqwest::Client::new();
+        let started = std::time::Instant::now();
+        let result =
+            poll_for_access_token(&client, &url, "ABCD1234", TEST_TIMEOUT, TEST_INTERVAL).await;
+
+        let elapsed = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        (result, elapsed)
+    }
+
+    async fn exchange_against(
+        template: wiremock::ResponseTemplate,
+    ) -> (crate::error::Result<String>, u64) {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(template)
+            .mount(&server)
+            .await;
+
+        poll_against(&server).await
+    }
+
+    #[test]
+    fn a_success_status_with_a_body_defers_to_the_body() {
+        assert_eq!(classify_exchange_status(status(200)), None);
+    }
+
+    /// A 204 carries no body, so deferring to one would classify every such
+    /// response as an unparseable success. It says the same thing a 200 with no
+    /// token says: keep polling.
+    #[test]
+    fn a_no_content_status_is_pending() {
+        assert_eq!(
+            classify_exchange_status(status(204)),
+            Some(ExchangeOutcome::Pending)
+        );
+    }
+
+    #[test]
+    fn a_server_error_or_backoff_status_is_retriable() {
+        for code in [408, 429, 500, 502, 503, 504] {
+            assert!(
+                matches!(
+                    classify_exchange_status(status(code)),
+                    Some(ExchangeOutcome::Transient(_))
+                ),
+                "{code} should be retriable"
+            );
+        }
+    }
+
+    #[test]
+    fn a_rejecting_status_is_permanent() {
+        // 302 is the cross-origin redirect the client declines to follow; the
+        // 4xx codes are the endpoint rejecting this exact request.
+        for code in [301, 302, 307, 400, 401, 403, 410] {
+            assert!(
+                matches!(
+                    classify_exchange_status(status(code)),
+                    Some(ExchangeOutcome::Permanent(_))
+                ),
+                "{code} should be permanent"
+            );
+        }
+    }
+
+    /// A 404 is how the exchange reports an authorization it has not been given
+    /// yet, so it has to keep polling rather than end the login.
+    #[test]
+    fn a_not_found_status_is_retriable() {
+        let Some(ExchangeOutcome::Transient(message)) = classify_exchange_status(status(404))
+        else {
+            panic!("404 should be retriable");
+        };
+        assert!(
+            message.contains("404") && message.contains("SPICE_BASE_URL"),
+            "the reason should name the status and the endpoint, got: {message}"
+        );
+    }
+
+    #[test]
+    fn a_body_carrying_a_token_succeeds() {
+        let body = serde_json::json!({ "access_token": "tok_123" });
+        assert_eq!(
+            classify_exchange_body(&body),
+            ExchangeOutcome::Token("tok_123".to_string())
+        );
+    }
+
+    #[test]
+    fn an_access_denied_body_is_denied() {
+        let body = serde_json::json!({ "access_denied": true });
+        assert_eq!(classify_exchange_body(&body), ExchangeOutcome::Denied);
+    }
+
+    #[test]
+    fn a_body_without_a_usable_token_is_still_pending() {
+        for body in [
+            serde_json::json!({}),
+            serde_json::json!({ "access_token": "" }),
+            serde_json::json!({ "access_denied": false }),
+            serde_json::json!({ "access_token": null }),
+        ] {
+            assert_eq!(
+                classify_exchange_body(&body),
+                ExchangeOutcome::Pending,
+                "{body} should keep polling"
+            );
+        }
+    }
+
+    /// Regression test for #12506: before the deadline this spun at one request
+    /// per second forever, because a body with no token is indistinguishable
+    /// from "the user has not finished yet".
+    #[tokio::test]
+    async fn a_perpetually_pending_exchange_gives_up_at_the_deadline() {
+        let template = wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({}));
+        let (result, elapsed) = exchange_against(template).await;
+
+        let Err(err) = result else {
+            panic!("a never-completing exchange should not succeed");
+        };
+        assert!(
+            err.to_string().contains("Authentication timed out"),
+            "expected a timeout error, got: {err}"
+        );
+        assert!(
+            elapsed < TEST_TIMEOUT_MS * 10,
+            "the loop should stop near its deadline, took {elapsed}ms"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rejecting_endpoint_fails_without_waiting_out_the_deadline() {
+        let (result, elapsed) = exchange_against(wiremock::ResponseTemplate::new(400)).await;
+
+        let Err(err) = result else {
+            panic!("a 400 exchange endpoint should not succeed");
+        };
+        assert!(
+            err.to_string().contains("400"),
+            "the error should name the status, got: {err}"
+        );
+        assert!(
+            elapsed < TEST_TIMEOUT_MS,
+            "a permanent failure should not wait out the deadline, took {elapsed}ms"
+        );
+    }
+
+    /// Regression test for #12870: the exchange answers 404 until the browser
+    /// authorization exists, so the first poll always lands there and a login
+    /// that treats it as fatal can never complete.
+    #[tokio::test]
+    async fn an_exchange_that_answers_not_found_first_still_yields_a_token() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(404))
+            .up_to_n_times(3)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "access_token": "tok_after_404" })),
+            )
+            .with_priority(2)
+            .mount(&server)
+            .await;
+
+        let (result, _) = poll_against(&server).await;
+
+        assert_eq!(
+            result.expect("a token after the leading 404s should succeed"),
+            "tok_after_404".to_string()
+        );
+    }
+
+    /// Regression test for #12506: a 404 every attempt — a base URL that does not
+    /// serve the exchange — is bounded by the deadline, and the error says so
+    /// rather than blaming the user for not finishing.
+    #[tokio::test]
+    async fn a_perpetually_not_found_exchange_gives_up_at_the_deadline() {
+        let (result, elapsed) = exchange_against(wiremock::ResponseTemplate::new(404)).await;
+
+        let Err(err) = result else {
+            panic!("a never-authorized exchange should not succeed");
+        };
+        let message = err.to_string();
+        assert!(
+            message.contains("Authentication timed out"),
+            "expected a timeout error, got: {message}"
+        );
+        assert!(
+            message.contains("404") && message.contains("SPICE_BASE_URL"),
+            "the timeout should point at the endpoint, got: {message}"
+        );
+        assert!(
+            elapsed < TEST_TIMEOUT_MS * 10,
+            "the loop should stop near its deadline, took {elapsed}ms"
+        );
+    }
+
+    /// A 5xx stays retriable, so it is the deadline — not the first bad
+    /// response — that ends the loop, and the reason survives into the error.
+    #[tokio::test]
+    async fn a_failing_but_retriable_endpoint_reports_why_it_timed_out() {
+        let (result, _) = exchange_against(wiremock::ResponseTemplate::new(503)).await;
+
+        let Err(err) = result else {
+            panic!("a 503 exchange endpoint should not succeed");
+        };
+        let message = err.to_string();
+        assert!(
+            message.contains("Authentication timed out"),
+            "expected a timeout error, got: {message}"
+        );
+        assert!(
+            message.contains("503"),
+            "the timeout should carry the last error, got: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_token_response_completes_the_flow() {
+        let template = wiremock::ResponseTemplate::new(200)
+            .set_body_json(serde_json::json!({ "access_token": "tok_abc" }));
+        let (result, _) = exchange_against(template).await;
+
+        assert_eq!(
+            result.expect("a token response should succeed"),
+            "tok_abc".to_string()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_access_denied_response_stops_immediately() {
+        let template = wiremock::ResponseTemplate::new(200)
+            .set_body_json(serde_json::json!({ "access_denied": true }));
+        let (result, elapsed) = exchange_against(template).await;
+
+        let Err(err) = result else {
+            panic!("an access_denied response should not succeed");
+        };
+        assert!(
+            err.to_string().contains("Access denied"),
+            "expected an access-denied error, got: {err}"
+        );
+        assert!(
+            elapsed < TEST_TIMEOUT_MS,
+            "a denial should not wait out the deadline, took {elapsed}ms"
+        );
+    }
 
     /// How long a request that must not hang is given before the test fails it. Well under
     /// the client's own 30-second timeout, so a regression fails fast instead of stalling.

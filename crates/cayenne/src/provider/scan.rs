@@ -548,6 +548,26 @@ fn accumulate_file_scan_sources(
     }
 }
 
+/// Whether executing `plan` decodes any file at all — i.e. whether it reaches a
+/// file-backed source that has files to read.
+///
+/// Gates the scan's memory accounting. A Cayenne scan unions its file branches
+/// with `MemorySourceConfig` branches for the durable inline corpus and the
+/// in-RAM CDC tier, and those memory branches yield batches that are already
+/// resident and already accounted: `mem_tier_budget` mirrors the tier's bytes
+/// into this same query pool under the `cayenne:mem_tier` consumer. Charging
+/// them again reserves for memory no scan allocated, which can refuse a query
+/// on bytes the pool has already been told about.
+///
+/// So a scan with nothing file-backed to decode is not charged at all. That is
+/// not a corner case: a `mode: memory` table keeps all of its data in the RAM
+/// mem-tier, and `mode` defaults to `memory`. A plan that mixes the two still
+/// charges both; see the type docs on [`MemoryAccountedScanStream`].
+fn plan_materializes_files(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    let (_snapshots, files) = count_file_scan_sources(plan);
+    files > 0
+}
+
 /// Walks `plan` looking for underlying file-backed `DataSourceExec` nodes,
 /// descending only through a whitelist of operators that are known to preserve
 /// scan identity, plus `UnionExec` for mixed file + inlined-memory scans.
@@ -891,11 +911,17 @@ impl ExecutionPlan for CayenneAccelerationExec {
             let _hold = &scan_guard;
             item
         });
-        // Charge this scan's canonicalized batches against the query pool. Only
-        // the outermost wrapper accounts (`scan_guard.is_some()`): the inner
-        // per-snapshot wrappers feed into this same stream, and registering a
-        // consumer at every layer would count one batch once per layer.
-        if self.scan_guard.is_some() {
+        // Charge this scan's canonicalized batches against the query pool. Two
+        // conditions gate it:
+        //
+        // - Only the outermost wrapper accounts (`scan_guard.is_some()`): the
+        //   inner per-snapshot wrappers feed into this same stream, and
+        //   registering a consumer at every layer would count one batch once per
+        //   layer.
+        // - Only a plan that decodes files accounts: a purely memory-backed scan
+        //   yields already-resident bytes that `cayenne:mem_tier` has already
+        //   mirrored into this pool (see `plan_materializes_files`).
+        if self.scan_guard.is_some() && plan_materializes_files(&self.inner) {
             let accounted = MemoryAccountedScanStream::new(
                 Box::pin(RecordBatchStreamAdapter::new(Arc::clone(&schema), mapped)),
                 schema,
@@ -1042,6 +1068,16 @@ impl ExecutionPlan for CayenneAccelerationExec {
 /// and neither should be inferred from the presence of this type: a plan whose
 /// memory is dominated by fan-out beneath the outermost scan is still able to
 /// exceed `runtime.query.memory_limit`.
+///
+/// In the other direction, a mixed plan over-counts its memory branches. The
+/// gate that installs this stream is whole-plan ([`plan_materializes_files`]),
+/// so a union that decodes files AND serves the RAM tier accounts for both, and
+/// each in-flight mem-tier batch is charged here as well as by
+/// `cayenne:mem_tier`. The overlap is one in-flight batch per partition against
+/// the tier's whole resident size, so it is small next to the mirror it doubles
+/// — but it is an over-charge, and an over-charge fails a query that would have
+/// fit. Charging at the materializing leaf removes it, along with the
+/// under-count above; that is the same follow-up, not a second one.
 struct MemoryAccountedScanStream<S> {
     inner: S,
     schema: SchemaRef,
@@ -1409,6 +1445,57 @@ mod tests {
             pool.reserved(),
             0,
             "dropping the stream must return its bytes to the pool"
+        );
+    }
+
+    /// A purely memory-backed scan must not be charged at all.
+    ///
+    /// The RAM CDC tier and the durable inline corpus reach a scan as
+    /// `MemorySourceConfig` branches, and their batches are already resident:
+    /// `mem_tier_budget` mirrors the tier's bytes into this same query pool under
+    /// the `cayenne:mem_tier` consumer. Charging them here as well reserves for
+    /// memory that no scan allocated — and unlike the under-count beneath the
+    /// outermost wrapper, an over-charge refuses a query that would have fit.
+    ///
+    /// The pool here is smaller than the pre-poll charge, so any accounting at
+    /// all fails the scan.
+    #[tokio::test]
+    async fn a_memory_only_scan_is_not_charged_to_the_query_pool() {
+        use datafusion_execution::memory_pool::GreedyMemoryPool;
+        use datafusion_execution::runtime_env::RuntimeEnvBuilder;
+
+        let pool: Arc<dyn datafusion_execution::memory_pool::MemoryPool> =
+            Arc::new(GreedyMemoryPool::new(1024));
+        assert!(
+            INITIAL_BATCH_ESTIMATE_BYTES > 1024,
+            "the pool must be smaller than the pre-poll charge for this to prove anything"
+        );
+        let runtime = RuntimeEnvBuilder::new()
+            .with_memory_pool(Arc::clone(&pool))
+            .build_arc()
+            .expect("runtime env");
+        let context = Arc::new(TaskContext::default().with_runtime(runtime));
+
+        // `with_guard` marks this the outermost wrapper, so only the file-backed
+        // gate can hold the accounting off.
+        let guard = SnapshotScanRef::new(Arc::new(Mutex::new(HashMap::new())), Vec::new());
+        let exec = CayenneAccelerationExec::with_guard(one_partition_plan(), guard);
+
+        let mut stream = exec
+            .execute(0, context)
+            .expect("a memory-only scan should execute");
+        let mut rows = 0;
+        while let Some(item) = stream.next().await {
+            rows += item
+                .expect("a memory-only scan must not be refused by the pool")
+                .num_rows();
+        }
+
+        assert_eq!(rows, 3, "every row should stream through");
+        assert_eq!(
+            pool.reserved(),
+            0,
+            "a memory-only scan must not reserve - cayenne:mem_tier already mirrors those bytes"
         );
     }
 

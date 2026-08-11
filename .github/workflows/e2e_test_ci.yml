@@ -61,6 +61,11 @@ jobs:
   check_changes:
     if: ${{ github.event_name != 'pull_request' }}
     runs-on: spiceai-dev-runners
+    # Every job here is bounded, because on a `merge_group` run an unbounded one does not
+    # just waste a job: the queue candidate stays `AWAITING_CHECKS` for GitHub's 6-hour
+    # default and every entry behind it waits (#12717). A full-history checkout is the
+    # slow part of this one.
+    timeout-minutes: 10
     outputs:
       relevant_changes: ${{ steps.check.outputs.relevant_changes == 'true' || github.event_name == 'workflow_dispatch' }}
     steps:
@@ -76,6 +81,9 @@ jobs:
     name: Setup strategy matrix
     if: ${{ github.event_name != 'pull_request' }}
     runs-on: spiceai-dev-runners
+    # One `github-script` step returning a literal, so anything past a minute is a stuck
+    # runner rather than slow work.
+    timeout-minutes: 5
     outputs:
       matrix: ${{ steps.setup-matrix.outputs.result }}
 
@@ -109,6 +117,11 @@ jobs:
     runs-on: ${{ matrix.target.builder }}
     needs: [setup-matrix, check_changes]
     if: ${{ needs.check_changes.outputs.relevant_changes == 'true' }}
+    # A backstop above the longest step bound below, leaving room for the artifact upload
+    # and the post steps. The compile steps carry their own tighter bounds so that a
+    # wedged one is cut while the `always()` diagnostics after it can still run — a hung
+    # compile is exactly when the sccache stats are worth having.
+    timeout-minutes: 200
     env:
       HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
 
@@ -136,7 +149,7 @@ jobs:
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
 
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           save-if: ${{ github.ref == 'refs/heads/trunk' }}
 
@@ -165,6 +178,11 @@ jobs:
 
       - name: Build spiced and spice CLI
         if: matrix.target.target_os != 'darwin'
+        # 65 minutes is the slowest this leg has taken across the last ten successful
+        # `merge_group` runs (44-65), so this is that worst case with room to spare. The
+        # spread is wide on a contended pool, and a bound tight enough to fail a
+        # legitimate build would be worse than the slow build it replaced.
+        timeout-minutes: 90
         uses: ./.github/actions/build-spiced
         with:
           features: 'tpc-extension,models,postgres-accel'
@@ -174,6 +192,12 @@ jobs:
 
       - name: Build spiced and spice CLI (macOS)
         if: matrix.target.target_os == 'darwin'
+        # This is the step that wedged for over 4.5 hours and held four queue candidates
+        # behind it (#12717). 138 minutes is its slowest successful `merge_group` run of
+        # the last ten (74-138); the self-hosted macOS pool puts several runner instances
+        # on one host, which is where that factor-of-two spread comes from, so the bound
+        # sits well clear of it rather than close to the median.
+        timeout-minutes: 180
         uses: ./.github/actions/build-spiced
         with:
           features: 'tpc-extension,models,postgres-accel,metal'
@@ -207,6 +231,7 @@ jobs:
     name: Setup model strategy matrix
     if: ${{ github.event_name != 'pull_request' }}
     runs-on: ubuntu-24.04
+    timeout-minutes: 5
     outputs:
       matrix: ${{ steps.setup-matrix.outputs.result }}
     steps:
@@ -235,7 +260,11 @@ jobs:
 
   test_openai_model:
     name: 'openai model (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})'
-    timeout-minutes: 5
+    # A backstop for the whole job, so it has to clear this job's own setup — artifact
+    # download and CLI install on the self-hosted pool — before the steps' bounded waits
+    # (60s readiness, then 30s/30s/60s inside the expect scripts) can report anything.
+    # Matches `test_hf_model`, which has the same setup on the same runners (#12644).
+    timeout-minutes: 10
     runs-on: ${{ matrix.target.runner }}
     needs:
       - build
@@ -267,16 +296,23 @@ jobs:
           cp ./test/models/spicepod_openai.yml ./spicepod.yaml
           cat ./spicepod.yaml
 
+      # This job runs on the self-hosted pool, where several runner instances
+      # share one host and therefore one network namespace, so spiced's default
+      # 8090/50051 cannot be assumed free (#12419).
+      - name: Allocate Spice runtime ports
+        uses: ./.github/actions/allocate-spice-ports
+
       - name: Start spice runtime
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICE_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
         run: |
-          spice run &> spice.log &
+          spice run --http-endpoint "${SPICE_HTTP_ENDPOINT}" --flight-endpoint "${SPICE_FLIGHT_ENDPOINT}" &> spice.log &
 
       - name: Wait for Spice runtime is ready
         uses: ./.github/actions/wait-for-spice-ready
         with:
+          url: ${{ env.SPICE_HTTP_ENDPOINT }}/v1/ready
           timeout: '60'
 
       - name: Install expect (linux)
@@ -463,16 +499,21 @@ jobs:
 
           exit "${rc}"
 
+      # Same shared-host constraint as the OpenAI model job above (#12419).
+      - name: Allocate Spice runtime ports
+        uses: ./.github/actions/allocate-spice-ports
+
       - name: Start spice runtime
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICE_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
         run: |
-          spice run &> spice.log &
+          spice run --http-endpoint "${SPICE_HTTP_ENDPOINT}" --flight-endpoint "${SPICE_FLIGHT_ENDPOINT}" &> spice.log &
 
       - name: Wait for Spice runtime is ready
         uses: ./.github/actions/wait-for-spice-ready
         with:
+          url: ${{ env.SPICE_HTTP_ENDPOINT }}/v1/ready
           timeout: '300'
 
       - name: Install expect (linux)
@@ -2356,6 +2397,10 @@ jobs:
     name: E2E Test CI
     runs-on: ubuntu-latest
     if: ${{ !cancelled() }}
+    # The gate only reads the results it already has. Bounding it matters because it is
+    # the required check: a stuck gate blocks the queue even when every job it summarises
+    # has finished.
+    timeout-minutes: 5
     needs:
       - check_changes
       - setup-matrix
@@ -2379,11 +2424,57 @@ jobs:
       - graceful_shutdown_test_full
     steps:
       - name: Verify all E2E jobs succeeded
+        # Named rather than left to the runner default: this gate is the required
+        # merge-queue context, so the shell it reads `set -uo pipefail`, `command -v`
+        # and `$(…)` under must not depend on the image's default staying bash.
+        shell: bash
+        env:
+          # Read through the environment rather than interpolated into the script:
+          # the results are GitHub's own, but keeping workflow expressions out of
+          # `run:` bodies is the habit that stops the next one being attacker-
+          # controlled.
+          E2E_JOB_RESULTS: ${{ toJSON(needs) }}
         run: |
-          failure="${{ contains(needs.*.result, 'failure') }}"
-          cancelled="${{ contains(needs.*.result, 'cancelled') }}"
-          if [ "$failure" = "true" ] || [ "$cancelled" = "true" ]; then
-            echo "::error::One or more E2E Test CI jobs did not succeed"
+          set -uo pipefail
+
+          # `contains(needs.*.result, 'failure')` can answer only *whether*
+          # something went wrong, never which job it was, so this gate used to
+          # fail with a single line — "One or more E2E Test CI jobs did not
+          # succeed" — whichever of the jobs above it was. Since it is the required
+          # merge-queue context standing in for the whole matrix, that line is also
+          # the entire failure summary a dequeued PR gets: whoever triages it has
+          # to open the run and read down the job list to learn anything at all
+          # (#12643). Name the jobs instead. `toJSON(needs)` carries each one's
+          # result, so this needs no extra API call and no token.
+          if ! command -v jq >/dev/null 2>&1; then
+            echo "::error::jq is not available on this runner, so this gate cannot read the E2E job results. Failing closed rather than reporting a pass it did not verify."
             exit 1
           fi
+
+          # A `jq` that dies must not be mistaken for "nothing failed" — that
+          # would turn this gate into a rubber stamp on exactly the runs it exists
+          # to catch. Hence the explicit status check before the emptiness test.
+          # Allow-list the two results that pass rather than deny-listing the two
+          # that fail: an entry whose result were absent, or some state GitHub
+          # adds later, would be silently ignored by a deny-list and this gate
+          # would report a pass it had not established.
+          if ! not_succeeded="$(printf '%s' "$E2E_JOB_RESULTS" | jq -r '
+                to_entries
+                | map((.value.result // "missing") as $r
+                      | select($r != "success" and $r != "skipped")
+                      | "\(.key) (\($r))")
+                | join(", ")
+              ')"; then
+            echo "::error::Could not read the E2E job results, so this gate cannot tell whether the matrix passed. Failing closed."
+            exit 1
+          fi
+
+          if [ -n "$not_succeeded" ]; then
+            # `needs` keys are job ids, and a matrix job reports one result for
+            # the whole matrix — so this names the job to open, not the cell. That
+            # is still the difference between one click and twenty.
+            echo "::error::E2E Test CI jobs did not succeed: ${not_succeeded}"
+            exit 1
+          fi
+
           echo "All E2E Test CI jobs succeeded"

@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::accelerated_table::refresh::Refresh;
+use crate::accelerated::refresh::Refresh;
 use crate::component::dataset::acceleration::OnConflictBehavior;
 use crate::dataupdate::UpdateType;
 use crate::internal_table::create_internal_accelerated_table;
@@ -37,7 +37,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tokio::sync::RwLock;
 
-use crate::accelerated_table::{AcceleratedTable, Retention};
+use crate::accelerated::{AcceleratedTable, Retention};
 
 pub mod federated;
 pub mod otel_exporter;

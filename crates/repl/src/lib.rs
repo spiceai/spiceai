@@ -177,6 +177,12 @@ pub fn http_endpoint_unpaired(flight_chosen: bool, http_chosen: bool) -> bool {
     flight_chosen && !http_chosen
 }
 
+/// How long `nql` waits with nothing arriving before it gives up on the runtime.
+///
+/// This bounds silence rather than the whole request, so a translation that is merely slow is
+/// not cut off. `spice nsql` applies the same deadline to the same endpoint.
+const NSQL_SILENCE_DEADLINE: std::time::Duration = std::time::Duration::from_mins(5);
+
 const NQL_LINE_PREFIX: &str = "nql ";
 
 /// The header the runtime's HTTP API reads an API key from.
@@ -1135,9 +1141,14 @@ async fn get_and_display_nql_records(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let start_time = Instant::now();
 
+    // `/v1/nsql` is a model round trip -- it builds context, invokes the model, and may retry
+    // generation before running the query it produced. A whole-request deadline therefore cuts
+    // off answers that are merely slow, so the deadline measures silence instead: this response
+    // is not streamed, so it bounds the wait for the answer without capping how long the model
+    // may take to produce one.
     let mut client = Client::builder()
         .connect_timeout(std::time::Duration::from_secs(10))
-        .timeout(std::time::Duration::from_secs(30));
+        .read_timeout(NSQL_SILENCE_DEADLINE);
 
     // A request carrying the session's key must not follow a redirect. `reqwest` follows up to
     // ten by default, and the sanitisation it applies when the origin changes drops

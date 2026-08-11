@@ -67,55 +67,44 @@ fn quota_to_millicores(quota: u64, period: u64) -> Option<u64> {
     Some(quota.saturating_mul(1000) / period)
 }
 
-/// cgroup v1 shares that correspond to one CPU.
-const SHARES_PER_CORE: u64 = 1024;
-
 /// The share Kubernetes assigns a container with no `requests.cpu` at all. Read
-/// back as "no request expressed" rather than as a request of ~2 millicores.
+/// back as "no request expressed" rather than as a share of 2.
 const SHARES_NO_REQUEST: u64 = 2;
 
-/// Parse cgroup v1 `cpu.shares` into the `requests.cpu` it was derived from, in
-/// millicores.
+/// Parse cgroup v1 `cpu.shares`, as written.
 ///
 /// Reporting only — see the module docs. `None` when the value is the
 /// no-request floor or the contents are malformed.
 ///
-/// The mapping is not injective: outside Kubernetes the default share is
-/// [`SHARES_PER_CORE`], which is indistinguishable from an explicit request of
-/// one CPU. Read the result as "the CPU share this cgroup carries", not as proof
-/// that an operator wrote `requests.cpu`.
+/// Returns the share **as written**, not a `requests.cpu` recovered from it.
+/// Under Kubernetes the kubelet derives the share from the request, but the
+/// conversion varies by writer, so the only safe reading of this number is "the
+/// CPU share this cgroup carries". Above the [`SHARES_NO_REQUEST`] floor is
+/// evidence that *something* set it; what it converts to is not ours to claim.
 #[must_use]
 pub fn parse_cpu_shares(contents: &str) -> Option<u64> {
     let shares: u64 = contents.trim().parse().ok()?;
-    if shares <= SHARES_NO_REQUEST {
-        return None;
-    }
-    Some(shares.saturating_mul(1000) / SHARES_PER_CORE)
+    (shares > SHARES_NO_REQUEST).then_some(shares)
 }
 
-/// Parse cgroup v2 `cpu.weight` into the `requests.cpu` it was derived from, in
-/// millicores.
+/// Parse cgroup v2 `cpu.weight`, as written.
 ///
 /// Reporting only — see the module docs. `None` when the weight is the
-/// no-request floor or the contents are malformed.
+/// no-request floor of 1 (what the kubelet writes for a container with no CPU
+/// request) or the contents are malformed.
 ///
-/// Inverts the kubelet's share-to-weight conversion,
-/// `weight = 1 + ((shares - 2) * 9999) / 262142`. Container runtimes outside
-/// Kubernetes do not all use that formula, so on a plain Docker host the
-/// recovered value is approximate.
+/// Deliberately does **not** invert the weight into a `requests.cpu`. The
+/// kubelet's conversion is `weight = 1 + ((shares - 2) * 9999) / 262142`, but
+/// other writers do not use it: measured against Docker 29.4, `--cpu-shares`
+/// 512/1024/2048/4096 produce weights 59/100/174/303, which that formula would
+/// invert to roughly 1486m/2536m/4431m/7734m for requests of 500m/1000m/2000m/
+/// 4000m — over-reporting by two to three times. A number that wrong is worse
+/// than no number, so the raw weight is what gets reported, and it is compared
+/// only against *itself* over time to notice that the share moved.
 #[must_use]
 pub fn parse_cpu_weight(contents: &str) -> Option<u64> {
     let weight: u64 = contents.trim().parse().ok()?;
-    if weight <= 1 {
-        return None;
-    }
-    let shares = SHARES_NO_REQUEST.saturating_add(
-        weight
-            .saturating_sub(1)
-            .saturating_mul(262_142)
-            .saturating_div(9_999),
-    );
-    Some(shares.saturating_mul(1000) / SHARES_PER_CORE)
+    (weight > 1).then_some(weight)
 }
 
 /// This process's cgroup v2 mountpoint and path within the hierarchy, or `None`
