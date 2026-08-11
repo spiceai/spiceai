@@ -1699,6 +1699,17 @@ impl Runtime {
         }
     }
 
+    /// Whether the initial component load is still running.
+    ///
+    /// While it is, what is registered is not yet what the loaded app describes,
+    /// so a caller that reconciles a new app against the loaded one — the diff
+    /// [`Runtime::apply_app`] performs — would treat components the load has not
+    /// reached yet as already registered.
+    #[must_use]
+    pub fn initial_load_in_flight(&self) -> bool {
+        self.initial_load.in_flight.load(Ordering::SeqCst)
+    }
+
     /// Will load all of the components of the Runtime, including `secret_stores`, `catalogs`, `datasets`, `models`, and `embeddings`.
     ///
     /// The future returned by this function will not resolve until all components have been loaded and marked as ready.
