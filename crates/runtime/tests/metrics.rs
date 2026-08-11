@@ -250,6 +250,7 @@ fn memory_gauges_are_exported_to_the_operator_metrics_pipeline() {
     );
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn process_cpu_time_is_exported_with_paired_modes_and_lifecycle_identity() {
     let registry = &*PROMETHEUS;
