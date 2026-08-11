@@ -16,10 +16,14 @@ limitations under the License.
 
 pub use opentelemetry::KeyValue;
 use opentelemetry::global;
-use opentelemetry::metrics::{Counter, Histogram};
+use opentelemetry::metrics::{Counter, Histogram, ObservableCounter};
 use opentelemetry::metrics::{Gauge, UpDownCounter};
+use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::{sync::OnceLock, time::Duration};
+use std::{
+    sync::OnceLock,
+    time::{Duration, Instant},
+};
 
 #[cfg(feature = "anonymous_telemetry")]
 pub mod anonymous;
@@ -342,6 +346,82 @@ pub fn track_spilled_bytes(value: u64, dimensions: &[KeyValue]) {
 }
 
 static PROCESS_RESIDENT_MEMORY_BYTES: OnceLock<Gauge<u64>> = OnceLock::new();
+
+static PROCESS_CPU_TIME_SECONDS: OnceLock<ObservableCounter<f64>> = OnceLock::new();
+static PROCESS_CPU_TIME_LAST_WARNING: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// Registers cumulative user and system CPU time for the process and all its threads.
+///
+/// The callback observes both modes from one `getrusage(RUSAGE_SELF)` snapshot. A
+/// failed snapshot omits both series so consumers never calculate a partial total.
+pub fn register_process_cpu_time_seconds() {
+    PROCESS_CPU_TIME_SECONDS.get_or_init(|| {
+        let user_attributes = [KeyValue::new("cpu.mode", "user")];
+        let system_attributes = [KeyValue::new("cpu.mode", "system")];
+
+        global::meter("process")
+            .f64_observable_counter("spiced_process_cpu_time_seconds")
+            .with_description(
+                "CPU seconds used by spiced and its threads; excludes child processes, sidecars, cgroup peers, requests, and limits.",
+            )
+            .with_unit("s")
+            .with_callback(move |observer| match process_cpu_time_seconds() {
+                Ok((user, system)) => {
+                    observer.observe(user, &user_attributes);
+                    observer.observe(system, &system_attributes);
+                }
+                Err(error) => warn_process_cpu_time_collection_failure(&error),
+            })
+            .build()
+    });
+}
+
+fn warn_process_cpu_time_collection_failure(error: &str) {
+    let mut last_warning = PROCESS_CPU_TIME_LAST_WARNING.lock();
+    if last_warning.is_none_or(|last| last.elapsed() >= Duration::from_mins(1)) {
+        tracing::warn!(
+            metric = "spiced_process_cpu_time_seconds",
+            error,
+            "Process CPU metric collection failed; omitted paired observations"
+        );
+        *last_warning = Some(Instant::now());
+    }
+}
+
+fn process_cpu_time_seconds() -> Result<(f64, f64), String> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+        // `getrusage` initializes every field of the supplied `rusage` on success.
+        if unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) } != 0 {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        let usage = unsafe { usage.assume_init() };
+        Ok((
+            timeval_to_seconds(usage.ru_utime)?,
+            timeval_to_seconds(usage.ru_stime)?,
+        ))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        Err("getrusage(RUSAGE_SELF) is not supported on this platform".to_string())
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "OpenTelemetry CPU-time counters are f64 seconds; precision beyond f64 is not exportable"
+)]
+fn timeval_to_seconds(time: libc::timeval) -> Result<f64, String> {
+    if time.tv_sec < 0 || !(0..1_000_000).contains(&time.tv_usec) {
+        return Err(format!(
+            "getrusage returned invalid timeval {} seconds {} microseconds",
+            time.tv_sec, time.tv_usec
+        ));
+    }
+    Ok(time.tv_sec as f64 + time.tv_usec as f64 / 1_000_000.0)
+}
 
 /// Records the process's resident set size — the number the kernel's OOM
 /// decision is made on. Budgets and pool gauges describe intent; this describes

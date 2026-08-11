@@ -541,6 +541,9 @@ pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
     register_external_connectors().await;
 
     let prometheus_registry = args.metrics.map(|_| prometheus::Registry::new());
+    // This must exist before constructing the meter provider so every configured
+    // metrics reader receives the same lifecycle identity.
+    let service_instance_id = uuid::Uuid::new_v4().to_string();
 
     let spicepod_path = args
         .spicepod
@@ -879,7 +882,7 @@ pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
         // on-demand reader and inherit attribution from the scheduler-side
         // pipeline, so the empty-resource case here is consistent with the
         // surrounding executor config flow.
-        let resource_attributes: Vec<KeyValue> = telemetry_config
+        let mut resource_attributes: Vec<KeyValue> = telemetry_config
             .get()
             .map(|c| {
                 c.properties
@@ -888,6 +891,7 @@ pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
                     .collect()
             })
             .unwrap_or_default();
+        resource_attributes.push(KeyValue::new("service.instance.id", service_instance_id));
         let metric_prefix = telemetry_config.get().and_then(|c| c.metric_prefix.clone());
 
         init_metrics(
@@ -903,6 +907,8 @@ pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
             },
         )
         .context(UnableToInitializeMetricsSnafu)?;
+
+        telemetry::register_process_cpu_time_seconds();
 
         // Metrics are now initialized (the Prometheus meter provider is installed).
         // Register the Cayenne compaction instruments so the carved pool-size gauge

@@ -87,7 +87,22 @@ The following guidelines apply the above principles, focusing on Developer Exper
    - **Family**: **Unit**
    - Timestamps and Duration: `ms`
     - Data size: `bytes`
-   - **Why**: Establishing default units ensures predictability, reduces potential scaling errors, and simplifies interpretation, aligning with Developer Experience by maintaining consistency.
+    - **Why**: Establishing default units ensures predictability, reduces potential scaling errors, and simplifies interpretation, aligning with Developer Experience by maintaining consistency.
+
+## Process CPU Time
+
+`spiced_process_cpu_time_seconds` is a monotonic OpenTelemetry counter of CPU seconds used by the `spiced` process and its threads. It has unit `s` and only the `cpu.mode` attribute, whose values are `user` and `system`. Prometheus renders that attribute as the `cpu_mode` label. Sum both modes to calculate total process CPU time; the metric excludes child processes, sidecars, cgroup peers, CPU requests, and CPU limits.
+
+`service.instance.id` is a per-start UUIDv4 resource attribute. Prometheus exposes it as the `service_instance_id` label. Use `rate` or `increase` before aggregating, so counter resets at process restart are handled correctly.
+
+```promql
+# Average process CPU cores used over five minutes
+sum without (cpu_mode) (
+  rate(spiced_process_cpu_time_seconds[5m])
+)
+```
+
+If CPU-time collection fails, neither mode is emitted for that collection. A missing paired sample is preferable to a partial or zero total.
 
 ## References and Standards Alignment
 
