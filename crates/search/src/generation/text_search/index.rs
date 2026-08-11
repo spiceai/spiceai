@@ -1101,7 +1101,6 @@ mod tests {
             .expect("Failed to create FullTextSearchFieldIndex");
         let batches: Vec<RecordBatch> = search_index
             .search(query.to_string(), &[], 1000)
-            .await
             .expect("Failed to search")
             .try_collect()
             .await
