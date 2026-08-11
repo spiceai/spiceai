@@ -1664,6 +1664,13 @@ pub struct CayenneTableProvider {
     /// when both hold exact keysets). Shared across clones like the caches.
     pk_keyset_bytes_single: Arc<AtomicUsize>,
     pk_keyset_bytes_sharded: Arc<AtomicUsize>,
+    /// Serializes read-both-components-then-publish. The two components are
+    /// written under different locks (the single keyset's and the sharded
+    /// index's), so without this a publisher can read the sum, be overtaken by a
+    /// publisher that reads a newer sum and writes it, and then land its own
+    /// stale total last — leaving both the pool reservation and this table's
+    /// share of the fleet budget under-reporting residency that exists.
+    pk_keyset_publish_lock: Arc<ParkingMutex<()>>,
     /// Per-key transaction OCC (`transaction_has_conflict`) trusts the Exact
     /// keyset's per-key `sequence` stamps ONLY when this is `false`. Set `true`
     /// whenever an event leaves the shared Exact keyset with a stale or missing
@@ -6084,6 +6091,7 @@ impl CayenneTableProvider {
             pk_warm_probe_done: Arc::new(AtomicBool::new(false)),
             pk_keyset_bytes_single: Arc::new(AtomicUsize::new(0)),
             pk_keyset_bytes_sharded: Arc::new(AtomicUsize::new(0)),
+            pk_keyset_publish_lock: Arc::new(ParkingMutex::new(())),
             pk_keyset_occ_degraded: Arc::new(AtomicBool::new(false)),
             cold_pk_existence: Arc::new(ParkingMutex::new(None)),
             table_memory,
@@ -7277,6 +7285,7 @@ impl CayenneTableProvider {
             pk_warm_probe_done: Arc::clone(&self.pk_warm_probe_done),
             pk_keyset_bytes_single: Arc::clone(&self.pk_keyset_bytes_single),
             pk_keyset_bytes_sharded: Arc::clone(&self.pk_keyset_bytes_sharded),
+            pk_keyset_publish_lock: Arc::clone(&self.pk_keyset_publish_lock),
             pk_keyset_occ_degraded: Arc::clone(&self.pk_keyset_occ_degraded),
             cold_pk_existence: Arc::clone(&self.cold_pk_existence),
             table_memory: Arc::clone(&self.table_memory),
@@ -7734,6 +7743,11 @@ impl CayenneTableProvider {
     }
 
     fn publish_keyset_bytes_total(&self) {
+        // Read both components AND publish under one lock. The components are
+        // stored before this point, so whichever publisher holds the lock last
+        // reads every completed store and publishes the true sum; splitting the
+        // read from the publish lets a stale total land last and under-report.
+        let _guard = self.pk_keyset_publish_lock.lock();
         let total = self
             .pk_keyset_bytes_single
             .load(Ordering::Relaxed)

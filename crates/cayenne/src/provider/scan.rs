@@ -510,6 +510,26 @@ pub(crate) fn plan_has_pushed_filter_deep(plan: &Arc<dyn ExecutionPlan>) -> bool
     false
 }
 
+/// Whether `plan` reaches a file-backed source anywhere in its subtree.
+///
+/// Gates the scan memory accounting. The charge exists to cover the Vortex
+/// decode — compressed encodings canonicalized into flat Arrow — which only a
+/// file branch performs. A plan whose every leaf is a `MemorySourceConfig` (the
+/// mem-tier and inline branches, and a `mode: memory` table's whole scan) hands
+/// out `RecordBatch` clones of buffers that are ALREADY resident and already
+/// mirrored into this same pool by the `cayenne:mem_tier` consumer, so charging
+/// them again double-counts and can refuse a memory-mode query over memory that
+/// was only ever reserved once.
+fn plan_reads_files(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    if let Some(data_source_exec) = plan.downcast_ref::<DataSourceExec>() {
+        return data_source_exec
+            .data_source()
+            .downcast_ref::<FileScanConfig>()
+            .is_some();
+    }
+    plan.children().into_iter().any(plan_reads_files)
+}
+
 /// Counts file-backed scan sources (snapshot generations) and the total files
 /// across them in `plan`, returning `(snapshots_scanned, files_scanned)`.
 ///
@@ -895,7 +915,13 @@ impl ExecutionPlan for CayenneAccelerationExec {
         // the outermost wrapper accounts (`scan_guard.is_some()`): the inner
         // per-snapshot wrappers feed into this same stream, and registering a
         // consumer at every layer would count one batch once per layer.
-        if self.scan_guard.is_some() {
+        //
+        // And only when the plan actually reaches a file: a memory-only plan
+        // emits clones of buffers the `cayenne:mem_tier` consumer has already
+        // reserved in this pool, so charging them here bills the same bytes
+        // twice. The guard alone does not distinguish the two — every scan the
+        // provider returns carries one.
+        if self.scan_guard.is_some() && plan_reads_files(&self.inner) {
             let accounted = MemoryAccountedScanStream::new(
                 Box::pin(RecordBatchStreamAdapter::new(Arc::clone(&schema), mapped)),
                 schema,
@@ -1043,6 +1069,14 @@ impl ExecutionPlan for CayenneAccelerationExec {
 /// unbounded, not the steady state. Charging a defensible upper bound instead
 /// would mean knowing the decoded size before decoding it, which is what moving
 /// the reservation into the materializing leaf below would buy.
+///
+/// **The mem-tier half of a mixed plan is still charged.** The wrapper attaches
+/// per plan, not per branch, so a base+delta plan that reaches a file — and is
+/// therefore accounted — also charges the `MemorySourceConfig` batches its
+/// mem-tier branch contributes, which `cayenne:mem_tier` has already reserved.
+/// `plan_reads_files` only keeps a *wholly* memory-backed plan out of the
+/// accounting; separating the branches means charging at each materializing
+/// leaf, below.
 ///
 /// Accounting attaches to the outermost wrapper only (`scan_guard.is_some()`),
 /// so it charges one estimate per output partition. Under a base+delta plan the
