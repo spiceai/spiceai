@@ -90,6 +90,8 @@ expect_rejected() {
 
 expect_rejected "replicaCount above one" --set replicaCount=2
 expect_rejected "non-persistent storage" --set stateful.enabled=false
+expect_rejected "startup probe shorter than the enrollment retry window" \
+  --set startupProbe.failureThreshold=60
 expect_rejected "SPICE_CONFIG_DIR off the stateful volume" \
   --set-json 'additionalEnv=[{"name":"SPICE_ENROLL_KEY","valueFrom":{"secretKeyRef":{"name":"spice-cloud-connect","key":"enroll-key"}}},{"name":"SPICE_CONFIG_DIR","value":"/var/lib/spice"}]'
 expect_rejected "SPICE_CONFIG_DIR escapes the stateful volume through traversal" \
@@ -118,6 +120,19 @@ expect_rejected "a token Secret reference with no key" \
   --set-json 'additionalEnv=[{"name":"SPICE_ENROLL_KEY","valueFrom":{"secretKeyRef":{"name":"spice-cloud-connect"}}},{"name":"SPICE_CONFIG_DIR","value":"/data/.spice"}]'
 expect_rejected "duplicate token environment entries" \
   --set-json 'additionalEnv=[{"name":"SPICE_ENROLL_KEY","valueFrom":{"secretKeyRef":{"name":"spice-cloud-connect","key":"enroll-key"}}},{"name":"SPICE_ENROLL_KEY","valueFrom":{"secretKeyRef":{"name":"another-secret","key":"enroll-key"}}},{"name":"SPICE_CONFIG_DIR","value":"/data/.spice"}]'
+
+# A custom bootstrap that does not load the example inherits the chart's
+# ordinary 30-second startup probe and must be rejected before rendering.
+if output="$(render \
+  --set stateful.enabled=true \
+  --set-json 'command=["spiced","--token","$(SPICE_ENROLL_KEY)"]' \
+  --set-json 'additionalEnv=[{"name":"SPICE_ENROLL_KEY","valueFrom":{"secretKeyRef":{"name":"custom-enroll","key":"token"}}},{"name":"SPICE_CONFIG_DIR","value":"/data/.spice"}]')"; then
+  fail "a custom token bootstrap rendered with the chart's 30-second startup probe"
+elif echo "${output}" | grep -q "startup-probe budget of at least 660 seconds"; then
+  pass "custom token bootstraps reject the chart's short default startup probe"
+else
+  fail "custom token bootstrap failed for the wrong reason: ${output}"
+fi
 
 # --- A chart with no --token keeps rendering with any replica count ---
 if render --set replicaCount=3 >/dev/null; then

@@ -127,6 +127,13 @@ survive a pod replacement, so a command carrying `--token` requires:
 {{- if or (ne (int (.Values.replicaCount | default 1)) 1) (not .Values.stateful.enabled) -}}
 {{- fail "Cloud Connect --token bootstrap requires one replica and persistent Spice identity storage. Set replicaCount: 1 and stateful.enabled: true, and set SPICE_CONFIG_DIR beneath stateful.mountPath. See deploy/chart/examples/cloud-connect/." -}}
 {{- end -}}
+{{- $startupPeriodSeconds := int (.Values.startupProbe.periodSeconds | default 10) -}}
+{{- $startupFailureThreshold := int (.Values.startupProbe.failureThreshold | default 3) -}}
+{{- $startupInitialDelaySeconds := int (.Values.startupProbe.initialDelaySeconds | default 0) -}}
+{{- $startupBudgetSeconds := add $startupInitialDelaySeconds (mul $startupPeriodSeconds $startupFailureThreshold) -}}
+{{- if lt $startupBudgetSeconds 660 -}}
+{{- fail "Cloud Connect --token bootstrap requires a startup-probe budget of at least 660 seconds so Kubernetes cannot restart spiced during its ten-minute enrollment retry window. Increase startupProbe.failureThreshold, periodSeconds, or initialDelaySeconds. See deploy/chart/examples/cloud-connect/." -}}
+{{- end -}}
 {{- $mount := clean (.Values.stateful.mountPath | default "") -}}
 {{- $configDirCount := 0 -}}
 {{- $configDirOk := false -}}
