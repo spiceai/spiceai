@@ -9,6 +9,7 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+ansi_colors = { path = "../ansi_colors" }
 backoff = { version = "0.4.0", features = ["futures", "tokio"] }
 chrono.workspace = true
 ctrlc = "3.5"
@@ -26,6 +27,11 @@ arrow.workspace = true
 arrow-schema.workspace = true
 datafusion = { workspace = true, optional = true }
 parking_lot.workspace = true
+
+[dev-dependencies]
+# Only the tests need a real matcher: they assert that the `glob` pre-filter
+# never drops a schema whose table a compiled GlobSet selects.
+globset.workspace = true
 
 [features]
 default = ["datafusion"]

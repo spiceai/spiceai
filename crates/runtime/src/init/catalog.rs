@@ -22,12 +22,13 @@ use crate::{
     catalogconnector::{self, CatalogConnector, get_catalog_provider},
     component::catalog::{Catalog, CatalogBuilder},
     dataconnector::parameters::ConnectorParamsBuilder,
-    status, warn_spaced,
+    status,
 };
 use app::App;
 use futures::future::join_all;
 use runtime_metrics as metrics;
 use snafu::prelude::*;
+use util::warn_spaced;
 use util::{RetryError, fibonacci_backoff::FibonacciBackoffBuilder, retry};
 
 impl Runtime {
@@ -62,6 +63,15 @@ impl Runtime {
                         status::ComponentStatus::error_with_message(err.to_string()),
                     );
                     metrics::catalogs::LOAD_ERROR.add(1, &[]);
+                    // Every failure this call can raise used to land in the
+                    // transient arm below, so a catalog naming an unregistered
+                    // provider — or missing a required parameter — was rebuilt
+                    // with unbounded backoff for the life of the process, and
+                    // counted again on each attempt. See #12417.
+                    if is_permanent_catalog_failure(&err) {
+                        tracing::error!("{catalog_name} {err}");
+                        return Err(RetryError::permanent(err));
+                    }
                     warn_spaced!(spaced_tracer, "{} {err}", catalog_name);
                     return Err(RetryError::transient(err));
                 }
@@ -69,12 +79,7 @@ impl Runtime {
 
             if let Err(err) = Arc::clone(&self).register_catalog(catalog, connector).await {
                 tracing::error!("{err}");
-                if matches!(
-                    &err,
-                    crate::Error::UnableToInitializeCatalogConnector { source }
-                        if source.downcast_ref::<catalogconnector::Error>()
-                            .is_some_and(catalogconnector::Error::is_configuration_error)
-                ) {
+                if is_permanent_catalog_failure(&err) {
                     let catalog_name = &catalog.name;
                     self.status.update_catalog(
                         catalog_name,
@@ -95,10 +100,18 @@ impl Runtime {
     }
 
     async fn load_catalog_connector(&self, catalog: &Catalog) -> Result<Arc<dyn CatalogConnector>> {
-        let spaced_tracer = Arc::clone(&self.spaced_tracer);
         let catalog = catalog.clone();
 
         let source = catalog.provider.clone();
+
+        // Resolve the provider before building parameters. The builder resolves it too — it
+        // reads the factory's prefix and parameter list — and fails with
+        // `InvalidConnectorType`, which names no alternative, so it used to answer every
+        // typo'd provider before `UnknownCatalogConnector` could. See #12415.
+        if !catalogconnector::is_registered(&source).await {
+            return Err(unknown_catalog_connector(&source).await);
+        }
+
         let params = ConnectorParamsBuilder::for_catalog(source.clone().into(), &catalog)
             .build(self.secrets(), self.tokio_io_runtime())
             .await
@@ -106,21 +119,9 @@ impl Runtime {
 
         let Some(catalog_connector) = catalogconnector::create_new_connector(&source, params).await
         else {
-            let catalog_name = &catalog.name;
-            metrics::catalogs::LOAD_ERROR.add(1, &[]);
-            let suggestion = catalogconnector::suggest_catalog_connector(&source).await;
-            let available = catalogconnector::registered_catalog_names().await;
-            let err = crate::Error::UnknownCatalogConnector {
-                catalog_connector: source,
-                suggestion,
-                available,
-            };
-            self.status.update_catalog(
-                catalog_name,
-                status::ComponentStatus::error_with_message(err.to_string()),
-            );
-            warn_spaced!(spaced_tracer, "{} {err}", catalog_name);
-            return Err(err);
+            // Only reachable if the provider is deregistered between the check above and this
+            // lookup; report the same error rather than a second, blunter one.
+            return Err(unknown_catalog_connector(&source).await);
         };
 
         Ok(catalog_connector)
@@ -251,5 +252,240 @@ impl Runtime {
                 );
             }
         }
+    }
+}
+
+/// The error for a catalog naming a provider this build does not register: the closest
+/// registered name plus the full list, so the message names a fix.
+///
+/// Reporting is the caller's. `load_catalog` counts `catalogs::LOAD_ERROR` and writes the
+/// component status for every error `load_catalog_connector` returns, so doing either here
+/// too would report one misconfigured catalog twice per attempt. See #12442.
+async fn unknown_catalog_connector(source: &str) -> crate::Error {
+    crate::Error::UnknownCatalogConnector {
+        catalog_connector: source.to_string(),
+        suggestion: catalogconnector::suggest_catalog_connector(source).await,
+        available: catalogconnector::registered_catalog_names().await,
+    }
+}
+
+/// Returns `true` when a catalog load failure cannot be cleared by retrying it.
+///
+/// `load_catalog` retries with unbounded backoff, so a failure that is a pure
+/// function of the Spicepod would otherwise be retried for the life of the
+/// process, incrementing `catalogs::LOAD_ERROR` on every attempt. This is the
+/// catalog analogue of `is_permanent_dataset_failure`, which #12345 added for
+/// the dataset load path.
+///
+/// Everything else stays retriable, so a catalog whose source is merely
+/// unreachable still recovers on its own — including
+/// `UnableToLoadCatalogConnector`, which reports a registration failure rather
+/// than a configuration one.
+fn is_permanent_catalog_failure(err: &crate::Error) -> bool {
+    match err {
+        // The Spicepod names a provider this build cannot supply.
+        crate::Error::UnknownCatalogConnector { .. } => true,
+        crate::Error::UnableToInitializeCatalogConnector { source } => {
+            is_permanent_catalog_source(source.as_ref())
+        }
+        _ => false,
+    }
+}
+
+/// Returns `true` when a boxed catalog-connector error is a configuration error
+/// that no retry can clear.
+///
+/// Two unrelated types box into `UnableToInitializeCatalogConnector`: the
+/// connector's own [`catalogconnector::Error`], and [`runtime_parameters::Error`]
+/// from `ConnectorParamsBuilder` when parameter validation rejects the catalog
+/// before any connector exists. Only the first was classified before, so a
+/// missing required parameter read as transient.
+///
+/// The `runtime_parameters` variant is matched by name rather than accepting any
+/// error of that type, so a future retriable variant does not silently inherit
+/// "permanent" from this arm.
+fn is_permanent_catalog_source(source: &(dyn std::error::Error + Send + Sync + 'static)) -> bool {
+    if let Some(err) = source.downcast_ref::<catalogconnector::Error>() {
+        return err.is_configuration_error();
+    }
+    matches!(
+        source.downcast_ref::<runtime_parameters::Error>(),
+        Some(runtime_parameters::Error::InvalidConfigurationNoSource { .. })
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::component::access::AccessMode;
+    use crate::component::catalog::CatalogSpec;
+    use crate::dataconnector::ConnectorComponent;
+    use std::collections::HashMap;
+
+    fn catalog_component() -> ConnectorComponent {
+        ConnectorComponent::Catalog(Arc::new(CatalogSpec {
+            provider: "unity_catalog".to_string(),
+            catalog_id: None,
+            from: "unity_catalog".to_string(),
+            name: "uc".to_string(),
+            access: AccessMode::default(),
+            orig_include: Vec::new(),
+            include: None,
+            orig_exclude: Vec::new(),
+            exclude: None,
+            params: HashMap::new(),
+            dataset_params: HashMap::new(),
+            acceleration: None,
+        }))
+    }
+
+    fn initialize_error(source: Box<dyn std::error::Error + Send + Sync>) -> crate::Error {
+        crate::Error::UnableToInitializeCatalogConnector { source }
+    }
+
+    fn test_catalog(from: &str, runtime: &Arc<Runtime>) -> Catalog {
+        CatalogBuilder::try_new(from.to_string(), "test_catalog")
+            .expect("valid catalog builder")
+            .with_app(Arc::new(app::AppBuilder::new("catalog_typo").build()))
+            .with_runtime(Arc::clone(runtime))
+            .build()
+            .expect("valid runtime catalog")
+    }
+
+    /// The #12415 regression: `ConnectorParamsBuilder::build` resolves the provider first and
+    /// fails with `InvalidConnectorType`, which names no alternative, so the
+    /// suggestion-bearing `UnknownCatalogConnector` written for this case was unreachable.
+    #[tokio::test]
+    async fn a_misspelled_catalog_provider_suggests_the_closest_provider() {
+        // `Runtime::builder().build()` registers the default catalog connectors itself, so
+        // `iceberg` is present for the suggestion to find without this test touching the
+        // process-global registry on its own account.
+        let runtime = Arc::new(Runtime::builder().build().await);
+        let catalog = test_catalog("iceber:some_catalog", &runtime);
+
+        // `CatalogConnector` is not `Debug`, so the success case cannot be unwrapped for the
+        // error the way `expect_err` would.
+        let Err(err) = runtime.load_catalog_connector(&catalog).await else {
+            panic!("a provider that is not registered must fail")
+        };
+
+        assert!(
+            matches!(err, crate::Error::UnknownCatalogConnector { .. }),
+            "expected UnknownCatalogConnector, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("Did you mean 'iceberg'?"),
+            "the error should name the closest registered provider: {err}"
+        );
+    }
+
+    /// #12442: `load_catalog` counts `catalogs::LOAD_ERROR` and writes the component status for
+    /// every error `load_catalog_connector` returns, so reporting the unknown-provider failure
+    /// here as well would report one misconfigured catalog twice per attempt.
+    #[tokio::test]
+    async fn an_unknown_catalog_provider_leaves_reporting_to_the_caller() {
+        let runtime = Arc::new(Runtime::builder().build().await);
+        let catalog = test_catalog("not_a_real_catalog_connector:some_catalog", &runtime);
+
+        let Err(err) = runtime.load_catalog_connector(&catalog).await else {
+            panic!("a provider that is not registered must fail")
+        };
+        assert!(
+            matches!(err, crate::Error::UnknownCatalogConnector { .. }),
+            "expected UnknownCatalogConnector, got: {err}"
+        );
+
+        let statuses = runtime.status().get_catalog_statuses();
+        assert!(
+            !statuses.contains_key("test_catalog"),
+            "load_catalog_connector must leave the status to load_catalog, wrote: {statuses:?}"
+        );
+    }
+
+    /// The #12417 regression: before this fix every failure `load_catalog_connector`
+    /// could raise reached `RetryError::transient`, so a Spicepod naming a provider
+    /// that is not registered was rebuilt with unbounded backoff forever.
+    #[test]
+    fn an_unregistered_catalog_provider_is_permanent() {
+        let err = crate::Error::UnknownCatalogConnector {
+            catalog_connector: "unity_catlog".to_string(),
+            suggestion: Some("unity_catalog".to_string()),
+            available: vec!["unity_catalog".to_string()],
+        };
+        assert!(
+            is_permanent_catalog_failure(&err),
+            "only a Spicepod edit can register the missing provider — retrying cannot"
+        );
+    }
+
+    /// The other half of #12417: parameter validation rejects the catalog before
+    /// any connector exists, so it raises `runtime_parameters::Error` rather than
+    /// a `catalogconnector::Error` and the original downcast missed it.
+    #[test]
+    fn a_catalog_parameter_validation_failure_is_permanent() {
+        let source = runtime_parameters::Error::InvalidConfigurationNoSource {
+            component: "catalog uc".to_string(),
+            message: "Missing required parameter: unity_catalog_token".to_string(),
+        };
+        let err = initialize_error(Box::new(source));
+        assert!(
+            is_permanent_catalog_failure(&err),
+            "a missing required parameter is a pure function of the Spicepod"
+        );
+    }
+
+    /// Guards the refactor from the inline `matches!` to the shared helper: the
+    /// connector's own configuration errors must still classify permanent.
+    #[test]
+    fn a_catalog_connector_configuration_error_is_still_permanent() {
+        let source = catalogconnector::Error::InvalidConfigurationNoSource {
+            connector: "unity_catalog".to_string(),
+            connector_component: catalog_component(),
+            message: "invalid endpoint".to_string(),
+        };
+        let err = initialize_error(Box::new(source));
+        assert!(
+            is_permanent_catalog_failure(&err),
+            "is_configuration_error() classified this before the helper existed"
+        );
+    }
+
+    #[test]
+    fn an_unreachable_catalog_source_stays_retriable() {
+        let source = catalogconnector::Error::UnableToGetCatalogProvider {
+            connector: "unity_catalog".to_string(),
+            connector_component: catalog_component(),
+            source: "connection refused".into(),
+        };
+        let err = initialize_error(Box::new(source));
+        assert!(
+            !is_permanent_catalog_failure(&err),
+            "a source that is merely down must keep retrying so it recovers on its own"
+        );
+    }
+
+    /// An error type neither downcast recognises must not be assumed permanent —
+    /// failing open here would strand a catalog that would have recovered.
+    #[test]
+    fn an_unclassified_boxed_error_stays_retriable() {
+        let err = initialize_error("some transport failure".into());
+        assert!(
+            !is_permanent_catalog_failure(&err),
+            "an unrecognised error is not evidence the configuration is wrong"
+        );
+    }
+
+    /// Registration failures are reported through a different variant, which this
+    /// change deliberately leaves retriable.
+    #[test]
+    fn a_registration_failure_stays_retriable() {
+        let err = crate::Error::UnableToLoadCatalogConnector {
+            catalog: "uc".to_string(),
+            source: "table already exists".into(),
+        };
+        assert!(
+            !is_permanent_catalog_failure(&err),
+            "registering into DataFusion can fail transiently"
+        );
     }
 }

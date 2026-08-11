@@ -29,8 +29,9 @@ pub use config::{
 
 use arrow::error::ArrowError;
 use arrow::{
-    array::{Array, ArrayRef, ListArray, RecordBatch, StringArray, StructArray},
-    datatypes::{DataType, Field, Schema, SchemaRef},
+    array::{Array, ArrayRef, BooleanArray, ListArray, RecordBatch, StringArray, StructArray},
+    compute::kernels::nullif::nullif,
+    datatypes::{DataType, Field, Fields, Schema, SchemaRef},
 };
 use arrow_buffer::OffsetBuffer;
 use async_trait::async_trait;
@@ -551,9 +552,7 @@ impl ChangeEnvelope {
     /// large burst it can run well past the async runtime's ~100µs-per-await
     /// budget. Prefer [`Self::into_parts_offloaded`] from an async task; reserve
     /// this for synchronous contexts or already-materialized envelopes.
-    pub fn into_parts(
-        self,
-    ) -> Result<(Box<dyn CommitChange + Send + Sync>, ChangeBatch, bool), ChangeBatchError> {
+    pub fn into_parts(self) -> Result<ChangeEnvelopeParts, ChangeBatchError> {
         let batch = self.change_batch.into_built()?;
         Ok((self.change_committer, batch, self.is_dataset_ready))
     }
@@ -565,18 +564,15 @@ impl ChangeEnvelope {
     /// An already-materialized (eager) envelope resolves inline — its build is
     /// a no-op, and `spawn_blocking` dispatch would only add overhead to that
     /// hot path.
-    pub async fn into_parts_offloaded(
-        self,
-    ) -> Result<(Box<dyn CommitChange + Send + Sync>, ChangeBatch, bool), ChangeBatchError> {
-        if self.change_batch.is_materialized() {
-            return self.into_parts();
-        }
-        match tokio::task::spawn_blocking(move || self.into_parts()).await {
-            Ok(parts) => parts,
-            Err(join_err) => Err(ChangeBatchError::DeferredBuild {
-                message: format!("deferred CDC batch build task failed: {join_err}"),
-            }),
-        }
+    pub async fn into_parts_offloaded(self) -> Result<ChangeEnvelopeParts, ChangeBatchError> {
+        let materialized = self.change_batch.is_materialized();
+        offload_build(materialized, move || self.into_parts()).await
+    }
+
+    /// Whether the change batch is already built, so [`Self::into_parts`]
+    /// resolves without running a deferred build.
+    fn is_materialized(&self) -> bool {
+        self.change_batch.is_materialized()
     }
 
     #[must_use]
@@ -601,6 +597,56 @@ impl ChangeEnvelope {
     pub fn is_dataset_ready(&self) -> bool {
         self.is_dataset_ready
     }
+}
+
+/// The parts of a consumed [`ChangeEnvelope`]: committer, built change batch,
+/// and dataset-ready flag.
+pub type ChangeEnvelopeParts = (Box<dyn CommitChange + Send + Sync>, ChangeBatch, bool);
+
+/// Run a CDC batch build off the async worker, but only when it would actually
+/// block: an already-materialized build is a no-op, and `spawn_blocking`
+/// dispatch would be pure overhead on that hot path.
+///
+/// Shared by both entry points so the offload policy — when to hand off, and how
+/// a lost blocking task maps onto [`ChangeBatchError`] — is decided in one place.
+async fn offload_build<T: Send + 'static>(
+    materialized: bool,
+    build: impl FnOnce() -> Result<T, ChangeBatchError> + Send + 'static,
+) -> Result<T, ChangeBatchError> {
+    if materialized {
+        return build();
+    }
+    match tokio::task::spawn_blocking(build).await {
+        Ok(parts) => parts,
+        Err(join_err) => Err(ChangeBatchError::DeferredBuild {
+            message: format!("deferred CDC batch build task failed: {join_err}"),
+        }),
+    }
+}
+
+/// [`ChangeEnvelope::into_parts_offloaded`] for a whole drained burst: one
+/// blocking-pool handoff for the burst instead of one per envelope.
+///
+/// The decode work is unchanged; what is amortized is the `spawn_blocking` round
+/// trip, so the win scales with envelopes-per-burst. A burst of
+/// already-materialized envelopes resolves inline, with no handoff at all.
+///
+/// The first failed build discards the rest of the burst — callers MUST treat
+/// the error as terminal for the dataset. The burst's committers are dropped
+/// unacked, so the source re-streams from the last acked position.
+pub async fn into_parts_offloaded_burst(
+    envelopes: Vec<ChangeEnvelope>,
+) -> Result<Vec<ChangeEnvelopeParts>, ChangeBatchError> {
+    // `all` short-circuits, so a deferred source (the case this exists for) reads
+    // exactly one envelope; only a fully-eager burst walks it.
+    let materialized = envelopes.iter().all(ChangeEnvelope::is_materialized);
+    offload_build(materialized, move || {
+        envelopes
+            .into_iter()
+            .map(ChangeEnvelope::into_parts)
+            .collect()
+    })
+    .await
 }
 
 /// A [`CommitChange`] implementation that does nothing. Useful when emitting
@@ -791,12 +837,63 @@ pub fn changes_schema(table_schema: &Schema) -> Schema {
     ])
 }
 
+/// The change-event schema extended with the row's **before-image**: the values
+/// the row held prior to an `UPDATE`/`DELETE`.
+///
+/// A source that can supply it builds its batches in this schema; every other
+/// source keeps [`changes_schema`] and behaves exactly as before.
+/// [`ChangeBatch`] accepts both, so this is additive. The sources that can:
+/// `MySQL`, which Spice pins to `binlog_row_image = FULL`, and `PostgreSQL`
+/// under `REPLICA IDENTITY FULL`.
+///
+/// Carrying the before-image lets a downstream incremental-aggregate maintainer
+/// retract a row's prior contribution directly from the change event. Without
+/// it, the maintainer has to retain every live row's values just to reconstruct
+/// them on update, which makes its state O(live rows) instead of O(groups).
+///
+/// The `before` struct's fields are all nullable even where the table declares
+/// them non-null, because a before-image is partial by nature: `PostgreSQL`
+/// under `REPLICA IDENTITY DEFAULT` sends only the identity columns and leaves
+/// the rest null. Reusing the table's own nullability would make that batch
+/// unconstructible — `StructArray::try_new` rejects a null under a non-nullable
+/// field — so a source could not express what its replication stream actually
+/// carries. `data` keeps the table's nullability: it is a complete row.
+#[must_use]
+pub fn changes_schema_with_before(table_schema: &Schema) -> Schema {
+    let mut fields = changes_schema(table_schema).fields().to_vec();
+    fields.push(Arc::new(Field::new(
+        "before",
+        DataType::Struct(nullable_fields(table_schema.fields()).into()),
+        true,
+    )));
+    Schema::new(fields)
+}
+
+/// The before-image's fields, every one marked nullable.
+///
+/// A before-image is partial by nature: an `INSERT` has none at all, and a
+/// source may send only the identity columns — `PostgreSQL` under
+/// `REPLICA IDENTITY DEFAULT` sends exactly those, leaving the rest null even
+/// where the table declares them non-null. Both accessors derive their schema
+/// here so neither hands back a batch whose schema claims a non-nullability its
+/// values do not honour.
+fn nullable_fields(fields: &Fields) -> Vec<Arc<Field>> {
+    fields
+        .iter()
+        .map(|field| Arc::new(field.as_ref().clone().with_nullable(true)))
+        .collect()
+}
+
 #[derive(Clone, Debug)]
 pub struct ChangeBatch {
     pub record: RecordBatch,
     op_idx: usize,
     primary_keys_idx: usize,
     data_idx: usize,
+    /// Column index of the optional before-image struct ([`changes_schema_with_before`]).
+    /// `None` for batches in the base [`changes_schema`], whose sources cannot
+    /// supply the row's prior values.
+    before_idx: Option<usize>,
     /// Newest upstream COMMIT timestamp in this batch (milliseconds since the Unix
     /// epoch — a wall clock, NOT a monotonic `Instant`), when the source provides
     /// one; `None` otherwise. Lets a downstream consumer compute true end-to-end
@@ -855,12 +952,15 @@ impl ChangeBatch {
         let Some((data_idx, _)) = schema.column_with_name("data") else {
             unreachable!("The schema is validated to have a 'data' field")
         };
+        // Absent for the base `changes_schema`; validation already accepted both.
+        let before_idx = schema.column_with_name("before").map(|(idx, _)| idx);
 
         Ok(Self {
             record,
             op_idx,
             primary_keys_idx,
             data_idx,
+            before_idx,
             source_commit_ts_ms: None,
         })
     }
@@ -989,6 +1089,113 @@ impl ChangeBatch {
         record_batch
     }
 
+    /// Whether this batch carries a before-image column
+    /// ([`changes_schema_with_before`]). Callers that can exploit prior row
+    /// values must branch on this rather than assuming it — most sources cannot
+    /// supply one.
+    #[must_use]
+    pub fn has_before_image(&self) -> bool {
+        self.before_idx.is_some()
+    }
+
+    /// The row's before-image — the values it held prior to an `UPDATE`/`DELETE`
+    /// — as a single-row `RecordBatch`.
+    ///
+    /// `None` when the batch carries no before-image column, and also when this
+    /// row's before-image is null (an `INSERT` has no prior values, and a source
+    /// may omit it per-row). A `Some` batch may still hold nulls in individual
+    /// columns where the source sent only key columns — `PostgreSQL` under
+    /// `REPLICA IDENTITY DEFAULT` does exactly that — so a caller needing
+    /// complete prior values must check the columns it reads;
+    /// [`changes_schema_with_before`] declares every before-image field nullable
+    /// so such a batch is representable at all.
+    #[must_use]
+    pub fn before(&self, row: usize) -> Option<RecordBatch> {
+        let before_idx = self.before_idx?;
+        let before_col = self.record.column(before_idx);
+        if before_col.is_null(row) {
+            return None;
+        }
+        let Some(before_array) = before_col.as_any().downcast_ref::<StructArray>() else {
+            unreachable!("The schema is validated to have a 'before' field which is a StructArray");
+        };
+        let DataType::Struct(fields) = before_array.data_type() else {
+            unreachable!("The schema is validated to have a 'before' field which is a StructArray");
+        };
+        let row_slice = before_array.slice(row, 1);
+        let Ok(record_batch) = RecordBatch::try_new(
+            Arc::new(Schema::new(fields.clone())),
+            row_slice.columns().to_vec(),
+        ) else {
+            unreachable!("A one-row slice's columns all have exactly one row");
+        };
+        Some(record_batch)
+    }
+
+    /// The whole before-image column as a `RecordBatch` aligned row-for-row with
+    /// [`Self::data_batch`]. `None` when the batch carries no before-image.
+    ///
+    /// Rows without prior values (inserts) read back as null in every column, so
+    /// a caller can retract from this batch alone; pairing each row with its `op`
+    /// still tells it which rows are *meant* to retract.
+    ///
+    /// So `op` is the only authority on what a row is. Do NOT infer the operation
+    /// from this batch: an all-null row means "the source sent no prior values"
+    /// *or* "every prior value was NULL", and the two are indistinguishable here
+    /// once the struct's validity has been pushed into the columns. `op` is
+    /// non-nullable in both change schemas precisely so this question never has
+    /// to be answered from the before-image.
+    ///
+    /// Every field is reported nullable regardless of how the table declares it:
+    /// a before-image is absent on insert, and a source may send only the key
+    /// columns (`PostgreSQL` under `REPLICA IDENTITY DEFAULT` does exactly that),
+    /// so nulls are expected in columns the table itself marks non-null.
+    #[must_use]
+    pub fn before_batch(&self) -> Option<RecordBatch> {
+        let before_idx = self.before_idx?;
+        let before_col = self.record.column(before_idx);
+        let Some(before_array) = before_col.as_any().downcast_ref::<StructArray>() else {
+            unreachable!("The schema is validated to have a 'before' field which is a StructArray");
+        };
+        let DataType::Struct(fields) = before_array.data_type() else {
+            unreachable!("The schema is validated to have a 'before' field which is a StructArray");
+        };
+
+        // A `RecordBatch` has no struct-level validity to carry, and Arrow lets a
+        // null struct slot hold arbitrary values underneath it. Returning the
+        // child arrays as-is would therefore let a row the source marked as
+        // having *no* prior values read back as real ones — and a maintained
+        // aggregate would retract a contribution that was never made. Push the
+        // struct's nulls down into every column so the batch says what the struct
+        // said.
+        let columns = if let Some(struct_nulls) = before_array.nulls() {
+            let row_is_null = BooleanArray::new(!struct_nulls.inner(), None);
+            before_array
+                .columns()
+                .iter()
+                .map(|column| {
+                    let Ok(masked) = nullif(column.as_ref(), &row_is_null) else {
+                        unreachable!(
+                            "The mask is this struct's own validity, so it shares the column's row count"
+                        );
+                    };
+                    masked
+                })
+                .collect()
+        } else {
+            before_array.columns().to_vec()
+        };
+
+        let Ok(record_batch) = RecordBatch::try_new(Arc::new(Schema::new(fields.clone())), columns)
+        else {
+            unreachable!("The 'before' struct's columns are validated to share one row count");
+        };
+        Some(record_batch)
+    }
+
+    /// Accepts both the base [`changes_schema`] and the before-image-carrying
+    /// [`changes_schema_with_before`], so a source that gains before-images does
+    /// not break consumers (or sources) that never had them.
     fn validate_schema(schema: SchemaRef) -> Result<(), ChangeBatchError> {
         let Some(data_col) = schema.fields().iter().find(|field| field.name() == "data") else {
             return SchemaMismatchSnafu {
@@ -1009,8 +1216,9 @@ impl ChangeBatch {
             }
         };
 
-        let expected_schema = changes_schema(&data_schema);
-        if *schema != expected_schema {
+        if *schema != changes_schema(&data_schema)
+            && *schema != changes_schema_with_before(&data_schema)
+        {
             return SchemaMismatchSnafu {
                 detail: "Schema didn't match expected change batch format",
                 schema,
@@ -1095,9 +1303,327 @@ pub fn replace_change_batch_data(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::datatypes::{DataType, Field, Fields, Schema};
     use arrow_array::{Int32Array, StringArray};
     use std::sync::Arc;
+
+    fn before_image_test_schema() -> Schema {
+        Schema::new(vec![
+            Field::new("id", DataType::Int32, true),
+            Field::new("amount", DataType::Int32, true),
+        ])
+    }
+
+    /// Builds a two-row change batch in the before-image schema: row 0 is an
+    /// INSERT (no prior values), row 1 an UPDATE carrying its before-image.
+    fn before_image_batch() -> ChangeBatch {
+        use arrow_array::StructArray;
+        use arrow_array::builder::{ListBuilder, StringBuilder};
+
+        let table = before_image_test_schema();
+        let wrapper = changes_schema_with_before(&table);
+
+        let data = StructArray::from(vec![
+            (
+                Arc::new(Field::new("id", DataType::Int32, true)),
+                Arc::new(Int32Array::from(vec![1, 2])) as arrow_array::ArrayRef,
+            ),
+            (
+                Arc::new(Field::new("amount", DataType::Int32, true)),
+                Arc::new(Int32Array::from(vec![10, 25])) as arrow_array::ArrayRef,
+            ),
+        ]);
+        // Row 0 (insert) has no before-image; row 1 (update) held amount=20.
+        let before = StructArray::try_new(
+            table.fields().clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![None, Some(2)])),
+                Arc::new(Int32Array::from(vec![None, Some(20)])),
+            ],
+            Some(vec![false, true].into()),
+        )
+        .expect("before-image struct should be valid");
+
+        // `primary_keys` is List<Utf8> with a non-null item field; both rows carry
+        // a single key name.
+        let mut pk_builder = ListBuilder::new(StringBuilder::new())
+            .with_field(Arc::new(Field::new("item", DataType::Utf8, false)));
+        for _ in 0..2 {
+            pk_builder.values().append_value("id");
+            pk_builder.append(true);
+        }
+
+        let record = RecordBatch::try_new(
+            Arc::new(wrapper),
+            vec![
+                Arc::new(StringArray::from(vec!["c", "u"])),
+                Arc::new(pk_builder.finish()) as arrow_array::ArrayRef,
+                Arc::new(data),
+                Arc::new(before),
+            ],
+        )
+        .expect("before-image test batch must match the wrapper schema");
+        ChangeBatch::try_new(record).expect("before-image batch should validate")
+    }
+
+    /// The base schema must keep validating unchanged: sources that cannot supply
+    /// a before-image (and the connectors that build batches for them) must not
+    /// break when the field is added.
+    #[test]
+    fn base_change_schema_still_validates_without_before_image() {
+        let table = before_image_test_schema();
+        let record = RecordBatch::new_empty(Arc::new(changes_schema(&table)));
+        let batch = ChangeBatch::try_new(record).expect("base schema must still validate");
+        assert!(
+            !batch.has_before_image(),
+            "a base-schema batch carries no before-image"
+        );
+        assert!(
+            batch.before_batch().is_none(),
+            "before_batch must be None when the column is absent"
+        );
+    }
+
+    #[test]
+    fn before_image_schema_validates_and_exposes_prior_values() {
+        let batch = before_image_batch();
+        assert!(batch.has_before_image(), "the before column must be seen");
+
+        // Row 0 is an insert: no prior values to retract.
+        assert!(
+            batch.before(0).is_none(),
+            "an insert has no before-image, so retraction must have nothing to read"
+        );
+
+        // Row 1 is an update: the prior amount is what a maintained aggregate
+        // subtracts, and it is exactly what the per-row index existed to store.
+        let before = batch.before(1).expect("an update carries its before-image");
+        assert_eq!(before.num_rows(), 1);
+        let amount = before
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("amount column is Int32");
+        assert_eq!(
+            amount.value(0),
+            20,
+            "the before-image must carry the row's prior value, not the new one"
+        );
+
+        // And the new value still arrives through `data`, unchanged.
+        let data = batch.data(1);
+        let new_amount = data
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("amount column is Int32");
+        assert_eq!(new_amount.value(0), 25, "data still carries the new value");
+    }
+
+    #[test]
+    fn before_batch_aligns_row_for_row_with_data_batch() {
+        let batch = before_image_batch();
+        let data = batch.data_batch();
+        let before = batch
+            .before_batch()
+            .expect("a before-image batch exposes the whole column");
+        assert_eq!(
+            data.num_rows(),
+            before.num_rows(),
+            "before-image rows must align with data rows so each row pairs with its op"
+        );
+        assert_eq!(
+            data.schema().fields().len(),
+            before.schema().fields().len(),
+            "before-image and data share the table schema"
+        );
+    }
+
+    /// A null struct slot means "this row has no prior values", but Arrow lets the
+    /// child arrays hold anything underneath it. `before_batch` flattens the
+    /// struct into a `RecordBatch`, which has no struct-level validity to carry,
+    /// so it must push that null down into every column — otherwise a maintained
+    /// aggregate reads the values hiding under an insert as real prior values and
+    /// retracts a contribution that was never made.
+    ///
+    /// The table also declares `id` non-null, so this covers the second half: the
+    /// mask introduces nulls into a column the table marks non-nullable, and the
+    /// returned schema has to admit them.
+    #[test]
+    fn before_batch_masks_columns_hidden_under_a_null_struct_slot() {
+        use arrow_array::StructArray;
+        use arrow_array::builder::{ListBuilder, StringBuilder};
+
+        let table = Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("amount", DataType::Int32, true),
+        ]);
+        let wrapper = changes_schema_with_before(&table);
+
+        let data = StructArray::try_new(
+            table.fields().clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])) as arrow_array::ArrayRef,
+                Arc::new(Int32Array::from(vec![10, 25])) as arrow_array::ArrayRef,
+            ],
+            None,
+        )
+        .expect("data struct should be valid");
+
+        // Row 0 is an insert: its struct slot is null, yet its child arrays are
+        // fully populated — legal Arrow, and exactly what a source that reuses a
+        // scratch buffer produces. The before-image's fields come from the
+        // wrapper, which declares them nullable however the table declares them.
+        let before = StructArray::try_new(
+            Fields::from(nullable_fields(table.fields())),
+            vec![
+                Arc::new(Int32Array::from(vec![999, 2])) as arrow_array::ArrayRef,
+                Arc::new(Int32Array::from(vec![777, 20])) as arrow_array::ArrayRef,
+            ],
+            Some(vec![false, true].into()),
+        )
+        .expect("before-image struct should be valid");
+
+        let mut pk_builder = ListBuilder::new(StringBuilder::new())
+            .with_field(Arc::new(Field::new("item", DataType::Utf8, false)));
+        for _ in 0..2 {
+            pk_builder.values().append_value("id");
+            pk_builder.append(true);
+        }
+
+        let record = RecordBatch::try_new(
+            Arc::new(wrapper),
+            vec![
+                Arc::new(StringArray::from(vec!["c", "u"])),
+                Arc::new(pk_builder.finish()) as arrow_array::ArrayRef,
+                Arc::new(data),
+                Arc::new(before),
+            ],
+        )
+        .expect("before-image test batch must match the wrapper schema");
+        let batch = ChangeBatch::try_new(record).expect("before-image batch should validate");
+
+        let before_batch = batch
+            .before_batch()
+            .expect("a before-image batch exposes the whole column");
+        for (column, name) in [(0, "id"), (1, "amount")] {
+            let values = before_batch
+                .column(column)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .expect("before-image columns are Int32");
+            assert!(
+                values.is_null(0),
+                "{name} must read back null for the insert, not the value hidden under the null struct slot"
+            );
+        }
+
+        // The update's prior values still survive the mask.
+        let amount = before_batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("amount column is Int32");
+        assert_eq!(
+            amount.value(1),
+            20,
+            "the update's before-image must be untouched by the mask"
+        );
+
+        // Per-row access agrees with the flattened batch.
+        assert!(
+            batch.before(0).is_none(),
+            "the insert has no before-image at all"
+        );
+
+        // And the per-row accessor reports the same nullability as the
+        // flattened one, so a partial before-image is representable either way.
+        let row = batch
+            .before(1)
+            .expect("the update carries its before-image");
+        assert!(
+            row.schema().field(0).is_nullable(),
+            "before() must report 'id' nullable even though the table declares it non-null"
+        );
+        assert_eq!(
+            row.schema().fields().len(),
+            before_batch.schema().fields().len(),
+            "both accessors expose the same columns"
+        );
+    }
+
+    /// `PostgreSQL` under `REPLICA IDENTITY DEFAULT` sends only the identity
+    /// columns, so a before-image legitimately holds nulls in columns the table
+    /// declares non-null. Building the single-row batch against the table's own
+    /// nullability would misrepresent that.
+    #[test]
+    fn before_row_admits_nulls_in_a_table_non_null_column() {
+        use arrow_array::StructArray;
+        use arrow_array::builder::{ListBuilder, StringBuilder};
+
+        let table = Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("amount", DataType::Int32, false),
+        ]);
+        let wrapper = changes_schema_with_before(&table);
+
+        let data = StructArray::try_new(
+            table.fields().clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![2])) as arrow_array::ArrayRef,
+                Arc::new(Int32Array::from(vec![25])) as arrow_array::ArrayRef,
+            ],
+            None,
+        )
+        .expect("data struct should be valid");
+
+        // Identity column present, non-identity column absent — the shape
+        // REPLICA IDENTITY DEFAULT produces.
+        let before = StructArray::try_new(
+            Fields::from(vec![
+                Field::new("id", DataType::Int32, true),
+                Field::new("amount", DataType::Int32, true),
+            ]),
+            vec![
+                Arc::new(Int32Array::from(vec![Some(2)])) as arrow_array::ArrayRef,
+                Arc::new(Int32Array::from(vec![Option::<i32>::None])) as arrow_array::ArrayRef,
+            ],
+            None,
+        )
+        .expect("partial before-image struct should be valid");
+
+        let mut pk_builder = ListBuilder::new(StringBuilder::new())
+            .with_field(Arc::new(Field::new("item", DataType::Utf8, false)));
+        pk_builder.values().append_value("id");
+        pk_builder.append(true);
+
+        let record = RecordBatch::try_new(
+            Arc::new(wrapper),
+            vec![
+                Arc::new(StringArray::from(vec!["u"])),
+                Arc::new(pk_builder.finish()) as arrow_array::ArrayRef,
+                Arc::new(data),
+                Arc::new(before),
+            ],
+        )
+        .expect("partial before-image batch must match the wrapper schema");
+        let batch = ChangeBatch::try_new(record).expect("batch should validate");
+
+        let row = batch.before(0).expect("the update carries a before-image");
+        let amount = row
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("amount column is Int32");
+        assert!(
+            amount.is_null(0),
+            "the column the source omitted stays null rather than being misreported"
+        );
+        assert!(
+            row.schema().field(1).is_nullable(),
+            "the returned schema must admit that null"
+        );
+    }
 
     #[test]
     fn noop_committer_does_not_support_deferral() {
@@ -1330,6 +1856,102 @@ mod deferred_tests {
             env.change_batch().expect("already built").record.num_rows(),
             0
         );
+    }
+
+    // ----- burst-wide deferred build -----
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn burst_builds_every_deferred_envelope_in_order() {
+        let builds = Arc::new(AtomicUsize::new(0));
+        let envelopes: Vec<ChangeEnvelope> = [1i32, 2, 3]
+            .into_iter()
+            .map(|rows| {
+                deferred(
+                    MockRows {
+                        result: Some(sample_batch(rows)),
+                        builds: Arc::clone(&builds),
+                        rows_hint: usize::try_from(rows).expect("positive row count"),
+                        empty: false,
+                        ts: None,
+                    },
+                    false,
+                )
+            })
+            .collect();
+
+        let parts = into_parts_offloaded_burst(envelopes)
+            .await
+            .expect("burst builds ok");
+
+        assert_eq!(
+            parts
+                .iter()
+                .map(|(_, batch, _)| batch.record.num_rows())
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3],
+            "burst order must be preserved — committers pair with their batches"
+        );
+        assert_eq!(builds.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn burst_of_materialized_envelopes_resolves_inline() {
+        // Eager sources materialize on delivery, so the whole burst must resolve
+        // through the no-handoff path and still return every part in order.
+        let envelopes = vec![
+            ChangeEnvelope::new(Box::new(NoOpCommitter), sample_batch(2), false),
+            ChangeEnvelope::new(Box::new(NoOpCommitter), sample_batch(4), true),
+        ];
+        assert!(envelopes.iter().all(ChangeEnvelope::is_materialized));
+
+        let parts = into_parts_offloaded_burst(envelopes)
+            .await
+            .expect("materialized burst resolves");
+
+        assert_eq!(
+            parts
+                .iter()
+                .map(|(_, batch, ready)| (batch.record.num_rows(), *ready))
+                .collect::<Vec<_>>(),
+            vec![(2, false), (4, true)]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn burst_surfaces_a_failed_build_as_a_typed_error() {
+        let builds = Arc::new(AtomicUsize::new(0));
+        let envelopes = vec![
+            deferred(
+                MockRows {
+                    result: Some(sample_batch(1)),
+                    builds: Arc::clone(&builds),
+                    rows_hint: 1,
+                    empty: false,
+                    ts: None,
+                },
+                false,
+            ),
+            deferred(
+                MockRows {
+                    result: None, // build fails
+                    builds: Arc::clone(&builds),
+                    rows_hint: 1,
+                    empty: false,
+                    ts: None,
+                },
+                false,
+            ),
+        ];
+
+        // `expect_err` is unavailable: the Ok side holds a `Box<dyn CommitChange>`,
+        // which is not `Debug`.
+        match into_parts_offloaded_burst(envelopes).await {
+            Ok(_) => panic!("a failed build must fail the burst"),
+            Err(err) => assert!(
+                matches!(err, ChangeBatchError::DeferredBuild { .. }),
+                "expected a typed DeferredBuild error, got {err:?}"
+            ),
+        }
     }
 
     // ----- lag-based readiness helpers -----

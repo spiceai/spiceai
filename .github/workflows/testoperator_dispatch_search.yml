@@ -1,0 +1,84 @@
+name: testoperator dispatch search
+
+on:
+  schedule:
+    - cron: '0 6 * * 2,5' # Every Monday and Thursday at 8pm PST (6am UTC next day)
+
+  workflow_dispatch:
+    inputs:
+      spiced_commit:
+        description: 'An optional commit hash to use for spiced'
+        required: false
+        type: string
+
+jobs:
+  dispatch-search:
+    name: Dispatch search benchmarks
+    runs-on: spiceai-dev-runners
+    timeout-minutes: 720
+    concurrency:
+      group: testoperator-dispatch-search-${{ github.event.schedule || github.event.ref }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install MinIO
+        uses: ./.github/actions/setup-minio
+        with:
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+
+      - name: Setup spiced
+        uses: ./.github/actions/setup-spiced
+        id: setup-spiced
+        with:
+          spiced_commit: ${{ github.event.inputs.spiced_commit }}
+          # github.event.ref is empty on schedule (cron only runs on the default branch).
+          ref: ${{ github.event.ref || 'refs/heads/trunk' }}
+
+      - name: Display spiced commit
+        run: echo "SPICED_COMMIT=${{ steps.setup-spiced.outputs.SPICED_COMMIT }}"
+
+      - name: Build Testoperator
+        uses: ./.github/actions/build-testoperator
+        with:
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+
+      - name: Build spicepod validator
+        id: build-spicepod-validator
+        uses: ./.github/actions/build-spicepod-validator
+        with:
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+
+      - name: Set spicepod validator path
+        run: echo "SPICEPOD_VALIDATOR=${{ steps.build-spicepod-validator.outputs.validator-path }}" >> $GITHUB_ENV
+
+      - name: Validate spicepods - Search - MTEB
+        run: |
+          shopt -s globstar nullglob
+          for file in ./test/spicepods/search/mteb/**/*.yaml; do
+            echo "Validating $file"
+            "$SPICEPOD_VALIDATOR" "$file"
+          done
+
+      # --max-concurrent 1 serializes the dispatched runs: configurations that share an
+      # embedding model provider throttle each other when run concurrently
+      # (https://github.com/spiceai/spiceai/issues/6653). The slot wait must exceed one
+      # run's wall clock (up to 60 minutes) so the queue drains instead of giving up.
+      - name: Dispatch Testoperator - Search - MTEB
+        run: |
+          testoperator dispatch ./tools/testoperator/dispatch/search \
+            --workflow search \
+            --max-concurrent 1 \
+            --max-concurrent-wait-timeout-mins 90
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
+          WORKFLOW_COMMIT: ${{ github.event.ref || 'trunk' }}

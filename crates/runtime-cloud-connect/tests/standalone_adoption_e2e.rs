@@ -41,7 +41,9 @@ limitations under the License.
 //!    code loads the persisted identity and reconnects over mTLS.
 //! 4. `heartbeat_and_telemetry_cadence` — periodic frames on their
 //!    configured cadences.
-//! 5. `apply_spicepod` — the YAML is written and hot-applied.
+//! 5. `apply_spicepod` — the YAML is persisted, the result is flushed, and the
+//!    runtime is asked to exit so its supervisor restarts it onto the new
+//!    configuration.
 //! 6. `reconnect_over_mtls` — after the server drops the stream, the
 //!    client reconnects, presenting its client certificate again.
 //! 7. `renewal` — a short-lived leaf triggers the renewal loop: a fresh
@@ -64,7 +66,6 @@ limitations under the License.
 
 use std::collections::{HashSet, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -77,7 +78,10 @@ use rcgen::{
     ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair, KeyUsagePurpose, PublicKeyData as _, SanType,
 };
 use runtime_cloud_connect::config::CloudConnectConfig;
-use runtime_cloud_connect::handlers::{Capability, CommandError, RuntimeHandle};
+use runtime_cloud_connect::handlers::{
+    ApplyOutcome, Capability, CommandError, MAX_QUERY_RESULT_BYTES, MAX_QUERY_ROWS, QueryOutcome,
+    RuntimeHandle, SpicepodDeployment,
+};
 use runtime_cloud_connect::identity::IdentityStore;
 use runtime_cloud_connect::proto;
 use runtime_cloud_connect::proto::cloud_connect_server::{CloudConnect, CloudConnectServer};
@@ -194,6 +198,10 @@ struct CloudMock {
     /// The public key pinned at the last enroll/renew — the only key whose
     /// PoP signature authorizes a rotation (mirrors the cloud's pinning).
     pinned_point: Arc<Mutex<Option<Vec<u8>>>>,
+    /// The region on the instance's registry row, standing in for the stored
+    /// column: an enroll declaring a region writes it, one that declares none
+    /// leaves it untouched.
+    stored_region: Arc<Mutex<Option<String>>>,
     enroll_requests: Arc<Mutex<Vec<Value>>>,
     renew_requests: Arc<Mutex<Vec<Value>>>,
 }
@@ -208,6 +216,7 @@ impl CloudMock {
             leaf_validity_secs,
             codes: Arc::new(Mutex::new(codes)),
             pinned_point: Arc::new(Mutex::new(None)),
+            stored_region: Arc::new(Mutex::new(None)),
             enroll_requests: Arc::new(Mutex::new(Vec::new())),
             renew_requests: Arc::new(Mutex::new(Vec::new())),
         }
@@ -259,6 +268,20 @@ async fn mock_enroll(
     // echoes the requested app back, matching the response contract.
     if let Some(app_name) = body["app_name"].as_str() {
         response["app_name"] = serde_json::Value::String(app_name.to_string());
+    }
+    // The real cloud reports the region now stored on the row: the declared
+    // one when the request carried it, otherwise whatever the row already
+    // held (a re-enrol with no `region` leaves it alone). The mock stands in
+    // for that stored value.
+    let stored_region = match body["region"].as_str() {
+        Some(region) => {
+            *mock.stored_region.lock().await = Some(region.to_string());
+            Some(region.to_string())
+        }
+        None => mock.stored_region.lock().await.clone(),
+    };
+    if let Some(region) = stored_region {
+        response["region"] = serde_json::Value::String(region);
     }
     (StatusCode::OK, Json(response))
 }
@@ -353,6 +376,10 @@ struct Captured {
     heartbeats: Vec<proto::Heartbeat>,
     telemetry: Vec<proto::Telemetry>,
     audits: Vec<proto::EventLog>,
+    /// Per-connection encryption keys the client announced. The gateway seals
+    /// delivered secrets to these, so a session that announced none receives
+    /// none.
+    secrets_keys: Vec<proto::SecretsKey>,
 }
 
 #[derive(Clone)]
@@ -475,10 +502,13 @@ impl CloudConnect for GatewayServer {
                     // pushes OTLP metrics. The arms are spelled out rather than
                     // wildcarded so a new client message still has to be
                     // accounted for here.
-                    Some(
-                        proto::client_message::Body::SecretsKey(_)
-                        | proto::client_message::Body::ExportMetrics(_),
-                    ) => {}
+                    Some(proto::client_message::Body::ExportMetrics(_)) => {}
+                    // Announced once per stream, immediately after the Hello:
+                    // the gateway needs it to seal the outer layer of any
+                    // secrets it dispatches on this session.
+                    Some(proto::client_message::Body::SecretsKey(key)) => {
+                        captured.lock().await.secrets_keys.push(key);
+                    }
                     None => break,
                 }
             }
@@ -526,7 +556,15 @@ async fn spawn_gateway(server: GatewayServer, ca: &TestCa) -> SocketAddr {
 
 #[derive(Default)]
 struct E2eRuntimeState {
-    applied_spicepod: Option<(std::path::PathBuf, String)>,
+    /// The path, spicepod, and app id of the last apply.
+    applied_spicepod: Option<(std::path::PathBuf, String, Option<String>)>,
+    /// Names of the secrets delivered with the last applied spicepod, never
+    /// values. `None` when the deployment carried no payload at all.
+    delivered_secret_names: Option<Vec<String>>,
+    /// Set when the client asked the runtime to exit and apply. The real
+    /// adapter ends the process here; a test one records that it was asked, so
+    /// the test can assert the result was flushed first.
+    exit_requested: bool,
 }
 
 struct E2eRuntime {
@@ -560,24 +598,703 @@ impl RuntimeHandle for E2eRuntime {
 
     async fn apply_spicepod(
         &self,
-        config_dir: &Path,
-        spicepod_yaml: &str,
-    ) -> Result<Value, CommandError> {
-        // Persist to the canonical path and report a hot apply, mirroring the
-        // spiced adapter's observable result envelope.
-        let path = config_dir.join(runtime_cloud_connect::config::CLOUD_MANAGED_SPICEPOD_FILE);
-        tokio::fs::create_dir_all(config_dir)
+        deployment: SpicepodDeployment<'_>,
+    ) -> Result<ApplyOutcome, CommandError> {
+        // Record the delivered names (never values) so a test can assert the
+        // payload reached the runtime adapter.
+        self.state.lock().await.delivered_secret_names = deployment
+            .delivered_secrets
+            .as_ref()
+            .map(|secrets| secrets.keys().cloned().collect());
+        // Persist to the canonical path and ask for the restart that makes it
+        // live, mirroring the spiced adapter's observable behavior.
+        let path = deployment
+            .config_dir
+            .join(runtime_cloud_connect::config::CLOUD_MANAGED_SPICEPOD_FILE);
+        tokio::fs::create_dir_all(deployment.config_dir)
             .await
             .map_err(|e| CommandError::failed(e.to_string()))?;
-        tokio::fs::write(&path, spicepod_yaml)
+        tokio::fs::write(&path, deployment.spicepod_yaml)
             .await
             .map_err(|e| CommandError::failed(e.to_string()))?;
-        self.state.lock().await.applied_spicepod = Some((path.clone(), spicepod_yaml.to_string()));
-        Ok(serde_json::json!({
+        self.state.lock().await.applied_spicepod = Some((
+            path.clone(),
+            deployment.spicepod_yaml.to_string(),
+            deployment.app_id.map(str::to_string),
+        ));
+        Ok(ApplyOutcome::exit_to_apply(serde_json::json!({
             "path": path.display().to_string(),
             "applied": true,
-            "reload": "hot",
-        }))
+            "live": false,
+            "restart": "required",
+        })))
+    }
+
+    async fn exit_to_apply(&self) {
+        self.state.lock().await.exit_requested = true;
+    }
+}
+
+// --------------------------------------------------------------------------
+// Runtime handle for the ExecuteQuery path. Records what the client handed it and
+// returns a scripted outcome, so the tests below observe the client's own
+// behavior (clamping, the single slot, the byte cap) rather than a query
+// engine's.
+// --------------------------------------------------------------------------
+
+#[derive(Default)]
+struct QueryRuntimeState {
+    /// The `max_rows` value of every call, in order — the clamp is the
+    /// client's job, so this is what proves it happened before the handle ran.
+    max_rows_seen: Vec<u32>,
+    /// The SQL of every call, so a test can confirm the statement reached the
+    /// handle intact.
+    sql_seen: Vec<String>,
+}
+
+struct QueryRuntime {
+    state: Arc<Mutex<QueryRuntimeState>>,
+    can_query: bool,
+    /// What `execute_query` answers with.
+    reply: Mutex<Option<Result<QueryOutcome, CommandError>>>,
+    /// Released to let an in-flight `execute_query` return. `None` returns at once.
+    release: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+}
+
+impl QueryRuntime {
+    /// A handle that can query and answers every call with `bytes`.
+    fn returning(bytes: Vec<u8>, row_count: u64) -> (Arc<Self>, Arc<Mutex<QueryRuntimeState>>) {
+        Self::build(
+            true,
+            Some(Ok(QueryOutcome {
+                arrow_ipc: bytes,
+                row_count,
+            })),
+            None,
+        )
+    }
+
+    /// A handle that can query but blocks inside `execute_query` until the returned
+    /// sender fires — how a test holds the single query slot open.
+    fn blocking() -> (
+        Arc<Self>,
+        Arc<Mutex<QueryRuntimeState>>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let (runtime, state) = Self::build(
+            true,
+            Some(Ok(QueryOutcome {
+                arrow_ipc: b"held".to_vec(),
+                row_count: 1,
+            })),
+            Some(rx),
+        );
+        (runtime, state, tx)
+    }
+
+    /// A handle that cannot query at all.
+    fn incapable() -> (Arc<Self>, Arc<Mutex<QueryRuntimeState>>) {
+        Self::build(false, None, None)
+    }
+
+    fn build(
+        can_query: bool,
+        reply: Option<Result<QueryOutcome, CommandError>>,
+        release: Option<tokio::sync::oneshot::Receiver<()>>,
+    ) -> (Arc<Self>, Arc<Mutex<QueryRuntimeState>>) {
+        let state = Arc::new(Mutex::new(QueryRuntimeState::default()));
+        (
+            Arc::new(Self {
+                state: Arc::clone(&state),
+                can_query,
+                reply: Mutex::new(reply),
+                release: Mutex::new(release),
+            }),
+            state,
+        )
+    }
+}
+
+#[async_trait]
+impl RuntimeHandle for QueryRuntime {
+    fn supports(&self, capability: Capability) -> bool {
+        match capability {
+            Capability::ExecuteQuery => self.can_query,
+            // GetRuntimeInfo needs no capability, so this keeps the handle to
+            // exactly the one command under test.
+            _ => false,
+        }
+    }
+
+    async fn execute_query(&self, sql: &str, max_rows: u32) -> Result<QueryOutcome, CommandError> {
+        {
+            let mut state = self.state.lock().await;
+            state.max_rows_seen.push(max_rows);
+            state.sql_seen.push(sql.to_string());
+        }
+        if let Some(release) = self.release.lock().await.take() {
+            let _ = release.await;
+        }
+        self.reply
+            .lock()
+            .await
+            .take()
+            .unwrap_or_else(|| Err(CommandError::failed("no scripted reply left")))
+    }
+}
+
+/// Enroll a client whose handle is a [`QueryRuntime`], and return the running
+/// client plus the temp dir keeping its identity alive.
+async fn enroll_query_runtime(
+    harness: &Harness,
+    runtime: Arc<dyn RuntimeHandle>,
+) -> (runtime_cloud_connect::CloudConnect, tempfile::TempDir) {
+    enroll_query_runtime_with_deadline(harness, runtime, Duration::from_mins(1)).await
+}
+
+/// As [`enroll_query_runtime`], with the `ExecuteQuery` deadline set explicitly so
+/// a test can exercise it without waiting out the production value.
+async fn enroll_query_runtime_with_deadline(
+    harness: &Harness,
+    runtime: Arc<dyn RuntimeHandle>,
+    query_deadline: Duration,
+) -> (runtime_cloud_connect::CloudConnect, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = harness.config(
+        dir.path().join("identity.json"),
+        dir.path().to_path_buf(),
+        Some(ADOPTION_CODE.to_string()),
+        Duration::from_hours(12),
+    );
+    config.query_deadline = query_deadline;
+    let (handle, _identity) = enroll(harness, &config, runtime).await;
+    (handle, dir)
+}
+
+/// Poll for the `CommandResult` correlated to `command_id`.
+async fn await_result(
+    captured: &Arc<Mutex<Captured>>,
+    command_id: &str,
+) -> Option<proto::CommandResult> {
+    let found = wait_until_async(Duration::from_secs(5), || {
+        let captured = Arc::clone(captured);
+        let command_id = command_id.to_string();
+        async move {
+            captured
+                .lock()
+                .await
+                .results
+                .iter()
+                .any(|r| r.command_id == command_id)
+        }
+    })
+    .await;
+    if !found {
+        return None;
+    }
+    let c = captured.lock().await;
+    c.results
+        .iter()
+        .find(|r| r.command_id == command_id)
+        .cloned()
+}
+
+/// The capability list on the most recent `Hello`.
+async fn advertised_capabilities(captured: &Arc<Mutex<Captured>>) -> Vec<String> {
+    let c = captured.lock().await;
+    c.hellos
+        .last()
+        .map(|(hello, _)| hello.capabilities.clone())
+        .expect("a Hello must have been captured")
+}
+
+fn execute_query(sql: &str, max_rows: u32) -> proto::control_message::Body {
+    proto::control_message::Body::ExecuteQuery(proto::ExecuteQuery {
+        sql: sql.to_string(),
+        max_rows,
+    })
+}
+
+/// A successful query comes back on the `binary` arm, byte-for-byte what the
+/// runtime encoded — the client is a courier for the Arrow IPC stream, not a
+/// re-encoder of it.
+#[tokio::test]
+async fn execute_query_returns_the_runtime_bytes_on_the_binary_arm() {
+    let harness = Harness::new(24 * 60 * 60).await;
+    let payload = b"ARROW-IPC-STREAM-BYTES".to_vec();
+    let (runtime, state) = QueryRuntime::returning(payload.clone(), 3);
+    let (handle, _dir) = enroll_query_runtime(&harness, runtime).await;
+
+    harness
+        .gateway
+        .outbound
+        .lock()
+        .await
+        .push_back(ctrl_id("cmd-query", execute_query("SELECT 1", 10)));
+
+    let result = await_result(&harness.gateway.captured, "cmd-query")
+        .await
+        .expect("the client must answer an ExecuteQuery");
+    assert_eq!(
+        result.code,
+        proto::ResultCode::Ok as i32,
+        "query must succeed: {}",
+        result.message
+    );
+    assert_eq!(
+        result.payload,
+        Some(proto::command_result::Payload::Binary(payload)),
+        "the Arrow IPC stream must ride on the binary arm, unmodified"
+    );
+    assert_eq!(state.lock().await.sql_seen, vec!["SELECT 1".to_string()]);
+
+    handle.shutdown().await;
+}
+
+/// The row cap is the client's to enforce: zero means the default, and a
+/// request above the cap is clamped before the runtime ever sees it. A runtime
+/// handed 500 cannot return 100_000 rows even if the caller asked for them.
+#[tokio::test]
+async fn execute_query_clamps_the_row_limit_before_the_runtime_runs() {
+    for (requested, expected) in [(0_u32, MAX_QUERY_ROWS), (10, 10), (100_000, MAX_QUERY_ROWS)] {
+        let harness = Harness::new(24 * 60 * 60).await;
+        let (runtime, state) = QueryRuntime::returning(b"rows".to_vec(), 1);
+        let (handle, _dir) = enroll_query_runtime(&harness, runtime).await;
+
+        harness
+            .gateway
+            .outbound
+            .lock()
+            .await
+            .push_back(ctrl_id("cmd-clamp", execute_query("SELECT 1", requested)));
+
+        await_result(&harness.gateway.captured, "cmd-clamp")
+            .await
+            .expect("the client must answer an ExecuteQuery");
+        assert_eq!(
+            state.lock().await.max_rows_seen,
+            vec![expected],
+            "a request for {requested} rows must reach the runtime as {expected}"
+        );
+
+        handle.shutdown().await;
+    }
+}
+
+/// A second query while one is in flight is refused before it executes — the
+/// runtime handle must be called exactly once, not queued behind the first.
+#[tokio::test]
+async fn execute_query_answers_busy_without_executing_a_second_query() {
+    let harness = Harness::new(24 * 60 * 60).await;
+    let (runtime, state, release) = QueryRuntime::blocking();
+    let (handle, _dir) = enroll_query_runtime(&harness, runtime).await;
+
+    harness
+        .gateway
+        .outbound
+        .lock()
+        .await
+        .push_back(ctrl_id("cmd-first", execute_query("SELECT 1", 10)));
+
+    // Wait until the first query is genuinely inside the handle, so the second
+    // one races a held slot rather than an empty one.
+    let running = wait_until_async(Duration::from_secs(5), || {
+        let state = Arc::clone(&state);
+        async move { !state.lock().await.max_rows_seen.is_empty() }
+    })
+    .await;
+    assert!(running, "the first query must reach the runtime handle");
+
+    harness
+        .gateway
+        .outbound
+        .lock()
+        .await
+        .push_back(ctrl_id("cmd-second", execute_query("SELECT 2", 10)));
+
+    let second = await_result(&harness.gateway.captured, "cmd-second")
+        .await
+        .expect("a concurrent query must be answered, not dropped");
+    assert_eq!(
+        second.code,
+        proto::ResultCode::Busy as i32,
+        "a concurrent query must be answered busy: {}",
+        second.message
+    );
+    assert!(
+        second.payload.is_none(),
+        "a busy answer carries no payload, got {:?}",
+        second.payload
+    );
+    assert_eq!(
+        state.lock().await.max_rows_seen.len(),
+        1,
+        "the second query must be refused BEFORE execution, not queued"
+    );
+
+    // Releasing the first query frees the slot again.
+    let _ = release.send(());
+    let first = await_result(&harness.gateway.captured, "cmd-first")
+        .await
+        .expect("the first query must still answer");
+    assert_eq!(first.code, proto::ResultCode::Ok as i32);
+
+    handle.shutdown().await;
+}
+
+/// Query work runs off the control-message pump.
+///
+/// The command dispatched mid-query is what proves it: awaiting the query in
+/// the pump stops every later command from being read at all. Heartbeats ride
+/// their own task and would survive a blocked pump, so they are asserted for
+/// the acceptance criterion rather than as evidence of where the query runs.
+#[tokio::test]
+async fn heartbeats_and_commands_stay_live_while_a_query_runs() {
+    let harness = Harness::new(24 * 60 * 60).await;
+    let (runtime, state, release) = QueryRuntime::blocking();
+    let (handle, _dir) = enroll_query_runtime(&harness, runtime).await;
+
+    harness
+        .gateway
+        .outbound
+        .lock()
+        .await
+        .push_back(ctrl_id("cmd-slow", execute_query("SELECT 1", 10)));
+
+    let running = wait_until_async(Duration::from_secs(5), || {
+        let state = Arc::clone(&state);
+        async move { !state.lock().await.max_rows_seen.is_empty() }
+    })
+    .await;
+    assert!(running, "the query must reach the runtime handle");
+
+    let captured = Arc::clone(&harness.gateway.captured);
+    let before = captured.lock().await.heartbeats.len();
+
+    // An unrelated command dispatched while the query is stuck must still be
+    // answered by the pump.
+    harness.gateway.outbound.lock().await.push_back(ctrl_id(
+        "cmd-info",
+        proto::control_message::Body::GetRuntimeInfo(proto::GetRuntimeInfo {}),
+    ));
+    let info = await_result(&captured, "cmd-info")
+        .await
+        .expect("the pump must answer other commands while a query runs");
+    assert_eq!(info.code, proto::ResultCode::Ok as i32);
+
+    let beating = wait_until_async(Duration::from_secs(5), || {
+        let captured = Arc::clone(&captured);
+        async move { captured.lock().await.heartbeats.len() > before + 1 }
+    })
+    .await;
+    assert!(
+        beating,
+        "heartbeats must keep flowing while a query is in flight"
+    );
+
+    let _ = release.send(());
+    handle.shutdown().await;
+}
+
+/// A result over the byte cap is refused at the contract boundary with no
+/// payload at all — a partial result would look to the caller like the whole
+/// answer.
+#[tokio::test]
+async fn execute_query_refuses_an_oversized_result_without_partial_data() {
+    let harness = Harness::new(24 * 60 * 60).await;
+    let oversized = vec![0_u8; MAX_QUERY_RESULT_BYTES + 1];
+    let (runtime, _state) = QueryRuntime::returning(oversized, 1);
+    let (handle, _dir) = enroll_query_runtime(&harness, runtime).await;
+
+    harness
+        .gateway
+        .outbound
+        .lock()
+        .await
+        .push_back(ctrl_id("cmd-big", execute_query("SELECT 1", 10)));
+
+    let result = await_result(&harness.gateway.captured, "cmd-big")
+        .await
+        .expect("an oversized result must still be answered");
+    assert_eq!(
+        result.code,
+        proto::ResultCode::ResultTooLarge as i32,
+        "an oversized result must be typed, not a generic failure: {}",
+        result.message
+    );
+    assert!(
+        result.payload.is_none(),
+        "an oversized result must carry no partial payload, got {:?}",
+        result.payload
+    );
+
+    handle.shutdown().await;
+}
+
+/// The row cap is re-checked against what the handle actually returned. A
+/// handle that ignores the limit it was given must not have its result
+/// forwarded — the whole point of holding the limits at the instance is that
+/// nothing downstream re-checks them.
+#[tokio::test]
+async fn execute_query_refuses_a_result_with_more_rows_than_the_limit() {
+    let harness = Harness::new(24 * 60 * 60).await;
+    // Small payload, but it claims far more rows than the 10 that were asked
+    // for — an honest byte count with a dishonest row count.
+    let (runtime, _state) = QueryRuntime::returning(b"rows".to_vec(), 5_000);
+    let (handle, _dir) = enroll_query_runtime(&harness, runtime).await;
+
+    harness
+        .gateway
+        .outbound
+        .lock()
+        .await
+        .push_back(ctrl_id("cmd-toomany", execute_query("SELECT 1", 10)));
+
+    let result = await_result(&harness.gateway.captured, "cmd-toomany")
+        .await
+        .expect("an over-limit result must still be answered");
+    assert_eq!(
+        result.code,
+        proto::ResultCode::Internal as i32,
+        "a handle breaking the row cap is an instance fault: {}",
+        result.message
+    );
+    assert!(
+        result.payload.is_none(),
+        "an over-limit result must not be forwarded, got {:?}",
+        result.payload
+    );
+
+    handle.shutdown().await;
+}
+
+/// A runtime that cannot query neither advertises `execute_query` nor pretends to
+/// answer one — and the session survives the refusal.
+#[tokio::test]
+async fn execute_query_is_unsupported_when_the_runtime_cannot_query() {
+    let harness = Harness::new(24 * 60 * 60).await;
+    let (runtime, state) = QueryRuntime::incapable();
+    let (handle, _dir) = enroll_query_runtime(&harness, runtime).await;
+
+    let captured = Arc::clone(&harness.gateway.captured);
+    let advertised = advertised_capabilities(&captured).await;
+    assert!(
+        !advertised.contains(&"execute_query".to_string()),
+        "a runtime that cannot query must not advertise execute_query: {advertised:?}"
+    );
+
+    harness
+        .gateway
+        .outbound
+        .lock()
+        .await
+        .push_back(ctrl_id("cmd-nope", execute_query("SELECT 1", 10)));
+
+    let result = await_result(&captured, "cmd-nope")
+        .await
+        .expect("an unsupported query must still be answered");
+    assert_eq!(
+        result.code,
+        proto::ResultCode::Unsupported as i32,
+        "an unsupported query must be typed unsupported: {}",
+        result.message
+    );
+    assert!(
+        state.lock().await.max_rows_seen.is_empty(),
+        "an unsupported query must never reach the runtime handle"
+    );
+
+    // The refusal must not tear the session down: existing commands keep working.
+    harness.gateway.outbound.lock().await.push_back(ctrl_id(
+        "cmd-after",
+        proto::control_message::Body::GetRuntimeInfo(proto::GetRuntimeInfo {}),
+    ));
+    let after = await_result(&captured, "cmd-after")
+        .await
+        .expect("the session must survive an unsupported query");
+    assert_eq!(after.code, proto::ResultCode::Ok as i32);
+
+    handle.shutdown().await;
+}
+
+/// A capable runtime advertises `execute_query` and announces the protocol revision
+/// that carries it. The gateway gates dispatch on the capability, so the two
+/// must appear together.
+#[tokio::test]
+async fn a_querying_runtime_advertises_execute_query() {
+    let harness = Harness::new(24 * 60 * 60).await;
+    let (runtime, _state) = QueryRuntime::returning(b"rows".to_vec(), 1);
+    let (handle, _dir) = enroll_query_runtime(&harness, runtime).await;
+
+    let captured = Arc::clone(&harness.gateway.captured);
+    let advertised = advertised_capabilities(&captured).await;
+    assert!(
+        advertised.contains(&"execute_query".to_string()),
+        "a querying runtime must advertise execute_query: {advertised:?}"
+    );
+    let protocol_version = captured
+        .lock()
+        .await
+        .hellos
+        .last()
+        .map(|(hello, _)| hello.protocol_version)
+        .expect("a Hello must have been captured");
+    assert_eq!(
+        protocol_version,
+        runtime_cloud_connect::PROTOCOL_VERSION,
+        "the announced revision must be the one that carries execute_query"
+    );
+
+    handle.shutdown().await;
+}
+
+/// An empty statement is the caller's mistake and is refused before the slot is
+/// taken, so a stream of blank queries cannot lock the instance out of real
+/// ones.
+#[tokio::test]
+async fn execute_query_rejects_an_empty_statement() {
+    let harness = Harness::new(24 * 60 * 60).await;
+    let (runtime, state) = QueryRuntime::returning(b"rows".to_vec(), 1);
+    let (handle, _dir) = enroll_query_runtime(&harness, runtime).await;
+
+    harness
+        .gateway
+        .outbound
+        .lock()
+        .await
+        .push_back(ctrl_id("cmd-empty", execute_query("   \n\t ", 10)));
+
+    let result = await_result(&harness.gateway.captured, "cmd-empty")
+        .await
+        .expect("an empty query must be answered");
+    assert_eq!(
+        result.code,
+        proto::ResultCode::InvalidArgument as i32,
+        "an empty query is the caller's mistake: {}",
+        result.message
+    );
+    assert!(
+        state.lock().await.max_rows_seen.is_empty(),
+        "an empty query must never reach the runtime handle"
+    );
+
+    // The slot was not consumed: a real query still runs.
+    harness
+        .gateway
+        .outbound
+        .lock()
+        .await
+        .push_back(ctrl_id("cmd-real", execute_query("SELECT 1", 10)));
+    let real = await_result(&harness.gateway.captured, "cmd-real")
+        .await
+        .expect("a real query must still run after an empty one");
+    assert_eq!(real.code, proto::ResultCode::Ok as i32);
+
+    handle.shutdown().await;
+}
+
+/// A query that never returns is abandoned at the deadline and, crucially,
+/// gives the slot back. Without the deadline the single in-flight slot would be
+/// held for the life of the process and every later query would answer busy —
+/// there is no cancellation command to rescue it.
+#[tokio::test]
+async fn a_query_that_never_returns_is_abandoned_and_frees_the_slot() {
+    let harness = Harness::new(24 * 60 * 60).await;
+    // The sender is dropped at the end of this scope, but `blocking()` holds
+    // the receiver, so the query never completes on its own.
+    let (runtime, state, release) = QueryRuntime::blocking();
+    let (handle, _dir) =
+        enroll_query_runtime_with_deadline(&harness, runtime, Duration::from_millis(300)).await;
+
+    harness
+        .gateway
+        .outbound
+        .lock()
+        .await
+        .push_back(ctrl_id("cmd-hang", execute_query("SELECT 1", 10)));
+
+    let hung = await_result(&harness.gateway.captured, "cmd-hang")
+        .await
+        .expect("a hung query must still be answered");
+    assert_eq!(
+        hung.code,
+        proto::ResultCode::Failed as i32,
+        "a query past the deadline is retryable, not the caller's mistake: {}",
+        hung.message
+    );
+    assert!(hung.payload.is_none(), "an abandoned query carries no data");
+
+    // The slot must be back: a second query runs rather than answering busy.
+    harness
+        .gateway
+        .outbound
+        .lock()
+        .await
+        .push_back(ctrl_id("cmd-after-hang", execute_query("SELECT 2", 10)));
+    let after = await_result(&harness.gateway.captured, "cmd-after-hang")
+        .await
+        .expect("a query after the deadline must be answered");
+    assert_ne!(
+        after.code,
+        proto::ResultCode::Busy as i32,
+        "the deadline must free the query slot, but the next query was refused as busy"
+    );
+    assert_eq!(
+        state.lock().await.max_rows_seen.len(),
+        2,
+        "the second query must actually reach the runtime handle"
+    );
+
+    drop(release);
+    handle.shutdown().await;
+}
+
+/// The failure classes a query can produce reach the control plane as their own
+/// codes, so the portal can tell a bad statement from a busy instance from a
+/// broken one without reading the English.
+#[tokio::test]
+async fn execute_query_maps_runtime_failures_onto_their_own_codes() {
+    for (error, expected) in [
+        (
+            CommandError::invalid_argument("Query failed: no such column"),
+            proto::ResultCode::InvalidArgument,
+        ),
+        (
+            CommandError::result_too_large("too big"),
+            proto::ResultCode::ResultTooLarge,
+        ),
+        (
+            CommandError::internal("encoder fault"),
+            proto::ResultCode::Internal,
+        ),
+        (
+            CommandError::failed("the source is unreachable"),
+            proto::ResultCode::Failed,
+        ),
+    ] {
+        let harness = Harness::new(24 * 60 * 60).await;
+        let (runtime, _state) = QueryRuntime::build(true, Some(Err(error)), None);
+        let (handle, _dir) = enroll_query_runtime(&harness, runtime).await;
+
+        harness
+            .gateway
+            .outbound
+            .lock()
+            .await
+            .push_back(ctrl_id("cmd-err", execute_query("SELECT 1", 10)));
+
+        let result = await_result(&harness.gateway.captured, "cmd-err")
+            .await
+            .expect("a failing query must be answered");
+        assert_eq!(
+            result.code, expected as i32,
+            "unexpected code for {}: {}",
+            result.message, result.code
+        );
+        assert!(result.payload.is_none(), "a failure carries no payload");
+
+        handle.shutdown().await;
     }
 }
 
@@ -639,12 +1356,17 @@ impl Harness {
             pending_adopt_code_path: None,
             adopt_app_name: None,
             adopt_create_app: false,
+            instance_region: None,
             runtime_version: "v0.0.0-e2e".to_string(),
             // Sub-second cadences keep the suite fast while still exercising
             // the periodic frame paths.
             heartbeat_interval: Duration::from_millis(150),
             telemetry_interval: Duration::from_millis(250),
+            metrics_interval: Duration::from_millis(200),
             renewal_lead,
+            // Long enough that only the test that targets the deadline ever
+            // reaches it; that test sets its own.
+            query_deadline: Duration::from_mins(1),
         }
     }
 }
@@ -847,7 +1569,10 @@ async fn one_shot_enroll_then_separate_run_connects_with_stored_identity() {
         .await
         .expect("one-shot enroll succeeds");
     assert_eq!(outcome.identity.identifier, ASSIGNED_ID);
-    assert_eq!(outcome.app_name, None, "no attachment was requested");
+    assert_eq!(
+        outcome.registration.app_name, None,
+        "no attachment was requested"
+    );
     assert!(
         config.identity_path.exists(),
         "identity must be persisted by the one-shot enroll"
@@ -954,12 +1679,99 @@ async fn one_shot_enroll_carries_app_attachment() {
     let outcome = runtime_cloud_connect::enroll::enroll_now(&config)
         .await
         .expect("enroll with attachment succeeds");
-    assert_eq!(outcome.app_name.as_deref(), Some("e2e-app"));
+    assert_eq!(outcome.registration.app_name.as_deref(), Some("e2e-app"));
 
     let requests = harness.cloud.enroll_requests.lock().await.clone();
     assert_eq!(requests.len(), 1, "exactly one enroll request");
     assert_eq!(requests[0]["app_name"], "e2e-app");
     assert_eq!(requests[0]["create_app"], true);
+}
+
+/// The declared instance region rides the enroll request as a **sibling of
+/// the probed host facts** and comes back on the registry row. Any
+/// syntactically valid label enrolls — including one no region catalog knows —
+/// because a standalone host may not be in a cloud region at all.
+#[tokio::test]
+async fn one_shot_enroll_records_the_declared_region() {
+    let harness = Harness::new(24 * 60 * 60).await;
+    let dir = tempfile::tempdir().unwrap();
+
+    let mut config = harness.config(
+        dir.path().join("identity.json"),
+        dir.path().to_path_buf(),
+        Some(ADOPTION_CODE.to_string()),
+        Duration::from_hours(12),
+    );
+    config.instance_region = Some("on-prem-syd".to_string());
+
+    let outcome = runtime_cloud_connect::enroll::enroll_now(&config)
+        .await
+        .expect("enroll with a non-catalog region succeeds");
+    assert_eq!(outcome.registration.region.as_deref(), Some("on-prem-syd"));
+
+    let requests = harness.cloud.enroll_requests.lock().await.clone();
+    assert_eq!(requests.len(), 1, "exactly one enroll request");
+    assert_eq!(requests[0]["region"], "on-prem-syd");
+    assert!(
+        requests[0]["instance"].get("region").is_none(),
+        "the declared region must not be nested inside the probed host facts"
+    );
+}
+
+/// Omitting `--region` on a re-enrol must leave the stored region alone.
+/// Re-enrolment is how a standalone instance recovers past its renewal grace
+/// window, so a request that unconditionally wrote the region would erase one
+/// set in the portal on every recovery.
+#[tokio::test]
+async fn re_enroll_without_a_region_leaves_the_stored_region_untouched() {
+    // A second code stands in for the re-issued one a past-grace recovery uses.
+    const SECOND_CODE: &str = "SPICE-ADOPT-22222-22222-22222-22222";
+
+    let harness = Harness::new(24 * 60 * 60).await;
+    let dir = tempfile::tempdir().unwrap();
+
+    // First enroll declares the region.
+    let mut config = harness.config(
+        dir.path().join("identity.json"),
+        dir.path().to_path_buf(),
+        Some(ADOPTION_CODE.to_string()),
+        Duration::from_hours(12),
+    );
+    config.instance_region = Some("us-west-2".to_string());
+    let first = runtime_cloud_connect::enroll::enroll_now(&config)
+        .await
+        .expect("first enroll succeeds");
+    assert_eq!(first.registration.region.as_deref(), Some("us-west-2"));
+
+    harness
+        .cloud
+        .codes
+        .lock()
+        .await
+        .insert(SECOND_CODE.to_string());
+
+    let mut re_enroll = harness.config(
+        dir.path().join("identity.json"),
+        dir.path().to_path_buf(),
+        Some(SECOND_CODE.to_string()),
+        Duration::from_hours(12),
+    );
+    re_enroll.instance_region = None;
+    let second = runtime_cloud_connect::enroll::enroll_now(&re_enroll)
+        .await
+        .expect("re-enroll without a region succeeds");
+
+    let requests = harness.cloud.enroll_requests.lock().await.clone();
+    assert_eq!(requests.len(), 2, "two enroll requests");
+    assert!(
+        requests[1].get("region").is_none(),
+        "an omitted region must not appear on the wire at all — `null` would clear it"
+    );
+    assert_eq!(
+        second.registration.region.as_deref(),
+        Some("us-west-2"),
+        "the region set by the first enroll must survive the re-enrol"
+    );
 }
 
 /// `create_app` is meaningless without an app to name, so it must never
@@ -983,7 +1795,7 @@ async fn one_shot_enroll_omits_create_app_without_app_name() {
     let outcome = runtime_cloud_connect::enroll::enroll_now(&config)
         .await
         .expect("enroll succeeds unattached");
-    assert_eq!(outcome.app_name, None, "nothing was attached");
+    assert_eq!(outcome.registration.app_name, None, "nothing was attached");
 
     let requests = harness.cloud.enroll_requests.lock().await.clone();
     assert_eq!(requests.len(), 1, "exactly one enroll request");
@@ -1220,8 +2032,202 @@ async fn heartbeat_and_telemetry_cadence() {
     handle.shutdown().await;
 }
 
+/// The delivery path end to end: the client announces a per-connection key, the
+/// (mock) gateway double-seals a payload to it exactly as the real one does, and
+/// the opened secrets reach the runtime adapter alongside the spicepod.
 #[tokio::test]
-async fn apply_spicepod_hot_applies_and_persists() {
+async fn apply_spicepod_delivers_double_sealed_secrets() {
+    use cloud_connect_crypto::{RecipientKey, SealLayer, SecretAddress};
+    use prost::Message as _;
+
+    // The envelope's `command_id` is part of the outer AAD, so the seal below and
+    // the dispatch must name the same one.
+    const COMMAND_ID: &str = "cmd-apply-secrets";
+
+    let harness = Harness::new(24 * 60 * 60).await;
+    let dir = tempfile::tempdir().unwrap();
+    let identity_path = dir.path().join("identity.json");
+    let config = harness.config(
+        identity_path.clone(),
+        dir.path().to_path_buf(),
+        Some(ADOPTION_CODE.to_string()),
+        Duration::from_hours(12),
+    );
+    let (runtime, rt_state) = E2eRuntime::new();
+    let (handle, identity) = enroll(&harness, &config, runtime).await;
+
+    // The session key the client announced — the gateway's outer recipient.
+    let captured = Arc::clone(&harness.gateway.captured);
+    let announced = wait_until_async(Duration::from_secs(5), || {
+        let captured = Arc::clone(&captured);
+        async move { !captured.lock().await.secrets_keys.is_empty() }
+    })
+    .await;
+    assert!(
+        announced,
+        "the client must announce a per-connection secrets key, or it can receive no secrets"
+    );
+    let session = with_captured!(captured, c => c.secrets_keys[0].clone());
+    assert_eq!(session.kem_id, cloud_connect_crypto::KEM_ID);
+    assert_eq!(session.aead_id, cloud_connect_crypto::AEAD_ID);
+
+    // Inner: the control plane seals to the instance's *enrolled* key.
+    let enrolled_pub =
+        cloud_connect_crypto::EncryptionKeypair::from_pkcs8_pem(&identity.enc_private_key_pem)
+            .expect("enrolled key parses");
+    let plaintext = proto::SecretPayload {
+        string_data: [("openai_key".to_string(), b"sk-e2e".to_vec())]
+            .into_iter()
+            .collect(),
+    }
+    .encode_to_vec();
+    let inner_aad = SecretAddress::standalone(ASSIGNED_ID, enrolled_pub.key_id())
+        .expect("inner address")
+        .inner_aad();
+    let inner_sealed = RecipientKey::from_public_key(enrolled_pub.public_key())
+        .expect("inner recipient")
+        .seal(SealLayer::Inner, &plaintext, &inner_aad)
+        .expect("inner seal");
+    let inner = proto::SealedSecretPayload {
+        key_id: enrolled_pub.key_id().to_string(),
+        enc: inner_sealed.enc,
+        ciphertext: inner_sealed.ciphertext,
+    };
+
+    // Outer: the gateway seals that opaque envelope to the announced key.
+    let outer_aad = SecretAddress::standalone(ASSIGNED_ID, &session.key_id)
+        .expect("outer address")
+        .outer_aad(COMMAND_ID)
+        .expect("outer aad");
+    let outer_sealed = RecipientKey::from_announcement(
+        &session.key_id,
+        session.kem_id,
+        session.kdf_id,
+        session.aead_id,
+        &session.public_key,
+    )
+    .expect("outer recipient")
+    .seal(SealLayer::Outer, &inner.encode_to_vec(), &outer_aad)
+    .expect("outer seal");
+
+    let yaml = "version: v2\nkind: Spicepod\nname: e2e-secrets\n";
+    harness.gateway.outbound.lock().await.push_back(ctrl_id(
+        COMMAND_ID,
+        proto::control_message::Body::ApplySpicepod(proto::ApplySpicepod {
+            spicepod_yaml: yaml.to_string(),
+            sealed_secret_payload: Some(proto::SealedSecretPayload {
+                key_id: session.key_id.clone(),
+                enc: outer_sealed.enc,
+                ciphertext: outer_sealed.ciphertext,
+            }),
+            app_id: "4002".to_string(),
+        }),
+    ));
+
+    let captured = Arc::clone(&harness.gateway.captured);
+    let succeeded = wait_until_async(Duration::from_secs(5), || {
+        let captured = Arc::clone(&captured);
+        async move {
+            captured
+                .lock()
+                .await
+                .results
+                .iter()
+                .any(|r| r.command_id == COMMAND_ID && r.code == proto::ResultCode::Ok as i32)
+        }
+    })
+    .await;
+    assert!(succeeded, "the delivery must be applied, not refused");
+
+    // The opened names reached the adapter; the value never leaves the process.
+    let names = rt_state.lock().await.delivered_secret_names.clone();
+    assert_eq!(
+        names,
+        Some(vec!["openai_key".to_string()]),
+        "the opened secrets must reach the runtime adapter with the spicepod"
+    );
+
+    // No result may carry a secret value — in any payload arm, or in the
+    // human-readable message.
+    let rendered = with_captured!(captured, c => c
+        .results
+        .iter()
+        .map(|r| {
+            let payload = match &r.payload {
+                Some(proto::command_result::Payload::Json(json)) => json.clone(),
+                Some(proto::command_result::Payload::Text(text)) => text.clone(),
+                Some(proto::command_result::Payload::Binary(bytes)) => {
+                    String::from_utf8_lossy(bytes).into_owned()
+                }
+                None => String::new(),
+            };
+            format!("{} {payload}", r.message)
+        })
+        .collect::<Vec<_>>());
+    assert!(
+        rendered.iter().all(|r| !r.contains("sk-e2e")),
+        "no command result may echo a delivered secret value: {rendered:?}"
+    );
+
+    handle.shutdown().await;
+}
+
+/// A payload the session key cannot open must fail the whole command — the
+/// spicepod is not applied, rather than applied without the secrets it needs.
+#[tokio::test]
+async fn apply_spicepod_refuses_an_unopenable_payload() {
+    let harness = Harness::new(24 * 60 * 60).await;
+    let dir = tempfile::tempdir().unwrap();
+    let config = harness.config(
+        dir.path().join("identity.json"),
+        dir.path().to_path_buf(),
+        Some(ADOPTION_CODE.to_string()),
+        Duration::from_hours(12),
+    );
+    let (runtime, rt_state) = E2eRuntime::new();
+    let (handle, _identity) = enroll(&harness, &config, runtime).await;
+
+    // Garbage addressed to a key this session never announced.
+    harness.gateway.outbound.lock().await.push_back(ctrl_id(
+        "cmd-bad-secrets",
+        proto::control_message::Body::ApplySpicepod(proto::ApplySpicepod {
+            spicepod_yaml: "version: v2\nkind: Spicepod\nname: nope\n".to_string(),
+            sealed_secret_payload: Some(proto::SealedSecretPayload {
+                key_id: "0000000000000000".to_string(),
+                enc: vec![0_u8; 32],
+                ciphertext: vec![0_u8; 64],
+            }),
+            app_id: String::new(),
+        }),
+    ));
+
+    let captured = Arc::clone(&harness.gateway.captured);
+    let failed = wait_until_async(Duration::from_secs(5), || {
+        let captured = Arc::clone(&captured);
+        async move {
+            captured.lock().await.results.iter().any(|r| {
+                r.command_id == "cmd-bad-secrets"
+                    && r.code == proto::ResultCode::InvalidArgument as i32
+            })
+        }
+    })
+    .await;
+    assert!(failed, "an unopenable payload must fail the command");
+
+    assert!(
+        rt_state.lock().await.applied_spicepod.is_none(),
+        "the spicepod must NOT be applied when its secrets could not be opened"
+    );
+
+    handle.shutdown().await;
+}
+
+/// A deployment persists the spicepod and applies it by restarting — and the
+/// result reaches the gateway *before* the runtime is asked to exit. If the
+/// client exited first, every deployment would lose its validation outcome, and
+/// an operator watching a deploy would see nothing at all.
+#[tokio::test]
+async fn apply_spicepod_persists_then_exits_to_restart() {
     let harness = Harness::new(24 * 60 * 60).await;
     let dir = tempfile::tempdir().unwrap();
     let config = harness.config(
@@ -1238,30 +2244,30 @@ async fn apply_spicepod_hot_applies_and_persists() {
         "cmd-apply",
         proto::control_message::Body::ApplySpicepod(proto::ApplySpicepod {
             spicepod_yaml: yaml.to_string(),
+            sealed_secret_payload: None,
+            app_id: "4002".to_string(),
         }),
     ));
 
-    let captured = Arc::clone(&harness.gateway.captured);
-    let applied = wait_until_async(Duration::from_secs(5), || {
-        let captured = Arc::clone(&captured);
-        async move {
-            captured
-                .lock()
-                .await
-                .results
-                .iter()
-                .any(|r| r.command_id == "cmd-apply")
-        }
+    // Wait on the exit request, not on the result: the exit is the *last* step
+    // of the apply, so once it has happened the result must already be out.
+    let exited = wait_until_async(Duration::from_secs(5), || {
+        let state = Arc::clone(&rt_state);
+        async move { state.lock().await.exit_requested }
     })
     .await;
-    assert!(applied, "apply result must arrive within 5s");
+    assert!(
+        exited,
+        "a persisted deployment must ask the runtime to exit so the supervisor restarts it"
+    );
 
+    let captured = Arc::clone(&harness.gateway.captured);
     let result = with_captured!(captured, c => c
         .results
         .iter()
         .find(|r| r.command_id == "cmd-apply")
         .cloned())
-    .expect("apply result");
+    .expect("the apply result must be flushed to the gateway before the runtime exits");
     assert_eq!(
         result.code,
         proto::ResultCode::Ok as i32,
@@ -1276,10 +2282,15 @@ async fn apply_spicepod_hot_applies_and_persists() {
     };
     let meta: Value = serde_json::from_str(&json).expect("parse ApplySpicepod JSON payload");
     assert_eq!(meta["applied"], true);
-    assert_eq!(meta["reload"], "hot");
+    assert_eq!(
+        meta["live"], false,
+        "the deployment is persisted, not yet serving — the restart is what makes it live"
+    );
+    assert_eq!(meta["restart"], "required");
 
-    // The runtime persisted the YAML to the canonical cloud-managed path.
-    let (path, written) = rt_state
+    // The runtime persisted the YAML to the canonical cloud-managed path, which
+    // is what the restart comes back up on.
+    let (path, written, app_id) = rt_state
         .lock()
         .await
         .applied_spicepod
@@ -1287,6 +2298,9 @@ async fn apply_spicepod_hot_applies_and_persists() {
         .expect("spicepod applied");
     assert_eq!(written, yaml);
     assert!(path.exists(), "spicepod file must be on disk");
+    // The app id rides the deploy: it is the only way the runtime learns which
+    // app to attribute its metrics to, and it exports none until it has one.
+    assert_eq!(app_id.as_deref(), Some("4002"));
 
     handle.shutdown().await;
 }
@@ -1394,6 +2408,10 @@ async fn renewal_rotates_keypair_and_persists() {
     })
     .await;
     assert!(renewed, "a renewal must be attempted within 15s");
+    assert!(
+        !enrolled_identity.cache_key_b64.is_empty(),
+        "enrollment must mint a local secrets-cache key"
+    );
 
     // The renew request carried the standard contract shape.
     let renew_body = harness.cloud.renew_requests.lock().await[0].clone();
@@ -1408,6 +2426,17 @@ async fn renewal_rotates_keypair_and_persists() {
             .unwrap()
             .contains("CERTIFICATE REQUEST"),
         "renew carries a fresh CSR"
+    );
+    // The encryption key rotates in the SAME request as the identity key, so
+    // the cloud re-pins both in one atomic update. The endpoint requires the
+    // field, so omitting it would fail every renewal.
+    let renewed_enc_pubkey = renew_body["enc_pubkey_pem"]
+        .as_str()
+        .expect("renew must carry the rotated encryption public key");
+    assert!(renewed_enc_pubkey.contains("PUBLIC KEY"));
+    assert_ne!(
+        renewed_enc_pubkey, enrolled_identity.enc_public_key_pem,
+        "the renewal must mint a FRESH encryption keypair, not re-send the enrolled one"
     );
     assert!(
         !renew_body["pop_sig"].as_str().unwrap().is_empty(),
@@ -1440,6 +2469,35 @@ async fn renewal_rotates_keypair_and_persists() {
     assert_ne!(
         renewed_identity.private_key_pem, enrolled_identity.private_key_pem,
         "every renewal rotates the keypair"
+    );
+    assert_ne!(
+        renewed_identity.enc_private_key_pem, enrolled_identity.enc_private_key_pem,
+        "the encryption key rotates with the identity key"
+    );
+    assert_eq!(
+        renewed_identity.enc_previous_private_key_pem, enrolled_identity.enc_private_key_pem,
+        "the outgoing encryption key must be retained for one rotation, so a payload sealed just \
+         before the rotation still opens"
+    );
+    assert_eq!(
+        renewed_identity.cache_key_b64, enrolled_identity.cache_key_b64,
+        "the local cache key must NOT rotate, or the cache is stranded every ~12h"
+    );
+    // Both keys are reachable for an open; the current one is the rotated key.
+    let keyring = renewed_identity
+        .encryption_keyring()
+        .expect("the rotated identity yields a keyring");
+    assert!(
+        keyring
+            .select(
+                cloud_connect_crypto::EncryptionKeypair::from_pkcs8_pem(
+                    &enrolled_identity.enc_private_key_pem
+                )
+                .expect("pre-rotation key parses")
+                .key_id()
+            )
+            .is_some(),
+        "the pre-rotation key must still be selectable by its key id"
     );
     assert_ne!(
         renewed_identity.identity_cert_pem, enrolled_identity.identity_cert_pem,

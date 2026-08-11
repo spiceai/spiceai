@@ -36,29 +36,74 @@ limitations under the License.
 //! runtime continues unmanaged. Conversely its absence keeps the
 //! signal-based activation, so instances enrolled before the flag existed
 //! keep connecting after an upgrade.
+//!
+//! ## How a deployment applies
+//!
+//! By restarting, and only by restarting. `apply_spicepod` validates the
+//! incoming spicepod, persists it as `spicepod-cloud-managed.yml`, records the
+//! deployment version beside it, and exits 0 — the supervisor relaunches
+//! `spiced`, [`cloud_managed_spicepod`] hands the persisted file to the app
+//! builder, and the instance comes up serving it and reporting its version.
+//!
+//! Two consequences the caller has to hold:
+//!
+//! - **The command result may never arrive.** The process exits mid-command, so
+//!   the stream drops before the result is guaranteed to land — a caller cannot
+//!   treat its absence as a failed deployment.
+//! - **Downtime is proportional to the app's size, not the change's.** A
+//!   one-line edit reloads every dataset and rebuilds every acceleration.
+//!
+//! What this buys is one behaviour instead of two: no section that reconciles
+//! in-process while another waits for an operator, and no partially-applied
+//! state that is neither the old configuration nor the new one.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use app::{App, AppBuilder};
+use arrow::array::RecordBatch;
+use arrow::error::ArrowError;
+use arrow::ipc::writer::StreamWriter;
 use async_trait::async_trait;
+use datafusion::error::DataFusionError;
+use datafusion::execution::SendableRecordBatchStream;
+use futures::StreamExt;
+use parking_lot::RwLock;
 use runtime::Runtime;
+use runtime::datafusion::query::Error as QueryError;
+use runtime::metrics_reader::MetricsReader;
 use runtime::status::ComponentStatus;
 use runtime_cloud_connect::config::{
     CLOUD_MANAGED_SPICEPOD_FILE, CloudConnectConfig, IDENTITY_FILE, PENDING_ADOPT_CODE_FILE,
 };
 use runtime_cloud_connect::handlers::{
-    Capability, CommandError, RuntimeHandle, RuntimePhase, StatusReport,
+    ApplyOutcome, Capability, CommandError, MAX_QUERY_RESULT_BYTES, QueryOutcome, RuntimeHandle,
+    RuntimePhase, SpicepodDeployment, StatusReport, effective_max_rows,
 };
+use runtime_cloud_connect::supervisor::Supervisor;
 use runtime_cloud_connect::{CloudConnect, identity::IdentityStore};
+// Reached through the `runtime` re-export rather than a direct dependency, the
+// same way `runtime::status` is.
+use runtime::secrets::stores::cloud_delivered::{CLOUD_DELIVERED_STORE, CloudDeliveredSecretStore};
+use runtime_cloud_connect::identity::CacheKey;
 
 use crate::log_capture::LogRingBuffer;
 
 /// Default number of log lines returned by `GetLogs` when the command leaves
 /// `tail_lines` unset. Bounded by the ring buffer's capacity.
 const DEFAULT_LOG_TAIL_LINES: usize = 500;
+
+/// How long a deployment's shutdown may drain before the process exits anyway.
+///
+/// A deployment restart is a planned shutdown, so it takes the same drain path
+/// a `SIGTERM` would — an accelerator with local state has to flush it. The
+/// bound is what keeps one stuck connection from turning a deployment into an
+/// instance that never comes back: `Runtime::shutdown` has its own
+/// (`runtime.shutdown_timeout`, 30s by default) budget, and this is the outer
+/// one that holds even if that budget is raised or a phase hangs.
+const DEPLOYMENT_DRAIN_BUDGET: Duration = Duration::from_mins(2);
 
 /// Cheap probe for whether Spice Cloud Connect is configured for this
 /// instance, using the same signals as [`maybe_start`]: the explicit
@@ -104,6 +149,98 @@ fn build_config(runtime_version: &str) -> CloudConnectConfig {
     config
 }
 
+/// The spicepod a deployment persisted, and the deployment it belongs to.
+///
+/// A deployment applies by persisting this file and restarting, so on every
+/// start it — not the instance directory's `spicepod.yaml` — is the
+/// configuration a cloud-managed instance serves.
+#[derive(Debug)]
+pub struct CloudManagedSpicepod {
+    pub path: PathBuf,
+    /// The persisted YAML, kept so an `ApplySpicepod` can tell a redelivery of
+    /// the running deployment from a new one without re-reading the file.
+    pub spicepod_yaml: String,
+}
+
+#[derive(Debug)]
+pub struct CloudManagedSpicepodReadError {
+    pub path: PathBuf,
+    pub source: std::io::Error,
+}
+
+/// The cloud-managed spicepod this instance starts on, or `None` when Cloud
+/// Connect is not configured or no deployment has ever landed here.
+///
+/// Reads files only — no control-plane round trip — so an instance whose
+/// gateway is unreachable still comes up on its deployed configuration.
+pub async fn cloud_managed_spicepod(
+    cloud_connect_flag: bool,
+) -> std::result::Result<Option<CloudManagedSpicepod>, CloudManagedSpicepodReadError> {
+    if !is_configured(cloud_connect_flag) {
+        return Ok(None);
+    }
+    let config_dir = CloudConnectConfig::default_config_dir();
+    let path = config_dir.join(CLOUD_MANAGED_SPICEPOD_FILE);
+    read_cloud_managed_spicepod(path).await
+}
+
+async fn read_cloud_managed_spicepod(
+    path: PathBuf,
+) -> std::result::Result<Option<CloudManagedSpicepod>, CloudManagedSpicepodReadError> {
+    match tokio::fs::read_to_string(&path).await {
+        Ok(spicepod_yaml) => Ok(Some(CloudManagedSpicepod {
+            path,
+            spicepod_yaml,
+        })),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(CloudManagedSpicepodReadError { path, source }),
+    }
+}
+
+/// The delivered-secrets store and its cache key, restored from local state.
+///
+/// Built and installed **before** the runtime loads its components, because
+/// component initialization is what resolves `${ secrets:… }`: a store
+/// registered afterwards would arrive after every referencing component had
+/// already failed. The Cloud Connect *client* still starts after loading (see
+/// [`maybe_start`]) — only the local restore has to be early.
+pub struct DeliveredSecretsState {
+    store: Arc<CloudDeliveredSecretStore>,
+}
+
+/// Register the delivered-secrets store on `runtime` and restore the last
+/// delivered set from the local cache.
+///
+/// Call this before `load_components()`. Returns `None` when Cloud Connect is
+/// not configured for this instance, in which case nothing is registered — a
+/// vanilla OSS install gains no store and reads no files.
+///
+/// Deliberately local-only: the key lives in `identity.json` and the payload in
+/// the config dir, so a restart restores its secrets with the gateway
+/// unreachable. That is the property the local cache key buys.
+pub async fn restore_delivered_secrets(
+    runtime_version: &str,
+    runtime: &Arc<Runtime>,
+    cloud_connect_flag: bool,
+) -> Option<DeliveredSecretsState> {
+    if !is_configured(cloud_connect_flag) {
+        return None;
+    }
+    let config = build_config(runtime_version);
+
+    // Registered as a built-in so `${ secrets:NAME }` reaches it with nothing
+    // declared in the spicepod, it sits below every user-declared store, and a
+    // spicepod reload cannot clear it.
+    let store = Arc::new(CloudDeliveredSecretStore::new());
+    runtime.secrets().write().await.register_builtin_store(
+        CLOUD_DELIVERED_STORE,
+        Arc::clone(&store) as Arc<dyn runtime::secrets::SecretStore>,
+    );
+
+    load_cached_secrets(&config, &store);
+    Some(DeliveredSecretsState { store })
+}
+
 /// Start the Cloud Connect client if any of the opt-in conditions are
 /// met. The returned `Option<CloudConnect>` is `None` when `CloudConnect`
 /// is disabled — which is the default for vanilla OSS installs.
@@ -112,10 +249,19 @@ fn build_config(runtime_version: &str) -> CloudConnectConfig {
 /// the client on, but with no identity and no adoption code there is
 /// nothing to connect with — that case logs an actionable warning (instead
 /// of the silent debug skip) and the runtime continues unmanaged.
+///
+/// `running_deployment` is the cloud-managed spicepod the runtime actually
+/// loaded, or `None` when it is serving something else (a local spicepod, or a
+/// deployed one that failed to build). It is what a redelivered `ApplySpicepod`
+/// is compared against, so passing a configuration that is not live would let a
+/// redelivery be answered as already applied when it is not.
 pub async fn maybe_start(
     runtime_version: &str,
     runtime: Arc<Runtime>,
     cloud_connect_flag: bool,
+    delivered_secrets: Option<DeliveredSecretsState>,
+    running_deployment: Option<CloudManagedSpicepod>,
+    metrics: Option<MetricsReader>,
 ) -> Option<CloudConnect> {
     let config = build_config(runtime_version);
 
@@ -124,8 +270,14 @@ pub async fn maybe_start(
     // rather than silently treating it as "not adopted", so a broken
     // identity file is visible to the operator instead of quietly
     // disabling Cloud Connect.
+    let mut persisted_app_id = None;
     let has_identity = match IdentityStore::load_optional(&config.identity_path) {
-        Ok(opt) => opt.is_some(),
+        Ok(opt) => {
+            // Restores the metrics attribution across a restart. Without it the
+            // instance exports nothing until its next deploy, which may be days.
+            persisted_app_id = opt.as_ref().and_then(|i| i.app_id.clone());
+            opt.is_some()
+        }
         Err(err) => {
             tracing::warn!(
                 "Spice Cloud Connect: could not read identity at {}: {err}; \
@@ -164,7 +316,64 @@ pub async fn maybe_start(
     // `GetLogs`. `None` if capture wasn't installed — the handler then
     // reports logs as unavailable rather than returning an empty blob.
     let logs = crate::log_capture::handle();
-    let handle: Arc<dyn RuntimeHandle> = Arc::new(SpicedRuntimeHandle::new(runtime, logs));
+
+    if let Some(app_id) = &persisted_app_id {
+        tracing::debug!(
+            app_id,
+            "Spice Cloud Connect: metrics attribution restored from the stored identity"
+        );
+    } else {
+        tracing::debug!(
+            "Spice Cloud Connect: the stored identity names no app; metrics are withheld until a deploy names one"
+        );
+    }
+
+    // Installed before `load_components()` by `restore_delivered_secrets`, so
+    // the cached secrets were already in place when components resolved their
+    // references. `None` only if that call was skipped, in which case a
+    // deployment can still deliver secrets to this process — they just will not
+    // have been available at startup.
+    let delivered_store = if let Some(state) = delivered_secrets {
+        state.store
+    } else {
+        tracing::debug!(
+            "Spice Cloud Connect: no delivered-secrets store was installed before component load; registering one now"
+        );
+        let store = Arc::new(CloudDeliveredSecretStore::new());
+        runtime.secrets().write().await.register_builtin_store(
+            CLOUD_DELIVERED_STORE,
+            Arc::clone(&store) as Arc<dyn runtime::secrets::SecretStore>,
+        );
+        load_cached_secrets(&config, &store);
+        store
+    };
+
+    // Detected once: nothing about the process's supervisor changes while it
+    // runs, and every deployment depends on the answer.
+    let supervisor = Supervisor::detect();
+    if let Some(caveat) = supervisor.caveat() {
+        tracing::warn!("Spice Cloud Connect: {caveat}");
+    } else {
+        tracing::info!(
+            "Spice Cloud Connect: process supervisor detected ({}); a deployment applies by restarting spiced",
+            supervisor.as_str()
+        );
+    }
+
+    // The cache key is read from the identity on each write, not captured here:
+    // an instance enrolling in this very process has no identity yet.
+    let identity_path = config.identity_path.clone();
+    let handle: Arc<dyn RuntimeHandle> =
+        Arc::new(SpicedRuntimeHandle::new(SpicedRuntimeHandleParts {
+            runtime,
+            logs,
+            delivered_secrets: delivered_store,
+            identity_path,
+            running_deployment,
+            supervisor,
+            metrics,
+            app_id: persisted_app_id,
+        }));
 
     match CloudConnect::start(config, handle).await {
         Ok(Some(client)) => Some(client),
@@ -178,17 +387,82 @@ pub async fn maybe_start(
     }
 }
 
-/// Tracks whether a deployed spicepod carried changes that `apply_app`
-/// cannot hot-reload (see [`restart_required_sections`]) and therefore need a
-/// process restart to take effect. Set by `apply_spicepod` and surfaced by
-/// `status` so the control plane can show a "restart required" state until
-/// the operator restarts spiced (standalone spiced cannot self-restart).
-#[derive(Default)]
-struct RestartState {
-    pending: AtomicBool,
-    /// Names of the spicepod sections still awaiting a restart. Guarded by a
-    /// std mutex held only for the brief read/write — never across `.await`.
-    sections: Mutex<Vec<String>>,
+/// Load the delivered-secrets cache into `store`.
+///
+/// The key lives in `identity.json`, so both halves come from local state and
+/// this never contacts the control plane — which is the property that lets a
+/// restart succeed while the gateway is down.
+///
+/// Every failure is a degradation, never fatal: an unreadable, corrupt,
+/// wrong-key, or unknown-version cache is discarded with an actionable warning
+/// and the instance comes up with no delivered secrets, which one deployment
+/// restores. Crashing here would make a corrupt file unbootable.
+fn load_cached_secrets(config: &CloudConnectConfig, store: &CloudDeliveredSecretStore) {
+    let Some(key) = IdentityStore::load_optional(&config.identity_path)
+        .ok()
+        .flatten()
+        .and_then(|identity| identity.cache_key())
+    else {
+        // No identity yet (a first boot that will enroll below), or one that
+        // predates the cache key. Either way there is nothing to restore.
+        return;
+    };
+
+    let path = config
+        .config_dir
+        .join(runtime_cloud_connect::secret_cache::SECRET_CACHE_FILE);
+    match runtime_cloud_connect::secret_cache::read(&path, &key) {
+        Ok(Some(cached)) => {
+            // Names only.
+            tracing::info!(
+                "Spice Cloud Connect: restored {} delivered secret(s) from the local cache: {}",
+                cached.names().len(),
+                cached.names().join(", ")
+            );
+            store.replace(cached.into_values());
+        }
+        Ok(None) => {
+            tracing::debug!(
+                "Spice Cloud Connect: no delivered-secrets cache at {}; components referencing \
+                 delivered secrets wait for the first deployment",
+                path.display()
+            );
+        }
+        Err(err) => {
+            tracing::warn!("Spice Cloud Connect: {err}");
+        }
+    }
+}
+
+/// What an incoming `ApplySpicepod` turns out to be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Disposition {
+    /// The runtime is already serving exactly this deployment. Restarting for
+    /// it would turn a redelivery into a restart loop.
+    AlreadyLive,
+    /// This process already persisted exactly this deployment and is on its way
+    /// out. Re-issuing the exit is safe and covers an exit that did not happen.
+    AlreadyPersisted,
+    /// Persist it, then restart onto it.
+    Apply,
+}
+
+/// Classify an incoming spicepod against what this process is serving (`live`)
+/// and what it has already persisted but not yet restarted onto (`persisted`).
+///
+/// The spicepod itself is the identity of a deployment here: with nothing else to
+/// compare, byte-identical YAML is the same configuration and anything else is a
+/// new one.
+fn disposition(live: &str, persisted: Option<&str>, incoming: &str) -> Disposition {
+    if persisted.is_some_and(|persisted| persisted == incoming) {
+        return Disposition::AlreadyPersisted;
+    }
+    // Only meaningful while nothing has been persisted: once it has, the live
+    // configuration is the one being replaced.
+    if persisted.is_none() && live == incoming {
+        return Disposition::AlreadyLive;
+    }
+    Disposition::Apply
 }
 
 /// Thin adapter so the cloud-connect client can call into the runtime
@@ -198,71 +472,188 @@ struct SpicedRuntimeHandle {
     /// Recent log lines for `GetLogs`. `None` when the capture layer was
     /// not installed (Cloud Connect not configured at tracing-init time).
     logs: Option<LogRingBuffer>,
-    /// Pending-restart state accumulated across `apply_spicepod` calls.
-    restart: RestartState,
+    /// Secrets the control plane delivered with a deployment. Registered as a
+    /// built-in store so `${ secrets:NAME }` resolves them with nothing declared
+    /// in the spicepod, and so a spicepod reload cannot drop them.
+    delivered_secrets: Arc<CloudDeliveredSecretStore>,
+    /// Where the identity — and with it the local cache key — lives.
+    ///
+    /// The key is read from here on each write rather than captured at startup,
+    /// because an instance enrolling *in this process* has no identity yet when
+    /// the handle is built: capturing then would leave the cache permanently
+    /// unwritable on a first boot, which is precisely the case the cache exists
+    /// for.
+    identity_path: std::path::PathBuf,
+    /// The deployment this process is serving. Fixed for the life of the
+    /// process: a deployment takes effect by restarting, so nothing can change
+    /// what is live without starting a new one.
+    ///
+    /// A runtime serving a local spicepod holds an empty string, which matches
+    /// no incoming deployment.
+    live: String,
+    /// A deployment this process validated and persisted, waiting on the exit
+    /// that makes it live. Read on every `Hello`, written once per apply — a
+    /// `parking_lot` lock held for the read/write only, never across an
+    /// `.await`.
+    persisted: RwLock<Option<String>>,
+    /// What will relaunch this process after a deployment exits it.
+    supervisor: Supervisor,
+    /// Reader for the metrics pushed to the control plane. `None` when no
+    /// reader was attached to the meter provider, in which case this instance
+    /// reports nothing rather than an empty payload.
+    metrics: Option<MetricsReader>,
+    /// The app this instance's metrics are attributed to, learned from
+    /// `ApplySpicepod` and mirrored into the identity file so it survives a
+    /// restart. `None` until the control plane names one, and metrics are
+    /// withheld for as long as it is: a series with no `scp_app_id` is ingested
+    /// but matches no app dashboard, so exporting one spends the backend's quota
+    /// to produce something nothing can read.
+    ///
+    /// Guarded by a `parking_lot` lock held only for the brief read/write, never
+    /// across an `.await`.
+    app_id: RwLock<Option<String>>,
+}
+
+/// What a [`SpicedRuntimeHandle`] is assembled from, before the deployment is
+/// reduced to the spicepod that is live and the mutable fields are wrapped.
+struct SpicedRuntimeHandleParts {
+    runtime: Arc<Runtime>,
+    logs: Option<LogRingBuffer>,
+    delivered_secrets: Arc<CloudDeliveredSecretStore>,
+    identity_path: std::path::PathBuf,
+    running_deployment: Option<CloudManagedSpicepod>,
+    supervisor: Supervisor,
+    metrics: Option<MetricsReader>,
+    app_id: Option<String>,
 }
 
 impl SpicedRuntimeHandle {
-    fn new(runtime: Arc<Runtime>, logs: Option<LogRingBuffer>) -> Self {
+    fn new(parts: SpicedRuntimeHandleParts) -> Self {
+        let SpicedRuntimeHandleParts {
+            runtime,
+            logs,
+            delivered_secrets,
+            identity_path,
+            running_deployment,
+            supervisor,
+            metrics,
+            app_id,
+        } = parts;
+        let live = running_deployment.map_or_else(String::new, |running| running.spicepod_yaml);
         Self {
             runtime,
             logs,
-            restart: RestartState::default(),
+            delivered_secrets,
+            identity_path,
+            live,
+            persisted: RwLock::new(None),
+            supervisor,
+            metrics,
+            app_id: RwLock::new(app_id),
         }
     }
-}
 
-/// Spicepod sections that differ between `current` and `new` and that
-/// [`Runtime::apply_app`] does **not** hot-reload — a change to any of them
-/// only takes effect after a process restart. Returns their names (empty means
-/// the change is fully hot-reloadable).
-///
-/// `apply_app` reconciles only catalogs, datasets, views, models, functions,
-/// and workers; every other section is read once at startup. The `runtime:`
-/// block is compared as a whole — a few of its fields are re-read live (e.g.
-/// `flight.batch_size`, `task_history.enabled`, `functions.enabled`), so this
-/// may occasionally over-report a restart, which is the safe direction: we
-/// never silently drop a configuration change (data-correctness first).
-///
-/// `workers` are intentionally NOT checked here: they hot-reload in builds
-/// without the `models` feature and, when `models` is enabled, model reloads
-/// cover the common case — treating them as restart-only would over-report on
-/// the typical spiced build.
-fn restart_required_sections(current: &App, new: &App) -> Vec<&'static str> {
-    let mut changed = Vec::new();
-    if current.runtime != new.runtime {
-        changed.push("runtime");
+    /// Record the app id alongside the credential so a restart keeps exporting.
+    ///
+    /// Runs on the blocking pool: the identity store is synchronous `std::fs`,
+    /// and this is called from the command dispatch loop.
+    ///
+    /// A failure is logged, not returned. The in-memory value is already set, so
+    /// metrics flow either way — all that is lost is durability across a
+    /// restart, and failing the deploy over that would be the wrong trade.
+    async fn persist_app_id(&self, app_id: &str) {
+        let path = self.identity_path.clone();
+        let app_id = app_id.to_string();
+        let result =
+            tokio::task::spawn_blocking(move || IdentityStore::store_app_id(&path, &app_id)).await;
+        let error = match result {
+            Ok(Ok(())) => return,
+            Ok(Err(err)) => err.to_string(),
+            Err(join) => format!("identity persistence task panicked: {join}"),
+        };
+        tracing::warn!(
+            "Spice Cloud Connect could not save the cloud app ID to {}. Metrics for this instance will not appear in Spice Cloud if the process restarts. Does the runtime have permission to write to that path? {error}",
+            self.identity_path.display()
+        );
     }
-    if current.embeddings != new.embeddings {
-        changed.push("embeddings");
+
+    async fn persist_attachment(&self, app_id: Option<&str>) -> Result<(), CommandError> {
+        let path = self.identity_path.clone();
+        let app_id = app_id.map(str::to_string);
+        let result = tokio::task::spawn_blocking(move || {
+            IdentityStore::set_app_id(&path, app_id.as_deref())
+        })
+        .await
+        .map_err(|error| {
+            CommandError::failed(format!("Failed to save the cloud app attachment: {error}"))
+        })?
+        .map_err(|error| {
+            CommandError::failed(format!(
+                "Failed to save the cloud app attachment to {}: {error}. Check that the runtime can write this path and retry.",
+                self.identity_path.display()
+            ))
+        })?;
+        if !result {
+            return Err(CommandError::failed(
+                "Failed to save the cloud app attachment because the Cloud Connect identity is missing. Reconnect the instance and retry.",
+            ));
+        }
+        Ok(())
     }
-    if current.rerankers != new.rerankers {
-        changed.push("rerankers");
+
+    /// The local delivered-secrets cache key, read fresh from `identity.json`.
+    ///
+    /// `None` when there is no identity yet, or it predates the cache key — in
+    /// both cases the cache is unavailable, which costs a redeploy after a
+    /// restart rather than the deployment.
+    fn cache_key(&self) -> Option<CacheKey> {
+        IdentityStore::load_optional(&self.identity_path)
+            .ok()
+            .flatten()
+            .and_then(|identity| identity.cache_key())
     }
-    if current.tools != new.tools {
-        changed.push("tools");
+
+    /// Persist the delivered secrets so the restart every deployment performs
+    /// comes back up with them, without a control-plane round trip.
+    ///
+    /// Best-effort by design: the secrets are already applied to this running
+    /// instance, so a cache failure costs a redeploy after the next restart
+    /// rather than the deployment. It is reported in the command result so the
+    /// operator is not left to discover it at restart time.
+    fn cache_delivered_secrets(
+        &self,
+        config_dir: &Path,
+        secrets: &runtime_cloud_connect::sealed_secrets::DeliveredSecrets,
+    ) -> Option<String> {
+        let key = self.cache_key()?;
+        let path = config_dir.join(runtime_cloud_connect::secret_cache::SECRET_CACHE_FILE);
+        // No deployment version to record: the dispatch does not carry one.
+        match runtime_cloud_connect::secret_cache::write(&path, &key, "", secrets) {
+            Ok(()) => None,
+            Err(err) => {
+                tracing::warn!("Spice Cloud Connect: could not cache delivered secrets: {err}");
+                Some(err.to_string())
+            }
+        }
     }
-    if current.secrets != new.secrets {
-        changed.push("secrets");
-    }
-    if current.extensions != new.extensions {
-        changed.push("extensions");
-    }
-    if current.management != new.management {
-        changed.push("management");
-    }
-    changed
 }
 
 #[async_trait]
 impl RuntimeHandle for SpicedRuntimeHandle {
     /// What a standalone `spiced` can answer. `Restart` is excluded
-    /// deliberately: there is no supervisor to bring the process back up, so
-    /// the command is not merely unimplemented here — it cannot be
-    /// implemented, and the control plane should not offer it.
+    /// deliberately: a restart is how a *deployment* applies, driven by the
+    /// instance once it has a validated spicepod to come back on — a restart on
+    /// demand, with nothing to change, is a control the portal should not offer
+    /// for a process that may have no supervisor to come back under.
     fn supports(&self, capability: Capability) -> bool {
         match capability {
-            Capability::ApplySpicepod | Capability::GetStatus => true,
+            // The handle holds the runtime, so it can always plan and execute
+            // a query against whatever the instance currently serves — an
+            // empty catalog answers with an error, not an inability.
+            Capability::ApplySpicepod
+            | Capability::AttachApp
+            | Capability::GetStatus
+            | Capability::ExecuteQuery => true,
             // Only when the log-capture layer was installed at startup;
             // otherwise there is no buffer to read from.
             Capability::GetLogs => self.logs.is_some(),
@@ -272,10 +663,13 @@ impl RuntimeHandle for SpicedRuntimeHandle {
 
     fn unsupported_reason(&self, capability: Capability) -> String {
         match capability {
-            Capability::Restart => "Restart is unsupported on standalone spiced: it has no supervisor to bring the process back up. Restart it via your process manager (systemd/Docker/Kubernetes). Configuration changes apply in-process via ApplySpicepod and do not need a restart.".to_string(),
+            Capability::Restart => "Restart is unsupported on standalone spiced: it is not a control the runtime offers on demand. A deployment already applies by restarting this instance onto the spicepod it validated; to restart it without deploying, use your process manager (systemd/Docker/Kubernetes). See: https://spiceai.org/docs".to_string(),
             Capability::UpgradeRuntime => "UpgradeRuntime is unsupported on standalone spiced: it cannot replace its own binary. Upgrade it the way you installed it (`spice upgrade`, your container image, or your package manager). See: https://spiceai.org/docs".to_string(),
             Capability::GetLogs => "Log capture is not enabled for this runtime: Spice Cloud Connect must be configured before startup for spiced to install the log-capture layer. See: https://spiceai.org/docs".to_string(),
-            Capability::ApplySpicepod | Capability::GetStatus => format!(
+            Capability::ApplySpicepod
+            | Capability::AttachApp
+            | Capability::GetStatus
+            | Capability::ExecuteQuery => format!(
                 "{} is not supported by this instance",
                 capability.wire_name()
             ),
@@ -317,94 +711,205 @@ impl RuntimeHandle for SpicedRuntimeHandle {
         })
     }
 
-    /// Apply a cloud-managed spicepod, hot-reloading what can be hot-reloaded
-    /// and flagging what cannot.
+    /// Apply a cloud-managed spicepod by persisting it and restarting onto it.
     ///
-    /// 1. The YAML is validated by building an [`App`] from it on a sibling
-    ///    temp file, so a malformed control-plane push is rejected with a
-    ///    clear error and the previous good `spicepod-cloud-managed.yml` is
-    ///    left untouched.
-    /// 2. The validated file is promoted to the canonical path so a later
-    ///    process restart picks up the FULL configuration — including the
-    ///    parts that can't hot-reload.
-    /// 3. Changes to catalogs/datasets/views/models/functions/workers are
-    ///    hot-applied via [`Runtime::apply_app`] and take effect immediately.
-    /// 4. Changes to sections `apply_app` does not reconcile (the `runtime:`
-    ///    block, embeddings, rerankers, tools, secrets, extensions,
-    ///    management — see [`restart_required_sections`]) cannot take effect
-    ///    until a restart. Rather than silently drop them, the result reports
-    ///    `restart_required: true` and the affected sections, and the pending
-    ///    state is recorded so `get_status` keeps surfacing it. Standalone
-    ///    spiced cannot self-restart, so the operator must restart it via
-    ///    their process manager.
+    /// 1. A redelivery of the spicepod this process is already serving — the
+    ///    same YAML, byte for byte — is answered as applied and changes nothing,
+    ///    not even the delivered secrets. Restarting for it would make a
+    ///    redelivery a restart loop, so a change to an app's secrets has to
+    ///    arrive with a changed spicepod rather than as a re-send of the current
+    ///    one.
+    /// 2. Delivered secrets are installed and cached first. The restart is what
+    ///    makes the spicepod live, and the components that resolve
+    ///    `${ secrets:… }` run during that start, so the cache — not this
+    ///    process's in-memory store — is what has to hold them by then.
+    /// 3. The YAML is validated by building an [`App`] from it on a sibling
+    ///    temp file, so a malformed push is rejected with a clear error and the
+    ///    previous good `spicepod-cloud-managed.yml` is left untouched and
+    ///    still running.
+    /// 4. The validated file is promoted to the canonical path and the
+    ///    deployment version recorded beside it, so the next start comes up on
+    ///    this configuration and reports this version.
+    /// 5. The client sends this result and then calls
+    ///    [`RuntimeHandle::exit_to_apply`], which drains and exits 0 for the
+    ///    supervisor to relaunch.
     ///
-    /// `success` is still `true` in the restart-required case: the spicepod
-    /// was accepted, validated, persisted, and its hot-reloadable parts
-    /// applied — the caller learns the caveat from `restart_required` rather
-    /// than from a blanket failure.
+    /// There is deliberately no hot-reload path. Reconciling part of a spicepod
+    /// in-process and leaving the rest (`runtime:`, `secrets:`, embeddings,
+    /// tools) for an operator to restart for meant two behaviours to reason
+    /// about and a partially-applied state that was neither. The cost is that
+    /// downtime is proportional to the app's size rather than the change's —
+    /// every deployment is a full start, including acceleration rebuilds.
     async fn apply_spicepod(
         &self,
-        config_dir: &Path,
-        spicepod_yaml: &str,
-    ) -> Result<serde_json::Value, CommandError> {
-        let (new_app, path) = stage_cloud_managed_spicepod(config_dir, spicepod_yaml).await?;
+        deployment: SpicepodDeployment<'_>,
+    ) -> Result<ApplyOutcome, CommandError> {
+        let SpicepodDeployment {
+            config_dir,
+            spicepod_yaml,
+            delivered_secrets,
+            app_id,
+        } = deployment;
 
-        // Determine which changes can't hot-reload BEFORE apply_app swaps the
-        // current app. No current app (first load) → startup applies it all,
-        // so nothing is restart-pending.
-        let restart_sections: Vec<String> = match self.runtime.read_app().await {
-            Some(current) => restart_required_sections(&current, &new_app)
-                .into_iter()
-                .map(String::from)
-                .collect(),
-            None => Vec::new(),
-        };
-
-        let datasets = new_app.datasets.len();
-        let models = new_app.models.len();
-        let catalogs = new_app.catalogs.len();
-        let views = new_app.views.len();
-
-        let changed = Arc::clone(&self.runtime).apply_app(Arc::new(new_app)).await;
-
-        let restart_required = !restart_sections.is_empty();
-        if restart_required {
-            // Record (accumulate) the pending-restart sections so get_status
-            // reports them until the runtime is actually restarted.
-            self.restart.pending.store(true, Ordering::SeqCst);
-            let mut guard = self
-                .restart
-                .sections
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            for section in &restart_sections {
-                if !guard.iter().any(|s| s == section) {
-                    guard.push(section.clone());
+        // Recorded before staging, and independently of whether staging succeeds:
+        // which app this instance belongs to is a fact about the deploy's target,
+        // not about the spicepod being valid. A rejected spicepod would otherwise
+        // withhold metrics for a reason that has nothing to do with them.
+        //
+        // Leave any id already recorded in place when the deployment names none:
+        // the instance's app has not changed, and clearing would silence metrics
+        // that are correctly attributed.
+        //
+        // Cloned out of the lock rather than read in the scrutinee: a scrutinee
+        // temporary lives until the match ends, so the read guard would still be
+        // held when an arm takes the write lock.
+        let held = self.app_id.read().clone();
+        match (app_id, held) {
+            (None, Some(held)) => tracing::debug!(
+                app_id = %held,
+                "Spice Cloud Connect: the Spicepod deployment named no cloud app; keeping the one already recorded"
+            ),
+            (None, None) => tracing::warn!(
+                "Spice Cloud Connect provided no app ID on Spicepod deployment. Metrics for this instance will not appear in Spice Cloud. Is this instance attached to an app?"
+            ),
+            (Some(app_id), held) => {
+                match held.as_deref() {
+                    Some(held) if held == app_id => tracing::debug!(
+                        app_id,
+                        "Spice Cloud Connect: the Spicepod deployment re-confirmed the cloud app metrics are attributed to"
+                    ),
+                    Some(previous) => tracing::debug!(
+                        app_id,
+                        previous,
+                        "Spice Cloud Connect: the Spicepod deployment moved this instance to a different cloud app; metrics follow it from the next export"
+                    ),
+                    None => tracing::debug!(
+                        app_id,
+                        "Spice Cloud Connect: metrics will be attributed to this cloud app from the next export"
+                    ),
                 }
+                *self.app_id.write() = Some(app_id.to_string());
+                self.persist_app_id(app_id).await;
             }
         }
 
-        let message = if restart_required {
-            format!(
-                "Spicepod accepted and persisted. Hot-reloadable components were applied, but changes to [{}] do not take effect until spiced is restarted. Standalone spiced cannot self-restart — restart it via your process manager (systemd/Docker/Kubernetes).",
-                restart_sections.join(", ")
-            )
-        } else {
-            "Spicepod applied without a restart.".to_string()
+        // Cloned out of the lock rather than compared under it: the guard must
+        // not be held across the awaits below.
+        let persisted = self.persisted.read().clone();
+        match disposition(&self.live, persisted.as_deref(), spicepod_yaml) {
+            Disposition::AlreadyLive => {
+                tracing::info!(
+                    "Spice Cloud Connect: the deployed spicepod is already applied; nothing to do"
+                );
+                return Ok(ApplyOutcome::settled(serde_json::json!({
+                    "path": config_dir.join(CLOUD_MANAGED_SPICEPOD_FILE).display().to_string(),
+                    "applied": true,
+                    "live": true,
+                    "restart": "not_required",
+                    "message": "This spicepod is already applied and live; this instance is serving it.",
+                })));
+            }
+            Disposition::AlreadyPersisted => {
+                tracing::info!(
+                    "Spice Cloud Connect: the deployed spicepod is already persisted; restarting onto it"
+                );
+                return Ok(ApplyOutcome::exit_to_apply(serde_json::json!({
+                    "path": config_dir.join(CLOUD_MANAGED_SPICEPOD_FILE).display().to_string(),
+                    "applied": true,
+                    "live": false,
+                    "restart": "in_progress",
+                    "message": "This spicepod is persisted; this instance is restarting onto it.",
+                })));
+            }
+            Disposition::Apply => {}
+        }
+
+        // Install and cache the delivered secrets BEFORE the spicepod is
+        // validated: `AppBuilder::build_from_path` resolves `${ secrets:… }`
+        // references, so secrets installed afterwards would arrive after
+        // validation had already failed on them.
+        let mut cache_error = None;
+        let delivered_names = match delivered_secrets {
+            None => None,
+            Some(secrets) => {
+                let names: Vec<String> = secrets.keys().cloned().collect();
+                cache_error = self.cache_delivered_secrets(config_dir, &secrets);
+                // Replaces the whole set: an app whose secrets were removed
+                // must stop resolving them.
+                self.delivered_secrets.replace(secrets);
+                Some(names)
+            }
         };
 
-        Ok(serde_json::json!({
+        let (new_app, path) = stage_cloud_managed_spicepod(config_dir, spicepod_yaml).await?;
+
+        *self.persisted.write() = Some(spicepod_yaml.to_string());
+
+        tracing::info!(
+            "Spice Cloud Connect: the deployed spicepod was validated and persisted to {} ({} datasets, {} models, {} catalogs, {} views); restarting to apply it",
+            path.display(),
+            new_app.datasets.len(),
+            new_app.models.len(),
+            new_app.catalogs.len(),
+            new_app.views.len(),
+        );
+
+        Ok(ApplyOutcome::exit_to_apply(serde_json::json!({
             "path": path.display().to_string(),
             "applied": true,
-            "spicepod_changed": changed,
-            "restart_required": restart_required,
-            "restart_required_sections": restart_sections,
-            "message": message,
-            "datasets": datasets,
-            "models": models,
-            "catalogs": catalogs,
-            "views": views,
-        }))
+            "live": false,
+            "restart": "required",
+            "supervised": self.supervisor.is_supervised(),
+            "supervisor": self.supervisor.as_str(),
+            "message": "The spicepod was validated and persisted. This instance is restarting to serve it; the restart reloads every dataset, so the app is unavailable until it finishes.",
+            "datasets": new_app.datasets.len(),
+            "models": new_app.models.len(),
+            "catalogs": new_app.catalogs.len(),
+            "views": new_app.views.len(),
+            // Names only — a delivered value never leaves this process.
+            "delivered_secrets": delivered_names,
+            "secrets_cache_error": cache_error,
+        })))
+    }
+
+    /// Drain and exit 0 so the supervisor relaunches spiced on the spicepod
+    /// [`SpicedRuntimeHandle::apply_spicepod`] persisted.
+    ///
+    /// Takes the same drain path a `SIGTERM` would rather than exiting outright:
+    /// a deployment restart is a planned shutdown, and an accelerator with local
+    /// state has to flush it before the process goes. The drain is bounded by
+    /// [`DEPLOYMENT_DRAIN_BUDGET`] — a deployment that cannot finish draining
+    /// must still restart the instance, not strand it.
+    ///
+    /// Does not return.
+    async fn exit_to_apply(&self) {
+        // Abandon an unfinished initial load first. It retries a failing
+        // component for as long as the runtime is up, so left running it would
+        // keep registering datasets from the app being replaced for the whole
+        // drain — work thrown away at exit, against a configuration that is no
+        // longer canonical.
+        if self.runtime.supersede_initial_load() {
+            tracing::debug!(
+                "Spice Cloud Connect: abandoned the in-flight component load to restart for a deployment"
+            );
+        }
+
+        if tokio::time::timeout(DEPLOYMENT_DRAIN_BUDGET, self.runtime.shutdown())
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                "Spice Cloud Connect: the runtime did not finish draining within {DEPLOYMENT_DRAIN_BUDGET:?}; exiting anyway to apply the deployment"
+            );
+        }
+
+        if !self.supervisor.is_supervised() {
+            tracing::error!(
+                "Spice Cloud Connect: exiting to apply a deployment with no process supervisor detected — nothing will restart this instance. Install the service with `sudo spice connect --install`, or run spiced under a supervisor. See: https://spiceai.org/docs"
+            );
+        }
+        tracing::info!("Spice Cloud Connect: exiting to apply the deployment");
+        std::process::exit(0);
     }
 
     /// Return recent captured log lines for a `GetLogs` command.
@@ -444,8 +949,9 @@ impl RuntimeHandle for SpicedRuntimeHandle {
     /// accelerated dataset can keep serving from its acceleration layer even
     /// while its source is in error — so a component error is not necessarily
     /// terminal. Per-component states and any error messages ride in the
-    /// `components`/`errors` detail, and `restart_pending` surfaces a deploy
-    /// that needs a restart (see `apply_spicepod`).
+    /// `components`/`errors` detail, alongside the deployment this instance is
+    /// serving and whether anything supervises it — the two facts that say
+    /// whether a deployment landed and whether the next one can.
     async fn status(&self) -> Result<StatusReport, CommandError> {
         let status = self.runtime.status();
         let all = status.get_all_statuses();
@@ -507,13 +1013,11 @@ impl RuntimeHandle for SpicedRuntimeHandle {
             .map(|(k, v)| (k.clone(), serde_json::json!(v.to_string())))
             .collect();
 
-        let restart_pending = self.restart.pending.load(Ordering::SeqCst);
-        let restart_pending_sections: Vec<String> = self
-            .restart
-            .sections
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
+        // A deployment this process persisted but has not yet restarted onto.
+        // The window is short — the client exits as soon as the result is
+        // flushed — but a status read inside it must not report the deployment
+        // as live.
+        let restart_pending = self.persisted.read().is_some();
 
         Ok(
             StatusReport::new(phase, reason).with_detail(serde_json::json!({
@@ -523,10 +1027,275 @@ impl RuntimeHandle for SpicedRuntimeHandle {
                 "components": components,
                 "errors": errors,
                 "restart_pending": restart_pending,
-                "restart_pending_sections": restart_pending_sections,
+                // Whether anything will bring this instance back when a
+                // deployment exits it. `false` means a deployment stops the
+                // instance instead of updating it — the operator has to know
+                // before that happens, not after.
+                "supervised": self.supervisor.is_supervised(),
+                "supervisor": self.supervisor.as_str(),
+                "supervisor_note": self.supervisor.caveat(),
+                // Names only, never values — this document reaches the portal
+                // and the command log. The count and the names are what let an
+                // operator tell "the deployment delivered no secrets" apart from
+                // "the component's reference is misspelled".
+                "delivered_secrets": self.delivered_secrets.names(),
+                "delivered_secrets_available": !self.delivered_secrets.is_empty(),
+                // Whether a restart will still have them. Without a cache key
+                // the secrets are memory-only, so the next restart needs a
+                // redeploy — status says so rather than failing mutely later.
+                "delivered_secrets_persisted": self.cache_key().is_some(),
             })),
         )
     }
+
+    async fn collect_metrics(&self) -> Result<Option<Vec<u8>>, CommandError> {
+        let Some(reader) = &self.metrics else {
+            return Ok(None);
+        };
+        // Read and release: the collection below is CPU work, and the write side
+        // is an inbound ApplySpicepod that must not queue behind it.
+        let app_id = self.app_id.read().clone();
+        let Some(app_id) = app_id else {
+            tracing::debug!(
+                "Spice Cloud Connect: metrics are withheld because this instance is not attached to a Spice Cloud app"
+            );
+            return Ok(None);
+        };
+        let reader = reader.clone();
+        tokio::task::spawn_blocking(move || reader.collect_otlp_export(&app_id))
+            .await
+            .map_err(|err| {
+                CommandError::internal(format!("The metrics encoder stopped unexpectedly: {err}"))
+            })?
+            .map_err(|err| CommandError::internal(err.to_string()))
+    }
+
+    async fn attach_app(&self, app_id: Option<&str>) -> Result<serde_json::Value, CommandError> {
+        self.persist_attachment(app_id).await?;
+        *self.app_id.write() = app_id.map(str::to_string);
+        Ok(serde_json::json!({ "app_id": app_id }))
+    }
+
+    /// Execute an `ExecuteQuery` against the in-process runtime.
+    ///
+    /// The query goes through the same `DataFusion` entry point the local SQL
+    /// APIs use, so there is no HTTP hop and no second set of query semantics
+    /// to keep aligned.
+    ///
+    /// It runs **read-only**: the statement is planned and then rejected if it
+    /// carries DDL, DML, `COPY`, or a write-capable extension. This command
+    /// arrives from the control plane rather than from someone holding the
+    /// instance's own credentials, so it reads the instance and never changes
+    /// it.
+    ///
+    /// `max_rows` is clamped again here rather than trusted: the caller already
+    /// clamps it, and a limit enforced in exactly one place is a limit one
+    /// refactor away from being gone.
+    async fn execute_query(&self, sql: &str, max_rows: u32) -> Result<QueryOutcome, CommandError> {
+        let result = self
+            .runtime
+            .datafusion()
+            .query_builder(sql)
+            .read_only(true)
+            .build()
+            .run()
+            .await
+            .map_err(|source| query_error(&source))?;
+        bounded_arrow_ipc(result.data, effective_max_rows(max_rows)).await
+    }
+}
+
+/// Classify a query failure so the portal can tell a bad statement from a
+/// struggling instance without reading the English.
+///
+/// A statement the engine could not parse, plan, or resolve is the caller's to
+/// fix and fails identically on retry — that is `INVALID_ARGUMENT`. An
+/// execution, resource, or I/O fault is the instance's, and may not recur, so
+/// it stays retryable.
+fn query_error(source: &QueryError) -> CommandError {
+    let caller_fault = match source {
+        QueryError::UnableToExecuteQuery { source } | QueryError::BindingParameters { source } => {
+            is_caller_error(source)
+        }
+        QueryError::TableAccessDisallowed { .. } => true,
+        _ => false,
+    };
+    classify(caller_fault, format!("Query failed: {source}"))
+}
+
+/// The same classification for a failure that arrives as a bare
+/// `DataFusionError` — mid-stream, after planning already succeeded.
+fn datafusion_error(source: &DataFusionError) -> CommandError {
+    classify(is_caller_error(source), format!("Query failed: {source}"))
+}
+
+fn classify(caller_fault: bool, message: String) -> CommandError {
+    if caller_fault {
+        CommandError::invalid_argument(message)
+    } else {
+        CommandError::failed(message)
+    }
+}
+
+/// Whether a `DataFusion` error blames the statement rather than the instance.
+fn is_caller_error(source: &DataFusionError) -> bool {
+    match source {
+        DataFusionError::SQL(..)
+        | DataFusionError::Plan(..)
+        | DataFusionError::SchemaError(..)
+        | DataFusionError::NotImplemented(..) => true,
+        // Wrappers that add context around the error that actually happened.
+        DataFusionError::Context(_, inner) | DataFusionError::Diagnostic(_, inner) => {
+            is_caller_error(inner)
+        }
+        DataFusionError::Shared(inner) => is_caller_error(inner),
+        // Only the caller's fault if nothing in the collection is the
+        // instance's: a set holding both blames the instance, since that is the
+        // half a retry might clear.
+        DataFusionError::Collection(errors) => {
+            !errors.is_empty() && errors.iter().all(is_caller_error)
+        }
+        _ => false,
+    }
+}
+
+/// An in-memory sink that refuses to grow past `limit`.
+///
+/// Bounding the *writer* is what makes an oversized result cheap: the encoder
+/// fails on the first write that would cross the cap, so the bytes are never
+/// materialized and then measured. A single row too large to fit trips it the
+/// same way a million small ones do.
+struct BoundedBuffer {
+    bytes: Vec<u8>,
+    limit: usize,
+    /// Set when a write was refused, so the caller can tell the cap apart from
+    /// a genuine encoding fault after the error has been laundered through
+    /// `ArrowError`.
+    overflowed: Arc<AtomicBool>,
+}
+
+impl std::io::Write for BoundedBuffer {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        if self.bytes.len().saturating_add(data.len()) > self.limit {
+            self.overflowed.store(true, Ordering::Relaxed);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "Cloud Connect query result limit exceeded",
+            ));
+        }
+        self.bytes.extend_from_slice(data);
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Encode a result of at most `max_rows` rows as one complete Arrow IPC stream
+/// of at most [`MAX_QUERY_RESULT_BYTES`] bytes.
+///
+/// One row beyond the cap is read so an exact-cap result can be distinguished
+/// from a truncated one. Encoding runs on Tokio's blocking pool and receives
+/// batches over a one-slot channel, retaining the streaming bound without
+/// doing synchronous Arrow serialization on a runtime worker. An empty result
+/// still produces a valid stream carrying the schema.
+async fn bounded_arrow_ipc(
+    mut stream: SendableRecordBatchStream,
+    max_rows: u32,
+) -> Result<QueryOutcome, CommandError> {
+    let schema = stream.schema();
+    let limit = max_rows as usize;
+    let overflowed = Arc::new(AtomicBool::new(false));
+    let encoder_overflowed = Arc::clone(&overflowed);
+    let (sender, mut receiver) = tokio::sync::mpsc::channel::<RecordBatch>(1);
+    let encoder = tokio::task::spawn_blocking(move || {
+        let sink = BoundedBuffer {
+            bytes: Vec::new(),
+            limit: MAX_QUERY_RESULT_BYTES,
+            overflowed: Arc::clone(&encoder_overflowed),
+        };
+        let mut writer = StreamWriter::try_new(sink, &schema)
+            .map_err(|source| encode_error(&encoder_overflowed, &source))?;
+        let mut rows = 0_u64;
+        while let Some(batch) = receiver.blocking_recv() {
+            rows = rows.saturating_add(batch.num_rows() as u64);
+            writer
+                .write(&batch)
+                .map_err(|source| encode_error(&encoder_overflowed, &source))?;
+        }
+        writer
+            .finish()
+            .map_err(|source| encode_error(&encoder_overflowed, &source))?;
+        let sink = writer
+            .into_inner()
+            .map_err(|source| encode_error(&encoder_overflowed, &source))?;
+        Ok(QueryOutcome {
+            arrow_ipc: sink.bytes,
+            row_count: rows,
+        })
+    });
+
+    let stream_result = async {
+        let mut rows = 0_usize;
+        let mut exceeded = false;
+        while let Some(batch) = stream.next().await {
+            // A failure that surfaces here rather than at planning is usually
+            // the instance's — a federated source going away mid-scan.
+            let batch = batch.map_err(|source| datafusion_error(&source))?;
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            let remaining = limit.saturating_sub(rows);
+            if batch.num_rows() > remaining {
+                exceeded = true;
+                break;
+            }
+            rows += batch.num_rows();
+            if sender.send(batch).await.is_err() {
+                // The encoder has already produced the more specific error;
+                // stop pulling the query stream and surface it below.
+                break;
+            }
+        }
+        Ok::<bool, CommandError>(exceeded)
+    }
+    .await;
+    drop(sender);
+
+    // Always join the blocking task, including after a stream failure, so an
+    // encoder never outlives the command that owns it.
+    let outcome = encoder.await.map_err(|err| {
+        CommandError::internal(format!(
+            "The query result encoder stopped unexpectedly: {err}"
+        ))
+    })?;
+    let exceeded = stream_result?;
+    if exceeded {
+        return Err(row_limit_error(max_rows));
+    }
+    outcome
+}
+
+fn row_limit_error(max_rows: u32) -> CommandError {
+    CommandError::result_too_large(format!(
+        "The query result exceeds the {max_rows}-row Cloud Connect limit and was not sent. Add or reduce LIMIT, narrow the projection, or aggregate the result and run it again."
+    ))
+}
+
+/// Classify an encoder failure: the byte cap, or a genuine fault.
+///
+/// Neither message repeats the query or a value from it.
+fn encode_error(overflowed: &AtomicBool, source: &ArrowError) -> CommandError {
+    if overflowed.load(Ordering::Relaxed) {
+        return CommandError::result_too_large(format!(
+            "The query result exceeds the {} MiB Cloud Connect limit and was not sent. Return fewer rows or columns (a smaller LIMIT, a narrower projection, or an aggregate) and run it again.",
+            MAX_QUERY_RESULT_BYTES / (1024 * 1024)
+        ));
+    }
+    CommandError::internal(format!(
+        "Failed to encode the query result as Arrow IPC: {source}"
+    ))
 }
 
 /// Validate a cloud-managed spicepod and persist it to disk.
@@ -535,8 +1304,9 @@ impl RuntimeHandle for SpicedRuntimeHandle {
 /// [`App`] from it to validate (parse + resolve), and only on success
 /// atomically promotes the temp file to the canonical
 /// [`CLOUD_MANAGED_SPICEPOD_FILE`] path. On any failure the canonical file is
-/// left untouched and the temp file is cleaned up. Returns the built `App`
-/// (ready to hot-apply) and the canonical path it was written to.
+/// left untouched — the instance keeps serving it — and the temp file is
+/// cleaned up. Returns the built `App`, which the caller reads counts off for
+/// the command result, and the canonical path it was written to.
 ///
 /// Factored out of [`SpicedRuntimeHandle::apply_spicepod`] so the
 /// file-staging + validation can be unit-tested without a running runtime.
@@ -623,6 +1393,12 @@ async fn replace_canonical_spicepod(incoming: &Path, path: &Path) -> Result<(), 
 mod tests {
     use super::*;
 
+    use arrow::array::{Int32Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+    use arrow::ipc::reader::StreamReader;
+    use datafusion::physical_plan::memory::MemoryStream;
+    use runtime_cloud_connect::handlers::MAX_QUERY_ROWS;
+
     /// Minimal valid spicepod (no components — an empty app is valid).
     const VALID_SPICEPOD: &str = "version: v2\nkind: Spicepod\nname: cloud-managed-test\n";
     /// Invalid YAML (unclosed flow sequence) — guaranteed to fail parsing.
@@ -636,6 +1412,36 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("create scratch dir");
         dir
+    }
+
+    #[tokio::test]
+    async fn a_missing_managed_deployment_is_an_ordinary_absence() {
+        let dir = scratch_dir("managed-missing");
+        let path = dir.join(CLOUD_MANAGED_SPICEPOD_FILE);
+
+        let deployed = read_cloud_managed_spicepod(path)
+            .await
+            .expect("a missing deployment is not a read failure");
+        assert!(deployed.is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_managed_deployment_is_not_treated_as_missing() {
+        let dir = scratch_dir("managed-unreadable");
+        let path = dir.join(CLOUD_MANAGED_SPICEPOD_FILE);
+        tokio::fs::write(&path, [0xff])
+            .await
+            .expect("write invalid UTF-8 fixture");
+
+        let Err(err) = read_cloud_managed_spicepod(path.clone()).await else {
+            panic!("invalid UTF-8 must remain a read failure");
+        };
+        assert_eq!(err.path, path);
+        assert_eq!(err.source.kind(), std::io::ErrorKind::InvalidData);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
@@ -706,29 +1512,311 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The redelivery case #1306 turns into a crash loop if it is missed: the
+    /// spicepod the instance is already serving must change nothing.
     #[test]
-    fn restart_required_sections_empty_for_identical_apps() {
-        let a = App::default();
-        let b = App::default();
-        assert!(
-            restart_required_sections(&a, &b).is_empty(),
-            "identical apps need no restart"
+    fn redelivering_the_running_spicepod_is_a_no_op() {
+        assert_eq!(
+            disposition(VALID_SPICEPOD, None, VALID_SPICEPOD),
+            Disposition::AlreadyLive
         );
     }
 
+    /// Anything else is a new configuration and must be applied, or the running
+    /// app stops matching what was deployed.
     #[test]
-    fn restart_required_sections_flags_runtime_change() {
-        let base = App::default();
-        // Change a `runtime:` field that apply_app does not hot-reload.
-        let mut changed = App::default();
-        changed.runtime.dataset_load_parallelism = Some(4);
-
+    fn a_changed_spicepod_is_applied() {
+        let changed = "version: v2\nkind: Spicepod\nname: changed\n";
         assert_eq!(
-            restart_required_sections(&base, &changed),
-            vec!["runtime"],
-            "a runtime-config change must require a restart"
+            disposition(VALID_SPICEPOD, None, changed),
+            Disposition::Apply
         );
-        // Detection is symmetric.
-        assert_eq!(restart_required_sections(&changed, &base), vec!["runtime"]);
+    }
+
+    /// Between the result being sent and the process exiting, the control plane
+    /// can redeliver. The instance has already committed to that spicepod, so it
+    /// re-issues the exit rather than persisting it again — and never reports it
+    /// as live, which it is not.
+    #[test]
+    fn redelivery_while_a_restart_is_pending_re_issues_the_exit() {
+        let pending = "version: v2\nkind: Spicepod\nname: next\n";
+        assert_eq!(
+            disposition(VALID_SPICEPOD, Some(pending), pending),
+            Disposition::AlreadyPersisted
+        );
+        // And the spicepod it replaced is no longer "already live": it is on its
+        // way out, so re-sending it is a new configuration to apply.
+        assert_eq!(
+            disposition(VALID_SPICEPOD, Some(pending), VALID_SPICEPOD),
+            Disposition::Apply
+        );
+    }
+
+    /// An instance serving a local spicepod has no deployment to match, so the
+    /// first one always applies.
+    #[test]
+    fn a_runtime_with_no_deployment_applies_the_first_one() {
+        assert_eq!(disposition("", None, VALID_SPICEPOD), Disposition::Apply);
+    }
+
+    // ----------------------------------------------------------------------
+    // ExecuteQuery: row cap, byte cap, and the Arrow IPC the caller decodes.
+    // ----------------------------------------------------------------------
+
+    /// One `Int32` column named `n`, the shape every query test below returns.
+    fn int_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![Field::new("n", DataType::Int32, false)]))
+    }
+
+    /// A batch of `count` rows counting up from `start`.
+    fn int_batch(start: i32, count: i32) -> RecordBatch {
+        let values: Vec<i32> = (start..start + count).collect();
+        RecordBatch::try_new(int_schema(), vec![Arc::new(Int32Array::from(values))])
+            .expect("build int batch")
+    }
+
+    /// A batch of one row holding `bytes` bytes of string, for the byte-cap
+    /// tests.
+    fn wide_batch(bytes: usize) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new("blob", DataType::Utf8, false)]));
+        let value = "x".repeat(bytes);
+        RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(vec![value]))])
+            .expect("build wide batch")
+    }
+
+    fn stream_of(schema: SchemaRef, batches: Vec<RecordBatch>) -> SendableRecordBatchStream {
+        Box::pin(MemoryStream::try_new(batches, schema, None).expect("memory stream"))
+    }
+
+    /// Decode an Arrow IPC stream back into batches — what the caller does, so
+    /// the assertion is on a real round trip rather than on a byte count.
+    fn decode(ipc: &[u8]) -> (SchemaRef, Vec<RecordBatch>) {
+        let reader = StreamReader::try_new(std::io::Cursor::new(ipc), None)
+            .expect("the payload must be a complete Arrow IPC stream");
+        let schema = reader.schema();
+        let batches = reader
+            .collect::<Result<Vec<_>, _>>()
+            .expect("every batch must decode");
+        (schema, batches)
+    }
+
+    fn total_rows(batches: &[RecordBatch]) -> usize {
+        batches.iter().map(RecordBatch::num_rows).sum()
+    }
+
+    #[tokio::test]
+    async fn a_query_result_round_trips_through_arrow_ipc() {
+        let outcome = bounded_arrow_ipc(
+            stream_of(int_schema(), vec![int_batch(0, 3), int_batch(3, 2)]),
+            MAX_QUERY_ROWS,
+        )
+        .await
+        .expect("a small result encodes");
+
+        assert_eq!(outcome.row_count, 5);
+        let (schema, batches) = decode(&outcome.arrow_ipc);
+        assert_eq!(schema.field(0).name(), "n");
+        assert_eq!(total_rows(&batches), 5);
+        let values: Vec<i32> = batches
+            .iter()
+            .flat_map(|b| {
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .expect("int column")
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        assert_eq!(values, vec![0, 1, 2, 3, 4], "values must survive the trip");
+    }
+
+    /// An empty result is a schema and zero rows, not an absent payload — the
+    /// caller must be able to tell "no rows" from "no answer".
+    #[tokio::test]
+    async fn an_empty_result_still_carries_the_schema() {
+        let outcome = bounded_arrow_ipc(stream_of(int_schema(), vec![]), MAX_QUERY_ROWS)
+            .await
+            .expect("an empty result encodes");
+
+        assert_eq!(outcome.row_count, 0);
+        assert!(
+            !outcome.arrow_ipc.is_empty(),
+            "an empty result must still be a valid stream"
+        );
+        let (schema, batches) = decode(&outcome.arrow_ipc);
+        assert_eq!(schema.field(0).name(), "n");
+        assert_eq!(total_rows(&batches), 0);
+    }
+
+    /// A row over the cap fails instead of returning an apparently complete
+    /// result that was silently truncated inside a batch.
+    #[tokio::test]
+    async fn the_row_cap_rejects_a_partial_batch() {
+        let err = bounded_arrow_ipc(
+            stream_of(int_schema(), vec![int_batch(0, 600)]),
+            MAX_QUERY_ROWS,
+        )
+        .await
+        .expect_err("a truncated result must be refused");
+        assert!(
+            matches!(err, CommandError::ResultTooLarge { .. }),
+            "an over-cap result must be typed result-too-large, got {err:?}"
+        );
+    }
+
+    /// The cap is enforced across the whole result, not per batch.
+    #[tokio::test]
+    async fn the_row_cap_rejects_rows_in_a_later_batch() {
+        let batches: Vec<RecordBatch> = (0..10).map(|i| int_batch(i * 100, 100)).collect();
+        let err = bounded_arrow_ipc(stream_of(int_schema(), batches), 250)
+            .await
+            .expect_err("a truncated result must be refused");
+        assert!(matches!(err, CommandError::ResultTooLarge { .. }));
+    }
+
+    #[tokio::test]
+    async fn a_result_with_exactly_the_row_cap_succeeds() {
+        let outcome = bounded_arrow_ipc(
+            stream_of(int_schema(), vec![int_batch(0, 100), int_batch(100, 150)]),
+            250,
+        )
+        .await
+        .expect("an exact-cap result is complete");
+        assert_eq!(outcome.row_count, 250);
+        let (_, decoded) = decode(&outcome.arrow_ipc);
+        assert_eq!(total_rows(&decoded), 250);
+    }
+
+    /// A result over the byte cap fails outright. No partial stream comes back:
+    /// a truncated Arrow IPC payload would look to the caller like a complete,
+    /// smaller answer.
+    #[tokio::test]
+    async fn an_oversized_result_fails_without_partial_data() {
+        // Twenty rows of ~512 KiB each — well past 4 MiB in total, but each one
+        // fits, so the cap has to be enforced across the whole stream.
+        let schema = wide_batch(1).schema();
+        let batches: Vec<RecordBatch> = (0..20).map(|_| wide_batch(512 * 1024)).collect();
+
+        let err = bounded_arrow_ipc(stream_of(schema, batches), MAX_QUERY_ROWS)
+            .await
+            .expect_err("an oversized result must fail");
+        assert!(
+            matches!(err, CommandError::ResultTooLarge { .. }),
+            "an oversized result must be typed result-too-large, got {err:?}"
+        );
+    }
+
+    /// A single row too large to send takes the same path — the caller cannot
+    /// narrow a LIMIT out of it, so it must still be a typed refusal rather
+    /// than a truncated row.
+    #[tokio::test]
+    async fn a_single_oversized_row_fails_the_same_way() {
+        let batch = wide_batch(MAX_QUERY_RESULT_BYTES + 1024);
+        let schema = batch.schema();
+
+        let err = bounded_arrow_ipc(stream_of(schema, vec![batch]), MAX_QUERY_ROWS)
+            .await
+            .expect_err("an oversized row must fail");
+        assert!(
+            matches!(err, CommandError::ResultTooLarge { .. }),
+            "an oversized row must be typed result-too-large, got {err:?}"
+        );
+    }
+
+    /// The refusal names the limit and the way out, and repeats neither the
+    /// query nor a value from it.
+    #[test]
+    fn the_oversized_message_leaks_neither_sql_nor_values() {
+        let overflowed = AtomicBool::new(true);
+        let message = encode_error(
+            &overflowed,
+            &ArrowError::IoError(
+                "ignored".to_string(),
+                std::io::Error::other("Cloud Connect query result limit exceeded"),
+            ),
+        )
+        .to_string();
+        assert!(message.contains("4 MiB"), "must name the limit: {message}");
+        assert!(
+            message.contains("LIMIT"),
+            "must say how to get under it: {message}"
+        );
+    }
+
+    /// A statement the engine could not parse, plan, or resolve is the caller's
+    /// to fix; an execution or I/O fault is the instance's and may not recur.
+    /// Collapsing both into one code leaves the portal unable to tell "your SQL
+    /// is wrong" from "this instance is struggling".
+    #[test]
+    fn query_failures_are_classified_by_who_can_fix_them() {
+        let callers = [
+            DataFusionError::Plan("No field named foo".to_string()),
+            DataFusionError::NotImplemented("LATERAL".to_string()),
+            // The engine wraps planning errors in context/diagnostic layers;
+            // classification has to see through them.
+            DataFusionError::Context(
+                "while planning".to_string(),
+                Box::new(DataFusionError::Plan("bad".to_string())),
+            ),
+        ];
+        for source in callers {
+            assert!(
+                is_caller_error(&source),
+                "must blame the statement: {source}"
+            );
+        }
+
+        let instances = [
+            DataFusionError::Execution("scan failed".to_string()),
+            DataFusionError::ResourcesExhausted("out of memory".to_string()),
+            DataFusionError::Internal("bug".to_string()),
+            DataFusionError::Context(
+                "while scanning".to_string(),
+                Box::new(DataFusionError::Execution("source down".to_string())),
+            ),
+        ];
+        for source in instances {
+            assert!(
+                !is_caller_error(&source),
+                "must blame the instance: {source}"
+            );
+        }
+    }
+
+    /// The classification has to survive the `QueryError` wrapper the runtime
+    /// actually returns, not just a bare `DataFusionError`.
+    #[test]
+    fn a_planning_failure_reaches_the_wire_as_invalid_argument() {
+        let planning = QueryError::UnableToExecuteQuery {
+            source: DataFusionError::Plan("No field named foo".to_string()),
+        };
+        assert!(
+            matches!(query_error(&planning), CommandError::InvalidArgument { .. }),
+            "a planning failure is the caller's mistake"
+        );
+
+        let execution = QueryError::UnableToExecuteQuery {
+            source: DataFusionError::Execution("source unreachable".to_string()),
+        };
+        assert!(
+            matches!(query_error(&execution), CommandError::Failed { .. }),
+            "an execution failure is retryable, not the caller's mistake"
+        );
+    }
+
+    /// A result that fits must never be misreported as oversized.
+    #[tokio::test]
+    async fn a_result_just_under_the_cap_still_sends() {
+        let batch = wide_batch(MAX_QUERY_RESULT_BYTES / 2);
+        let schema = batch.schema();
+
+        let outcome = bounded_arrow_ipc(stream_of(schema, vec![batch]), MAX_QUERY_ROWS)
+            .await
+            .expect("a result under the cap must send");
+        assert_eq!(outcome.row_count, 1);
+        assert!(outcome.arrow_ipc.len() <= MAX_QUERY_RESULT_BYTES);
+        let (_, batches) = decode(&outcome.arrow_ipc);
+        assert_eq!(total_rows(&batches), 1);
     }
 }

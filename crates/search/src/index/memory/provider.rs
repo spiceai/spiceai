@@ -26,7 +26,7 @@ use arrow_schema::{DataType, Field, SchemaRef};
 use async_trait::async_trait;
 use datafusion::{
     catalog::{MemTable, Session},
-    common::{Constraints, not_impl_err},
+    common::{Column, Constraints, not_impl_err},
     datasource::{DefaultTableSource, TableProvider, TableType},
     error::{DataFusionError, Result as DataFusionResult},
     logical_expr::Expr,
@@ -208,7 +208,8 @@ impl MemoryVectorQueryTable {
                 vec![lit(self.query.clone()), lit(self.model_name.clone())],
             ));
 
-        let embedding_col = col(self.embedding_column_name.clone());
+        let embedding_col =
+            LogicalExpr::Column(Column::new_unqualified(self.embedding_column_name.clone()));
         match self.metric {
             MemoryDistanceMetric::Cosine => binary_expr(
                 lit(1.0),
@@ -249,7 +250,7 @@ impl MemoryVectorQueryTable {
         Ok(schema
             .fields()
             .iter()
-            .map(|field| col(field.name().clone()))
+            .map(|field| LogicalExpr::Column(Column::new_unqualified(field.name())))
             .collect())
     }
 }

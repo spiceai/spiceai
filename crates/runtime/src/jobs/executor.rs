@@ -78,8 +78,13 @@ impl JobExecutor {
     /// Submits a new query job for async execution.
     ///
     /// Returns the job state immediately. The query will be executed in the background.
-    pub async fn submit(&self, request: SubmitQueryRequest, read_only: bool) -> Result<JobState> {
-        let state = self.job_store.create_job(request, read_only).await?;
+    pub async fn submit(
+        &self,
+        request: SubmitQueryRequest,
+        read_only: bool,
+        owner: String,
+    ) -> Result<JobState> {
+        let state = self.job_store.create_job(request, read_only, owner).await?;
         let job_id = state.job_id.clone();
 
         // Create cancellation token for this job
@@ -181,26 +186,69 @@ impl JobExecutor {
         );
     }
 
-    /// Requests cancellation of a running job.
-    pub async fn cancel(&self, job_id: &str) -> Result<JobState> {
+    /// Requests cancellation of a running job submitted by `caller`.
+    pub async fn cancel(&self, job_id: &str, caller: &str) -> Result<JobState> {
+        // Resolve ownership before signalling: a caller that did not submit
+        // the job must not be able to stop it.
+        self.owned_job(job_id, caller).await?;
+
         // Signal cancellation to the running task
-        let active = self.active_jobs.read().await;
-        if let Some(info) = active.get(job_id) {
-            info.cancel_token.cancel();
+        {
+            let active = self.active_jobs.read().await;
+            if let Some(info) = active.get(job_id) {
+                info.cancel_token.cancel();
+            }
         }
 
         // Update job state
         self.job_store.cancel_job(job_id).await
     }
 
-    /// Gets the current state of a job.
-    pub async fn get_status(&self, job_id: &str) -> Result<JobState> {
-        self.job_store.get_job(job_id).await
+    /// Gets the current state of a job submitted by `caller`.
+    pub async fn get_status(&self, job_id: &str, caller: &str) -> Result<JobState> {
+        self.owned_job(job_id, caller).await
     }
 
-    /// Reads a result chunk for a completed job.
-    pub async fn get_chunk(&self, job_id: &str, chunk_index: usize) -> Result<Vec<RecordBatch>> {
-        let state = self.job_store.get_job(job_id).await?;
+    /// Reads a job's state and authorizes `caller` against it.
+    ///
+    /// Ownership is resolved before expiry so every job `caller` does not own
+    /// answers identically, whether it is live, expired, or absent.
+    async fn owned_job(&self, job_id: &str, caller: &str) -> Result<JobState> {
+        let state = self.job_store.get_job_ignoring_expiry(job_id).await?;
+        Self::require_owner(&state, caller)?;
+        if state.is_expired() {
+            return Err(super::error::Error::JobResultsExpired {
+                job_id: job_id.to_string(),
+            });
+        }
+        Ok(state)
+    }
+
+    /// Rejects access to a job `caller` did not submit.
+    ///
+    /// Reports the job as missing rather than forbidden so the API does not
+    /// confirm that a job id exists to a principal that cannot read it.
+    fn require_owner(state: &JobState, caller: &str) -> Result<()> {
+        if state.is_owned_by(caller) {
+            return Ok(());
+        }
+        tracing::debug!(
+            job_id = %state.job_id,
+            "Refusing access to a job submitted by a different principal"
+        );
+        Err(super::error::Error::JobNotFound {
+            job_id: state.job_id.clone(),
+        })
+    }
+
+    /// Reads a result chunk for a completed job submitted by `caller`.
+    pub async fn get_chunk(
+        &self,
+        job_id: &str,
+        chunk_index: usize,
+        caller: &str,
+    ) -> Result<Vec<RecordBatch>> {
+        let state = self.owned_job(job_id, caller).await?;
 
         if state.status != JobStatus::Succeeded {
             return Err(super::error::Error::JobNotComplete {
@@ -221,8 +269,24 @@ impl JobExecutor {
         self.job_store.read_chunk(job_id, chunk_index).await
     }
 
-    /// Lists all jobs, optionally filtered by status.
-    pub async fn list_jobs(&self, status_filter: Option<JobStatus>) -> Result<Vec<JobState>> {
+    /// Lists the jobs `caller` submitted, optionally filtered by status.
+    pub async fn list_jobs(
+        &self,
+        status_filter: Option<JobStatus>,
+        caller: &str,
+    ) -> Result<Vec<JobState>> {
+        let mut jobs = self.job_store.list_jobs(status_filter).await?;
+        jobs.retain(|job| job.is_owned_by(caller));
+        Ok(jobs)
+    }
+
+    /// Lists every job regardless of who submitted it.
+    ///
+    /// For internal schedulers only — the recovery sweep has to see jobs
+    /// across all principals to re-drive the ones orphaned by a lost peer.
+    /// Never reachable from a client request; API surfaces use
+    /// [`Self::list_jobs`], which is scoped to the caller.
+    pub async fn list_all_jobs(&self, status_filter: Option<JobStatus>) -> Result<Vec<JobState>> {
         self.job_store.list_jobs(status_filter).await
     }
 
@@ -394,5 +458,190 @@ impl JobExecutor {
             }
             QueryHandleError::JobNotFound { .. } => (JobErrorCode::NotFound, e.to_string()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dataaccelerator::AcceleratorEngineRegistry;
+    use crate::datafusion::builder::DataFusionBuilder;
+    use crate::jobs::PUBLIC_JOB_OWNER;
+    use crate::status::RuntimeStatus;
+    use object_store::memory::InMemory;
+    use tokio::runtime::Handle;
+
+    const OWNER: &str = "apikey:0123456789abcdef";
+    const OTHER: &str = "apikey:fedcba9876543210";
+
+    fn executor(job_store: Arc<JobStore>) -> JobExecutor {
+        let df = Arc::new(
+            DataFusionBuilder::new(
+                RuntimeStatus::new(),
+                Arc::new(AcceleratorEngineRegistry::new()),
+                Handle::current(),
+            )
+            .build(),
+        );
+        JobExecutor::new(job_store, df)
+    }
+
+    /// Creates a job owned by `owner` directly through the store, so the test
+    /// exercises the read path without needing a live distributed executor.
+    async fn seed_job(job_store: &JobStore, owner: &str) -> String {
+        job_store
+            .create_job(
+                SubmitQueryRequest {
+                    sql: "SELECT 1".to_string(),
+                    parameters: None,
+                    timeout_seconds: None,
+                    maximum_size: None,
+                },
+                true,
+                owner.to_string(),
+            )
+            .await
+            .expect("job should be created")
+            .job_id
+    }
+
+    #[tokio::test]
+    async fn get_status_refuses_a_job_another_principal_submitted() {
+        let job_store = Arc::new(JobStore::new(Arc::new(InMemory::new()), "test", "node-1"));
+        let executor = executor(Arc::clone(&job_store));
+        let job_id = seed_job(&job_store, OWNER).await;
+
+        executor
+            .get_status(&job_id, OWNER)
+            .await
+            .expect("the submitting principal should read its own job");
+
+        let err = executor
+            .get_status(&job_id, OTHER)
+            .await
+            .expect_err("another principal must not read the job");
+        assert!(
+            matches!(err, super::super::error::Error::JobNotFound { .. }),
+            "a job owned by someone else must report as missing, not as forbidden: {err:?}"
+        );
+    }
+
+    /// Ownership is resolved before expiry, so a non-owner cannot tell an
+    /// expired job from one that never existed. Without this ordering the
+    /// expired job answers `JobResultsExpired` (HTTP 410) while a missing id
+    /// answers `JobNotFound` (404), which confirms someone else's job id.
+    #[tokio::test]
+    async fn an_expired_job_reads_as_missing_to_a_non_owner() {
+        let job_store = Arc::new(JobStore::new(Arc::new(InMemory::new()), "test", "node-1"));
+        let executor = executor(Arc::clone(&job_store));
+        let job_id = seed_job(&job_store, OWNER).await;
+
+        let mut state = job_store
+            .get_job(&job_id)
+            .await
+            .expect("the freshly created job should be readable");
+        state.expires_at_ms = Some(1);
+        job_store
+            .update_job(&mut state)
+            .await
+            .expect("the job should be marked expired");
+
+        let owner_err = executor
+            .get_status(&job_id, OWNER)
+            .await
+            .expect_err("the owner should be told its results expired");
+        assert!(
+            matches!(
+                owner_err,
+                super::super::error::Error::JobResultsExpired { .. }
+            ),
+            "the owner keeps the precise expiry error: {owner_err:?}"
+        );
+
+        let other_err = executor
+            .get_status(&job_id, OTHER)
+            .await
+            .expect_err("another principal must not read the job");
+        assert!(
+            matches!(other_err, super::super::error::Error::JobNotFound { .. }),
+            "an expired job must be indistinguishable from a missing one: {other_err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_chunk_refuses_a_job_another_principal_submitted() {
+        let job_store = Arc::new(JobStore::new(Arc::new(InMemory::new()), "test", "node-1"));
+        let executor = executor(Arc::clone(&job_store));
+        let job_id = seed_job(&job_store, OWNER).await;
+
+        let err = executor
+            .get_chunk(&job_id, 0, OTHER)
+            .await
+            .expect_err("another principal must not read result chunks");
+        assert!(
+            matches!(err, super::super::error::Error::JobNotFound { .. }),
+            "ownership must be resolved before the job's completion state: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_refuses_a_job_another_principal_submitted() {
+        let job_store = Arc::new(JobStore::new(Arc::new(InMemory::new()), "test", "node-1"));
+        let executor = executor(Arc::clone(&job_store));
+        let job_id = seed_job(&job_store, OWNER).await;
+
+        let err = executor
+            .cancel(&job_id, OTHER)
+            .await
+            .expect_err("another principal must not cancel the job");
+        assert!(
+            matches!(err, super::super::error::Error::JobNotFound { .. }),
+            "cancellation must be refused before the job is signalled: {err:?}"
+        );
+
+        let state = executor
+            .get_status(&job_id, OWNER)
+            .await
+            .expect("the job should still be readable by its owner");
+        assert_eq!(
+            state.status,
+            JobStatus::Pending,
+            "a refused cancellation must leave the job running"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_jobs_returns_only_the_callers_jobs() {
+        let job_store = Arc::new(JobStore::new(Arc::new(InMemory::new()), "test", "node-1"));
+        let executor = executor(Arc::clone(&job_store));
+        let mine = seed_job(&job_store, OWNER).await;
+        let theirs = seed_job(&job_store, OTHER).await;
+
+        let listed = executor
+            .list_jobs(None, OWNER)
+            .await
+            .expect("listing should succeed");
+        let ids: Vec<&str> = listed.iter().map(|j| j.job_id.as_str()).collect();
+        assert_eq!(ids, vec![mine.as_str()]);
+
+        let unauthenticated = executor
+            .list_jobs(None, PUBLIC_JOB_OWNER)
+            .await
+            .expect("listing should succeed");
+        assert!(
+            unauthenticated.is_empty(),
+            "the public scope must not see jobs submitted by a principal"
+        );
+
+        let all = executor
+            .list_all_jobs(None)
+            .await
+            .expect("internal listing should succeed");
+        assert_eq!(
+            all.len(),
+            2,
+            "the internal recovery sweep still sees every job"
+        );
+        assert!(all.iter().any(|j| j.job_id == theirs));
     }
 }

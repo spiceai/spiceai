@@ -18,15 +18,13 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Duration;
 
-use crate::accelerated_table::refresh::{self, RefreshOverrides};
-use crate::accelerated_table::refresh_task::changes::{
-    CdcSchemaEvolution, install_cdc_schema_evolution,
-};
-use crate::accelerated_table::snapshots::SnapshotRefreshState;
-use crate::accelerated_table::{
+use crate::accelerated::refresh::{self, RefreshOverrides};
+use crate::accelerated::refresh_task::changes::{CdcSchemaEvolution, install_cdc_schema_evolution};
+use crate::accelerated::snapshots::SnapshotRefreshState;
+use crate::accelerated::{
     self, AcceleratedTableBuilderError, SnapshotCreateTrigger, SnapshotCreationConfig,
 };
-use crate::accelerated_table::{AcceleratedTable, Retention, refresh::Refresh};
+use crate::accelerated::{AcceleratedTable, Retention, refresh::Refresh};
 use crate::catalogconnector::deferred::DeferredCatalogProvider;
 use crate::component::access::AccessMode;
 use crate::component::dataset::acceleration::{Acceleration, Engine, Mode, RefreshMode};
@@ -48,7 +46,7 @@ use crate::dataupdate::{
     DataUpdate, DataUpdateBroadcaster, StreamingDataUpdate, StreamingDataUpdateExecutionPlan,
     UpdateType,
 };
-use crate::federated_table::FederatedTable;
+use crate::federated::FederatedTable;
 use crate::schema_evolution::{
     SCHEMA_EVOLUTION_APPLIED, SCHEMA_EVOLUTION_DETECTED, SCHEMA_EVOLUTION_FAILED,
     dataset_constraint_columns, emit_schema_evolution_event, engine_supports_in_place_evolution,
@@ -81,10 +79,7 @@ use cache::result::embeddings::CachedEmbeddingResult;
 use cache::result::query::QueryResult;
 use cache::result::search::CachedSearchResult;
 use cache::{CacheProvider, Caching, QueryResultsCacheProvider, key::RawCacheKey};
-use data_components::{
-    FieldMetadata, MetadataEnrichedTableProvider, metadata_enriched_table_provider,
-    poly::PolyTableProvider,
-};
+use data_components::{MetadataEnrichedTableProvider, poly::PolyTableProvider};
 use datafusion::catalog::CatalogProvider;
 use datafusion::catalog::SchemaProvider;
 use datafusion::common::{Constraint, Constraints, ToDFSchema};
@@ -116,14 +111,12 @@ use runtime_acceleration::snapshot::AccelerationLayout;
 ))]
 use runtime_acceleration::snapshot::SnapshotManager;
 use runtime_async::ManagedTokioRuntime;
-use runtime_datafusion_index::IndexedTableProvider;
+use runtime_datafusion::schema_provider::{EnsureSchemaError, ensure_schema_exists};
 use runtime_query_engine::query_engine::Error as QueryEngineError;
-use runtime_search::embeddings::table::EmbeddingTable;
 use runtime_table_partition::provider::PartitionTableProvider;
-use schema::ensure_schema_exists;
 use snafu::prelude::*;
 use spicepod::acceleration::SnapshotsTrigger;
-use spicepod::{metric::Metrics, semantic::Column};
+use spicepod::metric::Metrics;
 use tokio::runtime::Handle;
 use tokio::spawn;
 use tokio::sync::{Mutex, Notify};
@@ -142,19 +135,19 @@ pub mod cayenne_ddl;
 pub use runtime_datafusion::composed_catalog;
 pub use runtime_datafusion::dialect;
 pub use runtime_datafusion::error;
-pub mod filter_converter;
+pub use runtime_table::filter_converter;
 pub mod flight_session_extension;
 pub mod iceberg_ddl;
 pub mod job_executor_context_extension;
 pub use runtime_datafusion::managed_runtime;
 pub use runtime_datafusion::param_utils;
-pub mod pg_catalog;
+pub use runtime_datafusion::pg_catalog;
 #[cfg(not(windows))]
 pub mod planner;
 pub use runtime_datafusion::refresh_sql;
 pub mod request_context_extension;
 pub use runtime_datafusion::retention_sql;
-pub mod schema;
+pub use runtime_table::table_provider_with_spicepod_metadata;
 pub mod secrets_context_extension;
 pub mod table;
 pub use runtime_datafusion::sort_columns;
@@ -213,6 +206,13 @@ impl StreamingBroadcastBuffer {
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+impl From<EnsureSchemaError> for Error {
+    fn from(value: EnsureSchemaError) -> Self {
+        let EnsureSchemaError::CatalogMissing { catalog } = value;
+        Error::CatalogMissing { catalog }
+    }
+}
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -311,7 +311,7 @@ pub enum Error {
     #[snafu(display("Failed to refresh the dataset {dataset_name}. {source}"))]
     UnableToTriggerRefresh {
         dataset_name: String,
-        source: crate::accelerated_table::Error,
+        source: crate::accelerated::Error,
     },
 
     #[snafu(display(
@@ -526,6 +526,47 @@ pub enum Error {
     },
 }
 
+impl Error {
+    /// Returns `true` if this error is transient and the operation may succeed
+    /// on retry. Errors that are a pure function of the Spicepod configuration
+    /// (and the engine capabilities it selects) are permanent: they resolve
+    /// only when an operator edits the configuration, so retrying them is
+    /// wasted work. Mirrors [`DataConnectorError::is_retriable`], which
+    /// classifies the same way for connector creation.
+    ///
+    /// Anything not listed stays retriable. A misclassified transient error
+    /// would leave a recoverable dataset permanently unloaded, so the default
+    /// is the conservative one.
+    #[must_use]
+    pub(crate) fn is_retriable(&self) -> bool {
+        !matches!(
+            self,
+            // Invalid `refresh_sql` / `retention_sql` in the Spicepod.
+            Self::RefreshSql { .. }
+                | Self::RetentionSql { .. }
+                // `time_column`/`time_format` disagree with the source schema.
+                | Self::InvalidTimeColumnTimeFormat { .. }
+                | Self::AppendRequiresTimeColumn { .. }
+                // Refresh-mode and snapshot settings the selected engine or
+                // connector cannot serve.
+                | Self::InvalidCachingRefreshMode { .. }
+                | Self::ConflictingStaleWhileRevalidateConfig { .. }
+                | Self::UnsupportedDistributedAccelerationEngine { .. }
+                | Self::UnsupportedStreamBatchesForBatchRefresh
+                | Self::UnsupportedRefreshCompleteForStream
+                | Self::UnsupportedSnapshotTriggerForCaching
+                | Self::UnsupportedAccelerationEngineForSnapshots
+                | Self::SnapshotRefreshModeRequiresSnapshots
+                | Self::SnapshotRefreshModeUnsupportedEngine { .. }
+                | Self::SnapshotRefreshModeReloadUnsupported { .. }
+                // Unparseable `snapshots_trigger_threshold` value.
+                | Self::InvalidSnapshotCreationInterval { .. }
+                | Self::InvalidSnapshotCreationBatches { .. }
+                | Self::SnapshotCreationBatchesShouldBePositive
+        )
+    }
+}
+
 /// Validates that the acceleration engine is supported in distributed mode.
 ///
 /// Only Arrow, `PartitionedArrow`, and Cayenne engines are supported for distributed acceleration.
@@ -694,79 +735,6 @@ pub enum Table {
     },
 }
 
-pub(crate) fn table_provider_with_spicepod_metadata(
-    provider: Arc<dyn TableProvider>,
-    table_metadata: &HashMap<String, String>,
-    columns: &[Column],
-) -> Arc<dyn TableProvider> {
-    let field_metadata = field_metadata_from_columns(columns);
-    if table_metadata.is_empty() && field_metadata.is_empty() {
-        return provider;
-    }
-
-    // If the provider is an IndexedTableProvider, push the metadata enrichment
-    // inside it so that the IndexTableScan analyzer can still discover it via
-    // downcast_ref::<IndexedTableProvider>().
-    //
-    // Recurse rather than enriching the underlying directly: a dataset with both
-    // `embeddings` and `full_text_search` nests an `EmbeddingTable` or a
-    // `VectorScanTableProvider` under this `IndexedTableProvider`, and those inner
-    // wrappers have the same discoverability requirement (see the arms below).
-    if let Some(indexed) = provider.downcast_ref::<IndexedTableProvider>() {
-        let enriched_underlying = table_provider_with_spicepod_metadata(
-            indexed.get_underlying(),
-            table_metadata,
-            columns,
-        );
-        return Arc::new(IndexedTableProvider::with_indexes(
-            enriched_underlying,
-            indexed.get_all_indexes(),
-        ));
-    }
-
-    // Same reasoning for an EmbeddingTable: push the metadata enrichment onto the
-    // base table so the wrapper stays discoverable via downcast_ref::<EmbeddingTable>().
-    // The CDC changes stream relies on EmbeddingConnector unwrapping this provider to
-    // its base table (see embeddings::connector::EmbeddingConnector::changes_stream);
-    // wrapping the EmbeddingTable opaquely instead hides it, so no changes stream is
-    // attached and `refresh_mode: changes` fails with "a changes stream is required".
-    if let Some(embedding) = provider.downcast_ref::<EmbeddingTable>() {
-        let mut enriched = embedding.clone();
-        enriched.base_table = table_provider_with_spicepod_metadata(
-            Arc::clone(&embedding.base_table),
-            table_metadata,
-            columns,
-        );
-        return Arc::new(enriched);
-    }
-
-    // And for a VectorScanTableProvider, which a dataset with `vectors` enabled nests
-    // under the `IndexedTableProvider`. `EmbeddingConnector::changes_stream` unwraps it
-    // to reach the raw source provider; a metadata layer on top hides it, so the source
-    // never receives a changes stream.
-    if let Some(vector_scan) = provider.downcast_ref::<search::index::VectorScanTableProvider>() {
-        let mut enriched = vector_scan.clone();
-        enriched.table_provider = table_provider_with_spicepod_metadata(
-            Arc::clone(&vector_scan.table_provider),
-            table_metadata,
-            columns,
-        );
-        return Arc::new(enriched);
-    }
-
-    metadata_enriched_table_provider(provider, table_metadata.clone(), field_metadata)
-}
-
-fn field_metadata_from_columns(columns: &[Column]) -> FieldMetadata {
-    columns
-        .iter()
-        .filter_map(|column| {
-            let metadata = column.metadata();
-            (!metadata.is_empty()).then(|| (column.name.clone(), metadata))
-        })
-        .collect()
-}
-
 struct PendingSinkRegistration {
     dataset: Arc<Dataset>,
     secrets: Arc<TokioRwLock<Secrets>>,
@@ -775,6 +743,23 @@ struct PendingSinkRegistration {
 struct DeferredTableRegistration {
     dataset: Arc<Dataset>,
     connector: Arc<dyn DataConnector>,
+}
+
+/// Where a dataset's table provider is installed once the dataset lifecycle has
+/// built it.
+///
+/// By default a dataset is registered into the default catalog, which is what
+/// makes it queryable as `spice.data.<name>`. A component that synthesizes
+/// datasets on a user's behalf — the `PostgreSQL` catalog connector, which
+/// builds one per discovered table — installs them into its own schema provider
+/// instead, so its internal registration names never occupy the user-facing
+/// namespace. The dataset is otherwise completely ordinary: status, metrics,
+/// health monitoring and the refresh loop are all keyed on the dataset name and
+/// are unaffected by where the provider lands.
+pub trait DatasetPlacement: std::fmt::Debug + Send + Sync {
+    /// Install `provider` for the dataset registered as `name`. Called in place
+    /// of registering it into the default catalog.
+    fn install(&self, name: &TableReference, provider: Arc<dyn TableProvider>) -> Result<()>;
 }
 
 pub struct DataFusion {
@@ -791,6 +776,9 @@ pub struct DataFusion {
     /// Used by the extension planner to pass `Weak<DataFusion>` to physical plans.
     datafusion_ref: iceberg_ddl::SharedDataFusionRef,
     accelerated_tables: TokioRwLock<HashSet<TableReference>>,
+    /// Datasets whose table provider is installed somewhere other than the
+    /// default catalog, keyed by dataset name (see [`DatasetPlacement`]).
+    dataset_placements: dashmap::DashMap<String, Arc<dyn DatasetPlacement>>,
     caching: Arc<Caching>,
     /// Per-dataset locks serializing write-time schema evolution + rebind (the `OTel`
     /// metric-dimension path). Keyed by table reference so concurrent exports for the
@@ -863,9 +851,18 @@ pub struct DataFusion {
     // Coordinated aggregate byte budget for the off-pool Cayenne in-memory CDC
     // tier, sized in the builder so query_pool + compaction + tier + headroom ≤
     // host (the cross-subsystem coordination that prevents the SF1000 process
-    // OOM). `Some` only when Cayenne acceleration is active; installed in
-    // `set_compaction_runtime`.
+    // OOM). `Some` only when some configured table can actually reach that tier
+    // (the small-write refresh profile); installed in
+    // `install_cayenne_global_budgets`.
     mem_tier_budget_bytes: Option<u64>,
+    // What the pod's Cayenne accelerations demand of the host, classified from the
+    // Spicepod in the Runtime builder. Retained so `spiced` can decide which
+    // dedicated thread pools are worth bringing up without re-reading the app.
+    cayenne_workload: crate::builder::CayenneWorkload,
+    // Cgroup-aware total memory, captured once at build time. `get_total_memory`
+    // rebuilds a sysinfo System on every call, so the budget installers read this
+    // rather than re-probing.
+    total_memory: u64,
     pub(crate) io_runtime: Handle,
     metrics: Option<Metrics>,
     resource_monitor: Option<crate::resource_monitor::ResourceMonitor>,
@@ -1011,6 +1008,39 @@ impl DataFusion {
 
     pub fn accelerator_engine_registry(&self) -> Arc<AcceleratorEngineRegistry> {
         Arc::clone(&self.accelerator_engine_registry)
+    }
+
+    /// Declare that `dataset_name`'s table provider belongs to `placement`
+    /// rather than the default catalog (see [`DatasetPlacement`]).
+    ///
+    /// Must be called before the dataset is loaded. Registering the placement up
+    /// front — rather than moving the provider afterwards — is what keeps the
+    /// dataset from ever being briefly queryable as `spice.data.<name>`.
+    pub fn set_dataset_placement(
+        &self,
+        dataset_name: &TableReference,
+        placement: Arc<dyn DatasetPlacement>,
+    ) {
+        self.dataset_placements
+            .insert(dataset_name.to_string(), placement);
+    }
+
+    /// Install a freshly built table provider wherever the dataset belongs: its
+    /// declared [`DatasetPlacement`] if it has one, otherwise the default
+    /// catalog.
+    fn install_table_provider(
+        &self,
+        name: &TableReference,
+        provider: Arc<dyn TableProvider>,
+    ) -> Result<()> {
+        if let Some(placement) = self.dataset_placements.get(&name.to_string()) {
+            return placement.install(name, provider);
+        }
+        self.ctx
+            .register_table(name.clone(), provider)
+            .map_err(find_datafusion_root)
+            .context(UnableToRegisterTableToDataFusionSnafu)?;
+        Ok(())
     }
 
     /// The query-admission semaphore when `runtime.query.max_concurrent_queries`
@@ -1172,7 +1202,7 @@ impl DataFusion {
         dataset: Arc<Dataset>,
         table: Table,
     ) -> Result<Option<Arc<Notify>>> {
-        schema::ensure_schema_exists(&self.ctx, SPICE_DEFAULT_CATALOG, &dataset.name)?;
+        ensure_schema_exists(&self.ctx, SPICE_DEFAULT_CATALOG, &dataset.name)?;
 
         let dataset_access_mode = dataset.access();
         let dataset_table_ref = dataset.name.clone();
@@ -1527,36 +1557,22 @@ impl DataFusion {
             .or_else(|| self.refresh_runtime())
     }
 
-    /// Set the dedicated compaction runtime for background Cayenne compaction
-    /// (size-tiered protected-snapshot merge + full snapshot rewrite).
+    /// Install the process-global Cayenne budgets that are NOT tied to the
+    /// compaction runtime, so they apply even to a pod that never brings one up
+    /// (nothing it accelerates produces a file to compact).
     ///
-    /// Also injects the runtime's [`Handle`](tokio::runtime::Handle) into the
-    /// Cayenne accelerator crate, so its background and post-write compaction
-    /// tasks spawn here instead of on the ambient (refresh/query) runtime.
-    /// Isolating compaction keeps the CPU-heavy snapshot rewrite off the
-    /// latency-sensitive query and CDC paths while letting it use spare cores.
-    pub fn set_compaction_runtime(&self, handle: ManagedTokioRuntime) {
-        let tokio_handle = handle.handle().clone();
-        if self.compaction_runtime.set(handle).is_err() {
-            // Already set — e.g. a concurrent first-Cayenne-table registration
-            // lost the race. Drop this redundant runtime WITHOUT injecting its
-            // handle into Cayenne: Cayenne must reference the runtime we actually
-            // retained, never one that is about to be dropped here.
-            tracing::debug!("Dedicated compaction runtime already set; dropping the redundant one");
-            return;
-        }
-        // Inject the dedicated runtime handle and the carved compaction memory
-        // environment into the Cayenne accelerator crate, so background and
-        // post-write compaction run isolated from queries and CDC on both CPU
-        // (this runtime's threads) and memory (the carved pool).
-        cayenne::set_compaction_runtime_handle(tokio_handle.clone());
-        // Install the process-global encode-concurrency budget: cap the aggregate
-        // number of concurrent Vortex encode shards across ALL Cayenne tables.
-        // Per-table `cayenne_write_concurrency` is sized in isolation — its unset
-        // default is conservative, but it can be raised per table — so without
-        // this a fleet of tables receiving CDC at once would sum their per-table
-        // shard counts and oversubscribe the machine. CPU-bound encode past the
-        // core count buys no throughput, only contention.
+    /// Kept separate from [`Self::set_compaction_runtime`] because these bound the
+    /// WRITE path and the off-pool in-memory CDC tier, which a pod that never
+    /// compacts exercises just as hard as a compacting one — folding them into the
+    /// compaction setup would silently un-cap a fleet of simultaneously-refreshing
+    /// tables, and leave a `mode: memory` pod's RAM tier unbounded.
+    pub fn install_cayenne_global_budgets(&self) {
+        // Cap the aggregate number of concurrent Vortex encode shards across ALL
+        // Cayenne tables. Per-table `cayenne_write_concurrency` is sized in
+        // isolation — its unset default is conservative, but it can be raised per
+        // table — so without this a fleet of tables writing at once would sum their
+        // per-table shard counts and oversubscribe the machine. CPU-bound encode
+        // past the core count buys no throughput, only contention.
         //
         // The ceiling is the core count MINUS a query reserve (a quarter of the
         // cores, at least 2, never reducing the budget below 1): encode shards
@@ -1565,9 +1581,7 @@ impl DataFusion {
         // #11170 mechanism — lowering write fan-out yielded 3-11x OLAP latency
         // wins from CPU-contention relief alone). Compaction is unaffected: it
         // has its own dedicated runtime and memory carve-out.
-        let cores = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
-        let query_reserve = (cores / 4).max(2);
-        let encode_budget = cores.saturating_sub(query_reserve).max(1);
+        let encode_budget = cpu_budget::cpu_budget().cayenne_encode_permits();
         cayenne::set_global_encode_concurrency(encode_budget);
         tracing::info!(
             encode_budget,
@@ -1593,6 +1607,21 @@ impl DataFusion {
             );
         }
 
+        // Install the cgroup-aware memory budget the dynamic auto-tuner uses to
+        // compute memory pressure (so the control loop closes on memory, not just
+        // ingest/query behavior). Mirrors the encode budget: injected here so the
+        // cayenne crate needs no runtime-specific resource detection of its own.
+        // Read from the value captured at build time rather than re-probing:
+        // `get_total_memory` rebuilds a sysinfo System on every call.
+        let memory_budget = self.total_memory;
+        cayenne::set_global_memory_budget(memory_budget);
+        tracing::info!(
+            memory_budget,
+            "Cayenne dynamic-tuning memory budget active (cgroup-aware)"
+        );
+
+        let rt = self.ctx.runtime_env();
+
         // Install the process-global in-memory CDC tier byte budget: the hard
         // aggregate RAM ceiling for `cdc_durability: memory` across ALL Cayenne
         // tables. Per-table `cayenne_cdc_mem_tier_max_bytes` is sized in
@@ -1602,73 +1631,85 @@ impl DataFusion {
         // under sustained overload, falls back to the durable path) rather than
         // growing the tier. File-mode tables never touch this budget.
         //
-        // CRITICAL: this budget is now COORDINATED with the query + compaction
-        // memory pools (sized in `DataFusionBuilder::build`). The tier lives
-        // off-pool, so sizing it from total RAM in isolation (the old
-        // `get_total_memory() / 4`) summed with the off-pool tier and the in-pool
-        // query/compaction budgets to >100% of host — the SF1000 process OOM (RSS
-        // 242 GiB on a 256 GiB box). `mem_tier_budget_bytes` is instead the host
-        // RAM left after the query pool, the compaction pool, and a headroom
-        // reserve, so the off-pool tier and the on-pool query/compaction budgets
-        // are coordinated against host RAM (see `coordinated_mem_tier_budget` for
-        // the exact bound and its precondition). The per-table caps and the
-        // spill/durable fallbacks stay the OOM backstops; the dynamic re-partition
-        // sampler may later resize this budget within the same envelope.
+        // CRITICAL: this budget is COORDINATED with the query + compaction memory
+        // pools (sized in `DataFusionBuilder::build`). The tier lives off-pool, so
+        // sizing it from total RAM in isolation summed with the off-pool tier and
+        // the in-pool query/compaction budgets to >100% of host — the SF1000
+        // process OOM (RSS 242 GiB on a 256 GiB box). `mem_tier_budget_bytes` is
+        // instead the host RAM left after the query pool, the compaction pool, and
+        // a headroom reserve, so the off-pool tier and the on-pool
+        // query/compaction budgets are coordinated against host RAM (see
+        // `coordinated_mem_tier_budget` for the exact bound and its precondition).
+        // The per-table caps and the spill/durable fallbacks stay the OOM
+        // backstops; the dynamic re-partition sampler below may later resize this
+        // budget within the same envelope.
         //
-        // Installed only when Cayenne acceleration is active (`mem_tier_budget_bytes`
-        // is `Some`, computed in the builder). It is `None` for non-Cayenne
-        // deployments that still get a dedicated compaction runtime — dedicated
-        // thread pools are the default, so `set_compaction_runtime` runs even with
-        // no Cayenne dataset — and those have no in-memory CDC tier to bound, so we
-        // install nothing and emit no tuning warning. `get_total_memory` rebuilds a
-        // sysinfo System each call, so read it once.
-        let total_memory = crate::resource_monitor::get_total_memory();
+        // It belongs with the other process-global budgets rather than with the
+        // compaction runtime because the tier is independent of compaction: a
+        // `mode: memory` table holds its whole dataset in the tier and never
+        // produces a file to compact, so pairing the two would leave exactly that
+        // pod's tier uncapped — with the query pool already shrunk to make room
+        // for it. `mem_tier_budget_bytes` is `None` when no configured table can
+        // reach the tier (and for a non-Cayenne deployment): nothing to bound, so
+        // nothing is installed and no tuning warning is emitted.
         if let Some(mem_tier_budget_bytes) = self.mem_tier_budget_bytes {
             cayenne::set_global_mem_tier_bytes(mem_tier_budget_bytes);
             // Mirror mem-tier `used` into the query MemoryPool so operators and
             // the planner see CDC RAM as reserved (visibility). Hard bound stays
             // the byte budget + spill path; the account is infallible resize.
             // Install AFTER the budget so the seed reads used=0.
-            let rt = self.ctx.runtime_env();
             cayenne::set_global_mem_tier_pool_account(&rt.memory_pool);
             tracing::info!(
                 mem_tier_budget_bytes,
                 query_memory_pool_bytes = self.query_memory_pool_bytes,
                 compaction_memory_bytes = self.compaction_memory_bytes.unwrap_or(0),
-                total_memory,
+                total_memory = self.total_memory,
                 "Cayenne global in-memory CDC tier byte budget active (coordinated with the query + compaction pools so their sum stays within host RAM)"
-            );
-
-            // Dynamic re-partition sampler: watches LIVE query + compaction pool
-            // usage and resizes the mem-tier budget within [floor, mem_tier_budget_bytes]
-            // so the off-pool CDC tier yields RAM to the query pool as it fills and
-            // reclaims it as the pool drains — never above the coordinated static
-            // ceiling, so it cannot reintroduce overcommit. The critical-pressure
-            // reactive spill drains the tier when the budget is lowered below resident.
-            let query_pool = Arc::downgrade(&rt.memory_pool);
-            let compaction_pool = self
-                .compaction_runtime_env
-                .as_ref()
-                .map(|env| Arc::downgrade(&env.memory_pool));
-            Self::spawn_mem_tier_repartition_sampler(
-                &tokio_handle,
-                query_pool,
-                compaction_pool,
-                mem_tier_budget_bytes,
-                total_memory,
             );
         }
 
-        // Install the cgroup-aware memory budget the dynamic auto-tuner uses to
-        // compute memory pressure (so the control loop closes on memory, not just
-        // ingest/query behavior). Mirrors the encode budget: injected here so the
-        // cayenne crate needs no runtime-specific resource detection of its own.
-        let memory_budget = total_memory;
-        cayenne::set_global_memory_budget(memory_budget);
-        tracing::info!(
-            memory_budget,
-            "Cayenne dynamic-tuning memory budget active (cgroup-aware)"
+        // The memory sampler runs for EVERY deployment, not just CDC ones. It owns
+        // two jobs: publishing the pool/RSS gauges that explain an OOM (#12195), and
+        // — only when an in-memory CDC tier budget exists — resizing that tier from
+        // live pool usage. The gauges are the reason it is unconditional: they are
+        // general memory observability, and a pod without a tier is no less likely
+        // to OOM. `mem_tier_budget_bytes` is `None` for such a pod, which switches
+        // off the resize half while leaving the gauges running.
+        Self::spawn_mem_tier_repartition_sampler(
+            &Handle::current(),
+            Arc::downgrade(&rt.memory_pool),
+            self.compaction_runtime_env
+                .as_ref()
+                .map(|env| Arc::downgrade(&env.memory_pool)),
+            self.mem_tier_budget_bytes,
+            self.total_memory,
         );
+    }
+
+    /// Set the dedicated compaction runtime for background Cayenne compaction
+    /// (size-tiered protected-snapshot merge + full snapshot rewrite).
+    ///
+    /// Also injects the runtime's [`Handle`](tokio::runtime::Handle) into the
+    /// Cayenne accelerator crate, so its background and post-write compaction
+    /// tasks spawn here instead of on the ambient (refresh/query) runtime.
+    /// Isolating compaction keeps the CPU-heavy snapshot rewrite off the
+    /// latency-sensitive query and CDC paths while letting it use spare cores.
+    pub fn set_compaction_runtime(&self, handle: ManagedTokioRuntime) {
+        let tokio_handle = handle.handle().clone();
+        if self.compaction_runtime.set(handle).is_err() {
+            // Already set — e.g. a concurrent first-Cayenne-table registration
+            // lost the race. Drop this redundant runtime WITHOUT injecting its
+            // handle into Cayenne: Cayenne must reference the runtime we actually
+            // retained, never one that is about to be dropped here.
+            tracing::debug!("Dedicated compaction runtime already set; dropping the redundant one");
+            return;
+        }
+        // Inject the dedicated runtime handle and the carved compaction memory
+        // environment into the Cayenne accelerator crate, so background and
+        // post-write compaction run isolated from queries and CDC on both CPU
+        // (this runtime's threads) and memory (the carved pool).
+        cayenne::set_compaction_runtime_handle(tokio_handle);
+
         if let Some(env) = &self.compaction_runtime_env {
             cayenne::set_compaction_runtime_env(Arc::clone(env));
         }
@@ -1703,7 +1744,7 @@ impl DataFusion {
         compaction_pool: Option<
             std::sync::Weak<dyn datafusion::execution::memory_pool::MemoryPool>,
         >,
-        static_ceiling_bytes: u64,
+        static_ceiling_bytes: Option<u64>,
         total_memory: u64,
     ) {
         // Short enough to react to a query-pool spike ahead of the slower per-table
@@ -1732,14 +1773,19 @@ impl DataFusion {
                 // Same coordinated partition as the static install (one tested
                 // definition of the no-overcommit invariant), but from LIVE pool
                 // usage, and never above the static ceiling so it can't overcommit.
-                let dynamic = builder::coordinated_mem_tier_budget(
-                    total_memory,
-                    pool_used,
-                    compaction_used,
-                    crate::accelerator_memory_budget::duckdb_total_reservation_bytes(),
-                )
-                .min(static_ceiling_bytes);
-                cayenne::update_global_mem_tier_total(dynamic);
+                // Only when a tier budget exists: a pod whose Cayenne tables are all
+                // bulk-written has no tier to resize, but still needs the gauges
+                // below — they are general memory observability, not CDC-specific.
+                if let Some(ceiling) = static_ceiling_bytes {
+                    let dynamic = builder::coordinated_mem_tier_budget(
+                        total_memory,
+                        pool_used,
+                        compaction_used,
+                        crate::accelerator_memory_budget::duckdb_total_reservation_bytes(),
+                    )
+                    .min(ceiling);
+                    cayenne::update_global_mem_tier_total(dynamic);
+                }
                 // Publish what this loop already measures. These are the numbers
                 // that reconcile budget against fact: pool gauges describe what
                 // the accounting believes, the RSS gauge describes what the
@@ -1760,6 +1806,14 @@ impl DataFusion {
                 }
             }
         });
+    }
+
+    /// What the pod's Cayenne accelerations demand of the host (classified from the
+    /// Spicepod at build time). `spiced` reads this to skip bringing up dedicated
+    /// thread pools nothing in the pod can use.
+    #[must_use]
+    pub fn cayenne_workload(&self) -> crate::builder::CayenneWorkload {
+        self.cayenne_workload
     }
 
     /// Returns the dedicated compaction runtime, if one has been set.
@@ -1877,7 +1931,7 @@ impl DataFusion {
         schema: arrow_schema::SchemaRef,
     ) -> Result<()> {
         use crate::datafusion::table::dataset_table_provider::DatasetTableProvider;
-        schema::ensure_schema_exists(&self.ctx, SPICE_DEFAULT_CATALOG, &dataset.name)?;
+        ensure_schema_exists(&self.ctx, SPICE_DEFAULT_CATALOG, &dataset.name)?;
 
         let placeholder = Arc::new(DatasetTableProvider::new(
             dataset.name.clone(),
@@ -2609,7 +2663,7 @@ impl DataFusion {
         // SQLite/Postgres/Cayenne backing table) before upgrading.
         let storage_schema = if matches!(refresh_mode, RefreshMode::Caching) {
             Arc::new(
-                crate::accelerated_table::caching::extend_schema_with_cache_namespace(
+                crate::accelerated::caching::extend_schema_with_cache_namespace(
                     &dataset.name.to_string(),
                     &refresh_schema,
                 )
@@ -2751,7 +2805,7 @@ impl DataFusion {
         // (executor owns no partition of this table) is preserved so the refresh
         // loads no rows rather than the entire source table.
         if let Some(filters) = initial_partition_filters {
-            use crate::accelerated_table::refresh::{RefreshSQL, RefreshSQLColumns};
+            use crate::accelerated::refresh::{RefreshSQL, RefreshSQLColumns};
             if let Some(ref mut sql) = refresh.sql {
                 sql.set_partition_filters(Some(filters));
             } else {
@@ -2804,7 +2858,7 @@ impl DataFusion {
         accelerated_table_builder.cluster_role(self.cluster_config.effective_role());
         accelerated_table_builder.accelerator_write_mutex(Arc::clone(&accelerator_write_mutex));
         accelerated_table_builder.cdc_param_overrides(
-            crate::accelerated_table::refresh_task::changes::extract_cdc_param_overrides(
+            crate::accelerated::refresh_task::changes::extract_cdc_param_overrides(
                 &acceleration_settings.params,
             )
             .map(Arc::new),
@@ -2891,9 +2945,7 @@ impl DataFusion {
                 let check_interval = retention_period.max(Duration::from_secs(30));
 
                 let cache_retention = Retention::builder()
-                    .time_column(Some(
-                        crate::accelerated_table::caching::CACHE_REFRESHED_AT_COLUMN,
-                    ))
+                    .time_column(Some(crate::accelerated::caching::CACHE_REFRESHED_AT_COLUMN))
                     .time_period(Some(retention_period))
                     .check_interval(Some(check_interval))
                     .enabled(true)
@@ -3705,7 +3757,7 @@ impl DataFusion {
     /// It is safe to fallback to the existing acceleration behavior, but the refreshes won't be synchronized.
     pub async fn attempt_to_synchronize_accelerated_table(
         &self,
-        accelerated_table_builder: &mut accelerated_table::Builder,
+        accelerated_table_builder: &mut accelerated::Builder,
         dataset: &Dataset,
     ) {
         let parent_table_reference = TableReference::parse_str(dataset.path());
@@ -3821,10 +3873,7 @@ impl DataFusion {
             &dataset.columns,
         );
 
-        self.ctx
-            .register_table(dataset.name.clone(), table_provider)
-            .map_err(find_datafusion_root)
-            .context(UnableToRegisterTableToDataFusionSnafu)?;
+        self.install_table_provider(&dataset.name, table_provider)?;
 
         self.register_metadata_table(&dataset, Arc::clone(&source))
             .await?;
@@ -3906,7 +3955,7 @@ impl DataFusion {
                 Some(
                     serde_json::to_string(o).map_err(|_| Error::UnableToTriggerRefresh {
                         dataset_name: dataset_name.to_string(),
-                        source: crate::accelerated_table::Error::FailedToTriggerRefresh {
+                        source: crate::accelerated::Error::FailedToTriggerRefresh {
                             source: tokio::sync::mpsc::error::SendError(None),
                         },
                     })?,
@@ -5343,6 +5392,7 @@ mod tests {
     use arrow::datatypes::{DataType, Field};
     use cache::{SimpleCache, key::CacheKey};
     use datafusion::datasource::MemTable;
+    use spicepod::semantic::Column;
 
     use crate::builder::RuntimeBuilder;
 
@@ -5514,203 +5564,6 @@ mod tests {
         assert_eq!(
             name_field.metadata().get("description").map(String::as_str),
             Some("display name")
-        );
-    }
-
-    #[test]
-    fn embedding_table_metadata_wrap_preserves_downcast() {
-        // Regression test for CDC-over-embeddings: when a dataset carries table- or
-        // column-level metadata, `table_provider_with_spicepod_metadata` must keep an
-        // `EmbeddingTable` discoverable via `downcast_ref::<EmbeddingTable>()` (pushing
-        // the metadata onto the base table) rather than wrapping it opaquely in a
-        // `MetadataEnrichedTableProvider`. `EmbeddingConnector::changes_stream` unwraps
-        // the `EmbeddingTable` to its base table to build the source changes stream; an
-        // opaque wrapper hides it, so no stream is attached and `refresh_mode: changes`
-        // fails with "a changes stream is required".
-        let base_schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int32, false),
-            Field::new("content", DataType::Utf8, true),
-        ]));
-        let base_table = Arc::new(
-            MemTable::try_new(base_schema, vec![vec![]]).expect("mem table should be created"),
-        ) as Arc<dyn TableProvider>;
-
-        let embedding_table = Arc::new(EmbeddingTable {
-            base_table,
-            embedded_columns: HashMap::new(),
-            embedding_models: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
-        }) as Arc<dyn TableProvider>;
-
-        let mut table_metadata = HashMap::new();
-        table_metadata.insert("source_owner".to_string(), "analytics".to_string());
-        let mut content_column = Column::new("content");
-        content_column.description = Some("post body".to_string());
-        let columns = vec![content_column];
-
-        let wrapped = table_provider_with_spicepod_metadata(
-            Arc::clone(&embedding_table),
-            &table_metadata,
-            &columns,
-        );
-
-        let wrapped_embedding = wrapped.downcast_ref::<EmbeddingTable>().expect(
-            "metadata wrap must keep the EmbeddingTable discoverable for the changes stream",
-        );
-
-        // Metadata enrichment is pushed onto the base table, not layered opaquely on top.
-        assert!(
-            wrapped_embedding
-                .base_table
-                .downcast_ref::<MetadataEnrichedTableProvider>()
-                .is_some(),
-            "base table should be metadata-enriched"
-        );
-    }
-
-    /// Builds the provider stack a dataset with `embeddings` produces:
-    /// `EmbeddingTable` over the source provider.
-    fn embedding_table_over_memtable() -> Arc<dyn TableProvider> {
-        let base_schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int32, false),
-            Field::new("content", DataType::Utf8, true),
-        ]));
-        let base_table = Arc::new(
-            MemTable::try_new(base_schema, vec![vec![]]).expect("mem table should be created"),
-        ) as Arc<dyn TableProvider>;
-
-        Arc::new(EmbeddingTable {
-            base_table,
-            embedded_columns: HashMap::new(),
-            embedding_models: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
-        }) as Arc<dyn TableProvider>
-    }
-
-    /// Builds the provider stack a dataset with `vectors` enabled produces:
-    /// `VectorScanTableProvider` over the source provider.
-    fn vector_scan_over_memtable() -> Arc<dyn TableProvider> {
-        let base_schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int32, false),
-            Field::new("content", DataType::Utf8, true),
-        ]));
-        let base_table = Arc::new(
-            MemTable::try_new(base_schema, vec![vec![]]).expect("mem table should be created"),
-        ) as Arc<dyn TableProvider>;
-
-        Arc::new(search::index::VectorScanTableProvider {
-            table_provider: base_table,
-            vector_index_list: Arc::new(datafusion::logical_expr::LogicalPlan::EmptyRelation(
-                datafusion::logical_expr::EmptyRelation {
-                    produce_one_row: false,
-                    schema: Arc::new(datafusion::common::DFSchema::empty()),
-                },
-            )),
-            primary_key: vec!["id".to_string()],
-        }) as Arc<dyn TableProvider>
-    }
-
-    fn spicepod_metadata_fixture() -> (HashMap<String, String>, Vec<Column>) {
-        let mut table_metadata = HashMap::new();
-        table_metadata.insert("source_owner".to_string(), "analytics".to_string());
-        let mut content_column = Column::new("content");
-        content_column.description = Some("post body".to_string());
-        (table_metadata, vec![content_column])
-    }
-
-    #[test]
-    fn embedding_table_metadata_wrap_preserves_table_metadata() {
-        // `EmbeddingTable::schema()` rebuilds the schema from its base table's fields.
-        // Pushing metadata enrichment onto the base table only works if that rebuild
-        // carries the base schema's metadata; otherwise dataset-level spicepod
-        // `metadata:` silently disappears from the source-facing schema.
-        let (table_metadata, columns) = spicepod_metadata_fixture();
-
-        let wrapped = table_provider_with_spicepod_metadata(
-            embedding_table_over_memtable(),
-            &table_metadata,
-            &columns,
-        );
-
-        let schema = wrapped.schema();
-        assert_eq!(
-            schema.metadata().get("source_owner").map(String::as_str),
-            Some("analytics"),
-            "table-level spicepod metadata must survive the metadata wrap"
-        );
-        assert_eq!(
-            schema
-                .field_with_name("content")
-                .expect("content field")
-                .metadata()
-                .get("description")
-                .map(String::as_str),
-            Some("post body"),
-            "column-level spicepod metadata must survive the metadata wrap"
-        );
-    }
-
-    #[test]
-    fn embedding_table_under_indexed_provider_stays_discoverable() {
-        // A dataset with both `embeddings` and `full_text_search` nests an
-        // `EmbeddingTable` under the `IndexedTableProvider` the FTS connector builds.
-        // `FullTextConnector::with_indexed_stream` hands `get_underlying()` to
-        // `EmbeddingConnector::changes_stream`, which downcasts to `EmbeddingTable`; if
-        // the metadata wrap hides it there, no changes stream is attached and
-        // `refresh_mode: changes` fails with "a changes stream is required".
-        let indexed = Arc::new(IndexedTableProvider::with_indexes(
-            embedding_table_over_memtable(),
-            vec![],
-        )) as Arc<dyn TableProvider>;
-
-        let (table_metadata, columns) = spicepod_metadata_fixture();
-        let wrapped = table_provider_with_spicepod_metadata(indexed, &table_metadata, &columns);
-
-        let found_indexed = wrapped
-            .downcast_ref::<IndexedTableProvider>()
-            .expect("IndexedTableProvider must remain discoverable for the index analyzer");
-
-        assert!(
-            found_indexed
-                .get_underlying()
-                .downcast_ref::<EmbeddingTable>()
-                .is_some(),
-            "EmbeddingTable nested under an IndexedTableProvider must stay discoverable"
-        );
-    }
-
-    #[test]
-    fn vector_scan_under_indexed_provider_stays_discoverable() {
-        // A dataset with `embeddings`, `full_text_search` and `vectors` enabled nests a
-        // `VectorScanTableProvider` under the `IndexedTableProvider` (the FTS index is
-        // added to the same provider the vector engine created).
-        // `FullTextConnector::with_indexed_stream` hands `get_underlying()` to
-        // `EmbeddingConnector::changes_stream`, which downcasts to
-        // `VectorScanTableProvider` to reach the raw source; if the metadata wrap hides
-        // it there, `refresh_mode: changes` fails with "a changes stream is required".
-        let indexed = Arc::new(IndexedTableProvider::with_indexes(
-            vector_scan_over_memtable(),
-            vec![],
-        )) as Arc<dyn TableProvider>;
-
-        let (table_metadata, columns) = spicepod_metadata_fixture();
-        let wrapped = table_provider_with_spicepod_metadata(indexed, &table_metadata, &columns);
-
-        let found_indexed = wrapped
-            .downcast_ref::<IndexedTableProvider>()
-            .expect("IndexedTableProvider must remain discoverable for the index analyzer");
-
-        let underlying = found_indexed.get_underlying();
-        let vector_scan = underlying
-            .downcast_ref::<search::index::VectorScanTableProvider>()
-            .expect("VectorScanTableProvider under an IndexedTableProvider must stay discoverable");
-
-        // Enrichment lands below the vector scan, on the raw source provider, so the
-        // source-facing bootstrap schema carries no synthetic embedding columns.
-        assert!(
-            vector_scan
-                .table_provider
-                .downcast_ref::<MetadataEnrichedTableProvider>()
-                .is_some(),
-            "metadata enrichment should be pushed onto the vector scan's source provider"
         );
     }
 

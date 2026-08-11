@@ -67,6 +67,8 @@ jobs:
     # stuck.
     name: Attestation
     runs-on: ubuntu-latest
+    # A few API calls. Anything past this is a wedged step, not a slow one.
+    timeout-minutes: 15
     permissions:
       contents: read
       statuses: read
@@ -502,7 +504,7 @@ jobs:
       # and blobs to reproduce the merge without relying on a lazy network fetch.
       - name: Check out pull request history
         if: ${{ github.event_name == 'pull_request' && steps.signoff.outputs.inheritance_candidate == 'true' }}
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0
@@ -592,9 +594,30 @@ jobs:
         if: ${{ github.event_name == 'pull_request' && steps.revert.outputs.fast_track == 'true' }}
         run: echo "Pure revert fast-tracked past sign-off; the full suite runs on the merged result in the merge queue."
 
+      # Named rather than negated. Entry into the queue is itself gated on a green
+      # Attestation, so by the time a merge_group run exists the sign-off has already
+      # been validated — that precondition is what makes passing here sound. Any other
+      # non-pull_request trigger reaching this step would be borrowing an assumption it
+      # does not satisfy.
       - name: Merge queue passthrough
-        if: ${{ github.event_name != 'pull_request' }}
+        if: ${{ github.event_name == 'merge_group' }}
         run: echo "Sign-off was validated at queue entry; the full suite runs in this merge_group run."
+
+      # A dispatch carries no pull_request payload, so every inspection above is
+      # unreachable: there is no head SHA to read a `signoff` status for, no base to
+      # walk the first-parent chain from, and no author or commit list for the
+      # fast-tracks. It has no queue-entry precondition either, so the passthrough
+      # above must not cover it. Since Attestation is the only gate a pull request has,
+      # a green one minted here would satisfy that gate having verified nothing, which
+      # makes failing the only honest verdict.
+      #
+      # This does not cost the dispatch its purpose: the heavy jobs below gate on
+      # `check_changes`, not on this job, so they still run.
+      - name: Reject an attestation asserted by dispatch
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        run: |
+          echo "::error title=Attestation cannot be established by dispatch::A workflow_dispatch of pr.yml has no pull request payload, so no sign-off can be read and no verdict asserted. Dispatch this workflow only to run the heavy jobs. To report Attestation on a pull request whose checks are absent, re-run the pull_request-triggered 'pr' run for that head commit, or push to the branch so the pull_request event fires again."
+          exit 1
 
   # The jobs below run ONLY in the merge queue (merge_group) and on manual
   # dispatch — never on a pull request. They stay required, so the full suite
@@ -604,10 +627,14 @@ jobs:
   check_changes:
     if: ${{ github.event_name != 'pull_request' }}
     runs-on: spiceai-macos
+    # A full-history checkout (`fetch-depth: 0`) and a path diff. Sized for a
+    # cold runner having to clone from scratch, not the ~1 min a warm
+    # self-hosted workspace takes.
+    timeout-minutes: 45
     outputs:
       relevant_changes: ${{ steps.check.outputs.relevant_changes }}
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # Use fetch-depth 2 for PR change detection (dorny/paths-filter only needs base + head)
           fetch-depth: ${{ github.event_name == 'pull_request' && 2 || 0 }}
@@ -625,13 +652,15 @@ jobs:
   lint-rust:
     name: Rust Lint
     runs-on: spiceai-macos
+    # Slowest observed success in the 2026-07-25..08-08 window: 126 min.
+    timeout-minutes: 300
     needs: check_changes
     if: ${{ github.event_name != 'pull_request' }}
     env:
       HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
 
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: needs.check_changes.outputs.relevant_changes == 'true'
         with:
           fetch-depth: 1
@@ -655,13 +684,14 @@ jobs:
       - name: Set up spiceio
         if: needs.check_changes.outputs.relevant_changes == 'true' && runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true'
         id: setup-spiceio
-        uses: spiceai/spiceio/.github/actions/setup@973bc49a7be396ec9430255ad0f7ed684d7a1317 # v0.5.8
+        uses: spiceai/spiceio/.github/actions/setup@2ad4a874ff4813f8190117bc645af0dbb90b708c # v0.8.0
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
           smb-pass: ${{ secrets.UNAS_SMB_PASS }}
           token: ${{ github.token }}
           bucket: sccache
           region: us-west-1
+          immutable-objects: "true"
 
       - name: Set up sccache
         if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -692,8 +722,13 @@ jobs:
           RUST_PROFILE: ${{ env.RUST_PROFILE }}
 
       - name: Show sccache stats
-        if: ${{ needs.check_changes.outputs.relevant_changes == 'true' && env.SCCACHE_SETUP == 'true' }}
-        run: sccache --show-stats
+        if: ${{ always() && (needs.check_changes.outputs.relevant_changes == 'true' && env.SCCACHE_SETUP == 'true') }}
+        # `always()`: this is the one step that reports cache health, and without it
+        # it is skipped on exactly the failures it would explain (#12420). The `||`
+        # keeps a diagnostic from ever deciding a verdict — when the cache backend is
+        # gone `--show-stats` cannot answer either, and that is itself the finding.
+        run: |
+          sccache --show-stats || echo "::warning::sccache --show-stats failed, so the cache server is not answering either. Read a build failure in this job as a possible cache-backend outage rather than a code failure."
 
       - name: Kill spiceio
         if: always() && runner.os == 'macOS' && steps.setup-spiceio.outputs.pid != ''
@@ -711,13 +746,15 @@ jobs:
   build-test:
     name: Build and Test
     runs-on: spiceai-macos
+    # Slowest observed success in the 2026-07-25..08-08 window: 117 min.
+    timeout-minutes: 300
     needs: [check_changes]
     if: ${{ github.event_name != 'pull_request' }}
     env:
       HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
 
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: needs.check_changes.outputs.relevant_changes == 'true'
         with:
           fetch-depth: 1
@@ -745,13 +782,14 @@ jobs:
       - name: Set up spiceio
         if: needs.check_changes.outputs.relevant_changes == 'true' && runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true'
         id: setup-spiceio
-        uses: spiceai/spiceio/.github/actions/setup@973bc49a7be396ec9430255ad0f7ed684d7a1317 # v0.5.8
+        uses: spiceai/spiceio/.github/actions/setup@2ad4a874ff4813f8190117bc645af0dbb90b708c # v0.8.0
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
           smb-pass: ${{ secrets.UNAS_SMB_PASS }}
           token: ${{ github.token }}
           bucket: sccache
           region: us-west-1
+          immutable-objects: "true"
 
       - name: Set up sccache
         if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -772,14 +810,15 @@ jobs:
         if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: ./.github/actions/setup-cc
 
-      # build-cli-dev, not build-cli: the latter is hardcoded to --release, so
-      # this job compiled the CLI in release while running its tests under
-      # RUST_PROFILE (lint) — two profiles, sharing nothing, in one job. Nothing
-      # here consumes the release binary, and the required `Build (release
-      # profile)` job below does the real release installs.
-      - name: Build CLI and run nextest
+      # No separate CLI build: nextest's `--tests` build already emits the `spice`
+      # binary, since cargo builds a package's bins alongside that package's
+      # integration tests, so a CLI link error fails nextest itself. `verify-cli`
+      # asserts the binary is there and runs, so the gate reports it if cargo ever
+      # stops producing it. The required `Build (release profile)` job below does
+      # the real release installs.
+      - name: Run nextest and verify the CLI
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        run: make build-cli-dev nextest
+        run: make nextest verify-cli
         env:
           RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
           AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
@@ -803,8 +842,13 @@ jobs:
         run: cargo build -p testoperator --all-features --locked
 
       - name: Show sccache stats
-        if: ${{ needs.check_changes.outputs.relevant_changes == 'true' && env.SCCACHE_SETUP == 'true' }}
-        run: sccache --show-stats
+        if: ${{ always() && (needs.check_changes.outputs.relevant_changes == 'true' && env.SCCACHE_SETUP == 'true') }}
+        # `always()`: this is the one step that reports cache health, and without it
+        # it is skipped on exactly the failures it would explain (#12420). The `||`
+        # keeps a diagnostic from ever deciding a verdict — when the cache backend is
+        # gone `--show-stats` cannot answer either, and that is itself the finding.
+        run: |
+          sccache --show-stats || echo "::warning::sccache --show-stats failed, so the cache server is not answering either. Read a build failure in this job as a possible cache-backend outage rather than a code failure."
 
       - name: Check if Cargo.lock is updated
         if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -838,13 +882,15 @@ jobs:
   build-install-release:
     name: Build (release profile)
     runs-on: spiceai-macos
+    # Slowest observed success in the 2026-07-25..08-08 window: 106 min.
+    timeout-minutes: 300
     needs: [check_changes]
     if: ${{ github.event_name != 'pull_request' }}
     env:
       HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
 
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: needs.check_changes.outputs.relevant_changes == 'true'
         with:
           fetch-depth: 1
@@ -856,13 +902,14 @@ jobs:
       - name: Set up spiceio
         if: needs.check_changes.outputs.relevant_changes == 'true' && runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true'
         id: setup-spiceio
-        uses: spiceai/spiceio/.github/actions/setup@973bc49a7be396ec9430255ad0f7ed684d7a1317 # v0.5.8
+        uses: spiceai/spiceio/.github/actions/setup@2ad4a874ff4813f8190117bc645af0dbb90b708c # v0.8.0
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
           smb-pass: ${{ secrets.UNAS_SMB_PASS }}
           token: ${{ github.token }}
           bucket: sccache
           region: us-west-1
+          immutable-objects: "true"
 
       - name: Set up sccache
         if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -911,8 +958,13 @@ jobs:
         run: make install-spiced
 
       - name: Show sccache stats
-        if: ${{ needs.check_changes.outputs.relevant_changes == 'true' && env.SCCACHE_SETUP == 'true' }}
-        run: sccache --show-stats
+        if: ${{ always() && (needs.check_changes.outputs.relevant_changes == 'true' && env.SCCACHE_SETUP == 'true') }}
+        # `always()`: this is the one step that reports cache health, and without it
+        # it is skipped on exactly the failures it would explain (#12420). The `||`
+        # keeps a diagnostic from ever deciding a verdict — when the cache backend is
+        # gone `--show-stats` cannot answer either, and that is itself the finding.
+        run: |
+          sccache --show-stats || echo "::warning::sccache --show-stats failed, so the cache server is not answering either. Read a build failure in this job as a possible cache-backend outage rather than a code failure."
 
       - name: Kill spiceio
         if: always() && runner.os == 'macOS' && steps.setup-spiceio.outputs.pid != ''

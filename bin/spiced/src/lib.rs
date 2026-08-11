@@ -160,6 +160,15 @@ pub enum Error {
     #[snafu(display("Failed to start Spice runtime: {source}"))]
     UnableToConstructSpiceApp { source: Box<app::Error> },
 
+    #[snafu(display(
+        "Failed to read the persisted Spice Cloud deployment at {}: {source}",
+        path.display()
+    ))]
+    UnableToReadCloudManagedSpicepod {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+
     #[snafu(display("Unable to start Spice Runtime servers: {source}"))]
     UnableToStartServers { source: Box<runtime::Error> },
 
@@ -373,6 +382,15 @@ pub struct Args {
     #[arg(long, action = ArgAction::Append, value_parser = parse_set_string)]
     pub set_runtime: Vec<(String, String)>,
 
+    /// How many CPUs the runtime should behave as though it has, as a
+    /// Kubernetes CPU quantity (`4`, `3.5`, `3500m`). `auto` (the default)
+    /// detects it from the cgroup CPU limit, a bounded multiple of the pod's
+    /// `requests.cpu`, or the host. `all` uses every available core regardless
+    /// of the request, still respecting a CPU limit. Takes precedence over
+    /// `SPICE_CPU_CORES` and `runtime.cpu.cores`.
+    #[arg(long, value_name = "CORES")]
+    pub cpu_cores: Option<String>,
+
     #[arg(skip)]
     pub open_telemetry_deprecated: bool,
 }
@@ -420,7 +438,104 @@ fn spawn_sighup_reload_task(control: std::sync::Arc<runtime::tls::TlsControl>) {
     }
 }
 
-pub async fn run(args: Args) -> Result<()> {
+/// How often to re-read the cgroup CPU share looking for an in-place pod resize.
+///
+/// Slow on purpose. A resize is a human- or VPA-scale event, the read is two small
+/// pseudo-files, and the only outcome is a log line — so there is nothing to gain
+/// from noticing it a minute sooner.
+const CPU_SHARE_POLL: Duration = Duration::from_mins(1);
+
+/// Watch for the pod being resized underneath us, and say so once when it happens.
+///
+/// The CPU budget resolves once at startup and every pool it sized captured its
+/// width then, so a resize cannot be applied without a restart. What it can be is
+/// visible: see [`cpu_budget::ShareDriftWatcher`] for why this reads the raw cgroup
+/// share rather than the declared request (an environment variable cannot change
+/// under a running container).
+fn spawn_cpu_share_drift_task() {
+    let watcher = cpu_budget::cpu_budget().share_drift_watcher();
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(CPU_SHARE_POLL);
+        // The first tick fires immediately and would compare the seed against
+        // itself; skip straight to the cadence.
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            // Two small reads off a timer, but still filesystem work: keep it off
+            // the async worker so a slow /sys cannot stall a runtime thread.
+            let current = match tokio::task::spawn_blocking(cpu_budget::detect_cpu_share).await {
+                Ok(share) => share,
+                Err(err) => {
+                    tracing::debug!("CPU share poll: read task failed: {err}");
+                    continue;
+                }
+            };
+            if let Some(drift) = watcher.observe(current) {
+                tracing::warn!("{drift}");
+            }
+        }
+    });
+}
+
+/// The parsed spicepod, where it came from, and the load error tolerated in
+/// pods-watcher mode.
+///
+/// [`build_app`] runs before the runtime's thread pools are built so
+/// `runtime.cpu.cores` can size them; its result is threaded into [`run`]
+/// rather than re-derived, so the spicepod is loaded exactly once — including
+/// the deployed one, whose `runtime.cpu.cores` therefore sizes the pools the
+/// same way a local spicepod's does.
+pub struct AppBundle {
+    pub app: Option<Arc<App>>,
+    /// Why the local `spicepod.yaml` did not load, in pods-watcher mode where
+    /// that is not fatal.
+    spicepod_load_error: Option<app::Error>,
+    /// The spicepod the app was loaded from, when it came from the cloud-managed
+    /// file. `None` means the runtime is serving something a deployment did not
+    /// put there, so no redelivery can match it.
+    running_deployment: Option<cloud_connect::CloudManagedSpicepod>,
+    /// Deferred because `build_app` runs before tracing is initialized.
+    deployment_note: Option<DeploymentNote>,
+}
+
+/// Resolve the CPU entitlement from all three configuration surfaces plus host
+/// detection, log it, and install it as the process-wide budget.
+///
+/// Must run before any thread pool, `DataFusion` session, or accelerator is
+/// created: [`cpu_budget::cpu_budget`] lazily detects into the same cell, so a
+/// read beforehand pins the detected value.
+///
+/// Logs through whatever subscriber the caller holds. That is also before [`run`]
+/// installs the global one, so the caller covers the whole startup window with a
+/// temporary subscriber rather than each step carrying its own.
+///
+/// # Errors
+///
+/// Fails when the configured value is not a positive CPU quantity or `auto`.
+/// An already-installed budget is a WARN, not an error — the detected value is
+/// the pre-existing behaviour, and refusing to start over it would be worse
+/// than sizing as trunk did.
+pub fn install_cpu_budget(args: &Args, app: Option<&App>) -> Result<(), cpu_budget::Error> {
+    let spicepod_cores = app
+        .and_then(|app| app.runtime.cpu.as_ref())
+        .and_then(|cpu| cpu.cores.as_ref())
+        .map(ToString::to_string);
+    let env_cores = cpu_budget::CpuConfig::env_cores();
+    let config = cpu_budget::CpuConfig::from_sources(
+        args.cpu_cores.as_deref(),
+        env_cores.as_deref(),
+        spicepod_cores.as_deref(),
+    );
+
+    let budget = cpu_budget::CpuBudget::resolve(&config, &cpu_budget::HostReadings::detect())?;
+    budget.log_summary();
+    if let Err(err) = budget.install() {
+        tracing::warn!("{err}");
+    }
+    Ok(())
+}
+
+pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
     // Register external data connectors before runtime initialization.
     // This makes connectors from extracted crates available to the runtime.
     register_external_connectors().await;
@@ -432,7 +547,15 @@ pub async fn run(args: Args) -> Result<()> {
         .clone()
         .unwrap_or_else(|| env::current_dir().unwrap_or(PathBuf::from(".")));
 
-    let (app, spicepod_load_error) = build_app(&args).await?;
+    let AppBundle {
+        app,
+        spicepod_load_error,
+        running_deployment,
+        deployment_note,
+    } = app_bundle;
+    // Deferred until tracing exists, and appended to below — everything about
+    // which configuration this start is serving belongs in one place in the log.
+    let mut deployment_notes: Vec<DeploymentNote> = deployment_note.into_iter().collect();
     let mut extension_factories: Vec<Box<dyn ExtensionFactory>> = vec![];
 
     if let Some(some_app) = &app
@@ -530,6 +653,21 @@ pub async fn run(args: Args) -> Result<()> {
         None
     };
 
+    // A reader of its own for the metrics Cloud Connect pushes to the control
+    // plane. Separate from the cluster reader above rather than shared: each
+    // reader registered with the meter provider gets its own pipeline and so
+    // sees every data point, whereas two consumers of one reader would divide
+    // them under delta temporality.
+    //
+    // Created here because readers are fixed when the meter provider is built,
+    // which happens well before Cloud Connect starts — so the decision is made
+    // from the same cheap on-disk/flag probe that gates log capture.
+    let cloud_connect_metrics = if cloud_connect::is_configured(args.cloud_connect) {
+        Some(runtime::metrics_reader::MetricsReader::new_cumulative())
+    } else {
+        None
+    };
+
     match resolved_cluster_config {
         Ok(resolved_cluster_config) => {
             // Validate that scheduler mode has state_location configured
@@ -569,8 +707,16 @@ pub async fn run(args: Args) -> Result<()> {
     }
 
     if args.pods_watcher_enabled && args.spicepod.is_none() {
-        let pods_watcher = PodsWatcher::new(spicepod_path.clone());
-        builder = builder.with_pods_watcher(pods_watcher);
+        if running_deployment.is_some() {
+            // The watcher reconciles the *local* spicepod into the running app.
+            // On an instance serving a deployment that would swap the deployed
+            // configuration out from under it, leaving the runtime serving
+            // something the control plane never sent.
+            deployment_notes.push(DeploymentNote::PodsWatcherDeclined);
+        } else {
+            let pods_watcher = PodsWatcher::new(spicepod_path.clone());
+            builder = builder.with_pods_watcher(pods_watcher);
+        }
     }
 
     let rt = builder.build().await;
@@ -601,6 +747,12 @@ pub async fn run(args: Args) -> Result<()> {
         tracing::warn!(
             "Starting in pods watcher mode without a valid spicepod.yaml. The runtime will load components once a valid spicepod.yaml is provided.\n{err}"
         );
+    }
+    // Same reason: `build_app` chooses between the deployed spicepod and the
+    // local one before tracing exists, and which one won is the first thing an
+    // operator debugging a deployment looks for.
+    for note in &deployment_notes {
+        note.log();
     }
 
     // Configure the CPU runtime for DataFusion by default. Opt-out via `runtime.params.dedicated_thread_pool=disabled`
@@ -634,29 +786,53 @@ pub async fn run(args: Args) -> Result<()> {
             // oversubscribed host. (Benchmarked nice-0 vs a nice-5 variant at SF50: equal
             // QPH, but nice-0 drained replication lag harder — cleared the stock backlog —
             // so it's the better default; the QPH cost vs the shared runtime was noise.)
-            let cdc_apply_runtime = ManagedTokioRuntime::builder()
-                .with_thread_name("cdc-apply-worker")
-                .build()
-                .boxed()
-                .context(UnableToInitializeDatafusionTokioRuntimeSnafu)?;
+            //
+            // Skipped when no dataset streams changes: each runtime is `cores - 1`
+            // worker threads, and `cdc_apply_runtime()` falls back to the refresh
+            // runtime, so a pod that never runs the apply loop should not pay for it.
+            if runtime::builder::streams_cdc_changes(app.as_ref()) {
+                let cdc_apply_runtime = ManagedTokioRuntime::builder()
+                    .with_thread_name("cdc-apply-worker")
+                    .build()
+                    .boxed()
+                    .context(UnableToInitializeDatafusionTokioRuntimeSnafu)?;
 
-            rt.datafusion().set_cdc_apply_runtime(cdc_apply_runtime);
+                rt.datafusion().set_cdc_apply_runtime(cdc_apply_runtime);
+            }
 
-            // Bring up the dedicated compaction runtime whenever dedicated
-            // thread pools are enabled. Cayenne can be activated lazily after
-            // startup (for example via Iceberg DDL acceleration defaults), so
-            // install the runtime handle even when the DataFusion builder did
-            // not carve a compaction memory environment from the initial
-            // spicepod. `set_compaction_runtime` injects the carved memory
-            // environment only when one is available.
-            let compaction_runtime = ManagedTokioRuntime::builder()
-                .with_low_priority()
-                .with_thread_name("compaction-worker")
-                .build()
-                .boxed()
-                .context(UnableToInitializeDatafusionTokioRuntimeSnafu)?;
+            // Process-global Cayenne budgets: the write path (encode concurrency, the
+            // auto-tuner's memory budget, query admission) and the off-pool in-memory
+            // CDC tier ceiling. These bound every Cayenne table, compacting or not, so
+            // they are installed independently of the compaction runtime below — a
+            // fleet of full-refresh tables refreshing at once needs the encode cap just
+            // as much as a CDC fleet does, and a `mode: memory` pod holds its whole
+            // dataset in the tier while never producing a file to compact.
+            rt.datafusion().install_cayenne_global_budgets();
 
-            rt.datafusion().set_compaction_runtime(compaction_runtime);
+            // Bring up the dedicated compaction runtime whenever dedicated thread
+            // pools are enabled. Cayenne can be activated lazily after startup (for
+            // example via Iceberg DDL acceleration defaults), so install the runtime
+            // handle even when the DataFusion builder did not carve a compaction
+            // memory environment from the initial spicepod. `set_compaction_runtime`
+            // injects the carved memory environment only when one is available.
+            //
+            // The one case we can rule out is a pod where no Cayenne table can
+            // produce a file to compact: a whole-table replace leaves nothing to
+            // consolidate, and `mode: memory` never writes a Vortex file at all, so
+            // their background compactors are never even spawned. A table created
+            // later by DDL in such a pod falls back to the ambient runtime
+            // (`spawn_compaction` handles an uninstalled handle), trading isolation —
+            // not correctness — for not reserving a pool the pod cannot use.
+            if rt.datafusion().cayenne_workload().may_compact() {
+                let compaction_runtime = ManagedTokioRuntime::builder()
+                    .with_low_priority()
+                    .with_thread_name("compaction-worker")
+                    .build()
+                    .boxed()
+                    .context(UnableToInitializeDatafusionTokioRuntimeSnafu)?;
+
+                rt.datafusion().set_compaction_runtime(compaction_runtime);
+            }
         }
         Some("disabled") => {
             tracing::info!(
@@ -675,8 +851,13 @@ pub async fn run(args: Args) -> Result<()> {
         .and_then(|c| c.otel_exporter.as_ref())
         .filter(|c| c.enabled);
 
-    let needs_metrics =
-        prometheus_registry.is_some() || otel_config.is_some() || metrics_reader.is_some();
+    // Cloud Connect counts: its reader only produces data once it is attached to
+    // the meter provider built below, and `spiced --cloud-connect` alone sets
+    // none of the other three signals.
+    let needs_metrics = prometheus_registry.is_some()
+        || otel_config.is_some()
+        || metrics_reader.is_some()
+        || cloud_connect_metrics.is_some();
 
     if needs_metrics {
         // Resolve secrets in OTEL exporter headers before initializing metrics
@@ -711,12 +892,15 @@ pub async fn run(args: Args) -> Result<()> {
 
         init_metrics(
             &rt.datafusion(),
-            prometheus_registry.clone(),
-            otel_config,
-            resolved_otel_headers,
-            metrics_reader,
-            resource_attributes,
-            metric_prefix,
+            MetricsInit {
+                registry: prometheus_registry.clone(),
+                otel_config,
+                resolved_otel_headers,
+                metrics_reader,
+                cloud_connect_metrics: cloud_connect_metrics.clone(),
+                resource_attributes,
+                metric_prefix,
+            },
         )
         .context(UnableToInitializeMetricsSnafu)?;
 
@@ -751,6 +935,18 @@ pub async fn run(args: Args) -> Result<()> {
         tokio_handles.push(("main", Handle::current()));
         telemetry::register_tokio_runtime_metrics(tokio_handles);
 
+        // The CPU entitlement every one of those pools was sized from.
+        // `tokio_runtime_workers` above is the cross-check.
+        let budget = cpu_budget::cpu_budget();
+        spawn_cpu_share_drift_task();
+        telemetry::register_cpu_budget_metrics(
+            u64::try_from(budget.cores()).unwrap_or(u64::MAX),
+            budget.millicores(),
+            budget.source().as_str(),
+            budget.limit_millicores(),
+            budget.declared_request_millicores(),
+        );
+
         // Cayenne write-path backpressure occupancy gauges (encode budget, in-memory
         // CDC tier byte budget, compaction semaphore). Pull-based observable gauges on
         // the global `cayenne` meter; registered here — after `init_metrics` — for the
@@ -759,6 +955,18 @@ pub async fn run(args: Args) -> Result<()> {
         // apply path when ingest falls behind.
         runtime::dataaccelerator::cayenne::register_cayenne_telemetry();
     }
+
+    // The global meter provider is now final: either `init_metrics` replaced the
+    // startup noop provider above, or metrics are not configured and the noop one
+    // stands. Operator instruments may cache from here on.
+    //
+    // This is outside the `needs_metrics` block on purpose. A deployment that
+    // exports nothing still records into these instruments, and leaving the seal
+    // off would make every such record rebuild its instrument forever rather than
+    // once. Sealing after `init_metrics` — rather than relying on the first record
+    // landing late enough — is what keeps a startup-time sampler's gauges on the
+    // operator's provider (#12667).
+    telemetry::seal_operator_meter_provider();
 
     let (tls_config, client_auth_mode) = tls::load_tls_config(
         &args,
@@ -848,31 +1056,49 @@ pub async fn run(args: Args) -> Result<()> {
         Box::pin(cloned_rt.start_servers(args.runtime, tls_config, endpoint_auth)).await
     });
 
-    let mut components_loaded = false;
-    tokio::select! {
-        () = Arc::clone(&rt).load_components() => { components_loaded = true; },
-        () = runtime::shutdown_signal() => {
-            tracing::debug!("Cancelling runtime initializing!");
-        },
-    }
+    // Restore control-plane-delivered secrets from the local cache and register
+    // their store BEFORE loading components. Component initialization is what
+    // resolves `${ secrets:… }`, so a store installed after this point would
+    // arrive too late for every component that referenced one — and since a
+    // deployment applies by restarting, that is the normal path, not an edge
+    // case. Local files only, no control-plane round trip, so this neither
+    // blocks nor fails when the gateway is unreachable.
+    let delivered_secrets = cloud_connect::restore_delivered_secrets(
+        env!("CARGO_PKG_VERSION"),
+        &rt,
+        cloud_connect_flag,
+    )
+    .await;
 
     // Spice Cloud Connect. Default off — only activates on the explicit
     // `--cloud-connect` flag, or when an identity is on disk or an adoption
     // code is available. Failures here are non-fatal: spiced keeps running.
-    // Started only after `load_components()` completes so an adopted control
-    // plane can't issue GetRuntimeInfo against a half-loaded runtime
-    // (datasets/models still registering).
-    let cloud_connect_handle = if components_loaded {
-        cloud_connect::maybe_start(
-            env!("CARGO_PKG_VERSION"),
-            Arc::clone(&rt),
-            cloud_connect_flag,
-        )
-        .await
-    } else {
-        // Shutting down before components finished loading — don't start.
-        None
-    };
+    //
+    // Started BEFORE `load_components()` so the control plane holds a session
+    // while components initialize. The load has no deadline — a dataset whose
+    // source is unreachable is retried for as long as the runtime is up — so
+    // gating the channel on a finished load lets a spicepod the runtime cannot
+    // satisfy lock out the very deployment that would fix it, with no way back
+    // short of an operator editing files on the host. Commands are answered
+    // during the load and `GetStatus` reports the runtime as progressing until
+    // it finishes; an `ApplySpicepod` abandons the load and restarts onto the
+    // configuration it just persisted.
+    let cloud_connect_handle = cloud_connect::maybe_start(
+        env!("CARGO_PKG_VERSION"),
+        Arc::clone(&rt),
+        cloud_connect_flag,
+        delivered_secrets,
+        running_deployment,
+        cloud_connect_metrics,
+    )
+    .await;
+
+    tokio::select! {
+        () = Arc::clone(&rt).load_components() => {},
+        () = runtime::shutdown_signal() => {
+            tracing::debug!("Cancelling runtime initializing!");
+        },
+    }
 
     let result = match server_thread.await {
         // Don't treat force terminated as an error
@@ -893,7 +1119,91 @@ pub async fn run(args: Args) -> Result<()> {
     result
 }
 
-async fn build_app(args: &Args) -> Result<(Option<Arc<App>>, Option<app::Error>)> {
+/// Whether a failed local spicepod load should be tolerated by starting on an
+/// empty spicepod instead of exiting.
+fn tolerates_missing_spicepod(args: &Args, error: &app::Error) -> bool {
+    tolerates_missing_spicepod_when_configured(
+        args,
+        error,
+        cloud_connect::is_configured(args.cloud_connect),
+    )
+}
+
+/// Pure policy behind [`tolerates_missing_spicepod`]. Keeping the configuration
+/// signal separate makes the implicit activation paths (an enrolled identity,
+/// pending adoption code, or adoption-code environment variable) testable
+/// without mutating process-global environment state.
+fn tolerates_missing_spicepod_when_configured(
+    args: &Args,
+    error: &app::Error,
+    cloud_connect_configured: bool,
+) -> bool {
+    cloud_connect_configured && args.spicepod.is_none() && error.is_spicepod_missing()
+}
+
+/// What `build_app` decided about which spicepod this start serves, logged once
+/// tracing exists.
+enum DeploymentNote {
+    /// The runtime started on the deployed spicepod.
+    Loaded { path: PathBuf },
+    /// The deployed spicepod would not build, so the runtime fell back to the
+    /// local configuration.
+    Rejected { path: PathBuf, error: String },
+    /// Neither the deployed spicepod nor the local one would build. The runtime
+    /// starts with no app so the control plane can still reach it.
+    NothingLoadable {
+        path: PathBuf,
+        error: String,
+        local_error: String,
+    },
+    /// `--pods-watcher-enabled` was passed on an instance serving a deployment.
+    /// The watcher is not installed: reconciling the local spicepod into a
+    /// deployed app would swap the deployed configuration out from under it.
+    PodsWatcherDeclined,
+    /// A cloud-managed instance found no spicepod — neither deployed nor local —
+    /// and started on an empty one.
+    NoSpicepod,
+}
+
+impl DeploymentNote {
+    fn log(&self) {
+        match self {
+            Self::Loaded { path } => tracing::info!(
+                "Spice Cloud Connect: serving the deployed spicepod from {}",
+                path.display()
+            ),
+            Self::Rejected { path, error } => tracing::error!(
+                "Spice Cloud Connect: the deployed spicepod at {} could not be loaded, so this instance started on its local configuration instead. Deploy a corrected spicepod to replace it: {error}",
+                path.display()
+            ),
+            Self::NothingLoadable {
+                path,
+                error,
+                local_error,
+            } => tracing::error!(
+                "Spice Cloud Connect: this instance started with no configuration — the deployed spicepod at {} could not be loaded ({error}), and neither could the local one ({local_error}). It serves nothing until a deployment replaces the file; the runtime stays reachable so that deployment can land.",
+                path.display()
+            ),
+            Self::PodsWatcherDeclined => tracing::warn!(
+                "Spice Cloud Connect: --pods-watcher-enabled was ignored because this instance serves a deployed spicepod. Watching the local spicepod.yaml would replace the deployed configuration while the instance kept reporting the deployment as applied. Edit the app in Spice Cloud and deploy it instead."
+            ),
+            Self::NoSpicepod => {
+                tracing::warn!("No existing spicepod was found. Starting Runtime without one.");
+            }
+        }
+    }
+}
+
+/// Load the spicepod and apply `--set-runtime` overrides.
+///
+/// Called from `main` before the multi-thread runtime is built, so
+/// `runtime.cpu.cores` can size it; only local/remote YAML parsing happens
+/// here, and the result is passed into [`run`].
+///
+/// A cloud-managed instance is loaded from the spicepod its last deployment
+/// persisted rather than the instance directory's `spicepod.yaml` — see the
+/// cloud-managed branch below.
+pub async fn build_app(args: &Args) -> Result<AppBundle> {
     // Check for explicit executor role OR implicit executor role (scheduler_address set without explicit role)
     let is_executor = matches!(args.runtime.cluster.role, Some(ClusterRole::Executor))
         || (args.runtime.cluster.role.is_none()
@@ -907,17 +1217,70 @@ async fn build_app(args: &Args) -> Result<(Option<Arc<App>>, Option<app::Error>)
             && let Ok(built_app) = AppBuilder::build_from_path(path.clone()).await
         {
             let mut app = App::default();
-            // Copy only runtime flight and telemetry config from the spicepod.
+            // Copy only runtime flight, telemetry, and CPU config from the
+            // spicepod. An executor is the deployment shape most likely to be
+            // running under a CPU request, so `runtime.cpu` must come across
+            // too — everything else it needs arrives from the scheduler.
             app.runtime.flight = built_app.runtime.flight;
             app.runtime.telemetry = built_app.runtime.telemetry;
+            app.runtime.cpu = built_app.runtime.cpu;
             app.runtime = apply_overrides(app.runtime, &args.set_runtime)?;
             tracing::info!("Starting as a cluster executor with runtime config from spicepod.");
-            return Ok((Some(Arc::new(app)), None));
+            return Ok(AppBundle {
+                app: Some(Arc::new(app)),
+                spicepod_load_error: None,
+                running_deployment: None,
+                deployment_note: None,
+            });
         }
         tracing::info!(
             "Starting as a cluster executor, without a Spicepod. The runtime will initialize its components upon joining the cluster."
         );
-        return Ok((Some(Arc::new(App::default())), None));
+        return Ok(AppBundle {
+            app: Some(Arc::new(App::default())),
+            spicepod_load_error: None,
+            running_deployment: None,
+            deployment_note: None,
+        });
+    }
+
+    // A cloud-managed instance serves what its last deployment persisted, not
+    // the instance directory's `spicepod.yaml`: a deployment applies by writing
+    // that file and restarting, so reading anything else here would drop every
+    // deployment on the floor at the moment it was meant to take effect.
+    let mut deployment_note = None;
+    let cloud_managed_spicepod = cloud_connect::cloud_managed_spicepod(args.cloud_connect)
+        .await
+        .map_err(
+            |cloud_connect::CloudManagedSpicepodReadError { path, source }| {
+                Error::UnableToReadCloudManagedSpicepod { path, source }
+            },
+        )?;
+    if let Some(deployed) = cloud_managed_spicepod {
+        match AppBuilder::build_from_path(deployed.path.clone()).await {
+            Ok(mut app) => {
+                app.runtime = apply_overrides(app.runtime, &args.set_runtime)?;
+                return Ok(AppBundle {
+                    app: Some(Arc::new(app)),
+                    spicepod_load_error: None,
+                    deployment_note: Some(DeploymentNote::Loaded {
+                        path: deployed.path.clone(),
+                    }),
+                    running_deployment: Some(deployed),
+                });
+            }
+            Err(e) => {
+                // Falling back rather than failing is what keeps a bad
+                // deployment recoverable: the process comes up, Cloud Connect
+                // connects, and the next deployment can replace the file. A
+                // runtime that refused to start here would crash-loop with no
+                // path back except an operator editing files on the host.
+                deployment_note = Some(DeploymentNote::Rejected {
+                    path: deployed.path,
+                    error: e.to_string(),
+                });
+            }
+        }
     }
 
     let spicepod_path = args
@@ -938,6 +1301,33 @@ async fn build_app(args: &Args) -> Result<(Option<Arc<App>>, Option<app::Error>)
             if args.pods_watcher_enabled && args.spicepod.is_none() {
                 spicepod_load_error = Some(e);
                 None
+            // `take()` cannot lose a note here: the `Loaded` case returned
+            // above, so what is left is either nothing or the rejection this
+            // arm folds the local failure into.
+            } else if let Some(DeploymentNote::Rejected { path, error }) = deployment_note.take() {
+                // Cloud-managed, and neither the deployed spicepod nor the
+                // local one loads. Come up with no app at all rather than
+                // exiting: Cloud Connect starts, reports the failure, and the
+                // next deployment can replace the file. Exiting here would
+                // crash-loop an instance whose only route back is the control
+                // plane it just refused to reach.
+                deployment_note = Some(DeploymentNote::NothingLoadable {
+                    path,
+                    error,
+                    local_error: e.to_string(),
+                });
+                None
+            } else if tolerates_missing_spicepod(args, &e) {
+                // A cloud-managed instance that has connected but not yet
+                // received a deployment has no spicepod anywhere: none was
+                // deployed, and `spice connect` writes nothing to the instance
+                // directory. Come up on an empty spicepod so the control plane
+                // can reach it and deploy one, rather than exiting with the
+                // "run spice init" guidance that does not apply here.
+                deployment_note = Some(DeploymentNote::NoSpicepod);
+                let mut app = App::default();
+                app.runtime = apply_overrides(app.runtime, &args.set_runtime)?;
+                Some(Arc::new(app))
             } else {
                 // In normal mode, fail immediately if spicepod cannot be loaded
                 return Err(Error::UnableToConstructSpiceApp {
@@ -947,7 +1337,12 @@ async fn build_app(args: &Args) -> Result<(Option<Arc<App>>, Option<app::Error>)
         }
     };
 
-    Ok((app, spicepod_load_error))
+    Ok(AppBundle {
+        app,
+        spicepod_load_error,
+        running_deployment: None,
+        deployment_note,
+    })
 }
 
 /// Initializes the global [`SdkMeterProvider`] with whichever metric sinks the
@@ -973,15 +1368,36 @@ async fn build_app(args: &Args) -> Result<(Option<Arc<App>>, Option<app::Error>)
 /// Caller is expected to short-circuit (not invoke this fn) when none of the
 /// three sources is configured — otherwise an empty `MeterProvider` would be
 /// installed.
+struct MetricsInit<'a> {
+    /// Prometheus scrape registry, when `/metrics` is served.
+    registry: Option<prometheus::Registry>,
+    /// OTEL push exporter, with the headers already resolved from secrets.
+    otel_config: Option<&'a app::spicepod::component::runtime::OtelExporterConfig>,
+    resolved_otel_headers: std::collections::HashMap<String, String>,
+    /// On-demand reader for cluster metrics collection.
+    metrics_reader: Option<runtime::metrics_reader::MetricsReader>,
+    /// On-demand reader for the metrics pushed over Cloud Connect.
+    cloud_connect_metrics: Option<runtime::metrics_reader::MetricsReader>,
+    /// `runtime.telemetry.properties`, as dimensions on every exported metric.
+    resource_attributes: Vec<KeyValue>,
+    /// `runtime.telemetry.metric_prefix`, applied as an SDK-level view.
+    metric_prefix: Option<String>,
+}
+
 fn init_metrics(
     df: &Arc<DataFusion>,
-    registry: Option<prometheus::Registry>,
-    otel_config: Option<&app::spicepod::component::runtime::OtelExporterConfig>,
-    resolved_otel_headers: std::collections::HashMap<String, String>,
-    metrics_reader: Option<runtime::metrics_reader::MetricsReader>,
-    resource_attributes: Vec<KeyValue>,
-    metric_prefix: Option<String>,
+    init: MetricsInit<'_>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let MetricsInit {
+        registry,
+        otel_config,
+        resolved_otel_headers,
+        metrics_reader,
+        cloud_connect_metrics,
+        resource_attributes,
+        metric_prefix,
+    } = init;
+
     // Apply user-configured `runtime.telemetry.properties` as OpenTelemetry
     // resource attributes so they appear as dimensions/tags on every metric
     // exported by any of the readers attached below (Prometheus scrape,
@@ -1056,6 +1472,13 @@ fn init_metrics(
     if let Some(reader) = metrics_reader {
         provider_builder = provider_builder.with_reader(reader);
         tracing::debug!("Cluster metrics reader enabled for on-demand OTLP collection");
+    }
+
+    // Case 2b: Cloud Connect push. Its own reader, so the cumulative totals it
+    // reports are unaffected by any other consumer collecting.
+    if let Some(reader) = cloud_connect_metrics {
+        provider_builder = provider_builder.with_reader(reader);
+        tracing::debug!("Cloud Connect metrics reader enabled for pushed OTLP export");
     }
 
     // Case 3: OTEL push exporter
@@ -1325,6 +1748,78 @@ mod tests {
         assert!(!should_warn_telemetry_disabled_setting_ignored(
             None, &config
         ));
+    }
+
+    /// The load failure a directory with no `spicepod.yaml` produces — what a
+    /// freshly connected instance hits on startup.
+    async fn missing_spicepod_error(dir: &std::path::Path) -> app::Error {
+        AppBuilder::build_from_path(dir)
+            .await
+            .expect_err("a directory with no spicepod.yaml must fail to load")
+    }
+
+    #[tokio::test]
+    async fn cloud_connect_starts_on_an_empty_spicepod_when_none_exists() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let error = missing_spicepod_error(dir.path()).await;
+
+        let args = Args::parse_from(["spiced", "--cloud-connect"]);
+        assert!(tolerates_missing_spicepod(&args, &error));
+    }
+
+    #[tokio::test]
+    async fn an_enrolled_instance_starts_without_the_explicit_flag_or_a_spicepod() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let error = missing_spicepod_error(dir.path()).await;
+
+        let args = Args::parse_from(["spiced"]);
+        assert!(tolerates_missing_spicepod_when_configured(
+            &args, &error, true
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_missing_spicepod_stays_fatal_without_cloud_connect() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let error = missing_spicepod_error(dir.path()).await;
+
+        let args = Args::parse_from(["spiced"]);
+        assert!(!tolerates_missing_spicepod(&args, &error));
+    }
+
+    #[tokio::test]
+    async fn an_explicitly_named_spicepod_stays_fatal_when_absent() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("spicepod.yaml");
+        let error = AppBuilder::build_from_path(&path)
+            .await
+            .expect_err("a spicepod.yaml that does not exist must fail to load");
+
+        let args = Args::parse_from([
+            std::ffi::OsStr::new("spiced"),
+            std::ffi::OsStr::new("--cloud-connect"),
+            path.as_os_str(),
+        ]);
+        assert_eq!(args.spicepod.as_deref(), Some(path.as_path()));
+        assert!(!tolerates_missing_spicepod(&args, &error));
+    }
+
+    /// A spicepod that exists but does not parse must not be swallowed as
+    /// "no spicepod" — the runtime would silently serve nothing.
+    #[tokio::test]
+    async fn a_malformed_spicepod_stays_fatal_under_cloud_connect() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::write(
+            dir.path().join("spicepod.yaml"),
+            "version: v1\nkind: Spicepod\nname: broken\ndatasets: 'not a list'\n",
+        )
+        .expect("write spicepod.yaml");
+        let error = AppBuilder::build_from_path(dir.path())
+            .await
+            .expect_err("a malformed spicepod.yaml must fail to load");
+
+        let args = Args::parse_from(["spiced", "--cloud-connect"]);
+        assert!(!tolerates_missing_spicepod(&args, &error));
     }
 
     #[test]

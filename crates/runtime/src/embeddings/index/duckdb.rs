@@ -31,7 +31,7 @@ use spicepod::{param::Params, semantic::ColumnLevelEmbeddingConfig, vector::Vect
 use tokio::sync::RwLock;
 
 use crate::model::EmbeddingModelStore;
-use runtime_parameters::typed::TypedParams as _;
+use runtime_parameters_typed::TypedParams as _;
 use runtime_search::store_params::duckdb::DuckDbVectorParams;
 
 pub(crate) type Result<T, E = Error> = std::result::Result<T, E>;

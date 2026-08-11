@@ -1,0 +1,26 @@
+[package]
+description = "Host and container resource introspection for the Spice runtime: cgroup-aware memory totals and process usage monitoring."
+edition.workspace = true
+exclude.workspace = true
+homepage.workspace = true
+license-file.workspace = true
+name = "runtime-resources"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+parking_lot.workspace = true
+# For `telemetry::hardware::cgroup_memory_limit`. This direction is backwards —
+# cgroup introspection is what this crate is for, and it should own that code
+# with `telemetry` depending on it. Inverting it means moving the ~15-function
+# cgroup cluster (v1/v2 path resolution, mountinfo parsing, limit walking) out of
+# `telemetry::hardware`, which currently has approved work in flight against it.
+# Tracked as follow-up in docs/dev/crate_layering_plan.md.
+sysinfo.workspace = true
+telemetry = { path = "../telemetry" }
+tracing.workspace = true
+util = { path = "../util" }
+
+[lints]
+workspace = true

@@ -18,6 +18,7 @@ use runtime::Runtime;
 use runtime::component::dataset::Dataset;
 use runtime::dataconnector::listing::{
     LISTING_TABLE_PARAMETERS, ListingTableConnector, ObjectVersionType, build_fragments,
+    object_store_timeout_message,
 };
 use runtime::dataconnector::parameters::{Validator, gcs::GcsAuthValidator};
 use runtime::dataconnector::{
@@ -35,6 +36,8 @@ use tokio::runtime::Handle;
 use url::Url;
 
 static PREFIX: &str = "gcs";
+
+const GCS_DOCS: &str = "https://spiceai.org/docs/components/data-connectors/gcs";
 
 static VALIDATORS: LazyLock<
     Vec<
@@ -242,6 +245,23 @@ impl ListingTableConnector for GoogleCloudStorage {
     ) -> DataConnectorError {
         match error {
             object_store::Error::Generic { source, .. } => {
+                // A timeout arrives in the same `Generic` variant as an authentication failure, so
+                // it is classified first: the credential checks below key off which credentials
+                // are configured, not off what failed, and would report a network timeout as a bad
+                // service account.
+                if let Some(message) = object_store_timeout_message(
+                    source.as_ref(),
+                    "GCS",
+                    self.params.get("client_timeout").expose().ok(),
+                    GCS_DOCS,
+                ) {
+                    return DataConnectorError::UnableToConnectInternal {
+                        dataconnector: format!("{self}"),
+                        connector_component: ConnectorComponent::from(dataset),
+                        source: message.into(),
+                    };
+                }
+
                 let has_service_account_path = self
                     .params
                     .get("service_account_path")
@@ -312,3 +332,154 @@ runtime::register_data_connector!(
     CONNECTOR_NAME,
     GoogleCloudStorageFactory
 );
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use app::AppBuilder;
+    use object_store::client::{HttpError, HttpErrorKind};
+    use runtime::builder::RuntimeBuilder;
+    use runtime::component::dataset::builder::DatasetBuilder;
+    use runtime_secrets::Secrets;
+    use tokio::sync::RwLock;
+
+    fn create_test_connector(params: Parameters) -> GoogleCloudStorage {
+        GoogleCloudStorage {
+            params,
+            runtime: None,
+            tokio_io_runtime: Handle::current(),
+        }
+    }
+
+    /// Component parameters must be passed `gcs_`-prefixed and runtime parameters unprefixed —
+    /// `Parameters::try_new` silently drops a key on the wrong side of that rule, which would
+    /// leave a credential unset and quietly turn the tests below into no-ops.
+    async fn create_test_parameters(params: Vec<(String, secrecy::SecretString)>) -> Parameters {
+        Parameters::try_new(
+            "gcs_test",
+            params,
+            PREFIX,
+            Arc::new(RwLock::new(Secrets::new())),
+            PARAMETERS.as_ref(),
+        )
+        .await
+        .expect("valid GCS test parameters")
+    }
+
+    async fn create_test_dataset() -> Dataset {
+        DatasetBuilder::try_new("gs://bucket/path/".to_string(), "test")
+            .expect("dataset builder should be created")
+            .with_app(Arc::new(AppBuilder::new("test").build()))
+            .with_runtime(Arc::new(RuntimeBuilder::new().build().await))
+            .build()
+            .expect("dataset should be built")
+    }
+
+    /// `object_store` flattens a transport failure into `Error::Generic`, keeping the
+    /// classification only as a typed `HttpError` in the source chain.
+    fn generic_error(kind: HttpErrorKind) -> object_store::Error {
+        object_store::Error::Generic {
+            store: "GoogleCloudStorage",
+            source: Box::new(HttpError::new(
+                kind,
+                std::io::Error::other("upstream transport failure"),
+            )),
+        }
+    }
+
+    /// A timed-out request arrives in the same `Generic` variant an authentication failure does,
+    /// so classifying it by which credential is configured reports a working service account as
+    /// broken and never names the parameter that resolves it (#12793).
+    #[tokio::test]
+    async fn a_timeout_is_not_reported_as_a_service_account_failure() {
+        let params = create_test_parameters(vec![(
+            "gcs_service_account_path".to_string(),
+            "/etc/gcp/service-account.json".to_string().into(),
+        )])
+        .await;
+        let connector = create_test_connector(params);
+        let dataset = create_test_dataset().await;
+
+        let message = connector
+            .handle_object_store_error(&dataset, generic_error(HttpErrorKind::Timeout))
+            .to_string();
+
+        assert!(
+            message.contains("client_timeout"),
+            "a timeout should point at client_timeout, got: {message}"
+        );
+        assert!(
+            !message.contains("authentication failed"),
+            "a timeout must not be reported as an authentication failure, got: {message}"
+        );
+    }
+
+    /// Application default credentials are a separate branch and must lose to the timeout check
+    /// for the same reason.
+    #[tokio::test]
+    async fn a_timeout_is_not_reported_against_application_default_credentials() {
+        let params = create_test_parameters(vec![(
+            "gcs_application_default_credentials".to_string(),
+            "true".to_string().into(),
+        )])
+        .await;
+        let connector = create_test_connector(params);
+        let dataset = create_test_dataset().await;
+
+        let message = connector
+            .handle_object_store_error(&dataset, generic_error(HttpErrorKind::Timeout))
+            .to_string();
+
+        assert!(
+            message.contains("client_timeout") && !message.contains("authentication failed"),
+            "a timeout with ADC configured must not be blamed on it, got: {message}"
+        );
+    }
+
+    /// The timeout check must not swallow the classification it runs ahead of: a `Generic` error
+    /// that is *not* a timeout is still reported against the configured credential.
+    #[tokio::test]
+    async fn a_non_timeout_error_still_reports_the_configured_auth_method() {
+        let params = create_test_parameters(vec![(
+            "gcs_service_account_path".to_string(),
+            "/etc/gcp/service-account.json".to_string().into(),
+        )])
+        .await;
+        let connector = create_test_connector(params);
+        let dataset = create_test_dataset().await;
+
+        let message = connector
+            .handle_object_store_error(&dataset, generic_error(HttpErrorKind::Decode))
+            .to_string();
+
+        assert!(
+            message.contains("service account authentication failed"),
+            "a non-timeout error should keep its auth classification, got: {message}"
+        );
+        assert!(
+            !message.contains("client_timeout"),
+            "a non-timeout error must not be reported as a timeout, got: {message}"
+        );
+    }
+
+    /// The message names the number to raise, not just the parameter.
+    #[tokio::test]
+    async fn a_timeout_surfaces_the_configured_client_timeout() {
+        let params = create_test_parameters(vec![(
+            "client_timeout".to_string(),
+            "120s".to_string().into(),
+        )])
+        .await;
+        let connector = create_test_connector(params);
+        let dataset = create_test_dataset().await;
+
+        let message = connector
+            .handle_object_store_error(&dataset, generic_error(HttpErrorKind::Timeout))
+            .to_string();
+
+        assert!(
+            message.contains("120s"),
+            "the configured client_timeout should be surfaced, got: {message}"
+        );
+    }
+}

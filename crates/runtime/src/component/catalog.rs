@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use app::App;
+use data_components::catalog_filter::TableSelector;
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use snafu::prelude::*;
 use spicepod::{component::catalog as spicepod_catalog, param::Params};
@@ -102,6 +103,21 @@ impl Catalog {
     pub fn runtime(&self) -> Arc<Runtime> {
         Arc::clone(&self.runtime)
     }
+}
+
+/// Which of the catalog's discovered tables it registers.
+///
+/// Every catalog connector resolves the configuration through here rather than
+/// reading `include` directly, so a connector cannot apply one half of it and
+/// silently drop the other -- which is what left `exclude` ignored by all but
+/// the `PostgreSQL` connectors (#12636).
+///
+/// Takes the spec so a `&Catalog` coerces, and so the compiled patterns can be
+/// tested without the `app`/`runtime` a built [`Catalog`] also carries.
+#[must_use]
+pub fn table_selector(catalog: &CatalogSpec) -> TableSelector {
+    TableSelector::new(catalog.include.clone(), catalog.exclude.clone())
+        .with_include_patterns(&catalog.orig_include)
 }
 
 pub struct CatalogBuilder {
@@ -257,36 +273,42 @@ impl CatalogBuilder {
         self
     }
 
-    pub fn build(self) -> Result<Catalog> {
-        let app = self.app.ok_or(Error::UnableToBuildCatalog {
+    pub fn build(mut self) -> Result<Catalog> {
+        let app = self.app.take().ok_or(Error::UnableToBuildCatalog {
             catalog: self.name.clone(),
             missing_component: "app".to_string(),
         })?;
-        let runtime = self.runtime.ok_or(Error::UnableToBuildCatalog {
+        let runtime = self.runtime.take().ok_or(Error::UnableToBuildCatalog {
             catalog: self.name.clone(),
             missing_component: "runtime".to_string(),
         })?;
 
         let catalog = Catalog {
-            spec: CatalogSpec {
-                provider: self.provider,
-                catalog_id: self.catalog_id,
-                from: self.from,
-                name: self.name,
-                access: self.access,
-                orig_include: self.orig_include,
-                include: self.include,
-                orig_exclude: self.orig_exclude,
-                exclude: self.exclude,
-                params: self.params,
-                dataset_params: self.dataset_params,
-                acceleration: self.acceleration,
-            },
+            spec: self.into_spec(),
             app,
             runtime,
         };
 
         Ok(catalog)
+    }
+
+    /// The configuration half of the catalog, without the `app`/`runtime` a
+    /// fully built [`Catalog`] also carries.
+    fn into_spec(self) -> CatalogSpec {
+        CatalogSpec {
+            provider: self.provider,
+            catalog_id: self.catalog_id,
+            from: self.from,
+            name: self.name,
+            access: self.access,
+            orig_include: self.orig_include,
+            include: self.include,
+            orig_exclude: self.orig_exclude,
+            exclude: self.exclude,
+            params: self.params,
+            dataset_params: self.dataset_params,
+            acceleration: self.acceleration,
+        }
     }
 }
 
@@ -339,28 +361,124 @@ mod tests {
         assert!(!exclude.is_match("public.orders"));
     }
 
+    /// The end of the chain the `exclude` field travels: a spicepod `exclude:`
+    /// is compiled into a `GlobSet` and must reach the selector every catalog
+    /// connector filters through. Before #12636 the compiled set was built and
+    /// then read by nobody but the `PostgreSQL` connectors, so an excluded
+    /// table was silently registered.
     #[test]
-    fn test_try_from_maps_acceleration() {
-        let acceleration = spicepod_catalog::CatalogAcceleration {
+    fn test_table_selector_carries_both_include_and_exclude() {
+        let selector = table_selector(
+            &CatalogBuilder::try_from(spicepod_catalog(&["public.*"], &["public.audit_log"], None))
+                .expect("should build")
+                .into_spec(),
+        );
+
+        assert!(selector.selects_table("public", "orders"));
+        assert!(
+            !selector.selects_table("public", "audit_log"),
+            "an excluded table must not be selected"
+        );
+        assert!(!selector.selects_table("reporting", "orders"));
+    }
+
+    /// An `exclude` with no `include` still withholds: the connectors that only
+    /// ever consulted `include` treated this configuration as selecting
+    /// everything.
+    #[test]
+    fn test_table_selector_honors_exclude_without_include() {
+        let selector = table_selector(
+            &CatalogBuilder::try_from(spicepod_catalog(&[], &["private.*"], None))
+                .expect("should build")
+                .into_spec(),
+        );
+
+        assert!(selector.selects_table("public", "orders"));
+        assert!(!selector.selects_table("private", "secrets"));
+    }
+
+    #[test]
+    fn test_table_selector_selects_everything_when_unconfigured() {
+        let selector = table_selector(
+            &CatalogBuilder::try_from(spicepod_catalog(&[], &[], None))
+                .expect("should build")
+                .into_spec(),
+        );
+
+        assert!(selector.selects_table("public", "orders"));
+        assert!(selector.selects_table("private", "secrets"));
+    }
+
+    fn cayenne_file_acceleration() -> spicepod_catalog::CatalogAcceleration {
+        spicepod_catalog::CatalogAcceleration {
             engine: spicepod_catalog::CatalogAccelerationEngine::Cayenne,
             refresh_mode: spicepod_catalog::CatalogRefreshMode::Changes,
-        };
+            mode: spicepod::acceleration::Mode::File,
+            params: Some(spicepod::param::Params::from_string_map(
+                [("cayenne_file_path".to_string(), "/data".to_string())].into(),
+            )),
+        }
+    }
 
-        let builder = CatalogBuilder::try_from(spicepod_catalog(&[], &[], Some(acceleration)))
-            .expect("should build");
+    // Catalog acceleration is only supported for the `pg` provider, which
+    // exists only under the `postgres` feature. Each arm of that conditional
+    // gets its own test so the suite passes -- and asserts the behaviour the
+    // build actually has -- in both configurations.
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn test_try_from_maps_acceleration() {
+        let builder = CatalogBuilder::try_from(spicepod_catalog(
+            &[],
+            &[],
+            Some(cayenne_file_acceleration()),
+        ))
+        .expect("should build");
 
         let mapped = builder.acceleration.expect("acceleration should be mapped");
         assert_eq!(mapped.engine, CatalogAccelerationEngine::Cayenne);
         assert_eq!(mapped.refresh_mode, CatalogRefreshMode::Changes);
+        // `mode` and `params` must survive the mapping -- dropping either would
+        // silently downgrade a durable catalog acceleration to in-memory.
+        assert_eq!(
+            mapped.mode,
+            runtime_component::dataset::acceleration::Mode::File
+        );
+        assert_eq!(
+            mapped.params.get("cayenne_file_path").map(String::as_str),
+            Some("/data")
+        );
+        assert!(mapped.is_durable());
+    }
+
+    // Without `postgres` there is no `pg` catalog connector compiled in, so no
+    // provider supports catalog acceleration and the config is rejected rather
+    // than silently no-oping.
+    #[cfg(not(feature = "postgres"))]
+    #[test]
+    fn test_try_from_rejects_acceleration_without_postgres_feature() {
+        // `CatalogBuilder` is not `Debug`; drop the success value so the
+        // failure message can render the error.
+        let result = CatalogBuilder::try_from(spicepod_catalog(
+            &[],
+            &[],
+            Some(cayenne_file_acceleration()),
+        ))
+        .map(|_| ());
+
+        assert!(
+            matches!(
+                result,
+                Err(crate::Error::ComponentError {
+                    source: crate::component::Error::CatalogAccelerationUnsupportedProvider { .. }
+                })
+            ),
+            "a 'pg' catalog acceleration must be rejected when the postgres feature is off, got: {result:?}"
+        );
     }
 
     #[test]
     fn test_try_from_rejects_acceleration_for_unsupported_provider() {
-        let acceleration = spicepod_catalog::CatalogAcceleration {
-            engine: spicepod_catalog::CatalogAccelerationEngine::Cayenne,
-            refresh_mode: spicepod_catalog::CatalogRefreshMode::Changes,
-        };
-        let mut catalog = spicepod_catalog(&[], &[], Some(acceleration));
+        let mut catalog = spicepod_catalog(&[], &[], Some(cayenne_file_acceleration()));
         catalog.from = "mysql".to_string();
 
         let result = CatalogBuilder::try_from(catalog);

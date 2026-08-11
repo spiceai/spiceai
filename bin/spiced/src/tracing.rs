@@ -186,6 +186,27 @@ where
     )
 }
 
+/// The layer that writes the human-readable log to `writer`, `spiced`'s stdout
+/// in production.
+///
+/// `ansi` decides whether each line carries SGR escapes. It is a parameter
+/// rather than a literal because the answer depends on where the writer points:
+/// escapes are what make an interactive log readable, and what make a redirected
+/// one unreadable — a captured `spice.log` full of `\x1b[2m` defeats any pattern
+/// written the way the line reads.
+fn console_layer<S, W>(ansi: bool, writer: W) -> impl Layer<S>
+where
+    S: Subscriber + for<'a> LookupSpan<'a>,
+    W: for<'a> fmt::MakeWriter<'a> + Send + Sync + 'static,
+{
+    fmt::layer()
+        .with_ansi(ansi)
+        .with_writer(writer)
+        .with_filter(filter::filter_fn(|metadata| {
+            metadata.target() != "task_history"
+        }))
+}
+
 /// Whether the task-history sink layer is installed, i.e. whether spans and
 /// events on the `task_history` target are persisted to the
 /// `runtime.task_history` table.
@@ -220,6 +241,11 @@ pub(crate) async fn init_tracing(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let include_otel_location = should_include_otel_location(!cfg!(debug_assertions), &verbosity);
     let filter: EnvFilter = verbosity.into();
+    // The console layer writes to stdout, so stdout is the stream whose
+    // terminal-ness decides this — not stderr. `NO_COLOR` and `FORCE_COLOR`
+    // override it, and the answer is cached process-wide, which keeps this
+    // subscriber and the CLI's own painted output in agreement.
+    let ansi = ansi_colors::colors_enabled_for(ansi_colors::Target::Stdout);
 
     // One stack, one place that installs the `log` bridge. Only the
     // task-history sink is conditional: the progress event stream and
@@ -236,13 +262,7 @@ pub(crate) async fn init_tracing(
         .with(filter)
         .with(task_history_layer)
         .with(progress_layer())
-        .with(
-            fmt::layer()
-                .with_ansi(true)
-                .with_filter(filter::filter_fn(|metadata| {
-                    metadata.target() != "task_history"
-                })),
-        )
+        .with(console_layer(ansi, std::io::stdout))
         .with(cloud_connect_log_capture_layer(cloud_connect_flag));
 
     tracing::subscriber::set_global_default(subscriber)?;
@@ -529,14 +549,9 @@ mod tests {
         ($verbosity:expr) => {{
             let probe = ProbeWriter::default();
             let env_filter: EnvFilter = $verbosity.into();
-            let subscriber = tracing_subscriber::registry().with(env_filter).with(
-                fmt::layer()
-                    .with_ansi(false)
-                    .with_writer(probe.clone())
-                    .with_filter(filter::filter_fn(|metadata| {
-                        metadata.target() != "task_history"
-                    })),
-            );
+            let subscriber = tracing_subscriber::registry()
+                .with(env_filter)
+                .with(console_layer(false, probe.clone()));
 
             tracing::subscriber::with_default(subscriber, || {
                 tracing::warn!(
@@ -583,6 +598,62 @@ mod tests {
         assert!(
             very_verbose.contains("could not load model weights"),
             "very verbose must still surface candle errors, got: {very_verbose}"
+        );
+    }
+
+    /// Runs `console_layer` the way `init_tracing` runs it and returns what
+    /// reached the writer: a `runtime` event, plus a `task_history` event that
+    /// the layer's filter must keep out of the console.
+    fn console_layer_output(ansi: bool) -> String {
+        let probe = ProbeWriter::default();
+        let subscriber = tracing_subscriber::registry().with(console_layer(ansi, probe.clone()));
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::warn!(
+                target: "runtime::accelerated::refresh_task",
+                "Failed to load data for dataset taxi_trips"
+            );
+            tracing::info!(target: "task_history", "sql_query");
+        });
+
+        probe.contents()
+    }
+
+    /// A redirected `spice.log` must be plain text. Colouring it unconditionally
+    /// puts escapes between the level and the target, so a pattern written the
+    /// way the line reads cannot match it.
+    #[test]
+    fn console_layer_omits_ansi_escapes_when_the_sink_is_not_a_terminal() {
+        let plain = console_layer_output(false);
+
+        assert!(
+            !plain.contains('\x1b'),
+            "an uncoloured console layer must emit no escape sequences, got: {plain:?}"
+        );
+        assert!(
+            plain.contains("Failed to load data for dataset taxi_trips"),
+            "the event itself must still reach the console, got: {plain}"
+        );
+        assert!(
+            !plain.contains("sql_query"),
+            "task_history records belong to the task-history table, not the console, got: {plain}"
+        );
+    }
+
+    /// The other half: the flag is what decides, so an interactive terminal keeps
+    /// the colours it had before. A layer that dropped `ansi` on the floor would
+    /// pass the test above for the wrong reason.
+    #[test]
+    fn console_layer_emits_ansi_escapes_when_the_sink_is_a_terminal() {
+        let coloured = console_layer_output(true);
+
+        assert!(
+            coloured.contains('\x1b'),
+            "a coloured console layer must emit escape sequences, got: {coloured:?}"
+        );
+        assert!(
+            coloured.contains("Failed to load data for dataset taxi_trips"),
+            "the event itself must still reach the console, got: {coloured}"
         );
     }
 

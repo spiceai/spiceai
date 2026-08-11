@@ -28,25 +28,16 @@ use std::path::PathBuf;
 use std::sync::{Arc, LazyLock, RwLock, Weak};
 use std::time::Duration;
 
-use regex::Regex;
-
 use arrow_schema::{DataType, Schema};
 use async_trait::async_trait;
+use cayenne::CayennePartitionCreator;
 use data_components::poly::PolyTableProvider;
-use datafusion::common::DFSchema;
 use datafusion::common::arrow::datatypes::SchemaRef;
 use datafusion::datasource::TableProvider;
-use datafusion::error::DataFusionError;
 use datafusion::execution::runtime_env::RuntimeEnv;
-use datafusion::logical_expr::{CreateExternalTable, TableProviderFilterPushDown};
+use datafusion::logical_expr::CreateExternalTable;
 use datafusion::prelude::Expr;
-use datafusion::scalar::ScalarValue;
 use datafusion_table_providers::UnsupportedTypeAction;
-use runtime_table_partition::Partition;
-use runtime_table_partition::creator::filename::{
-    encode_composite_key, encode_key, parse_partition_value, to_hive_partition_dir,
-};
-use runtime_table_partition::creator::{self, PartitionCreator};
 use runtime_table_partition::expression::PartitionedBy;
 use runtime_table_partition::provider::PartitionTableProvider;
 use snafu::prelude::*;
@@ -111,15 +102,6 @@ pub enum Error {
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
-
-/// Regex pattern for partition values that are not supported on local filesystem.
-/// Partition values matching `.*#\d+` (e.g., "abcdef#123") are only supported on S3 Express
-/// One Zone locations, not on local filesystem paths.
-static UNSUPPORTED_LOCAL_PARTITION_PATTERN: LazyLock<Regex> =
-    LazyLock::new(|| match Regex::new(r".*#\d+$") {
-        Ok(compiled) => compiled,
-        Err(e) => unreachable!("Unable to compile regexp: {e}"),
-    });
 
 fn maintained_aggregate_specs_for_cayenne(
     acceleration: Option<&Acceleration>,
@@ -243,16 +225,22 @@ fn parse_maintained_aggregate_filter(
                 "Cayenne maintained_aggregates filter '{sql}' is not a valid SQL predicate over the table columns: {source}"
             )),
         })?;
-    let physical = datafusion::physical_expr::create_physical_expr(
-        &logical,
-        &df_schema,
-        &datafusion_expr::execution_props::ExecutionProps::new(),
-    )
-    .map_err(|source| Error::InvalidConfiguration {
-        detail: Arc::from(format!(
-            "Cayenne maintained_aggregates filter '{sql}' could not be planned: {source}"
-        )),
-    })?;
+    // Plan through the session rather than calling `create_physical_expr`
+    // directly: the session coerces the expression against the schema first, and
+    // a filter written the way SQL is normally written needs that. A predicate
+    // like `ts_col > '2007-01-02 00:00:00'` parses to a `Timestamp` compared
+    // against a `Utf8` literal, which builds a physical expression happily and
+    // then fails at evaluation with "Invalid comparison operation:
+    // Timestamp(µs) > Utf8" — the maintained aggregate goes stale on its first
+    // delta, and every query silently falls back to a base-table scan for the
+    // life of the process.
+    let physical = context
+        .create_physical_expr(logical, &df_schema)
+        .map_err(|source| Error::InvalidConfiguration {
+            detail: Arc::from(format!(
+                "Cayenne maintained_aggregates filter '{sql}' could not be planned: {source}"
+            )),
+        })?;
     // A filter is a `WHERE` condition, so it must evaluate to Boolean. Reject a
     // non-Boolean predicate (e.g. `filter: 1`) at config time with a clear error,
     // rather than letting it fail later during maintenance.
@@ -309,7 +297,7 @@ pub struct CayenneAccelerator {
     footer_cache_mb: Option<usize>,
     /// Shared semaphore that bounds the number of concurrent per-table
     /// background compactions across all Cayenne tables registered with this
-    /// accelerator. Sized at `available_parallelism()` so a fleet of tables
+    /// accelerator. Sized at the CPU budget's core count so a fleet of tables
     /// can't oversubscribe the writer pool.
     compaction_semaphore: Arc<tokio::sync::Semaphore>,
     /// Initial permit count of `compaction_semaphore` (the semaphore itself only
@@ -572,7 +560,12 @@ const SMALL_WRITE_INLINE_MAX_ROWS: usize = cayenne::metadata::DEFAULT_INLINE_MAX
 const SMALL_WRITE_INLINE_MAX_BYTES: usize = cayenne::metadata::DEFAULT_INLINE_MAX_BYTES;
 const SMALL_WRITE_INLINE_MAX_BUFFER_BYTES: usize =
     cayenne::metadata::DEFAULT_INLINE_MAX_BUFFER_BYTES;
-const APPEND_SMALL_WRITE_REFRESH_INTERVAL_THRESHOLD: Duration = Duration::from_mins(5);
+/// Longest `refresh_check_interval` at which a scheduled `append` still counts as
+/// a small-write (CDC-shaped) stream rather than a bulk load. Shared by both
+/// classification entry points ([`refresh_write_profile`] and
+/// [`RefreshWriteProfile::from_spicepod`]) so the pre-init and post-init views of a
+/// pod agree.
+pub(crate) const APPEND_SMALL_WRITE_REFRESH_INTERVAL_THRESHOLD: Duration = Duration::from_mins(5);
 
 /// Map the runtime's detected acceleration storage class onto the Cayenne-local
 /// [`cayenne::metadata::StorageClass`] (the crates can't share the enum — `runtime`
@@ -646,6 +639,68 @@ fn warn_if_low_disk_blocking(label: &str, path: &str) {
     );
 }
 
+/// Fingerprint of everything the `Cayenne auto-tuned config` line prints for one
+/// table, used to emit it once per resolved configuration instead of once per
+/// provider construction.
+///
+/// Hashes the *rendered* values rather than a hand-listed tuple of typed fields:
+/// `{config:?}` covers every [`cayenne::metadata::VortexConfig`] knob, so a knob
+/// added to the line later cannot silently fall out of the key and start hiding
+/// re-tunes. The measured members of `hw` (`data_perf`, `metastore_perf`) are
+/// deliberately excluded — they are calibration readings the line does not print;
+/// they still reach the fingerprint where they matter, through the knobs they
+/// resolved.
+fn auto_tuned_config_fingerprint(
+    table_name: &str,
+    hw: &autotune::HardwareProfile,
+    workload: &autotune::WorkloadProfile,
+    config: &cayenne::metadata::VortexConfig,
+) -> u64 {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+
+    let mut hasher = DefaultHasher::new();
+    format!(
+        "{table_name}|{cores}|{total_mem_bytes}|{data_storage:?}|{metastore_storage:?}|\
+         {row_count:?}|{table_bytes:?}|{schema_present}|{has_primary_key}|{is_upsert}|{config:?}",
+        cores = hw.cores,
+        total_mem_bytes = hw.total_mem_bytes,
+        data_storage = hw.data_storage,
+        metastore_storage = hw.metastore_storage,
+        row_count = workload.row_count,
+        table_bytes = workload.table_bytes,
+        schema_present = workload.inferred_metadata.is_present(),
+        has_primary_key = workload.has_primary_key,
+        is_upsert = workload.is_upsert,
+    )
+    .hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Whether the `Cayenne auto-tuned config` line for `table_name` should be emitted
+/// for this `fingerprint`: true the first time the table is resolved, and again
+/// whenever the resolution *changes*.
+///
+/// Dataset initialization retries with unbounded backoff and rebuilds the table
+/// provider on every attempt, so a dataset that never loads would otherwise repeat
+/// its ~1 KB config line at fibonacci-spaced intervals for the life of the process,
+/// burying the WARN that explains why it is unhealthy. Keying on the resolved values
+/// (rather than logging once per table) keeps the two cases worth seeing: the first
+/// resolution, and a genuine re-tune — adaptive tuning moving a knob, or a config
+/// edit after a hot reload.
+fn auto_tuned_config_is_newly_resolved(table_name: &str, fingerprint: u64) -> bool {
+    static LOGGED: LazyLock<std::sync::Mutex<HashMap<String, u64>>> =
+        LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+    let mut logged = LOGGED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if logged.get(table_name) == Some(&fingerprint) {
+        return false;
+    }
+    logged.insert(table_name.to_string(), fingerprint);
+    true
+}
+
 /// Default read-current freshness (bounded staleness), in ms, for a READ-ONLY Cayenne
 /// CDC replica (`access: read` + `refresh_mode: changes`). Such a replica's data
 /// streams in only via CDC and is eventually-consistent by design, so a scan need not
@@ -685,67 +740,229 @@ fn read_only_scan_freshness() -> std::time::Duration {
     *READ_ONLY_SCAN_FRESHNESS
 }
 
+/// How a dataset's refresh mode writes to its Cayenne table. The three shapes want
+/// materially different compaction defaults, so they are named rather than inferred
+/// at each use site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RefreshWriteProfile {
+    /// A continuous stream of small deltas (`changes` / `caching`, or a
+    /// fast-cadence `append`). Files accumulate between refreshes, so compaction is
+    /// load-bearing and runs on a tight cadence; small deltas are inlined into the
+    /// metastore instead of becoming tiny Vortex files.
+    SmallWrite,
+    /// Every refresh REPLACES the whole table (`full`). Nothing accumulates across
+    /// refreshes — the previous snapshot is dropped wholesale — so compaction has
+    /// nothing to consolidate and is off by default; the write should just reach the
+    /// target file size as fast as it can.
+    BulkOverwrite,
+    /// Bulk data arrives incrementally and accumulates (`append` on a slow cadence,
+    /// `snapshot`, or refresh `disabled` with writes arriving another way). Files
+    /// build up across writes, so compaction stays on at the conservative cadence.
+    BulkAppend,
+}
+
+impl RefreshWriteProfile {
+    /// The single classification. Every caller — pre-init and post-init alike —
+    /// funnels through this, so the two views of a pod cannot drift.
+    pub(crate) fn classify(
+        refresh_mode: RefreshMode,
+        refresh_check_interval: Option<Duration>,
+    ) -> Self {
+        match refresh_mode {
+            RefreshMode::Caching | RefreshMode::Changes => Self::SmallWrite,
+            RefreshMode::Append => {
+                if refresh_check_interval
+                    .is_some_and(|i| i <= APPEND_SMALL_WRITE_REFRESH_INTERVAL_THRESHOLD)
+                {
+                    Self::SmallWrite
+                } else {
+                    Self::BulkAppend
+                }
+            }
+            RefreshMode::Full => Self::BulkOverwrite,
+            // `snapshot` reloads whole snapshot files rather than issuing an
+            // overwrite through the sink, and `disabled` means rows arrive by some
+            // other write path entirely (e.g. `INSERT INTO` on a read-write
+            // dataset). Neither is a whole-table replace this module can prove, so
+            // both keep compaction on.
+            RefreshMode::Snapshot | RefreshMode::Disabled => Self::BulkAppend,
+        }
+    }
+
+    /// Classify a Spicepod acceleration, BEFORE component initialization has turned
+    /// it into an [`Acceleration`]. The runtime builder uses this to size host memory
+    /// and decide which thread pools to bring up.
+    ///
+    /// Two things are not yet resolved at this point, and the caller supplies one:
+    ///
+    /// * `unset_refresh_mode` — an absent `refresh_mode` is filled in by the
+    ///   *connector* (`DataConnector::resolve_refresh_mode`), not by a fixed
+    ///   default: `debezium` and `cdc` resolve it to `changes`, `sink` to
+    ///   `disabled`, everything else to `full`. Assuming `full` here would classify
+    ///   an unannotated CDC dataset as a whole-table replace and under-provision its
+    ///   memory. See `crate::builder::connector_unset_refresh_mode`.
+    /// * `refresh_check_interval` is still an unparsed string. An unparseable one is
+    ///   treated as absent — the same conservative direction the component builder
+    ///   takes when it later rejects the value, and the same `fundu` parser it uses.
+    pub(crate) fn from_spicepod(
+        accel: &spicepod::acceleration::Acceleration,
+        unset_refresh_mode: RefreshMode,
+    ) -> Self {
+        let refresh_mode = accel
+            .refresh_mode
+            .as_ref()
+            .map_or(unset_refresh_mode, |mode| RefreshMode::from(mode.clone()));
+        let interval = accel
+            .refresh_check_interval
+            .as_deref()
+            .and_then(|raw| fundu::parse_duration(raw).ok());
+        Self::classify(refresh_mode, interval)
+    }
+
+    /// Whether a table on this profile ever accumulates files for compaction to
+    /// consolidate. False only for the whole-table replace, where each refresh
+    /// discards everything the previous one wrote.
+    pub(crate) const fn needs_compaction(self) -> bool {
+        !matches!(self, RefreshWriteProfile::BulkOverwrite)
+    }
+
+    /// Whether a table on this profile can hold rows in the off-pool in-memory CDC
+    /// tier. `get_vortex_config` forces `cdc_durability` back to `file` for every
+    /// other profile, so this is exactly the set that makes the tier reachable.
+    pub(crate) const fn uses_cdc_tier(self) -> bool {
+        matches!(self, RefreshWriteProfile::SmallWrite)
+    }
+
+    /// Whether a table on this profile keeps small writes in the metastore inline
+    /// tier instead of turning them into tiny Vortex files.
+    ///
+    /// True for the two profiles whose writes are small by shape: a CDC-style
+    /// stream of deltas, and a whole-table replace of a table small enough to fit
+    /// the admission caps. The whole-table replace is the one that most needs it —
+    /// nothing accumulates across its refreshes, so its background compactor is
+    /// off and the tiny files one refresh writes would never be merged.
+    pub(crate) const fn inlines_small_writes(self) -> bool {
+        matches!(
+            self,
+            RefreshWriteProfile::SmallWrite | RefreshWriteProfile::BulkOverwrite
+        )
+    }
+}
+
 fn apply_refresh_mode_defaults(
     config: &mut cayenne::metadata::VortexConfig,
+    source: &dyn AccelerationSource,
     acceleration: &Acceleration,
     inline_flush_caps: autotune::InlineFlushCaps,
 ) {
-    if uses_small_write_refresh_profile(acceleration) {
-        config.compaction_trigger_files = SMALL_WRITE_COMPACTION_TRIGGER_FILES;
-        config.compaction_trigger_protected_snapshots =
-            SMALL_WRITE_COMPACTION_TRIGGER_PROTECTED_SNAPSHOTS;
-        config.compaction_trigger_snapshot_age_ms = SMALL_WRITE_COMPACTION_TRIGGER_SNAPSHOT_AGE_MS;
-        config.compaction_background_interval_ms = SMALL_WRITE_COMPACTION_BACKGROUND_INTERVAL_MS;
-        // Per-entry inline-admission caps stay static by design: inlined entries
-        // are re-read on every scan with no zone-map pruning, so raising them is
-        // pure read-amp (see `provider::table` inlining-caps comment).
-        config.inline_max_rows = SMALL_WRITE_INLINE_MAX_ROWS;
-        config.inline_max_bytes = SMALL_WRITE_INLINE_MAX_BYTES;
-        config.inline_max_buffer_bytes = SMALL_WRITE_INLINE_MAX_BUFFER_BYTES;
-        // Memtable flush caps scale with machine memory + metastore storage class
-        // (see `autotune::HardwareProfile::inline_flush_caps`). Explicit operator
-        // params still override these in the param-resolution pass below.
-        config.inline_flush_max_rows = inline_flush_caps.max_rows;
-        config.inline_flush_max_segments = inline_flush_caps.max_segments;
-        config.inline_flush_max_bytes = inline_flush_caps.max_bytes;
-    } else {
-        config.inline_max_rows = 0;
-        config.inline_max_bytes = 0;
-        config.inline_max_buffer_bytes = 0;
+    match refresh_write_profile(source, acceleration) {
+        RefreshWriteProfile::SmallWrite => {
+            config.compaction_trigger_files = SMALL_WRITE_COMPACTION_TRIGGER_FILES;
+            config.compaction_trigger_protected_snapshots =
+                SMALL_WRITE_COMPACTION_TRIGGER_PROTECTED_SNAPSHOTS;
+            config.compaction_trigger_snapshot_age_ms =
+                SMALL_WRITE_COMPACTION_TRIGGER_SNAPSHOT_AGE_MS;
+            config.compaction_background_interval_ms =
+                SMALL_WRITE_COMPACTION_BACKGROUND_INTERVAL_MS;
+            // Per-entry inline-admission caps stay static by design: inlined entries
+            // are re-read on every scan with no zone-map pruning, so raising them is
+            // pure read-amp (see `provider::table` inlining-caps comment).
+            config.inline_max_rows = SMALL_WRITE_INLINE_MAX_ROWS;
+            config.inline_max_bytes = SMALL_WRITE_INLINE_MAX_BYTES;
+            config.inline_max_buffer_bytes = SMALL_WRITE_INLINE_MAX_BUFFER_BYTES;
+            // Memtable flush caps scale with machine memory + metastore storage class
+            // (see `autotune::HardwareProfile::inline_flush_caps`). Explicit operator
+            // params still override these in the param-resolution pass below.
+            config.inline_flush_max_rows = inline_flush_caps.max_rows;
+            config.inline_flush_max_segments = inline_flush_caps.max_segments;
+            config.inline_flush_max_bytes = inline_flush_caps.max_bytes;
+        }
+        RefreshWriteProfile::BulkOverwrite => {
+            // Nothing survives a whole-table replace for compaction to consolidate:
+            // the overwrite publishes a fresh snapshot, `update_current_snapshot_id`
+            // resets the small-file counter, and no protected snapshot is ever
+            // created. So the background compactor would wake forever only to re-run
+            // its early-outs. Turn it off and let the refresh spend the whole machine
+            // on ingest instead. Inline compaction on writes is unaffected, so a
+            // table that also takes `INSERT`s still consolidates; an operator can
+            // also set `cayenne_compaction_background_interval_ms` explicitly.
+            config.compaction_background_interval_ms = 0;
+            // Same static admission caps as a CDC delta, for the same reason and
+            // then some: a refresh that fits them becomes ONE metastore row
+            // instead of `write_concurrency` tiny Vortex files that — with the
+            // background compactor off, above — nothing would ever merge. The
+            // `inline_flush_*` memtable caps are deliberately left at their
+            // defaults: a whole-table replace leaves exactly one inline entry, so
+            // the flush caps never bind.
+            config.inline_max_rows = SMALL_WRITE_INLINE_MAX_ROWS;
+            config.inline_max_bytes = SMALL_WRITE_INLINE_MAX_BYTES;
+            config.inline_max_buffer_bytes = SMALL_WRITE_INLINE_MAX_BUFFER_BYTES;
+        }
+        RefreshWriteProfile::BulkAppend => {
+            config.inline_max_rows = 0;
+            config.inline_max_bytes = 0;
+            config.inline_max_buffer_bytes = 0;
+        }
     }
 }
 
-/// Whether the dataset's refresh mode writes small batches continuously, which is
-/// what the CDC-shaped defaults (inline memtable, aggressive compaction triggers,
-/// `cdc_durability: memory`) are for. Together with a file acceleration mode it also
-/// decides whether the process carves the Cayenne compaction memory pool at all — see
-/// `builder::count_cayenne_budget_eligible_accelerations`.
+/// Classify a post-initialization [`Acceleration`], using `resolved_refresh_mode`
+/// for the connector-filled value rather than reading `acceleration.refresh_mode`
+/// raw.
 ///
-/// It does *not* gate the in-memory CDC tier budget, which every Cayenne deployment
-/// installs whatever its refresh mode: the carve takes bytes away from queries, so it
-/// is only worth taking when some acceleration can compact into it, whereas the tier
-/// budget is sized from what the query pool leaves over and costs queries nothing.
-fn uses_small_write_refresh_profile(acceleration: &Acceleration) -> bool {
-    is_small_write_refresh_profile(
-        acceleration.refresh_mode.unwrap_or(RefreshMode::Full),
-        acceleration.refresh_check_interval,
-    )
+/// That distinction is load-bearing: `DataConnector::resolve_refresh_mode` is never
+/// written back into the `Acceleration`, so an unannotated `debezium:`/`cdc:`
+/// dataset is a real `changes` stream while its `refresh_mode` field is still
+/// `None`. Reading the field raw would classify it as a whole-table replace and
+/// switch off its background compactor.
+fn refresh_write_profile_for(
+    acceleration: &Acceleration,
+    resolved_refresh_mode: RefreshMode,
+) -> RefreshWriteProfile {
+    RefreshWriteProfile::classify(resolved_refresh_mode, acceleration.refresh_check_interval)
 }
 
-/// [`uses_small_write_refresh_profile`] over the two fields it reads, for callers
-/// that hold a Spicepod acceleration rather than an initialized component one (the
-/// Runtime builder decides the Cayenne memory budgets before initialization). Both
-/// go through this so the profile rule has a single definition.
-pub(crate) fn is_small_write_refresh_profile(
-    refresh_mode: RefreshMode,
-    refresh_check_interval: Option<Duration>,
+/// The refresh mode a source actually runs with, applying the connector's fill-in
+/// for an unset `refresh_mode`.
+///
+/// `DataConnector::resolve_refresh_mode` decides that fill-in and its result is never
+/// written back into the [`Acceleration`], so `acceleration.refresh_mode` is still
+/// `None` for a genuine `debezium:`/`cdc:` stream. Mapping the source's connector
+/// name through [`crate::builder::unset_refresh_mode_for_connector`] — the same table
+/// the runtime builder classifies the pod with — recovers it.
+///
+/// A source with no connector (a view, an Iceberg DDL table) has no default to apply
+/// and falls back to `full`, which is what those paths resolve an unset mode to.
+fn resolved_refresh_mode(
+    source: &dyn AccelerationSource,
+    acceleration: &Acceleration,
+) -> RefreshMode {
+    acceleration.refresh_mode.unwrap_or_else(|| {
+        source.connector_name().map_or(
+            RefreshMode::Full,
+            crate::builder::unset_refresh_mode_for_connector,
+        )
+    })
+}
+
+fn refresh_write_profile(
+    source: &dyn AccelerationSource,
+    acceleration: &Acceleration,
+) -> RefreshWriteProfile {
+    refresh_write_profile_for(acceleration, resolved_refresh_mode(source, acceleration))
+}
+
+/// Whether the dataset writes small batches continuously, which is what the
+/// CDC-shaped defaults (inline memtable, aggressive compaction triggers,
+/// `cdc_durability: memory`) are for. It is also exactly the set of tables that can
+/// reach the off-pool in-memory CDC tier, so the runtime builder gates the tier's
+/// aggregate byte budget — and the reduced query-pool default that leaves room for
+/// it — on a pod containing one (see `builder::CayenneWorkload`).
+fn uses_small_write_refresh_profile(
+    source: &dyn AccelerationSource,
+    acceleration: &Acceleration,
 ) -> bool {
-    match refresh_mode {
-        RefreshMode::Caching | RefreshMode::Changes => true,
-        RefreshMode::Append => refresh_check_interval
-            .is_some_and(|interval| interval <= APPEND_SMALL_WRITE_REFRESH_INTERVAL_THRESHOLD),
-        RefreshMode::Disabled | RefreshMode::Full | RefreshMode::Snapshot => false,
-    }
+    refresh_write_profile(source, acceleration).uses_cdc_tier()
 }
 
 /// Whether the resolved `on_conflict` performs an upsert (replace existing rows
@@ -770,12 +987,14 @@ fn is_upsert_on_conflict(
 /// signal degrades gracefully: an unknown one falls back to the hardware-only
 /// derivation.
 fn build_workload_profile(
+    source: &dyn AccelerationSource,
     acceleration: Option<&Acceleration>,
     schema: &Schema,
     primary_keys: &[String],
     on_conflict: Option<&datafusion_table_providers::util::on_conflict::OnConflict>,
 ) -> autotune::WorkloadProfile {
-    let small_write = acceleration.is_some_and(uses_small_write_refresh_profile);
+    let small_write = acceleration
+        .is_some_and(|acceleration| uses_small_write_refresh_profile(source, acceleration));
     let inferred =
         data_components::inferred_schema::InferredSchema::from_metadata(schema.metadata());
     autotune::WorkloadProfile::from_inferred(
@@ -832,9 +1051,7 @@ impl CayenneAccelerator {
 
     #[must_use]
     pub fn with_footer_cache_mb(footer_cache_mb: Option<usize>) -> Self {
-        let permits = std::thread::available_parallelism()
-            .map_or(1, std::num::NonZeroUsize::get)
-            .max(1);
+        let permits = cpu_budget::cpu_budget().cayenne_compaction_permits();
         let compaction_semaphore = Arc::new(tokio::sync::Semaphore::new(permits));
         Self {
             catalog: Arc::new(OnceCell::new()),
@@ -1038,7 +1255,7 @@ impl CayenneAccelerator {
     ) -> cayenne::metadata::VortexConfig {
         let small_write = source
             .acceleration()
-            .is_some_and(uses_small_write_refresh_profile);
+            .is_some_and(|acceleration| uses_small_write_refresh_profile(source, acceleration));
         let workload = autotune::WorkloadProfile::hardware_only(small_write);
         Self::get_vortex_config_with_footer_cache(table_name, source, None, &workload).await
     }
@@ -1083,7 +1300,7 @@ impl CayenneAccelerator {
                     .params
                     .get("cayenne_file_path")
                     .is_some_and(|p| p.starts_with("s3://"));
-            let small_write = uses_small_write_refresh_profile(acceleration);
+            let small_write = uses_small_write_refresh_profile(source, acceleration);
 
             // Detect the host profile once: cores, cgroup-aware memory, and the
             // storage medium under both the Vortex data files and the metastore
@@ -1160,7 +1377,7 @@ impl CayenneAccelerator {
             } else {
                 autotune::InlineFlushCaps::FLOOR
             };
-            apply_refresh_mode_defaults(&mut config, acceleration, inline_flush_caps);
+            apply_refresh_mode_defaults(&mut config, source, acceleration, inline_flush_caps);
 
             // In-RAM CDC tier caps (`cdc_durability: memory`) scale with host
             // memory only — see `autotune::HardwareProfile::mem_tier_caps`.
@@ -1319,7 +1536,8 @@ impl CayenneAccelerator {
                     );
                 }
             }
-            if config.cdc_durability.is_memory() && !uses_small_write_refresh_profile(acceleration)
+            if config.cdc_durability.is_memory()
+                && !uses_small_write_refresh_profile(source, acceleration)
             {
                 // Warn only when memory was explicitly requested: memory is
                 // the DEFAULT now, so every full/snapshot-profile dataset
@@ -1549,8 +1767,8 @@ impl CayenneAccelerator {
             }
 
             // Write concurrency: `auto`/unset leaves the per-write default
-            // (session target_partitions, capped at the host core count and the
-            // global encode budget); 0 → warn + minimum 1.
+            // (session target_partitions, capped at the CPU budget's core count
+            // and the global encode budget); 0 → warn + minimum 1.
             match autotune::read_knob(
                 acceleration,
                 &["cayenne_write_concurrency", "write_concurrency"],
@@ -1819,64 +2037,73 @@ impl CayenneAccelerator {
                 ),
             };
 
-            // Surface cross-parameter and out-of-range issues that parse cleanly
-            // but won't behave as intended (silently clamped at use, or don't
-            // compose with each other) — see `VortexConfig::config_warnings`.
-            for warning in config.config_warnings(hw.cores) {
-                tracing::warn!(
-                    "Dataset '{table_name}': {warning} For details, visit: https://spiceai.org/docs/components/data-accelerators/cayenne#configuration"
+            // Report the resolution once per *resolved configuration*, not once per
+            // provider construction: this function runs on every
+            // `create_external_table` / `create_cayenne_table_provider`, and a
+            // dataset that keeps failing to load is rebuilt on every retry. Both
+            // emits below are pure functions of `config` and `hw.cores`, so the one
+            // fingerprint covers them.
+            let fingerprint = auto_tuned_config_fingerprint(table_name, &hw, workload, &config);
+            if auto_tuned_config_is_newly_resolved(table_name, fingerprint) {
+                // Surface cross-parameter and out-of-range issues that parse cleanly
+                // but won't behave as intended (silently clamped at use, or don't
+                // compose with each other) — see `VortexConfig::config_warnings`.
+                for warning in config.config_warnings(hw.cores) {
+                    tracing::warn!(
+                        "Dataset '{table_name}': {warning} For details, visit: https://spiceai.org/docs/components/data-accelerators/cayenne#configuration"
+                    );
+                }
+
+                // One structured line per table recording the host basis and the
+                // knobs `auto` resolved to, so an operator (or a benchmark sweep) can
+                // see exactly what was chosen on this host — the observability that
+                // makes "works regardless of the host machine" verifiable.
+                tracing::info!(
+                    target: "spiced::acceleration::cayenne",
+                    table = %table_name,
+                    cores = hw.cores,
+                    total_mem_mib = hw.total_mem_bytes / (1024 * 1024),
+                    data_storage = %hw.data_storage,
+                    metastore_storage = %hw.metastore_storage,
+                    runtime_footer_cache_mb = ?config.footer_cache_mb,
+                    tuning = if config.dynamic_tuning { "adaptive" } else { "auto" },
+                    // Inferred workload signals (from schema inference). When these are
+                    // `None`/false the source exposed no inferred metadata for this
+                    // table (no catalog access, or nothing to infer), so the data-aware
+                    // sizing fell back to hardware-only — makes that immediately visible.
+                    inferred_row_count = ?workload.row_count,
+                    inferred_table_bytes = ?workload.table_bytes,
+                    inferred_schema_present = workload.inferred_metadata.is_present(),
+                    has_primary_key = workload.has_primary_key,
+                    is_upsert = workload.is_upsert,
+                    "Cayenne auto-tuned config: segment_cache={}MB, pk_keyset_cache={:?}MB, target_file_size={}MB, upload_concurrency={}, write_concurrency_override={:?}, sort_columns={:?}, compression_strategy={:?}, delta_encoding={}, pk_conflict_detection={}, deletion_mode={:?}, compaction_trigger_files={}, compaction_trigger_protected_snapshots={}, compaction_trigger_snapshot_age_ms={}, compaction_max_levels={}, compaction_max_files_per_pick={}, compaction_background_interval_ms={}, inline_max_rows={}, inline_max_bytes={}, inline_max_buffer_bytes={}, inline_flush_max_rows={}, inline_flush_max_segments={}, inline_flush_max_bytes={}, cdc_durability={}, cdc_mem_tier_max_bytes={}, cdc_mem_tier_min_flush_bytes={}",
+                    config.segment_cache_mb,
+                    config.pk_keyset_cache_mb,
+                    config.target_vortex_file_size_mb,
+                    config.upload_concurrency,
+                    config.write_concurrency,
+                    config.sort_columns,
+                    config.compression_strategy,
+                    config.delta_encoding,
+                    config.pk_conflict_detection.as_str(),
+                    config.deletion_mode,
+                    config.compaction_trigger_files,
+                    config.compaction_trigger_protected_snapshots,
+                    config.compaction_trigger_snapshot_age_ms,
+                    config.compaction_max_levels,
+                    config.compaction_max_files_per_pick,
+                    config.compaction_background_interval_ms,
+                    config.inline_max_rows,
+                    config.inline_max_bytes,
+                    config.inline_max_buffer_bytes,
+                    config.inline_flush_max_rows,
+                    config.inline_flush_max_segments,
+                    config.inline_flush_max_bytes,
+                    config.cdc_durability.as_str(),
+                    config.cdc_mem_tier_max_bytes,
+                    config.cdc_mem_tier_min_flush_bytes,
                 );
             }
-
-            // One structured line per table recording the host basis and the
-            // knobs `auto` resolved to, so an operator (or a benchmark sweep) can
-            // see exactly what was chosen on this host — the observability that
-            // makes "works regardless of the host machine" verifiable.
-            tracing::info!(
-                target: "spiced::acceleration::cayenne",
-                table = %table_name,
-                cores = hw.cores,
-                total_mem_mib = hw.total_mem_bytes / (1024 * 1024),
-                data_storage = %hw.data_storage,
-                metastore_storage = %hw.metastore_storage,
-                runtime_footer_cache_mb = ?config.footer_cache_mb,
-                tuning = if config.dynamic_tuning { "adaptive" } else { "auto" },
-                // Inferred workload signals (from schema inference). When these are
-                // `None`/false the source exposed no inferred metadata for this
-                // table (no catalog access, or nothing to infer), so the data-aware
-                // sizing fell back to hardware-only — makes that immediately visible.
-                inferred_row_count = ?workload.row_count,
-                inferred_table_bytes = ?workload.table_bytes,
-                inferred_schema_present = workload.inferred_metadata.is_present(),
-                has_primary_key = workload.has_primary_key,
-                is_upsert = workload.is_upsert,
-                "Cayenne auto-tuned config: segment_cache={}MB, pk_keyset_cache={:?}MB, target_file_size={}MB, upload_concurrency={}, write_concurrency_override={:?}, sort_columns={:?}, compression_strategy={:?}, delta_encoding={}, pk_conflict_detection={}, deletion_mode={:?}, compaction_trigger_files={}, compaction_trigger_protected_snapshots={}, compaction_trigger_snapshot_age_ms={}, compaction_max_levels={}, compaction_max_files_per_pick={}, compaction_background_interval_ms={}, inline_max_rows={}, inline_max_bytes={}, inline_max_buffer_bytes={}, inline_flush_max_rows={}, inline_flush_max_segments={}, inline_flush_max_bytes={}, cdc_durability={}, cdc_mem_tier_max_bytes={}, cdc_mem_tier_min_flush_bytes={}",
-                config.segment_cache_mb,
-                config.pk_keyset_cache_mb,
-                config.target_vortex_file_size_mb,
-                config.upload_concurrency,
-                config.write_concurrency,
-                config.sort_columns,
-                config.compression_strategy,
-                config.delta_encoding,
-                config.pk_conflict_detection.as_str(),
-                config.deletion_mode,
-                config.compaction_trigger_files,
-                config.compaction_trigger_protected_snapshots,
-                config.compaction_trigger_snapshot_age_ms,
-                config.compaction_max_levels,
-                config.compaction_max_files_per_pick,
-                config.compaction_background_interval_ms,
-                config.inline_max_rows,
-                config.inline_max_bytes,
-                config.inline_max_buffer_bytes,
-                config.inline_flush_max_rows,
-                config.inline_flush_max_segments,
-                config.inline_flush_max_bytes,
-                config.cdc_durability.as_str(),
-                config.cdc_mem_tier_max_bytes,
-                config.cdc_mem_tier_min_flush_bytes,
-            );
         }
 
         config
@@ -2086,6 +2313,7 @@ impl CayenneAccelerator {
         // them as inactive so we don't fail with a missing object-store error.
         let is_s3_express = !memory_mode && s3::is_s3_express_data_path(source);
         let workload = build_workload_profile(
+            source,
             acceleration,
             schema.as_ref(),
             &primary_keys,
@@ -2576,9 +2804,9 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
             .one_of(&["auto", "key", "position"])
             .default("auto"),
         ParameterSpec::component("upload_concurrency")
-            .description("Maximum number of concurrent file uploads when writing multiple Vortex files. 'auto' (or unset) uses available CPU parallelism. The aggregate encode concurrency across all Cayenne tables is separately bounded by a process-global budget sized to the host core count."),
+            .description("Maximum number of concurrent file uploads when writing multiple Vortex files. 'auto' (or unset) uses the runtime's CPU budget (see `runtime.cpu.cores`). The aggregate encode concurrency across all Cayenne tables is separately bounded by a process-global budget sized from that same value."),
         ParameterSpec::component("write_concurrency")
-            .description("Writer partition override (parallel encoders) for unsorted Cayenne ingests. 'auto' (or unset) uses a small fixed default of 4, capped at the host core count (= runtime.query.target_partitions) and the process-global encode budget — deliberately not the full core count, because each table is sized independently and the per-table values sum across tables under concurrent CDC. Raise it explicitly for a table that needs more encode parallelism."),
+            .description("Writer partition override (parallel encoders) for unsorted Cayenne ingests. 'auto' (or unset) uses a small fixed default of 4, capped at the runtime's CPU budget (= runtime.query.target_partitions) and the process-global encode budget — deliberately not the full core count, because each table is sized independently and the per-table values sum across tables under concurrent CDC. Raise it explicitly for a table that needs more encode parallelism."),
         ParameterSpec::component("compaction_trigger_files")
             .description("Minimum number of small Vortex files in the current snapshot before tiered compaction runs. A 'small' file is one whose size is below cayenne_target_file_size_mb / 4. Default: 4 for refresh_mode: caching, changes, or append with refresh_check_interval <= 5m; 8 otherwise."),
         ParameterSpec::component("bake_deletion_index_trigger")
@@ -2594,7 +2822,7 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
             .description("Maximum number of eligible file paths retained in one compaction candidate for trigger selection and observability. The current compactor rewrites the whole current snapshot once triggered, so this does not bound rewrite IO or memory. Default: 32.")
             .default("32"),
         ParameterSpec::component("compaction_background_interval_ms")
-            .description("Background compaction interval in milliseconds. The accelerator runs a per-table background task at this interval. Set to 0 to disable the background task — inline compaction on writes still runs. Default: 10000 for refresh_mode: caching, changes, or append with refresh_check_interval <= 5m; 30000 otherwise."),
+            .description("Background compaction interval in milliseconds. The accelerator runs a per-table background task at this interval. Set to 0 to disable the background task — inline compaction on writes still runs. Default: 10000 for refresh_mode: caching, changes, or append with refresh_check_interval <= 5m; 0 (disabled) for refresh_mode: full, whose whole-table replace leaves nothing to consolidate; 30000 otherwise."),
         ParameterSpec::component("inline_max_rows")
             .description("Maximum rows in a single write that can be inlined into the Cayenne metastore instead of writing a Vortex file. Set to 0 to disable write-entry inlining. Default: 1024 for refresh_mode: caching, changes, or append with refresh_check_interval <= 5m; 0 otherwise."),
         ParameterSpec::component("inline_max_bytes")
@@ -3203,6 +3431,7 @@ impl DataAccelerator for CayenneAccelerator {
             let unsupported_type_action = Self::get_unsupported_type_action(source);
             let is_s3_express = s3::is_s3_express_data_path(source);
             let workload = build_workload_profile(
+                source,
                 source.acceleration(),
                 arrow_schema.as_ref(),
                 &primary_keys,
@@ -3238,23 +3467,29 @@ impl DataAccelerator for CayenneAccelerator {
                 );
             }
 
-            let creator = Arc::new(CayennePartitionCreator::new(
-                table_name.clone(),
-                PathBuf::from(&dir_path),
-                partition_by.clone(),
-                Arc::clone(&arrow_schema),
-                catalog,
-                table_metadata.table_id,
-                unsupported_type_action,
-                retention_filters,
-                time_retention_filter_builder,
-                vortex_config,
-                object_store_config,
-                primary_keys.clone(),
-                on_conflict,
-                runtime_env,
-                Arc::clone(&self.compaction_semaphore),
-            ));
+            let creator = Arc::new(
+                CayennePartitionCreator::new(
+                    table_name.clone(),
+                    PathBuf::from(&dir_path),
+                    partition_by.clone(),
+                    Arc::clone(&arrow_schema),
+                    catalog,
+                    table_metadata.table_id,
+                    unsupported_type_action,
+                    retention_filters,
+                    time_retention_filter_builder,
+                    vortex_config,
+                    object_store_config,
+                    primary_keys.clone(),
+                    on_conflict,
+                    runtime_env,
+                )
+                // Per-partition background compaction draws on the accelerator's
+                // one budget, and an accelerated partitioned table is a target for
+                // the dual-write path.
+                .with_background_compaction(Arc::clone(&self.compaction_semaphore))
+                .with_direct_partition_writes(),
+            );
 
             // Wrap the base table provider with partitioning logic, installing
             // the Cayenne-specific cross-partition insert strategy so that
@@ -3555,421 +3790,6 @@ fn serialize_partition_child_writes(
     config.write_concurrency = Some(1);
 }
 
-/// Partition creator for Cayenne accelerator.
-///
-/// Supports single and composite partition keys (e.g., `partition_by: [year, month, day]`).
-/// For composite partitions, data is stored in nested Hive-style directories.
-pub(crate) struct CayennePartitionCreator {
-    table_name: String,
-    base_path: PathBuf,
-    /// Partition expressions. For hierarchical partitions like `partition_by: [year, month]`,
-    /// this contains all expressions in order.
-    partition_by: Vec<PartitionedBy>,
-    schema: SchemaRef,
-    catalog: Arc<dyn cayenne::MetadataCatalog>,
-    table_id: String,
-    unsupported_type_action: UnsupportedTypeAction,
-    retention_filters: Vec<Expr>,
-    time_retention_filter_builder: Option<cayenne::TimeRetentionFilterBuilder>,
-    vortex_config: cayenne::metadata::VortexConfig,
-    object_store_config: Option<cayenne::metadata::ObjectStoreConfig>,
-    primary_key: Vec<String>,
-    on_conflict: Option<datafusion_table_providers::util::on_conflict::OnConflict>,
-    /// Shared Cayenne context with cache, created once and shared across all partitions.
-    context: Arc<cayenne::CayenneContext>,
-    /// Shared compaction semaphore inherited from the parent
-    /// [`CayenneAccelerator`]. Per-partition providers spawn their own
-    /// background compaction tasks through this semaphore so the whole accelerator
-    /// shares one concurrency budget.
-    compaction_semaphore: Arc<tokio::sync::Semaphore>,
-}
-
-impl std::fmt::Debug for CayennePartitionCreator {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CayennePartitionCreator")
-            .field("table_name", &self.table_name)
-            .field("base_path", &self.base_path)
-            .field("partition_by", &self.partition_by)
-            .field("schema", &self.schema)
-            .field("catalog", &"<dyn MetadataCatalog>")
-            .field("table_id", &self.table_id)
-            .field("unsupported_type_action", &self.unsupported_type_action)
-            .field("retention_filters", &self.retention_filters.len())
-            .field(
-                "time_retention_filter_builder",
-                &self.time_retention_filter_builder.is_some(),
-            )
-            .field("vortex_config", &"<VortexConfig>")
-            .field("object_store_config", &self.object_store_config.is_some())
-            .field("primary_key", &self.primary_key)
-            .field("on_conflict", &self.on_conflict.is_some())
-            .field("context", &"<CayenneContext>")
-            .finish_non_exhaustive()
-    }
-}
-
-impl CayennePartitionCreator {
-    #[expect(clippy::too_many_arguments)]
-    pub(crate) fn new(
-        table_name: String,
-        base_path: PathBuf,
-        partition_by: Vec<PartitionedBy>,
-        schema: SchemaRef,
-        catalog: Arc<dyn cayenne::MetadataCatalog>,
-        table_id: String,
-        unsupported_type_action: UnsupportedTypeAction,
-        retention_filters: Vec<Expr>,
-        time_retention_filter_builder: Option<cayenne::TimeRetentionFilterBuilder>,
-        vortex_config: cayenne::metadata::VortexConfig,
-        object_store_config: Option<cayenne::metadata::ObjectStoreConfig>,
-        primary_key: Vec<String>,
-        on_conflict: Option<datafusion_table_providers::util::on_conflict::OnConflict>,
-        runtime_env: Arc<RuntimeEnv>,
-        compaction_semaphore: Arc<tokio::sync::Semaphore>,
-    ) -> Self {
-        // Create shared Cayenne context with cache once, to be shared across all partitions.
-        // This ensures all partitions share the same footer/segment caches instead of
-        // each partition creating its own cache.
-        let context = cayenne::CayenneContext::new_for_partition_child(
-            &vortex_config,
-            runtime_env,
-            &table_name,
-        );
-
-        Self {
-            table_name,
-            base_path,
-            partition_by,
-            schema,
-            catalog,
-            table_id,
-            unsupported_type_action,
-            retention_filters,
-            time_retention_filter_builder,
-            vortex_config,
-            object_store_config,
-            primary_key,
-            on_conflict,
-            context,
-            compaction_semaphore,
-        }
-    }
-
-    /// Returns the partition column labels for all partition expressions.
-    fn partition_column_labels(&self) -> Vec<String> {
-        self.partition_by
-            .iter()
-            .map(|p| match &p.expression {
-                Expr::Column(col) => col.name.clone(),
-                _ => p.name.clone(),
-            })
-            .collect()
-    }
-
-    /// Generate a unique table name for this partition based on composite key.
-    fn partition_table_name(&self, partition_key: &str) -> String {
-        format!(
-            "{}_p{}",
-            self.table_name,
-            encode_identifier_hex(partition_key)
-        )
-    }
-
-    fn legacy_partition_table_name(&self, partition_values: &[String]) -> String {
-        format!("{}_{}", self.table_name, partition_values.join("_"))
-    }
-
-    /// Generate partition directory path from multiple partition values.
-    /// Creates nested Hive-style directories (e.g., `year=2025/month=10/day=15/`).
-    fn partition_dir(&self, partition_values: &[ScalarValue]) -> Result<PathBuf, creator::Error> {
-        let pairings: Vec<(PartitionedBy, ScalarValue)> = self
-            .partition_by
-            .iter()
-            .cloned()
-            .zip(partition_values.iter().cloned())
-            .collect();
-
-        let partition_dir = to_hive_partition_dir(&pairings)
-            .boxed()
-            .context(creator::CreatePartitionSnafu)?;
-
-        Ok(self.base_path.join(partition_dir))
-    }
-}
-
-#[async_trait]
-impl PartitionCreator for CayennePartitionCreator {
-    async fn create_partition(
-        &self,
-        partition_values: Vec<ScalarValue>,
-    ) -> Result<Partition, creator::Error> {
-        if partition_values.is_empty() {
-            return Err(creator::Error::CreatePartition {
-                source: "At least one partition value is required".into(),
-            });
-        }
-
-        if partition_values.len() != self.partition_by.len() {
-            return Err(creator::Error::CreatePartition {
-                source: format!(
-                    "Expected {} partition values but got {} (one per partition_by expression)",
-                    self.partition_by.len(),
-                    partition_values.len()
-                )
-                .into(),
-            });
-        }
-
-        let partition_dir = self.partition_dir(&partition_values)?;
-        let partition_path = partition_dir.to_string_lossy().to_string();
-
-        // Encode partition values as strings for metadata storage
-        let partition_value_strings: Vec<String> = partition_values
-            .iter()
-            .map(encode_key)
-            .collect::<Result<Vec<_>, _>>()
-            .boxed()
-            .context(creator::CreatePartitionSnafu)?;
-
-        // Validate partition values for local filesystem compatibility.
-        // Partition values matching the pattern `.*#\d+` (e.g., "abcdef#123") are not supported
-        // on local filesystem paths but are supported on remote Object Store locations.
-        if self.object_store_config.is_none() {
-            for value in &partition_value_strings {
-                if UNSUPPORTED_LOCAL_PARTITION_PATTERN.is_match(value) {
-                    return Err(creator::Error::CreatePartition {
-                        source: format!(
-                            "Partition value '{value}' is not supported for local filesystem locations. \
-                            Values matching the pattern '*#<digits>' (e.g., 'abcdef#123') are only supported \
-                            for S3 Express One Zone locations."
-                        )
-                        .into(),
-                    });
-                }
-            }
-        }
-
-        tracing::debug!("creating Cayenne partition at {partition_path}");
-
-        // Create the partition directory (including nested directories for composite partitions).
-        // Use tokio's async variant so partition creation does not block the runtime thread.
-        tokio::fs::create_dir_all(&partition_dir)
-            .await
-            .boxed()
-            .context(creator::CreatePartitionSnafu)?;
-        let partition_column_names = self.partition_column_labels();
-
-        let partition_key = encode_composite_key(&partition_values)
-            .boxed()
-            .context(creator::CreatePartitionSnafu)?;
-
-        // Create partition metadata with composite key support
-        let partition_metadata = cayenne::PartitionMetadata::new_composite(
-            self.table_id.clone(),
-            partition_column_names,
-            partition_value_strings.clone(),
-            partition_path.clone(),
-            false, // path_is_relative
-        );
-
-        self.catalog
-            .add_partition(partition_metadata)
-            .await
-            .boxed()
-            .context(creator::CreatePartitionSnafu)?;
-
-        // Create table options for this partition
-        let table_options = cayenne::metadata::CreateTableOptions {
-            table_name: self.partition_table_name(&partition_key),
-            schema: Arc::clone(&self.schema),
-            primary_key: self.primary_key.clone(),
-            on_conflict: self.on_conflict.clone(),
-            base_path: partition_path.clone(),
-            partition_column: None, // Partitions themselves are not partitioned
-            vortex_config: self.vortex_config.clone(),
-        };
-
-        // Create Cayenne table provider for this partition with S3 support.
-        // Use the shared context to share footer/segment caches across partitions.
-        let mut builder = cayenne::CayenneTableProviderBuilder::new(
-            Arc::clone(&self.catalog),
-            Arc::clone(self.context.runtime_env()),
-        )
-        .with_context(Arc::clone(&self.context))
-        .with_retention_filters(self.retention_filters.clone());
-        if let Some(ref retention_builder) = self.time_retention_filter_builder {
-            builder = builder.with_time_retention_filter_builder(retention_builder.clone());
-        }
-        if let Some(ref object_store) = self.object_store_config {
-            builder = builder.with_object_store(object_store.clone());
-        }
-        let cayenne_table = builder
-            .create(table_options)
-            .await
-            .boxed()
-            .context(creator::CreatePartitionSnafu)?;
-
-        let partition_provider = Arc::new(cayenne_table);
-        partition_provider.spawn_background_compaction(Arc::clone(&self.compaction_semaphore));
-        partition_provider.init_scan_view_cache();
-        Ok(Partition {
-            partition_values,
-            table_provider: partition_provider,
-        })
-    }
-
-    async fn infer_existing_partitions(&self) -> Result<Vec<Partition>, creator::Error> {
-        // Query catalog for existing partitions
-        let partitions = self
-            .catalog
-            .get_partitions(&self.table_id)
-            .await
-            .boxed()
-            .context(creator::InferringPartitionsSnafu)?;
-
-        let mut result = Vec::new();
-
-        let df_schema = DFSchema::try_from(Arc::clone(&self.schema))
-            .boxed()
-            .context(creator::InferringPartitionsSnafu)?;
-
-        let expected_partition_columns = self.partition_column_labels();
-
-        for partition_meta in partitions {
-            // Validate that stored partition metadata matches current partition_by expressions.
-            // Both the column names and their order must match exactly, otherwise the partition
-            // was created with different partition_by configuration and cannot be safely used.
-            // Silently skipping mismatched partitions would cause incomplete query results (data loss).
-            if partition_meta.partition_columns != expected_partition_columns {
-                return Err(creator::Error::PartitionByExpressionsChanged);
-            }
-
-            let mut partition_values = Vec::with_capacity(self.partition_by.len());
-            for (partition_expr, value_str) in self
-                .partition_by
-                .iter()
-                .zip(&partition_meta.partition_values)
-            {
-                let partition_value = parse_partition_value(&df_schema, partition_expr, value_str)
-                    .map_err(|e| creator::Error::InferringPartitions {
-                        source: Box::new(e),
-                    })?;
-                partition_values.push(partition_value);
-            }
-
-            let partition_key = partition_meta.composite_key();
-            let partition_table_name = self.partition_table_name(&partition_key);
-
-            // Use builder pattern to pass object store config for S3 support.
-            // Use the shared context to share footer/segment caches across partitions.
-            let mut builder = cayenne::CayenneTableProviderBuilder::new(
-                Arc::clone(&self.catalog),
-                Arc::clone(self.context.runtime_env()),
-            )
-            .with_context(Arc::clone(&self.context))
-            .with_retention_filters(self.retention_filters.clone());
-            if let Some(ref retention_builder) = self.time_retention_filter_builder {
-                builder = builder.with_time_retention_filter_builder(retention_builder.clone());
-            }
-            if let Some(ref object_store) = self.object_store_config {
-                builder = builder.with_object_store(object_store.clone());
-            }
-            let cayenne_table = match builder.open(&partition_table_name).await {
-                Ok(table) => table,
-                Err(cayenne::provider::Error::Catalog {
-                    source: cayenne::CatalogError::TableNotFound { .. },
-                }) => {
-                    let legacy_name =
-                        self.legacy_partition_table_name(&partition_meta.partition_values);
-                    let mut legacy_builder = cayenne::CayenneTableProviderBuilder::new(
-                        Arc::clone(&self.catalog),
-                        Arc::clone(self.context.runtime_env()),
-                    )
-                    .with_context(Arc::clone(&self.context))
-                    .with_retention_filters(self.retention_filters.clone());
-                    if let Some(ref retention_builder) = self.time_retention_filter_builder {
-                        legacy_builder = legacy_builder
-                            .with_time_retention_filter_builder(retention_builder.clone());
-                    }
-                    if let Some(ref object_store) = self.object_store_config {
-                        legacy_builder = legacy_builder.with_object_store(object_store.clone());
-                    }
-                    legacy_builder
-                        .open(&legacy_name)
-                        .await
-                        .boxed()
-                        .context(creator::InferringPartitionsSnafu)?
-                }
-                Err(error) => {
-                    return Err(creator::Error::InferringPartitions {
-                        source: Box::new(error),
-                    });
-                }
-            };
-
-            let partition_provider = Arc::new(cayenne_table);
-            partition_provider.spawn_background_compaction(Arc::clone(&self.compaction_semaphore));
-            partition_provider.init_scan_view_cache();
-            result.push(Partition {
-                partition_values,
-                table_provider: partition_provider,
-            });
-        }
-
-        Ok(result)
-    }
-
-    fn supports_filters_pushdown(
-        &self,
-        filters: &[&Expr],
-    ) -> Result<Vec<TableProviderFilterPushDown>, DataFusionError> {
-        // Partition pruning works for filters on partition columns, even though
-        // Cayenne doesn't have native filter pushdown to the storage layer
-        use datafusion::logical_expr::TableProviderFilterPushDown;
-
-        // Collect all partition columns from all partition expressions
-        let partition_columns: std::collections::HashSet<_> = self
-            .partition_by
-            .iter()
-            .flat_map(|p| p.expression.column_refs())
-            .collect();
-
-        Ok(filters
-            .iter()
-            .map(|filter| {
-                let filter_columns = filter.column_refs();
-
-                // Check if filter columns match partition columns (ignoring table qualifiers)
-                // Both `order_date` and `table.order_date` should match partition column `order_date`
-                let matches_partition_cols = filter_columns.is_empty()
-                    || filter_columns.iter().all(|filter_col| {
-                        partition_columns
-                            .iter()
-                            .any(|part_col| filter_col.name == part_col.name)
-                    });
-
-                // If filter references partition columns or contains the partition expression,
-                // it can be used for partition pruning
-                if matches_partition_cols {
-                    TableProviderFilterPushDown::Inexact
-                } else {
-                    TableProviderFilterPushDown::Unsupported
-                }
-            })
-            .collect())
-    }
-}
-
-fn encode_identifier_hex(value: &str) -> String {
-    use std::fmt::Write as _;
-
-    let mut encoded = String::with_capacity(value.len() * 2);
-    for byte in value.as_bytes() {
-        let _ = write!(encoded, "{byte:02X}");
-    }
-    encoded
-}
-
 data_accelerator_api::register_data_accelerator!(Engine::Cayenne, CayenneAccelerator);
 
 /// Normalize a raw `cayenne_tuning` value: trim + lowercase, mapping `auto`/`adaptive`
@@ -3988,6 +3808,61 @@ fn normalize_cayenne_tuning(raw: Option<&str>) -> (Option<String>, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A timestamp column compared against a string literal is how such a filter
+    /// is normally written, and it must survive all the way to *evaluation*.
+    /// Planning it is not enough: without coercion the physical expression builds
+    /// fine and then fails on the first batch with "Invalid comparison operation:
+    /// Timestamp(µs) > Utf8", which takes the maintained aggregate stale on its
+    /// first delta and silently drops every query back to a base-table scan.
+    #[test]
+    fn a_timestamp_filter_against_a_string_literal_evaluates() {
+        use arrow::array::{Int32Array, TimestampMicrosecondArray};
+        use arrow::datatypes::TimeUnit;
+        use arrow::record_batch::RecordBatch;
+
+        let schema = Schema::new(vec![
+            Field::new(
+                "ol_delivery_d",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                true,
+            ),
+            Field::new("ol_quantity", DataType::Int32, true),
+        ]);
+
+        let filter = parse_maintained_aggregate_filter(
+            "ol_delivery_d > '2007-01-02 00:00:00.000000'",
+            &schema,
+        )
+        .expect("a timestamp-vs-string filter must be accepted");
+
+        // 2007-01-01 (before the bound) and 2008-01-01 (after it).
+        let batch = RecordBatch::try_new(
+            Arc::new(schema.clone()),
+            vec![
+                Arc::new(TimestampMicrosecondArray::from(vec![
+                    1_167_609_600_000_000,
+                    1_199_145_600_000_000,
+                ])),
+                Arc::new(Int32Array::from(vec![1, 2])),
+            ],
+        )
+        .expect("test batch");
+
+        // The assertion that matters: evaluating does not error.
+        let evaluated = filter
+            .evaluate(&batch)
+            .expect("the filter must evaluate, not just plan");
+        let mask = evaluated
+            .into_array(batch.num_rows())
+            .expect("filter yields an array");
+        let mask = mask
+            .as_any()
+            .downcast_ref::<arrow::array::BooleanArray>()
+            .expect("a WHERE predicate evaluates to Boolean");
+        assert!(!mask.value(0), "2007-01-01 is not after the bound");
+        assert!(mask.value(1), "2008-01-01 is after the bound");
+    }
 
     #[test]
     fn normalize_cayenne_tuning_folds_invalid_to_auto() {
@@ -4452,6 +4327,168 @@ mod tests {
         assert!(dims.contains(&1536));
     }
 
+    /// `DataConnector::resolve_refresh_mode` fills in an unset `refresh_mode`
+    /// (`debezium`/`cdc` → `changes`, `sink` → `disabled`, everything else → `full`)
+    /// and its result is never written back into the `Acceleration`. So the
+    /// accelerator must resolve the connector default itself: classifying from the
+    /// raw field would read a genuine `debezium:` stream as a whole-table replace and
+    /// switch its background compactor off.
+    ///
+    /// Every case is also checked against the runtime builder's pre-init
+    /// classification, which sizes host memory for the same pod from the raw `from:`
+    /// string. The two reach the connector name by different routes — the builder
+    /// parses the Spicepod value, the accelerator asks the initialized component —
+    /// so agreeing on every case is what proves the pod cannot be budgeted as one
+    /// shape and configured as another.
+    #[tokio::test]
+    async fn accelerator_resolves_connector_unset_refresh_mode() {
+        use spicepod::acceleration::RefreshMode as SpicepodRefreshMode;
+
+        let app = Arc::new(AppBuilder::new("connector-unset-refresh-mode").build());
+        let rt = Arc::new(crate::Runtime::builder().build().await);
+
+        // The profile the ACCELERATOR configures the table with, through a real
+        // `Dataset` — so `Dataset::connector_name` and `DatasetSpec::source()` are
+        // the code under test, not a hand-rolled parse.
+        let accelerator_profile = |from: &str, refresh_mode: Option<&SpicepodRefreshMode>| {
+            let mut dataset = DatasetBuilder::try_new(from.to_string(), "ds")
+                .expect("dataset builder")
+                .with_app(Arc::clone(&app))
+                .with_runtime(Arc::clone(&rt))
+                .build()
+                .expect("build dataset");
+            dataset.acceleration = Some(Acceleration {
+                engine: Engine::Cayenne,
+                mode: Mode::File,
+                refresh_mode: refresh_mode.cloned().map(RefreshMode::from),
+                ..Default::default()
+            });
+            let acceleration = dataset.acceleration.as_ref().expect("acceleration set");
+            refresh_write_profile(&dataset, acceleration)
+        };
+
+        // The profile the runtime BUILDER classifies the same pod with, pre-init.
+        let builder_profile = |from: &str, refresh_mode: Option<&SpicepodRefreshMode>| {
+            let accel = spicepod::acceleration::Acceleration {
+                refresh_mode: refresh_mode.cloned(),
+                ..Default::default()
+            };
+            RefreshWriteProfile::from_spicepod(
+                &accel,
+                crate::builder::connector_unset_refresh_mode(from),
+            )
+        };
+
+        let both_agree = |from: &str, refresh_mode: Option<&SpicepodRefreshMode>| {
+            let accelerator = accelerator_profile(from, refresh_mode);
+            assert_eq!(
+                accelerator,
+                builder_profile(from, refresh_mode),
+                "the accelerator and the runtime builder must classify `from: {from}` identically"
+            );
+            accelerator
+        };
+
+        // A CDC stream with no `refresh_mode:` line. `debezium/topic` is the case a
+        // `split_once(':')` would miss: `DatasetSpec::source()` treats `/` as a
+        // delimiter too.
+        for from in [
+            "debezium:my.topic",
+            "debezium/topic",
+            "cdc:stream",
+            "cdc/stream",
+        ] {
+            assert_eq!(
+                both_agree(from, None),
+                RefreshWriteProfile::SmallWrite,
+                "`{from}` with no refresh_mode is a CDC stream"
+            );
+        }
+
+        // `sink` resolves to `disabled`: no refresh runs, but `INSERT INTO` rows
+        // accumulate, so files still need consolidating.
+        assert_eq!(
+            both_agree("sink", None),
+            RefreshWriteProfile::BulkAppend,
+            "`sink` resolves to refresh_mode: disabled"
+        );
+
+        // Every other connector takes `resolve_refresh_mode`'s `full` default.
+        for from in ["s3://bucket/path", "postgres:public.orders"] {
+            assert_eq!(
+                both_agree(from, None),
+                RefreshWriteProfile::BulkOverwrite,
+                "`{from}` with no refresh_mode is a whole-table replace"
+            );
+        }
+
+        // An explicit `refresh_mode` always wins over the connector default, in both
+        // directions.
+        assert_eq!(
+            both_agree("debezium:my.topic", Some(&SpicepodRefreshMode::Full)),
+            RefreshWriteProfile::BulkOverwrite,
+            "an explicit refresh_mode: full overrides debezium's changes default"
+        );
+        assert_eq!(
+            both_agree(
+                "postgres:public.orders",
+                Some(&SpicepodRefreshMode::Changes)
+            ),
+            RefreshWriteProfile::SmallWrite,
+            "an explicit refresh_mode: changes overrides the full default"
+        );
+    }
+
+    /// The consequence of the classification above: an unannotated `debezium:`
+    /// dataset must keep a background compactor. Reading `refresh_mode` raw makes it
+    /// bulk-overwrite, whose defaults set `compaction_background_interval_ms = 0` —
+    /// the compactor is then never spawned, and its small files never consolidate.
+    #[tokio::test]
+    async fn unset_cdc_refresh_mode_keeps_background_compaction() {
+        let app = Arc::new(AppBuilder::new("connector-unset-compaction").build());
+        let rt = Arc::new(crate::Runtime::builder().build().await);
+
+        let interval_for = |from: &str| {
+            let mut dataset = DatasetBuilder::try_new(from.to_string(), "ds")
+                .expect("dataset builder")
+                .with_app(Arc::clone(&app))
+                .with_runtime(Arc::clone(&rt))
+                .build()
+                .expect("build dataset");
+            dataset.acceleration = Some(Acceleration {
+                engine: Engine::Cayenne,
+                mode: Mode::File,
+                // No `refresh_mode`: the connector fills it in.
+                ..Default::default()
+            });
+            let acceleration = dataset.acceleration.as_ref().expect("acceleration set");
+            let mut config = cayenne::metadata::VortexConfig::default();
+            apply_refresh_mode_defaults(
+                &mut config,
+                &dataset,
+                acceleration,
+                autotune::InlineFlushCaps::FLOOR,
+            );
+            config.compaction_background_interval_ms
+        };
+
+        assert_eq!(
+            interval_for("debezium:my.topic"),
+            SMALL_WRITE_COMPACTION_BACKGROUND_INTERVAL_MS,
+            "an unannotated debezium dataset is a CDC stream and keeps the tight compaction cadence"
+        );
+        assert_ne!(
+            interval_for("cdc:stream"),
+            0,
+            "an unannotated cdc dataset must keep a background compactor"
+        );
+        assert_eq!(
+            interval_for("s3://bucket/path"),
+            0,
+            "a whole-table replace has nothing to consolidate, so the compactor stays off"
+        );
+    }
+
     #[tokio::test]
     async fn test_cayenne_file_path_generation() {
         let app = AppBuilder::new("test").build();
@@ -4741,6 +4778,220 @@ mod tests {
         assert_eq!(quiet.write_concurrency, Some(2));
     }
 
+    /// A `MakeWriter` that accumulates formatted log output so a test can assert on
+    /// what an operator would actually see in `spice.log`.
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl CapturedLogs {
+        fn occurrences_of(&self, needle: &str) -> usize {
+            let buffer = self
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            String::from_utf8_lossy(&buffer).matches(needle).count()
+        }
+    }
+
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl tracing_subscriber::fmt::MakeWriter<'_> for CapturedLogs {
+        type Writer = Self;
+
+        fn make_writer(&self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    #[test]
+    fn auto_tuned_config_is_reported_once_per_resolution() {
+        // Table names are process-global keys; keep them unique to this test.
+        const TABLE: &str = "dedupe_decision_table";
+        const OTHER: &str = "dedupe_decision_other_table";
+
+        // First resolution reports; the identical re-resolutions an unbounded init
+        // retry produces do not.
+        assert!(auto_tuned_config_is_newly_resolved(TABLE, 1));
+        assert!(!auto_tuned_config_is_newly_resolved(TABLE, 1));
+        assert!(!auto_tuned_config_is_newly_resolved(TABLE, 1));
+
+        // A genuine re-tune reports again, then settles at the new resolution.
+        assert!(auto_tuned_config_is_newly_resolved(TABLE, 2));
+        assert!(!auto_tuned_config_is_newly_resolved(TABLE, 2));
+
+        // Reverting to an earlier resolution is still a change worth reporting —
+        // the key is the last value seen, not the set of values ever seen.
+        assert!(auto_tuned_config_is_newly_resolved(TABLE, 1));
+
+        // Tables are independent: one table's line never suppresses another's.
+        assert!(auto_tuned_config_is_newly_resolved(OTHER, 1));
+    }
+
+    #[test]
+    fn auto_tuned_config_fingerprint_covers_the_logged_values_only() {
+        use crate::dataaccelerator::storage::ResolvedAccelerationStorage;
+
+        let hw = autotune::HardwareProfile::new(
+            8,
+            32 * 1024 * 1024 * 1024,
+            ResolvedAccelerationStorage::LocalSsd,
+            ResolvedAccelerationStorage::LocalSsd,
+        );
+        let workload = autotune::WorkloadProfile::default();
+        let config = cayenne::metadata::VortexConfig::default();
+        let baseline = auto_tuned_config_fingerprint("t", &hw, &workload, &config);
+
+        // Deterministic: the same resolution fingerprints the same way, which is
+        // what collapses the retry storm.
+        assert_eq!(
+            baseline,
+            auto_tuned_config_fingerprint("t", &hw, &workload, &config)
+        );
+
+        // Every printed input participates.
+        let mut retuned = config.clone();
+        retuned.target_vortex_file_size_mb += 1;
+        assert_ne!(
+            baseline,
+            auto_tuned_config_fingerprint("t", &hw, &workload, &retuned),
+            "a knob that appears in the line must change the fingerprint"
+        );
+        let mut bigger_host = hw;
+        bigger_host.cores += 1;
+        assert_ne!(
+            baseline,
+            auto_tuned_config_fingerprint("t", &bigger_host, &workload, &config),
+            "the host basis appears in the line and must change the fingerprint"
+        );
+        let inferred = autotune::WorkloadProfile {
+            row_count: Some(1_000),
+            ..workload
+        };
+        assert_ne!(
+            baseline,
+            auto_tuned_config_fingerprint("t", &hw, &inferred, &config),
+            "the inferred workload signals appear in the line"
+        );
+        assert_ne!(
+            baseline,
+            auto_tuned_config_fingerprint("other", &hw, &workload, &config),
+            "the fingerprint is per table"
+        );
+
+        // A knob the line does not print still participates, through `{config:?}`:
+        // over-reporting is the safe direction, and it keeps the key from silently
+        // narrowing as knobs are added to the line.
+        let mut unprinted = config.clone();
+        unprinted.stream_publish_interval_ms += 1;
+        assert_ne!(
+            baseline,
+            auto_tuned_config_fingerprint("t", &hw, &workload, &unprinted)
+        );
+
+        // The calibration measurements are deliberately excluded: they are not
+        // printed, and they reach the fingerprint through the knobs they resolved.
+        let mut probed = hw;
+        probed.data_perf.write_mbps = Some(125.0);
+        probed.metastore_perf.write_mbps = Some(4_000.0);
+        assert_eq!(
+            baseline,
+            auto_tuned_config_fingerprint("t", &probed, &workload, &config),
+            "a measured storage rate is not part of the line and must not re-report it"
+        );
+    }
+
+    /// Regression test for #12330: dataset initialization retries with unbounded
+    /// backoff and rebuilds the table provider on every attempt, so a dataset that
+    /// never loads used to repeat its ~1 KB config line forever.
+    #[tokio::test]
+    async fn auto_tuned_config_line_survives_a_provider_rebuild_storm() {
+        const TABLE: &str = "dedupe_rebuild_storm";
+        const LINE: &str = "Cayenne auto-tuned config:";
+        // A configuration warning derived from the same resolution, so it shares the
+        // gate: a misconfigured dataset is exactly the one that retries forever.
+        const WARNING: &str = "cayenne_compaction_trigger_files is 1";
+        let misconfigured = || {
+            vec![(
+                "cayenne_compaction_trigger_files".to_string(),
+                "1".to_string(),
+            )]
+        };
+
+        let app = Arc::new(AppBuilder::new("test").build());
+        let rt = Arc::new(crate::Runtime::builder().build().await);
+        let build = |params: Vec<(String, String)>| {
+            let mut dataset = DatasetBuilder::try_new(TABLE.to_string(), TABLE)
+                .expect("dataset builder")
+                .with_app(Arc::clone(&app))
+                .with_runtime(Arc::clone(&rt))
+                .build()
+                .expect("dataset");
+            dataset.acceleration = Some(Acceleration {
+                engine: Engine::Cayenne,
+                mode: Mode::File,
+                params: params.into_iter().collect(),
+                ..Default::default()
+            });
+            dataset
+        };
+
+        // Capture only the emits below: `#[tokio::test]` runs the whole test body on
+        // one thread, and `set_default` installs the subscriber on that thread only,
+        // so concurrent tests cannot contribute to the count.
+        let captured = CapturedLogs::default();
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_writer(captured.clone())
+                .with_ansi(false)
+                .with_max_level(tracing::Level::INFO)
+                .finish(),
+        );
+
+        let dataset = build(misconfigured());
+        for _ in 0..3 {
+            let _ = CayenneAccelerator::get_vortex_config(TABLE, &dataset).await;
+        }
+        assert_eq!(
+            captured.occurrences_of(LINE),
+            1,
+            "rebuilding the provider must not re-report an unchanged resolution"
+        );
+        assert_eq!(
+            captured.occurrences_of(WARNING),
+            1,
+            "a configuration warning derived from that resolution must not repeat either"
+        );
+
+        // A genuine re-tune is still reported — the line's whole purpose is to
+        // record what `auto` resolved to, including when that answer changes.
+        let mut retuned_params = misconfigured();
+        retuned_params.push(("cayenne_target_file_size_mb".to_string(), "512".to_string()));
+        let retuned = build(retuned_params);
+        let _ = CayenneAccelerator::get_vortex_config(TABLE, &retuned).await;
+        assert_eq!(
+            captured.occurrences_of(LINE),
+            2,
+            "a changed resolution must still be reported"
+        );
+        assert_eq!(
+            captured.occurrences_of(WARNING),
+            2,
+            "the warning is re-reported alongside the resolution it describes"
+        );
+    }
+
     #[tokio::test]
     async fn test_vortex_config_defaults_use_small_write_refresh_profile() {
         let app = Arc::new(AppBuilder::new("test").build());
@@ -4829,10 +5080,11 @@ mod tests {
         let app = Arc::new(AppBuilder::new("test").build());
         let rt = Arc::new(crate::Runtime::builder().build().await);
 
+        // The bulk-APPEND profile only. `full` (and an unset mode, which the
+        // connector default resolves to `full`) is the bulk-OVERWRITE profile and
+        // does inline — see `test_full_refresh_disables_background_compaction`.
         for (table_name, refresh_mode) in [
             ("append_manual_load", Some(RefreshMode::Append)),
-            ("default_load", None),
-            ("full_load", Some(RefreshMode::Full)),
             ("snapshot_load", Some(RefreshMode::Snapshot)),
             ("disabled_load", Some(RefreshMode::Disabled)),
         ] {
@@ -5051,6 +5303,86 @@ mod tests {
             "non-small-write profiles keep the static default (knob is inert there)"
         );
         assert_eq!(config.cdc_mem_tier_min_flush_bytes, 32 * MIB);
+    }
+
+    /// A full refresh replaces the whole table, so there is nothing for compaction
+    /// to consolidate and the background compactor must be off by default.
+    #[tokio::test]
+    async fn test_full_refresh_disables_background_compaction() {
+        let app = Arc::new(AppBuilder::new("test").build());
+        let rt = Arc::new(crate::Runtime::builder().build().await);
+
+        let build = |name: &str, refresh_mode: RefreshMode, params: Vec<(String, String)>| {
+            let mut ds = DatasetBuilder::try_new(name.to_string(), name)
+                .expect("dataset builder")
+                .with_app(Arc::clone(&app))
+                .with_runtime(Arc::clone(&rt))
+                .build()
+                .expect("dataset");
+            ds.acceleration = Some(Acceleration {
+                engine: Engine::Cayenne,
+                mode: Mode::File,
+                refresh_mode: Some(refresh_mode),
+                params: params.into_iter().collect(),
+                ..Default::default()
+            });
+            ds
+        };
+
+        let full = build("full_tbl", RefreshMode::Full, vec![]);
+        let config = CayenneAccelerator::get_vortex_config("full_tbl", &full).await;
+        assert_eq!(
+            config.compaction_background_interval_ms, 0,
+            "full refresh must not spawn a background compactor"
+        );
+        assert_eq!(
+            config.inline_max_rows, SMALL_WRITE_INLINE_MAX_ROWS,
+            "a whole-table replace small enough to be admitted must inline: with the background \
+             compactor off, the tiny Vortex files it would otherwise write are never merged"
+        );
+        assert_eq!(config.inline_max_bytes, SMALL_WRITE_INLINE_MAX_BYTES);
+        assert_eq!(
+            config.inline_max_buffer_bytes,
+            SMALL_WRITE_INLINE_MAX_BUFFER_BYTES
+        );
+        assert_eq!(
+            config.inline_flush_max_rows,
+            cayenne::metadata::DEFAULT_INLINE_FLUSH_MAX_ROWS,
+            "the cumulative flush caps stay at their defaults — a replace leaves one entry, so \
+             the flush gate never binds"
+        );
+
+        // An explicit interval still wins: a pod that mixes in-place writes with
+        // full refreshes can turn the compactor back on.
+        let pinned = build(
+            "full_pinned",
+            RefreshMode::Full,
+            vec![(
+                "cayenne_compaction_background_interval_ms".to_string(),
+                "15000".to_string(),
+            )],
+        );
+        let config = CayenneAccelerator::get_vortex_config("full_pinned", &pinned).await;
+        assert_eq!(config.compaction_background_interval_ms, 15_000);
+
+        // CDC is untouched: tight cadence, inlining on.
+        let cdc = build("cdc_tbl", RefreshMode::Changes, vec![]);
+        let config = CayenneAccelerator::get_vortex_config("cdc_tbl", &cdc).await;
+        assert_eq!(
+            config.compaction_background_interval_ms,
+            SMALL_WRITE_COMPACTION_BACKGROUND_INTERVAL_MS
+        );
+        assert_eq!(config.inline_max_rows, SMALL_WRITE_INLINE_MAX_ROWS);
+
+        // Snapshot mode accumulates files, so it keeps the conservative cadence and
+        // stays OUT of the inline tier (its entries would never be drained promptly).
+        let snapshot = build("snap_tbl", RefreshMode::Snapshot, vec![]);
+        let config = CayenneAccelerator::get_vortex_config("snap_tbl", &snapshot).await;
+        assert_ne!(
+            config.compaction_background_interval_ms, 0,
+            "snapshot mode still accumulates files to consolidate"
+        );
+        assert_eq!(config.inline_max_rows, 0);
     }
 
     /// `deletion_mode: auto` resolves to `key` ONLY for `refresh_mode`: changes
@@ -5322,9 +5654,18 @@ mod tests {
             CayenneAccelerator::get_vortex_config("full_partial_override", &large_write_dataset)
                 .await;
 
+        // Bulk-overwrite inlines too, on the same static caps as small-write, so
+        // the un-overridden knobs keep those defaults rather than the zeros that
+        // meant "this profile never inlines".
         assert_eq!(large_write_config.inline_max_rows, 321);
-        assert_eq!(large_write_config.inline_max_bytes, 0);
-        assert_eq!(large_write_config.inline_max_buffer_bytes, 0);
+        assert_eq!(
+            large_write_config.inline_max_bytes,
+            SMALL_WRITE_INLINE_MAX_BYTES
+        );
+        assert_eq!(
+            large_write_config.inline_max_buffer_bytes,
+            SMALL_WRITE_INLINE_MAX_BUFFER_BYTES
+        );
     }
 
     #[tokio::test]
@@ -5394,72 +5735,6 @@ mod tests {
         assert_eq!(
             CayenneAccelerator::resolve_metadata_dir(Some(&acceleration)),
             "/persistent/data/metadata"
-        );
-    }
-
-    #[test]
-    fn test_unsupported_local_partition_pattern() {
-        // Pattern should match values ending with `#<digits>` (e.g., "abcdef#123")
-        // These are only supported on S3 Express One Zone, not local filesystem.
-
-        // Values that should match (unsupported on local filesystem)
-        assert!(
-            UNSUPPORTED_LOCAL_PARTITION_PATTERN.is_match("abcdef#123"),
-            "Expected 'abcdef#123' to match unsupported pattern"
-        );
-        assert!(
-            UNSUPPORTED_LOCAL_PARTITION_PATTERN.is_match("test#1"),
-            "Expected 'test#1' to match unsupported pattern"
-        );
-        assert!(
-            UNSUPPORTED_LOCAL_PARTITION_PATTERN.is_match("some_value#999999"),
-            "Expected 'some_value#999999' to match unsupported pattern"
-        );
-        assert!(
-            UNSUPPORTED_LOCAL_PARTITION_PATTERN.is_match("#0"),
-            "Expected '#0' to match unsupported pattern"
-        );
-        assert!(
-            UNSUPPORTED_LOCAL_PARTITION_PATTERN.is_match("a#1"),
-            "Expected 'a#1' to match unsupported pattern"
-        );
-
-        // Values that should NOT match (supported on local filesystem)
-        assert!(
-            !UNSUPPORTED_LOCAL_PARTITION_PATTERN.is_match("abcdef"),
-            "Expected 'abcdef' to not match unsupported pattern"
-        );
-        assert!(
-            !UNSUPPORTED_LOCAL_PARTITION_PATTERN.is_match("test_123"),
-            "Expected 'test_123' to not match unsupported pattern"
-        );
-        assert!(
-            !UNSUPPORTED_LOCAL_PARTITION_PATTERN.is_match("2024-01-01"),
-            "Expected '2024-01-01' to not match unsupported pattern"
-        );
-        assert!(
-            !UNSUPPORTED_LOCAL_PARTITION_PATTERN.is_match("partition_value"),
-            "Expected 'partition_value' to not match unsupported pattern"
-        );
-        assert!(
-            !UNSUPPORTED_LOCAL_PARTITION_PATTERN.is_match("123"),
-            "Expected '123' (pure digits) to not match unsupported pattern"
-        );
-        assert!(
-            !UNSUPPORTED_LOCAL_PARTITION_PATTERN.is_match("abc#def"),
-            "Expected 'abc#def' (# not followed by only digits) to not match unsupported pattern"
-        );
-        assert!(
-            !UNSUPPORTED_LOCAL_PARTITION_PATTERN.is_match("test#"),
-            "Expected 'test#' (# with no digits) to not match unsupported pattern"
-        );
-        assert!(
-            !UNSUPPORTED_LOCAL_PARTITION_PATTERN.is_match("test#abc"),
-            "Expected 'test#abc' (# followed by non-digits) to not match unsupported pattern"
-        );
-        assert!(
-            !UNSUPPORTED_LOCAL_PARTITION_PATTERN.is_match("test#123abc"),
-            "Expected 'test#123abc' (digits followed by non-digits) to not match unsupported pattern"
         );
     }
 }

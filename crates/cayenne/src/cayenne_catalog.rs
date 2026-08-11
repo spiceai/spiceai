@@ -180,6 +180,14 @@ impl MetastoreImpl {
         }
     }
 
+    pub(crate) async fn incremental_vacuum(&self) -> CatalogResult<u64> {
+        match self {
+            MetastoreImpl::Sqlite(m) => m.incremental_vacuum().await,
+            #[cfg(feature = "turso")]
+            MetastoreImpl::Turso(m) => m.incremental_vacuum().await,
+        }
+    }
+
     /// Begin a transaction on the underlying metastore.
     ///
     /// Each backend sends the appropriate BEGIN statement (e.g. `BEGIN TRANSACTION`
@@ -896,8 +904,10 @@ impl CayenneCatalog {
         // The proven overwrite clear FIRST (it also clears the cold manifest —
         // replace-all), then register this graduation's cold files, so cold
         // graduation is exactly an overwrite whose new content lives on the
-        // cold store.
-        self.commit_overwrite_in_txn(txn, table_id, new_snapshot_id)
+        // cold store. No inline payload: a graduation's content is the cold files
+        // registered below, and the overwrite clear correctly drops the warm
+        // tier's inline corpus along with everything else keyed on the old snapshot.
+        self.commit_overwrite_in_txn(txn, table_id, new_snapshot_id, None)
             .await?;
         for f in cold_files {
             txn.execute(ExecuteParams {
@@ -927,12 +937,15 @@ impl CayenneCatalog {
     /// Returns [`CatalogError::InvalidOperationNoSource`] if either UUID is
     /// malformed.
     /// Returns [`CatalogError::FailedToSetCurrentSnapshot`] if the
-    /// `execute_batch` call against the borrowed transaction fails.
+    /// `execute_batch` call against the borrowed transaction fails, and
+    /// [`CatalogError::InvalidOperation`] if inserting the overwrite's inline
+    /// replacement row fails after it.
     pub async fn commit_overwrite_in_txn(
         &self,
         txn: &mut dyn MetastoreTransaction,
         table_id: &str,
         new_snapshot_id: &str,
+        inlined: Option<&InlinedData>,
     ) -> CatalogResult<()> {
         for (name, value) in [("table_id", table_id), ("new_snapshot_id", new_snapshot_id)] {
             if uuid::Uuid::parse_str(value).is_err() {
@@ -967,11 +980,33 @@ impl CayenneCatalog {
              UPDATE cayenne_table SET current_snapshot_id = {new_snapshot_id_literal} WHERE table_id = {table_id_literal};"
         );
 
-        txn.execute_batch(&batch_sql)
-            .await
-            .map_err(|e| CatalogError::FailedToSetCurrentSnapshot {
+        txn.execute_batch(&batch_sql).await.map_err(|e| {
+            CatalogError::FailedToSetCurrentSnapshot {
                 source: Box::new(e),
-            })
+            }
+        })?;
+
+        // The overwrite's own replacement rows, when the whole refresh fit inline.
+        // Inserted AFTER the batch — which just deleted every inline row for this
+        // table — and inside the same transaction, so a reader either sees the old
+        // snapshot with the old inline corpus or the new snapshot with exactly
+        // these rows, never a mix. Bound as a parameter rather than folded into the
+        // `execute_batch` SQL above because `data_ipc` is a binary BLOB.
+        if let Some(inlined) = inlined {
+            let (_inlined_id, insert) =
+                inlined_data_insert(inlined.clone(), table_id, inlined.sequence_number);
+            // NOT `FailedToSetCurrentSnapshot`: the snapshot UPDATE above already
+            // succeeded, so reporting this as a snapshot failure points at the
+            // wrong statement.
+            txn.execute(insert)
+                .await
+                .map_err(|e| CatalogError::InvalidOperation {
+                    message: "Failed to insert the inlined replacement rows for the overwrite"
+                        .to_string(),
+                    source: Box::new(e),
+                })?;
+        }
+        Ok(())
     }
 
     /// Mark primary keys dirty for durable federated write-back (#11838) inside
@@ -1822,6 +1857,10 @@ impl MetadataCatalog for CayenneCatalog {
     /// PASSIVE checkpoint (delegated to the backend).
     async fn checkpoint_wal(&self) -> CatalogResult<()> {
         self.metastore.checkpoint_wal().await
+    }
+
+    async fn incremental_vacuum(&self) -> CatalogResult<u64> {
+        self.metastore.incremental_vacuum().await
     }
 
     async fn list_table_names(&self) -> CatalogResult<Vec<String>> {
@@ -2996,10 +3035,18 @@ impl MetadataCatalog for CayenneCatalog {
         })
     }
 
-    async fn commit_overwrite(&self, table_id: &str, new_snapshot_id: &str) -> CatalogResult<()> {
+    async fn commit_overwrite(
+        &self,
+        table_id: &str,
+        new_snapshot_id: &str,
+        inlined: Option<&InlinedData>,
+    ) -> CatalogResult<()> {
         // Same retry-on-conflict shape as commit_compaction; the only
         // additional work happens inside the transaction via
-        // commit_overwrite_in_txn below.
+        // commit_overwrite_in_txn below. Retrying is safe with an inline payload:
+        // a conflicted attempt rolled back, so the next one re-runs the same
+        // clear-then-insert against the unchanged pre-state and cannot duplicate
+        // the row (`inlined_id` is fixed by the caller, not minted per attempt).
         let max_attempts = DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS;
         if max_attempts == 0 {
             return Err(CatalogError::InvalidOperationNoSource {
@@ -3015,7 +3062,7 @@ impl MetadataCatalog for CayenneCatalog {
             })?;
 
             match self
-                .commit_overwrite_in_txn(&mut *tx, table_id, new_snapshot_id)
+                .commit_overwrite_in_txn(&mut *tx, table_id, new_snapshot_id, inlined)
                 .await
             {
                 Ok(()) => match tx.commit().await {
@@ -3656,28 +3703,10 @@ impl MetadataCatalog for CayenneCatalog {
     }
 
     async fn add_inlined_data(&self, data: InlinedData) -> CatalogResult<String> {
-        let inlined_id = if data.inlined_id.is_empty() {
-            uuid::Uuid::now_v7().to_string()
-        } else {
-            data.inlined_id
-        };
-        self.metastore
-            .execute_helper(ExecuteParams {
-                sql: r"
-                INSERT INTO cayenne_inlined_data
-                    (inlined_id, table_id, partition_key, data_ipc, record_count, sequence_number)
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-                ",
-                params: vec![
-                    MetastoreValue::Text(inlined_id.clone()),
-                    MetastoreValue::Text(data.table_id),
-                    data.partition_key.into(),
-                    MetastoreValue::Blob(data.data_ipc),
-                    MetastoreValue::Integer(data.record_count),
-                    MetastoreValue::Integer(data.sequence_number),
-                ],
-            })
-            .await?;
+        let table_id = data.table_id.clone();
+        let sequence_number = data.sequence_number;
+        let (inlined_id, insert) = inlined_data_insert(data, &table_id, sequence_number);
+        self.metastore.execute_helper(insert).await?;
         Ok(inlined_id)
     }
 
@@ -4047,34 +4076,18 @@ impl MetadataCatalog for CayenneCatalog {
             }
 
             for data_entry in &data {
-                let inlined_id = if data_entry.inlined_id.is_empty() {
-                    uuid::Uuid::now_v7().to_string()
-                } else {
-                    data_entry.inlined_id.clone()
-                };
-                tx.execute(ExecuteParams {
-                    sql: r"
-                    INSERT INTO cayenne_inlined_data
-                        (inlined_id, table_id, partition_key, data_ipc, record_count, sequence_number)
-                    VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-                    ",
-                    params: vec![
-                        MetastoreValue::Text(inlined_id),
-                        MetastoreValue::Text(table_id.to_string()),
-                        data_entry.partition_key.clone().into(),
-                        MetastoreValue::Blob(data_entry.data_ipc.clone()),
-                        MetastoreValue::Integer(data_entry.record_count),
-                        // Lever B2: stamp the caller-allocated sequence directly,
-                        // replacing the prior correlated subquery read of the DB
-                        // counter (which no longer moves inside this txn).
-                        MetastoreValue::Integer(assigned_sequence),
-                    ],
-                })
-                .await
-                .map_err(|e| CatalogError::InvalidOperation {
-                    message: "Failed to execute inline mutation transaction".to_string(),
-                    source: Box::new(e),
-                })?;
+                // Lever B2: stamp the caller-allocated sequence directly, replacing
+                // the prior correlated subquery read of the DB counter (which no
+                // longer moves inside this txn). Cloned per attempt so a retry
+                // re-binds the same row against the unchanged pre-state.
+                let (_inlined_id, insert) =
+                    inlined_data_insert(data_entry.clone(), table_id, assigned_sequence);
+                tx.execute(insert)
+                    .await
+                    .map_err(|e| CatalogError::InvalidOperation {
+                        message: "Failed to execute inline mutation transaction".to_string(),
+                        source: Box::new(e),
+                    })?;
             }
 
             match tx.commit().await {
@@ -4964,6 +4977,52 @@ fn insert_record_table_id_blob_literal(table_id: &str) -> String {
     hex
 }
 
+/// The one statement that appends a row to `cayenne_inlined_data`. Shared by
+/// every inline write path so the column list and parameter order cannot drift
+/// between them; see [`inlined_data_insert`].
+const INLINED_DATA_INSERT_SQL: &str = "INSERT INTO cayenne_inlined_data \
+     (inlined_id, table_id, partition_key, data_ipc, record_count, sequence_number) \
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6)";
+
+/// Bind one `cayenne_inlined_data` row, minting a `UUIDv7` identity when the row
+/// carries none, and return that identity alongside the statement.
+///
+/// Every inline write path funnels through here: the standalone
+/// [`MetadataCatalog::add_inlined_data`], the CDC
+/// [`MetadataCatalog::commit_inlined_mutation`], and the overwrite's atomic
+/// clear-then-replace in [`CayenneCatalog::commit_overwrite_in_txn`].
+///
+/// `table_id` and `sequence_number` are passed separately rather than read off
+/// `data`: the mutation path validates the caller's `table_id` against every row
+/// and stamps each appended row with the sequence its caller allocated, which is
+/// not the (unset) sequence on the row it hands in.
+fn inlined_data_insert(
+    data: InlinedData,
+    table_id: &str,
+    sequence_number: i64,
+) -> (String, ExecuteParams<'static>) {
+    let inlined_id = if data.inlined_id.is_empty() {
+        uuid::Uuid::now_v7().to_string()
+    } else {
+        data.inlined_id
+    };
+    let params = vec![
+        MetastoreValue::Text(inlined_id.clone()),
+        MetastoreValue::Text(table_id.to_string()),
+        data.partition_key.into(),
+        MetastoreValue::Blob(data.data_ipc),
+        MetastoreValue::Integer(data.record_count),
+        MetastoreValue::Integer(sequence_number),
+    ];
+    (
+        inlined_id,
+        ExecuteParams {
+            sql: INLINED_DATA_INSERT_SQL,
+            params,
+        },
+    )
+}
+
 async fn ensure_snapshot_directory_exists(table: &TableMetadata) -> CatalogResult<()> {
     if table.path.starts_with("s3://") {
         return Ok(());
@@ -5267,7 +5326,12 @@ mod tests {
         );
 
         drop(catalog);
-        let _ = std::fs::remove_file(test_db.trim_start_matches("sqlite://"));
+
+        // Cleanup test database
+        let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(format!("{db_path}-shm"));
+        let _ = std::fs::remove_file(format!("{db_path}-wal"));
     }
 
     #[tokio::test]

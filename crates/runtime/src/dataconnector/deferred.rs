@@ -52,6 +52,7 @@ impl DeferredConnector {
     }
 }
 
+#[deny(clippy::missing_trait_methods)]
 #[async_trait]
 impl DataConnector for DeferredConnector {
     fn as_any(&self) -> &dyn Any {
@@ -104,7 +105,7 @@ impl DataConnector for DeferredConnector {
 
     fn changes_stream(
         &self,
-        _federated_table: Arc<crate::federated_table::FederatedTable>,
+        _federated_table: Arc<crate::federated::FederatedTable>,
         _dataset: &Dataset,
     ) -> Option<data_components::cdc::ChangesStream> {
         None
@@ -116,7 +117,7 @@ impl DataConnector for DeferredConnector {
 
     fn append_stream(
         &self,
-        _federated_table: Arc<crate::federated_table::FederatedTable>,
+        _federated_table: Arc<crate::federated::FederatedTable>,
     ) -> Option<data_components::cdc::ChangesStream> {
         None
     }
@@ -131,7 +132,7 @@ impl DataConnector for DeferredConnector {
     async fn on_accelerator_setup(
         &self,
         dataset: &Dataset,
-        builder: &mut crate::accelerated_table::Builder,
+        builder: &mut crate::accelerated::Builder,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.inner.on_accelerator_setup(dataset, builder).await
     }
@@ -139,7 +140,7 @@ impl DataConnector for DeferredConnector {
     async fn on_accelerated_table_registration(
         &self,
         dataset: &Dataset,
-        accelerated_table: &mut crate::accelerated_table::AcceleratedTable,
+        accelerated_table: &mut crate::accelerated::AcceleratedTable,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.inner
             .on_accelerated_table_registration(dataset, accelerated_table)

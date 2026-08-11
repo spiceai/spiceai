@@ -15,11 +15,7 @@ limitations under the License.
 */
 
 use super::{ConnectorParams, DataConnector, DataConnectorFactory, ParameterSpec, Parameters};
-use crate::accelerated_table::refresh_task::changes::{
-    CdcSchemaEvolution, SCHEMA_EVOLUTION_APPLIED, SCHEMA_EVOLUTION_DETECTED,
-    SCHEMA_EVOLUTION_FAILED, install_cdc_schema_evolution, schema_evolution_labels,
-    widening_plan_kind,
-};
+use crate::accelerated::refresh_task::changes::{CdcSchemaEvolution, install_cdc_schema_evolution};
 use crate::component::dataset::acceleration::{Engine, RefreshMode};
 use crate::component::dataset::{Dataset, OnSchemaChange};
 use crate::dataaccelerator::spice_sys::{self, OpenOption, debezium_kafka::DebeziumKafkaSys};
@@ -29,8 +25,11 @@ use crate::dataconnector::{
     kafka::{SidecarOffsetCommitHook, SidecarOffsetStore},
 };
 use crate::datafusion::refresh_sql;
-use crate::federated_table::FederatedTable;
-use crate::schema_evolution::evolution_allowed;
+use crate::federated::FederatedTable;
+use crate::schema_evolution::{
+    SCHEMA_EVOLUTION_APPLIED, SCHEMA_EVOLUTION_DETECTED, SCHEMA_EVOLUTION_FAILED,
+    evolution_allowed, schema_evolution_labels, widening_plan_kind,
+};
 use arrow::datatypes::SchemaRef;
 use arrow_tools::schema_evolution::{self, EvolutionContext, SchemaEvolution};
 use async_stream::stream;

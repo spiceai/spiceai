@@ -30,6 +30,7 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Weak;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use std::{collections::HashMap, sync::Arc};
 use token_provider::registry::TokenProviderRegistry;
@@ -84,7 +85,7 @@ use crate::cluster::{
 use crate::extension::Extension;
 use crate::udtfs::ListUDFTableFunc;
 use runtime_async::cancellable_task::{CancellableTaskHandle, spawn_cancellable_task};
-pub mod accelerated_table;
+pub use runtime_table::accelerated;
 pub(crate) mod accelerator_memory_budget;
 pub mod auth;
 pub mod builder;
@@ -96,13 +97,13 @@ pub mod dataaccelerator;
 pub mod dataconnector;
 pub mod datafusion;
 pub mod datasets_health_monitor;
-pub mod dataupdate;
+pub use runtime_acceleration::dataupdate;
 pub(crate) mod egress;
 pub mod embeddings;
 pub mod execution_plan;
 pub mod executor_table;
 pub mod extension;
-pub mod federated_table;
+pub use runtime_table::federated;
 pub mod flight;
 mod http;
 
@@ -120,14 +121,18 @@ pub mod model;
 mod object_store_state;
 pub mod opentelemetry;
 pub mod otel_push_exporter;
-pub mod resource_monitor;
+// Host/container resource introspection lives in `runtime-resources`; it names
+// nothing from the runtime. Re-exported so `crate::resource_monitor::…` resolves.
+pub mod resource_monitor {
+    pub use runtime_resources::*;
+}
 
 pub use runtime_parameters as parameters;
 
 pub mod podswatcher;
 pub mod request;
 mod scheduling;
-pub(crate) mod schema_evolution;
+pub(crate) use runtime_component::schema_evolution;
 pub mod search;
 pub mod secrets {
     pub use runtime_secrets::*;
@@ -136,6 +141,7 @@ pub mod cluster;
 mod secrets_preflight;
 pub mod spice_metrics;
 pub mod status;
+pub(crate) mod table_layers;
 pub mod task_history;
 pub mod tls;
 pub mod token_providers;
@@ -531,6 +537,33 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 #[derive(Clone, Copy)]
 pub struct LogErrors(pub bool);
 
+/// State of the initial [`Runtime::load_components`] pass.
+///
+/// The load has no deadline: `load_dataset` retries a transient failure for as
+/// long as the runtime is up, so a spicepod the runtime cannot satisfy — an
+/// unreachable source, a `${ secrets:… }` reference nothing resolves — leaves
+/// the load running indefinitely. A caller holding the configuration that fixes
+/// that (Spice Cloud Connect applying a deployment) needs to supersede the load
+/// rather than race it: a load left running keeps registering datasets from the
+/// app it started against, after a new app has replaced it.
+///
+/// `in_flight` starts `true` — a load is pending from the moment the runtime
+/// exists — so a supersede that lands before the load begins still stops it,
+/// and `load_components` returns without starting.
+struct InitialLoad {
+    cancel: CancellationToken,
+    in_flight: AtomicBool,
+}
+
+impl Default for InitialLoad {
+    fn default() -> Self {
+        Self {
+            cancel: CancellationToken::new(),
+            in_flight: AtomicBool::new(true),
+        }
+    }
+}
+
 #[derive(Clone)]
 #[expect(clippy::struct_field_names)]
 pub struct Runtime {
@@ -547,6 +580,10 @@ pub struct Runtime {
     /// keeping the read-lock-for-diff / write-lock-for-swap discipline, so the
     /// diff phase can still read the app `RwLock` without deadlocking.
     apply_app_lock: Arc<tokio::sync::Mutex<()>>,
+    /// State of the process's one-time initial component load, so a caller that
+    /// cannot wait for it can stop it. See [`Runtime::supersede_initial_load`].
+    /// Shared, not copied, so every clone of the runtime supersedes the same load.
+    initial_load: Arc<InitialLoad>,
     df: Arc<DataFusion>,
     llm_runtime_stores: Arc<model::LlmRuntimeStores>,
     http_rate_control_registry: Arc<dataconnector::http_rate_control::HttpRateControlRegistry>,
@@ -572,7 +609,7 @@ pub struct Runtime {
 
     autoload_extensions: Arc<HashMap<String, Box<dyn ExtensionFactory>>>,
     extensions: Arc<RwLock<HashMap<String, Arc<dyn Extension>>>>,
-    spaced_tracer: Arc<tracers::SpacedTracer>,
+    spaced_tracer: Arc<util::tracers::SpacedTracer>,
 
     status: Arc<status::RuntimeStatus>,
     tasks: Arc<RwLock<HashMap<String, CancellableTaskHandle>>>,
@@ -1636,11 +1673,48 @@ impl Runtime {
         }
     }
 
+    /// Abandon the initial component load.
+    ///
+    /// The load has no deadline — `load_dataset` retries a transient failure for
+    /// as long as the runtime is up — so a process that is on its way out (a
+    /// Spice Cloud deployment restarting onto a new spicepod) has to be able to
+    /// stop it: left running it keeps registering datasets from the
+    /// configuration being replaced, for the whole of the shutdown drain.
+    ///
+    /// Returns `true` only when this call is the one that stopped a pending or
+    /// running load, and `false` once the load has finished or was already
+    /// superseded.
+    ///
+    /// Components already registered when this fires stay registered; only the
+    /// load's remaining work is dropped.
+    pub fn supersede_initial_load(&self) -> bool {
+        if self.initial_load.in_flight.swap(false, Ordering::SeqCst) {
+            tracing::info!(
+                "Superseding the initial component load: a new configuration replaces the one being loaded"
+            );
+            self.initial_load.cancel.cancel();
+            true
+        } else {
+            false
+        }
+    }
+
     /// Will load all of the components of the Runtime, including `secret_stores`, `catalogs`, `datasets`, `models`, and `embeddings`.
     ///
     /// The future returned by this function will not resolve until all components have been loaded and marked as ready.
     /// This includes waiting for the first refresh of any accelerated tables to complete.
+    ///
+    /// [`Runtime::supersede_initial_load`] abandons the load — including before
+    /// it starts, in which case this returns immediately and the superseding
+    /// caller loads the app it applied.
     pub async fn load_components(self: Arc<Self>) {
+        if self.initial_load.cancel.is_cancelled() {
+            tracing::info!(
+                "Skipping the initial component load: it was superseded before it started"
+            );
+            return;
+        }
+
         Arc::clone(&self).set_components_initializing().await;
 
         Arc::clone(&self).start_extensions().await;
@@ -1708,8 +1782,9 @@ impl Runtime {
 
         let components = vec![task_history, datasets, catalogs, models];
 
-        // Signal that the load must be canceled if the runtime is shut down before the components are loaded
-        let cancel_loading = CancellationToken::new();
+        // Signal that the load must be canceled if the runtime is shut down before the components are loaded.
+        // A child of the initial-load token so `supersede_initial_load` abandons the load through this same path.
+        let cancel_loading = self.initial_load.cancel.child_token();
 
         // Wait for all components to load returning the first error
         // or canceling spawned tokio tasks if the runtime is shutting down
@@ -1738,7 +1813,13 @@ impl Runtime {
             )
             .await;
 
-        if let Err(err) = load_result.await {
+        let load_outcome = load_result.await;
+
+        // The initial load is over — completed, failed, or cancelled — so a
+        // later deployment has nothing left to supersede and applies normally.
+        self.initial_load.in_flight.store(false, Ordering::SeqCst);
+
+        if let Err(err) = load_outcome {
             if !matches!(err, Error::ComponentsInitializationCancelled) {
                 tracing::error!("Could not start the Spice runtime: {err}");
             }

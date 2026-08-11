@@ -28,7 +28,7 @@ use futures::StreamExt;
 use runtime_datafusion_index::IndexedTableProvider;
 use tokio::sync::RwLock;
 
-use crate::accelerated_table::{self, AcceleratedTable};
+use crate::accelerated::{self, AcceleratedTable};
 use crate::changes::{Indexes, index_change_envelope};
 use crate::component::{
     ComponentInitialization,
@@ -38,11 +38,11 @@ use crate::component::{
     },
 };
 use crate::dataconnector::{DataConnector, DataConnectorError, DataConnectorResult};
-use crate::federated_table::FederatedTable;
+use crate::federated::FederatedTable;
 use crate::search::full_text::table::add_compound_fts_to_table;
 use crate::search::util::find_concrete_table_provider;
 use runtime_metrics::component::MetricsProvider;
-use runtime_parameters::typed::TypedParams as _;
+use runtime_parameters_typed::TypedParams as _;
 use runtime_search::store_params::elasticsearch::{
     ElasticsearchFtsConfig, ElasticsearchFtsParams, normalize_elasticsearch_prefix,
 };
@@ -144,6 +144,7 @@ impl ElasticsearchFullTextConnector {
     }
 }
 
+#[deny(clippy::missing_trait_methods)]
 #[async_trait]
 impl DataConnector for ElasticsearchFullTextConnector {
     fn as_any(&self) -> &dyn Any {
@@ -228,7 +229,7 @@ impl DataConnector for ElasticsearchFullTextConnector {
     async fn on_accelerator_setup(
         &self,
         dataset: &Dataset,
-        builder: &mut accelerated_table::Builder,
+        builder: &mut accelerated::Builder,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.inner_connector
             .on_accelerator_setup(dataset, builder)
@@ -275,6 +276,10 @@ impl DataConnector for ElasticsearchFullTextConnector {
 
     fn append_stream(&self, federated_table: Arc<FederatedTable>) -> Option<ChangesStream> {
         self.with_indexed_stream(federated_table, |inner, table| inner.append_stream(table))
+    }
+
+    fn initialization_for_dataset(&self, dataset: &Dataset) -> ComponentInitialization {
+        self.inner_connector.initialization_for_dataset(dataset)
     }
 }
 

@@ -39,21 +39,21 @@ limitations under the License.
 //! clicked Adopt) — the cert was already issued at enroll, so the client
 //! just acknowledges against the identity it holds.
 //!
-//! If a Remove arrives, we clear the local identity from disk and, on
+//! If a `Remove` arrives, we clear the local identity from disk and, on
 //! success, exit the cloud-connect task — spiced itself stays up and keeps
 //! serving local spicepod traffic as before. This matches the adoption
-//! semantics where Remove releases management but doesn't destroy the
+//! semantics where a release stops management but doesn't destroy the
 //! device. To re-adopt, the user runs `spice connect <code>` and restarts
-//! spiced. If the on-disk identity cannot be cleared, the Remove is
+//! spiced. If the on-disk identity cannot be cleared, the `Remove` is
 //! reported as failed and the driver stays connected with the still-valid
-//! identity rather than falsely exiting as removed.
+//! identity rather than falsely reporting the instance as released.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use crate::TransportSnafu;
 use snafu::ResultExt;
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::{RwLock, Semaphore, mpsc};
 use tokio::time;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::Streaming;
@@ -62,7 +62,8 @@ use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint};
 use crate::config::CloudConnectConfig;
 use crate::enroll::{EnrollClient, RENEWAL_GRACE};
 use crate::handlers::{
-    Capability, CommandError, RestartMode, RuntimeHandle, advertised_capabilities,
+    Capability, CommandError, MAX_QUERY_RESULT_BYTES, PostApply, RestartMode, RuntimeHandle,
+    SpicepodDeployment, advertised_capabilities, effective_max_rows,
 };
 use crate::heartbeat::{build_heartbeat, build_telemetry, now_unix};
 use crate::identity::{Identity, IdentityStore};
@@ -83,13 +84,22 @@ const RENEW_RETRY_INTERVAL: Duration = Duration::from_mins(5);
 /// Outbound channel size: bounded to keep memory predictable.
 const CLIENT_CHANNEL_SIZE: usize = 64;
 
+/// How long the client waits for the outbound channel to drain before exiting
+/// the process to apply a deployment, and how often it re-checks.
+///
+/// Best-effort by design: the spicepod is already persisted and the restart is
+/// what makes it live, so a slow gateway delays the exit by at most this budget
+/// rather than stalling the deployment on a result nobody is waiting for.
+const APPLY_FLUSH_BUDGET: Duration = Duration::from_secs(5);
+const APPLY_FLUSH_POLL: Duration = Duration::from_millis(25);
+
 /// State held by the driver across reconnects.
 pub(crate) struct ClientDriver {
     config: CloudConnectConfig,
     runtime: Arc<dyn RuntimeHandle>,
     shutdown: Arc<Shutdown>,
     /// Currently-effective identity, if any. Set by out-of-band enrollment,
-    /// replaced on renewal (rotated keypair); cleared on Remove or when
+    /// replaced on renewal (rotated keypair); cleared on `Remove` or when
     /// the cloud permanently refuses renewal (revocation).
     identity: Option<Identity>,
     /// Earliest instant the next in-stream renewal attempt may run — set
@@ -97,6 +107,12 @@ pub(crate) struct ClientDriver {
     /// paced by [`RENEW_RETRY_INTERVAL`] rather than spinning on a
     /// due-in-the-past `not_after`. Cleared on enrollment.
     renew_not_before: Option<time::Instant>,
+    /// The single `ExecuteQuery` slot. Its one permit is taken by the spawned
+    /// query task and released when that task ends, so a second query is
+    /// refused as busy before it executes. Held on the driver rather than the
+    /// stream so a reconnect cannot hand out a second slot while the first
+    /// query is still running.
+    query_slot: Arc<Semaphore>,
 }
 
 impl ClientDriver {
@@ -112,6 +128,7 @@ impl ClientDriver {
             shutdown,
             identity,
             renew_not_before: None,
+            query_slot: Arc::new(Semaphore::new(1)),
         }
     }
 
@@ -119,7 +136,7 @@ impl ClientDriver {
     ///
     /// The driver is fully fault-tolerant: a transport, decode, or
     /// stream error triggers a reconnect with backoff; only an explicit
-    /// shutdown notify, a Remove, or a non-recoverable credential state
+    /// shutdown notify, a `Remove`, or a non-recoverable credential state
     /// exits the loop.
     pub(crate) async fn run(mut self) -> Result<()> {
         let enroll_client = match EnrollClient::new(&self.config) {
@@ -175,7 +192,7 @@ impl ClientDriver {
                 Ok(ExitReason::Shutdown) => return Ok(()),
                 Ok(ExitReason::Removed) => {
                     tracing::info!(
-                        "Cloud Connect: Remove acknowledged; cloud-connect task exiting. spiced remains running and serving local spicepod traffic. To re-adopt, run `spice connect <code>` and restart spiced."
+                        "Cloud Connect: Remove acknowledged; this instance was released and the cloud-connect task is exiting. spiced remains running and serving local spicepod traffic. To re-adopt, run `spice connect <code>` and restart spiced."
                     );
                     return Ok(());
                 }
@@ -287,7 +304,7 @@ impl ClientDriver {
                 Ok(()) => {}
                 Err(err) if err.is_authoritative_rejection() => {
                     // Renewal authoritatively refused by the cloud: the
-                    // instance was removed/revoked cloud-side (refusing
+                    // instance was removed or revoked cloud-side (refusing
                     // renewal IS the revocation, DR-025) or the pinned key no
                     // longer matches. The identity is dead; the next pass
                     // enrolls with a staged code or exits with re-adopt
@@ -367,13 +384,18 @@ impl ClientDriver {
         client: &EnrollClient,
         code: &str,
     ) -> Result<(), enroll::Error> {
-        let (identity, app_name) = enroll::acquire_identity(client, code, &self.config).await?;
+        let (identity, registration) = enroll::acquire_identity(client, code, &self.config).await?;
         self.persist_identity(&identity).await;
         tracing::info!(
-            "Cloud Connect: enrolled as {}{} (gateway {}); identity stored at {}",
+            "Cloud Connect: enrolled as {}{}{} (gateway {}); identity stored at {}",
             identity.identifier,
-            app_name
+            registration
+                .app_name
                 .map(|app| format!(" attached to app {app}"))
+                .unwrap_or_default(),
+            registration
+                .region
+                .map(|region| format!(" in region {region}"))
                 .unwrap_or_default(),
             identity.gateway_addr,
             self.config.identity_path.display()
@@ -404,7 +426,7 @@ impl ClientDriver {
         })?;
         let outcome = client.renew(&current, &material).await?;
 
-        let rotated = Identity {
+        let mut rotated = Identity {
             identifier: current.identifier,
             identity_cert_pem: outcome.identity_cert_pem,
             private_key_pem: material.private_key_pem,
@@ -413,19 +435,38 @@ impl ClientDriver {
             ca_bundle_pem: current.ca_bundle_pem,
             gateway_addr: current.gateway_addr,
             not_after_unix: Some(outcome.not_after_unix),
-            // The encryption keypair rotates alongside the identity keypair
-            // on each renewal: the cloud pins it in the same transaction
-            // that issues the new leaf, and begins sealing secrets to it.
-            enc_private_key_pem: material.enc_private_key_pem,
-            enc_public_key_pem: material.enc_public_key_pem,
+            // The app attribution is not part of the credential and /renew
+            // does not re-send it, so it rides across the rotation unchanged.
+            app_id: current.app_id,
+            // Seeded with the OUTGOING keypair and rotated by the call below,
+            // which shifts it into `enc_previous_private_key_pem` — assigning
+            // `material` here instead would leave the retained key equal to the
+            // current one, retaining nothing.
+            enc_private_key_pem: current.enc_private_key_pem,
+            enc_public_key_pem: current.enc_public_key_pem,
+            enc_previous_private_key_pem: current.enc_previous_private_key_pem,
+            // Local and deliberately never rotated: the cache must stay
+            // readable across every identity rotation.
+            cache_key_b64: current.cache_key_b64,
         };
+        // The encryption keypair rotates alongside the identity keypair on each
+        // renewal: the renew request already carried this public key, so the
+        // cloud pinned it in the same transaction that issued the new leaf and
+        // seals to it from that commit on.
+        //
+        // The outgoing private key is retained for exactly one rotation, because
+        // a payload sealed moments before this point is still addressed to it and
+        // cannot be re-sealed in flight.
+        rotated.rotate_encryption_key(material.enc_private_key_pem, material.enc_public_key_pem);
         // The cloud has already pinned the new public key: even if
         // persistence fails, the rotated identity must be used in memory
         // (the old key can no longer renew). `persist_identity` logs the
         // failure; the next successful renewal re-attempts the write.
-        self.persist_identity(&rotated).await;
+        rotated = self
+            .persist_identity_preserving_attachment(rotated, "renewed identity")
+            .await;
         tracing::info!(
-            "Cloud Connect: identity renewed for {} (keypair rotated, valid until {})",
+            "Cloud Connect: identity renewed for {} (identity and encryption keypairs rotated, valid until {})",
             rotated.identifier,
             rotated
                 .not_after_unix
@@ -461,6 +502,45 @@ impl ClientDriver {
         );
     }
 
+    /// Persist a full credential update while retaining the attachment most
+    /// recently written by a command handler.
+    async fn persist_identity_preserving_attachment(
+        &self,
+        identity: Identity,
+        update: &'static str,
+    ) -> Identity {
+        let path = self.config.identity_path.clone();
+        let fallback = identity.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            IdentityStore::store_credential_update(&path, &identity)
+        })
+        .await;
+        match result {
+            Ok(Ok(Some(merged))) => merged,
+            Ok(Ok(None)) => {
+                tracing::error!(
+                    "Cloud Connect: identity disappeared while the {update} was being persisted at {}; continuing with the updated in-memory identity",
+                    self.config.identity_path.display()
+                );
+                fallback
+            }
+            Ok(Err(error)) => {
+                tracing::error!(
+                    "Cloud Connect: failed to persist the {update} at {}: {error}; continuing with the updated in-memory identity (it will be lost on restart)",
+                    self.config.identity_path.display()
+                );
+                fallback
+            }
+            Err(error) => {
+                tracing::error!(
+                    "Cloud Connect: {update} persistence task failed at {}: {error}; continuing with the updated in-memory identity (it will be lost on restart)",
+                    self.config.identity_path.display()
+                );
+                fallback
+            }
+        }
+    }
+
     /// Remove the staged pending-adoption-code file, if configured. A
     /// missing file is success.
     async fn discard_pending_code(&self) {
@@ -479,7 +559,7 @@ impl ClientDriver {
     }
 
     /// Clear the identity from disk and memory (best-effort on the disk
-    /// side — unlike Remove, the cloud has already invalidated it, so a
+    /// side — unlike `Remove`, the cloud has already invalidated it, so a
     /// stale file only produces a failed renewal on the next start).
     async fn clear_identity(&mut self) {
         if let Err(err) = IdentityStore::clear_async(&self.config.identity_path).await {
@@ -546,9 +626,50 @@ impl ClientDriver {
         let mut server_stream: Streaming<proto::ControlMessage> = response.into_inner();
         tracing::info!("Cloud Connect: stream established to {endpoint}");
 
-        // Spawn periodic heartbeat + telemetry tasks. They emit through
-        // the same outbound channel. The identifier is shared by RwLock
-        // so a Remove can blank it for frames still in flight on the
+        // Announce a per-connection encryption key. The gateway seals the
+        // control plane's already-sealed secret envelope to this key before
+        // dispatching it, so recorded ciphertext stays undecryptable even if the
+        // persisted enrolled key is later compromised. A session that announces
+        // no key receives no secrets at all — so failing to generate one is a
+        // "no secrets this session" degradation, not a reason to drop the stream
+        // and lose every other command with it.
+        let session_key = match cloud_connect_crypto::EncryptionKeypair::generate() {
+            Ok(keypair) => {
+                let announcement = proto::SecretsKey {
+                    key_id: keypair.key_id().to_string(),
+                    kem_id: cloud_connect_crypto::KEM_ID,
+                    kdf_id: cloud_connect_crypto::KDF_ID,
+                    aead_id: cloud_connect_crypto::AEAD_ID,
+                    public_key: keypair.public_key().to_vec(),
+                };
+                if tx
+                    .send(proto::ClientMessage {
+                        body: Some(proto::client_message::Body::SecretsKey(announcement)),
+                    })
+                    .await
+                    .is_err()
+                {
+                    return Ok(ExitReason::Disconnected);
+                }
+                tracing::debug!(
+                    "Cloud Connect: announced per-connection secrets key {}",
+                    keypair.key_id()
+                );
+                Some(Arc::new(keypair))
+            }
+            Err(err) => {
+                tracing::warn!(
+                    "Cloud Connect: could not generate a per-connection secrets key ({err}); \
+                     this session cannot receive delivered secrets. Deployments still apply, and \
+                     any cached secrets remain in effect."
+                );
+                None
+            }
+        };
+
+        // Spawn the periodic heartbeat, metrics, and telemetry tasks. They emit
+        // through the same outbound channel. The identifier is shared by RwLock
+        // so a `Remove` can blank it for frames still in flight on the
         // draining stream.
         let runtime = Arc::clone(&self.runtime);
         let identifier = Arc::new(RwLock::new(identity.identifier.clone()));
@@ -573,6 +694,84 @@ impl ClientDriver {
                 };
                 if hb_tx.send(msg).await.is_err() {
                     break;
+                }
+            }
+        });
+
+        // Metrics ride the same stream but not the same delivery guarantee. The
+        // payload carries cumulative totals, so a dropped export costs a data
+        // point and no data — whereas a late heartbeat is read as an instance
+        // going away. This task therefore offers its message and moves on
+        // instead of waiting for room behind one.
+        let met_tx = tx.clone();
+        let met_runtime = Arc::clone(&runtime);
+        let met_identifier = Arc::clone(&identifier);
+        let met_interval = self.config.metrics_interval;
+        // Collecting metrics is CPU work the other periodic tasks do not do, so
+        // this one races the shutdown signal rather than relying on the `abort()`
+        // below: aborting resolves only at an await point, which can leave a
+        // collection running past the shutdown it was supposed to end.
+        let met_shutdown = Arc::clone(&self.shutdown);
+        let met_handle = tokio::spawn(async move {
+            let mut ticker = time::interval(met_interval);
+            ticker.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    () = met_shutdown.wait() => break,
+                    _ = ticker.tick() => {}
+                }
+                // Every interval accounts for itself: one line per tick, whatever
+                // the outcome. An export path that silently stops is
+                // indistinguishable from a runtime with nothing to report, which
+                // is the failure this whole feature exists to remove.
+                let id = met_identifier.read().await.clone();
+                if id.is_empty() {
+                    tracing::debug!(
+                        "Cloud Connect: metrics export skipped — enrollment has not assigned an identifier yet, so nothing could attribute the payload"
+                    );
+                    continue;
+                }
+                let payload = match met_runtime.collect_metrics().await {
+                    Ok(Some(payload)) => payload,
+                    Ok(None) => {
+                        tracing::debug!(
+                            identifier = %id,
+                            "Cloud Connect: metrics export skipped — the runtime reported no metrics to send"
+                        );
+                        continue;
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            "Failed to export metrics to Spice Cloud: {err}. Runtime will retry the export on the next interval. Metrics may be delayed to appear in Spice Cloud"
+                        );
+                        continue;
+                    }
+                };
+                let bytes = payload.len();
+                let msg = proto::ClientMessage {
+                    body: Some(proto::client_message::Body::ExportMetrics(
+                        proto::ExportMetrics {
+                            identifier: id.clone(),
+                            otlp_request: payload,
+                        },
+                    )),
+                };
+                match met_tx.try_send(msg) {
+                    Ok(()) => {
+                        tracing::debug!(
+                            identifier = %id,
+                            bytes,
+                            "Cloud Connect: metrics export queued to the gateway"
+                        );
+                    }
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        tracing::warn!(
+                            identifier = %id,
+                            bytes,
+                            "Failed to export metrics to Spice Cloud: the outbound queue is full. Runtime will retry the export on the next interval. Metrics may be delayed to appear in Spice Cloud"
+                        );
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => break,
                 }
             }
         });
@@ -612,7 +811,7 @@ impl ClientDriver {
                     match next {
                         Ok(Some(msg)) => {
                             if let Some(reason) = self
-                                .dispatch(&tx, msg, &identifier)
+                                .dispatch(&tx, msg, &identifier, session_key.as_deref())
                                 .await
                             {
                                 break reason;
@@ -662,6 +861,7 @@ impl ClientDriver {
         // out-of-band exit.
         hb_handle.abort();
         tel_handle.abort();
+        met_handle.abort();
         drop(tx);
 
         Ok(exit_reason)
@@ -672,6 +872,7 @@ impl ClientDriver {
         tx: &mpsc::Sender<proto::ClientMessage>,
         msg: proto::ControlMessage,
         live_identifier: &Arc<RwLock<String>>,
+        session_key: Option<&cloud_connect_crypto::EncryptionKeypair>,
     ) -> Option<ExitReason> {
         let command_id = msg.command_id;
         let Some(body) = msg.body else {
@@ -724,10 +925,23 @@ impl ClientDriver {
                     .supported(tx, &command_id, Capability::ApplySpicepod, name)
                     .await
                 {
-                    let result = self
-                        .runtime
-                        .apply_spicepod(&self.config.config_dir, &cmd.spicepod_yaml)
+                    self.handle_apply_spicepod(tx, &command_id, cmd, session_key)
                         .await;
+                }
+            }
+            proto::control_message::Body::AttachApp(cmd) => {
+                if self
+                    .supported(tx, &command_id, Capability::AttachApp, name)
+                    .await
+                {
+                    let app_id = cmd.app_id.as_deref();
+                    let result = if app_id.is_some_and(str::is_empty) {
+                        Err(CommandError::invalid_argument(
+                            "AttachApp.app_id must be non-empty when present",
+                        ))
+                    } else {
+                        self.runtime.attach_app(app_id).await
+                    };
                     reply_with_json(tx, &command_id, result).await;
                 }
             }
@@ -768,6 +982,14 @@ impl ClientDriver {
                         }
                         Err(err) => send_command_error(tx, &command_id, &err).await,
                     }
+                }
+            }
+            proto::control_message::Body::ExecuteQuery(cmd) => {
+                if self
+                    .supported(tx, &command_id, Capability::ExecuteQuery, name)
+                    .await
+                {
+                    self.handle_execute_query(tx, &command_id, cmd).await;
                 }
             }
             proto::control_message::Body::Adopt(cmd) => {
@@ -830,6 +1052,298 @@ impl ClientDriver {
         false
     }
 
+    /// Take the query slot and run the query on its own task.
+    ///
+    /// The pump must stay free to answer heartbeats and other commands while a
+    /// query executes, so nothing here awaits the query: the slot permit moves
+    /// into the spawned task and is released when that task ends, which is
+    /// also what makes a concurrent second query busy rather than queued.
+    ///
+    /// An empty statement is refused before the slot is taken, so a caller
+    /// sending blank queries cannot keep a real one out.
+    ///
+    /// The query is bounded by `query_deadline` rather than left to run: this
+    /// contract has no cancellation command, so a query that never returns
+    /// would hold the only slot for the life of the process.
+    async fn handle_execute_query(
+        &self,
+        tx: &mpsc::Sender<proto::ClientMessage>,
+        command_id: &str,
+        cmd: proto::ExecuteQuery,
+    ) {
+        if cmd.sql.trim().is_empty() {
+            send_result(
+                tx,
+                command_id,
+                proto::ResultCode::InvalidArgument,
+                "The query is empty. Send a SQL statement to execute.",
+                None,
+            )
+            .await;
+            return;
+        }
+
+        let Ok(permit) = Arc::clone(&self.query_slot).try_acquire_owned() else {
+            send_result(
+                tx,
+                command_id,
+                proto::ResultCode::Busy,
+                "This instance is already running a query. Cloud Connect runs one query at a time — retry once the running query finishes.",
+                None,
+            )
+            .await;
+            return;
+        };
+
+        let max_rows = effective_max_rows(cmd.max_rows);
+        let sql = cmd.sql;
+        let runtime = Arc::clone(&self.runtime);
+        let tx = tx.clone();
+        let command_id = command_id.to_string();
+        let deadline = self.config.query_deadline;
+
+        tokio::spawn(async move {
+            // Held for the whole query so the slot frees only once the work is
+            // genuinely finished, panic or not.
+            let _permit = permit;
+
+            let started = time::Instant::now();
+            let outcome = time::timeout(deadline, runtime.execute_query(&sql, max_rows)).await;
+            let elapsed_ms = started.elapsed().as_millis();
+
+            let Ok(outcome) = outcome else {
+                // Dropping the query future abandons the work and, with the
+                // permit, frees the slot. Without this a query that never
+                // returns would answer every later one as busy for the life of
+                // the process — there is no cancellation command to rescue it.
+                tracing::warn!(
+                    "Cloud Connect: query {command_id} exceeded the {}s deadline; abandoning the waiter and freeing the query slot",
+                    deadline.as_secs()
+                );
+                send_result(
+                    &tx,
+                    &command_id,
+                    proto::ResultCode::Failed,
+                    &format!(
+                        "The query exceeded this instance's {}s Cloud Connect limit and was abandoned; no result will follow. Narrow it, or run it against the instance directly.",
+                        deadline.as_secs()
+                    ),
+                    None,
+                )
+                .await;
+                return;
+            };
+
+            match outcome {
+                Ok(result) => {
+                    let bytes = result.arrow_ipc.len();
+                    // The handle serializes under the same caps, so these are
+                    // the contract boundary refusing to put an out-of-bounds
+                    // payload on the control stream rather than the primary
+                    // enforcement. A handle that miscounts or ignores the caps
+                    // is refused here instead of being forwarded.
+                    if bytes > MAX_QUERY_RESULT_BYTES {
+                        tracing::warn!(
+                            "Cloud Connect: query {command_id} produced {bytes} bytes, over the {MAX_QUERY_RESULT_BYTES} byte limit; answering result-too-large"
+                        );
+                        send_result(
+                            &tx,
+                            &command_id,
+                            proto::ResultCode::ResultTooLarge,
+                            &result_too_large_message(),
+                            None,
+                        )
+                        .await;
+                        return;
+                    }
+                    if result.row_count > u64::from(max_rows) {
+                        tracing::error!(
+                            "Cloud Connect: query {command_id} returned {} rows against a {max_rows} row limit; refusing the result",
+                            result.row_count
+                        );
+                        send_result(
+                            &tx,
+                            &command_id,
+                            proto::ResultCode::Internal,
+                            "The query result exceeded this instance's row limit and was not sent.",
+                            None,
+                        )
+                        .await;
+                        return;
+                    }
+                    tracing::debug!(
+                        "Cloud Connect: query {command_id} returned {} rows ({bytes} bytes) in {elapsed_ms}ms",
+                        result.row_count
+                    );
+                    send_ok(
+                        &tx,
+                        &command_id,
+                        Some(proto::command_result::Payload::Binary(result.arrow_ipc)),
+                    )
+                    .await;
+                }
+                Err(err) => {
+                    tracing::debug!(
+                        "Cloud Connect: query {command_id} failed after {elapsed_ms}ms: {}",
+                        result_code(&err).as_str_name()
+                    );
+                    send_command_error(&tx, &command_id, &err).await;
+                }
+            }
+        });
+    }
+
+    /// Handle an `ApplySpicepod`, opening any secrets that rode with it.
+    ///
+    /// A payload that fails to open **fails the whole command**: the spicepod is
+    /// not written and the components that referenced those secrets are left on
+    /// the previous configuration rather than started without them. Applying the
+    /// spicepod and dropping the secrets would report success and then fail
+    /// every referencing component with a missing-parameter error naming
+    /// nothing.
+    ///
+    /// A deployment applies by restart, so a successful apply usually ends with
+    /// this process exiting: the result is sent and flushed first, then the
+    /// runtime handle exits and the supervisor relaunches it on the persisted
+    /// spicepod. Sending the result first is what lets a caller see the
+    /// validation outcome at all — once the process is gone the stream is too,
+    /// so a result that has not been flushed by then is lost.
+    ///
+    /// `command_id` comes from the `ControlMessage` envelope, not from the
+    /// command body — and it is part of the outer AAD, so an envelope cannot be
+    /// replayed onto a different dispatch.
+    async fn handle_apply_spicepod(
+        &mut self,
+        tx: &mpsc::Sender<proto::ClientMessage>,
+        command_id: &str,
+        cmd: proto::ApplySpicepod,
+        session_key: Option<&cloud_connect_crypto::EncryptionKeypair>,
+    ) {
+        // The app id is not reported here. Whether one arrived only matters
+        // against what the handle already holds, which only the handle knows, so
+        // it is the handle that says what the deployment did to the attribution.
+        tracing::debug!(
+            command_id,
+            yaml_bytes = cmd.spicepod_yaml.len(),
+            "Spice Cloud Connect: received a Spicepod deployment"
+        );
+
+        let delivered = match cmd.sealed_secret_payload.as_ref() {
+            None => None,
+            Some(payload) => match self
+                .open_delivered_secrets(payload, command_id, session_key)
+                .await
+            {
+                Ok(secrets) => Some(secrets),
+                Err(err) => {
+                    send_command_error(tx, command_id, &err).await;
+                    return;
+                }
+            },
+        };
+
+        let outcome = self
+            .runtime
+            .apply_spicepod(SpicepodDeployment {
+                config_dir: &self.config.config_dir,
+                spicepod_yaml: &cmd.spicepod_yaml,
+                delivered_secrets: delivered,
+                // An empty app id on the wire means the control plane named no
+                // app, which is a different thing from an app named "".
+                app_id: Some(cmd.app_id.as_str()).filter(|id| !id.is_empty()),
+            })
+            .await;
+
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                tracing::warn!(
+                    command_id,
+                    "Failed to apply the Spicepod deployed from Spice Cloud: {err}. This instance keeps serving its current configuration; correct the Spicepod and deploy it again. See: https://spiceai.org/docs"
+                );
+                send_command_error(tx, command_id, &err).await;
+                return;
+            }
+        };
+        tracing::debug!(
+            command_id,
+            "Spice Cloud Connect: applied the deployed Spicepod"
+        );
+
+        send_ok_json(tx, command_id, &outcome.document).await;
+
+        if outcome.post_apply == PostApply::ExitToApply {
+            tracing::info!(
+                "Cloud Connect: the deployed spicepod is persisted; exiting so the supervisor restarts spiced on it"
+            );
+            flush_outbound(tx).await;
+            self.runtime.exit_to_apply().await;
+            // Reaching here means the handle did not exit. The spicepod stays
+            // persisted and takes effect on the next start, so say what state
+            // the instance is actually in rather than letting the control plane
+            // infer it from a deployment that never goes live.
+            tracing::error!(
+                "Cloud Connect: the runtime did not exit to apply the deployment; it is persisted but NOT live, and takes effect the next time spiced starts. Restart it via your process manager. See: https://spiceai.org/docs"
+            );
+        }
+    }
+
+    /// Open a delivered payload against this instance's keys.
+    ///
+    /// Errors are [`CommandError`]s so the control plane learns whether a retry
+    /// could help: a missing session key or an unknown enrolled key is
+    /// `InvalidArgument` (this envelope will never open here — re-deploy to
+    /// re-seal), while a local key-material fault is `Internal`. No variant
+    /// carries key or secret material.
+    async fn open_delivered_secrets(
+        &mut self,
+        payload: &proto::SealedSecretPayload,
+        command_id: &str,
+        session_key: Option<&cloud_connect_crypto::EncryptionKeypair>,
+    ) -> std::result::Result<crate::sealed_secrets::DeliveredSecrets, CommandError> {
+        let identity = self.identity.clone().ok_or_else(|| {
+            CommandError::internal("no identity is held, so delivered secrets cannot be opened")
+        })?;
+        let keyring = identity.encryption_keyring().map_err(|err| {
+            CommandError::invalid_argument(format!("delivered secrets could not be opened: {err}"))
+        })?;
+
+        let opened = crate::sealed_secrets::open_delivered(
+            payload,
+            &identity.identifier,
+            command_id,
+            session_key,
+            &keyring,
+        )
+        .map_err(|err| CommandError::invalid_argument(err.to_string()))?;
+
+        // The *current* key opening a payload proves the control plane is
+        // sealing to the rotated key, so nothing in flight can still be
+        // addressed to the retained one. Retiring it here is what stops a
+        // superseded private key lingering on disk indefinitely. A payload that
+        // opened with the previous key deliberately does not retire it.
+        if crate::sealed_secrets::opened_with_current(&opened.inner_key_id, &keyring) {
+            let mut updated = identity;
+            if updated.retire_previous_enc_key() {
+                self.identity = Some(
+                    self.persist_identity_preserving_attachment(
+                        updated,
+                        "previous encryption-key retirement",
+                    )
+                    .await,
+                );
+            }
+        }
+
+        // Count only — a name is safe to log, a value never is, and the count is
+        // enough to tell "secrets arrived" from "none did".
+        tracing::info!(
+            "Cloud Connect: opened {} delivered secret(s) for this deployment",
+            opened.secrets.len()
+        );
+        Ok(opened.secrets)
+    }
+
     async fn handle_adopt(
         &mut self,
         tx: &mpsc::Sender<proto::ClientMessage>,
@@ -843,7 +1357,7 @@ impl ClientDriver {
         // against the identity we already hold.
         let Some(identity) = self.identity.clone() else {
             // Reaching the stream at all requires an identity (mTLS), so
-            // this indicates a driver bug or a Remove racing the Adopt.
+            // this indicates a driver bug or a `Remove` racing the Adopt.
             tracing::error!("Cloud Connect: received Adopt while holding no identity; refusing");
             send_result(
                 tx,
@@ -978,6 +1492,9 @@ enum CredentialStep {
 enum ExitReason {
     Shutdown,
     Disconnected,
+    /// The cloud dispatched `Remove`: the local identity was cleared and the
+    /// instance released. `spiced` keeps serving; only the cloud-connect task
+    /// exits.
     Removed,
     /// The cloud permanently refused to renew the identity (revocation);
     /// the local identity was cleared before exiting the stream.
@@ -1094,6 +1611,32 @@ fn build_channel(
     Ok(endpoint.connect_lazy())
 }
 
+/// Wait for everything queued on the outbound channel to be handed to tonic,
+/// bounded by [`APPLY_FLUSH_BUDGET`].
+///
+/// Called before the process exits to apply a deployment. Full capacity means
+/// the transport took every queued frame — including the `CommandResult` just
+/// sent — which is as close to "it is on the wire" as a channel can report. The
+/// budget is what keeps a stalled gateway from holding up the deployment, which
+/// is already persisted and takes effect on the restart either way.
+async fn flush_outbound(tx: &mpsc::Sender<proto::ClientMessage>) {
+    let deadline = time::Instant::now() + APPLY_FLUSH_BUDGET;
+    while tx.capacity() < tx.max_capacity() {
+        if time::Instant::now() >= deadline {
+            tracing::warn!(
+                "Cloud Connect: the deployment result was still queued after {}; exiting anyway (the control plane reconciles the deployment from the version reported on reconnect)",
+                humanize(APPLY_FLUSH_BUDGET)
+            );
+            return;
+        }
+        if tx.is_closed() {
+            // The stream is gone, so nothing more will be sent from this queue.
+            return;
+        }
+        time::sleep(APPLY_FLUSH_POLL).await;
+    }
+}
+
 fn build_hello(
     config: &CloudConnectConfig,
     identity: &Identity,
@@ -1126,6 +1669,7 @@ fn command_name(body: &proto::control_message::Body) -> &'static str {
         Body::GetRuntimeInfo(_) => "GetRuntimeInfo",
         Body::Restart(_) => "Restart",
         Body::ApplySpicepod(_) => "ApplySpicepod",
+        Body::AttachApp(_) => "AttachApp",
         Body::UpgradeRuntime(_) => "UpgradeRuntime",
         Body::Adopt(_) => "Adopt",
         Body::Remove(_) => "Remove",
@@ -1137,7 +1681,18 @@ fn command_name(body: &proto::control_message::Body) -> &'static str {
         Body::ApplySecrets(_) => "ApplySecrets",
         Body::DeleteSecrets(_) => "DeleteSecrets",
         Body::GetLogs(_) => "GetLogs",
+        Body::ExecuteQuery(_) => "ExecuteQuery",
     }
+}
+
+/// What the control plane is told when a result will not fit on the control
+/// stream. Names the limit and the way out, and repeats neither the query nor
+/// any value from it.
+fn result_too_large_message() -> String {
+    format!(
+        "The query result exceeds the {} MiB Cloud Connect limit and was not sent. Return fewer rows or columns (a smaller LIMIT, a narrower projection, or an aggregate) and run it again.",
+        MAX_QUERY_RESULT_BYTES / (1024 * 1024)
+    )
 }
 
 /// Map the wire restart mode onto the handler-level one. A value a newer
@@ -1160,6 +1715,8 @@ fn result_code(err: &CommandError) -> proto::ResultCode {
         CommandError::InvalidArgument { .. } => proto::ResultCode::InvalidArgument,
         CommandError::Failed { .. } => proto::ResultCode::Failed,
         CommandError::Internal { .. } => proto::ResultCode::Internal,
+        CommandError::Busy { .. } => proto::ResultCode::Busy,
+        CommandError::ResultTooLarge { .. } => proto::ResultCode::ResultTooLarge,
     }
 }
 
@@ -1326,6 +1883,9 @@ mod tests {
             not_after_unix,
             enc_private_key_pem: String::new(),
             enc_public_key_pem: String::new(),
+            enc_previous_private_key_pem: String::new(),
+            cache_key_b64: String::new(),
+            app_id: None,
         }
     }
 
