@@ -29,6 +29,9 @@
 
 replicaCount: 1
 
+cloudConnect:
+  mode: bootstrap
+
 stateful:
   enabled: true
   mountPath: /data

@@ -34,7 +34,7 @@ fn unused_local_addr() -> SocketAddr {
     listener.local_addr().expect("read ephemeral address")
 }
 
-fn read_http_request(stream: &mut TcpStream) {
+fn read_http_request(stream: &mut TcpStream) -> serde_json::Value {
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .expect("set request read timeout");
@@ -59,9 +59,31 @@ fn read_http_request(stream: &mut TcpStream) {
             })
             .unwrap_or_default();
         if bytes.len() >= header_end + 4 + content_length {
-            return;
+            return serde_json::from_slice(&bytes[header_end + 4..header_end + 4 + content_length])
+                .expect("parse enrollment request JSON");
         }
     }
+}
+
+fn sign_enrollment_csr(csr_pem: &str) -> (String, String) {
+    use rcgen::{
+        BasicConstraints, CertificateParams, CertificateSigningRequestParams, IsCa, Issuer,
+        KeyPair, KeyUsagePurpose,
+    };
+
+    let ca_key = KeyPair::generate().expect("generate enrollment test CA key");
+    let mut ca_params = CertificateParams::default();
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign];
+    let ca_certificate = ca_params
+        .self_signed(&ca_key)
+        .expect("self-sign enrollment test CA");
+    let issuer = Issuer::new(ca_params, ca_key);
+    let identity_certificate = CertificateSigningRequestParams::from_pem(csr_pem)
+        .expect("parse enrollment CSR")
+        .signed_by(&issuer)
+        .expect("sign enrollment CSR");
+    (identity_certificate.pem(), ca_certificate.pem())
 }
 
 #[test]
@@ -80,7 +102,7 @@ fn enrollment_failure_happens_before_any_listener_or_readiness() {
     let server = std::thread::spawn(move || {
         let (mut stream, _) = enrollment_listener.accept().expect("accept enrollment");
         request_seen_tx.send(()).expect("signal request");
-        read_http_request(&mut stream);
+        let _request = read_http_request(&mut stream);
         respond_rx.recv().expect("wait for listener assertion");
 
         // Deliberately hostile response: the peer echoes the bearer. The
@@ -203,11 +225,15 @@ fn successful_enrollment_is_durable_before_the_runtime_listener_binds() {
 
     let server = std::thread::spawn(move || {
         let (mut stream, _) = enrollment_listener.accept().expect("accept enrollment");
-        read_http_request(&mut stream);
+        let request = read_http_request(&mut stream);
+        let csr_pem = request["csr_pem"]
+            .as_str()
+            .expect("enrollment request contains a CSR");
+        let (identity_cert_pem, ca_bundle_pem) = sign_enrollment_csr(csr_pem);
         let body = serde_json::json!({
             "instance_id": "inst_process_bootstrap",
-            "identity_cert_pem": "TEST CERTIFICATE",
-            "ca_bundle_pem": "",
+            "identity_cert_pem": identity_cert_pem,
+            "ca_bundle_pem": ca_bundle_pem,
             "gateway_addr": "127.0.0.1:9",
             "not_after": "2099-01-01T00:00:00Z",
             "organization": {"id": 42, "name": "acme"},

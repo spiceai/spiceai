@@ -19405,6 +19405,7 @@ dependencies = [
  "otel-arrow",
  "parking_lot",
  "prometheus",
+ "rcgen",
  "repl",
  "reqwest 0.13.4",
  "runtime",

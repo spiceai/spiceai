@@ -1,5 +1,5 @@
 def token_syntax_pattern:
-  "(^|[[:space:];|&])[$`'\"\\\\]*--token[`'\"\\\\]*($|[=$[:space:];|&])";
+  "(^|[[:space:];|&])[$`'\"\\\\]*-[$`'\"\\\\]*-[$`'\"\\\\]*t[$`'\"\\\\]*o[$`'\"\\\\]*k[$`'\"\\\\]*e[$`'\"\\\\]*n[`'\"\\\\]*($|[=$[:space:];|&])";
 
 def contains_token($container):
   (($container.command // []) + ($container.args // [])) as $command

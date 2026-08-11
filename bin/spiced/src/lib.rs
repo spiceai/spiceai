@@ -376,6 +376,7 @@ pub struct Args {
     #[arg(
         long,
         value_name = "ENROLLMENT_KEY",
+        conflicts_with = "repl",
         help_heading = "Spice Cloud Connect"
     )]
     pub token: Option<EnrollmentKeyArg>,
@@ -1922,6 +1923,17 @@ mod tests {
             "the bootstrap must be able to remove the raw argument before runtime startup"
         );
         assert_eq!(token.expose_secret(), "not-a-real-key");
+    }
+
+    #[test]
+    fn token_arg_conflicts_with_repl_without_echoing_the_key() {
+        let err = Args::try_parse_from(["spiced", "--repl", "--token", TEST_ENROLLMENT_KEY])
+            .expect_err("--token must not be accepted when the runtime bootstrap is bypassed");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+        assert!(
+            !err.to_string().contains(TEST_ENROLLMENT_KEY),
+            "clap conflict output must not reproduce the enrollment key"
+        );
     }
 
     #[test]

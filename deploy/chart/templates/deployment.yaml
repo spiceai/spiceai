@@ -1,5 +1,5 @@
 ---
-{{- include "spiceai.validateCloudConnectBootstrap" . }}
+{{- include "spiceai.validateCloudConnect" . }}
 apiVersion: apps/v1
 {{- if .Values.stateful.enabled }}
 kind: StatefulSet

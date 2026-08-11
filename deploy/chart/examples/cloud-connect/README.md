@@ -5,8 +5,8 @@ Enrolls one `spiced` instance with Spice Cloud using a one-time
 
 | Phase | Values | What it does |
 | --- | --- | --- |
-| 1. Bootstrap | `values-bootstrap.yaml` | `spiced --token "$(SPICE_ENROLL_KEY)"` enrolls before readiness and persists the identity at `SPICE_CONFIG_DIR` on the PVC. |
-| 2. Connected | `values-connected.yaml` | Same release without the key: the stored identity alone reconnects. The single-use Secret is deleted last. |
+| 1. Bootstrap | `values-bootstrap.yaml` | `cloudConnect.mode: bootstrap` validates a direct `spiced --token "$(SPICE_ENROLL_KEY)"`, then enrollment runs before readiness and persists the identity at `SPICE_CONFIG_DIR` on the PVC. |
+| 2. Connected | `values-connected.yaml` | `cloudConnect.mode: connected` validates the same persistent single-replica shape without the key: the stored identity alone reconnects. The single-use Secret is deleted last. |
 
 ## Phase 1 — bootstrap
 
@@ -60,7 +60,8 @@ example with `--reuse-values` or a maintained connected values file).
 ## Guardrails
 
 One enrollment key enrolls exactly one identity, so `helm template` fails —
-before anything renders — when a `--token` command is combined with:
+before anything renders — unless direct Cloud Connect explicitly uses
+`cloudConnect.mode: bootstrap` with:
 
 - `replicaCount` other than 1 (scaling a direct `--token` deployment above
   one replica is unsupported; multi-replica enrollment belongs to the
@@ -71,6 +72,14 @@ before anything renders — when a `--token` command is combined with:
   variable, or a literal/ambiguous matching environment entry — the token
   argument must expand exactly one Secret-backed environment variable
   (`"$(SPICE_ENROLL_KEY)"`). No chart value accepts a literal key.
+
+The chart deliberately supports only a direct command-array token option; it
+does not attempt to interpret arbitrary `sh -c` programs or custom entrypoint
+scripts. `cloudConnect.mode: bootstrap` rejects those computed forms instead
+of guessing whether they enroll. `cloudConnect.mode: connected` preserves the
+single-replica persistent-identity contract and rejects a retained direct
+token. Leave the default `disabled` mode for ordinary non-Cloud-Connect
+deployments.
 
 Kubernetes retains the key expansion in the phase-1 pod's argv and pod spec
 for that pod's full lifetime, even though `spiced` consumes the key before

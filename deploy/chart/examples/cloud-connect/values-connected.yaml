@@ -20,6 +20,9 @@
 
 replicaCount: 1
 
+cloudConnect:
+  mode: connected
+
 stateful:
   enabled: true
   mountPath: /data

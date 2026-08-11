@@ -5,7 +5,8 @@
 #    argument as a Secret-backed env expansion, SPICE_CONFIG_DIR on the
 #    volume — and never a literal enrollment key.
 #  - values-connected.yaml renders with no token or Secret reference left.
-#  - Template validation FAILS (before rendering) for every invalid shape:
+#  - Template validation FAILS (before rendering) for every invalid shape or
+#    unsupported implicit/computed bootstrap command:
 #    more than one replica, non-persistent storage, SPICE_CONFIG_DIR missing
 #    or off the volume, a literal enrollment key, or a token expansion that
 #    is not backed by exactly one Kubernetes Secret environment entry.
@@ -73,6 +74,13 @@ if output="$(render -f "${EXAMPLES}/values-connected.yaml")"; then
 else
   fail "values-connected.yaml failed to render: ${output}"
 fi
+if output="$(render -f "${EXAMPLES}/values-connected.yaml" --set replicaCount=0)"; then
+  fail "connected mode rendered with zero replicas"
+elif echo "${output}" | grep -q "Direct Cloud Connect requires one replica"; then
+  pass "connected mode rejects zero replicas"
+else
+  fail "connected mode rejected zero replicas for the wrong reason: ${output}"
+fi
 
 # --- Invalid shapes must fail before rendering, with the canonical message ---
 expect_rejected() {
@@ -81,7 +89,7 @@ expect_rejected() {
   local output
   if output="$(render -f "${EXAMPLES}/values-bootstrap.yaml" "$@")"; then
     fail "${reason}: template rendered but must be rejected"
-  elif echo "${output}" | grep -q "Cloud Connect --token"; then
+  elif echo "${output}" | grep -Eq "Cloud Connect|cloudConnect.mode"; then
     pass "${reason}: rejected with the Cloud Connect validation message"
   else
     fail "${reason}: rejected, but not by the Cloud Connect validation: ${output}"
@@ -89,6 +97,7 @@ expect_rejected() {
 }
 
 expect_rejected "replicaCount above one" --set replicaCount=2
+expect_rejected "replicaCount zero" --set replicaCount=0
 expect_rejected "non-persistent storage" --set stateful.enabled=false
 expect_rejected "startup probe shorter than the enrollment retry window" \
   --set startupProbe.failureThreshold=60
@@ -112,12 +121,28 @@ expect_rejected "a quoted shell-form token command" \
   --set-json 'command=["/bin/sh","-c","spiced '\''--token'\'' $(SPICE_ENROLL_KEY)"]'
 expect_rejected "a backslash-escaped shell-form token command" \
   --set-json 'command=["/bin/sh","-c","spiced \\--token $(SPICE_ENROLL_KEY)"]'
+expect_rejected "a shell-spliced backslash token command" \
+  --set-json 'command=["/bin/sh","-c","spiced --to\\ken $(SPICE_ENROLL_KEY)"]'
+expect_rejected "a shell-spliced quoted token command" \
+  --set-json 'command=["/bin/sh","-c","spiced --to\"\"ken $(SPICE_ENROLL_KEY)"]'
+expect_rejected "a shell-variable-computed token command" \
+  --set-json 'command=["/bin/sh","-c","T=--token; exec spiced $T $SPICE_ENROLL_KEY"]'
+expect_rejected "a command-substitution-computed token command" \
+  --set-json 'command=["/bin/sh","-c","exec spiced $(printf %s --token)=$SPICE_ENROLL_KEY"]'
+expect_rejected "an encoded-computed token command" \
+  --set-json 'command=["/bin/sh","-c","exec spiced $(echo LS10b2tlbg== | base64 -d) $SPICE_ENROLL_KEY"]'
 expect_rejected "an ANSI-C-quoted shell-form token command" \
   --set-json 'command=["/bin/bash","-c","spiced $'\''--token'\'' $(SPICE_ENROLL_KEY)"]'
 expect_rejected "a quote-adjacent shell-form token command" \
   --set-json 'command=["/bin/sh","-c","spiced '\''--token'\''$(SPICE_ENROLL_KEY)"]'
 expect_rejected "mixed direct and shell-form token commands" \
   --set-json 'command=["/bin/sh","-c","spiced --token literal","--token","$(SPICE_ENROLL_KEY)"]'
+expect_rejected "--token after the end-of-options marker" \
+  --set-json 'command=["/usr/local/bin/spiced","--","--token","$(SPICE_ENROLL_KEY)"]'
+expect_rejected "--token while Cloud Connect mode is disabled" \
+  --set cloudConnect.mode=disabled
+expect_rejected "--token while Cloud Connect mode is connected" \
+  --set cloudConnect.mode=connected
 expect_rejected "--token with no value" \
   --set-json 'command=["/usr/local/bin/spiced","--http","0.0.0.0:8090","--token"]'
 expect_rejected "an undefined token environment variable" \
@@ -132,6 +157,7 @@ expect_rejected "duplicate token environment entries" \
 # A custom bootstrap that does not load the example inherits the chart's
 # ordinary 30-second startup probe and must be rejected before rendering.
 if output="$(render \
+  --set cloudConnect.mode=bootstrap \
   --set stateful.enabled=true \
   --set-json 'command=["spiced","--token","$(SPICE_ENROLL_KEY)"]' \
   --set-json 'additionalEnv=[{"name":"SPICE_ENROLL_KEY","valueFrom":{"secretKeyRef":{"name":"custom-enroll","key":"token"}}},{"name":"SPICE_CONFIG_DIR","value":"/data/.spice"}]')"; then
@@ -180,7 +206,7 @@ else
   pass "transition does not apply mount-bearing static example values"
 fi
 TRANSITION_FILTER="${EXAMPLES}/transition-values.jq"
-installed_values='{"command":["/usr/local/bin/spiced","--token","$(SPICE_ENROLL_KEY)","--http","0.0.0.0:8090","--set-runtime","custom.mode=enabled"],"additionalEnv":[{"name":"SPICE_ENROLL_KEY","valueFrom":{"secretKeyRef":{"name":"spice-cloud-connect","key":"enroll-key"}}},{"name":"SPICE_CONFIG_DIR","value":"/data/.spice"},{"name":"CUSTOM_FLAG","value":"kept"}]}'
+installed_values='{"command":["/usr/local/bin/spiced","--token","$(SPICE_ENROLL_KEY)","--http","0.0.0.0:8090","--set-runtime","custom.mode=enabled"],"additionalEnv":[{"name":"SPICE_ENROLL_KEY","valueFrom":{"secretKeyRef":{"name":"spice-cloud-connect","key":"enroll-key"}}},{"name":"SPICE_CONFIG_DIR","value":"/data/.spice"},{"name":"CUSTOM_FLAG","value":"kept"}],"cloudConnect":{"mode":"bootstrap"}}'
 if transition_plan="$(printf '%s' "${installed_values}" | jq -f "${TRANSITION_FILTER}")"; then
   connected_values="$(printf '%s' "${transition_plan}" | jq '.values')"
   if printf '%s' "${connected_values}" | jq -e '
@@ -190,6 +216,7 @@ if transition_plan="$(printf '%s' "${installed_values}" | jq -f "${TRANSITION_FI
     and (.additionalEnv | map(.name) | index("SPICE_ENROLL_KEY") == null)
     and (.additionalEnv | map(.name) | index("SPICE_CONFIG_DIR") != null)
     and (.additionalEnv | map(.name) | index("CUSTOM_FLAG") != null)
+    and (.cloudConnect.mode == "connected")
   ' >/dev/null; then
     pass "transition removes only the token argument and matching env"
   else
@@ -257,6 +284,18 @@ if printf '%s' "${escaped_shell_token_values}" | jq -f "${TRANSITION_FILTER}" >/
   fail "transition accepted backslash-escaped shell-form token syntax"
 else
   pass "transition rejects backslash-escaped shell-form token syntax before upgrade"
+fi
+spliced_escaped_shell_token_values='{"command":["/bin/sh","-c","spiced --to\\ken $(ENROLLMENT)"],"additionalEnv":[{"name":"ENROLLMENT","valueFrom":{"secretKeyRef":{"name":"secret","key":"token"}}}]}'
+if printf '%s' "${spliced_escaped_shell_token_values}" | jq -f "${TRANSITION_FILTER}" >/dev/null 2>&1; then
+  fail "transition accepted a shell-spliced backslash token option"
+else
+  pass "transition rejects shell-spliced backslash token syntax before upgrade"
+fi
+spliced_quoted_shell_token_values='{"command":["/bin/sh","-c","spiced --to\"\"ken $(ENROLLMENT)"],"additionalEnv":[{"name":"ENROLLMENT","valueFrom":{"secretKeyRef":{"name":"secret","key":"token"}}}]}'
+if printf '%s' "${spliced_quoted_shell_token_values}" | jq -f "${TRANSITION_FILTER}" >/dev/null 2>&1; then
+  fail "transition accepted a shell-spliced quoted token option"
+else
+  pass "transition rejects shell-spliced quoted token syntax before upgrade"
 fi
 ansi_quoted_shell_token_values='{"command":["/bin/bash","-c","spiced $'\''--token'\'' $(ENROLLMENT)"],"additionalEnv":[{"name":"ENROLLMENT","valueFrom":{"secretKeyRef":{"name":"secret","key":"token"}}}]}'
 if printf '%s' "${ansi_quoted_shell_token_values}" | jq -f "${TRANSITION_FILTER}" >/dev/null 2>&1; then
@@ -343,6 +382,20 @@ if printf '%s' "${escaped_token_workload}" \
   fail "structured workload validation missed backslash-escaped token syntax"
 else
   pass "structured workload validation detects backslash-escaped token syntax"
+fi
+spliced_escaped_token_workload='{"spec":{"template":{"spec":{"containers":[{"command":["/bin/sh","-c","spiced --to\\ken $(KEY)"]}]}}}}'
+if printf '%s' "${spliced_escaped_token_workload}" \
+  | jq -e --arg secret spice-cloud-connect -f "${WORKLOAD_FILTER}" >/dev/null; then
+  fail "structured workload validation missed shell-spliced backslash token syntax"
+else
+  pass "structured workload validation detects shell-spliced backslash token syntax"
+fi
+spliced_quoted_token_workload='{"spec":{"template":{"spec":{"containers":[{"command":["/bin/sh","-c","spiced --to\"\"ken $(KEY)"]}]}}}}'
+if printf '%s' "${spliced_quoted_token_workload}" \
+  | jq -e --arg secret spice-cloud-connect -f "${WORKLOAD_FILTER}" >/dev/null; then
+  fail "structured workload validation missed shell-spliced quoted token syntax"
+else
+  pass "structured workload validation detects shell-spliced quoted token syntax"
 fi
 ansi_quoted_token_workload='{"spec":{"template":{"spec":{"containers":[{"command":["/bin/bash","-c","spiced $'\''--token'\'' $(KEY)"]}]}}}}'
 if printf '%s' "${ansi_quoted_token_workload}" \

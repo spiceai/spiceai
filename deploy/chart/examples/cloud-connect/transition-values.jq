@@ -1,5 +1,5 @@
 def token_syntax_pattern:
-  "(^|[[:space:];|&])[$`'\"\\\\]*--token[`'\"\\\\]*($|[=$[:space:];|&])";
+  "(^|[[:space:];|&])[$`'\"\\\\]*-[$`'\"\\\\]*-[$`'\"\\\\]*t[$`'\"\\\\]*o[$`'\"\\\\]*k[$`'\"\\\\]*e[$`'\"\\\\]*n[`'\"\\\\]*($|[=$[:space:];|&])";
 
 def token_matches($command):
   [
@@ -38,6 +38,7 @@ def embedded_token_syntax($command):
         command: $command,
         additionalEnv: ($values.additionalEnv // []),
         cloudConnect: (($values.cloudConnect // {}) + {
+          mode: "connected",
           bootstrapSecretName: $remembered_secret
         })
       },
@@ -72,6 +73,7 @@ def embedded_token_syntax($command):
                   | select(.name != $token_env)
                 ],
                 cloudConnect: (($values.cloudConnect // {}) + {
+                  mode: "connected",
                   bootstrapSecretName: $installed_secret
                 })
               },

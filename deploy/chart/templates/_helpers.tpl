@@ -81,12 +81,13 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end }}
 
 {{/*
-Canonical boundary detector for direct, quoted, and backslash-escaped
-`--token` shell syntax. Keep the same expression in the two transition jq
-filters under deploy/chart/examples/cloud-connect/.
+Canonical boundary detector for direct shell syntax and option names assembled
+with shell-removed quoting, escaping, or empty expansion. Keep the same
+expression in the two transition jq filters under
+deploy/chart/examples/cloud-connect/.
 */}}
 {{- define "spiceai.cloudConnectTokenSyntaxPattern" -}}
-(^|[[:space:];|&])[$`'"\\]*--token[`'"\\]*($|[=$[:space:];|&])
+(^|[[:space:];|&])[$`'"\\]*-[$`'"\\]*-[$`'"\\]*t[$`'"\\]*o[$`'"\\]*k[$`'"\\]*e[$`'"\\]*n[`'"\\]*($|[=$[:space:];|&])
 {{- end -}}
 
 {{/*
@@ -108,42 +109,64 @@ here and rejected there. The boundary excludes values such as
 {{- end -}}
 
 {{/*
-Validate a Cloud Connect `--token` bootstrap deployment before rendering.
+Validate direct Cloud Connect deployment modes before rendering.
 
 One enrollment key enrolls exactly one identity, and the identity must
-survive a pod replacement, so a command carrying `--token` requires:
-  - exactly one replica (an absent replicaCount renders a 1-replica
-    workload and is accepted),
+survive a pod replacement, so `cloudConnect.mode: bootstrap` requires:
+  - exactly one direct command-array `--token` argument (arbitrary shell
+    programs are intentionally not interpreted),
+  - exactly one replica,
   - stateful persistent storage,
   - SPICE_CONFIG_DIR set to a literal path beneath the stateful mountPath,
   - exactly one token argument expanding `$(VAR)`, with exactly one matching
     `additionalEnv` entry backed by a non-empty Secret name and key — never a
     literal key baked into a chart value or environment value.
+
+The `connected` mode retains the single-replica persistent-identity contract
+and rejects a leftover direct token. `disabled` is the default for ordinary
+deployments. Explicit mode is required because templates cannot safely infer
+security policy by interpreting arbitrary shell programs or entrypoints.
 */}}
-{{- define "spiceai.validateCloudConnectBootstrap" -}}
-{{- if include "spiceai.cloudConnectTokenBootstrap" . -}}
+{{- define "spiceai.validateCloudConnect" -}}
+{{- $cloudConnect := .Values.cloudConnect | default dict -}}
+{{- $mode := get $cloudConnect "mode" | default "disabled" -}}
+{{- if not (has $mode (list "disabled" "bootstrap" "connected")) -}}
+{{- fail "cloudConnect.mode must be one of disabled, bootstrap, or connected. See deploy/chart/examples/cloud-connect/." -}}
+{{- end -}}
+{{- if regexMatch "spice-enroll-[A-Za-z0-9_-]+" (toJson .Values) -}}
+{{- fail "Cloud Connect enrollment keys must come from a Kubernetes Secret and must never be stored in chart values. See deploy/chart/examples/cloud-connect/." -}}
+{{- end -}}
+{{- $hasTokenSyntax := include "spiceai.cloudConnectTokenBootstrap" . -}}
+{{- if and (eq $mode "disabled") $hasTokenSyntax -}}
+{{- fail "Cloud Connect --token is permitted only with cloudConnect.mode: bootstrap. See deploy/chart/examples/cloud-connect/." -}}
+{{- end -}}
+{{- if and (eq $mode "connected") $hasTokenSyntax -}}
+{{- fail "cloudConnect.mode: connected must not retain --token syntax. Run the Cloud Connect transition before deleting the bootstrap Secret. See deploy/chart/examples/cloud-connect/." -}}
+{{- end -}}
+{{- if eq $mode "bootstrap" -}}
 {{- $hasDirectTokenArg := false -}}
 {{- $hasUnsupportedTokenSyntax := false -}}
+{{- $afterEndOfOptions := false -}}
 {{- $tokenSyntaxPattern := include "spiceai.cloudConnectTokenSyntaxPattern" . -}}
 {{- range .Values.command -}}
-{{- if or (eq . "--token") (hasPrefix "--token=" .) -}}
+{{- if eq . "--" -}}
+{{- $afterEndOfOptions = true -}}
+{{- else if or (eq . "--token") (hasPrefix "--token=" .) -}}
 {{- $hasDirectTokenArg = true -}}
+{{- if $afterEndOfOptions -}}
+{{- $hasUnsupportedTokenSyntax = true -}}
+{{- end -}}
 {{- else if regexMatch $tokenSyntaxPattern . -}}
 {{- $hasUnsupportedTokenSyntax = true -}}
 {{- end -}}
 {{- end -}}
 {{- if or (not $hasDirectTokenArg) $hasUnsupportedTokenSyntax -}}
-{{- fail "Cloud Connect --token must be a direct command-array argument; shell-form or embedded --token syntax is unsupported. See deploy/chart/examples/cloud-connect/." -}}
+{{- fail "cloudConnect.mode: bootstrap requires --token as a direct command-array option before any -- end-of-options marker; shell-form, computed, or embedded token syntax is unsupported. See deploy/chart/examples/cloud-connect/." -}}
 {{- end -}}
-{{- if or (ne (int (.Values.replicaCount | default 1)) 1) (not .Values.stateful.enabled) -}}
-{{- fail "Cloud Connect --token bootstrap requires one replica and persistent Spice identity storage. Set replicaCount: 1 and stateful.enabled: true, and set SPICE_CONFIG_DIR beneath stateful.mountPath. See deploy/chart/examples/cloud-connect/." -}}
 {{- end -}}
-{{- $startupPeriodSeconds := int (.Values.startupProbe.periodSeconds | default 10) -}}
-{{- $startupFailureThreshold := int (.Values.startupProbe.failureThreshold | default 3) -}}
-{{- $startupInitialDelaySeconds := int (.Values.startupProbe.initialDelaySeconds | default 0) -}}
-{{- $startupBudgetSeconds := add $startupInitialDelaySeconds (mul $startupPeriodSeconds $startupFailureThreshold) -}}
-{{- if lt $startupBudgetSeconds 660 -}}
-{{- fail "Cloud Connect --token bootstrap requires a startup-probe budget of at least 660 seconds so Kubernetes cannot restart spiced during its ten-minute enrollment retry window. Increase startupProbe.failureThreshold, periodSeconds, or initialDelaySeconds. See deploy/chart/examples/cloud-connect/." -}}
+{{- if or (eq $mode "bootstrap") (eq $mode "connected") -}}
+{{- if or (ne (int .Values.replicaCount) 1) (not .Values.stateful.enabled) -}}
+{{- fail "Direct Cloud Connect requires one replica and persistent Spice identity storage. Set replicaCount: 1 and stateful.enabled: true, and set SPICE_CONFIG_DIR beneath stateful.mountPath. See deploy/chart/examples/cloud-connect/." -}}
 {{- end -}}
 {{- $mount := clean (.Values.stateful.mountPath | default "") -}}
 {{- $configDirCount := 0 -}}
@@ -160,7 +183,16 @@ survive a pod replacement, so a command carrying `--token` requires:
 {{- end -}}
 {{- end -}}
 {{- if or (ne $configDirCount 1) (not $configDirOk) -}}
-{{- fail "Cloud Connect --token bootstrap requires one replica and persistent Spice identity storage. Add exactly one additionalEnv entry setting SPICE_CONFIG_DIR to a path beneath stateful.mountPath (for example /data/.spice under mountPath /data). See deploy/chart/examples/cloud-connect/." -}}
+{{- fail "Direct Cloud Connect requires one replica and persistent Spice identity storage. Add exactly one additionalEnv entry setting SPICE_CONFIG_DIR to a path beneath stateful.mountPath (for example /data/.spice under mountPath /data). See deploy/chart/examples/cloud-connect/." -}}
+{{- end -}}
+{{- end -}}
+{{- if eq $mode "bootstrap" -}}
+{{- $startupPeriodSeconds := int (.Values.startupProbe.periodSeconds | default 10) -}}
+{{- $startupFailureThreshold := int (.Values.startupProbe.failureThreshold | default 3) -}}
+{{- $startupInitialDelaySeconds := int (.Values.startupProbe.initialDelaySeconds | default 0) -}}
+{{- $startupBudgetSeconds := add $startupInitialDelaySeconds (mul $startupPeriodSeconds $startupFailureThreshold) -}}
+{{- if lt $startupBudgetSeconds 660 -}}
+{{- fail "Cloud Connect --token bootstrap requires a startup-probe budget of at least 660 seconds so Kubernetes cannot restart spiced during its ten-minute enrollment retry window. Increase startupProbe.failureThreshold, periodSeconds, or initialDelaySeconds. See deploy/chart/examples/cloud-connect/." -}}
 {{- end -}}
 {{- $cmd := .Values.command -}}
 {{- $tokenArgCount := 0 -}}

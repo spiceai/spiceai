@@ -95,16 +95,24 @@ fn main() {
     // produced it.
     let crash_reporting = spiced::crash_handler::install(&get_version_string());
 
-    let matches = spiced::Args::command().get_matches();
-    let open_telemetry_deprecated =
-        matches.value_source("open_telemetry_bind_address") == Some(ValueSource::CommandLine);
-    // `--repl-flight-endpoint` moves only the REPL's SQL target, leaving the HTTP endpoint that
-    // `nql` uses wherever it already was. Choosing one without the other leaves nothing pointing
-    // the HTTP endpoint at that runtime, so `nql` says so instead of answering from whatever
-    // that endpoint reaches. See #11005.
-    let flight_chosen = chosen_on_command_line(&matches, "repl_flight_endpoint");
-    let http_chosen = chosen_on_command_line(&matches, "http_endpoint");
-    let mut args = spiced::Args::from_arg_matches(&matches).unwrap_or_else(|err| err.exit());
+    let (mut args, open_telemetry_deprecated, flight_chosen, http_chosen) = {
+        let mut matches = spiced::Args::command().get_matches();
+        let open_telemetry_deprecated =
+            matches.value_source("open_telemetry_bind_address") == Some(ValueSource::CommandLine);
+        // `--repl-flight-endpoint` moves only the REPL's SQL target, leaving the HTTP endpoint that
+        // `nql` uses wherever it already was. Choosing one without the other leaves nothing pointing
+        // the HTTP endpoint at that runtime, so `nql` says so instead of answering from whatever
+        // that endpoint reaches. See #11005.
+        let flight_chosen = chosen_on_command_line(&matches, "repl_flight_endpoint");
+        let http_chosen = chosen_on_command_line(&matches, "http_endpoint");
+        let args =
+            spiced::Args::from_arg_matches_mut(&mut matches).unwrap_or_else(|err| err.exit());
+        (args, open_telemetry_deprecated, flight_chosen, http_chosen)
+    };
+    // Mutable extraction removes typed values from `ArgMatches`; ending its
+    // scope here also drops clap's remaining parse state before startup. The
+    // enrollment key is left only in the zeroizing `Args` value, which the
+    // Cloud Connect bootstrap removes immediately.
     args.open_telemetry_deprecated = open_telemetry_deprecated;
     args.repl_config.http_endpoint_may_be_another_runtime =
         repl::http_endpoint_unpaired(flight_chosen, http_chosen);

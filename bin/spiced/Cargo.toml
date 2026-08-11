@@ -97,6 +97,7 @@ util = { path = "../../crates/util"}
 
 # Non-default features should be added to `lint-rust` make target.
 [dev-dependencies]
+rcgen = { version = "0.14", features = ["x509-parser"] }
 tempfile.workspace = true
 
 [features]
