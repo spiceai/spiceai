@@ -51,7 +51,12 @@ columns that are actually indexed in Elasticsearch (`index: true`) may be regist
 a non-indexed field would make Elasticsearch reject or mis-answer the query.
 
 - `EsFilterSchema::from_connector_schema` — for an externally-managed index (the SQL connector
-  path): numeric and boolean columns only, since the Arrow schema does not preserve the
-  `text`-vs-`keyword` distinction for strings.
+  path) when only the derived Arrow schema is available: numeric and boolean columns only, since
+  Arrow does not preserve the `text`-vs-`keyword` distinction for strings.
+- `EsFilterSchema::from_mapping` — for an externally-managed index when the real Elasticsearch
+  mapping is available (see `data_components::elasticsearch::schema::mapping_to_filter_schema`):
+  `keyword`/`wildcard`/`constant_keyword` columns are exact-filterable, and `text` columns with a
+  keyword-typed multi-field sibling are inexact-filterable against that sibling. Prefer this over
+  `from_connector_schema` whenever the mapping is available.
 - `EsFilterSchema::from_spice_managed` — for a Spice-managed search index, where string columns
   carry a `.keyword` sub-field and the filterable column set is known.

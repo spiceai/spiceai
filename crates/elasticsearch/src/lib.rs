@@ -89,6 +89,10 @@ pub struct FieldMapping {
     pub field_type: Option<String>,
     #[serde(default)]
     pub properties: Option<HashMap<String, FieldMapping>>,
+    /// Multi-field sub-mappings (Elasticsearch's `"fields"` key), e.g. the `keyword`
+    /// sibling Spice and many external mappings attach to a `text` field.
+    #[serde(default)]
+    pub fields: Option<HashMap<String, FieldMapping>>,
     /// For `dense_vector` fields.
     pub dims: Option<i64>,
     /// Similarity metric for `dense_vector` (e.g. `cosine`, `l2_norm`, `dot_product`).

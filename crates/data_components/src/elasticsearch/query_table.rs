@@ -63,9 +63,25 @@ pub struct ElasticsearchQueryTable {
 }
 
 impl ElasticsearchQueryTable {
+    /// Derives the filter schema from the Arrow schema alone — every string column is omitted
+    /// since the analyzed-vs-`keyword` distinction is already lost by that point. Prefer
+    /// [`Self::with_filter_schema`] with a mapping-derived [`EsFilterSchema`] (see
+    /// `crate::elasticsearch::schema::mapping_to_filter_schema`) when the real Elasticsearch
+    /// mapping is available, so `keyword` fields and `text` fields with a `keyword` sibling can
+    /// be filtered too.
     #[must_use]
     pub fn new(client: Arc<dyn Elasticsearch>, index: String, schema: SchemaRef) -> Self {
         let filter_schema = EsFilterSchema::from_connector_schema(&schema);
+        Self::with_filter_schema(client, index, schema, filter_schema)
+    }
+
+    #[must_use]
+    pub fn with_filter_schema(
+        client: Arc<dyn Elasticsearch>,
+        index: String,
+        schema: SchemaRef,
+        filter_schema: EsFilterSchema,
+    ) -> Self {
         Self {
             client,
             index,
@@ -192,8 +208,8 @@ impl DisplayAs for ElasticsearchQueryExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(
             f,
-            "ElasticsearchQueryExec: index={}, limit={:?}",
-            self.index, self.limit
+            "ElasticsearchQueryExec: index={}, limit={:?}, query={}",
+            self.index, self.limit, self.query
         )
     }
 }

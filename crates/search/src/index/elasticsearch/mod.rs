@@ -609,6 +609,11 @@ pub struct ElasticsearchTextIndex {
     /// Full source schema for extracting fields.
     pub source_schema: SchemaRef,
 
+    /// Filterable / non-filterable metadata columns as declared by the user.
+    /// These influence the ES mapping (index: true vs index: false) but are
+    /// otherwise written into `_source` like any other source column.
+    pub metadata_columns: MetadataColumns,
+
     /// Maximum number of rows to send per Elasticsearch `_bulk` request.
     pub batch_write_rows: usize,
 
@@ -688,10 +693,12 @@ impl SearchIndex for ElasticsearchTextIndex {
         ));
         let schema = Arc::new(Schema::new(result_fields));
 
-        // The text index indexes the primary key and the analyzed search fields; only the
-        // primary-key columns are safe exact-value pre-filter targets.
-        let filterable: Vec<String> =
+        // The text index indexes the primary key, the analyzed search fields, and any
+        // user-declared filterable metadata columns (mapped `index: true`, mirroring the
+        // vector-index path) as safe exact-value pre-filter targets.
+        let mut filterable: Vec<String> =
             self.primary_key.iter().map(|f| f.name().clone()).collect();
+        filterable.extend(self.metadata_columns.filterable_names());
         let filter_schema = EsFilterSchema::from_spice_managed(&self.source_schema, &filterable);
 
         let table: Arc<dyn TableProvider> = Arc::new(ElasticsearchTextSearchTable {
@@ -728,6 +735,13 @@ impl Index for ElasticsearchTextIndex {
         for field in &self.search_fields {
             if !cols.contains(field) {
                 cols.push(field.clone());
+            }
+        }
+        // Include user-declared metadata columns (`vectors: filterable | non-filterable`)
+        // so they survive projection pruning and reach `_source` on refresh/CDC indexing.
+        for name in self.metadata_columns.all_names() {
+            if !cols.contains(&name) {
+                cols.push(name);
             }
         }
         cols

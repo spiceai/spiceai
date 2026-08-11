@@ -197,7 +197,11 @@ impl DisplayAs for ElasticsearchKnnExec {
             f,
             "ElasticsearchKnnExec: index={}, field={}, k={}",
             self.index, self.vector_field, self.k
-        )
+        )?;
+        if let Some(filter) = &self.filter {
+            write!(f, ", filter={filter}")?;
+        }
+        Ok(())
     }
 }
 
@@ -447,7 +451,11 @@ impl DisplayAs for ElasticsearchTextSearchExec {
             f,
             "ElasticsearchTextSearchExec: index={}, fields={:?}, limit={}",
             self.index, self.search_fields, self.limit
-        )
+        )?;
+        if let Some(filter) = &self.filter {
+            write!(f, ", filter={filter}")?;
+        }
+        Ok(())
     }
 }
 

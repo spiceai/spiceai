@@ -21,6 +21,7 @@ use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use elasticsearch::FieldMapping;
+use elasticsearch_datafusion_filter::{EsFilterSchema, EsMappingField};
 
 /// Convert an Elasticsearch index mapping to an Arrow [`Schema`].
 ///
@@ -32,6 +33,62 @@ pub fn mapping_to_schema(properties: &HashMap<String, FieldMapping>) -> SchemaRe
     let mut fields = Vec::new();
     collect_fields(properties, "", &mut fields);
     Arc::new(Schema::new(fields))
+}
+
+/// Convert an Elasticsearch index mapping to an [`EsFilterSchema`], using the real per-field
+/// `type` (and any `keyword`-typed multi-field sibling) rather than the derived Arrow schema —
+/// so `keyword` fields and `text` fields with a `keyword` sibling are filterable, not just
+/// numeric/boolean columns. Field names are flattened the same way as [`mapping_to_schema`] so
+/// they line up with the Arrow schema the filters are expressed against.
+#[must_use]
+#[expect(clippy::implicit_hasher)]
+pub fn mapping_to_filter_schema(properties: &HashMap<String, FieldMapping>) -> EsFilterSchema {
+    let mut fields = HashMap::new();
+    collect_mapping_fields(properties, "", &mut fields);
+    EsFilterSchema::from_mapping(fields.iter().map(|(name, info)| (name.as_str(), info)))
+}
+
+fn collect_mapping_fields(
+    properties: &HashMap<String, FieldMapping>,
+    prefix: &str,
+    fields: &mut HashMap<String, EsMappingField>,
+) {
+    for (name, mapping) in properties {
+        let full_name = if prefix.is_empty() {
+            name.clone()
+        } else {
+            format!("{prefix}.{name}")
+        };
+
+        // Recurse into nested objects, mirroring `collect_fields`; a `nested` object is treated
+        // as an opaque JSON string by `mapping_to_schema` and is not filterable here either.
+        if let Some(sub_props) = &mapping.properties {
+            if mapping.field_type.as_deref() != Some("nested") {
+                collect_mapping_fields(sub_props, &full_name, fields);
+            }
+            continue;
+        }
+
+        let Some(field_type) = &mapping.field_type else {
+            continue;
+        };
+        let keyword_subfield = mapping.fields.as_ref().and_then(|subfields| {
+            subfields.iter().find_map(|(sub_name, sub_mapping)| {
+                matches!(
+                    sub_mapping.field_type.as_deref(),
+                    Some("keyword" | "constant_keyword" | "wildcard")
+                )
+                .then(|| sub_name.clone())
+            })
+        });
+        fields.insert(
+            full_name,
+            EsMappingField {
+                field_type: field_type.clone(),
+                keyword_subfield,
+            },
+        );
+    }
 }
 
 fn collect_fields(
@@ -117,6 +174,7 @@ mod tests {
             FieldMapping {
                 field_type: Some("text".to_string()),
                 properties: None,
+                fields: None,
                 dims: None,
                 similarity: None,
             },
@@ -126,6 +184,7 @@ mod tests {
             FieldMapping {
                 field_type: Some("integer".to_string()),
                 properties: None,
+                fields: None,
                 dims: None,
                 similarity: None,
             },
@@ -135,6 +194,7 @@ mod tests {
             FieldMapping {
                 field_type: Some("dense_vector".to_string()),
                 properties: None,
+                fields: None,
                 dims: Some(384),
                 similarity: Some("cosine".to_string()),
             },
@@ -163,6 +223,7 @@ mod tests {
             FieldMapping {
                 field_type: Some("unsigned_long".to_string()),
                 properties: None,
+                fields: None,
                 dims: None,
                 similarity: None,
             },

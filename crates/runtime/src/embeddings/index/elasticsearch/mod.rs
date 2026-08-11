@@ -159,7 +159,7 @@ pub async fn try_from_table(
     // (`index: true` / `index: false`) so filterable fields participate in
     // query filters, and non-filterable fields are stored only in `_source`.
     let metadata_columns =
-        es_metadata_columns(&dataset_columns, &inner_schema, &column, &vector_field);
+        es_metadata_columns(&dataset_columns, &inner_schema, &[&column, &vector_field]);
 
     // Normalize the source schema to match what the Elasticsearch HTTP client actually produces.
     // Accelerated tables (e.g. DuckDB) may store columns with types that differ from what ES
@@ -268,17 +268,17 @@ struct VectorMappingOptions {
 
 /// Resolve spicepod `vectors` metadata hints from dataset columns into
 /// [`MetadataColumns`]. Columns marked `filterable`/`non-filterable` contribute
-/// to the ES mapping (index: true / index: false respectively). The embedded
-/// column and the vector field itself are excluded.
-fn es_metadata_columns(
+/// to the ES mapping (index: true / index: false respectively). Columns named in
+/// `exclude` (the embedded/vector-field or search-field columns, which carry their
+/// own mapping and must not also be treated as metadata) are skipped.
+pub(crate) fn es_metadata_columns(
     columns: &[Column],
     schema: &SchemaRef,
-    embedded_column: &str,
-    vector_field: &str,
+    exclude: &[&str],
 ) -> MetadataColumns {
     let cols: Vec<MetadataColumn> = columns
         .iter()
-        .filter(|c| c.name != embedded_column && c.name != vector_field)
+        .filter(|c| !exclude.contains(&c.name.as_str()))
         .filter_map(|c| {
             let kind = c.as_vector_metadata()?;
             let field = schema.field_with_name(&c.name).ok()?.clone();
@@ -289,6 +289,43 @@ fn es_metadata_columns(
         })
         .collect();
     cols.into()
+}
+
+/// Add mapping entries for `metadata_columns` to `properties`. Filterable columns get
+/// mapped with `index: true` so they can participate in ES query filters; non-filterable
+/// columns are stored in `_source` only (`index: false`, `doc_values: false`) — retrieved
+/// on hits but never scanned for filtering. A column already present in `properties`
+/// (e.g. `skip`, or a column also covered by a text/vector mapping) is left alone.
+pub(crate) fn add_metadata_column_mappings(
+    properties: &mut serde_json::Map<String, serde_json::Value>,
+    metadata_columns: &MetadataColumns,
+    skip: &str,
+) {
+    for c in metadata_columns.iter() {
+        let name = c.name().to_string();
+        if name == skip || properties.contains_key(&name) {
+            continue;
+        }
+        let mut mapping = arrow_type_to_es_mapping(c.field().data_type());
+        if let Some(obj) = mapping.as_object_mut() {
+            let indexable = matches!(c, MetadataColumn::Filterable(_));
+            obj.insert("index".to_string(), serde_json::Value::Bool(indexable));
+            if !indexable {
+                // `doc_values` is not supported on `text` fields in Elasticsearch;
+                // attempting to set it causes mapping creation/updates to fail.
+                // For `text` mappings (and other field types that don't support
+                // doc_values), skip the override — `_source` retrieval still works.
+                let field_type = obj
+                    .get("type")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                if field_type != "text" {
+                    obj.insert("doc_values".to_string(), serde_json::Value::Bool(false));
+                }
+            }
+        }
+        properties.insert(name, mapping);
+    }
 }
 
 /// Create the ES index with a `dense_vector` mapping for `vector_field` if the index
@@ -357,36 +394,7 @@ async fn ensure_index_with_mapping(
         );
     }
 
-    // Filterable metadata columns get mapped with `index: true` so they can
-    // participate in ES query filters. Non-filterable columns are stored in
-    // `_source` only (`index: false`, `doc_values: false`) — retrieved on hits
-    // but never scanned for filtering. Columns already covered by the text
-    // mapping above are skipped.
-    for c in metadata_columns.iter() {
-        let name = c.name().to_string();
-        if name == vector_field || properties.contains_key(&name) {
-            continue;
-        }
-        let mut mapping = arrow_type_to_es_mapping(c.field().data_type());
-        if let Some(obj) = mapping.as_object_mut() {
-            let indexable = matches!(c, MetadataColumn::Filterable(_));
-            obj.insert("index".to_string(), serde_json::Value::Bool(indexable));
-            if !indexable {
-                // `doc_values` is not supported on `text` fields in Elasticsearch;
-                // attempting to set it causes mapping creation/updates to fail.
-                // For `text` mappings (and other field types that don't support
-                // doc_values), skip the override — `_source` retrieval still works.
-                let field_type = obj
-                    .get("type")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("");
-                if field_type != "text" {
-                    obj.insert("doc_values".to_string(), serde_json::Value::Bool(false));
-                }
-            }
-        }
-        properties.insert(name, mapping);
-    }
+    add_metadata_column_mappings(&mut properties, metadata_columns, vector_field);
 
     // Explicitly map the chunk key when chunking is enabled. `_source` retrieval works via
     // dynamic mapping regardless; the explicit `index: false` mapping documents that it is a
@@ -557,6 +565,7 @@ pub(crate) async fn ensure_index_with_text_mapping(
     client: &dyn Elasticsearch,
     es_index: &str,
     text_fields: &[String],
+    metadata_columns: &MetadataColumns,
     index_settings: Option<&serde_json::Value>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut properties = serde_json::Map::new();
@@ -569,6 +578,7 @@ pub(crate) async fn ensure_index_with_text_mapping(
             }),
         );
     }
+    add_metadata_column_mappings(&mut properties, metadata_columns, "");
 
     let exists = client
         .index_exists(es_index)

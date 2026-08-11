@@ -63,5 +63,5 @@ pub mod schema;
 mod translate;
 
 pub use error::{Error, Result};
-pub use schema::{EsFieldType, EsFilterSchema};
+pub use schema::{EsFieldType, EsFilterSchema, EsMappingField};
 pub use translate::{classify_filter, translate_filter};

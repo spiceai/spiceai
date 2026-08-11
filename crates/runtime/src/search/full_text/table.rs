@@ -285,7 +285,8 @@ pub(crate) async fn build_elasticsearch_text_index(
     use crate::component::column::full_text_search_config;
     use crate::component::dataset::FullTextSearchDatasetConfig;
     use crate::embeddings::index::elasticsearch::{
-        ElasticsearchIndexWriteMaintenance, ensure_index_with_text_mapping, normalize_es_data_type,
+        ElasticsearchIndexWriteMaintenance, ensure_index_with_text_mapping, es_metadata_columns,
+        normalize_es_data_type,
     };
     use arrow_schema::Field;
     use runtime_search::store_params::elasticsearch::{
@@ -397,11 +398,18 @@ pub(crate) async fn build_elasticsearch_text_index(
     )?;
     let write_maintenance = Arc::new(ElasticsearchIndexWriteMaintenance::new(write_options));
 
+    // Resolve spicepod `vectors: filterable | non-filterable` hints into metadata columns,
+    // mirroring the vector-index path: filterable columns get `index: true` (usable in query
+    // filters), non-filterable columns are stored in `_source` only.
+    let search_field_names: Vec<&str> = search_fields.iter().map(String::as_str).collect();
+    let metadata_columns = es_metadata_columns(columns, &source_schema, &search_field_names);
+
     // Ensure the ES index exists with text mappings for all search fields.
     ensure_index_with_text_mapping(
         client.as_ref(),
         &fts_params.es_index,
         &search_fields,
+        &metadata_columns,
         index_settings.as_ref(),
     )
     .await?;
@@ -424,6 +432,7 @@ pub(crate) async fn build_elasticsearch_text_index(
         search_fields,
         primary_key: pk_fields,
         source_schema: Arc::clone(&source_schema),
+        metadata_columns,
         batch_write_rows: fts_params.params.batch_write_rows,
         write_maintenance: Arc::clone(&write_maintenance),
     }))

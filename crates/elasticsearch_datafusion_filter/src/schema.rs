@@ -164,6 +164,53 @@ impl EsFilterSchema {
     }
 }
 
+/// The Elasticsearch mapping info for one field, decoupled from any particular client's wire
+/// representation (so this crate does not need to depend on one) — just the `type` and, for a
+/// `text` field, the name of any keyword-typed multi-field sibling.
+#[derive(Debug, Clone)]
+pub struct EsMappingField {
+    /// The Elasticsearch field `type` (e.g. `"keyword"`, `"text"`, `"long"`, `"boolean"`).
+    pub field_type: String,
+    /// The name of a `keyword`/`constant_keyword`/`wildcard`-typed multi-field sibling (e.g.
+    /// `"keyword"` for `title.keyword`), if the mapping declares one. Only meaningful when
+    /// `field_type` is an analyzed text type.
+    pub keyword_subfield: Option<String>,
+}
+
+impl EsFilterSchema {
+    /// Build a filter schema for an **externally-managed** index from its real Elasticsearch
+    /// mapping, rather than the Arrow schema `from_connector_schema` is limited to. Unlike that
+    /// method, a `keyword`-mapped string is exact-filterable, and a `text` field with a
+    /// `keyword` multi-field sibling is inexact-filterable against that sibling — only a bare
+    /// analyzed `text` field with no such sibling is omitted, because pushing an exact-value
+    /// predicate against it could drop rows.
+    #[must_use]
+    pub fn from_mapping<'a>(
+        mapping: impl IntoIterator<Item = (&'a str, &'a EsMappingField)>,
+    ) -> Self {
+        let mut fields = HashMap::new();
+        for (name, info) in mapping {
+            let field_type = match info.field_type.as_str() {
+                "boolean" => Some(EsFieldType::Boolean),
+                "byte" | "short" | "integer" | "long" | "unsigned_long" => {
+                    Some(EsFieldType::Integer)
+                }
+                "float" | "half_float" | "double" | "scaled_float" => Some(EsFieldType::Float),
+                "keyword" | "wildcard" | "constant_keyword" => Some(EsFieldType::Keyword),
+                "text" | "match_only_text" => info
+                    .keyword_subfield
+                    .clone()
+                    .map(|keyword_subfield| EsFieldType::TextWithKeyword { keyword_subfield }),
+                _ => None,
+            };
+            if let Some(field_type) = field_type {
+                fields.insert(name.to_string(), field_type);
+            }
+        }
+        Self { fields }
+    }
+}
+
 /// Map an Arrow numeric/boolean type to its Elasticsearch field type, mirroring
 /// `arrow_type_to_es_mapping` on the write path. Returns `None` for strings, dates, and
 /// anything else (the caller decides how to handle those).

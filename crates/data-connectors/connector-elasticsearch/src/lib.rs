@@ -25,7 +25,7 @@ limitations under the License.
 
 use async_trait::async_trait;
 use data_components::elasticsearch::query_table::ElasticsearchQueryTable;
-use data_components::elasticsearch::schema::mapping_to_schema;
+use data_components::elasticsearch::schema::{mapping_to_filter_schema, mapping_to_schema};
 use datafusion::datasource::TableProvider;
 use elasticsearch::{Client, Elasticsearch};
 use runtime::component::dataset::Dataset;
@@ -193,21 +193,28 @@ impl DataConnector for ElasticsearchConnector {
             }
         })?;
 
-        let schema = mapping
+        let properties = &mapping
             .get(&index_name)
-            .map(|m| mapping_to_schema(&m.mappings.properties))
             .ok_or_else(|| ReadProviderError::UnableToGetReadProvider {
                 dataconnector: "elasticsearch",
                 connector_component: ConnectorComponent::from(dataset),
                 source: Box::from(format!(
                     "Elasticsearch index '{index_name}' not found in mapping response"
                 )),
-            })?;
+            })?
+            .mappings
+            .properties;
+        let schema = mapping_to_schema(properties);
+        // Built from the real per-field mapping (not the derived Arrow schema), so `keyword`
+        // fields and `text` fields with a `keyword` sibling are filterable, not just
+        // numeric/boolean columns.
+        let filter_schema = mapping_to_filter_schema(properties);
 
-        Ok(Arc::new(ElasticsearchQueryTable::new(
+        Ok(Arc::new(ElasticsearchQueryTable::with_filter_schema(
             Arc::clone(&self.client),
             index_name,
             schema,
+            filter_schema,
         )))
     }
 }
