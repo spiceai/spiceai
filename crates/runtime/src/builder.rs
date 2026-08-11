@@ -1621,7 +1621,9 @@ impl DuckDbBudgetContext {
     /// `DuckDB` instance created from `app` is capped for the acceleration set `app`
     /// declares. Call before anything initializes those accelerators; an instance
     /// that already exists keeps the `memory_limit` it was created with, which the
-    /// published aggregate reservation goes on covering.
+    /// published aggregate reservation goes on covering — including when `app`
+    /// declares no `DuckDB` accelerator at all, since dropping the dataset does not
+    /// evict the instance.
     ///
     /// The query memory pool is sized once, at build, and is not resizable, so the
     /// ceiling already in effect is honored verbatim here and the `DuckDB` instances
@@ -1632,7 +1634,7 @@ impl DuckDbBudgetContext {
     pub(crate) fn publish_for(&self, app: &Arc<App>) {
         let inputs = duckdb_budget_inputs(Some(app));
         if inputs.is_empty() {
-            crate::accelerator_memory_budget::clear_duckdb_budget();
+            crate::accelerator_memory_budget::retire_duckdb_cap();
             return;
         }
 

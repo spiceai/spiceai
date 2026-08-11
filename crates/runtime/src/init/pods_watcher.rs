@@ -294,12 +294,14 @@ mod tests {
         assert_eq!(
             published_per_instance_mib(),
             None,
-            "a reload that removes every DuckDB accelerator must clear the per-instance cap"
+            "a reload that removes every DuckDB accelerator must retire the per-instance cap"
         );
+        // Dropping the datasets does not evict the accelerator's cached pools, so the
+        // instances can go on holding what they were created with.
         assert_eq!(
             duckdb_total_reservation_bytes(),
-            0,
-            "a reload that removes every DuckDB accelerator must clear the reservation"
+            reservation_after_two,
+            "a reload that removes every DuckDB accelerator must keep reserving what its instances may still hold"
         );
 
         rt.shutdown().await;

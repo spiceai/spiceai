@@ -162,11 +162,30 @@ fn reservation_at_cap_in_play(
     )
 }
 
-/// Clears the budget — no `DuckDB` accelerator is configured, so nothing is reserved
-/// and no cap is in play. Returns whether either published value moved.
+/// Clears the budget — no `DuckDB` accelerator is configured and no instance of one
+/// exists, so nothing is reserved and no ceiling is in play. Returns whether either
+/// published value moved.
+///
+/// Only a runtime being built may say this: it has created no `DuckDB` instance yet.
+/// A reload cannot, because deregistering a dataset does not evict the accelerator's
+/// pool — see [`retire_duckdb_cap`].
 pub fn clear_duckdb_budget() -> bool {
     DUCKDB_MAX_LIVE_CAP_BYTES.store(0, Ordering::Relaxed);
     publish(0, 0)
+}
+
+/// Retires the per-instance cap for an app that declares no `DuckDB` accelerator,
+/// while leaving the aggregate reservation and the ceiling in play standing. Returns
+/// whether the published cap moved.
+///
+/// A reload that drops the last `DuckDB`-accelerated dataset deregisters its table,
+/// but the accelerator's factory caches pools by database identity and only evicts
+/// one when something explicitly invalidates it, so the instance can go on holding
+/// the `memory_limit` it was created with — and a dataset re-added onto the same file
+/// gets that cached pool, at that same limit. Releasing the reservation here would
+/// hand a co-resident consumer memory `DuckDB` still has.
+pub fn retire_duckdb_cap() -> bool {
+    publish(0, DUCKDB_TOTAL_RESERVATION_BYTES.load(Ordering::Relaxed))
 }
 
 fn publish(per_instance_cap_bytes: u64, total_reservation_bytes: u64) -> bool {
