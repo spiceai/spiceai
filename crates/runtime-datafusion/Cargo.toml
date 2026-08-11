@@ -35,6 +35,7 @@ runtime-request-context = { path = "../runtime-request-context" }
 search = { path = "../search", default-features = false }
 serde_json.workspace = true
 snafu.workspace = true
+spice-table = { path = "../spice-table" }
 tokio.workspace = true
 tokio-stream.workspace = true
 tokio-util.workspace = true
