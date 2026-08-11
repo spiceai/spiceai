@@ -343,6 +343,18 @@ fn classify_exchange_status(status: reqwest::StatusCode) -> Option<ExchangeOutco
         )));
     }
 
+    // The auth code is minted locally, so the exchange answers 404 until the
+    // browser authorization for it exists -- including on the first poll, which
+    // races the browser. A base URL that does not serve the exchange answers the
+    // same way, which is why this reports a reason rather than only pending: the
+    // deadline bounds either, and its error has to name both.
+    if status == reqwest::StatusCode::NOT_FOUND {
+        return Some(ExchangeOutcome::Transient(format!(
+            "the exchange endpoint has no authorization for this code ({status}); \
+             a SPICE_BASE_URL pointing at the wrong deployment answers the same way"
+        )));
+    }
+
     // Anything else is the endpoint rejecting this exact request: a 4xx, or a
     // redirect the client declines to follow because it leaves the origin the
     // credential was minted for. Neither is cleared by sending it again.
@@ -616,6 +628,17 @@ mod tests {
         reqwest::StatusCode::from_u16(code).expect("code should be a valid HTTP status")
     }
 
+    async fn poll_against(server: &wiremock::MockServer) -> (crate::error::Result<String>, u64) {
+        let url = format!("{}/auth/token/exchange", server.uri());
+        let client = reqwest::Client::new();
+        let started = std::time::Instant::now();
+        let result =
+            poll_for_access_token(&client, &url, "ABCD1234", TEST_TIMEOUT, TEST_INTERVAL).await;
+
+        let elapsed = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        (result, elapsed)
+    }
+
     async fn exchange_against(
         template: wiremock::ResponseTemplate,
     ) -> (crate::error::Result<String>, u64) {
@@ -625,14 +648,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let url = format!("{}/auth/token/exchange", server.uri());
-        let client = reqwest::Client::new();
-        let started = std::time::Instant::now();
-        let result =
-            poll_for_access_token(&client, &url, "ABCD1234", TEST_TIMEOUT, TEST_INTERVAL).await;
-
-        let elapsed = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-        (result, elapsed)
+        poll_against(&server).await
     }
 
     #[test]
@@ -668,7 +684,7 @@ mod tests {
     fn a_rejecting_status_is_permanent() {
         // 302 is the cross-origin redirect the client declines to follow; the
         // 4xx codes are the endpoint rejecting this exact request.
-        for code in [301, 302, 307, 400, 401, 403, 404, 410] {
+        for code in [301, 302, 307, 400, 401, 403, 410] {
             assert!(
                 matches!(
                     classify_exchange_status(status(code)),
@@ -677,6 +693,20 @@ mod tests {
                 "{code} should be permanent"
             );
         }
+    }
+
+    /// A 404 is how the exchange reports an authorization it has not been given
+    /// yet, so it has to keep polling rather than end the login.
+    #[test]
+    fn a_not_found_status_is_retriable() {
+        let Some(ExchangeOutcome::Transient(message)) = classify_exchange_status(status(404))
+        else {
+            panic!("404 should be retriable");
+        };
+        assert!(
+            message.contains("404") && message.contains("SPICE_BASE_URL"),
+            "the reason should name the status and the endpoint, got: {message}"
+        );
     }
 
     #[test]
@@ -731,22 +761,74 @@ mod tests {
         );
     }
 
-    /// Regression test for #12506: a wrong `SPICE_BASE_URL` answers 404 to every
-    /// attempt, which the old loop retried forever.
     #[tokio::test]
     async fn a_rejecting_endpoint_fails_without_waiting_out_the_deadline() {
-        let (result, elapsed) = exchange_against(wiremock::ResponseTemplate::new(404)).await;
+        let (result, elapsed) = exchange_against(wiremock::ResponseTemplate::new(400)).await;
 
         let Err(err) = result else {
-            panic!("a 404 exchange endpoint should not succeed");
+            panic!("a 400 exchange endpoint should not succeed");
         };
         assert!(
-            err.to_string().contains("404"),
+            err.to_string().contains("400"),
             "the error should name the status, got: {err}"
         );
         assert!(
             elapsed < TEST_TIMEOUT_MS,
             "a permanent failure should not wait out the deadline, took {elapsed}ms"
+        );
+    }
+
+    /// Regression test for #12870: the exchange answers 404 until the browser
+    /// authorization exists, so the first poll always lands there and a login
+    /// that treats it as fatal can never complete.
+    #[tokio::test]
+    async fn an_exchange_that_answers_not_found_first_still_yields_a_token() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(404))
+            .up_to_n_times(3)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "access_token": "tok_after_404" })),
+            )
+            .with_priority(2)
+            .mount(&server)
+            .await;
+
+        let (result, _) = poll_against(&server).await;
+
+        assert_eq!(
+            result.expect("a token after the leading 404s should succeed"),
+            "tok_after_404".to_string()
+        );
+    }
+
+    /// Regression test for #12506: a 404 every attempt — a base URL that does not
+    /// serve the exchange — is bounded by the deadline, and the error says so
+    /// rather than blaming the user for not finishing.
+    #[tokio::test]
+    async fn a_perpetually_not_found_exchange_gives_up_at_the_deadline() {
+        let (result, elapsed) = exchange_against(wiremock::ResponseTemplate::new(404)).await;
+
+        let Err(err) = result else {
+            panic!("a never-authorized exchange should not succeed");
+        };
+        let message = err.to_string();
+        assert!(
+            message.contains("Authentication timed out"),
+            "expected a timeout error, got: {message}"
+        );
+        assert!(
+            message.contains("404") && message.contains("SPICE_BASE_URL"),
+            "the timeout should point at the endpoint, got: {message}"
+        );
+        assert!(
+            elapsed < TEST_TIMEOUT_MS * 10,
+            "the loop should stop near its deadline, took {elapsed}ms"
         );
     }
 
