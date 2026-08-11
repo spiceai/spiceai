@@ -72,6 +72,17 @@ impl CloudDeliveredSecretStore {
         *self.values.write() = Arc::new(values);
     }
 
+    /// Whether `values` is exactly the set already held — same names, same
+    /// bytes.
+    ///
+    /// Answers whether a delivery changes anything without handing the caller a
+    /// value to compare itself, which is what lets a redelivery of the current
+    /// secrets be told apart from a rotation.
+    #[must_use]
+    pub fn holds(&self, values: &BTreeMap<String, Zeroizing<Vec<u8>>>) -> bool {
+        **self.values.read() == *values
+    }
+
     /// The delivered secret names, sorted. Safe to log and to report in status;
     /// the values are never exposed this way.
     #[must_use]
@@ -184,6 +195,34 @@ mod tests {
         assert!(
             !message.contains('\u{fffd}'),
             "no lossy replacement: {message}"
+        );
+    }
+
+    /// A caller deciding whether a delivery changes anything has to see a
+    /// rotated value, not just a changed name — the names are identical across
+    /// a rotation, which is the case that matters.
+    #[test]
+    fn holds_distinguishes_a_redelivery_from_a_rotation() {
+        let store = CloudDeliveredSecretStore::new();
+        store.replace(values(&[("a", b"1"), ("b", b"2")]));
+
+        assert!(store.holds(&values(&[("a", b"1"), ("b", b"2")])));
+        assert!(
+            !store.holds(&values(&[("a", b"9"), ("b", b"2")])),
+            "a rotated value is not the set already held"
+        );
+        assert!(
+            !store.holds(&values(&[("a", b"1")])),
+            "a removed secret is not the set already held"
+        );
+        assert!(
+            !store.holds(&values(&[("a", b"1"), ("b", b"2"), ("c", b"3")])),
+            "an added secret is not the set already held"
+        );
+        assert!(!store.holds(&BTreeMap::new()));
+        assert!(
+            CloudDeliveredSecretStore::new().holds(&BTreeMap::new()),
+            "an empty delivery to an empty store changes nothing"
         );
     }
 
