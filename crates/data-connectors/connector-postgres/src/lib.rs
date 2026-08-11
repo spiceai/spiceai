@@ -42,9 +42,9 @@ use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult, NewDataConnectorResult,
 };
-use runtime::datafusion::udf::deny_spice_functions_for_postgres_table_providers;
-use runtime::parameters::ParameterSpec;
+use runtime_datafusion::function_support::deny_spice_functions_for_postgres_table_providers;
 use runtime_metrics::component::MetricsProvider;
+use runtime_parameters::ParameterSpec;
 use secrecy::SecretBox;
 use snafu::prelude::*;
 use std::any::Any;

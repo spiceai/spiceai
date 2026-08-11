@@ -61,7 +61,7 @@ use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult, NewDataConnectorResult,
 };
-use runtime::parameters::{ParameterSpec, Parameters};
+use runtime_parameters::{ParameterSpec, Parameters};
 use secrecy::SecretString;
 use snafu::{ResultExt, Snafu};
 use std::any::Any;

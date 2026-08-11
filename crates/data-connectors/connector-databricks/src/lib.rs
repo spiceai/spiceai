@@ -30,6 +30,7 @@ use data_components::databricks::DatabricksSparkConnect;
 use data_components::databricks::sql_warehouse::DatabricksMetrics;
 use data_components::databricks::{DatabricksDelta, DatabricksSqlWarehouse, sql_warehouse};
 use data_components::unity_catalog::{Endpoint, UnityCatalog as UnityCatalogClient};
+use data_connector_rate_control as http_rate_control;
 use datafusion::datasource::TableProvider;
 use datafusion::datasource::listing::ListingTableUrl;
 use datafusion::execution::runtime_env::RuntimeEnv;
@@ -39,15 +40,15 @@ use runtime::component::ComponentInitialization;
 use runtime::component::dataset::Dataset;
 use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
-    DataConnectorResult, NewDataConnectorResult, http_rate_control,
+    DataConnectorResult, NewDataConnectorResult,
 };
-use runtime::parameters::{ParameterSpec, Parameters};
 use runtime::token_providers::databricks::{
     AUTH_MODE_DESCRIPTION, AUTH_MODES, AuthConfigError, AuthCredentials,
     DatabricksM2MTokenProvider, DatabricksU2MTokenProvider,
 };
 use runtime_api_types::v1::ComponentType;
 use runtime_metrics::component::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback};
+use runtime_parameters::{ParameterSpec, Parameters};
 use runtime_rate_control::RateController;
 use secrecy::ExposeSecret;
 use secrecy::SecretString;
