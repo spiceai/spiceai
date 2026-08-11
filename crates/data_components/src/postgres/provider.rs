@@ -30,6 +30,8 @@ use datafusion::common::utils::quote_identifier;
 use datafusion::datasource::TableProvider;
 use datafusion::error::Result as DFResult;
 use datafusion::sql::TableReference;
+use datafusion_table_providers::sql::db_connection_pool::DbConnectionPool;
+use datafusion_table_providers::sql::db_connection_pool::dbconnection::postgresconn::PostgresConnection;
 use datafusion_table_providers::sql::db_connection_pool::postgrespool::PostgresConnectionPool;
 use snafu::prelude::*;
 
@@ -58,6 +60,11 @@ pub enum Error {
     SchemaResolutionFailed {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
+
+    #[snafu(display(
+        "Failed to resolve table schemas for the PostgreSQL catalog: the connection pool returned a connection of an unexpected type. An unexpected error occurred. Report a bug: https://github.com/spiceai/spiceai/issues"
+    ))]
+    UnexpectedConnectionType {},
 
     /// Wraps errors from the shared `connector-postgres-common` queries
     /// (`list_schemas`/`list_tables`, re-exported below) so this crate's own
@@ -515,11 +522,22 @@ impl PostgresSchemaProvider {
     /// every table on Redshift, where the per-table `SHOW COLUMNS` cannot be
     /// batched.
     async fn list_column_schemas(&self) -> Result<HashMap<String, SchemaRef>> {
-        let conn = self
-            .pool
-            .connect_direct()
+        // Taken through `DbConnectionPool::connect`, not `connect_direct`: only
+        // that path applies the pool's `unsupported_type_action`. A connection
+        // without it rejects any column type the mapping does not support, so a
+        // schema containing one -- `jsonb`, say -- would fail this lookup even
+        // under the catalog's default `string`, and every table in the namespace
+        // would fall back to resolving its own schema. The result would still be
+        // correct, which is what makes it worth pinning down: the optimization
+        // would simply never apply, silently, in the common configuration.
+        let conn = DbConnectionPool::connect(&*self.pool)
             .await
-            .context(ConnectionFailedSnafu)?;
+            .map_err(|source| Error::ConnectionFailed { source })?;
+
+        let conn = conn
+            .as_any()
+            .downcast_ref::<PostgresConnection>()
+            .context(UnexpectedConnectionTypeSnafu)?;
 
         conn.get_schemas_in(&self.schema_name)
             .await

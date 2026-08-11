@@ -40,6 +40,11 @@ use crate::{
     postgres::common::{self, get_pg_params},
     utils::{register_test_connectors, run_query, runtime_ready_check, test_request_context},
 };
+use datafusion_table_providers::UnsupportedTypeAction;
+use datafusion_table_providers::sql::db_connection_pool::DbConnectionPool;
+use datafusion_table_providers::sql::db_connection_pool::dbconnection::postgresconn::PostgresConnection;
+use datafusion_table_providers::sql::db_connection_pool::postgrespool::PostgresConnectionPool;
+use datafusion_table_providers::util::secrets::to_secret_map;
 
 const CATALOG_NAME: &str = "pg_e2e";
 
@@ -627,6 +632,78 @@ async fn test_catalog_discovery_ignores_a_shadowed_version_function() -> Result<
             )
             .await?;
             assert_batches_eq!(&["+---+", "| n |", "+---+", "| 1 |", "+---+"], &rows);
+
+            Ok(())
+        })
+        .await
+}
+
+/// Bulk schema resolution must honour the catalog's `unsupported_type_action`.
+///
+/// The lookup that resolves a whole schema at once runs on a pooled connection,
+/// and only the pool's own `connect` applies the configured action — a
+/// connection taken any other way rejects every unsupported column type. A
+/// schema holding one, `jsonb` being the ordinary case, would then fail the bulk
+/// lookup under the catalog's default `string` and send every table in the
+/// namespace back to resolving its own schema.
+///
+/// Nothing about the resulting catalog would look wrong, which is why this is
+/// asserted rather than left to inspection: the per-table fallback produces the
+/// same tables, so the optimization would simply stop applying, silently, in the
+/// configuration most users are in.
+#[tokio::test]
+async fn test_bulk_schema_resolution_honors_unsupported_type_action() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    test_request_context()
+        .scope(async {
+            let port = common::get_random_port()?;
+            let _container = common::start_postgres_docker_container(port).await?;
+
+            seed_unsupported_type_table(port).await?;
+
+            // The pool exactly as the catalog connector builds it: the default
+            // action for a `pg` catalog is `string` (#11728).
+            let pool = PostgresConnectionPool::new(to_secret_map(
+                get_pg_params(port)
+                    .into_iter()
+                    .map(|(k, v)| (k, v.expose_secret().to_string()))
+                    .collect::<HashMap<String, String>>(),
+            ))
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+            .with_unsupported_type_action(UnsupportedTypeAction::String);
+
+            // The connection acquisition bulk resolution uses. `connect_direct`
+            // would not carry the action, and this lookup would fail.
+            let conn = DbConnectionPool::connect(&pool)
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let conn = conn
+                .as_any()
+                .downcast_ref::<PostgresConnection>()
+                .ok_or_else(|| anyhow::anyhow!("pool should hand out a PostgresConnection"))?;
+
+            let schemas = conn
+                .get_schemas_in("public")
+                .await
+                .map_err(|e| anyhow::anyhow!("bulk resolution must honor the action: {e}"))?;
+
+            let widgets = schemas
+                .get("widgets_jsonb")
+                .ok_or_else(|| anyhow::anyhow!("bulk resolution should cover the jsonb table"))?;
+            assert_eq!(
+                widgets
+                    .fields()
+                    .iter()
+                    .map(|f| (f.name().clone(), f.data_type().to_string()))
+                    .collect::<Vec<_>>(),
+                vec![
+                    ("id".to_string(), "Int32".to_string()),
+                    ("metadata".to_string(), "Utf8".to_string()),
+                ],
+                "the unsupported column should be converted per the action, not rejected"
+            );
 
             Ok(())
         })
