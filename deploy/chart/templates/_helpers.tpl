@@ -81,14 +81,26 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end }}
 
 {{/*
-Whether the container command carries a Cloud Connect `--token` bootstrap
-argument, in either its two-element (`--token`, `$(VAR)`) or single-element
-(`--token=$(VAR)`) form.
+Whether the container is launched through a supported POSIX shell. Token-like
+text embedded in a direct `spiced` argument is not a CLI argument; shell script
+text is parsed again and therefore needs separate validation.
+*/}}
+{{- define "spiceai.cloudConnectShellCommand" -}}
+{{- $command := .Values.command | default list -}}
+{{- if and (gt (len $command) 0) (regexMatch "(^|/)(sh|bash|dash|ash|zsh)$" (index $command 0)) }}true{{ end -}}
+{{- end -}}
+
+{{/*
+Whether the container command carries Cloud Connect `--token` syntax. Exact
+two-element (`--token`, `$(VAR)`) and single-element (`--token=$(VAR)`) forms
+are validated below; token syntax in an actual shell command is detected here
+and rejected there.
 */}}
 {{- define "spiceai.cloudConnectTokenBootstrap" -}}
 {{- $found := false -}}
+{{- $shellCommand := eq (include "spiceai.cloudConnectShellCommand" .) "true" -}}
 {{- range .Values.command -}}
-{{- if or (eq . "--token") (hasPrefix "--token=" .) -}}
+{{- if or (eq . "--token") (hasPrefix "--token=" .) (and $shellCommand (regexMatch "(^|[[:space:];|&])--token($|[=[:space:];|&])" .)) -}}
 {{- $found = true -}}
 {{- end -}}
 {{- end -}}
@@ -110,6 +122,19 @@ survive a pod replacement, so a command carrying `--token` requires:
 */}}
 {{- define "spiceai.validateCloudConnectBootstrap" -}}
 {{- if include "spiceai.cloudConnectTokenBootstrap" . -}}
+{{- $hasDirectTokenArg := false -}}
+{{- $hasUnsupportedTokenSyntax := false -}}
+{{- $shellCommand := eq (include "spiceai.cloudConnectShellCommand" .) "true" -}}
+{{- range .Values.command -}}
+{{- if and (not $shellCommand) (or (eq . "--token") (hasPrefix "--token=" .)) -}}
+{{- $hasDirectTokenArg = true -}}
+{{- else if and $shellCommand (regexMatch "(^|[[:space:];|&])--token($|[=[:space:];|&])" .) -}}
+{{- $hasUnsupportedTokenSyntax = true -}}
+{{- end -}}
+{{- end -}}
+{{- if or (not $hasDirectTokenArg) $hasUnsupportedTokenSyntax -}}
+{{- fail "Cloud Connect --token must be a direct command-array argument; shell-form or embedded --token syntax is unsupported. See deploy/chart/examples/cloud-connect/." -}}
+{{- end -}}
 {{- if or (ne (int (.Values.replicaCount | default 1)) 1) (not .Values.stateful.enabled) -}}
 {{- fail "Cloud Connect --token bootstrap requires one replica and persistent Spice identity storage. Set replicaCount: 1 and stateful.enabled: true, and set SPICE_CONFIG_DIR beneath stateful.mountPath. See deploy/chart/examples/cloud-connect/." -}}
 {{- end -}}

@@ -102,6 +102,10 @@ expect_rejected "a literal enrollment key in command" \
   --set-json "command=[\"/usr/local/bin/spiced\",\"--token\",\"${TEST_ENROLLMENT_KEY}\",\"--http\",\"0.0.0.0:8090\"]"
 expect_rejected "a literal enrollment key in --token= form" \
   --set-json "command=[\"/usr/local/bin/spiced\",\"--token=${TEST_ENROLLMENT_KEY}\",\"--http\",\"0.0.0.0:8090\"]"
+expect_rejected "a shell-form token command" \
+  --set-json "command=[\"/bin/sh\",\"-c\",\"spiced --token ${TEST_ENROLLMENT_KEY}\"]"
+expect_rejected "mixed direct and shell-form token commands" \
+  --set-json 'command=["/bin/sh","-c","spiced --token literal","--token","$(SPICE_ENROLL_KEY)"]'
 expect_rejected "--token with no value" \
   --set-json 'command=["/usr/local/bin/spiced","--http","0.0.0.0:8090","--token"]'
 expect_rejected "an undefined token environment variable" \
@@ -118,6 +122,11 @@ if render --set replicaCount=3 >/dev/null; then
   pass "a non-token deployment still scales freely"
 else
   fail "the validation wrongly rejected a deployment without --token"
+fi
+if render --set-json 'command=["spiced","--set-runtime","debug.flag=--token"]' >/dev/null; then
+  pass "incidental token-like text in a direct argument is not bootstrap syntax"
+else
+  fail "the validation mistook incidental direct-argument text for token syntax"
 fi
 
 # --- The example values files never hold a literal key ---
@@ -140,6 +149,117 @@ if grep -q -- '--reuse-values' "${TRANSITION}"; then
 else
   fail "transition would reset installed Helm values"
 fi
+if sed -n '/helm upgrade/,/--wait --timeout/p' "${TRANSITION}" | grep -q 'values-connected.yaml'; then
+  fail "transition would overwrite customized scalar or stateful values from the static example"
+else
+  pass "transition does not apply mount-bearing static example values"
+fi
+TRANSITION_FILTER="${EXAMPLES}/transition-values.jq"
+installed_values='{"command":["/usr/local/bin/spiced","--token","$(SPICE_ENROLL_KEY)","--http","0.0.0.0:8090","--set-runtime","custom.mode=enabled"],"additionalEnv":[{"name":"SPICE_ENROLL_KEY","valueFrom":{"secretKeyRef":{"name":"spice-cloud-connect","key":"enroll-key"}}},{"name":"SPICE_CONFIG_DIR","value":"/data/.spice"},{"name":"CUSTOM_FLAG","value":"kept"}]}'
+if transition_plan="$(printf '%s' "${installed_values}" | jq -f "${TRANSITION_FILTER}")"; then
+  connected_values="$(printf '%s' "${transition_plan}" | jq '.values')"
+  if printf '%s' "${connected_values}" | jq -e '
+    (.command | index("--token") == null)
+    and (.command | index("$(SPICE_ENROLL_KEY)") == null)
+    and (.command | index("custom.mode=enabled") != null)
+    and (.additionalEnv | map(.name) | index("SPICE_ENROLL_KEY") == null)
+    and (.additionalEnv | map(.name) | index("SPICE_CONFIG_DIR") != null)
+    and (.additionalEnv | map(.name) | index("CUSTOM_FLAG") != null)
+  ' >/dev/null; then
+    pass "transition removes only the token argument and matching env"
+  else
+    fail "transition dropped a custom command or environment value: ${connected_values}"
+  fi
+  if printf '%s' "${transition_plan}" | jq -e '.bootstrapSecretName == "spice-cloud-connect"' >/dev/null; then
+    pass "transition derives the exact installed Secret name"
+  else
+    fail "transition did not derive the installed Secret name: ${transition_plan}"
+  fi
+  second_plan="$(printf '%s' "${connected_values}" | jq -f "${TRANSITION_FILTER}")"
+  second_values="$(printf '%s' "${second_plan}" | jq '.values')"
+  if [ "$(printf '%s' "${connected_values}" | jq -S -c .)" = "$(printf '%s' "${second_values}" | jq -S -c .)" ] \
+    && printf '%s' "${second_plan}" | jq -e '.bootstrapSecretName == "spice-cloud-connect"' >/dev/null; then
+    pass "connected-value filtering is idempotent"
+  else
+    fail "connected-value filtering changed an already-connected release or forgot its Secret: ${second_plan}"
+  fi
+else
+  fail "transition could not derive connected values from a valid bootstrap release"
+fi
+duplicate_token_values='{"command":["spiced","--token","$(FIRST)","--token=$(SECOND)"],"additionalEnv":[]}'
+if printf '%s' "${duplicate_token_values}" | jq -f "${TRANSITION_FILTER}" >/dev/null 2>&1; then
+  fail "transition accepted an ambiguous installed command with two tokens"
+else
+  pass "transition rejects ambiguous installed token commands"
+fi
+equals_token_values='{"command":["spiced","--token=$(ENROLLMENT)","--http","127.0.0.1:8090"],"additionalEnv":[{"name":"ENROLLMENT","valueFrom":{"secretKeyRef":{"name":"custom-enroll-secret","key":"token"}}},{"name":"CUSTOM","value":"kept"}]}'
+if equals_plan="$(printf '%s' "${equals_token_values}" | jq -f "${TRANSITION_FILTER}")" \
+  && printf '%s' "${equals_plan}" | jq -e '
+    (.bootstrapSecretName == "custom-enroll-secret")
+    and (.values.command | all(startswith("--token=") | not))
+    and (.values.additionalEnv | map(.name) == ["CUSTOM"])
+  ' >/dev/null; then
+  pass "transition removes --token= form and preserves its unrelated env"
+else
+  fail "transition mishandled the --token= form: ${equals_plan:-no plan}"
+fi
+shell_token_values='{"command":["/bin/sh","-c","spiced --token $(ENROLLMENT)"],"additionalEnv":[{"name":"ENROLLMENT","valueFrom":{"secretKeyRef":{"name":"secret","key":"token"}}}]}'
+if printf '%s' "${shell_token_values}" | jq -f "${TRANSITION_FILTER}" >/dev/null 2>&1; then
+  fail "transition accepted unsupported shell-form token syntax"
+else
+  pass "transition rejects installed shell-form token syntax before upgrade"
+fi
+mixed_token_values='{"command":["/bin/sh","-c","spiced --token literal","--token","$(ENROLLMENT)"],"additionalEnv":[{"name":"ENROLLMENT","valueFrom":{"secretKeyRef":{"name":"secret","key":"token"}}}]}'
+if printf '%s' "${mixed_token_values}" | jq -f "${TRANSITION_FILTER}" >/dev/null 2>&1; then
+  fail "transition accepted mixed direct and shell-form token syntax"
+else
+  pass "transition rejects mixed direct and shell-form token syntax before upgrade"
+fi
+stale_marker_values='{"command":["spiced","--token","$(ENROLLMENT)"],"additionalEnv":[{"name":"ENROLLMENT","valueFrom":{"secretKeyRef":{"name":"installed-secret","key":"token"}}}],"cloudConnect":{"bootstrapSecretName":"different-secret"}}'
+if printf '%s' "${stale_marker_values}" | jq -f "${TRANSITION_FILTER}" >/dev/null 2>&1; then
+  fail "transition accepted a remembered Secret name that conflicts with the installed secretKeyRef"
+else
+  pass "transition rejects conflicting remembered and installed Secret names"
+fi
+incidental_token_values='{"command":["spiced","--set-runtime","debug.flag=--token"],"additionalEnv":[{"name":"CUSTOM","value":"kept"}]}'
+if incidental_plan="$(printf '%s' "${incidental_token_values}" | jq -f "${TRANSITION_FILTER}")" \
+  && printf '%s' "${incidental_plan}" | jq -e '
+    (.values.command == ["spiced", "--set-runtime", "debug.flag=--token"])
+    and (.values.additionalEnv == [{"name":"CUSTOM","value":"kept"}])
+  ' >/dev/null; then
+  pass "incidental token-like text in a direct argument is preserved"
+else
+  fail "transition treated incidental direct-argument text as token syntax: ${incidental_plan:-no plan}"
+fi
+WORKLOAD_FILTER="${EXAMPLES}/transition-workload-clean.jq"
+name_collision_workload='{"metadata":{"name":"spice-cloud-connect","labels":{"app":"spice-cloud-connect"}},"spec":{"template":{"spec":{"containers":[{"command":["spiced","--http","0.0.0.0:8090"],"env":[{"name":"SPICE_CONFIG_DIR","value":"/data/.spice"}]}],"volumes":[{"name":"spice-cloud-connect-data"}]}}}}'
+if printf '%s' "${name_collision_workload}" \
+  | jq -e --arg secret spice-cloud-connect -f "${WORKLOAD_FILTER}" >/dev/null; then
+  pass "release-name collisions do not impersonate Secret references"
+else
+  fail "structured workload validation rejected an unrelated name collision"
+fi
+secret_ref_workload='{"spec":{"template":{"spec":{"containers":[{"command":["spiced"],"env":[{"name":"OTHER","valueFrom":{"secretKeyRef":{"name":"spice-cloud-connect","key":"value"}}}]}]}}}}'
+if printf '%s' "${secret_ref_workload}" \
+  | jq -e --arg secret spice-cloud-connect -f "${WORKLOAD_FILTER}" >/dev/null; then
+  fail "structured workload validation missed an exact bootstrap Secret reference"
+else
+  pass "structured workload validation detects the exact Secret reference"
+fi
+token_workload='{"spec":{"template":{"spec":{"containers":[{"command":["/bin/sh","-c","spiced --token $(KEY)"]}]}}}}'
+if printf '%s' "${token_workload}" \
+  | jq -e --arg secret spice-cloud-connect -f "${WORKLOAD_FILTER}" >/dev/null; then
+  fail "structured workload validation missed residual shell-form token syntax"
+else
+  pass "structured workload validation detects residual token syntax"
+fi
+incidental_token_workload='{"spec":{"template":{"spec":{"containers":[{"command":["spiced","--set-runtime","debug.flag=--token"]}]}}}}'
+if printf '%s' "${incidental_token_workload}" \
+  | jq -e --arg secret spice-cloud-connect -f "${WORKLOAD_FILTER}" >/dev/null; then
+  pass "structured workload validation preserves incidental direct-argument text"
+else
+  fail "structured workload validation mistook incidental text for a token argument"
+fi
 if output="$(SPICE_WAIT_TIMEOUT=10m bash "${TRANSITION}" test default 2>&1)"; then
   fail "transition accepted an unsupported timeout format"
 elif echo "${output}" | grep -q "positive integer seconds"; then
@@ -147,6 +267,34 @@ elif echo "${output}" | grep -q "positive integer seconds"; then
 else
   fail "transition timeout rejection was not actionable: ${output}"
 fi
+
+# The shell-level expected-Secret guard is exercised with exported mocks so it
+# must fail after reading installed values but before any upgrade or deletion.
+TRANSITION_TEST_INSTALLED_VALUES="${installed_values}"
+export TRANSITION_TEST_INSTALLED_VALUES
+helm() {
+  if [ "${1:-} ${2:-}" = "get values" ]; then
+    printf '%s\n' "${TRANSITION_TEST_INSTALLED_VALUES}"
+  else
+    return 99
+  fi
+}
+kubectl() {
+  if printf '%s\n' "$*" | grep -q ' wait '; then
+    return 0
+  fi
+  return 99
+}
+export -f helm kubectl
+if output="$(SPICE_SECRET_NAME=different-secret bash "${TRANSITION}" test default 2>&1)"; then
+  fail "transition accepted SPICE_SECRET_NAME that conflicts with installed values"
+elif echo "${output}" | grep -q "does not match the installed token secretKeyRef"; then
+  pass "transition rejects a mismatched SPICE_SECRET_NAME before upgrade"
+else
+  fail "transition did not report the expected Secret-name mismatch: ${output}"
+fi
+unset -f helm kubectl
+unset TRANSITION_TEST_INSTALLED_VALUES
 
 echo
 if [ "${FAILURES}" -gt 0 ]; then

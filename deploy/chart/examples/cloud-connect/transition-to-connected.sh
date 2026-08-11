@@ -7,9 +7,9 @@
 #   1. Wait for the bootstrap pod to be Ready. The runtime is unready until
 #      the enrolled identity is durable at SPICE_CONFIG_DIR on the PVC, so
 #      Ready IS the durable-identity signal.
-#   2. Upgrade the release to values-connected.yaml — removing the `--token`
-#      argument and its Secret environment reference while keeping
-#      SPICE_CONFIG_DIR and the stateful volume — and wait for the rollout.
+#   2. Derive a token-free override from the installed values, then upgrade —
+#      removing the `--token` argument and its Secret environment reference
+#      while preserving every other value — and wait for the rollout.
 #   3. Verify the replacement pod establishes its control stream from the
 #      stored identity alone, with no key in the pod spec.
 #   4. Only then delete the Secret. Deleting a Secret a pod template still
@@ -17,13 +17,16 @@
 #
 # Idempotent: re-running against an already-transitioned release re-applies
 # the same connected values and treats an already-deleted Secret as success.
+# The installed command and environment arrays are filtered so every custom
+# entry other than the token argument and its matching env remains installed.
 #
 # Usage:
 #   transition-to-connected.sh <release> [namespace]
 #
 # Environment:
 #   SPICE_CHART        Chart path or name (default: deploy/chart)
-#   SPICE_SECRET_NAME  Bootstrap Secret name (default: spice-cloud-connect)
+#   SPICE_SECRET_NAME  Optional expected bootstrap Secret name. Normally
+#                      derived from the installed secretKeyRef.
 #   SPICE_WAIT_TIMEOUT Per-step wait budget as positive integer seconds
 #                      with an `s` suffix (default: 600s)
 
@@ -32,7 +35,7 @@ set -euo pipefail
 RELEASE="${1:?usage: transition-to-connected.sh <release> [namespace]}"
 NAMESPACE="${2:-default}"
 CHART="${SPICE_CHART:-deploy/chart}"
-SECRET_NAME="${SPICE_SECRET_NAME:-spice-cloud-connect}"
+REQUESTED_SECRET_NAME="${SPICE_SECRET_NAME:-}"
 WAIT_TIMEOUT="${SPICE_WAIT_TIMEOUT:-600s}"
 case "${WAIT_TIMEOUT}" in
   *s) WAIT_SECONDS="${WAIT_TIMEOUT%s}" ;;
@@ -53,6 +56,14 @@ if [ "${WAIT_SECONDS}" -eq 0 ]; then
 fi
 VALUES_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SELECTOR="app=${RELEASE}"
+if ! command -v jq >/dev/null 2>&1; then
+  echo "error: jq is required to preserve installed command and environment values while removing --token" >&2
+  exit 1
+fi
+TRANSITION_PLAN="$(mktemp "${TMPDIR:-/tmp}/spice-transition-plan.XXXXXX.json")"
+CONNECTED_OVERRIDES="$(mktemp "${TMPDIR:-/tmp}/spice-connected-values.XXXXXX.json")"
+WORKLOAD_JSON="$(mktemp "${TMPDIR:-/tmp}/spice-connected-workload.XXXXXX.json")"
+trap 'rm -f -- "${TRANSITION_PLAN}" "${CONNECTED_OVERRIDES}" "${WORKLOAD_JSON}"' EXIT
 
 log() { echo "[transition-to-connected] $*"; }
 
@@ -70,11 +81,28 @@ workload_kind() {
 log "step 1/4: waiting for the bootstrap pod of release '${RELEASE}' to be Ready (identity durable on the PVC)"
 kubectl -n "${NAMESPACE}" wait --for=condition=Ready pod -l "${SELECTOR}" --timeout="${WAIT_TIMEOUT}"
 
-log "step 2/4: upgrading '${RELEASE}' to the connected values (removes --token and the ${SECRET_NAME} Secret reference, keeps the volume)"
+if ! helm get values "${RELEASE}" --namespace "${NAMESPACE}" -o json \
+  | jq -f "${VALUES_DIR}/transition-values.jq" >"${TRANSITION_PLAN}"; then
+  echo "error: failed to derive token-free connected values from the installed Helm release; no upgrade was performed" >&2
+  exit 1
+fi
+if ! jq '.values' "${TRANSITION_PLAN}" >"${CONNECTED_OVERRIDES}"; then
+  echo "error: the derived connected-values plan is invalid; no upgrade was performed" >&2
+  exit 1
+fi
+DERIVED_SECRET_NAME="$(jq -r '.bootstrapSecretName // empty' "${TRANSITION_PLAN}")"
+if [ -n "${REQUESTED_SECRET_NAME}" ] && [ -n "${DERIVED_SECRET_NAME}" ] \
+  && [ "${REQUESTED_SECRET_NAME}" != "${DERIVED_SECRET_NAME}" ]; then
+  echo "error: SPICE_SECRET_NAME '${REQUESTED_SECRET_NAME}' does not match the installed token secretKeyRef '${DERIVED_SECRET_NAME}'; no upgrade was performed" >&2
+  exit 1
+fi
+SECRET_NAME="${DERIVED_SECRET_NAME:-${REQUESTED_SECRET_NAME:-spice-cloud-connect}}"
+
+log "step 2/4: upgrading '${RELEASE}' with token-free installed values (removes --token and the ${SECRET_NAME} Secret reference, keeps all other values)"
 helm upgrade "${RELEASE}" "${CHART}" \
   --namespace "${NAMESPACE}" \
   --reuse-values \
-  -f "${VALUES_DIR}/values-connected.yaml" \
+  -f "${CONNECTED_OVERRIDES}" \
   --wait --timeout "${WAIT_TIMEOUT}"
 
 WORKLOAD="$(workload_kind)"
@@ -84,10 +112,25 @@ if [ -z "${WORKLOAD}" ]; then
 fi
 kubectl -n "${NAMESPACE}" rollout status "${WORKLOAD}" --timeout="${WAIT_TIMEOUT}"
 
-# The upgraded pod spec must no longer reference the token or the Secret.
-if kubectl -n "${NAMESPACE}" get "${WORKLOAD}" -o yaml | grep -qE -- "--token|${SECRET_NAME}"; then
-  echo "error: the upgraded pod template still references --token or the ${SECRET_NAME} Secret; not deleting the Secret" >&2
+# The upgraded pod template must no longer carry token syntax or an exact
+# reference to the bootstrap Secret. Inspect structured fields so a release or
+# volume whose name happens to contain SECRET_NAME cannot cause a false match.
+if ! kubectl -n "${NAMESPACE}" get "${WORKLOAD}" -o json >"${WORKLOAD_JSON}"; then
+  echo "error: failed to read the upgraded pod template; not deleting the Secret" >&2
   exit 1
+fi
+if jq -e --arg secret "${SECRET_NAME}" \
+  -f "${VALUES_DIR}/transition-workload-clean.jq" "${WORKLOAD_JSON}" >/dev/null; then
+  :
+else
+  jq_status=$?
+  if [ "${jq_status}" -eq 1 ]; then
+    echo "error: the upgraded pod template still references --token or the ${SECRET_NAME} Secret; not deleting the Secret" >&2
+    exit 1
+  else
+    echo "error: failed to validate the upgraded pod template; not deleting the Secret" >&2
+    exit 1
+  fi
 fi
 
 log "step 3/4: verifying the replacement pod reconnects from the stored identity"
@@ -106,4 +149,4 @@ kubectl -n "${NAMESPACE}" wait --for=condition=Ready pod -l "${SELECTOR}" --time
 log "step 4/4: deleting the single-use bootstrap Secret '${SECRET_NAME}'"
 kubectl -n "${NAMESPACE}" delete secret "${SECRET_NAME}" --ignore-not-found
 
-log "done: '${RELEASE}' runs from its stored identity; use values-connected.yaml for all future upgrades"
+log "done: '${RELEASE}' runs from its stored identity; preserve its connected installed values with --reuse-values or a maintained custom values file on future upgrades"

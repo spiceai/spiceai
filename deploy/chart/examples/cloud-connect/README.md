@@ -35,15 +35,22 @@ retry window.
 deploy/chart/examples/cloud-connect/transition-to-connected.sh spiceai [namespace]
 ```
 
-The script waits for readiness (identity durable), upgrades the release to
-`values-connected.yaml` — removing `--token` and the Secret env reference
-while reusing all other installed values and keeping the volume — verifies the
-replacement pod reconnects from the identity alone, and only then deletes the
-Secret. Deleting a Secret that a pod template still references is forbidden.
-The script is idempotent. `SPICE_WAIT_TIMEOUT`, when set, must be positive
-integer seconds such as `900s`.
+The script waits for readiness (identity durable), derives a token-free
+override from the release's installed values, and upgrades with
+`--reuse-values`. It removes only `--token` and its matching Secret env while
+retaining every unrelated command argument, environment entry, PVC mount, and
+other installed value. It then verifies the replacement pod reconnects from
+the identity alone and only then deletes the exact Secret named by the
+installed `secretKeyRef`. The non-secret Secret name remains in the Helm
+release values as an interruption-recovery marker, so a rerun can still delete
+a custom-named Secret after the token reference has already been removed. The
+script is idempotent and requires `jq`.
+`SPICE_WAIT_TIMEOUT`, when set, must be positive integer seconds such as
+`900s`; `SPICE_SECRET_NAME`, when set, must match the installed Secret.
 
-All later upgrades and restarts use `values-connected.yaml` only.
+The supplied `values-connected.yaml` is the token-free default example. For a
+customized release, preserve those custom values on later upgrades (for
+example with `--reuse-values` or a maintained connected values file).
 
 ## Guardrails
 

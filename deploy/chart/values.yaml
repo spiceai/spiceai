@@ -49,6 +49,13 @@ serviceAccount:
 #   - --flight
 #   - 0.0.0.0:50051
 
+# Internal recovery marker written by the Cloud Connect phase-transition
+# script. It contains only a Kubernetes Secret name, never the enrollment key,
+# and lets an interrupted custom-Secret transition resume after `--token` and
+# its secretKeyRef have already been removed from the installed pod values.
+cloudConnect:
+  bootstrapSecretName:
+
 # Configure Kubernetes probes for the Spice.ai runtime container.
 # Omitted probe fields keep these defaults, so overrides can be partial.
 # If a probe value is omitted entirely, the template renders these defaults.

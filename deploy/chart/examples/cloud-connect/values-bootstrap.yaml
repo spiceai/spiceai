@@ -21,7 +21,9 @@
 # pod retains the expanded value in its argv/spec until this replacement:
 #   deploy/chart/examples/cloud-connect/transition-to-connected.sh spiceai
 #
-# Normal restarts and upgrades use values-connected.yaml only.
+# For the default example, values-connected.yaml documents the token-free
+# shape. Customized releases must preserve their installed values; use the
+# transition script and --reuse-values (or a maintained custom values file).
 #
 # See: https://spiceai.org/docs
 
