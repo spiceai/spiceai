@@ -133,9 +133,7 @@ pub(crate) async fn post(
     );
     span.in_scope(|| tracing::info!(target: "task_history", model = %req.model, "labels"));
 
-    if let Some(traceparent) = context.trace_parent() {
-        crate::http::traceparent::override_task_history_with_trace_parent(&span, traceparent);
-    }
+    crate::task_history::correlation::record_task_history_trace_id(&span, &context);
 
     let span_clone = span.clone();
     async move {

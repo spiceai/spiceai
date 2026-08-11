@@ -26,6 +26,7 @@ limitations under the License.
 //! Standalone DuckDB↔SQLite agreement (no Spice) lives under
 //! `result_correctness_standalone_engines_test`.
 
+#![recursion_limit = "256"]
 #![allow(clippy::expect_used)]
 #![allow(clippy::unwrap_used)]
 #![allow(clippy::too_many_lines)]

@@ -74,10 +74,8 @@ use runtime_datafusion::refresh_scan::get_data;
 use runtime_datafusion::refresh_sql;
 use runtime_datafusion::schema_provider::ensure_schema_exists;
 use runtime_datafusion::session_config::get_df_default_config;
-use runtime_datafusion_index::rebuild_innermost_table_provider;
-use runtime_datafusion_index::{
-    IndexedTableProvider,
-    analyzer::{IndexTableScanExtensionPlanner, IndexTableScanOptimizerRule},
+use runtime_datafusion_index::analyzer::{
+    IndexTableScanExtensionPlanner, IndexTableScanOptimizerRule,
 };
 use runtime_metrics::acceleration as metrics;
 use runtime_metrics::telemetry::track_bytes_processed;
@@ -85,6 +83,7 @@ use runtime_object_store::registry::default_runtime_env;
 use runtime_request_context::{AsyncMarker, RequestContext};
 use runtime_status as status;
 use snafu::{OptionExt, ResultExt};
+use spice_table::{LayerWalk, SpiceTable};
 use spicepod::metric::Metrics;
 use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
@@ -136,10 +135,8 @@ fn table_provider_with_existing_metadata(
     metadata_enriched_table_provider_preserving_indexes(provider, &table_metadata, &field_metadata)
 }
 
-/// Pushes metadata enrichment to the base of the provider stack, rebuilding
-/// the index, stale-enrichment and federation layers around it so they stay
-/// discoverable by downcast. Restricted to the layers a refresh-path provider
-/// stack contains; see the layer table in [`crate::table_layers`].
+/// Pushes metadata enrichment to the base of the provider stack, keeping every
+/// layer above it intact so indexes and federation stay discoverable.
 fn metadata_enriched_table_provider_preserving_indexes(
     provider: Arc<dyn TableProvider>,
     table_metadata: &HashMap<String, String>,
@@ -149,21 +146,11 @@ fn metadata_enriched_table_provider_preserving_indexes(
         return provider;
     }
 
-    rebuild_innermost_table_provider(
-        provider,
-        &[
-            crate::table_layers::INDEXED_LAYER,
-            crate::table_layers::METADATA_ENRICHED_LAYER,
-            crate::table_layers::FEDERATED_ADAPTOR_LAYER,
-        ],
-        &|innermost| {
-            metadata_enriched_table_provider(
-                innermost,
-                table_metadata.clone(),
-                field_metadata.clone(),
-            )
-        },
-    )
+    let enrich = |base: Arc<dyn TableProvider>| {
+        metadata_enriched_table_provider(base, table_metadata.clone(), field_metadata.clone())
+    };
+
+    spice_table::rebuild_base(&provider, &enrich)
 }
 
 #[derive(Debug, Clone, Default)]
@@ -172,38 +159,23 @@ struct RefreshStat {
     pub memory_size: usize,
 }
 
-/// Synchronous traversal: walks a provider chain and collects indexes from every
-/// [`IndexedTableProvider`] layer, stepping through every read-transparent layer
-/// (see [`crate::table_layers`]) so an index nested under a metadata-enrichment
-/// or vector-scan layer is not silently missed. Kept as a plain fn (not async)
-/// so that the `HashSet<*const ()>` used for dedup never appears inside an
-/// async fn and cannot make the enclosing future non-`Send`.
+/// Collects the indexes attached anywhere in a dataset's stack.
+///
+/// Kept as a plain fn (not async) so the identity set used for de-duplication
+/// never appears inside an async fn and cannot make the enclosing future
+/// non-`Send`.
 pub(crate) fn collect_indexes_from_provider(
     root: &Arc<dyn datafusion::catalog::TableProvider>,
-) -> Vec<Arc<dyn runtime_datafusion_index::Index + Send + Sync>> {
-    let mut indexes: Vec<Arc<dyn runtime_datafusion_index::Index + Send + Sync>> = Vec::new();
+) -> Vec<Arc<dyn spice_table::Index + Send + Sync>> {
     let mut seen = std::collections::HashSet::new();
-
-    runtime_datafusion_index::visit_provider_chain(
-        root,
-        crate::table_layers::layers(),
-        runtime_datafusion_index::LayerWalk::Read,
-        &mut |provider| {
-            if let Some(indexed) = provider.downcast_ref::<IndexedTableProvider>() {
-                for index in indexed.get_all_indexes() {
-                    let ptr = Arc::as_ptr(&index).cast::<()>();
-                    if seen.insert(ptr) {
-                        indexes.push(index);
-                    }
-                }
-            }
-        },
-    );
-
-    indexes
+    spice_table::nodes(root.as_ref(), LayerWalk::Read)
+        .flat_map(SpiceTable::indexes)
+        .filter(|index| seen.insert(Arc::as_ptr(index).cast::<()>()))
+        .map(Arc::clone)
+        .collect()
 }
 
-/// Walks the federated provider chain and collects indexes from **every** [`IndexedTableProvider`]
+/// Walks the federated provider chain and collects indexes from **every** [`IndexLayer`]
 /// layer encountered, stepping through the read-transparent wrapper layers so that indexes nested
 /// inside them are not silently missed. These indexes receive write lifecycle hooks alongside
 /// accelerator refreshes.
@@ -212,7 +184,7 @@ pub(crate) fn collect_indexes_from_provider(
 /// (e.g. during schema evolution). If the provider is not yet available, returns an empty list.
 pub(crate) fn indexes_from_federated(
     federated: &FederatedTable,
-) -> Vec<Arc<dyn runtime_datafusion_index::Index + Send + Sync>> {
+) -> Vec<Arc<dyn spice_table::Index + Send + Sync>> {
     let Some(root) = federated.try_table_provider_sync() else {
         return Vec::new();
     };
@@ -222,7 +194,7 @@ pub(crate) fn indexes_from_federated(
 /// Collects every index attached to this dataset, from both sides of the accelerated table.
 ///
 /// An external-store vector/search index (e.g. S3 Vectors, Elasticsearch) is only ever attached
-/// via `IndexedTableProvider` on the *federated/read* side (`EmbeddingConnector::wrap_table` wraps
+/// via `IndexLayer` on the *federated/read* side (`EmbeddingConnector::wrap_table` wraps
 /// the source connector, not the accelerator) — `collect_indexes_from_provider(accelerator)` alone
 /// finds nothing for these. The `DuckDB` vector engine is the opposite: it wraps the *accelerator*
 /// itself (`wrap_accelerator_with_duckdb_vector_indexes`), not the federated side. Both are checked
@@ -231,7 +203,7 @@ pub(crate) fn indexes_from_federated(
 pub(crate) fn collect_all_indexes(
     accelerator: &Arc<dyn datafusion::catalog::TableProvider>,
     federated: &FederatedTable,
-) -> Vec<Arc<dyn runtime_datafusion_index::Index + Send + Sync>> {
+) -> Vec<Arc<dyn spice_table::Index + Send + Sync>> {
     let mut seen = std::collections::HashSet::new();
     collect_indexes_from_provider(accelerator)
         .into_iter()
@@ -2669,7 +2641,10 @@ fn accelerator_df(
 }
 
 pub fn accelerator_table_provider(accelerator: &Arc<dyn TableProvider>) -> Arc<dyn TableProvider> {
-    match accelerator.downcast_ref::<PolyTableProvider>() {
+    match spice_table::find_layer::<PolyTableProvider>(
+        accelerator.as_ref(),
+        spice_table::LayerWalk::Write,
+    ) {
         Some(poly) => match poly
             .get_federated_table_provider()
             .downcast_ref::<FederatedTableProviderAdaptor>()
@@ -2685,7 +2660,9 @@ pub fn accelerator_table_provider(accelerator: &Arc<dyn TableProvider>) -> Arc<d
             | Some(FederatedTableProviderAdaptor {
                 source: _,
                 table_provider: None,
-            }) => Arc::new(EnsureSchema::new(Arc::new(poly.clone()))),
+            }) => Arc::new(EnsureSchema::new(
+                Arc::new(poly.clone()).into_table() as Arc<dyn TableProvider>
+            )),
         },
         None => Arc::new(EnsureSchema::new(Arc::clone(accelerator))),
     }
@@ -2902,6 +2879,7 @@ mod tests {
     use datafusion::physical_plan::memory::MemoryStream;
     use datafusion::prelude::SessionContext;
     use runtime_acceleration::dataupdate::{StreamingDataUpdate, UpdateType};
+    use spice_table::IndexLayer;
     use std::sync::Arc;
     use tokio::sync::Mutex;
 
@@ -2909,7 +2887,7 @@ mod tests {
     struct TestRefreshIndex;
 
     #[async_trait::async_trait]
-    impl runtime_datafusion_index::Index for TestRefreshIndex {
+    impl spice_table::Index for TestRefreshIndex {
         fn name(&self) -> &'static str {
             "test_refresh_index"
         }
@@ -2941,21 +2919,24 @@ mod tests {
             MemTable::try_new(Arc::clone(&schema), vec![vec![batch]])
                 .expect("mem table should be created"),
         );
-        let index: Arc<dyn runtime_datafusion_index::Index + Send + Sync> =
-            Arc::new(TestRefreshIndex);
-        let indexed_provider: Arc<dyn TableProvider> = Arc::new(
-            IndexedTableProvider::with_indexes(mem_table, vec![Arc::clone(&index)]),
+        let index: Arc<dyn spice_table::Index + Send + Sync> = Arc::new(TestRefreshIndex);
+        let indexed_provider: Arc<dyn TableProvider> = SpiceTable::over(
+            Arc::new(IndexLayer::with_indexes(vec![Arc::clone(&index)])),
+            mem_table,
         );
 
         let wrapped = table_provider_with_existing_metadata(indexed_provider);
-        let indexed = wrapped
-            .downcast_ref::<IndexedTableProvider>()
-            .expect("indexed provider should remain the outer provider");
-        assert_eq!(indexed.get_all_indexes().len(), 1);
+        let index_node = spice_table::nodes(wrapped.as_ref(), LayerWalk::Index)
+            .find(|node| node.layer_as::<IndexLayer>().is_some())
+            .expect("the index layer should remain the outermost layer");
+        assert_eq!(index_node.indexes().len(), 1);
         assert!(
-            indexed
-                .get_underlying()
-                .is::<MetadataEnrichedTableProvider>()
+            spice_table::find_layer::<MetadataEnrichedTableProvider>(
+                index_node.below().as_ref(),
+                LayerWalk::Read
+            )
+            .is_some(),
+            "enrichment should sit below the index layer"
         );
 
         let wrapped_schema = wrapped.schema();
@@ -2985,10 +2966,10 @@ mod tests {
         let mem_table: Arc<dyn TableProvider> = Arc::new(
             MemTable::try_new(schema, vec![vec![batch]]).expect("mem table should be created"),
         );
-        Arc::new(IndexedTableProvider::with_indexes(
+        SpiceTable::over(
+            Arc::new(IndexLayer::with_indexes(vec![Arc::new(TestRefreshIndex)])),
             mem_table,
-            vec![Arc::new(TestRefreshIndex)],
-        ))
+        )
     }
 
     /// An index nested under a metadata-enrichment layer must still receive
@@ -2996,7 +2977,6 @@ mod tests {
     /// silently drops the index writes for the whole refresh.
     #[test]
     fn collect_indexes_finds_indexes_under_metadata_enrichment() {
-        crate::table_layers::install_for_tests();
         let enriched: Arc<dyn TableProvider> = data_components::metadata_enriched_table_provider(
             indexed_mem_table(),
             std::collections::HashMap::from([("table_meta".to_string(), "value".to_string())]),
@@ -3006,14 +2986,13 @@ mod tests {
         assert_eq!(
             collect_indexes_from_provider(&enriched).len(),
             1,
-            "an index below a MetadataEnrichedTableProvider layer must be collected"
+            "an index below a metadata-enrichment layer must be collected"
         );
     }
 
     /// Same requirement for a vector-scan layer above the indexed provider.
     #[test]
     fn collect_indexes_finds_indexes_under_vector_scan() {
-        crate::table_layers::install_for_tests();
         let plan = datafusion::logical_expr::LogicalPlanBuilder::empty(false)
             .build()
             .expect("empty logical plan should build");
@@ -3022,7 +3001,8 @@ mod tests {
                 table_provider: indexed_mem_table(),
                 vector_index_list: Arc::new(plan),
                 primary_key: vec![],
-            });
+            })
+            .into_table();
 
         assert_eq!(
             collect_indexes_from_provider(&vector_scan).len(),
