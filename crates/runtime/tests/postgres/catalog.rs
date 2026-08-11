@@ -40,6 +40,10 @@ use crate::{
     postgres::common::{self, get_pg_params},
     utils::{register_test_connectors, run_query, runtime_ready_check, test_request_context},
 };
+use data_components::Read;
+use data_components::RefreshableCatalogProvider;
+use data_components::catalog_filter::TableSelector;
+use data_components::postgres::provider::PostgresCatalogProvider;
 use datafusion_table_providers::UnsupportedTypeAction;
 use datafusion_table_providers::sql::db_connection_pool::DbConnectionPool;
 use datafusion_table_providers::sql::db_connection_pool::dbconnection::postgresconn::PostgresConnection;
@@ -638,19 +642,82 @@ async fn test_catalog_discovery_ignores_a_shadowed_version_function() -> Result<
         .await
 }
 
+/// A recording [`Read`] that reports which construction path each table took.
+///
+/// Whether a table's schema came from the schema-wide lookup or from its own
+/// query is invisible in the resulting catalog — both register the same table —
+/// so a test that wants to assert it has to observe the call.
+#[derive(Default)]
+struct RecordingRead {
+    from_supplied_schema: std::sync::Mutex<Vec<String>>,
+    self_resolved: std::sync::Mutex<Vec<String>>,
+}
+
+impl RecordingRead {
+    fn from_supplied_schema(&self) -> Vec<String> {
+        self.from_supplied_schema
+            .lock()
+            .expect("mutex should not be poisoned")
+            .clone()
+    }
+
+    fn self_resolved(&self) -> Vec<String> {
+        self.self_resolved
+            .lock()
+            .expect("mutex should not be poisoned")
+            .clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl Read for RecordingRead {
+    async fn table_provider(
+        &self,
+        table_reference: datafusion::sql::TableReference,
+    ) -> Result<
+        Arc<dyn datafusion::datasource::TableProvider + 'static>,
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
+        self.self_resolved
+            .lock()
+            .expect("mutex should not be poisoned")
+            .push(table_reference.table().to_string());
+        Ok(Arc::new(datafusion::datasource::empty::EmptyTable::new(
+            Arc::new(arrow::datatypes::Schema::empty()),
+        )))
+    }
+
+    async fn table_provider_with_schema(
+        &self,
+        table_reference: datafusion::sql::TableReference,
+        schema: arrow::datatypes::SchemaRef,
+    ) -> Result<
+        Arc<dyn datafusion::datasource::TableProvider + 'static>,
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
+        self.from_supplied_schema
+            .lock()
+            .expect("mutex should not be poisoned")
+            .push(table_reference.table().to_string());
+        Ok(Arc::new(datafusion::datasource::empty::EmptyTable::new(
+            schema,
+        )))
+    }
+}
+
 /// Bulk schema resolution must honour the catalog's `unsupported_type_action`.
 ///
-/// The lookup that resolves a whole schema at once runs on a pooled connection,
-/// and only the pool's own `connect` applies the configured action — a
-/// connection taken any other way rejects every unsupported column type. A
-/// schema holding one, `jsonb` being the ordinary case, would then fail the bulk
-/// lookup under the catalog's default `string` and send every table in the
-/// namespace back to resolving its own schema.
+/// The schema-wide lookup runs on a pooled connection, and only the pool's own
+/// `connect` applies the configured action — a connection taken any other way
+/// rejects every unsupported column type. A schema holding one, `jsonb` being
+/// the ordinary case, then fails that lookup under the catalog's default
+/// `string`, and every table in the namespace resolves its own schema instead.
 ///
-/// Nothing about the resulting catalog would look wrong, which is why this is
-/// asserted rather than left to inspection: the per-table fallback produces the
-/// same tables, so the optimization would simply stop applying, silently, in the
-/// configuration most users are in.
+/// Nothing about the resulting catalog would look wrong: the per-table path
+/// registers the same tables. So this drives a real refresh and observes which
+/// path each table took, rather than re-creating the connection acquisition —
+/// which would prove only that the dependency *can* carry the action, and would
+/// stay green if the connector stopped asking it to.
 #[tokio::test]
 async fn test_bulk_schema_resolution_honors_unsupported_type_action() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
@@ -662,47 +729,39 @@ async fn test_bulk_schema_resolution_honors_unsupported_type_action() -> Result<
 
             seed_unsupported_type_table(port).await?;
 
-            // The pool exactly as the catalog connector builds it: the default
-            // action for a `pg` catalog is `string` (#11728).
-            let pool = PostgresConnectionPool::new(to_secret_map(
-                get_pg_params(port)
-                    .into_iter()
-                    .map(|(k, v)| (k, v.expose_secret().to_string()))
-                    .collect::<HashMap<String, String>>(),
-            ))
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?
-            .with_unsupported_type_action(UnsupportedTypeAction::String);
-
-            // The connection acquisition bulk resolution uses. `connect_direct`
-            // would not carry the action, and this lookup would fail.
-            let conn = DbConnectionPool::connect(&pool)
+            // The pool as the catalog connector builds it: a `pg` catalog
+            // defaults to `string` (#11728).
+            let pool = Arc::new(
+                PostgresConnectionPool::new(to_secret_map(
+                    get_pg_params(port)
+                        .into_iter()
+                        .map(|(k, v)| (k, v.expose_secret().to_string()))
+                        .collect::<HashMap<String, String>>(),
+                ))
                 .await
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-            let conn = conn
-                .as_any()
-                .downcast_ref::<PostgresConnection>()
-                .ok_or_else(|| anyhow::anyhow!("pool should hand out a PostgresConnection"))?;
+                .map_err(|e| anyhow::anyhow!("{e}"))?
+                .with_unsupported_type_action(UnsupportedTypeAction::String),
+            );
 
-            let schemas = conn
-                .get_schemas_in("public")
+            let recorder = Arc::new(RecordingRead::default());
+            let provider = PostgresCatalogProvider::new(
+                CATALOG_NAME.to_string(),
+                pool,
+                Arc::clone(&recorder) as Arc<dyn Read>,
+                TableSelector::select_all(),
+            );
+
+            provider
+                .refresh()
                 .await
-                .map_err(|e| anyhow::anyhow!("bulk resolution must honor the action: {e}"))?;
+                .map_err(|e| anyhow::anyhow!("catalog refresh: {e}"))?;
 
-            let widgets = schemas
-                .get("widgets_jsonb")
-                .ok_or_else(|| anyhow::anyhow!("bulk resolution should cover the jsonb table"))?;
-            assert_eq!(
-                widgets
-                    .fields()
-                    .iter()
-                    .map(|f| (f.name().clone(), f.data_type().to_string()))
-                    .collect::<Vec<_>>(),
-                vec![
-                    ("id".to_string(), "Int32".to_string()),
-                    ("metadata".to_string(), "Utf8".to_string()),
-                ],
-                "the unsupported column should be converted per the action, not rejected"
+            assert!(
+                recorder
+                    .from_supplied_schema()
+                    .contains(&"widgets_jsonb".to_string()),
+                "the jsonb table should have been built from the schema-wide lookup,                  not by resolving its own schema; resolved individually: {:?}",
+                recorder.self_resolved()
             );
 
             Ok(())
