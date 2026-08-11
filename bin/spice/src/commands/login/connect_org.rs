@@ -190,7 +190,13 @@ async fn resolve_with_stored_default<D: OrgDiscovery, P: Prompter>(
 ) -> Result<OrgResolution> {
     // Highlight hint only. A context file that cannot be read must not block
     // the resolution — the hint moves the chooser's cursor, nothing else.
-    let stored_default = cloud_org::active_org().unwrap_or(None);
+    // Read under spawn_blocking: it is filesystem I/O against the home
+    // directory, which must not occupy an async runtime thread.
+    let stored_default = tokio::task::spawn_blocking(cloud_org::active_org)
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .flatten();
 
     resolve_with(
         discovery,

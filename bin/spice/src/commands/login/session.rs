@@ -489,74 +489,69 @@ mod tests {
         );
     }
 
-    /// Serializes tests that change the working directory (the env-file
-    /// backend writes to the cwd-relative `.env`), and restores it afterwards.
-    /// `cargo nextest` isolates each test in its own process anyway; this
-    /// keeps a plain `cargo test` correct too.
-    static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    struct DirGuard {
-        original: std::path::PathBuf,
-        _lock: std::sync::MutexGuard<'static, ()>,
-    }
-
-    impl DirGuard {
-        fn enter(dir: &std::path::Path) -> Self {
-            let lock = CWD_LOCK.lock().expect("cwd lock should not be poisoned");
-            let original = std::env::current_dir().expect("current dir should resolve");
-            std::env::set_current_dir(dir).expect("test dir should be enterable");
-            Self {
-                original,
-                _lock: lock,
-            }
-        }
-    }
-
-    impl Drop for DirGuard {
-        fn drop(&mut self) {
-            let _ = std::env::set_current_dir(&self.original);
-        }
-    }
+    /// Marks the child half of [`establishing_a_session_persists_the_credential_pair`].
+    const ESTABLISH_SESSION_CHILD_FLAG: &str = "SPICE_TEST_ESTABLISH_SESSION_IN_CHILD_CWD";
 
     /// The session must leave the machine in the same state `spice login`
     /// always has: token and API key merged into the env file, and the handle
     /// reporting where they went.
+    ///
+    /// The env-file backend writes to the cwd-relative `.env`, and the process
+    /// working directory is shared by every test in this binary — so instead
+    /// of mutating it, the test re-runs itself as a child process whose cwd
+    /// *is* a scratch directory, and the parent asserts what landed on disk.
     #[test]
     fn establishing_a_session_persists_the_credential_pair() {
-        let dir = std::env::temp_dir().join(format!("spice-login-session-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("scratch dir should be creatable");
-        let guard = DirGuard::enter(&dir);
+        if std::env::var_os(ESTABLISH_SESSION_CHILD_FLAG).is_some() {
+            // Child: the parent spawned us with a scratch working directory.
+            let context = SpiceAuthContext {
+                username: "jane".to_string(),
+                email: "jane@example.com".to_string(),
+                org_name: "acme".to_string(),
+                app_name: Some("retail-analytics".to_string()),
+                app_api_key: Some("key_live_456".to_string()),
+            };
 
-        let context = SpiceAuthContext {
-            username: "jane".to_string(),
-            email: "jane@example.com".to_string(),
-            org_name: "acme".to_string(),
-            app_name: Some("retail-analytics".to_string()),
-            app_api_key: Some("key_live_456".to_string()),
-        };
+            let session = establish_session(
+                "tok_live_123".to_string(),
+                context,
+                CredentialStore::EnvFile,
+            )
+            .expect("the env backend should persist");
 
-        let session = establish_session(
-            "tok_live_123".to_string(),
-            context,
-            CredentialStore::EnvFile,
-        )
-        .expect("the env backend should persist");
+            assert_eq!(session.credential_store(), CredentialStore::EnvFile);
+            assert_eq!(session.username(), "jane");
+            assert_eq!(session.org_name(), "acme");
+            assert_eq!(session.access_token(), "tok_live_123");
+            return;
+        }
 
-        assert_eq!(session.credential_store(), CredentialStore::EnvFile);
-        assert_eq!(session.username(), "jane");
-        assert_eq!(session.org_name(), "acme");
-        assert_eq!(session.access_token(), "tok_live_123");
+        let scratch = tempfile::TempDir::new().expect("scratch dir should be creatable");
+        let exe = std::env::current_exe().expect("test binary path should resolve");
+        let output = std::process::Command::new(exe)
+            .args([
+                "commands::login::session::tests::establishing_a_session_persists_the_credential_pair",
+                "--exact",
+                "--test-threads=1",
+            ])
+            .env(ESTABLISH_SESSION_CHILD_FLAG, "1")
+            .current_dir(scratch.path())
+            .output()
+            .expect("child test process should run");
+        assert!(
+            output.status.success(),
+            "the child assertions failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
 
-        let env = std::fs::read_to_string(dir.join(".env")).expect(".env should be written");
+        let env = std::fs::read_to_string(scratch.path().join(".env"))
+            .expect(".env should be written in the child's working directory");
         assert!(
             env.contains("SPICE_SPICEAI_TOKEN=tok_live_123")
                 && env.contains("SPICE_SPICEAI_API_KEY=key_live_456"),
             "the credential pair must be persisted: {env}"
         );
-
-        drop(guard);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The user declining in the browser ends an inline login cleanly: the
