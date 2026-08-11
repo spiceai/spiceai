@@ -799,15 +799,28 @@ mod connect {
 
     #[test]
     fn positional_enrollment_keys_are_rejected_without_echoing_the_secret() {
-        let key = format!("spice-enroll-{}", "A".repeat(32));
-        spice_cmd()
-            .arg("connect")
-            .arg(&key)
-            .assert()
-            .failure()
-            .stdout(predicate::str::contains("spiced --token"))
-            .stdout(predicate::str::contains(key.clone()).not())
-            .stderr(predicate::str::contains(key).not());
+        let secret = "A".repeat(32);
+        for key in [
+            format!("spice-enroll-{secret}"),
+            format!("spice-enrol-{secret}"),
+            format!("SPICE-ENROLL-{secret}"),
+            format!("spice_enroll_{secret}"),
+            format!("\u{feff}spice-enroll-{secret}"),
+            format!("spice-enrol-{secret}\n"),
+            format!("spcie-enroll-{secret}"),
+            format!("acme/spice-enroll-{secret}"),
+        ] {
+            spice_cmd()
+                .arg("connect")
+                .arg(&key)
+                .assert()
+                .failure()
+                .stdout(predicate::str::contains("spiced --token"))
+                .stdout(predicate::str::contains(key.clone()).not())
+                .stdout(predicate::str::contains(secret.clone()).not())
+                .stderr(predicate::str::contains(key).not())
+                .stderr(predicate::str::contains(secret.clone()).not());
+        }
     }
 
     #[test]

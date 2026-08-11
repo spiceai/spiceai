@@ -191,11 +191,11 @@ pub async fn execute(ctx: &RuntimeContext, args: ConnectArgs) -> Result<()> {
         return connect_existing(ctx, &config_dir, args.install, args.endpoint.as_deref()).await;
     };
 
-    // A secret must never ride a positional argument. Reject it by its
-    // prefix — and never echo it — instead of falling through to the pod-add
-    // path, which would treat the key as a pod name and reproduce it in
-    // errors and requests.
-    if target.starts_with(runtime_cloud_connect::enrollment_key::ENROLLMENT_KEY_PREFIX) {
+    // A secret must never ride a positional argument. Reject canonical keys
+    // and close near misses — and never echo either — instead of falling
+    // through to the pod-add path, which would treat the key as a pod name and
+    // reproduce it in errors and requests.
+    if runtime_cloud_connect::enrollment_key::looks_like_enrollment_key(target) {
         return Err(Error::InvalidArgument {
             message: "An enrollment key is not accepted as a positional argument. \
                       Enrollment is performed by the runtime: start it with \

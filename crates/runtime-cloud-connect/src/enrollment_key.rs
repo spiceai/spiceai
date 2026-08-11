@@ -46,6 +46,82 @@ pub const ENROLLMENT_KEY_PREFIX: &str = "spice-enroll-";
 /// 32 base64url characters carrying 192 random bits.
 pub const ENROLLMENT_KEY_SECRET_LEN: usize = 32;
 
+/// Whether a raw CLI value resembles an enrollment key closely enough that it
+/// must be treated as sensitive even when it is not canonical.
+///
+/// This is a redaction boundary, not validation: [`EnrollmentKey::parse`] is
+/// still the only way to construct an authorized key. A case or delimiter
+/// mistake, or one edit in `spice-enroll`, can leave the complete 32-character
+/// bearer secret intact. Callers that would otherwise log or forward an
+/// arbitrary value use this conservative check to reject that near miss
+/// without reproducing it. The marker may be embedded in a larger value and
+/// separated by non-ASCII or punctuation bytes; two edits cover adjacent
+/// transpositions as well as common insertions, deletions, and substitutions.
+#[must_use]
+pub fn looks_like_enrollment_key(raw: &str) -> bool {
+    if raw.starts_with(ENROLLMENT_KEY_PREFIX) {
+        return true;
+    }
+    if raw.len() < ENROLLMENT_KEY_SECRET_LEN {
+        return false;
+    }
+
+    let canonical_prefix = normalize_marker(ENROLLMENT_KEY_PREFIX.as_bytes());
+    let bytes = raw.as_bytes();
+    let max_marker_len = canonical_prefix.len() + 2;
+    let mut normalized_prefix = Vec::with_capacity(max_marker_len);
+    for secret_start in 0..=bytes.len() - ENROLLMENT_KEY_SECRET_LEN {
+        let secret = &bytes[secret_start..secret_start + ENROLLMENT_KEY_SECRET_LEN];
+        if secret.iter().all(|byte| is_base64url(*byte)) {
+            let shortest = canonical_prefix.len().saturating_sub(2);
+            let longest = normalized_prefix.len().min(canonical_prefix.len() + 2);
+            if (shortest..=longest).any(|candidate_len| {
+                let candidate = &normalized_prefix[normalized_prefix.len() - candidate_len..];
+                edit_distance(candidate, &canonical_prefix) <= 2
+            }) {
+                return true;
+            }
+        }
+
+        let byte = bytes[secret_start];
+        if byte.is_ascii_alphanumeric() {
+            if normalized_prefix.len() == max_marker_len {
+                normalized_prefix.remove(0);
+            }
+            normalized_prefix.push(byte.to_ascii_lowercase());
+        }
+    }
+    false
+}
+
+fn normalize_marker(raw: &[u8]) -> Vec<u8> {
+    raw.iter()
+        .copied()
+        .filter(u8::is_ascii_alphanumeric)
+        .map(|byte| byte.to_ascii_lowercase())
+        .collect()
+}
+
+fn is_base64url(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_'
+}
+
+fn edit_distance(left: &[u8], right: &[u8]) -> usize {
+    let mut previous = (0..=right.len()).collect::<Vec<_>>();
+    let mut current = vec![0; right.len() + 1];
+    for (left_index, left_byte) in left.iter().enumerate() {
+        current[0] = left_index + 1;
+        for (right_index, right_byte) in right.iter().enumerate() {
+            let substitution = previous[right_index] + usize::from(left_byte != right_byte);
+            current[right_index + 1] = (current[right_index] + 1)
+                .min(previous[right_index + 1] + 1)
+                .min(substitution);
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+    previous[right.len()]
+}
+
 /// Why a value failed to parse as an enrollment key.
 ///
 /// Deliberately coarse, and the messages never echo the rejected value —
@@ -228,5 +304,41 @@ mod tests {
             !err.to_string().contains(&"B".repeat(16)),
             "the parse error must not echo the rejected value: {err}"
         );
+    }
+
+    #[test]
+    fn sensitive_near_misses_are_recognized_without_becoming_valid_keys() {
+        let secret = "A".repeat(ENROLLMENT_KEY_SECRET_LEN);
+        for raw in [
+            format!("spice-enrol-{secret}"),
+            format!("SPICE-ENROLL-{secret}"),
+            format!("spice_enroll_{secret}"),
+            format!("spice-enrollx-{secret}"),
+            format!("spcie-enroll-{secret}"),
+            format!("spice-enro-{secret}"),
+            format!("\u{feff}spice-enroll-{secret}"),
+            format!("\u{200b}spice-enroll-{secret}"),
+            format!("spice-enrol-{secret}\n"),
+            format!("spice-enrol-{secret}!"),
+            format!("acme/spice-enroll-{secret}"),
+        ] {
+            assert!(looks_like_enrollment_key(&raw), "{raw:?} must be sensitive");
+            assert!(
+                EnrollmentKey::parse(&raw).is_err(),
+                "a sensitive near miss must not become authorized"
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_pod_targets_do_not_look_like_enrollment_keys() {
+        for raw in [
+            "acme/search",
+            "spice-enrol-short",
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "acme/a-very-long-ordinary-pod-name-1234567890",
+        ] {
+            assert!(!looks_like_enrollment_key(raw), "{raw:?} is a pod target");
+        }
     }
 }
