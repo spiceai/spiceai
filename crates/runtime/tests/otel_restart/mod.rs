@@ -91,7 +91,7 @@ async fn start_runtime(ds: &Dataset) -> Arc<Runtime> {
 
     let cloned = Arc::clone(&rt);
     tokio::select! {
-        () = tokio::time::sleep(Duration::from_secs(60)) => {
+        () = tokio::time::sleep(Duration::from_mins(1)) => {
             panic!("timed out loading components");
         }
         () = cloned.load_components() => {}
