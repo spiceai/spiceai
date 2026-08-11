@@ -726,15 +726,10 @@ impl EnrollClient {
         // measured skew when there is one — a host hours out of step can
         // have its CSR refused, and the cloud's message alone would not say
         // why. A proxy or defensive server can echo a rejected credential,
-        // so redact the authority before parsing or bounding the message.
+        // so redact the authority before parsing or bounding the message and
+        // again after JSON decoding (escapes can reconstruct it).
         let (code, message) = match response.text().await {
-            Ok(text) => {
-                let text = redact_sensitive(&text, sensitive);
-                match serde_json::from_str::<ErrorBody>(&text) {
-                    Ok(body) => (body.code, body.error.unwrap_or_else(|| bounded(&text, 256))),
-                    Err(_) => (None, bounded(&text, 256)),
-                }
-            }
+            Ok(text) => parse_error_body(&text, sensitive),
             Err(_) => (None, String::new()),
         };
         let message = match skew {
@@ -769,6 +764,28 @@ fn redact_sensitive(text: &str, sensitive: Option<&str>) -> String {
     match sensitive.filter(|value| !value.is_empty()) {
         Some(value) => text.replace(value, "[REDACTED]"),
         None => text.to_string(),
+    }
+}
+
+fn parse_error_body(text: &str, sensitive: Option<&str>) -> (Option<String>, String) {
+    let text = redact_sensitive(text, sensitive);
+    match serde_json::from_str::<ErrorBody>(&text) {
+        Ok(body) => (
+            body.code.map(|code| redact_sensitive(&code, sensitive)),
+            body.error.map_or_else(
+                || error_body_fallback(&text, sensitive),
+                |error| redact_sensitive(&error, sensitive),
+            ),
+        ),
+        Err(_) => (None, error_body_fallback(&text, sensitive)),
+    }
+}
+
+fn error_body_fallback(text: &str, sensitive: Option<&str>) -> String {
+    if sensitive.is_some_and(|value| !value.is_empty()) {
+        "the response contained no usable error message".to_string()
+    } else {
+        bounded(text, 256)
     }
 }
 
@@ -2001,6 +2018,45 @@ mod tests {
         let redacted = redact_sensitive(&text, Some(secret));
         assert!(!redacted.contains(secret));
         assert_eq!(redacted.matches("[REDACTED]").count(), 2);
+    }
+
+    #[test]
+    fn json_escaped_authorities_are_redacted_after_error_body_decoding() {
+        let secret = "spice-enroll-secret-that-must-never-appear";
+        let escaped = secret.replace('-', r"\u002d");
+        let text =
+            format!(r#"{{"code":"invalid_token","error":"rejected enrollment key {escaped}"}}"#);
+        assert!(
+            !text.contains(secret),
+            "the wire response must exercise structural redaction"
+        );
+
+        let (code, message) = parse_error_body(&text, Some(secret));
+        assert_eq!(code.as_deref(), Some("invalid_token"));
+        assert!(!message.contains(secret));
+        assert!(message.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn sensitive_authorities_are_never_surfaced_from_unstructured_fallbacks() {
+        let secret = "spice-enroll-secret-that-must-never-appear";
+        let escaped = secret.replace('-', r"\u002d");
+        let bodies = [
+            format!(r#"{{"code":"invalid_token","note":"rejected {escaped}"}}"#),
+            format!(r#"{{"code":"invalid_token","error":null,"note":"{escaped}"}}"#),
+            format!("not JSON: rejected {escaped}"),
+        ];
+
+        for body in bodies {
+            assert!(!body.contains(secret));
+            let (_code, message) = parse_error_body(&body, Some(secret));
+            assert_eq!(
+                message, "the response contained no usable error message",
+                "an unrecognized response must not become operator-visible"
+            );
+            assert!(!message.contains(secret));
+            assert!(!message.contains(&escaped));
+        }
     }
 
     #[tokio::test(start_paused = true)]

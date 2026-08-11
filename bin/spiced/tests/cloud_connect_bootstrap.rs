@@ -105,13 +105,18 @@ fn enrollment_failure_happens_before_any_listener_or_readiness() {
         let _request = read_http_request(&mut stream);
         respond_rx.recv().expect("wait for listener assertion");
 
-        // Deliberately hostile response: the peer echoes the bearer. The
-        // runtime must redact it before constructing or logging the error.
-        let body = serde_json::json!({
-            "code": "invalid_token",
-            "error": format!("rejected enrollment key {echoed_key}"),
-        })
-        .to_string();
+        // Deliberately hostile response: the peer echoes the bearer through
+        // JSON escapes, so raw byte replacement cannot find it. The runtime
+        // must redact the decoded field before constructing or logging the
+        // error.
+        let escaped_key = echoed_key.replace('-', r"\u002d");
+        let body = format!(
+            r#"{{"code":"invalid_token","error":"rejected enrollment key {escaped_key}"}}"#
+        );
+        assert!(
+            !body.contains(&echoed_key),
+            "the mock response must not contain the literal key"
+        );
         let response = format!(
             "HTTP/1.1 401 Unauthorized\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
             body.len()
