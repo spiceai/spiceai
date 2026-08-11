@@ -307,8 +307,15 @@ impl SpiceTable {
 /// its layer where the walk goes, and a `FederatedTableProviderAdaptor`, which
 /// datafusion-federation requires to stay *outermost* (its analyzer recovers the
 /// federated source by downcasting the scan's provider to it), so it cannot be
-/// wrapped in a layer and has to be stepped through here instead. That is the one
-/// foreign type this module names, in the one place it names it.
+/// wrapped in a layer and has to be stepped through here instead.
+///
+/// A known temporary shape, not the settled design: it is the one foreign type
+/// this module names, and the reason several call sites elsewhere go out of their
+/// way to keep the adaptor outermost. Giving the fork a source resolver would let
+/// the adaptor be an ordinary layer and remove both — see
+/// <https://github.com/spiceai/spiceai/issues/12890>, and
+/// <https://github.com/spiceai/spiceai/issues/12889> for the pushdown loss the
+/// current shape allows.
 fn step(current: &dyn TableProvider, walk: LayerWalk) -> Option<&Arc<dyn TableProvider>> {
     if let Some(table) = current.downcast_ref::<SpiceTable>() {
         return table.layer.route(walk, &table.below);
