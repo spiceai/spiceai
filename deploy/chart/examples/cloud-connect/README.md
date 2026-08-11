@@ -41,11 +41,13 @@ override from the release's installed values, and upgrades with
 retaining every unrelated command argument, environment entry, PVC mount, and
 other installed value. It then verifies the replacement pod reconnects from
 the identity alone and only then deletes the exact Secret named by the
-installed `secretKeyRef`. The non-secret Secret name remains in the Helm
-release values as an interruption-recovery marker, so a rerun can still delete
-a custom-named Secret after the token reference has already been removed. A
-token-free rerun treats an absent Secret as success, but refuses to delete a
-currently existing Secret using only the remembered name: set
+installed `secretKeyRef`. It captures that Secret's UID before the upgrade and
+submits it as an API deletion precondition, so a different Secret that reuses
+the name during rollout is preserved. The non-secret Secret name remains in
+the Helm release values as an interruption-recovery marker, so a rerun can
+still delete a custom-named Secret after the token reference has already been
+removed. A token-free rerun treats an absent Secret as success, but refuses to
+delete a currently existing Secret using only the remembered name: set
 `SPICE_SECRET_NAME` to that exact name to confirm deletion. This prevents an
 unrelated Secret that later reused the name from being deleted implicitly.
 The script is idempotent and requires `jq`.

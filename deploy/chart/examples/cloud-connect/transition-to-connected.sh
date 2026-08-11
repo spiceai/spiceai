@@ -12,8 +12,9 @@
 #      while preserving every other value — and wait for the rollout.
 #   3. Verify the replacement pod establishes its control stream from the
 #      stored identity alone, with no key in the pod spec.
-#   4. Only then delete the Secret. Deleting a Secret a pod template still
-#      references is forbidden — that ordering is the point of this script.
+#   4. Only then delete the exact Secret UID observed before the upgrade.
+#      Deleting a Secret a pod template still references, or a same-name
+#      replacement created during rollout, is forbidden.
 #
 # Idempotent: re-running against an already-transitioned release re-applies
 # the same connected values and treats an already-deleted Secret as success.
@@ -67,7 +68,8 @@ fi
 TRANSITION_PLAN="$(mktemp "${TMPDIR:-/tmp}/spice-transition-plan.XXXXXX.json")"
 CONNECTED_OVERRIDES="$(mktemp "${TMPDIR:-/tmp}/spice-connected-values.XXXXXX.json")"
 WORKLOAD_JSON="$(mktemp "${TMPDIR:-/tmp}/spice-connected-workload.XXXXXX.json")"
-trap 'rm -f -- "${TRANSITION_PLAN}" "${CONNECTED_OVERRIDES}" "${WORKLOAD_JSON}"' EXIT
+DELETE_OPTIONS="$(mktemp "${TMPDIR:-/tmp}/spice-secret-delete.XXXXXX.json")"
+trap 'rm -f -- "${TRANSITION_PLAN}" "${CONNECTED_OVERRIDES}" "${WORKLOAD_JSON}" "${DELETE_OPTIONS}"' EXIT
 
 log() { echo "[transition-to-connected] $*"; }
 
@@ -123,6 +125,27 @@ if [ "${HAD_TOKEN_REFERENCE}" = false ] && [ -z "${REQUESTED_SECRET_NAME}" ]; th
   # authorization. Treat absence as success and never let a same-named Secret
   # created during the rollout become a step-4 deletion target.
   DELETE_SECRET=false
+fi
+SECRET_UID=""
+if [ "${DELETE_SECRET}" = true ]; then
+  if ! SECRET_UID="$(kubectl -n "${NAMESPACE}" get secret "${SECRET_NAME}" --ignore-not-found -o 'jsonpath={.metadata.uid}')"; then
+    echo "error: failed to capture the UID of bootstrap Secret '${SECRET_NAME}'; not deleting any Secret and no upgrade was performed" >&2
+    exit 1
+  fi
+  if [ -z "${SECRET_UID}" ]; then
+    # A Secret absent before the rollout cannot become a deletion target merely
+    # by reusing the same name while the rollout is in progress.
+    DELETE_SECRET=false
+  elif ! jq -n --arg uid "${SECRET_UID}" '
+    {
+      apiVersion: "meta.k8s.io/v1",
+      kind: "DeleteOptions",
+      preconditions: {uid: $uid}
+    }
+  ' >"${DELETE_OPTIONS}"; then
+    echo "error: failed to prepare UID-bound deletion for bootstrap Secret '${SECRET_NAME}'; no upgrade was performed" >&2
+    exit 1
+  fi
 fi
 if ! jq --arg secret "${SECRET_NAME}" \
   '.values | .cloudConnect.bootstrapSecretName = $secret' \
@@ -180,8 +203,25 @@ done
 kubectl -n "${NAMESPACE}" wait --for=condition=Ready pod -l "${SELECTOR}" --timeout="${WAIT_TIMEOUT}"
 
 if [ "${DELETE_SECRET}" = true ]; then
-  log "step 4/4: deleting the single-use bootstrap Secret '${SECRET_NAME}'"
-  kubectl -n "${NAMESPACE}" delete secret "${SECRET_NAME}" --ignore-not-found
+  log "step 4/4: deleting the single-use bootstrap Secret '${SECRET_NAME}' observed before the upgrade"
+  SECRET_API_PATH="/api/v1/namespaces/${NAMESPACE}/secrets/${SECRET_NAME}"
+  if kubectl delete --raw "${SECRET_API_PATH}" -f "${DELETE_OPTIONS}" >/dev/null 2>&1; then
+    :
+  else
+    if ! CURRENT_SECRET_UID="$(kubectl -n "${NAMESPACE}" get secret "${SECRET_NAME}" --ignore-not-found -o 'jsonpath={.metadata.uid}')"; then
+      echo "error: UID-bound deletion of bootstrap Secret '${SECRET_NAME}' failed, and its current UID could not be verified; the Secret was preserved" >&2
+      exit 1
+    fi
+    if [ -z "${CURRENT_SECRET_UID}" ]; then
+      log "step 4/4: bootstrap Secret '${SECRET_NAME}' was already absent"
+    elif [ "${CURRENT_SECRET_UID}" != "${SECRET_UID}" ]; then
+      echo "error: bootstrap Secret '${SECRET_NAME}' changed from UID '${SECRET_UID}' to '${CURRENT_SECRET_UID}' during the rollout; the replacement Secret was preserved" >&2
+      exit 1
+    else
+      echo "error: failed to delete bootstrap Secret '${SECRET_NAME}' with its captured UID '${SECRET_UID}'; the Secret was preserved" >&2
+      exit 1
+    fi
+  fi
 else
   log "step 4/4: bootstrap Secret '${SECRET_NAME}' was already absent; no deletion was authorized or attempted"
 fi

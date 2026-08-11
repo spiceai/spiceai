@@ -563,6 +563,10 @@ kubectl() {
     printf '%s\n' 'secret/spice-cloud-connect'
     return 0
   fi
+  if printf '%s\n' "$*" | grep -q ' get secret spice-cloud-connect --ignore-not-found -o jsonpath='; then
+    printf '%s\n' 'uid-explicitly-confirmed'
+    return 0
+  fi
   return 99
 }
 export -f helm kubectl
@@ -575,6 +579,75 @@ elif echo "${output}" | grep -q 'MOCK_RECOVERY_MARKER_PERSISTED' \
 else
   fail "an exact SPICE_SECRET_NAME did not persist its recovery marker: ${output}"
 fi
+
+# Capture the original Secret UID before a token-bearing upgrade and submit it
+# as a server-side delete precondition. A same-name replacement that appears
+# during rollout must receive the API's conflict rather than being deleted.
+UID_RACE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/spice-uid-race.XXXXXX")"
+UID_QUERY_STATE="${UID_RACE_DIR}/uid-read"
+export UID_QUERY_STATE
+helm() {
+  if [ "${1:-} ${2:-}" = "get values" ]; then
+    printf '%s\n' "${TRANSITION_TEST_INSTALLED_VALUES}"
+  elif [ "${1:-}" = "upgrade" ]; then
+    return 0
+  else
+    return 99
+  fi
+}
+kubectl() {
+  arguments="$*"
+  if printf '%s\n' "${arguments}" | grep -q ' get secret spice-cloud-connect --ignore-not-found -o jsonpath='; then
+    if [ -e "${UID_QUERY_STATE}" ]; then
+      printf '%s\n' 'uid-replacement'
+    else
+      : >"${UID_QUERY_STATE}"
+      printf '%s\n' 'uid-original'
+    fi
+    return 0
+  fi
+  if printf '%s\n' "${arguments}" | grep -q '^delete --raw /api/v1/namespaces/default/secrets/spice-cloud-connect -f '; then
+    previous=''
+    for argument in "$@"; do
+      if [ "${previous}" = '-f' ]; then
+        if jq -e '.preconditions.uid == "uid-original"' "${argument}" >/dev/null; then
+          return 1
+        fi
+        return 0
+      fi
+      previous="${argument}"
+    done
+    return 0
+  fi
+  if printf '%s\n' "${arguments}" | grep -q ' get statefulset/test -o json'; then
+    printf '%s\n' '{"spec":{"template":{"spec":{"containers":[{"command":["spiced","--http","0.0.0.0:8090"]}]}}}}'
+    return 0
+  fi
+  if printf '%s\n' "${arguments}" | grep -q ' get statefulset -l app=test -o name'; then
+    printf '%s\n' 'statefulset/test'
+    return 0
+  fi
+  if printf '%s\n' "${arguments}" | grep -q ' logs -l app=test '; then
+    printf '%s\n' 'Cloud Connect: stream established'
+    return 0
+  fi
+  if printf '%s\n' "${arguments}" | grep -q ' wait \| rollout status '; then
+    return 0
+  fi
+  return 99
+}
+export -f helm kubectl
+TRANSITION_TEST_INSTALLED_VALUES="${installed_values}"
+if output="$(bash "${TRANSITION}" test default 2>&1)"; then
+  fail "the UID-precondition race mock deleted a same-name replacement"
+elif echo "${output}" | grep -q "changed from UID 'uid-original' to 'uid-replacement'"; then
+  pass "the initial transition preserves a same-name replacement with a Secret UID precondition"
+else
+  fail "the initial transition did not fail safely on Secret UID replacement: ${output}"
+fi
+rm -f -- "${UID_QUERY_STATE}"
+rmdir -- "${UID_RACE_DIR}"
+unset UID_QUERY_STATE
 unset -f helm kubectl
 unset TRANSITION_TEST_INSTALLED_VALUES
 
