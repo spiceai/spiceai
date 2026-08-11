@@ -18,7 +18,7 @@ limitations under the License.
 
 use super::{CacheBackend, CacheBackendBuilder};
 use crate::Sizeable;
-use crate::metrics::CacheMetrics;
+use crate::metrics::{CacheMetrics, EvictionReason};
 use async_trait::async_trait;
 use parking_lot::RwLock;
 use pingora_lru::Lru;
@@ -164,7 +164,7 @@ where
             // site. Counted once per yielded entry — the `remove` below only drops a
             // key a concurrent `insert` re-admitted, which is a second removal of a
             // different admission rather than a second eviction of this one.
-            V::record_eviction();
+            V::record_eviction(EvictionReason::Size);
 
             // A concurrent `insert` can re-admit the key between its eviction above and
             // the metadata drop. Holding the shard across both the drop and the re-admit
@@ -238,7 +238,7 @@ where
                 // cache — counting on that keeps the losers from over-reporting.
                 self.remove_metadata(*key);
                 if self.cache.remove(*key).is_some() {
-                    V::record_eviction();
+                    V::record_eviction(EvictionReason::Expired);
                 }
                 return None;
             }
