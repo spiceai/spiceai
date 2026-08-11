@@ -29,6 +29,7 @@ use datafusion_common::{DataFusionError, Statistics, stats::Precision};
 use datafusion_datasource::file_groups::FileGroup;
 use datafusion_datasource::file_scan_config::FileScanConfig;
 use datafusion_datasource::source::DataSourceExec;
+use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion_execution::{SendableRecordBatchStream, TaskContext};
 use datafusion_physical_expr::expressions::{Column, DynamicFilterPhysicalExpr};
 use datafusion_physical_expr::{Distribution, OrderingRequirements, PhysicalExpr};
@@ -509,6 +510,26 @@ pub(crate) fn plan_has_pushed_filter_deep(plan: &Arc<dyn ExecutionPlan>) -> bool
     false
 }
 
+/// Whether `plan` reaches a file-backed source anywhere in its subtree.
+///
+/// Gates the scan memory accounting. The charge exists to cover the Vortex
+/// decode — compressed encodings canonicalized into flat Arrow — which only a
+/// file branch performs. A plan whose every leaf is a `MemorySourceConfig` (the
+/// mem-tier and inline branches, and a `mode: memory` table's whole scan) hands
+/// out `RecordBatch` clones of buffers that are ALREADY resident and already
+/// mirrored into this same pool by the `cayenne:mem_tier` consumer, so charging
+/// them again double-counts and can refuse a memory-mode query over memory that
+/// was only ever reserved once.
+fn plan_reads_files(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    if let Some(data_source_exec) = plan.downcast_ref::<DataSourceExec>() {
+        return data_source_exec
+            .data_source()
+            .downcast_ref::<FileScanConfig>()
+            .is_some();
+    }
+    plan.children().into_iter().any(plan_reads_files)
+}
+
 /// Counts file-backed scan sources (snapshot generations) and the total files
 /// across them in `plan`, returning `(snapshots_scanned, files_scanned)`.
 ///
@@ -859,7 +880,9 @@ impl ExecutionPlan for CayenneAccelerationExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> datafusion::error::Result<SendableRecordBatchStream> {
-        let stream = self.inner.execute(partition, context)?;
+        // Cloned rather than moved: the memory-accounted wrapper below needs the
+        // pool from this same context. `Arc::clone` is a refcount bump.
+        let stream = self.inner.execute(partition, Arc::clone(&context))?;
         let schema = stream.schema();
         let mapped = stream.map_err(|e| {
             let msg = e.to_string();
@@ -888,6 +911,25 @@ impl ExecutionPlan for CayenneAccelerationExec {
             let _hold = &scan_guard;
             item
         });
+        // Charge this scan's canonicalized batches against the query pool. Only
+        // the outermost wrapper accounts (`scan_guard.is_some()`): the inner
+        // per-snapshot wrappers feed into this same stream, and registering a
+        // consumer at every layer would count one batch once per layer.
+        //
+        // And only when the plan actually reaches a file: a memory-only plan
+        // emits clones of buffers the `cayenne:mem_tier` consumer has already
+        // reserved in this pool, so charging them here bills the same bytes
+        // twice. The guard alone does not distinguish the two — every scan the
+        // provider returns carries one.
+        if self.scan_guard.is_some() && plan_reads_files(&self.inner) {
+            let accounted = MemoryAccountedScanStream::new(
+                Box::pin(RecordBatchStreamAdapter::new(Arc::clone(&schema), mapped)),
+                schema,
+                format!("cayenne_scan[partition={partition}]"),
+                &context,
+            );
+            return Ok(Box::pin(accounted));
+        }
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, mapped)))
     }
 
@@ -978,6 +1020,209 @@ impl ExecutionPlan for CayenneAccelerationExec {
     }
 }
 
+/// Charges a scan's materialized batches against the `DataFusion` memory pool.
+///
+/// Reading Cayenne means canonicalizing Vortex's compressed encodings (`RunEnd`,
+/// Constant, dictionary) into flat Arrow, and that expansion is the single
+/// largest allocator in the process at scale: a SF-1000 heap profile put ~50 GiB
+/// under `vortex_buffer::BufferMut::with_capacity_preferred_aligned`, reached
+/// through `to_arrow_struct`, `canonical::execute`, `to_arrow_primitive`,
+/// `runend_decode_primitive` and friends.
+///
+/// None of it was accounted. `DataFusion`'s operators reserve for what they hold
+/// and Cayenne's `memory_account` covers long-lived resident state (the PK keyset
+/// and deletion indexes, explicitly *outside* query execution), but the
+/// materialization in between reserved from nothing. So the query pool could sit
+/// at its limit and spill while the scan beneath it kept allocating, and
+/// `runtime.query.memory_limit` did not bound the process: measured peak RSS
+/// tracked the cgroup cap (95.8 GiB at 96G, 109.8 GiB at 110G) and was unmoved by
+/// concurrency or by the tuning mode.
+///
+/// The charge is taken **before** each poll and held across it, then settled to
+/// the measured size once the batch exists. Charging afterwards would be a
+/// detector rather than a bound: the decode has already run, so a refusal could
+/// only reject the *next* batch, never the one that exceeded the budget. Holding
+/// it across a `Pending` matters for the same reason — that is the window the
+/// buffers are being expanded in.
+///
+/// The reservation then covers the batch **in flight** until the next poll,
+/// rather than its whole downstream lifetime, which this stream cannot observe.
+/// Whatever an operator above retains, it reserves for itself.
+///
+/// A pre-poll charge that does not fit returns `ResourcesExhausted` before the
+/// decode runs, so a scan that cannot fit its estimate fails without allocating.
+/// That is a deliberate behaviour change: a query that used to drift toward an
+/// OOM kill now errors.
+///
+/// # What this does NOT bound
+///
+/// **A batch bigger than the running estimate is allocated before it can be
+/// refused.** What is charged pre-poll is the estimate, not the batch: the first
+/// batch of every partition is charged at `INITIAL_BATCH_ESTIMATE_BYTES`, and
+/// any later batch that decodes larger than the high-water estimate is fully
+/// materialized by `inner.poll_next` before `try_resize` measures it — the
+/// refusal then drops the batch that already exists (which is the path
+/// `a_failed_settle_releases_the_charge_and_recharges_next_poll` exercises).
+/// So the bound is one batch behind on the way up: a single decode far larger
+/// than anything seen before can still exhaust the host. The estimate ratchets
+/// (`self.estimate.max(actual)`), so it is only the *growing* edge that is
+/// unbounded, not the steady state. Charging a defensible upper bound instead
+/// would mean knowing the decoded size before decoding it, which is what moving
+/// the reservation into the materializing leaf below would buy.
+///
+/// **The mem-tier half of a mixed plan is still charged.** The wrapper attaches
+/// per plan, not per branch, so a base+delta plan that reaches a file — and is
+/// therefore accounted — also charges the `MemorySourceConfig` batches its
+/// mem-tier branch contributes, which `cayenne:mem_tier` has already reserved.
+/// `plan_reads_files` only keeps a *wholly* memory-backed plan out of the
+/// accounting; separating the branches means charging at each materializing
+/// leaf, below.
+///
+/// Accounting attaches to the outermost wrapper only (`scan_guard.is_some()`),
+/// so it charges one estimate per output partition. Under a base+delta plan the
+/// inner per-snapshot wrappers and the Vortex `DataSourceExec` beneath them can
+/// decode CONCURRENTLY while the outer stream holds a single charge, which
+/// under-counts by roughly the number of concurrently decoding children. The
+/// pre-poll charge means that window is no longer *unaccounted*, but it is not
+/// accurately accounted either.
+///
+/// Bounding it properly means charging at each materializing leaf, or gating
+/// concurrent decodes behind a shared budget. Both are larger changes than this,
+/// and neither should be inferred from the presence of this type: a plan whose
+/// memory is dominated by fan-out beneath the outermost scan is still able to
+/// exceed `runtime.query.memory_limit`.
+struct MemoryAccountedScanStream<S> {
+    inner: S,
+    schema: SchemaRef,
+    /// Always `Some` in practice — `MemoryConsumer::register` is infallible, so
+    /// there is no unaccounted path. `Option` only so the accounting can be
+    /// skipped wholesale in a future caller (or a test) without threading a
+    /// second flag through the poll loop.
+    reservation: Option<MemoryReservation>,
+    /// What to charge BEFORE a poll, since the batch's real size is unknowable
+    /// until the decode that allocates it has already run. Adapted upward to the
+    /// largest batch this stream has produced.
+    ///
+    /// A running max, not the last size: under-reserving is the failure this
+    /// exists to prevent, and batch widths vary run to run, so the estimate
+    /// converges upward and stays there. Over-reserving costs pool headroom;
+    /// under-reserving costs the guarantee.
+    estimate: usize,
+    /// True while the reservation covers an in-progress decode rather than a
+    /// batch already handed downstream. Keeps the charge in place across a
+    /// `Pending`, which is exactly when Vortex is expanding buffers.
+    decode_charged: bool,
+}
+
+/// First-poll charge, before any batch has been measured.
+///
+/// Deliberately small. The charge has to be paid before the first batch's size
+/// can be known, so an estimate that is too large refuses scans that would have
+/// fit — a pool sized for a handful of narrow batches should not be rejected
+/// because the guess was megabytes. It is equally deliberately not zero: a zero
+/// first charge would reopen, for one batch per partition, exactly the hole this
+/// type exists to close.
+///
+/// So the exposure is bounded and explicit: until the running max converges
+/// (from the second batch on), a scan can decode one batch per partition against
+/// this charge rather than its true size. At 1 MiB x 20 partitions that is ~20
+/// MiB of slack, against the tens of GiB this bounds in steady state.
+const INITIAL_BATCH_ESTIMATE_BYTES: usize = 1024 * 1024;
+
+impl<S> MemoryAccountedScanStream<S> {
+    fn new(inner: S, schema: SchemaRef, consumer_name: String, context: &Arc<TaskContext>) -> Self {
+        // Infallible: `register` hands back a zero-sized reservation and the
+        // pool only refuses later, at `try_grow`.
+        let reservation = Some(MemoryConsumer::new(consumer_name).register(context.memory_pool()));
+        Self {
+            inner,
+            schema,
+            reservation,
+            estimate: INITIAL_BATCH_ESTIMATE_BYTES,
+            decode_charged: false,
+        }
+    }
+}
+
+impl<S> futures::Stream for MemoryAccountedScanStream<S>
+where
+    S: futures::Stream<Item = Result<arrow::record_batch::RecordBatch>> + Unpin,
+{
+    type Item = Result<arrow::record_batch::RecordBatch>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        // Charge BEFORE polling. The inner poll is where Vortex canonicalizes
+        // into Arrow, so charging after it would mean the allocation has already
+        // happened and a refusal could only reject the NEXT batch, never the one
+        // that broke the budget — a detector, not a bound.
+        if !self.decode_charged {
+            // The previous batch has been handed downstream; whatever holds it
+            // now reserves for itself, so keeping its bytes here would
+            // double-count them.
+            let estimate = self.estimate;
+            if let Some(reservation) = self.reservation.as_mut() {
+                reservation.free();
+                if let Err(e) = reservation.try_grow(estimate) {
+                    // Refused before the decode runs, so this returns without
+                    // having allocated the batch.
+                    return std::task::Poll::Ready(Some(Err(e)));
+                }
+            }
+            self.decode_charged = true;
+        }
+
+        let polled = std::pin::Pin::new(&mut self.inner).poll_next(cx);
+        match &polled {
+            // Decode still in progress: hold the charge across it. This is the
+            // window the buffers are actually being expanded in.
+            std::task::Poll::Pending => {}
+            std::task::Poll::Ready(Some(Ok(batch))) => {
+                // `get_array_memory_size` counts the buffers this batch actually
+                // holds — the expanded Arrow form, not the compressed on-disk
+                // size. Settle the estimate to the truth now that it is known.
+                let actual = batch.get_array_memory_size();
+                self.estimate = self.estimate.max(actual);
+                if let Some(reservation) = self.reservation.as_mut()
+                    && let Err(e) = reservation.try_resize(actual)
+                {
+                    // Settling failed, so this batch is dropped with the error.
+                    // Release its charge and clear the flag: leaving the flag set
+                    // would make the next poll skip both the free and the
+                    // pre-charge, so a stream that is polled again after an error
+                    // would decode against a reservation held for a batch that no
+                    // longer exists. Most consumers abort on first error, but the
+                    // accounting must not depend on that.
+                    reservation.free();
+                    self.decode_charged = false;
+                    return std::task::Poll::Ready(Some(Err(e)));
+                }
+                // The charge now covers the in-flight batch; the next poll
+                // releases it and re-charges for the following decode.
+                self.decode_charged = false;
+            }
+            std::task::Poll::Ready(Some(Err(_)) | None) => {
+                if let Some(reservation) = self.reservation.as_mut() {
+                    reservation.free();
+                }
+                self.decode_charged = false;
+            }
+        }
+        polled
+    }
+}
+
+impl<S> datafusion::physical_plan::RecordBatchStream for MemoryAccountedScanStream<S>
+where
+    S: futures::Stream<Item = Result<arrow::record_batch::RecordBatch>> + Unpin,
+{
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -986,6 +1231,235 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::datasource::memory::MemorySourceConfig;
     use datafusion::physical_plan::expressions::col;
+
+    /// A scan must charge its canonicalized batches to the query pool, and must
+    /// fail rather than exceed it.
+    ///
+    /// Before this, `runtime.query.memory_limit` did not bound the process:
+    /// `DataFusion` operators reserved for what they held and Cayenne's
+    /// `memory_account` covered long-lived resident state, but the Vortex ->
+    /// Arrow materialization between them reserved from nothing. At SF-1000 that
+    /// was ~50 GiB of the heap, and peak RSS tracked the cgroup cap rather than
+    /// the configured limit.
+    #[tokio::test]
+    async fn a_scan_over_its_pool_budget_fails_instead_of_allocating() {
+        use datafusion_execution::memory_pool::GreedyMemoryPool;
+        use datafusion_execution::runtime_env::RuntimeEnvBuilder;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        // Comfortably smaller than one batch's Arrow footprint, so the very
+        // first `try_grow` is refused.
+        let runtime = RuntimeEnvBuilder::new()
+            .with_memory_pool(Arc::new(GreedyMemoryPool::new(64)))
+            .build_arc()
+            .expect("runtime env");
+        let context = Arc::new(TaskContext::default().with_runtime(runtime));
+
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(
+                (0..4096_i64).collect::<Vec<_>>(),
+            ))],
+        )
+        .expect("batch");
+        let inner = futures::stream::iter(vec![Ok(batch)]);
+
+        let mut stream = MemoryAccountedScanStream::new(
+            Box::pin(inner),
+            Arc::clone(&schema),
+            "cayenne_scan[test]".to_string(),
+            &context,
+        );
+
+        let first = stream.next().await.expect("one item");
+        let err = first.expect_err("a batch larger than the pool must be refused");
+        assert!(
+            err.to_string().contains("Resources exhausted"),
+            "expected a pool refusal, got: {err}"
+        );
+    }
+
+    /// A failed settle must not leave the charge stuck.
+    ///
+    /// `try_resize` failing means the batch is dropped with the error. If the
+    /// `decode_charged` flag stayed set, the next poll would skip BOTH the free
+    /// and the pre-charge, so the following decode would run against a
+    /// reservation still held for a batch that no longer exists — accounting
+    /// drift in the direction that under-charges. Most consumers abort on the
+    /// first error, but the accounting must not rely on that.
+    #[tokio::test]
+    async fn a_failed_settle_releases_the_charge_and_recharges_next_poll() {
+        use datafusion_execution::memory_pool::GreedyMemoryPool;
+        use datafusion_execution::runtime_env::RuntimeEnvBuilder;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let wide = || {
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Int64Array::from(
+                    (0..262_144_i64).collect::<Vec<_>>(),
+                ))],
+            )
+            .expect("batch")
+        };
+        // Pool fits the 1 MiB pre-charge but not the settled size of this batch,
+        // so `try_grow` succeeds and `try_resize` is what fails.
+        let batch_bytes = wide().get_array_memory_size();
+        assert!(
+            batch_bytes > INITIAL_BATCH_ESTIMATE_BYTES,
+            "the batch must settle larger than the pre-charge for this to exercise try_resize"
+        );
+        let pool: Arc<dyn datafusion_execution::memory_pool::MemoryPool> = Arc::new(
+            GreedyMemoryPool::new(INITIAL_BATCH_ESTIMATE_BYTES + (batch_bytes / 2)),
+        );
+        let runtime = RuntimeEnvBuilder::new()
+            .with_memory_pool(Arc::clone(&pool))
+            .build_arc()
+            .expect("runtime env");
+        let context = Arc::new(TaskContext::default().with_runtime(runtime));
+
+        let inner = futures::stream::iter(vec![Ok(wide()), Ok(wide())]);
+        let mut stream = MemoryAccountedScanStream::new(
+            Box::pin(inner),
+            Arc::clone(&schema),
+            "cayenne_scan[test]".to_string(),
+            &context,
+        );
+
+        let first = stream.next().await.expect("one item");
+        assert!(
+            first.is_err(),
+            "a batch larger than the pool must fail to settle"
+        );
+        assert!(
+            !stream.decode_charged,
+            "a failed settle must clear the charge flag, or the next poll skips its pre-charge"
+        );
+        assert_eq!(
+            pool.reserved(),
+            0,
+            "a failed settle must release the charge for the batch it dropped"
+        );
+    }
+
+    /// The charge must land BEFORE the decode, not after it.
+    ///
+    /// Charging afterwards makes the guard a detector rather than a bound: the
+    /// batch has already been materialized, so a refusal can only reject the
+    /// next one. This asserts the inner stream is never polled when the pool
+    /// cannot fit the charge — i.e. that no allocation happened.
+    #[tokio::test]
+    async fn an_over_budget_scan_is_refused_without_polling_the_decode() {
+        use datafusion_execution::memory_pool::GreedyMemoryPool;
+        use datafusion_execution::runtime_env::RuntimeEnvBuilder;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let polls = Arc::new(AtomicUsize::new(0));
+
+        // A stream that records every poll. If the charge is taken first and
+        // refused, this must never be polled at all.
+        let counted = {
+            let polls = Arc::clone(&polls);
+            let schema = Arc::clone(&schema);
+            futures::stream::poll_fn(move |_cx| {
+                polls.fetch_add(1, Ordering::SeqCst);
+                let batch = RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![Arc::new(Int64Array::from(vec![1_i64]))],
+                )
+                .expect("batch");
+                std::task::Poll::Ready(Some(Ok(batch)))
+            })
+        };
+
+        // Smaller than INITIAL_BATCH_ESTIMATE_BYTES, so the pre-poll charge is
+        // refused on the very first poll.
+        let runtime = RuntimeEnvBuilder::new()
+            .with_memory_pool(Arc::new(GreedyMemoryPool::new(1024)))
+            .build_arc()
+            .expect("runtime env");
+        let context = Arc::new(TaskContext::default().with_runtime(runtime));
+
+        let mut stream = MemoryAccountedScanStream::new(
+            Box::pin(counted),
+            Arc::clone(&schema),
+            "cayenne_scan[test]".to_string(),
+            &context,
+        );
+
+        let err = stream
+            .next()
+            .await
+            .expect("one item")
+            .expect_err("the pre-poll charge must be refused");
+        assert!(
+            err.to_string().contains("Resources exhausted"),
+            "expected a pool refusal, got: {err}"
+        );
+        assert_eq!(
+            polls.load(Ordering::SeqCst),
+            0,
+            "the decode must not run when the pool refused the charge - charging \
+             after the poll would mean the batch was already materialized"
+        );
+    }
+
+    /// The reservation covers the batch in flight only. Holding every batch for
+    /// the stream's lifetime would double-count against whichever operator above
+    /// now owns it, and would make a long scan look like a leak.
+    #[tokio::test]
+    async fn a_scan_releases_each_batch_before_taking_the_next() {
+        use datafusion_execution::memory_pool::GreedyMemoryPool;
+        use datafusion_execution::runtime_env::RuntimeEnvBuilder;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let batch = || {
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Int64Array::from(
+                    (0..1024_i64).collect::<Vec<_>>(),
+                ))],
+            )
+            .expect("batch")
+        };
+        let one_batch_bytes = batch().get_array_memory_size();
+
+        // Sized for the pre-poll charge plus a batch, and no more. Ten batches
+        // are streamed through it: an in-flight-only reservation fits, a
+        // cumulative one is refused partway through. The pre-charge is the floor
+        // here, not the batch size — these batches are far smaller than it.
+        let pool: Arc<dyn datafusion_execution::memory_pool::MemoryPool> = Arc::new(
+            GreedyMemoryPool::new(INITIAL_BATCH_ESTIMATE_BYTES + one_batch_bytes),
+        );
+        let runtime = RuntimeEnvBuilder::new()
+            .with_memory_pool(Arc::clone(&pool))
+            .build_arc()
+            .expect("runtime env");
+        let context = Arc::new(TaskContext::default().with_runtime(runtime));
+
+        let inner = futures::stream::iter((0..10).map(|_| Ok(batch())));
+        let mut stream = MemoryAccountedScanStream::new(
+            Box::pin(inner),
+            Arc::clone(&schema),
+            "cayenne_scan[test]".to_string(),
+            &context,
+        );
+
+        let mut seen = 0;
+        while let Some(item) = stream.next().await {
+            item.expect("an in-flight-only reservation fits a pool sized for two batches");
+            seen += 1;
+        }
+        assert_eq!(seen, 10, "every batch should stream through");
+
+        drop(stream);
+        assert_eq!(
+            pool.reserved(),
+            0,
+            "dropping the stream must return its bytes to the pool"
+        );
+    }
 
     fn one_partition_plan() -> Arc<dyn ExecutionPlan> {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
