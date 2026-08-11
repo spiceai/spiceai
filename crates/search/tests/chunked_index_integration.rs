@@ -16,7 +16,7 @@ limitations under the License.
 #![expect(clippy::expect_used, reason = "integration-test helpers")]
 
 //! End-to-end integration test for issue #7507: bounded intermediate batch size in
-//! [`ChunkedSearchIndex`]. The test wires up an `IndexedTableProvider` whose only index is a
+//! [`ChunkedSearchIndex`]. The test wires up an `IndexLayer` whose only index is a
 //! `ChunkedSearchIndex` (over a row-counting inner index), runs a `SELECT *` through the
 //! `IndexTableScanOptimizerRule` + `IndexTableScanExtensionPlanner` pipeline, and asserts that
 //! the inner index's `write` method is called with strictly-bounded batches even when the input
@@ -49,14 +49,14 @@ use datafusion::{
     physical_planner::{DefaultPhysicalPlanner, PhysicalPlanner},
     prelude::SessionContext,
 };
-use runtime_datafusion_index::{
-    Index, IndexedTableProvider,
-    analyzer::{IndexTableScanExtensionPlanner, IndexTableScanOptimizerRule},
+use runtime_datafusion_index::analyzer::{
+    IndexTableScanExtensionPlanner, IndexTableScanOptimizerRule,
 };
 use search::index::{
     SearchIndex,
     chunking::{CHUNKED_INDEX_CHUNK_KEY, ChunkedSearchIndex},
 };
+use spice_table::{Index, IndexLayer, SpiceTable};
 
 /// A chunker that always produces exactly `n` evenly-spaced chunks per non-empty input row,
 /// regardless of content. Deterministic chunk counts make the assertions in this test crisp.
@@ -331,9 +331,9 @@ async fn chunked_index_emits_bounded_intermediate_batches_to_inner() {
     let schema = input.schema();
     let mem_table = Arc::new(MemTable::try_new(schema, vec![vec![input]]).expect("valid table"));
 
-    let indexed = Arc::new(
-        IndexedTableProvider::new(mem_table as Arc<dyn TableProvider>)
-            .add_index(chunked_index as Arc<dyn Index + Send + Sync>),
+    let indexed = SpiceTable::over(
+        Arc::new(IndexLayer::new().add_index(chunked_index as Arc<dyn Index + Send + Sync>)),
+        mem_table as Arc<dyn TableProvider>,
     );
 
     ctx.register_table("docs", indexed as Arc<dyn TableProvider>)

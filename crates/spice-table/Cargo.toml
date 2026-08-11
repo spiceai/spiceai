@@ -1,21 +1,17 @@
 [package]
-description = "Indexing middleware and traits for the Spice runtime that extend DataFusion"
+description = "The table a Spice dataset presents: a stack of layers over a connector's own provider"
 edition.workspace = true
 homepage.workspace = true
 license-file.workspace = true
-name = "runtime-datafusion-index"
+name = "spice-table"
 repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
 async-trait.workspace = true
-arrow_tools = { path = "../arrow_tools" }
 datafusion.workspace = true
-futures.workspace = true
-itertools.workspace = true
-snafu.workspace = true
-spice-table = { path = "../spice-table" }
+datafusion-federation.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]

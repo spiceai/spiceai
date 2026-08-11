@@ -258,6 +258,8 @@ lint-rust:
 	cargo fmt $(_FMT_FLAGS) -- --check
 	## Crate-layering guard (fast, no compile): no crate may depend on a higher tier. See docs/dev/crate_layering.md
 	python3 scripts/check_crate_layers.py
+	## Table-layer guard (fast, no compile): a provider-wrapping TableProvider silently stops every layer walk. See docs/dev/crate_layering.md
+	python3 scripts/check_table_layers.py
 	## Rust-gate path-list guard (fast, no compile): the sign-off, Attestation, and merge-queue path lists must agree. See docs/dev/ci_signoff.md
 	python3 scripts/check_rust_gate_paths.py
 	## All except metal, cuda, nfs (nfs requires system libnfs library)
