@@ -1490,6 +1490,15 @@ impl DataFusion {
         // install nothing and emit no tuning warning. `get_total_memory` rebuilds a
         // sysinfo System each call, so read it once.
         let total_memory = crate::resource_monitor::get_total_memory();
+        // Aggregate ceiling on the PK keyset caches. Per-table figures are
+        // independently derived, so a fleet shares this process-wide bound.
+        let pk_keyset_budget_bytes = total_memory / 16;
+        cayenne::set_global_pk_keyset_bytes(pk_keyset_budget_bytes);
+        tracing::info!(
+            pk_keyset_budget_bytes,
+            total_memory,
+            "Cayenne global PK keyset byte budget active (bounds the SUM of per-table keyset caches, which are sized independently)"
+        );
         if let Some(mem_tier_budget_bytes) = self.mem_tier_budget_bytes {
             cayenne::set_global_mem_tier_bytes(mem_tier_budget_bytes);
             tracing::info!(
