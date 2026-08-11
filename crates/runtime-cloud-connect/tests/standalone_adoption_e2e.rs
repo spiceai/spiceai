@@ -263,6 +263,7 @@ async fn mock_enroll(
         "ca_bundle_pem": mock.ca.ca_cert_pem,
         "gateway_addr": mock.gateway_addr,
         "not_after": mock.not_after(),
+        "org": " acme ",
     });
     // Attach-at-connect: the real cloud validates and attaches; the mock
     // echoes the requested app back, matching the response contract.
@@ -1569,6 +1570,8 @@ async fn one_shot_enroll_then_separate_run_connects_with_stored_identity() {
         .await
         .expect("one-shot enroll succeeds");
     assert_eq!(outcome.identity.identifier, ASSIGNED_ID);
+    assert_eq!(outcome.identity.org_name.as_deref(), Some("acme"));
+    assert_eq!(outcome.registration.org.as_deref(), Some("acme"));
     assert_eq!(
         outcome.registration.app_name, None,
         "no attachment was requested"
@@ -1576,6 +1579,15 @@ async fn one_shot_enroll_then_separate_run_connects_with_stored_identity() {
     assert!(
         config.identity_path.exists(),
         "identity must be persisted by the one-shot enroll"
+    );
+    assert_eq!(
+        IdentityStore::load_optional(&config.identity_path)
+            .expect("load stored identity")
+            .expect("stored identity exists")
+            .org_name
+            .as_deref(),
+        Some("acme"),
+        "enrollment org must survive in the canonical identity file"
     );
     assert!(
         !pending_path.exists(),

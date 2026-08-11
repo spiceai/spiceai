@@ -47,9 +47,9 @@
 // A oneof is its own group and numbers its arms contiguously from 1; the
 // enclosing message's remaining fields follow it. Every other message numbers
 // contiguously from 1 in declaration order. New fields take the next free
-// number. Nothing is skipped or reserved: the two sides of this contract ship
-// together, so a removed field's number is free to be reused rather than frozen
-// for a peer that does not exist.
+// number. A field or enum value that is ever removed must be reserved and its
+// number never reused: deployed peers can retain old payloads or lag a rollout,
+// so reuse would reinterpret valid historical bytes as a different field.
 //
 // Protobuf shares one number space across a message and the oneofs inside it,
 // so a message whose oneof starts at 1 declares that oneof first and its own
@@ -240,6 +240,30 @@ message Heartbeat {
   uint32 active_models = 6;
   uint32 active_spicepods = 7;
   map<string, string> runtime_versions = 8;
+  // Detail that only a standalone runtime can truthfully report. A message
+  // field rather than top-level fields because this Heartbeat is shared with
+  // the cluster operator, and a cluster has no single runtime deployment
+  // state — a top-level restart field would falsely imply one restart state
+  // exists for a whole cluster. Absent from a cluster heartbeat, and absent
+  // from a standalone heartbeat whose sender predates the field; presence is
+  // the scope marker, so the control plane must treat "absent" (no detail
+  // reported) and "present but empty" (nothing requires a restart) as
+  // different states.
+  StandaloneRuntimeStatus standalone_runtime = 9;
+}
+
+// Standalone-runtime deployment state, carried on `Heartbeat` only by a
+// standalone instance. The cluster operator never sends it (its heartbeat
+// aggregates many runtimes), so every field here is scoped to exactly one
+// runtime process.
+message StandaloneRuntimeStatus {
+  // The setting/section paths whose desired configuration differs from the
+  // active one and cannot apply without a restart (`runtime.telemetry`,
+  // `runtime.memory_pool`, ...). Sticky while desired and active state
+  // differ; empty means nothing is waiting on a restart. The same source of
+  // truth the foreground log and `/v1/status` report, so every surface names
+  // the same sections.
+  repeated string restart_required = 1;
 }
 
 // Terminal reply to a command, correlated by `command_id`.
@@ -428,9 +452,33 @@ message ExecuteQuery {
 }
 
 // The app this instance is attached to, as the control plane currently sees it.
-// Absent means detached. If present it must be non-empty.
+// `app_id` absent means detached. Every present field must be non-empty.
+//
+// The portal metadata (fields 2-4) rides with a present `app_id` so the
+// instance can name its org/project destination without constructing portal
+// URLs itself — the Cloud owns environment and route metadata. For the
+// instance org and a same-app reassertion, presence updates and absence
+// preserves: a control plane that sends app-id-only attachments (any sender
+// predating these fields) leaves metadata a fuller command recorded.
+//
+// `org_name` is instance-level, not attachment-scoped — the org an instance
+// is enrolled in owns every attachment it can have, so the instance never
+// clears a stored org on its own: not on a detach, and not for an attach
+// that names none. That stored org is what keeps the org's new-project page
+// reachable as the recovery path for a detached instance. `app_name` and
+// `monitor_url` describe exactly one app and never survive an app change:
+// attaching a different app replaces them with what this command carries.
+// On a detach (absent `app_id`) fields 2-4 are meaningless and ignored, and
+// the instance clears the project-scoped state (`app_name`, `monitor_url`)
+// while keeping the org.
 message AttachApp {
   optional string app_id = 1;
+  // The organization the instance is enrolled/attached under.
+  optional string org_name = 2;
+  // The attached app (project) name inside the instance's org.
+  optional string app_name = 3;
+  // Cloud-constructed portal URL for the attached app's monitor page.
+  optional string monitor_url = 4;
 }
 
 // Sealed secrets delivery. A secret value is sealed TWICE with HPKE

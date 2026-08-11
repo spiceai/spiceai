@@ -31,6 +31,7 @@ use std::path::Path;
 use async_trait::async_trait;
 use snafu::Snafu;
 
+use crate::identity::AppAttachment;
 use crate::sealed_secrets::DeliveredSecrets;
 
 /// Why a command did not succeed.
@@ -557,11 +558,18 @@ pub trait RuntimeHandle: Send + Sync + 'static {
         Ok(None)
     }
 
-    /// Apply the control plane's current app attachment state.
+    /// Apply the control plane's current app attachment state: the attached
+    /// app plus the portal metadata that describes it, as one tuple.
     ///
-    /// `None` means detached. A present value is always non-empty; the client
-    /// rejects an empty present value before invoking the handle.
-    async fn attach_app(&self, _app_id: Option<&str>) -> Result<serde_json::Value, CommandError> {
+    /// `None` means detached. A present attachment always carries a non-empty
+    /// `app_id`, and its optional members are non-empty when present; the
+    /// client rejects empty present values before invoking the handle. An
+    /// implementation persists the tuple as a unit — see
+    /// [`crate::IdentityStore::set_attachment`] for the detach semantics.
+    async fn attach_app(
+        &self,
+        _attachment: Option<&AppAttachment>,
+    ) -> Result<serde_json::Value, CommandError> {
         Err(CommandError::unsupported(
             "AttachApp is not implemented in this build",
         ))
@@ -662,7 +670,13 @@ mod tests {
             Err(CommandError::Unsupported { .. })
         ));
         assert!(matches!(
-            h.attach_app(Some("4002")).await,
+            h.attach_app(Some(&AppAttachment {
+                app_id: "4002".to_string(),
+                org_name: None,
+                app_name: None,
+                monitor_url: None,
+            }))
+            .await,
             Err(CommandError::Unsupported { .. })
         ));
         assert!(matches!(

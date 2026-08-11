@@ -49,6 +49,11 @@ pub(crate) async fn build_heartbeat(
         active_models,
         active_spicepods: 0,
         runtime_versions: std::collections::HashMap::new(),
+        // Absent, not empty: this runtime does not report deployment restart
+        // state yet, and on the wire "no detail reported" and "nothing needs a
+        // restart" are different states. Populate it only from a real
+        // restart-required source of truth, never with a placeholder.
+        standalone_runtime: None,
     }
 }
 
@@ -127,6 +132,10 @@ mod tests {
         assert_eq!(hb.sequence, 42);
         // A handle that cannot report status must not claim a phase.
         assert_eq!(hb.phase, proto::RuntimePhase::Unspecified as i32);
+        // A runtime with no restart-state source of truth reports no
+        // standalone detail — absent, never a present-but-empty placeholder,
+        // since the control plane reads those as different states.
+        assert_eq!(hb.standalone_runtime, None);
     }
 
     #[tokio::test]

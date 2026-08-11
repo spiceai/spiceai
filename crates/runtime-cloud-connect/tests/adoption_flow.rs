@@ -50,7 +50,7 @@ use runtime_cloud_connect::config::CloudConnectConfig;
 use runtime_cloud_connect::handlers::{
     ApplyOutcome, Capability, CommandError, RuntimeHandle, SpicepodDeployment,
 };
-use runtime_cloud_connect::identity::IdentityStore;
+use runtime_cloud_connect::identity::{AppAttachment, AttachmentState, IdentityStore};
 use runtime_cloud_connect::proto;
 use runtime_cloud_connect::proto::cloud_connect_server::{CloudConnect, CloudConnectServer};
 use serde_json::Value;
@@ -147,8 +147,15 @@ struct CapturedRuntime {
     applied: Arc<Mutex<Option<AppliedSpicepod>>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AppliedAttachment {
+    command: Option<AppAttachment>,
+    persisted: AttachmentState,
+}
+
 struct AttachmentRuntime {
-    applied: Arc<Mutex<Vec<Option<String>>>>,
+    applied: Arc<Mutex<Vec<AppliedAttachment>>>,
+    identity_path: PathBuf,
 }
 
 #[async_trait]
@@ -157,9 +164,28 @@ impl RuntimeHandle for AttachmentRuntime {
         capability == Capability::AttachApp
     }
 
-    async fn attach_app(&self, app_id: Option<&str>) -> Result<serde_json::Value, CommandError> {
-        self.applied.lock().await.push(app_id.map(str::to_string));
-        Ok(serde_json::json!({ "app_id": app_id }))
+    /// Mirrors the production handle: the tuple is persisted into the identity
+    /// file before the command is acknowledged, so the test can assert what
+    /// ends up on disk — org durability across detach and bare re-attach —
+    /// not only what reached the handle.
+    async fn attach_app(
+        &self,
+        attachment: Option<&AppAttachment>,
+    ) -> Result<serde_json::Value, CommandError> {
+        let path = self.identity_path.clone();
+        let owned = attachment.cloned();
+        let persisted = tokio::task::spawn_blocking(move || {
+            IdentityStore::set_attachment(&path, owned.as_ref())
+        })
+        .await
+        .map_err(|e| CommandError::failed(e.to_string()))?
+        .map_err(|e| CommandError::failed(e.to_string()))?
+        .ok_or_else(|| CommandError::failed("the identity file is missing"))?;
+        self.applied.lock().await.push(AppliedAttachment {
+            command: attachment.cloned(),
+            persisted: persisted.clone(),
+        });
+        Ok(serde_json::json!(persisted))
     }
 }
 
@@ -523,6 +549,9 @@ async fn apply_spicepod_writes_file_and_acks() {
         gateway_addr: addr.to_string(),
         not_after_unix: None,
         app_id: None,
+        org_name: None,
+        app_name: None,
+        monitor_url: None,
         enc_private_key_pem: String::new(),
         enc_public_key_pem: String::new(),
         enc_previous_private_key_pem: String::new(),
@@ -620,17 +649,68 @@ async fn apply_spicepod_writes_file_and_acks() {
 async fn attach_app_applies_complete_state_and_rejects_empty_ids() {
     let dir = tempfile::tempdir().expect("create tempdir");
     let identity_path = dir.path().join("identity.json");
-    let commands = [Some("4002"), None, Some("3387"), Some("")]
-        .into_iter()
-        .enumerate()
-        .map(|(index, app_id)| proto::ControlMessage {
-            command_id: format!("cmd-attach-{index}"),
-            target: None,
-            body: Some(proto::control_message::Body::AttachApp(proto::AttachApp {
-                app_id: app_id.map(str::to_string),
-            })),
-        })
-        .collect();
+    let commands = [
+        // A full attachment tuple: the id plus the portal metadata.
+        proto::AttachApp {
+            app_id: Some("4002".to_string()),
+            org_name: Some("acme".to_string()),
+            app_name: Some("retail-analytics".to_string()),
+            monitor_url: Some("https://spice.ai/acme/retail-analytics/monitor".to_string()),
+        },
+        // An attachment with no metadata is still a valid attachment (what a
+        // control plane predating the metadata fields sends).
+        proto::AttachApp {
+            app_id: Some("3387".to_string()),
+            org_name: None,
+            app_name: None,
+            monitor_url: None,
+        },
+        // Detach. Fields 2-4 are meaningless on a detach and must be ignored,
+        // not validated — even present-but-empty leftovers.
+        proto::AttachApp {
+            app_id: None,
+            org_name: Some(String::new()),
+            app_name: None,
+            monitor_url: None,
+        },
+        // Present-but-empty metadata on an attach is a malformed command...
+        proto::AttachApp {
+            app_id: Some("4002".to_string()),
+            org_name: Some(String::new()),
+            app_name: None,
+            monitor_url: None,
+        },
+        // ...as is blank-only whitespace...
+        proto::AttachApp {
+            app_id: Some("4002".to_string()),
+            org_name: None,
+            app_name: None,
+            monitor_url: Some("  ".to_string()),
+        },
+        // ...as is surrounding whitespace that would make the id compare as a
+        // different app while looking identical to a person...
+        proto::AttachApp {
+            app_id: Some("4002 ".to_string()),
+            org_name: None,
+            app_name: None,
+            monitor_url: None,
+        },
+        // ...and a present-but-empty id.
+        proto::AttachApp {
+            app_id: Some(String::new()),
+            org_name: None,
+            app_name: None,
+            monitor_url: None,
+        },
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(index, attach)| proto::ControlMessage {
+        command_id: format!("cmd-attach-{index}"),
+        target: None,
+        body: Some(proto::control_message::Body::AttachApp(attach)),
+    })
+    .collect();
     let mock = MockServer::new(commands);
     let mock_state = Arc::clone(&mock.state);
     let addr = spawn_server(mock).await;
@@ -645,6 +725,9 @@ async fn attach_app_applies_complete_state_and_rejects_empty_ids() {
             gateway_addr: addr.to_string(),
             not_after_unix: None,
             app_id: None,
+            org_name: None,
+            app_name: None,
+            monitor_url: None,
             enc_private_key_pem: String::new(),
             enc_public_key_pem: String::new(),
             enc_previous_private_key_pem: String::new(),
@@ -656,13 +739,14 @@ async fn attach_app_applies_complete_state_and_rejects_empty_ids() {
     let applied = Arc::new(Mutex::new(Vec::new()));
     let runtime: Arc<dyn RuntimeHandle> = Arc::new(AttachmentRuntime {
         applied: Arc::clone(&applied),
+        identity_path: identity_path.clone(),
     });
     let config = CloudConnectConfig {
         enroll_endpoint: "http://127.0.0.1:9".to_string(),
         gateway_endpoint: None,
         ca_cert_pem: None,
         insecure: true,
-        identity_path,
+        identity_path: identity_path.clone(),
         config_dir: dir.path().to_path_buf(),
         adoption_code: None,
         pending_adopt_code_path: None,
@@ -687,7 +771,7 @@ async fn attach_app_applies_complete_state_and_rejects_empty_ids() {
             .await
             .last_result
             .as_ref()
-            .is_some_and(|result| result.command_id == "cmd-attach-3")
+            .is_some_and(|result| result.command_id == "cmd-attach-6")
         {
             break;
         }
@@ -695,7 +779,46 @@ async fn attach_app_applies_complete_state_and_rejects_empty_ids() {
     }
     assert_eq!(
         applied.lock().await.as_slice(),
-        [Some("4002".to_string()), None, Some("3387".to_string())]
+        [
+            AppliedAttachment {
+                command: Some(AppAttachment {
+                    app_id: "4002".to_string(),
+                    org_name: Some("acme".to_string()),
+                    app_name: Some("retail-analytics".to_string()),
+                    monitor_url: Some("https://spice.ai/acme/retail-analytics/monitor".to_string()),
+                }),
+                persisted: AttachmentState {
+                    app_id: Some("4002".to_string()),
+                    org_name: Some("acme".to_string()),
+                    app_name: Some("retail-analytics".to_string()),
+                    monitor_url: Some("https://spice.ai/acme/retail-analytics/monitor".to_string()),
+                },
+            },
+            AppliedAttachment {
+                command: Some(AppAttachment {
+                    app_id: "3387".to_string(),
+                    org_name: None,
+                    app_name: None,
+                    monitor_url: None,
+                }),
+                persisted: AttachmentState {
+                    app_id: Some("3387".to_string()),
+                    org_name: Some("acme".to_string()),
+                    app_name: None,
+                    monitor_url: None,
+                },
+            },
+            AppliedAttachment {
+                command: None,
+                persisted: AttachmentState {
+                    app_id: None,
+                    org_name: Some("acme".to_string()),
+                    app_name: None,
+                    monitor_url: None,
+                },
+            },
+        ],
+        "the malformed commands must never reach the runtime handle"
     );
     let state = mock_state.lock().await;
     assert_eq!(
@@ -707,9 +830,20 @@ async fn attach_app_applies_complete_state_and_rejects_empty_ids() {
         ["attach_app".to_string()]
     );
     let result = state.last_result.as_ref().expect("server saw a result");
-    assert_eq!(result.command_id, "cmd-attach-3");
+    assert_eq!(result.command_id, "cmd-attach-6");
     assert_eq!(result.code, proto::ResultCode::InvalidArgument as i32);
     drop(state);
+
+    // Disk state after full attach → bare re-attach → detach: detached, with
+    // the org recorded by the full attach surviving both the app-id-only
+    // re-attach and the detach — the recovery pointer the contract promises.
+    let identity = IdentityStore::load_optional(&identity_path)
+        .expect("load identity")
+        .expect("identity present");
+    assert_eq!(identity.app_id, None);
+    assert_eq!(identity.org_name.as_deref(), Some("acme"));
+    assert_eq!(identity.app_name, None);
+    assert_eq!(identity.monitor_url, None);
 
     handle.shutdown().await;
 }
@@ -779,6 +913,9 @@ async fn unknown_command_is_nacked_rather_than_dropped() {
         gateway_addr: addr.to_string(),
         not_after_unix: None,
         app_id: None,
+        org_name: None,
+        app_name: None,
+        monitor_url: None,
         enc_private_key_pem: String::new(),
         enc_public_key_pem: String::new(),
         enc_previous_private_key_pem: String::new(),

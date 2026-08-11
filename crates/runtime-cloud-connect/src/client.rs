@@ -66,7 +66,7 @@ use crate::handlers::{
     SpicepodDeployment, advertised_capabilities, effective_max_rows,
 };
 use crate::heartbeat::{build_heartbeat, build_telemetry, now_unix};
-use crate::identity::{Identity, IdentityStore};
+use crate::identity::{AppAttachment, Identity, IdentityStore};
 use crate::proto;
 use crate::shutdown::Shutdown;
 use crate::{Error, Result, enroll, fingerprint};
@@ -435,9 +435,14 @@ impl ClientDriver {
             ca_bundle_pem: current.ca_bundle_pem,
             gateway_addr: current.gateway_addr,
             not_after_unix: Some(outcome.not_after_unix),
-            // The app attribution is not part of the credential and /renew
-            // does not re-send it, so it rides across the rotation unchanged.
+            // The attachment tuple is not part of the credential and /renew
+            // does not re-send it, so it rides across the rotation unchanged
+            // (and is re-merged from disk by the persist below, in case a
+            // command handler moved it while this renewal was in flight).
             app_id: current.app_id,
+            org_name: current.org_name,
+            app_name: current.app_name,
+            monitor_url: current.monitor_url,
             // Seeded with the OUTGOING keypair and rotated by the call below,
             // which shifts it into `enc_previous_private_key_pem` — assigning
             // `material` here instead would leave the retained key equal to the
@@ -934,13 +939,9 @@ impl ClientDriver {
                     .supported(tx, &command_id, Capability::AttachApp, name)
                     .await
                 {
-                    let app_id = cmd.app_id.as_deref();
-                    let result = if app_id.is_some_and(str::is_empty) {
-                        Err(CommandError::invalid_argument(
-                            "AttachApp.app_id must be non-empty when present",
-                        ))
-                    } else {
-                        self.runtime.attach_app(app_id).await
+                    let result = match attachment_from_command(&cmd) {
+                        Ok(attachment) => self.runtime.attach_app(attachment.as_ref()).await,
+                        Err(err) => Err(err),
                     };
                     reply_with_json(tx, &command_id, result).await;
                 }
@@ -1695,6 +1696,47 @@ fn result_too_large_message() -> String {
     )
 }
 
+/// Map an `AttachApp` command onto the handler-level attachment tuple,
+/// enforcing the wire contract's "every present field is non-empty" before the
+/// handle is invoked: an empty or blank present value is a malformed command,
+/// not a state, and applying it would persist something no reader can
+/// distinguish from data.
+///
+/// A detach — absent `app_id` — is exempt: the contract declares fields 2-4
+/// meaningless on a detach, so they are ignored entirely rather than
+/// validated. Rejecting a detach over a leftover zeroed optional would leave
+/// the instance attached when the control plane just said it is not.
+fn attachment_from_command(cmd: &proto::AttachApp) -> Result<Option<AppAttachment>, CommandError> {
+    let Some(app_id) = cmd.app_id.as_deref() else {
+        return Ok(None);
+    };
+    for (field, value) in [
+        ("app_id", Some(app_id)),
+        ("org_name", cmd.org_name.as_deref()),
+        ("app_name", cmd.app_name.as_deref()),
+        ("monitor_url", cmd.monitor_url.as_deref()),
+    ] {
+        if let Some(value) = value {
+            if value.trim().is_empty() {
+                return Err(CommandError::invalid_argument(format!(
+                    "AttachApp.{field} must be non-empty when present"
+                )));
+            }
+            if value.trim() != value {
+                return Err(CommandError::invalid_argument(format!(
+                    "AttachApp.{field} must not have leading or trailing whitespace"
+                )));
+            }
+        }
+    }
+    Ok(Some(AppAttachment {
+        app_id: app_id.to_string(),
+        org_name: cmd.org_name.clone(),
+        app_name: cmd.app_name.clone(),
+        monitor_url: cmd.monitor_url.clone(),
+    }))
+}
+
 /// Map the wire restart mode onto the handler-level one. A value a newer
 /// control plane knows and this build doesn't degrades to `Unspecified`,
 /// which implementations treat as graceful.
@@ -1886,6 +1928,9 @@ mod tests {
             enc_previous_private_key_pem: String::new(),
             cache_key_b64: String::new(),
             app_id: None,
+            org_name: None,
+            app_name: None,
+            monitor_url: None,
         }
     }
 
