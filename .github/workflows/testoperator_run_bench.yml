@@ -303,29 +303,24 @@ jobs:
           if [ "$PGHOST" != "127.0.0.1" ]; then
             echo "::error::$DB_NAME is missing or empty on the hosted $PGHOST cluster. Scale factor $SCALE_FACTOR is too large to safely generate and load inline from a CI runner. Pre-provision it first, e.g.:"
             echo "  cd test/tpc-bench && DB_HOST=$PGHOST DB_PORT=5432 DB_USER=postgres DB_NAME=$DB_NAME DBGEN_SCALE=$SCALE_FACTOR make tpch-clone tpch-fleet-gen pg-init && DB_HOST=$PGHOST DB_PORT=5432 DB_USER=postgres DB_NAME=$DB_NAME TPCH_DATA_DIR=./tmp/fleet make pg-load && DB_HOST=$PGHOST DB_PORT=5432 DB_USER=postgres DB_NAME=$DB_NAME make pg-create-index"
-            echo "(substitute the tpcds-* targets for a tpcds run)"
+            echo "(for a tpcds run: make tpcds-clone tpcds-fleet-gen pg-tpcds-init, then TPCDS_DATA_DIR=./tmp/tpcds-fleet make pg-tpcds-load, then make pg-tpcds-create-index)"
             exit 1
           fi
 
           echo "$DB_NAME is missing or empty on $PGHOST - seeding it now."
           sudo apt-get install -y git
-          if [ "$QUERY_SET" = "tpcds" ]; then
-            # tpcds-kit's tools/Makefile hardcodes CC=gcc-9 on Linux; ubuntu-24.04's
-            # default gcc isn't named gcc-9, so install it explicitly via the PPA.
-            sudo add-apt-repository ppa:ubuntu-toolchain-r/ppa -y
-            sudo apt-get update -y
-            sudo apt-get install -y flex bison byacc gcc-9 g++-9
-          else
-            # TPC-H data comes from the pinned DuckDB CLI (see tpch-fleet-gen), so
-            # nothing is compiled here - tpch-kit is only cloned for dss.ddl.
-            sudo apt-get install -y unzip
-          fi
+          # Both query sets seed from the pinned DuckDB CLI (tpch-fleet-gen /
+          # tpcds-fleet-gen), so nothing is compiled here - the kits are only
+          # cloned for their DDL (dss.ddl / tpcds.sql, tpcds_ri.sql). Seeding
+          # from any other generator produces data the recorded expected
+          # answers don't match (see the fleet-gen comments in the Makefile).
+          sudo apt-get install -y unzip
 
           if [ "$QUERY_SET" = "tpcds" ]; then
-            make tpcds-init
-            DBGEN_SCALE=$SCALE_FACTOR make tpcds-gen
+            make tpcds-clone
+            DBGEN_SCALE=$SCALE_FACTOR make tpcds-fleet-gen
             DB_HOST=$PGHOST DB_PORT=5432 DB_USER=postgres DB_NAME=$DB_NAME make pg-tpcds-init
-            DB_HOST=$PGHOST DB_PORT=5432 DB_USER=postgres DB_NAME=$DB_NAME make pg-tpcds-load
+            DB_HOST=$PGHOST DB_PORT=5432 DB_USER=postgres DB_NAME=$DB_NAME TPCDS_DATA_DIR=./tmp/tpcds-fleet make pg-tpcds-load
             DB_HOST=$PGHOST DB_PORT=5432 DB_USER=postgres DB_NAME=$DB_NAME make pg-tpcds-create-index
           else
             make tpch-clone
