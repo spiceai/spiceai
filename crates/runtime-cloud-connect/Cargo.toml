@@ -1,6 +1,6 @@
 [package]
 name = "runtime-cloud-connect"
-description = "Outbound control-plane client for Spice Cloud Connect (adoption flow for standalone spiced)"
+description = "Outbound control-plane client for Spice Cloud Connect enrollment and control"
 edition.workspace = true
 exclude.workspace = true
 homepage.workspace = true
@@ -54,6 +54,8 @@ tokio-stream = { workspace = true }
 tonic = { workspace = true }
 tonic-prost = "0.14"
 tracing = { workspace = true }
+# Enrollment operation IDs (`Idempotency-Key`) for retry-safe enrollment.
+uuid = { workspace = true, features = ["v4"] }
 # Key material and decrypted secret values are held in `Zeroizing` so a freed
 # buffer never leaves plaintext in the heap.
 zeroize = "1.8"
@@ -70,7 +72,7 @@ tokio = { workspace = true, features = ["macros", "test-util"] }
 # The workspace dependency only enables `sync`, so opt-in explicitly here
 # for the integration tests.
 tokio-stream = { workspace = true, features = ["net"] }
-# The standalone-adoption e2e test stands up a real TLS control server that
+# The standalone-enrollment e2e test stands up a real TLS control server that
 # signs client CSRs, so it needs rcgen's CSR/CA parsing (x509-parser) plus a
 # rustls crypto provider to install as the process default before the tonic
 # server builds its `ServerConfig`.

@@ -1,0 +1,47 @@
+# Spice Cloud Connect — steady state for an enrolled instance.
+#
+# The enrolled identity on the `spice-identity` volume (SPICE_CONFIG_DIR) is
+# what connects this instance to Spice Cloud on every start — no flag and no
+# key. First enrollment is a one-time bootstrap overlay:
+#
+#   SPICE_ENROLL_KEY=<key from the Spice Cloud portal> \
+#     docker compose -f compose.yaml -f compose.bootstrap.yaml up -d
+#
+# then, once http://localhost:8090/v1/ready answers `ready`:
+#
+#   docker compose up -d
+#
+# which recreates the container without the key. See README.md.
+services:
+  init-volume:
+    # The runtime image is FROM scratch and runs as uid 65534; a freshly
+    # created named volume is root-owned, so hand it to the runtime user
+    # before spiced first writes its identity there.
+    image: busybox:1.37
+    command: ["chown", "-R", "65534:65534", "/data"]
+    volumes:
+      - spice-identity:/data
+
+  spiced:
+    image: spiceai/spiceai:latest
+    depends_on:
+      init-volume:
+        condition: service_completed_successfully
+    command:
+      - --http
+      - 0.0.0.0:8090
+      - --metrics
+      - 0.0.0.0:9090
+      - --flight
+      - 0.0.0.0:50051
+    environment:
+      SPICE_CONFIG_DIR: /data/.spice
+    volumes:
+      - spice-identity:/data
+    ports:
+      - "8090:8090"
+      - "50051:50051"
+    restart: unless-stopped
+
+volumes:
+  spice-identity:

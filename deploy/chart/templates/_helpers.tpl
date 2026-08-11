@@ -81,6 +81,72 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end }}
 
 {{/*
+Whether the container command carries a Cloud Connect `--token` bootstrap
+argument, in either its two-element (`--token`, `$(VAR)`) or single-element
+(`--token=$(VAR)`) form.
+*/}}
+{{- define "spiceai.cloudConnectTokenBootstrap" -}}
+{{- $found := false -}}
+{{- range .Values.command -}}
+{{- if or (eq . "--token") (hasPrefix "--token=" .) -}}
+{{- $found = true -}}
+{{- end -}}
+{{- end -}}
+{{- if $found }}true{{ end -}}
+{{- end -}}
+
+{{/*
+Validate a Cloud Connect `--token` bootstrap deployment before rendering.
+
+One enrollment key enrolls exactly one identity, and the identity must
+survive a pod replacement, so a command carrying `--token` requires:
+  - exactly one replica (an absent replicaCount renders a 1-replica
+    workload and is accepted),
+  - stateful persistent storage,
+  - SPICE_CONFIG_DIR set to a literal path beneath the stateful mountPath,
+  - the token argument to be an env expansion `$(VAR)` (normally from a
+    Secret) — never a literal key baked into a chart value.
+*/}}
+{{- define "spiceai.validateCloudConnectBootstrap" -}}
+{{- if include "spiceai.cloudConnectTokenBootstrap" . -}}
+{{- if or (ne (int (.Values.replicaCount | default 1)) 1) (not .Values.stateful.enabled) -}}
+{{- fail "Cloud Connect --token bootstrap requires one replica and persistent Spice identity storage. Set replicaCount: 1 and stateful.enabled: true, and set SPICE_CONFIG_DIR beneath stateful.mountPath. See deploy/chart/examples/cloud-connect/." -}}
+{{- end -}}
+{{- $mount := clean (.Values.stateful.mountPath | default "") -}}
+{{- $configDirOk := false -}}
+{{- range .Values.additionalEnv -}}
+{{- if and (eq (get . "name") "SPICE_CONFIG_DIR") (get . "value") -}}
+{{- $configDir := clean (get . "value") -}}
+{{- if and (ne $mount ".") (hasPrefix (printf "%s/" $mount) $configDir) -}}
+{{- $configDirOk = true -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- if not $configDirOk -}}
+{{- fail "Cloud Connect --token bootstrap requires one replica and persistent Spice identity storage. Add an additionalEnv entry setting SPICE_CONFIG_DIR to a path beneath stateful.mountPath (for example /data/.spice under mountPath /data). See deploy/chart/examples/cloud-connect/." -}}
+{{- end -}}
+{{- $cmd := .Values.command -}}
+{{- range $i, $arg := $cmd -}}
+{{- if eq $arg "--token" -}}
+{{- $next := "" -}}
+{{- if lt (add1 $i) (len $cmd) -}}
+{{- $next = index $cmd (add1 $i) -}}
+{{- end -}}
+{{- if not (regexMatch "^\\$\\([A-Za-z_][A-Za-z0-9_]*\\)$" $next) -}}
+{{- fail "Cloud Connect --token must expand an environment variable (for example \"$(SPICE_ENROLL_KEY)\" from a Kubernetes Secret) — no chart value accepts a literal enrollment key. See deploy/chart/examples/cloud-connect/." -}}
+{{- end -}}
+{{- end -}}
+{{- if hasPrefix "--token=" $arg -}}
+{{- $value := trimPrefix "--token=" $arg -}}
+{{- if not (regexMatch "^\\$\\([A-Za-z_][A-Za-z0-9_]*\\)$" $value) -}}
+{{- fail "Cloud Connect --token must expand an environment variable (for example \"$(SPICE_ENROLL_KEY)\" from a Kubernetes Secret) — no chart value accepts a literal enrollment key. See deploy/chart/examples/cloud-connect/." -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
 Render a Kubernetes probe with built-in HTTP defaults.
 */}}
 {{- define "spiceai.probe" -}}

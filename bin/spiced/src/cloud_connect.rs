@@ -17,7 +17,7 @@ limitations under the License.
 //! Bootstrap glue for Spice Cloud Connect inside `spiced`.
 //!
 //! Wires the spice-cloud-connect client into the runtime so that a
-//! standalone `spiced` can be discovered, adopted, and managed by a
+//! standalone `spiced` can be discovered, enrolled, and managed by a
 //! Spice Cloud control plane.
 //!
 //! ## Opt-in semantics
@@ -25,17 +25,16 @@ limitations under the License.
 //! `CloudConnect` is **disabled by default**. It activates only if one of
 //! the following is true at boot:
 //!
-//! 1. The `--cloud-connect` flag was passed.
-//! 2. `$SPICE_CONFIG_DIR/identity.json` exists.
-//! 3. `SPICE_CONNECT_ADOPT_CODE` env var is set.
-//! 4. `$SPICE_CONFIG_DIR/pending-adopt-code` file exists.
+//! 1. `--token <enrollment-key>` was passed — [`bootstrap_enrollment`]
+//!    then enrolls this instance *before the runtime is built or any
+//!    listener binds*, so the durable identity exists by the time anything
+//!    else here runs.
+//! 2. `$SPICE_CONFIG_DIR/identity.json` exists (a previously enrolled
+//!    instance) — reconnection is automatic, with no flag.
 //!
-//! If none of the above is true, this module never opens a connection.
-//! `--cloud-connect` forces the client on but cannot conjure a credential:
-//! with no identity and no code it logs an actionable warning and the
-//! runtime continues unmanaged. Conversely its absence keeps the
-//! signal-based activation, so instances enrolled before the flag existed
-//! keep connecting after an upgrade.
+//! If neither is true, this module never opens a connection. An existing
+//! identity always wins over a supplied `--token`: the key is not redeemed
+//! and nothing about it is persisted.
 //!
 //! ## How a deployment applies
 //!
@@ -76,7 +75,7 @@ use runtime::datafusion::query::Error as QueryError;
 use runtime::metrics_reader::MetricsReader;
 use runtime::status::ComponentStatus;
 use runtime_cloud_connect::config::{
-    CLOUD_MANAGED_SPICEPOD_FILE, CloudConnectConfig, IDENTITY_FILE, PENDING_ADOPT_CODE_FILE,
+    CLOUD_MANAGED_SPICEPOD_FILE, CloudConnectConfig, IDENTITY_FILE,
 };
 use runtime_cloud_connect::handlers::{
     ApplyOutcome, Capability, CommandError, MAX_QUERY_RESULT_BYTES, QueryOutcome, RuntimeHandle,
@@ -106,24 +105,21 @@ const DEFAULT_LOG_TAIL_LINES: usize = 500;
 const DEPLOYMENT_DRAIN_BUDGET: Duration = Duration::from_mins(2);
 
 /// Cheap probe for whether Spice Cloud Connect is configured for this
-/// instance, using the same signals as [`maybe_start`]: the explicit
-/// `--cloud-connect` flag, an on-disk identity, a staged pending adoption
-/// code, or the `SPICE_CONNECT_ADOPT_CODE` env var.
+/// instance, using the same signals as [`maybe_start`]: a `--token`
+/// enrollment bootstrap in progress, or an on-disk identity.
 ///
 /// Called from `init_tracing` (before [`maybe_start`]) to decide whether to
 /// install the log-capture layer. It runs in the same process — hence the
 /// same working directory — as [`maybe_start`], so both resolve the config
 /// directory identically. This is a lightweight existence check; it does not
-/// read or validate the files (that happens in `maybe_start`).
-pub(crate) fn is_configured(cloud_connect_flag: bool) -> bool {
-    if cloud_connect_flag {
+/// read or validate the file (that happens in `maybe_start`).
+pub(crate) fn is_configured(token_supplied: bool) -> bool {
+    if token_supplied {
         return true;
     }
-    let config_dir = CloudConnectConfig::default_config_dir();
-    config_dir.join(IDENTITY_FILE).exists()
-        || config_dir.join(PENDING_ADOPT_CODE_FILE).exists()
-        || std::env::var_os(runtime_cloud_connect::config::ADOPT_CODE_ENV)
-            .is_some_and(|v| !v.is_empty())
+    CloudConnectConfig::default_config_dir()
+        .join(IDENTITY_FILE)
+        .exists()
 }
 
 /// Read the optional `cloud-endpoint` override file written by
@@ -147,6 +143,122 @@ fn build_config(runtime_version: &str) -> CloudConnectConfig {
         config.enroll_endpoint = override_endpoint;
     }
     config
+}
+
+/// Why a `--token` bootstrap could not produce a durable identity. Every
+/// message is safe to print: none can contain the enrollment key.
+#[derive(Debug, snafu::Snafu)]
+pub enum BootstrapEnrollmentError {
+    #[snafu(display(
+        "Failed to enroll this instance with Spice Cloud: the --token value was rejected \
+         before any request was made. {source}"
+    ))]
+    InvalidKey {
+        source: runtime_cloud_connect::InvalidEnrollmentKey,
+    },
+
+    #[snafu(display(
+        "Failed to enroll this instance with Spice Cloud: the --region value {region:?} is not \
+         a valid region label. Expected 2-64 lowercase letters, digits, or hyphens (for example \
+         'us-west-2' or 'on-prem-syd'). See: https://spiceai.org/docs"
+    ))]
+    InvalidRegion { region: String },
+
+    #[snafu(display("Failed to enroll this instance with Spice Cloud ({endpoint}): {source}"))]
+    Enroll {
+        endpoint: String,
+        source: runtime_cloud_connect::EnrollNowError,
+    },
+}
+
+/// Redeem a `--token` enrollment key: the pre-runtime Cloud Connect
+/// bootstrap.
+///
+/// Called from `main` **before the runtime is built, any listener binds, or
+/// readiness can be reported** — a failed enrollment therefore leaves the
+/// process with no port bound and nothing an orchestrator could route
+/// traffic to. Retryable failures are retried for up to the headless
+/// ten-minute budget while the process stays unready; terminal failures
+/// return an error the caller exits `1` on.
+///
+/// No-op without `--token`. An existing valid identity wins: the key is not
+/// redeemed, nothing about it is persisted, and the runtime reconnects from
+/// the identity as it would have without the flag.
+///
+/// # Errors
+///
+/// Returns [`BootstrapEnrollmentError`] when the key or region is malformed
+/// (checked locally, never echoed) or when [`enroll_now`] fails terminally
+/// or exhausts its retry budget.
+pub async fn bootstrap_enrollment(args: &mut crate::Args) -> Result<(), BootstrapEnrollmentError> {
+    use runtime_cloud_connect::{
+        EnrollNowOutcome, EnrollmentAuthority, EnrollmentKey, RetryPolicy,
+    };
+
+    let Some(raw_key) = args.token.take() else {
+        return Ok(());
+    };
+
+    let key = EnrollmentKey::parse(raw_key.expose_secret())
+        .map_err(|source| BootstrapEnrollmentError::InvalidKey { source })?;
+    // The canonical wrapper owns a zeroizing copy now. Drop the raw clap
+    // value immediately so it cannot live inside `Args` for the runtime's
+    // entire process lifetime.
+    drop(raw_key);
+
+    // Validated before anything else so a typo fails fast — even when an
+    // existing identity would win and the region would go unused.
+    if let Some(region) = args.region.as_deref()
+        && !runtime_cloud_connect::is_valid_instance_region(region)
+    {
+        return Err(BootstrapEnrollmentError::InvalidRegion {
+            region: region.to_string(),
+        });
+    }
+
+    let mut config = build_config(env!("CARGO_PKG_VERSION"));
+    config.instance_region = args.region.clone();
+
+    let authority = EnrollmentAuthority::Token {
+        key,
+        expected_org: None,
+    };
+    let outcome = runtime_cloud_connect::enroll_now(&config, &authority, RetryPolicy::HEADLESS)
+        .await
+        .map_err(|source| BootstrapEnrollmentError::Enroll {
+            endpoint: config.enroll_endpoint.clone(),
+            source,
+        })?;
+
+    match outcome {
+        EnrollNowOutcome::AlreadyEnrolled { identity } => {
+            tracing::info!(
+                "Spice Cloud Connect: this instance is already enrolled as {} (identity at {}); \
+                 the supplied enrollment key was NOT redeemed and can be used elsewhere or revoked",
+                identity.identifier,
+                config.identity_path.display()
+            );
+        }
+        EnrollNowOutcome::Enrolled { identity, metadata } => {
+            tracing::info!(
+                "Spice Cloud Connect: enrolled as {} in organization {}{} (identity stored at {})",
+                identity.identifier,
+                metadata.organization.name,
+                metadata
+                    .region
+                    .as_deref()
+                    .map(|region| format!(", region {region}"))
+                    .unwrap_or_default(),
+                config.identity_path.display()
+            );
+            if let Some(url) = metadata.new_project_url.as_deref() {
+                tracing::info!(
+                    "Spice Cloud Connect: this instance is not yet attached to a project. Create one: {url}"
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The spicepod a deployment persisted, and the deployment it belongs to.
@@ -174,9 +286,9 @@ pub struct CloudManagedSpicepodReadError {
 /// Reads files only — no control-plane round trip — so an instance whose
 /// gateway is unreachable still comes up on its deployed configuration.
 pub async fn cloud_managed_spicepod(
-    cloud_connect_flag: bool,
+    token_supplied: bool,
 ) -> std::result::Result<Option<CloudManagedSpicepod>, CloudManagedSpicepodReadError> {
-    if !is_configured(cloud_connect_flag) {
+    if !is_configured(token_supplied) {
         return Ok(None);
     }
     let config_dir = CloudConnectConfig::default_config_dir();
@@ -221,9 +333,9 @@ pub struct DeliveredSecretsState {
 pub async fn restore_delivered_secrets(
     runtime_version: &str,
     runtime: &Arc<Runtime>,
-    cloud_connect_flag: bool,
+    token_supplied: bool,
 ) -> Option<DeliveredSecretsState> {
-    if !is_configured(cloud_connect_flag) {
+    if !is_configured(token_supplied) {
         return None;
     }
     let config = build_config(runtime_version);
@@ -241,14 +353,14 @@ pub async fn restore_delivered_secrets(
     Some(DeliveredSecretsState { store })
 }
 
-/// Start the Cloud Connect client if any of the opt-in conditions are
-/// met. The returned `Option<CloudConnect>` is `None` when `CloudConnect`
-/// is disabled — which is the default for vanilla OSS installs.
+/// Start the Cloud Connect client when this instance holds an enrolled
+/// identity. The returned `Option<CloudConnect>` is `None` when
+/// `CloudConnect` is disabled — which is the default for vanilla OSS
+/// installs.
 ///
-/// `cloud_connect_flag` is the explicit `--cloud-connect` opt-in: it forces
-/// the client on, but with no identity and no adoption code there is
-/// nothing to connect with — that case logs an actionable warning (instead
-/// of the silent debug skip) and the runtime continues unmanaged.
+/// Activation is identity-driven and needs no flag: a `--token` bootstrap
+/// persisted the identity before the runtime was built ([`bootstrap_enrollment`]),
+/// and a previously enrolled instance reconnects from the identity alone.
 ///
 /// `running_deployment` is the cloud-managed spicepod the runtime actually
 /// loaded, or `None` when it is serving something else (a local spicepod, or a
@@ -258,18 +370,16 @@ pub async fn restore_delivered_secrets(
 pub async fn maybe_start(
     runtime_version: &str,
     runtime: Arc<Runtime>,
-    cloud_connect_flag: bool,
     delivered_secrets: Option<DeliveredSecretsState>,
     running_deployment: Option<CloudManagedSpicepod>,
     metrics: Option<MetricsReader>,
 ) -> Option<CloudConnect> {
     let config = build_config(runtime_version);
 
-    // Quick sanity probe — if no identity AND no adoption code, skip.
-    // Surface a load/parse error (corrupt or unreadable identity.json)
-    // rather than silently treating it as "not adopted", so a broken
-    // identity file is visible to the operator instead of quietly
-    // disabling Cloud Connect.
+    // Quick sanity probe — no identity means disabled. Surface a load/parse
+    // error (corrupt or unreadable identity.json) rather than silently
+    // treating it as "not enrolled", so a broken identity file is visible
+    // to the operator instead of quietly disabling Cloud Connect.
     let mut persisted_app_id = None;
     let has_identity = match IdentityStore::load_optional(&config.identity_path) {
         Ok(opt) => {
@@ -281,34 +391,23 @@ pub async fn maybe_start(
         Err(err) => {
             tracing::warn!(
                 "Spice Cloud Connect: could not read identity at {}: {err}; \
-                 treating as not-adopted — fix or remove the file to re-adopt",
+                 treating as not-enrolled — fix or remove the file to re-enroll",
                 config.identity_path.display()
             );
             false
         }
     };
-    if !has_identity && config.adoption_code.is_none() {
-        if cloud_connect_flag {
-            tracing::warn!(
-                "Spice Cloud Connect: --cloud-connect was passed but no identity exists at {} and no adoption code is available; \
-                 the runtime is NOT connected to Spice Cloud. Run `spice connect <code>` with a code from the Spice Cloud portal, \
-                 or set {} and restart. See: https://spiceai.org/docs",
-                config.identity_path.display(),
-                runtime_cloud_connect::config::ADOPT_CODE_ENV
-            );
-        } else {
-            tracing::debug!(
-                "Spice Cloud Connect: disabled (no identity at {} and no adoption code)",
-                config.identity_path.display()
-            );
-        }
+    if !has_identity {
+        tracing::debug!(
+            "Spice Cloud Connect: disabled (no identity at {})",
+            config.identity_path.display()
+        );
         return None;
     }
 
     tracing::info!(
-        "Spice Cloud Connect: enabled, enroll_endpoint={} mode={}",
+        "Spice Cloud Connect: enabled, enroll_endpoint={}",
         config.enroll_endpoint,
-        if has_identity { "identity" } else { "adopt" }
     );
 
     // Hand the runtime handle the log-capture ring buffer (installed by

@@ -18,7 +18,7 @@ limitations under the License.
 //!
 //! The identity file lives at `$SPICE_CONFIG_DIR/identity.json` with
 //! `0600` perms on Unix. On first boot the client generates a keypair
-//! (ECDSA P-256) and a PKCS#10 CSR, presents the adoption code + CSR to
+//! (ECDSA P-256) and a PKCS#10 CSR, presents the enrollment authority + CSR to
 //! the **cloud enroll endpoint** over plain HTTPS (out-of-band, before
 //! any gRPC stream), and receives back the signed leaf certificate, the
 //! issuing-CA bundle, and the gateway address. The leaf, the matching
@@ -74,7 +74,7 @@ pub enum Error {
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// Persisted runtime identity. Treat as opaque outside this crate.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Identity {
     /// Cloud-assigned stable instance identifier (`instance_id` from the
     /// enroll response, e.g. `inst_...`).
@@ -102,8 +102,8 @@ pub struct Identity {
     /// the address the mTLS `CloudConnect` stream connects to. Defaulted
     /// so identity files written before this field existed still load;
     /// an empty value means the identity predates the enroll-first flow
-    /// and cannot be used to reach the gateway (re-adopt with a fresh
-    /// code).
+    /// and cannot be used to reach the gateway (re-enroll with a fresh
+    /// enrollment key).
     #[serde(default)]
     pub gateway_addr: String,
     /// Unix timestamp (seconds) after which the identity cert is no longer
@@ -171,6 +171,25 @@ pub struct Identity {
     pub app_id: Option<String>,
 }
 
+impl std::fmt::Debug for Identity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Identity")
+            .field("identifier", &self.identifier)
+            .field("identity_cert_pem", &"[CERTIFICATE]")
+            .field("private_key_pem", &"[REDACTED]")
+            .field("public_key_pem", &"[PUBLIC KEY]")
+            .field("ca_bundle_pem", &"[CERTIFICATE BUNDLE]")
+            .field("gateway_addr", &self.gateway_addr)
+            .field("not_after_unix", &self.not_after_unix)
+            .field("enc_private_key_pem", &"[REDACTED]")
+            .field("enc_public_key_pem", &"[PUBLIC KEY]")
+            .field("enc_previous_private_key_pem", &"[REDACTED]")
+            .field("cache_key_b64", &"[REDACTED]")
+            .field("app_id", &self.app_id)
+            .finish()
+    }
+}
+
 /// Read the persisted `not_after_unix`, mapping a missing, null, or `0` value
 /// to "no expiry" so identity files written before the field carried presence
 /// keep their meaning.
@@ -182,6 +201,33 @@ where
 }
 
 impl Identity {
+    /// Why this identity cannot establish a control stream, if any.
+    ///
+    /// Enrollment uses this as a fail-closed gate before honoring the
+    /// existing-identity precedence rule. An explicit gateway override makes
+    /// a legacy identity with no stored gateway usable, but credentials and
+    /// the cloud identifier are always required.
+    pub(crate) fn reconnect_validation_error(
+        &self,
+        gateway_override: Option<&str>,
+    ) -> Option<&'static str> {
+        if self.identifier.trim().is_empty() {
+            return Some("the cloud-assigned instance identifier is empty");
+        }
+        if self.identity_cert_pem.trim().is_empty() {
+            return Some("the client identity certificate is empty");
+        }
+        if self.private_key_pem.trim().is_empty() {
+            return Some("the client identity private key is empty");
+        }
+        if self.gateway_addr.trim().is_empty()
+            && gateway_override.is_none_or(|endpoint| endpoint.trim().is_empty())
+        {
+            return Some("the gateway address is empty");
+        }
+        None
+    }
+
     /// Returns `true` if the identity has an expiry that is in the past
     /// relative to the system clock. An identity with no expiry never expires.
     #[must_use]
@@ -220,7 +266,7 @@ impl Identity {
                 reason:
                     "this identity holds no encryption key; it enrolled before encrypted secret \
                      delivery existed. It is re-keyed by the next renewal (~12h), or immediately \
-                     by re-running `spice connect <code>`."
+                     by restarting `spiced --token <enrollment-key>` with a fresh key."
                         .to_string(),
             }
         );
@@ -623,7 +669,7 @@ fn generate_enc_keypair_pem() -> Result<(String, String)> {
 /// PKCS#10 CSR built from it. The private key is retained locally and, on
 /// successful enroll/renew, persisted into the [`Identity`] alongside the
 /// signed leaf; the CSR is sent in the HTTP enroll (or renew) request.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct EnrollmentMaterial {
     pub private_key_pem: String,
     pub public_key_pem: String,
@@ -635,6 +681,18 @@ pub struct EnrollmentMaterial {
     /// X25519 encryption public key (RFC 8410 SPKI PEM); sent as the
     /// enroll request's `enc_pubkey_pem`.
     pub enc_public_key_pem: String,
+}
+
+impl std::fmt::Debug for EnrollmentMaterial {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EnrollmentMaterial")
+            .field("private_key_pem", &"[REDACTED]")
+            .field("public_key_pem", &"[PUBLIC KEY]")
+            .field("csr_pem", &"[CERTIFICATE REQUEST]")
+            .field("enc_private_key_pem", &"[REDACTED]")
+            .field("enc_public_key_pem", &"[PUBLIC KEY]")
+            .finish()
+    }
 }
 
 /// Write the identity file, mapping I/O failures onto the identity error type.
@@ -712,7 +770,7 @@ pub(crate) fn atomic_write_owner_only(path: &Path, bytes: &[u8]) -> std::io::Res
 /// Promote a freshly-written temp file into its final location on non-Unix
 /// platforms, where `std::fs::rename` does **not** atomically replace an
 /// existing destination (it errors if the target already exists). A rotated
-/// or re-adopted identity must be able to overwrite an existing
+/// or re-enrolled identity must be able to overwrite an existing
 /// `identity.json`, so when the plain rename fails we move the existing file
 /// to a backup, retry the rename, and roll the backup back if the retry
 /// fails. The backup is removed on success.
@@ -815,6 +873,44 @@ mod tests {
         assert_eq!(loaded.public_key_pem, identity.public_key_pem);
         assert_eq!(loaded.ca_bundle_pem, identity.ca_bundle_pem);
         assert_eq!(loaded.gateway_addr, identity.gateway_addr);
+    }
+
+    #[test]
+    fn debug_redacts_all_private_identity_material() {
+        let mut identity = sample_identity();
+        identity.enc_previous_private_key_pem = "PREVIOUS-PRIVATE-KEY".to_string();
+        identity.cache_key_b64 = "CACHE-KEY-SECRET".to_string();
+        let private_values = [
+            identity.private_key_pem.clone(),
+            identity.enc_private_key_pem.clone(),
+            identity.enc_previous_private_key_pem.clone(),
+            identity.cache_key_b64.clone(),
+        ];
+
+        let debug = format!("{identity:?}");
+        for private in private_values {
+            assert!(!debug.contains(&private), "Debug leaked private material");
+        }
+        assert!(debug.contains("inst_test"));
+        assert!(debug.contains("REDACTED"));
+    }
+
+    #[test]
+    fn enrollment_material_debug_redacts_private_keys() {
+        let material = IdentityStore::generate_enrollment().expect("generate material");
+        let private_key = material.private_key_pem.clone();
+        let enc_private_key = material.enc_private_key_pem.clone();
+
+        let debug = format!("{material:?}");
+        assert!(
+            !debug.contains(&private_key),
+            "Debug leaked the identity key"
+        );
+        assert!(
+            !debug.contains(&enc_private_key),
+            "Debug leaked the encryption key"
+        );
+        assert!(debug.contains("REDACTED"));
     }
 
     /// `store_app_id` is a read-modify-write, and everything it does not touch

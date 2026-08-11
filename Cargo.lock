@@ -17128,6 +17128,7 @@ dependencies = [
  "tonic-prost",
  "tonic-prost-build",
  "tracing",
+ "uuid 1.23.2",
  "zeroize",
 ]
 
@@ -19247,7 +19248,6 @@ dependencies = [
  "flate2",
  "fundu",
  "futures",
- "gethostname",
  "http 1.4.1",
  "humantime",
  "insta",
@@ -19426,6 +19426,7 @@ dependencies = [
  "tracing-subscriber",
  "util",
  "yaml",
+ "zeroize",
 ]
 
 [[package]]

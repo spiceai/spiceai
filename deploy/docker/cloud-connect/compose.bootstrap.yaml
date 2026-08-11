@@ -1,0 +1,26 @@
+# Spice Cloud Connect — one-time enrollment bootstrap overlay.
+#
+# Layered over compose.yaml to pass a one-time `spice-enroll-` enrollment key
+# for the FIRST start only:
+#
+#   SPICE_ENROLL_KEY=<key from the Spice Cloud portal> \
+#     docker compose -f compose.yaml -f compose.bootstrap.yaml up -d
+#
+# Compose interpolates ${SPICE_ENROLL_KEY} from the host environment (or an
+# .env file) at `up` time; the key is never stored in this file. The runtime
+# enrolls before it reports ready and persists the identity on the
+# `spice-identity` volume, then the key is spent. Return to the base file
+# (`docker compose up -d`) to drop the key from the container's argv; if the
+# container restarts before then, the existing identity wins and the key is
+# NOT redeemed again.
+services:
+  spiced:
+    command:
+      - --token
+      - ${SPICE_ENROLL_KEY:?Set SPICE_ENROLL_KEY to an enrollment key minted in the Spice Cloud portal}
+      - --http
+      - 0.0.0.0:8090
+      - --metrics
+      - 0.0.0.0:9090
+      - --flight
+      - 0.0.0.0:50051

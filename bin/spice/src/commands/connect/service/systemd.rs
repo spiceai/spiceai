@@ -68,7 +68,7 @@ fn render_unit(
          Group={gid}\n\
          WorkingDirectory=\"{instance_dir}\"\n\
          Environment=\"SPICE_CONFIG_DIR={config_dir}\"\n\
-         ExecStart=\"{spiced}\" --cloud-connect\n\
+         ExecStart=\"{spiced}\"\n\
          # Every deployment applies by restart: the runtime validates and\n\
          # persists the new spicepod, exits 0, and this relaunches it on the\n\
          # new configuration. Without Restart=always a deployment would stop\n\
@@ -435,13 +435,16 @@ mod tests {
     }
 
     #[test]
-    fn rendered_unit_runs_spiced_with_cloud_connect() {
+    fn rendered_unit_runs_spiced_from_the_enrolled_directory() {
         let unit = rendered(
             "/opt/edge-1",
             "/opt/edge-1/.spice",
             "/root/.spice/bin/spiced",
         );
-        assert!(unit.contains("ExecStart=\"/root/.spice/bin/spiced\" --cloud-connect\n"));
+        // No flag: the enrolled identity under SPICE_CONFIG_DIR is what
+        // activates Cloud Connect on every start.
+        assert!(unit.contains("ExecStart=\"/root/.spice/bin/spiced\"\n"));
+        assert!(!unit.contains("--cloud-connect"));
     }
 
     #[test]
@@ -516,15 +519,13 @@ mod tests {
     #[test]
     fn parse_exec_runtime_drops_arguments_and_prefixes() {
         assert_eq!(
-            parse_exec_runtime(
-                "[Service]\nExecStart=/usr/local/lib/spice/spiced --cloud-connect\n"
-            ),
+            parse_exec_runtime("[Service]\nExecStart=/usr/local/lib/spice/spiced\n"),
             Some(PathBuf::from("/usr/local/lib/spice/spiced")),
             "the reported runtime is the binary, not the whole command line"
         );
         // systemd's special executable prefixes are not part of the path.
         assert_eq!(
-            parse_exec_runtime("ExecStart=-/usr/bin/spiced --cloud-connect\n"),
+            parse_exec_runtime("ExecStart=-/usr/bin/spiced\n"),
             Some(PathBuf::from("/usr/bin/spiced"))
         );
         assert_eq!(

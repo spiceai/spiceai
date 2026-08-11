@@ -14,16 +14,16 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Outbound client: out-of-band cloud enrollment + mTLS gateway stream.
+//! Outbound client: mTLS gateway stream over a pre-obtained identity.
 //!
-//! Identity is obtained **before** any gRPC stream (see [`crate::enroll`]):
-//! the adoption code + CSR go to the cloud enroll endpoint over plain
-//! HTTPS, and the issued leaf + CA bundle + gateway address are persisted
-//! to `identity.json`. The driver then connects to the stateless gateway
-//! over **mTLS** (the leaf is the credential, which is why the `Hello`
-//! carries none) and enters a long-running loop that processes
-//! `ControlMessage`s from the server and emits `ClientMessage`s back
-//! (heartbeats, command results, telemetry).
+//! Identity is obtained **before** any gRPC stream — and before this
+//! driver even starts (see [`crate::enroll::enroll_now`]): enrollment is
+//! an explicit pre-runtime step, and the driver only ever runs with a
+//! stored identity. It connects to the stateless gateway over **mTLS**
+//! (the leaf is the credential, which is why the `Hello` carries none) and
+//! enters a long-running loop that processes `ControlMessage`s from the
+//! server and emits `ClientMessage`s back (heartbeats, command results,
+//! telemetry).
 //!
 //! Disconnects are tolerated: the driver reconnects with exponential
 //! backoff (1s → 60s with jitter), always presenting the identity leaf.
@@ -33,20 +33,20 @@ limitations under the License.
 //! endpoint, both from the live stream loop and before reconnect attempts;
 //! every renewal rotates the keypair. An expired leaf can still renew
 //! within the 30-day grace window ([`crate::enroll::RENEWAL_GRACE`]);
-//! past it a fresh adoption code is required.
+//! past it a fresh enrollment key is required.
 //!
 //! `Adopt` over the stream is a trust/marker message (the portal admin
-//! clicked Adopt) — the cert was already issued at enroll, so the client
-//! just acknowledges against the identity it holds.
+//! confirmed the instance) — the cert was already issued at enroll, so the
+//! client just acknowledges against the identity it holds.
 //!
 //! If a `Remove` arrives, we clear the local identity from disk and, on
 //! success, exit the cloud-connect task — spiced itself stays up and keeps
-//! serving local spicepod traffic as before. This matches the adoption
-//! semantics where a release stops management but doesn't destroy the
-//! device. To re-adopt, the user runs `spice connect <code>` and restarts
-//! spiced. If the on-disk identity cannot be cleared, the `Remove` is
-//! reported as failed and the driver stays connected with the still-valid
-//! identity rather than falsely reporting the instance as released.
+//! serving local spicepod traffic as before: a release stops management
+//! but doesn't destroy the device. To re-enroll, the user starts the
+//! runtime with a fresh enrollment key (`spiced --token`). If the on-disk
+//! identity cannot be cleared, the `Remove` is reported as failed and the
+//! driver stays connected with the still-valid identity rather than
+//! falsely reporting the instance as released.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -60,7 +60,7 @@ use tonic::Streaming;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint};
 
 use crate::config::CloudConnectConfig;
-use crate::enroll::{EnrollClient, RENEWAL_GRACE};
+use crate::enroll::EnrollClient;
 use crate::handlers::{
     Capability, CommandError, MAX_QUERY_RESULT_BYTES, PostApply, RestartMode, RuntimeHandle,
     SpicepodDeployment, advertised_capabilities, effective_max_rows,
@@ -159,9 +159,8 @@ impl ClientDriver {
                 return Ok(());
             }
 
-            // Ensure a usable identity: enroll out-of-band when we only
-            // hold an adoption code, renew when the current leaf is due.
-            match self.ensure_credentials(&enroll_client, &mut backoff).await {
+            // Ensure a usable identity: renew when the current leaf is due.
+            match self.ensure_credentials(&enroll_client).await {
                 CredentialStep::Ready => {}
                 CredentialStep::Retry => {
                     if !self.sleep_backoff(&mut backoff).await {
@@ -175,7 +174,8 @@ impl ClientDriver {
             // Connect the mTLS stream to the gateway.
             let Some(endpoint) = self.stream_endpoint() else {
                 tracing::error!(
-                    "Cloud Connect: the stored identity has no gateway address (it predates the enroll-first flow); exiting cloud-connect. Run `spice connect <code>` with a fresh adoption code and restart spiced to re-enroll."
+                    "Cloud Connect: the stored identity at {} has no gateway address (it predates the enroll-first flow); exiting cloud-connect. Stop spiced, remove this identity file, mint a new enrollment key in the Spice Cloud portal, and restart with `spiced --token <enrollment-key>`. The existing identity always wins, so merely supplying --token without removing the unusable file cannot re-enroll.",
+                    self.config.identity_path.display()
                 );
                 return Ok(());
             };
@@ -192,15 +192,14 @@ impl ClientDriver {
                 Ok(ExitReason::Shutdown) => return Ok(()),
                 Ok(ExitReason::Removed) => {
                     tracing::info!(
-                        "Cloud Connect: Remove acknowledged; this instance was released and the cloud-connect task is exiting. spiced remains running and serving local spicepod traffic. To re-adopt, run `spice connect <code>` and restart spiced."
+                        "Cloud Connect: Remove acknowledged; this instance was released and the cloud-connect task is exiting. spiced remains running and serving local spicepod traffic. To re-enroll, mint a new enrollment key in the Spice Cloud portal and restart spiced with `--token <enrollment-key>`."
                     );
                     return Ok(());
                 }
                 Ok(ExitReason::IdentityRevoked) => {
                     // The in-stream renewal was permanently refused and the
-                    // identity was cleared; loop back — with an adoption code
-                    // still staged we re-enroll, otherwise the no-credentials
-                    // branch above exits with the re-adopt guidance.
+                    // identity was cleared; loop back — the no-credentials
+                    // branch exits with the re-enrollment guidance.
                     tracing::warn!(
                         "Cloud Connect: identity renewal was refused by the control plane; reconnecting with remaining credentials"
                     );
@@ -221,75 +220,29 @@ impl ClientDriver {
         }
     }
 
-    /// Pre-connect credential phase: drop an unrenewable identity, enroll
-    /// out-of-band when only an adoption code is held, and renew a due
-    /// identity. Returns what the connect loop should do next.
-    async fn ensure_credentials(
-        &mut self,
-        enroll_client: &EnrollClient,
-        backoff: &mut Duration,
-    ) -> CredentialStep {
+    /// Pre-connect credential phase: drop an unrenewable identity and renew
+    /// a due one. Returns what the connect loop should do next.
+    ///
+    /// The driver never enrolls — enrollment is an explicit pre-runtime
+    /// step ([`crate::enroll::enroll_now`]) — so running out of usable
+    /// credentials exits the task with re-enrollment guidance.
+    async fn ensure_credentials(&mut self, enroll_client: &EnrollClient) -> CredentialStep {
         // An identity past the renewal grace window can no longer be
-        // renewed by the cloud — only a fresh adoption code helps.
+        // renewed by the cloud — only a fresh enrollment key helps.
         if let Some(ref id) = self.identity
-            && past_renewal_grace(id)
+            && enroll::past_renewal_grace(id)
         {
             tracing::warn!(
-                "Cloud Connect: stored identity expired past the renewal grace window; falling back to pending-adoption state"
+                "Cloud Connect: the stored identity expired past the renewal grace window and can no longer be renewed"
             );
             self.identity = None;
         }
 
-        // Out-of-band enrollment: no identity yet, so present the
-        // adoption code + CSR to the cloud enroll endpoint.
         if self.identity.is_none() {
-            let Some(code) = self.config.adoption_code.clone() else {
-                tracing::error!(
-                    "Cloud Connect: cannot connect (no identity and no adoption code); exiting cloud-connect. Run `spice connect <code>` and restart spiced to re-adopt."
-                );
-                return CredentialStep::Exit;
-            };
-            match self.enroll_once(enroll_client, &code).await {
-                Ok(()) => {
-                    *backoff = MIN_BACKOFF;
-                }
-                Err(err) if err.is_credential_rejection() => {
-                    // The cloud rejected the code itself — it is dead
-                    // (invalid or already consumed): discard the staged file
-                    // so a restart does not re-send it, and exit with an
-                    // actionable message.
-                    self.discard_pending_code().await;
-                    tracing::error!(
-                        "Cloud Connect: enrollment with {} was rejected: {err}; exiting cloud-connect. Mint a new adoption code in the Spice Cloud portal, run `spice connect <code>`, and restart spiced. See: https://spiceai.org/docs",
-                        self.config.enroll_endpoint
-                    );
-                    return CredentialStep::Exit;
-                }
-                Err(err) if err.is_authoritative_rejection() => {
-                    // Rejected for a reason other than the code (expired
-                    // code, or app-attachment validation: no such app,
-                    // attach conflict, app limit). The code was NOT consumed
-                    // — keep the staged file so a corrected configuration
-                    // (e.g. a fixed SPICE_CONNECT_ADOPT_APP_NAME) can still
-                    // redeem it, and exit with the server's reason.
-                    tracing::error!(
-                        "Cloud Connect: enrollment with {} was rejected: {err}; exiting cloud-connect. The adoption code was not consumed — fix the reported problem and restart spiced. See: https://spiceai.org/docs",
-                        self.config.enroll_endpoint
-                    );
-                    return CredentialStep::Exit;
-                }
-                Err(err) => {
-                    // Transient (transport / 5xx) OR a local failure that never
-                    // reached the cloud (e.g. key-material generation). Either
-                    // way the code was NOT consumed, so keep the staged code
-                    // and retry rather than burning it.
-                    tracing::warn!(
-                        "Cloud Connect: enrollment attempt against {} failed (will retry): {err}",
-                        self.config.enroll_endpoint
-                    );
-                    return CredentialStep::Retry;
-                }
-            }
+            tracing::error!(
+                "Cloud Connect: cannot connect (no usable identity); exiting cloud-connect. Mint a new enrollment key in the Spice Cloud portal and restart spiced with `--token <enrollment-key>` to re-enroll. See: https://spiceai.org/docs"
+            );
+            return CredentialStep::Exit;
         }
 
         // Renew before connecting when due — this covers the
@@ -302,13 +255,10 @@ impl ClientDriver {
         {
             match self.renew_once(enroll_client).await {
                 Ok(()) => {}
-                Err(err) if err.is_authoritative_rejection() => {
-                    // Renewal authoritatively refused by the cloud: the
-                    // instance was removed or revoked cloud-side (refusing
-                    // renewal IS the revocation, DR-025) or the pinned key no
-                    // longer matches. The identity is dead; the next pass
-                    // enrolls with a staged code or exits with re-adopt
-                    // guidance.
+                Err(err) if err.is_credential_rejection() => {
+                    // A 401 is the cloud's credential revocation signal. It
+                    // is the sole response that proves the local identity is
+                    // dead; other terminal request errors must preserve it.
                     tracing::error!(
                         "Cloud Connect: identity renewal was refused: {err}; clearing the local identity"
                     );
@@ -376,42 +326,6 @@ impl ClientDriver {
         Some(format!("{scheme}://{}", identity.gateway_addr))
     }
 
-    /// Perform the out-of-band cloud enrollment: generate a fresh keypair +
-    /// CSR, present the adoption code + host facts, persist the issued
-    /// identity, and consume the staged code.
-    async fn enroll_once(
-        &mut self,
-        client: &EnrollClient,
-        code: &str,
-    ) -> Result<(), enroll::Error> {
-        let (identity, registration) = enroll::acquire_identity(client, code, &self.config).await?;
-        self.persist_identity(&identity).await;
-        tracing::info!(
-            "Cloud Connect: enrolled as {}{}{} (gateway {}); identity stored at {}",
-            identity.identifier,
-            registration
-                .app_name
-                .map(|app| format!(" attached to app {app}"))
-                .unwrap_or_default(),
-            registration
-                .region
-                .map(|region| format!(" in region {region}"))
-                .unwrap_or_default(),
-            identity.gateway_addr,
-            self.config.identity_path.display()
-        );
-        self.identity = Some(identity);
-        // A stale pacing mark from a previous identity's failed renewals
-        // must not delay the fresh identity's first renewal.
-        self.renew_not_before = None;
-
-        // The code was atomically consumed by the cloud — it can never be
-        // redeemed again, so drop the staged copy and the in-memory value.
-        self.discard_pending_code().await;
-        self.config.adoption_code = None;
-        Ok(())
-    }
-
     /// Renew the identity against the cloud `/renew` endpoint with a fresh
     /// keypair (every renewal rotates the keypair) and persist the rotated
     /// identity.
@@ -460,8 +374,8 @@ impl ClientDriver {
         rotated.rotate_encryption_key(material.enc_private_key_pem, material.enc_public_key_pem);
         // The cloud has already pinned the new public key: even if
         // persistence fails, the rotated identity must be used in memory
-        // (the old key can no longer renew). `persist_identity` logs the
-        // failure; the next successful renewal re-attempts the write.
+        // (the old key can no longer renew). Persistence logs the failure;
+        // the next successful renewal re-attempts the write.
         rotated = self
             .persist_identity_preserving_attachment(rotated, "renewed identity")
             .await;
@@ -480,26 +394,6 @@ impl ClientDriver {
         // waits on it.
         self.renew_not_before = Some(time::Instant::now() + RENEW_RETRY_INTERVAL);
         Ok(())
-    }
-
-    /// Persist an identity to disk on the blocking pool, logging (not
-    /// failing on) errors: the in-memory identity stays authoritative, and
-    /// a persistence failure must not wedge an otherwise-working
-    /// connection — it only costs durability across a restart.
-    async fn persist_identity(&self, identity: &Identity) {
-        let path = self.config.identity_path.clone();
-        let to_store = identity.clone();
-        let result =
-            tokio::task::spawn_blocking(move || IdentityStore::store(&path, &to_store)).await;
-        let error = match result {
-            Ok(Ok(())) => return,
-            Ok(Err(err)) => err.to_string(),
-            Err(join) => format!("identity persistence task panicked: {join}"),
-        };
-        tracing::error!(
-            "Cloud Connect: failed to persist identity at {}: {error}; continuing with the in-memory identity (it will be lost on restart)",
-            self.config.identity_path.display()
-        );
     }
 
     /// Persist a full credential update while retaining the attachment most
@@ -537,23 +431,6 @@ impl ClientDriver {
                     self.config.identity_path.display()
                 );
                 fallback
-            }
-        }
-    }
-
-    /// Remove the staged pending-adoption-code file, if configured. A
-    /// missing file is success.
-    async fn discard_pending_code(&self) {
-        if let Some(ref path) = self.config.pending_adopt_code_path {
-            match tokio::fs::remove_file(path).await {
-                Ok(()) => {}
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                Err(err) => {
-                    tracing::warn!(
-                        "Cloud Connect: failed to remove pending adoption code at {}: {err}",
-                        path.display()
-                    );
-                }
             }
         }
     }
@@ -1397,7 +1274,7 @@ impl ClientDriver {
         }
 
         tracing::info!(
-            "Cloud Connect: adoption confirmed by the control plane for {}",
+            "Cloud Connect: enrollment confirmed by the control plane for {}",
             identity.identifier
         );
         *live_identifier.write().await = identity.identifier.clone();
@@ -1517,14 +1394,6 @@ fn renewal_due(identity: &Identity, lead: Duration) -> bool {
         return false;
     };
     now_unix().saturating_add(lead.as_secs()) >= not_after
-}
-
-/// `true` when the identity expired longer than [`RENEWAL_GRACE`] ago —
-/// the cloud refuses to renew it, so only a fresh adoption code helps.
-fn past_renewal_grace(identity: &Identity) -> bool {
-    identity
-        .not_after_unix
-        .is_some_and(|not_after| now_unix() >= not_after.saturating_add(RENEWAL_GRACE.as_secs()))
 }
 
 /// Trust anchors for verifying the gateway's SERVER certificate on the mTLS
@@ -1844,6 +1713,7 @@ fn next_backoff(prev: Duration) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::enroll::past_renewal_grace;
 
     #[test]
     fn backoff_doubles_until_cap() {
@@ -1914,7 +1784,7 @@ mod tests {
     #[test]
     fn identity_past_grace_cannot_renew() {
         let long_dead = identity_with_not_after(Some(
-            now_unix().saturating_sub(RENEWAL_GRACE.as_secs() + 60),
+            now_unix().saturating_sub(crate::enroll::RENEWAL_GRACE.as_secs() + 60),
         ));
         assert!(past_renewal_grace(&long_dead));
     }

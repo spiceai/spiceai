@@ -166,12 +166,12 @@ fn should_include_otel_location(is_release_build: bool, verbosity: &LogVerbosity
 /// unchanged. The same `task_history` exclusion as the console layer is
 /// applied so span-only records don't pollute the log tail.
 fn cloud_connect_log_capture_layer<S>(
-    cloud_connect_flag: bool,
+    token_supplied: bool,
 ) -> Option<Box<dyn Layer<S> + Send + Sync>>
 where
     S: Subscriber + for<'a> LookupSpan<'a>,
 {
-    if !crate::cloud_connect::is_configured(cloud_connect_flag) {
+    if !crate::cloud_connect::is_configured(token_supplied) {
         return None;
     }
     let ring = crate::log_capture::install(crate::log_capture::DEFAULT_CAPACITY);
@@ -237,7 +237,7 @@ pub(crate) async fn init_tracing(
     config: Option<&TracingConfig>,
     df: Arc<DataFusion>,
     verbosity: LogVerbosity,
-    cloud_connect_flag: bool,
+    token_supplied: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let include_otel_location = should_include_otel_location(!cfg!(debug_assertions), &verbosity);
     let filter: EnvFilter = verbosity.into();
@@ -263,7 +263,7 @@ pub(crate) async fn init_tracing(
         .with(task_history_layer)
         .with(progress_layer())
         .with(console_layer(ansi, std::io::stdout))
-        .with(cloud_connect_log_capture_layer(cloud_connect_flag));
+        .with(cloud_connect_log_capture_layer(token_supplied));
 
     tracing::subscriber::set_global_default(subscriber)?;
     // Routes `log` records — which most of the dependency graph, DataFusion

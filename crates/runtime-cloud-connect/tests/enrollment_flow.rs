@@ -21,13 +21,14 @@ limitations under the License.
 //! that speaks the `spice.cloud.v1.CloudConnect` protocol (the gateway),
 //! then exercise:
 //!
-//! - Out-of-band enrollment: adoption code + CSR + host facts → HTTP
-//!   enroll → identity persisted (with the issued gateway address) → the
-//!   gRPC stream opens against the gateway with the assigned identifier
-//!   and no credential of its own; a subsequent `Adopt` marker is
-//!   acknowledged with `AdoptAck` + an `OK` `CommandResult`.
-//! - Permanent enroll rejection (consumed/expired code): the driver
-//!   discards the staged code and exits without creating an identity.
+//! - Pre-runtime enrollment (`enroll_now`, the `spiced --token` core):
+//!   enrollment key + CSR + host facts → HTTP enroll → identity persisted
+//!   (with the issued gateway address) → the gRPC stream opens against the
+//!   gateway with the assigned identifier and no credential of its own; a
+//!   subsequent `Adopt` marker is acknowledged with `AdoptAck` + an `OK`
+//!   `CommandResult`.
+//! - Terminal enroll rejection (an unknown/consumed key): `enroll_now`
+//!   stops after one request and creates no identity.
 //! - `ApplySpicepod` round-trip: server sends ApplySpicepod → client
 //!   writes the YAML to disk and replies with success.
 
@@ -60,7 +61,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status, Streaming};
 
-const ADOPTION_CODE: &str = "SPICE-ADOPT-AAAAA-BBBBB";
+const ENROLLMENT_KEY: &str = "spice-enroll-flow00000000000000000000000000aa";
 const ASSIGNED_ID: &str = "inst_unit_test";
 
 #[derive(Default)]
@@ -220,8 +221,8 @@ struct EnrollMockState {
     requests: Arc<Mutex<Vec<Value>>>,
     /// `gateway_addr` returned on success.
     gateway_addr: String,
-    /// When set, every request is rejected with this (status, error).
-    reject: Option<(u16, &'static str)>,
+    /// When set, every request is rejected with this (status, code, error).
+    reject: Option<(u16, &'static str, &'static str)>,
 }
 
 fn not_after_in(hours: i64) -> String {
@@ -233,10 +234,10 @@ async fn enroll_handler(
     Json(body): Json<Value>,
 ) -> (StatusCode, Json<Value>) {
     state.requests.lock().await.push(body);
-    if let Some((status, error)) = state.reject {
+    if let Some((status, code, error)) = state.reject {
         return (
             StatusCode::from_u16(status).expect("valid status"),
-            Json(serde_json::json!({ "error": error })),
+            Json(serde_json::json!({ "code": code, "error": error, "retryable": false })),
         );
     }
     (
@@ -249,6 +250,9 @@ async fn enroll_handler(
                 "-----BEGIN CERTIFICATE-----\nUNIT-TEST-CA\n-----END CERTIFICATE-----\n",
             "gateway_addr": state.gateway_addr,
             "not_after": not_after_in(24),
+            "organization": {"id": 7, "name": "unit-org"},
+            "portal": {"new_project_url": "https://cloud.test/unit-org/new?instance=inst_unit_test"},
+            "attachment": null,
         })),
     )
 }
@@ -257,7 +261,7 @@ async fn enroll_handler(
 /// and the captured request log.
 async fn spawn_enroll_server(
     gateway_addr: String,
-    reject: Option<(u16, &'static str)>,
+    reject: Option<(u16, &'static str, &'static str)>,
 ) -> (SocketAddr, Arc<Mutex<Vec<Value>>>) {
     let requests = Arc::new(Mutex::new(Vec::new()));
     let state = EnrollMockState {
@@ -276,11 +280,7 @@ async fn spawn_enroll_server(
     (addr, requests)
 }
 
-fn enroll_config(
-    enroll_addr: SocketAddr,
-    dir: &std::path::Path,
-    pending_code_path: Option<PathBuf>,
-) -> CloudConnectConfig {
+fn enroll_config(enroll_addr: SocketAddr, dir: &std::path::Path) -> CloudConnectConfig {
     CloudConnectConfig {
         enroll_endpoint: format!("http://{enroll_addr}"),
         // No override: the stream must connect to the gateway_addr issued
@@ -290,10 +290,6 @@ fn enroll_config(
         insecure: true,
         identity_path: dir.join("identity.json"),
         config_dir: dir.to_path_buf(),
-        adoption_code: Some(ADOPTION_CODE.to_string()),
-        pending_adopt_code_path: pending_code_path,
-        adopt_app_name: None,
-        adopt_create_app: false,
         instance_region: None,
         runtime_version: "v0.0.0-test".to_string(),
         heartbeat_interval: Duration::from_secs(30),
@@ -304,15 +300,27 @@ fn enroll_config(
     }
 }
 
+fn token_authority() -> runtime_cloud_connect::EnrollmentAuthority {
+    runtime_cloud_connect::EnrollmentAuthority::Token {
+        key: runtime_cloud_connect::EnrollmentKey::parse(ENROLLMENT_KEY)
+            .expect("test key is canonical"),
+        expected_org: None,
+    }
+}
+
+fn quick_retry() -> runtime_cloud_connect::RetryPolicy {
+    runtime_cloud_connect::RetryPolicy {
+        deadline: Duration::from_secs(10),
+    }
+}
+
 #[tokio::test]
-async fn out_of_band_enroll_persists_identity_and_connects() {
+async fn pre_runtime_enroll_persists_identity_and_connects() {
     let dir = tempfile::tempdir().unwrap();
     let identity_path = dir.path().join("identity.json");
-    let pending_path = dir.path().join("pending-adopt-code");
-    std::fs::write(&pending_path, ADOPTION_CODE).expect("stage pending code");
 
     // Gateway mock: send an Adopt trust/marker after Hello (the portal
-    // admin clicked Adopt). Post-DR-025 it carries no certificate.
+    // admin confirmed the instance). Post-DR-025 it carries no certificate.
     let adopt_cmd = proto::ControlMessage {
         command_id: "cmd-adopt-1".to_string(),
         target: None,
@@ -326,7 +334,18 @@ async fn out_of_band_enroll_persists_identity_and_connects() {
 
     let (enroll_addr, enroll_requests) = spawn_enroll_server(gateway_addr.to_string(), None).await;
 
-    let config = enroll_config(enroll_addr, dir.path(), Some(pending_path.clone()));
+    let config = enroll_config(enroll_addr, dir.path());
+
+    // Enrollment happens BEFORE the client exists — the `spiced --token`
+    // sequence — and its return means the identity is durable.
+    let outcome = runtime_cloud_connect::enroll_now(&config, &token_authority(), quick_retry())
+        .await
+        .expect("enrollment succeeds");
+    let runtime_cloud_connect::EnrollNowOutcome::Enrolled { metadata, .. } = outcome else {
+        panic!("a fresh directory must enroll");
+    };
+    assert_eq!(metadata.organization.name, "unit-org");
+    assert!(identity_path.exists(), "identity durable before the client");
 
     let runtime: Arc<dyn RuntimeHandle> =
         Arc::new(runtime_cloud_connect::handlers::NoopRuntimeHandle);
@@ -334,17 +353,6 @@ async fn out_of_band_enroll_persists_identity_and_connects() {
         .await
         .expect("start")
         .expect("started");
-
-    // Wait for enrollment to persist the identity.
-    let mut adopted = false;
-    for _ in 0..50 {
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        if identity_path.exists() {
-            adopted = true;
-            break;
-        }
-    }
-    assert!(adopted, "identity file should be created within 5s");
 
     let identity = IdentityStore::load_optional(&identity_path)
         .expect("load identity")
@@ -363,12 +371,13 @@ async fn out_of_band_enroll_persists_identity_and_connects() {
         "not_after must be parsed"
     );
 
-    // The enroll request carried the contract shape: adoption_code +
-    // csr_pem + host facts nested under `instance`.
+    // The enroll request carried the canonical contract shape: kind + token
+    // + csr_pem + host facts nested under `instance`.
     let requests = enroll_requests.lock().await.clone();
     assert_eq!(requests.len(), 1, "exactly one enroll request");
     let body = &requests[0];
-    assert_eq!(body["adoption_code"], ADOPTION_CODE);
+    assert_eq!(body["kind"], "standalone");
+    assert_eq!(body["token"], ENROLLMENT_KEY);
     assert!(
         body["csr_pem"]
             .as_str()
@@ -382,17 +391,6 @@ async fn out_of_band_enroll_persists_identity_and_connects() {
     assert!(!instance["os"].as_str().unwrap().is_empty());
     assert!(!instance["arch"].as_str().unwrap().is_empty());
     assert_eq!(instance["runtime_version"], "v0.0.0-test");
-
-    // The staged single-use code is discarded after the cloud consumed it.
-    let mut code_discarded = false;
-    for _ in 0..50 {
-        if !pending_path.exists() {
-            code_discarded = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    assert!(code_discarded, "pending code must be removed after enroll");
 
     // Server should have received the Hello, AdoptAck, and a successful
     // CommandResult. The CommandResult lands last, so poll for it (rather
@@ -442,50 +440,46 @@ async fn out_of_band_enroll_persists_identity_and_connects() {
 }
 
 #[tokio::test]
-async fn enroll_rejection_discards_code_and_exits_without_identity() {
+async fn a_terminal_rejection_creates_no_identity_and_stops_immediately() {
     let dir = tempfile::tempdir().unwrap();
     let identity_path = dir.path().join("identity.json");
-    let pending_path = dir.path().join("pending-adopt-code");
-    std::fs::write(&pending_path, ADOPTION_CODE).expect("stage pending code");
 
-    // The cloud authoritatively rejects the code (single-use, already
-    // consumed). No gateway is involved.
-    let (enroll_addr, enroll_requests) =
-        spawn_enroll_server(String::new(), Some((401, "Adoption code already used"))).await;
+    // The cloud terminally rejects the key (unknown/consumed). No gateway
+    // is involved.
+    let (enroll_addr, enroll_requests) = spawn_enroll_server(
+        String::new(),
+        Some((401, "invalid_token", "unknown enrollment key")),
+    )
+    .await;
 
-    let config = enroll_config(enroll_addr, dir.path(), Some(pending_path.clone()));
-    let runtime: Arc<dyn RuntimeHandle> =
-        Arc::new(runtime_cloud_connect::handlers::NoopRuntimeHandle);
-    let handle = runtime_cloud_connect::CloudConnect::start(config, runtime)
+    let config = enroll_config(enroll_addr, dir.path());
+    let err = runtime_cloud_connect::enroll_now(&config, &token_authority(), quick_retry())
         .await
-        .expect("start")
-        .expect("started");
-
-    // The permanent rejection removes the staged (dead) code so a restart
-    // does not replay it.
-    let mut code_discarded = false;
-    for _ in 0..50 {
-        if !pending_path.exists() {
-            code_discarded = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+        .expect_err("a terminal rejection fails the bootstrap");
     assert!(
-        code_discarded,
-        "a permanently-rejected code must be discarded"
+        matches!(err, runtime_cloud_connect::EnrollNowError::Rejected { .. }),
+        "{err}"
     );
 
     // No identity was created, and no retry was attempted (401 is
-    // authoritative — retrying a consumed code cannot succeed).
+    // authoritative — retrying a dead key cannot succeed). A client started
+    // afterwards finds no identity and stays disabled.
     assert!(!identity_path.exists(), "no identity on rejection");
     assert_eq!(
         enroll_requests.lock().await.len(),
         1,
-        "permanent rejection must not be retried"
+        "a terminal rejection must not be retried"
     );
 
-    handle.shutdown().await;
+    let runtime: Arc<dyn RuntimeHandle> =
+        Arc::new(runtime_cloud_connect::handlers::NoopRuntimeHandle);
+    let started = runtime_cloud_connect::CloudConnect::start(config, runtime)
+        .await
+        .expect("start succeeds");
+    assert!(
+        started.is_none(),
+        "with no identity the client must stay disabled"
+    );
 }
 
 #[tokio::test]
@@ -515,10 +509,10 @@ async fn apply_spicepod_writes_file_and_acks() {
     // here, so the cert/key PEMs are never used for a real handshake —
     // this test isolates the ApplySpicepod dispatch.
     let identity = runtime_cloud_connect::identity::Identity {
-        identifier: "inst_pre_adopted".to_string(),
-        identity_cert_pem: "PRE-ADOPTED-CERT".to_string(),
-        private_key_pem: "PRE-ADOPTED-KEY".to_string(),
-        public_key_pem: "PRE-ADOPTED-PUB".to_string(),
+        identifier: "inst_pre_enrolled".to_string(),
+        identity_cert_pem: "PRE-ENROLLED-CERT".to_string(),
+        private_key_pem: "PRE-ENROLLED-KEY".to_string(),
+        public_key_pem: "PRE-ENROLLED-PUB".to_string(),
         ca_bundle_pem: String::new(),
         gateway_addr: addr.to_string(),
         not_after_unix: None,
@@ -543,10 +537,6 @@ async fn apply_spicepod_writes_file_and_acks() {
         insecure: true,
         identity_path: identity_path.clone(),
         config_dir: config_dir.clone(),
-        adoption_code: None,
-        pending_adopt_code_path: None,
-        adopt_app_name: None,
-        adopt_create_app: false,
         instance_region: None,
         runtime_version: "v0.0.0-test".to_string(),
         heartbeat_interval: Duration::from_secs(30),
@@ -596,7 +586,7 @@ async fn apply_spicepod_writes_file_and_acks() {
 
     let s = mock_state.lock().await;
     let hello = s.last_hello.clone().expect("server saw Hello");
-    assert_eq!(hello.identifier, "inst_pre_adopted");
+    assert_eq!(hello.identifier, "inst_pre_enrolled");
     assert_eq!(
         hello.capabilities,
         vec!["apply_spicepod".to_string()],
@@ -664,10 +654,6 @@ async fn attach_app_applies_complete_state_and_rejects_empty_ids() {
         insecure: true,
         identity_path,
         config_dir: dir.path().to_path_buf(),
-        adoption_code: None,
-        pending_adopt_code_path: None,
-        adopt_app_name: None,
-        adopt_create_app: false,
         instance_region: None,
         runtime_version: "v0.0.0-test".to_string(),
         heartbeat_interval: Duration::from_secs(30),
@@ -771,10 +757,10 @@ async fn unknown_command_is_nacked_rather_than_dropped() {
     let addr = spawn_server(mock).await;
 
     let identity = runtime_cloud_connect::identity::Identity {
-        identifier: "inst_pre_adopted".to_string(),
-        identity_cert_pem: "PRE-ADOPTED-CERT".to_string(),
-        private_key_pem: "PRE-ADOPTED-KEY".to_string(),
-        public_key_pem: "PRE-ADOPTED-PUB".to_string(),
+        identifier: "inst_pre_enrolled".to_string(),
+        identity_cert_pem: "PRE-ENROLLED-CERT".to_string(),
+        private_key_pem: "PRE-ENROLLED-KEY".to_string(),
+        public_key_pem: "PRE-ENROLLED-PUB".to_string(),
         ca_bundle_pem: String::new(),
         gateway_addr: addr.to_string(),
         not_after_unix: None,
@@ -793,8 +779,6 @@ async fn unknown_command_is_nacked_rather_than_dropped() {
         insecure: true,
         identity_path: identity_path.clone(),
         config_dir: dir.path().to_path_buf(),
-        adoption_code: None,
-        pending_adopt_code_path: None,
         instance_region: None,
         runtime_version: "v0.0.0-test".to_string(),
         heartbeat_interval: Duration::from_secs(30),
@@ -802,8 +786,6 @@ async fn unknown_command_is_nacked_rather_than_dropped() {
         metrics_interval: Duration::from_secs(30),
         renewal_lead: Duration::from_hours(12),
         query_deadline: Duration::from_mins(1),
-        adopt_app_name: None,
-        adopt_create_app: false,
     };
 
     let runtime: Arc<dyn RuntimeHandle> =

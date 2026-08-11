@@ -26,10 +26,9 @@ use crate::redirect::same_origin_redirect_policy;
 use crate::types::{
     ApiKeysResponse, AuthContext, AuthContextRaw, AuthExchangeRequest, AuthExchangeResponse,
     ContainerImagesResponse, CreateDeploymentRequest, CreateProjectRequest, Deployment,
-    DeploymentsResponse, LogsResponse, MetricsResponse, MintAdoptionCodeRequest,
-    MintAdoptionCodeResponse, OAuthTokenRequest, OAuthTokenResponse, Org, OrgsResponse, Project,
-    ProjectsResponse, RegenerateApiKeyRequest, RegenerateApiKeyResponse, RegionsResponse, Secret,
-    SecretsResponse, SetSecretRequest, UpdateProjectRequest,
+    DeploymentsResponse, LogsResponse, MetricsResponse, OAuthTokenRequest, OAuthTokenResponse, Org,
+    OrgsResponse, Project, ProjectsResponse, RegenerateApiKeyRequest, RegenerateApiKeyResponse,
+    RegionsResponse, Secret, SecretsResponse, SetSecretRequest, UpdateProjectRequest,
 };
 
 const DEFAULT_BASE_URL: &str = "https://api.spice.ai";
@@ -546,37 +545,6 @@ impl CloudClient {
         let response = self
             .authed(self.client.post(&url))
             .json(&request)
-            .send()
-            .await
-            .context(HttpRequestSnafu)?;
-
-        self.handle_response(response).await
-    }
-
-    // ========================================================================
-    // Standalone instance adoption codes
-    // ========================================================================
-
-    /// Mint a single-use standalone-instance adoption code.
-    ///
-    /// This is the codeless-connect path: a host already authenticated with
-    /// `spice login` can mint its own code and redeem it in the same command
-    /// rather than sending the customer to the portal.
-    ///
-    /// The code is minted in the client's org context, so a credential that
-    /// spans several orgs adopts the instance into the requested one rather
-    /// than the token's default.
-    ///
-    /// Requires org admin/owner. The plaintext code is returned once and must
-    /// never be printed or persisted — the caller consumes it immediately.
-    pub async fn mint_instance_adoption_code(
-        &self,
-        request: &MintAdoptionCodeRequest,
-    ) -> Result<MintAdoptionCodeResponse> {
-        let url = format!("{}/v1/instance-adoption-codes", self.base_url);
-        let response = self
-            .authed(self.client.post(&url))
-            .json(request)
             .send()
             .await
             .context(HttpRequestSnafu)?;

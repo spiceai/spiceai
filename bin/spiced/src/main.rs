@@ -166,7 +166,7 @@ fn main() {
 /// parsed before the pool exists. It is loaded here on a throwaway
 /// current-thread runtime and handed to `spiced::run`, so it is read exactly
 /// once and all three configuration surfaces resolve through one path.
-fn load_and_run(args: spiced::Args) -> Result<(), Box<dyn std::error::Error>> {
+fn load_and_run(mut args: spiced::Args) -> Result<(), Box<dyn std::error::Error>> {
     // One temporary subscriber for the whole window before `spiced::run` installs the
     // global one, so every line the spicepod load and the CPU budget emit — including
     // any added later — has somewhere to go. Both the bootstrap runtime and
@@ -177,6 +177,16 @@ fn load_and_run(args: spiced::Args) -> Result<(), Box<dyn std::error::Error>> {
         let bootstrap = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
+        // Cloud Connect `--token` bootstrap: enrollment must be durable
+        // before the runtime is built, any listener binds, or readiness is
+        // reachable — so it runs first, on the throwaway runtime. A terminal
+        // enrollment failure exits 1 with nothing bound and no identity
+        // persisted; retryable failures were already retried for up to the
+        // headless budget inside the call.
+        if let Err(err) = bootstrap.block_on(spiced::cloud_connect_bootstrap(&mut args)) {
+            tracing::error!("{err}");
+            std::process::exit(1);
+        }
         let app_bundle = bootstrap.block_on(spiced::build_app(&args))?;
         drop(bootstrap);
 

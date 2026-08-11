@@ -76,6 +76,7 @@ serde_json = { workspace = true }
 rustls.workspace = true
 yaml = { path = "../../crates/yaml" }
 snafu.workspace = true
+zeroize = "1.8"
 snmalloc-rs = { version = "0.3.6" }
 spice-cloud = { path = "../../crates/spice_cloud" }
 telemetry = { path = "../../crates/telemetry" }
