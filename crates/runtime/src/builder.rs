@@ -53,7 +53,7 @@ use std::{
     collections::HashMap,
     net::SocketAddr,
     str::FromStr,
-    sync::{Arc, LazyLock, OnceLock},
+    sync::{Arc, LazyLock},
     time::Duration,
 };
 use telemetry::timing::TimeMeasurement;
@@ -521,7 +521,6 @@ impl RuntimeBuilder {
         // applies, so the projected base matches the pool it will build.
         let cayenne_cdc_active = dedicated_thread_pools_enabled && cayenne_workload.uses_cdc_tier();
         let duckdb_budget_inputs = duckdb_budget_inputs(self.app.as_ref());
-        let base_query_budget = OnceLock::new();
         let (duckdb_query_pool_cap, query_pool_ceiling_bytes) = if duckdb_budget_inputs.is_empty() {
             // No DuckDB accelerators (or the duckdb feature isn't compiled in): skip
             // the cgroup/host memory probes and the planner entirely — the plan would
@@ -530,18 +529,17 @@ impl RuntimeBuilder {
             crate::accelerator_memory_budget::clear_duckdb_budget();
             (None, memory_limit)
         } else {
-            let (total_memory, duckdb_default_per_instance) = *DUCKDB_BUDGET_HOST_TERMS;
+            let total_memory = crate::resource_monitor::get_total_memory();
+            let duckdb_default_per_instance = *DUCKDB_HOST_DEFAULT_BYTES;
             let plan = crate::accelerator_memory_budget::plan(
                 total_memory,
                 duckdb_default_per_instance,
-                *base_query_budget.get_or_init(|| {
-                    crate::datafusion::builder::effective_query_memory_limit(
-                        None,
-                        cayenne_cdc_active,
-                        cayenne_reservation_bytes,
-                        None,
-                    )
-                }),
+                crate::datafusion::builder::effective_query_memory_limit(
+                    None,
+                    cayenne_cdc_active,
+                    cayenne_reservation_bytes,
+                    None,
+                ),
                 memory_limit,
                 &duckdb_budget_inputs,
             );
@@ -569,7 +567,6 @@ impl RuntimeBuilder {
             query_pool_ceiling_bytes,
             cayenne_cdc_active,
             cayenne_reservation_bytes,
-            base_query_budget,
         };
 
         #[cfg(not(windows))]
@@ -1551,18 +1548,18 @@ fn estimate_cayenne_reservation_bytes(
     0
 }
 
-/// Cgroup-aware total memory, and `DuckDB`'s own ~80%-of-HOST-RAM per-instance
-/// default. Probed once: each rebuilds a sysinfo `System`, and neither moves over the
-/// process's life, so a reload re-plans against the terms its build used. `DuckDB`
-/// sizes its default from HOST RAM rather than the cgroup limit, so a container (host
-/// RAM > cgroup) would otherwise under-estimate that ceiling and skip coordination
-/// exactly where the OOM risk is highest.
-static DUCKDB_BUDGET_HOST_TERMS: LazyLock<(u64, u64)> = LazyLock::new(|| {
-    (
-        crate::resource_monitor::get_total_memory(),
-        crate::accelerator_memory_budget::duckdb_default_per_instance_bytes(
-            crate::resource_monitor::get_host_memory(),
-        ),
+/// `DuckDB`'s own per-instance default `memory_limit`, ~80% of HOST RAM. Probed once:
+/// rebuilding a sysinfo `System` is not free and the host's physical RAM does not
+/// change under a running process. `DuckDB` sizes this from host RAM rather than the
+/// cgroup limit, so a container (host RAM > cgroup) would otherwise under-estimate
+/// the ceiling and skip coordination exactly where the OOM risk is highest.
+///
+/// The cgroup-aware total is deliberately NOT cached beside it: a limit can be
+/// resized in place under a running process, and a re-plan plans against the memory
+/// available now.
+static DUCKDB_HOST_DEFAULT_BYTES: LazyLock<u64> = LazyLock::new(|| {
+    crate::accelerator_memory_budget::duckdb_default_per_instance_bytes(
+        crate::resource_monitor::get_host_memory(),
     )
 });
 
@@ -1580,7 +1577,7 @@ enum QueryPoolSizing {
 /// The query-side terms of the coordinated `DuckDB` memory budget, carried by the
 /// [`Runtime`] so a reload can re-split it for the acceleration set the new app
 /// declares (see [`DuckDbBudgetContext::publish_for`]).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub(crate) struct DuckDbBudgetContext {
     /// The query-pool ceiling in effect. `None` when nothing narrowed it: the build
     /// configured no `DuckDB` accelerator and no explicit `runtime.query.memory_limit`,
@@ -1588,10 +1585,6 @@ pub(crate) struct DuckDbBudgetContext {
     query_pool_ceiling_bytes: Option<u64>,
     cayenne_cdc_active: bool,
     cayenne_reservation_bytes: u64,
-    /// What the query pool would be with no `DuckDB` coordination — the region the
-    /// pool and the `DuckDB` instances are split out of. Derived on first use: a pod
-    /// that builds without `DuckDB` accelerators never pays for it.
-    base_query_budget: OnceLock<u64>,
 }
 
 impl DuckDbBudgetContext {
@@ -1614,15 +1607,17 @@ impl DuckDbBudgetContext {
             return;
         }
 
-        let (total_memory, duckdb_default_per_instance) = *DUCKDB_BUDGET_HOST_TERMS;
-        let base_query_budget = *self.base_query_budget.get_or_init(|| {
-            crate::datafusion::builder::effective_query_memory_limit(
-                None,
-                self.cayenne_cdc_active,
-                self.cayenne_reservation_bytes,
-                None,
-            )
-        });
+        // Probed per re-plan, not carried from the build: a cgroup limit can be
+        // resized in place, and a budget that exists to prevent an OOM kill has to
+        // split the memory available now.
+        let total_memory = crate::resource_monitor::get_total_memory();
+        let duckdb_default_per_instance = *DUCKDB_HOST_DEFAULT_BYTES;
+        let base_query_budget = crate::datafusion::builder::effective_query_memory_limit(
+            None,
+            self.cayenne_cdc_active,
+            self.cayenne_reservation_bytes,
+            None,
+        );
         let plan = crate::accelerator_memory_budget::plan(
             total_memory,
             duckdb_default_per_instance,

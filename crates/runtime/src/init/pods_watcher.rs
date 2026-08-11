@@ -139,6 +139,7 @@ impl Runtime {
 
 #[cfg(all(test, feature = "duckdb"))]
 mod tests {
+    use std::num::NonZeroU64;
     use std::path::Path;
     use std::sync::Arc;
 
@@ -194,10 +195,43 @@ mod tests {
     /// first accelerator on reload gets the per-instance floor — its query pool was
     /// sized without coordinating for `DuckDB` and only a restart re-sizes it.
     ///
-    /// One test, because the budget is process-global: two tests reading it run
-    /// concurrently in one test binary and would each see the other's runtime.
+    /// The budget is process-global and every `Runtime` built anywhere in this binary
+    /// republishes it — an app with no `DuckDB` accelerator clears it — so a peer test
+    /// building a runtime can land between an apply here and the read of what it
+    /// published. That shows up as a cleared budget, which no step of this scenario
+    /// produces, so [`observe`] retries the scenario instead of reporting it. A
+    /// budget this reload leaves *unchanged* is the defect under test and is never
+    /// retried.
     #[tokio::test]
     async fn apply_app_republishes_the_duckdb_memory_budget() {
+        for attempt in 1..=OBSERVATION_ATTEMPTS {
+            if republishes_the_duckdb_memory_budget(attempt == OBSERVATION_ATTEMPTS).await {
+                return;
+            }
+        }
+    }
+
+    /// How many times [`apply_app_republishes_the_duckdb_memory_budget`] re-runs when
+    /// a concurrently-built runtime clears the budget out from under it. Interference
+    /// needs a peer test to publish inside a window of a few hundred microseconds, so
+    /// a handful of attempts puts a spurious failure out of reach.
+    const OBSERVATION_ATTEMPTS: u32 = 5;
+
+    /// One run of the scenario. Returns whether it observed its own state throughout;
+    /// `false` means a peer runtime cleared the budget mid-scenario and it proved
+    /// nothing. When `final_attempt`, a cleared budget fails rather than returning
+    /// `false`, so exhausting the retries can never pass silently.
+    async fn republishes_the_duckdb_memory_budget(final_attempt: bool) -> bool {
+        macro_rules! observe {
+            ($value:expr, $what:expr) => {
+                match $value {
+                    Some(observed) => observed,
+                    None if final_attempt => panic!("{}", $what),
+                    None => return false,
+                }
+            };
+        }
+
         let dir = tempfile::tempdir().expect("temp dir");
         let one = duckdb_dataset("one", &dir.path().join("one.db"));
         let two = duckdb_dataset("two", &dir.path().join("two.db"));
@@ -212,8 +246,10 @@ mod tests {
                 .build()
                 .await,
         );
-        let one_instance = published_per_instance_mib()
-            .expect("building with a DuckDB accelerator publishes a per-instance cap");
+        let one_instance = observe!(
+            published_per_instance_mib(),
+            "building with a DuckDB accelerator publishes a per-instance cap"
+        );
 
         let both = AppBuilder::new("duckdb_budget_reload")
             .with_dataset(one)
@@ -224,8 +260,10 @@ mod tests {
             "the reload adds a dataset, so it must be applied"
         );
 
-        let two_instances = published_per_instance_mib()
-            .expect("a reload that keeps a DuckDB accelerator keeps a per-instance cap");
+        let two_instances = observe!(
+            published_per_instance_mib(),
+            "a reload that keeps a DuckDB accelerator keeps a per-instance cap"
+        );
         assert!(
             two_instances < one_instance,
             "the reload added a second DuckDB instance, so the published cap must shrink: {two_instances} MiB vs {one_instance} MiB"
@@ -236,7 +274,11 @@ mod tests {
         );
         // The instance that already exists keeps the memory_limit it was created
         // with, so the aggregate still has to cover it at the larger cap.
-        let reservation_after_two = duckdb_total_reservation_bytes();
+        let reservation_after_two = observe!(
+            NonZeroU64::new(duckdb_total_reservation_bytes()),
+            "a reload that keeps a DuckDB accelerator keeps a reservation"
+        )
+        .get();
         assert!(
             reservation_after_two >= 2 * one_instance * MIB,
             "the reservation must cover the first instance at the cap it was created with: {reservation_after_two} bytes"
@@ -290,12 +332,17 @@ mod tests {
                 .await,
             "the reload adds a DuckDB-accelerated dataset, so it must be applied"
         );
-        assert_eq!(
+        let first_instance = observe!(
             published_per_instance_mib(),
-            Some(DUCKDB_MIN_INSTANCE_CAP_BYTES / MIB),
+            "a reload that adds the first DuckDB accelerator publishes a per-instance cap"
+        );
+        assert_eq!(
+            first_instance,
+            DUCKDB_MIN_INSTANCE_CAP_BYTES / MIB,
             "the query pool already holds the splittable region, so the instance the reload adds gets the per-instance floor"
         );
 
         uncoordinated.shutdown().await;
+        true
     }
 }

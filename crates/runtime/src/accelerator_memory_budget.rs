@@ -109,8 +109,12 @@ static DUCKDB_MAX_LIVE_CAP_BYTES: AtomicU64 = AtomicU64::new(0);
 /// — not at this plan's: an instance created under a cap a later reload shrank keeps
 /// the `memory_limit` it was created with, and a co-resident consumer reading
 /// [`duckdb_total_reservation_bytes`] has to leave that larger ceiling alone.
-/// Instances an app moved to an explicit `duckdb_memory_limit` are charged at that
-/// limit, which is what they get once recreated.
+///
+/// The charge follows the app's declaration, not instance identity, so an instance
+/// whose `duckdb_memory_limit` moved between explicit and un-limited across a reload
+/// is charged at what the new declaration gives it — which is what it holds only once
+/// it is recreated. Tracking that exactly needs per-instance ceilings, which live with
+/// the accelerator rather than the Spicepod.
 pub fn publish_duckdb_budget(
     plan: &AcceleratorMemoryPlan,
     unset_instances: u32,
