@@ -19446,6 +19446,7 @@ impl CayenneTableProvider {
         maintained_aggregate_epoch: Option<u64>,
     ) -> Arc<dyn ExecutionPlan> {
         let overlay = self.optimizer_stats_overlay_for_schema(&plan.schema());
+        let table_name = self.table_metadata.table_name.as_str();
         if let Some(epoch) = maintained_aggregate_epoch {
             Arc::new(
                 CayenneAccelerationExec::with_guard_and_maintained_aggregates(
@@ -19454,12 +19455,14 @@ impl CayenneTableProvider {
                     Arc::clone(&self.maintained_aggregates),
                     epoch,
                 )
-                .with_optimizer_column_overlay(overlay),
+                .with_optimizer_column_overlay(overlay)
+                .with_table_name(table_name),
             )
         } else {
             Arc::new(
                 CayenneAccelerationExec::with_guard(plan, scan_guard)
-                    .with_optimizer_column_overlay(overlay),
+                    .with_optimizer_column_overlay(overlay)
+                    .with_table_name(table_name),
             )
         }
     }
