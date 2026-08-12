@@ -17,11 +17,11 @@ limitations under the License.
 //! `spice connect --install`: run `spiced --cloud-connect` as a persistent
 //! system service.
 //!
-//! The supervisor is not a convenience here, it is the mechanism deployments
-//! depend on: a deployment applies by having the runtime validate and persist
-//! the new spicepod and then exit 0, which only becomes a deployment if
-//! something relaunches it. Both back ends therefore restart the runtime
-//! unconditionally — systemd with `Restart=always`, launchd with `KeepAlive`.
+//! A deployment applies to the running instance and never ends its process, so
+//! the supervisor is what keeps the instance up across the things that do end
+//! it — a host reboot, an OOM kill, an operator's `systemctl restart`. Both
+//! back ends therefore restart the runtime unconditionally — systemd with
+//! `Restart=always`, launchd with `KeepAlive`.
 //!
 //! ## Support matrix
 //!
