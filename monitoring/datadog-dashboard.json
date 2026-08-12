@@ -1,6 +1,6 @@
 {
   "title": "Spice.ai Dashboard",
-  "description": "Monitoring dashboard for Spice.ai runtime - covers system health, query performance, data acceleration, caching, AI/ML operations, and Flight protocol metrics.",
+  "description": "Monitoring dashboard for Spice.ai runtime - covers system health, query performance, data acceleration, caching, AI/ML operations, and Flight protocol metrics.\n\nRequires the Datadog Agent to tag Spice scrapes with `service_instance_id` (see the Datadog integration docs). This is Spice's instance-identity contract, not a Datadog-standard tag: the Agent does not supply it automatically, and without it the $instance filter matches nothing and every per-instance panel collapses into a single N/A series. Panels backed by the Kubernetes integration group by `pod_name` instead, the native infrastructure identity.",
   "widgets": [
     {
       "id": 1,
