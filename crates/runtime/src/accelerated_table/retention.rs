@@ -199,7 +199,9 @@ impl super::AcceleratedTable {
                 apply_retention_filters_once(&dataset_name, &accelerator, expr, &io_runtime).await
                 && num_records > 0
                 && let Some(cache_provider) = caching.as_ref()
-                && let Err(e) = cache_provider.invalidate_for_table(dataset_name.clone())
+                && let Err(e) = cache_provider
+                    .invalidate_for_table(dataset_name.clone())
+                    .await
             {
                 tracing::error!(
                     "Failed to invalidate cached results for dataset {}: {e}",

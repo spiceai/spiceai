@@ -90,6 +90,16 @@ pub enum Error {
     #[snafu(display("Cache invalidation failed with error: {source}."))]
     FailedToInvalidateCacheGeneric { source: moka::PredicateError },
 
+    // Single line on purpose: callers interpolate this into a one-line `tracing` event, so an
+    // embedded newline would split the event and break structured log ingestion.
+    #[snafu(display(
+        "Cache invalidation for dataset {table_name} did not finish: {source}. Cached results for it may be stale until the next invalidation."
+    ))]
+    InvalidationDidNotFinish {
+        source: tokio::task::JoinError,
+        table_name: Arc<str>,
+    },
+
     #[snafu(display(
         "Invalid hashing algorithm. Please refer to the documentation for supported algorithms: https://spiceai.org/docs/features/caching#choosing-a-hashing_algorithm"
     ))]
@@ -190,15 +200,20 @@ pub trait CacheProvider<V: Clone + Send + Sync + 'static>:
 }
 
 /// A ``TabledCacheProvider`` represents a cache that can invalidate entries based on table references which their values reference.
+#[async_trait]
 pub trait TabledCacheProvider<V: AsTableRefs + Clone + Send + Sync + 'static>:
     CacheProvider<V>
 {
     /// Invalidates all cache entries for the specified table.
     ///
+    /// Awaiting this is what lets an implementation take its work off the calling runtime
+    /// worker; the entries are invalidated by the time it returns, so a caller that awaits it
+    /// before reporting a write complete keeps the ordering it had when this was synchronous.
+    ///
     /// # Errors
     ///
     /// If the cache invalidation fails.
-    fn invalidate_for_table(&self, table_ref: TableReference) -> Result<()>;
+    async fn invalidate_for_table(&self, table_ref: TableReference) -> Result<()>;
 }
 
 #[derive(Clone)]
@@ -379,15 +394,17 @@ impl Caching {
     /// # Errors
     ///
     /// If the cache invalidation fails for any of the caches.
-    pub fn invalidate_for_table(&self, table_ref: TableReference) -> Result<()> {
+    pub async fn invalidate_for_table(&self, table_ref: TableReference) -> Result<()> {
         if let Some(results_cache) = &self.results {
-            results_cache.invalidate_for_table(table_ref.clone())?;
+            results_cache
+                .invalidate_for_table(table_ref.clone())
+                .await?;
         }
         if let Some(plans_cache) = &self.plans {
-            plans_cache.invalidate_for_table(table_ref.clone())?;
+            plans_cache.invalidate_for_table(table_ref.clone()).await?;
         }
         if let Some(search_cache) = &self.search {
-            search_cache.invalidate_for_table(table_ref)?;
+            search_cache.invalidate_for_table(table_ref).await?;
         }
         Ok(())
     }
@@ -708,7 +725,7 @@ impl QueryResultsCacheProvider {
     /// # Errors
     ///
     /// Will return `Err` if method fails to invalidate cache for the table provided
-    pub fn invalidate_for_table(&self, table_name: TableReference) -> Result<()> {
+    pub async fn invalidate_for_table(&self, table_name: TableReference) -> Result<()> {
         // Record the invalidation before removing entries, never after. A
         // writer that started before this point must be rejected by
         // `tables_invalidated_since`, and stamping afterwards leaves exactly
@@ -717,7 +734,7 @@ impl QueryResultsCacheProvider {
             .mark_invalidated(&table_name, std::time::Instant::now());
         // The invalidation itself is counted by the underlying cache, so that
         // every cache type is counted the same way rather than only this one.
-        self.cache.invalidate_for_table(table_name)
+        self.cache.invalidate_for_table(table_name).await
     }
 
     /// Returns `true` if any of `tables` has been invalidated at or after
@@ -1095,6 +1112,7 @@ mod tests {
         let read_started_at = std::time::Instant::now();
         provider
             .invalidate_for_table(TableReference::bare("customer"))
+            .await
             .expect("invalidation should succeed");
 
         let key = RawCacheKey::new(1);
@@ -1141,6 +1159,7 @@ mod tests {
 
         provider
             .invalidate_for_table(TableReference::bare("customer"))
+            .await
             .expect("invalidation should succeed");
 
         assert!(
@@ -1164,6 +1183,7 @@ mod tests {
         let read_started_at = std::time::Instant::now();
         provider
             .invalidate_for_table(TableReference::bare("orders"))
+            .await
             .expect("invalidation should succeed");
 
         let key = RawCacheKey::new(3);
@@ -1184,8 +1204,8 @@ mod tests {
 
     /// `invalidate_for_table` must stamp the clock, not just remove entries —
     /// this is the wiring the write-side guard depends on.
-    #[test]
-    fn invalidate_for_table_records_the_invalidation() {
+    #[tokio::test]
+    async fn invalidate_for_table_records_the_invalidation() {
         let provider =
             QueryResultsCacheProvider::try_new(&SQLResultsCacheConfig::default(), Box::new([]))
                 .expect("valid cache provider");
@@ -1196,6 +1216,7 @@ mod tests {
 
         provider
             .invalidate_for_table(TableReference::bare("customer"))
+            .await
             .expect("invalidation should succeed");
 
         assert!(
@@ -1355,6 +1376,7 @@ mod tests {
         for _ in 0..1_000 {
             caching
                 .invalidate_for_table(table.clone())
+                .await
                 .expect("invalidation should succeed");
         }
 
@@ -1369,6 +1391,7 @@ mod tests {
         // Another invalidate + maintenance cycle still works.
         caching
             .invalidate_for_table(table)
+            .await
             .expect("invalidation should succeed");
         caching.run_pending_maintenance().await;
     }
