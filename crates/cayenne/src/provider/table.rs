@@ -40328,6 +40328,204 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn object_store_refcounted_cleanup_invalidates_only_retired_cached_path() {
+        use crate::metadata::ObjectStoreConfig;
+        use crate::provider::delta_encoding::WriteClass;
+        use object_store::memory::InMemory;
+
+        let temp_dir = tempfile::tempdir().expect("temp dir created");
+        let metadata_dir = temp_dir.path().join("metadata");
+        std::fs::create_dir_all(&metadata_dir).expect("metadata dir created");
+        let connection_string = format!(
+            "sqlite://{}/cayenne.db",
+            metadata_dir
+                .to_str()
+                .expect("metadata path should be UTF-8")
+        );
+        let catalog = Arc::new(CayenneCatalog::new(connection_string).expect("catalog created"))
+            as Arc<dyn MetadataCatalog>;
+        catalog.init().await.expect("catalog initialized");
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let store_url = url::Url::parse("s3://segment-cache-retirement")
+            .expect("object-store URL should be valid");
+        let provider = CayenneTableProviderBuilder::new(
+            Arc::clone(&catalog),
+            SessionContext::new().runtime_env(),
+        )
+        .with_object_store(ObjectStoreConfig {
+            url: store_url,
+            store: Arc::clone(&store),
+        })
+        .create(CreateTableOptions {
+            table_name: "object_store_segment_cache_retirement".to_string(),
+            schema: Arc::clone(&schema),
+            primary_key: vec![],
+            on_conflict: None,
+            base_path: "s3://segment-cache-retirement/cayenne".to_string(),
+            partition_column: None,
+            vortex_config: VortexConfig {
+                inline_max_rows: 0,
+                ..VortexConfig::default()
+            },
+        })
+        .await
+        .expect("object-store table created");
+
+        let snapshot_id = provider.get_current_snapshot_id();
+        provider
+            .write_to_snapshot(
+                single_batch_stream(
+                    RecordBatch::try_new(
+                        Arc::clone(&schema),
+                        vec![Arc::new(Int64Array::from_iter_values(0..2_000))],
+                    )
+                    .expect("input batch"),
+                ),
+                provider.target_file_size_bytes(),
+                &snapshot_id,
+                1,
+                None,
+                WriteClass::Delta,
+            )
+            .await
+            .expect("write source Vortex object");
+
+        let prefix = provider
+            .snapshot_object_store_prefix(&snapshot_id)
+            .expect("snapshot prefix should resolve")
+            .expect("S3 table should have an object-store prefix");
+        let source_objects: Vec<_> = store
+            .list(Some(&prefix))
+            .try_collect()
+            .await
+            .expect("list written objects");
+        let source_data_paths: Vec<_> = source_objects
+            .iter()
+            .filter(|meta| {
+                meta.location.parts().next_back().is_some_and(|name| {
+                    CayenneTableProvider::is_compactable_data_file(name.as_ref())
+                })
+            })
+            .map(|meta| meta.location.clone())
+            .collect();
+        assert_eq!(
+            source_data_paths.len(),
+            1,
+            "the single-shard write should create one Vortex object: {source_data_paths:?}"
+        );
+        let source_path = source_data_paths[0].clone();
+        let retired_path =
+            ObjectStorePath::from(format!("{}/retired-copy.vortex", prefix.as_ref()));
+        store
+            .copy(&source_path, &retired_path)
+            .await
+            .expect("copy source object to the retiring path");
+
+        provider
+            .refresh_listing_table()
+            .await
+            .expect("refresh listing after copied object");
+        let ctx = SessionContext::new();
+        CayenneTableProvider::register_object_store_if_needed(
+            &ctx.runtime_env(),
+            provider
+                .object_store_config
+                .as_ref()
+                .expect("object-store config should be retained"),
+        );
+        let snapshot_url = CayenneTableProvider::snapshot_dir_url(
+            provider.table_path(),
+            provider.table_id(),
+            &snapshot_id,
+        );
+        let listing_table = CayenneTableProvider::create_listing_table(
+            &snapshot_url,
+            Arc::clone(&schema),
+            provider.context().file_format(),
+            &provider.pk_deletion_strategy,
+        )
+        .expect("create direct snapshot listing");
+        let listed_files = listing_table
+            .list_files_for_scan(&ctx.state(), &[], None)
+            .await
+            .expect("list direct snapshot files");
+        let listed_paths: HashSet<_> = listed_files
+            .file_groups
+            .iter()
+            .flat_map(FileGroup::iter)
+            .map(|file| file.path().clone())
+            .collect();
+        assert_eq!(
+            listed_paths,
+            HashSet::from([source_path.clone(), retired_path.clone()]),
+            "the direct snapshot listing must include both object paths"
+        );
+        let scan = listing_table
+            .scan(&ctx.state(), None, &[], None)
+            .await
+            .expect("plan direct snapshot scan");
+        let rows: usize = collect(scan, ctx.task_ctx())
+            .await
+            .expect("scan both snapshot objects")
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum();
+        assert_eq!(rows, 4_000, "the scan must read both identical objects");
+        let entries_before = provider
+            .context()
+            .file_format()
+            .segment_cache_entry_count()
+            .await
+            .expect("the segment cache should be enabled");
+        assert!(entries_before > 1, "both object paths must be cached");
+
+        let source_file_name = source_path
+            .parts()
+            .next_back()
+            .expect("source path should have a file name");
+        let live_referenced = HashSet::from([CayenneTableProvider::manifest_file_relative_path(
+            &snapshot_id,
+            source_file_name.as_ref(),
+        )]);
+        provider
+            .delete_prefix_refcounted(&prefix, &snapshot_id, &live_referenced)
+            .await
+            .expect("ref-counted object-store cleanup");
+
+        let remaining_data_paths: HashSet<_> = store
+            .list(Some(&prefix))
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("list objects after cleanup")
+            .into_iter()
+            .filter(|meta| {
+                meta.location.parts().next_back().is_some_and(|name| {
+                    CayenneTableProvider::is_compactable_data_file(name.as_ref())
+                })
+            })
+            .map(|meta| meta.location)
+            .collect();
+        assert_eq!(
+            remaining_data_paths,
+            HashSet::from([source_path]),
+            "cleanup must preserve the referenced object and delete only the retired object"
+        );
+        let entries_after = provider
+            .context()
+            .file_format()
+            .segment_cache_entry_count()
+            .await
+            .expect("the segment cache should remain enabled");
+        assert_eq!(
+            entries_after.saturating_mul(2),
+            entries_before,
+            "identical objects cache equal segment counts, so cleanup must evict only the retired path"
+        );
+    }
+
     /// Helper to read all data from a `CayenneTableProvider` as `RecordBatch`es.
     async fn read_all(
         ctx: &SessionContext,
