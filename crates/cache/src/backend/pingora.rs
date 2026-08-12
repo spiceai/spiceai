@@ -18,6 +18,7 @@ limitations under the License.
 
 use super::{CacheBackend, CacheBackendBuilder};
 use crate::Sizeable;
+use crate::metrics::{CacheMetrics, EvictionReason};
 use async_trait::async_trait;
 use parking_lot::RwLock;
 use pingora_lru::Lru;
@@ -95,7 +96,7 @@ where
 
 impl<V> PingoraBackend<V>
 where
-    V: Sizeable + Clone + Send + Sync + 'static,
+    V: Sizeable + CacheMetrics + Clone + Send + Sync + 'static,
 {
     /// Creates a new Pingora backend with the given configuration.
     #[must_use]
@@ -171,6 +172,15 @@ where
         // every reader and writer mapped to this shard, and a destructor that
         // re-entered the cache would deadlock on the non-reentrant lock.
         drop(shard);
+
+        // As in `evict_to_weight_limit`, no listener reports this engine's own
+        // removals, so an expiry only reaches the counter if it is recorded here.
+        // Counted only when the value actually came out of the cache: metadata can
+        // briefly outlive the value while a size eviction (which has already counted
+        // that removal) is still on its way to dropping the metadata.
+        if removed.is_some() {
+            V::record_eviction(EvictionReason::Expired);
+        }
         drop(removed);
         true
     }
@@ -183,6 +193,16 @@ where
     /// least-recently-used set rather than ordering it globally.
     fn evict_to_weight_limit(&self) {
         for (entry, _) in self.cache.evict_to_limit() {
+            // `evict_to_limit` has already taken this entry out under the weight limit,
+            // so the removal is a fact by the time it is yielded here. Nothing else
+            // counts it: the eviction listener that reports a moka removal belongs to
+            // the moka cache, which this engine does not have, so a removal this
+            // backend performs is only observable if it is recorded at its own call
+            // site. Counted once per yielded entry — the `remove` below only drops a
+            // key a concurrent `insert` re-admitted, which is a second removal of a
+            // different admission rather than a second eviction of this one.
+            V::record_eviction(EvictionReason::Size);
+
             // A concurrent `insert` can re-admit the key between its eviction above and
             // the metadata drop. Holding the shard across both the drop and the re-admit
             // check serialises this against `insert`, which publishes the value and its
@@ -205,7 +225,7 @@ where
 #[async_trait]
 impl<V> CacheBackend<V> for PingoraBackend<V>
 where
-    V: Sizeable + Clone + Send + Sync + 'static,
+    V: Sizeable + CacheMetrics + Clone + Send + Sync + 'static,
 {
     async fn insert(&self, key: u64, value: V) {
         // Calculate weight for the value
@@ -380,6 +400,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     /// Simple test value that implements Sizeable
     #[derive(Clone, Debug, PartialEq)]
@@ -409,6 +430,54 @@ mod tests {
         fn get_memory_size(&self) -> usize {
             self.size
         }
+    }
+
+    impl CacheMetrics for TestValue {
+        fn record_hit() {}
+        fn record_miss() {}
+        fn record_request() {}
+        fn record_item_count(_count: u64) {}
+        fn record_size(_size: u64) {}
+        fn record_max_size(_size: u64) {}
+        fn record_eviction(_reason: EvictionReason) {}
+        fn record_stale_rejection() {}
+        fn update_hit_ratio(_hits: u64, _total: u64) {}
+        fn publish_counters_at_zero() {}
+    }
+
+    /// A test value whose evictions are counted in-process, so a test can assert
+    /// what the backend actually reported without standing up an `OpenTelemetry`
+    /// pipeline. [`CacheMetrics`] is implemented on the type rather than on an
+    /// instance, so each test needs its own type to keep a count only it can move.
+    macro_rules! counting_value {
+        ($name:ident, $counter:ident) => {
+            static $counter: AtomicU64 = AtomicU64::new(0);
+
+            #[derive(Clone, Debug, PartialEq)]
+            struct $name(TestValue);
+
+            impl Sizeable for $name {
+                fn get_memory_size(&self) -> usize {
+                    self.0.get_memory_size()
+                }
+            }
+
+            impl CacheMetrics for $name {
+                fn record_hit() {}
+                fn record_miss() {}
+                fn record_request() {}
+                fn record_item_count(_count: u64) {}
+                fn record_size(_size: u64) {}
+                fn record_max_size(_size: u64) {}
+                fn record_stale_rejection() {}
+                fn update_hit_ratio(_hits: u64, _total: u64) {}
+                fn publish_counters_at_zero() {}
+
+                fn record_eviction(_reason: EvictionReason) {
+                    $counter.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        };
     }
 
     fn create_backend(capacity: u64, ttl_secs: u64) -> PingoraBackend<TestValue> {
@@ -1100,6 +1169,19 @@ mod tests {
         }
     }
 
+    impl CacheMetrics for GatedValue {
+        fn record_hit() {}
+        fn record_miss() {}
+        fn record_request() {}
+        fn record_item_count(_count: u64) {}
+        fn record_size(_size: u64) {}
+        fn record_max_size(_size: u64) {}
+        fn record_eviction(_reason: EvictionReason) {}
+        fn record_stale_rejection() {}
+        fn update_hit_ratio(_hits: u64, _total: u64) {}
+        fn publish_counters_at_zero() {}
+    }
+
     /// The hit path reads by removing the value and re-admitting it. An `insert` that
     /// completes between the two is then undone by the re-admit: the old value goes back
     /// over the new one, and the new one's metadata stays, so the cache serves the replaced
@@ -1332,5 +1414,102 @@ mod tests {
         backend.insert(1, TestValue::new("value")).await;
 
         assert_eq!(backend.get(&1).await, Some(TestValue::new("value")));
+    }
+
+    // ==========================
+    // eviction reporting (#12792)
+    // ==========================
+
+    counting_value!(ExpiryCountedValue, EXPIRY_EVICTIONS);
+
+    /// Regression test for #12792.
+    ///
+    /// `get` removes a lapsed entry inline. Eviction counting on the Moka engine
+    /// rides on moka's `eviction_listener`; this engine has none, so a removal it
+    /// performs itself is only counted if it is recorded at the call site. Before
+    /// the fix the expiry series stayed at zero however many entries lapsed.
+    #[tokio::test]
+    async fn an_expiry_this_engine_removes_is_counted() {
+        let backend: PingoraBackend<ExpiryCountedValue> =
+            PingoraBackend::with_params(1024, Duration::from_millis(10));
+
+        backend
+            .insert(1, ExpiryCountedValue(TestValue::new("value")))
+            .await;
+        assert_eq!(
+            EXPIRY_EVICTIONS.load(Ordering::Relaxed),
+            0,
+            "an entry that is still live must not be counted as evicted"
+        );
+
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        assert_eq!(
+            backend.get(&1).await,
+            None,
+            "the entry has outlived its TTL, so it must not be served"
+        );
+        assert_eq!(
+            EXPIRY_EVICTIONS.load(Ordering::Relaxed),
+            1,
+            "the expiry `get` removed must reach the eviction counter"
+        );
+    }
+
+    counting_value!(MissCountedValue, MISS_EVICTIONS);
+
+    /// A `get` for a key the cache never held removes nothing, so it must not be
+    /// counted. Without this the counter would report evictions for plain misses,
+    /// which is the same false reading as the zero it replaces.
+    #[tokio::test]
+    async fn a_miss_on_an_absent_key_is_not_an_eviction() {
+        let backend: PingoraBackend<MissCountedValue> =
+            PingoraBackend::with_params(1024, Duration::from_mins(1));
+
+        assert_eq!(backend.get(&404).await, None);
+
+        assert_eq!(
+            MISS_EVICTIONS.load(Ordering::Relaxed),
+            0,
+            "a key the cache never held was not evicted"
+        );
+    }
+
+    counting_value!(SizeCountedValue, SIZE_EVICTIONS);
+
+    /// Regression test for #12792.
+    ///
+    /// The size eviction introduced with #12694 brings the cache back under its
+    /// weight limit, and had the same shape as the expiry above: it removed
+    /// entries and recorded nothing, so `reason="size"` stayed a false zero on
+    /// this engine.
+    #[tokio::test]
+    async fn an_eviction_down_to_max_size_is_counted() {
+        // Three 100-byte values against a 250-byte budget: the third admission
+        // pushes the cache over, so at least one entry has to go.
+        let backend: PingoraBackend<SizeCountedValue> =
+            PingoraBackend::with_params(250, Duration::from_mins(1));
+
+        for i in 0..3u64 {
+            backend
+                .insert(i, SizeCountedValue(TestValue::with_size("x", 100)))
+                .await;
+        }
+
+        assert!(
+            backend.weighted_size().await <= 250,
+            "the cache must be back within its weight limit"
+        );
+
+        let evicted = SIZE_EVICTIONS.load(Ordering::Relaxed);
+        assert!(
+            evicted > 0,
+            "an eviction down to max_size must reach the counter, got {evicted}"
+        );
+        assert_eq!(
+            u64::try_from(3 - backend.len().await).unwrap_or(u64::MAX),
+            evicted,
+            "every entry the cache no longer holds must be accounted for exactly once"
+        );
     }
 }
