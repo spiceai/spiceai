@@ -21,9 +21,14 @@ use vortex::layout::segments::{SegmentCache, SegmentId};
 /// `SipHash` on the per-segment hot path.
 type SegmentCacheHasher = BuildHasherDefault<XxHash3_64>;
 
-/// Publish a segment-cache stats sample once every this many `get` calls (per
-/// table cache).
-const SEGMENT_CACHE_STATS_SAMPLE_EVERY: u64 = 200_000;
+/// Publish the cheap segment-cache gauges once every this many `get` calls, per
+/// table cache. Small so low-traffic tables stay observable.
+const SEGMENT_CACHE_STATS_SAMPLE_EVERY: u64 = 256;
+
+/// Flush moka's deferred bookkeeping and publish the fill gauges this often. Far
+/// rarer than the cheap sample because the `run_pending_tasks()` flush is the
+/// expensive step.
+const SEGMENT_CACHE_FLUSH_EVERY: u64 = 200_000;
 
 static METER: LazyLock<Meter> = LazyLock::new(|| global::meter("cayenne_segment_cache"));
 
@@ -134,12 +139,16 @@ impl SegmentCache for PathSegmentCache {
         }
         let accesses = self.shared.accesses.fetch_add(1, Ordering::Relaxed) + 1;
         if accesses.is_multiple_of(SEGMENT_CACHE_STATS_SAMPLE_EVERY) {
-            // Rare branch: flush moka bookkeeping so the reported fill is accurate.
-            self.shared.cache.run_pending_tasks().await;
             let hits = self.shared.hits.load(Ordering::Relaxed);
             let labels = [KeyValue::new("dataset", self.shared.dataset.to_string())];
             ACCESSES.record(accesses, &labels);
             HITS.record(hits, &labels);
+        }
+        if accesses.is_multiple_of(SEGMENT_CACHE_FLUSH_EVERY) {
+            // Flush moka's deferred bookkeeping so weighted_size()/entry_count()
+            // below are exact rather than approximate.
+            self.shared.cache.run_pending_tasks().await;
+            let labels = [KeyValue::new("dataset", self.shared.dataset.to_string())];
             WEIGHTED_BYTES.record(self.shared.cache.weighted_size(), &labels);
             CAPACITY_BYTES.record(self.shared.capacity_bytes, &labels);
             ENTRIES.record(self.shared.cache.entry_count(), &labels);
