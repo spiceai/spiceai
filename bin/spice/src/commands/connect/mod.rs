@@ -612,11 +612,11 @@ async fn remove_identity(
     // provisional key material and operation ID — released along with
     // everything else so the next enrollment starts clean.
     if had_draft {
-        runtime_cloud_connect::EnrollmentDraft::delete(config_dir).map_err(|e| {
-            Error::CloudConnectIo {
+        runtime_cloud_connect::EnrollmentDraft::delete_async(config_dir)
+            .await
+            .map_err(|e| Error::CloudConnectIo {
                 message: format!("remove enrollment draft: {e}"),
-            }
-        })?;
+            })?;
     }
     // Also clear any `cloud-endpoint` override so a later enrollment
     // without `SPICE_CLOUD_ENDPOINT` doesn't silently keep using the stale

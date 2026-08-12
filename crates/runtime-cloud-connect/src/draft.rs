@@ -106,6 +106,9 @@ pub enum Error {
         path.display()
     ))]
     CreationInProgress { path: PathBuf },
+
+    #[snafu(display("Failed to remove the enrollment draft: {source}"))]
+    DeleteTaskPanicked { source: tokio::task::JoinError },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -149,6 +152,10 @@ impl EnrollmentTransactionLock {
                 source,
             }),
         }
+    }
+
+    pub(crate) fn delete(&self) -> Result<()> {
+        EnrollmentDraft::delete_at(&self.draft_path)
     }
 }
 
@@ -352,20 +359,47 @@ impl EnrollmentDraft {
         Ok(draft)
     }
 
-    /// Remove the draft for `config_dir`. A missing file is success.
+    /// Remove the draft for `config_dir`. A missing file is success. Deletion
+    /// acquires the same transaction lock as enrollment so an external remove
+    /// cannot discard retry identity while another process is using it.
     ///
     /// # Errors
     ///
-    /// Returns an error when the file exists but cannot be removed.
+    /// Returns an error when another live enrollment owns the directory or
+    /// when the file exists but cannot be removed.
     pub fn delete(config_dir: &Path) -> Result<()> {
-        let path = Self::path_in(config_dir);
-        match std::fs::remove_file(&path) {
+        EnrollmentTransactionLock::acquire(config_dir)?.delete()
+    }
+
+    /// Async variant of [`EnrollmentDraft::delete`] for callers on a Tokio
+    /// runtime. Lock acquisition can wait for another enrollment transaction,
+    /// so it runs on the blocking pool rather than occupying a worker thread.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when another live enrollment owns the directory, when
+    /// the file cannot be removed, or when the blocking task panics.
+    pub async fn delete_async(config_dir: &Path) -> Result<()> {
+        let config_dir = config_dir.to_path_buf();
+        tokio::task::spawn_blocking(move || Self::delete(&config_dir))
+            .await
+            .map_err(|source| Error::DeleteTaskPanicked { source })?
+    }
+
+    fn delete_at(path: &Path) -> Result<()> {
+        match std::fs::remove_file(path) {
             Ok(()) => {
-                crate::identity::sync_parent_directory(&path)
-                    .context(IoSnafu { path: path.clone() })?;
+                crate::identity::sync_parent_directory(path).context(IoSnafu {
+                    path: path.to_path_buf(),
+                })?;
             }
             Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
-            Err(source) => return Err(Error::Io { path, source }),
+            Err(source) => {
+                return Err(Error::Io {
+                    path: path.to_path_buf(),
+                    source,
+                });
+            }
         }
         Ok(())
     }
@@ -645,6 +679,52 @@ mod tests {
         );
         EnrollmentDraft::delete(dir.path()).expect("second delete is a no-op");
         load_or_create(dir.path()).expect("the persistent lock permits re-enrollment");
+    }
+
+    #[test]
+    fn external_delete_cannot_remove_an_active_enrollment_draft() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let transaction = EnrollmentTransactionLock::acquire(dir.path()).expect("acquire lock");
+        transaction
+            .load_or_create(&test_instance("v2.2.0-test"), Some("us-west-2"))
+            .expect("publish draft while locked");
+
+        let error = EnrollmentDraft::delete(dir.path()).expect_err("live enrollment owns draft");
+        assert!(matches!(error, Error::CreationInProgress { .. }), "{error}");
+        assert!(
+            EnrollmentDraft::path_in(dir.path()).exists(),
+            "external cleanup must preserve the active retry identity"
+        );
+
+        drop(transaction);
+        EnrollmentDraft::delete(dir.path()).expect("delete after enrollment releases lock");
+        assert!(!EnrollmentDraft::path_in(dir.path()).exists());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn async_delete_does_not_block_the_tokio_runtime_during_lock_contention() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let transaction = EnrollmentTransactionLock::acquire(dir.path()).expect("acquire lock");
+        transaction
+            .load_or_create(&test_instance("v2.2.0-test"), Some("us-west-2"))
+            .expect("publish draft while locked");
+
+        let started = std::time::Instant::now();
+        let sentinel = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            started.elapsed()
+        });
+        let error = EnrollmentDraft::delete_async(dir.path())
+            .await
+            .expect_err("live enrollment owns draft");
+        let sentinel_elapsed = sentinel.await.expect("sentinel task");
+
+        assert!(matches!(error, Error::CreationInProgress { .. }), "{error}");
+        assert!(
+            sentinel_elapsed < std::time::Duration::from_millis(100),
+            "lock contention blocked the Tokio runtime for {sentinel_elapsed:?}"
+        );
+        assert!(EnrollmentDraft::path_in(dir.path()).exists());
     }
 
     #[cfg(unix)]

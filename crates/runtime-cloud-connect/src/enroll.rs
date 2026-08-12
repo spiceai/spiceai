@@ -1096,7 +1096,7 @@ pub async fn enroll_now(
                     reason,
                 });
             }
-            cleanup_enrollment_draft(config.config_dir.clone()).await;
+            cleanup_enrollment_draft(&enrollment_transaction).await;
             drop(enrollment_transaction);
             return Ok(EnrollNowOutcome::AlreadyEnrolled { identity });
         }
@@ -1196,7 +1196,7 @@ pub async fn enroll_now(
     // The identity is durable; retire the draft. A failure here only leaves
     // a stale draft behind — enrollment never runs again while the identity
     // exists, so it is a warning, not an error.
-    cleanup_enrollment_draft(config.config_dir.clone()).await;
+    cleanup_enrollment_draft(&enrollment_transaction).await;
     drop(enrollment_transaction);
 
     Ok(EnrollNowOutcome::Enrolled {
@@ -1205,8 +1205,9 @@ pub async fn enroll_now(
     })
 }
 
-async fn cleanup_enrollment_draft(config_dir: std::path::PathBuf) {
-    let deleted = tokio::task::spawn_blocking(move || EnrollmentDraft::delete(&config_dir)).await;
+async fn cleanup_enrollment_draft(enrollment_transaction: &Arc<EnrollmentTransactionLock>) {
+    let enrollment_transaction = Arc::clone(enrollment_transaction);
+    let deleted = tokio::task::spawn_blocking(move || enrollment_transaction.delete()).await;
     match deleted {
         Ok(Ok(())) => {}
         Ok(Err(err)) => {
