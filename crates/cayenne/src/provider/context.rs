@@ -892,6 +892,7 @@ impl CayenneContext {
             target_file_size_mb: config.target_vortex_file_size_mb,
             projection_pushdown: ProjectionPushdown::On,
             segment_cache_size_bytes,
+            scan_concurrency: config.scan_concurrency,
             ..VortexTableOptions::default()
         }
     }

@@ -4,6 +4,7 @@
 use std::fmt::Debug;
 use std::fmt::Display;
 use std::fmt::Formatter;
+use std::str::FromStr;
 use std::sync::Arc;
 
 use arrow_schema::Schema;
@@ -49,10 +50,11 @@ use futures::stream;
 use object_store::ObjectMeta;
 use object_store::ObjectStore;
 use vortex::VortexSessionDefault;
+use vortex::arrow::ArrowSessionExt;
+use vortex::arrow::FromArrowType;
 use vortex::dtype::DType;
 use vortex::dtype::Nullability;
 use vortex::dtype::PType;
-use vortex::dtype::arrow::FromArrowType;
 use vortex::error::VortexResult;
 use vortex::expr::stats;
 use vortex::expr::stats::Stat;
@@ -178,6 +180,35 @@ impl Display for ScanConcurrency {
     }
 }
 
+impl FromStr for ScanConcurrency {
+    type Err = String;
+
+    /// Parses `auto`, `off` (also `disabled`/`none`/`0`), or a positive integer.
+    ///
+    /// The single parser for this setting: `ConfigField::set` delegates here, so a
+    /// caller reading the mode from its own configuration (e.g. a Spicepod
+    /// parameter) accepts exactly the spellings a `DataFusion` `OPTIONS(...)`
+    /// clause does.
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Ok(match value.trim().to_ascii_lowercase().as_str() {
+            "auto" => Self::Auto,
+            "off" | "disabled" | "none" | "0" => Self::Off,
+            other => {
+                let concurrency = other.parse::<usize>().map_err(|err| {
+                    format!(
+                        "Invalid scan_concurrency value {other:?}; expected 'auto', 'off', or a positive integer: {err}"
+                    )
+                })?;
+                if concurrency == 0 {
+                    Self::Off
+                } else {
+                    Self::Explicit(concurrency)
+                }
+            }
+        })
+    }
+}
+
 impl ConfigField for ScanConcurrency {
     fn visit<V: datafusion_common::config::Visit>(
         &self,
@@ -195,22 +226,9 @@ impl ConfigField for ScanConcurrency {
             )));
         }
 
-        *self = match value.trim().to_ascii_lowercase().as_str() {
-            "auto" => Self::Auto,
-            "off" | "disabled" | "none" | "0" => Self::Off,
-            value => {
-                let concurrency = value.parse::<usize>().map_err(|err| {
-                    DataFusionError::Configuration(format!(
-                        "Invalid scan_concurrency value {value:?}; expected 'auto', 'off', or a positive integer: {err}"
-                    ))
-                })?;
-                if concurrency == 0 {
-                    Self::Off
-                } else {
-                    Self::Explicit(concurrency)
-                }
-            }
-        };
+        *self = value
+            .parse::<Self>()
+            .map_err(DataFusionError::Configuration)?;
 
         Ok(())
     }
@@ -592,7 +610,8 @@ impl FileFormat for VortexFormat {
                             .as_any()
                             .downcast_ref::<CachedVortexMetadata>()
                     {
-                        let inferred_schema = cached_vortex.footer().dtype().to_arrow_schema()?;
+                        let inferred_schema =
+                            session.arrow().to_arrow_schema(cached_vortex.footer().dtype())?;
                         return VortexResult::Ok((object.location, inferred_schema));
                     }
 
@@ -624,7 +643,7 @@ impl FileFormat for VortexFormat {
                     let entry = CachedFileMetadataEntry::new(object.clone(), cached_metadata);
                     cache.put(&object.location, entry);
 
-                    let inferred_schema = vxf.dtype().to_arrow_schema()?;
+                    let inferred_schema = session.arrow().to_arrow_schema(vxf.dtype())?;
                     VortexResult::Ok((object.location, inferred_schema))
                 })
                 .map(|result| -> DFResult<_> {

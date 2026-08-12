@@ -195,30 +195,24 @@ pub(crate) fn strategy_builder_for_level(level: u8) -> Option<WriteStrategyBuild
     let builder = match level {
         // 0: no schemes — pure canonical/uncompressed (zero search, zero transform).
         0 => BtrBlocksCompressorBuilder::empty(),
-        // 1: + constant / sparse detection (near-free; common CDC shapes).
+        // 1: + sparse detection (near-free; constant detection is built into
+        // the cascade by this Vortex revision).
         1 => builder_with_schemes(&[
-            &integer::IntConstantScheme,
             &integer::SparseScheme,
-            &float::FloatConstantScheme,
             &float::NullDominatedSparseScheme,
-            &string::StringConstantScheme,
             &string::NullDominatedSparseScheme,
         ]),
         // 2: + dictionary (cheap, high-value on repetitive CDC data).
         2 => builder_with_schemes(&[
-            &integer::IntConstantScheme,
             &integer::SparseScheme,
             &integer::IntDictScheme,
-            &float::FloatConstantScheme,
             &float::NullDominatedSparseScheme,
             &float::FloatDictScheme,
-            &string::StringConstantScheme,
             &string::NullDominatedSparseScheme,
             &string::StringDictScheme,
         ]),
         // 3: + cheap numeric schemes (FoR, BitPacking, ZigZag, RunEnd, Sequence).
         3 => builder_with_schemes(&[
-            &integer::IntConstantScheme,
             &integer::SparseScheme,
             &integer::IntDictScheme,
             &integer::FoRScheme,
@@ -226,11 +220,9 @@ pub(crate) fn strategy_builder_for_level(level: u8) -> Option<WriteStrategyBuild
             &integer::ZigZagScheme,
             &integer::RunEndScheme,
             &integer::SequenceScheme,
-            &float::FloatConstantScheme,
             &float::NullDominatedSparseScheme,
             &float::FloatDictScheme,
             &float::FloatRLEScheme,
-            &string::StringConstantScheme,
             &string::NullDominatedSparseScheme,
             &string::StringDictScheme,
         ]),

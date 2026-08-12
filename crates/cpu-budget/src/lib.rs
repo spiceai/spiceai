@@ -596,6 +596,26 @@ impl CpuBudget {
         self.cores
     }
 
+    /// Ceiling on the splits ONE Vortex file scan decodes concurrently when the
+    /// count is derived rather than configured (`scan_concurrency: auto`).
+    ///
+    /// The derivation divides the query fan-out across the files a scan plans, so
+    /// a table held in few files concentrates the whole fan-out inside a single
+    /// file scan. That fan-out follows [`Self::target_partitions`] only while it
+    /// is unset — an explicit `runtime.query.target_partitions` above the
+    /// entitlement would otherwise carry straight into the number of decodes a
+    /// single scan runs at once. Past the entitlement those decodes cannot run in
+    /// parallel anyway; they only add resident decoded batches, which the scan
+    /// charges to the query memory pool. So the derived count stops here.
+    ///
+    /// An explicit per-table `scan_concurrency` is an operator override and is NOT
+    /// clamped, matching how every other explicitly-set knob outranks its derived
+    /// default.
+    #[must_use]
+    pub const fn scan_split_concurrency(&self) -> usize {
+        self.cores
+    }
+
     /// Concurrently-executing query plans admitted when
     /// `runtime.query.max_concurrent_queries` is unset.
     ///

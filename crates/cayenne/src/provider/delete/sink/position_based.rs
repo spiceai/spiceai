@@ -46,7 +46,7 @@ use roaring::RoaringBitmap;
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 use vortex::VortexSessionDefault;
-use vortex::array::arrow::IntoArrowArray;
+use vortex::arrow::IntoArrowArray;
 use vortex::file::OpenOptionsSessionExt;
 use vortex::layout::layouts::row_idx::row_idx;
 use vortex_datafusion::DefaultExpressionConvertor;

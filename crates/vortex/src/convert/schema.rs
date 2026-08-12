@@ -6,7 +6,7 @@ use arrow_schema::Field;
 use arrow_schema::Schema;
 use datafusion_common::Result as DFResult;
 use datafusion_common::exec_datafusion_err;
-use vortex::array::arrow::ArrowSession;
+use vortex::arrow::ArrowSession;
 use vortex::dtype::DType;
 
 /// Calculate the physical Arrow schema for a Vortex file given its `DType` and the expected logical schema.
@@ -214,7 +214,7 @@ mod tests {
     use std::sync::Arc;
 
     use arrow_schema::Fields;
-    use vortex::array::arrow::ArrowSession;
+    use vortex::arrow::ArrowSession;
     use vortex::dtype::Nullability;
     use vortex::dtype::PType;
     use vortex::dtype::StructFields;

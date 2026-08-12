@@ -37,7 +37,7 @@ use itertools::Itertools;
 use object_store::path::Path;
 use tracing::Instrument;
 use vortex::array::VortexSessionExecute;
-use vortex::array::arrow::ArrowSessionExt;
+use vortex::arrow::ArrowSessionExt;
 use vortex::dtype::FieldMask;
 use vortex::error::VortexError;
 use vortex::error::VortexExpect;
@@ -407,7 +407,13 @@ impl FileOpener for VortexOpener {
             }
 
             if let Some(concurrency) = scan_concurrency {
-                scan_builder = scan_builder.with_concurrency(concurrency);
+                // Absolute, not per-worker: this count is charged to the query
+                // memory pool one decoded batch at a time, and it is capped
+                // against the process's CPU entitlement. The per-worker form
+                // multiplies by `available_parallelism`, which reports the
+                // machine's cores rather than the share a cgroup granted, so
+                // neither the charge nor the cap would mean what it says.
+                scan_builder = scan_builder.with_absolute_concurrency(concurrency);
             }
 
             let stream_target_field = Field::new_struct("", stream_schema.fields().clone(), false);
@@ -644,7 +650,7 @@ mod tests {
     use rstest::rstest;
     use vortex::VortexSessionDefault;
     use vortex::array::ArrayRef;
-    use vortex::array::arrow::FromArrowArray;
+    use vortex::arrow::FromArrowArray;
     use vortex::buffer::Buffer;
     use vortex::file::WriteOptionsSessionExt;
     use vortex::io::VortexWrite;

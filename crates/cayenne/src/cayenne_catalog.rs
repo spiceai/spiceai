@@ -679,14 +679,69 @@ impl CayenneCatalog {
             })
     }
 
+    /// Reconcile the scan concurrency of a reopened table's stored
+    /// `VortexConfig` with the currently configured options.
+    ///
+    /// Scan concurrency describes how the table is run rather than how its data
+    /// is written, so changing it must not recreate the table. The provider runs
+    /// with the stored config, however, so persist a changed value here to make
+    /// `cayenne_scan_concurrency` effective for an existing table.
+    async fn reconcile_scan_concurrency(
+        &self,
+        stored: &mut TableMetadata,
+        options: &CreateTableOptions,
+    ) -> CatalogResult<()> {
+        let configured = options.vortex_config.scan_concurrency;
+        if stored.vortex_config.scan_concurrency == configured {
+            return Ok(());
+        }
+
+        stored.vortex_config.scan_concurrency = configured;
+        let vortex_config_json = serde_json::to_string(&stored.vortex_config).map_err(|e| {
+            CatalogError::InvalidOperation {
+                message: format!(
+                    "Failed to serialize updated runtime configuration for table {}.",
+                    stored.table_name
+                ),
+                source: Box::new(e),
+            }
+        })?;
+        self.metastore
+            .execute_helper(ExecuteParams {
+                sql: "UPDATE cayenne_table SET vortex_config_json = ?1 WHERE table_id = ?2",
+                params: vec![
+                    MetastoreValue::Text(vortex_config_json),
+                    MetastoreValue::Text(stored.table_id.clone()),
+                ],
+            })
+            .await
+            .map_err(|e| CatalogError::InvalidOperation {
+                message: format!(
+                    "Failed to persist updated runtime configuration for table {}.",
+                    stored.table_name
+                ),
+                source: Box::new(e),
+            })?;
+        tracing::debug!(
+            table = stored.table_name.as_str(),
+            "Reconciled runtime configuration from spicepod params on table reopen"
+        );
+        Ok(())
+    }
+
     async fn validate_existing_table_configuration(
         &self,
         table_name: &str,
         options: &CreateTableOptions,
     ) -> CatalogResult<TableMetadata> {
         match self.get_table(table_name).await {
-            Ok(stored_metadata) => {
+            Ok(mut stored_metadata) => {
                 log_runtime_footer_cache_drift(table_name, &stored_metadata, options);
+
+                if configuration_matches_ignoring_schema(&stored_metadata, options) {
+                    self.reconcile_scan_concurrency(&mut stored_metadata, options)
+                        .await?;
+                }
 
                 if configuration_matches(&stored_metadata, options) {
                     return Ok(stored_metadata);
