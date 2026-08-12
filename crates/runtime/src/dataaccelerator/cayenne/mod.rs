@@ -5169,12 +5169,9 @@ mod tests {
         let app = Arc::new(
             AppBuilder::new("test")
                 .with_runtime_params(
-                    [(
-                        "cayenne_goal_replication_lag".to_string(),
-                        "5s".to_string(),
-                    )]
-                    .into_iter()
-                    .collect(),
+                    [("cayenne_goal_replication_lag".to_string(), "5s".to_string())]
+                        .into_iter()
+                        .collect(),
                 )
                 .build(),
         );

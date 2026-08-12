@@ -690,7 +690,10 @@ mod tests {
             (TuningMode::Adaptive, false)
         );
         // An unrecognized value is reported, and can NEVER enable adaptive.
-        assert_eq!(TuningMode::parse(Some("nonsense")), (TuningMode::Auto, true));
+        assert_eq!(
+            TuningMode::parse(Some("nonsense")),
+            (TuningMode::Auto, true)
+        );
         assert!(!TuningMode::default().is_adaptive());
     }
 
