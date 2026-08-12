@@ -1092,7 +1092,7 @@ impl Refresher {
                                 // attach after their own initial load completes, so the set is
                                 // resolved live rather than captured when this loop started.
                                 for table_name in refresh_task.get_dataset_names().await {
-                                    if let Err(e) = cache_provider.invalidate_for_table(table_name.clone()) {
+                                    if let Err(e) = cache_provider.invalidate_for_table(table_name.clone()).await {
                                         tracing::warn!("Failed to invalidate cached results for dataset {table_name}: {e}");
                                     }
                                 }
