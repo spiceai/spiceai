@@ -308,6 +308,26 @@ pub trait Read: Send + Sync {
         &self,
         table_reference: TableReference,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn Error + Send + Sync>>;
+
+    /// A provider for a table whose schema the caller has already resolved.
+    ///
+    /// Lets a caller holding many schemas at once -- a catalog that resolved a
+    /// whole namespace in one query, say -- build providers without a round trip
+    /// per table.
+    ///
+    /// The default delegates to [`Read::table_provider`], discarding `schema`
+    /// and resolving it from the source instead: correct, and as costly as not
+    /// having asked. An implementation that overrides this must return a
+    /// provider indistinguishable from [`Read::table_provider`]'s -- same
+    /// wrappers, same pushdown -- since a table that plans differently depending
+    /// on how it was discovered is a bug the caller cannot see.
+    async fn table_provider_with_schema(
+        &self,
+        table_reference: TableReference,
+        _schema: SchemaRef,
+    ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn Error + Send + Sync>> {
+        self.table_provider(table_reference).await
+    }
 }
 
 #[async_trait]

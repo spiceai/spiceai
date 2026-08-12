@@ -22,6 +22,7 @@ use std::sync::Arc;
 
 use crate::{Read, ReadWrite};
 
+use datafusion::arrow::datatypes::SchemaRef;
 use datafusion_table_providers::postgres::PostgresTableFactory;
 
 #[async_trait]
@@ -30,7 +31,21 @@ impl Read for PostgresTableFactory {
         &self,
         table_reference: TableReference,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
-        self.table_provider(table_reference).await
+        // Named through the concrete type: `self.table_provider(..)` would also
+        // resolve to the inherent method today, but silently becomes unbounded
+        // recursion into this impl if that method is ever renamed or removed.
+        PostgresTableFactory::table_provider(self, table_reference).await
+    }
+
+    /// Skips the per-table schema query, which is the point of resolving a
+    /// namespace in bulk. The underlying constructor shares its dialect and
+    /// federation wrapping with the querying one, so the provider is the same.
+    async fn table_provider_with_schema(
+        &self,
+        table_reference: TableReference,
+        schema: SchemaRef,
+    ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
+        PostgresTableFactory::table_provider_with_schema(self, table_reference, schema)
     }
 }
 
