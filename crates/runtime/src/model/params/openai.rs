@@ -130,7 +130,7 @@ impl TypedParams for OpenAiModelParams {
         mut params: HashMap<String, SecretString>,
         secrets: &Arc<RwLock<R>>,
     ) -> Result<Self, ParamsError> {
-        let responses_api_is_supplied = params.contains_key("openai_responses_api");
+        let responses_api_is_supplied = params.contains_key("responses_api");
         let auth_mode = params
             .remove("openai_auth_mode")
             .map(|value| parse_param("openai_auth_mode", &value))

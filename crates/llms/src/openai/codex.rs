@@ -24,9 +24,7 @@ use async_openai::types::chat::{
 };
 use async_openai::types::responses::{CreateResponse, Response, ResponseStream};
 use async_trait::async_trait;
-use reqwest::header::{
-    ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue, USER_AGENT,
-};
+use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, USER_AGENT};
 use runtime_rate_control::RateController;
 use runtime_request_context::{AsyncMarker, Extension, RequestContext};
 
@@ -101,6 +99,7 @@ impl Extension for CodexRequestHeaders {
 /// An OpenAI Responses API client authenticated by a Codex caller's headers.
 pub struct Codex {
     api_base: String,
+    http_client: reqwest::Client,
     model: String,
     rate_controller: Arc<RateController>,
 }
@@ -114,6 +113,7 @@ impl Codex {
     ) -> Self {
         Self {
             api_base,
+            http_client: reqwest::Client::new(),
             model,
             rate_controller,
         }
@@ -135,7 +135,7 @@ impl Codex {
         }
 
         let config = HostedModelConfig::from_url(&self.api_base).with_headers(headers.headers());
-        Ok(Client::with_config(config))
+        Ok(Client::with_config(config).with_http_client(self.http_client.clone()))
     }
 }
 
@@ -224,6 +224,7 @@ impl Chat for Codex {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use reqwest::header::HeaderValue;
 
     #[test]
     fn forwards_only_the_codex_header_allowlist() {

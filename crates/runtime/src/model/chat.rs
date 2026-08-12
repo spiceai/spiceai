@@ -612,6 +612,8 @@ fn openai(
     raw_params: &HashMap<String, SecretString>,
     params: &OpenAiModelParams,
 ) -> Result<Arc<dyn Chat>, LlmError> {
+    validate_temperature(raw_params, "openai")?;
+
     if params.auth.is_codex() {
         validate_codex_params(params)?;
         return Ok(Arc::new(llms::openai::new_codex_client(
@@ -628,8 +630,6 @@ fn openai(
     let usage_tier = Some(params.usage_tier);
     let chat_backend = params.responses_api;
 
-    validate_temperature(raw_params, "openai")?;
-
     Ok(Arc::new(llms::openai::new_openai_client_with_chat_backend(
         model_id.unwrap_or(DEFAULT_LLM_MODEL.to_string()),
         api_base,
@@ -644,7 +644,7 @@ fn openai(
 pub(super) fn validate_codex_params(params: &OpenAiModelParams) -> Result<(), LlmError> {
     if params.responses_api != llms::openai::ChatBackend::Responses {
         return Err(LlmError::FailedToLoadModel {
-            source: "Codex authentication requires `openai_responses_api: enabled` so chat-completions requests use the Responses API.".into(),
+            source: "Codex authentication requires `responses_api: enabled` so chat-completions requests use the Responses API.".into(),
         });
     }
 
@@ -655,7 +655,7 @@ pub(super) fn validate_codex_params(params: &OpenAiModelParams) -> Result<(), Ll
 /// than deferring to a request-time provider error. The value is read from the
 /// raw params map because overrides are passthrough (see [`super::params::common`]),
 /// accepting the unprefixed, `{prefix}_`-prefixed, and legacy `openai_` forms.
-fn validate_temperature(
+pub(super) fn validate_temperature(
     raw_params: &HashMap<String, SecretString>,
     prefix: &str,
 ) -> Result<(), LlmError> {

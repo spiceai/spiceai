@@ -181,7 +181,7 @@ mod tests {
             "model openai",
             params(&[
                 ("openai_auth_mode", "codex_plan"),
-                ("openai_endpoint", "https://codex.example/v1"),
+                ("endpoint", "https://codex.example/v1"),
             ]),
             &empty_secrets(),
         )
@@ -189,6 +189,22 @@ mod tests {
         .expect("Codex plan authentication params should deserialize");
 
         assert_eq!(typed.endpoint, "https://codex.example/v1");
+    }
+
+    #[tokio::test]
+    async fn openai_codex_authentication_preserves_responses_api_override() {
+        let typed = openai::OpenAiModelParams::try_from_params(
+            "model openai",
+            params(&[("openai_auth_mode", "codex"), ("responses_api", "disabled")]),
+            &empty_secrets(),
+        )
+        .await
+        .expect("Codex authentication params should deserialize");
+
+        assert_eq!(
+            typed.responses_api,
+            llms::openai::ChatBackend::ChatCompletions
+        );
     }
 
     #[tokio::test]

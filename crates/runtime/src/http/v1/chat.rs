@@ -124,6 +124,9 @@ pub(crate) async fn post(
     Json(req): Json<CreateChatCompletionRequest>,
 ) -> Response {
     let context = RequestContext::current(AsyncMarker::new().await);
+    context.insert_extension(llms::openai::codex::CodexRequestHeaders::from_headers(
+        &headers,
+    ));
 
     let span = tracing::span!(
         target: "task_history",
