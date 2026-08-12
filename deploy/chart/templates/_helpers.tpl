@@ -133,7 +133,7 @@ security policy by interpreting arbitrary shell programs or entrypoints.
 {{- if not (has $mode (list "disabled" "bootstrap" "connected")) -}}
 {{- fail "cloudConnect.mode must be one of disabled, bootstrap, or connected. See deploy/chart/examples/cloud-connect/." -}}
 {{- end -}}
-{{- if regexMatch "spice-enroll-[A-Za-z0-9_-]+" (toJson .Values) -}}
+{{- if regexMatch "spice-enroll-[A-Za-z0-9_-]{32}([^A-Za-z0-9_-]|$)" (toJson .Values) -}}
 {{- fail "Cloud Connect enrollment keys must come from a Kubernetes Secret and must never be stored in chart values. See deploy/chart/examples/cloud-connect/." -}}
 {{- end -}}
 {{- $hasTokenSyntax := include "spiceai.cloudConnectTokenBootstrap" . -}}

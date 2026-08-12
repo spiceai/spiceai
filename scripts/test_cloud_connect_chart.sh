@@ -20,6 +20,7 @@ CHART="deploy/chart"
 EXAMPLES="${CHART}/examples/cloud-connect"
 FAILURES=0
 TEST_ENROLLMENT_KEY="spice-enroll-$(printf 'A%.0s' {1..32})"
+TEST_OVERLONG_ENROLLMENT_LIKE_VALUE="spice-enroll-$(printf 'A%.0s' {1..33})"
 
 pass() { echo "ok: $1"; }
 fail() {
@@ -199,6 +200,23 @@ if render --set-json 'command=["spiced","--set-runtime","debug.flag=--token"]' >
   pass "incidental token-like text in a direct argument is not bootstrap syntax"
 else
   fail "the validation mistook incidental direct-argument text for token syntax"
+fi
+if render --set-string additionalLabels.event-stream=spice-enroll-events >/dev/null; then
+  pass "ordinary enrollment-like label text is not treated as an enrollment key"
+else
+  fail "the validation mistook ordinary enrollment-like label text for an enrollment key"
+fi
+if render --set-string "additionalLabels.overlong-value=${TEST_OVERLONG_ENROLLMENT_LIKE_VALUE}" >/dev/null; then
+  pass "an overlong base64url lookalike is not treated as an enrollment key"
+else
+  fail "the validation matched an enrollment-key prefix inside a longer base64url value"
+fi
+if output="$(render --set-string "additionalLabels.enrollment-key=${TEST_ENROLLMENT_KEY}")"; then
+  fail "a literal enrollment key outside the bootstrap values rendered"
+elif echo "${output}" | grep -q "enrollment keys must come from a Kubernetes Secret"; then
+  pass "a literal enrollment key anywhere in chart values is rejected"
+else
+  fail "a literal enrollment key outside bootstrap values was rejected for the wrong reason: ${output}"
 fi
 
 # --- The example values files never hold a literal key ---
