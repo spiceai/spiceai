@@ -142,6 +142,8 @@ enum QueryHandleState {
 pub struct QueryHandle {
     /// The Ballista scheduler job ID (or a synthetic ID for cached results).
     ballista_job_id: String,
+    /// Start of the query read, used to reject cache writes invalidated while executing.
+    query_start: std::time::Instant,
     /// Internal state (running or cached).
     state: QueryHandleState,
     /// Result schema from the logical plan.
@@ -209,9 +211,11 @@ impl QueryHandle {
         tracker: Option<QueryTracker>,
         request_context: Arc<RequestContext>,
         task_history_span: Span,
+        query_start: std::time::Instant,
     ) -> Self {
         Self {
             ballista_job_id,
+            query_start,
             state: QueryHandleState::Running { scheduler },
             schema,
             datasets: Some(datasets),
@@ -239,6 +243,7 @@ impl QueryHandle {
     ) -> Self {
         Self {
             ballista_job_id: job_id,
+            query_start: std::time::Instant::now(),
             state: QueryHandleState::Cached {
                 cached_stream: Arc::new(Mutex::new(Some(cached_stream))),
             },

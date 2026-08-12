@@ -586,6 +586,7 @@ impl Query {
         // Get the scheduler server
         let scheduler = Self::get_scheduler_server(&self.df)?;
         let tracker = self.tracker;
+        let query_start = std::time::Instant::now();
 
         // Create session for this job. The
         // `SpiceRequestContextConfig` extension propagates the originating
@@ -823,6 +824,7 @@ impl Query {
             tracker,
             request_context,
             span,
+            query_start,
         ))
     }
 
@@ -873,6 +875,7 @@ impl Query {
     }
 
     async fn run_internal(self, request_context: Arc<RequestContext>) -> Result<QueryResult> {
+        let query_start = std::time::Instant::now();
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "sql_query", input = %self.sql, runtime_query = false);
 
         if let Some(traceparent) = request_context.trace_parent() {
