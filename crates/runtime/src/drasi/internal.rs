@@ -206,16 +206,29 @@ fn declared_primary_key(
     constraints: Option<&Constraints>,
     schema: &SchemaRef,
 ) -> Option<Vec<String>> {
-    let columns = datafusion_ddl::extract_primary_key_columns(constraints?, schema);
+    let constraints = constraints?;
+
+    // How many columns the key declares, before any of them are resolved.
+    let declared = constraints.iter().find_map(|constraint| {
+        if let datafusion::common::Constraint::PrimaryKey(indices) = constraint {
+            Some(indices.len())
+        } else {
+            None
+        }
+    })?;
+
+    let columns = datafusion_ddl::extract_primary_key_columns(constraints, schema);
 
     // `extract_primary_key_columns` drops an index it cannot resolve, which
     // would silently shorten the key — and a shortened key is a wrong element
-    // id, merging distinct rows onto one Drasi node. Take it only when every
-    // index resolved.
-    if columns.is_empty() {
-        None
-    } else {
+    // id, merging distinct rows onto one Drasi node. Comparing against the
+    // declared count is what catches a *partially* resolved composite key: it
+    // is non-empty, so an emptiness check alone accepts it. The caller turns
+    // `None` into a structured error naming the table.
+    if columns.len() == declared && !columns.is_empty() {
         Some(columns)
+    } else {
+        None
     }
 }
 
@@ -304,6 +317,23 @@ mod tests {
             declared_primary_key(Some(&constraints), &schema()),
             Some(vec!["trace_id".to_string(), "span_id".to_string()])
         );
+    }
+
+    /// A composite key whose trailing index names no column resolves to a
+    /// *shorter* key, not an empty one. Accepting it would map every row
+    /// sharing `trace_id` onto one Drasi element id, merging distinct rows.
+    #[test]
+    fn partially_resolved_composite_key_is_rejected() {
+        let constraints = Constraints::new_unverified(vec![Constraint::PrimaryKey(vec![0, 99])]);
+        assert_eq!(declared_primary_key(Some(&constraints), &schema()), None);
+    }
+
+    /// Every index unresolvable is the same fault, and must not be read as
+    /// "this table declares no key".
+    #[test]
+    fn wholly_unresolved_key_is_rejected() {
+        let constraints = Constraints::new_unverified(vec![Constraint::PrimaryKey(vec![99])]);
+        assert_eq!(declared_primary_key(Some(&constraints), &schema()), None);
     }
 
     /// A `Unique` constraint is not an identity: two rows can differ on it over
