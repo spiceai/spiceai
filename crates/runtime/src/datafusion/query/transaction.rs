@@ -53,7 +53,7 @@ use futures::TryStreamExt;
 use runtime_request_context::{AsyncMarker, RequestContext};
 
 use super::{Error as QueryError, QueryBuilder, ResultsCacheMode};
-use crate::accelerated_table::{
+use crate::accelerated::{
     AcceleratedTable,
     write::{CayenneWriteTarget, dual_write::extract_cayenne_write_target},
 };
@@ -367,7 +367,10 @@ async fn resolve_cayenne_staged(
     table_name: &str,
 ) -> Option<CayenneTableProvider> {
     let provider = df.get_accelerated_table_provider(table_name).await.ok()?;
-    let accel = provider.downcast_ref::<AcceleratedTable>()?;
+    let accel = spice_table::find_layer::<AcceleratedTable>(
+        provider.as_ref(),
+        spice_table::LayerWalk::Read,
+    )?;
     // Accelerator-only (the gate governs the sole accelerator write) OR durable
     // write-back (the write stages to the accelerator, marks its keys, and a
     // per-table worker reconciles them to the source — see #11838). Both stage

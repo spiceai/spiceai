@@ -15,102 +15,28 @@ limitations under the License.
 */
 
 #![allow(clippy::missing_errors_doc)]
-use std::{borrow::Cow, collections::HashMap, error::Error, hash::BuildHasher, sync::Arc};
+use std::{collections::HashMap, error::Error, hash::BuildHasher, sync::Arc};
 
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::{Schema, SchemaRef};
 use datafusion::{
-    catalog::{CatalogProvider, Session},
-    common::{Constraints, Statistics, stats::Precision},
-    datasource::{TableProvider, TableType},
-    error::Result as DataFusionResult,
-    logical_expr::{LogicalPlan, TableProviderFilterPushDown, dml::InsertOp},
-    physical_plan::ExecutionPlan,
-    prelude::Expr,
+    catalog::CatalogProvider,
+    common::{Statistics, stats::Precision},
+    datasource::TableProvider,
     sql::TableReference,
 };
 use datafusion_federation::FederatedTableProviderAdaptor;
+use spice_table::{LayerWalk, SpiceTable, TableLayer};
 
-/// Schema-level metadata key for foreign key relationships.
-///
-/// The value is a JSON array of objects, each describing one foreign key constraint:
-/// ```json
-/// [
-///   {
-///     "columns": ["customer_id"],
-///     "foreign_table": "catalog.public.customers",
-///     "foreign_columns": ["id"]
-///   }
-/// ]
-/// ```
-///
-/// `foreign_table` is a fully-qualified `catalog.schema.table` name whose
-/// components are quoted following `PostgreSQL` `quote_ident` semantics
-/// (quoted only when required, doubling any embedded `"`). This keeps the
-/// name unambiguous — and round-trippable via `TableReference::parse_str` —
-/// when a component legally contains a `.`, e.g. `catalog."my.schema".table`.
-pub const FOREIGN_KEYS_METADATA_KEY: &str = "foreign_keys";
-
-/// Canonical Arrow metadata key for user-facing table and column descriptions.
-pub const DESCRIPTION_METADATA_KEY: &str = "description";
-
-/// Canonical Arrow field metadata key for the source-native column type.
-pub const SOURCE_TYPE_METADATA_KEY: &str = "source_type";
-
-/// Canonical Arrow field metadata key marking source partition columns.
-pub const PARTITION_METADATA_KEY: &str = "partition";
-
-/// Canonical Arrow field metadata key marking source clustering columns.
-///
-/// Values are one-based ordinals when the source reports clustering order.
-pub const CLUSTERING_METADATA_KEY: &str = "clustering";
-
-/// Canonical Arrow schema metadata key for a source-native clustering expression.
-pub const CLUSTERING_KEY_METADATA_KEY: &str = "clustering_key";
-
-/// Schema-level metadata key for an inferred primary key (schema inference).
-///
-/// The value is a JSON array of column names in key order, e.g. `["tenant_id","id"]`.
-/// Emitted by connectors that perform schema inference and consumed by the
-/// runtime to fill `acceleration.primary_key` when the user left it unset.
-pub const INFERRED_PRIMARY_KEY_METADATA_KEY: &str = "spice.inferred_primary_key";
-
-/// Schema-level metadata key for inferred secondary indexes (schema inference).
-///
-/// The value is a JSON array of objects, each describing one index:
-/// `[{ "columns": ["email"], "unique": true }]`.
-pub const INFERRED_INDEXES_METADATA_KEY: &str = "spice.inferred_indexes";
-
-/// Schema-level metadata key for inferred sort/clustering columns (schema inference).
-///
-/// The value is a JSON array of objects in sort order, each with a direction:
-/// `[{ "column": "created_at", "desc": true }, { "column": "id", "desc": false }]`.
-pub const INFERRED_SORT_COLUMNS_METADATA_KEY: &str = "spice.inferred_sort_columns";
-
-/// Schema-level metadata key for the rough estimated row count (schema inference).
-///
-/// The value is a base-10 integer string. This is a catalog estimate (e.g. Postgres
-/// `pg_class.reltuples`), not a precise count, and is surfaced as table statistics.
-pub const INFERRED_ROW_COUNT_METADATA_KEY: &str = "spice.inferred_row_count";
-
-/// Schema-level metadata key for the rough estimated table byte size (schema inference).
-///
-/// The value is a base-10 integer string of bytes (e.g. Postgres `pg_relation_size`).
-pub const INFERRED_TABLE_BYTES_METADATA_KEY: &str = "spice.inferred_table_bytes";
-
-/// Schema-level metadata key for the source's declared distribution/shard key
-/// (schema inference): Postgres partition-key columns or the `MongoDB`
-/// shard-key fields.
-///
-/// The value is a JSON array of column names in key order: `["region", "id"]`.
-pub const INFERRED_SHARD_KEY_METADATA_KEY: &str = "spice.inferred_shard_key";
-
-/// Schema-level metadata key for rough per-column statistics (extended schema
-/// inference), e.g. from Postgres `pg_stats`.
-///
-/// The value is a JSON array of objects:
-/// `[{ "column": "created_at", "distinct_count": 100000, "correlation": 0.99 }]`.
-pub const INFERRED_COLUMN_STATS_METADATA_KEY: &str = "spice.inferred_column_stats";
+/// Canonical Arrow metadata keys, re-exported from `arrow_tools` where they are
+/// defined, so connectors keep reaching them through this crate.
+pub use arrow_tools::metadata_keys::{
+    CLUSTERING_KEY_METADATA_KEY, CLUSTERING_METADATA_KEY, DESCRIPTION_METADATA_KEY,
+    FOREIGN_KEYS_METADATA_KEY, INFERRED_COLUMN_STATS_METADATA_KEY, INFERRED_INDEXES_METADATA_KEY,
+    INFERRED_PRIMARY_KEY_METADATA_KEY, INFERRED_ROW_COUNT_METADATA_KEY,
+    INFERRED_SHARD_KEY_METADATA_KEY, INFERRED_SORT_COLUMNS_METADATA_KEY,
+    INFERRED_TABLE_BYTES_METADATA_KEY, PARTITION_METADATA_KEY, SOURCE_TYPE_METADATA_KEY,
+};
 
 /// Metadata to merge into fields, keyed by field name.
 pub type FieldMetadata = HashMap<String, HashMap<String, String>>;
@@ -177,6 +103,7 @@ pub mod sqlite;
 pub mod turso;
 pub mod unity_catalog;
 
+pub mod catalog_filter;
 pub mod key_filter;
 pub mod pk_filter_expr;
 pub mod rate_limit;
@@ -189,12 +116,12 @@ pub mod object;
 pub mod poly;
 pub mod update;
 
-/// A [`TableProvider`] wrapper that merges additional metadata into the Arrow schema.
+/// A layer that merges additional metadata into the Arrow schema.
 ///
-/// All trait methods delegate to the inner provider except [`schema()`](TableProvider::schema),
-/// which returns the original schema with `extra_metadata` merged in.
+/// Declares only what it changes — the schema, which is the original with
+/// `extra_metadata` merged in, and the statistics it can infer from that
+/// metadata. Everything else is the table beneath it.
 pub struct MetadataEnrichedTableProvider {
-    inner: Arc<dyn TableProvider>,
     schema: SchemaRef,
 }
 
@@ -203,7 +130,10 @@ impl MetadataEnrichedTableProvider {
     ///
     /// Keys in `extra_metadata` will overwrite any pre-existing schema metadata with the same key.
     #[must_use]
-    pub fn new<S>(inner: Arc<dyn TableProvider>, extra_metadata: HashMap<String, String, S>) -> Self
+    pub fn new<S>(
+        inner: &Arc<dyn TableProvider>,
+        extra_metadata: HashMap<String, String, S>,
+    ) -> Self
     where
         S: BuildHasher,
     {
@@ -216,7 +146,7 @@ impl MetadataEnrichedTableProvider {
     /// `field_metadata` overwrite pre-existing field metadata for matching field names.
     #[must_use]
     pub fn new_with_field_metadata<S>(
-        inner: Arc<dyn TableProvider>,
+        inner: &Arc<dyn TableProvider>,
         extra_metadata: HashMap<String, String, S>,
         field_metadata: &FieldMetadata,
     ) -> Self
@@ -246,12 +176,7 @@ impl MetadataEnrichedTableProvider {
             .collect::<Vec<_>>();
 
         let schema = Arc::new(Schema::new_with_metadata(fields, metadata));
-        Self { inner, schema }
-    }
-
-    #[must_use]
-    pub fn get_inner_ref(&self) -> &Arc<dyn TableProvider> {
-        &self.inner
+        Self { schema }
     }
 }
 
@@ -292,11 +217,14 @@ where
         ));
     }
 
-    Arc::new(MetadataEnrichedTableProvider::new_with_field_metadata(
+    SpiceTable::over(
+        Arc::new(MetadataEnrichedTableProvider::new_with_field_metadata(
+            &provider,
+            extra_metadata,
+            &field_metadata,
+        )),
         provider,
-        extra_metadata,
-        &field_metadata,
-    ))
+    ) as Arc<dyn TableProvider>
 }
 
 impl std::fmt::Debug for MetadataEnrichedTableProvider {
@@ -307,81 +235,38 @@ impl std::fmt::Debug for MetadataEnrichedTableProvider {
 }
 
 #[async_trait]
-impl TableProvider for MetadataEnrichedTableProvider {
-    fn schema(&self) -> SchemaRef {
+impl TableLayer for MetadataEnrichedTableProvider {
+    /// Injects spicepod table/column metadata into the schema and carries no
+    /// read, CDC, source or index semantics of its own — so every walk but the
+    /// write walk sees past it, matching the write pass-through it does not have.
+    fn route<'a>(
+        &'a self,
+        walk: LayerWalk,
+        below: &'a Arc<dyn TableProvider>,
+    ) -> Option<&'a Arc<dyn TableProvider>> {
+        // Exhaustive on purpose: a wildcard would answer a future walk kind
+        // for this layer without anyone deciding what it should say.
+        match walk {
+            LayerWalk::Read
+            | LayerWalk::CdcDetection
+            | LayerWalk::Source
+            | LayerWalk::RetentionDelete
+            | LayerWalk::Index => Some(below),
+            LayerWalk::Write => None,
+        }
+    }
+
+    fn schema(&self, _below: &Arc<dyn TableProvider>) -> SchemaRef {
         Arc::clone(&self.schema)
     }
 
-    fn constraints(&self) -> Option<&Constraints> {
-        self.inner.constraints()
-    }
-
-    fn table_type(&self) -> TableType {
-        self.inner.table_type()
-    }
-
-    fn get_logical_plan(&self) -> Option<Cow<'_, LogicalPlan>> {
-        self.inner.get_logical_plan()
-    }
-
-    fn get_column_default(&self, column: &str) -> Option<&Expr> {
-        self.inner.get_column_default(column)
-    }
-
-    fn supports_filters_pushdown(
-        &self,
-        filters: &[&Expr],
-    ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
-        self.inner.supports_filters_pushdown(filters)
-    }
-
-    async fn scan(
-        &self,
-        state: &dyn Session,
-        projection: Option<&Vec<usize>>,
-        filters: &[Expr],
-        limit: Option<usize>,
-    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        self.inner.scan(state, projection, filters, limit).await
-    }
-
-    async fn insert_into(
-        &self,
-        state: &dyn Session,
-        input: Arc<dyn ExecutionPlan>,
-        overwrite: InsertOp,
-    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        self.inner.insert_into(state, input, overwrite).await
-    }
-
-    async fn delete_from(
-        &self,
-        state: &dyn Session,
-        filters: Vec<Expr>,
-    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        self.inner.delete_from(state, filters).await
-    }
-
-    async fn update(
-        &self,
-        state: &dyn Session,
-        assignments: Vec<(String, Expr)>,
-        filters: Vec<Expr>,
-    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        self.inner.update(state, assignments, filters).await
-    }
-
-    async fn truncate(&self, state: &dyn Session) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        self.inner.truncate(state).await
-    }
-
-    fn statistics(&self) -> Option<Statistics> {
+    fn statistics(&self, below: &Arc<dyn TableProvider>) -> Option<Statistics> {
         // Surface the inferred rough table size as table statistics so the query
         // optimizer, acceleration sizing, and observability can use it. Prefer the
-        // inner provider's statistics where it has them (they may be exact or
-        // cheaper), filling only the row-count / byte-size fields it leaves `Absent`
-        // with the inferred estimate.
-        match (inferred_statistics(&self.schema), self.inner.statistics()) {
+        // provider beneath where it has them (they may be exact or cheaper),
+        // filling only the row-count / byte-size fields it leaves `Absent` with
+        // the inferred estimate.
+        match (inferred_statistics(&self.schema), below.statistics()) {
             (Some(inferred), Some(mut inner)) => {
                 if matches!(inner.num_rows, Precision::Absent) {
                     inner.num_rows = inferred.num_rows;
@@ -532,8 +417,13 @@ impl Drop for RefreshingCatalogProvider {
 mod tests {
     use super::*;
     use datafusion::arrow::datatypes::{DataType, Field};
+    use datafusion::catalog::Session;
+    use datafusion::datasource::TableType;
     use datafusion::error::DataFusionError;
+    use datafusion::error::Result as DataFusionResult;
     use datafusion::logical_expr::{LogicalPlan, TableSource};
+    use datafusion::physical_plan::ExecutionPlan;
+    use datafusion::prelude::Expr;
     use datafusion_federation::{
         FederatedTableProviderAdaptor, FederatedTableSource, FederationAnalyzerForLogicalPlan,
         FederationProvider,

@@ -85,7 +85,7 @@ use crate::cluster::{
 use crate::extension::Extension;
 use crate::udtfs::ListUDFTableFunc;
 use runtime_async::cancellable_task::{CancellableTaskHandle, spawn_cancellable_task};
-pub mod accelerated_table;
+pub use runtime_table::accelerated;
 pub(crate) mod accelerator_memory_budget;
 pub mod auth;
 pub mod builder;
@@ -103,7 +103,7 @@ pub mod embeddings;
 pub mod execution_plan;
 pub mod executor_table;
 pub mod extension;
-pub mod federated_table;
+pub use runtime_table::federated;
 pub mod flight;
 mod http;
 
@@ -119,7 +119,7 @@ pub mod metrics_reader;
 mod metrics_server;
 pub mod model;
 mod object_store_state;
-mod opentelemetry;
+pub mod opentelemetry;
 pub mod otel_push_exporter;
 // Host/container resource introspection lives in `runtime-resources`; it names
 // nothing from the runtime. Re-exported so `crate::resource_monitor::…` resolves.
@@ -141,7 +141,6 @@ pub mod cluster;
 mod secrets_preflight;
 pub mod spice_metrics;
 pub mod status;
-pub(crate) mod table_layers;
 pub mod task_history;
 pub mod tls;
 pub mod token_providers;
@@ -609,7 +608,7 @@ pub struct Runtime {
 
     autoload_extensions: Arc<HashMap<String, Box<dyn ExtensionFactory>>>,
     extensions: Arc<RwLock<HashMap<String, Arc<dyn Extension>>>>,
-    spaced_tracer: Arc<tracers::SpacedTracer>,
+    spaced_tracer: Arc<util::tracers::SpacedTracer>,
 
     status: Arc<status::RuntimeStatus>,
     tasks: Arc<RwLock<HashMap<String, CancellableTaskHandle>>>,
@@ -1697,6 +1696,17 @@ impl Runtime {
         } else {
             false
         }
+    }
+
+    /// Whether the initial component load is still running.
+    ///
+    /// While it is, what is registered is not yet what the loaded app describes,
+    /// so a caller that reconciles a new app against the loaded one — the diff
+    /// [`Runtime::apply_app`] performs — would treat components the load has not
+    /// reached yet as already registered.
+    #[must_use]
+    pub fn initial_load_in_flight(&self) -> bool {
+        self.initial_load.in_flight.load(Ordering::SeqCst)
     }
 
     /// Will load all of the components of the Runtime, including `secret_stores`, `catalogs`, `datasets`, `models`, and `embeddings`.

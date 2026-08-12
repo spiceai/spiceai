@@ -46,6 +46,7 @@ serde.workspace = true
 serde_json.workspace = true
 search = { path = "../search", default-features = false, features = ["text_search"] }
 snafu.workspace = true
+spice-table = { path = "../spice-table" }
 spicepod = { path = "../spicepod" }
 rayon = { workspace = true }
 moka.workspace = true

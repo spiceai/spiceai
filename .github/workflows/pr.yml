@@ -67,6 +67,8 @@ jobs:
     # stuck.
     name: Attestation
     runs-on: ubuntu-latest
+    # A few API calls. Anything past this is a wedged step, not a slow one.
+    timeout-minutes: 15
     permissions:
       contents: read
       statuses: read
@@ -275,7 +277,7 @@ jobs:
               return;
             }
 
-            const rustAffecting = /(\.rs$|(^|\/)Cargo\.(toml|lock)$|(^|\/)rust-toolchain(\.toml)?$|(^|\/)\.cargo\/|(^|\/)\.?(clippy|rustfmt)\.toml$|(^|\/)nextest\.toml$|(^|\/)layers\.toml$|^scripts\/check_(crate_layers|rust_gate_paths)\.py$|^Makefile$)/;
+            const rustAffecting = /(\.rs$|(^|\/)Cargo\.(toml|lock)$|(^|\/)rust-toolchain(\.toml)?$|(^|\/)\.cargo\/|(^|\/)\.?(clippy|rustfmt)\.toml$|(^|\/)nextest\.toml$|(^|\/)layers\.toml$|^scripts\/check_(crate_layers|table_layers|rust_gate_paths)\.py$|^Makefile$)/;
             for (const file of files) {
               // A rename off a .rs path changes Rust sources even though the new
               // name doesn't match, so both sides of the rename must be clean.
@@ -625,6 +627,10 @@ jobs:
   check_changes:
     if: ${{ github.event_name != 'pull_request' }}
     runs-on: spiceai-macos
+    # A full-history checkout (`fetch-depth: 0`) and a path diff. Sized for a
+    # cold runner having to clone from scratch, not the ~1 min a warm
+    # self-hosted workspace takes.
+    timeout-minutes: 45
     outputs:
       relevant_changes: ${{ steps.check.outputs.relevant_changes }}
     steps:
@@ -646,6 +652,8 @@ jobs:
   lint-rust:
     name: Rust Lint
     runs-on: spiceai-macos
+    # Slowest observed success in the 2026-07-25..08-08 window: 126 min.
+    timeout-minutes: 300
     needs: check_changes
     if: ${{ github.event_name != 'pull_request' }}
     env:
@@ -676,7 +684,7 @@ jobs:
       - name: Set up spiceio
         if: needs.check_changes.outputs.relevant_changes == 'true' && runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true'
         id: setup-spiceio
-        uses: spiceai/spiceio/.github/actions/setup@97c3578dcf337786923da33cecd350e7335386b6 # v0.7.0
+        uses: spiceai/spiceio/.github/actions/setup@2ad4a874ff4813f8190117bc645af0dbb90b708c # v0.8.0
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
           smb-pass: ${{ secrets.UNAS_SMB_PASS }}
@@ -738,6 +746,8 @@ jobs:
   build-test:
     name: Build and Test
     runs-on: spiceai-macos
+    # Slowest observed success in the 2026-07-25..08-08 window: 117 min.
+    timeout-minutes: 300
     needs: [check_changes]
     if: ${{ github.event_name != 'pull_request' }}
     env:
@@ -772,7 +782,7 @@ jobs:
       - name: Set up spiceio
         if: needs.check_changes.outputs.relevant_changes == 'true' && runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true'
         id: setup-spiceio
-        uses: spiceai/spiceio/.github/actions/setup@97c3578dcf337786923da33cecd350e7335386b6 # v0.7.0
+        uses: spiceai/spiceio/.github/actions/setup@2ad4a874ff4813f8190117bc645af0dbb90b708c # v0.8.0
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
           smb-pass: ${{ secrets.UNAS_SMB_PASS }}
@@ -872,6 +882,8 @@ jobs:
   build-install-release:
     name: Build (release profile)
     runs-on: spiceai-macos
+    # Slowest observed success in the 2026-07-25..08-08 window: 106 min.
+    timeout-minutes: 300
     needs: [check_changes]
     if: ${{ github.event_name != 'pull_request' }}
     env:
@@ -890,7 +902,7 @@ jobs:
       - name: Set up spiceio
         if: needs.check_changes.outputs.relevant_changes == 'true' && runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true'
         id: setup-spiceio
-        uses: spiceai/spiceio/.github/actions/setup@97c3578dcf337786923da33cecd350e7335386b6 # v0.7.0
+        uses: spiceai/spiceio/.github/actions/setup@2ad4a874ff4813f8190117bc645af0dbb90b708c # v0.8.0
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
           smb-pass: ${{ secrets.UNAS_SMB_PASS }}

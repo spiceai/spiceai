@@ -42,7 +42,7 @@ use runtime::catalogconnector::cayenne::provider::CayenneCatalogProvider;
 use runtime::config::Config;
 use runtime::dataaccelerator::cayenne::s3::generate_bucket_name;
 use runtime::dataupdate::{DataUpdate, UpdateType};
-use runtime::{Runtime, accelerated_table::AcceleratedTable};
+use runtime::{Runtime, accelerated::AcceleratedTable};
 use runtime_auth::FlightBasicAuth;
 use runtime_auth::api_key::ApiKeyAuth;
 use spicepod::acceleration::{Acceleration, Mode, OnConflictBehavior, RefreshMode};
@@ -589,9 +589,14 @@ async fn test_cayenne_s3_express_multi_zone_live() -> Result<(), String> {
                 .get_accelerated_table_provider(&table_name)
                 .await
                 .map_err(|e| format!("failed to resolve accelerated provider: {e}"))?;
-            if !accelerated_provider.is::<AcceleratedTable>() {
+            if spice_table::find_layer::<AcceleratedTable>(
+                accelerated_provider.as_ref(),
+                spice_table::LayerWalk::Read,
+            )
+            .is_none()
+            {
                 return Err(format!(
-                    "Expected provider for {table_name} to be AcceleratedTable in {zone_count}-zone scenario"
+                    "Expected provider for {table_name} to carry an accelerated-table layer in {zone_count}-zone scenario"
                 ));
             }
 

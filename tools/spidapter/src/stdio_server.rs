@@ -1429,7 +1429,7 @@ impl Handler for SpidapterHandler {
             RunState::Scp(scp) => {
                 let cloud_metrics = scp
                     .cloud
-                    .get_app_metrics(scp.app_id, None)
+                    .get_project_metrics(scp.app_id, None)
                     .await
                     .map_err(|e| format!("Failed to fetch metrics: {e}"))?;
 
@@ -1600,7 +1600,7 @@ impl Handler for SpidapterHandler {
                 // On `?` failure here, `scp` (and its still-armed `app_guard`) is
                 // dropped, so the guard retries the delete on drop. On success we
                 // disarm it below so it does not delete the app a second time.
-                commands::delete_app(cloud, scp.app_id)
+                commands::delete_project(cloud, scp.app_id)
                     .await
                     .map_err(|e| format!("Failed to delete app {}: {e}", scp.app_id))?;
                 if let Some(mut guard) = scp.app_guard.take() {

@@ -17,7 +17,6 @@ limitations under the License.
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
-use crate::datafusion::pg_catalog::register_postgres_comment_udfs;
 use crate::datafusion::udtf::flatten_json::{
     FLATTEN_JSON_UDTF_NAME, FlattenJsonScalar, FlattenJsonTableFunc,
 };
@@ -28,7 +27,6 @@ use crate::datafusion::udtf::json_tree::{JSON_TREE_UDTF_NAME, JsonTreeScalar, Js
 use crate::embeddings::udtf::VectorSearchTableFunc;
 use crate::executor_table::{EXECUTOR_TABLE_UDTF_NAME, ExecutorTableFunc};
 use datafusion::execution::FunctionRegistry;
-use datafusion::functions::math::random::RandomFunc;
 use datafusion::logical_expr::ScalarUDF;
 use datafusion::prelude::SessionContext;
 use datafusion_table_providers::util::supported_functions::FunctionSupport;
@@ -55,17 +53,6 @@ const EMBED_UDF_NAME: &str = "embed";
 // so register it here alongside the fallback constant.
 #[cfg(not(feature = "models"))]
 runtime_udfs_api::register_spice_function!(EMBED_SPICE_FUNCTION_FALLBACK, EMBED_UDF_NAME);
-use runtime_datafusion_udfs::{
-    alias::ScalarUDFAlias,
-    assert::Assert,
-    bucket::Bucket,
-    cosine_distance::CosineDistance,
-    digest_many::INSTANCE,
-    inner_product::InnerProduct,
-    l2_distance::{L2Distance, L2SquaredDistance},
-    l2_norm::L2Norm,
-    truncate::Truncate,
-};
 use serde_json::Value;
 use spicepod::component::function::{Function, FunctionKind, Volatility};
 use util::in_tracing_context_async;
@@ -75,23 +62,7 @@ use util::in_tracing_context_async;
 // rather than in a UDF crate.
 runtime_udfs_api::register_spice_function!(RAND_SPICE_FUNCTION, "rand");
 
-/// Register core scalar UDFs that have no runtime dependencies.
-///
-/// These UDFs only need a [`SessionContext`] and can be registered on any
-/// context, including isolated ones like the refresh-task context.
-pub fn register_core_scalar_udfs(ctx: &SessionContext) {
-    ctx.register_udf(ScalarUDFAlias::new(Arc::new(RandomFunc::default()), "rand").into());
-    ctx.register_udf(Bucket::new().into());
-    ctx.register_udf(CosineDistance::new().into());
-    ctx.register_udf(InnerProduct::new().into());
-    ctx.register_udf(L2Distance::new().into());
-    ctx.register_udf(L2SquaredDistance::new().into());
-    ctx.register_udf(L2Norm::new().into());
-    ctx.register_udf(Truncate::new().into());
-    ctx.register_udf(Assert::new().into());
-    ctx.register_udf(INSTANCE.clone());
-    register_postgres_comment_udfs(ctx);
-}
+pub use runtime_datafusion::udf::register_core_scalar_udfs;
 
 pub async fn register_udfs(runtime: &crate::Runtime) {
     let ctx = &runtime.df.ctx;
@@ -652,31 +623,10 @@ pub fn is_code_executing_function(name: &str) -> bool {
         .any(|function_name| function_name.eq_ignore_ascii_case(name))
 }
 
-/// The functions no remote source may be asked to evaluate: every Spice
-/// function plus every user-registered one. Safe to call from per-query filter
-/// pushdown paths.
-#[must_use]
-pub fn deny_spice_specific_functions() -> Arc<FunctionSupport> {
-    Arc::new(runtime_udfs_api::FunctionSupportBuilder::new().build())
-}
-
-/// As [`deny_spice_specific_functions`], but allowing the functions the target
-/// backend evaluates itself.
-///
-/// `native` is normally that backend's unparser dialect's native-function names
-/// (e.g. [`crate::datafusion::dialect::duckdb_native_function_names`]), which is
-/// how the deny-list becomes backend-aware: a Spice function the dialect
-/// rewrites into a real remote function pushes down instead of being denied.
-/// User-registered functions are never carved out — no remote source has an
-/// equivalent.
-#[must_use]
-pub fn deny_spice_specific_functions_excluding(native: &[&str]) -> Arc<FunctionSupport> {
-    Arc::new(
-        runtime_udfs_api::FunctionSupportBuilder::new()
-            .native(native)
-            .build(),
-    )
-}
+pub use runtime_udfs_api::{
+    deny_spice_functions_for_table_providers, deny_spice_specific_functions,
+    deny_spice_specific_functions_excluding,
+};
 
 /// The [`FunctionSupport`] for `DuckDB` connectors and accelerators: allows
 /// every function the `DuckDB` dialect can rewrite into native SQL (e.g.
@@ -696,13 +646,6 @@ pub fn deny_spice_functions_for_duckdb_table_providers() -> FunctionSupport {
     runtime_udfs_api::FunctionSupportBuilder::new()
         .native(&crate::datafusion::dialect::duckdb_native_function_names())
         .build()
-}
-
-/// Full deny-list as a value, for any SQL connector whose unparser dialect has
-/// no Spice-function carve-out. See issue #10703.
-#[must_use]
-pub fn deny_spice_functions_for_table_providers() -> FunctionSupport {
-    runtime_udfs_api::FunctionSupportBuilder::new().build()
 }
 
 /// `DataFusion`'s nested array/list/map functions that `PostgreSQL` cannot
@@ -831,6 +774,9 @@ mod tests {
     };
     use runtime_datafusion_udfs::cosine_distance::COSINE_DISTANCE_UDF_NAME;
     use runtime_datafusion_udfs::inner_product::{DOT_PRODUCT_UDF_ALIAS, INNER_PRODUCT_UDF_NAME};
+    use runtime_datafusion_udfs::{
+        bucket::Bucket, cosine_distance::CosineDistance, digest_many::INSTANCE, truncate::Truncate,
+    };
     use runtime_udfs_api::datafusion_nested_function_names;
     use std::collections::HashSet;
 

@@ -92,6 +92,7 @@ secrecy.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 snafu.workspace = true
+spice-table = { path = "../spice-table" }
 snowflake-api = { workspace = true, optional = true }
 spark-connect-rs = { git = "https://github.com/spiceai/spark-connect-rs.git", rev = "5f7c2452d4202d7496abac0a6f2eaa4bef46a5ad", features = [
     "tls",
@@ -191,8 +192,6 @@ sqlite = [
 ]
 turso = ["dep:turso", "dep:turso-shared", "datafusion-table-providers/sqlite-federation"]
 
-test_hadoop_catalog_docker = []
-
 [dev-dependencies]
 arrow = { workspace = true, features = ["prettyprint"] }
 arrow-array = { workspace = true }
@@ -200,7 +199,6 @@ aws-smithy-types = { workspace = true }
 brotli = "8.0.2"
 chrono = { workspace = true }
 criterion = { version = "0.7", features = ["async_tokio", "html_reports"] }
-ctor = "0.8.0"
 flate2 = "1.1.5"
 iceberg-storage-opendal.workspace = true
 iceberg_test_utils = { workspace = true, features = ["tests"] }

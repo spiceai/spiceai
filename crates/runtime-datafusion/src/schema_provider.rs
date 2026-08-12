@@ -22,7 +22,10 @@ use datafusion::{
     catalog::SchemaProvider,
     datasource::TableProvider,
     error::{DataFusionError, Result},
+    execution::context::SessionContext,
+    sql::TableReference,
 };
+use snafu::{OptionExt, Snafu};
 
 /// Copy of default `MemorySchemaProvider` that allows `register_table` to atomically overwrite any existing tables
 /// `<https://github.com/apache/datafusion/blob/deebda78a34251b2bddf0c5f66edfaa112c4559b/datafusion/core/src/catalog/schema.rs#L84>`
@@ -78,5 +81,48 @@ impl SchemaProvider for SpiceSchemaProvider {
 
     fn table_exist(&self, name: &str) -> bool {
         self.tables.contains_key(name)
+    }
+}
+
+/// The catalog a schema was to be created in is not registered on the session.
+#[derive(Debug, Snafu)]
+pub enum EnsureSchemaError {
+    #[snafu(display("The catalog {catalog} is not registered."))]
+    CatalogMissing { catalog: String },
+}
+
+/// Registers `table_reference`'s schema in `catalog` if it does not already exist.
+///
+/// A table reference without a schema component needs nothing registered, so
+/// that case succeeds without touching the catalog.
+///
+/// # Errors
+///
+/// Returns [`EnsureSchemaError::CatalogMissing`] if `catalog` is not registered
+/// on the session.
+pub fn ensure_schema_exists(
+    ctx: &SessionContext,
+    catalog: &str,
+    table_reference: &TableReference,
+) -> Result<(), EnsureSchemaError> {
+    let catalog_provider = ctx
+        .catalog(catalog)
+        .context(CatalogMissingSnafu { catalog })?;
+
+    // This TableReference doesn't have a schema component, nothing to do.
+    let Some(schema_name) = table_reference.schema() else {
+        return Ok(());
+    };
+
+    // If the schema exists, nothing to do.
+    if catalog_provider.schema(schema_name).is_some() {
+        return Ok(());
+    }
+
+    // Create the schema
+    let schema_provider = Arc::new(SpiceSchemaProvider::new());
+    match catalog_provider.register_schema(schema_name, schema_provider) {
+        Ok(_) => Ok(()),
+        Err(_) => unreachable!("register_schema will never fail"),
     }
 }

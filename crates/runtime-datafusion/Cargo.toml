@@ -29,10 +29,13 @@ runtime-datafusion-index = { path = "../runtime-datafusion-index" }
 runtime-object-store = { path = "../runtime-object-store" }
 runtime-query-engine = { path = "../runtime-query-engine" }
 runtime-datafusion-udfs = { path = "../runtime-datafusion-udfs" }
+runtime-udfs-api = { path = "../runtime-udfs-api" }
+linkme.workspace = true
 runtime-request-context = { path = "../runtime-request-context" }
 search = { path = "../search", default-features = false }
 serde_json.workspace = true
 snafu.workspace = true
+spice-table = { path = "../spice-table" }
 tokio.workspace = true
 tokio-stream.workspace = true
 tokio-util.workspace = true
