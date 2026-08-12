@@ -41,8 +41,8 @@ use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult, NewDataConnectorResult,
 };
-use runtime::datafusion::udf::deny_spice_specific_functions;
-use runtime::parameters::{ParamLookup, ParameterSpec, Parameters};
+use runtime_parameters::{ParamLookup, ParameterSpec, Parameters};
+use runtime_udfs_api::deny_spice_specific_functions;
 use secrecy::ExposeSecret;
 use snafu::prelude::*;
 use std::any::Any;

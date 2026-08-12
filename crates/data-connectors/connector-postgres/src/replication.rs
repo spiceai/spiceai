@@ -17,7 +17,7 @@ limitations under the License.
 //! Glue between Spice's connector params and the `postgres_replication` module.
 //!
 //! Responsibilities:
-//!   - Parse connection & replication params out of `runtime::parameters::Parameters`.
+//!   - Parse connection & replication params out of `runtime_parameters::Parameters`.
 //!   - Fall back to sensible per-replica defaults for slot & publication names.
 //!   - Look up the source table schema (via the federated table) and hand everything
 //!     off to `data_components::postgres_replication::start_replication_stream`.
@@ -36,9 +36,9 @@ use futures::StreamExt;
 use opentelemetry::KeyValue;
 use runtime::component::dataset::Dataset;
 use runtime::federated::FederatedTable;
-use runtime::parameters::{ExposedParamLookup, Parameters};
 use runtime_api_types::v1::ComponentType;
 use runtime_metrics::component::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback};
+use runtime_parameters::{ExposedParamLookup, Parameters};
 use secrecy::SecretString;
 
 // Standby status feedback cadence. Kept well below Postgres's default

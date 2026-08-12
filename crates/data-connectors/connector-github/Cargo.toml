@@ -38,6 +38,8 @@ graphql-parser.workspace = true
 http.workspace = true
 reqwest.workspace = true
 runtime = { path = "../../runtime" }
+runtime-datafusion = { path = "../../runtime-datafusion" }
+runtime-parameters = { path = "../../runtime-parameters" }
 util = { path = "../../util" }
 runtime-rate-control = { path = "../../runtime-rate-control" }
 secrecy.workspace = true

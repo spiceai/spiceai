@@ -17,6 +17,7 @@ members = [
     "crates/datafusion-dml",
     "crates/datafusion-optimizer-rules",
     "crates/data-connector-api",
+    "crates/data-http-rate-control",
     "crates/data_components",
     "crates/dataformat-json",
     "crates/document_parse",
