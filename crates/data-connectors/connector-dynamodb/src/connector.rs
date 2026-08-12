@@ -694,6 +694,7 @@ async fn emit_overwrite_then_live(
         )),
         checkpoint_batch,
         false, // readiness comes from the live stream, preserving prior behavior
+        false, // not a history-unavailable signal: this is the bootstrap checkpoint barrier
     );
 
     let live = match changes_stream_from_checkpoint(

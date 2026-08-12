@@ -917,7 +917,7 @@ async fn attach_member(
         let schema_mismatch = |e: crate::cdc::ChangeBatchError| Error::SchemaMismatch {
             message: e.to_string(),
         };
-        let (_, boundary_batch, _) = crate::cdc::build_heartbeat_envelope(&schema, None, false)
+        let (_, boundary_batch, _, _) = crate::cdc::build_heartbeat_envelope(&schema, None, false)
             .map_err(schema_mismatch)?
             .into_parts()
             .map_err(schema_mismatch)?;
@@ -928,6 +928,10 @@ async fn attach_member(
                 dataset: dataset_for_boundary,
             }),
             boundary_batch,
+            false,
+            // Not a history-unavailable signal: this boundary envelope exists to
+            // persist the snapshot head, and MySQL's own purged-binlog case is
+            // not wired to this mechanism.
             false,
         );
         Box::pin(
@@ -2237,10 +2241,11 @@ async fn rebootstrap_member(
     let schema_mismatch = |e: crate::cdc::ChangeBatchError| Error::SchemaMismatch {
         message: e.to_string(),
     };
-    let (_, boundary_batch, _) = crate::cdc::build_heartbeat_envelope(&member.schema, None, false)
-        .map_err(schema_mismatch)?
-        .into_parts()
-        .map_err(schema_mismatch)?;
+    let (_, boundary_batch, _, _) =
+        crate::cdc::build_heartbeat_envelope(&member.schema, None, false)
+            .map_err(schema_mismatch)?
+            .into_parts()
+            .map_err(schema_mismatch)?;
     let boundary = ChangeEnvelope::from_parts(
         Box::new(SnapshotBoundaryCommitter {
             source: Arc::clone(source),
@@ -2248,6 +2253,8 @@ async fn rebootstrap_member(
             dataset: member.dataset_name.clone(),
         }),
         boundary_batch,
+        false,
+        // See the sibling boundary envelope: not a history-unavailable signal.
         false,
     );
     if member.sender.send(Ok(boundary)).await.is_err() {

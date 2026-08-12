@@ -26,6 +26,8 @@ description = "PostgreSQL data connector for Spice.ai runtime"
 linkme.workspace = true
 async-stream.workspace = true
 async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 data_components = { path = "../../data_components", features = ["postgres"] }
 datafusion.workspace = true
 datafusion-table-providers = { workspace = true, features = ["postgres", "postgres-federation"] }

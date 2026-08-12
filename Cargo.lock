@@ -4797,6 +4797,8 @@ dependencies = [
  "runtime-metrics",
  "runtime-parameters",
  "secrecy",
+ "serde",
+ "serde_json",
  "snafu",
  "tokio",
  "tokio-postgres",

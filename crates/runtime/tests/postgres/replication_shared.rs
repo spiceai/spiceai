@@ -38,8 +38,8 @@ use arrow::array::{Array, AsArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use data_components::cdc::{ChangeEnvelope, ChangesStream};
 use data_components::postgres_replication::{
-    PgOutputFormat, ReplicationMetricsCollector, ReplicationParams, ReplicationStreamInput,
-    SchemaEvolutionPolicy, config, start_replication_stream,
+    NoopAppliedLsnStore, PgOutputFormat, ReplicationMetricsCollector, ReplicationParams,
+    ReplicationStreamInput, SchemaEvolutionPolicy, config, start_replication_stream,
 };
 use futures::StreamExt;
 use secrecy::SecretString;
@@ -109,6 +109,7 @@ fn independent_input(port: u16, table: &str) -> ReplicationStreamInput {
         table_name: table.to_string(),
         metrics: ReplicationMetricsCollector::new(),
         policy: SchemaEvolutionPolicy::Block,
+        applied_lsn_store: Arc::new(NoopAppliedLsnStore),
     }
 }
 
@@ -122,6 +123,7 @@ fn input_with_schema(port: u16, table: &str, schema: SchemaRef) -> ReplicationSt
         table_name: table.to_string(),
         metrics: ReplicationMetricsCollector::new(),
         policy: SchemaEvolutionPolicy::Block,
+        applied_lsn_store: Arc::new(NoopAppliedLsnStore),
     }
 }
 
