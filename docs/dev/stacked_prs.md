@@ -169,15 +169,16 @@ if git ls-files --stage -- ":(literal)$f" | awk '{ print $1 }' | grep -qx 120000
   # which restores the blob and the file mode exactly:
   #   git checkout --ours -- "$f" && git add -- "$f"      # or --theirs
   echo "SYMLINK conflict on $f — resolve by hand"
+elif ! git show ":2:$f" > "$t/ours" ||         # your side
+     ! git show ":3:$f" > "$t/theirs" ||       # trunk's side
+     ! git show "$STACKBASE:$f" > "$t/base"    # the correct base — NOT git's stage 1
+then
+  # A side is missing — resolve by hand; see below for why this cannot be merged.
+  echo "MISSING SIDE for $f — resolve by hand: $(git ls-files -u -- ":(literal)$f" | wc -l) of 3 stages"
+elif git merge-file -p --diff3 "$t/ours" "$t/base" "$t/theirs" > "$t/merged"; then
+  cp -- "$t/merged" "$f" && git add -- "$f"                # clean — accept it
 else
-  git show ":2:$f" > "$t/ours"          # your side
-  git show ":3:$f" > "$t/theirs"        # trunk's side
-  git show "$STACKBASE:$f" > "$t/base"  # the correct base — NOT git's stage 1
-  if git merge-file -p --diff3 "$t/ours" "$t/base" "$t/theirs" > "$t/merged"; then
-    cp -- "$t/merged" "$f" && git add -- "$f"              # clean — accept it
-  else
-    grep -n '^<<<<<<<\|^|||||||\|^>>>>>>>' "$t/merged"     # real conflict — by hand first
-  fi
+  grep -n '^<<<<<<<\|^|||||||\|^>>>>>>>' "$t/merged"       # real conflict — by hand first
 fi
 rm -rf "$t"                             # once you are done with this path
 ```
@@ -188,6 +189,19 @@ pasted snippet can silently destroy a file outside the repo on a shared machine.
 `--` before the operands matters for the same reason `:(literal)` does — a repository
 path may begin with `-`, and GNU `cp` permutes its arguments and parses it as options
 (BSD `cp` stops at the first operand, so this one hides on a Mac and breaks in CI).
+
+**The extraction has to fail closed.** A redirection creates its file before git runs,
+so a failed `git show` leaves an *empty* file behind and `merge-file` reads that as
+"this side is empty" rather than "this side is missing" — which can merge cleanly and
+stage the wrong content with no conflict reported. It is reachable in exactly the
+situation this document is about: the parent rewrites a file, the child deletes it, and
+`trunk` squash-merges the parent. There is then no stage 2 (you deleted it) while stage
+3 matches `$STACKBASE` exactly, so the merge is `empty + base + base` → clean, empty
+output, and the block would stage a 0-byte file where you meant a deletion. The step-3
+audit does catch that one as a `RESURRECTED` path, but only after the fact. Note this
+is also why `git show "$STACKBASE:$f"` can fail on a genuinely three-stage conflict:
+`$STACKBASE` is deliberately newer than git's stage 1, so a path can be conflicted and
+still not exist there.
 
 Three more things about that block. `merge-file -p` only writes the merged text to
 stdout —
