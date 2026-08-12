@@ -165,16 +165,16 @@ ls-files -u <path>` shows them):
 f=<path>
 t=$(mktemp -d)                          # never fixed /tmp names — see below
 if git ls-files --stage -- ":(literal)$f" | awk '{ print $1 }' | grep -qx 120000; then
-  # A symlink on ANY side — never cp onto it. A conflicted symlink's blob content is
-  # its target path, so recreate the link from whichever side is right, then stage it:
-  #   ln -sfn "$(git show ":2:$f")" "$f" && git add -- "$f"
+  # A symlink on ANY side — never cp onto it. Take whichever side is right through git,
+  # which restores the blob and the file mode exactly:
+  #   git checkout --ours -- "$f" && git add -- "$f"      # or --theirs
   echo "SYMLINK conflict on $f — resolve by hand"
 else
   git show ":2:$f" > "$t/ours"          # your side
   git show ":3:$f" > "$t/theirs"        # trunk's side
   git show "$STACKBASE:$f" > "$t/base"  # the correct base — NOT git's stage 1
   if git merge-file -p --diff3 "$t/ours" "$t/base" "$t/theirs" > "$t/merged"; then
-    cp "$t/merged" "$f" && git add -- "$f"                 # clean — accept it
+    cp -- "$t/merged" "$f" && git add -- "$f"              # clean — accept it
   else
     grep -n '^<<<<<<<\|^|||||||\|^>>>>>>>' "$t/merged"     # real conflict — by hand first
   fi
@@ -184,7 +184,10 @@ rm -rf "$t"                             # once you are done with this path
 
 The intermediates go in a private `mktemp -d`, never fixed `/tmp` paths: `> /tmp/ours`
 follows a pre-existing symlink at that name and truncates whatever it points at, so a
-pasted snippet can silently destroy a file outside the repo on a shared machine.
+pasted snippet can silently destroy a file outside the repo on a shared machine. The
+`--` before the operands matters for the same reason `:(literal)` does — a repository
+path may begin with `-`, and GNU `cp` permutes its arguments and parses it as options
+(BSD `cp` stops at the first operand, so this one hides on a Mac and breaks in CI).
 
 Three more things about that block. `merge-file -p` only writes the merged text to
 stdout —
@@ -254,10 +257,14 @@ stats look right while the commit still carries the wrong content.
 let `cargo metadata` re-add the branch's own crates:
 
 ```bash
-git checkout origin/trunk -- Cargo.lock
-cargo metadata --format-version 1 >/dev/null
-git add Cargo.lock
+git checkout origin/trunk -- Cargo.lock &&
+  cargo metadata --format-version 1 >/dev/null &&
+  git add -- Cargo.lock
 ```
+
+Chained deliberately: unchained, a failed `cargo metadata` still reaches the `git add`
+and stages `trunk`'s lockfile without the branch's own crates — the opposite of what
+this step is for.
 
 `cargo metadata` only re-adds what the branch's *manifests* require, so any lockfile
 change the branch made without a manifest change — a `cargo update` of a transitive
