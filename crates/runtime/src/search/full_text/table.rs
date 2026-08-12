@@ -91,12 +91,8 @@ pub(crate) fn build_full_text_database_index(
                 // Both metadata kinds are only about vector-search's own metadata filter;
                 // either one still means the column should be projectable and, per its
                 // tantivy type, filterable through the FTS index too.
-                if c.as_vector_metadata().is_none() {
-                    return None;
-                }
-                let Some((_, field)) = schema.column_with_name(&c.name) else {
-                    return None;
-                };
+                c.as_vector_metadata()?;
+                let (_, field) = schema.column_with_name(&c.name)?;
                 if !FullTextDatabaseIndex::is_field_type_supported(field.data_type()) {
                     // e.g. `Date32`/`Date64`/`Timestamp`: a valid `Filterable` metadata type for
                     // other index backends (Elasticsearch), but not yet representable in the
