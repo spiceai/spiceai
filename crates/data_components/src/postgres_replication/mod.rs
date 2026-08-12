@@ -203,20 +203,35 @@ pub struct AppliedLsn {
 /// The whole gap decision, as arithmetic rather than inference:
 ///
 /// * `watermark` — the LSN the acceleration's contents are complete as of, or
-///   `None` when it has never been loaded.
+///   `None` when none has been recorded.
 /// * `slot_restart_lsn` — the earliest LSN the slot can still stream from, or
 ///   `None` when the slot does not exist.
+/// * `absence_implies_gap` — whether a *missing* watermark is evidence of one.
+///   True when the acceleration survives restarts (so it can hold rows this
+///   process did not load) and a position could have been recorded (so absence
+///   is informative rather than permanent).
 ///
 /// A watermark the slot cannot reach is a gap nothing can fill: the changes in
 /// between are gone from the source's log, so a row deleted there would never be
 /// deleted here. Rebuilding re-reads the table; resuming would keep it forever.
+///
+/// A *missing* watermark is not proof of an empty acceleration. It is also what
+/// an acceleration written by a version that never recorded one looks like, and
+/// what one whose watermark write failed looks like. Both can hold rows, and both
+/// can be missing deletions for exactly the same reason. So a durable
+/// acceleration with no recorded position is rebuilt rather than assumed fresh:
+/// on a genuinely first load the rebuild reads the same rows the bootstrap would
+/// have, and on an upgraded one it repairs divergence that is already there.
 #[must_use]
-pub fn needs_rebuild(watermark: Option<AppliedLsn>, slot_restart_lsn: Option<u64>) -> bool {
+pub fn needs_rebuild(
+    watermark: Option<AppliedLsn>,
+    slot_restart_lsn: Option<u64>,
+    absence_implies_gap: bool,
+) -> bool {
     match watermark {
-        // Never loaded, so there is nothing to be inconsistent with — a first
-        // bootstrap, not a gap. Also every ephemeral acceleration, whose store
-        // records nothing because it boots empty and re-snapshots each start.
-        None => false,
+        // Nothing recorded: a gap only when absence is informative — see
+        // `absence_implies_gap`.
+        None => absence_implies_gap,
         // A gap when there is no slot at all, or when the slot's earliest
         // retained position is already past the watermark.
         Some(watermark) => slot_restart_lsn.is_none_or(|earliest| earliest > watermark.lsn),
@@ -232,6 +247,17 @@ pub fn needs_rebuild(watermark: Option<AppliedLsn>, slot_restart_lsn: Option<u64
 /// [`ReplicationStreamInput`].
 #[async_trait::async_trait]
 pub trait AppliedLsnStore: Send + Sync {
+    /// Whether this store can actually record a position.
+    ///
+    /// A store that cannot (see [`NoopAppliedLsnStore`]) makes the *absence* of a
+    /// watermark meaningless: it proves nothing about what the acceleration
+    /// holds, and no start will ever record one. Rebuilding on absence would then
+    /// re-read the whole table on every restart, forever, so absence is treated
+    /// as it was before watermarks existed.
+    fn records_positions(&self) -> bool {
+        true
+    }
+
     /// The recorded position, or `None` when this acceleration has never been
     /// loaded — a first bootstrap, not a gap.
     async fn load(
@@ -256,6 +282,10 @@ pub struct NoopAppliedLsnStore;
 
 #[async_trait::async_trait]
 impl AppliedLsnStore for NoopAppliedLsnStore {
+    fn records_positions(&self) -> bool {
+        false
+    }
+
     async fn load(
         &self,
     ) -> std::result::Result<Option<AppliedLsn>, Box<dyn std::error::Error + Send + Sync>> {
@@ -399,39 +429,52 @@ mod tests {
     #[test]
     fn a_watermark_the_slot_cannot_reach_is_the_only_thing_that_forces_a_rebuild() {
         let at = |lsn| Some(AppliedLsn { lsn });
+        // A recorded watermark makes durability irrelevant: the comparison alone
+        // decides, so these cases are asserted against a persisting acceleration.
+        let needs_rebuild_persist = |watermark, restart| needs_rebuild(watermark, restart, true);
 
-        // Never loaded: a first bootstrap, not a gap. Snapshot-and-append is
-        // exactly right, and this is also every ephemeral acceleration (whose
-        // store records nothing because it boots empty).
-        assert!(!needs_rebuild(None, Some(100)));
+        // Nothing recorded, and the acceleration boots empty: a first bootstrap,
+        // not a gap. Snapshot-and-append is exactly right.
+        assert!(!needs_rebuild(None, Some(100), false));
         assert!(
-            !needs_rebuild(None, None),
-            "a first load with no slot yet is still a first load"
+            !needs_rebuild(None, None, false),
+            "an ephemeral acceleration with no slot yet is still a first load"
         );
+
+        // Nothing recorded, but the acceleration persists: it may be holding rows
+        // from a version that never recorded a watermark, or from a start whose
+        // watermark write failed — either can already be missing deletions.
+        // Rebuilding costs a re-read on a genuinely first load and repairs the
+        // rest, so absence must not be read as emptiness.
+        assert!(needs_rebuild(None, Some(100), true));
+        assert!(needs_rebuild(None, None, true));
 
         // The slot still holds WAL from at or before the watermark, so the gap is
         // replayable: resume.
-        assert!(!needs_rebuild(at(100), Some(100)), "exactly reachable");
         assert!(
-            !needs_rebuild(at(100), Some(40)),
+            !needs_rebuild_persist(at(100), Some(100)),
+            "exactly reachable"
+        );
+        assert!(
+            !needs_rebuild_persist(at(100), Some(40)),
             "slot reaches further back"
         );
 
         // The slot's earliest position is past the watermark: the changes in
         // between are gone from the source's log and cannot be replayed.
         assert!(
-            needs_rebuild(at(100), Some(101)),
+            needs_rebuild_persist(at(100), Some(101)),
             "one byte past is still a gap"
         );
-        assert!(needs_rebuild(at(100), Some(u64::MAX)));
+        assert!(needs_rebuild_persist(at(100), Some(u64::MAX)));
 
         // No slot at all reaches nothing.
-        assert!(needs_rebuild(at(100), None));
+        assert!(needs_rebuild_persist(at(100), None));
 
         // An unreadable watermark is reported by the caller as position 0, which
         // must resolve to a rebuild against any real slot position rather than
         // being mistaken for "never loaded".
-        assert!(needs_rebuild(at(0), Some(1)));
-        assert!(needs_rebuild(at(0), None));
+        assert!(needs_rebuild_persist(at(0), Some(1)));
+        assert!(needs_rebuild_persist(at(0), None));
     }
 }

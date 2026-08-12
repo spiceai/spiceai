@@ -888,6 +888,7 @@ fn snapshot_watermark_envelope(
     applied_lsn_store: Arc<dyn AppliedLsnStore>,
     lsn: u64,
     dataset: String,
+    history_unavailable: bool,
 ) -> std::result::Result<ChangeEnvelope, StreamError> {
     let (_, batch, _, _) = crate::cdc::build_heartbeat_envelope(schema, None, false)
         .map_err(|e| StreamError::External(e.to_string()))?
@@ -900,10 +901,9 @@ fn snapshot_watermark_envelope(
             dataset,
         }),
         batch,
-        // Readiness stays lag-based, and this envelope is not a rebuild request:
-        // it only records where the snapshot left off.
+        // Readiness stays lag-based: an acceleration being loaded is not ready.
         false,
-        false,
+        history_unavailable,
     ))
 }
 
@@ -1998,7 +1998,24 @@ async fn attach_member(
             Some(AppliedLsn { lsn: 0 })
         }
     };
-    let rebuild_via_consumer = super::needs_rebuild(watermark, setup.slot_restart_lsn);
+    // Absence of a watermark is evidence of a gap only when the acceleration
+    // could be holding rows this process did not load AND a position could have
+    // been recorded. An ephemeral acceleration boots empty, so absence means
+    // nothing is there; a store that cannot record (no durable sidecar) makes
+    // absence permanent, and rebuilding on it would re-read the whole table on
+    // every restart rather than once.
+    let tracks_positions = applied_lsn_store.records_positions();
+    if !params.ephemeral_accelerator && !tracks_positions {
+        tracing::warn!(
+            dataset = %dataset_name,
+            "this acceleration persists across restarts but has nowhere to record how far it has been advanced, so a replication slot that is dropped or invalidated cannot be detected and rows deleted at the source while it was gone would survive here"
+        );
+    }
+    let rebuild_via_consumer = super::needs_rebuild(
+        watermark,
+        setup.slot_restart_lsn,
+        !params.ephemeral_accelerator && tracks_positions,
+    );
 
     let (sender, receiver) = member_mailbox(params.member_channel_capacity);
     // Grouping signal for the analysis: record which shared slot this dataset joined.
@@ -2098,11 +2115,24 @@ async fn attach_member(
         // snapshot. The consumer applies nothing further until the reload
         // completes, so the WAL that follows lands on top of it — back-pressure
         // in the member mailbox is what orders the two.
-        let signal_schema = Arc::clone(&schema);
-        let signal = stream::once(async move {
-            crate::cdc::build_history_unavailable_envelope(&signal_schema)
-                .map_err(|e| StreamError::External(e.to_string()))
-        });
+        // The signal carries the watermark committer, not a no-op one, so the
+        // position is recorded when the consumer finishes the rebuild and commits
+        // it. Without that, a rebuild would leave no watermark behind and the
+        // very next start would rebuild again — re-reading the whole table on
+        // every restart of a dataset whose source happens to be quiet.
+        //
+        // A real committer also keeps this envelope out of the consumer's
+        // heartbeat stripping (which requires a no-op committer), so it reaches
+        // the write path and is committed with the usual durability-then-commit
+        // ordering.
+        let signal_item = snapshot_watermark_envelope(
+            &schema,
+            Arc::clone(&applied_lsn_store),
+            setup.slot.consistent_lsn,
+            dataset_name.clone(),
+            true,
+        );
+        let signal = stream::once(async move { signal_item });
         tracing::warn!(
             dataset = %dataset_name,
             table = %format_member(&member_key),
@@ -2121,6 +2151,7 @@ async fn attach_member(
             Arc::clone(&applied_lsn_store),
             setup.slot.consistent_lsn,
             dataset_name.clone(),
+            false,
         );
         let snapshot = bootstrap::snapshot_stream(bootstrap::SnapshotInput {
             params: params.clone(),
@@ -2146,20 +2177,38 @@ async fn attach_member(
         let hook_source = Arc::clone(source);
         let hook_key = member_key.clone();
         let mut hook_fired = false;
+        let flip_error_flag = Arc::clone(&saw_error);
         let bootstrap_finished = stream::poll_fn(move |_| {
             if !hook_fired {
                 hook_fired = true;
-                if !saw_error.load(Ordering::Acquire) {
+                if !flip_error_flag.load(Ordering::Acquire) {
                     hook_source.ack.snapshot_finished(&hook_key);
                     hook_source.restart_requested.store(true, Ordering::Release);
                 }
             }
             std::task::Poll::Ready(None)
         });
-        // Record the snapshot's position as soon as its rows are durable, then
-        // flip the member live. The boundary envelope's committer cannot be
-        // deferred, so it runs only after the snapshot is durably applied.
-        let boundary = stream::once(async move { watermark_boundary });
+        // Record the snapshot's position, but ONLY for a snapshot that completed
+        // cleanly — gated on the same flag as the live flip above.
+        //
+        // A failed snapshot ends its stream after yielding the error, so without
+        // this gate the boundary would still be reached and could record a
+        // watermark for an acceleration that is missing base rows. The next start
+        // would then find that watermark reachable, resume, and never load the
+        // rows the snapshot never delivered.
+        //
+        // The committer itself cannot be deferred, so when it does run, the
+        // snapshot's rows are already durable.
+        let mut boundary_item = Some(watermark_boundary);
+        let boundary = stream::poll_fn(move |_| {
+            let Some(item) = boundary_item.take() else {
+                return std::task::Poll::Ready(None);
+            };
+            if saw_error.load(Ordering::Acquire) {
+                return std::task::Poll::Ready(None);
+            }
+            std::task::Poll::Ready(Some(item))
+        });
         Box::pin(snapshot.chain(boundary).chain(bootstrap_finished))
     } else {
         metrics.mark_bootstrap_complete();

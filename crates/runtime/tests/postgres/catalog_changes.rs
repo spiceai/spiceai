@@ -207,9 +207,11 @@ async fn slot_active(port: usize, slot_name: &str) -> Result<Option<bool>, anyho
 /// The slot's `confirmed_flush_lsn`, as the source sees it.
 ///
 /// This advances only when Spice acknowledges a change, which is the same call
-/// that records the local applied-LSN watermark — so it is the source-side proof
-/// that the watermark has been written, without reaching into the accelerator's
-/// sidecar from a test.
+/// that attempts the local applied-LSN watermark write. It is therefore evidence
+/// that the write was *reached*, not that it succeeded — the acknowledgement
+/// proceeds even if the sidecar write fails, which is only logged. Convergence
+/// after the restart is what actually proves the watermark behaved; this exists
+/// so the test stops racing durability before shutting down.
 async fn slot_confirmed_flush(
     port: usize,
     slot_name: &str,
@@ -1361,13 +1363,13 @@ async fn test_durable_acceleration_is_rebuilt_when_its_slot_is_gone() -> Result<
 
             // Drive one change through the live stream before shutting down.
             //
-            // This is what records the applied-LSN watermark: it is written by the
-            // commit that acknowledges a WAL change, which is the only point at
-            // which the acked data is known durable. A bootstrap alone leaves no
-            // watermark yet, so the restart below would read "never loaded" and
-            // take the first-load path. (Persisting the watermark at the snapshot
-            // boundary too would remove that window; it is deliberately deferred
-            // to the atomic replacement work.)
+            // Exercises the ordinary watermark path: the position is recorded by
+            // the commit that acknowledges a WAL change, which is the only point
+            // at which the acked data is known durable. The snapshot boundary
+            // records one too, so this is not the only thing standing between the
+            // restart and a usable watermark — it is the steady-state path, and
+            // it also gives the restart a position strictly newer than the
+            // bootstrap's.
             conn.conn
                 .simple_query("INSERT INTO orders (id, customer) VALUES (3, 'carol-live');")
                 .await?;

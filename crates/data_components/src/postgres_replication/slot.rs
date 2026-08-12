@@ -254,10 +254,81 @@ async fn fetch_generated_columns(
 
 /// Look up the named slot, creating it if absent. See [`setup_slot_and_publication`]
 /// for the semantics of the returned `consistent_lsn` / `created_fresh`.
+/// SQLSTATE `42703` (`undefined_column`) — `pg_replication_slots.wal_status` is
+/// `PostgreSQL` 13+.
+const SQLSTATE_UNDEFINED_COLUMN: &str = "42703";
+
+/// Drop a slot the server has invalidated, so the caller's `ensure_slot`
+/// recreates it.
+///
+/// An invalidated slot (`wal_status = 'lost'`, from exhausted
+/// `max_slot_wal_keep_size` or `PostgreSQL` 18 idle-timeout invalidation) still
+/// exists in the catalog and can still report a non-null `confirmed_flush_lsn`,
+/// so every "does the slot exist" check passes while `START_REPLICATION` against
+/// it fails permanently with SQLSTATE 55000 ("can no longer get changes from
+/// replication slot"), which is classified non-transient and stops the stream. Left in place it produces the worst outcome available:
+/// the acceleration is rebuilt from the source, and then streaming never
+/// resumes.
+///
+/// Returns whether a slot was dropped. Best-effort — a failure here leaves the
+/// slot in place and surfaces through the streaming error it was going to cause
+/// anyway.
+async fn drop_slot_if_invalidated(
+    client: &tokio_postgres::Client,
+    slot_name: &str,
+) -> Result<bool> {
+    let row = client
+        .query_opt(
+            "SELECT wal_status FROM pg_catalog.pg_replication_slots WHERE slot_name = $1",
+            &[&slot_name],
+        )
+        .await;
+    let wal_status = match row {
+        Ok(row) => row.and_then(|row| row.get::<_, Option<String>>(0)),
+        // `wal_status` is PostgreSQL 13+. On an older server there is nothing to
+        // read and nothing to detect.
+        Err(e)
+            if e.as_db_error()
+                .is_some_and(|db| db.code().code() == SQLSTATE_UNDEFINED_COLUMN) =>
+        {
+            return Ok(false);
+        }
+        Err(e) => return Err(e).context(SetupExecSnafu),
+    };
+
+    if wal_status.as_deref() != Some("lost") {
+        return Ok(false);
+    }
+
+    tracing::warn!(
+        slot = %slot_name,
+        "PostgreSQL invalidated this replication slot (wal_status=lost): the WAL it needed is gone, so it can never stream again. Dropping it and creating a replacement; the acceleration is rebuilt from the source. Raise max_slot_wal_keep_size, or reduce replication lag, to avoid this."
+    );
+    match client
+        .execute("SELECT pg_drop_replication_slot($1)", &[&slot_name])
+        .await
+    {
+        Ok(_) => Ok(true),
+        // Already gone: a concurrent drop raced us, which is the desired state.
+        Err(e)
+            if e.as_db_error()
+                .is_some_and(|db| db.code().code() == SQLSTATE_UNDEFINED_OBJECT) =>
+        {
+            Ok(true)
+        }
+        Err(e) => Err(e).context(SetupExecSnafu),
+    }
+}
+
 async fn ensure_slot(
     client: &tokio_postgres::Client,
     params: &ReplicationParams,
 ) -> Result<SlotInfo> {
+    // A slot the server has invalidated still looks present to every check
+    // below, so retire it first and let the rest of this function create its
+    // replacement.
+    drop_slot_if_invalidated(client, &params.slot_name).await?;
+
     // Distinguish three catalog states for the named slot:
     //   * None            — no slot exists; we create one and need a bootstrap.
     //   * Some(0)         — slot exists but confirmed_flush_lsn is NULL. This
