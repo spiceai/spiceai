@@ -1652,6 +1652,26 @@ impl DataFusion {
         // for it. `mem_tier_budget_bytes` is `None` when no configured table can
         // reach the tier (and for a non-Cayenne deployment): nothing to bound, so
         // nothing is installed and no tuning warning is emitted.
+        // Aggregate ceiling on the PK keyset caches. Each table derives its own
+        // from `pk_keyset_cache_mb` — ~1/32 of memory, clamped 256 MiB–8 GiB —
+        // with no view of its siblings, so a seven-table CDC pod on a 96 GiB host
+        // grants 21 GiB in total that no single table can ever exceed. Measured
+        // at SF-1000: ~14.5 GiB resident in keysets and not one over-budget
+        // event, because every table was correctly inside its own limit.
+        //
+        // 1/16 of the coordinated total, the same order as one table's own
+        // ceiling: generous enough that a single-table pod is unaffected (it
+        // clamps to its own figure anyway) while a fleet shares one bound
+        // instead of multiplying it. Over the ceiling a table degrades to its
+        // bloom, which is the fallback an over-budget table already takes.
+        let pk_keyset_budget_bytes = self.total_memory / 16;
+        cayenne::set_global_pk_keyset_bytes(pk_keyset_budget_bytes);
+        tracing::info!(
+            pk_keyset_budget_bytes,
+            total_memory = self.total_memory,
+            "Cayenne global PK keyset byte budget active (bounds the SUM of per-table keyset caches, which are sized independently)"
+        );
+
         if let Some(mem_tier_budget_bytes) = self.mem_tier_budget_bytes {
             cayenne::set_global_mem_tier_bytes(mem_tier_budget_bytes);
             // Mirror mem-tier `used` into the query MemoryPool so operators and
