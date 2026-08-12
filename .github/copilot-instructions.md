@@ -30,6 +30,7 @@ make lint-rust-fix      # Auto-fix lint issues
 ## Git & PRs
 
 - **Never force-push** — not on `trunk`, not on feature branches, not with `--force-with-lease` (it can't see pushes since your last fetch). Force-pushing destroys collaborator commits and orphans PR review history. Instead: `git pull --rebase` or merge, then push normally; fix reviewed history with follow-up commits and squash on merge; never `--amend` after pushing.
+- **Stacked PRs are supported and need no rebase.** Base the child branch on the parent branch, and once the parent squash-merges, restack by merging `trunk` into the child — then audit, because that merge can silently restore files the child deleted: `docs/dev/stacked_prs.md`.
 - Never bypass hooks or signing (`--no-verify`, `--no-gpg-sign`) — fix the underlying failure.
 - Investigate before destructive ops (`reset --hard`, `checkout --`, `clean -f`): unfamiliar files or branches may be in-progress work.
 - Branch from `trunk`, link the issue, add tests. Style: `docs/dev/style_guide.md`, `docs/dev/error_handling.md`.
@@ -161,4 +162,4 @@ For any feature: check whether it needs a new extension point; test correctness 
 
 `brew install rust cmake protobuf && make install-dev`; `export PATH="$PATH:$HOME/.spice/bin"`. Copy `.vscode/settings.json.template` → `.vscode/settings.json` (gitignored): rust-analyzer runs clippy with `-Dclippy::pedantic -Dclippy::unwrap_used -Dclippy::clone_on_ref_ptr`, so lints fail locally, not just in CI.
 
-Key docs: `docs/PRINCIPLES.md`, `docs/EXTENSIBILITY.md`, `docs/dev/style_guide.md`, `docs/dev/error_handling.md`, `CONTRIBUTING.md`, `docs/decisions/`, `docs/threat_models/`; [Spice docs](https://spiceai.org/docs), [Cookbook](https://github.com/spiceai/cookbook).
+Key docs: `docs/PRINCIPLES.md`, `docs/EXTENSIBILITY.md`, `docs/dev/style_guide.md`, `docs/dev/error_handling.md`, `docs/dev/stacked_prs.md`, `CONTRIBUTING.md`, `docs/decisions/`, `docs/threat_models/`; [Spice docs](https://spiceai.org/docs), [Cookbook](https://github.com/spiceai/cookbook).
