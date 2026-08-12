@@ -156,6 +156,7 @@ mod tests {
         .expect("Codex authentication params should deserialize");
 
         assert_eq!(typed.endpoint, openai::CODEX_API_BASE);
+        assert_eq!(typed.responses_api, llms::openai::ChatBackend::Responses);
     }
 
     #[tokio::test]

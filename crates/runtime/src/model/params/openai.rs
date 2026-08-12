@@ -91,7 +91,7 @@ struct OpenAiModelParamsFields {
     /// The current usage tier for the `OpenAI` account associated with the API key: 'free', 'tier1', 'tier2', 'tier3', 'tier4', or 'tier5'.
     #[param(default = "tier1")]
     usage_tier: UsageTier,
-    /// Whether to use the Responses API backend when serving `/v1/chat/completions` for this model. `disabled` proxies to backend `/v1/chat/completions`; `enabled` proxies to backend `/v1/responses`.
+    /// Whether to use the Responses API backend when serving `/v1/chat/completions` for this model. `disabled` proxies to backend `/v1/chat/completions`; `enabled` proxies to backend `/v1/responses`. Defaults to `enabled` with Codex authentication.
     #[param(runtime, default = "disabled")]
     responses_api: ChatBackend,
     /// The `OpenAI` Responses tools to use when calling the model from the Responses API.
@@ -122,6 +122,7 @@ impl TypedParams for OpenAiModelParams {
         mut params: HashMap<String, SecretString>,
         secrets: &Arc<RwLock<R>>,
     ) -> Result<Self, ParamsError> {
+        let responses_api_is_supplied = params.contains_key("openai_responses_api");
         let auth_mode = params
             .remove("openai_auth_mode")
             .map(|value| parse_param("openai_auth_mode", &value))
@@ -154,6 +155,11 @@ impl TypedParams for OpenAiModelParams {
         } else {
             fields.endpoint
         };
+        let responses_api = if auth.is_codex() && !responses_api_is_supplied {
+            ChatBackend::Responses
+        } else {
+            fields.responses_api
+        };
 
         Ok(Self {
             endpoint,
@@ -161,7 +167,7 @@ impl TypedParams for OpenAiModelParams {
             org_id: fields.org_id,
             project_id: fields.project_id,
             usage_tier: fields.usage_tier,
-            responses_api: fields.responses_api,
+            responses_api,
             responses_tools: fields.responses_tools,
         })
     }
