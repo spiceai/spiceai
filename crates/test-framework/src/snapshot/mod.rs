@@ -572,8 +572,7 @@ mod tests {
 
         // Different file counts must redact to the identical token.
         let input = "|               |   CayenneAccelerationExec: snapshots_scanned=1, files_scanned=30   |";
-        let expected =
-            "|               |   CayenneAccelerationExec: snapshots_scanned=<N>, files_scanned=<N>   |";
+        let expected = "|               |   CayenneAccelerationExec: snapshots_scanned=<N>, files_scanned=<N>   |";
         assert_eq!(regex.replace_all(input, replacement), expected);
 
         let input = "|               |   CayenneAccelerationExec: snapshots_scanned=1, files_scanned=35   |";
@@ -589,7 +588,8 @@ mod tests {
         assert_eq!(regex.replace_all(input, replacement), input);
 
         // Other operators' counters are not this filter's job.
-        let input = "DataSourceExec: file_groups={16 groups: [<redacted>]}, projection=[o_orderkey]";
+        let input =
+            "DataSourceExec: file_groups={16 groups: [<redacted>]}, projection=[o_orderkey]";
         assert_eq!(regex.replace_all(input, replacement), input);
 
         Ok(())
