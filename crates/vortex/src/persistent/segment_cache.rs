@@ -13,7 +13,7 @@ use moka::future::Cache;
 use object_store::path::Path;
 use opentelemetry::metrics::{Meter, ObservableCounter, ObservableGauge};
 use opentelemetry::{KeyValue, global};
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use twox_hash::XxHash3_64;
 use vortex::buffer::ByteBuffer;
 use vortex::error::VortexResult;
@@ -50,22 +50,6 @@ impl SegmentCacheMetrics {
         let datasets = Arc::new(RwLock::new(Vec::<Weak<SegmentCacheDatasetMetrics>>::new()));
         let counters = Arc::new(RwLock::new(HashMap::new()));
 
-        // Observe hits before accesses. `get()` increments accesses first, so a
-        // concurrent collection can under-report hits briefly but cannot make a
-        // completed hit appear without its corresponding access.
-        let hits = {
-            let counters = Arc::clone(&counters);
-            meter
-                .u64_observable_counter("cayenne_segment_cache_hits")
-                .with_description("Cumulative Vortex segment cache hits.")
-                .with_callback(move |observer| {
-                    observe_counters(&counters, |dataset| {
-                        observer
-                            .observe(dataset.hits.load(Ordering::Relaxed), &dataset.dataset_label);
-                    });
-                })
-                .build()
-        };
         let accesses = {
             let counters = Arc::clone(&counters);
             meter
@@ -73,10 +57,23 @@ impl SegmentCacheMetrics {
                 .with_description("Cumulative Vortex segment cache get() calls.")
                 .with_callback(move |observer| {
                     observe_counters(&counters, |dataset| {
-                        observer.observe(
-                            dataset.accesses.load(Ordering::Relaxed),
-                            &dataset.dataset_label,
-                        );
+                        dataset.observe_accesses(|value| {
+                            observer.observe(value, &dataset.dataset_label);
+                        });
+                    });
+                })
+                .build()
+        };
+        let hits = {
+            let counters = Arc::clone(&counters);
+            meter
+                .u64_observable_counter("cayenne_segment_cache_hits")
+                .with_description("Cumulative Vortex segment cache hits.")
+                .with_callback(move |observer| {
+                    observe_counters(&counters, |dataset| {
+                        dataset.observe_hits(|value| {
+                            observer.observe(value, &dataset.dataset_label);
+                        });
                     });
                 })
                 .build()
@@ -237,6 +234,11 @@ struct SegmentCacheCounters {
     dataset_label: [KeyValue; 1],
     accesses: AtomicU64,
     hits: AtomicU64,
+    // Observable callbacks can execute independently and readers can collect
+    // concurrently. Serializing only collection publishes a hit total against
+    // an access total that every reader has already observed, while keeping the
+    // cache read path lock-free.
+    last_observed_accesses: Mutex<u64>,
 }
 
 impl SegmentCacheCounters {
@@ -245,7 +247,21 @@ impl SegmentCacheCounters {
             dataset_label: [KeyValue::new("dataset", dataset.to_string())],
             accesses: AtomicU64::new(0),
             hits: AtomicU64::new(0),
+            last_observed_accesses: Mutex::new(0),
         }
+    }
+
+    fn observe_accesses(&self, observe: impl FnOnce(u64)) {
+        let mut last_observed_accesses = self.last_observed_accesses.lock();
+        let accesses = self.accesses.load(Ordering::Relaxed);
+        observe(accesses);
+        *last_observed_accesses = accesses;
+    }
+
+    fn observe_hits(&self, observe: impl FnOnce(u64)) {
+        let last_observed_accesses = self.last_observed_accesses.lock();
+        let hits = self.hits.load(Ordering::Relaxed);
+        observe(hits.min(*last_observed_accesses));
     }
 }
 
@@ -680,6 +696,30 @@ mod tests {
             MetricType::GAUGE,
             0,
         );
+    }
+
+    #[test]
+    fn counter_callbacks_cannot_publish_hits_ahead_of_accesses() {
+        let counters = SegmentCacheCounters::new("callback_order");
+        counters.accesses.store(1, Ordering::Relaxed);
+        counters.hits.store(1, Ordering::Relaxed);
+
+        let mut hits = u64::MAX;
+        counters.observe_hits(|value| hits = value);
+        assert_eq!(hits, 0, "hits wait for a completed access observation");
+
+        let mut accesses = u64::MAX;
+        counters.observe_accesses(|value| accesses = value);
+        assert_eq!(accesses, 1);
+
+        counters.accesses.store(2, Ordering::Relaxed);
+        counters.hits.store(2, Ordering::Relaxed);
+        counters.observe_hits(|value| hits = value);
+        assert_eq!(hits, 1, "hits use the last completed access snapshot");
+
+        counters.observe_accesses(|value| accesses = value);
+        counters.observe_hits(|value| hits = value);
+        assert_eq!((accesses, hits), (2, 2));
     }
 
     #[tokio::test]
