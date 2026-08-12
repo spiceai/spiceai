@@ -23,7 +23,7 @@ use std::time::Duration;
 /// plane): the base URL the out-of-band HTTPS `/v1/cloud-connect/enroll`
 /// and `/v1/cloud-connect/renew` requests are made against. The gateway
 /// (stream) address is returned by the enroll response, not configured.
-pub const DEFAULT_ENDPOINT: &str = "https://cloud.spice.ai";
+pub const DEFAULT_ENDPOINT: &str = "https://api.spice.ai";
 
 /// Default lead time before the identity cert's `not_after` at which the
 /// client renews. The cloud issues 24h leaves, so a 12h lead yields the
@@ -35,6 +35,25 @@ pub const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Default cadence for `Telemetry` frames on an established stream.
 pub const DEFAULT_TELEMETRY_INTERVAL: Duration = Duration::from_mins(1);
+
+/// Default cadence for `ExportMetrics` frames on an established stream.
+///
+/// Matches the heartbeat cadence: the payload carries cumulative totals, so the
+/// interval sets chart resolution rather than what is or is not recorded.
+pub const DEFAULT_METRICS_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Default ceiling on a single `ExecuteQuery`.
+///
+/// There is no cancellation command on this contract, and one query runs at a
+/// time, so a query that never finishes would hold the only slot for the life
+/// of the process and answer every later query as busy. The deadline is what
+/// bounds that: it releases the slot and abandons the work.
+///
+/// It sits below the control plane's own command budget so the instance is the
+/// layer that gives up first. The slot is then free by the time the caller is
+/// told the query failed, and the retry it prompts is not answered busy by the
+/// query it is replacing.
+pub const DEFAULT_QUERY_DEADLINE: Duration = Duration::from_secs(25);
 
 /// File name (relative to `$SPICE_CONFIG_DIR`) where the cloud-managed
 /// spicepod is written when an `ApplySpicepod` command arrives.
@@ -76,7 +95,7 @@ fn adoption_code_from_env() -> Option<String> {
 /// Runtime config for the Cloud Connect client.
 #[derive(Debug, Clone)]
 pub struct CloudConnectConfig {
-    /// Cloud enroll endpoint (state plane), e.g. `https://cloud.spice.ai`.
+    /// Cloud enroll endpoint (state plane), e.g. `https://api.spice.ai`.
     /// Base URL for the out-of-band HTTPS `/v1/cloud-connect/enroll` and
     /// `/v1/cloud-connect/renew` requests. This is **not** the stream
     /// endpoint: the gateway address for the mTLS `CloudConnect` stream
@@ -158,11 +177,20 @@ pub struct CloudConnectConfig {
     /// Defaults to [`DEFAULT_TELEMETRY_INTERVAL`].
     pub telemetry_interval: Duration,
 
+    /// Cadence for `ExportMetrics` frames once a stream is established.
+    /// Defaults to [`DEFAULT_METRICS_INTERVAL`].
+    pub metrics_interval: Duration,
+
     /// Lead time before the identity cert's `not_after` at which the
     /// client renews (fresh keypair + CSR against `/renew`). Defaults to
     /// [`DEFAULT_RENEWAL_LEAD`]; overridable so tests can exercise the
     /// renewal loop without waiting hours.
     pub renewal_lead: Duration,
+
+    /// How long an `ExecuteQuery` may run before the instance abandons it and frees
+    /// the query slot. Defaults to [`DEFAULT_QUERY_DEADLINE`]; overridable so
+    /// tests can exercise the deadline without waiting it out.
+    pub query_deadline: Duration,
 }
 
 impl CloudConnectConfig {
@@ -339,7 +367,9 @@ impl CloudConnectConfig {
             runtime_version: runtime_version.into(),
             heartbeat_interval: DEFAULT_HEARTBEAT_INTERVAL,
             telemetry_interval: DEFAULT_TELEMETRY_INTERVAL,
+            metrics_interval: DEFAULT_METRICS_INTERVAL,
             renewal_lead: DEFAULT_RENEWAL_LEAD,
+            query_deadline: DEFAULT_QUERY_DEADLINE,
         }
     }
 }
@@ -350,6 +380,31 @@ mod tests {
     use std::sync::Mutex;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// The instance must be the layer that gives up first, because it is the
+    /// only one holding the query slot. If the control plane answers the caller
+    /// while the query runs on, the retry that answer invites is refused as busy
+    /// by the query it is replacing, and the deadline's own result code never
+    /// reaches anyone.
+    ///
+    /// Serializing the result is inside the deadline, not inside the margin:
+    /// the encode runs within the future the deadline wraps. The margin is what
+    /// putting the finished payload on the control stream costs, so the answer
+    /// lands inside the budget rather than exactly on it.
+    #[test]
+    fn the_query_deadline_expires_inside_the_control_plane_command_budget() {
+        /// The control plane's shared `DEFAULT_COMMAND_TIMEOUT`, which bounds
+        /// every command it dispatches rather than queries alone. Mirrored here
+        /// because it is the number this deadline has to fit inside; if it moves
+        /// there, it moves here, and this test is what notices.
+        const CONTROL_PLANE_COMMAND_BUDGET: Duration = Duration::from_secs(30);
+        const MARGIN: Duration = Duration::from_secs(5);
+
+        assert!(
+            DEFAULT_QUERY_DEADLINE.saturating_add(MARGIN) <= CONTROL_PLANE_COMMAND_BUDGET,
+            "the {DEFAULT_QUERY_DEADLINE:?} query deadline leaves under {MARGIN:?} of the {CONTROL_PLANE_COMMAND_BUDGET:?} command budget to return the result; lower it, or raise the budget first"
+        );
+    }
 
     #[test]
     fn default_config_dir_respects_env_var() {

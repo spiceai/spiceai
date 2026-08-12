@@ -51,6 +51,21 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+impl Error {
+    #[must_use]
+    pub fn is_not_found(&self) -> bool {
+        match self {
+            Self::UnableToOpenPath { source, .. } => source.kind() == std::io::ErrorKind::NotFound,
+            #[cfg(feature = "object-store")]
+            Self::UnableToOpenObjectStorePath { source, .. } => {
+                matches!(source, object_store::Error::NotFound { .. })
+            }
+            #[cfg(feature = "object-store")]
+            Self::UnableToParseObjectStorePath { .. } => false,
+        }
+    }
+}
+
 /// Trait for objects that can open a path for reading.
 #[async_trait]
 pub trait ReadablePath {
@@ -83,17 +98,19 @@ pub trait ReadableYaml: ReadablePath {
         &self,
         base_path: PathBuf,
         basename: &str,
-    ) -> Option<Box<dyn io::Read + Send + Sync>> {
+    ) -> Result<Option<Box<dyn io::Read + Send + Sync>>> {
         let yaml_files = vec![format!("{basename}.yaml"), format!("{basename}.yml")];
 
         for yaml_file in yaml_files {
             let yaml_path = base_path.join(&yaml_file);
-            if let Ok(yaml_file) = self.open(yaml_path.clone()).await {
-                return Some(yaml_file);
+            match self.open(yaml_path).await {
+                Ok(yaml_file) => return Ok(Some(yaml_file)),
+                Err(err) if err.is_not_found() => {}
+                Err(err) => return Err(err),
             }
         }
 
-        None
+        Ok(None)
     }
 
     async fn open_exact_yaml(&self, filename: PathBuf) -> Result<Box<dyn io::Read + Send + Sync>> {
@@ -144,3 +161,44 @@ impl ReadablePath for ObjectStoreFilesystem {
 
 #[cfg(feature = "object-store")]
 impl ReadableYaml for ObjectStoreFilesystem {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct FailingFilesystem(std::io::ErrorKind);
+
+    #[async_trait]
+    impl ReadablePath for FailingFilesystem {
+        async fn open(&self, path: PathBuf) -> Result<Box<dyn io::Read + Send + Sync>> {
+            Err(Error::UnableToOpenPath {
+                source: std::io::Error::from(self.0),
+                path,
+            })
+        }
+    }
+
+    impl ReadableYaml for FailingFilesystem {}
+
+    #[tokio::test]
+    async fn open_yaml_treats_only_not_found_as_absent() {
+        let missing = FailingFilesystem(std::io::ErrorKind::NotFound)
+            .open_yaml(PathBuf::from("/app"), "spicepod")
+            .await
+            .expect("not found is a normal candidate miss");
+        assert!(missing.is_none());
+
+        let Err(err) = FailingFilesystem(std::io::ErrorKind::PermissionDenied)
+            .open_yaml(PathBuf::from("/app"), "spicepod")
+            .await
+        else {
+            panic!("permission denied must not be reported as absent");
+        };
+        assert!(!err.is_not_found());
+        assert!(matches!(
+            err,
+            Error::UnableToOpenPath { source, .. }
+                if source.kind() == std::io::ErrorKind::PermissionDenied
+        ));
+    }
+}

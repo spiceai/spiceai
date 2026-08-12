@@ -16,9 +16,10 @@ limitations under the License.
 
 //! What will relaunch this process after a deployment exits it.
 //!
-//! A deployment applies by persisting the spicepod and exiting, so whatever
-//! supervises the process is the mechanism, not a convenience: with nothing
-//! watching, a deployment *stops* the instance instead of updating it. The
+//! A deployment the runtime cannot apply in place applies by persisting the
+//! spicepod and exiting, so whatever supervises the process is the mechanism,
+//! not a convenience: with nothing watching, such a deployment *stops* the
+//! instance instead of updating it. The
 //! runtime cannot install a supervisor, so it detects one and says what it
 //! found — at startup, in `get_status`, and therefore in the portal — before
 //! the first deployment is the way the operator finds out.

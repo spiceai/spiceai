@@ -52,6 +52,7 @@ mod do_put;
 mod prepared_statements;
 mod statement_substrait_plan;
 mod statement_update;
+mod trace_id;
 
 async fn start_spice_test_app(
     flight_auth: Option<Arc<dyn FlightBasicAuth + Send + Sync>>,
@@ -243,7 +244,7 @@ async fn register_test_table(
     .map_err(anyhow::Error::from)?;
 
     datafusion
-        .register_table_as_writable_and_with_schema(table_name, table)
+        .register_table_as_writable_and_with_schema(table_name, table.into_table())
         .map_err(anyhow::Error::from)?;
 
     Ok(())

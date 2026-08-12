@@ -17,7 +17,9 @@ limitations under the License.
 //! Login command and subcommands for authenticating with various data sources.
 
 mod auth_config;
+pub mod connect_org;
 mod providers;
+pub mod session;
 
 use crate::context::RuntimeContext;
 use crate::error::Result;
@@ -193,86 +195,53 @@ async fn login_spiceai(
     }
 
     // Spice.ai OAuth flow
-    let base_url = get_spice_base_url();
-    let auth_code = generate_auth_code();
-
-    let auth_url = format!("{base_url}/auth/token?code={auth_code}");
+    let flow = session::BrowserLogin::new();
 
     if !is_json {
-        println!("Attempting to open Spice.ai authorization page in your default browser");
-        println!("\nYour auth code:\n");
-        println!("{}-{}", &auth_code[..4], &auth_code[4..]);
-        println!("\nIf the browser does not open, visit the following URL manually:");
-        println!("\n{auth_url}\n");
+        flow.announce();
     }
-
-    // Fire-and-forget: open in spawn_blocking so Command::status does not
-    // block a Tokio worker or delay the OAuth poll loop.
-    let auth_url_for_open = auth_url.clone();
-    tokio::task::spawn_blocking(move || {
-        let _ = system_open::that(auth_url_for_open);
-    });
+    flow.open_browser();
 
     tracing::info!("Waiting for authentication...");
 
-    // Poll for auth status. The exchange below posts the auth code in the request body, so
-    // this client must not follow a redirect off the origin.
-    let client = credentialed_client()?;
-    let exchange_url = format!("{base_url}/auth/token/exchange");
+    let (access_token, auth_context) = match flow.authenticate().await? {
+        session::BrowserLoginOutcome::Declined => return Err(access_denied_error()),
+        session::BrowserLoginOutcome::Granted {
+            access_token,
+            context,
+        } => (access_token, context),
+    };
 
-    let access_token = poll_for_access_token(
-        &client,
-        &exchange_url,
-        &auth_code,
-        LOGIN_POLL_TIMEOUT,
-        LOGIN_POLL_INTERVAL,
-    )
-    .await?;
-
-    // Try to read the Spicepod manifest for preferred org/app.
-    let (org_name, app_name) = read_spicepod_metadata();
-
-    // Get auth context
-    let auth_context = get_spice_auth_context(
-        &base_url,
-        &access_token,
-        org_name.as_deref(),
-        app_name.as_deref(),
-    )
-    .await?;
-
-    let api_key_value = auth_context.app_api_key.unwrap_or_default();
-
-    // Save credentials
     if is_json {
         // In JSON mode, include auth context fields alongside credentials
         let json = serde_json::json!({
             "SPICE_SPICEAI_TOKEN": &access_token,
-            "SPICE_SPICEAI_API_KEY": &api_key_value,
+            "SPICE_SPICEAI_API_KEY": auth_context.app_api_key.as_deref().unwrap_or_default(),
             "username": &auth_context.username,
             "org": &auth_context.org_name,
             "app": auth_context.app_name.as_deref().unwrap_or_default(),
         });
         println!("{}", serde_json::to_string(&json).unwrap_or_default());
-    } else {
-        save_credentials(
-            &output,
-            "SPICEAI",
-            &[("TOKEN", &access_token), ("API_KEY", &api_key_value)],
-        )?;
-
-        println!(
-            "\x1b[32mSuccessfully logged in to Spice.ai as {} ({})\x1b[0m",
-            auth_context.username, auth_context.email
-        );
-        println!(
-            "\x1b[32mUsing app {}/{}\x1b[0m",
-            auth_context.org_name,
-            auth_context.app_name.unwrap_or_default()
-        );
+        return Ok(());
     }
 
+    let session = session::establish_session(
+        access_token,
+        auth_context,
+        session::CredentialStore::from_output(&output),
+    )?;
+    session::print_login_success(&session);
+
     Ok(())
+}
+
+/// The user refused the browser authorization. The standalone command reports
+/// it as a failure; an inline login maps the same outcome to a clean
+/// cancellation instead.
+fn access_denied_error() -> crate::error::Error {
+    crate::error::Error::InvalidArgument {
+        message: "Access denied".to_string(),
+    }
 }
 
 /// How long the Spice.ai browser flow waits for the user before giving up.
@@ -343,6 +312,18 @@ fn classify_exchange_status(status: reqwest::StatusCode) -> Option<ExchangeOutco
         )));
     }
 
+    // The auth code is minted locally, so the exchange answers 404 until the
+    // browser authorization for it exists -- including on the first poll, which
+    // races the browser. A base URL that does not serve the exchange answers the
+    // same way, which is why this reports a reason rather than only pending: the
+    // deadline bounds either, and its error has to name both.
+    if status == reqwest::StatusCode::NOT_FOUND {
+        return Some(ExchangeOutcome::Transient(format!(
+            "the exchange endpoint has no authorization for this code ({status}); \
+             a SPICE_BASE_URL pointing at the wrong deployment answers the same way"
+        )));
+    }
+
     // Anything else is the endpoint rejecting this exact request: a 4xx, or a
     // redirect the client declines to follow because it leaves the origin the
     // credential was minted for. Neither is cleared by sending it again.
@@ -364,20 +345,39 @@ fn classify_exchange_body(body: &serde_json::Value) -> ExchangeOutcome {
     }
 }
 
+/// What the exchange poll decided: the browser flow granted a token, or the
+/// user refused the authorization. Refusal is a decision, not a transport
+/// failure — the standalone command and the inline continuation report it
+/// differently, so the poll does not turn it into an error itself.
+enum AccessTokenPoll {
+    Granted(String),
+    Denied,
+}
+
+/// Redacts the token; this type carries a live credential.
+impl std::fmt::Debug for AccessTokenPoll {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Granted(_) => f.write_str("Granted(<redacted>)"),
+            Self::Denied => f.write_str("Denied"),
+        }
+    }
+}
+
 /// Poll the Spice.ai token exchange until it yields a token, refuses, or
 /// `timeout` elapses.
 ///
 /// # Errors
 ///
-/// Returns an error if the authorization is refused, if the endpoint reports a
-/// failure that repeating cannot clear, or if `timeout` elapses first.
+/// Returns an error if the endpoint reports a failure that repeating cannot
+/// clear, or if `timeout` elapses first.
 async fn poll_for_access_token(
     client: &reqwest::Client,
     exchange_url: &str,
     auth_code: &str,
     timeout: std::time::Duration,
     interval: std::time::Duration,
-) -> Result<String> {
+) -> Result<AccessTokenPoll> {
     let start = std::time::Instant::now();
     // Kept so an endpoint that only ever fails reports *why* it timed out,
     // rather than logging the same line once a second for the whole deadline.
@@ -426,12 +426,8 @@ async fn poll_for_access_token(
         };
 
         match outcome {
-            ExchangeOutcome::Token(token) => return Ok(token),
-            ExchangeOutcome::Denied => {
-                return Err(crate::error::Error::InvalidArgument {
-                    message: "Access denied".to_string(),
-                });
-            }
+            ExchangeOutcome::Token(token) => return Ok(AccessTokenPoll::Granted(token)),
+            ExchangeOutcome::Denied => return Ok(AccessTokenPoll::Denied),
             ExchangeOutcome::Permanent(message) => {
                 return Err(crate::error::Error::InvalidArgument {
                     message: format!("Authentication failed: {message}."),
@@ -532,13 +528,29 @@ fn read_spicepod_metadata() -> (Option<String>, Option<String>) {
 }
 
 /// Auth context from Spice.ai API.
-#[derive(Debug, serde::Deserialize)]
 struct SpiceAuthContext {
     username: String,
     email: String,
     org_name: String,
     app_name: Option<String>,
     app_api_key: Option<String>,
+}
+
+/// Redacts the app API key: the context rides inside login outcomes and
+/// sessions whose `Debug` output can reach logs and assertion messages.
+impl std::fmt::Debug for SpiceAuthContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SpiceAuthContext")
+            .field("username", &self.username)
+            .field("email", &self.email)
+            .field("org_name", &self.org_name)
+            .field("app_name", &self.app_name)
+            .field(
+                "app_api_key",
+                &self.app_api_key.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
 }
 
 /// Get auth context from Spice.ai API.
@@ -599,8 +611,8 @@ async fn get_spice_auth_context(
 #[cfg(test)]
 mod tests {
     use super::{
-        ExchangeOutcome, classify_exchange_body, classify_exchange_status, credentialed_client,
-        poll_for_access_token,
+        AccessTokenPoll, ExchangeOutcome, classify_exchange_body, classify_exchange_status,
+        credentialed_client, poll_for_access_token,
     };
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::{TcpListener, TcpStream};
@@ -616,15 +628,9 @@ mod tests {
         reqwest::StatusCode::from_u16(code).expect("code should be a valid HTTP status")
     }
 
-    async fn exchange_against(
-        template: wiremock::ResponseTemplate,
-    ) -> (crate::error::Result<String>, u64) {
-        let server = wiremock::MockServer::start().await;
-        wiremock::Mock::given(wiremock::matchers::method("POST"))
-            .respond_with(template)
-            .mount(&server)
-            .await;
-
+    async fn poll_against(
+        server: &wiremock::MockServer,
+    ) -> (crate::error::Result<AccessTokenPoll>, u64) {
         let url = format!("{}/auth/token/exchange", server.uri());
         let client = reqwest::Client::new();
         let started = std::time::Instant::now();
@@ -633,6 +639,18 @@ mod tests {
 
         let elapsed = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         (result, elapsed)
+    }
+
+    async fn exchange_against(
+        template: wiremock::ResponseTemplate,
+    ) -> (crate::error::Result<AccessTokenPoll>, u64) {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(template)
+            .mount(&server)
+            .await;
+
+        poll_against(&server).await
     }
 
     #[test]
@@ -668,7 +686,7 @@ mod tests {
     fn a_rejecting_status_is_permanent() {
         // 302 is the cross-origin redirect the client declines to follow; the
         // 4xx codes are the endpoint rejecting this exact request.
-        for code in [301, 302, 307, 400, 401, 403, 404, 410] {
+        for code in [301, 302, 307, 400, 401, 403, 410] {
             assert!(
                 matches!(
                     classify_exchange_status(status(code)),
@@ -677,6 +695,20 @@ mod tests {
                 "{code} should be permanent"
             );
         }
+    }
+
+    /// A 404 is how the exchange reports an authorization it has not been given
+    /// yet, so it has to keep polling rather than end the login.
+    #[test]
+    fn a_not_found_status_is_retriable() {
+        let Some(ExchangeOutcome::Transient(message)) = classify_exchange_status(status(404))
+        else {
+            panic!("404 should be retriable");
+        };
+        assert!(
+            message.contains("404") && message.contains("SPICE_BASE_URL"),
+            "the reason should name the status and the endpoint, got: {message}"
+        );
     }
 
     #[test]
@@ -731,22 +763,75 @@ mod tests {
         );
     }
 
-    /// Regression test for #12506: a wrong `SPICE_BASE_URL` answers 404 to every
-    /// attempt, which the old loop retried forever.
     #[tokio::test]
     async fn a_rejecting_endpoint_fails_without_waiting_out_the_deadline() {
-        let (result, elapsed) = exchange_against(wiremock::ResponseTemplate::new(404)).await;
+        let (result, elapsed) = exchange_against(wiremock::ResponseTemplate::new(400)).await;
 
         let Err(err) = result else {
-            panic!("a 404 exchange endpoint should not succeed");
+            panic!("a 400 exchange endpoint should not succeed");
         };
         assert!(
-            err.to_string().contains("404"),
+            err.to_string().contains("400"),
             "the error should name the status, got: {err}"
         );
         assert!(
             elapsed < TEST_TIMEOUT_MS,
             "a permanent failure should not wait out the deadline, took {elapsed}ms"
+        );
+    }
+
+    /// Regression test for #12870: the exchange answers 404 until the browser
+    /// authorization exists, so the first poll always lands there and a login
+    /// that treats it as fatal can never complete.
+    #[tokio::test]
+    async fn an_exchange_that_answers_not_found_first_still_yields_a_token() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(404))
+            .up_to_n_times(3)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "access_token": "tok_after_404" })),
+            )
+            .with_priority(2)
+            .mount(&server)
+            .await;
+
+        let (result, _) = poll_against(&server).await;
+
+        let outcome = result.expect("a token after the leading 404s should succeed");
+        assert!(
+            matches!(outcome, AccessTokenPoll::Granted(ref token) if token == "tok_after_404"),
+            "expected the token, got: {outcome:?}"
+        );
+    }
+
+    /// Regression test for #12506: a 404 every attempt — a base URL that does not
+    /// serve the exchange — is bounded by the deadline, and the error says so
+    /// rather than blaming the user for not finishing.
+    #[tokio::test]
+    async fn a_perpetually_not_found_exchange_gives_up_at_the_deadline() {
+        let (result, elapsed) = exchange_against(wiremock::ResponseTemplate::new(404)).await;
+
+        let Err(err) = result else {
+            panic!("a never-authorized exchange should not succeed");
+        };
+        let message = err.to_string();
+        assert!(
+            message.contains("Authentication timed out"),
+            "expected a timeout error, got: {message}"
+        );
+        assert!(
+            message.contains("404") && message.contains("SPICE_BASE_URL"),
+            "the timeout should point at the endpoint, got: {message}"
+        );
+        assert!(
+            elapsed < TEST_TIMEOUT_MS * 10,
+            "the loop should stop near its deadline, took {elapsed}ms"
         );
     }
 
@@ -776,28 +861,35 @@ mod tests {
             .set_body_json(serde_json::json!({ "access_token": "tok_abc" }));
         let (result, _) = exchange_against(template).await;
 
-        assert_eq!(
-            result.expect("a token response should succeed"),
-            "tok_abc".to_string()
+        let outcome = result.expect("a token response should succeed");
+        assert!(
+            matches!(outcome, AccessTokenPoll::Granted(ref token) if token == "tok_abc"),
+            "expected the token, got: {outcome:?}"
         );
     }
 
+    /// A refusal ends the poll as a decided outcome — the standalone command
+    /// turns it into "Access denied", an inline login into a cancellation.
     #[tokio::test]
     async fn an_access_denied_response_stops_immediately() {
         let template = wiremock::ResponseTemplate::new(200)
             .set_body_json(serde_json::json!({ "access_denied": true }));
         let (result, elapsed) = exchange_against(template).await;
 
-        let Err(err) = result else {
-            panic!("an access_denied response should not succeed");
-        };
+        let outcome = result.expect("a denial is a decided outcome, not an error");
         assert!(
-            err.to_string().contains("Access denied"),
-            "expected an access-denied error, got: {err}"
+            matches!(outcome, AccessTokenPoll::Denied),
+            "expected a denial, got: {outcome:?}"
         );
         assert!(
             elapsed < TEST_TIMEOUT_MS,
             "a denial should not wait out the deadline, took {elapsed}ms"
+        );
+        assert!(
+            super::access_denied_error()
+                .to_string()
+                .contains("Access denied"),
+            "the standalone login must still report the denial as 'Access denied'"
         );
     }
 
@@ -853,6 +945,54 @@ mod tests {
             .local_addr()
             .expect("listener should have a local address")
             .port()
+    }
+
+    /// Provider regression guard: the SharePoint/ABFS OAuth device-code flows
+    /// are dispatched to the provider module untouched by the session refactor.
+    /// A grammar change that rerouted them through the Spice.ai browser flow
+    /// would change their vocabulary and credential handling.
+    #[test]
+    fn provider_subcommands_still_route_to_the_device_code_flows() {
+        use clap::Parser;
+
+        #[derive(clap::Parser)]
+        struct TestCli {
+            #[command(subcommand)]
+            command: TestCommand,
+        }
+
+        #[derive(clap::Subcommand)]
+        enum TestCommand {
+            Login(super::LoginArgs),
+        }
+
+        for provider in ["sharepoint", "abfs"] {
+            let cli = TestCli::try_parse_from([
+                "spice",
+                "login",
+                provider,
+                "-t",
+                "tenant123",
+                "-c",
+                "client456",
+            ])
+            .unwrap_or_else(|e| panic!("`spice login {provider}` should still parse: {e}"));
+
+            let TestCommand::Login(args) = cli.command;
+            match (provider, args.command) {
+                ("sharepoint", Some(super::LoginCommands::Sharepoint(provider_args))) => {
+                    assert_eq!(provider_args.tenant_id, "tenant123");
+                    assert_eq!(provider_args.client_id, "client456");
+                }
+                ("abfs", Some(super::LoginCommands::Abfs(provider_args))) => {
+                    assert_eq!(provider_args.tenant_id, "tenant123");
+                    assert_eq!(provider_args.client_id, "client456");
+                }
+                (provider, other) => panic!(
+                    "`spice login {provider}` no longer routes to its provider flow: {other:?}"
+                ),
+            }
+        }
     }
 
     /// A cross-origin redirect must not be followed, because the request body carries the

@@ -57,17 +57,16 @@ use runtime_component::schema_evolution::{
 };
 use runtime_datafusion::error::{find_datafusion_root, format_datafusion_error};
 use runtime_datafusion::execution_plan::schema_cast::SchemaCastScanExec;
-use runtime_datafusion_index::{IndexedTableProvider, LayerWalk, find_concrete_table_provider_in};
 use runtime_metrics::acceleration as metrics;
-use runtime_search::embeddings::table::EmbeddingTable;
 use runtime_status as status;
 use runtime_table_partition::provider::PartitionTableProvider;
 #[cfg(test)]
 use snafu::OptionExt;
 use snafu::ResultExt;
+use spice_table::{LayerWalk, SpiceTable, find_concrete};
 use std::collections::{HashMap, VecDeque};
 use std::hash::BuildHasherDefault;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 use tokio::sync::{Notify, RwLock};
@@ -539,8 +538,14 @@ const CDC_PREFETCH_BUFFER_DEFAULT: usize = 128;
 // buffered in this channel. With the old 1024 max the 4096 envelope cap never bound.
 // Raised 1024 -> 16384 so high-throughput tables form larger bursts, amortizing the
 // fixed per-batch publish cost (one EBS directory `sync_all()` per batch per table)
-// over more rows. `max_coalesced_bytes` (128 MiB default) still bounds peak burst memory,
-// and the drain never waits, so low-load latency is unchanged (burst.len()==1).
+// over more rows. `max_coalesced_bytes` (128 MiB default) bounds the burst DRAINED
+// from the channel — not what sits in it. The channel's bound is this envelope
+// count, and an envelope carries a batch of any width, so the size of what is
+// queued ahead of apply is bounded by nothing. `cdc_prefetch_buffer_bytes`
+// estimates it, on the same decode-free scale `max_coalesced_bytes` budgets
+// against; a large value means memory no budget accounts for and is worth
+// investigating. The drain never waits, so low-load latency is unchanged
+// (burst.len()==1).
 const CDC_PREFETCH_BUFFER_MAX: usize = 16384;
 const CDC_MAX_COALESCED_ENVELOPES_DEFAULT: usize = 256;
 // Raised 4096 -> 16384 to match the prefetch ceiling (otherwise it would re-clip the burst).
@@ -1065,8 +1070,12 @@ impl RefreshTask {
         // its source-side offset, the reader task can already be pulling and
         // decoding batch N+1 (network/CPU work that would otherwise be idle).
         // The bounded channel provides natural backpressure: when the apply
-        // loop is the bottleneck, the reader parks on `send` and stops
-        // pulling, so we never accumulate unbounded memory.
+        // loop is the bottleneck, the reader parks on `send` and stops pulling.
+        // That bounds the number of envelopes in flight, not their size — a full
+        // channel holds `prefetch_buffer` batches of whatever width the source
+        // produces, which at a large scale factor can be a substantial and
+        // otherwise unmeasured share of the process. `cdc_prefetch_buffer_bytes`
+        // estimates it.
         let (tx, mut rx) = tokio::sync::mpsc::channel::<
             Result<cdc::ChangeEnvelope, cdc::StreamError>,
         >(cdc_cfg.prefetch_buffer);
@@ -1077,6 +1086,23 @@ impl RefreshTask {
         // while the reader's real sender lives, so it can never resurrect a closed
         // channel.
         let tx_probe = tx.downgrade();
+        // Estimated size of what is queued in the channel above. The capacity
+        // bound counts envelopes, so this is not derivable from occupancy: a
+        // mid-range envelope count can hold anything from kilobytes to gigabytes
+        // depending on how wide the source's batches are. The reader adds an
+        // envelope's encoded size as it hands it over and the apply loop
+        // subtracts it on receipt, so the value tracks what is queued ahead of
+        // apply. `encoded_len` is a decode-free estimate, not measured resident
+        // bytes — see `CDC_PREFETCH_BUFFER_BYTES` for what it does and does not
+        // claim.
+        let prefetch_bytes = Arc::new(AtomicU64::new(0));
+        let reader_prefetch_bytes = Arc::clone(&prefetch_bytes);
+        // Zeroes the gauge once this stream is gone, however it goes (see
+        // `PrefetchBytesGaugeReset`). Held for the whole function so the reset
+        // also covers the finalize/commit drain below, not just the apply loop.
+        let _prefetch_gauge_reset = PrefetchBytesGaugeReset {
+            labels: metric_labels.clone(),
+        };
 
         let reader_dataset = dataset_name.clone();
         let reader_metric_labels = metric_labels.clone();
@@ -1102,10 +1128,24 @@ impl RefreshTask {
                     }
                     item = stream.next() => {
                         let Some(item) = item else { return; };
+                        // Charge the envelope before handing it over: once `send`
+                        // returns the apply loop may already have taken it and
+                        // subtracted, and crediting afterwards could then drive
+                        // the counter negative. `encoded_len` does not force a
+                        // deferred envelope to build.
+                        let queued_bytes = match &item {
+                            Ok(envelope) => envelope.encoded_len() as u64,
+                            Err(_) => 0,
+                        };
+                        reader_prefetch_bytes.fetch_add(queued_bytes, Ordering::Relaxed);
                         // Time blocked on send: non-zero => the prefetch channel is
                         // full and the apply loop can't drain fast enough (apply-bound).
                         let send_start = Instant::now();
                         let send_res = tx.send(item).await;
+                        if send_res.is_err() {
+                            // Nobody will receive it, so nobody will subtract it.
+                            discharge_prefetch_bytes(&reader_prefetch_bytes, queued_bytes);
+                        }
                         metrics::CDC_READER_SEND_WAIT_MS.record(elapsed_ms(send_start), send_labels);
                         if send_res.is_err() {
                             tracing::debug!(
@@ -1267,6 +1307,17 @@ impl RefreshTask {
                 },
             };
             metrics::CDC_SOURCE_RECV_WAIT_MS.record(elapsed_ms(recv_start), recv_wait_labels);
+            // Discharge what this receive took out, before sampling, so the byte
+            // gauge and the envelope occupancy below describe the same thing: the
+            // backlog still queued, not counting the item now in hand.
+            //
+            // A CARRIED item is deliberately not discharged here: it left the
+            // channel on the previous iteration's `try_recv` and was discharged
+            // there. Charging it out twice drove the counter below zero, and an
+            // unsigned wrap made the gauge read ~1.8e19.
+            if !from_carried && let Some(item) = next_item.as_ref() {
+                discharge_prefetch_bytes(&prefetch_bytes, cdc_item_budget_bytes(item) as u64);
+            }
             // Sample prefetch-channel occupancy at the moment the apply loop wakes
             // (the just-received `first` is out of the buffer; whatever remains is
             // the backlog the reader has queued ahead). Near capacity => apply-bound.
@@ -1275,6 +1326,11 @@ impl RefreshTask {
                 let occupancy = capacity.saturating_sub(tx.capacity() as u64);
                 metrics::CDC_PREFETCH_BUFFER_OCCUPANCY.record(occupancy, recv_wait_labels);
                 metrics::CDC_PREFETCH_BUFFER_CAPACITY.record(capacity, recv_wait_labels);
+                // Sampled next to the envelope count deliberately: read together
+                // they say whether a full channel is holding a little or a lot,
+                // which the count alone cannot.
+                metrics::CDC_PREFETCH_BUFFER_BYTES
+                    .record(prefetch_bytes.load(Ordering::Relaxed), recv_wait_labels);
             }
             let Some(first) = next_item else {
                 break;
@@ -1357,6 +1413,11 @@ impl RefreshTask {
                 match rx.try_recv() {
                     Ok(item) => {
                         let item_bytes = cdc_item_budget_bytes(&item);
+                        // Out of the channel, so out of the channel's byte count —
+                        // whether it joins this burst or is carried to the next.
+                        // A carried item is discharged HERE and not again when the
+                        // next iteration picks it up.
+                        discharge_prefetch_bytes(&prefetch_bytes, item_bytes as u64);
                         if burst_bytes > 0
                             && item_bytes > 0
                             && burst_bytes.saturating_add(item_bytes) > max_burst_bytes
@@ -1404,6 +1465,10 @@ impl RefreshTask {
                     match tokio::time::timeout(remaining, rx.recv()).await {
                         Ok(Some(item)) => {
                             let item_bytes = cdc_item_budget_bytes(&item);
+                            // Out of the channel, so out of the channel's byte
+                            // count — burst or carried, it is no longer queued.
+                            // A carried item is discharged HERE, once.
+                            discharge_prefetch_bytes(&prefetch_bytes, item_bytes as u64);
                             if burst_bytes > 0
                                 && item_bytes > 0
                                 && burst_bytes.saturating_add(item_bytes) > max_burst_bytes
@@ -2604,7 +2669,7 @@ impl RefreshTask {
     /// the wrappers it is created behind. Non-partitioned Cayenne tables are
     /// wrapped in `PolyTableProvider` (read/write split), optionally
     /// `UpsertDedupTableProvider` (when `remove_duplicates`/`last_write_wins` is
-    /// set), and `IndexedTableProvider` (vector indexes). A direct downcast to
+    /// set), and `IndexLayer` (vector indexes). A direct downcast to
     /// `CayenneTableProvider` misses through any of these, so without peeling the
     /// CDC apply silently falls back to the synchronous `insert_into` path and
     /// loses pipelined finalization (backgrounded publish, no blocking
@@ -2612,10 +2677,10 @@ impl RefreshTask {
     ///
     /// Uses [`LayerWalk::Write`], which steps only through wrappers whose
     /// `insert_into` is a pass-through (`PolyTableProvider` to its writer side,
-    /// `IndexedTableProvider`) — see the layer table in [`crate::table_layers`].
+    /// `IndexLayer`), as each layer's `route` declares.
     ///
     /// NOTE: `UpsertDedupTableProvider` is opaque to the write walk. Unlike
-    /// `PolyTableProvider` (delegates writes) and `IndexedTableProvider`
+    /// `PolyTableProvider` (delegates writes) and `IndexLayer`
     /// (`insert_into` is a pass-through), it *rewrites* the write on insert
     /// (dedup / last-write-wins via `UpsertDedupExec`). Routing CDC past it to the
     /// inner provider would bypass that transform, so a dedup-configured table
@@ -2623,11 +2688,7 @@ impl RefreshTask {
     /// semantics) and emits the fallback warning below.
     #[cfg(not(windows))]
     fn cayenne_accelerator(&self) -> Option<&CayenneTableProvider> {
-        find_concrete_table_provider_in::<CayenneTableProvider>(
-            &self.accelerator,
-            crate::table_layers::layers(),
-            LayerWalk::Write,
-        )
+        find_concrete::<CayenneTableProvider>(self.accelerator.as_ref(), LayerWalk::Write)
     }
 
     /// Effective per-plan delete-key cap for this dataset: the process-global
@@ -2888,7 +2949,7 @@ impl RefreshTask {
 
                 if handled_by_cayenne_cdc_path {
                     // Cayenne's fast CDC-delete path bypasses `TableProvider::delete_from`
-                    // entirely, so it never reaches `IndexedTableProvider::delete_from`'s
+                    // entirely, so it never reaches `IndexLayer::delete_from`'s
                     // index-aware handling on either side — drive index deletion explicitly
                     // here instead, across both the accelerator and federated sides (an
                     // external-store vector/search index, e.g. S3 Vectors, is attached only
@@ -2919,7 +2980,7 @@ impl RefreshTask {
                         .context(crate::accelerated::FailedToWriteDataSnafu)?;
 
                     // `self.accelerator.delete_from` above already drives any
-                    // `IndexedTableProvider` wrapping the accelerator itself (e.g. the DuckDB
+                    // `IndexLayer` wrapping the accelerator itself (e.g. the DuckDB
                     // vector engine) through its own index-aware handling. It cannot reach an
                     // index attached only on the federated side (e.g. S3 Vectors, Elasticsearch)
                     // — that's a distinct `TableProvider` chain — so drive those explicitly here.
@@ -3040,6 +3101,55 @@ fn cdc_item_budget_bytes(item: &Result<cdc::ChangeEnvelope, cdc::StreamError>) -
     item.as_ref().map_or(0, cdc::ChangeEnvelope::encoded_len)
 }
 
+/// Zeroes `cdc_prefetch_buffer_bytes` for one dataset when the CDC stream that
+/// feeds it goes away.
+///
+/// The gauge is only ever recorded from inside the apply loop, so its last
+/// reading outlives that loop. Every exit — a `break` out to the finalize drain,
+/// or the whole future being dropped mid-`await` when the refresh task is
+/// cancelled — drops the receiver and everything still queued behind it, but
+/// leaves the exported value describing a backlog that no longer exists. An
+/// operator reading a torn-down dataset would see prefetch memory that was
+/// already freed, which is the same class of lie the gauge exists to stop
+/// telling. `Drop` is what covers the cancellation path; resetting at each
+/// `break` would not, since an aborted task never reaches one.
+struct PrefetchBytesGaugeReset {
+    labels: DatasetMetricLabels,
+}
+
+impl Drop for PrefetchBytesGaugeReset {
+    fn drop(&mut self) {
+        metrics::CDC_PREFETCH_BUFFER_BYTES.record(0, self.labels.dataset());
+    }
+}
+
+/// Subtract from the CDC prefetch byte counter without wrapping.
+///
+/// Charge and discharge are meant to be symmetric, but `u64::fetch_sub` past
+/// zero wraps to ~1.8e19, which turns a small accounting slip into a reading no
+/// operator can interpret — and which looks nothing like "slightly wrong". A
+/// gauge that fails should fail toward zero, where the error stays proportional
+/// to the mistake, so saturate rather than wrap.
+fn discharge_prefetch_bytes(counter: &AtomicU64, bytes: u64) {
+    let previous = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        Some(current.saturating_sub(bytes))
+    });
+    // Saturating in release is the right failure mode for a gauge, but it also
+    // HIDES the bug that motivated it: discharging one envelope twice used to
+    // wrap the counter to ~1.8e19, and saturation would instead quietly clamp to
+    // zero and look plausible. Every charge has exactly one discharge, so a
+    // discharge larger than the balance is a real accounting error - fail loudly
+    // where a test can see it, and stay soft where an operator would only see a
+    // gauge.
+    debug_assert!(
+        previous.is_ok_and(|balance| balance >= bytes),
+        "CDC prefetch byte counter underflowed: discharged {bytes} against a balance of \
+         {previous:?}. Each envelope must be discharged exactly once - a carried item \
+         is discharged at the try_recv that removed it, not again when the next \
+         iteration adopts it."
+    );
+}
+
 fn elapsed_ms(start: Instant) -> f64 {
     start.elapsed().as_secs_f64() * 1000.0
 }
@@ -3094,17 +3204,11 @@ async fn delete_matching_rows_from_arrow_provider(
     provider: &Arc<dyn TableProvider>,
     rows: &RecordBatch,
 ) -> crate::accelerated::Result<Option<u64>> {
-    if let Some(indexed) = provider.downcast_ref::<IndexedTableProvider>() {
+    // Peel any layers stacked on the accelerator to reach the provider that
+    // actually holds the rows.
+    if let Some(table) = provider.downcast_ref::<SpiceTable>() {
         return Box::pin(delete_matching_rows_from_arrow_provider(
-            indexed.get_underlying_ref(),
-            rows,
-        ))
-        .await;
-    }
-
-    if let Some(embedding_table) = provider.downcast_ref::<EmbeddingTable>() {
-        return Box::pin(delete_matching_rows_from_arrow_provider(
-            embedding_table.get_underlying_ref(),
+            table.below(),
             rows,
         ))
         .await;
@@ -3152,18 +3256,10 @@ async fn delete_matching_rows_from_arrow_provider(
 async fn perform_change_write_maintenance(
     provider: &Arc<dyn TableProvider>,
 ) -> crate::accelerated::Result<()> {
-    if let Some(indexed) = provider.downcast_ref::<IndexedTableProvider>() {
-        return Box::pin(perform_change_write_maintenance(
-            indexed.get_underlying_ref(),
-        ))
-        .await;
-    }
-
-    if let Some(embedding_table) = provider.downcast_ref::<EmbeddingTable>() {
-        return Box::pin(perform_change_write_maintenance(
-            embedding_table.get_underlying_ref(),
-        ))
-        .await;
+    // Peel any layers stacked on the accelerator to reach the provider that
+    // actually performs maintenance.
+    if let Some(table) = provider.downcast_ref::<SpiceTable>() {
+        return Box::pin(perform_change_write_maintenance(table.below())).await;
     }
 
     if let Some(partitioned) = provider.downcast_ref::<PartitionTableProvider>() {
@@ -3796,6 +3892,7 @@ mod tests {
     use data_components::arrow::write::MemTable;
     use data_components::cdc::changes_schema;
     use datafusion::datasource::TableProvider;
+    use spice_table::IndexLayer;
 
     use std::sync::Arc;
 
@@ -4811,9 +4908,10 @@ mod tests {
             MemTable::try_new(Arc::clone(&schema), vec![vec![initial.clone()]])
                 .expect("mem table should be created"),
         );
-        let wrapped = Arc::new(IndexedTableProvider::new(
-            Arc::clone(&table) as Arc<dyn TableProvider>
-        )) as Arc<dyn TableProvider>;
+        let wrapped = SpiceTable::over(
+            Arc::new(IndexLayer::new()),
+            Arc::clone(&table) as Arc<dyn TableProvider>,
+        ) as Arc<dyn TableProvider>;
 
         let deleted = delete_matching_rows_from_arrow_provider(&wrapped, &initial)
             .await
@@ -6837,6 +6935,50 @@ mod tests {
             .expect("task join")
             .expect("changes stream should succeed");
         // Final invariant: every envelope was committed exactly once, in order.
+        assert_eq!(log.ids().await, vec![1, 2, 3, 4, 5, 6]);
+    }
+
+    /// Regression test for the CDC prefetch byte counter.
+    ///
+    /// An envelope pulled from the channel but deferred past the burst byte cap
+    /// is stashed in `carried_item` and adopted by the NEXT iteration. It leaves
+    /// the channel exactly once, at the `try_recv` that removed it, so it must be
+    /// discharged exactly once. Discharging it again when the outer receive
+    /// adopted it drove the counter below zero, and the unsigned wrap made
+    /// `cdc_prefetch_buffer_bytes` report ~1.8e19 for every table with carry-over
+    /// activity - which is how it was found, on a lab run rather than here.
+    ///
+    /// `max_coalesced_bytes: 1` puts every envelope after the first over budget,
+    /// so this drives the carry path on every iteration. The accounting invariant
+    /// is enforced by the `debug_assert!` in `discharge_prefetch_bytes`, which is
+    /// live in test builds: a double discharge panics here rather than saturating
+    /// quietly to zero and looking plausible.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn carried_envelopes_are_discharged_from_the_prefetch_counter_exactly_once() {
+        let task = make_refresh_task(make_mem_table() as Arc<dyn TableProvider>);
+        let log = CommitLog::new();
+
+        let envelopes: Vec<Result<ChangeEnvelope, CdcStreamError>> = (1..=6)
+            .map(|id| Ok(make_tracked_envelope(id, Arc::clone(&log), false)))
+            .collect();
+        let stream: ChangesStream = fstream::iter(envelopes).boxed();
+
+        let cfg = CdcConfig {
+            prefetch_buffer: 128,
+            max_coalesced_envelopes: 256,
+            // Every envelope after the first exceeds this, so each one is carried
+            // rather than folded into the burst - the path under test.
+            max_coalesced_bytes: 1,
+            max_coalesce_age_ms: 0,
+            commit_timeout: Duration::from_secs(30),
+            delete_subbatch_max: CDC_DELETE_SUBBATCH_MAX_DEFAULT,
+        };
+
+        run_changes_stream_with_config(&task, cfg, stream)
+            .await
+            .expect("changes stream should succeed");
+
+        // Carrying must not lose, duplicate, or reorder an envelope either.
         assert_eq!(log.ids().await, vec![1, 2, 3, 4, 5, 6]);
     }
 

@@ -16,9 +16,9 @@ limitations under the License.
 
 //! Encrypted at-rest cache for control-plane-delivered secrets.
 //!
-//! Every deployment applies by restart, so delivered secrets that lived only in
-//! process memory would be gone by the time the components that need them come
-//! back up — the normal deploy would take two deploys. This cache closes that:
+//! A deployment that delivers secrets applies by restart, so secrets that lived
+//! only in process memory would be gone by the time the components that need
+//! them come back up — that deploy would take two deploys. This cache closes it:
 //! it is written when a deployment delivers secrets and opened locally at
 //! startup, with **no control-plane round trip**, so a restart succeeds even
 //! with the gateway unreachable.

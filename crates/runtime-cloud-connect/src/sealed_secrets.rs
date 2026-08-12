@@ -41,7 +41,6 @@ use std::collections::BTreeMap;
 use cloud_connect_crypto::{EncryptionKeypair, EncryptionKeyring, SecretAddress};
 use prost::Message as _;
 use snafu::{OptionExt as _, ResultExt, Snafu};
-use zeroize::Zeroizing;
 
 use crate::proto;
 
@@ -103,6 +102,10 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// Secret names and values as delivered. Values are [`Zeroizing`] so the
 /// plaintext is scrubbed when dropped rather than left in freed heap.
 pub type DeliveredSecrets = BTreeMap<String, Zeroizing<Vec<u8>>>;
+
+/// Re-exported so a caller holding a [`DeliveredSecrets`] can name what is in
+/// it without depending on `zeroize` itself.
+pub use zeroize::Zeroizing;
 
 /// A successfully opened payload.
 pub struct Opened {
