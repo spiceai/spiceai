@@ -80,7 +80,11 @@ impl std::fmt::Debug for FullTextSearchExec {
 }
 impl DisplayAs for FullTextSearchExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut Formatter) -> std::fmt::Result {
-        write!(f, "FullTextSearchTableExec q={}, limit={}", self.query, self.limit)?;
+        write!(
+            f,
+            "FullTextSearchTableExec q={}, limit={}",
+            self.query, self.limit
+        )?;
         if !self.filters.is_empty() {
             let filters = self
                 .filters

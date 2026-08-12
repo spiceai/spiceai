@@ -675,6 +675,37 @@ impl FullTextDatabaseIndex {
         }
     }
 
+    /// Whether `dt` can be represented as a local Tantivy field by [`Self::add_to_tantivy_schema`].
+    /// Callers deriving store/filter fields from a column's type (e.g. vector-search metadata
+    /// columns) must check this first and skip unsupported types rather than let index
+    /// construction fail — a type such as `Date32`/`Date64`/`Timestamp` may be a valid
+    /// `Filterable` metadata column for other index backends (e.g. Elasticsearch) without being
+    /// representable in the local FTS schema yet.
+    #[must_use]
+    pub fn is_field_type_supported(dt: &DataType) -> bool {
+        matches!(
+            dt,
+            DataType::Float16
+                | DataType::Float32
+                | DataType::Float64
+                | DataType::UInt8
+                | DataType::UInt16
+                | DataType::UInt32
+                | DataType::UInt64
+                | DataType::Int8
+                | DataType::Int16
+                | DataType::Int32
+                | DataType::Int64
+                | DataType::Boolean
+                | DataType::Utf8
+                | DataType::LargeUtf8
+                | DataType::Utf8View
+                | DataType::Binary
+                | DataType::LargeBinary
+                | DataType::BinaryView
+        )
+    }
+
     // Adds the Arrow [`Field`] as a stored and indexed field.
     //
     // Note: for Utf8, does not tokenize.
