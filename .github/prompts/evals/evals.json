@@ -1,0 +1,80 @@
+{
+  "skill_name": "writeReleaseNotes",
+  "skill_path": ".github/prompts/writeReleaseNotes.prompt.md",
+  "scorer": ".github/prompts/evals/score_eval.py",
+  "notes": "Every eval runs from frozen fixtures, so no eval touches git history or the GitHub API. That keeps runs repeatable as trunk moves and lets the scorer assert exact PR coverage.",
+  "evals": [
+    {
+      "id": "create-patch-release",
+      "prompt": "Write the release notes for Spice v2.1.4 (released August 18, 2026), covering everything since v2.1.3.\n\nDo not run `git log` or `gh` for this task — the history has been captured for you. Use these files as the complete and only record of what shipped:\n\n- `.github/prompts/evals/fixtures/v2.1.4/commits.txt` — the commit list between the two tags\n- `.github/prompts/evals/fixtures/v2.1.4/pull_requests.json` — the title, body, author, and labels for every PR in that list\n- `.github/prompts/evals/fixtures/v2.1.4/authors.txt` — the authors and their GitHub handles\n\nSave the result to the outputs directory as `v2.1.4.md`. Do not write into `docs/release_notes/`.",
+      "expected_output": "A complete v2.1.4 release notes document: summary, What's New subsections for the Snowflake on_conflict parameter, cayenne_scan_concurrency, the rrf() recency_decay parameter, and the bug fixes; a Breaking Changes section covering the runtime.cpu.cores -> runtime.cpu.limit rename with before/after YAML; the DuckDB v1.6.0 upgrade; Contributors without bots; and a changelog covering every shipped PR. All authored prose in Simplified Technical English.",
+      "files": [
+        ".github/prompts/evals/fixtures/v2.1.4/commits.txt",
+        ".github/prompts/evals/fixtures/v2.1.4/pull_requests.json",
+        ".github/prompts/evals/fixtures/v2.1.4/authors.txt"
+      ],
+      "assertions": [
+        "STE checker reports zero errors",
+        "No authored sentence exceeds 25 words",
+        "No participle clauses (using / enabling / including / by -ing)",
+        "No vague or figurative wording",
+        "No semicolons joining two ideas",
+        "Passive voice under 15% of authored sentences",
+        "Average sentence length at or under 20 words",
+        "All required sections present",
+        "Every user-visible PR appears in the changelog",
+        "No PR is listed twice in the changelog",
+        "Noise commits stay out of the narrative",
+        "Breaking change documented with before/after migration",
+        "User-visible DuckDB v1.6.0 upgrade recorded",
+        "Contributors lists every human author and no bots",
+        "Key identifiers from the PR bodies survive into the notes"
+      ]
+    },
+    {
+      "id": "rewrite-to-ste",
+      "prompt": "`.github/prompts/evals/fixtures/rewrite/published-excerpt.md` is an excerpt of published Spice v2.1.0 release notes, written before the project adopted Simplified Technical English.\n\nRewrite it in the release notes house style. Keep every technical fact, identifier, error code, version number, and the YAML sample exactly as they are — the goal is to change how it reads, not what it says.\n\nSave the rewritten excerpt to the outputs directory as `rewritten.md`.",
+      "expected_output": "The same excerpt with the same headings, YAML, identifiers, and version numbers, rewritten into short active declarative sentences. No participle clauses, no semicolons, no 'headlined by' or 'significant'. Roughly the same amount of information, in more sentences.",
+      "files": [".github/prompts/evals/fixtures/rewrite/published-excerpt.md"],
+      "assertions": [
+        "STE checker reports zero errors",
+        "No authored sentence exceeds 25 words",
+        "No participle clauses (using / enabling / including / by -ing)",
+        "No vague or figurative wording",
+        "No semicolons joining two ideas",
+        "Passive voice under 15% of authored sentences",
+        "Average sentence length at or under 20 words",
+        "Every identifier, error code, and version from the source survives",
+        "The YAML sample is reproduced unchanged",
+        "Content is rewritten, not deleted (word count within 80-160% of source)",
+        "Section headings are preserved",
+        "Marketing metaphors from the source are gone"
+      ]
+    },
+    {
+      "id": "update-in-progress-notes",
+      "prompt": "Update the in-progress release notes at `.github/prompts/evals/fixtures/update/v2.2.0-rc.1.md` with the PRs that have landed since the file was last edited.\n\nDo not run `git log` or `gh` — the new history has been captured for you:\n\n- `.github/prompts/evals/fixtures/update/new_commits.txt` — the commits since the file was last edited\n- `.github/prompts/evals/fixtures/update/new_pull_requests.json` — the title, body, author, and labels for each\n\nThe existing file is the source of truth for tone, ordering, and editorial decisions. Copy it to the outputs directory as `v2.2.0-rc.1.md` and edit the copy; leave the fixture itself untouched.",
+      "expected_output": "The original file with new material added: a What's New subsection or entries for Anthropic prompt caching, the rrf() tie-break fix, and the MongoDB resume-token fix; Jeadie and karifabri added to Contributors; three new changelog lines. The two pre-existing subsections are untouched. Snapshot and dependency-bump PRs do not appear in the narrative.",
+      "files": [
+        ".github/prompts/evals/fixtures/update/v2.2.0-rc.1.md",
+        ".github/prompts/evals/fixtures/update/new_commits.txt",
+        ".github/prompts/evals/fixtures/update/new_pull_requests.json"
+      ],
+      "assertions": [
+        "STE checker reports zero errors",
+        "No authored sentence exceeds 25 words",
+        "No participle clauses (using / enabling / including / by -ing)",
+        "No vague or figurative wording",
+        "No semicolons joining two ideas",
+        "Passive voice under 15% of authored sentences",
+        "Average sentence length at or under 20 words",
+        "Pre-existing subsections are left byte-identical",
+        "New PRs added to the changelog",
+        "Original changelog entries are retained",
+        "Snapshot and dependency noise stays out of the narrative",
+        "New contributors added, bots excluded",
+        "New entries carry the substance from the PR bodies"
+      ]
+    }
+  ]
+}
