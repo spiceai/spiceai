@@ -1076,7 +1076,7 @@ impl CayenneContext {
 
         Arc::new(
             VortexFormat::new_with_options(vortex_session, Self::vortex_table_options(config))
-                .with_dataset_label(dataset),
+                .with_dataset_label_and_retirement_tracking(dataset),
         )
     }
 

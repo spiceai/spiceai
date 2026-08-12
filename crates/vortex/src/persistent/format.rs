@@ -402,7 +402,7 @@ impl VortexFormat {
             .segment_cache_size_bytes
             .and_then(|bytes| u64::try_from(bytes).ok())
             .filter(|bytes| *bytes > 0)
-            .map(|bytes| Arc::new(SharedSegmentCache::new(bytes, None)));
+            .map(|bytes| Arc::new(SharedSegmentCache::new(bytes, None, false)));
 
         Self {
             session,
@@ -419,39 +419,11 @@ impl VortexFormat {
         &self.opts
     }
 
-    /// Registers invalidation of cached Vortex segments for exact object-store paths.
-    ///
-    /// Callers performing blocking filesystem cleanup can register before unlinking
-    /// files, then await [`Self::run_pending_segment_cache_tasks`] after returning to
-    /// async code.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if path-predicate invalidation is unavailable.
-    pub fn register_segment_cache_path_invalidation(&self, paths: HashSet<Path>) -> DFResult<()> {
-        self.segment_cache
-            .as_ref()
-            .map_or(Ok(()), |cache| cache.register_path_invalidation(paths))
-    }
-
     /// Invalidates cached Vortex segments for the exact object-store paths and
     /// physically evicts them before returning.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if path-predicate invalidation is unavailable.
-    pub async fn invalidate_segment_cache_paths(&self, paths: HashSet<Path>) -> DFResult<()> {
-        match self.segment_cache.as_ref() {
-            Some(cache) => cache.invalidate_paths(paths).await,
-            None => Ok(()),
-        }
-    }
-
-    /// Completes pending physical evictions after a blocking cleanup registered
-    /// path invalidations with [`Self::register_segment_cache_path_invalidation`].
-    pub async fn run_pending_segment_cache_tasks(&self) {
+    pub async fn invalidate_segment_cache_paths(&self, paths: HashSet<Path>) {
         if let Some(cache) = self.segment_cache.as_ref() {
-            cache.run_pending_tasks().await;
+            cache.invalidate_paths(paths).await;
         }
     }
 
@@ -502,12 +474,32 @@ impl VortexFormat {
     #[must_use]
     pub fn with_dataset_label(&self, dataset: impl Into<Arc<str>>) -> Self {
         let dataset = dataset.into();
+        self.with_dataset_label_inner(&dataset, false)
+    }
+
+    /// Returns a dataset-labelled format whose segment cache also prevents an
+    /// already-open file from inserting segments after its path is retired.
+    /// Mutable Cayenne tables use this; read-only formats keep the original
+    /// cache-miss path without retirement bookkeeping.
+    #[must_use]
+    pub fn with_dataset_label_and_retirement_tracking(&self, dataset: impl Into<Arc<str>>) -> Self {
+        let dataset = dataset.into();
+        self.with_dataset_label_inner(&dataset, true)
+    }
+
+    fn with_dataset_label_inner(&self, dataset: &Arc<str>, track_retirement: bool) -> Self {
         let segment_cache = self
             .opts
             .segment_cache_size_bytes
             .and_then(|bytes| u64::try_from(bytes).ok())
             .filter(|bytes| *bytes > 0)
-            .map(|bytes| Arc::new(SharedSegmentCache::new(bytes, Some(Arc::clone(&dataset)))));
+            .map(|bytes| {
+                Arc::new(SharedSegmentCache::new(
+                    bytes,
+                    Some(Arc::clone(dataset)),
+                    track_retirement,
+                ))
+            });
         Self {
             session: self.session.clone(),
             opts: self.opts.clone(),

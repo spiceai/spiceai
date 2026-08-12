@@ -3872,6 +3872,7 @@ impl CayenneTableProvider {
 
         let mut deleted = 0u64;
         let mut skipped_errors = 0u64;
+        let mut retired_cache_paths = HashSet::new();
         for full_url in to_delete {
             // Map the absolute URL back to the store-relative path for deletion.
             let Some(rel) = full_url.strip_prefix(object_store_url_str.as_str()) else {
@@ -3883,6 +3884,7 @@ impl CayenneTableProvider {
                 // another sweep or manual cleanup), not a retryable failure.
                 Ok(()) | Err(object_store::Error::NotFound { .. }) => {
                     deleted += 1;
+                    retired_cache_paths.insert(path);
                     self.cold_gc_orphaned_first_seen.lock().remove(&full_url);
                 }
                 Err(error) => {
@@ -3897,6 +3899,11 @@ impl CayenneTableProvider {
                 }
             }
         }
+        // Cold scans use the same shared Vortex format as warm scans. Evict
+        // exactly the successfully absent objects after the physical sweep so
+        // superseded generations cannot occupy the bounded per-table cache.
+        self.invalidate_segment_cache_paths(retired_cache_paths)
+            .await;
         if deleted > 0 || skipped_errors > 0 {
             tracing::info!(
                 target: "cayenne::compaction",
@@ -4042,16 +4049,24 @@ impl CayenneTableProvider {
         catalog: Arc<dyn MetadataCatalog>,
         file_format: Arc<VortexFormat>,
     ) -> Result<()> {
-        let all_rows = catalog
-            .get_all_snapshot_files(&table_id)
-            .await
-            .map_err(|source| Error::Catalog { source })?;
+        let all_rows = match catalog.get_all_snapshot_files(&table_id).await {
+            Ok(rows) => rows,
+            Err(source) => {
+                tracing::warn!(
+                    table_id,
+                    %source,
+                    "Old-snapshot cleanup skipped: failed to read the snapshot manifest safety gate"
+                );
+                return Err(Error::Catalog { source });
+            }
+        };
         let manifest_populated = !all_rows.is_empty();
         let mut live_snapshot_ids = protected_snapshot_ids.clone();
         live_snapshot_ids.insert(current_snapshot.clone());
         let live_referenced = Self::live_referenced_relative_paths(&all_rows, &live_snapshot_ids);
         let task_table = table_id.clone();
-        let file_format_for_cleanup = Arc::clone(&file_format);
+        let retired_cache_paths = Arc::new(ParkingMutex::new(HashSet::new()));
+        let retired_cache_paths_for_cleanup = Arc::clone(&retired_cache_paths);
         let cleanup_result = tokio::task::spawn_blocking(move || {
             Self::cleanup_old_snapshots_blocking(
                 &table_path,
@@ -4061,20 +4076,15 @@ impl CayenneTableProvider {
                 manifest_populated,
                 &live_referenced,
                 |paths| {
-                    if let Err(error) =
-                        file_format_for_cleanup.register_segment_cache_path_invalidation(paths)
-                    {
-                        tracing::warn!(
-                            table_id = %table_id,
-                            %error,
-                            "Failed to invalidate retired Vortex segment-cache paths"
-                        );
-                    }
+                    retired_cache_paths_for_cleanup.lock().extend(paths);
                 },
             )
         })
         .await;
-        file_format.run_pending_segment_cache_tasks().await;
+        // The blocking cleanup has finished unlinking every reported path, so
+        // no valid scan can insert another segment after this exact-key sweep.
+        let paths = std::mem::take(&mut *retired_cache_paths.lock());
+        file_format.invalidate_segment_cache_paths(paths).await;
         cleanup_result
             .map_err(|source| Error::TaskPanicked {
                 table: task_table,
@@ -4091,13 +4101,9 @@ impl CayenneTableProvider {
         let mut protected_snapshot_ids: HashSet<String> =
             self.protected_snapshots.load().keys().cloned().collect();
         protected_snapshot_ids.extend(self.in_flight_scan_snapshot_ids());
-        Self::cleanup_old_snapshots_local(
-            self.table_metadata.path.clone(),
-            self.table_metadata.table_id.clone(),
-            current_snapshot.to_string(),
+        self.cleanup_old_snapshots_with_protected_now_for_test(
+            current_snapshot,
             protected_snapshot_ids,
-            Arc::clone(&self.catalog),
-            Arc::clone(self.context.file_format()),
         )
         .await
     }
@@ -4256,7 +4262,6 @@ impl CayenneTableProvider {
 
         let mut kept_any = false;
         let mut retired_files = Vec::new();
-        let mut retired_cache_paths = HashSet::new();
         for entry in entries {
             let entry = entry?;
             let path = entry.path();
@@ -4285,18 +4290,36 @@ impl CayenneTableProvider {
                 kept_any = true;
                 continue;
             }
-            retired_cache_paths.insert(Self::local_segment_cache_path(&path)?);
-            retired_files.push(path);
+            let cache_path = match Self::local_segment_cache_path(&path) {
+                Ok(cache_path) => Some(cache_path),
+                Err(error) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        %error,
+                        "Failed to reconstruct a retired Vortex segment-cache path; physical cleanup will continue"
+                    );
+                    None
+                }
+            };
+            retired_files.push((path, cache_path));
         }
 
-        invalidate(retired_cache_paths);
-        for path in retired_files {
+        let mut retired_cache_paths = HashSet::new();
+        for (path, cache_path) in retired_files {
             match std::fs::remove_file(&path) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e),
+                Ok(()) => {
+                    retired_cache_paths.extend(cache_path);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    retired_cache_paths.extend(cache_path);
+                }
+                Err(e) => {
+                    invalidate(retired_cache_paths);
+                    return Err(e);
+                }
             }
         }
+        invalidate(retired_cache_paths);
 
         if kept_any {
             return Ok(false);
@@ -4334,17 +4357,31 @@ impl CayenneTableProvider {
                     .to_str()
                     .is_some_and(Self::is_compactable_data_file)
             {
-                paths.insert(Self::local_segment_cache_path(&entry.path())?);
+                let path = entry.path();
+                match Self::local_segment_cache_path(&path) {
+                    Ok(cache_path) => {
+                        paths.insert(cache_path);
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            path = %path.display(),
+                            %error,
+                            "Failed to reconstruct a retired Vortex segment-cache path; physical cleanup will continue"
+                        );
+                    }
+                }
             }
         }
         Ok(paths)
     }
 
     fn local_segment_cache_path(path: &std::path::Path) -> std::io::Result<ObjectStorePath> {
-        // Match ListingTableUrl's lexical absolute path without resolving
-        // symlinks, which would change the LocalFileSystem object key.
-        let absolute = std::path::absolute(path)?;
-        ObjectStorePath::from_absolute_path(absolute).map_err(std::io::Error::other)
+        // Use the same parser and prefix derivation as the scan-time
+        // ListingTable, rather than maintaining a parallel approximation of
+        // LocalFileSystem key normalization here.
+        ListingTableUrl::parse(path.to_string_lossy().as_ref())
+            .map(|url| url.prefix().clone())
+            .map_err(std::io::Error::other)
     }
 
     /// Physically delete retired snapshot dirs whose grace has fully elapsed,
@@ -4445,8 +4482,8 @@ impl CayenneTableProvider {
                 let dir = Self::snapshot_dir_path(&table_path, &table_id, &id);
                 let id_for_task = id.clone();
                 let referenced = live_referenced.clone();
-                let file_format_for_task = Arc::clone(&file_format);
-                let table_id_for_task = table_id.clone();
+                let retired_cache_paths = Arc::new(ParkingMutex::new(HashSet::new()));
+                let retired_cache_paths_for_task = Arc::clone(&retired_cache_paths);
                 let removed = tokio::task::spawn_blocking(move || {
                     if manifest_populated {
                         Self::delete_retired_snapshot_dir_refcounted(
@@ -4454,30 +4491,14 @@ impl CayenneTableProvider {
                             &id_for_task,
                             &referenced,
                             |paths| {
-                                if let Err(error) = file_format_for_task
-                                    .register_segment_cache_path_invalidation(paths)
-                                {
-                                    tracing::warn!(
-                                        table_id = %table_id_for_task,
-                                        %error,
-                                        "Failed to invalidate retired Vortex segment-cache paths"
-                                    );
-                                }
+                                retired_cache_paths_for_task.lock().extend(paths);
                             },
                         )
                     } else {
                         // Legacy path: no manifest, so no file is referenced
                         // across snapshots — the whole dir is dead.
                         let paths = Self::segment_cache_paths_in_dir(&dir)?;
-                        if let Err(error) =
-                            file_format_for_task.register_segment_cache_path_invalidation(paths)
-                        {
-                            tracing::warn!(
-                                table_id = %table_id_for_task,
-                                %error,
-                                "Failed to invalidate retired Vortex segment-cache paths"
-                            );
-                        }
+                        retired_cache_paths_for_task.lock().extend(paths);
                         match std::fs::remove_dir_all(&dir) {
                             Ok(()) => Ok(true),
                             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(true),
@@ -4486,7 +4507,10 @@ impl CayenneTableProvider {
                     }
                 })
                 .await;
-                file_format.run_pending_segment_cache_tasks().await;
+                // Physical cleanup is complete before exact-key invalidation;
+                // the same scan-ref gate above excludes a later cache reinsert.
+                let paths = std::mem::take(&mut *retired_cache_paths.lock());
+                file_format.invalidate_segment_cache_paths(paths).await;
                 match removed {
                     Ok(Ok(true)) => {
                         // Dir fully removed. Evict the cached listing AFTER the
@@ -4655,19 +4679,57 @@ impl CayenneTableProvider {
         Ok(Some(ObjectStorePath::from(path)))
     }
 
-    async fn invalidate_segment_cache_paths(&self, paths: HashSet<ObjectStorePath>) {
-        if let Err(error) = self
-            .context
+    pub(crate) async fn invalidate_segment_cache_paths(&self, paths: HashSet<ObjectStorePath>) {
+        self.context
             .file_format()
             .invalidate_segment_cache_paths(paths)
-            .await
-        {
-            tracing::warn!(
-                table = self.table_metadata.table_name.as_str(),
-                %error,
-                "Failed to invalidate retired Vortex segment-cache paths"
-            );
+            .await;
+    }
+
+    /// Delete listed objects and evict segments only for paths confirmed
+    /// absent. Every delete is allowed to finish even when a sibling fails, so
+    /// a partial object-store cleanup cannot lose track of an already-deleted
+    /// cache key.
+    async fn delete_objects_and_invalidate(
+        &self,
+        objects: Vec<ObjectMeta>,
+        operation: &'static str,
+    ) -> Result<()> {
+        let store = Arc::clone(&self.require_object_store()?.store);
+        let table_name = self.table_metadata.table_name.clone();
+        let deletes = stream::iter(objects).map(|meta| {
+            let store = Arc::clone(&store);
+            let table_name = table_name.clone();
+            async move {
+                let location = meta.location;
+                match store.delete(&location).await {
+                    Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(location),
+                    Err(source) => Err(Error::ObjectStore {
+                        operation,
+                        table: table_name,
+                        source,
+                    }),
+                }
+            }
+        });
+        let mut deletes = deletes.buffer_unordered(OBJECT_STORE_MOVE_CONCURRENCY);
+        let mut retired_cache_paths = HashSet::new();
+        let mut first_error = None;
+        while let Some(result) = deletes.next().await {
+            match result {
+                Ok(path) => {
+                    retired_cache_paths.insert(path);
+                }
+                Err(error) if first_error.is_none() => first_error = Some(error),
+                Err(_) => {}
+            }
         }
+        self.invalidate_segment_cache_paths(retired_cache_paths)
+            .await;
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+        Ok(())
     }
 
     async fn delete_prefix_with_object_store(&self, prefix: &ObjectStorePath) -> Result<()> {
@@ -4683,31 +4745,8 @@ impl CayenneTableProvider {
                 source: e,
             })?;
 
-        self.invalidate_segment_cache_paths(
-            objects.iter().map(|meta| meta.location.clone()).collect(),
-        )
-        .await;
-
-        let store = Arc::clone(&config.store);
-        let table_name = self.table_metadata.table_name.clone();
-        stream::iter(objects.into_iter().map(Ok::<_, Error>))
-            .try_for_each_concurrent(OBJECT_STORE_MOVE_CONCURRENCY, |meta| {
-                let store = Arc::clone(&store);
-                let table_name = table_name.clone();
-                async move {
-                    store
-                        .delete(&meta.location)
-                        .await
-                        .map_err(|e| Error::ObjectStore {
-                            operation: "delete object from snapshot cleanup",
-                            table: table_name,
-                            source: e,
-                        })
-                }
-            })
-            .await?;
-
-        Ok(())
+        self.delete_objects_and_invalidate(objects, "delete object from snapshot cleanup")
+            .await
     }
 
     async fn cleanup_old_snapshots_s3(
@@ -4816,48 +4855,18 @@ impl CayenneTableProvider {
         let objects: Vec<_> = objects
             .into_iter()
             .filter(|meta| {
-                let file_name = meta
-                    .location
-                    .parts()
-                    .next_back()
-                    .map(|part| part.as_ref().to_string());
-                file_name
-                    .as_deref()
-                    .is_some_and(Self::is_compactable_data_file)
-                    && file_name.as_deref().is_some_and(|name| {
-                        !live_referenced.contains(&Self::manifest_file_relative_path(
+                meta.location.filename().is_some_and(|name| {
+                    Self::is_compactable_data_file(name)
+                        && !live_referenced.contains(&Self::manifest_file_relative_path(
                             retiring_snapshot_id,
                             name,
                         ))
-                    })
+                })
             })
             .collect();
 
-        self.invalidate_segment_cache_paths(
-            objects.iter().map(|meta| meta.location.clone()).collect(),
-        )
-        .await;
-
-        let store = Arc::clone(&config.store);
-        let table_name = self.table_metadata.table_name.clone();
-        stream::iter(objects.into_iter().map(Ok::<_, Error>))
-            .try_for_each_concurrent(OBJECT_STORE_MOVE_CONCURRENCY, |meta| {
-                let store = Arc::clone(&store);
-                let table_name = table_name.clone();
-                async move {
-                    store
-                        .delete(&meta.location)
-                        .await
-                        .map_err(|e| Error::ObjectStore {
-                            operation: "delete object from snapshot cleanup",
-                            table: table_name,
-                            source: e,
-                        })
-                }
-            })
-            .await?;
-
-        Ok(())
+        self.delete_objects_and_invalidate(objects, "delete object from snapshot cleanup")
+            .await
     }
 
     /// Create a new `ListingTable` for a snapshot directory.
@@ -5672,11 +5681,57 @@ impl CayenneTableProvider {
             }
             return Ok(());
         }
-        match tokio::fs::remove_dir_all(self.snapshot_dir_path_for(snapshot_id)).await {
-            Ok(()) => Ok(()),
-            Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(source) => Err(Error::IoError { source }),
+
+        let snapshot_dir = self.snapshot_dir_path_for(snapshot_id);
+        let cache_path_dir = snapshot_dir.clone();
+        let cache_paths = match tokio::task::spawn_blocking(move || {
+            Self::segment_cache_paths_in_dir(&cache_path_dir)
+        })
+        .await
+        {
+            Ok(Ok(paths)) => paths,
+            Ok(Err(error)) => {
+                tracing::warn!(
+                    table = %self.table_metadata.table_name,
+                    path = %snapshot_dir.display(),
+                    %error,
+                    "Failed to enumerate Vortex segment-cache paths; physical snapshot cleanup will continue"
+                );
+                HashSet::new()
+            }
+            Err(error) => {
+                tracing::warn!(
+                    table = %self.table_metadata.table_name,
+                    path = %snapshot_dir.display(),
+                    %error,
+                    "Vortex segment-cache path enumeration task failed; physical snapshot cleanup will continue"
+                );
+                HashSet::new()
+            }
+        };
+        let deletion_error = match tokio::fs::remove_dir_all(&snapshot_dir).await {
+            Ok(()) => None,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => None,
+            Err(source) => Some(source),
+        };
+        let absent_paths = if deletion_error.is_some() {
+            let remaining_dir = snapshot_dir.clone();
+            match tokio::task::spawn_blocking(move || {
+                Self::segment_cache_paths_in_dir(&remaining_dir)
+            })
+            .await
+            {
+                Ok(Ok(remaining)) => cache_paths.difference(&remaining).cloned().collect(),
+                Ok(Err(_)) | Err(_) => HashSet::new(),
+            }
+        } else {
+            cache_paths
+        };
+        self.invalidate_segment_cache_paths(absent_paths).await;
+        if let Some(source) = deletion_error {
+            return Err(Error::IoError { source });
         }
+        Ok(())
     }
 
     pub(crate) async fn write_stream_to_staging_snapshot(
@@ -5913,10 +5968,22 @@ impl CayenneTableProvider {
             } else {
                 let paths = Self::segment_cache_paths_in_dir(&path)
                     .map_err(|source| CatalogError::IoError { source })?;
-                invalidate(paths);
-                std::fs::remove_dir_all(&path)
-                    .map_err(|source| CatalogError::IoError { source })?;
-                deleted_count += 1;
+                match std::fs::remove_dir_all(&path) {
+                    Ok(()) => {
+                        invalidate(paths);
+                        deleted_count += 1;
+                    }
+                    Err(source) => {
+                        // `remove_dir_all` may have removed a prefix of the
+                        // tree before failing. Invalidate only paths confirmed
+                        // absent by a fresh listing; keep every surviving
+                        // path cached.
+                        let remaining = Self::segment_cache_paths_in_dir(&path)
+                            .unwrap_or_else(|_| paths.clone());
+                        invalidate(paths.difference(&remaining).cloned().collect());
+                        return Err(CatalogError::IoError { source });
+                    }
+                }
             }
         }
 
@@ -13372,15 +13439,12 @@ impl CayenneTableProvider {
                         );
                     }
                 }
-            } else {
-                let snapshot_dir = self.snapshot_dir_path_for(&new_snapshot_id);
-                if let Err(e) = tokio::fs::remove_dir_all(&snapshot_dir).await {
-                    tracing::warn!(
-                        "Failed to clean up failed sort-rewrite snapshot dir {} for table {}: {e}",
-                        snapshot_dir.display(),
-                        self.table_metadata.table_name
-                    );
-                }
+            } else if let Err(e) = self.clear_snapshot_dir(&new_snapshot_id).await {
+                tracing::warn!(
+                    "Failed to clean up failed sort-rewrite snapshot {} for table {}: {e}",
+                    new_snapshot_id,
+                    self.table_metadata.table_name
+                );
             }
         };
 
@@ -18750,17 +18814,12 @@ impl CayenneTableProvider {
                     );
                 }
             }
-        } else {
-            let snapshot_dir = self.snapshot_dir_path_for(new_snapshot_id);
-            if let Err(e) = tokio::fs::remove_dir_all(&snapshot_dir).await
-                && e.kind() != std::io::ErrorKind::NotFound
-            {
-                tracing::warn!(
-                    "Failed to clean up failed compaction snapshot dir {} for table {}: {e}",
-                    snapshot_dir.display(),
-                    self.table_metadata.table_name
-                );
-            }
+        } else if let Err(e) = self.clear_snapshot_dir(new_snapshot_id).await {
+            tracing::warn!(
+                "Failed to clean up failed compaction snapshot {} for table {}: {e}",
+                new_snapshot_id,
+                self.table_metadata.table_name
+            );
         }
     }
 
@@ -29951,6 +30010,270 @@ mod tests {
         assert!(first_seen.is_empty(), "gone-from-store entry pruned");
     }
 
+    #[tokio::test]
+    async fn cold_gc_invalidates_segments_for_deleted_objects() {
+        use crate::metadata::ObjectStoreConfig;
+        use object_store::memory::InMemory;
+
+        let ctx = SessionContext::new();
+        let temp_dir = tempfile::tempdir().expect("temp dir created");
+        let metadata_dir = temp_dir.path().join("metadata");
+        let data_dir = temp_dir.path().join("data");
+        std::fs::create_dir_all(&metadata_dir).expect("metadata dir created");
+        let catalog = Arc::new(
+            CayenneCatalog::new(format!(
+                "sqlite://{}/cayenne.db",
+                metadata_dir
+                    .to_str()
+                    .expect("metadata path should be UTF-8")
+            ))
+            .expect("catalog created"),
+        ) as Arc<dyn MetadataCatalog>;
+        catalog.init().await.expect("catalog initialized");
+
+        let cold_store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let cold_store_url =
+            url::Url::parse("s3://cold-segment-cache").expect("cold object-store URL should parse");
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let provider = CayenneTableProviderBuilder::new(Arc::clone(&catalog), ctx.runtime_env())
+            .with_cold_object_store(ObjectStoreConfig {
+                url: cold_store_url,
+                store: Arc::clone(&cold_store),
+            })
+            .create(CreateTableOptions {
+                table_name: "cold_gc_segment_cache".to_string(),
+                schema: Arc::clone(&schema),
+                primary_key: vec![],
+                on_conflict: None,
+                base_path: data_dir.to_string_lossy().into_owned(),
+                partition_column: None,
+                vortex_config: VortexConfig {
+                    inline_max_rows: 0,
+                    cold_tier_location: Some("s3://cold-segment-cache/root".to_string()),
+                    cold_tier_gc_interval_ms: 0,
+                    cold_tier_background_interval_ms: 3_600_000,
+                    ..VortexConfig::default()
+                },
+            })
+            .await
+            .expect("cold-tier table created");
+
+        insert_batch(
+            &provider,
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Int64Array::from_iter_values(0..2_000))],
+            )
+            .expect("input batch"),
+        )
+        .await;
+        let warm_snapshot_dir = provider.snapshot_dir_path_for(&provider.get_current_snapshot_id());
+        let warm_file = std::fs::read_dir(&warm_snapshot_dir)
+            .expect("list warm snapshot")
+            .filter_map(std::result::Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.file_name()
+                    .and_then(std::ffi::OsStr::to_str)
+                    .is_some_and(CayenneTableProvider::is_compactable_data_file)
+            })
+            .expect("warm Vortex file");
+        let cold_path = ObjectStorePath::from(format!(
+            "root/{}/data/orphan.vortex",
+            provider.table_metadata.datalake_dir_segment()
+        ));
+        cold_store
+            .put(
+                &cold_path,
+                tokio::fs::read(&warm_file)
+                    .await
+                    .expect("read warm Vortex file")
+                    .into(),
+            )
+            .await
+            .expect("copy Vortex file to cold store");
+
+        CayenneTableProvider::register_object_store_if_needed(
+            &ctx.runtime_env(),
+            provider
+                .cold_object_store_config
+                .as_ref()
+                .expect("cold store config retained"),
+        );
+        let cold_listing = CayenneTableProvider::create_listing_table(
+            &format!(
+                "s3://cold-segment-cache/root/{}/data/",
+                provider.table_metadata.datalake_dir_segment()
+            ),
+            Arc::clone(&schema),
+            provider.context().file_format(),
+            &provider.pk_deletion_strategy,
+        )
+        .expect("cold listing table");
+        let cold_plan = cold_listing
+            .scan(&ctx.state(), None, &[], None)
+            .await
+            .expect("cold scan plan");
+        let cold_rows: usize = collect(cold_plan, ctx.task_ctx())
+            .await
+            .expect("scan cold object")
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum();
+        assert_eq!(cold_rows, 2_000, "the copied cold object must be scanned");
+        let entries_before_gc = provider
+            .context()
+            .file_format()
+            .segment_cache_entry_count()
+            .await
+            .expect("segment cache enabled");
+        assert!(
+            entries_before_gc > 0,
+            "the cold scan must populate the cache"
+        );
+
+        provider.run_cold_tier_gc_tick().await;
+        assert!(
+            cold_store.head(&cold_path).await.is_ok(),
+            "the first GC observation only marks the orphan"
+        );
+        provider.run_cold_tier_gc_tick().await;
+        assert!(
+            matches!(
+                cold_store.head(&cold_path).await,
+                Err(object_store::Error::NotFound { .. })
+            ),
+            "the second GC pass must physically delete the aged orphan"
+        );
+        assert_eq!(
+            provider
+                .context()
+                .file_format()
+                .segment_cache_entry_count()
+                .await,
+            Some(0),
+            "cold GC must evict every segment cached for the deleted object"
+        );
+    }
+
+    #[tokio::test]
+    async fn file_retention_invalidates_segments_for_deleted_files() {
+        use arrow::array::TimestampNanosecondArray;
+        use arrow_schema::TimeUnit;
+
+        let ctx = SessionContext::new();
+        let temp_dir = tempfile::tempdir().expect("temp dir created");
+        let metadata_dir = temp_dir.path().join("metadata");
+        let data_dir = temp_dir.path().join("data");
+        std::fs::create_dir_all(&metadata_dir).expect("metadata dir created");
+        let catalog = Arc::new(
+            CayenneCatalog::new(format!(
+                "sqlite://{}/cayenne.db",
+                metadata_dir
+                    .to_str()
+                    .expect("metadata path should be UTF-8")
+            ))
+            .expect("catalog created"),
+        ) as Arc<dyn MetadataCatalog>;
+        catalog.init().await.expect("catalog initialized");
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "event_time",
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            false,
+        )]));
+        let retention_builder =
+            crate::TimeRetentionFilterBuilder::try_new("event_time", u64::MAX, &schema)
+                .expect("retention builder");
+        let provider = CayenneTableProviderBuilder::new(catalog, ctx.runtime_env())
+            .with_time_retention_filter_builder(retention_builder)
+            .create(CreateTableOptions {
+                table_name: "file_retention_segment_cache".to_string(),
+                schema: Arc::clone(&schema),
+                primary_key: vec![],
+                on_conflict: None,
+                base_path: data_dir.to_string_lossy().into_owned(),
+                partition_column: None,
+                vortex_config: VortexConfig {
+                    inline_max_rows: 0,
+                    compaction_background_interval_ms: 3_600_000,
+                    ..VortexConfig::default()
+                },
+            })
+            .await
+            .expect("retention table created");
+
+        for values in [vec![1_i64, 1], vec![3_i64, 3]] {
+            insert_batch(
+                &provider,
+                RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![Arc::new(TimestampNanosecondArray::from(values))],
+                )
+                .expect("timestamp batch"),
+            )
+            .await;
+        }
+        assert_eq!(
+            read_all(&ctx, &provider, "file_retention_segment_cache")
+                .await
+                .iter()
+                .map(RecordBatch::num_rows)
+                .sum::<usize>(),
+            4,
+            "both source files must be visible and scanned before retention"
+        );
+        let entries_before_delete = provider
+            .context()
+            .file_format()
+            .segment_cache_entry_count()
+            .await
+            .expect("segment cache enabled");
+        assert!(
+            entries_before_delete > 1,
+            "both files must populate the cache"
+        );
+
+        let delete_plan = provider
+            .delete_from(
+                &ctx.state(),
+                vec![datafusion_expr::col("event_time").lt(datafusion_expr::lit(
+                    ScalarValue::TimestampNanosecond(Some(2), None),
+                ))],
+            )
+            .await
+            .expect("file-retention delete plan");
+        let delete_output = collect(delete_plan, ctx.task_ctx())
+            .await
+            .expect("file-retention delete executed");
+        let deleted_rows = delete_output[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::UInt64Array>()
+            .expect("delete count is UInt64")
+            .value(0);
+        assert_eq!(deleted_rows, 2, "only the fully expired file is deleted");
+        let entries_after_delete = provider
+            .context()
+            .file_format()
+            .segment_cache_entry_count()
+            .await
+            .expect("segment cache remains enabled");
+        assert!(
+            entries_after_delete > 0 && entries_after_delete < entries_before_delete,
+            "file retention must evict retired segments while preserving the live file's cache"
+        );
+        assert_eq!(
+            read_all(&ctx, &provider, "file_retention_segment_cache")
+                .await
+                .iter()
+                .map(RecordBatch::num_rows)
+                .sum::<usize>(),
+            2,
+            "the live file remains queryable after retention"
+        );
+    }
+
     /// The orphaned-DV sweep floor must never trust an empty manifest as genesis
     /// while data files still exist — that was the P1 resurrection bug (#9388 /
     /// PR #11516). Mirrors the contract documented on `current_snapshot_floor`.
@@ -40324,7 +40647,9 @@ mod tests {
     #[test]
     fn local_segment_cache_path_matches_relative_listing_path() {
         let tmp = TempDir::new_in(".").expect("relative temp dir");
-        let file = tmp.path().join("data.vortex");
+        let nested = tmp.path().join("space % # ü");
+        std::fs::create_dir_all(&nested).expect("create special-character directory");
+        let file = nested.join("data # %.vortex");
         std::fs::write(&file, b"data").expect("write listed file");
 
         let listing = ListingTableUrl::parse(file.to_string_lossy())
