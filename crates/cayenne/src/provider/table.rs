@@ -4003,6 +4003,7 @@ impl CayenneTableProvider {
             let protected_snapshots = Arc::clone(&self.protected_snapshots);
             let catalog = Arc::clone(&self.catalog);
             let snapshot_scan_refs = Arc::clone(&self.snapshot_scan_refs);
+            let file_format = Arc::clone(self.context.file_format());
             tokio::spawn(async move {
                 tokio::time::sleep(OLD_SNAPSHOT_CLEANUP_GRACE).await;
                 // Read the LIVE protected set after the grace period. During the
@@ -4017,48 +4018,100 @@ impl CayenneTableProvider {
                 // long-running query's Vortex files are not deleted mid-read; a
                 // later compaction's cleanup retries any dir deferred here.
                 protected_snapshot_ids.extend(snapshot_scan_refs.lock().keys().cloned());
-                // Ref-count source: the manifest, read AFTER the grace so it
-                // reflects the same live set the protected read above does. A
-                // live/protected snapshot can reference a data file that lives
-                // in an old snapshot's dir (an in-place compaction reference);
-                // those files must survive even though their dir is "old". The
-                // in-flight scan snapshots added above are part of the live set,
-                // so their referenced files are protected too.
-                let all_rows = match catalog.get_all_snapshot_files(&table_id).await {
-                    Ok(rows) => rows,
-                    Err(error) => {
-                        // Reading the manifest is the safety gate; on failure do
-                        // NOT delete (a referenced file could be orphaned).
-                        tracing::warn!(
-                            "Old-snapshot cleanup skipped for table {table_id}: failed to read \
-                             snapshot manifest ({error})"
-                        );
-                        return;
-                    }
-                };
-                let manifest_populated = !all_rows.is_empty();
-                let mut live_snapshot_ids = protected_snapshot_ids.clone();
-                live_snapshot_ids.insert(current_snapshot.clone());
-                let live_referenced =
-                    Self::live_referenced_relative_paths(&all_rows, &live_snapshot_ids);
-                let _ = tokio::task::spawn_blocking(move || {
-                    if let Err(e) = Self::cleanup_old_snapshots_blocking(
-                        &table_path,
-                        &table_id,
-                        &current_snapshot,
-                        &protected_snapshot_ids,
-                        manifest_populated,
-                        &live_referenced,
-                    ) {
-                        tracing::warn!(
-                            "Failed to cleanup old snapshots for table {}: {e}",
-                            table_id
-                        );
-                    }
-                })
-                .await;
+                if let Err(error) = Self::cleanup_old_snapshots_local(
+                    table_path,
+                    table_id.clone(),
+                    current_snapshot,
+                    protected_snapshot_ids,
+                    catalog,
+                    file_format,
+                )
+                .await
+                {
+                    tracing::warn!("Failed to cleanup old snapshots for table {table_id}: {error}");
+                }
             });
         }
+    }
+
+    async fn cleanup_old_snapshots_local(
+        table_path: String,
+        table_id: String,
+        current_snapshot: String,
+        protected_snapshot_ids: HashSet<String>,
+        catalog: Arc<dyn MetadataCatalog>,
+        file_format: Arc<VortexFormat>,
+    ) -> Result<()> {
+        let all_rows = catalog
+            .get_all_snapshot_files(&table_id)
+            .await
+            .map_err(|source| Error::Catalog { source })?;
+        let manifest_populated = !all_rows.is_empty();
+        let mut live_snapshot_ids = protected_snapshot_ids.clone();
+        live_snapshot_ids.insert(current_snapshot.clone());
+        let live_referenced = Self::live_referenced_relative_paths(&all_rows, &live_snapshot_ids);
+        let task_table = table_id.clone();
+        tokio::task::spawn_blocking(move || {
+            Self::cleanup_old_snapshots_blocking(
+                &table_path,
+                &table_id,
+                &current_snapshot,
+                &protected_snapshot_ids,
+                manifest_populated,
+                &live_referenced,
+                |paths| {
+                    if let Err(error) = file_format.invalidate_segment_cache_paths(paths) {
+                        tracing::warn!(
+                            table_id = %table_id,
+                            %error,
+                            "Failed to invalidate retired Vortex segment-cache paths"
+                        );
+                    }
+                },
+            )
+        })
+        .await
+        .map_err(|source| Error::TaskPanicked {
+            table: task_table,
+            source,
+        })?
+        .map_err(|source| Error::Catalog { source })
+    }
+
+    #[cfg(test)]
+    pub(super) async fn cleanup_old_snapshots_now_for_test(
+        &self,
+        current_snapshot: &str,
+    ) -> Result<()> {
+        let mut protected_snapshot_ids: HashSet<String> =
+            self.protected_snapshots.load().keys().cloned().collect();
+        protected_snapshot_ids.extend(self.in_flight_scan_snapshot_ids());
+        Self::cleanup_old_snapshots_local(
+            self.table_metadata.path.clone(),
+            self.table_metadata.table_id.clone(),
+            current_snapshot.to_string(),
+            protected_snapshot_ids,
+            Arc::clone(&self.catalog),
+            Arc::clone(self.context.file_format()),
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    pub(super) async fn cleanup_old_snapshots_with_protected_now_for_test(
+        &self,
+        current_snapshot: &str,
+        protected_snapshot_ids: HashSet<String>,
+    ) -> Result<()> {
+        Self::cleanup_old_snapshots_local(
+            self.table_metadata.path.clone(),
+            self.table_metadata.table_id.clone(),
+            current_snapshot.to_string(),
+            protected_snapshot_ids,
+            Arc::clone(&self.catalog),
+            Arc::clone(self.context.file_format()),
+        )
+        .await
     }
 
     /// Grace before physically deleting a retired snapshot dir, measured from
@@ -4188,6 +4241,7 @@ impl CayenneTableProvider {
         snapshot_dir: &std::path::Path,
         retiring_snapshot_id: &str,
         live_referenced: &HashSet<String>,
+        invalidate: impl FnOnce(HashSet<ObjectStorePath>),
     ) -> std::io::Result<bool> {
         let entries = match std::fs::read_dir(snapshot_dir) {
             Ok(entries) => entries,
@@ -4196,6 +4250,8 @@ impl CayenneTableProvider {
         };
 
         let mut kept_any = false;
+        let mut retired_files = Vec::new();
+        let mut retired_cache_paths = HashSet::new();
         for entry in entries {
             let entry = entry?;
             let path = entry.path();
@@ -4224,6 +4280,12 @@ impl CayenneTableProvider {
                 kept_any = true;
                 continue;
             }
+            retired_cache_paths.insert(Self::local_segment_cache_path(&path)?);
+            retired_files.push(path);
+        }
+
+        invalidate(retired_cache_paths);
+        for path in retired_files {
             match std::fs::remove_file(&path) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -4246,6 +4308,38 @@ impl CayenneTableProvider {
             Err(e) if e.kind() == std::io::ErrorKind::DirectoryNotEmpty => Ok(false),
             Err(e) => Err(e),
         }
+    }
+
+    fn segment_cache_paths_in_dir(
+        snapshot_dir: &std::path::Path,
+    ) -> std::io::Result<HashSet<ObjectStorePath>> {
+        let entries = match std::fs::read_dir(snapshot_dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(HashSet::new());
+            }
+            Err(error) => return Err(error),
+        };
+        let mut paths = HashSet::new();
+        for entry in entries {
+            let entry = entry?;
+            if entry.file_type()?.is_file()
+                && entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(Self::is_compactable_data_file)
+            {
+                paths.insert(Self::local_segment_cache_path(&entry.path())?);
+            }
+        }
+        Ok(paths)
+    }
+
+    fn local_segment_cache_path(path: &std::path::Path) -> std::io::Result<ObjectStorePath> {
+        // Match ListingTableUrl's lexical absolute path without resolving
+        // symlinks, which would change the LocalFileSystem object key.
+        let absolute = std::path::absolute(path)?;
+        ObjectStorePath::from_absolute_path(absolute).map_err(std::io::Error::other)
     }
 
     /// Physically delete retired snapshot dirs whose grace has fully elapsed,
@@ -4312,6 +4406,7 @@ impl CayenneTableProvider {
         let table_path = self.table_metadata.path.clone();
         let table_id = self.table_metadata.table_id.clone();
         let runtime_env = Arc::clone(self.context.runtime_env());
+        let file_format = Arc::clone(self.context.file_format());
         let ledger = Arc::clone(&self.retired_snapshot_dirs);
         let last_listed = Arc::clone(&self.snapshot_last_listed);
         let catalog = Arc::clone(&self.catalog);
@@ -4345,16 +4440,39 @@ impl CayenneTableProvider {
                 let dir = Self::snapshot_dir_path(&table_path, &table_id, &id);
                 let id_for_task = id.clone();
                 let referenced = live_referenced.clone();
+                let file_format_for_task = Arc::clone(&file_format);
+                let table_id_for_task = table_id.clone();
                 let removed = tokio::task::spawn_blocking(move || {
                     if manifest_populated {
                         Self::delete_retired_snapshot_dir_refcounted(
                             &dir,
                             &id_for_task,
                             &referenced,
+                            |paths| {
+                                if let Err(error) =
+                                    file_format_for_task.invalidate_segment_cache_paths(paths)
+                                {
+                                    tracing::warn!(
+                                        table_id = %table_id_for_task,
+                                        %error,
+                                        "Failed to invalidate retired Vortex segment-cache paths"
+                                    );
+                                }
+                            },
                         )
                     } else {
                         // Legacy path: no manifest, so no file is referenced
                         // across snapshots — the whole dir is dead.
+                        let paths = Self::segment_cache_paths_in_dir(&dir)?;
+                        if let Err(error) =
+                            file_format_for_task.invalidate_segment_cache_paths(paths)
+                        {
+                            tracing::warn!(
+                                table_id = %table_id_for_task,
+                                %error,
+                                "Failed to invalidate retired Vortex segment-cache paths"
+                            );
+                        }
                         match std::fs::remove_dir_all(&dir) {
                             Ok(()) => Ok(true),
                             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(true),
@@ -4531,6 +4649,20 @@ impl CayenneTableProvider {
         Ok(Some(ObjectStorePath::from(path)))
     }
 
+    fn invalidate_segment_cache_paths(&self, paths: HashSet<ObjectStorePath>) {
+        if let Err(error) = self
+            .context
+            .file_format()
+            .invalidate_segment_cache_paths(paths)
+        {
+            tracing::warn!(
+                table = self.table_metadata.table_name.as_str(),
+                %error,
+                "Failed to invalidate retired Vortex segment-cache paths"
+            );
+        }
+    }
+
     async fn delete_prefix_with_object_store(&self, prefix: &ObjectStorePath) -> Result<()> {
         let config = self.require_object_store()?;
         let objects: Vec<_> = config
@@ -4543,6 +4675,10 @@ impl CayenneTableProvider {
                 table: self.table_metadata.table_name.clone(),
                 source: e,
             })?;
+
+        self.invalidate_segment_cache_paths(
+            objects.iter().map(|meta| meta.location.clone()).collect(),
+        );
 
         let store = Arc::clone(&config.store);
         let table_name = self.table_metadata.table_name.clone();
@@ -4669,41 +4805,37 @@ impl CayenneTableProvider {
                 source: e,
             })?;
 
+        let objects: Vec<_> = objects
+            .into_iter()
+            .filter(|meta| {
+                let file_name = meta
+                    .location
+                    .parts()
+                    .next_back()
+                    .map(|part| part.as_ref().to_string());
+                file_name
+                    .as_deref()
+                    .is_some_and(Self::is_compactable_data_file)
+                    && file_name.as_deref().is_some_and(|name| {
+                        !live_referenced.contains(&Self::manifest_file_relative_path(
+                            retiring_snapshot_id,
+                            name,
+                        ))
+                    })
+            })
+            .collect();
+
+        self.invalidate_segment_cache_paths(
+            objects.iter().map(|meta| meta.location.clone()).collect(),
+        );
+
         let store = Arc::clone(&config.store);
         let table_name = self.table_metadata.table_name.clone();
         stream::iter(objects.into_iter().map(Ok::<_, Error>))
             .try_for_each_concurrent(OBJECT_STORE_MOVE_CONCURRENCY, |meta| {
                 let store = Arc::clone(&store);
                 let table_name = table_name.clone();
-                // The object's bare file name is the last path segment; combined
-                // with the retiring snapshot id it forms the same relative key
-                // the manifest ref-count is built from.
-                let file_name = meta
-                    .location
-                    .parts()
-                    .next_back()
-                    .map(|p| p.as_ref().to_string());
-                // Only compactable data files participate in ref-counting; a
-                // non-data sidecar (e.g. a staging WAL artifact) is never a
-                // manifest target, so leave it untouched — mirrors the local
-                // delete_retired_snapshot_dir_refcounted conservative
-                // (never-orphan) behavior instead of deleting unknown objects.
-                let is_data_file = file_name
-                    .as_deref()
-                    .is_some_and(Self::is_compactable_data_file);
-                let referenced = is_data_file
-                    && file_name.as_ref().is_some_and(|name| {
-                        live_referenced.contains(&Self::manifest_file_relative_path(
-                            retiring_snapshot_id,
-                            name,
-                        ))
-                    });
                 async move {
-                    if !is_data_file || referenced {
-                        // Non-data sidecar (kept, never orphaned) or referenced in
-                        // place by a live/protected snapshot — keep.
-                        return Ok(());
-                    }
                     store
                         .delete(&meta.location)
                         .await
@@ -5658,6 +5790,7 @@ impl CayenneTableProvider {
         protected_snapshot_ids: &HashSet<String>,
         manifest_populated: bool,
         live_referenced: &HashSet<String>,
+        mut invalidate: impl FnMut(HashSet<ObjectStorePath>),
     ) -> CatalogResult<()> {
         let table_dir = std::path::PathBuf::from(table_path).join(table_id);
 
@@ -5757,6 +5890,7 @@ impl CayenneTableProvider {
                     &path,
                     &snapshot_id,
                     live_referenced,
+                    &mut invalidate,
                 )
                 .map_err(|source| CatalogError::IoError { source })?;
                 if fully_removed {
@@ -5768,6 +5902,9 @@ impl CayenneTableProvider {
                     );
                 }
             } else {
+                let paths = Self::segment_cache_paths_in_dir(&path)
+                    .map_err(|source| CatalogError::IoError { source })?;
+                invalidate(paths);
                 std::fs::remove_dir_all(&path)
                     .map_err(|source| CatalogError::IoError { source })?;
                 deleted_count += 1;
@@ -40067,6 +40204,8 @@ mod tests {
     /// dir as NOT fully removed while a referenced file survives.
     #[test]
     fn delete_retired_snapshot_dir_refcounted_keeps_referenced_files() {
+        use std::cell::RefCell;
+
         let tmp = TempDir::new().expect("temp dir");
         let table_root = tmp.path().join("table-id");
         let retired_dir = table_root.join("retired-snap");
@@ -40084,11 +40223,19 @@ mod tests {
         let referenced: HashSet<String> = ["retired-snap/kept.vortex".to_string()]
             .into_iter()
             .collect();
+        let orphan_cache_path =
+            CayenneTableProvider::local_segment_cache_path(&retired_dir.join("orphan.vortex"))
+                .expect("orphan path should convert before deletion");
+        let referenced_cache_path =
+            CayenneTableProvider::local_segment_cache_path(&retired_dir.join("kept.vortex"))
+                .expect("referenced path should convert before deletion");
 
+        let invalidated = RefCell::new(HashSet::new());
         let fully_removed = CayenneTableProvider::delete_retired_snapshot_dir_refcounted(
             &retired_dir,
             "retired-snap",
             &referenced,
+            |paths| *invalidated.borrow_mut() = paths,
         )
         .expect("refcounted delete");
 
@@ -40107,6 +40254,15 @@ mod tests {
         assert!(
             retired_dir.join("notes.txt").exists(),
             "a non-data sidecar is conservatively kept (never a manifest target)"
+        );
+        assert_eq!(invalidated.borrow().len(), 1);
+        assert!(
+            invalidated.borrow().contains(&orphan_cache_path),
+            "the orphan's exact cache path must be invalidated"
+        );
+        assert!(
+            !invalidated.borrow().contains(&referenced_cache_path),
+            "a path referenced in place by a live snapshot must remain cached"
         );
     }
 
@@ -40129,6 +40285,7 @@ mod tests {
             &retired_dir,
             "dead-snap",
             &referenced,
+            |_| {},
         )
         .expect("refcounted delete");
 
@@ -40149,9 +40306,26 @@ mod tests {
             &missing,
             "never-existed",
             &HashSet::new(),
+            |_| {},
         )
         .expect("missing dir is not an error");
         assert!(fully_removed, "a NotFound dir counts as fully removed");
+    }
+
+    #[test]
+    fn local_segment_cache_path_matches_relative_listing_path() {
+        let tmp = TempDir::new_in(".").expect("relative temp dir");
+        let file = tmp.path().join("data.vortex");
+        std::fs::write(&file, b"data").expect("write listed file");
+
+        let listing = ListingTableUrl::parse(file.to_string_lossy())
+            .expect("relative file path should parse as a listing URL");
+        assert_eq!(
+            CayenneTableProvider::local_segment_cache_path(&file)
+                .expect("relative cache path should convert"),
+            listing.prefix().clone(),
+            "cache retirement must reconstruct the exact LocalFileSystem key"
+        );
     }
 
     /// Helper to read all data from a `CayenneTableProvider` as `RecordBatch`es.
@@ -40328,6 +40502,122 @@ mod tests {
         assert!(
             plan_after.properties().output_ordering().is_none(),
             "after an append delta-adds an unsorted file, output_ordering must NOT be advertised"
+        );
+    }
+
+    #[tokio::test]
+    async fn committed_compaction_invalidates_retired_segments_after_cleanup() {
+        use arrow::array::Int64Array;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let ctx = SessionContext::new();
+        let (provider, _tmp) = create_cayenne_table_with_config(
+            "compaction_segment_cache_retirement",
+            Arc::clone(&schema),
+            VortexConfig {
+                inline_max_rows: 0,
+                ..VortexConfig::default()
+            },
+            vec![],
+            ctx.runtime_env(),
+        )
+        .await;
+        insert_batch(
+            &provider,
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Int64Array::from_iter_values(0..2_000))],
+            )
+            .expect("input batch"),
+        )
+        .await;
+        assert_eq!(
+            read_all(&ctx, &provider, "compaction_segment_cache_retirement")
+                .await
+                .iter()
+                .map(RecordBatch::num_rows)
+                .sum::<usize>(),
+            2_000
+        );
+        let old_cache_entries = provider
+            .context()
+            .file_format()
+            .segment_cache_entry_count()
+            .await
+            .expect("the file-backed test enables the segment cache");
+        assert!(
+            old_cache_entries > 0,
+            "the source scan must populate the cache"
+        );
+        let old_snapshot = provider.get_current_snapshot_id();
+
+        assert!(
+            provider
+                .rewrite_current_snapshot_for_compaction()
+                .await
+                .expect("compaction rewrite"),
+            "the compaction must publish a replacement snapshot"
+        );
+        provider
+            .drain_in_flight_maintenance()
+            .await
+            .expect("drain post-compaction maintenance");
+        assert_eq!(
+            read_all(&ctx, &provider, "compaction_segment_cache_retirement")
+                .await
+                .iter()
+                .map(RecordBatch::num_rows)
+                .sum::<usize>(),
+            2_000
+        );
+        let entries_before_cleanup = provider
+            .context()
+            .file_format()
+            .segment_cache_entry_count()
+            .await
+            .expect("segment cache remains enabled");
+        assert!(
+            entries_before_cleanup > old_cache_entries,
+            "the replacement scan must cache live segments alongside retired inputs"
+        );
+
+        let current_snapshot = provider.get_current_snapshot_id();
+        provider.protected_snapshots.store(Arc::new(HashMap::new()));
+        provider
+            .snapshot_scan_refs
+            .lock()
+            .insert(old_snapshot.clone(), 1);
+        provider
+            .cleanup_old_snapshots_now_for_test(&current_snapshot)
+            .await
+            .expect("in-flight cleanup pass");
+        assert_eq!(
+            provider
+                .context()
+                .file_format()
+                .segment_cache_entry_count()
+                .await,
+            Some(entries_before_cleanup),
+            "in-flight compaction inputs must remain cached"
+        );
+        assert_eq!(
+            provider.snapshot_scan_refs.lock().remove(&old_snapshot),
+            Some(1),
+            "the test must release the old snapshot's in-flight guard"
+        );
+        provider
+            .cleanup_old_snapshots_now_for_test(&current_snapshot)
+            .await
+            .expect("cleanup committed compaction inputs after the scan guard is released");
+        let entries_after_cleanup = provider
+            .context()
+            .file_format()
+            .segment_cache_entry_count()
+            .await
+            .expect("segment cache remains enabled");
+        assert!(
+            entries_after_cleanup > 0 && entries_after_cleanup < entries_before_cleanup,
+            "cleanup must remove retired compaction inputs while preserving the output cache"
         );
     }
 
@@ -45760,7 +46050,9 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_skips_snapshots_newer_than_current() {
+    fn cleanup_invalidates_only_committed_retired_snapshot_paths() {
+        use std::cell::RefCell;
+
         let tmp = TempDir::new().expect("create temp dir");
         let table_path = tmp.path().to_str().expect("valid UTF-8 path");
         let table_id = uuid::Uuid::now_v7().to_string();
@@ -45769,21 +46061,40 @@ mod tests {
         let table_dir = tmp.path().join(&table_id);
         std::fs::create_dir_all(&table_dir).expect("create table dir");
 
-        // Create 3 snapshot directories:
+        // Create 4 snapshot directories:
         // - old_snapshot (older than current) → should be deleted
+        // - protected_snapshot (older than current) → should be kept
         // - current_snapshot → should be kept
         // - newer_snapshot (newer than current, simulating in-flight write) → should be kept
         let old_snapshot = uuid::Uuid::now_v7().to_string();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let protected_snapshot = uuid::Uuid::now_v7().to_string();
         std::thread::sleep(std::time::Duration::from_millis(2));
         let current_snapshot = uuid::Uuid::now_v7().to_string();
         std::thread::sleep(std::time::Duration::from_millis(2));
         let newer_snapshot = uuid::Uuid::now_v7().to_string();
 
         std::fs::create_dir(table_dir.join(&old_snapshot)).expect("create old snapshot dir");
+        std::fs::create_dir(table_dir.join(&protected_snapshot))
+            .expect("create protected snapshot dir");
         std::fs::create_dir(table_dir.join(&current_snapshot)).expect("create current dir");
         std::fs::create_dir(table_dir.join(&newer_snapshot)).expect("create newer dir");
+        for snapshot in [
+            &old_snapshot,
+            &protected_snapshot,
+            &current_snapshot,
+            &newer_snapshot,
+        ] {
+            std::fs::write(table_dir.join(snapshot).join("data.vortex"), b"data")
+                .expect("write snapshot data file");
+        }
 
-        let protected: HashSet<String> = HashSet::new();
+        let protected = HashSet::from([protected_snapshot.clone()]);
+        let old_cache_path = CayenneTableProvider::local_segment_cache_path(
+            &table_dir.join(&old_snapshot).join("data.vortex"),
+        )
+        .expect("old data path should convert before cleanup");
+        let invalidated = RefCell::new(HashSet::new());
 
         // Legacy / unpopulated-manifest mode: whole-dir delete (the historical
         // behavior). Ref-counted file-by-file deletion is covered separately.
@@ -45794,6 +46105,7 @@ mod tests {
             &protected,
             false,
             &HashSet::new(),
+            |paths| invalidated.borrow_mut().extend(paths),
         )
         .expect("cleanup should succeed");
 
@@ -45807,10 +46119,19 @@ mod tests {
             table_dir.join(&current_snapshot).exists(),
             "current snapshot must be preserved"
         );
+        assert!(
+            table_dir.join(&protected_snapshot).exists(),
+            "protected snapshot must be preserved"
+        );
         // newer_snapshot should be kept (in-flight write protection)
         assert!(
             table_dir.join(&newer_snapshot).exists(),
             "snapshot newer than current must be preserved (in-flight write)"
+        );
+        assert_eq!(
+            *invalidated.borrow(),
+            HashSet::from([old_cache_path]),
+            "only the exact committed retired path is invalidated"
         );
     }
 

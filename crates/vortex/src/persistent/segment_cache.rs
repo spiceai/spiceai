@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
+use std::collections::HashSet;
 use std::hash::BuildHasherDefault;
 use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
+use datafusion_common::{DataFusionError, Result as DFResult};
 use moka::future::Cache;
 use object_store::path::Path;
 use opentelemetry::metrics::{Gauge, Meter};
@@ -93,6 +95,7 @@ impl SharedSegmentCache {
             cache: Cache::builder()
                 .name("vortex-datafusion-segment-cache")
                 .max_capacity(max_capacity_bytes)
+                .support_invalidation_closures()
                 .weigher(|_, buffer: &ByteBuffer| {
                     u32::try_from(buffer.len().min(u32::MAX as usize)).unwrap_or(u32::MAX)
                 })
@@ -109,6 +112,22 @@ impl SharedSegmentCache {
             shared: self.clone(),
             path: Arc::new(path),
         })
+    }
+
+    pub(crate) fn invalidate_paths(&self, paths: HashSet<Path>) -> DFResult<()> {
+        if paths.is_empty() {
+            return Ok(());
+        }
+
+        self.cache
+            .invalidate_entries_if(move |(path, _), _| paths.contains(path.as_ref()))
+            .map(|_| ())
+            .map_err(|error| DataFusionError::External(Box::new(error)))
+    }
+
+    pub(crate) async fn entry_count(&self) -> u64 {
+        self.cache.run_pending_tasks().await;
+        self.cache.entry_count()
     }
 }
 
@@ -201,6 +220,46 @@ mod tests {
                 .await
                 .expect("get should not error")
                 .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn invalidates_exact_paths_only() {
+        let shared = SharedSegmentCache::new(1 << 20, None);
+        let path_a = Path::from("snapshot-a/a.vortex");
+        let path_b = Path::from("snapshot-b/b.vortex");
+        let cache_a = shared.for_path(path_a.clone());
+        let cache_b = shared.for_path(path_b.clone());
+        let id = SegmentId::from(1);
+
+        cache_a
+            .put(id, ByteBuffer::from(vec![1u8, 2, 3, 4]))
+            .await
+            .expect("put for retired path should not error");
+        cache_b
+            .put(id, ByteBuffer::from(vec![5u8, 6, 7, 8]))
+            .await
+            .expect("put for live path should not error");
+
+        shared
+            .invalidate_paths(HashSet::from([path_a]))
+            .expect("path invalidation should be enabled");
+
+        assert!(
+            cache_a
+                .get(id)
+                .await
+                .expect("get for retired path should not error")
+                .is_none(),
+            "the retired path must be invalidated"
+        );
+        assert!(
+            cache_b
+                .get(id)
+                .await
+                .expect("get for live path should not error")
+                .is_some(),
+            "an unrelated live path must remain cached"
         );
     }
 }

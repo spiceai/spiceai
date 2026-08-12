@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
+use std::collections::HashSet;
 use std::fmt::Debug;
 use std::fmt::Display;
 use std::fmt::Formatter;
@@ -48,6 +49,7 @@ use futures::TryStreamExt as _;
 use futures::stream;
 use object_store::ObjectMeta;
 use object_store::ObjectStore;
+use object_store::path::Path;
 use vortex::VortexSessionDefault;
 use vortex::arrow::ArrowSessionExt;
 use vortex::arrow::FromArrowType;
@@ -415,6 +417,26 @@ impl VortexFormat {
     #[must_use]
     pub fn options(&self) -> &VortexTableOptions {
         &self.opts
+    }
+
+    /// Invalidates cached Vortex segments for the exact object-store paths.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if path-predicate invalidation is unavailable.
+    pub fn invalidate_segment_cache_paths(&self, paths: HashSet<Path>) -> DFResult<()> {
+        self.segment_cache
+            .as_ref()
+            .map_or(Ok(()), |cache| cache.invalidate_paths(paths))
+    }
+
+    /// Returns the current number of cached Vortex segments, or `None` when the
+    /// segment cache is disabled.
+    pub async fn segment_cache_entry_count(&self) -> Option<u64> {
+        match self.segment_cache.as_ref() {
+            Some(cache) => Some(cache.entry_count().await),
+            None => None,
+        }
     }
 
     /// Creates a format that attaches access plans and adjusts footer-derived
