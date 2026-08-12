@@ -916,6 +916,10 @@ impl Refresher {
         let mut refresh_task_runner = refresh_task_runner.build();
 
         let (start_refresh, mut on_refresh_complete) = refresh_task_runner.start()?;
+        // Handle for the refresh-completion handler below: cache invalidation
+        // must cover the live set of dataset names (self + synchronized
+        // children), which grows as children finish their initial loads.
+        let refresh_task = Arc::clone(refresh_task_runner.refresh_task());
         self.refresh_task_runner = Some(refresh_task_runner);
 
         let notifier = self.on_complete_notification.clone();
@@ -1081,10 +1085,18 @@ impl Refresher {
 
                         if refresh_changed_accelerator && let Some(cache_provider_ref) = caching.as_ref() {
                             // No cache provider means runtime is shutting down and cache is already cleaned up
-                            if let Some(cache_provider) = cache_provider_ref.upgrade()
-                                && let Err(e) = cache_provider.invalidate_for_table(dataset_name.clone()).await {
-                                    tracing::warn!("Failed to invalidate cached results for dataset {dataset_name}: {e}");
+                            if let Some(cache_provider) = cache_provider_ref.upgrade() {
+                                // The refresh rewrote every synchronized (e.g. localpod) child's
+                                // accelerator along with this dataset's, so cached results for the
+                                // children are exactly as stale as the parent's (#12887). Children
+                                // attach after their own initial load completes, so the set is
+                                // resolved live rather than captured when this loop started.
+                                for table_name in refresh_task.get_dataset_names().await {
+                                    if let Err(e) = cache_provider.invalidate_for_table(table_name.clone()).await {
+                                        tracing::warn!("Failed to invalidate cached results for dataset {table_name}: {e}");
+                                    }
                                 }
+                            }
                         }
 
                         if refresh_succeeded && checkpoint_counting_enabled.load(Ordering::Acquire) && create_checkpoint_snapshot_after_refresh && let Some(checkpointer) = &checkpointer {

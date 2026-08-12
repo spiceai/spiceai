@@ -361,10 +361,12 @@ impl DataConnector for IcebergDataConnector {
 
         // Wrap so the scan can be serialized for distributed (Ballista) execution.
         // In a single-node session this is a transparent pass-through.
+        let inner = parts.provider;
         Ok(Arc::new(IcebergClusterTableProvider::new(
             dataset.name.clone(),
-            parts.provider,
-        )))
+            Arc::clone(&inner),
+        ))
+        .into_table() as Arc<dyn TableProvider>)
     }
 
     #[cfg(feature = "iceberg-write")]
@@ -378,19 +380,22 @@ impl DataConnector for IcebergDataConnector {
             Err(e) => return Some(Err(e)),
         };
 
-        // Wrap in IcebergDeletionProvider for DELETE FROM support.
+        // Stack a deletion layer for DELETE FROM support.
+        let base = parts.provider;
         let deletion_provider = data_components::iceberg::delete::IcebergDeletionProvider::new(
             parts.catalog,
             parts.table_identifier.namespace().clone(),
             parts.table_identifier.name().to_string(),
-            parts.provider,
+            Arc::clone(&base),
         );
+        let deletable = spice_table::SpiceTable::over(Arc::new(deletion_provider), base);
 
-        // Then wrap so the scan can be serialized for distributed execution.
+        // Then a cluster layer, so the scan can be serialized for distributed execution.
         Some(Ok(Arc::new(IcebergClusterTableProvider::new(
             dataset.name.clone(),
-            Arc::new(deletion_provider),
-        ))))
+            deletable as Arc<dyn TableProvider>,
+        ))
+        .into_table() as Arc<dyn TableProvider>))
     }
 }
 

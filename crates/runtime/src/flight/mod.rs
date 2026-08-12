@@ -83,6 +83,7 @@ pub mod middleware;
 mod mtls;
 mod session;
 pub(crate) mod session_auth;
+mod traced_ticket;
 mod util;
 
 pub use session::SessionStore;

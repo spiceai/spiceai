@@ -45,7 +45,7 @@ use crate::{
         query::{
             Error as QueryError, QueryBuilder, TransactionError, error_code::ErrorCode,
             is_cancellation_error, is_timeout_error, json_array_writer, run_transaction,
-            schema_has_union_columns, transaction_statements, write_to_json_string,
+            schema_has_union_columns, single_line, transaction_statements, write_to_json_string,
             write_to_json_value,
         },
     },
@@ -412,46 +412,18 @@ impl SqlErrorKind {
     }
 }
 
-/// Collapses the control characters in a query error message so it logs as a
-/// single record.
-///
-/// A memory-pool refusal spreads its top-consumer breakdown over several lines,
-/// and a record that breaks mid-message is one a log collector cannot group or
-/// alert on. Every control character is replaced rather than dropped, so
-/// offsets into the logged line still match the message the response carries.
-/// Only the logged copy is collapsed — the body keeps what the engine wrote —
-/// and a message with nothing to collapse is borrowed, so the common path does
-/// not allocate.
-fn single_line(message: &str) -> std::borrow::Cow<'_, str> {
-    if message.contains(char::is_control) {
-        std::borrow::Cow::Owned(
-            message
-                .chars()
-                .map(|c| if c.is_control() { ' ' } else { c })
-                .collect(),
-        )
-    } else {
-        std::borrow::Cow::Borrowed(message)
-    }
-}
-
 /// Maps a query error message to an HTTP response, distinguishing cancellation
 /// (499 Client Closed Request), query timeout (504 Gateway Timeout) and
 /// resource exhaustion (503 Service Unavailable) from other errors.
 ///
-/// Resource exhaustion is logged at `warn`, everything else at `debug`. A
-/// malformed query is the client's problem and would only be noise in the
-/// runtime's log, but a runtime that is refusing queries for want of memory is
-/// an outage its operator cannot see any other way: `/health` is served by a
-/// separate tokio runtime and stays green throughout, so nothing else raises
-/// the condition at the default verbosity.
+/// Logged at `debug` — including a refusal for want of memory, which
+/// `QueryTracker::finish` names at `warn` instead. It has to be named there:
+/// this function runs after the query has returned and its trace span has
+/// closed, so a record written here can carry no `trace_id` and names no
+/// particular query. `finish` is also protocol-agnostic, so naming it there
+/// covers Flight, which never reaches this function.
 fn sql_error_response(message: String, kind: SqlErrorKind) -> Response {
-    let logged = single_line(&message);
-    if matches!(kind, SqlErrorKind::ResourcesExhausted) {
-        tracing::warn!("Query refused, out of memory: {logged}");
-    } else {
-        tracing::debug!("Error executing query: {logged}");
-    }
+    tracing::debug!("Error executing query: {}", single_line(&message));
     let status = match kind {
         SqlErrorKind::Cancellation => StatusCode::from_u16(499).unwrap_or(StatusCode::BAD_REQUEST),
         SqlErrorKind::Timeout => StatusCode::GATEWAY_TIMEOUT,

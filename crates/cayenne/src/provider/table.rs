@@ -1664,6 +1664,13 @@ pub struct CayenneTableProvider {
     /// when both hold exact keysets). Shared across clones like the caches.
     pk_keyset_bytes_single: Arc<AtomicUsize>,
     pk_keyset_bytes_sharded: Arc<AtomicUsize>,
+    /// Serializes read-both-components-then-publish. The two components are
+    /// written under different locks (the single keyset's and the sharded
+    /// index's), so without this a publisher can read the sum, be overtaken by a
+    /// publisher that reads a newer sum and writes it, and then land its own
+    /// stale total last — leaving both the pool reservation and this table's
+    /// share of the fleet budget under-reporting residency that exists.
+    pk_keyset_publish_lock: Arc<ParkingMutex<()>>,
     /// Per-key transaction OCC (`transaction_has_conflict`) trusts the Exact
     /// keyset's per-key `sequence` stamps ONLY when this is `false`. Set `true`
     /// whenever an event leaves the shared Exact keyset with a stale or missing
@@ -6084,6 +6091,7 @@ impl CayenneTableProvider {
             pk_warm_probe_done: Arc::new(AtomicBool::new(false)),
             pk_keyset_bytes_single: Arc::new(AtomicUsize::new(0)),
             pk_keyset_bytes_sharded: Arc::new(AtomicUsize::new(0)),
+            pk_keyset_publish_lock: Arc::new(ParkingMutex::new(())),
             pk_keyset_occ_degraded: Arc::new(AtomicBool::new(false)),
             cold_pk_existence: Arc::new(ParkingMutex::new(None)),
             table_memory,
@@ -7277,6 +7285,7 @@ impl CayenneTableProvider {
             pk_warm_probe_done: Arc::clone(&self.pk_warm_probe_done),
             pk_keyset_bytes_single: Arc::clone(&self.pk_keyset_bytes_single),
             pk_keyset_bytes_sharded: Arc::clone(&self.pk_keyset_bytes_sharded),
+            pk_keyset_publish_lock: Arc::clone(&self.pk_keyset_publish_lock),
             pk_keyset_occ_degraded: Arc::clone(&self.pk_keyset_occ_degraded),
             cold_pk_existence: Arc::clone(&self.cold_pk_existence),
             table_memory: Arc::clone(&self.table_memory),
@@ -7681,17 +7690,44 @@ impl CayenneTableProvider {
         matches!(self.table_metadata.on_conflict, Some(OnConflict::Upsert(_)))
     }
 
+    /// Effective byte budget for the table-wide PK keyset cache
+    /// (`pk_keyset_cache`).
+    fn effective_single_keyset_budget(&self) -> usize {
+        self.effective_pk_keyset_budget(self.pk_keyset_bytes_single.load(Ordering::Relaxed))
+    }
+
+    /// Effective byte budget for the per-shard PK index (`sharded_pk_keyset_cache`).
+    fn effective_sharded_keyset_budget(&self) -> usize {
+        self.effective_pk_keyset_budget(self.pk_keyset_bytes_sharded.load(Ordering::Relaxed))
+    }
+
     /// Effective byte budget for ONE PK cache. Sharded (N>1) tables maintain
     /// two live caches — the table-wide keyset and the per-shard index — so
     /// each gets half the configured budget, keeping their combined resident
     /// size within it.
-    fn effective_pk_keyset_budget(&self) -> usize {
+    ///
+    /// `own` is the residency of the cache being bounded, NOT the table's total
+    /// across both. Every caller compares this ceiling against one cache's
+    /// `approx_bytes`, so feeding it the sum would hand each cache the other's
+    /// bytes as extra allowance: with the fleet full and the table-wide keyset
+    /// holding 1 GiB, the per-shard index would be told it may reach 1 GiB too,
+    /// and the pair would grow to twice what the fleet had left.
+    fn effective_pk_keyset_budget(&self, own: usize) -> usize {
         let max_bytes = self.context.pk_keyset_cache_max_bytes();
-        if self.mem_tier_shard_count() > 1 {
+        let per_cache = if self.mem_tier_shard_count() > 1 {
             max_bytes / 2
         } else {
             max_bytes
-        }
+        };
+        // Clamp to what the FLEET has left. `pk_keyset_cache_mb` derives each
+        // table's figure from total memory (~1/32, clamped 256 MiB–8 GiB) with
+        // no view of its siblings, so seven CDC tables on a 96 GiB host each
+        // believe they may hold 3 GiB — 21 GiB in aggregate, which no single
+        // table can ever exceed. A SF-1000 profile measured ~14.5 GiB resident
+        // in keysets with zero over-budget events for exactly that reason.
+        //
+        // Unset (embedders, tests) leaves the per-table figure untouched.
+        super::pk_keyset_budget::clamp_pk_keyset_budget(per_cache, own)
     }
 
     /// Publish the table-wide PK cache's resident bytes and refresh the sum.
@@ -7707,10 +7743,17 @@ impl CayenneTableProvider {
     }
 
     fn publish_keyset_bytes_total(&self) {
+        // Read both components AND publish under one lock. The components are
+        // stored before this point, so whichever publisher holds the lock last
+        // reads every completed store and publishes the true sum; splitting the
+        // read from the publish lets a stale total land last and under-report.
+        let _guard = self.pk_keyset_publish_lock.lock();
         let total = self
             .pk_keyset_bytes_single
             .load(Ordering::Relaxed)
             .saturating_add(self.pk_keyset_bytes_sharded.load(Ordering::Relaxed));
+        // `set_keyset_bytes` also restates this table's share of the fleet
+        // ceiling, and releases it on drop.
         self.table_memory.set_keyset_bytes(total);
     }
 
@@ -7736,7 +7779,7 @@ impl CayenneTableProvider {
     }
 
     pub(crate) fn store_cached_pk_index(&self, index: CachedPkIndex) {
-        let max_bytes = self.effective_pk_keyset_budget();
+        let max_bytes = self.effective_single_keyset_budget();
         let to_store = match index {
             CachedPkIndex::Exact(keyset) if keyset.approx_bytes > max_bytes => {
                 if self.upsert_bloom_eligible() {
@@ -7963,15 +8006,28 @@ impl CayenneTableProvider {
             let mut sharded = self.sharded_pk_keyset_cache.lock();
             let mut drop_index = false;
             if let Some(index) = sharded.as_mut() {
-                index.record_keys(keys, location);
-                // Byte budget: upsert degrades to per-shard blooms (a false
+                // Budget enforced DURING the insert, not after it. Recording the
+                // whole batch first and reconciling afterwards made the budget a
+                // trim rather than an admission control: the peak was
+                // `batch_keys x entry_bytes` with no ceiling, which at SF-1000
+                // reached ~14.5 GiB against a 256 MiB default.
+                let max_bytes = self.effective_sharded_keyset_budget();
+                let within_budget = index.record_keys_bounded(keys, location, max_bytes);
+                // Over budget: upsert degrades to per-shard blooms (a false
                 // positive is only a redundant delete); `DoNothing` needs
                 // exactness, so drop and let the next validation lazy-rebuild.
-                let max_bytes = self.effective_pk_keyset_budget();
-                if index.approx_bytes() > max_bytes {
+                if !within_budget {
                     if self.upsert_bloom_eligible() {
                         let per_shard = max_bytes / index.shard_count().max(1);
                         index.degrade_to_blooms(per_shard);
+                        // The bounded insert stopped at the budget and the
+                        // degrade only converted what was already held, so the
+                        // rest of this batch is missing from the bloom. An
+                        // absent key is a false negative, which under upsert
+                        // reads as a new PK and writes a duplicate live row —
+                        // backfill the whole batch, as the single-keyset path
+                        // below has always done.
+                        index.record_keys_after_degrade(keys);
                     } else {
                         drop_index = true;
                     }
@@ -7985,7 +8041,7 @@ impl CayenneTableProvider {
             }
         }
 
-        let max_bytes = self.effective_pk_keyset_budget();
+        let max_bytes = self.effective_single_keyset_budget();
         let mut guard = self.pk_keyset_cache.lock();
         // Take ownership so an over-budget Exact keyset can be replaced by a
         // bloom without a borrow conflict; the index is restored before return.
@@ -8730,7 +8786,7 @@ impl CayenneTableProvider {
         // would wrongly drop a genuinely new row) and keeps the exact build.
         let budget = self
             .upsert_bloom_eligible()
-            .then(|| self.effective_pk_keyset_budget());
+            .then(|| self.effective_sharded_keyset_budget());
         let mut keyset = BoundedShardedPkIndexBuilder::new(shards, budget);
         let mut row_id_base: i64 = 0;
 
@@ -10771,7 +10827,7 @@ impl CayenneTableProvider {
             // already-bloomed index whose blooms sit above a very small budget.
             let mut bytes = None;
             if let Some(index @ ShardedPkIndex::Exact(_)) = sharded.as_mut() {
-                let max_bytes = self.effective_pk_keyset_budget();
+                let max_bytes = self.effective_sharded_keyset_budget();
                 let resident = index.approx_bytes();
                 if resident > max_bytes && self.upsert_bloom_eligible() {
                     tracing::warn!(
@@ -33075,7 +33131,7 @@ mod tests {
             None => panic!("a DoNothing table must keep its exact cache, not drop it"),
         };
         assert!(
-            resident > provider.effective_pk_keyset_budget(),
+            resident > provider.effective_sharded_keyset_budget(),
             "the index the resync left alone must be the over-budget one"
         );
         assert!(
