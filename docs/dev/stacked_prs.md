@@ -34,10 +34,17 @@ Derive them rather than assuming they are the same commit — the parent branch 
 gains review-fix commits after the child splits off:
 
 ```bash
+git fetch origin                                   # refresh origin/trunk — see the warning below
 git fetch origin "refs/pull/<parent-pr>/head"      # the branch is deleted; the PR ref survives
 PARENT_HEAD=$(gh pr view <parent-pr> --json headRefOid -q .headRefOid)
 STACKBASE=$(git merge-base HEAD "$PARENT_HEAD")
 ```
+
+> **Fetch the tracking refs, not just the PR ref.** `git fetch origin <refspec>` leaves
+> its result in `FETCH_HEAD` and does **not** update `origin/trunk`. Every comparison,
+> rebase, and merge below is against `origin/trunk`, so a stale local ref silently
+> restacks onto a commit that predates the parent's squash — the wrong base, with no
+> error. Plain `git fetch origin` first.
 
 Using `$PARENT_HEAD` as the stack base is wrong whenever the child never took the
 parent's last commits: the audit would read that parent work as child deletions, and
@@ -56,6 +63,7 @@ carried — expect it to arrive with the merge, and do not read it as child inte
    into the child and push normally:
 
    ```bash
+   git fetch origin              # without this, origin/<parent> is stale and the merge is a no-op
    git checkout <child>
    git merge origin/<parent>
    git push
@@ -155,33 +163,31 @@ ls-files -u <path>` shows them):
 
 ```bash
 f=<path>
-# Symlinks must not go through this block — see below.
-git ls-files --stage -- "$f" | awk '$1 == 120000 { print "SYMLINK, resolve by hand: " $4 }'
-git show ":2:$f" > /tmp/ours          # your side
-git show ":3:$f" > /tmp/theirs        # trunk's side
-git show "$STACKBASE:$f" > /tmp/base  # the correct base — NOT git's stage 1
-if git merge-file -p --diff3 /tmp/ours /tmp/base /tmp/theirs > /tmp/merged; then
-  cp /tmp/merged "$f" && git add "$f"          # clean — accept it
+if [ "$(git ls-files --stage -- "$f" | awk 'NR == 1 { print $1 }')" = 120000 ]; then
+  # Symlink: recreate the link, never cp onto it. Its blob content is the target path.
+  ln -sfn "$(git show ":2:$f")" "$f" && git add "$f"   # or stage 3, whichever target is right
 else
-  grep -n '^<<<<<<<\|^|||||||\|^>>>>>>>' /tmp/merged   # real conflict — resolve by hand first
+  git show ":2:$f" > /tmp/ours          # your side
+  git show ":3:$f" > /tmp/theirs        # trunk's side
+  git show "$STACKBASE:$f" > /tmp/base  # the correct base — NOT git's stage 1
+  if git merge-file -p --diff3 /tmp/ours /tmp/base /tmp/theirs > /tmp/merged; then
+    cp /tmp/merged "$f" && git add "$f"                 # clean — accept it
+  else
+    grep -n '^<<<<<<<\|^|||||||\|^>>>>>>>' /tmp/merged  # real conflict — resolve by hand first
+  fi
 fi
 ```
 
 Three things about that block. `merge-file -p` only writes the merged text to stdout —
 it neither updates the worktree file nor stages it, so the `cp`/`git add` are what
 actually resolve the path. The staging must be *guarded* by the exit status (0 clean,
-else the number of conflicts left): an unguarded `cp` after a warning comment stages
-conflict markers the moment someone pastes the block.
+else the number of conflicts left): an unguarded `cp` stages conflict markers the moment
+someone pastes the block.
 
-And **never run it on a symlink** — index mode `120000`, which is why the block checks
-for it first. `cp` follows the link and writes *through* it, so resolving a conflict on
-`CLAUDE.md` this way would silently overwrite `.github/copilot-instructions.md` while
-leaving the link itself looking untouched. A conflicted symlink's blob content is just
-its target path, so recreate the link instead:
-
-```bash
-ln -sfn "$(git show ":2:$f")" "$f" && git add "$f"   # or stage 3, whichever target is right
-```
+And the symlink branch has to be **control flow, not a warning**. `cp` follows a link
+and writes *through* it, so resolving a conflicted `CLAUDE.md` in the text-merge branch
+would silently overwrite `.github/copilot-instructions.md` while the link itself still
+looked untouched. A printed warning does not stop the `cp` that follows it.
 
 **3. Audit for silent damage** — this is the step that catches the resurrection. It
 compares what the child *intended* against what the merge actually put on disk:
