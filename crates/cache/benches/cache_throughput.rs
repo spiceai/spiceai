@@ -93,6 +93,17 @@ fn all_caching_policies() -> Vec<(&'static str, CachingPolicy)> {
     ]
 }
 
+// Get all cache engines to benchmark. Pingora is listed only when the feature is
+// enabled: without it, requesting `CacheEngine::Pingora` silently falls back to
+// Moka, and the comparison would measure Moka against itself.
+fn all_cache_engines() -> Vec<(&'static str, CacheEngine)> {
+    vec![
+        ("moka", CacheEngine::Moka),
+        #[cfg(feature = "pingora")]
+        ("pingora", CacheEngine::Pingora),
+    ]
+}
+
 fn random_value(rng: &mut StdRng) -> String {
     rng.sample_iter(&Alphanumeric)
         .take(32)
@@ -521,6 +532,122 @@ fn bench_lru_cache_concurrent_mixed(c: &mut Criterion) {
     group.finish();
 }
 
+type EngineBenchCache = LruCache<BenchValue, HashBuilder, Box<dyn Hasher + Send + Sync>>;
+
+/// Builds a cache on the given engine, prepopulated with `prepopulate` entries.
+///
+/// Policy and hasher are fixed (LRU, xxh3) so the engine is the only variable:
+/// the policy only selects between Moka's internal algorithms anyway, and the
+/// Pingora backend is always plain LRU.
+fn new_engine_cache(
+    engine: CacheEngine,
+    handle: &tokio::runtime::Handle,
+    prepopulate: usize,
+) -> Arc<EngineBenchCache> {
+    let hash_builder =
+        get_hash_builder(HashingAlgorithm::XXH3).expect("Failed to get hash builder");
+    let cache: Arc<EngineBenchCache> = Arc::new(LruCache::new(
+        CACHE_WEIGHT,
+        Duration::from_mins(1),
+        hash_builder,
+        CachingPolicy::Lru,
+        engine,
+    ));
+    if prepopulate > 0 {
+        let mut rng = StdRng::seed_from_u64(42);
+        handle.block_on(async {
+            for i in 0..prepopulate {
+                let key = (i as u64 * 17) % KEY_SPACE;
+                let value = BenchValue(random_value(&mut rng));
+                cache.put_raw_key(&key, value).await;
+            }
+        });
+    }
+    cache
+}
+
+/// Runs `OPERATIONS_PER_THREAD` operations on each of `threads` OS threads and
+/// waits for them all, mirroring the runner the per-policy benchmarks use.
+/// `put_probability` selects the workload: 0.0 is get-only, 1.0 is put-only.
+fn run_engine_workload(
+    cache: &Arc<EngineBenchCache>,
+    handle: &tokio::runtime::Handle,
+    threads: usize,
+    put_probability: f64,
+) {
+    let handles: Vec<_> = (0..threads)
+        .map(|thread_id| {
+            let cache = Arc::clone(cache);
+            let handle = handle.clone();
+            std::thread::spawn(move || {
+                let mut rng = StdRng::seed_from_u64(thread_id as u64);
+                handle.block_on(async {
+                    for _ in 0..OPERATIONS_PER_THREAD {
+                        let key = rng.random_range(0..KEY_SPACE);
+                        if rng.random_bool(put_probability) {
+                            let value = BenchValue(random_value(&mut rng));
+                            black_box(cache.put_raw_key(&key, value).await);
+                        } else {
+                            black_box(cache.get_raw_key(&key).await);
+                        }
+                    }
+                });
+            })
+        })
+        .collect();
+    for handle in handles {
+        handle.join().expect("thread panicked");
+    }
+}
+
+/// Moka vs Pingora on one workload. Criterion's per-iteration time is the
+/// latency read; with `Throughput::Elements` it also reports ops/sec.
+fn bench_cache_engines(
+    c: &mut Criterion,
+    group_name: &str,
+    prepopulate: usize,
+    put_probability: f64,
+) {
+    let mut group = c.benchmark_group(group_name);
+    let rt = create_bench_runtime();
+    let handle = rt.handle().clone();
+
+    for (engine_name, engine) in all_cache_engines() {
+        for thread_count in [1, 4, 8, 16] {
+            group.throughput(Throughput::Elements(
+                (thread_count * OPERATIONS_PER_THREAD) as u64,
+            ));
+
+            let bench_name = format!("{engine_name}_{thread_count}threads");
+
+            group.bench_with_input(
+                BenchmarkId::from_parameter(&bench_name),
+                &thread_count,
+                |b, &threads| {
+                    b.iter_batched(
+                        || new_engine_cache(engine, &handle, prepopulate),
+                        |cache| run_engine_workload(&cache, &handle, threads, put_probability),
+                        criterion::BatchSize::LargeInput,
+                    );
+                },
+            );
+        }
+    }
+    group.finish();
+}
+
+fn bench_cache_engine_concurrent_get(c: &mut Criterion) {
+    bench_cache_engines(c, "cache_engine_concurrent_get", 5000, 0.0);
+}
+
+fn bench_cache_engine_concurrent_put(c: &mut Criterion) {
+    bench_cache_engines(c, "cache_engine_concurrent_put", 0, 1.0);
+}
+
+fn bench_cache_engine_concurrent_mixed(c: &mut Criterion) {
+    bench_cache_engines(c, "cache_engine_concurrent_mixed_80_20", 5000, 0.2);
+}
+
 criterion_group!(
     benches,
     bench_simple_cache_concurrent_get,
@@ -528,6 +655,9 @@ criterion_group!(
     bench_simple_cache_concurrent_mixed,
     bench_lru_cache_concurrent_get,
     bench_lru_cache_concurrent_put,
-    bench_lru_cache_concurrent_mixed
+    bench_lru_cache_concurrent_mixed,
+    bench_cache_engine_concurrent_get,
+    bench_cache_engine_concurrent_put,
+    bench_cache_engine_concurrent_mixed
 );
 criterion_main!(benches);
