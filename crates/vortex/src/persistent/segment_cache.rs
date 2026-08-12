@@ -289,15 +289,16 @@ impl Drop for PathSegmentCache {
         else {
             return;
         };
-        if Arc::strong_count(state) != 1 {
-            return;
-        }
         let mut states = path_states.lock();
-        if states
+        // `for_path` takes this same mutex before upgrading the registry's
+        // weak entry. Check ownership only after acquiring it: otherwise an
+        // opener can upgrade between an out-of-lock last-owner check and this
+        // removal, leaving that opener on an unregistered state that a later
+        // retirement cannot mark.
+        let is_registered_state = states
             .get(self.path.as_ref())
-            .and_then(Weak::upgrade)
-            .is_some_and(|registered| Arc::ptr_eq(&registered, state))
-        {
+            .is_some_and(|registered| std::ptr::addr_eq(registered.as_ptr(), Arc::as_ptr(state)));
+        if is_registered_state && Arc::strong_count(state) == 1 {
             states.remove(self.path.as_ref());
         }
     }
@@ -438,6 +439,56 @@ mod tests {
             shared.cache.entry_count(),
             257,
             "invalidation must physically evict only the retired buffers before it returns"
+        );
+    }
+
+    #[tokio::test]
+    async fn path_state_stays_registered_until_the_last_open_file_drops() {
+        let shared = SharedSegmentCache::new(1 << 20, Some(Arc::from("test")), true);
+        let path = Path::from("snapshot/shared.vortex");
+        let first = shared.for_path(path.clone());
+        let second = shared.for_path(path.clone());
+        let states = shared
+            .path_states
+            .as_ref()
+            .expect("retirement tracking enabled");
+
+        assert_eq!(
+            states
+                .lock()
+                .get(&path)
+                .map_or(0, std::sync::Weak::strong_count),
+            2,
+            "both file-cache handles must share one registered path state"
+        );
+        drop(first);
+        assert_eq!(
+            states
+                .lock()
+                .get(&path)
+                .map_or(0, std::sync::Weak::strong_count),
+            1,
+            "dropping one opener must not unregister the state used by the other"
+        );
+
+        shared.invalidate_paths(HashSet::from([path.clone()])).await;
+        second
+            .put(SegmentId::from(1), ByteBuffer::from(vec![1u8, 2, 3, 4]))
+            .await
+            .expect("a late put on the still-registered retired state is ignored");
+        assert!(
+            second
+                .get(SegmentId::from(1))
+                .await
+                .expect("get after retirement")
+                .is_none(),
+            "the surviving opener must observe retirement"
+        );
+
+        drop(second);
+        assert!(
+            !states.lock().contains_key(&path),
+            "the registry entry is removed when the last opener drops"
         );
     }
 }
