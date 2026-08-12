@@ -1049,11 +1049,6 @@ pub struct CayenneTableProvider {
     /// `build_sharded_pk_index` / the sharded validate path; routed by
     /// `shard_of_pk` so a key co-locates with its tier segments + tombstones.
     sharded_pk_keyset_cache: Arc<ParkingMutex<Option<ShardedPkIndex>>>,
-    /// One-shot latch for the write-path warm-cache probe
-    /// (`maybe_install_warm_pk_caches`): probe once per cache lifetime,
-    /// re-armed by `clear_cached_pk_keyset`. Shared across clones so every
-    /// writer observes the same probe state.
-    pk_warm_probe_done: Arc<AtomicBool>,
     /// Resident-byte components of the two PK caches, published as their SUM
     /// through `table_memory.set_keyset_bytes` (a single slot — writing one
     /// cache's size alone would under-account the other by up to a full budget
@@ -1067,27 +1062,6 @@ pub struct CayenneTableProvider {
     /// stale total last — leaving both the pool reservation and this table's
     /// share of the fleet budget under-reporting residency that exists.
     pk_keyset_publish_lock: Arc<ParkingMutex<()>>,
-    /// Per-key transaction OCC (`transaction_has_conflict`) trusts the Exact
-    /// keyset's per-key `sequence` stamps ONLY when this is `false`. Set `true`
-    /// whenever an event leaves the shared Exact keyset with a stale or missing
-    /// stamp that per-key validation would then wrongly trust — a dropped stamp
-    /// (`record_pk_keys_with_location`'s checked-out keyset), a stale-present key
-    /// after an upsert filter-DELETE (`PkKeysetInvalidatingDeletionSink`), or a
-    /// keys-published-with-no-sequence fallback (`publish_validated_file_keys`).
-    /// While `true`, `transaction_has_conflict` degrades to the conservative
-    /// per-table high-water check (over-abort, never a missed conflict). Cleared
-    /// only by `clear_cached_pk_keyset`, whose next rebuild floor-stamps every
-    /// key to the current high-water (or returns a Bloom, which also takes the
-    /// per-table fallback) — so a cleared flag can never uncover a stale keyset.
-    pk_keyset_occ_degraded: Arc<AtomicBool>,
-    /// Table-global cold-tier (datalake) PK existence view: one bloom per live
-    /// cold file, from the manifest's per-file `pk_bloom` blobs. Lets the
-    /// CDC-upsert keyset rebuild fold cold-resident keys WITHOUT the O(cold-rows)
-    /// object-store scan. Rebuilt on keyset cache miss by
-    /// [`Self::resolve_cold_keyset_source`], cleared by
-    /// [`Self::clear_cached_pk_keyset`] (promotion calls it on commit). `None` =
-    /// no bloom-backed cold contribution (see [`ColdKeysetSource`]).
-    cold_pk_existence: Arc<ParkingMutex<Option<Arc<ColdPkExistence>>>>,
     /// Accounts the keyset + deletion indexes against the query memory
     /// pool. `Arc`-shared with provider clones so they update one reservation.
     table_memory: Arc<CayenneMemoryAccount>,
@@ -4251,12 +4225,9 @@ impl CayenneTableProvider {
             )),
             pk_keyset_cache: Arc::new(ParkingMutex::new(None)),
             sharded_pk_keyset_cache: Arc::new(ParkingMutex::new(None)),
-            pk_warm_probe_done: Arc::new(AtomicBool::new(false)),
             pk_keyset_bytes_single: Arc::new(AtomicUsize::new(0)),
             pk_keyset_bytes_sharded: Arc::new(AtomicUsize::new(0)),
             pk_keyset_publish_lock: Arc::new(ParkingMutex::new(())),
-            pk_keyset_occ_degraded: Arc::new(AtomicBool::new(false)),
-            cold_pk_existence: Arc::new(ParkingMutex::new(None)),
             table_memory,
             inline_checkpoint_scheduled: Arc::new(AtomicBool::new(false)),
             inlined_row_count: Arc::new(AtomicI64::new(inlined_row_count)),
@@ -5042,12 +5013,9 @@ impl CayenneTableProvider {
             ),
             pk_keyset_cache: Arc::clone(&self.pk_keyset_cache),
             sharded_pk_keyset_cache: Arc::clone(&self.sharded_pk_keyset_cache),
-            pk_warm_probe_done: Arc::clone(&self.pk_warm_probe_done),
             pk_keyset_bytes_single: Arc::clone(&self.pk_keyset_bytes_single),
             pk_keyset_bytes_sharded: Arc::clone(&self.pk_keyset_bytes_sharded),
             pk_keyset_publish_lock: Arc::clone(&self.pk_keyset_publish_lock),
-            pk_keyset_occ_degraded: Arc::clone(&self.pk_keyset_occ_degraded),
-            cold_pk_existence: Arc::clone(&self.cold_pk_existence),
             table_memory: Arc::clone(&self.table_memory),
             inline_checkpoint_scheduled: Arc::clone(&self.inline_checkpoint_scheduled),
             inlined_row_count: Arc::clone(&self.inlined_row_count),
@@ -5525,7 +5493,7 @@ impl CayenneTableProvider {
                         "Skipping primary-key keyset cache because it exceeds the configured byte budget"
                     );
                     *self.pk_keyset_cache.lock() = None;
-                    self.table_memory.set_keyset_bytes(0);
+                    self.publish_single_keyset_bytes(0);
                     return;
                 }
             }
@@ -5534,7 +5502,7 @@ impl CayenneTableProvider {
 
         let bytes = to_store.approx_bytes();
         *self.pk_keyset_cache.lock() = Some(to_store);
-        self.table_memory.set_keyset_bytes(bytes);
+        self.publish_single_keyset_bytes(bytes);
     }
 
     pub(crate) fn clear_cached_pk_keyset(&self) {
@@ -5544,7 +5512,8 @@ impl CayenneTableProvider {
         // recovery) equally invalidates the sharded view. At N=1 the sharded cache
         // is never populated, so this is a no-op there.
         *self.sharded_pk_keyset_cache.lock() = None;
-        self.table_memory.set_keyset_bytes(0);
+        self.publish_single_keyset_bytes(0);
+        self.publish_sharded_keyset_bytes(0);
     }
 
     /// Rewrite every cached keyset entry from `RowLocation::Inlined` to
@@ -5686,14 +5655,14 @@ impl CayenneTableProvider {
                     "Clearing primary-key keyset cache because the write would exceed the byte budget"
                 );
                 // `guard` already holds None from the take() above.
-                self.table_memory.set_keyset_bytes(0);
+                self.publish_single_keyset_bytes(0);
                 return;
             }
         }
 
         let bytes = index.approx_bytes();
         *guard = Some(index);
-        self.table_memory.set_keyset_bytes(bytes);
+        self.publish_single_keyset_bytes(bytes);
     }
 
     pub(crate) fn record_inlined_pk_keys(&self, keys: &HashSet<OwnedRow>) {
@@ -5710,7 +5679,7 @@ impl CayenneTableProvider {
     fn store_sharded_pk_index(&self, index: ShardedPkIndex) {
         let bytes = index.approx_bytes();
         *self.sharded_pk_keyset_cache.lock() = Some(index);
-        self.table_memory.set_keyset_bytes(bytes);
+        self.publish_sharded_keyset_bytes(bytes);
     }
 
     pub(crate) fn record_file_pk_keys(&self, keys: &HashSet<OwnedRow>) {
@@ -5924,7 +5893,7 @@ impl CayenneTableProvider {
             .lock()
             .as_ref()
             .map_or(0, CachedPkIndex::approx_bytes);
-        self.table_memory.set_keyset_bytes(keyset_bytes);
+        self.publish_single_keyset_bytes(keyset_bytes);
 
         Ok(())
     }
@@ -6058,13 +6027,7 @@ impl CayenneTableProvider {
             _ => None,
         };
 
-        // Byte budget only for upsert tables — a bloom is a sound existence
-        // answer there; `do-nothing` needs an exact answer (a false positive
-        // would wrongly drop a genuinely new row) and keeps the exact build.
-        let budget = self
-            .upsert_bloom_eligible()
-            .then(|| self.effective_sharded_keyset_budget());
-        let mut keyset = BoundedShardedPkIndexBuilder::new(shards, budget);
+        let mut keyset = CachedPkKeyset::with_capacity(1024);
         let mut row_id_base: i64 = 0;
 
         // After projection, batch columns are at indices 0..pk_indices.len()
