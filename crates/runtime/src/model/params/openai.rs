@@ -30,10 +30,11 @@ pub enum OpenAiAuthMode {
     #[default]
     ApiKey,
     Codex,
+    CodexPlan,
 }
 
 impl OpenAiAuthMode {
-    const VALUES: &[&str] = &["api_key", "codex"];
+    const VALUES: &[&str] = &["api_key", "codex", "codex_plan"];
 }
 
 impl FromStr for OpenAiAuthMode {
@@ -43,6 +44,7 @@ impl FromStr for OpenAiAuthMode {
         match value.trim().to_ascii_lowercase().as_str() {
             "api_key" => Ok(Self::ApiKey),
             "codex" => Ok(Self::Codex),
+            "codex_plan" => Ok(Self::CodexPlan),
             other => Err(format!(
                 "must be one of: {}. Found {other}",
                 Self::VALUES.join(", ")
@@ -56,19 +58,25 @@ impl FromStr for OpenAiAuthMode {
 pub enum OpenAiAuth {
     ApiKey { api_key: Option<SecretString> },
     Codex,
+    CodexPlan,
 }
 
 impl OpenAiAuth {
     #[must_use]
     pub const fn is_codex(&self) -> bool {
-        matches!(self, Self::Codex)
+        matches!(self, Self::Codex | Self::CodexPlan)
+    }
+
+    #[must_use]
+    pub const fn is_codex_plan(&self) -> bool {
+        matches!(self, Self::CodexPlan)
     }
 
     #[must_use]
     pub fn api_key(&self) -> Option<&SecretString> {
         match self {
             Self::ApiKey { api_key } => api_key.as_ref(),
-            Self::Codex => None,
+            Self::Codex | Self::CodexPlan => None,
         }
     }
 }
@@ -141,16 +149,27 @@ impl TypedParams for OpenAiModelParams {
                 if supplied_api_key.is_some() {
                     return Err(ParamsError::InvalidValue {
                         user_key: "openai_auth_mode".to_string(),
-                        reason: "`codex` cannot be combined with `openai_api_key`".to_string(),
+                        reason: "`codex` and `codex_plan` cannot be combined with `openai_api_key`"
+                            .to_string(),
                     });
                 }
                 OpenAiAuth::Codex
+            }
+            OpenAiAuthMode::CodexPlan => {
+                if supplied_api_key.is_some() {
+                    return Err(ParamsError::InvalidValue {
+                        user_key: "openai_auth_mode".to_string(),
+                        reason: "`codex` and `codex_plan` cannot be combined with `openai_api_key`"
+                            .to_string(),
+                    });
+                }
+                OpenAiAuth::CodexPlan
             }
         };
 
         let fields =
             OpenAiModelParamsFields::try_from_params(component_name, params, secrets).await?;
-        let endpoint = if auth.is_codex() && fields.endpoint == "https://api.openai.com/v1" {
+        let endpoint = if auth.is_codex_plan() && fields.endpoint == "https://api.openai.com/v1" {
             CODEX_API_BASE.to_string()
         } else {
             fields.endpoint
@@ -179,12 +198,12 @@ impl OpenAiModelParams {
         let mut specs = OpenAiModelParamsFields::parameter_specs();
         specs.push(
             ParameterSpec::component("auth_mode")
-                .description("Authentication mode for the OpenAI-compatible endpoint. `api_key` uses `openai_api_key`; `codex` forwards authenticated Codex request headers to the configured Codex endpoint.")
+                .description("Authentication mode for the OpenAI-compatible endpoint. `api_key` uses `openai_api_key`; `codex` forwards a Codex API-key request to the OpenAI endpoint; `codex_plan` forwards a signed-in Codex request to the ChatGPT Codex endpoint.")
                 .default("api_key"),
         );
         specs.push(
             ParameterSpec::component("api_key")
-                .description("The OpenAI API key. Cannot be used with `openai_auth_mode: codex`.")
+                .description("The OpenAI API key. Cannot be used with `openai_auth_mode: codex` or `codex_plan`.")
                 .secret(),
         );
         specs
