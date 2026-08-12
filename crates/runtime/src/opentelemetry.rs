@@ -1045,12 +1045,26 @@ mod tests {
     use arrow::array::UInt64Array;
     use arrow::datatypes::Float64Type;
     use arrow::datatypes::UInt64Type;
+    use datafusion::datasource::TableProvider;
+    use datafusion::error::DataFusionError;
+    use datafusion::execution::SendableRecordBatchStream;
+    use datafusion::logical_expr::LogicalPlan;
+    use datafusion::prelude::SessionContext;
     use opentelemetry_proto::tonic::common::v1::AnyValue;
     use opentelemetry_proto::tonic::metrics::v1::ExponentialHistogram;
     use opentelemetry_proto::tonic::metrics::v1::ExponentialHistogramDataPoint;
+    use opentelemetry_proto::tonic::metrics::v1::Gauge;
     use opentelemetry_proto::tonic::metrics::v1::Histogram;
+    use opentelemetry_proto::tonic::metrics::v1::Metric as OtlpMetric;
+    use opentelemetry_proto::tonic::metrics::v1::ResourceMetrics;
+    use opentelemetry_proto::tonic::metrics::v1::ScopeMetrics;
     use opentelemetry_proto::tonic::metrics::v1::Summary;
     use opentelemetry_proto::tonic::metrics::v1::SummaryDataPoint;
+    use runtime_query_engine::query_engine::Error as QueryEngineError;
+    use runtime_query_engine::query_engine::QueryRequest;
+    use runtime_query_engine::query_engine::Result as QueryEngineResult;
+    use std::sync::atomic::AtomicU64;
+    use std::sync::atomic::Ordering;
 
     fn string_attribute(key: &str, value: &str) -> KeyValue {
         KeyValue {
@@ -1787,12 +1801,10 @@ mod tests {
         assert!(duplicate_column_names(&well_formed).is_empty());
     }
 
-    /// A metric table can already hold two columns of the same name: Arrow permits it, and an
-    /// OTLP ingest predating the value-column collision fix wrote such a batch (an attribute
-    /// named like a value column became a second column of that name). No batch this module
-    /// builds can ever match that table, so the export must fail with an error naming the
-    /// metric, the duplicated column and the fix — not be dropped by a schema mismatch the
-    /// operator cannot act on (regression test for #12095).
+    /// A metric table can hold two columns of the same name, because Arrow permits duplicate
+    /// field names. No batch this module builds can ever match such a table, so the export must
+    /// fail with an error naming the metric, the duplicated column and the fix — not be dropped
+    /// by a schema mismatch the operator cannot act on (regression test for #12095).
     #[test]
     fn metric_table_with_duplicate_columns_fails_with_an_actionable_error() {
         let existing = Schema::new(vec![
@@ -1802,7 +1814,7 @@ mod tests {
             Field::new(MAX_COLUMN_NAME, DataType::Float64, true),
             Field::new(TIME_UNIX_NANO_COLUMN_NAME, DataType::UInt64, true),
             Field::new(START_TIME_UNIX_NANO_COLUMN_NAME, DataType::UInt64, true),
-            // The `count` attribute, stored as a second column of that name.
+            // A second column named `count`, alongside the histogram value column.
             Field::new(COUNT_COLUMN_NAME, DataType::Utf8, true),
             Field::new("host", DataType::Utf8, true),
         ]);
@@ -1878,5 +1890,219 @@ mod tests {
                 .value(0),
             "5"
         );
+    }
+
+    /// A [`QueryEngine`] that accepts every write and reports no stored table, so
+    /// [`Service::export`] can be driven end to end without a runtime. Only the methods the
+    /// export path calls do anything; the rest are unreachable from it.
+    struct WriteRecordingQueryEngine {
+        session: Arc<SessionContext>,
+        rows_written: AtomicU64,
+    }
+
+    // `QueryEngine` requires `Debug`, and `SessionContext` does not implement it.
+    impl std::fmt::Debug for WriteRecordingQueryEngine {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("WriteRecordingQueryEngine")
+                .field("rows_written", &self.rows_written())
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl WriteRecordingQueryEngine {
+        fn new() -> Self {
+            Self {
+                session: Arc::new(SessionContext::new()),
+                rows_written: AtomicU64::new(0),
+            }
+        }
+
+        fn rows_written(&self) -> u64 {
+            self.rows_written.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl QueryEngine for WriteRecordingQueryEngine {
+        fn session_context(&self) -> &Arc<SessionContext> {
+            &self.session
+        }
+
+        async fn get_table(&self, _table_ref: &TableReference) -> Option<Arc<dyn TableProvider>> {
+            None
+        }
+
+        fn get_table_sync(&self, _table_ref: &TableReference) -> Option<Arc<dyn TableProvider>> {
+            None
+        }
+
+        fn table_exists(&self, _table_ref: &TableReference) -> bool {
+            false
+        }
+
+        async fn get_arrow_schema(&self, table_ref: TableReference) -> QueryEngineResult<Schema> {
+            // No stored schema: each batch is built from the exported data points alone.
+            Err(QueryEngineError::GetSchema {
+                table_ref: table_ref.to_string(),
+                source: DataFusionError::Plan(format!("table {table_ref} is not registered")),
+            })
+        }
+
+        fn get_user_table_names(&self) -> Vec<TableReference> {
+            Vec::new()
+        }
+
+        fn get_public_table_names(&self) -> QueryEngineResult<Vec<String>> {
+            Ok(Vec::new())
+        }
+
+        fn is_writable(&self, _table_ref: &TableReference) -> bool {
+            true
+        }
+
+        fn is_path_catalog_writable(&self, _table_ref: &TableReference) -> bool {
+            true
+        }
+
+        async fn execute_query(
+            &self,
+            _request: QueryRequest,
+        ) -> QueryEngineResult<SendableRecordBatchStream> {
+            unimplemented!("the OpenTelemetry export path does not run queries")
+        }
+
+        async fn execute_plan(
+            &self,
+            _plan: LogicalPlan,
+        ) -> QueryEngineResult<SendableRecordBatchStream> {
+            unimplemented!("the OpenTelemetry export path does not run plans")
+        }
+
+        async fn write_data(
+            &self,
+            _table_ref: &TableReference,
+            _schema: Arc<Schema>,
+            data: Vec<RecordBatch>,
+            _update_type: UpdateType,
+        ) -> QueryEngineResult<()> {
+            let rows: u64 = data.iter().map(|batch| batch.num_rows() as u64).sum();
+            self.rows_written.fetch_add(rows, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    fn otlp_metric(name: &str, data: Option<Data>) -> OtlpMetric {
+        OtlpMetric {
+            name: name.to_string(),
+            data,
+            ..Default::default()
+        }
+    }
+
+    fn otlp_request(metrics: Vec<OtlpMetric>) -> ExportMetricsServiceRequest {
+        ExportMetricsServiceRequest {
+            resource_metrics: vec![ResourceMetrics {
+                scope_metrics: vec![ScopeMetrics {
+                    metrics,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        }
+    }
+
+    fn gauge(value: f64) -> Option<Data> {
+        Some(Data::Gauge(Gauge {
+            data_points: vec![number_data_point(
+                value,
+                vec![string_attribute("region", "us")],
+            )],
+        }))
+    }
+
+    fn summary(data_points: usize) -> Option<Data> {
+        Some(Data::Summary(Summary {
+            data_points: vec![SummaryDataPoint::default(); data_points],
+        }))
+    }
+
+    /// An export mixing a supported metric with one whose type has no batch builder is a
+    /// partially accepted export: the client must be told how many data points were dropped
+    /// through `ExportMetricsPartialSuccess`, rather than being told the export succeeded
+    /// (regression test for #12188).
+    #[tokio::test]
+    async fn mixed_export_reports_unsupported_metric_data_points_as_rejected() {
+        let engine = Arc::new(WriteRecordingQueryEngine::new());
+        let service = build_metrics_service(Arc::clone(&engine) as Arc<dyn QueryEngine>, None);
+
+        let request = otlp_request(vec![
+            otlp_metric("svc_requests", gauge(1.0)),
+            otlp_metric("gc_pause_seconds", summary(3)),
+        ]);
+
+        let response = service
+            .export(Request::new(request))
+            .await
+            .expect("an export with accepted data points must not fail")
+            .into_inner();
+
+        let partial = response
+            .partial_success
+            .expect("the dropped Summary data points must be reported as rejected");
+        assert_eq!(
+            partial.rejected_data_points, 3,
+            "every data point of the unsupported metric must be counted"
+        );
+        assert_eq!(
+            engine.rows_written(),
+            1,
+            "the supported metric's data point must still be written"
+        );
+    }
+
+    /// An export whose data points were all rejected is a failed export, including when every
+    /// metric in it has an unsupported type.
+    #[tokio::test]
+    async fn export_of_only_unsupported_metrics_fails() {
+        let engine = Arc::new(WriteRecordingQueryEngine::new());
+        let service = build_metrics_service(Arc::clone(&engine) as Arc<dyn QueryEngine>, None);
+
+        let request = otlp_request(vec![otlp_metric("gc_pause_seconds", summary(3))]);
+
+        let status = service
+            .export(Request::new(request))
+            .await
+            .expect_err("an export that lost every data point must fail");
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert_eq!(engine.rows_written(), 0);
+    }
+
+    /// An export carrying no data points at all lost nothing, so it succeeded — it must not be
+    /// reported as fully rejected.
+    #[tokio::test]
+    async fn export_without_data_points_succeeds() {
+        let engine = Arc::new(WriteRecordingQueryEngine::new());
+        let service = build_metrics_service(Arc::clone(&engine) as Arc<dyn QueryEngine>, None);
+
+        let request = otlp_request(vec![
+            otlp_metric("svc_requests", None),
+            otlp_metric(
+                "svc_latency",
+                Some(Data::Gauge(Gauge {
+                    data_points: vec![],
+                })),
+            ),
+        ]);
+
+        let response = service
+            .export(Request::new(request))
+            .await
+            .expect("an export that rejected nothing must succeed")
+            .into_inner();
+        assert!(
+            response.partial_success.is_none(),
+            "nothing was rejected, so no partial success is reported"
+        );
+        assert_eq!(engine.rows_written(), 0);
     }
 }
