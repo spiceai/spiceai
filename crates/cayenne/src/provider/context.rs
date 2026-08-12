@@ -375,9 +375,15 @@ impl CayenneContext {
         shard: Option<WriteShardConfig>,
     ) -> Arc<VortexFormat> {
         let session = VortexSession::default().set(strategy);
-        let format =
-            VortexFormat::new_with_options(session, Self::vortex_table_options(&self.config))
-                .with_dataset_label(self.dataset.as_str());
+        let mut options = Self::vortex_table_options(&self.config);
+        // This format only writes files. Keeping a read-path segment cache here
+        // would add an idle full-capacity cache to the dataset's live metrics.
+        options.segment_cache_size_bytes = None;
+        let format = VortexFormat::new_with_options_and_dataset_label(
+            session,
+            options,
+            self.dataset.as_str(),
+        );
         let format = match shard {
             Some(config) => format.with_write_shard(config),
             None => format,
@@ -406,8 +412,11 @@ impl CayenneContext {
         // and avoid constructing a `SharedSegmentCache` (moka + metrics) per
         // promotion.
         options.segment_cache_size_bytes = None;
-        let format = VortexFormat::new_with_options(session, options)
-            .with_dataset_label(self.dataset.as_str());
+        let format = VortexFormat::new_with_options_and_dataset_label(
+            session,
+            options,
+            self.dataset.as_str(),
+        );
         let format = match shard {
             Some(config) => format.with_write_shard(config),
             None => format,
@@ -1074,10 +1083,11 @@ impl CayenneContext {
             vortex_session = vortex_session.set(full_strategy);
         }
 
-        Arc::new(
-            VortexFormat::new_with_options(vortex_session, Self::vortex_table_options(config))
-                .with_dataset_label(dataset),
-        )
+        Arc::new(VortexFormat::new_with_options_and_dataset_label(
+            vortex_session,
+            Self::vortex_table_options(config),
+            dataset,
+        ))
     }
 
     /// Table options shared by the base format and any per-write format

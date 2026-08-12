@@ -10,6 +10,7 @@ description = "FTP data connector for Spice.ai runtime"
 linkme.workspace = true
 paste.workspace = true
 runtime = { path = "../../runtime" }
+runtime-parameters = { path = "../../runtime-parameters" }
 snafu.workspace = true
 tokio.workspace = true
 url.workspace = true

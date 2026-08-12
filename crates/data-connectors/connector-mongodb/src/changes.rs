@@ -23,6 +23,7 @@ use data_components::cdc::{
     ChangeEnvelope, ChangesStream, CommitChange, CommitError, NoOpCommitter, StreamError,
     build_ready_signal_envelope, wrap_data_as_change_batch,
 };
+use data_connector_api::schema_projection::{ProjectionPolicy, parse_schema_projection};
 use datafusion::{
     arrow::datatypes::SchemaRef, datasource::TableProvider,
     physical_plan::SendableRecordBatchStream, prelude::SessionContext,
@@ -44,10 +45,9 @@ use runtime::{
         OpenOption,
         mongodb::{MongoCheckpointMetadata, MongoSys},
     },
-    dataconnector::schema_projection::{ProjectionPolicy, parse_schema_projection},
     federated::FederatedTable,
-    parameters::{ExposedParamLookup, Parameters},
 };
+use runtime_parameters::{ExposedParamLookup, Parameters};
 use std::{sync::Arc, time::Duration};
 use tokio_stream::StreamExt as TokioStreamExt;
 

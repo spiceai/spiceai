@@ -1114,10 +1114,31 @@ impl ShardedPkIndex {
     /// unbounded. Safe only under upsert semantics (a bloom false positive
     /// yields a harmless redundant delete) — the caller gates on that.
     pub(crate) fn degrade_to_blooms(&mut self, per_shard_max_bytes: usize) {
+        self.degrade_to_blooms_observed(per_shard_max_bytes, |_, _| {});
+    }
+
+    /// [`Self::degrade_to_blooms`], reporting each shard as it converts.
+    ///
+    /// `observe` receives the shard just converted and the exact bytes still
+    /// held across every keyset. That the figure falls at each step — rather
+    /// than staying at the full exact total until the last shard — is the
+    /// difference between releasing as the conversion goes and releasing at the
+    /// end, and it is not visible in the post-state the two share. Production
+    /// callers pass a no-op.
+    fn degrade_to_blooms_observed(
+        &mut self,
+        per_shard_max_bytes: usize,
+        mut observe: impl FnMut(usize, usize),
+    ) {
         if let Self::Exact(keysets) = self {
+            let mut exact_bytes_held = keysets
+                .iter()
+                .map(|k| k.approx_bytes)
+                .fold(0, usize::saturating_add);
             let blooms: Vec<PkBloom> = keysets
                 .iter_mut()
-                .map(|keyset| {
+                .enumerate()
+                .map(|(shard, keyset)| {
                     // Right-size per shard: conversion-time keys with 4× growth
                     // headroom, capped by the per-shard budget split (rationale:
                     // `bloom_from_keyset`).
@@ -1133,7 +1154,9 @@ impl ShardedPkIndex {
                     // keysets at the end would peak at exact + blooms together,
                     // which is the worst moment to need extra memory: this
                     // conversion only runs because the budget was already hit.
+                    exact_bytes_held = exact_bytes_held.saturating_sub(keyset.approx_bytes);
                     *keyset = CachedPkKeyset::with_capacity(0);
+                    observe(shard, exact_bytes_held);
                     bloom
                 })
                 .collect();
@@ -1251,18 +1274,22 @@ mod tests {
         );
     }
 
-    /// Degrading leaves a bloom index smaller than the exact one it replaced.
+    /// Each shard's exact entries are released as its bloom is built, so exact
+    /// and blooms are never both fully resident.
     ///
-    /// Note what this does NOT establish: it checks the post-state, not the
-    /// peak. The point of releasing each shard as it converts is that exact and
-    /// blooms are never both fully resident, and this assertion would pass
-    /// equally on an implementation that built every bloom first and dropped the
-    /// keysets at the end. Proving the peak needs an allocator hook or an
-    /// injected counter; this covers the observable result only.
+    /// The post-state alone cannot show this — an implementation that built
+    /// every bloom first and dropped the keysets at the end reaches the same
+    /// one. What separates them is the exact bytes still held at each step, so
+    /// the conversion is run through its observation hook: releasing as it goes
+    /// steps the figure down per shard and reaches zero on the last, while
+    /// releasing at the end would report the full exact total until then.
     #[test]
     fn degrading_releases_each_shard_as_it_converts() {
-        let keysets: Vec<CachedPkKeyset> =
-            (0..4).map(|_| CachedPkKeyset::with_capacity(0)).collect();
+        const SHARDS: usize = 4;
+
+        let keysets: Vec<CachedPkKeyset> = (0..SHARDS)
+            .map(|_| CachedPkKeyset::with_capacity(0))
+            .collect();
         let mut index = ShardedPkIndex::Exact(keysets.into_boxed_slice());
 
         let mut keys = PkDigestSet::with_capacity(4096);
@@ -1277,10 +1304,34 @@ mod tests {
             "the exact index should hold something to release"
         );
 
-        index.degrade_to_blooms(64 * 1024);
+        // (shard converted, exact bytes still held) after each conversion.
+        let mut steps: Vec<(usize, usize)> = Vec::new();
+        index.degrade_to_blooms_observed(64 * 1024, |shard, still_held| {
+            steps.push((shard, still_held));
+        });
+
+        assert_eq!(
+            steps.iter().map(|(shard, _)| *shard).collect::<Vec<_>>(),
+            (0..SHARDS).collect::<Vec<_>>(),
+            "every shard converts, in order"
+        );
+        let mut previously_held = exact_bytes;
+        for (shard, still_held) in &steps {
+            assert!(
+                *still_held < previously_held,
+                "shard {shard} was converted without releasing its exact entries: \
+                 {still_held} bytes still held, unchanged from {previously_held}"
+            );
+            previously_held = *still_held;
+        }
+        assert_eq!(
+            previously_held, 0,
+            "the last conversion must leave no exact entries behind"
+        );
+
         match &index {
             ShardedPkIndex::Bloom(blooms) => {
-                assert_eq!(blooms.len(), 4, "every shard converts");
+                assert_eq!(blooms.len(), SHARDS, "every shard converts");
             }
             ShardedPkIndex::Exact(_) => panic!("degrade_to_blooms must leave a bloom index"),
         }
