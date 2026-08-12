@@ -2011,19 +2011,19 @@ mod tests {
         }
     }
 
-    fn gauge(value: f64) -> Option<Data> {
-        Some(Data::Gauge(Gauge {
+    fn gauge(value: f64) -> Data {
+        Data::Gauge(Gauge {
             data_points: vec![number_data_point(
                 value,
                 vec![string_attribute("region", "us")],
             )],
-        }))
+        })
     }
 
-    fn summary(data_points: usize) -> Option<Data> {
-        Some(Data::Summary(Summary {
+    fn summary(data_points: usize) -> Data {
+        Data::Summary(Summary {
             data_points: vec![SummaryDataPoint::default(); data_points],
-        }))
+        })
     }
 
     /// An export mixing a supported metric with one whose type has no batch builder is a
@@ -2036,8 +2036,8 @@ mod tests {
         let service = build_metrics_service(Arc::clone(&engine) as Arc<dyn QueryEngine>, None);
 
         let request = otlp_request(vec![
-            otlp_metric("svc_requests", gauge(1.0)),
-            otlp_metric("gc_pause_seconds", summary(3)),
+            otlp_metric("svc_requests", Some(gauge(1.0))),
+            otlp_metric("gc_pause_seconds", Some(summary(3))),
         ]);
 
         let response = service
@@ -2067,7 +2067,7 @@ mod tests {
         let engine = Arc::new(WriteRecordingQueryEngine::new());
         let service = build_metrics_service(Arc::clone(&engine) as Arc<dyn QueryEngine>, None);
 
-        let request = otlp_request(vec![otlp_metric("gc_pause_seconds", summary(3))]);
+        let request = otlp_request(vec![otlp_metric("gc_pause_seconds", Some(summary(3)))]);
 
         let status = service
             .export(Request::new(request))
