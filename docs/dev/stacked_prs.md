@@ -4,6 +4,11 @@ A **stacked PR** is a branch based on another open branch rather than on `trunk`
 a large change can be reviewed as a sequence of small PRs. Stacking is supported and
 encouraged for work that would otherwise land as one unreviewable PR.
 
+The mechanical steps live in `scripts/restack_stacked_branch.sh`, covered by
+`scripts/test_restack_stacked_branch.sh` — every case there is a way one of those steps
+once failed silently. This document is the reasoning around them: which mechanism to
+use, which commit is which, and why the audit is not optional.
+
 **Stacking never requires a force push.** A rebase is never *required* either — merging
 always works — but once the parent lands, an unpushed child is cleaner to rebase, so
 the restack step below picks between the two. This document covers (1) the workflow
@@ -35,17 +40,18 @@ Derive them rather than assuming they are the same commit — the parent branch 
 gains review-fix commits after the child splits off:
 
 ```bash
-git fetch origin                                   # refresh origin/trunk — see the warning below
-git fetch origin "refs/pull/<parent-pr>/head"      # the branch is deleted; the PR ref survives
-PARENT_HEAD=$(gh pr view <parent-pr> --json headRefOid -q .headRefOid)
-STACKBASE=$(git merge-base HEAD "$PARENT_HEAD")
+STACKBASE=$(scripts/restack_stacked_branch.sh stack-base <parent-pr>)
+PARENT_HEAD=$(gh pr view <parent-pr> --json headRefOid -q .headRefOid)   # step 1 only
 ```
+
+The script fetches the tracking refs and the PR ref (the parent branch is deleted, but
+`refs/pull/<n>/head` survives) and derives the stack base with `merge-base`.
 
 > **Fetch the tracking refs, not just the PR ref.** `git fetch origin <refspec>` leaves
 > its result in `FETCH_HEAD` and does **not** update `origin/trunk`. Every comparison,
 > rebase, and merge below is against `origin/trunk`, so a stale local ref silently
 > restacks onto a commit that predates the parent's squash — the wrong base, with no
-> error. Plain `git fetch origin` first.
+> error. The script does both fetches; do the same if you work by hand.
 
 Using `$PARENT_HEAD` as the stack base is wrong whenever the child never took the
 parent's last commits: the audit would read that parent work as child deletions, and
@@ -159,119 +165,50 @@ git diff --stat "$PARENT_HEAD" origin/trunk -- <paths the parent touched>
 
 **2. Re-resolve each conflicted file three-way against the stack base**, not against
 the base git chose. Git's own attempt conflicted all 13 files in the case above; all
-13 resolved cleanly this way. For a path with all three stages present (`git
-ls-files -u <path>` shows them):
+13 resolved cleanly this way:
 
 ```bash
-f=<path>
-m2=$(git ls-files --stage -- ":(literal)$f" | awk '$3 == 2 { print $1 }')   # your mode
-m3=$(git ls-files --stage -- ":(literal)$f" | awk '$3 == 3 { print $1 }')   # trunk's mode
-if ! t=$(mktemp -d); then                     # never fixed /tmp names — see below
-  echo "no private temp dir — stopping"
-elif [ "${m2:-none}" != "${m3:-none}" ] || [ "$m2" = 120000 ]; then
-  # Modes disagree, a side is missing, or it is a symlink. cp copies content only, so
-  # the result would keep whatever mode the worktree file already had. Take a side whole:
-  #   git checkout --ours -- "$f" && git add -- "$f"      # or --theirs
-  echo "MODE/SIDE mismatch on $f (ours=${m2:-none} theirs=${m3:-none}) — resolve by hand"
-elif ! git show ":2:$f" > "$t/ours" ||         # your side
-     ! git show ":3:$f" > "$t/theirs" ||       # trunk's side
-     ! git show "$STACKBASE:$f" > "$t/base"    # the correct base — NOT git's stage 1
-then
-  echo "MISSING SIDE for $f — resolve by hand"
-elif git merge-file -p --diff3 -L ours -L "base ($STACKBASE)" -L trunk \
-       "$t/ours" "$t/base" "$t/theirs" > "$t/merged"; then
-  cp -- "$t/merged" "$f" && git add -- "$f"                # clean — accept it
-elif [ -s "$t/merged" ]; then
-  cp -- "$t/merged" "$f"                                   # conflicted, correctly based —
-  grep -n '^<<<<<<<\|^|||||||\|^>>>>>>>' "$f"              # left UNSTAGED for you to fix
-else
-  echo "merge-file failed on $f — worktree left untouched"
-fi
-[ -n "${t:-}" ] && rm -rf "$t"          # once you are done with this path
+scripts/restack_stacked_branch.sh resolve "$STACKBASE" <path>
 ```
 
-The intermediates go in a private `mktemp -d`, never fixed `/tmp` paths: `> /tmp/ours`
-follows a pre-existing symlink at that name and truncates whatever it points at, so a
-pasted snippet can silently destroy a file outside the repo on a shared machine. The
-`--` before the operands matters for the same reason `:(literal)` does — a repository
-path may begin with `-`, and GNU `cp` permutes its arguments and parses it as options
-(BSD `cp` stops at the first operand, so this one hides on a Mac and breaks in CI).
+It resolves and stages the path when the merge is clean (exit 0); writes the correctly
+based conflict into the worktree and deliberately leaves it **unstaged** when there is a
+real conflict, so the path stays unmerged until you agree with it (exit 1); and refuses
+outright, touching nothing, when the path needs a person (exit 2).
 
-**The extraction has to fail closed.** A redirection creates its file before git runs,
-so a failed `git show` leaves an *empty* file behind and `merge-file` reads that as
-"this side is empty" rather than "this side is missing" — which can merge cleanly and
-stage the wrong content with no conflict reported. It is reachable in exactly the
-situation this document is about: the parent rewrites a file, the child deletes it, and
-`trunk` squash-merges the parent. There is then no stage 2 (you deleted it) while stage
-3 matches `$STACKBASE` exactly, so the merge is `empty + base + base` → clean, empty
-output, and the block would stage a 0-byte file where you meant a deletion. The step-3
-audit does catch that one as a `RESURRECTED` path, but only after the fact. Note this
-is also why `git show "$STACKBASE:$f"` can fail on a genuinely three-stage conflict:
-`$STACKBASE` is deliberately newer than git's stage 1, so a path can be conflicted and
-still not exist there.
+That last case is not rare, and each variety of it is a way this went wrong silently
+before the script existed:
 
-Three more things about that block. `merge-file -p` only writes the merged text to
-stdout —
-it neither updates the worktree file nor stages it, so the `cp`/`git add` are what
-actually resolve the path. The staging must be *guarded* by the exit status (0 clean,
-else the number of conflicts left): an unguarded `cp` stages conflict markers the moment
-someone pastes the block.
+- **A mode disagreement.** Copying content leaves the destination's mode alone, so a
+  `100644` vs `100755` conflict resolved to your mode and quietly dropped an executable
+  bit `trunk` added — and a symlink destination is *followed*, so resolving a conflicted
+  `CLAUDE.md` that way overwrote `.github/copilot-instructions.md` while the link itself
+  still looked untouched.
+- **A missing side.** The parent rewrites a file, the child deletes it, `trunk` squashes
+  the parent: there is then no stage 2 while stage 3 matches `$STACKBASE` exactly, so a
+  naive three-way merge is `empty + base + base` — clean, empty, and it stages a 0-byte
+  file where you meant a deletion.
+- **A path absent from `$STACKBASE`.** `$STACKBASE` is deliberately newer than git's
+  stage 1, so a path can be genuinely conflicted and still not exist at that base.
 
-And the mode check has to be **control flow, not a warning** — a printed warning does
-not stop the `cp` that follows it — comparing **your stage against trunk's**, not the
-first line `git ls-files --stage` prints, which is stage 1, the *base's* mode. `cp`
-copies content and leaves the destination's existing mode alone, which breaks two ways:
-a symlink destination is followed and written *through*, so resolving a conflicted
-`CLAUDE.md` that way silently overwrites `.github/copilot-instructions.md` while the
-link still looks untouched; and a plain `100644` vs `100755` disagreement resolves to
-your mode, quietly dropping an executable bit `trunk` added. Comparing stage 2 to stage
-3 covers both, plus the missing-stage case, in one test.
-
-When `merge-file` does report conflicts, its output is the *correctly based* conflict —
-the thing this whole step exists to produce — so the block writes it into the worktree
-and deliberately leaves it unstaged. Throwing it away would send you back to resolving
-git's spurious-base conflict by hand. A fatal `merge-file` error writes nothing, so the
-worktree is left untouched rather than overwritten with an empty file.
-
-**3. Audit for silent damage** — this is the step that catches the resurrection. It
-compares what the child *intended* against what the merge actually put on disk:
+**3. Audit for silent damage** — this is the step that catches the resurrection, and the
+one not to skip:
 
 ```bash
-# Files the child deleted that the merge brought back
-git diff --name-only -z --no-renames --diff-filter=D "$STACKBASE" "$PRE" |
-  while IFS= read -r -d '' f; do
-    git ls-files --error-unmatch -- ":(literal)$f" >/dev/null 2>&1 && echo "RESURRECTED $f"
-  done
-
-# Files the child added that the merge dropped
-git diff --name-only -z --no-renames --diff-filter=A "$STACKBASE" "$PRE" |
-  while IFS= read -r -d '' f; do
-    git ls-files --error-unmatch -- ":(literal)$f" >/dev/null 2>&1 || echo "LOST $f"
-  done
+scripts/restack_stacked_branch.sh audit "$STACKBASE" "$PRE"
 ```
 
-Both must print nothing. Four details the checks depend on:
+It compares what the child *intended* against what the merge actually staged, and exits
+non-zero on any `RESURRECTED` or `LOST` path. Run it again after every correction.
 
-- The comparison uses `$PRE`, the pre-merge tip. A resurrected file is no longer a
-  deletion in the merge *result*, so comparing against a committed merge reports
-  success no matter what happened. (If you have already committed the merge, `$PRE` is
-  `HEAD^1`.)
-- `--no-renames` is required. Rename detection is on by default (even with
-  `diff.renames` unset), and it reports a moved file as a single `R` entry, so its
-  **old path appears under neither `D` nor `A`** — the merge could restore the old path
-  and this audit would print nothing. A stacked PR that carves or moves code is mostly
-  renames, which is exactly the shape of the case that motivated this document.
-- `-z` and NUL-delimited reading are required for the same reason `--no-renames` is.
-  Git C-quotes any path containing a tab, newline, backslash, or non-ASCII byte —
-  `naïve.txt` prints as `"na\303\257ve.txt"` — and that quoted string is not the real
-  path, so the lookup misses and the audit says nothing. `:(literal)` keeps a path with
-  glob characters from being read as a pathspec pattern.
-- The checks query the **index**, not the filesystem, because `git commit` records the
-  index. They are meant to be re-run after you correct something, and that is where a
-  filesystem test fails: `rm` a resurrected file without staging the removal and
-  `[ -e ]` reports it gone while the index still carries it, so the audit prints a
-  clean result and the merge commit contains the file anyway. Querying the index also
-  removes the need to special-case a dangling symlink, which `[ -e ]` gets wrong.
+Two properties are worth knowing, because both were bugs that reported success:
+
+- It compares against `$PRE`, the pre-merge tip. A resurrected file is no longer a
+  deletion in the merge *result*, so comparing against a committed merge reports success
+  no matter what happened. (If you have already committed the merge, `$PRE` is `HEAD^1`.)
+- It tests the **index**, not the filesystem, because `git commit` records the index.
+  `rm` a resurrected file without staging the removal and a filesystem test reports it
+  gone while the index still carries it — clean audit, wrong commit.
 
 Then check the whole shape: `git diff --stat "$STACKBASE" "$PRE"` (intent) against
 `git diff --stat --cached origin/trunk` (result) should agree file for file, apart from
@@ -317,7 +254,7 @@ make signoff
 - [ ] No `trunk` merge into the child before the parent lands.
 - [ ] Stack base derived with `git merge-base`, not assumed to be the parent's final head.
 - [ ] After the parent lands: rebased if unpushed, `merge --no-ff --no-commit` if pushed.
-- [ ] Conflicts re-resolved against the stack base, and staged (merge path only).
-- [ ] `RESURRECTED` / `LOST` audit clean before the merge is committed (merge path only).
+- [ ] Conflicts re-resolved against the stack base with `restack_stacked_branch.sh resolve`.
+- [ ] `restack_stacked_branch.sh audit` clean before the merge is committed.
 - [ ] `Cargo.lock` taken from `trunk` and re-resolved by cargo.
 - [ ] Merge committed and pushed, then `make signoff` re-run on the new pushed HEAD.

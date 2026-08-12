@@ -1,0 +1,57 @@
+---
+name: Restack Script Tests
+
+# `scripts/restack_stacked_branch.sh` is the mechanical half of restacking a
+# branch whose parent squash-merged: re-resolving a conflict against the stack
+# base, and auditing what the merge did to paths the branch meant to add or
+# delete.
+#
+# Every case in the test file is a defect the script had, and all of them failed
+# by printing nothing -- a restore reported as clean, a dropped executable bit,
+# a deletion staged as a 0-byte file. An audit that says "clean" when the merge
+# reverted a deletion is worse than no audit, because git already reports that
+# merge as conflict-free and the reader stops looking.
+on:
+  pull_request:
+    branches:
+      - trunk
+      - release-*
+      - release/*
+      - feature-*
+    paths:
+      - 'scripts/restack_stacked_branch.sh'
+      - 'scripts/test_restack_stacked_branch.sh'
+      - '.github/workflows/restack_script_test.yml'
+  push:
+    branches:
+      - trunk
+    paths:
+      - 'scripts/restack_stacked_branch.sh'
+      - 'scripts/test_restack_stacked_branch.sh'
+      - '.github/workflows/restack_script_test.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  test-restack-script:
+    name: Unit tests for the restack helper
+    # GitHub-hosted on purpose: a handful of throwaway git repositories in a
+    # tmpdir, no network and no build, so it must not queue behind the
+    # self-hosted pool.
+    runs-on: ubuntu-24.04
+    # Reads the repository and nothing else.
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Run tests
+        # Invoked through `bash` rather than as `./…` so the job does not depend
+        # on the script's executable bit surviving a checkout on every platform.
+        run: bash scripts/test_restack_stacked_branch.sh
