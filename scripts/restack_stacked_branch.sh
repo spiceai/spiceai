@@ -85,7 +85,7 @@ cmd_resolve() {
 
   if [ "${ours_mode:-none}" != "${theirs_mode:-none}" ] || [ "$ours_mode" = 120000 ]; then
     echo "MANUAL $path: ours=${ours_mode:-none} theirs=${theirs_mode:-none} (mode, symlink, or missing stage)"
-    echo "  take one side whole: git checkout --ours -- '$path' && git add -- '$path'"
+    echo "  take one side whole: git checkout --ours -- ':(literal)$path' && git add -- ':(literal)$path'"
     return 2
   fi
 
@@ -120,7 +120,9 @@ resolve_with_tmp() {
   if git merge-file -p --diff3 \
        -L ours -L "base ($stack_base)" -L trunk \
        "$tmp/ours" "$tmp/base" "$tmp/theirs" > "$tmp/merged" 2>/dev/null; then
-    cp -- "$tmp/merged" "$path" && git add -- "$path" || die "could not stage $path"
+    # `:(literal)` because git add takes a pathspec, not a filename: a conflicted
+    # path containing *, ? or [] would otherwise stage every other path it matches.
+    cp -- "$tmp/merged" "$path" && git add -- ":(literal)$path" || die "could not stage $path"
     echo "RESOLVED $path"
     return 0
   fi

@@ -322,6 +322,35 @@ start_test "resolve stages a clean three-way merge against the stack base"
   [ -z "$(git ls-files -u -- f.txt)" ] || fail_test "the path was left unmerged"
 ) || failures=$((failures + 1))
 
+start_test "resolve stages only the named path when the name contains glob characters"
+(
+  new_stack "$work_root/globby"
+  # Both names exist, and the first one read as a pathspec pattern matches the
+  # second: staging by filename rather than by literal pathspec would sweep an
+  # unrelated file into the merge commit.
+  printf 'l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\n' > 'weird[1].txt'
+  printf 'unrelated\n' > weird1.txt
+  commit_all "fork point"
+  git checkout --quiet -b parent
+  printf 'l1\nPARENT\nl3\nl4\nl5\nl6\nl7\nl8\n' > 'weird[1].txt' && commit_all "parent edits"
+  stack_base=$(git rev-parse HEAD)
+  git checkout --quiet -b child
+  printf 'l1\nPARENT\nl3\nl4\nl5\nl6\nl7\nCHILD\n' > 'weird[1].txt' && commit_all "child edits"
+  squash_parent_onto_trunk
+  printf 'l1\nPARENT\nTRUNK\nl4\nl5\nl6\nl7\nl8\n' > 'weird[1].txt' && commit_all "trunk edits"
+  git checkout --quiet child
+  git merge --no-ff --no-commit trunk >/dev/null 2>&1
+  # An uncommitted change to the collateral file: if it gets staged, the merge
+  # commit carries an edit nobody reviewed.
+  printf 'modified but not staged\n' > weird1.txt
+
+  "$subject" resolve "$stack_base" 'weird[1].txt' >/dev/null 2>&1
+  git diff --cached --name-only | grep -qx 'weird1.txt' &&
+    fail_test "an unrelated path matching the glob was staged"
+  git diff --cached --name-only | grep -qFx 'weird[1].txt' ||
+    fail_test "the named path was not staged"
+) || failures=$((failures + 1))
+
 # ---------------------------------------------------------------------------
 # stack-base
 # ---------------------------------------------------------------------------
