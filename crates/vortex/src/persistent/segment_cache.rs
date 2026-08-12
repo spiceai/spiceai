@@ -406,21 +406,6 @@ impl SegmentCache for PathSegmentCache {
     }
 
     async fn put(&self, id: SegmentId, buffer: ByteBuffer) -> VortexResult<()> {
-        // Copy into an exact-sized allocation before inserting.
-        //
-        // The buffer handed to us is usually a view into a coalesced read block:
-        // `ObjectStoreReadAt` merges requests within 1 MiB into reads of up to
-        // 16 MiB, and the reader hands each segment `base.slice(..)` over that one
-        // allocation. `ByteBuffer` is backed by `bytes::Bytes`, so a slice shares
-        // the allocation and keeps all of it alive while the weigher counts only
-        // the slice's length. Caching a view would therefore let one small
-        // segment pin its whole block, and — worse — the overshoot would grow as
-        // eviction proceeded, because dropping some slices frees nothing until
-        // the last one goes. Copying costs one memcpy on the miss path (the read
-        // that produced the buffer cost far more) and makes the weight the true
-        // resident size, so `max_capacity` bounds real memory.
-        let buffer = ByteBuffer::copy_from_aligned(buffer.as_slice(), buffer.alignment());
-
         // Two checks around the active-put registration close both races with
         // retirement: a put already registered makes invalidation wait; a put
         // that read `retired = false` just before the mark observes it on the
@@ -438,6 +423,26 @@ impl SegmentCache for PathSegmentCache {
         } else {
             None
         };
+
+        // Copy into an exact-sized allocation, after the retirement checks so a
+        // compaction burst does not pay a memcpy per discarded put.
+        //
+        // The buffer handed to us is usually a view into a coalesced read block:
+        // `ObjectStoreReadAt` merges requests within 1 MiB into reads of up to
+        // 16 MiB, and the reader hands each segment `base.slice(..)` over that one
+        // allocation. `ByteBuffer` is backed by `bytes::Bytes`, so a slice shares
+        // the allocation and keeps all of it alive while the weigher counts only
+        // the slice's length. Caching a view would therefore let one small
+        // segment pin its whole block, and — worse — the overshoot would grow as
+        // eviction proceeded, because dropping some slices frees nothing until
+        // the last one goes. Copying costs one memcpy on the miss path (the read
+        // that produced the buffer cost far more) and makes the weight the true
+        // resident size, so `max_capacity` bounds real memory.
+        //
+        // This runs while the active-put guard is held, so `invalidate_paths`
+        // waits for it — bounded by the copy, and well inside its 1 ms poll.
+        let buffer = ByteBuffer::copy_from_aligned(buffer.as_slice(), buffer.alignment());
+
         self.shared
             .cache
             .insert(
