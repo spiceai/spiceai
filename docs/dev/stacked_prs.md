@@ -202,11 +202,11 @@ compares what the child *intended* against what the merge actually put on disk:
 ```bash
 # Files the child deleted that the merge brought back
 git diff --name-only --no-renames --diff-filter=D "$STACKBASE" "$PRE" |
-  while read -r f; do { [ -e "$f" ] || [ -L "$f" ]; } && echo "RESURRECTED $f"; done
+  while read -r f; do git ls-files --error-unmatch -- "$f" >/dev/null 2>&1 && echo "RESURRECTED $f"; done
 
 # Files the child added that the merge dropped
 git diff --name-only --no-renames --diff-filter=A "$STACKBASE" "$PRE" |
-  while read -r f; do { [ -e "$f" ] || [ -L "$f" ]; } || echo "LOST $f"; done
+  while read -r f; do git ls-files --error-unmatch -- "$f" >/dev/null 2>&1 || echo "LOST $f"; done
 ```
 
 Both must print nothing. Three details the checks depend on:
@@ -220,15 +220,19 @@ Both must print nothing. Three details the checks depend on:
   **old path appears under neither `D` nor `A`** — the merge could restore the old path
   and this audit would print nothing. A stacked PR that carves or moves code is mostly
   renames, which is exactly the shape of the case that motivated this document.
-- The `-e || -L` test is deliberate: `-e` alone is false for a dangling symlink, and
-  this repo tracks symlinks (`CLAUDE.md` is one), so a restored symlink with a missing
-  target would otherwise slip through.
+- The checks query the **index**, not the filesystem, because `git commit` records the
+  index. They are meant to be re-run after you correct something, and that is where a
+  filesystem test fails: `rm` a resurrected file without staging the removal and
+  `[ -e ]` reports it gone while the index still carries it, so the audit prints a
+  clean result and the merge commit contains the file anyway. Querying the index also
+  removes the need to special-case a dangling symlink, which `[ -e ]` gets wrong.
 
 Then check the whole shape: `git diff --stat "$STACKBASE" "$PRE"` (intent) against
-`git diff --stat origin/trunk` (result — the one-commit form compares `trunk` against
-the worktree, which is where the merge currently lives) should agree file for file,
-apart from other commits `trunk` took meanwhile. Investigate anything in one list but
-not the other.
+`git diff --stat --cached origin/trunk` (result) should agree file for file, apart from
+other commits `trunk` took meanwhile. Investigate anything in one list but not the
+other. `--cached` for the same reason as above — it compares `trunk` against the index,
+which is what the merge commit will record; without it an unstaged correction makes the
+stats look right while the commit still carries the wrong content.
 
 **4. Take `trunk`'s `Cargo.lock` wholesale** rather than resolving it by hand, then
 let `cargo metadata` re-add the branch's own crates:
