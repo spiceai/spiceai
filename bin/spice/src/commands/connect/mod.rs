@@ -34,7 +34,10 @@ limitations under the License.
 
 mod service;
 
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use crate::commands::add::{AddArgs, execute_add_or_connect};
 use crate::context::RuntimeContext;
@@ -517,6 +520,17 @@ async fn remove_identity(
     endpoint: Option<&str>,
     assume_yes: bool,
 ) -> Result<()> {
+    // Own the complete state transition before inspecting any file. Without
+    // this boundary, removal can clear old state while enrollment is still
+    // promoting a replacement identity under the same directory lock.
+    let enrollment_transaction = Arc::new(
+        runtime_cloud_connect::EnrollmentTransactionLock::try_acquire_async(config_dir)
+            .await
+            .map_err(|e| Error::CloudConnectIo {
+                message: format!("acquire the enrollment transaction before removal: {e}"),
+            })?,
+    );
+
     let identity_path = config_dir.join(IDENTITY_FILE);
     let draft_path = runtime_cloud_connect::EnrollmentDraft::path_in(config_dir);
     let endpoint_path = config_dir.join(CLOUD_ENDPOINT_FILE);
@@ -612,7 +626,8 @@ async fn remove_identity(
     // provisional key material and operation ID — released along with
     // everything else so the next enrollment starts clean.
     if had_draft {
-        runtime_cloud_connect::EnrollmentDraft::delete_async(config_dir)
+        enrollment_transaction
+            .delete_draft_async()
             .await
             .map_err(|e| Error::CloudConnectIo {
                 message: format!("remove enrollment draft: {e}"),
@@ -798,5 +813,49 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn removal_does_not_touch_state_without_enrollment_transaction_ownership() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let config_dir = dir.path().join(".spice");
+        let active =
+            runtime_cloud_connect::EnrollmentTransactionLock::try_acquire_async(&config_dir)
+                .await
+                .expect("hold enrollment transaction");
+
+        let draft_path = runtime_cloud_connect::EnrollmentDraft::path_in(&config_dir);
+        let cache_path = config_dir.join(runtime_cloud_connect::secret_cache::SECRET_CACHE_FILE);
+        let endpoint_path = config_dir.join(CLOUD_ENDPOINT_FILE);
+        let state = [
+            (&draft_path, b"active-draft".as_slice()),
+            (&cache_path, b"active-cache".as_slice()),
+            (&endpoint_path, b"https://active.example".as_slice()),
+        ];
+        for (path, contents) in state {
+            std::fs::write(path, contents).expect("write active state");
+        }
+
+        let error = remove_identity(&config_dir, None, true)
+            .await
+            .expect_err("active enrollment owns removal transaction");
+        assert!(
+            error.to_string().contains("Another live process"),
+            "{error}"
+        );
+        assert_eq!(
+            std::fs::read(&draft_path).expect("draft remains"),
+            b"active-draft"
+        );
+        assert_eq!(
+            std::fs::read(&cache_path).expect("cache remains"),
+            b"active-cache"
+        );
+        assert_eq!(
+            std::fs::read(&endpoint_path).expect("endpoint remains"),
+            b"https://active.example"
+        );
+
+        drop(active);
     }
 }

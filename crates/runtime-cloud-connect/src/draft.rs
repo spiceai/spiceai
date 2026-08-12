@@ -38,7 +38,10 @@ limitations under the License.
 //!   consumes against the existing operation rather than a new instance.
 //! - On success, atomically promoted into `identity.json` and deleted.
 
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use serde::{Deserialize, Serialize};
 use snafu::{ResultExt, Snafu};
@@ -109,6 +112,9 @@ pub enum Error {
 
     #[snafu(display("Failed to remove the enrollment draft: {source}"))]
     DeleteTaskPanicked { source: tokio::task::JoinError },
+
+    #[snafu(display("Failed to acquire the enrollment transaction: {source}"))]
+    AcquireTaskPanicked { source: tokio::task::JoinError },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -119,13 +125,17 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// draft cleanup. Releasing it earlier permits another process to observe no
 /// identity after promotion has started and race a new operation against the
 /// first process.
-pub(crate) struct EnrollmentTransactionLock {
+pub struct EnrollmentTransactionLock {
     draft_path: PathBuf,
     file: std::fs::File,
 }
 
 impl EnrollmentTransactionLock {
     pub(crate) fn acquire(config_dir: &Path) -> Result<Self> {
+        Self::acquire_with_budget(config_dir, LOCK_WAIT_BUDGET)
+    }
+
+    fn acquire_with_budget(config_dir: &Path, wait_budget: std::time::Duration) -> Result<Self> {
         let draft_path = EnrollmentDraft::path_in(config_dir);
         if let Some(parent) = draft_path.parent() {
             std::fs::create_dir_all(parent).context(IoSnafu {
@@ -133,8 +143,28 @@ impl EnrollmentTransactionLock {
             })?;
         }
         let lock_path = EnrollmentDraft::lock_path(&draft_path);
-        let file = EnrollmentDraft::acquire_publication_lock(&lock_path)?;
+        let file = EnrollmentDraft::acquire_publication_lock_with_budget(&lock_path, wait_budget)?;
         Ok(Self { draft_path, file })
+    }
+
+    /// Try once to acquire exclusive ownership of a config directory's
+    /// enrollment transaction without blocking a Tokio worker thread.
+    ///
+    /// This is the removal boundary: callers must acquire it before inspecting
+    /// identity, draft, cache, or endpoint state and retain it until all those
+    /// files have been removed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if another process owns the transaction, the lock file
+    /// cannot be opened, or the blocking task panics.
+    pub async fn try_acquire_async(config_dir: &Path) -> Result<Self> {
+        let config_dir = config_dir.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            Self::acquire_with_budget(&config_dir, std::time::Duration::ZERO)
+        })
+        .await
+        .map_err(|source| Error::AcquireTaskPanicked { source })?
     }
 
     pub(crate) fn load_or_create(
@@ -156,6 +186,19 @@ impl EnrollmentTransactionLock {
 
     pub(crate) fn delete(&self) -> Result<()> {
         EnrollmentDraft::delete_at(&self.draft_path)
+    }
+
+    /// Delete the enrollment draft while retaining this transaction lock.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the draft cannot be removed or the blocking task
+    /// panics.
+    pub async fn delete_draft_async(self: &Arc<Self>) -> Result<()> {
+        let transaction = Arc::clone(self);
+        tokio::task::spawn_blocking(move || transaction.delete())
+            .await
+            .map_err(|source| Error::DeleteTaskPanicked { source })?
     }
 }
 
@@ -280,7 +323,15 @@ impl EnrollmentDraft {
         Self::publish_locked(path, &publication_lock, instance, region)
     }
 
+    #[cfg(test)]
     fn acquire_publication_lock(lock_path: &Path) -> Result<std::fs::File> {
+        Self::acquire_publication_lock_with_budget(lock_path, LOCK_WAIT_BUDGET)
+    }
+
+    fn acquire_publication_lock_with_budget(
+        lock_path: &Path,
+        wait_budget: std::time::Duration,
+    ) -> Result<std::fs::File> {
         #[cfg(unix)]
         use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 
@@ -303,7 +354,7 @@ impl EnrollmentDraft {
             path: lock_path.to_path_buf(),
         })?;
 
-        let deadline = std::time::Instant::now() + LOCK_WAIT_BUDGET;
+        let deadline = std::time::Instant::now() + wait_budget;
         loop {
             if fs4::fs_std::FileExt::try_lock_exclusive(&file).context(IoSnafu {
                 path: lock_path.to_path_buf(),

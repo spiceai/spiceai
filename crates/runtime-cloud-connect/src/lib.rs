@@ -98,7 +98,7 @@ use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
 pub use config::CloudConnectConfig;
-pub use draft::EnrollmentDraft;
+pub use draft::{EnrollmentDraft, EnrollmentTransactionLock};
 pub use enroll::{
     EnrollNowError, EnrollNowOutcome, EnrollmentAuthority, EnrollmentMetadata, RetryPolicy,
     SessionToken, enroll_now,
