@@ -22766,6 +22766,7 @@ dependencies = [
  "anyhow",
  "arrow-schema",
  "async-trait",
+ "cpu-budget",
  "criterion 0.7.0",
  "datafusion",
  "datafusion-catalog",

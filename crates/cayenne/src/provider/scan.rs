@@ -49,6 +49,7 @@ use datafusion_physical_plan::{
     repartition::RepartitionExec,
     union::UnionExec,
 };
+use vortex_datafusion::VortexSource;
 
 /// Keeps a scan's snapshot directories alive for the FULL lifetime of the scan —
 /// plan-build AND execution. Increments a per-snapshot in-flight-scan ref-count on
@@ -530,6 +531,47 @@ fn plan_reads_files(plan: &Arc<dyn ExecutionPlan>) -> bool {
     plan.children().into_iter().any(plan_reads_files)
 }
 
+/// The largest number of splits any Vortex scan in `plan` decodes concurrently
+/// inside a single file (see `VortexSource::resolved_scan_concurrency`).
+///
+/// Scales the scan charge. A Vortex file scan is not one decode at a time: it runs
+/// N split decodes concurrently, so N canonicalized batches can be resident while
+/// the wrapper emits one. Charging a single batch under-counts by exactly that
+/// factor, and the factor is largest where it is least expected — under the default
+/// `auto` mode it is `target_partitions / planned_file_count`, so a table small
+/// enough to live in ONE file resolves to the full core count.
+///
+/// The value is read from the source rather than recomputed here: the resolution
+/// depends on the pushed-down limit and the post-repartitioning target partitions,
+/// and a second implementation of that arithmetic would silently drift from the one
+/// the scan actually uses.
+///
+/// `max`, not `sum`: the factor being corrected is per-file-scan. Whether sibling
+/// snapshot branches of a base+delta plan also decode concurrently is a separate,
+/// still-open gap (see the `MemoryAccountedScanStream` docs) that needs charging at
+/// each materializing leaf to close — this does not claim to have closed it.
+fn plan_scan_fan_out(plan: &Arc<dyn ExecutionPlan>) -> usize {
+    if let Some(data_source_exec) = plan.downcast_ref::<DataSourceExec>() {
+        return data_source_exec
+            .data_source()
+            .downcast_ref::<FileScanConfig>()
+            .and_then(|config| {
+                config
+                    .file_source()
+                    .downcast_ref::<VortexSource>()
+                    .map(|source| source.resolved_scan_concurrency(config))
+            })
+            .unwrap_or(1)
+            .max(1);
+    }
+    plan.children()
+        .into_iter()
+        .map(plan_scan_fan_out)
+        .max()
+        .unwrap_or(1)
+        .max(1)
+}
+
 /// Counts file-backed scan sources (snapshot generations) and the total files
 /// across them in `plan`, returning `(snapshots_scanned, files_scanned)`.
 ///
@@ -927,6 +969,7 @@ impl ExecutionPlan for CayenneAccelerationExec {
                 schema,
                 format!("cayenne_scan[partition={partition}]"),
                 &context,
+                plan_scan_fan_out(&self.inner),
             );
             return Ok(Box::pin(accounted));
         }
@@ -1045,9 +1088,16 @@ impl ExecutionPlan for CayenneAccelerationExec {
 /// it across a `Pending` matters for the same reason — that is the window the
 /// buffers are being expanded in.
 ///
-/// The reservation then covers the batch **in flight** until the next poll,
-/// rather than its whole downstream lifetime, which this stream cannot observe.
+/// The reservation then covers the batches **in flight** until the next poll,
+/// rather than their whole downstream lifetime, which this stream cannot observe.
 /// Whatever an operator above retains, it reserves for itself.
+///
+/// "Batches", plural, because a Vortex file scan decodes several splits at once:
+/// the charge is `estimate * fan_out`, where the fan-out is the concurrency the
+/// scan below resolved (see [`plan_scan_fan_out`]). Charging one batch would
+/// under-count by that factor, which under the default `auto` mode is
+/// `target_partitions / planned_file_count` — largest for a table small enough to
+/// occupy a single file, where it reaches the whole core count.
 ///
 /// A pre-poll charge that does not fit returns `ResourcesExhausted` before the
 /// decode runs, so a scan that cannot fit its estimate fails without allocating.
@@ -1078,19 +1128,18 @@ impl ExecutionPlan for CayenneAccelerationExec {
 /// accounting; separating the branches means charging at each materializing
 /// leaf, below.
 ///
-/// Accounting attaches to the outermost wrapper only (`scan_guard.is_some()`),
-/// so it charges one estimate per output partition. Under a base+delta plan the
-/// inner per-snapshot wrappers and the Vortex `DataSourceExec` beneath them can
-/// decode CONCURRENTLY while the outer stream holds a single charge, which
-/// under-counts by roughly the number of concurrently decoding children. The
-/// pre-poll charge means that window is no longer *unaccounted*, but it is not
-/// accurately accounted either.
+/// **Sibling snapshot branches are counted once, not summed.** Accounting
+/// attaches to the outermost wrapper only (`scan_guard.is_some()`), which charges
+/// per output partition and scales that charge by the fan-out of the single widest
+/// scan beneath it ([`plan_scan_fan_out`] takes a `max`). That closes the
+/// intra-file split fan-out. It does not close the case where a base+delta plan's
+/// per-snapshot branches decode CONCURRENTLY beneath one wrapper: their splits are
+/// covered only up to the widest branch, so a plan whose memory is dominated by
+/// *cross-branch* concurrency can still exceed `runtime.query.memory_limit`.
 ///
-/// Bounding it properly means charging at each materializing leaf, or gating
-/// concurrent decodes behind a shared budget. Both are larger changes than this,
-/// and neither should be inferred from the presence of this type: a plan whose
-/// memory is dominated by fan-out beneath the outermost scan is still able to
-/// exceed `runtime.query.memory_limit`.
+/// Bounding that properly means charging at each materializing leaf, or gating
+/// concurrent decodes behind a shared budget — both larger changes than this, and
+/// neither should be inferred from the presence of this type.
 struct MemoryAccountedScanStream<S> {
     inner: S,
     schema: SchemaRef,
@@ -1108,6 +1157,11 @@ struct MemoryAccountedScanStream<S> {
     /// converges upward and stays there. Over-reserving costs pool headroom;
     /// under-reserving costs the guarantee.
     estimate: usize,
+    /// Concurrent split decodes running beneath this stream, from
+    /// [`plan_scan_fan_out`]. The charge is `estimate * fan_out`, because a Vortex
+    /// file scan holds that many canonicalized batches at once while emitting one.
+    /// Always at least 1, so a serial scan charges exactly one batch as before.
+    fan_out: usize,
     /// True while the reservation covers an in-progress decode rather than a
     /// batch already handed downstream. Keeps the charge in place across a
     /// `Pending`, which is exactly when Vortex is expanding buffers.
@@ -1130,7 +1184,13 @@ struct MemoryAccountedScanStream<S> {
 const INITIAL_BATCH_ESTIMATE_BYTES: usize = 1024 * 1024;
 
 impl<S> MemoryAccountedScanStream<S> {
-    fn new(inner: S, schema: SchemaRef, consumer_name: String, context: &Arc<TaskContext>) -> Self {
+    fn new(
+        inner: S,
+        schema: SchemaRef,
+        consumer_name: String,
+        context: &Arc<TaskContext>,
+        fan_out: usize,
+    ) -> Self {
         // Infallible: `register` hands back a zero-sized reservation and the
         // pool only refuses later, at `try_grow`.
         let reservation = Some(MemoryConsumer::new(consumer_name).register(context.memory_pool()));
@@ -1139,8 +1199,17 @@ impl<S> MemoryAccountedScanStream<S> {
             schema,
             reservation,
             estimate: INITIAL_BATCH_ESTIMATE_BYTES,
+            fan_out: fan_out.max(1),
             decode_charged: false,
         }
+    }
+
+    /// Bytes to hold for `per_batch` across every concurrently decoding split.
+    ///
+    /// Saturating: a pathological fan-out must degrade into "charge everything and
+    /// let the pool refuse", never wrap into a small charge.
+    fn charge_for(&self, per_batch: usize) -> usize {
+        per_batch.saturating_mul(self.fan_out)
     }
 }
 
@@ -1162,7 +1231,7 @@ where
             // The previous batch has been handed downstream; whatever holds it
             // now reserves for itself, so keeping its bytes here would
             // double-count them.
-            let estimate = self.estimate;
+            let estimate = self.charge_for(self.estimate);
             if let Some(reservation) = self.reservation.as_mut() {
                 reservation.free();
                 if let Err(e) = reservation.try_grow(estimate) {
@@ -1185,8 +1254,12 @@ where
                 // size. Settle the estimate to the truth now that it is known.
                 let actual = batch.get_array_memory_size();
                 self.estimate = self.estimate.max(actual);
+                // Settle to the measured size, still scaled: the emitted batch is
+                // one of `fan_out` in flight, and the others stay resident while
+                // this one is handed downstream.
+                let settled = self.charge_for(actual);
                 if let Some(reservation) = self.reservation.as_mut()
-                    && let Err(e) = reservation.try_resize(actual)
+                    && let Err(e) = reservation.try_resize(settled)
                 {
                     // Settling failed, so this batch is dropped with the error.
                     // Release its charge and clear the flag: leaving the flag set
@@ -1269,10 +1342,86 @@ mod tests {
             Arc::clone(&schema),
             "cayenne_scan[test]".to_string(),
             &context,
+            1,
         );
 
         let first = stream.next().await.expect("one item");
         let err = first.expect_err("a batch larger than the pool must be refused");
+        assert!(
+            err.to_string().contains("Resources exhausted"),
+            "expected a pool refusal, got: {err}"
+        );
+    }
+
+    /// The charge must cover every split a Vortex scan decodes concurrently, not
+    /// just the one batch the stream emits.
+    ///
+    /// A Vortex file scan runs `scan_concurrency` split decodes at once, so N
+    /// canonicalized batches are resident while the wrapper hands out one. Charging
+    /// a single batch under-counts by exactly N — and under the default `auto` mode
+    /// N is `target_partitions / planned_file_count`, so it is LARGEST for a table
+    /// small enough to live in one file. A pool sized to hold one batch but not
+    /// four must refuse a scan whose fan-out is four.
+    #[tokio::test]
+    async fn a_scan_charges_for_every_concurrently_decoding_split() {
+        use datafusion_execution::memory_pool::GreedyMemoryPool;
+        use datafusion_execution::runtime_env::RuntimeEnvBuilder;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(
+                (0..4096_i64).collect::<Vec<_>>(),
+            ))],
+        )
+        .expect("batch");
+        // Room for one batch's initial charge and change, but nowhere near four.
+        let pool_bytes = INITIAL_BATCH_ESTIMATE_BYTES * 2;
+
+        // Serial: the same batch through the same pool must succeed, so the
+        // refusal below is attributable to the fan-out and not to a pool that was
+        // simply too small.
+        let serial_context = {
+            let runtime = RuntimeEnvBuilder::new()
+                .with_memory_pool(Arc::new(GreedyMemoryPool::new(pool_bytes)))
+                .build_arc()
+                .expect("runtime env");
+            Arc::new(TaskContext::default().with_runtime(runtime))
+        };
+        let mut serial = MemoryAccountedScanStream::new(
+            Box::pin(futures::stream::iter(vec![Ok(batch.clone())])),
+            Arc::clone(&schema),
+            "cayenne_scan[test-serial]".to_string(),
+            &serial_context,
+            1,
+        );
+        serial
+            .next()
+            .await
+            .expect("one item")
+            .expect("a serial scan must fit a pool sized for one batch");
+
+        // Fanned out four ways over the SAME pool: four in-flight decodes do not
+        // fit, and the refusal must arrive before the decode rather than after.
+        let fanned_context = {
+            let runtime = RuntimeEnvBuilder::new()
+                .with_memory_pool(Arc::new(GreedyMemoryPool::new(pool_bytes)))
+                .build_arc()
+                .expect("runtime env");
+            Arc::new(TaskContext::default().with_runtime(runtime))
+        };
+        let mut fanned = MemoryAccountedScanStream::new(
+            Box::pin(futures::stream::iter(vec![Ok(batch)])),
+            Arc::clone(&schema),
+            "cayenne_scan[test-fanned]".to_string(),
+            &fanned_context,
+            4,
+        );
+        let err = fanned
+            .next()
+            .await
+            .expect("one item")
+            .expect_err("four concurrent decodes must not fit a pool sized for one");
         assert!(
             err.to_string().contains("Resources exhausted"),
             "expected a pool refusal, got: {err}"
@@ -1324,6 +1473,7 @@ mod tests {
             Arc::clone(&schema),
             "cayenne_scan[test]".to_string(),
             &context,
+            1,
         );
 
         let first = stream.next().await.expect("one item");
@@ -1386,6 +1536,7 @@ mod tests {
             Arc::clone(&schema),
             "cayenne_scan[test]".to_string(),
             &context,
+            1,
         );
 
         let err = stream
@@ -1444,6 +1595,7 @@ mod tests {
             Arc::clone(&schema),
             "cayenne_scan[test]".to_string(),
             &context,
+            1,
         );
 
         let mut seen = 0;

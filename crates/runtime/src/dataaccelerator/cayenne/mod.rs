@@ -1420,6 +1420,23 @@ impl CayenneAccelerator {
                 },
             );
 
+            // Intra-file scan concurrency: `auto` derives it from target
+            // partitions and the planned file count, `off` decodes serially, an
+            // explicit count pins it. The scan charges the query pool for every
+            // concurrent split, so this is the lever for trading resident decode
+            // memory against scan throughput without moving the whole query
+            // fan-out via `runtime.query.target_partitions`.
+            if let Some(concurrency_str) = acceleration.params.get("cayenne_scan_concurrency") {
+                match concurrency_str.parse::<cayenne::metadata::ScanConcurrency>() {
+                    Ok(concurrency) => config.scan_concurrency = concurrency,
+                    Err(err) => {
+                        tracing::warn!(
+                            "Failed to configure dataset {table_name} (cayenne): Invalid `cayenne_scan_concurrency` value '{concurrency_str}'. {err} Falling back to 'auto'. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+                        );
+                    }
+                }
+            }
+
             // Parse compression strategy
             if let Some(strategy_str) = acceleration.params.get("cayenne_compression_strategy") {
                 match strategy_str.to_lowercase().as_str() {
@@ -2711,8 +2728,8 @@ fn wrap_with_native_vector_indexes(
 const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
     ParameterSpec,
     S3_PARAMS_LEN,
-    63,
-    { S3_PARAMS_LEN + 63 },
+    64,
+    { S3_PARAMS_LEN + 64 },
 >(
     S3_PARAMETERS,
     [
@@ -2731,6 +2748,9 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
             .default("string"),
         ParameterSpec::component("segment_cache_mb")
             .description("Size of the in-memory Vortex decompressed-segment cache in MB. 'auto' (default, or when unset) scales with machine memory (~1/128 of RAM) but never below 256 MB and never above 1024 MB. Set an explicit MB value to override.")
+            .default("auto"),
+        ParameterSpec::component("scan_concurrency")
+            .description("How many splits a single Vortex file scan decodes concurrently. 'auto' (default) derives it from the query fan-out and the number of files a scan plans, so a table held in few files still decodes in parallel. 'off' decodes each file serially. An explicit count pins it. Each concurrent split holds a decoded batch, and all of them are charged to 'runtime.query.memory_limit', so lowering this cuts a scan's resident decode memory without shrinking query parallelism everywhere the way 'runtime.query.target_partitions' does.")
             .default("auto"),
         ParameterSpec::component("pk_keyset_cache_mb")
             .description("Byte budget (in MB) for the in-memory primary-key index used to detect upsert conflicts during CDC ingestion. Within budget an exact keyset is kept; over budget, upsert tables fall back to a bounded bloom existence filter (avoiding the per-batch full-table rebuild) while DoNothing tables rebuild from a scan. When unset, an optimal default is derived from available machine memory."),
