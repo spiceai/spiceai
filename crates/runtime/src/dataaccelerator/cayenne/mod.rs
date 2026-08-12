@@ -1910,15 +1910,10 @@ impl CayenneAccelerator {
                 || config.goal_qph.is_some();
             // A goal never switches the mode: `adaptive` is a preview feature and
             // is entered only by asking for it, so a goal configured while the
-            // loop is off is reported as ignored rather than silently promoting
-            // the table into a different tuning regime.
-            if any_goal && !config.dynamic_tuning {
-                tracing::warn!(
-                    target: "spiced::acceleration::cayenne",
-                    table = %table_name,
-                    "`cayenne_goal_*` is set but adaptive tuning is off, so the goals are ignored (`cayenne_tuning` defaults to 'auto'). Set `cayenne_tuning: adaptive` on this dataset to enable goal-seeking."
-                );
-            }
+            // loop is off is reported as ignored (below, under the newly-resolved
+            // guard so a dataset that keeps failing to load does not repeat it)
+            // rather than silently promoting the table into a different regime.
+            let goals_are_inert = any_goal && !config.dynamic_tuning;
             if config.dynamic_tuning {
                 tracing::warn!(
                     target: "spiced::acceleration::cayenne",
@@ -1970,11 +1965,21 @@ impl CayenneAccelerator {
             // Report the resolution once per *resolved configuration*, not once per
             // provider construction: this function runs on every
             // `create_external_table` / `create_cayenne_table_provider`, and a
-            // dataset that keeps failing to load is rebuilt on every retry. Both
-            // emits below are pure functions of `config` and `hw.cores`, so the one
-            // fingerprint covers them.
+            // dataset that keeps failing to load is rebuilt on every retry. Every
+            // emit below is a pure function of `config` and `hw.cores`, so the one
+            // fingerprint covers them all.
             let fingerprint = auto_tuned_config_fingerprint(table_name, &hw, workload, &config);
             if auto_tuned_config_is_newly_resolved(table_name, fingerprint) {
+                // A `cayenne_goal_*` SLO with the closed loop off does nothing, and
+                // it is easy to set one globally and assume it took effect.
+                if goals_are_inert {
+                    tracing::warn!(
+                        target: "spiced::acceleration::cayenne",
+                        table = %table_name,
+                        "`cayenne_goal_*` is set but adaptive tuning is off, so the goals are ignored (`cayenne_tuning` defaults to 'auto'). Set `cayenne_tuning: adaptive` on this dataset to enable goal-seeking."
+                    );
+                }
+
                 // Surface cross-parameter and out-of-range issues that parse cleanly
                 // but won't behave as intended (silently clamped at use, or don't
                 // compose with each other) — see `VortexConfig::config_warnings`.
@@ -2143,16 +2148,22 @@ impl CayenneAccelerator {
         config.inline_max_rows = 0;
         config.inline_max_bytes = 0;
         config.inline_max_buffer_bytes = 0;
-        // Only a NUMBER is an explicit limit. `auto` is a request for the derived
-        // default, which in memory mode is "no cap" — reading mere key presence
-        // would turn `cayenne_cdc_mem_tier_max_bytes: auto` into the file-mode
-        // host-derived cap, and memory mode has no spill path to fall back on, so
-        // crossing it fails the write. `is_pinned` is the same "explicitly set"
-        // test the tuning actuators use.
+        // Only a number the config field can actually hold is an explicit limit.
+        // `auto` is a request for the derived default, which in memory mode is "no
+        // cap" — reading mere key presence would turn
+        // `cayenne_cdc_mem_tier_max_bytes: auto` into the file-mode host-derived
+        // cap, and memory mode has no spill path to fall back on, so crossing it
+        // fails the write. A value above `i64::MAX` is the same story: knobs parse
+        // as `usize`, so it reads as set, but `auto_or_i64` cannot represent it and
+        // has already fallen back to the derived value — treating it as explicit
+        // would pin a cap the operator never asked for.
         let explicit_limit = acceleration.is_some_and(|a| {
-            autotune::is_pinned(
-                a,
-                &["cayenne_cdc_mem_tier_max_bytes", "cdc_mem_tier_max_bytes"],
+            matches!(
+                autotune::read_knob(
+                    a,
+                    &["cayenne_cdc_mem_tier_max_bytes", "cdc_mem_tier_max_bytes"],
+                ),
+                autotune::Knob::Set(bytes) if i64::try_from(bytes).is_ok()
             )
         });
         if !explicit_limit {
@@ -3832,6 +3843,28 @@ mod tests {
         assert_ne!(
             config.cdc_mem_tier_max_bytes, 0,
             "a number is still an explicit hard limit"
+        );
+
+        // A value the `i64` config field cannot hold reads as set (knobs parse as
+        // `usize`) but never reaches the config — `auto_or_i64` has already fallen
+        // back to the derived value — so it must not pin a cap either.
+        let mut config = cayenne::metadata::VortexConfig {
+            cdc_mem_tier_max_bytes: 512 * 1024 * 1024,
+            ..Default::default()
+        };
+        let overflowing = Acceleration {
+            params: [(
+                "cayenne_cdc_mem_tier_max_bytes".to_string(),
+                u64::MAX.to_string(),
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        CayenneAccelerator::apply_memory_mode_overrides(&mut config, Some(&overflowing));
+        assert_eq!(
+            config.cdc_mem_tier_max_bytes, 0,
+            "a value too large for the config field is not an explicit limit"
         );
     }
     use crate::component::dataset::acceleration::{Acceleration, Mode, RefreshMode};
