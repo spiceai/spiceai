@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::hash::BuildHasherDefault;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
@@ -12,6 +12,7 @@ use object_store::path::Path;
 use opentelemetry::global;
 use opentelemetry::metrics::{Meter, ObservableCounter, ObservableGauge};
 use parking_lot::Mutex;
+use vortex_utils::aliases::dash_map::{DashMap, Entry};
 use twox_hash::XxHash3_64;
 use vortex::buffer::ByteBuffer;
 use vortex::error::VortexResult;
@@ -21,7 +22,14 @@ use vortex::layout::segments::{SegmentCache, SegmentId};
 /// project-wide cache hashing default and is markedly faster than moka's default
 /// `SipHash` on the per-segment hot path.
 type SegmentCacheHasher = BuildHasherDefault<XxHash3_64>;
-type PathStates = Arc<Mutex<HashMap<Path, Weak<PathCacheState>>>>;
+/// Per-path insertion state, sharded.
+///
+/// One cache now serves every table, so this registry is touched by every cached
+/// file open and close in the process. A single mutex would serialize file
+/// opening across all concurrent scans; `DashMap` shards it while still
+/// serializing operations on the *same* path, which is what the retirement and
+/// last-owner invariants rely on.
+type PathStates = Arc<DashMap<Path, Weak<PathCacheState>>>;
 
 /// Identity of the object store a [`Path`] is relative to, as a store URL
 /// (`s3://bucket/`, `file:///`).
@@ -31,6 +39,13 @@ type PathStates = Arc<Mutex<HashMap<Path, Weak<PathCacheState>>>>;
 /// from that table's store; one cache serving every table does, and two stores
 /// holding the same relative path would otherwise return each other's bytes.
 type StoreKey = Arc<str>;
+
+/// Largest segment copied inline on the async put path.
+///
+/// At roughly 10 GB/s a 256 KiB copy is ~25µs, comfortably inside the ~100µs an
+/// async task may run without yielding. Larger segments — up to the 16 MiB
+/// coalescing ceiling — are trimmed on the blocking pool instead.
+const INLINE_TRIM_MAX_BYTES: usize = 256 * 1024;
 
 /// Cache key: the store, the file within it, and the segment within the file.
 type SegmentKey = (StoreKey, Arc<Path>, SegmentId);
@@ -246,7 +261,7 @@ impl SharedSegmentCache {
                     u32::try_from(buffer.len().min(u32::MAX as usize)).unwrap_or(u32::MAX)
                 })
                 .build_with_hasher(SegmentCacheHasher::default()),
-            path_states: track_retirement.then(|| Arc::new(Mutex::new(HashMap::new()))),
+            path_states: track_retirement.then(|| Arc::new(DashMap::default())),
             capacity_bytes: max_capacity_bytes,
             accesses: AtomicU64::new(0),
             hits: AtomicU64::new(0),
@@ -275,15 +290,24 @@ impl SharedSegmentCache {
     /// to; see [`StoreKey`].
     pub(crate) fn for_path(self: &Arc<Self>, store: StoreKey, path: Path) -> Arc<dyn SegmentCache> {
         let state = self.path_states.as_ref().map(|path_states| {
-            let mut states = path_states.lock();
-            states
-                .get(&path)
-                .and_then(Weak::upgrade)
-                .unwrap_or_else(|| {
+            // `entry` holds this shard's lock across the upgrade-or-insert, so a
+            // concurrent drop for the same path cannot unregister a state between
+            // the lookup and the insert.
+            match path_states.entry(path.clone()) {
+                Entry::Occupied(mut occupied) => match occupied.get().upgrade() {
+                    Some(live) => live,
+                    None => {
+                        let state = Arc::new(PathCacheState::default());
+                        occupied.insert(Arc::downgrade(&state));
+                        state
+                    }
+                },
+                Entry::Vacant(vacant) => {
                     let state = Arc::new(PathCacheState::default());
-                    states.insert(path.clone(), Arc::downgrade(&state));
+                    vacant.insert(Arc::downgrade(&state));
                     state
-                })
+                }
+            }
         });
         Arc::new(PathSegmentCache {
             shared: Arc::clone(self),
@@ -308,10 +332,9 @@ impl SharedSegmentCache {
             .path_states
             .as_ref()
             .map_or_else(Vec::new, |path_states| {
-                let states = path_states.lock();
                 paths
                     .iter()
-                    .filter_map(|path| states.get(path).and_then(Weak::upgrade))
+                    .filter_map(|path| path_states.get(path).and_then(|state| state.upgrade()))
                     .collect()
             });
         for state in &states {
@@ -330,11 +353,38 @@ impl SharedSegmentCache {
         // returning means the buffers are removed from the cache table;
         // predicate invalidation would defer physical eviction to bounded
         // maintenance passes.
-        let keys: Vec<_> = self
-            .cache
-            .iter()
-            .filter_map(|(key, _)| paths.contains(key.1.as_ref()).then(|| key.as_ref().clone()))
-            .collect();
+        //
+        // The walk is O(entries in the whole cache), not O(retiring paths), and
+        // one cache now holds every table's segments — so a single table's
+        // compaction would otherwise occupy a runtime worker scanning entries
+        // belonging to every other table. Run it on the blocking pool.
+        // A reverse index from path to resident keys would remove the scan
+        // entirely; see spiceai/spiceai#12964.
+        let scan_cache = self.cache.clone();
+        let scan_paths = paths.clone();
+        let keys: Vec<SegmentKey> = match tokio::task::spawn_blocking(move || {
+            scan_cache
+                .iter()
+                .filter_map(|(key, _)| {
+                    scan_paths.contains(key.1.as_ref()).then(|| key.as_ref().clone())
+                })
+                .collect()
+        })
+        .await
+        {
+            Ok(keys) => keys,
+            Err(error) => {
+                // The scan is the only way to find the retired keys, so a failed
+                // join leaves them cached. Report it rather than pretending the
+                // retirement completed.
+                tracing::error!(
+                    target: "vortex::segment_cache",
+                    %error,
+                    "Segment-cache invalidation scan failed to run; retired segments stay cached until capacity evicts them"
+                );
+                return;
+            }
+        };
         for key in keys {
             self.cache.invalidate(&key).await;
         }
@@ -346,9 +396,11 @@ impl SharedSegmentCache {
 
         drop(states);
         if let Some(path_states) = self.path_states.as_ref() {
-            path_states
-                .lock()
-                .retain(|_, state| state.strong_count() > 0);
+            // Only the paths just retired, not a sweep of the whole registry:
+            // every other entry belongs to a file some other scan still has open.
+            for path in &paths {
+                path_states.remove_if(path, |_, state| state.strong_count() == 0);
+            }
         }
     }
 
@@ -435,13 +487,35 @@ impl SegmentCache for PathSegmentCache {
         // the slice's length. Caching a view would therefore let one small
         // segment pin its whole block, and — worse — the overshoot would grow as
         // eviction proceeded, because dropping some slices frees nothing until
-        // the last one goes. Copying costs one memcpy on the miss path (the read
-        // that produced the buffer cost far more) and makes the weight the true
-        // resident size, so `max_capacity` bounds real memory.
+        // the last one goes. Copying makes the weight the true resident size, so
+        // `max_capacity` bounds real memory.
         //
-        // This runs while the active-put guard is held, so `invalidate_paths`
-        // waits for it — bounded by the copy, and well inside its 1 ms poll.
-        let buffer = ByteBuffer::copy_from_aligned(buffer.as_slice(), buffer.alignment());
+        // Only small copies run inline. A segment can reach the 16 MiB coalescing
+        // ceiling, and copying that on a runtime worker would hold it far past the
+        // ~100µs an async task may go without yielding, delaying unrelated
+        // queries; anything above the threshold goes to the blocking pool.
+        let buffer = if buffer.len() <= INLINE_TRIM_MAX_BYTES {
+            ByteBuffer::copy_from_aligned(buffer.as_slice(), buffer.alignment())
+        } else {
+            let alignment = buffer.alignment();
+            match tokio::task::spawn_blocking(move || {
+                ByteBuffer::copy_from_aligned(buffer.as_slice(), alignment)
+            })
+            .await
+            {
+                Ok(trimmed) => trimmed,
+                Err(error) => {
+                    // Caching the untrimmed view would pin its whole read block
+                    // while accounting for a fraction of it, so skip the insert.
+                    tracing::warn!(
+                        target: "vortex::segment_cache",
+                        %error,
+                        "Segment trim failed to run; not caching this segment"
+                    );
+                    return Ok(());
+                }
+            }
+        };
 
         self.shared
             .cache
@@ -461,18 +535,16 @@ impl Drop for PathSegmentCache {
         else {
             return;
         };
-        let mut states = path_states.lock();
-        // `for_path` takes this same mutex before upgrading the registry's
-        // weak entry. Check ownership only after acquiring it: otherwise an
-        // opener can upgrade between an out-of-lock last-owner check and this
-        // removal, leaving that opener on an unregistered state that a later
-        // retirement cannot mark.
-        let is_registered_state = states
-            .get(self.path.as_ref())
-            .is_some_and(|registered| std::ptr::addr_eq(registered.as_ptr(), Arc::as_ptr(state)));
-        if is_registered_state && Arc::strong_count(state) == 1 {
-            states.remove(self.path.as_ref());
-        }
+        // `remove_if` evaluates the predicate while holding this path's shard
+        // lock, which `for_path` also takes before upgrading the registry's weak
+        // entry. Checking ownership there — rather than before taking a lock —
+        // is what stops an opener from upgrading between the last-owner check and
+        // the removal, which would leave it on an unregistered state that a later
+        // retirement could not mark.
+        path_states.remove_if(self.path.as_ref(), |_, registered| {
+            std::ptr::addr_eq(registered.as_ptr(), Arc::as_ptr(state))
+                && Arc::strong_count(state) == 1
+        });
     }
 }
 #[cfg(test)]
@@ -1144,18 +1216,16 @@ mod tests {
 
         assert_eq!(
             states
-                .lock()
                 .get(&path)
-                .map_or(0, std::sync::Weak::strong_count),
+                .map_or(0, |state| state.strong_count()),
             2,
             "both file-cache handles must share one registered path state"
         );
         drop(first);
         assert_eq!(
             states
-                .lock()
                 .get(&path)
-                .map_or(0, std::sync::Weak::strong_count),
+                .map_or(0, |state| state.strong_count()),
             1,
             "dropping one opener must not unregister the state used by the other"
         );
@@ -1176,7 +1246,7 @@ mod tests {
 
         drop(second);
         assert!(
-            !states.lock().contains_key(&path),
+            !states.contains_key(&path),
             "the registry entry is removed when the last opener drops"
         );
     }
