@@ -3873,6 +3873,7 @@ impl CayenneTableProvider {
         let mut deleted = 0u64;
         let mut skipped_errors = 0u64;
         let mut retired_cache_paths = HashSet::new();
+        let mut retired_listing_dirs = HashSet::new();
         for full_url in to_delete {
             // Map the absolute URL back to the store-relative path for deletion.
             let Some(rel) = full_url.strip_prefix(object_store_url_str.as_str()) else {
@@ -3885,6 +3886,9 @@ impl CayenneTableProvider {
                 Ok(()) | Err(object_store::Error::NotFound { .. }) => {
                     deleted += 1;
                     retired_cache_paths.insert(path);
+                    if let Some((dir, _)) = full_url.rsplit_once('/') {
+                        retired_listing_dirs.insert(format!("{dir}/"));
+                    }
                     self.cold_gc_orphaned_first_seen.lock().remove(&full_url);
                 }
                 Err(error) => {
@@ -3904,6 +3908,15 @@ impl CayenneTableProvider {
         // superseded generations cannot occupy the bounded per-table cache.
         self.invalidate_segment_cache_paths(retired_cache_paths)
             .await;
+        // Key-delete scans build one `ListingTable` per live cold directory.
+        // A directory can contain both live manifest files and an orphan from
+        // an earlier generation, so deleting only that orphan leaves the
+        // directory in service. Evict its infinite-TTL listing after the
+        // physical delete; otherwise the next delete can try to open the now
+        // absent file even though the manifest no longer references it.
+        for dir in retired_listing_dirs {
+            Self::invalidate_list_files_cache(self.context.runtime_env(), &dir);
+        }
         if deleted > 0 || skipped_errors > 0 {
             tracing::info!(
                 target: "cayenne::compaction",
@@ -30027,7 +30040,10 @@ mod tests {
         use crate::metadata::ObjectStoreConfig;
         use object_store::memory::InMemory;
 
-        let ctx = SessionContext::new();
+        let ctx = SessionContext::new_with_config_rt(
+            SessionConfig::default(),
+            runtime_env_with_list_files_cache(),
+        );
         let temp_dir = tempfile::tempdir().expect("temp dir created");
         let metadata_dir = temp_dir.path().join("metadata");
         let data_dir = temp_dir.path().join("data");
@@ -30112,11 +30128,12 @@ mod tests {
                 .as_ref()
                 .expect("cold store config retained"),
         );
+        let cold_dir_url = format!(
+            "s3://cold-segment-cache/root/{}/data/",
+            provider.table_metadata.datalake_dir_segment()
+        );
         let cold_listing = CayenneTableProvider::create_listing_table(
-            &format!(
-                "s3://cold-segment-cache/root/{}/data/",
-                provider.table_metadata.datalake_dir_segment()
-            ),
+            &cold_dir_url,
             Arc::clone(&schema),
             provider.context().file_format(),
             &provider.pk_deletion_strategy,
@@ -30133,6 +30150,22 @@ mod tests {
             .map(RecordBatch::num_rows)
             .sum();
         assert_eq!(cold_rows, 2_000, "the copied cold object must be scanned");
+        let listing_key = TableScopedPath {
+            table: None,
+            path: ListingTableUrl::parse(&cold_dir_url)
+                .expect("cold directory URL should parse")
+                .prefix()
+                .clone(),
+        };
+        let listing_cache = ctx
+            .runtime_env()
+            .cache_manager
+            .get_list_files_cache()
+            .expect("list-files cache enabled");
+        assert!(
+            listing_cache.get(&listing_key).is_some(),
+            "the cold scan must populate the directory listing cache"
+        );
         let entries_before_gc = provider
             .context()
             .file_format()
@@ -30166,6 +30199,21 @@ mod tests {
             Some(0),
             "cold GC must evict every segment cached for the deleted object"
         );
+        assert!(
+            listing_cache.get(&listing_key).is_none(),
+            "cold GC must evict the directory listing that named the deleted object"
+        );
+        let post_gc_plan = cold_listing
+            .scan(&ctx.state(), None, &[], None)
+            .await
+            .expect("post-GC cold scan plan");
+        let post_gc_rows: usize = collect(post_gc_plan, ctx.task_ctx())
+            .await
+            .expect("post-GC cold scan must not reopen the deleted object")
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum();
+        assert_eq!(post_gc_rows, 0, "the deleted orphan must not be relisted");
     }
 
     #[tokio::test]
