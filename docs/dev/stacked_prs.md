@@ -163,24 +163,31 @@ ls-files -u <path>` shows them):
 
 ```bash
 f=<path>
-if git ls-files --stage -- "$f" | awk '{ print $1 }' | grep -qx 120000; then
+t=$(mktemp -d)                          # never fixed /tmp names — see below
+if git ls-files --stage -- ":(literal)$f" | awk '{ print $1 }' | grep -qx 120000; then
   # A symlink on ANY side — never cp onto it. A conflicted symlink's blob content is
   # its target path, so recreate the link from whichever side is right, then stage it:
-  #   ln -sfn "$(git show ":2:$f")" "$f" && git add "$f"
+  #   ln -sfn "$(git show ":2:$f")" "$f" && git add -- "$f"
   echo "SYMLINK conflict on $f — resolve by hand"
 else
-  git show ":2:$f" > /tmp/ours          # your side
-  git show ":3:$f" > /tmp/theirs        # trunk's side
-  git show "$STACKBASE:$f" > /tmp/base  # the correct base — NOT git's stage 1
-  if git merge-file -p --diff3 /tmp/ours /tmp/base /tmp/theirs > /tmp/merged; then
-    cp /tmp/merged "$f" && git add "$f"                 # clean — accept it
+  git show ":2:$f" > "$t/ours"          # your side
+  git show ":3:$f" > "$t/theirs"        # trunk's side
+  git show "$STACKBASE:$f" > "$t/base"  # the correct base — NOT git's stage 1
+  if git merge-file -p --diff3 "$t/ours" "$t/base" "$t/theirs" > "$t/merged"; then
+    cp "$t/merged" "$f" && git add -- "$f"                 # clean — accept it
   else
-    grep -n '^<<<<<<<\|^|||||||\|^>>>>>>>' /tmp/merged  # real conflict — resolve by hand first
+    grep -n '^<<<<<<<\|^|||||||\|^>>>>>>>' "$t/merged"     # real conflict — by hand first
   fi
 fi
+rm -rf "$t"                             # once you are done with this path
 ```
 
-Three things about that block. `merge-file -p` only writes the merged text to stdout —
+The intermediates go in a private `mktemp -d`, never fixed `/tmp` paths: `> /tmp/ours`
+follows a pre-existing symlink at that name and truncates whatever it points at, so a
+pasted snippet can silently destroy a file outside the repo on a shared machine.
+
+Three more things about that block. `merge-file -p` only writes the merged text to
+stdout —
 it neither updates the worktree file nor stages it, so the `cp`/`git add` are what
 actually resolve the path. The staging must be *guarded* by the exit status (0 clean,
 else the number of conflicts left): an unguarded `cp` stages conflict markers the moment
@@ -201,15 +208,19 @@ compares what the child *intended* against what the merge actually put on disk:
 
 ```bash
 # Files the child deleted that the merge brought back
-git diff --name-only --no-renames --diff-filter=D "$STACKBASE" "$PRE" |
-  while read -r f; do git ls-files --error-unmatch -- "$f" >/dev/null 2>&1 && echo "RESURRECTED $f"; done
+git diff --name-only -z --no-renames --diff-filter=D "$STACKBASE" "$PRE" |
+  while IFS= read -r -d '' f; do
+    git ls-files --error-unmatch -- ":(literal)$f" >/dev/null 2>&1 && echo "RESURRECTED $f"
+  done
 
 # Files the child added that the merge dropped
-git diff --name-only --no-renames --diff-filter=A "$STACKBASE" "$PRE" |
-  while read -r f; do git ls-files --error-unmatch -- "$f" >/dev/null 2>&1 || echo "LOST $f"; done
+git diff --name-only -z --no-renames --diff-filter=A "$STACKBASE" "$PRE" |
+  while IFS= read -r -d '' f; do
+    git ls-files --error-unmatch -- ":(literal)$f" >/dev/null 2>&1 || echo "LOST $f"
+  done
 ```
 
-Both must print nothing. Three details the checks depend on:
+Both must print nothing. Four details the checks depend on:
 
 - The comparison uses `$PRE`, the pre-merge tip. A resurrected file is no longer a
   deletion in the merge *result*, so comparing against a committed merge reports
@@ -220,6 +231,11 @@ Both must print nothing. Three details the checks depend on:
   **old path appears under neither `D` nor `A`** — the merge could restore the old path
   and this audit would print nothing. A stacked PR that carves or moves code is mostly
   renames, which is exactly the shape of the case that motivated this document.
+- `-z` and NUL-delimited reading are required for the same reason `--no-renames` is.
+  Git C-quotes any path containing a tab, newline, backslash, or non-ASCII byte —
+  `naïve.txt` prints as `"na\303\257ve.txt"` — and that quoted string is not the real
+  path, so the lookup misses and the audit says nothing. `:(literal)` keeps a path with
+  glob characters from being read as a pathspec pattern.
 - The checks query the **index**, not the filesystem, because `git commit` records the
   index. They are meant to be re-run after you correct something, and that is where a
   filesystem test fails: `rm` a resurrected file without staging the removal and
