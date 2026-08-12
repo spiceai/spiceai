@@ -1986,6 +1986,36 @@ mod test {
     use super::*;
 
     #[test]
+    fn segment_cache_budget_honours_an_explicit_value() {
+        const MIB: u64 = 1024 * 1024;
+        assert_eq!(segment_cache_budget_bytes(Some(512)), 512 * MIB);
+        // Below the derived floor on purpose: an explicit value is the operator's
+        // call, not a hint to clamp.
+        assert_eq!(segment_cache_budget_bytes(Some(16)), 16 * MIB);
+        assert_eq!(
+            segment_cache_budget_bytes(Some(0)),
+            0,
+            "zero disables segment caching"
+        );
+    }
+
+    #[test]
+    fn segment_cache_budget_default_stays_within_its_bounds() {
+        const MIB: u64 = 1024 * 1024;
+        // Derived from the host, so assert the contract rather than a figure: one
+        // shared budget between 256 MiB and 2 GiB, whatever the machine.
+        let derived = segment_cache_budget_bytes(None);
+        assert!(
+            (256 * MIB..=2048 * MIB).contains(&derived),
+            "derived budget {derived} out of bounds"
+        );
+        assert!(
+            derived.is_multiple_of(MIB),
+            "the budget is a whole number of MiB"
+        );
+    }
+
+    #[test]
     fn test_parse_memory_limit() {
         let test_cases: Vec<(Option<&str>, Option<u64>)> = vec![
             // bytes

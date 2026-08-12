@@ -476,6 +476,18 @@ impl VortexFormat {
         }
     }
 
+    /// Byte capacity of the segment cache backing this format's scans, or `None`
+    /// when scans run uncached.
+    ///
+    /// This is the whole cache's budget, not a share of it: the cache is
+    /// process-wide, so every format reports the same figure.
+    #[must_use]
+    pub fn segment_cache_capacity_bytes(&self) -> Option<u64> {
+        self.segment_cache
+            .as_ref()
+            .map(|cache| cache.capacity_bytes())
+    }
+
     /// The configured intra-write shard config, if write sharding is enabled for
     /// this format (set via [`Self::with_write_shard`]). Read-only; primarily for
     /// inspection and tests.

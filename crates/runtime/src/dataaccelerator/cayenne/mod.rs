@@ -356,6 +356,12 @@ pub fn register_cayenne_telemetry() {
     use opentelemetry::global;
     let meter = global::meter("cayenne");
 
+    // Process-wide Vortex segment cache: fill vs capacity, entries, and the
+    // access/hit counters. Registered here rather than where the cache is
+    // installed, because the cache must exist before any table is registered —
+    // well before the real meter provider replaces the startup noop one.
+    vortex_datafusion::register_process_segment_cache_metrics();
+
     // --- Process-global encode-concurrency budget ---
     let _ = meter
         .u64_observable_gauge("cayenne_encode_permits_available")
@@ -1345,13 +1351,18 @@ impl CayenneAccelerator {
                 config.cdc_mem_tier_min_flush_bytes = tier_caps.min_flush_bytes;
             }
 
-            // Vortex segment cache: memory-aware `auto` default (scales up on
-            // memory-rich hosts, never below the historical 256 MiB), overridable.
-            config.segment_cache_mb = autotune::auto_or_usize(
-                acceleration,
-                &["cayenne_segment_cache_mb"],
-                hw.segment_cache_mb(),
-            );
+            // Vortex segment cache: one cache serves every table, so its budget is
+            // set once at the runtime level and a per-table value has nothing to
+            // size. This memory-aware default only reaches a process with no
+            // installed cache (an embedded host that skips the runtime builder).
+            config.segment_cache_mb = hw.segment_cache_mb();
+            if let autotune::Knob::Set(requested_mb) =
+                autotune::read_knob(acceleration, &["cayenne_segment_cache_mb"])
+            {
+                tracing::info!(
+                    "Dataset {table_name}: acceleration.params.cayenne_segment_cache_mb={requested_mb} is no longer applied per table — the Vortex segment cache is shared by every table under one budget. Set runtime.params.cayenne_segment_cache_mb to size it. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+                );
+            }
 
             // PK keyset cache: `auto`/unset → memory-derived default; 0 → warn +
             // minimum 1 MiB (mirroring upload_concurrency); else the operator value.
@@ -2011,8 +2022,7 @@ impl CayenneAccelerator {
                     inferred_schema_present = workload.inferred_metadata.is_present(),
                     has_primary_key = workload.has_primary_key,
                     is_upsert = workload.is_upsert,
-                    "Cayenne auto-tuned config: segment_cache={}MB, pk_keyset_cache={:?}MB, target_file_size={}MB, upload_concurrency={}, write_concurrency_override={:?}, sort_columns={:?}, compression_strategy={:?}, delta_encoding={}, pk_conflict_detection={}, deletion_mode={:?}, compaction_trigger_files={}, compaction_trigger_protected_snapshots={}, compaction_trigger_snapshot_age_ms={}, compaction_max_levels={}, compaction_max_files_per_pick={}, compaction_background_interval_ms={}, inline_max_rows={}, inline_max_bytes={}, inline_max_buffer_bytes={}, inline_flush_max_rows={}, inline_flush_max_segments={}, inline_flush_max_bytes={}, cdc_durability={}, cdc_mem_tier_max_bytes={}, cdc_mem_tier_min_flush_bytes={}",
-                    config.segment_cache_mb,
+                    "Cayenne auto-tuned config: pk_keyset_cache={:?}MB, target_file_size={}MB, upload_concurrency={}, write_concurrency_override={:?}, sort_columns={:?}, compression_strategy={:?}, delta_encoding={}, pk_conflict_detection={}, deletion_mode={:?}, compaction_trigger_files={}, compaction_trigger_protected_snapshots={}, compaction_trigger_snapshot_age_ms={}, compaction_max_levels={}, compaction_max_files_per_pick={}, compaction_background_interval_ms={}, inline_max_rows={}, inline_max_bytes={}, inline_max_buffer_bytes={}, inline_flush_max_rows={}, inline_flush_max_segments={}, inline_flush_max_bytes={}, cdc_durability={}, cdc_mem_tier_max_bytes={}, cdc_mem_tier_min_flush_bytes={}",
                     config.pk_keyset_cache_mb,
                     config.target_vortex_file_size_mb,
                     config.upload_concurrency,
@@ -2679,8 +2689,7 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
             .one_of(&["string", "error", "ignore", "warn"])
             .default("string"),
         ParameterSpec::component("segment_cache_mb")
-            .description("Size of the in-memory Vortex decompressed-segment cache in MB. 'auto' (default, or when unset) scales with machine memory (~1/128 of RAM) but never below 256 MB and never above 1024 MB. Set an explicit MB value to override.")
-            .default("auto"),
+            .description("Deprecated and no longer applied per table: the in-memory Vortex decompressed-segment cache is shared by every Cayenne table under a single budget. Set runtime.params.cayenne_segment_cache_mb to size it (unset: ~1/64 of the available memory, clamped to [256 MB, 2048 MB]; 0 disables caching). A value set here is ignored with a log line."),
         ParameterSpec::component("pk_keyset_cache_mb")
             .description("Byte budget (in MB) for the in-memory primary-key index used to detect upsert conflicts during CDC ingestion. Within budget an exact keyset is kept; over budget, upsert tables fall back to a bounded bloom existence filter (avoiding the per-batch full-table rebuild) while DoNothing tables rebuild from a scan. When unset, an optimal default is derived from available machine memory."),
         ParameterSpec::component("target_file_size_mb")

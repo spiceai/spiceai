@@ -43,6 +43,10 @@ static PROCESS_METRICS: OnceLock<SegmentCacheMetrics> = OnceLock::new();
 ///
 /// Returns `false` when a cache is already installed (the existing one keeps its
 /// capacity) or when `max_capacity_bytes` is zero, which disables caching.
+///
+/// Metrics are registered separately by [`register_process_segment_cache_metrics`]:
+/// the cache has to exist before any table is registered, which is earlier than
+/// the point where the real meter provider is in place.
 pub fn install_process_segment_cache(max_capacity_bytes: u64) -> bool {
     if max_capacity_bytes == 0 {
         return false;
@@ -51,14 +55,24 @@ pub fn install_process_segment_cache(max_capacity_bytes: u64) -> bool {
     // from repopulating a retired path, the per-put cost is one atomic load, and
     // read-only formats share this cache with mutable ones.
     let cache = Arc::new(SharedSegmentCache::new(max_capacity_bytes, true));
-    if PROCESS_CACHE.set(Arc::clone(&cache)).is_err() {
-        return false;
-    }
+    PROCESS_CACHE.set(cache).is_ok()
+}
+
+/// Register the installed cache's observable instruments.
+///
+/// Call this **after** the process meter provider is final. Instruments bind to
+/// whichever provider is current when they are built, so registering during
+/// startup would attach them to the early noop provider and they would never
+/// report — the same ordering constraint the other Cayenne operator gauges
+/// document. No-op when no cache is installed or metrics are already registered.
+pub fn register_process_segment_cache_metrics() {
+    let Some(cache) = PROCESS_CACHE.get() else {
+        return;
+    };
     let _ = PROCESS_METRICS.set(SegmentCacheMetrics::register(
         &global::meter("cayenne_segment_cache"),
-        &cache,
+        cache,
     ));
-    true
 }
 
 /// The installed process-wide cache, or `None` when segment caching is disabled.
@@ -201,6 +215,10 @@ impl SharedSegmentCache {
             hits: AtomicU64::new(0),
             last_observed_accesses: Mutex::new(0),
         }
+    }
+
+    pub(crate) fn capacity_bytes(&self) -> u64 {
+        self.capacity_bytes
     }
 
     fn observe_accesses(&self, observe: impl FnOnce(u64)) {
@@ -422,8 +440,7 @@ mod tests {
 
     struct MetricsHarness {
         registry: prometheus::Registry,
-        _provider: SdkMeterProvider,
-        metrics: SegmentCacheMetrics,
+        provider: SdkMeterProvider,
     }
 
     impl MetricsHarness {
@@ -441,22 +458,21 @@ mod tests {
                 .with_resource(Resource::builder_empty().build())
                 .with_reader(exporter)
                 .build();
-            let metrics = SegmentCacheMetrics::new(&provider.meter("cayenne_segment_cache_test"));
-
             Self {
                 registry,
-                _provider: provider,
-                metrics,
+                provider,
             }
         }
 
-        fn cache(&self, capacity_bytes: u64, dataset: &str) -> SharedSegmentCache {
-            SharedSegmentCache::new_registered(
-                capacity_bytes,
-                Some(Arc::from(dataset)),
-                false,
-                &self.metrics,
-            )
+        /// One cache with instruments registered against it. The returned
+        /// `SegmentCacheMetrics` must be held for as long as the test collects.
+        fn cache(&self, capacity_bytes: u64) -> (Arc<SharedSegmentCache>, SegmentCacheMetrics) {
+            let cache = Arc::new(SharedSegmentCache::new(capacity_bytes, false));
+            let metrics = SegmentCacheMetrics::register(
+                &self.provider.meter("cayenne_segment_cache_test"),
+                &cache,
+            );
+            (cache, metrics)
         }
 
         fn gather(&self) -> MetricSamples {
@@ -491,9 +507,8 @@ mod tests {
 
     struct DeltaMetricsHarness {
         registry: prometheus::Registry,
-        _provider: SdkMeterProvider,
+        provider: SdkMeterProvider,
         reader: SharedManualReader,
-        metrics: SegmentCacheMetrics,
     }
 
     impl DeltaMetricsHarness {
@@ -517,30 +532,27 @@ mod tests {
                 .with_reader(exporter)
                 .with_reader(reader.clone())
                 .build();
-            let metrics = SegmentCacheMetrics::new(&provider.meter("segment_cache_delta_test"));
-
             Self {
                 registry,
-                _provider: provider,
+                provider,
                 reader,
-                metrics,
             }
         }
 
-        fn cache(&self, capacity_bytes: u64, dataset: &str) -> SharedSegmentCache {
-            SharedSegmentCache::new_registered(
-                capacity_bytes,
-                Some(Arc::from(dataset)),
-                false,
-                &self.metrics,
-            )
+        fn cache(&self, capacity_bytes: u64) -> (Arc<SharedSegmentCache>, SegmentCacheMetrics) {
+            let cache = Arc::new(SharedSegmentCache::new(capacity_bytes, false));
+            let metrics = SegmentCacheMetrics::register(
+                &self.provider.meter("segment_cache_delta_test"),
+                &cache,
+            );
+            (cache, metrics)
         }
 
         fn gather(&self) -> MetricSamples {
             MetricSamples::from_registry(&self.registry)
         }
 
-        fn collect_accesses(&self, dataset: &str) -> Option<u64> {
+        fn collect_accesses(&self) -> Option<u64> {
             let mut resource_metrics = ResourceMetrics::default();
             self.reader
                 .collect(&mut resource_metrics)
@@ -554,11 +566,7 @@ mod tests {
                 let AggregatedMetrics::U64(MetricData::Sum(sum)) = metric.data() else {
                     panic!("segment-cache accesses must be a u64 sum");
                 };
-                if let Some(point) = sum.data_points().find(|point| {
-                    point.attributes().any(|attribute| {
-                        attribute.key.as_str() == "dataset" && attribute.value.as_str() == dataset
-                    })
-                }) {
+                if let Some(point) = sum.data_points().next() {
                     return Some(point.value());
                 }
             }
@@ -568,8 +576,8 @@ mod tests {
     }
 
     struct MetricSamples {
-        values: HashMap<(String, String), (MetricType, f64)>,
-        series_counts: HashMap<(String, String), usize>,
+        values: HashMap<String, (MetricType, f64)>,
+        series_counts: HashMap<String, usize>,
     }
 
     impl MetricSamples {
@@ -584,17 +592,16 @@ mod tests {
             {
                 let metric_type = family.get_field_type();
                 for metric in family.get_metric() {
-                    let dataset = metric
-                        .get_label()
-                        .iter()
-                        .find(|label| label.name() == "dataset")
-                        .map_or_else(String::new, |label| label.value().to_string());
+                    assert!(
+                        metric.get_label().is_empty(),
+                        "the segment cache is process-wide, so its series carry no labels"
+                    );
                     let value = match metric_type {
                         MetricType::COUNTER => metric.get_counter().value(),
                         MetricType::GAUGE => metric.get_gauge().value(),
                         other => panic!("unexpected segment-cache metric type {other:?}"),
                     };
-                    let key = (family.name().to_string(), dataset);
+                    let key = family.name().to_string();
                     *series_counts.entry(key.clone()).or_insert(0) += 1;
                     values.insert(key, (metric_type, value));
                 }
@@ -606,18 +613,12 @@ mod tests {
             }
         }
 
-        fn assert_value(
-            &self,
-            metric: &str,
-            dataset: &str,
-            metric_type: MetricType,
-            expected: u32,
-        ) {
-            let key = (metric.to_string(), dataset.to_string());
+        fn assert_value(&self, metric: &str, metric_type: MetricType, expected: u32) {
+            let key = metric.to_string();
             let actual = self
                 .values
                 .get(&key)
-                .unwrap_or_else(|| panic!("missing metric {metric} for dataset {dataset}"));
+                .unwrap_or_else(|| panic!("missing metric {metric}"));
             assert_eq!(actual.0, metric_type, "wrong type for {metric}");
             assert!(
                 (actual.1 - f64::from(expected)).abs() < f64::EPSILON,
@@ -627,26 +628,21 @@ mod tests {
             assert_eq!(
                 self.series_counts.get(&key),
                 Some(&1),
-                "metric {metric} must have one series for dataset {dataset}"
+                "metric {metric} must have exactly one series"
             );
         }
 
-        fn assert_live_gauges_absent(&self, dataset: &str) {
+        fn assert_absent(&self) {
             assert!(
-                self.values.keys().all(|(metric, label)| {
-                    label != dataset
-                        || matches!(
-                            metric.as_str(),
-                            "cayenne_segment_cache_accesses" | "cayenne_segment_cache_hits"
-                        )
-                }),
-                "retired dataset {dataset} must not report live cache gauges"
+                self.values.is_empty(),
+                "no segment-cache series should be reported, found {:?}",
+                self.values.keys().collect::<Vec<_>>()
             );
         }
     }
 
     async fn settle_cache_bookkeeping(cache: &SharedSegmentCache) {
-        cache.state.cache.run_pending_tasks().await;
+        cache.cache.run_pending_tasks().await;
     }
 
     #[tokio::test]
@@ -701,7 +697,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_put_roundtrip_and_path_isolation() {
-        let shared = SharedSegmentCache::new(1 << 20, None, false);
+        let shared = Arc::new(SharedSegmentCache::new(1 << 20, false));
         let cache_a = shared.for_path(Path::from("a.vortex"));
         let cache_b = shared.for_path(Path::from("b.vortex"));
         let id = SegmentId::from(1);
@@ -745,36 +741,31 @@ mod tests {
     #[test]
     fn metrics_report_initial_zero_state() {
         let harness = MetricsHarness::new();
-        let _cache = harness.cache(2_048, "initial_state");
+        let (_cache, _metrics) = harness.cache(2_048);
 
         let samples = harness.gather();
         samples.assert_value(
             "cayenne_segment_cache_accesses",
-            "initial_state",
             MetricType::COUNTER,
             0,
         );
         samples.assert_value(
             "cayenne_segment_cache_hits",
-            "initial_state",
             MetricType::COUNTER,
             0,
         );
         samples.assert_value(
             "cayenne_segment_cache_weighted_bytes",
-            "initial_state",
             MetricType::GAUGE,
             0,
         );
         samples.assert_value(
             "cayenne_segment_cache_capacity_bytes",
-            "initial_state",
             MetricType::GAUGE,
             2_048,
         );
         samples.assert_value(
             "cayenne_segment_cache_entries",
-            "initial_state",
             MetricType::GAUGE,
             0,
         );
@@ -782,7 +773,7 @@ mod tests {
 
     #[test]
     fn counter_callbacks_cannot_publish_hits_ahead_of_accesses() {
-        let counters = SegmentCacheCounters::new("callback_order");
+        let counters = SharedSegmentCache::new(1_024, false);
         counters.accesses.store(1, Ordering::Relaxed);
         counters.hits.store(1, Ordering::Relaxed);
 
@@ -805,9 +796,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn metrics_update_below_sampling_threshold_without_clone_duplicates() {
+    async fn metrics_are_visible_after_a_handful_of_accesses() {
         let harness = MetricsHarness::new();
-        let shared = harness.cache(1_024, "active");
+        let (shared, _metrics) = harness.cache(1_024);
         let cache = shared.for_path(Path::from("active.vortex"));
         let id_one = SegmentId::from(1);
         let id_two = SegmentId::from(2);
@@ -835,31 +826,26 @@ mod tests {
         let first = harness.gather();
         first.assert_value(
             "cayenne_segment_cache_accesses",
-            "active",
             MetricType::COUNTER,
             2,
         );
         first.assert_value(
             "cayenne_segment_cache_hits",
-            "active",
             MetricType::COUNTER,
             1,
         );
         first.assert_value(
             "cayenne_segment_cache_weighted_bytes",
-            "active",
             MetricType::GAUGE,
             4,
         );
         first.assert_value(
             "cayenne_segment_cache_entries",
-            "active",
             MetricType::GAUGE,
             1,
         );
 
-        // A second path wrapper clones the shared cache but must not register a
-        // second observation of the same dataset.
+        // A second path wrapper over the same cache must not add a second series.
         let cache_clone = shared.for_path(Path::from("active.vortex"));
         assert!(
             cache_clone
@@ -884,426 +870,115 @@ mod tests {
         let second = harness.gather();
         second.assert_value(
             "cayenne_segment_cache_accesses",
-            "active",
             MetricType::COUNTER,
             4,
         );
         second.assert_value(
             "cayenne_segment_cache_hits",
-            "active",
             MetricType::COUNTER,
             2,
         );
         second.assert_value(
             "cayenne_segment_cache_weighted_bytes",
-            "active",
             MetricType::GAUGE,
             7,
         );
         second.assert_value(
             "cayenne_segment_cache_entries",
-            "active",
             MetricType::GAUGE,
             2,
-        );
-    }
-
-    #[tokio::test]
-    async fn metrics_keep_datasets_separate() {
-        let harness = MetricsHarness::new();
-        let alpha = harness.cache(1_024, "alpha");
-        let beta = harness.cache(4_096, "beta");
-        let alpha_path = alpha.for_path(Path::from("alpha.vortex"));
-        let beta_path = beta.for_path(Path::from("beta.vortex"));
-        let id = SegmentId::from(1);
-
-        assert!(
-            alpha_path
-                .get(id)
-                .await
-                .expect("alpha cache miss")
-                .is_none()
-        );
-        alpha_path
-            .put(id, ByteBuffer::from(vec![1_u8; 11]))
-            .await
-            .expect("insert alpha segment");
-        settle_cache_bookkeeping(&alpha).await;
-        assert!(alpha_path.get(id).await.expect("alpha cache hit").is_some());
-        assert!(beta_path.get(id).await.expect("beta cache miss").is_none());
-
-        let samples = harness.gather();
-        samples.assert_value(
-            "cayenne_segment_cache_accesses",
-            "alpha",
-            MetricType::COUNTER,
-            2,
-        );
-        samples.assert_value(
-            "cayenne_segment_cache_hits",
-            "alpha",
-            MetricType::COUNTER,
-            1,
-        );
-        samples.assert_value(
-            "cayenne_segment_cache_weighted_bytes",
-            "alpha",
-            MetricType::GAUGE,
-            11,
-        );
-        samples.assert_value(
-            "cayenne_segment_cache_capacity_bytes",
-            "alpha",
-            MetricType::GAUGE,
-            1_024,
-        );
-        samples.assert_value(
-            "cayenne_segment_cache_accesses",
-            "beta",
-            MetricType::COUNTER,
-            1,
-        );
-        samples.assert_value("cayenne_segment_cache_hits", "beta", MetricType::COUNTER, 0);
-        samples.assert_value(
-            "cayenne_segment_cache_weighted_bytes",
-            "beta",
-            MetricType::GAUGE,
-            0,
-        );
-        samples.assert_value(
-            "cayenne_segment_cache_capacity_bytes",
-            "beta",
-            MetricType::GAUGE,
-            4_096,
-        );
-    }
-
-    #[tokio::test]
-    async fn metrics_aggregate_same_dataset_caches_without_counter_resets() {
-        let harness = MetricsHarness::new();
-        let primary = harness.cache(1_024, "shared");
-        let cache = primary.for_path(Path::from("primary.vortex"));
-        let id = SegmentId::from(1);
-
-        assert!(cache.get(id).await.expect("primary cache miss").is_none());
-        cache
-            .put(id, ByteBuffer::from(vec![1_u8, 2, 3, 4]))
-            .await
-            .expect("insert primary segment");
-        settle_cache_bookkeeping(&primary).await;
-        assert!(cache.get(id).await.expect("primary cache hit").is_some());
-
-        let before = harness.gather();
-        before.assert_value(
-            "cayenne_segment_cache_accesses",
-            "shared",
-            MetricType::COUNTER,
-            2,
-        );
-        before.assert_value(
-            "cayenne_segment_cache_hits",
-            "shared",
-            MetricType::COUNTER,
-            1,
-        );
-
-        let overlapping = harness.cache(4_096, "shared");
-        assert!(
-            Arc::ptr_eq(&primary.dataset_metrics, &overlapping.dataset_metrics),
-            "same-label cache instances must share monotonic counters"
-        );
-        let during = harness.gather();
-        during.assert_value(
-            "cayenne_segment_cache_accesses",
-            "shared",
-            MetricType::COUNTER,
-            2,
-        );
-        during.assert_value(
-            "cayenne_segment_cache_hits",
-            "shared",
-            MetricType::COUNTER,
-            1,
-        );
-        during.assert_value(
-            "cayenne_segment_cache_weighted_bytes",
-            "shared",
-            MetricType::GAUGE,
-            4,
-        );
-        during.assert_value(
-            "cayenne_segment_cache_capacity_bytes",
-            "shared",
-            MetricType::GAUGE,
-            5_120,
-        );
-        during.assert_value(
-            "cayenne_segment_cache_entries",
-            "shared",
-            MetricType::GAUGE,
-            1,
-        );
-
-        drop(overlapping);
-        let after = harness.gather();
-        after.assert_value(
-            "cayenne_segment_cache_accesses",
-            "shared",
-            MetricType::COUNTER,
-            2,
-        );
-        after.assert_value(
-            "cayenne_segment_cache_hits",
-            "shared",
-            MetricType::COUNTER,
-            1,
-        );
-        after.assert_value(
-            "cayenne_segment_cache_capacity_bytes",
-            "shared",
-            MetricType::GAUGE,
-            1_024,
         );
     }
 
     #[tokio::test]
     async fn metrics_report_unsettled_moka_estimates_without_flushing() {
         let harness = MetricsHarness::new();
-        let shared = harness.cache(1_024, "unsettled");
+        let (shared, _metrics) = harness.cache(1_024);
         let cache = shared.for_path(Path::from("unsettled.vortex"));
         cache
             .put(SegmentId::from(1), ByteBuffer::from(vec![1_u8; 9]))
             .await
             .expect("insert unsettled segment");
 
-        let expected_weighted_bytes = u32::try_from(shared.state.cache.weighted_size())
+        let expected_weighted_bytes = u32::try_from(shared.cache.weighted_size())
             .expect("test cache weighted size fits in u32");
-        let expected_entries = u32::try_from(shared.state.cache.entry_count())
+        let expected_entries = u32::try_from(shared.cache.entry_count())
             .expect("test cache entry count fits in u32");
         let samples = harness.gather();
         samples.assert_value(
             "cayenne_segment_cache_weighted_bytes",
-            "unsettled",
             MetricType::GAUGE,
             expected_weighted_bytes,
         );
         samples.assert_value(
             "cayenne_segment_cache_entries",
-            "unsettled",
             MetricType::GAUGE,
             expected_entries,
         );
     }
 
     #[test]
-    fn metrics_stop_after_cache_drop() {
+    fn metrics_stop_reporting_once_the_cache_is_dropped() {
         let harness = MetricsHarness::new();
-        let shared = harness.cache(1_024, "retired");
-        let state = Arc::downgrade(&shared.state);
+        let (shared, _metrics) = harness.cache(1_024);
+        let weak = Arc::downgrade(&shared);
         let cache = shared.for_path(Path::from("retired.vortex"));
 
-        let present = harness.gather();
-        present.assert_value(
-            "cayenne_segment_cache_capacity_bytes",
-            "retired",
-            MetricType::GAUGE,
-            1_024,
-        );
+        harness
+            .gather()
+            .assert_value("cayenne_segment_cache_capacity_bytes", MetricType::GAUGE, 1_024);
 
         drop(cache);
         drop(shared);
         assert!(
-            state.upgrade().is_none(),
+            weak.upgrade().is_none(),
             "observable callbacks must not keep the cache alive"
         );
 
+        // Every series stops, counters included. The process cache lives in a
+        // `OnceLock` for the process lifetime, so this only happens to a private
+        // cache — and reporting nothing for a cache that no longer exists beats
+        // freezing its last value, which would read as a live-but-idle cache.
         let retired = harness.gather();
-        retired.assert_live_gauges_absent("retired");
-        retired.assert_value(
-            "cayenne_segment_cache_accesses",
-            "retired",
-            MetricType::COUNTER,
-            0,
-        );
-        retired.assert_value(
-            "cayenne_segment_cache_hits",
-            "retired",
-            MetricType::COUNTER,
-            0,
-        );
+        retired.assert_absent();
     }
 
     #[tokio::test]
-    async fn counters_remain_monotonic_after_full_dataset_recreation() {
-        let harness = MetricsHarness::new();
-        let shared = harness.cache(1_024, "recreated");
-        let cache = shared.for_path(Path::from("before.vortex"));
-        let id = SegmentId::from(1);
-
-        assert!(
-            cache
-                .get(id)
-                .await
-                .expect("cache miss before drop")
-                .is_none()
-        );
-        cache
-            .put(id, ByteBuffer::from(vec![1_u8; 4]))
-            .await
-            .expect("insert before drop");
-        assert!(
-            cache
-                .get(id)
-                .await
-                .expect("cache hit before drop")
-                .is_some()
-        );
-
-        let before = harness.gather();
-        before.assert_value(
-            "cayenne_segment_cache_accesses",
-            "recreated",
-            MetricType::COUNTER,
-            2,
-        );
-        before.assert_value(
-            "cayenne_segment_cache_hits",
-            "recreated",
-            MetricType::COUNTER,
-            1,
-        );
-
-        drop(cache);
-        drop(shared);
-        let retired = harness.gather();
-        retired.assert_live_gauges_absent("recreated");
-        retired.assert_value(
-            "cayenne_segment_cache_accesses",
-            "recreated",
-            MetricType::COUNTER,
-            2,
-        );
-
-        let recreated = harness.cache(2_048, "recreated");
-        let recreated_cache = recreated.for_path(Path::from("after.vortex"));
-        let resumed = harness.gather();
-        resumed.assert_value(
-            "cayenne_segment_cache_accesses",
-            "recreated",
-            MetricType::COUNTER,
-            2,
-        );
-        resumed.assert_value(
-            "cayenne_segment_cache_hits",
-            "recreated",
-            MetricType::COUNTER,
-            1,
-        );
-        assert!(
-            recreated_cache
-                .get(SegmentId::from(2))
-                .await
-                .expect("cache miss after recreation")
-                .is_none()
-        );
-        let after = harness.gather();
-        after.assert_value(
-            "cayenne_segment_cache_accesses",
-            "recreated",
-            MetricType::COUNTER,
-            3,
-        );
-        after.assert_value(
-            "cayenne_segment_cache_hits",
-            "recreated",
-            MetricType::COUNTER,
-            1,
-        );
-    }
-
-    #[tokio::test]
-    async fn delta_counter_stays_safe_when_another_reader_observes_a_dataset_gap() {
+    async fn a_delta_reader_sees_the_live_cache_and_nothing_after_it_drops() {
         let harness = DeltaMetricsHarness::new();
-        let shared = harness.cache(1_024, "delta_recreated");
-        let cache = shared.for_path(Path::from("before.vortex"));
+        let (shared, _metrics) = harness.cache(1_024);
+        let cache = shared.for_path(Path::from("delta.vortex"));
         let id = SegmentId::from(1);
 
-        assert!(
-            cache
-                .get(id)
-                .await
-                .expect("cache miss before drop")
-                .is_none()
-        );
+        assert!(cache.get(id).await.expect("cache miss").is_none());
         cache
             .put(id, ByteBuffer::from(vec![1_u8; 4]))
             .await
-            .expect("insert before drop");
-        assert!(
-            cache
-                .get(id)
-                .await
-                .expect("cache hit before drop")
-                .is_some()
+            .expect("insert");
+        assert!(cache.get(id).await.expect("cache hit").is_some());
+
+        assert_eq!(
+            harness.collect_accesses(),
+            Some(2),
+            "a delta reader collects the accesses recorded so far"
         );
-        harness.gather().assert_value(
-            "cayenne_segment_cache_accesses",
-            "delta_recreated",
-            MetricType::COUNTER,
-            2,
-        );
-        assert_eq!(harness.collect_accesses("delta_recreated"), Some(2));
 
         drop(cache);
         drop(shared);
-        // A callback run by one reader writes observations to every SDK
-        // pipeline, so another reader can have one already-buffered live gauge
-        // sample. Its first collection drains that sample; the next collection
-        // proves the retired cache is no longer contributing observations.
-        let buffered = harness.gather();
-        buffered.assert_value(
-            "cayenne_segment_cache_accesses",
-            "delta_recreated",
-            MetricType::COUNTER,
-            2,
-        );
-        let retired = harness.gather();
-        retired.assert_live_gauges_absent("delta_recreated");
-        retired.assert_value(
-            "cayenne_segment_cache_accesses",
-            "delta_recreated",
-            MetricType::COUNTER,
-            2,
-        );
-        assert_eq!(harness.collect_accesses("delta_recreated"), Some(0));
-
-        let recreated = harness.cache(2_048, "delta_recreated");
-        let recreated_cache = recreated.for_path(Path::from("after.vortex"));
-        assert!(
-            recreated_cache
-                .get(SegmentId::from(2))
-                .await
-                .expect("cache miss after recreation")
-                .is_none()
-        );
-        harness.gather().assert_value(
-            "cayenne_segment_cache_accesses",
-            "delta_recreated",
-            MetricType::COUNTER,
-            3,
-        );
+        // A callback run for one reader writes observations to every SDK
+        // pipeline, so the other reader may still hold one buffered sample; its
+        // first collection drains it.
+        let _buffered = harness.gather();
         assert_eq!(
-            harness.collect_accesses("delta_recreated"),
-            Some(1),
-            "one reader's gap collection must not reset the absolute total seen by a delta reader"
+            harness.collect_accesses(),
+            None,
+            "a dropped cache contributes no further observations"
         );
     }
-
-
 
     #[tokio::test]
     async fn invalidates_exact_paths_only() {
-        let shared = SharedSegmentCache::new(1 << 20, Some(Arc::from("test")), true);
+        let shared = Arc::new(SharedSegmentCache::new(1 << 20, true));
         let path_a = Path::from("snapshot-a/a.vortex");
         let path_b = Path::from("snapshot-b/b.vortex");
         let cache_a = shared.for_path(path_a.clone());
@@ -1355,7 +1030,7 @@ mod tests {
 
     #[tokio::test]
     async fn invalidation_physically_evicts_entries_without_later_cache_activity() {
-        let shared = SharedSegmentCache::new(1 << 20, Some(Arc::from("test")), true);
+        let shared = Arc::new(SharedSegmentCache::new(1 << 20, true));
         let retired_path = Path::from("snapshot-a/retired.vortex");
         let live_path = Path::from("snapshot-b/live.vortex");
         let retired = shared.for_path(retired_path.clone());
@@ -1378,7 +1053,7 @@ mod tests {
         }
         shared.run_pending_tasks().await;
         assert_eq!(
-            shared.state.cache.entry_count(),
+            shared.cache.entry_count(),
             258,
             "retired, live, and more than one maintenance batch of unrelated paths should be resident"
         );
@@ -1386,7 +1061,7 @@ mod tests {
         shared.invalidate_paths(HashSet::from([retired_path])).await;
 
         assert_eq!(
-            shared.state.cache.entry_count(),
+            shared.cache.entry_count(),
             257,
             "invalidation must physically evict only the retired buffers before it returns"
         );
@@ -1394,7 +1069,7 @@ mod tests {
 
     #[tokio::test]
     async fn path_state_stays_registered_until_the_last_open_file_drops() {
-        let shared = SharedSegmentCache::new(1 << 20, Some(Arc::from("test")), true);
+        let shared = Arc::new(SharedSegmentCache::new(1 << 20, true));
         let path = Path::from("snapshot/shared.vortex");
         let first = shared.for_path(path.clone());
         let second = shared.for_path(path.clone());

@@ -20,7 +20,7 @@ pub use format::VortexFormat;
 pub use format::VortexFormatFactory;
 pub use format::VortexTableOptions;
 pub use format::WriteShardConfig;
-pub use segment_cache::install_process_segment_cache;
+pub use segment_cache::{install_process_segment_cache, register_process_segment_cache_metrics};
 pub use source::VortexSource;
 
 #[cfg(test)]
