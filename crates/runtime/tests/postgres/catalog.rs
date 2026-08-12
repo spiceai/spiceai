@@ -577,7 +577,7 @@ async fn test_unsupported_type_action_override_drops_table() -> Result<(), anyho
 ///
 /// An unqualified `version()` would resolve through `search_path`, letting a
 /// `public.version()` in the source — which a user may define for any reason —
-/// decide the classification. That is the regression this guards: a PostgreSQL
+/// decide the classification. That is the regression this guards: a `PostgreSQL`
 /// server misread as Redshift makes discovery issue `SHOW COLUMNS`, which it
 /// cannot answer, so every table fails to resolve.
 ///
@@ -652,7 +652,7 @@ struct RecordingRead {
 }
 
 impl RecordingRead {
-    fn from_supplied_schema(&self) -> Vec<String> {
+    fn built_from_supplied_schema(&self) -> Vec<String> {
         self.from_supplied_schema
             .lock()
             .expect("mutex should not be poisoned")
@@ -756,7 +756,7 @@ async fn test_bulk_schema_resolution_honors_unsupported_type_action() -> Result<
 
             assert!(
                 recorder
-                    .from_supplied_schema()
+                    .built_from_supplied_schema()
                     .contains(&"widgets_jsonb".to_string()),
                 "the jsonb table should have been built from the schema-wide lookup,                  not by resolving its own schema; resolved individually: {:?}",
                 recorder.self_resolved()

@@ -820,33 +820,33 @@ mod tests {
 
     #[derive(Debug)]
     struct MockRead {
-        fail_tables: HashSet<String>,
-        seen_tables: Mutex<Vec<String>>,
+        failing: HashSet<String>,
+        requested: Mutex<Vec<String>>,
         /// Tables built from a caller-supplied schema, so a test can tell which
         /// construction path each one took.
-        supplied_schema_tables: Mutex<Vec<String>>,
+        built_from_schema: Mutex<Vec<String>>,
     }
 
     impl MockRead {
-        fn new(fail_tables: HashSet<String>) -> Self {
+        fn new(failing: HashSet<String>) -> Self {
             Self {
-                fail_tables,
-                seen_tables: Mutex::new(Vec::new()),
-                supplied_schema_tables: Mutex::new(Vec::new()),
+                failing,
+                requested: Mutex::new(Vec::new()),
+                built_from_schema: Mutex::new(Vec::new()),
             }
         }
 
         fn supplied_schema_tables(&self) -> Vec<String> {
-            self.supplied_schema_tables
+            self.built_from_schema
                 .lock()
-                .expect("supplied_schema_tables mutex should not be poisoned")
+                .expect("built_from_schema mutex should not be poisoned")
                 .clone()
         }
 
         fn seen_tables(&self) -> Vec<String> {
-            self.seen_tables
+            self.requested
                 .lock()
-                .expect("seen_tables mutex should not be poisoned")
+                .expect("requested mutex should not be poisoned")
                 .clone()
         }
     }
@@ -866,12 +866,12 @@ mod tests {
             };
 
             let full_name = format!("{schema}.{table}");
-            self.seen_tables
+            self.requested
                 .lock()
-                .expect("seen_tables mutex should not be poisoned")
+                .expect("requested mutex should not be poisoned")
                 .push(full_name.clone());
 
-            if self.fail_tables.contains(&full_name) {
+            if self.failing.contains(&full_name) {
                 return Err("simulated table provider creation failure".into());
             }
 
@@ -884,9 +884,9 @@ mod tests {
             _schema: SchemaRef,
         ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>>
         {
-            self.supplied_schema_tables
+            self.built_from_schema
                 .lock()
-                .expect("supplied_schema_tables mutex should not be poisoned")
+                .expect("built_from_schema mutex should not be poisoned")
                 .push(table_reference.table().to_string());
             self.table_provider(table_reference).await
         }
@@ -1063,9 +1063,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_build_table_providers_skips_failed_table_provider_creation() {
-        let mut fail_tables = HashSet::new();
-        fail_tables.insert("public.orders".to_string());
-        let read = Arc::new(MockRead::new(fail_tables));
+        let mut failing = HashSet::new();
+        failing.insert("public.orders".to_string());
+        let read = Arc::new(MockRead::new(failing));
         let table_creator: Arc<dyn Read> = Arc::<MockRead>::clone(&read);
         let no_fks: ForeignKeyMap = HashMap::new();
         let no_comments: CommentMap = HashMap::new();
@@ -1093,9 +1093,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_build_table_providers_returns_empty_when_all_factory_calls_fail() {
-        let fail_tables =
+        let failing =
             HashSet::from(["public.orders".to_string(), "public.lineitem".to_string()]);
-        let read = Arc::new(MockRead::new(fail_tables));
+        let read = Arc::new(MockRead::new(failing));
         let table_creator: Arc<dyn Read> = Arc::<MockRead>::clone(&read);
         let no_fks: ForeignKeyMap = HashMap::new();
         let no_comments: CommentMap = HashMap::new();
