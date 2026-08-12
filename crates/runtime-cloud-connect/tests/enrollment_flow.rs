@@ -106,9 +106,8 @@ async fn start_rejects_a_persisted_public_key_that_does_not_match_the_mtls_ident
     );
     let runtime: Arc<dyn RuntimeHandle> =
         Arc::new(runtime_cloud_connect::handlers::NoopRuntimeHandle);
-    let error = match runtime_cloud_connect::CloudConnect::start(config, runtime).await {
-        Ok(_) => panic!("startup must fail closed before advertising a mismatched public key"),
-        Err(error) => error,
+    let Err(error) = runtime_cloud_connect::CloudConnect::start(config, runtime).await else {
+        panic!("startup must fail closed before advertising a mismatched public key");
     };
     assert!(
         matches!(
