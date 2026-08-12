@@ -48,7 +48,7 @@ use async_trait::async_trait;
 use axum::{Json, Router, extract::State, http::StatusCode, routing::post};
 use runtime_cloud_connect::config::CloudConnectConfig;
 use runtime_cloud_connect::handlers::{
-    ApplyOutcome, Capability, CommandError, RuntimeHandle, SpicepodDeployment,
+    Capability, CommandError, RuntimeHandle, SpicepodDeployment,
 };
 use runtime_cloud_connect::identity::IdentityStore;
 use runtime_cloud_connect::proto;
@@ -172,7 +172,7 @@ impl RuntimeHandle for CapturedRuntime {
     async fn apply_spicepod(
         &self,
         deployment: SpicepodDeployment<'_>,
-    ) -> Result<ApplyOutcome, CommandError> {
+    ) -> Result<serde_json::Value, CommandError> {
         let path = deployment
             .config_dir
             .join(runtime_cloud_connect::config::CLOUD_MANAGED_SPICEPOD_FILE);
@@ -185,11 +185,7 @@ impl RuntimeHandle for CapturedRuntime {
             spicepod_yaml: deployment.spicepod_yaml.to_string(),
             app_id: deployment.app_id.map(str::to_string),
         });
-        // `settled`, not `exit_to_apply`: this handle has no process to restart,
-        // and asking the client to exit would take the test process with it.
-        Ok(ApplyOutcome::settled(
-            serde_json::json!({ "path": path.display().to_string() }),
-        ))
+        Ok(serde_json::json!({ "path": path.display().to_string() }))
     }
 }
 

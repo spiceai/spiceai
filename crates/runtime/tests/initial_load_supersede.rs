@@ -14,14 +14,15 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! `Runtime::supersede_initial_load` — the escape hatch that lets a
-//! control-plane deployment stop a component load that will not finish.
+//! The two ways out of an initial component load that will not finish:
+//! `Runtime::wait_for_initial_load`, which waits for it under a bound of the
+//! caller's choosing, and `Runtime::supersede_initial_load`, which abandons it.
 //!
-//! The initial load has no deadline: `load_dataset` retries a transient failure
-//! for as long as the runtime is up. Spice Cloud Connect starts before the load
-//! for exactly that reason, and a deployment arriving mid-load abandons it
-//! rather than letting it keep registering datasets from the configuration it
-//! is restarting away from.
+//! The load has no deadline of its own: `load_dataset` retries a transient
+//! failure for as long as the runtime is up. Spice Cloud Connect starts before
+//! the load for exactly that reason, and a deployment arriving mid-load must be
+//! answered — applied once the load is over, or reported as not applied — rather
+//! than reconciling against components the load has not registered yet.
 
 #![recursion_limit = "256"]
 
@@ -80,5 +81,71 @@ async fn a_completed_load_leaves_nothing_to_supersede() {
     assert!(
         !rt.supersede_initial_load(),
         "a finished load must not report itself as superseded"
+    );
+}
+
+/// A caller that cannot reconcile against a half-registered app waits for the
+/// load, and the wait ends as soon as the load does.
+#[tokio::test]
+async fn waiting_for_the_initial_load_returns_when_it_finishes() {
+    let rt = Arc::new(Runtime::builder().build().await);
+
+    let waiting = tokio::spawn({
+        let rt = Arc::clone(&rt);
+        async move { rt.wait_for_initial_load(Duration::from_secs(30)).await }
+    });
+
+    tokio::time::timeout(Duration::from_secs(30), Arc::clone(&rt).load_components())
+        .await
+        .expect("an empty runtime finishes its component load");
+
+    assert!(
+        waiting.await.expect("the waiter finishes"),
+        "the load finished, so the wait must report it settled"
+    );
+    assert!(
+        rt.wait_for_initial_load(Duration::from_secs(30)).await,
+        "a load that is already over must not make a later caller wait at all"
+    );
+}
+
+/// A load that never finishes must not hold its caller: the bound is what turns
+/// an unsatisfiable spicepod into an answered deployment instead of a stuck one.
+#[tokio::test]
+async fn waiting_for_a_load_that_never_runs_gives_up_at_the_bound() {
+    let rt = Arc::new(Runtime::builder().build().await);
+
+    let started = tokio::time::Instant::now();
+    assert!(
+        !rt.wait_for_initial_load(Duration::from_millis(200)).await,
+        "a load still in flight must report itself as not settled"
+    );
+    assert!(
+        started.elapsed() >= Duration::from_millis(200),
+        "the wait must be the caller's bound, not an immediate answer"
+    );
+    assert!(
+        rt.initial_load_in_flight(),
+        "giving up on the wait leaves the load running"
+    );
+}
+
+/// Abandoning the load settles it too: the caller that superseded it is the one
+/// reconciling now, and anything else waiting on the load has nothing left to
+/// wait for.
+#[tokio::test]
+async fn superseding_the_load_ends_the_wait() {
+    let rt = Arc::new(Runtime::builder().build().await);
+
+    let waiting = tokio::spawn({
+        let rt = Arc::clone(&rt);
+        async move { rt.wait_for_initial_load(Duration::from_secs(30)).await }
+    });
+
+    assert!(rt.supersede_initial_load());
+
+    assert!(
+        waiting.await.expect("the waiter finishes"),
+        "a superseded load is over, so the wait must report it settled"
     );
 }
