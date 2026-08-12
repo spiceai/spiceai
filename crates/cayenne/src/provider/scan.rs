@@ -106,6 +106,12 @@ impl Drop for SnapshotScanRef {
 pub struct CayenneAccelerationExec {
     inner: Arc<dyn ExecutionPlan>,
     scan_identity: OnceLock<Option<Arc<ScanIdentity>>>,
+    /// Concurrent split decodes this plan runs, expressed per output partition —
+    /// the scan charge's multiplier. Plan-time-stable, so it is computed once
+    /// rather than re-walking the subtree on every partition's `execute` (a
+    /// base+delta plan is `2N + 18` nodes for N protected snapshots). `None` when
+    /// the plan reaches no file-backed source and the accounting does not apply.
+    decode_fan_out: OnceLock<Option<usize>>,
     /// In-flight-scan ref-count guard for the snapshot dirs this scan reads. Held
     /// for the plan's lifetime AND injected into each output stream by `execute`,
     /// so the snapshots stay GC-protected until execution completes. `None` for the
@@ -131,6 +137,7 @@ impl CayenneAccelerationExec {
         Self {
             inner,
             scan_identity: OnceLock::new(),
+            decode_fan_out: OnceLock::new(),
             scan_guard: None,
             maintained_aggregates: None,
             maintained_aggregate_epoch: 0,
@@ -145,6 +152,7 @@ impl CayenneAccelerationExec {
         Self {
             inner,
             scan_identity: OnceLock::new(),
+            decode_fan_out: OnceLock::new(),
             scan_guard: Some(guard),
             maintained_aggregates: None,
             maintained_aggregate_epoch: 0,
@@ -163,6 +171,7 @@ impl CayenneAccelerationExec {
         Self {
             inner,
             scan_identity: OnceLock::new(),
+            decode_fan_out: OnceLock::new(),
             scan_guard: None,
             maintained_aggregates: Some(maintained_aggregates),
             maintained_aggregate_epoch,
@@ -184,6 +193,7 @@ impl CayenneAccelerationExec {
         Self {
             inner,
             scan_identity: OnceLock::new(),
+            decode_fan_out: OnceLock::new(),
             scan_guard: Some(guard),
             maintained_aggregates: Some(maintained_aggregates),
             maintained_aggregate_epoch,
@@ -225,11 +235,33 @@ impl CayenneAccelerationExec {
         Self {
             inner,
             scan_identity: OnceLock::new(),
+            decode_fan_out: OnceLock::new(),
             scan_guard: self.scan_guard.clone(),
             maintained_aggregates: self.maintained_aggregates.clone(),
             maintained_aggregate_epoch: self.maintained_aggregate_epoch,
             optimizer_column_overlay: self.optimizer_column_overlay.clone(),
         }
+    }
+
+    /// Concurrent split decodes beneath this plan, divided across the output
+    /// partitions that will each take a charge — or `None` when no file-backed
+    /// source is reached and the accounting does not apply.
+    ///
+    /// The division is what keeps the charge honest: [`plan_decode_concurrency`]
+    /// returns a subtree TOTAL, and Cayenne's round-robin `RepartitionExec` sits
+    /// beneath this wrapper, so one file scan's splits are commonly spread over
+    /// many accounted output partitions. Charging each of them the full total
+    /// would over-reserve the pool by that factor and refuse queries that fit.
+    fn decode_fan_out(&self) -> Option<usize> {
+        *self.decode_fan_out.get_or_init(|| {
+            let total = plan_decode_concurrency(&self.inner)?;
+            let partitions = self
+                .properties()
+                .output_partitioning()
+                .partition_count()
+                .max(1);
+            Some(total.div_ceil(partitions).max(1))
+        })
     }
 
     /// Returns a stable identity for the underlying scan source, derived from
@@ -511,65 +543,60 @@ pub(crate) fn plan_has_pushed_filter_deep(plan: &Arc<dyn ExecutionPlan>) -> bool
     false
 }
 
-/// Whether `plan` reaches a file-backed source anywhere in its subtree.
+/// Splits the file-backed scans under `plan` decode CONCURRENTLY, summed across the
+/// whole subtree, or `None` when `plan` reaches no file-backed source at all.
 ///
-/// Gates the scan memory accounting. The charge exists to cover the Vortex
-/// decode — compressed encodings canonicalized into flat Arrow — which only a
-/// file branch performs. A plan whose every leaf is a `MemorySourceConfig` (the
-/// mem-tier and inline branches, and a `mode: memory` table's whole scan) hands
-/// out `RecordBatch` clones of buffers that are ALREADY resident and already
-/// mirrored into this same pool by the `cayenne:mem_tier` consumer, so charging
-/// them again double-counts and can refuse a memory-mode query over memory that
-/// was only ever reserved once.
-fn plan_reads_files(plan: &Arc<dyn ExecutionPlan>) -> bool {
-    if let Some(data_source_exec) = plan.downcast_ref::<DataSourceExec>() {
-        return data_source_exec
-            .data_source()
-            .downcast_ref::<FileScanConfig>()
-            .is_some();
-    }
-    plan.children().into_iter().any(plan_reads_files)
-}
-
-/// The largest number of splits any Vortex scan in `plan` decodes concurrently
-/// inside a single file (see `VortexSource::resolved_scan_concurrency`).
+/// This is the quantity the scan charge is sized from, and the one place the shape
+/// of that charge is explained.
 ///
-/// Scales the scan charge. A Vortex file scan is not one decode at a time: it runs
-/// N split decodes concurrently, so N canonicalized batches can be resident while
-/// the wrapper emits one. Charging a single batch under-counts by exactly that
-/// factor, and the factor is largest where it is least expected — under the default
-/// `auto` mode it is `target_partitions / planned_file_count`, so a table small
-/// enough to live in ONE file resolves to the full core count.
-///
-/// The value is read from the source rather than recomputed here: the resolution
+/// A Vortex file scan is not one decode at a time: it holds
+/// `VortexSource::resolved_scan_concurrency` splits in flight per scan partition, so
+/// that many canonicalized batches can be resident while the wrapper hands out one.
+/// The per-source total is therefore `scan partitions x concurrency`, and summing it
+/// over the subtree counts every branch of a base+delta plan rather than only the
+/// widest. The concurrency is read off the source instead of recomputed here: it
 /// depends on the pushed-down limit and the post-repartitioning target partitions,
-/// and a second implementation of that arithmetic would silently drift from the one
-/// the scan actually uses.
+/// and a second implementation of that arithmetic would drift from the one the scan
+/// actually runs.
 ///
-/// `max`, not `sum`: the factor being corrected is per-file-scan. Whether sibling
-/// snapshot branches of a base+delta plan also decode concurrently is a separate,
-/// still-open gap (see the `MemoryAccountedScanStream` docs) that needs charging at
-/// each materializing leaf to close — this does not claim to have closed it.
-fn plan_scan_fan_out(plan: &Arc<dyn ExecutionPlan>) -> usize {
+/// The total is a SUBTREE total, not a per-stream charge. The caller divides by its
+/// own output partition count ([`CayenneAccelerationExec::decode_fan_out`]), because
+/// Cayenne inserts a round-robin `RepartitionExec` beneath the accounting wrapper —
+/// so a single-partition file scan can sit under many accounted output partitions,
+/// and charging each of them the whole subtree total would over-reserve by that
+/// factor.
+///
+/// `None` for a wholly memory-backed plan, which is what keeps the mem-tier and
+/// inline branches out of the accounting: they hand out `RecordBatch` clones of
+/// buffers already resident and already mirrored into this same pool by the
+/// `cayenne:mem_tier` consumer, so charging them again double-counts and can refuse
+/// a memory-mode query over memory reserved only once. A MIXED plan contributes only
+/// its file branches, so the mem-tier half is no longer multiplied by a file
+/// branch's fan-out.
+///
+/// A file source that is not a `VortexSource` counts as one decode per partition —
+/// its fan-out is unknown, and assuming serial matches the accounting that existed
+/// before this scaled anything.
+fn plan_decode_concurrency(plan: &Arc<dyn ExecutionPlan>) -> Option<usize> {
     if let Some(data_source_exec) = plan.downcast_ref::<DataSourceExec>() {
-        return data_source_exec
+        let config = data_source_exec
             .data_source()
-            .downcast_ref::<FileScanConfig>()
-            .and_then(|config| {
-                config
-                    .file_source()
-                    .downcast_ref::<VortexSource>()
-                    .map(|source| source.resolved_scan_concurrency(config))
-            })
-            .unwrap_or(1)
+            .downcast_ref::<FileScanConfig>()?;
+        let partitions = data_source_exec
+            .properties()
+            .output_partitioning()
+            .partition_count()
             .max(1);
+        let concurrency = config
+            .file_source()
+            .downcast_ref::<VortexSource>()
+            .map_or(1, |source| source.resolved_scan_concurrency(config));
+        return Some(partitions.saturating_mul(concurrency).max(1));
     }
     plan.children()
         .into_iter()
-        .map(plan_scan_fan_out)
-        .max()
-        .unwrap_or(1)
-        .max(1)
+        .filter_map(plan_decode_concurrency)
+        .reduce(usize::saturating_add)
 }
 
 /// Counts file-backed scan sources (snapshot generations) and the total files
@@ -958,18 +985,20 @@ impl ExecutionPlan for CayenneAccelerationExec {
         // per-snapshot wrappers feed into this same stream, and registering a
         // consumer at every layer would count one batch once per layer.
         //
-        // And only when the plan actually reaches a file: a memory-only plan
-        // emits clones of buffers the `cayenne:mem_tier` consumer has already
-        // reserved in this pool, so charging them here bills the same bytes
-        // twice. The guard alone does not distinguish the two — every scan the
-        // provider returns carries one.
-        if self.scan_guard.is_some() && plan_reads_files(&self.inner) {
+        // And only when the plan actually reaches a file — `decode_fan_out` is
+        // `None` for a memory-only plan, which emits clones of buffers the
+        // `cayenne:mem_tier` consumer has already reserved in this pool, so
+        // charging them here would bill the same bytes twice. The guard alone does
+        // not distinguish the two: every scan the provider returns carries one.
+        if self.scan_guard.is_some()
+            && let Some(fan_out) = self.decode_fan_out()
+        {
             let accounted = MemoryAccountedScanStream::new(
                 Box::pin(RecordBatchStreamAdapter::new(Arc::clone(&schema), mapped)),
                 schema,
                 format!("cayenne_scan[partition={partition}]"),
                 &context,
-                plan_scan_fan_out(&self.inner),
+                fan_out,
             );
             return Ok(Box::pin(accounted));
         }
@@ -1093,11 +1122,10 @@ impl ExecutionPlan for CayenneAccelerationExec {
 /// Whatever an operator above retains, it reserves for itself.
 ///
 /// "Batches", plural, because a Vortex file scan decodes several splits at once:
-/// the charge is `estimate * fan_out`, where the fan-out is the concurrency the
-/// scan below resolved (see [`plan_scan_fan_out`]). Charging one batch would
-/// under-count by that factor, which under the default `auto` mode is
-/// `target_partitions / planned_file_count` — largest for a table small enough to
-/// occupy a single file, where it reaches the whole core count.
+/// the charge is `estimate * fan_out`, the concurrent decodes this stream's share
+/// of the plan runs. See [`plan_decode_concurrency`] for how that number is
+/// derived and [`CayenneAccelerationExec::decode_fan_out`] for why it is divided
+/// across output partitions.
 ///
 /// A pre-poll charge that does not fit returns `ResourcesExhausted` before the
 /// decode runs, so a scan that cannot fit its estimate fails without allocating.
@@ -1128,18 +1156,22 @@ impl ExecutionPlan for CayenneAccelerationExec {
 /// accounting; separating the branches means charging at each materializing
 /// leaf, below.
 ///
-/// **Sibling snapshot branches are counted once, not summed.** Accounting
-/// attaches to the outermost wrapper only (`scan_guard.is_some()`), which charges
-/// per output partition and scales that charge by the fan-out of the single widest
-/// scan beneath it ([`plan_scan_fan_out`] takes a `max`). That closes the
-/// intra-file split fan-out. It does not close the case where a base+delta plan's
-/// per-snapshot branches decode CONCURRENTLY beneath one wrapper: their splits are
-/// covered only up to the widest branch, so a plan whose memory is dominated by
-/// *cross-branch* concurrency can still exceed `runtime.query.memory_limit`.
+/// **The charge is spread evenly, not per branch.** Accounting attaches to the
+/// outermost wrapper only (`scan_guard.is_some()`), so every output partition takes
+/// the same share of the subtree's decode concurrency. A plan whose branches are
+/// lopsided — one wide file scan beside several narrow ones — charges each stream
+/// the average rather than what its own branch runs, so an individual partition can
+/// be over- or under-reserved even though the total is right.
 ///
-/// Bounding that properly means charging at each materializing leaf, or gating
-/// concurrent decodes behind a shared budget — both larger changes than this, and
-/// neither should be inferred from the presence of this type.
+/// **A mixed plan still charges its mem-tier batches.** The wrapper attaches per
+/// plan, not per branch. Memory-backed branches no longer contribute to the
+/// multiplier ([`plan_decode_concurrency`] ignores them), but batches they emit
+/// still flow through this stream and are charged at the prevailing rate, on top of
+/// the `cayenne:mem_tier` reservation that already covers them.
+///
+/// Both want charging at each materializing leaf, where the branch and its decoded
+/// size are known together — a larger change than this, and one that should not be
+/// inferred from the presence of this type.
 struct MemoryAccountedScanStream<S> {
     inner: S,
     schema: SchemaRef,
@@ -1158,9 +1190,10 @@ struct MemoryAccountedScanStream<S> {
     /// under-reserving costs the guarantee.
     estimate: usize,
     /// Concurrent split decodes running beneath this stream, from
-    /// [`plan_scan_fan_out`]. The charge is `estimate * fan_out`, because a Vortex
-    /// file scan holds that many canonicalized batches at once while emitting one.
-    /// Always at least 1, so a serial scan charges exactly one batch as before.
+    /// [`CayenneAccelerationExec::decode_fan_out`]. The charge is
+    /// `estimate * fan_out`, because a Vortex file scan holds that many
+    /// canonicalized batches at once while emitting one. Its source guarantees at
+    /// least 1, so a serial scan charges exactly one batch.
     fan_out: usize,
     /// True while the reservation covers an in-progress decode rather than a
     /// batch already handed downstream. Keeps the charge in place across a
@@ -1199,7 +1232,7 @@ impl<S> MemoryAccountedScanStream<S> {
             schema,
             reservation,
             estimate: INITIAL_BATCH_ESTIMATE_BYTES,
-            fan_out: fan_out.max(1),
+            fan_out,
             decode_charged: false,
         }
     }
@@ -1304,6 +1337,34 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::datasource::memory::MemorySourceConfig;
     use datafusion::physical_plan::expressions::col;
+    use datafusion_execution::memory_pool::GreedyMemoryPool;
+    use datafusion_execution::runtime_env::RuntimeEnvBuilder;
+
+    /// A task context whose query pool holds exactly `bytes`.
+    fn pool_context(bytes: usize) -> Arc<TaskContext> {
+        let runtime = RuntimeEnvBuilder::new()
+            .with_memory_pool(Arc::new(GreedyMemoryPool::new(bytes)))
+            .build_arc()
+            .expect("runtime env");
+        Arc::new(TaskContext::default().with_runtime(runtime))
+    }
+
+    /// A wholly memory-backed plan must not be charged at all.
+    ///
+    /// Its batches are clones of buffers already resident and already reserved in
+    /// this same pool by the `cayenne:mem_tier` consumer, so charging them here
+    /// bills the same bytes twice — and once the charge is scaled by a decode
+    /// fan-out, bills them N times. `decode_fan_out` returning `None` is what keeps
+    /// the mem-tier and inline branches out of the accounting entirely.
+    #[test]
+    fn a_memory_backed_plan_is_not_charged_for_decodes_it_never_runs() {
+        let exec = CayenneAccelerationExec::new(one_partition_plan());
+        assert_eq!(
+            exec.decode_fan_out(),
+            None,
+            "a MemorySourceConfig plan decodes nothing and must not be accounted"
+        );
+    }
 
     /// A scan must charge its canonicalized batches to the query pool, and must
     /// fail rather than exceed it.
@@ -1316,17 +1377,10 @@ mod tests {
     /// the configured limit.
     #[tokio::test]
     async fn a_scan_over_its_pool_budget_fails_instead_of_allocating() {
-        use datafusion_execution::memory_pool::GreedyMemoryPool;
-        use datafusion_execution::runtime_env::RuntimeEnvBuilder;
-
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
         // Comfortably smaller than one batch's Arrow footprint, so the very
         // first `try_grow` is refused.
-        let runtime = RuntimeEnvBuilder::new()
-            .with_memory_pool(Arc::new(GreedyMemoryPool::new(64)))
-            .build_arc()
-            .expect("runtime env");
-        let context = Arc::new(TaskContext::default().with_runtime(runtime));
+        let context = pool_context(64);
 
         let batch = RecordBatch::try_new(
             Arc::clone(&schema),
@@ -1364,9 +1418,6 @@ mod tests {
     /// four must refuse a scan whose fan-out is four.
     #[tokio::test]
     async fn a_scan_charges_for_every_concurrently_decoding_split() {
-        use datafusion_execution::memory_pool::GreedyMemoryPool;
-        use datafusion_execution::runtime_env::RuntimeEnvBuilder;
-
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
         let batch = RecordBatch::try_new(
             Arc::clone(&schema),
@@ -1381,13 +1432,7 @@ mod tests {
         // Serial: the same batch through the same pool must succeed, so the
         // refusal below is attributable to the fan-out and not to a pool that was
         // simply too small.
-        let serial_context = {
-            let runtime = RuntimeEnvBuilder::new()
-                .with_memory_pool(Arc::new(GreedyMemoryPool::new(pool_bytes)))
-                .build_arc()
-                .expect("runtime env");
-            Arc::new(TaskContext::default().with_runtime(runtime))
-        };
+        let serial_context = pool_context(pool_bytes);
         let mut serial = MemoryAccountedScanStream::new(
             Box::pin(futures::stream::iter(vec![Ok(batch.clone())])),
             Arc::clone(&schema),
@@ -1403,13 +1448,7 @@ mod tests {
 
         // Fanned out four ways over the SAME pool: four in-flight decodes do not
         // fit, and the refusal must arrive before the decode rather than after.
-        let fanned_context = {
-            let runtime = RuntimeEnvBuilder::new()
-                .with_memory_pool(Arc::new(GreedyMemoryPool::new(pool_bytes)))
-                .build_arc()
-                .expect("runtime env");
-            Arc::new(TaskContext::default().with_runtime(runtime))
-        };
+        let fanned_context = pool_context(pool_bytes);
         let mut fanned = MemoryAccountedScanStream::new(
             Box::pin(futures::stream::iter(vec![Ok(batch)])),
             Arc::clone(&schema),
@@ -1438,9 +1477,6 @@ mod tests {
     /// first error, but the accounting must not rely on that.
     #[tokio::test]
     async fn a_failed_settle_releases_the_charge_and_recharges_next_poll() {
-        use datafusion_execution::memory_pool::GreedyMemoryPool;
-        use datafusion_execution::runtime_env::RuntimeEnvBuilder;
-
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
         let wide = || {
             RecordBatch::try_new(
@@ -1500,8 +1536,6 @@ mod tests {
     /// cannot fit the charge — i.e. that no allocation happened.
     #[tokio::test]
     async fn an_over_budget_scan_is_refused_without_polling_the_decode() {
-        use datafusion_execution::memory_pool::GreedyMemoryPool;
-        use datafusion_execution::runtime_env::RuntimeEnvBuilder;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
@@ -1525,11 +1559,7 @@ mod tests {
 
         // Smaller than INITIAL_BATCH_ESTIMATE_BYTES, so the pre-poll charge is
         // refused on the very first poll.
-        let runtime = RuntimeEnvBuilder::new()
-            .with_memory_pool(Arc::new(GreedyMemoryPool::new(1024)))
-            .build_arc()
-            .expect("runtime env");
-        let context = Arc::new(TaskContext::default().with_runtime(runtime));
+        let context = pool_context(1024);
 
         let mut stream = MemoryAccountedScanStream::new(
             Box::pin(counted),
@@ -1561,9 +1591,6 @@ mod tests {
     /// now owns it, and would make a long scan look like a leak.
     #[tokio::test]
     async fn a_scan_releases_each_batch_before_taking_the_next() {
-        use datafusion_execution::memory_pool::GreedyMemoryPool;
-        use datafusion_execution::runtime_env::RuntimeEnvBuilder;
-
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
         let batch = || {
             RecordBatch::try_new(

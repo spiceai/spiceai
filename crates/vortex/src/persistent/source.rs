@@ -471,7 +471,7 @@ fn resolve_scan_concurrency(
         ScanConcurrency::Auto => target_partitions
             .max(1)
             .div_ceil(planned_file_count.max(1))
-            .min(max_auto_concurrency.max(1))
+            .min(max_auto_concurrency)
             .max(1),
         ScanConcurrency::Off => 1,
         ScanConcurrency::Explicit(value) => value.max(1),

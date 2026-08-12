@@ -68,6 +68,13 @@ pub enum Error {
         source: datafusion::error::DataFusionError,
     },
 
+    #[snafu(display(
+        "Failed to configure dataset {table_name} (cayenne): Invalid 'cayenne_scan_concurrency' value '{value}'. \
+        Expected 'auto', 'off', or a positive number of splits. \
+        See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+    ))]
+    InvalidScanConcurrency { table_name: String, value: String },
+
     #[snafu(display("Acceleration creation failed: {source}"))]
     AccelerationCreationFailed {
         source: Box<dyn std::error::Error + Send + Sync>,
@@ -1252,7 +1259,7 @@ impl CayenneAccelerator {
     async fn get_vortex_config(
         table_name: &str,
         source: &dyn AccelerationSource,
-    ) -> cayenne::metadata::VortexConfig {
+    ) -> Result<cayenne::metadata::VortexConfig> {
         let small_write = source
             .acceleration()
             .is_some_and(|acceleration| uses_small_write_refresh_profile(source, acceleration));
@@ -1265,7 +1272,7 @@ impl CayenneAccelerator {
         source: &dyn AccelerationSource,
         footer_cache_mb: Option<usize>,
         workload: &autotune::WorkloadProfile,
-    ) -> cayenne::metadata::VortexConfig {
+    ) -> Result<cayenne::metadata::VortexConfig> {
         let mut config = cayenne::metadata::VortexConfig {
             footer_cache_mb,
             // Default the query/scan path to native Arrow types (Utf8/Binary).
@@ -1426,15 +1433,20 @@ impl CayenneAccelerator {
             // concurrent split, so this is the lever for trading resident decode
             // memory against scan throughput without moving the whole query
             // fan-out via `runtime.query.target_partitions`.
+            //
+            // A bad value FAILS the dataset rather than warning and continuing.
+            // The siblings below fall back to their defaults, but this one bounds
+            // memory: falling back would resolve a value meant to REDUCE the
+            // fan-out into `auto`, the widest one, and surface as pool exhaustion
+            // under load rather than as the typo it is.
             if let Some(concurrency_str) = acceleration.params.get("cayenne_scan_concurrency") {
-                match concurrency_str.parse::<cayenne::metadata::ScanConcurrency>() {
-                    Ok(concurrency) => config.scan_concurrency = concurrency,
-                    Err(err) => {
-                        tracing::warn!(
-                            "Failed to configure dataset {table_name} (cayenne): Invalid `cayenne_scan_concurrency` value '{concurrency_str}'. {err} Falling back to 'auto'. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
-                        );
-                    }
-                }
+                config.scan_concurrency = concurrency_str
+                    .parse::<cayenne::metadata::ScanConcurrency>()
+                    .ok()
+                    .context(InvalidScanConcurrencySnafu {
+                        table_name,
+                        value: concurrency_str,
+                    })?;
             }
 
             // Parse compression strategy
@@ -2123,7 +2135,7 @@ impl CayenneAccelerator {
             }
         }
 
-        config
+        Ok(config)
     }
 
     fn transformed_arrow_schema(
@@ -2342,7 +2354,7 @@ impl CayenneAccelerator {
             self.footer_cache_mb,
             &workload,
         )
-        .await;
+        .await?;
 
         // Memory mode: make the mem-tier the permanent in-RAM store — never
         // checkpoint/seal to Vortex, no compaction/cold tier, single shard (so a
@@ -3465,7 +3477,7 @@ impl DataAccelerator for CayenneAccelerator {
                 self.footer_cache_mb,
                 &workload,
             )
-            .await;
+            .await?;
             // Partitioned tables are excluded from v1 schema evolution
             // (per-partition catalog tables would evolve lazily as each
             // partition opens, leaving mixed schemas across partitions);
@@ -4794,8 +4806,12 @@ mod tests {
             ..Default::default()
         });
 
-        let hot = CayenneAccelerator::get_vortex_config("hot", &hot_dataset).await;
-        let quiet = CayenneAccelerator::get_vortex_config("quiet", &quiet_dataset).await;
+        let hot = CayenneAccelerator::get_vortex_config("hot", &hot_dataset)
+            .await
+            .expect("hot config should be valid");
+        let quiet = CayenneAccelerator::get_vortex_config("quiet", &quiet_dataset)
+            .await
+            .expect("quiet config should be valid");
 
         assert_eq!(hot.write_concurrency, Some(16));
         assert_eq!(quiet.write_concurrency, Some(2));
@@ -4984,7 +5000,9 @@ mod tests {
 
         let dataset = build(misconfigured());
         for _ in 0..3 {
-            let _ = CayenneAccelerator::get_vortex_config(TABLE, &dataset).await;
+            let _ = CayenneAccelerator::get_vortex_config(TABLE, &dataset)
+                .await
+                .expect("config should be valid");
         }
         assert_eq!(
             captured.occurrences_of(LINE),
@@ -5002,7 +5020,9 @@ mod tests {
         let mut retuned_params = misconfigured();
         retuned_params.push(("cayenne_target_file_size_mb".to_string(), "512".to_string()));
         let retuned = build(retuned_params);
-        let _ = CayenneAccelerator::get_vortex_config(TABLE, &retuned).await;
+        let _ = CayenneAccelerator::get_vortex_config(TABLE, &retuned)
+            .await
+            .expect("config should be valid");
         assert_eq!(
             captured.occurrences_of(LINE),
             2,
@@ -5037,7 +5057,9 @@ mod tests {
                 ..Default::default()
             });
 
-            let config = CayenneAccelerator::get_vortex_config(table_name, &dataset).await;
+            let config = CayenneAccelerator::get_vortex_config(table_name, &dataset)
+                .await
+                .expect("config should be valid");
 
             assert_eq!(
                 config.compaction_trigger_files,
@@ -5083,7 +5105,9 @@ mod tests {
             ..Default::default()
         });
 
-        let config = CayenneAccelerator::get_vortex_config("append_hot", &dataset).await;
+        let config = CayenneAccelerator::get_vortex_config("append_hot", &dataset)
+            .await
+            .expect("config should be valid");
 
         assert_eq!(
             config.compaction_trigger_files,
@@ -5124,7 +5148,9 @@ mod tests {
                 ..Default::default()
             });
 
-            let config = CayenneAccelerator::get_vortex_config(table_name, &dataset).await;
+            let config = CayenneAccelerator::get_vortex_config(table_name, &dataset)
+                .await
+                .expect("config should be valid");
 
             assert_eq!(config.inline_max_rows, 0);
             assert_eq!(config.inline_max_bytes, 0);
@@ -5160,7 +5186,9 @@ mod tests {
             ..Default::default()
         });
 
-        let config = CayenneAccelerator::get_vortex_config("append_batch_load", &dataset).await;
+        let config = CayenneAccelerator::get_vortex_config("append_batch_load", &dataset)
+            .await
+            .expect("config should be valid");
 
         assert_eq!(config.inline_max_rows, 0);
         assert_eq!(config.inline_max_bytes, 0);
@@ -5223,7 +5251,9 @@ mod tests {
             ..Default::default()
         });
 
-        let config = CayenneAccelerator::get_vortex_config("cdc_hot", &dataset).await;
+        let config = CayenneAccelerator::get_vortex_config("cdc_hot", &dataset)
+            .await
+            .expect("config should be valid");
 
         assert_eq!(config.inline_max_rows, 123);
         assert_eq!(config.inline_max_bytes, 262_144);
@@ -5261,7 +5291,9 @@ mod tests {
             ..Default::default()
         });
 
-        let config = CayenneAccelerator::get_vortex_config("cdc_hot", &dataset).await;
+        let config = CayenneAccelerator::get_vortex_config("cdc_hot", &dataset)
+            .await
+            .expect("config should be valid");
 
         assert_eq!(config.cdc_mem_tier_max_bytes, 123_456);
         assert_eq!(config.cdc_mem_tier_max_age_ms, 7_890);
@@ -5288,7 +5320,9 @@ mod tests {
             refresh_mode: Some(RefreshMode::Changes),
             ..Default::default()
         });
-        let config = CayenneAccelerator::get_vortex_config("cdc_auto_tier", &cdc).await;
+        let config = CayenneAccelerator::get_vortex_config("cdc_auto_tier", &cdc)
+            .await
+            .expect("config should be valid");
         assert!(
             (256 * MIB..=1024 * MIB).contains(&config.cdc_mem_tier_max_bytes),
             "derived cap {} outside [256 MiB, 1 GiB]",
@@ -5319,7 +5353,9 @@ mod tests {
             refresh_mode: Some(RefreshMode::Full),
             ..Default::default()
         });
-        let config = CayenneAccelerator::get_vortex_config("full_tier", &full).await;
+        let config = CayenneAccelerator::get_vortex_config("full_tier", &full)
+            .await
+            .expect("config should be valid");
         assert_eq!(
             config.cdc_mem_tier_max_bytes,
             256 * MIB,
@@ -5353,7 +5389,9 @@ mod tests {
         };
 
         let full = build("full_tbl", RefreshMode::Full, vec![]);
-        let config = CayenneAccelerator::get_vortex_config("full_tbl", &full).await;
+        let config = CayenneAccelerator::get_vortex_config("full_tbl", &full)
+            .await
+            .expect("config should be valid");
         assert_eq!(
             config.compaction_background_interval_ms, 0,
             "full refresh must not spawn a background compactor"
@@ -5385,12 +5423,16 @@ mod tests {
                 "15000".to_string(),
             )],
         );
-        let config = CayenneAccelerator::get_vortex_config("full_pinned", &pinned).await;
+        let config = CayenneAccelerator::get_vortex_config("full_pinned", &pinned)
+            .await
+            .expect("config should be valid");
         assert_eq!(config.compaction_background_interval_ms, 15_000);
 
         // CDC is untouched: tight cadence, inlining on.
         let cdc = build("cdc_tbl", RefreshMode::Changes, vec![]);
-        let config = CayenneAccelerator::get_vortex_config("cdc_tbl", &cdc).await;
+        let config = CayenneAccelerator::get_vortex_config("cdc_tbl", &cdc)
+            .await
+            .expect("config should be valid");
         assert_eq!(
             config.compaction_background_interval_ms,
             SMALL_WRITE_COMPACTION_BACKGROUND_INTERVAL_MS
@@ -5400,7 +5442,9 @@ mod tests {
         // Snapshot mode accumulates files, so it keeps the conservative cadence and
         // stays OUT of the inline tier (its entries would never be drained promptly).
         let snapshot = build("snap_tbl", RefreshMode::Snapshot, vec![]);
-        let config = CayenneAccelerator::get_vortex_config("snap_tbl", &snapshot).await;
+        let config = CayenneAccelerator::get_vortex_config("snap_tbl", &snapshot)
+            .await
+            .expect("config should be valid");
         assert_ne!(
             config.compaction_background_interval_ms, 0,
             "snapshot mode still accumulates files to consolidate"
@@ -5733,7 +5777,9 @@ mod tests {
             ..Default::default()
         });
 
-        let config = CayenneAccelerator::get_vortex_config("compact", &dataset).await;
+        let config = CayenneAccelerator::get_vortex_config("compact", &dataset)
+            .await
+            .expect("config should be valid");
 
         assert_eq!(config.compaction_trigger_files, 12);
         assert_eq!(config.compaction_trigger_protected_snapshots, 9);

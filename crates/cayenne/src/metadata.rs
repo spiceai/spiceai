@@ -753,13 +753,13 @@ impl StorageClass {
 /// second mapping here would be free to drift from the one the scan honors.
 mod scan_concurrency_serde {
     use super::ScanConcurrency;
-    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use serde::{Deserialize, Deserializer, Serializer};
 
     pub(super) fn serialize<S: Serializer>(
         value: &ScanConcurrency,
         serializer: S,
     ) -> Result<S::Ok, S::Error> {
-        value.to_string().serialize(serializer)
+        serializer.collect_str(value)
     }
 
     pub(super) fn deserialize<'de, D: Deserializer<'de>>(
