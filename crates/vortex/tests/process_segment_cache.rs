@@ -27,8 +27,10 @@ fn format() -> VortexFormat {
 /// runtime builder keeps working.
 #[test]
 fn without_a_process_decision_a_format_may_cache_privately() {
-    let mut opts = VortexTableOptions::default();
-    opts.segment_cache_size_bytes = Some(4 * 1024 * 1024);
+    let opts = VortexTableOptions {
+        segment_cache_size_bytes: Some(4 * 1024 * 1024),
+        ..Default::default()
+    };
     let format = VortexFormat::new_with_options(VortexSession::default(), opts);
     assert_eq!(
         format.segment_cache_capacity_bytes(),

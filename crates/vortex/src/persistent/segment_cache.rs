@@ -273,11 +273,7 @@ impl SharedSegmentCache {
 
     /// A per-file view. `store` identifies the object store `path` is relative
     /// to; see [`StoreKey`].
-    pub(crate) fn for_path(
-        self: &Arc<Self>,
-        store: StoreKey,
-        path: Path,
-    ) -> Arc<dyn SegmentCache> {
+    pub(crate) fn for_path(self: &Arc<Self>, store: StoreKey, path: Path) -> Arc<dyn SegmentCache> {
         let state = self.path_states.as_ref().map(|path_states| {
             let mut states = path_states.lock();
             states
@@ -511,10 +507,7 @@ mod tests {
                 .with_resource(Resource::builder_empty().build())
                 .with_reader(exporter)
                 .build();
-            Self {
-                registry,
-                provider,
-            }
+            Self { registry, provider }
         }
 
         /// One cache with instruments registered against it. The returned
@@ -721,10 +714,7 @@ mod tests {
             .expect("cache the warm-tier segment");
 
         assert!(
-            cold.get(id)
-                .await
-                .expect("get should not error")
-                .is_none(),
+            cold.get(id).await.expect("get should not error").is_none(),
             "the same relative path in another store must not hit"
         );
 
@@ -856,31 +846,15 @@ mod tests {
         let (_cache, _metrics) = harness.cache(2_048);
 
         let samples = harness.gather();
-        samples.assert_value(
-            "cayenne_segment_cache_accesses",
-            MetricType::COUNTER,
-            0,
-        );
-        samples.assert_value(
-            "cayenne_segment_cache_hits",
-            MetricType::COUNTER,
-            0,
-        );
-        samples.assert_value(
-            "cayenne_segment_cache_weighted_bytes",
-            MetricType::GAUGE,
-            0,
-        );
+        samples.assert_value("cayenne_segment_cache_accesses", MetricType::COUNTER, 0);
+        samples.assert_value("cayenne_segment_cache_hits", MetricType::COUNTER, 0);
+        samples.assert_value("cayenne_segment_cache_weighted_bytes", MetricType::GAUGE, 0);
         samples.assert_value(
             "cayenne_segment_cache_capacity_bytes",
             MetricType::GAUGE,
             2_048,
         );
-        samples.assert_value(
-            "cayenne_segment_cache_entries",
-            MetricType::GAUGE,
-            0,
-        );
+        samples.assert_value("cayenne_segment_cache_entries", MetricType::GAUGE, 0);
     }
 
     #[test]
@@ -936,26 +910,10 @@ mod tests {
         );
 
         let first = harness.gather();
-        first.assert_value(
-            "cayenne_segment_cache_accesses",
-            MetricType::COUNTER,
-            2,
-        );
-        first.assert_value(
-            "cayenne_segment_cache_hits",
-            MetricType::COUNTER,
-            1,
-        );
-        first.assert_value(
-            "cayenne_segment_cache_weighted_bytes",
-            MetricType::GAUGE,
-            4,
-        );
-        first.assert_value(
-            "cayenne_segment_cache_entries",
-            MetricType::GAUGE,
-            1,
-        );
+        first.assert_value("cayenne_segment_cache_accesses", MetricType::COUNTER, 2);
+        first.assert_value("cayenne_segment_cache_hits", MetricType::COUNTER, 1);
+        first.assert_value("cayenne_segment_cache_weighted_bytes", MetricType::GAUGE, 4);
+        first.assert_value("cayenne_segment_cache_entries", MetricType::GAUGE, 1);
 
         // A second path wrapper over the same cache must not add a second series.
         let cache_clone = shared.for_path(test_store(), Path::from("active.vortex"));
@@ -980,26 +938,10 @@ mod tests {
         settle_cache_bookkeeping(&shared).await;
 
         let second = harness.gather();
-        second.assert_value(
-            "cayenne_segment_cache_accesses",
-            MetricType::COUNTER,
-            4,
-        );
-        second.assert_value(
-            "cayenne_segment_cache_hits",
-            MetricType::COUNTER,
-            2,
-        );
-        second.assert_value(
-            "cayenne_segment_cache_weighted_bytes",
-            MetricType::GAUGE,
-            7,
-        );
-        second.assert_value(
-            "cayenne_segment_cache_entries",
-            MetricType::GAUGE,
-            2,
-        );
+        second.assert_value("cayenne_segment_cache_accesses", MetricType::COUNTER, 4);
+        second.assert_value("cayenne_segment_cache_hits", MetricType::COUNTER, 2);
+        second.assert_value("cayenne_segment_cache_weighted_bytes", MetricType::GAUGE, 7);
+        second.assert_value("cayenne_segment_cache_entries", MetricType::GAUGE, 2);
     }
 
     #[tokio::test]
@@ -1014,8 +956,8 @@ mod tests {
 
         let expected_weighted_bytes = u32::try_from(shared.cache.weighted_size())
             .expect("test cache weighted size fits in u32");
-        let expected_entries = u32::try_from(shared.cache.entry_count())
-            .expect("test cache entry count fits in u32");
+        let expected_entries =
+            u32::try_from(shared.cache.entry_count()).expect("test cache entry count fits in u32");
         let samples = harness.gather();
         samples.assert_value(
             "cayenne_segment_cache_weighted_bytes",
@@ -1036,9 +978,11 @@ mod tests {
         let weak = Arc::downgrade(&shared);
         let cache = shared.for_path(test_store(), Path::from("retired.vortex"));
 
-        harness
-            .gather()
-            .assert_value("cayenne_segment_cache_capacity_bytes", MetricType::GAUGE, 1_024);
+        harness.gather().assert_value(
+            "cayenne_segment_cache_capacity_bytes",
+            MetricType::GAUGE,
+            1_024,
+        );
 
         drop(cache);
         drop(shared);
@@ -1158,7 +1102,10 @@ mod tests {
             .expect("put for live path should not error");
         for index in 0..256 {
             shared
-                .for_path(test_store(), Path::from(format!("unrelated/{index}.vortex")))
+                .for_path(
+                    test_store(),
+                    Path::from(format!("unrelated/{index}.vortex")),
+                )
                 .put(id, ByteBuffer::from(vec![9u8, 10, 11, 12]))
                 .await
                 .expect("put for unrelated path should not error");

@@ -1533,8 +1533,8 @@ fn estimate_cayenne_reservation_bytes(
     // budget is counted once rather than per acceleration. Prefer the installed
     // capacity — the estimate then describes the cache that exists, including
     // when an earlier runtime in this process installed a different budget.
-    let mut total: u64 = vortex_datafusion::process_segment_cache_capacity_bytes()
-        .unwrap_or_else(|| {
+    let mut total: u64 =
+        vortex_datafusion::process_segment_cache_capacity_bytes().unwrap_or_else(|| {
             segment_cache_budget_bytes(parse_usize_runtime_param(
                 runtime_params,
                 CAYENNE_SEGMENT_CACHE_MB_PARAM,

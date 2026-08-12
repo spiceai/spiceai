@@ -20,8 +20,10 @@ fn a_disabled_process_cache_is_not_replaced_by_private_per_table_caches() {
     // `VortexTableOptions`, which is exactly the input that used to resurrect a
     // private cache per table — each one invisible to the runtime's memory
     // accounting, which counts nothing when the cache is disabled.
-    let mut opts = VortexTableOptions::default();
-    opts.segment_cache_size_bytes = Some(512 * 1024 * 1024);
+    let opts = VortexTableOptions {
+        segment_cache_size_bytes: Some(512 * 1024 * 1024),
+        ..Default::default()
+    };
 
     let format = VortexFormat::new_with_options(VortexSession::default(), opts.clone());
     assert_eq!(
@@ -39,9 +41,7 @@ fn a_disabled_process_cache_is_not_replaced_by_private_per_table_caches() {
         !install_process_segment_cache(64 * 1024 * 1024),
         "the disabled decision is final"
     );
-    let after = VortexFormat::new_with_options(
-        VortexSession::default(),
-        VortexTableOptions::default(),
-    );
+    let after =
+        VortexFormat::new_with_options(VortexSession::default(), VortexTableOptions::default());
     assert_eq!(after.segment_cache_capacity_bytes(), None);
 }
