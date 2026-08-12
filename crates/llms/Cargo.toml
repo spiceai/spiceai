@@ -32,6 +32,7 @@ regex.workspace = true
 reqwest.workspace = true
 reqwest-eventsource = { git = "https://github.com/spiceai/reqwest-eventsource", rev = "eb11e695128ce264bf05e4220ce2311c25992c73" } # branch: spiceai
 runtime-rate-control = { path = "../runtime-rate-control" }
+runtime-request-context = { path = "../runtime-request-context" }
 schemars.workspace = true
 secrecy.workspace = true
 serde = { workspace = true, features = ["derive"] }

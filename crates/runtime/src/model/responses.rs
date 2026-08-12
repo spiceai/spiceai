@@ -17,7 +17,7 @@ limitations under the License.
 use crate::Runtime;
 use crate::model::ToolUsingResponses;
 use crate::model::params::azure::AzureModelParams;
-use crate::model::params::openai::OpenAiModelParams;
+use crate::model::params::openai::{OpenAiAuthMode, OpenAiModelParams};
 use crate::model::params::xai::XaiModelParams;
 use crate::model::tool_use_responses::OpenAIResponsesTools;
 use crate::model::wrapper::responses::ResponsesWrapper;
@@ -226,6 +226,15 @@ fn openai(
     raw_params: &HashMap<String, SecretString>,
     params: &OpenAiModelParams,
 ) -> Result<Arc<dyn Responses>, LlmError> {
+    if params.auth_mode == OpenAiAuthMode::Codex {
+        super::chat::validate_codex_params(params)?;
+        return Ok(Arc::new(llms::openai::new_codex_client(
+            model_id.unwrap_or(DEFAULT_LLM_MODEL.to_string()),
+            params.endpoint.clone(),
+            Some(params.usage_tier),
+        )) as Arc<dyn Responses>);
+    }
+
     let api_base = Some(params.endpoint.as_str());
     let api_key = params.api_key.as_ref().map(ExposeSecret::expose_secret);
     let org_id = params.org_id.as_deref();

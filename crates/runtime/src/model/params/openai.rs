@@ -17,6 +17,33 @@ limitations under the License.
 use llms::openai::{ChatBackend, UsageTier};
 use runtime_parameters::TypedParams;
 use secrecy::SecretString;
+use std::str::FromStr;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum OpenAiAuthMode {
+    #[default]
+    ApiKey,
+    Codex,
+}
+
+impl OpenAiAuthMode {
+    const VALUES: &[&str] = &["api_key", "codex"];
+}
+
+impl FromStr for OpenAiAuthMode {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "api_key" => Ok(Self::ApiKey),
+            "codex" => Ok(Self::Codex),
+            other => Err(format!(
+                "must be one of: {}. Found {other}",
+                Self::VALUES.join(", ")
+            )),
+        }
+    }
+}
 
 /// Parameters for `from: openai` chat/responses models.
 #[derive(Debug, TypedParams)]
@@ -32,6 +59,9 @@ pub struct OpenAiModelParams {
     /// The `OpenAI` API key.
     #[param(autoload_secret)]
     pub api_key: Option<SecretString>,
+    /// Authentication mode for the OpenAI-compatible endpoint. `api_key` uses `openai_api_key`; `codex` forwards the authenticated Codex request headers to the configured Codex endpoint.
+    #[param(default = "api_key")]
+    pub auth_mode: OpenAiAuthMode,
     /// The `OpenAI` organization ID.
     pub org_id: Option<String>,
     /// The `OpenAI` project ID.

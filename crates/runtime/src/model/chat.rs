@@ -49,7 +49,7 @@ use super::params::file::FileModelParams;
 use super::params::google::GoogleModelParams;
 #[cfg(feature = "models")]
 use super::params::huggingface::HuggingFaceModelParams;
-use super::params::openai::OpenAiModelParams;
+use super::params::openai::{OpenAiAuthMode, OpenAiModelParams};
 use super::params::spiceai::SpiceAiModelParams;
 use super::params::xai::XaiModelParams;
 use super::wrapper::OPENAI_DEFAULT_PARAM_KEYS;
@@ -612,6 +612,15 @@ fn openai(
     raw_params: &HashMap<String, SecretString>,
     params: &OpenAiModelParams,
 ) -> Result<Arc<dyn Chat>, LlmError> {
+    if params.auth_mode == OpenAiAuthMode::Codex {
+        validate_codex_params(params)?;
+        return Ok(Arc::new(llms::openai::new_codex_client(
+            model_id.unwrap_or(DEFAULT_LLM_MODEL.to_string()),
+            params.endpoint.clone(),
+            Some(params.usage_tier),
+        )) as Arc<dyn Chat>);
+    }
+
     let api_base = Some(params.endpoint.as_str());
     let api_key = params.api_key.as_ref().map(ExposeSecret::expose_secret);
     let org_id = params.org_id.as_deref();
@@ -630,6 +639,28 @@ fn openai(
         usage_tier,
         chat_backend,
     )) as Arc<dyn Chat>)
+}
+
+pub(super) fn validate_codex_params(params: &OpenAiModelParams) -> Result<(), LlmError> {
+    if params.api_key.is_some() {
+        return Err(LlmError::FailedToLoadModel {
+            source: "Codex authentication forwards the caller credentials and cannot be combined with `openai_api_key`. Remove `openai_api_key`.".into(),
+        });
+    }
+
+    if params.endpoint == "https://api.openai.com/v1" {
+        return Err(LlmError::FailedToLoadModel {
+            source: "Codex authentication requires `openai_endpoint` to be the Codex backend endpoint. Set `openai_endpoint`, for example `https://chatgpt.com/backend-api/codex`.".into(),
+        });
+    }
+
+    if params.responses_api != llms::openai::ChatBackend::Responses {
+        return Err(LlmError::FailedToLoadModel {
+            source: "Codex authentication requires `openai_responses_api: enabled` so chat-completions requests use the Responses API.".into(),
+        });
+    }
+
+    Ok(())
 }
 
 /// Rejects a negative or unparseable `temperature` override at load time rather

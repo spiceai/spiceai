@@ -85,7 +85,7 @@ Changes in Spice:
    - streaming tool call.
 3. Test Spice.
 4. After #41 merges, pin final async-openai `spiceai` SHA.
-5. Make Codex plan auth go through Spice.
+5. Test Codex plan auth goes through Spice.
 
 Do not run many Cargo commands at once. Cargo locks the build folder. Big builds are slow.
 
@@ -182,6 +182,7 @@ codex
 ```
 
 This way needs an OpenAI API key in Spice. Codex does not need the key.
+For Codex plan login, use the no-key Codex mode below instead.
 
 ## Use Codex plan later
 
@@ -204,22 +205,29 @@ x-codex-turn-metadata
 x-codex-window-id
 ```
 
-Spice does not pass these headers upstream now. Spice uses
-`openai_api_key` now.
-
-Future work:
-
-```text
-Codex plan header -> Spice -> Codex/ChatGPT upstream
-```
-
-Send all headers above. Do not send `host` or `content-length`. New HTTP
-request makes those.
+Spice has `openai_auth_mode: codex` for this. It forwards only these
+headers to the configured Codex backend. It does not forward `host`,
+`content-length`, or random headers. The new HTTP request makes transport
+headers itself.
 
 Do not log `authorization`.
 
 This is not the normal OpenAI API key path. Do not send Codex plan bearer
-header to `api.openai.com`.
+header to `api.openai.com`. Codex mode needs a Codex endpoint and no
+`openai_api_key`:
+
+```yaml
+models:
+  - name: spice-codex
+    from: openai:gpt-5.3-codex
+    params:
+      openai_auth_mode: codex
+      openai_endpoint: https://chatgpt.com/backend-api/codex
+      openai_responses_api: enabled
+```
+
+Spice does no remote health request for this model. Login headers only live
+inside a Codex request. Do not log `authorization`.
 
 ## Before done
 

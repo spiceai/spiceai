@@ -9,7 +9,7 @@ use async_openai::types::responses::{
 };
 use axum::{
     Extension, Json,
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{
         IntoResponse, Response,
         sse::{Event, KeepAlive, Sse},
@@ -164,9 +164,13 @@ fn responses_support_gate(model_id: &str, support: &ResponsesApiSupport) -> Opti
 pub(crate) async fn post(
     Extension(rt): Extension<Arc<Runtime>>,
     Extension(llms): Extension<Arc<RwLock<LLMResponsesModelStore>>>,
+    headers: HeaderMap,
     Json(req): Json<CreateResponse>,
 ) -> Response {
     let context = RequestContext::current(AsyncMarker::new().await);
+    context.insert_extension(llms::openai::codex::CodexRequestHeaders::from_headers(
+        &headers,
+    ));
 
     let span = tracing::span!(
         target: "task_history",

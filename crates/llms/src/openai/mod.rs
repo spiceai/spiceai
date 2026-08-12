@@ -25,6 +25,7 @@ use governor::Quota;
 use runtime_rate_control::{JitterConfig, RateController};
 
 pub mod chat;
+pub mod codex;
 pub mod embed;
 pub mod list_models;
 pub mod responses;
@@ -268,6 +269,19 @@ pub fn new_openai_client_with_config<C: async_openai::config::Config + Clone>(
         rate_controller: default_rate_controller(),
         chat_backend: ChatBackend::ChatCompletions,
     }
+}
+
+#[must_use]
+pub fn new_codex_client(
+    model: String,
+    api_base: impl Into<String>,
+    usage_tier: Option<UsageTier>,
+) -> codex::Codex {
+    codex::Codex::new(
+        model,
+        api_base.into(),
+        usage_tier.map_or_else(default_rate_controller, Into::into),
+    )
 }
 
 impl<C: Config + Clone> Openai<C> {
