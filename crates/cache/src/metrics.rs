@@ -163,6 +163,19 @@ macro_rules! generate_cache_metrics {
                         .build()
                 });
 
+            pub static STALE_WHILE_REVALIDATE_ACCELERATION_REFRESHES: LazyLock<Counter<u64>> =
+                LazyLock::new(|| {
+                    METER
+                        .u64_counter(concat!(
+                            $prefix,
+                            "_cache_swr_acceleration_refresh_count"
+                        ))
+                        .with_description(
+                            "Number of acceleration refreshes triggered by stale-while-revalidate cache hits.",
+                        )
+                        .build()
+                });
+
             /// Publishes every counter in this module at zero.
             ///
             /// A `LazyLock` counter is only built — and so only registered with
@@ -181,6 +194,7 @@ macro_rules! generate_cache_metrics {
                 STALE_REJECTIONS.add(0, &[]);
                 STALE_WHILE_REVALIDATE_SKIPPED.add(0, &[]);
                 STALE_WHILE_REVALIDATE_BACKGROUND_QUERIES.add(0, &[]);
+                STALE_WHILE_REVALIDATE_ACCELERATION_REFRESHES.add(0, &[]);
                 for reason in EvictionReason::ALL {
                     EVICTIONS.add(0, &[reason.key_value()]);
                 }

@@ -1259,6 +1259,23 @@ impl AcceleratedTable {
         }
     }
 
+    /// The parent dataset this table's refreshes are synchronized with, if any.
+    ///
+    /// Set for `localpod` children: they have no refresh loop of their own
+    /// ([`Self::trigger_refresh`] returns `RefreshNotSupportedForChildTable`),
+    /// so a refresh must be triggered on the (transitive) parent instead.
+    #[must_use]
+    pub fn synchronized_parent(&self) -> Option<TableReference> {
+        self.synchronized_with
+            .as_ref()
+            .map(SynchronizedTable::parent_dataset_name)
+    }
+
+    #[must_use]
+    pub fn refresh_mode(&self) -> RefreshMode {
+        self.refresh_mode
+    }
+
     /// # Errors
     ///
     /// Returns an error if the table has no refresh trigger (it is not configured

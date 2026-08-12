@@ -17,7 +17,10 @@ limitations under the License.
 use super::{
     BindingParametersSnafu, Query, QueryResult, QueryTracker, attach_query_tracker_to_stream,
 };
+use crate::accelerated::AcceleratedTable;
+use crate::component::dataset::acceleration::RefreshMode;
 use crate::datafusion::{DataFusion, error::find_datafusion_root, query::error_code::ErrorCode};
+use crate::status::ComponentStatus;
 use cache::{
     key::{CacheKey, RawCacheKey},
     result::CacheStatus,
@@ -36,6 +39,7 @@ use runtime_request_context::{
 };
 use snafu::ResultExt;
 use std::sync::OnceLock;
+use std::time::Duration;
 use std::{collections::HashSet, hash::Hasher, sync::Arc};
 use tracing::Span;
 
@@ -629,6 +633,196 @@ impl Query {
         }
     }
 
+    /// Resolve the dataset whose refresh actually loads new data for
+    /// `table_ref`, when `table_ref` is a `localpod`-synchronized accelerated
+    /// dataset.
+    ///
+    /// A `localpod` child has no refresh loop of its own and its federated
+    /// "source" is another dataset's accelerator, so refreshing anything but
+    /// the *root* of the synchronization chain would only re-copy stale
+    /// accelerated data. The root's refresh writes through to every
+    /// synchronized child before signaling completion.
+    ///
+    /// Returns `None` when `table_ref` is not a localpod-synchronized
+    /// accelerated dataset, or when the chain root is not refreshed in `full`
+    /// mode (a `caching`-mode root revalidates per cache entry through its own
+    /// stale-while-revalidate path and must not receive full-refresh triggers).
+    async fn swr_acceleration_refresh_target(
+        df: &Arc<DataFusion>,
+        table_ref: &TableReference,
+    ) -> Option<TableReference> {
+        // Bounds the parent walk so a malformed chain cannot loop forever.
+        const MAX_SYNCHRONIZATION_CHAIN_DEPTH: usize = 16;
+
+        let provider = df
+            .get_accelerated_table_provider(table_ref.to_string().as_str())
+            .await
+            .ok()?;
+        let mut parent = provider
+            .downcast_ref::<AcceleratedTable>()?
+            .synchronized_parent()?;
+
+        for _ in 0..MAX_SYNCHRONIZATION_CHAIN_DEPTH {
+            let provider = df
+                .get_accelerated_table_provider(parent.to_string().as_str())
+                .await
+                .ok()?;
+            let accelerated = provider.downcast_ref::<AcceleratedTable>()?;
+            match accelerated.synchronized_parent() {
+                Some(grandparent) => parent = grandparent,
+                None => {
+                    return (accelerated.refresh_mode() == RefreshMode::Full).then_some(parent);
+                }
+            }
+        }
+
+        tracing::warn!(
+            "Skipping stale-while-revalidate acceleration refresh for dataset {table_ref}: its localpod synchronization chain exceeds {MAX_SYNCHRONIZATION_CHAIN_DEPTH} levels"
+        );
+        None
+    }
+
+    /// Trigger an acceleration refresh for `dataset` and wait (bounded by
+    /// `max_wait`) for it to complete, so the revalidation query that follows
+    /// observes refreshed data.
+    ///
+    /// At most one stale-while-revalidate triggered refresh is in flight per
+    /// dataset at any moment: the refresh task runner *cancels* an in-flight
+    /// refresh when a new trigger arrives, so triggering on every stale hit
+    /// would keep restarting the refresh and it could never complete. The
+    /// first revalidation to arrive triggers; concurrent revalidations (other
+    /// cache keys over the same dataset) wait on the same completion signal.
+    async fn refresh_acceleration_and_wait(
+        df: &Arc<DataFusion>,
+        dataset: &TableReference,
+        max_wait: Duration,
+    ) {
+        // Datasets with a stale-while-revalidate triggered refresh currently in
+        // flight. Completion is only signaled on success, so entries expire on
+        // a TTL as the backstop for failed or abandoned refreshes.
+        static IN_FLIGHT_REFRESHES: OnceLock<
+            moka::future::Cache<String, (), std::hash::RandomState>,
+        > = OnceLock::new();
+        let in_flight = IN_FLIGHT_REFRESHES.get_or_init(|| {
+            moka::future::Cache::builder()
+                .max_capacity(10_000)
+                .time_to_live(Duration::from_mins(5))
+                .build()
+        });
+
+        let Ok(provider) = df
+            .get_accelerated_table_provider(dataset.to_string().as_str())
+            .await
+        else {
+            return;
+        };
+        let Some(accelerated) = provider.downcast_ref::<AcceleratedTable>() else {
+            return;
+        };
+        let Some(notifier) = accelerated.refresher().on_complete_notification() else {
+            // Without a completion signal we cannot know when the refreshed
+            // data is visible, and firing blind triggers risks cancelling an
+            // in-flight refresh.
+            return;
+        };
+
+        // Register for the completion signal BEFORE deciding whether to
+        // trigger: `Notify::notify_waiters` only wakes waiters that are
+        // already registered, so a fast refresh could otherwise complete
+        // unobserved and stall this task until the timeout.
+        let notified = notifier.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+
+        let guard_key = dataset.to_string();
+        let is_first_revalidation = in_flight
+            .entry(guard_key.clone())
+            .or_insert(())
+            .await
+            .is_fresh();
+        // Also stand down while any refresh is already running (scheduled or
+        // manual, not just SWR-triggered) — a new trigger would cancel it.
+        let already_refreshing = matches!(
+            df.runtime_status().get_dataset_status(dataset),
+            Some(ComponentStatus::Refreshing)
+        );
+
+        if is_first_revalidation && !already_refreshing {
+            tracing::debug!(
+                "Stale-while-revalidate triggering acceleration refresh for dataset {dataset}"
+            );
+            if let Err(e) = accelerated.trigger_refresh(None).await {
+                tracing::warn!(
+                    "Failed to refresh dataset {dataset} for stale-while-revalidate: {e}"
+                );
+                in_flight.invalidate(&guard_key).await;
+                return;
+            }
+            cache::metrics::sql_results::STALE_WHILE_REVALIDATE_ACCELERATION_REFRESHES.add(1, &[]);
+        }
+
+        match tokio::time::timeout(max_wait, notified).await {
+            Ok(()) => {
+                tracing::debug!(
+                    "Acceleration refresh for dataset {dataset} completed, revalidating cached results"
+                );
+                // Let the next stale hit trigger a fresh refresh.
+                in_flight.invalidate(&guard_key).await;
+            }
+            Err(_) => {
+                // Re-execute against the current accelerated data rather than
+                // leaving the entry stale; this matches the behavior for
+                // non-accelerated sources. The in-flight entry is deliberately
+                // kept: the refresh may still be running and a new trigger
+                // would cancel it — the TTL expires the entry if the refresh
+                // failed.
+                tracing::debug!(
+                    "Acceleration refresh for dataset {dataset} did not complete within {max_wait:?}; revalidating against current accelerated data"
+                );
+            }
+        }
+    }
+
+    /// Refresh the accelerations a stale-while-revalidate revalidation depends
+    /// on before re-executing the query.
+    ///
+    /// Queries over `localpod`-accelerated datasets are served entirely from
+    /// the acceleration, so re-executing the query alone would re-cache the
+    /// same stale data the acceleration already holds. For every input table
+    /// that is a localpod-synchronized dataset, trigger a refresh of its
+    /// synchronization-chain root (which writes through to the children) and
+    /// wait — bounded — for it to complete.
+    async fn refresh_accelerations_for_revalidation(
+        df: &Arc<DataFusion>,
+        input_tables: &HashSet<TableReference>,
+    ) {
+        let mut targets: Vec<TableReference> = Vec::new();
+        for table_ref in input_tables {
+            if let Some(target) = Self::swr_acceleration_refresh_target(df, table_ref).await
+                && !targets.contains(&target)
+            {
+                targets.push(target);
+            }
+        }
+        if targets.is_empty() {
+            return;
+        }
+
+        // Waiting longer than the stale-while-revalidate window is pointless —
+        // the entry being revalidated expires with it. Capped below the
+        // 5-minute per-key revalidation lock TTL so a second revalidation for
+        // the same cache key cannot start while this one is still waiting.
+        let max_wait = df
+            .results_cache_provider()
+            .and_then(|provider| provider.stale_while_revalidate_ttl())
+            .unwrap_or(Duration::from_secs(60))
+            .min(Duration::from_secs(240));
+
+        for target in targets {
+            Self::refresh_acceleration_and_wait(df, &target, max_wait).await;
+        }
+    }
+
     fn trigger_background_query_revalidation(
         df: Arc<DataFusion>,
         sql: &str,
@@ -682,6 +876,11 @@ impl Query {
                         plan_owned,
                         cached_input_tables,
                     );
+
+                    // Refresh any localpod accelerations the query reads from
+                    // before re-executing it — the query alone would only
+                    // re-cache the acceleration's current (stale) contents.
+                    Self::refresh_accelerations_for_revalidation(&df, &input_tables).await;
 
                     // Captured before the query reads anything, so any
                     // invalidation of its tables that lands while it executes
