@@ -2113,19 +2113,53 @@ cmd_mine() {
     return 0
   fi
 
-  # Fetch in-flight Remote Sign-off runs once for all PRs, not once per PR.
+  # Everything below is independent of everything else, so it all runs
+  # concurrently instead of one round trip after another: `mine`'s wall-clock
+  # time is network-bound, and this turns N+2 sequential round trips into
+  # roughly the slowest one. Each PR's combined commit status is the one
+  # remaining per-PR REST call (statuses aren't a GraphQL field for an
+  # arbitrary sha, so they can't join the batched query below); capped at
+  # $max_parallel concurrent `gh api` processes to stay polite to the rate
+  # limit, by draining the batch every $max_parallel jobs rather than
+  # `wait -n`, since that needs bash 4.3+ and this script runs under macOS's
+  # bash 3.2 (see has_content() above).
+  local status_dir
+  status_dir=$(mktemp -d "${TMPDIR:-/tmp}/spice-signoff-mine.XXXXXX") \
+    || fail "failed to create a temp directory for concurrent status lookups"
+  # A RETURN trap isn't function-scoped — left set, it fires again when this
+  # function's *caller* (main's case statement) returns too, by which point
+  # $status_dir (a local of this function) no longer exists, aborting under
+  # `set -u`. Clear it as part of firing so it only ever runs once.
+  trap 'rm -rf "$status_dir"; trap - RETURN' RETURN
+
   # Match on displayTitle, not headBranch: a workflow_dispatch run's headBranch
   # is the ref it was dispatched *against* (always trunk here — cmd_remote
   # doesn't pass --ref), not the `branch` input. signoff.yml's `run-name:
   # Remote Sign-off (${{ inputs.branch }})` puts the actual branch in the
   # title instead, so we match on that exact string.
-  local remote_runs
-  remote_runs=$(gh run list --repo "$repo" --workflow signoff.yml \
-    --json displayTitle,status,conclusion,databaseId --limit 50) || remote_runs="[]"
+  ( gh run list --repo "$repo" --workflow signoff.yml \
+      --json displayTitle,status,conclusion,databaseId --limit 50 \
+      > "${status_dir}/remote_runs" 2>/dev/null ) &
 
-  # Fetch merge-queue membership once for all PRs, not once per PR.
-  local mq_status
-  mq_status=$(fetch_merge_queue_status "$repo" "$(jq '[.[].number]' <<<"$prs")")
+  ( fetch_merge_queue_status "$repo" "$(jq '[.[].number]' <<<"$prs")" \
+      > "${status_dir}/mq_status" ) &
+
+  local max_parallel=8 launched=2 i number sha
+  for ((i = 0; i < count; i++)); do
+    number=$(jq -r ".[$i].number" <<<"$prs")
+    sha=$(jq -r ".[$i].headRefOid" <<<"$prs")
+    ( gh api "repos/${repo}/commits/${sha}/status" 2>/dev/null \
+        > "${status_dir}/status_${number}" ) &
+    launched=$((launched + 1))
+    (( launched % max_parallel == 0 )) && wait
+  done
+  wait
+
+  local remote_runs mq_status
+  remote_runs=$(cat "${status_dir}/remote_runs" 2>/dev/null)
+  [[ -n "$remote_runs" ]] || remote_runs="[]"
+  mq_status=$(cat "${status_dir}/mq_status" 2>/dev/null)
+  [[ -n "$mq_status" ]] || mq_status="{}"
 
   local width
   width=$(tput cols 2>/dev/null) || width=100
@@ -2133,7 +2167,7 @@ cmd_mine() {
   echo "${C_BOLD}${repo}${C_RESET} — ${count} open PR(s)"
   echo
 
-  local i pr number title branch sha combined state run_id running in_queue review_decision is_draft has_conflicts
+  local pr title branch combined state run_id running in_queue review_decision is_draft has_conflicts
   for ((i = 0; i < count; i++)); do
     pr=$(jq -c ".[$i]" <<<"$prs")
     number=$(jq -r '.number' <<<"$pr")
@@ -2141,7 +2175,8 @@ cmd_mine() {
     branch=$(jq -r '.headRefName' <<<"$pr")
     sha=$(jq -r '.headRefOid' <<<"$pr")
 
-    combined=$(gh api "repos/${repo}/commits/${sha}/status" 2>/dev/null) || combined='{}'
+    combined=$(cat "${status_dir}/status_${number}" 2>/dev/null)
+    [[ -n "$combined" ]] || combined='{}'
     state=$(combined_status_state "$combined")
     state="${state:-none}"
 
