@@ -106,12 +106,13 @@ impl Drop for SnapshotScanRef {
 pub struct CayenneAccelerationExec {
     inner: Arc<dyn ExecutionPlan>,
     scan_identity: OnceLock<Option<Arc<ScanIdentity>>>,
-    /// Concurrent split decodes this plan runs, expressed per output partition —
-    /// the scan charge's multiplier. Plan-time-stable, so it is computed once
-    /// rather than re-walking the subtree on every partition's `execute` (a
-    /// base+delta plan is `2N + 18` nodes for N protected snapshots). `None` when
-    /// the plan reaches no file-backed source and the accounting does not apply.
-    decode_fan_out: OnceLock<Option<usize>>,
+    /// Concurrent split decodes this plan runs, summed over the whole subtree —
+    /// the quantity each output partition's scan charge takes a share of.
+    /// Plan-time-stable, so it is computed once rather than re-walking the subtree
+    /// on every partition's `execute` (a base+delta plan is `2N + 18` nodes for N
+    /// protected snapshots). `None` when the plan reaches no file-backed source and
+    /// the accounting does not apply.
+    decode_concurrency: OnceLock<Option<usize>>,
     /// In-flight-scan ref-count guard for the snapshot dirs this scan reads. Held
     /// for the plan's lifetime AND injected into each output stream by `execute`,
     /// so the snapshots stay GC-protected until execution completes. `None` for the
@@ -137,7 +138,7 @@ impl CayenneAccelerationExec {
         Self {
             inner,
             scan_identity: OnceLock::new(),
-            decode_fan_out: OnceLock::new(),
+            decode_concurrency: OnceLock::new(),
             scan_guard: None,
             maintained_aggregates: None,
             maintained_aggregate_epoch: 0,
@@ -152,7 +153,7 @@ impl CayenneAccelerationExec {
         Self {
             inner,
             scan_identity: OnceLock::new(),
-            decode_fan_out: OnceLock::new(),
+            decode_concurrency: OnceLock::new(),
             scan_guard: Some(guard),
             maintained_aggregates: None,
             maintained_aggregate_epoch: 0,
@@ -171,7 +172,7 @@ impl CayenneAccelerationExec {
         Self {
             inner,
             scan_identity: OnceLock::new(),
-            decode_fan_out: OnceLock::new(),
+            decode_concurrency: OnceLock::new(),
             scan_guard: None,
             maintained_aggregates: Some(maintained_aggregates),
             maintained_aggregate_epoch,
@@ -193,7 +194,7 @@ impl CayenneAccelerationExec {
         Self {
             inner,
             scan_identity: OnceLock::new(),
-            decode_fan_out: OnceLock::new(),
+            decode_concurrency: OnceLock::new(),
             scan_guard: Some(guard),
             maintained_aggregates: Some(maintained_aggregates),
             maintained_aggregate_epoch,
@@ -235,7 +236,7 @@ impl CayenneAccelerationExec {
         Self {
             inner,
             scan_identity: OnceLock::new(),
-            decode_fan_out: OnceLock::new(),
+            decode_concurrency: OnceLock::new(),
             scan_guard: self.scan_guard.clone(),
             maintained_aggregates: self.maintained_aggregates.clone(),
             maintained_aggregate_epoch: self.maintained_aggregate_epoch,
@@ -243,25 +244,28 @@ impl CayenneAccelerationExec {
         }
     }
 
-    /// Concurrent split decodes beneath this plan, divided across the output
-    /// partitions that will each take a charge — or `None` when no file-backed
-    /// source is reached and the accounting does not apply.
+    /// `partition`'s share of the concurrent split decodes beneath this plan — or
+    /// `None` when no file-backed source is reached and the accounting does not
+    /// apply.
     ///
     /// The division is what keeps the charge honest: [`plan_decode_concurrency`]
     /// returns a subtree TOTAL, and Cayenne's round-robin `RepartitionExec` sits
     /// beneath this wrapper, so one file scan's splits are commonly spread over
     /// many accounted output partitions. Charging each of them the full total
     /// would over-reserve the pool by that factor and refuse queries that fit.
-    fn decode_fan_out(&self) -> Option<usize> {
-        *self.decode_fan_out.get_or_init(|| {
-            let total = plan_decode_concurrency(&self.inner)?;
-            let partitions = self
-                .properties()
-                .output_partitioning()
-                .partition_count()
-                .max(1);
-            Some(total.div_ceil(partitions).max(1))
-        })
+    ///
+    /// See [`partition_decode_share`] for how a total that does not divide evenly
+    /// is split.
+    fn decode_fan_out(&self, partition: usize) -> Option<usize> {
+        let total = (*self
+            .decode_concurrency
+            .get_or_init(|| plan_decode_concurrency(&self.inner)))?;
+        let partitions = self
+            .properties()
+            .output_partitioning()
+            .partition_count()
+            .max(1);
+        Some(partition_decode_share(total, partitions, partition))
     }
 
     /// Returns a stable identity for the underlying scan source, derived from
@@ -559,12 +563,11 @@ pub(crate) fn plan_has_pushed_filter_deep(plan: &Arc<dyn ExecutionPlan>) -> bool
 /// and a second implementation of that arithmetic would drift from the one the scan
 /// actually runs.
 ///
-/// The total is a SUBTREE total, not a per-stream charge. The caller divides by its
-/// own output partition count ([`CayenneAccelerationExec::decode_fan_out`]), because
-/// Cayenne inserts a round-robin `RepartitionExec` beneath the accounting wrapper —
-/// so a single-partition file scan can sit under many accounted output partitions,
-/// and charging each of them the whole subtree total would over-reserve by that
-/// factor.
+/// The total is a SUBTREE total, not a per-stream charge. The caller divides it over
+/// its own output partitions ([`partition_decode_share`]), because Cayenne inserts a
+/// round-robin `RepartitionExec` beneath the accounting wrapper — so a
+/// single-partition file scan can sit under many accounted output partitions, and
+/// charging each of them the whole subtree total would over-reserve by that factor.
 ///
 /// `None` for a wholly memory-backed plan, which is what keeps the mem-tier and
 /// inline branches out of the accounting: they hand out `RecordBatch` clones of
@@ -597,6 +600,26 @@ fn plan_decode_concurrency(plan: &Arc<dyn ExecutionPlan>) -> Option<usize> {
         .into_iter()
         .filter_map(plan_decode_concurrency)
         .reduce(usize::saturating_add)
+}
+
+/// `partition`'s share of `total` concurrent split decodes spread over `partitions`
+/// accounted output streams.
+///
+/// Every partition takes the quotient and the lowest-numbered ones take a remainder
+/// batch each, so the shares sum to exactly `total`. Rounding each share up instead
+/// would make the aggregate reservation `partitions * ceil(total / partitions)` —
+/// over-reserving by up to `partitions - 1` batches whenever the total does not
+/// divide evenly, which a mixed base+delta plan routinely does, and refusing queries
+/// that fit.
+///
+/// The floor of one batch is the one deliberate exception. With fewer decodes than
+/// partitions some streams take a zero share, and a stream charging nothing is
+/// unaccounted for the batch it is holding; those partitions charge one batch each,
+/// which is the accounting this scaling started from.
+fn partition_decode_share(total: usize, partitions: usize, partition: usize) -> usize {
+    let partitions = partitions.max(1);
+    let extra = usize::from(partition < total % partitions);
+    ((total / partitions) + extra).max(1)
 }
 
 /// Counts file-backed scan sources (snapshot generations) and the total files
@@ -991,7 +1014,7 @@ impl ExecutionPlan for CayenneAccelerationExec {
         // charging them here would bill the same bytes twice. The guard alone does
         // not distinguish the two: every scan the provider returns carries one.
         if self.scan_guard.is_some()
-            && let Some(fan_out) = self.decode_fan_out()
+            && let Some(fan_out) = self.decode_fan_out(partition)
         {
             let accounted = MemoryAccountedScanStream::new(
                 Box::pin(RecordBatchStreamAdapter::new(Arc::clone(&schema), mapped)),
@@ -1158,10 +1181,12 @@ impl ExecutionPlan for CayenneAccelerationExec {
 ///
 /// **The charge is spread evenly, not per branch.** Accounting attaches to the
 /// outermost wrapper only (`scan_guard.is_some()`), so every output partition takes
-/// the same share of the subtree's decode concurrency. A plan whose branches are
-/// lopsided — one wide file scan beside several narrow ones — charges each stream
-/// the average rather than what its own branch runs, so an individual partition can
-/// be over- or under-reserved even though the total is right.
+/// an equal share of the subtree's decode concurrency (to within the one remainder
+/// batch [`partition_decode_share`] hands the lowest-numbered partitions). A plan
+/// whose branches are lopsided — one wide file scan beside several narrow ones —
+/// charges each stream the average rather than what its own branch runs, so an
+/// individual partition can be over- or under-reserved even though the total is
+/// right.
 ///
 /// **A mixed plan still charges its mem-tier batches.** The wrapper attaches per
 /// plan, not per branch. Memory-backed branches no longer contribute to the
@@ -1360,10 +1385,53 @@ mod tests {
     fn a_memory_backed_plan_is_not_charged_for_decodes_it_never_runs() {
         let exec = CayenneAccelerationExec::new(one_partition_plan());
         assert_eq!(
-            exec.decode_fan_out(),
+            exec.decode_fan_out(0),
             None,
             "a MemorySourceConfig plan decodes nothing and must not be accounted"
         );
+    }
+
+    /// The per-partition shares must sum to the subtree total, not to a rounded-up
+    /// multiple of it.
+    ///
+    /// Rounding each share up charges `partitions * ceil(total / partitions)` in
+    /// aggregate — up to `partitions - 1` batches more than the plan can ever have
+    /// in flight, which refuses queries that fit. A mixed base+delta plan is where
+    /// this bites: its total is a sum over branches and rarely divides evenly by the
+    /// wrapper's output partition count.
+    #[test]
+    fn partition_shares_sum_to_the_subtree_decode_total() {
+        for partitions in 1_usize..=16 {
+            for total in 1_usize..=64 {
+                let shares: Vec<usize> = (0..partitions)
+                    .map(|partition| partition_decode_share(total, partitions, partition))
+                    .collect();
+                let charged: usize = shares.iter().sum();
+                // Below one decode per partition the floor takes over: every stream
+                // still holds a batch, so it charges one rather than nothing.
+                let expected = total.max(partitions);
+                assert_eq!(
+                    charged, expected,
+                    "total={total} over {partitions} partitions charged {charged} \
+                     (shares {shares:?})"
+                );
+                assert!(
+                    shares.iter().all(|share| *share >= 1),
+                    "every accounted stream must charge at least the batch it holds"
+                );
+            }
+        }
+    }
+
+    /// The remainder must land on distinct partitions, so no stream is charged two
+    /// extra batches while another is charged none.
+    #[test]
+    fn partition_shares_differ_by_at_most_one_batch() {
+        let (total, partitions) = (10_usize, 4_usize);
+        let shares: Vec<usize> = (0..partitions)
+            .map(|partition| partition_decode_share(total, partitions, partition))
+            .collect();
+        assert_eq!(shares, vec![3, 3, 2, 2], "quotient 2 with a remainder of 2");
     }
 
     /// A scan must charge its canonicalized batches to the query pool, and must
