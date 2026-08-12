@@ -1093,8 +1093,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_build_table_providers_returns_empty_when_all_factory_calls_fail() {
-        let failing =
-            HashSet::from(["public.orders".to_string(), "public.lineitem".to_string()]);
+        let failing = HashSet::from(["public.orders".to_string(), "public.lineitem".to_string()]);
         let read = Arc::new(MockRead::new(failing));
         let table_creator: Arc<dyn Read> = Arc::<MockRead>::clone(&read);
         let no_fks: ForeignKeyMap = HashMap::new();
