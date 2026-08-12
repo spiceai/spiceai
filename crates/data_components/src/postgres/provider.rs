@@ -473,14 +473,7 @@ impl PostgresSchemaProvider {
     ) -> Result<()> {
         let table_names = self.list_tables().await?;
 
-        // The tables this schema will actually register: resolved in one query
-        // rather than one per table, and named so the query describes exactly
-        // these and nothing else.
-        let selected: Vec<String> = table_names
-            .iter()
-            .filter(|table| self.selector.selects_table(&self.schema_name, table))
-            .cloned()
-            .collect();
+        let selected = select_relations(&self.selector, &self.schema_name, &table_names);
 
         // Advisory: an entry lets a table skip its own schema query, and its
         // absence means that table resolves individually. A failure here is
@@ -562,6 +555,27 @@ impl PostgresSchemaProvider {
         // discovered. See `connector_postgres_common::list_tables`.
         Ok(list_tables(&self.pool, &self.schema_name, true).await?)
     }
+}
+
+/// The relations a schema will actually register, which are the only ones worth
+/// describing.
+///
+/// The bulk lookup names its relations rather than taking the whole namespace,
+/// so this is what bounds its cost: a schema holding thousands of tables behind
+/// an `include` that selects a handful describes the handful. Narrowing here has
+/// no effect on the resulting catalog -- the rejected names would be dropped
+/// when the providers are built regardless -- which is exactly why it is worth
+/// asserting directly.
+fn select_relations(
+    selector: &TableSelector,
+    schema_name: &str,
+    table_names: &[String],
+) -> Vec<String> {
+    table_names
+        .iter()
+        .filter(|table| selector.selects_table(schema_name, table))
+        .cloned()
+        .collect()
 }
 
 /// Build the fully-qualified name of a foreign-key target table
@@ -771,6 +785,7 @@ mod tests {
     use super::{
         CommentMap, ForeignKeyConstraint, ForeignKeyMap, SchemaRefreshOutcome, TableComments,
         build_table_providers_for_schema, foreign_key_target, schema_refresh_outcome,
+        select_relations,
     };
     use crate::{
         DESCRIPTION_METADATA_KEY, FOREIGN_KEYS_METADATA_KEY, Read, SOURCE_TYPE_METADATA_KEY,
@@ -898,6 +913,72 @@ mod tests {
             builder.add(Glob::new(pattern).expect("glob pattern should parse"));
         }
         builder.build().expect("glob set should build")
+    }
+
+    fn names(names: &[&str]) -> Vec<String> {
+        names.iter().map(|n| (*n).to_string()).collect()
+    }
+
+    /// The bulk lookup must ask about the tables the schema will register, and
+    /// no others.
+    ///
+    /// Describing a rejected relation is invisible in the catalog -- it is
+    /// dropped when the providers are built either way -- so nothing downstream
+    /// can catch a selection that widens back to the whole namespace. That is
+    /// the cost this change exists to remove, which makes this the assertion
+    /// that guards it.
+    #[test]
+    fn select_relations_names_only_the_tables_the_schema_will_register() {
+        let all = names(&["orders", "lineitem", "customer"]);
+
+        let include = TableSelector::new(Some(make_globset(&["public.orders"])), None);
+        assert_eq!(
+            select_relations(&include, "public", &all),
+            names(&["orders"]),
+            "an include pattern should leave only the tables it matches"
+        );
+
+        let exclude = TableSelector::new(None, Some(make_globset(&["public.lineitem"])));
+        assert_eq!(
+            select_relations(&exclude, "public", &all),
+            names(&["orders", "customer"]),
+            "an exclude pattern should drop only the tables it matches"
+        );
+
+        assert_eq!(
+            select_relations(&TableSelector::select_all(), "public", &all),
+            all,
+            "an unfiltered catalog should still describe every table"
+        );
+    }
+
+    /// A selection matching nothing must stay empty rather than falling back to
+    /// every table, which is what an "empty means unfiltered" reading would do.
+    #[test]
+    fn select_relations_is_empty_when_no_table_is_selected() {
+        let selector = TableSelector::new(Some(make_globset(&["public.nothing_here"])), None);
+
+        assert!(
+            select_relations(&selector, "public", &names(&["orders", "lineitem"])).is_empty(),
+            "a selection that matches nothing should describe nothing"
+        );
+    }
+
+    /// The schema name takes part in the match, so the same table name in a
+    /// schema the pattern does not name is not selected.
+    #[test]
+    fn select_relations_matches_within_the_schema_being_refreshed() {
+        let selector = TableSelector::new(Some(make_globset(&["sales.orders"])), None);
+        let all = names(&["orders"]);
+
+        assert_eq!(
+            select_relations(&selector, "sales", &all),
+            names(&["orders"])
+        );
+        assert!(
+            select_relations(&selector, "public", &all).is_empty(),
+            "`sales.orders` should not select `public.orders`"
+        );
     }
 
     /// Regression test for #11727: a foreign-key target whose schema or table

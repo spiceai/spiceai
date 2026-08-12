@@ -758,11 +758,99 @@ async fn test_bulk_schema_resolution_honors_unsupported_type_action() -> Result<
                 recorder
                     .built_from_supplied_schema()
                     .contains(&"widgets_jsonb".to_string()),
-                "the jsonb table should have been built from the schema-wide lookup,                  not by resolving its own schema; resolved individually: {:?}",
+                "the jsonb table should have been built from the schema-wide lookup; resolved individually: {:?}",
                 recorder.self_resolved()
+            );
+            // Taking the bulk path does not by itself mean the round trip was
+            // saved: a table built from a supplied schema that also resolved its
+            // own would satisfy the assertion above while costing exactly what
+            // this change removes.
+            assert!(
+                !recorder.self_resolved().contains(&"widgets_jsonb".to_string()),
+                "the jsonb table resolved its own schema as well as taking the schema-wide lookup, so the per-table query was not saved"
             );
 
             Ok(())
         })
         .await
+}
+
+/// A filtered catalog must still build its selected tables from the schema-wide
+/// lookup, and must not build the tables it rejected at all.
+///
+/// The refresh resolves the schemas it will need before it knows which provider
+/// each table gets, so a selection that reached only one of those two steps
+/// would show up here: an excluded table appearing on either construction path
+/// means the filter was consulted too late to save anything.
+#[tokio::test]
+async fn test_filtered_refresh_builds_only_selected_tables_from_the_bulk_lookup()
+-> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    test_request_context()
+        .scope(async {
+            let port = common::get_random_port()?;
+            let _container = common::start_postgres_docker_container(port).await?;
+
+            let pool = common::get_postgres_connection_pool(port, None).await?;
+            pool.connect_direct()
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?
+                .conn
+                .simple_query(
+                    "CREATE TABLE kept (id INT PRIMARY KEY, label TEXT); \
+                     CREATE TABLE rejected (id INT PRIMARY KEY, label TEXT);",
+                )
+                .await?;
+
+            let recorder = Arc::new(RecordingRead::default());
+            let provider = PostgresCatalogProvider::new(
+                CATALOG_NAME.to_string(),
+                Arc::new(
+                    PostgresConnectionPool::new(to_secret_map(
+                        get_pg_params(port)
+                            .into_iter()
+                            .map(|(k, v)| (k, v.expose_secret().to_string()))
+                            .collect::<HashMap<String, String>>(),
+                    ))
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))?,
+                ),
+                Arc::clone(&recorder) as Arc<dyn Read>,
+                TableSelector::new(Some(globset_of(&["public.kept"])), None),
+            );
+
+            provider
+                .refresh()
+                .await
+                .map_err(|e| anyhow::anyhow!("catalog refresh: {e}"))?;
+
+            let bulk = recorder.built_from_supplied_schema();
+            let individual = recorder.self_resolved();
+
+            assert!(
+                bulk.contains(&"kept".to_string()),
+                "the selected table should have been built from the schema-wide lookup; resolved individually: {individual:?}"
+            );
+            assert!(
+                !individual.contains(&"kept".to_string()),
+                "the selected table resolved its own schema as well, so the per-table query was not saved"
+            );
+            assert!(
+                !bulk.contains(&"rejected".to_string())
+                    && !individual.contains(&"rejected".to_string()),
+                "an excluded table should not be built at all; bulk: {bulk:?}, individual: {individual:?}"
+            );
+
+            Ok(())
+        })
+        .await
+}
+
+fn globset_of(patterns: &[&str]) -> globset::GlobSet {
+    let mut builder = globset::GlobSetBuilder::new();
+    for pattern in patterns {
+        builder.add(globset::Glob::new(pattern).expect("glob pattern should parse"));
+    }
+    builder.build().expect("glob set should build")
 }
