@@ -415,11 +415,41 @@ impl VortexFormat {
     /// Creates a new instance with configured by a [`VortexTableOptions`].
     #[must_use]
     pub fn new_with_options(session: VortexSession, opts: VortexTableOptions) -> Self {
+        Self::new_with_options_and_optional_dataset(session, opts, None, false)
+    }
+
+    /// Creates a configured format whose segment-cache metrics use `dataset`.
+    #[must_use]
+    pub fn new_with_options_and_dataset_label(
+        session: VortexSession,
+        opts: VortexTableOptions,
+        dataset: impl Into<Arc<str>>,
+    ) -> Self {
+        Self::new_with_options_and_optional_dataset(session, opts, Some(dataset.into()), false)
+    }
+
+    /// Creates a dataset-labelled format that also prevents late inserts for
+    /// retired paths. Mutable Cayenne tables use this constructor.
+    #[must_use]
+    pub fn new_with_options_and_dataset_label_and_retirement_tracking(
+        session: VortexSession,
+        opts: VortexTableOptions,
+        dataset: impl Into<Arc<str>>,
+    ) -> Self {
+        Self::new_with_options_and_optional_dataset(session, opts, Some(dataset.into()), true)
+    }
+
+    fn new_with_options_and_optional_dataset(
+        session: VortexSession,
+        opts: VortexTableOptions,
+        dataset: Option<Arc<str>>,
+        track_retirement: bool,
+    ) -> Self {
         let segment_cache = opts
             .segment_cache_size_bytes
             .and_then(|bytes| u64::try_from(bytes).ok())
             .filter(|bytes| *bytes > 0)
-            .map(|bytes| Arc::new(SharedSegmentCache::new(bytes, None, false)));
+            .map(|bytes| Arc::new(SharedSegmentCache::new(bytes, dataset, track_retirement)));
 
         Self {
             session,

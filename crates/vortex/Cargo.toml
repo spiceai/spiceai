@@ -45,6 +45,9 @@ vortex-utils = { workspace = true, features = ["dashmap"] }
 anyhow = { workspace = true }
 datafusion = { workspace = true }
 insta = { workspace = true }
+opentelemetry-prometheus = { workspace = true }
+opentelemetry_sdk = { workspace = true }
+prometheus = { workspace = true }
 rstest = "0.26.1"
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util", "rt-multi-thread", "fs"] }
