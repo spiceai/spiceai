@@ -5497,7 +5497,8 @@ mod tests {
             None,
             &pk_workload,
         )
-        .await;
+        .await
+        .expect("config should be valid");
         assert_eq!(config.deletion_mode, cayenne::metadata::DeletionMode::Key);
 
         // Explicit `position` on the same shape is respected.
@@ -5514,7 +5515,8 @@ mod tests {
             None,
             &pk_workload,
         )
-        .await;
+        .await
+        .expect("config should be valid");
         assert_eq!(
             config.deletion_mode,
             cayenne::metadata::DeletionMode::Position
@@ -5533,7 +5535,8 @@ mod tests {
             None,
             &nopk_workload,
         )
-        .await;
+        .await
+        .expect("config should be valid");
         assert_eq!(config.deletion_mode, cayenne::metadata::DeletionMode::Auto);
 
         // A non-CDC profile with a PK stays Auto (position downstream).
@@ -5544,7 +5547,8 @@ mod tests {
             None,
             &pk_workload,
         )
-        .await;
+        .await
+        .expect("config should be valid");
         assert_eq!(config.deletion_mode, cayenne::metadata::DeletionMode::Auto);
     }
 
@@ -5688,7 +5692,8 @@ mod tests {
 
         let small_write_config =
             CayenneAccelerator::get_vortex_config("cdc_partial_override", &small_write_dataset)
-                .await;
+                .await
+                .expect("config should be valid");
 
         assert_eq!(small_write_config.inline_max_rows, 321);
         assert_eq!(
@@ -5719,7 +5724,8 @@ mod tests {
 
         let large_write_config =
             CayenneAccelerator::get_vortex_config("full_partial_override", &large_write_dataset)
-                .await;
+                .await
+                .expect("config should be valid");
 
         // Bulk-overwrite inlines too, on the same static caps as small-write, so
         // the un-overridden knobs keep those defaults rather than the zeros that
