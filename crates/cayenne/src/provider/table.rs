@@ -13190,10 +13190,12 @@ impl CayenneTableProvider {
         scan_guard: Arc<SnapshotScanRef>,
     ) -> Arc<dyn ExecutionPlan> {
         let overlay = self.optimizer_stats_overlay_for_schema(&plan.schema());
+        let table_name = self.table_metadata.table_name.as_str();
         if self.maintained_aggregates.is_empty() {
             Arc::new(
                 CayenneAccelerationExec::with_guard(plan, scan_guard)
-                    .with_optimizer_column_overlay(overlay),
+                    .with_optimizer_column_overlay(overlay)
+                    .with_table_name(table_name),
             )
         } else {
             let epoch = self.maintained_aggregate_epoch.load(Ordering::Acquire);
@@ -13204,7 +13206,8 @@ impl CayenneTableProvider {
                     Arc::clone(&self.maintained_aggregates),
                     epoch,
                 )
-                .with_optimizer_column_overlay(overlay),
+                .with_optimizer_column_overlay(overlay)
+                .with_table_name(table_name),
             )
         }
     }
