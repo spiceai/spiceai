@@ -15,6 +15,16 @@ catches the one failure mode that is otherwise silent.
 > because that requires a force push. That distinction decides which restack
 > mechanism you use below.
 
+Two commits get referred to throughout, and they are not the same one:
+
+- **Fork point** — the `trunk` commit the *parent* branched from. This is what
+  `git merge-base <child> origin/trunk` reports, both before and after the parent
+  lands.
+- **Stack base** (`$STACKBASE`) — the *parent's* tip at the moment the child branched
+  from it. It contains the parent's commits, and everything after it on the child is
+  the child's own work. Recover it from the merged parent PR:
+  `gh pr view <parent-pr> --json headRefOid -q .headRefOid`.
+
 ---
 
 ## While the parent PR is open
@@ -46,22 +56,24 @@ costs a full re-signoff for nothing.
 lands:
 
 - The parent's individual commits **never appear on `trunk`**. `trunk` gets one new
-  commit whose *content* equals the parent branch, with the pre-split commit as its
-  parent.
+  commit whose parent is **whatever `trunk`'s tip was at merge time** and whose tree is
+  that tip plus the parent branch's net diff. If `trunk` moved after the fork point,
+  that tree is *not* equal to the parent branch's tree — it also carries the
+  intervening commits.
 - The parent branch is deleted, and GitHub **retargets the child PR's base to
   `trunk`** automatically.
-- The child's merge base is still the **pre-split** commit, so until you restack, the
-  child's PR diff includes the parent's changes as well as its own.
+- The child's merge base is still the **fork point**, so until you restack, the child's
+  PR diff includes the parent's changes as well as its own.
 
 That last point makes the restack mandatory rather than cosmetic. Because the merge
-base predates the split, the parent's changes now appear on *both* sides of the
-comparison, and git handles the three cases differently:
+base is the fork point — older than the stack base — the parent's changes now appear
+on *both* sides of the comparison, and git handles the three cases differently:
 
 | Case, child vs. squashed parent | What git does |
 | --- | --- |
 | A file only the parent touched | Identical content on both sides — resolves silently and correctly. |
 | A file the parent **and** child both edited | Frequently a **spurious conflict**: git cannot align the duplicated parent hunks against a base that predates them. |
-| A file the parent **added** and the child **deleted** | **Silently restored, with no conflict reported.** From the pre-split base the file is absent on your side too, so trunk's add applies unopposed. |
+| A file the parent **added** and the child **deleted** | **Silently restored, with no conflict reported.** At the fork point the file does not exist, and it does not exist in your tree either, so git sees no change on your side and applies trunk's add unopposed. |
 
 The third row is the dangerous one. It hit `ben/issue-12614-spice-layer` (stacked on
 the branch that landed as #12661): 13 reported conflicts, plus
@@ -79,14 +91,8 @@ published yet:
 
 ```bash
 git checkout <child>
-git rebase --onto origin/trunk <parent-tip>   # <parent-tip> = parent's head SHA at the split
+git rebase --onto origin/trunk "$STACKBASE"   # stack base = parent's tip at the split
 git push -u origin <child>                    # first push, not a force push
-```
-
-Get `<parent-tip>` from the merged parent PR:
-
-```bash
-gh pr view <parent-pr> --json headRefOid -q .headRefOid
 ```
 
 The rebase drops the parent's commits (already on `trunk` as the squash commit) and
@@ -98,15 +104,24 @@ adds/deletes are preserved.
 Rewriting a pushed branch needs a force push, so merge instead — and treat the audit
 as part of the merge, not an optional check.
 
+Start the merge with `--no-commit`. A conflict-free merge otherwise commits itself
+immediately, which is exactly the case where the silent resurrection happens and the
+one where you most need the worktree held open for the audit:
+
 ```bash
 git checkout <child>
 PRE=$(git rev-parse HEAD)          # the child's pre-merge tip; needed by the audit
-STACKBASE=<parent-tip>             # as above
-git merge origin/trunk
+STACKBASE=<stack base>             # the parent's tip at the split, as defined above
+git merge --no-ff --no-commit origin/trunk
 ```
 
-**1. Confirm trunk's squash really matches the stack base** — if it does not, the
-parent changed during merge and every assumption below needs rechecking:
+`HEAD` stays at `$PRE` for every step below; the merge result lives in the index and
+worktree until you commit it in step 5.
+
+**1. Confirm trunk's squash really matches the stack base.** Restrict the comparison
+to the paths the parent touched, since `trunk` will have moved elsewhere; anything
+reported here means the parent changed during merge and the assumptions below need
+rechecking:
 
 ```bash
 git diff --stat "$STACKBASE" origin/trunk -- <paths the parent touched>
@@ -114,35 +129,51 @@ git diff --stat "$STACKBASE" origin/trunk -- <paths the parent touched>
 
 **2. Re-resolve each conflicted file three-way against the stack base**, not against
 the base git chose. Git's own attempt conflicted all 13 files in the case above; all
-13 resolved cleanly this way:
+13 resolved cleanly this way. For a path with all three stages present (`git
+ls-files -u <path>` shows them):
 
 ```bash
-git show "$STACKBASE":<path> > /tmp/base
-git merge-file -p --diff3 <ours> /tmp/base <theirs>
+f=<path>
+git show ":2:$f" > /tmp/ours          # your side
+git show ":3:$f" > /tmp/theirs        # trunk's side
+git show "$STACKBASE:$f" > /tmp/base  # the correct base — NOT git's stage 1
+git merge-file -p --diff3 /tmp/ours /tmp/base /tmp/theirs > /tmp/merged
+grep -n '^<<<<<<<\|^>>>>>>>' /tmp/merged   # must be empty before you accept it
+cp /tmp/merged "$f" && git add "$f"
 ```
 
-**3. Audit for silent damage** — run this before committing the merge. It compares
-what the child *intended* against what is on disk:
+`merge-file -p` only writes the merged text to stdout — it neither updates the
+worktree file nor stages it, so the `cp`/`git add` are what actually resolve the path.
+Its exit status is the number of conflicts left.
+
+**3. Audit for silent damage** — this is the step that catches the resurrection. It
+compares what the child *intended* against what the merge actually put on disk:
 
 ```bash
 # Files the child deleted that the merge brought back
 git diff --name-only --diff-filter=D "$STACKBASE" "$PRE" |
-  while read -r f; do [ -e "$f" ] && echo "RESURRECTED $f"; done
+  while read -r f; do { [ -e "$f" ] || [ -L "$f" ]; } && echo "RESURRECTED $f"; done
 
 # Files the child added that the merge dropped
 git diff --name-only --diff-filter=A "$STACKBASE" "$PRE" |
-  while read -r f; do [ -e "$f" ] || echo "LOST $f"; done
+  while read -r f; do { [ -e "$f" ] || [ -L "$f" ]; } || echo "LOST $f"; done
 ```
 
-Both must print nothing. The comparison has to use `$PRE`, the pre-merge tip — a
-resurrected file is no longer a deletion in the merge result, so comparing against
-the post-merge `HEAD` reports success no matter what happened. (After the merge
-commit exists, `$PRE` is `HEAD^1`.)
+Both must print nothing. Two details the checks depend on:
+
+- The comparison uses `$PRE`, the pre-merge tip. A resurrected file is no longer a
+  deletion in the merge *result*, so comparing against a committed merge reports
+  success no matter what happened. (If you have already committed the merge, `$PRE` is
+  `HEAD^1`.)
+- The `-e || -L` test is deliberate: `-e` alone is false for a dangling symlink, and
+  this repo tracks symlinks (`CLAUDE.md` is one), so a restored symlink with a missing
+  target would otherwise slip through.
 
 Then check the whole shape: `git diff --stat "$STACKBASE" "$PRE"` (intent) against
-`git diff --stat origin/trunk HEAD` (result) should agree file for file, apart from
-other commits `trunk` took meanwhile. Investigate anything in one list but not the
-other.
+`git diff --stat origin/trunk` (result — the one-commit form compares `trunk` against
+the worktree, which is where the merge currently lives) should agree file for file,
+apart from other commits `trunk` took meanwhile. Investigate anything in one list but
+not the other.
 
 **4. Take `trunk`'s `Cargo.lock` wholesale** rather than resolving it by hand, then
 let `cargo metadata` re-add the branch's own crates:
@@ -150,10 +181,19 @@ let `cargo metadata` re-add the branch's own crates:
 ```bash
 git checkout origin/trunk -- Cargo.lock
 cargo metadata --format-version 1 >/dev/null
+git add Cargo.lock
 ```
 
-**5. Re-run `make signoff`** — the merge produced a new commit, so the previous
-attestation no longer covers the pushed HEAD.
+**5. Commit, push, then re-run `make signoff`.** Sign-off attests the *pushed* HEAD
+from a clean checkout (`docs/dev/ci_signoff.md`), and the merge is a new commit, so the
+previous attestation no longer covers it:
+
+```bash
+git commit                    # completes the --no-commit merge
+git status --short            # must be clean before signing off
+git push
+make signoff
+```
 
 ---
 
@@ -161,7 +201,8 @@ attestation no longer covers the pushed HEAD.
 
 - [ ] Child PR based on the parent branch while the parent is open.
 - [ ] No `trunk` merge into the child before the parent lands.
-- [ ] After the parent lands: rebased if unpushed, merged if pushed.
-- [ ] `RESURRECTED` / `LOST` audit clean (merge path only).
+- [ ] After the parent lands: rebased if unpushed, `merge --no-ff --no-commit` if pushed.
+- [ ] Conflicts re-resolved against the stack base, and staged (merge path only).
+- [ ] `RESURRECTED` / `LOST` audit clean before the merge is committed (merge path only).
 - [ ] `Cargo.lock` taken from `trunk` and re-resolved by cargo.
-- [ ] `make signoff` re-run on the new pushed HEAD.
+- [ ] Merge committed and pushed, then `make signoff` re-run on the new pushed HEAD.
