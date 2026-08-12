@@ -224,18 +224,44 @@ pub struct AppliedLsn {
 /// have, and on an upgraded one it repairs divergence that is already there.
 #[must_use]
 pub fn needs_rebuild(
-    watermark: Option<AppliedLsn>,
+    position: &RecordedPosition,
     slot_restart_lsn: Option<u64>,
     absence_implies_gap: bool,
 ) -> bool {
-    match watermark {
+    match position {
         // Nothing recorded: a gap only when absence is informative — see
         // `absence_implies_gap`.
-        None => absence_implies_gap,
+        RecordedPosition::Absent => absence_implies_gap,
+        // Recorded against a different source. Whatever the acceleration holds
+        // came from somewhere else, and the LSN is not even comparable — a small
+        // LSN from the new source would otherwise read as "already covered" and
+        // leave the old source's rows in place while never loading the new
+        // source's.
+        RecordedPosition::ForeignSource => true,
         // A gap when there is no slot at all, or when the slot's earliest
         // retained position is already past the watermark.
-        Some(watermark) => slot_restart_lsn.is_none_or(|earliest| earliest > watermark.lsn),
+        RecordedPosition::At(watermark) => {
+            slot_restart_lsn.is_none_or(|earliest| earliest > watermark.lsn)
+        }
     }
+}
+
+/// What the local record says about an acceleration's position.
+///
+/// Three outcomes rather than `Option`, because "recorded against a different
+/// source" is neither "no record" nor a usable position: LSNs are only
+/// comparable within one source's history, so a watermark carried over to a
+/// different server, database, or table describes contents that have nothing to
+/// do with what this dataset now streams.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RecordedPosition {
+    /// Nothing recorded.
+    Absent,
+    /// A position exists, but for a different source than this dataset streams
+    /// from now. Its LSN cannot be compared and its contents cannot be trusted.
+    ForeignSource,
+    /// A position recorded against this same source.
+    At(AppliedLsn),
 }
 
 /// Durable, client-side record of how far a dataset's acceleration has been
@@ -258,11 +284,11 @@ pub trait AppliedLsnStore: Send + Sync {
         true
     }
 
-    /// The recorded position, or `None` when this acceleration has never been
-    /// loaded — a first bootstrap, not a gap.
+    /// The recorded position — see [`RecordedPosition`] for why a record made
+    /// against a different source is reported distinctly from no record at all.
     async fn load(
         &self,
-    ) -> std::result::Result<Option<AppliedLsn>, Box<dyn std::error::Error + Send + Sync>>;
+    ) -> std::result::Result<RecordedPosition, Box<dyn std::error::Error + Send + Sync>>;
     /// Record `applied` as durably reflected in the acceleration. Called only
     /// after the corresponding changes are durable, never before.
     async fn save(
@@ -288,8 +314,8 @@ impl AppliedLsnStore for NoopAppliedLsnStore {
 
     async fn load(
         &self,
-    ) -> std::result::Result<Option<AppliedLsn>, Box<dyn std::error::Error + Send + Sync>> {
-        Ok(None)
+    ) -> std::result::Result<RecordedPosition, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(RecordedPosition::Absent)
     }
     async fn save(
         &self,
@@ -419,7 +445,7 @@ pub(crate) fn err_to_stream(err: Error) -> StreamError {
 
 #[cfg(test)]
 mod tests {
-    use super::{AppliedLsn, needs_rebuild};
+    use super::{AppliedLsn, RecordedPosition, needs_rebuild};
 
     /// The gap decision is the correctness hinge of the rebuild path: a wrong
     /// `false` resumes over rows the source has deleted (silent divergence, the
@@ -428,16 +454,17 @@ mod tests {
     /// comparison to read correctly.
     #[test]
     fn a_watermark_the_slot_cannot_reach_is_the_only_thing_that_forces_a_rebuild() {
-        let at = |lsn| Some(AppliedLsn { lsn });
+        let at = |lsn| RecordedPosition::At(AppliedLsn { lsn });
         // A recorded watermark makes durability irrelevant: the comparison alone
         // decides, so these cases are asserted against a persisting acceleration.
-        let needs_rebuild_persist = |watermark, restart| needs_rebuild(watermark, restart, true);
+        let needs_rebuild_persist =
+            |position: RecordedPosition, restart| needs_rebuild(&position, restart, true);
 
         // Nothing recorded, and the acceleration boots empty: a first bootstrap,
         // not a gap. Snapshot-and-append is exactly right.
-        assert!(!needs_rebuild(None, Some(100), false));
+        assert!(!needs_rebuild(&RecordedPosition::Absent, Some(100), false));
         assert!(
-            !needs_rebuild(None, None, false),
+            !needs_rebuild(&RecordedPosition::Absent, None, false),
             "an ephemeral acceleration with no slot yet is still a first load"
         );
 
@@ -446,8 +473,23 @@ mod tests {
         // watermark write failed — either can already be missing deletions.
         // Rebuilding costs a re-read on a genuinely first load and repairs the
         // rest, so absence must not be read as emptiness.
-        assert!(needs_rebuild(None, Some(100), true));
-        assert!(needs_rebuild(None, None, true));
+        assert!(needs_rebuild(&RecordedPosition::Absent, Some(100), true));
+        assert!(needs_rebuild(&RecordedPosition::Absent, None, true));
+
+        // A position recorded against another source is never usable, whatever
+        // the slot says and whatever the acceleration's durability: its LSN is
+        // not comparable and its contents describe a different table.
+        assert!(needs_rebuild(
+            &RecordedPosition::ForeignSource,
+            Some(0),
+            true
+        ));
+        assert!(needs_rebuild(
+            &RecordedPosition::ForeignSource,
+            Some(0),
+            false
+        ));
+        assert!(needs_rebuild(&RecordedPosition::ForeignSource, None, false));
 
         // The slot still holds WAL from at or before the watermark, so the gap is
         // replayable: resume.

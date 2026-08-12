@@ -28,9 +28,9 @@ use std::time::Duration;
 use async_stream::try_stream;
 use data_components::cdc::{ChangesStream, InitialSnapshotMode, StreamError};
 use data_components::postgres_replication::{
-    AppliedLsn, AppliedLsnStore, NoopAppliedLsnStore, PgOutputFormat, ReplicationMetrics,
-    ReplicationMetricsCollector, ReplicationParams, ReplicationStreamInput, SchemaEvolutionPolicy,
-    config, start_replication_stream,
+    AppliedLsn, AppliedLsnStore, NoopAppliedLsnStore, PgOutputFormat, RecordedPosition,
+    ReplicationMetrics, ReplicationMetricsCollector, ReplicationParams, ReplicationStreamInput,
+    SchemaEvolutionPolicy, config, start_replication_stream,
 };
 use datafusion::sql::TableReference;
 use futures::StreamExt;
@@ -63,35 +63,75 @@ const MAX_MEMBER_CHANNEL_CAPACITY: usize = 1_048_576;
 /// without a migration.
 struct SidecarAppliedLsnStore {
     blobs: Arc<dyn runtime::dataaccelerator::spice_sys::postgres_replication::WatermarkBlobStore>,
+    /// Which source the recorded position belongs to (see [`source_identity`]).
+    ///
+    /// LSNs are only comparable within one source's history. Without this, a
+    /// dataset repointed to another server, database, or table while keeping its
+    /// acceleration files would compare the new source's LSNs against a
+    /// watermark describing the old one's contents — and a low new LSN reads as
+    /// "already covered", leaving the old rows in place and never loading the
+    /// new source's.
+    identity: String,
+}
+
+/// Identity of the source a watermark was recorded against: endpoint, database,
+/// and table.
+///
+/// Deliberately not the slot name — a different slot on the same server shares
+/// its LSN space, so slot changes stay comparable. Note this does not detect a
+/// same-endpoint cluster restored from a backup or rewound by PITR, whose LSNs
+/// can move backwards; the resume-position clamp in `postgres_replication` is
+/// what keeps that from silently skipping changes.
+fn source_identity(params: &ReplicationParams, schema: &str, table: &str) -> String {
+    format!(
+        "{}:{}/{}/{}.{}",
+        params.host, params.port, params.database, schema, table
+    )
 }
 
 /// Serialized form of [`AppliedLsn`] in the sidecar.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct StoredAppliedLsn {
     lsn: u64,
+    /// The source this position was recorded against. Absent in records written
+    /// before the field existed, which are treated as belonging to a different
+    /// source — the conservative reading, since they cannot be verified.
+    #[serde(default)]
+    source: Option<String>,
 }
 
 #[async_trait::async_trait]
 impl AppliedLsnStore for SidecarAppliedLsnStore {
     async fn load(
         &self,
-    ) -> std::result::Result<Option<AppliedLsn>, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> std::result::Result<RecordedPosition, Box<dyn std::error::Error + Send + Sync>> {
         let Some(checkpoint) = self.blobs.get().await? else {
-            return Ok(None);
+            return Ok(RecordedPosition::Absent);
         };
         // A row that exists but cannot be parsed is surfaced, not swallowed:
         // treating corruption as "no watermark" would silently resume as if this
         // were a first load, and the caller's fallback for an unreadable
         // watermark is a rebuild — the safe direction.
         let stored: StoredAppliedLsn = serde_json::from_str(&checkpoint.data)?;
-        Ok(Some(AppliedLsn { lsn: stored.lsn }))
+        if stored.source.as_deref() != Some(self.identity.as_str()) {
+            tracing::warn!(
+                recorded_for = stored.source.as_deref().unwrap_or("an unrecorded source"),
+                streaming_from = %self.identity,
+                "this acceleration's recorded position belongs to a different source, so its contents cannot be resumed against this one; it will be rebuilt from the source"
+            );
+            return Ok(RecordedPosition::ForeignSource);
+        }
+        Ok(RecordedPosition::At(AppliedLsn { lsn: stored.lsn }))
     }
 
     async fn save(
         &self,
         applied: AppliedLsn,
     ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let payload = serde_json::to_string(&StoredAppliedLsn { lsn: applied.lsn })?;
+        let payload = serde_json::to_string(&StoredAppliedLsn {
+            lsn: applied.lsn,
+            source: Some(self.identity.clone()),
+        })?;
         self.blobs.upsert(&payload).await?;
         Ok(())
     }
@@ -300,7 +340,10 @@ pub fn build_changes_stream(
             )
             .await
             {
-                Some(blobs) => Arc::new(SidecarAppliedLsnStore { blobs }),
+                Some(blobs) => Arc::new(SidecarAppliedLsnStore {
+                    blobs,
+                    identity: source_identity(&params_for_stream, &schema_name, &table_name),
+                }),
                 None => Arc::new(NoopAppliedLsnStore),
             }
         };

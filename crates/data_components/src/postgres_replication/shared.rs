@@ -1934,7 +1934,7 @@ async fn attach_member(
     }
 
     // Slot + publication DDL (idempotent, retried on transient errors).
-    let setup = slot::setup_shared_member(&source.params, &schema_name, &table_name).await?;
+    let mut setup = slot::setup_shared_member(&source.params, &schema_name, &table_name).await?;
     if setup.slot.created_fresh {
         source.slot_created_fresh.store(true, Ordering::Release);
     }
@@ -1989,13 +1989,14 @@ async fn attach_member(
         Ok(watermark) => watermark,
         Err(e) => {
             // Reading it failed, so we cannot prove the gap is fillable. Treat it
-            // as unfillable: a needless rebuild costs a re-read, while a wrong
-            // resume silently keeps rows the source has deleted.
+            // the same as a position belonging to another source — unusable — so
+            // the acceleration is rebuilt: a needless rebuild costs a re-read,
+            // while a wrong resume silently keeps rows the source has deleted.
             tracing::warn!(
                 dataset = %dataset_name,
                 "could not read how far this acceleration has been advanced, so it will be rebuilt from the source rather than resumed on an unproven position: {e}"
             );
-            Some(AppliedLsn { lsn: 0 })
+            super::RecordedPosition::ForeignSource
         }
     };
     // Absence of a watermark is evidence of a gap only when the acceleration
@@ -2012,10 +2013,36 @@ async fn attach_member(
         );
     }
     let rebuild_via_consumer = super::needs_rebuild(
-        watermark,
+        &watermark,
         setup.slot_restart_lsn,
         !params.ephemeral_accelerator && tracks_positions,
     );
+
+    // Resume from the watermark, not from the server's acknowledged position,
+    // whenever the watermark is behind it.
+    //
+    // The two can disagree: the slot ack is advanced by the same commit that
+    // records the watermark, but the ack reaches the server through the pump's
+    // status updates while the watermark is a local write that can fail or be
+    // interrupted. The server's `confirmed_flush_lsn` is what streaming would
+    // otherwise resume from, so a watermark behind it means the interval between
+    // them was acknowledged but never recorded as applied — and resuming at the
+    // server's position would skip it silently. The WAL for that interval is
+    // still retained (`restart_lsn` is at or before the watermark, or this would
+    // have been a rebuild), so replaying it is both possible and idempotent
+    // through the primary-key upsert.
+    if let super::RecordedPosition::At(watermark) = &watermark
+        && !rebuild_via_consumer
+        && setup.slot.consistent_lsn > watermark.lsn
+    {
+        tracing::warn!(
+            dataset = %dataset_name,
+            server_position = %slot::format_lsn(setup.slot.consistent_lsn),
+            recorded_position = %slot::format_lsn(watermark.lsn),
+            "this slot was acknowledged past what the acceleration recorded as applied, so streaming resumes from the recorded position and replays the difference rather than skipping it"
+        );
+        setup.slot.consistent_lsn = watermark.lsn;
+    }
 
     let (sender, receiver) = member_mailbox(params.member_channel_capacity);
     // Grouping signal for the analysis: record which shared slot this dataset joined.
