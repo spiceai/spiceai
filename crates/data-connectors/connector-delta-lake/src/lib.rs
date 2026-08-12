@@ -27,7 +27,7 @@ use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult, NewDataConnectorResult,
 };
-use runtime::parameters::{ParameterSpec, Parameters};
+use runtime_parameters::{ParameterSpec, Parameters};
 use secrecy::ExposeSecret;
 use std::any::Any;
 use std::future::Future;
@@ -303,7 +303,7 @@ pub fn factory() -> Arc<dyn DataConnectorFactory> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use runtime::secrets::Secrets;
+    use runtime_secrets::Secrets;
     use secrecy::SecretString;
     use tokio::sync::RwLock;
 

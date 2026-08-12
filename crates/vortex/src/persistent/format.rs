@@ -413,11 +413,33 @@ impl VortexFormat {
     /// Creates a new instance with configured by a [`VortexTableOptions`].
     #[must_use]
     pub fn new_with_options(session: VortexSession, opts: VortexTableOptions) -> Self {
+        Self::new_with_options_and_optional_dataset(session, opts, None)
+    }
+
+    /// Creates a configured format whose segment-cache metrics use `dataset`.
+    ///
+    /// Prefer this constructor when the label is known up front so the format
+    /// does not briefly construct an unlabeled cache before
+    /// [`Self::with_dataset_label`] replaces it.
+    #[must_use]
+    pub fn new_with_options_and_dataset_label(
+        session: VortexSession,
+        opts: VortexTableOptions,
+        dataset: impl Into<Arc<str>>,
+    ) -> Self {
+        Self::new_with_options_and_optional_dataset(session, opts, Some(dataset.into()))
+    }
+
+    fn new_with_options_and_optional_dataset(
+        session: VortexSession,
+        opts: VortexTableOptions,
+        dataset: Option<Arc<str>>,
+    ) -> Self {
         let segment_cache = opts
             .segment_cache_size_bytes
             .and_then(|bytes| u64::try_from(bytes).ok())
             .filter(|bytes| *bytes > 0)
-            .map(|bytes| Arc::new(SharedSegmentCache::new(bytes, None)));
+            .map(|bytes| Arc::new(SharedSegmentCache::new(bytes, dataset)));
 
         Self {
             session,
@@ -471,20 +493,16 @@ impl VortexFormat {
     /// scans run. No-op label-wise when this format has no segment cache.
     #[must_use]
     pub fn with_dataset_label(&self, dataset: impl Into<Arc<str>>) -> Self {
-        let dataset = dataset.into();
-        let segment_cache = self
-            .opts
-            .segment_cache_size_bytes
-            .and_then(|bytes| u64::try_from(bytes).ok())
-            .filter(|bytes| *bytes > 0)
-            .map(|bytes| Arc::new(SharedSegmentCache::new(bytes, Some(Arc::clone(&dataset)))));
-        Self {
-            session: self.session.clone(),
-            opts: self.opts.clone(),
-            access_plan_provider: self.access_plan_provider.clone(),
-            segment_cache,
-            write_shard: self.write_shard.clone(),
-        }
+        let mut format = Self::new_with_options_and_dataset_label(
+            self.session.clone(),
+            self.opts.clone(),
+            dataset,
+        );
+        format
+            .access_plan_provider
+            .clone_from(&self.access_plan_provider);
+        format.write_shard.clone_from(&self.write_shard);
+        format
     }
 
     /// The configured intra-write shard config, if write sharding is enabled for
