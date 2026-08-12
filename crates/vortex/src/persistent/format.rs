@@ -407,6 +407,13 @@ impl VortexFormat {
         let segment_cache = segment_cache::process_segment_cache()
             .map(Arc::clone)
             .or_else(|| {
+                // Only when the process never decided. A process that switched
+                // caching off must not get a private cache per format — that is
+                // the per-table allocation the shared budget replaced, and it
+                // would be invisible to the runtime's memory accounting.
+                if segment_cache::segment_caching_disabled() {
+                    return None;
+                }
                 opts.segment_cache_size_bytes
                     .and_then(|bytes| u64::try_from(bytes).ok())
                     .filter(|bytes| *bytes > 0)

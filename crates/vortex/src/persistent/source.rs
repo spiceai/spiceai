@@ -261,6 +261,7 @@ impl FileSource for VortexSource {
             expression_convertor: Arc::clone(&self.expression_convertor),
             file_metadata_cache: self.file_metadata_cache.as_ref().map(Arc::clone),
             segment_cache: self.segment_cache.as_ref().map(Arc::clone),
+            object_store_url: Arc::from(base_config.object_store_url.as_str()),
             projection_pushdown: self.options.projection_pushdown.enabled(),
             scan_concurrency: Some(scan_concurrency),
         };

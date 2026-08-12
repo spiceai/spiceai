@@ -22,6 +22,21 @@ fn format() -> VortexFormat {
     VortexFormat::new_with_options(VortexSession::default(), opts)
 }
 
+/// With no decision made, a format may still build a cache of its own from
+/// `segment_cache_size_bytes` — that is how an embedded host that skips the
+/// runtime builder keeps working.
+#[test]
+fn without_a_process_decision_a_format_may_cache_privately() {
+    let mut opts = VortexTableOptions::default();
+    opts.segment_cache_size_bytes = Some(4 * 1024 * 1024);
+    let format = VortexFormat::new_with_options(VortexSession::default(), opts);
+    assert_eq!(
+        format.segment_cache_capacity_bytes(),
+        Some(4 * 1024 * 1024),
+        "an uninitialized process leaves the per-format size in charge"
+    );
+}
+
 #[test]
 fn the_installed_cache_is_shared_by_every_format_and_installed_once() {
     // Before any install, and with no per-format size, scans run uncached.
@@ -30,13 +45,6 @@ fn the_installed_cache_is_shared_by_every_format_and_installed_once() {
         None,
         "nothing installed means no cache"
     );
-
-    // A zero budget is a disable, not an install of an unbounded cache.
-    assert!(
-        !install_process_segment_cache(0),
-        "zero must not install a cache"
-    );
-    assert_eq!(format().segment_cache_capacity_bytes(), None);
 
     assert!(
         install_process_segment_cache(INSTALLED_BYTES),

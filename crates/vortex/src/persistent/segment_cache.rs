@@ -17,15 +17,32 @@ use vortex::buffer::ByteBuffer;
 use vortex::error::VortexResult;
 use vortex::layout::segments::{SegmentCache, SegmentId};
 
-/// Hasher for the segment cache key `(Path, SegmentId)`. XXH3 matches the
+/// Hasher for the segment cache key. XXH3 matches the
 /// project-wide cache hashing default and is markedly faster than moka's default
 /// `SipHash` on the per-segment hot path.
 type SegmentCacheHasher = BuildHasherDefault<XxHash3_64>;
 type PathStates = Arc<Mutex<HashMap<Path, Weak<PathCacheState>>>>;
 
-/// The process-wide segment cache, installed once at startup by
+/// Identity of the object store a [`Path`] is relative to, as a store URL
+/// (`s3://bucket/`, `file:///`).
+///
+/// `object_store::path::Path` is **store-relative**, so it cannot identify a file
+/// on its own. A per-table cache never noticed, because every path it saw came
+/// from that table's store; one cache serving every table does, and two stores
+/// holding the same relative path would otherwise return each other's bytes.
+type StoreKey = Arc<str>;
+
+/// Cache key: the store, the file within it, and the segment within the file.
+type SegmentKey = (StoreKey, Arc<Path>, SegmentId);
+
+/// The process-wide segment cache decision, made once at startup by
 /// [`install_process_segment_cache`].
-static PROCESS_CACHE: OnceLock<Arc<SharedSegmentCache>> = OnceLock::new();
+///
+/// Three states, and the distinction matters: unset means the process never made
+/// a decision (an embedded host that skips the runtime builder), so a format may
+/// still build a cache of its own; `Some` is the shared cache; `None` is caching
+/// switched **off**, which must not be quietly re-enabled per table.
+static PROCESS_CACHE: OnceLock<Option<Arc<SharedSegmentCache>>> = OnceLock::new();
 
 /// Keeps the process cache's observable instruments alive. `OpenTelemetry`
 /// retains observable callbacks for the meter provider's lifetime, so the
@@ -35,27 +52,29 @@ static PROCESS_METRICS: OnceLock<SegmentCacheMetrics> = OnceLock::new();
 /// Install the process-wide segment cache with a total budget of
 /// `max_capacity_bytes`, shared by every table.
 ///
-/// One cache for the whole process rather than one per table: the key carries
-/// the full object-store path, so tables cannot collide, and a single budget
-/// means adding a table divides a fixed pool instead of reserving another
-/// full-sized cache. Moka fixes capacity at build time, so per-table caches
-/// could not be resized to share a budget without discarding their contents.
+/// One cache for the whole process rather than one per table: keys are qualified
+/// by store and path (see [`SegmentKey`]) so tables cannot collide, and a single
+/// budget means adding a table divides a fixed pool instead of reserving another
+/// full-sized cache. Moka fixes capacity at build time, so per-table caches could
+/// not be resized to share a budget without discarding their contents.
 ///
-/// Returns `false` when a cache is already installed (the existing one keeps its
-/// capacity) or when `max_capacity_bytes` is zero, which disables caching.
+/// `max_capacity_bytes` of zero installs the **disabled** decision rather than a
+/// cache: scans then run uncached, and no format may substitute one of its own.
+///
+/// Returns `false` when a decision was already made; the first one stands, so a
+/// second runtime in the same process cannot resize or re-enable the cache.
 ///
 /// Metrics are registered separately by [`register_process_segment_cache_metrics`]:
 /// the cache has to exist before any table is registered, which is earlier than
 /// the point where the real meter provider is in place.
 pub fn install_process_segment_cache(max_capacity_bytes: u64) -> bool {
-    if max_capacity_bytes == 0 {
-        return false;
-    }
-    // Retirement tracking is always on here: Cayenne needs it to keep a late put
-    // from repopulating a retired path, the per-put cost is one atomic load, and
-    // read-only formats share this cache with mutable ones.
-    let cache = Arc::new(SharedSegmentCache::new(max_capacity_bytes, true));
-    PROCESS_CACHE.set(cache).is_ok()
+    let decision = (max_capacity_bytes > 0).then(|| {
+        // Retirement tracking is always on here: Cayenne needs it to keep a late
+        // put from repopulating a retired path, the per-put cost is one atomic
+        // load, and read-only formats share this cache with mutable ones.
+        Arc::new(SharedSegmentCache::new(max_capacity_bytes, true))
+    });
+    PROCESS_CACHE.set(decision).is_ok()
 }
 
 /// Register the installed cache's observable instruments.
@@ -66,7 +85,7 @@ pub fn install_process_segment_cache(max_capacity_bytes: u64) -> bool {
 /// report — the same ordering constraint the other Cayenne operator gauges
 /// document. No-op when no cache is installed or metrics are already registered.
 pub fn register_process_segment_cache_metrics() {
-    let Some(cache) = PROCESS_CACHE.get() else {
+    let Some(Some(cache)) = PROCESS_CACHE.get() else {
         return;
     };
     let _ = PROCESS_METRICS.set(SegmentCacheMetrics::register(
@@ -75,9 +94,27 @@ pub fn register_process_segment_cache_metrics() {
     ));
 }
 
-/// The installed process-wide cache, or `None` when segment caching is disabled.
+/// The installed process-wide cache, if one is installed.
 pub(crate) fn process_segment_cache() -> Option<&'static Arc<SharedSegmentCache>> {
-    PROCESS_CACHE.get()
+    PROCESS_CACHE.get()?.as_ref()
+}
+
+/// Byte capacity of the installed process cache, or `None` when caching is
+/// disabled or no decision has been made.
+///
+/// Lets the runtime's memory accounting reserve against the cache that actually
+/// exists rather than recomputing what it asked for.
+#[must_use]
+pub fn process_segment_cache_capacity_bytes() -> Option<u64> {
+    process_segment_cache().map(|cache| cache.capacity_bytes())
+}
+
+/// Whether the process decided segment caching is off.
+///
+/// Distinct from "no cache installed": this says a decision was made and the
+/// answer was no, so a format must not fall back to a private cache.
+pub(crate) fn segment_caching_disabled() -> bool {
+    matches!(PROCESS_CACHE.get(), Some(None))
 }
 
 /// Observable instruments over one segment cache.
@@ -170,14 +207,14 @@ impl SegmentCacheMetrics {
 
 /// Segment cache keyed by file path and Vortex segment id.
 ///
-/// Vortex segment ids are local to each file, so the key pairs the id with the
-/// file's object-store path. That key is globally unique, which is what lets one
-/// cache — and one byte budget — serve every table in the process. Nothing here
-/// is per-table, so the metrics above carry no `dataset` label: fill, capacity
-/// and hit rate describe the single shared resource.
+/// Vortex segment ids are local to each file, so a key pairs the id with the
+/// file's path *and* the store that path is relative to — see [`SegmentKey`].
+/// Fully qualified, it lets one cache and one byte budget serve every table in the
+/// process. Nothing here is per-table, so the metrics above carry no `dataset`
+/// label: fill, capacity and hit rate describe the single shared resource.
 #[derive(Debug)]
 pub(crate) struct SharedSegmentCache {
-    cache: Cache<(Arc<Path>, SegmentId), ByteBuffer, SegmentCacheHasher>,
+    cache: Cache<SegmentKey, ByteBuffer, SegmentCacheHasher>,
     /// Weak per-path insertion states. An open file keeps its state alive; the
     /// last [`PathSegmentCache`] drop removes the weak registry entry, so paths
     /// retired over the process's lifetime do not accumulate as tombstones.
@@ -234,7 +271,13 @@ impl SharedSegmentCache {
         observe(hits.min(*last_observed_accesses));
     }
 
-    pub(crate) fn for_path(self: &Arc<Self>, path: Path) -> Arc<dyn SegmentCache> {
+    /// A per-file view. `store` identifies the object store `path` is relative
+    /// to; see [`StoreKey`].
+    pub(crate) fn for_path(
+        self: &Arc<Self>,
+        store: StoreKey,
+        path: Path,
+    ) -> Arc<dyn SegmentCache> {
         let state = self.path_states.as_ref().map(|path_states| {
             let mut states = path_states.lock();
             states
@@ -248,6 +291,7 @@ impl SharedSegmentCache {
         });
         Arc::new(PathSegmentCache {
             shared: Arc::clone(self),
+            store,
             path: Arc::new(path),
             state,
         })
@@ -293,7 +337,7 @@ impl SharedSegmentCache {
         let keys: Vec<_> = self
             .cache
             .iter()
-            .filter_map(|(key, _)| paths.contains(key.0.as_ref()).then(|| key.as_ref().clone()))
+            .filter_map(|(key, _)| paths.contains(key.1.as_ref()).then(|| key.as_ref().clone()))
             .collect();
         for key in keys {
             self.cache.invalidate(&key).await;
@@ -324,6 +368,8 @@ impl SharedSegmentCache {
 
 struct PathSegmentCache {
     shared: Arc<SharedSegmentCache>,
+    /// The store `path` is relative to. Part of every key this view forms.
+    store: StoreKey,
     // `Arc<Path>` so forming the `(path, segment)` cache key on every `get`/`put`
     // is a refcount bump, not a `Path` (string) clone — segment reads are hot.
     path: Arc<Path>,
@@ -347,7 +393,11 @@ impl Drop for ActivePutGuard<'_> {
 #[async_trait]
 impl SegmentCache for PathSegmentCache {
     async fn get(&self, id: SegmentId) -> VortexResult<Option<ByteBuffer>> {
-        let result = self.shared.cache.get(&(Arc::clone(&self.path), id)).await;
+        let result = self
+            .shared
+            .cache
+            .get(&(Arc::clone(&self.store), Arc::clone(&self.path), id))
+            .await;
 
         // Collection reads these atomics directly, so the hot path never
         // allocates labels or synchronously records metrics.
@@ -394,7 +444,10 @@ impl SegmentCache for PathSegmentCache {
         };
         self.shared
             .cache
-            .insert((Arc::clone(&self.path), id), buffer)
+            .insert(
+                (Arc::clone(&self.store), Arc::clone(&self.path), id),
+                buffer,
+            )
             .await;
         Ok(())
     }
@@ -641,8 +694,67 @@ mod tests {
         }
     }
 
+    /// The store every single-store test keys against.
+    fn test_store() -> StoreKey {
+        Arc::from("memory:///")
+    }
+
     async fn settle_cache_bookkeeping(cache: &SharedSegmentCache) {
         cache.cache.run_pending_tasks().await;
+    }
+
+    /// Regression test: one cache serves every table, and `Path` is
+    /// store-relative, so the store has to be part of the key. Without it, two
+    /// stores holding the same relative path return each other's bytes — wrong
+    /// data, not just a wrong hit rate.
+    #[tokio::test]
+    async fn identical_paths_in_different_stores_do_not_collide() {
+        let shared = Arc::new(SharedSegmentCache::new(1 << 20, false));
+        let path = Path::from("narrow/019ff413/019ff41a/data.vortex");
+        let id = SegmentId::from(1);
+
+        let warm = shared.for_path(Arc::from("file:///"), path.clone());
+        let cold = shared.for_path(Arc::from("s3://datalake/"), path.clone());
+
+        warm.put(id, ByteBuffer::copy_from(vec![1_u8, 1, 1, 1]))
+            .await
+            .expect("cache the warm-tier segment");
+
+        assert!(
+            cold.get(id)
+                .await
+                .expect("get should not error")
+                .is_none(),
+            "the same relative path in another store must not hit"
+        );
+
+        cold.put(id, ByteBuffer::copy_from(vec![2_u8, 2, 2, 2]))
+            .await
+            .expect("cache the cold-tier segment");
+
+        let from_warm = warm
+            .get(id)
+            .await
+            .expect("get should not error")
+            .expect("the warm entry is still cached");
+        let from_cold = cold
+            .get(id)
+            .await
+            .expect("get should not error")
+            .expect("the cold entry is cached");
+        assert_eq!(
+            from_warm.as_slice(),
+            &[1, 1, 1, 1],
+            "each store must get its own bytes back"
+        );
+        assert_eq!(from_cold.as_slice(), &[2, 2, 2, 2]);
+
+        shared.run_pending_tasks().await;
+        assert_eq!(
+            shared.cache.entry_count(),
+            2,
+            "the two stores occupy separate entries"
+        );
     }
 
     #[tokio::test]
@@ -659,7 +771,7 @@ mod tests {
         let segment_ptr = segment.as_slice().as_ptr();
 
         let shared = Arc::new(SharedSegmentCache::new(8 * 1024 * 1024, false));
-        let cache = shared.for_path(Path::from("coalesced.vortex"));
+        let cache = shared.for_path(test_store(), Path::from("coalesced.vortex"));
         let id = SegmentId::from(1);
         cache
             .put(id, segment.clone())
@@ -698,8 +810,8 @@ mod tests {
     #[tokio::test]
     async fn get_put_roundtrip_and_path_isolation() {
         let shared = Arc::new(SharedSegmentCache::new(1 << 20, false));
-        let cache_a = shared.for_path(Path::from("a.vortex"));
-        let cache_b = shared.for_path(Path::from("b.vortex"));
+        let cache_a = shared.for_path(test_store(), Path::from("a.vortex"));
+        let cache_b = shared.for_path(test_store(), Path::from("b.vortex"));
         let id = SegmentId::from(1);
 
         // Miss before insert.
@@ -799,7 +911,7 @@ mod tests {
     async fn metrics_are_visible_after_a_handful_of_accesses() {
         let harness = MetricsHarness::new();
         let (shared, _metrics) = harness.cache(1_024);
-        let cache = shared.for_path(Path::from("active.vortex"));
+        let cache = shared.for_path(test_store(), Path::from("active.vortex"));
         let id_one = SegmentId::from(1);
         let id_two = SegmentId::from(2);
 
@@ -846,7 +958,7 @@ mod tests {
         );
 
         // A second path wrapper over the same cache must not add a second series.
-        let cache_clone = shared.for_path(Path::from("active.vortex"));
+        let cache_clone = shared.for_path(test_store(), Path::from("active.vortex"));
         assert!(
             cache_clone
                 .get(id_one)
@@ -894,7 +1006,7 @@ mod tests {
     async fn metrics_report_unsettled_moka_estimates_without_flushing() {
         let harness = MetricsHarness::new();
         let (shared, _metrics) = harness.cache(1_024);
-        let cache = shared.for_path(Path::from("unsettled.vortex"));
+        let cache = shared.for_path(test_store(), Path::from("unsettled.vortex"));
         cache
             .put(SegmentId::from(1), ByteBuffer::from(vec![1_u8; 9]))
             .await
@@ -922,7 +1034,7 @@ mod tests {
         let harness = MetricsHarness::new();
         let (shared, _metrics) = harness.cache(1_024);
         let weak = Arc::downgrade(&shared);
-        let cache = shared.for_path(Path::from("retired.vortex"));
+        let cache = shared.for_path(test_store(), Path::from("retired.vortex"));
 
         harness
             .gather()
@@ -947,7 +1059,7 @@ mod tests {
     async fn a_delta_reader_sees_the_live_cache_and_nothing_after_it_drops() {
         let harness = DeltaMetricsHarness::new();
         let (shared, _metrics) = harness.cache(1_024);
-        let cache = shared.for_path(Path::from("delta.vortex"));
+        let cache = shared.for_path(test_store(), Path::from("delta.vortex"));
         let id = SegmentId::from(1);
 
         assert!(cache.get(id).await.expect("cache miss").is_none());
@@ -981,8 +1093,8 @@ mod tests {
         let shared = Arc::new(SharedSegmentCache::new(1 << 20, true));
         let path_a = Path::from("snapshot-a/a.vortex");
         let path_b = Path::from("snapshot-b/b.vortex");
-        let cache_a = shared.for_path(path_a.clone());
-        let cache_b = shared.for_path(path_b.clone());
+        let cache_a = shared.for_path(test_store(), path_a.clone());
+        let cache_b = shared.for_path(test_store(), path_b.clone());
         let id = SegmentId::from(1);
 
         cache_a
@@ -1033,8 +1145,8 @@ mod tests {
         let shared = Arc::new(SharedSegmentCache::new(1 << 20, true));
         let retired_path = Path::from("snapshot-a/retired.vortex");
         let live_path = Path::from("snapshot-b/live.vortex");
-        let retired = shared.for_path(retired_path.clone());
-        let live = shared.for_path(live_path);
+        let retired = shared.for_path(test_store(), retired_path.clone());
+        let live = shared.for_path(test_store(), live_path);
         let id = SegmentId::from(1);
 
         retired
@@ -1046,7 +1158,7 @@ mod tests {
             .expect("put for live path should not error");
         for index in 0..256 {
             shared
-                .for_path(Path::from(format!("unrelated/{index}.vortex")))
+                .for_path(test_store(), Path::from(format!("unrelated/{index}.vortex")))
                 .put(id, ByteBuffer::from(vec![9u8, 10, 11, 12]))
                 .await
                 .expect("put for unrelated path should not error");
@@ -1071,8 +1183,8 @@ mod tests {
     async fn path_state_stays_registered_until_the_last_open_file_drops() {
         let shared = Arc::new(SharedSegmentCache::new(1 << 20, true));
         let path = Path::from("snapshot/shared.vortex");
-        let first = shared.for_path(path.clone());
-        let second = shared.for_path(path.clone());
+        let first = shared.for_path(test_store(), path.clone());
+        let second = shared.for_path(test_store(), path.clone());
         let states = shared
             .path_states
             .as_ref()

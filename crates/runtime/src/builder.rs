@@ -1530,11 +1530,16 @@ fn estimate_cayenne_reservation_bytes(
         parse_u64(runtime_params, &["cdc_max_coalesced_bytes"]).unwrap_or(DEFAULT_COALESCE_BYTES);
 
     // Scan-path cache: one process-wide cache shared by every table, so its
-    // budget is counted once rather than per acceleration.
-    let mut total: u64 = segment_cache_budget_bytes(parse_usize_runtime_param(
-        runtime_params,
-        CAYENNE_SEGMENT_CACHE_MB_PARAM,
-    ));
+    // budget is counted once rather than per acceleration. Prefer the installed
+    // capacity — the estimate then describes the cache that exists, including
+    // when an earlier runtime in this process installed a different budget.
+    let mut total: u64 = vortex_datafusion::process_segment_cache_capacity_bytes()
+        .unwrap_or_else(|| {
+            segment_cache_budget_bytes(parse_usize_runtime_param(
+                runtime_params,
+                CAYENNE_SEGMENT_CACHE_MB_PARAM,
+            ))
+        });
     for (accel, profile) in cayenne_accelerations(app) {
         let params = accel
             .params
