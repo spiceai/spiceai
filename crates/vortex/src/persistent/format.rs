@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
+use std::collections::HashSet;
 use std::fmt::Debug;
 use std::fmt::Display;
 use std::fmt::Formatter;
@@ -49,6 +50,7 @@ use futures::TryStreamExt as _;
 use futures::stream;
 use object_store::ObjectMeta;
 use object_store::ObjectStore;
+use object_store::path::Path;
 use vortex::VortexSessionDefault;
 use vortex::arrow::ArrowSessionExt;
 use vortex::arrow::FromArrowType;
@@ -417,7 +419,7 @@ impl VortexFormat {
             .segment_cache_size_bytes
             .and_then(|bytes| u64::try_from(bytes).ok())
             .filter(|bytes| *bytes > 0)
-            .map(|bytes| Arc::new(SharedSegmentCache::new(bytes, None)));
+            .map(|bytes| Arc::new(SharedSegmentCache::new(bytes, None, false)));
 
         Self {
             session,
@@ -432,6 +434,23 @@ impl VortexFormat {
     #[must_use]
     pub fn options(&self) -> &VortexTableOptions {
         &self.opts
+    }
+
+    /// Invalidates cached Vortex segments for the exact object-store paths and
+    /// physically evicts them before returning.
+    pub async fn invalidate_segment_cache_paths(&self, paths: HashSet<Path>) {
+        if let Some(cache) = self.segment_cache.as_ref() {
+            cache.invalidate_paths(paths).await;
+        }
+    }
+
+    /// Returns the current number of cached Vortex segments, or `None` when the
+    /// segment cache is disabled.
+    pub async fn segment_cache_entry_count(&self) -> Option<u64> {
+        match self.segment_cache.as_ref() {
+            Some(cache) => Some(cache.entry_count().await),
+            None => None,
+        }
     }
 
     /// Creates a format that attaches access plans and adjusts footer-derived
@@ -472,12 +491,32 @@ impl VortexFormat {
     #[must_use]
     pub fn with_dataset_label(&self, dataset: impl Into<Arc<str>>) -> Self {
         let dataset = dataset.into();
+        self.with_dataset_label_inner(&dataset, false)
+    }
+
+    /// Returns a dataset-labelled format whose segment cache also prevents an
+    /// already-open file from inserting segments after its path is retired.
+    /// Mutable Cayenne tables use this; read-only formats keep the original
+    /// cache-miss path without retirement bookkeeping.
+    #[must_use]
+    pub fn with_dataset_label_and_retirement_tracking(&self, dataset: impl Into<Arc<str>>) -> Self {
+        let dataset = dataset.into();
+        self.with_dataset_label_inner(&dataset, true)
+    }
+
+    fn with_dataset_label_inner(&self, dataset: &Arc<str>, track_retirement: bool) -> Self {
         let segment_cache = self
             .opts
             .segment_cache_size_bytes
             .and_then(|bytes| u64::try_from(bytes).ok())
             .filter(|bytes| *bytes > 0)
-            .map(|bytes| Arc::new(SharedSegmentCache::new(bytes, Some(Arc::clone(&dataset)))));
+            .map(|bytes| {
+                Arc::new(SharedSegmentCache::new(
+                    bytes,
+                    Some(Arc::clone(dataset)),
+                    track_retirement,
+                ))
+            });
         Self {
             session: self.session.clone(),
             opts: self.opts.clone(),

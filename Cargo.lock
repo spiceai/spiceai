@@ -21871,6 +21871,7 @@ dependencies = [
  "moka",
  "object_store 0.13.2",
  "opentelemetry",
+ "parking_lot",
  "rstest 0.26.1",
  "tempfile",
  "tokio",
