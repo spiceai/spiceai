@@ -47,7 +47,7 @@ limitations under the License.
 //! body is indistinguishable from response loss; decoded-but-invalid response
 //! fields are terminal under the operation's idempotency key.
 
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use base64::Engine as _;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -55,7 +55,7 @@ use snafu::{ResultExt, Snafu};
 use zeroize::Zeroizing;
 
 use crate::config::CloudConnectConfig;
-use crate::draft::EnrollmentDraft;
+use crate::draft::{EnrollmentDraft, EnrollmentTransactionLock};
 use crate::enrollment_key::EnrollmentKey;
 use crate::identity::{EnrollmentMaterial, Identity, IdentityStore};
 
@@ -1043,6 +1043,27 @@ pub async fn enroll_now(
     authority: &EnrollmentAuthority,
     retry: RetryPolicy,
 ) -> std::result::Result<EnrollNowOutcome, EnrollNowError> {
+    // One process owns the complete identity-check → draft → request →
+    // promotion → cleanup transaction for this config directory. Locking only
+    // draft publication leaves a gap where a second process can observe no
+    // identity, then publish a sibling operation after the first deletes its
+    // draft.
+    let config_dir = config.config_dir.clone();
+    let transaction_dir = config_dir.clone();
+    let enrollment_transaction =
+        tokio::task::spawn_blocking(move || EnrollmentTransactionLock::acquire(&transaction_dir))
+            .await
+            .unwrap_or_else(|join| {
+                Err(crate::draft::Error::Io {
+                    path: EnrollmentDraft::path_in(&config_dir),
+                    source: std::io::Error::other(format!(
+                        "enrollment transaction lock task panicked: {join}"
+                    )),
+                })
+            })
+            .context(DraftSnafu)?;
+    let enrollment_transaction = Arc::new(enrollment_transaction);
+
     // Existing identity wins without redeeming the supplied authority.
     let identity_path = config.identity_path.clone();
     let existing = tokio::task::spawn_blocking({
@@ -1076,6 +1097,7 @@ pub async fn enroll_now(
                 });
             }
             cleanup_enrollment_draft(config.config_dir.clone()).await;
+            drop(enrollment_transaction);
             return Ok(EnrollNowOutcome::AlreadyEnrolled { identity });
         }
     }
@@ -1089,12 +1111,11 @@ pub async fn enroll_now(
     }
 
     let facts = InstanceFacts::gather(&config.runtime_version);
-    let config_dir = config.config_dir.clone();
     let draft_facts = facts.clone();
     let draft_region = config.instance_region.clone();
-    let draft = tokio::task::spawn_blocking({
-        let config_dir = config_dir.clone();
-        move || EnrollmentDraft::load_or_create(&config_dir, &draft_facts, draft_region.as_deref())
+    let draft_transaction = Arc::clone(&enrollment_transaction);
+    let draft = tokio::task::spawn_blocking(move || {
+        draft_transaction.load_or_create(&draft_facts, draft_region.as_deref())
     })
     .await
     .unwrap_or_else(|join| {
@@ -1176,6 +1197,7 @@ pub async fn enroll_now(
     // a stale draft behind — enrollment never runs again while the identity
     // exists, so it is a warning, not an error.
     cleanup_enrollment_draft(config.config_dir.clone()).await;
+    drop(enrollment_transaction);
 
     Ok(EnrollNowOutcome::Enrolled {
         identity,

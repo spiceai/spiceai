@@ -71,7 +71,9 @@ use rcgen::{
     ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair, KeyUsagePurpose, PublicKeyData as _, SanType,
 };
 use runtime_cloud_connect::config::CloudConnectConfig;
-use runtime_cloud_connect::enroll::{EnrollmentAuthority, RetryPolicy, enroll_now};
+use runtime_cloud_connect::enroll::{
+    EnrollNowOutcome, EnrollmentAuthority, RetryPolicy, enroll_now,
+};
 use runtime_cloud_connect::enrollment_key::EnrollmentKey;
 use runtime_cloud_connect::handlers::{
     ApplyOutcome, Capability, CommandError, MAX_QUERY_RESULT_BYTES, MAX_QUERY_ROWS, QueryOutcome,
@@ -82,7 +84,7 @@ use runtime_cloud_connect::proto;
 use runtime_cloud_connect::proto::cloud_connect_server::{CloudConnect, CloudConnectServer};
 use serde_json::Value;
 use tokio::net::TcpListener;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, Notify, mpsc};
 use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
 use tonic::transport::{Certificate, Identity as TonicIdentity, Server, ServerTlsConfig};
 use tonic::{Request, Response, Status, Streaming};
@@ -252,6 +254,11 @@ struct CloudMock {
     /// While > 0, an enroll request is refused 503 BEFORE any processing —
     /// a plain transient outage. Decremented per use.
     unavailable_responses: Arc<Mutex<u32>>,
+    /// Test-only gate that pauses one request after capture but before cloud
+    /// processing, making overlapping local enrollment deterministic.
+    pause_next_enroll: Arc<AtomicBool>,
+    enroll_paused: Arc<Notify>,
+    resume_enroll: Arc<Notify>,
     /// When set, enrollment returns a valid X.509 leaf for a different key
     /// than the submitted CSR, modeling an unusable committed response.
     issue_mismatched_enroll_certificate: Arc<AtomicBool>,
@@ -297,6 +304,9 @@ impl CloudMock {
             instances_created: Arc::new(Mutex::new(0)),
             drop_responses: Arc::new(Mutex::new(0)),
             unavailable_responses: Arc::new(Mutex::new(0)),
+            pause_next_enroll: Arc::new(AtomicBool::new(false)),
+            enroll_paused: Arc::new(Notify::new()),
+            resume_enroll: Arc::new(Notify::new()),
             issue_mismatched_enroll_certificate: Arc::new(AtomicBool::new(false)),
             pinned_point: Arc::new(Mutex::new(None)),
             stored_region: Arc::new(Mutex::new(None)),
@@ -352,6 +362,11 @@ async fn mock_enroll(
         .lock()
         .await
         .push((body.clone(), captured.clone()));
+
+    if mock.pause_next_enroll.swap(false, Ordering::SeqCst) {
+        mock.enroll_paused.notify_one();
+        mock.resume_enroll.notified().await;
+    }
 
     // A plain transient outage: refused before any processing.
     {
@@ -2434,6 +2449,92 @@ async fn an_existing_identity_wins_without_redeeming_the_key() {
     )
     .await
     .expect("the unredeemed key still enrolls a fresh directory");
+}
+
+/// Two processes sharing one config directory must serialize the complete
+/// enrollment transaction. The contender cannot submit a second authority
+/// while the owner is between its identity check and durable promotion.
+#[tokio::test]
+async fn concurrent_enrollment_is_serialized_through_identity_promotion() {
+    let harness = Harness::new(24 * 60 * 60).await;
+    let dir = tempfile::tempdir().expect("create shared enrollment directory");
+    let config = harness.config(
+        dir.path().join("identity.json"),
+        dir.path().to_path_buf(),
+        Duration::from_hours(12),
+    );
+
+    harness
+        .cloud
+        .pause_next_enroll
+        .store(true, Ordering::SeqCst);
+    let first_config = config.clone();
+    let first = tokio::spawn(async move {
+        enroll_now(
+            &first_config,
+            &token_authority(ENROLLMENT_KEY),
+            test_retry(),
+        )
+        .await
+    });
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        harness.cloud.enroll_paused.notified(),
+    )
+    .await
+    .expect("the first request reaches the deterministic cloud gate");
+
+    let second_config = config.clone();
+    let mut second = tokio::spawn(async move {
+        enroll_now(
+            &second_config,
+            &token_authority(SECOND_ENROLLMENT_KEY),
+            test_retry(),
+        )
+        .await
+    });
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(250), &mut second)
+            .await
+            .is_err(),
+        "the contender must wait for the transaction owner"
+    );
+    assert_eq!(
+        harness.cloud.enroll_requests.lock().await.len(),
+        1,
+        "the contender must not submit another authority before promotion"
+    );
+
+    harness.cloud.resume_enroll.notify_one();
+    let first_outcome = tokio::time::timeout(Duration::from_secs(5), first)
+        .await
+        .expect("the transaction owner finishes")
+        .expect("the transaction owner task joins")
+        .expect("the transaction owner enrolls");
+    let second_outcome = tokio::time::timeout(Duration::from_secs(5), second)
+        .await
+        .expect("the contender finishes after promotion")
+        .expect("the contender task joins")
+        .expect("the contender reuses the promoted identity");
+
+    assert!(matches!(first_outcome, EnrollNowOutcome::Enrolled { .. }));
+    assert!(matches!(
+        second_outcome,
+        EnrollNowOutcome::AlreadyEnrolled { .. }
+    ));
+    assert_eq!(harness.cloud.enroll_requests.lock().await.len(), 1);
+    assert_eq!(*harness.cloud.instances_created.lock().await, 1);
+    assert!(
+        harness
+            .cloud
+            .tokens
+            .lock()
+            .await
+            .get(SECOND_ENROLLMENT_KEY)
+            .is_some_and(|token| token.consumed_by.is_none()),
+        "the waiting contender's key must remain unredeemed"
+    );
 }
 
 /// A readable but unusable identity fails closed. The caller receives the

@@ -113,8 +113,8 @@ Validate direct Cloud Connect deployment modes before rendering.
 
 One enrollment key enrolls exactly one identity, and the identity must
 survive a pod replacement, so `cloudConnect.mode: bootstrap` requires:
-  - exactly one direct command-array `--token` argument (arbitrary shell
-    programs are intentionally not interpreted),
+  - a direct `spiced` executable followed by exactly one command-array
+    `--token` argument (arbitrary shell programs are intentionally rejected),
   - exactly one replica,
   - stateful persistent storage,
   - SPICE_CONFIG_DIR set to a literal path beneath the stateful mountPath,
@@ -144,6 +144,13 @@ security policy by interpreting arbitrary shell programs or entrypoints.
 {{- fail "cloudConnect.mode: connected must not retain --token syntax. Run the Cloud Connect transition before deleting the bootstrap Secret. See deploy/chart/examples/cloud-connect/." -}}
 {{- end -}}
 {{- if eq $mode "bootstrap" -}}
+{{- if eq (len .Values.command) 0 -}}
+{{- fail "cloudConnect.mode: bootstrap requires a direct spiced command array; shell entrypoints and implicit image commands cannot prove which executable receives --token. See deploy/chart/examples/cloud-connect/." -}}
+{{- end -}}
+{{- $commandExecutable := first .Values.command -}}
+{{- if ne (base $commandExecutable) "spiced" -}}
+{{- fail "cloudConnect.mode: bootstrap requires a direct spiced command array; shell entrypoints and implicit image commands cannot prove which executable receives --token. See deploy/chart/examples/cloud-connect/." -}}
+{{- end -}}
 {{- $hasDirectTokenArg := false -}}
 {{- $hasUnsupportedTokenSyntax := false -}}
 {{- $afterEndOfOptions := false -}}

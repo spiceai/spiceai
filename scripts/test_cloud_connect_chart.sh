@@ -156,6 +156,8 @@ expect_rejected "a quote-adjacent shell-form token command" \
   --set-json 'command=["/bin/sh","-c","spiced '\''--token'\''$(SPICE_ENROLL_KEY)"]'
 expect_rejected "mixed direct and shell-form token commands" \
   --set-json 'command=["/bin/sh","-c","spiced --token literal","--token","$(SPICE_ENROLL_KEY)"]'
+expect_rejected "a shell argv-zero token that is not passed to spiced" \
+  --set-json 'command=["/bin/sh","-c","exec spiced","--token","$(SPICE_ENROLL_KEY)"]'
 expect_rejected "--token after the end-of-options marker" \
   --set-json 'command=["/usr/local/bin/spiced","--","--token","$(SPICE_ENROLL_KEY)"]'
 expect_rejected "--token while Cloud Connect mode is disabled" \
@@ -353,6 +355,14 @@ if printf '%s' "${mixed_token_values}" | jq -f "${TRANSITION_FILTER}" >/dev/null
   fail "transition accepted mixed direct and shell-form token syntax"
 else
   pass "transition rejects mixed direct and shell-form token syntax before upgrade"
+fi
+shell_argv_zero_values='{"command":["/bin/sh","-c","exec spiced","--token","$(ENROLLMENT)"],"additionalEnv":[{"name":"ENROLLMENT","valueFrom":{"secretKeyRef":{"name":"secret","key":"token"}}}]}'
+if output="$(printf '%s' "${shell_argv_zero_values}" | jq -e -f "${TRANSITION_FILTER}" 2>&1)"; then
+  fail "transition accepted a shell argv-zero token that is not passed to spiced"
+elif echo "${output}" | grep -q "not attached to a direct spiced command"; then
+  pass "transition rejects a shell argv-zero token before upgrade"
+else
+  fail "transition rejected a shell argv-zero token for the wrong reason: ${output}"
 fi
 stale_marker_values='{"command":["spiced","--token","$(ENROLLMENT)"],"additionalEnv":[{"name":"ENROLLMENT","valueFrom":{"secretKeyRef":{"name":"installed-secret","key":"token"}}}],"cloudConnect":{"bootstrapSecretName":"different-secret"}}'
 if printf '%s' "${stale_marker_values}" | jq -f "${TRANSITION_FILTER}" >/dev/null 2>&1; then

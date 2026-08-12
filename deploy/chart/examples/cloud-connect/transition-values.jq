@@ -20,6 +20,11 @@ def embedded_token_syntax($command):
     | select(test(token_syntax_pattern))
   ];
 
+def direct_spiced_command($command):
+  ($command | length) > 0
+  and (($command[0] | type) == "string")
+  and (($command[0] | split("/") | last) == "spiced");
+
 (. // {}) as $values
 | ($values.command // []) as $command
 | ($values.cloudConnect.bootstrapSecretName // null) as $remembered_secret
@@ -32,6 +37,8 @@ def embedded_token_syntax($command):
     error("installed command contains more than one --token argument")
   elif ($token_syntax | length) > 0 then
     error("installed command contains unsupported embedded or shell-form --token syntax")
+  elif ($matches | length) > 0 and (direct_spiced_command($command) | not) then
+    error("installed --token is not attached to a direct spiced command")
   elif ($matches | length) == 0 then
     {
       values: {

@@ -29,9 +29,10 @@ limitations under the License.
 //!
 //! Lifecycle:
 //! - Created (and persisted) before the first enrollment request.
-//! - First publication is serialized by a persistent advisory lock file. The
-//!   operating system releases lock ownership if a creator exits, so a later
-//!   process can recover without replacing an in-progress operation.
+//! - The full identity-check, request, promotion, and cleanup transaction is
+//!   serialized by a persistent advisory lock file. The operating system
+//!   releases lock ownership if an enrolling process exits, so a later process
+//!   can recover without overlapping or replacing an in-progress operation.
 //! - Reused verbatim by every retry — including a later process presenting
 //!   a **new** key after the first one expired mid-retry, which the cloud
 //!   consumes against the existing operation rather than a new instance.
@@ -48,7 +49,7 @@ use crate::identity::{EnrollmentMaterial, IdentityStore};
 /// File name (relative to `$SPICE_CONFIG_DIR`) of the enrollment draft.
 pub const ENROLLMENT_DRAFT_FILE: &str = "enrollment-draft.json";
 
-/// The stable advisory lock file that serializes first publication.
+/// The stable advisory lock file that serializes enrollment for one directory.
 ///
 /// This inode is deliberately persistent. Unlinking an advisory lock file can
 /// let a new process lock a replacement inode while another process still
@@ -101,13 +102,55 @@ pub enum Error {
     Material { source: crate::identity::Error },
 
     #[snafu(display(
-        "Another live process is still publishing the enrollment draft protected by {}. Wait for that process to finish and retry",
+        "Another live process is still enrolling this config directory under the lock at {}. Wait for that process to finish and retry",
         path.display()
     ))]
     CreationInProgress { path: PathBuf },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+/// Exclusive ownership of one config directory's enrollment transaction.
+///
+/// The file handle must remain alive from the first identity read through
+/// draft cleanup. Releasing it earlier permits another process to observe no
+/// identity after promotion has started and race a new operation against the
+/// first process.
+pub(crate) struct EnrollmentTransactionLock {
+    draft_path: PathBuf,
+    file: std::fs::File,
+}
+
+impl EnrollmentTransactionLock {
+    pub(crate) fn acquire(config_dir: &Path) -> Result<Self> {
+        let draft_path = EnrollmentDraft::path_in(config_dir);
+        if let Some(parent) = draft_path.parent() {
+            std::fs::create_dir_all(parent).context(IoSnafu {
+                path: parent.to_path_buf(),
+            })?;
+        }
+        let lock_path = EnrollmentDraft::lock_path(&draft_path);
+        let file = EnrollmentDraft::acquire_publication_lock(&lock_path)?;
+        Ok(Self { draft_path, file })
+    }
+
+    pub(crate) fn load_or_create(
+        &self,
+        instance: &InstanceFacts,
+        region: Option<&str>,
+    ) -> Result<EnrollmentDraft> {
+        match std::fs::read_to_string(&self.draft_path) {
+            Ok(contents) => EnrollmentDraft::load_published(&self.draft_path, &contents),
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                EnrollmentDraft::publish_locked(&self.draft_path, &self.file, instance, region)
+            }
+            Err(source) => Err(Error::Io {
+                path: self.draft_path.clone(),
+                source,
+            }),
+        }
+    }
+}
 
 /// The provisional, retry-stable state of one enrollment operation.
 ///
@@ -189,14 +232,7 @@ impl EnrollmentDraft {
         instance: &InstanceFacts,
         region: Option<&str>,
     ) -> Result<Self> {
-        let path = Self::path_in(config_dir);
-        match std::fs::read_to_string(&path) {
-            Ok(contents) => Self::load_published(&path, &contents),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                Self::create_at(&path, instance, region)
-            }
-            Err(source) => Err(Error::Io { path, source }),
-        }
+        EnrollmentTransactionLock::acquire(config_dir)?.load_or_create(instance, region)
     }
 
     fn parse_at(path: &Path, contents: &str) -> Result<Self> {
@@ -224,6 +260,7 @@ impl EnrollmentDraft {
 
     /// Generate a fresh draft and persist it at `path` before returning it,
     /// so the operation ID is durable before the first request that uses it.
+    #[cfg(test)]
     fn create_at(path: &Path, instance: &InstanceFacts, region: Option<&str>) -> Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).context(IoSnafu {
@@ -281,10 +318,10 @@ impl EnrollmentDraft {
         instance: &InstanceFacts,
         region: Option<&str>,
     ) -> Result<Self> {
-        // `load_or_create` observed NotFound before entering `create_at`, but
-        // another process may have published before this process acquired the
-        // lock. Re-read while locked so a delayed creator cannot replace the
-        // durable winner through the atomic rename below.
+        // A caller may have observed NotFound before acquiring the lock, but
+        // another process can publish before this process owns it. Re-read
+        // while locked so a delayed creator cannot replace the durable winner
+        // through the atomic rename below.
         match std::fs::read_to_string(path) {
             Ok(contents) => return Self::parse_at(path, &contents),
             Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
