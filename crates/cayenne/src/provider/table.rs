@@ -4498,11 +4498,23 @@ impl CayenneTableProvider {
                         // Legacy path: no manifest, so no file is referenced
                         // across snapshots — the whole dir is dead.
                         let paths = Self::segment_cache_paths_in_dir(&dir)?;
-                        retired_cache_paths_for_task.lock().extend(paths);
                         match std::fs::remove_dir_all(&dir) {
-                            Ok(()) => Ok(true),
-                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(true),
-                            Err(e) => Err(e),
+                            Ok(()) => {
+                                retired_cache_paths_for_task.lock().extend(paths);
+                                Ok(true)
+                            }
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                                retired_cache_paths_for_task.lock().extend(paths);
+                                Ok(true)
+                            }
+                            Err(e) => {
+                                let remaining = Self::segment_cache_paths_in_dir(&dir)
+                                    .unwrap_or_else(|_| paths.clone());
+                                retired_cache_paths_for_task
+                                    .lock()
+                                    .extend(paths.difference(&remaining).cloned());
+                                Err(e)
+                            }
                         }
                     }
                 })

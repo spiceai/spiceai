@@ -162,7 +162,10 @@ impl SharedSegmentCache {
         }
         for state in &states {
             while state.active_puts.load(Ordering::SeqCst) > 0 {
-                tokio::task::yield_now().await;
+                // Back off instead of spinning on a Moka insert. This is not a
+                // safety timeout: the path is not enumerated until every put
+                // that registered before retirement has completed or canceled.
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
             }
         }
 
@@ -216,11 +219,11 @@ struct PathCacheState {
     active_puts: AtomicUsize,
 }
 
-struct ActivePutGuard<'a>(&'a AtomicUsize);
+struct ActivePutGuard<'a>(&'a PathCacheState);
 
 impl Drop for ActivePutGuard<'_> {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::SeqCst);
+        self.0.active_puts.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -263,7 +266,7 @@ impl SegmentCache for PathSegmentCache {
                 return Ok(());
             }
             state.active_puts.fetch_add(1, Ordering::SeqCst);
-            let guard = ActivePutGuard(&state.active_puts);
+            let guard = ActivePutGuard(state);
             if state.retired.load(Ordering::SeqCst) {
                 return Ok(());
             }
