@@ -25,7 +25,7 @@ description = "GraphQL data connector for Spice.ai runtime"
 [dependencies]
 arrow.workspace = true
 async-trait.workspace = true
-data-connector-rate-control = { path = "../../data-connector-rate-control" }
+data-http-rate-control = { path = "../../data-http-rate-control" }
 data_components = { path = "../../data_components" }
 datafusion.workspace = true
 futures.workspace = true

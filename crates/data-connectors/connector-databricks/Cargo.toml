@@ -25,7 +25,7 @@ description = "Databricks data and catalog connector for Spice.ai runtime"
 [dependencies]
 async-trait.workspace = true
 aws-sdk-credential-bridge = { path = "../../aws-sdk-credential-bridge" }
-data-connector-rate-control = { path = "../../data-connector-rate-control" }
+data-http-rate-control = { path = "../../data-http-rate-control" }
 data_components = { path = "../../data_components", features = ["databricks"] }
 datafusion.workspace = true
 futures.workspace = true

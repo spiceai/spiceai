@@ -4297,7 +4297,7 @@ dependencies = [
  "app",
  "async-trait",
  "aws-sdk-credential-bridge",
- "data-connector-rate-control",
+ "data-http-rate-control",
  "data_components",
  "datafusion",
  "futures",
@@ -4576,7 +4576,7 @@ dependencies = [
  "app",
  "arrow",
  "async-trait",
- "data-connector-rate-control",
+ "data-http-rate-control",
  "data_components",
  "datafusion",
  "futures",
@@ -6004,7 +6004,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "data-connector-rate-control"
+name = "data-encoding"
+version = "2.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a4ae5f15dda3c708c0ade84bfee31ccab44a3da4f88015ed22f63732abe300c8"
+
+[[package]]
+name = "data-http-rate-control"
 version = "2.2.0-unstable"
 dependencies = [
  "data-connector-api",
@@ -6022,12 +6028,6 @@ dependencies = [
  "url",
  "uuid 1.23.2",
 ]
-
-[[package]]
-name = "data-encoding"
-version = "2.11.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a4ae5f15dda3c708c0ade84bfee31ccab44a3da4f88015ed22f63732abe300c8"
 
 [[package]]
 name = "data_components"
@@ -16867,7 +16867,7 @@ dependencies = [
  "dashmap",
  "data-accelerator-api",
  "data-connector-api",
- "data-connector-rate-control",
+ "data-http-rate-control",
  "data_components",
  "dataformat-json",
  "datafusion",

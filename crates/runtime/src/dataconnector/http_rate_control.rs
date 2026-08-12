@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 //! Re-export of connector HTTP rate control, which lives in
-//! `data-connector-rate-control` so a connector can reach it without the runtime.
+//! `data-http-rate-control` so a connector can reach it without the runtime.
 //!
 //! The crate's entry points name a [`ConnectorComponent`] and a spicepod name;
 //! [`resolve_config`] here is the `&Dataset` convenience form for the runtime's
@@ -24,7 +24,7 @@ limitations under the License.
 use std::collections::HashMap;
 use std::hash::BuildHasher;
 
-pub use data_connector_rate_control::*;
+pub use data_http_rate_control::*;
 
 use crate::component::dataset::Dataset;
 use crate::dataconnector::{ConnectorComponent, DataConnectorResult};

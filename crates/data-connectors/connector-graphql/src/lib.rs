@@ -24,8 +24,8 @@ use crate::graphql::{
 };
 use async_trait::async_trait;
 use data_components::rate_limit::RateLimiter;
-use data_connector_rate_control as http_rate_control;
-use data_connector_rate_control::{
+use data_http_rate_control as http_rate_control;
+use data_http_rate_control::{
     HttpRateControlMetricSource, HttpRateControlMetrics, HttpRateControlMetricsProvider,
 };
 use datafusion::datasource::TableProvider;
