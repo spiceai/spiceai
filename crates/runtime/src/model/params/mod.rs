@@ -123,8 +123,25 @@ mod tests {
             llms::openai::ChatBackend::ChatCompletions
         );
         assert_eq!(
-            typed.api_key.as_ref().map(ExposeSecret::expose_secret),
+            typed.auth.api_key().map(ExposeSecret::expose_secret),
             Some("sk-1")
+        );
+    }
+
+    #[tokio::test]
+    async fn openai_rejects_api_key_with_codex_authentication() {
+        let err = openai::OpenAiModelParams::try_from_params(
+            "model openai",
+            params(&[("openai_auth_mode", "codex"), ("openai_api_key", "sk-1")]),
+            &empty_secrets(),
+        )
+        .await
+        .expect_err("Codex authentication must not accept an API key");
+
+        assert!(
+            err.to_string()
+                .contains("`codex` cannot be combined with `openai_api_key`"),
+            "unexpected message: {err}"
         );
     }
 

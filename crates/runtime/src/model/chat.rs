@@ -49,7 +49,7 @@ use super::params::file::FileModelParams;
 use super::params::google::GoogleModelParams;
 #[cfg(feature = "models")]
 use super::params::huggingface::HuggingFaceModelParams;
-use super::params::openai::{OpenAiAuthMode, OpenAiModelParams};
+use super::params::openai::OpenAiModelParams;
 use super::params::spiceai::SpiceAiModelParams;
 use super::params::xai::XaiModelParams;
 use super::wrapper::OPENAI_DEFAULT_PARAM_KEYS;
@@ -612,7 +612,7 @@ fn openai(
     raw_params: &HashMap<String, SecretString>,
     params: &OpenAiModelParams,
 ) -> Result<Arc<dyn Chat>, LlmError> {
-    if params.auth_mode == OpenAiAuthMode::Codex {
+    if params.auth.is_codex() {
         validate_codex_params(params)?;
         return Ok(Arc::new(llms::openai::new_codex_client(
             model_id.unwrap_or(DEFAULT_LLM_MODEL.to_string()),
@@ -622,7 +622,7 @@ fn openai(
     }
 
     let api_base = Some(params.endpoint.as_str());
-    let api_key = params.api_key.as_ref().map(ExposeSecret::expose_secret);
+    let api_key = params.auth.api_key().map(ExposeSecret::expose_secret);
     let org_id = params.org_id.as_deref();
     let project_id = params.project_id.as_deref();
     let usage_tier = Some(params.usage_tier);
@@ -642,12 +642,6 @@ fn openai(
 }
 
 pub(super) fn validate_codex_params(params: &OpenAiModelParams) -> Result<(), LlmError> {
-    if params.api_key.is_some() {
-        return Err(LlmError::FailedToLoadModel {
-            source: "Codex authentication forwards the caller credentials and cannot be combined with `openai_api_key`. Remove `openai_api_key`.".into(),
-        });
-    }
-
     if params.endpoint == "https://api.openai.com/v1" {
         return Err(LlmError::FailedToLoadModel {
             source: "Codex authentication requires `openai_endpoint` to be the Codex backend endpoint. Set `openai_endpoint`, for example `https://chatgpt.com/backend-api/codex`.".into(),
