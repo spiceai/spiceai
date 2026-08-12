@@ -285,8 +285,12 @@ impl Identity {
             EncKeyGenerationSnafu {
                 reason:
                     "this identity holds no encryption key; it enrolled before encrypted secret \
-                     delivery existed. It is re-keyed by the next renewal (~12h), or immediately \
-                     by restarting `spiced --token <enrollment-key>` with a fresh key."
+                     delivery existed. If this identity has a certificate expiry, its scheduled \
+                     renewal will re-key it when due. To recover immediately, or if it has no \
+                     renewal deadline, stop spiced, run `spice connect remove --yes` from this \
+                     instance directory, mint a new enrollment key in the Spice Cloud portal, \
+                     and restart with `spiced --token <enrollment-key>`. The existing identity \
+                     always wins, so supplying --token before removing it cannot re-enroll."
                         .to_string(),
             }
         );
@@ -1523,7 +1527,12 @@ mod tests {
         let err = loaded
             .encryption_keyring()
             .expect_err("an identity with no encryption key cannot open secrets");
-        assert!(err.to_string().contains("renewal"), "{err}");
+        let guidance = err.to_string();
+        assert!(guidance.contains("scheduled renewal"), "{err}");
+        assert!(guidance.contains("no renewal deadline"), "{err}");
+        assert!(guidance.contains("stop spiced"), "{err}");
+        assert!(guidance.contains("spice connect remove --yes"), "{err}");
+        assert!(guidance.contains("existing identity always wins"), "{err}");
     }
 
     #[test]
