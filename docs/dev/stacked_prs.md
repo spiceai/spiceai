@@ -4,10 +4,12 @@ A **stacked PR** is a branch based on another open branch rather than on `trunk`
 a large change can be reviewed as a sequence of small PRs. Stacking is supported and
 encouraged for work that would otherwise land as one unreviewable PR.
 
-Stacking never requires a rebase, and never requires a force push. This document
-covers (1) the workflow while the parent is open, (2) what changes when the parent
-squash-merges, (3) the two ways to restack and how to choose, and (4) the audit that
-catches the one failure mode that is otherwise silent.
+**Stacking never requires a force push.** A rebase is never *required* either — merging
+always works — but once the parent lands, an unpushed child is cleaner to rebase, so
+the restack step below picks between the two. This document covers (1) the workflow
+while the parent is open, (2) what changes when the parent squash-merges, (3) the two
+ways to restack and how to choose, and (4) the audit that catches the one failure mode
+that is otherwise silent.
 
 > **The rule stacking interacts with:** never force-push (see `CLAUDE.md`). Rebasing
 > is not itself forbidden — `git pull --rebase` is the recommended way to take
@@ -153,6 +155,8 @@ ls-files -u <path>` shows them):
 
 ```bash
 f=<path>
+# Symlinks must not go through this block — see below.
+git ls-files --stage -- "$f" | awk '$1 == 120000 { print "SYMLINK, resolve by hand: " $4 }'
 git show ":2:$f" > /tmp/ours          # your side
 git show ":3:$f" > /tmp/theirs        # trunk's side
 git show "$STACKBASE:$f" > /tmp/base  # the correct base — NOT git's stage 1
@@ -163,11 +167,21 @@ else
 fi
 ```
 
-Two things about that block. `merge-file -p` only writes the merged text to stdout — it
-neither updates the worktree file nor stages it, so the `cp`/`git add` are what actually
-resolve the path. And the staging must be *guarded* by the exit status (0 clean, else
-the number of conflicts left): an unguarded `cp` after a warning comment stages conflict
-markers the moment someone pastes the block.
+Three things about that block. `merge-file -p` only writes the merged text to stdout —
+it neither updates the worktree file nor stages it, so the `cp`/`git add` are what
+actually resolve the path. The staging must be *guarded* by the exit status (0 clean,
+else the number of conflicts left): an unguarded `cp` after a warning comment stages
+conflict markers the moment someone pastes the block.
+
+And **never run it on a symlink** — index mode `120000`, which is why the block checks
+for it first. `cp` follows the link and writes *through* it, so resolving a conflict on
+`CLAUDE.md` this way would silently overwrite `.github/copilot-instructions.md` while
+leaving the link itself looking untouched. A conflicted symlink's blob content is just
+its target path, so recreate the link instead:
+
+```bash
+ln -sfn "$(git show ":2:$f")" "$f" && git add "$f"   # or stage 3, whichever target is right
+```
 
 **3. Audit for silent damage** — this is the step that catches the resurrection. It
 compares what the child *intended* against what the merge actually put on disk:

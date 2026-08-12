@@ -30,7 +30,7 @@ make lint-rust-fix      # Auto-fix lint issues
 ## Git & PRs
 
 - **Never force-push** — not on `trunk`, not on feature branches, not with `--force-with-lease` (it can't see pushes since your last fetch). Force-pushing destroys collaborator commits and orphans PR review history. Instead: `git pull --rebase` or merge, then push normally; fix reviewed history with follow-up commits and squash on merge; never `--amend` after pushing.
-- **Stacked PRs are supported and need no rebase.** Base the child branch on the parent branch, and once the parent squash-merges, restack by merging `trunk` into the child — then audit, because that merge can silently restore files the child deleted: `docs/dev/stacked_prs.md`.
+- **Stacked PRs are supported and need no force-push.** Base the child branch on the parent branch; once the parent squash-merges, restack an *unpushed* child with `git rebase --onto`, and a *pushed* one by merging `trunk` and then auditing — that merge can silently restore files the child deleted: `docs/dev/stacked_prs.md`.
 - Never bypass hooks or signing (`--no-verify`, `--no-gpg-sign`) — fix the underlying failure.
 - Investigate before destructive ops (`reset --hard`, `checkout --`, `clean -f`): unfamiliar files or branches may be in-progress work.
 - Branch from `trunk`, link the issue, add tests. Style: `docs/dev/style_guide.md`, `docs/dev/error_handling.md`.
