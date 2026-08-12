@@ -254,9 +254,8 @@ impl Runtime {
     /// workers against the currently-loaded app.
     ///
     /// This is the diff-based reconcile the pods watcher performs when a
-    /// spicepod file changes on disk. It is the *local* configuration path: a
-    /// Spice Cloud deployment does not come through here, because it applies by
-    /// persisting the spicepod and restarting onto it (see
+    /// spicepod file changes on disk, and the one a Spice Cloud deployment takes
+    /// when what it changes is confined to the sections reconciled here (see
     /// `spiced`'s `cloud_connect` module).
     ///
     /// Returns `true` if `new_app` differed from the current app and was

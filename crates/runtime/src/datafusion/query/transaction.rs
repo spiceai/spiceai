@@ -216,7 +216,7 @@ pub async fn run_transaction(
         // visible, so a concurrent SELECT could have repopulated the cache with
         // pre-commit state. Re-invalidate now that the writes are published.
         for (_table_id, table_ref) in &handle.written {
-            if let Err(e) = df.caching().invalidate_for_table(table_ref.clone()) {
+            if let Err(e) = df.caching().invalidate_for_table(table_ref.clone()).await {
                 tracing::warn!(
                     "transaction: post-commit cache invalidation for {table_ref} failed: {e}"
                 );
@@ -367,7 +367,10 @@ async fn resolve_cayenne_staged(
     table_name: &str,
 ) -> Option<CayenneTableProvider> {
     let provider = df.get_accelerated_table_provider(table_name).await.ok()?;
-    let accel = provider.downcast_ref::<AcceleratedTable>()?;
+    let accel = spice_table::find_layer::<AcceleratedTable>(
+        provider.as_ref(),
+        spice_table::LayerWalk::Read,
+    )?;
     // Accelerator-only (the gate governs the sole accelerator write) OR durable
     // write-back (the write stages to the accelerator, marks its keys, and a
     // per-table worker reconciles them to the source — see #11838). Both stage

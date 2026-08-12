@@ -119,7 +119,7 @@ pub mod metrics_reader;
 mod metrics_server;
 pub mod model;
 mod object_store_state;
-mod opentelemetry;
+pub mod opentelemetry;
 pub mod otel_push_exporter;
 // Host/container resource introspection lives in `runtime-resources`; it names
 // nothing from the runtime. Re-exported so `crate::resource_monitor::…` resolves.
@@ -141,7 +141,6 @@ pub mod cluster;
 mod secrets_preflight;
 pub mod spice_metrics;
 pub mod status;
-pub(crate) mod table_layers;
 pub mod task_history;
 pub mod tls;
 pub mod token_providers;
@@ -1701,6 +1700,17 @@ impl Runtime {
         } else {
             false
         }
+    }
+
+    /// Whether the initial component load is still running.
+    ///
+    /// While it is, what is registered is not yet what the loaded app describes,
+    /// so a caller that reconciles a new app against the loaded one — the diff
+    /// [`Runtime::apply_app`] performs — would treat components the load has not
+    /// reached yet as already registered.
+    #[must_use]
+    pub fn initial_load_in_flight(&self) -> bool {
+        self.initial_load.in_flight.load(Ordering::SeqCst)
     }
 
     /// Will load all of the components of the Runtime, including `secret_stores`, `catalogs`, `datasets`, `models`, and `embeddings`.

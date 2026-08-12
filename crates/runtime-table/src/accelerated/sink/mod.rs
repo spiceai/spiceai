@@ -19,7 +19,7 @@ use datafusion::{
     physical_plan::RecordBatchStream,
 };
 use multi::MultiSink;
-use runtime_datafusion_index::{Index, WriteWindow};
+use spice_table::{Index, WriteWindow};
 use std::{pin::Pin, sync::Arc};
 use table::TableSink;
 use util::RetryError;
