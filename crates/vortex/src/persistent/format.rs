@@ -71,6 +71,7 @@ use vortex::session::VortexSession;
 
 use super::access_plan::VortexAccessPlanProvider;
 use super::cache::CachedVortexMetadata;
+use super::segment_cache;
 use super::segment_cache::SharedSegmentCache;
 use super::sink::{ShardSpec, VortexSink};
 use super::source::VortexSource;
@@ -396,48 +397,21 @@ impl VortexFormat {
     }
 
     /// Creates a new instance with configured by a [`VortexTableOptions`].
+    ///
+    /// Scans share the process-wide segment cache when one is installed (see
+    /// `install_process_segment_cache`), so its byte budget covers every table
+    /// rather than being reserved per format. `segment_cache_size_bytes` builds a
+    /// private cache instead, for a standalone format outside that budget.
     #[must_use]
     pub fn new_with_options(session: VortexSession, opts: VortexTableOptions) -> Self {
-        Self::new_with_options_and_optional_dataset(session, opts, None, false)
-    }
-
-    /// Creates a configured format whose segment-cache metrics use `dataset`.
-    ///
-    /// Prefer this constructor when the label is known up front so the format
-    /// does not briefly construct an unlabeled cache before
-    /// [`Self::with_dataset_label`] replaces it.
-    #[must_use]
-    pub fn new_with_options_and_dataset_label(
-        session: VortexSession,
-        opts: VortexTableOptions,
-        dataset: impl Into<Arc<str>>,
-    ) -> Self {
-        Self::new_with_options_and_optional_dataset(session, opts, Some(dataset.into()), false)
-    }
-
-    /// Like [`Self::new_with_options_and_dataset_label`], but the segment cache
-    /// also prevents an already-open file from inserting segments after its path
-    /// is retired. Mutable Cayenne tables use this.
-    #[must_use]
-    pub fn new_with_options_and_dataset_label_tracking_retirement(
-        session: VortexSession,
-        opts: VortexTableOptions,
-        dataset: impl Into<Arc<str>>,
-    ) -> Self {
-        Self::new_with_options_and_optional_dataset(session, opts, Some(dataset.into()), true)
-    }
-
-    fn new_with_options_and_optional_dataset(
-        session: VortexSession,
-        opts: VortexTableOptions,
-        dataset: Option<Arc<str>>,
-        track_retirement: bool,
-    ) -> Self {
-        let segment_cache = opts
-            .segment_cache_size_bytes
-            .and_then(|bytes| u64::try_from(bytes).ok())
-            .filter(|bytes| *bytes > 0)
-            .map(|bytes| Arc::new(SharedSegmentCache::new(bytes, dataset, track_retirement)));
+        let segment_cache = segment_cache::process_segment_cache()
+            .map(Arc::clone)
+            .or_else(|| {
+                opts.segment_cache_size_bytes
+                    .and_then(|bytes| u64::try_from(bytes).ok())
+                    .filter(|bytes| *bytes > 0)
+                    .map(|bytes| Arc::new(SharedSegmentCache::new(bytes, true)))
+            });
 
         Self {
             session,
@@ -500,42 +474,6 @@ impl VortexFormat {
             segment_cache: self.segment_cache.clone(),
             write_shard: Some(config),
         }
-    }
-
-    /// Returns a format whose segment cache reports its right-sizing metrics
-    /// (hit rate, fill) under the given `dataset` label. Rebuilds the (empty)
-    /// segment cache to attach the label, so call once at construction before any
-    /// scans run. No-op label-wise when this format has no segment cache.
-    #[must_use]
-    pub fn with_dataset_label(&self, dataset: impl Into<Arc<str>>) -> Self {
-        let mut format = Self::new_with_options_and_dataset_label(
-            self.session.clone(),
-            self.opts.clone(),
-            dataset,
-        );
-        format
-            .access_plan_provider
-            .clone_from(&self.access_plan_provider);
-        format.write_shard.clone_from(&self.write_shard);
-        format
-    }
-
-    /// Returns a dataset-labelled format whose segment cache also prevents an
-    /// already-open file from inserting segments after its path is retired.
-    /// Mutable Cayenne tables use this; read-only formats keep the original
-    /// cache-miss path without retirement bookkeeping.
-    #[must_use]
-    pub fn with_dataset_label_and_retirement_tracking(&self, dataset: impl Into<Arc<str>>) -> Self {
-        let mut format = Self::new_with_options_and_dataset_label_tracking_retirement(
-            self.session.clone(),
-            self.opts.clone(),
-            dataset,
-        );
-        format
-            .access_plan_provider
-            .clone_from(&self.access_plan_provider);
-        format.write_shard.clone_from(&self.write_shard);
-        format
     }
 
     /// The configured intra-write shard config, if write sharding is enabled for

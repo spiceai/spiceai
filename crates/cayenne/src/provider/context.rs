@@ -167,7 +167,7 @@ impl CayenneContext {
     /// is configured once by the owning runtime before table providers are created.
     #[must_use]
     pub fn new(config: &VortexConfig, runtime_env: Arc<RuntimeEnv>, dataset: &str) -> Arc<Self> {
-        let vortex_format = Self::create_vortex_format(config, dataset);
+        let vortex_format = Self::create_vortex_format(config);
         // Seed the live actuators from the static config so every hot-path accessor
         // reads exactly the static value until (and unless) the controller moves
         // it — enabling dynamic tuning is therefore a strict, bounded refinement,
@@ -376,14 +376,11 @@ impl CayenneContext {
     ) -> Arc<VortexFormat> {
         let session = VortexSession::default().set(strategy);
         let mut options = Self::vortex_table_options(&self.config);
-        // This format only writes files. Keeping a read-path segment cache here
-        // would add an idle full-capacity cache to the dataset's live metrics.
+        // This format only writes files, so it has no use for a read-path cache.
+        // Clearing the size keeps it from building a private one when no
+        // process-wide segment cache is installed.
         options.segment_cache_size_bytes = None;
-        let format = VortexFormat::new_with_options_and_dataset_label(
-            session,
-            options,
-            self.dataset.as_str(),
-        );
+        let format = VortexFormat::new_with_options(session, options);
         let format = match shard {
             Some(config) => format.with_write_shard(config),
             None => format,
@@ -408,15 +405,10 @@ impl CayenneContext {
         }
         let mut options = Self::vortex_table_options(&self.config);
         options.target_file_size_mb = cold_target_file_size_mb;
-        // Write-only format: it never scans, so drop the read-path segment cache
-        // and avoid constructing a `SharedSegmentCache` (moka + metrics) per
-        // promotion.
+        // Write-only format: it never scans, so drop the read-path cache size and
+        // avoid building a private `SharedSegmentCache` per promotion.
         options.segment_cache_size_bytes = None;
-        let format = VortexFormat::new_with_options_and_dataset_label(
-            session,
-            options,
-            self.dataset.as_str(),
-        );
+        let format = VortexFormat::new_with_options(session, options);
         let format = match shard {
             Some(config) => format.with_write_shard(config),
             None => format,
@@ -1068,7 +1060,7 @@ impl CayenneContext {
     ///
     /// The format carries Vortex scan/write options, including the shared
     /// segment-cache capacity for scans created from this context.
-    fn create_vortex_format(config: &VortexConfig, dataset: &str) -> Arc<VortexFormat> {
+    fn create_vortex_format(config: &VortexConfig) -> Arc<VortexFormat> {
         // Create a Vortex session with default encodings. The session's write
         // strategy is the table's FULL encoding tier: the BtrBlocks cascade by
         // default, optionally extended with the Zstd string scheme when
@@ -1084,13 +1076,10 @@ impl CayenneContext {
             vortex_session = vortex_session.set(full_strategy);
         }
 
-        Arc::new(
-            VortexFormat::new_with_options_and_dataset_label_tracking_retirement(
-                vortex_session,
-                Self::vortex_table_options(config),
-                dataset,
-            ),
-        )
+        Arc::new(VortexFormat::new_with_options(
+            vortex_session,
+            Self::vortex_table_options(config),
+        ))
     }
 
     /// Table options shared by the base format and any per-write format

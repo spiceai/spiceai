@@ -3,17 +3,15 @@
 
 use std::collections::{HashMap, HashSet};
 use std::hash::BuildHasherDefault;
-use std::sync::Arc;
-use std::sync::LazyLock;
-use std::sync::Weak;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock, Weak};
 
 use async_trait::async_trait;
 use moka::future::Cache;
 use object_store::path::Path;
+use opentelemetry::global;
 use opentelemetry::metrics::{Meter, ObservableCounter, ObservableGauge};
-use opentelemetry::{KeyValue, global};
-use parking_lot::{Mutex, RwLock};
+use parking_lot::Mutex;
 use twox_hash::XxHash3_64;
 use vortex::buffer::ByteBuffer;
 use vortex::error::VortexResult;
@@ -25,20 +23,55 @@ use vortex::layout::segments::{SegmentCache, SegmentId};
 type SegmentCacheHasher = BuildHasherDefault<XxHash3_64>;
 type PathStates = Arc<Mutex<HashMap<Path, Weak<PathCacheState>>>>;
 
-/// The process-lifetime observable instruments and the cache instances they
-/// inspect during metrics collection.
+/// The process-wide segment cache, installed once at startup by
+/// [`install_process_segment_cache`].
+static PROCESS_CACHE: OnceLock<Arc<SharedSegmentCache>> = OnceLock::new();
+
+/// Keeps the process cache's observable instruments alive. `OpenTelemetry`
+/// retains observable callbacks for the meter provider's lifetime, so the
+/// instruments are registered once and never rebuilt.
+static PROCESS_METRICS: OnceLock<SegmentCacheMetrics> = OnceLock::new();
+
+/// Install the process-wide segment cache with a total budget of
+/// `max_capacity_bytes`, shared by every table.
 ///
-/// OpenTelemetry 0.32 retains observable callbacks for the meter provider's
-/// lifetime and does not unregister them when an instrument handle is dropped.
-/// A single callback set with weak cache references therefore avoids both
-/// per-table callback accumulation and keeping retired tables alive.
+/// One cache for the whole process rather than one per table: the key carries
+/// the full object-store path, so tables cannot collide, and a single budget
+/// means adding a table divides a fixed pool instead of reserving another
+/// full-sized cache. Moka fixes capacity at build time, so per-table caches
+/// could not be resized to share a budget without discarding their contents.
+///
+/// Returns `false` when a cache is already installed (the existing one keeps its
+/// capacity) or when `max_capacity_bytes` is zero, which disables caching.
+pub fn install_process_segment_cache(max_capacity_bytes: u64) -> bool {
+    if max_capacity_bytes == 0 {
+        return false;
+    }
+    // Retirement tracking is always on here: Cayenne needs it to keep a late put
+    // from repopulating a retired path, the per-put cost is one atomic load, and
+    // read-only formats share this cache with mutable ones.
+    let cache = Arc::new(SharedSegmentCache::new(max_capacity_bytes, true));
+    if PROCESS_CACHE.set(Arc::clone(&cache)).is_err() {
+        return false;
+    }
+    let _ = PROCESS_METRICS.set(SegmentCacheMetrics::register(
+        &global::meter("cayenne_segment_cache"),
+        &cache,
+    ));
+    true
+}
+
+/// The installed process-wide cache, or `None` when segment caching is disabled.
+pub(crate) fn process_segment_cache() -> Option<&'static Arc<SharedSegmentCache>> {
+    PROCESS_CACHE.get()
+}
+
+/// Observable instruments over one segment cache.
+///
+/// Held for the process (or, in tests, for the harness) lifetime. The callbacks
+/// keep only a [`Weak`] reference so a dropped cache is not kept alive and a
+/// scrape after the drop simply reports nothing.
 struct SegmentCacheMetrics {
-    datasets: Arc<RwLock<Vec<Weak<SegmentCacheDatasetMetrics>>>>,
-    // Reader pipelines collect independently but observable callbacks write to
-    // all of them. Retaining only these small counter cells prevents an idle
-    // collection by one reader from resetting the absolute value still tracked
-    // by a Delta reader. Live cache state remains weak and is pruned separately.
-    counters: Arc<RwLock<HashMap<Arc<str>, Arc<SegmentCacheCounters>>>>,
     _accesses: ObservableCounter<u64>,
     _hits: ObservableCounter<u64>,
     _weighted_bytes: ObservableGauge<u64>,
@@ -47,89 +80,71 @@ struct SegmentCacheMetrics {
 }
 
 impl SegmentCacheMetrics {
-    fn new(meter: &Meter) -> Self {
-        let datasets = Arc::new(RwLock::new(Vec::<Weak<SegmentCacheDatasetMetrics>>::new()));
-        let counters = Arc::new(RwLock::new(HashMap::new()));
-
+    fn register(meter: &Meter, cache: &Arc<SharedSegmentCache>) -> Self {
         let accesses = {
-            let counters = Arc::clone(&counters);
+            let cache = Arc::downgrade(cache);
             meter
                 .u64_observable_counter("cayenne_segment_cache_accesses")
                 .with_description("Cumulative Vortex segment cache get() calls.")
                 .with_callback(move |observer| {
-                    observe_counters(&counters, |dataset| {
-                        dataset.observe_accesses(|value| {
-                            observer.observe(value, &dataset.dataset_label);
-                        });
-                    });
+                    if let Some(cache) = cache.upgrade() {
+                        cache.observe_accesses(|value| observer.observe(value, &[]));
+                    }
                 })
                 .build()
         };
         let hits = {
-            let counters = Arc::clone(&counters);
+            let cache = Arc::downgrade(cache);
             meter
                 .u64_observable_counter("cayenne_segment_cache_hits")
                 .with_description("Cumulative Vortex segment cache hits.")
                 .with_callback(move |observer| {
-                    observe_counters(&counters, |dataset| {
-                        dataset.observe_hits(|value| {
-                            observer.observe(value, &dataset.dataset_label);
-                        });
-                    });
+                    if let Some(cache) = cache.upgrade() {
+                        cache.observe_hits(|value| observer.observe(value, &[]));
+                    }
                 })
                 .build()
         };
         let weighted_bytes = {
-            let datasets = Arc::clone(&datasets);
+            let cache = Arc::downgrade(cache);
             meter
                 .u64_observable_gauge("cayenne_segment_cache_weighted_bytes")
-                .with_description("Combined approximate live Vortex segment cache size in bytes.")
+                .with_description("Approximate live Vortex segment cache size in bytes.")
                 .with_unit("By")
                 .with_callback(move |observer| {
-                    observe_datasets(&datasets, |dataset| {
-                        observer.observe(
-                            dataset.total_live_cache_metric(|cache| cache.cache.weighted_size()),
-                            &dataset.counters.dataset_label,
-                        );
-                    });
+                    if let Some(cache) = cache.upgrade() {
+                        observer.observe(cache.cache.weighted_size(), &[]);
+                    }
                 })
                 .build()
         };
         let capacity_bytes = {
-            let datasets = Arc::clone(&datasets);
+            let cache = Arc::downgrade(cache);
             meter
                 .u64_observable_gauge("cayenne_segment_cache_capacity_bytes")
-                .with_description("Combined configured Vortex segment cache capacity in bytes.")
+                .with_description("Configured Vortex segment cache capacity in bytes.")
                 .with_unit("By")
                 .with_callback(move |observer| {
-                    observe_datasets(&datasets, |dataset| {
-                        observer.observe(
-                            dataset.total_live_cache_metric(|cache| cache.capacity_bytes),
-                            &dataset.counters.dataset_label,
-                        );
-                    });
+                    if let Some(cache) = cache.upgrade() {
+                        observer.observe(cache.capacity_bytes, &[]);
+                    }
                 })
                 .build()
         };
         let entries = {
-            let datasets = Arc::clone(&datasets);
+            let cache = Arc::downgrade(cache);
             meter
                 .u64_observable_gauge("cayenne_segment_cache_entries")
-                .with_description("Combined approximate live Vortex segment cache entry count.")
+                .with_description("Approximate live Vortex segment cache entry count.")
                 .with_callback(move |observer| {
-                    observe_datasets(&datasets, |dataset| {
-                        observer.observe(
-                            dataset.total_live_cache_metric(|cache| cache.cache.entry_count()),
-                            &dataset.counters.dataset_label,
-                        );
-                    });
+                    if let Some(cache) = cache.upgrade() {
+                        observer.observe(cache.cache.entry_count(), &[]);
+                    }
                 })
                 .build()
         };
 
         Self {
-            datasets,
-            counters,
             _accesses: accesses,
             _hits: hits,
             _weighted_bytes: weighted_bytes,
@@ -137,115 +152,51 @@ impl SegmentCacheMetrics {
             _entries: entries,
         }
     }
-
-    fn register(
-        &self,
-        dataset: Arc<str>,
-        cache: &Arc<SegmentCacheState>,
-    ) -> Arc<SegmentCacheDatasetMetrics> {
-        let mut datasets = self.datasets.write();
-        datasets.retain(|dataset| dataset.strong_count() > 0);
-
-        if let Some(existing) = datasets
-            .iter()
-            .filter_map(Weak::upgrade)
-            .find(|existing| existing.dataset == dataset)
-        {
-            {
-                let mut caches = existing.caches.write();
-                caches.retain(|cache| cache.strong_count() > 0);
-                caches.push(Arc::downgrade(cache));
-            }
-            return existing;
-        }
-
-        let counters = Arc::clone(
-            self.counters
-                .write()
-                .entry(Arc::clone(&dataset))
-                .or_insert_with(|| Arc::new(SegmentCacheCounters::new(&dataset))),
-        );
-        let metrics = Arc::new(SegmentCacheDatasetMetrics {
-            dataset,
-            counters,
-            caches: RwLock::new(vec![Arc::downgrade(cache)]),
-        });
-        datasets.push(Arc::downgrade(&metrics));
-        metrics
-    }
 }
 
-fn live_datasets(
-    datasets: &RwLock<Vec<Weak<SegmentCacheDatasetMetrics>>>,
-) -> Vec<Arc<SegmentCacheDatasetMetrics>> {
-    let (live, had_retired) = {
-        let datasets = datasets.read();
-        let live: Vec<_> = datasets.iter().filter_map(Weak::upgrade).collect();
-        let had_retired = live.len() != datasets.len();
-        (live, had_retired)
-    };
-    if had_retired {
-        datasets
-            .write()
-            .retain(|dataset| dataset.strong_count() > 0);
-    }
-    live
-}
-
-fn observe_counters(
-    counters: &RwLock<HashMap<Arc<str>, Arc<SegmentCacheCounters>>>,
-    mut observe: impl FnMut(&SegmentCacheCounters),
-) {
-    for dataset in counters.read().values() {
-        observe(dataset);
-    }
-}
-
-fn observe_datasets(
-    datasets: &RwLock<Vec<Weak<SegmentCacheDatasetMetrics>>>,
-    mut observe: impl FnMut(&SegmentCacheDatasetMetrics),
-) {
-    let live = live_datasets(datasets);
-    for dataset in live {
-        observe(&dataset);
-    }
-}
-
-static SEGMENT_CACHE_METRICS: LazyLock<SegmentCacheMetrics> =
-    LazyLock::new(|| SegmentCacheMetrics::new(&global::meter("cayenne_segment_cache")));
-
+/// Segment cache keyed by file path and Vortex segment id.
+///
+/// Vortex segment ids are local to each file, so the key pairs the id with the
+/// file's object-store path. That key is globally unique, which is what lets one
+/// cache — and one byte budget — serve every table in the process. Nothing here
+/// is per-table, so the metrics above carry no `dataset` label: fill, capacity
+/// and hit rate describe the single shared resource.
 #[derive(Debug)]
-struct SegmentCacheState {
+pub(crate) struct SharedSegmentCache {
     cache: Cache<(Arc<Path>, SegmentId), ByteBuffer, SegmentCacheHasher>,
+    /// Weak per-path insertion states. An open file keeps its state alive; the
+    /// last [`PathSegmentCache`] drop removes the weak registry entry, so paths
+    /// retired over the process's lifetime do not accumulate as tombstones.
+    path_states: Option<PathStates>,
+    /// Configured byte capacity, reported next to the live fill.
     capacity_bytes: u64,
-}
-
-#[derive(Debug)]
-struct SegmentCacheDatasetMetrics {
-    // Cache instances with the same dataset share these counters so observable
-    // instruments emit exactly one monotonic series per label set. This occurs
-    // when multiple read-capable Vortex formats for a table overlap.
-    dataset: Arc<str>,
-    counters: Arc<SegmentCacheCounters>,
-    caches: RwLock<Vec<Weak<SegmentCacheState>>>,
-}
-
-#[derive(Debug)]
-struct SegmentCacheCounters {
-    dataset_label: [KeyValue; 1],
+    /// Cumulative `get` calls. Read directly during collection, so the hot path
+    /// neither allocates labels nor records synchronously.
     accesses: AtomicU64,
+    /// `get` calls that returned a cached buffer (a hit).
     hits: AtomicU64,
-    // Observable callbacks can execute independently and readers can collect
-    // concurrently. Serializing only collection publishes a hit total against
-    // an access total that every reader has already observed, while keeping the
-    // cache read path lock-free.
+    /// Access total published by the last collection. Observable callbacks can
+    /// run independently and readers can collect concurrently; clamping hits to
+    /// this bound keeps a hit total from being published against an access total
+    /// no reader has seen yet, while leaving the read path lock-free.
     last_observed_accesses: Mutex<u64>,
 }
 
-impl SegmentCacheCounters {
-    fn new(dataset: &str) -> Self {
+impl SharedSegmentCache {
+    /// A cache with a budget of its own. Callers outside the process cache use
+    /// this — a standalone `VortexFormat` configured with
+    /// `segment_cache_size_bytes`, and tests that need an isolated budget.
+    pub(crate) fn new(max_capacity_bytes: u64, track_retirement: bool) -> Self {
         Self {
-            dataset_label: [KeyValue::new("dataset", dataset.to_string())],
+            cache: Cache::builder()
+                .name("vortex-datafusion-segment-cache")
+                .max_capacity(max_capacity_bytes)
+                .weigher(|_, buffer: &ByteBuffer| {
+                    u32::try_from(buffer.len().min(u32::MAX as usize)).unwrap_or(u32::MAX)
+                })
+                .build_with_hasher(SegmentCacheHasher::default()),
+            path_states: track_retirement.then(|| Arc::new(Mutex::new(HashMap::new()))),
+            capacity_bytes: max_capacity_bytes,
             accesses: AtomicU64::new(0),
             hits: AtomicU64::new(0),
             last_observed_accesses: Mutex::new(0),
@@ -264,79 +215,8 @@ impl SegmentCacheCounters {
         let hits = self.hits.load(Ordering::Relaxed);
         observe(hits.min(*last_observed_accesses));
     }
-}
 
-impl SegmentCacheDatasetMetrics {
-    fn total_live_cache_metric(&self, value: impl Fn(&SegmentCacheState) -> u64) -> u64 {
-        let (live, had_retired) = {
-            let caches = self.caches.read();
-            let live: Vec<_> = caches.iter().filter_map(Weak::upgrade).collect();
-            let had_retired = live.len() != caches.len();
-            (live, had_retired)
-        };
-        if had_retired {
-            self.caches.write().retain(|cache| cache.strong_count() > 0);
-        }
-        live.iter()
-            .fold(0, |total, cache| total.saturating_add(value(cache)))
-    }
-}
-
-/// Shared segment cache keyed by file path and Vortex segment id.
-///
-/// Vortex segment ids are local to each file. This wrapper keeps a single
-/// bounded cache across files while presenting each open file with the
-/// `SegmentCache` interface it expects.
-#[derive(Clone, Debug)]
-pub(crate) struct SharedSegmentCache {
-    state: Arc<SegmentCacheState>,
-    dataset_metrics: Arc<SegmentCacheDatasetMetrics>,
-    /// Weak per-path insertion states. An open file keeps its state alive; the
-    /// last [`PathSegmentCache`] drop removes the weak registry entry, so paths
-    /// retired over the table's lifetime do not accumulate as tombstones.
-    path_states: Option<PathStates>,
-}
-
-impl SharedSegmentCache {
-    pub(crate) fn new(
-        max_capacity_bytes: u64,
-        dataset: Option<Arc<str>>,
-        track_retirement: bool,
-    ) -> Self {
-        Self::new_registered(
-            max_capacity_bytes,
-            dataset,
-            track_retirement,
-            &SEGMENT_CACHE_METRICS,
-        )
-    }
-
-    fn new_registered(
-        max_capacity_bytes: u64,
-        dataset: Option<Arc<str>>,
-        track_retirement: bool,
-        metrics: &SegmentCacheMetrics,
-    ) -> Self {
-        let dataset = dataset.unwrap_or_else(|| Arc::from("unknown"));
-        let state = Arc::new(SegmentCacheState {
-            cache: Cache::builder()
-                .name("vortex-datafusion-segment-cache")
-                .max_capacity(max_capacity_bytes)
-                .weigher(|_, buffer: &ByteBuffer| {
-                    u32::try_from(buffer.len().min(u32::MAX as usize)).unwrap_or(u32::MAX)
-                })
-                .build_with_hasher(SegmentCacheHasher::default()),
-            capacity_bytes: max_capacity_bytes,
-        });
-        let dataset_metrics = metrics.register(dataset, &state);
-        Self {
-            state,
-            dataset_metrics,
-            path_states: track_retirement.then(|| Arc::new(Mutex::new(HashMap::new()))),
-        }
-    }
-
-    pub(crate) fn for_path(&self, path: Path) -> Arc<dyn SegmentCache> {
+    pub(crate) fn for_path(self: &Arc<Self>, path: Path) -> Arc<dyn SegmentCache> {
         let state = self.path_states.as_ref().map(|path_states| {
             let mut states = path_states.lock();
             states
@@ -349,7 +229,7 @@ impl SharedSegmentCache {
                 })
         });
         Arc::new(PathSegmentCache {
-            shared: self.clone(),
+            shared: Arc::clone(self),
             path: Arc::new(path),
             state,
         })
@@ -393,13 +273,12 @@ impl SharedSegmentCache {
         // predicate invalidation would defer physical eviction to bounded
         // maintenance passes.
         let keys: Vec<_> = self
-            .state
             .cache
             .iter()
             .filter_map(|(key, _)| paths.contains(key.0.as_ref()).then(|| key.as_ref().clone()))
             .collect();
         for key in keys {
-            self.state.cache.invalidate(&key).await;
+            self.cache.invalidate(&key).await;
         }
         // Direct invalidation removes the hash-table entries immediately, but
         // Moka's queued policy-removal records still retain the removed values
@@ -416,17 +295,17 @@ impl SharedSegmentCache {
     }
 
     pub(crate) async fn run_pending_tasks(&self) {
-        self.state.cache.run_pending_tasks().await;
+        self.cache.run_pending_tasks().await;
     }
 
     pub(crate) async fn entry_count(&self) -> u64 {
         self.run_pending_tasks().await;
-        self.state.cache.entry_count()
+        self.cache.entry_count()
     }
 }
 
 struct PathSegmentCache {
-    shared: SharedSegmentCache,
+    shared: Arc<SharedSegmentCache>,
     // `Arc<Path>` so forming the `(path, segment)` cache key on every `get`/`put`
     // is a refcount bump, not a `Path` (string) clone — segment reads are hot.
     path: Arc<Path>,
@@ -450,32 +329,34 @@ impl Drop for ActivePutGuard<'_> {
 #[async_trait]
 impl SegmentCache for PathSegmentCache {
     async fn get(&self, id: SegmentId) -> VortexResult<Option<ByteBuffer>> {
-        let result = self
-            .shared
-            .state
-            .cache
-            .get(&(Arc::clone(&self.path), id))
-            .await;
+        let result = self.shared.cache.get(&(Arc::clone(&self.path), id)).await;
 
         // Collection reads these atomics directly, so the hot path never
         // allocates labels or synchronously records metrics.
-        self.shared
-            .dataset_metrics
-            .counters
-            .accesses
-            .fetch_add(1, Ordering::Relaxed);
+        self.shared.accesses.fetch_add(1, Ordering::Relaxed);
         if result.is_some() {
-            self.shared
-                .dataset_metrics
-                .counters
-                .hits
-                .fetch_add(1, Ordering::Relaxed);
+            self.shared.hits.fetch_add(1, Ordering::Relaxed);
         }
 
         Ok(result)
     }
 
     async fn put(&self, id: SegmentId, buffer: ByteBuffer) -> VortexResult<()> {
+        // Copy into an exact-sized allocation before inserting.
+        //
+        // The buffer handed to us is usually a view into a coalesced read block:
+        // `ObjectStoreReadAt` merges requests within 1 MiB into reads of up to
+        // 16 MiB, and the reader hands each segment `base.slice(..)` over that one
+        // allocation. `ByteBuffer` is backed by `bytes::Bytes`, so a slice shares
+        // the allocation and keeps all of it alive while the weigher counts only
+        // the slice's length. Caching a view would therefore let one small
+        // segment pin its whole block, and — worse — the overshoot would grow as
+        // eviction proceeded, because dropping some slices frees nothing until
+        // the last one goes. Copying costs one memcpy on the miss path (the read
+        // that produced the buffer cost far more) and makes the weight the true
+        // resident size, so `max_capacity` bounds real memory.
+        let buffer = ByteBuffer::copy_from_aligned(buffer.as_slice(), buffer.alignment());
+
         // Two checks around the active-put registration close both races with
         // retirement: a put already registered makes invalidation wait; a put
         // that read `retired = false` just before the mark observes it on the
@@ -494,7 +375,6 @@ impl SegmentCache for PathSegmentCache {
             None
         };
         self.shared
-            .state
             .cache
             .insert((Arc::clone(&self.path), id), buffer)
             .await;
@@ -523,7 +403,6 @@ impl Drop for PathSegmentCache {
         }
     }
 }
-
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -768,6 +647,56 @@ mod tests {
 
     async fn settle_cache_bookkeeping(cache: &SharedSegmentCache) {
         cache.state.cache.run_pending_tasks().await;
+    }
+
+    #[tokio::test]
+    async fn put_trims_a_coalesced_slice_so_the_weight_is_the_resident_size() {
+        // The reader coalesces adjacent segment requests into one read of up to
+        // 16 MiB and hands each segment a slice over that single allocation. A
+        // cached slice would keep the whole block alive while weighing only its
+        // own length, so `put` must copy.
+        const BLOCK_BYTES: usize = 16 * 1024 * 1024;
+        const SEGMENT_BYTES: usize = 64 * 1024;
+
+        let block = ByteBuffer::copy_from(vec![7u8; BLOCK_BYTES]);
+        let segment = block.slice(0..SEGMENT_BYTES);
+        let segment_ptr = segment.as_slice().as_ptr();
+
+        let shared = Arc::new(SharedSegmentCache::new(8 * 1024 * 1024, false));
+        let cache = shared.for_path(Path::from("coalesced.vortex"));
+        let id = SegmentId::from(1);
+        cache
+            .put(id, segment.clone())
+            .await
+            .expect("put should not error");
+
+        let cached = cache
+            .get(id)
+            .await
+            .expect("get should not error")
+            .expect("the segment should be cached");
+        assert_eq!(cached.len(), SEGMENT_BYTES, "the segment round-trips whole");
+        assert_eq!(
+            cached.as_slice(),
+            segment.as_slice(),
+            "trimming must preserve the bytes"
+        );
+        assert!(
+            !std::ptr::eq(cached.as_slice().as_ptr(), segment_ptr),
+            "the cached buffer must own its allocation, not alias the 16 MiB block"
+        );
+        assert_eq!(
+            cached.alignment(),
+            segment.alignment(),
+            "trimming must preserve alignment so decode stays zero-copy"
+        );
+
+        shared.run_pending_tasks().await;
+        assert_eq!(
+            shared.cache.weighted_size(),
+            SEGMENT_BYTES as u64,
+            "the accounted weight is the segment, and now so is the resident size"
+        );
     }
 
     #[tokio::test]

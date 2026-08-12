@@ -59,6 +59,7 @@ use util::{in_tracing_context, in_tracing_context_async};
 type DatafusionConfigurationCallback = fn(&mut DataFusion);
 
 const CAYENNE_FOOTER_CACHE_MB_PARAM: &str = "cayenne_footer_cache_mb";
+const CAYENNE_SEGMENT_CACHE_MB_PARAM: &str = "cayenne_segment_cache_mb";
 const CAYENNE_SORT_MERGE_MIN_ROWS_PARAM: &str = "cayenne_sort_merge_min_rows";
 const CAYENNE_SORT_MERGE_MEMORY_POOL_FRACTION_PARAM: &str =
     "cayenne_sort_merge_memory_pool_fraction";
@@ -108,6 +109,7 @@ const MAX_COMPACTION_MEMORY_FRACTION: f64 = 0.9;
 /// `runtime.params` keys with a `cayenne_` prefix that the runtime recognizes.
 const KNOWN_CAYENNE_RUNTIME_PARAMS: &[&str] = &[
     CAYENNE_FOOTER_CACHE_MB_PARAM,
+    CAYENNE_SEGMENT_CACHE_MB_PARAM,
     CAYENNE_SORT_MERGE_MIN_ROWS_PARAM,
     CAYENNE_SORT_MERGE_MEMORY_POOL_FRACTION_PARAM,
     CAYENNE_FILTER_PROPAGATION_PARAM,
@@ -397,6 +399,10 @@ impl RuntimeBuilder {
         let cayenne_footer_cache_mb =
             parse_usize_runtime_param(&spicepod_rt.params, CAYENNE_FOOTER_CACHE_MB_PARAM);
         log_applied_cayenne_param(CAYENNE_FOOTER_CACHE_MB_PARAM, cayenne_footer_cache_mb);
+        let cayenne_segment_cache_mb =
+            parse_usize_runtime_param(&spicepod_rt.params, CAYENNE_SEGMENT_CACHE_MB_PARAM);
+        log_applied_cayenne_param(CAYENNE_SEGMENT_CACHE_MB_PARAM, cayenne_segment_cache_mb);
+        install_segment_cache(cayenne_segment_cache_mb);
         let cayenne_filter_propagation = parse_cayenne_filter_propagation(&spicepod_rt.params);
 
         // Process-global SQLite metastore pragma tuning (cache, mmap, busy
@@ -1031,6 +1037,56 @@ fn parse_memory_limit(memory_limit: Option<String>) -> Option<u64> {
 /// operators see at startup which override actually took effect. Only logs
 /// when `value` is `Some` (the parser already emits a warning for malformed
 /// values). See spiceai/spiceai#10970.
+/// Total byte budget for the process-wide Vortex segment cache.
+///
+/// One cache serves every Cayenne table, so this is a whole-process budget:
+/// adding a table divides this pool instead of reserving another cache of its own
+/// (spiceai/spiceai#12937). Unset derives ~1/64 of the process's memory
+/// entitlement, clamped to [256 MiB, 2 GiB] — a single-table deployment gets
+/// somewhat more than the old per-table share, while a fleet of tables can no
+/// longer multiply it. `0` disables segment caching.
+///
+/// Note `get_total_memory()` prefers the cgroup limit but falls back to host RAM,
+/// so a pod with `requests.memory` and no `limits.memory` still derives from the
+/// node's memory; that entitlement gap is tracked separately.
+fn segment_cache_budget_bytes(configured_mb: Option<usize>) -> u64 {
+    const MIB: u64 = 1024 * 1024;
+    const FLOOR_BYTES: u64 = 256 * MIB;
+    const CEIL_BYTES: u64 = 2048 * MIB;
+    const HOST_FRACTION: u64 = 64;
+
+    match configured_mb {
+        Some(mb) => u64::try_from(mb).unwrap_or(u64::MAX).saturating_mul(MIB),
+        None => (crate::resource_monitor::get_total_memory() / HOST_FRACTION)
+            .clamp(FLOOR_BYTES, CEIL_BYTES),
+    }
+}
+
+/// Install the process-wide Vortex segment cache before any Cayenne table is
+/// registered, so every format shares one budget.
+fn install_segment_cache(configured_mb: Option<usize>) {
+    let bytes = segment_cache_budget_bytes(configured_mb);
+    if bytes == 0 {
+        tracing::info!(
+            "Vortex segment cache disabled by runtime.params.{CAYENNE_SEGMENT_CACHE_MB_PARAM}=0"
+        );
+        return;
+    }
+    if vortex_datafusion::install_process_segment_cache(bytes) {
+        tracing::info!(
+            "Vortex segment cache installed: {} MB shared across all Cayenne tables",
+            bytes / (1024 * 1024)
+        );
+    } else {
+        // A second runtime in one process (tests, embedded hosts) keeps the cache
+        // the first one installed; the budget is process-wide by construction.
+        tracing::debug!(
+            "Vortex segment cache already installed; keeping the existing budget and ignoring {} MB",
+            bytes / (1024 * 1024)
+        );
+    }
+}
+
 fn log_applied_cayenne_param<V: std::fmt::Display>(key: &str, value: Option<V>) {
     if let Some(value) = value {
         tracing::info!("Cayenne runtime tunable applied: runtime.params.{key}={value}");
@@ -1453,7 +1509,6 @@ fn estimate_cayenne_reservation_bytes(
     const GIB: u64 = 1024 * MIB;
     // Auto-derived per-table cap fractions (mirror of the accelerator's autotune).
     const KEYSET_CACHE_HOST_FRACTION: u64 = 32; // ~1/32 host, clamped [256 MiB, 8 GiB]
-    const SEGMENT_CACHE_HOST_FRACTION: u64 = 128; // ~1/128 host, clamped [256 MiB, 1 GiB]
     const DEFAULT_COALESCE_BYTES: u64 = 128 * MIB;
     const DEFAULT_INLINE_BYTES: u64 = 8 * MIB;
 
@@ -1474,22 +1529,18 @@ fn estimate_cayenne_reservation_bytes(
     let global_coalesce_bytes =
         parse_u64(runtime_params, &["cdc_max_coalesced_bytes"]).unwrap_or(DEFAULT_COALESCE_BYTES);
 
-    let mut total: u64 = 0;
+    // Scan-path cache: one process-wide cache shared by every table, so its
+    // budget is counted once rather than per acceleration.
+    let mut total: u64 = segment_cache_budget_bytes(parse_usize_runtime_param(
+        runtime_params,
+        CAYENNE_SEGMENT_CACHE_MB_PARAM,
+    ));
     for (accel, profile) in cayenne_accelerations(app) {
         let params = accel
             .params
             .as_ref()
             .map(spicepod::param::Params::as_string_map)
             .unwrap_or_default();
-        // Scan-path cache: allocated per registered Cayenne acceleration regardless
-        // of refresh mode.
-        let segment = parse_u64(&params, &["cayenne_segment_cache_mb", "segment_cache_mb"])
-            .map_or_else(
-                || (total_memory / SEGMENT_CACHE_HOST_FRACTION).clamp(256 * MIB, GIB),
-                |mb| mb.saturating_mul(MIB),
-            );
-        total = total.saturating_add(segment);
-
         // Inline-admission state: the bounded Arrow buffer a write is admitted
         // through, plus the Arrow IPC entry it serializes into. Byte-valued
         // params, so no MB conversion; the accelerator's key lists (with the
