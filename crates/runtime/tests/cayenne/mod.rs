@@ -589,9 +589,14 @@ async fn test_cayenne_s3_express_multi_zone_live() -> Result<(), String> {
                 .get_accelerated_table_provider(&table_name)
                 .await
                 .map_err(|e| format!("failed to resolve accelerated provider: {e}"))?;
-            if !accelerated_provider.is::<AcceleratedTable>() {
+            if spice_table::find_layer::<AcceleratedTable>(
+                accelerated_provider.as_ref(),
+                spice_table::LayerWalk::Read,
+            )
+            .is_none()
+            {
                 return Err(format!(
-                    "Expected provider for {table_name} to be AcceleratedTable in {zone_count}-zone scenario"
+                    "Expected provider for {table_name} to carry an accelerated-table layer in {zone_count}-zone scenario"
                 ));
             }
 

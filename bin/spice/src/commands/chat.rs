@@ -170,6 +170,13 @@ struct ChunkChoice {
     /// with nothing to print, not an unreadable one.
     #[serde(default)]
     delta: Option<Delta>,
+    /// Why the model stopped producing this choice, on the last chunk that carries it.
+    ///
+    /// Intermediate chunks send `null` here, which reads as `None`: the answer is still being
+    /// produced and nothing has ended it. A value means the generation is over, and only
+    /// `stop` means it is over because the model had said everything it meant to.
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 /// Delta content in a streaming response.
@@ -196,6 +203,8 @@ struct ChatResponse {
     total_duration: std::time::Duration,
     first_token_duration: Option<std::time::Duration>,
     usage: Option<Usage>,
+    /// The reason the last chunk gave for the generation ending, when it gave one.
+    finish_reason: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -205,6 +214,9 @@ struct ChatJsonResponse<'a> {
     duration_ms: u128,
     first_token_ms: Option<u128>,
     usage: Option<&'a Usage>,
+    /// Present so a consumer reading `content` can tell a whole answer from a truncated one
+    /// without parsing the notice written to stderr.
+    finish_reason: Option<&'a str>,
 }
 
 impl<'a> ChatJsonResponse<'a> {
@@ -217,11 +229,53 @@ impl<'a> ChatJsonResponse<'a> {
                 .first_token_duration
                 .map(|duration| duration.as_millis()),
             usage: response.usage.as_ref(),
+            finish_reason: response.finish_reason.as_deref(),
         }
     }
 }
 
+/// The longest `finish_reason` repeated back to the user. The reasons the API defines are far
+/// shorter; this only bounds what an arbitrary endpoint can put on the terminal.
+const LONGEST_REPORTED_FINISH_REASON: usize = 40;
+
 impl ChatResponse {
+    /// How the answer ended, when it did not end whole.
+    ///
+    /// `stop` is the only reason meaning the model said everything it meant to, and an absent
+    /// reason means the same: a server that never reports one is not reporting an early stop.
+    /// Every other reason ended the generation before the answer was finished. The tokens
+    /// already printed are genuine, so this is something to tell the user about the answer
+    /// rather than a failure to raise -- nothing else on screen distinguishes a fragment from
+    /// a complete reply.
+    fn incomplete_notice(&self) -> Option<String> {
+        let reason = self.finish_reason.as_deref()?;
+
+        let detail = match reason {
+            "stop" => return None,
+            "length" => "it reached the maximum number of tokens it was allowed to produce",
+            "content_filter" => "a content filter stopped it",
+            "tool_calls" | "function_call" => {
+                "it asked to call a tool, which `spice chat` does not run"
+            }
+            _ => "the reason is not one this version recognises",
+        };
+
+        // The reason is one of a closed set of tokens, so a value outside that shape is
+        // described rather than repeated: an endpoint can put anything in the field,
+        // terminal escapes included, and this line goes straight to the user's terminal.
+        let is_token = !reason.is_empty()
+            && reason.len() <= LONGEST_REPORTED_FINISH_REASON
+            && reason
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_');
+
+        Some(if is_token {
+            format!("The model stopped early ({reason}): {detail}. The answer above is incomplete.")
+        } else {
+            format!("The model stopped early: {detail}. The answer above is incomplete.")
+        })
+    }
+
     /// Format the stats output like the Go CLI:
     /// `Time: 3.36s (first token 0.45s). Tokens: 1652. Prompt: 1475. Completion: 177 (292.25/s).`
     fn format_stats(&self) -> String {
@@ -413,6 +467,11 @@ pub async fn execute(ctx: &RuntimeContext, args: &ChatArgs) -> Result<()> {
         } else {
             println!();
         }
+        // On stderr so it reaches a user reading the terminal without joining the answer a
+        // caller is capturing on stdout.
+        if let Some(notice) = response.incomplete_notice() {
+            eprintln!("{notice}");
+        }
         return Ok(());
     }
 
@@ -502,6 +561,9 @@ async fn run_repl(ctx: &RuntimeContext, config: &ChatConfig<'_>) -> Result<()> {
             Ok(response) => {
                 // Print stats first before consuming content
                 println!("\n\n{}\n", response.format_stats());
+                if let Some(notice) = response.incomplete_notice() {
+                    eprintln!("{notice}");
+                }
                 // Add assistant response to history
                 if !response.content.is_empty() {
                     messages.push(Message {
@@ -598,6 +660,7 @@ async fn send_chat_streaming(
         usage: None,
         first_token: None,
         spinner,
+        finish_reason: None,
     };
 
     // An event can straddle two reads, so the bytes are reassembled into events before
@@ -676,6 +739,7 @@ async fn send_chat_streaming(
         total_duration: start_time.elapsed(),
         first_token_duration: state.first_token,
         usage: state.usage,
+        finish_reason: state.finish_reason,
     })
 }
 
@@ -711,6 +775,9 @@ struct StreamState {
     usage: Option<Usage>,
     first_token: Option<std::time::Duration>,
     spinner: Option<Spinner>,
+    /// The last reason a choice gave for ending, which is the one that describes the answer
+    /// as it stands when the stream is over.
+    finish_reason: Option<String>,
 }
 
 impl StreamState {
@@ -785,6 +852,12 @@ async fn apply_event(
     }
 
     for choice in &chunk.choices {
+        // Recorded from whichever chunk carries one. A choice that ends the generation
+        // usually carries no delta alongside it, so this cannot hang off the content branch.
+        if let Some(reason) = &choice.finish_reason {
+            state.finish_reason = Some(reason.clone());
+        }
+
         if let Some(content) = choice
             .delta
             .as_ref()
@@ -842,6 +915,16 @@ mod tests {
     /// One SSE event carrying `payload` verbatim, for the events that are not content.
     fn raw_event(payload: &str) -> String {
         format!("data: {payload}\n\n")
+    }
+
+    /// The final event of a generation, carrying why it ended and no content -- the shape a
+    /// server sends once it has stopped producing. `reason` is escaped as JSON rather than
+    /// interpolated, so a test can send one containing characters JSON has to encode.
+    fn finish_event(reason: &str) -> String {
+        let reason = serde_json::to_string(reason).expect("a string always serialises");
+        format!(
+            "data: {{\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":{reason}}}]}}\n\n"
+        )
     }
 
     /// A context whose deadlines are generous enough that only the response itself ends the
@@ -1166,6 +1249,135 @@ mod tests {
             .expect("an annotation choice is a valid event with nothing to print");
 
         assert_eq!(response.content, "before after");
+    }
+
+    /// Azure `OpenAI` ends the stream when its content filter trips. Every token already sent
+    /// stays on screen and the command still succeeds, so unless the reason the generation
+    /// ended is read and reported, a filtered fragment is indistinguishable from a whole
+    /// answer -- the failure reported in
+    /// <https://github.com/spiceai/spiceai/issues/12596>.
+    #[tokio::test]
+    async fn a_content_filtered_answer_is_reported_as_incomplete() {
+        let server = SlowServer::dribbling(
+            vec![
+                content_event("as I was saying"),
+                finish_event("content_filter"),
+            ],
+            Duration::from_millis(5),
+        );
+
+        let response = stream_from(&server)
+            .await
+            .expect("the tokens that arrived are genuine, so this is not a failure");
+
+        // The tokens are kept: what the model did say is worth showing.
+        assert_eq!(response.content, "as I was saying");
+
+        let notice = response
+            .incomplete_notice()
+            .expect("an answer a filter stopped is not a whole answer");
+        assert!(
+            notice.contains("content_filter") && notice.contains("incomplete"),
+            "the notice should name the reason and say the answer is incomplete, got: {notice}"
+        );
+    }
+
+    /// An answer that hit `max_tokens` is cut off mid-sentence, and the CLI exits `0` either
+    /// way, so the same reporting has to cover it.
+    #[tokio::test]
+    async fn an_answer_cut_off_by_the_token_limit_is_reported_as_incomplete() {
+        let server = SlowServer::dribbling(
+            vec![content_event("counting: one two"), finish_event("length")],
+            Duration::from_millis(5),
+        );
+
+        let response = stream_from(&server)
+            .await
+            .expect("a truncated answer is still an answer");
+
+        assert_eq!(response.content, "counting: one two");
+
+        let notice = response
+            .incomplete_notice()
+            .expect("an answer stopped at the token limit is not a whole answer");
+        assert!(
+            notice.contains("length"),
+            "the notice should name the reason, got: {notice}"
+        );
+    }
+
+    /// The negative control for the two above. `stop` is the reason a finished answer carries,
+    /// and reporting it would warn on every successful chat.
+    #[tokio::test]
+    async fn a_whole_answer_is_not_reported_as_incomplete() {
+        let server = SlowServer::dribbling(
+            vec![content_event("all of it"), finish_event("stop")],
+            Duration::from_millis(5),
+        );
+
+        let response = stream_from(&server).await.expect("a whole answer is read");
+
+        assert_eq!(response.content, "all of it");
+        assert_eq!(
+            response.incomplete_notice(),
+            None,
+            "an answer the model finished must not be called incomplete"
+        );
+    }
+
+    /// A server that reports no reason at all is not reporting an early stop, so the absence
+    /// must stay silent rather than being read as an unrecognised reason.
+    #[tokio::test]
+    async fn an_answer_with_no_finish_reason_is_not_reported_as_incomplete() {
+        let server = SlowServer::dribbling(
+            vec![content_event("plain answer")],
+            Duration::from_millis(5),
+        );
+
+        let response = stream_from(&server)
+            .await
+            .expect("a stream that never reports a reason is an ordinary stream");
+
+        assert_eq!(response.content, "plain answer");
+        assert_eq!(
+            response.incomplete_notice(),
+            None,
+            "no reported reason is not an early stop"
+        );
+    }
+
+    /// The answer is still reported as incomplete when the endpoint puts something other than
+    /// a reason token in the field -- but the field's contents are described, not written to
+    /// the terminal, since nothing stops an endpoint from filling it with escape sequences.
+    #[tokio::test]
+    async fn an_unreasonable_finish_reason_is_described_and_not_echoed() {
+        let server = SlowServer::dribbling(
+            vec![
+                content_event("partial"),
+                // A terminal title-setting sequence. It reaches the wire as a JSON escape,
+                // and would reach the terminal as a control sequence if it were echoed.
+                finish_event("\u{1b}]0;owned\u{7}"),
+            ],
+            Duration::from_millis(5),
+        );
+
+        let response = stream_from(&server)
+            .await
+            .expect("an odd reason is not a failure to read the stream");
+
+        assert_eq!(response.content, "partial");
+
+        let notice = response
+            .incomplete_notice()
+            .expect("a reason that is not `stop` still ended the answer early");
+        assert!(
+            notice.contains("incomplete"),
+            "the answer should still be called incomplete, got: {notice}"
+        );
+        assert!(
+            !notice.contains('\u{1b}') && !notice.contains("owned"),
+            "the reason should be described rather than echoed, got: {notice}"
+        );
     }
 
     /// A single event spread over several reads is the model producing, even before its

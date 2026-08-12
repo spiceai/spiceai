@@ -55,6 +55,15 @@ pub struct CachedQueryResult {
     pub input_tables: Arc<HashSet<TableReference>>,
     /// Timestamp when the result was cached.
     cached_at: Instant,
+    /// When the query that produced this result began reading.
+    ///
+    /// Serving this entry is only sound while none of [`Self::input_tables`]
+    /// has been invalidated since this instant, which is what
+    /// [`crate::QueryResultsCacheProvider::get_raw_key`] checks on every hit.
+    /// It is deliberately *not* [`Self::cached_at`]: an invalidation landing
+    /// between the read and the store must also disqualify the entry, and
+    /// `cached_at` is after both.
+    pub read_started_at: Instant,
     /// Encoder used to decode the data
     encoder: Option<Arc<dyn Encoder>>,
 }
@@ -70,12 +79,14 @@ impl CachedQueryResult {
         schema: SchemaRef,
         input_tables: Arc<HashSet<TableReference>>,
         cached_at: Instant,
+        read_started_at: Instant,
     ) -> Self {
         Self {
             data: CachedData::Raw(Arc::new(batches)),
             schema,
             input_tables,
             cached_at,
+            read_started_at,
             encoder: None,
         }
     }
@@ -87,6 +98,7 @@ impl CachedQueryResult {
         schema: Arc<Schema>,
         input_tables: Arc<HashSet<TableReference>>,
         cached_at: Instant,
+        read_started_at: Instant,
         encoder: Option<Arc<dyn Encoder>>,
     ) -> Self {
         Self {
@@ -94,6 +106,7 @@ impl CachedQueryResult {
             schema,
             input_tables,
             cached_at,
+            read_started_at,
             encoder,
         }
     }
@@ -112,6 +125,7 @@ impl CachedQueryResult {
         schema: SchemaRef,
         input_tables: Arc<HashSet<TableReference>>,
         cached_at: Instant,
+        read_started_at: Instant,
         encoder: Option<Arc<dyn Encoder>>,
     ) -> Result<Self, crate::encoding::Error> {
         // Only store encoded data if an encoder is provided
@@ -127,6 +141,7 @@ impl CachedQueryResult {
             schema,
             input_tables,
             cached_at,
+            read_started_at,
             encoder,
         })
     }
@@ -319,8 +334,13 @@ mod tests {
         let input_tables = Arc::new(HashSet::new());
         let cached_at = Instant::now();
 
-        let cached_result =
-            CachedQueryResult::new_raw(batches, Arc::clone(&schema), input_tables, cached_at);
+        let cached_result = CachedQueryResult::new_raw(
+            batches,
+            Arc::clone(&schema),
+            input_tables,
+            cached_at,
+            cached_at,
+        );
 
         // Calculate expected size
         let expected_size = std::mem::size_of::<CachedQueryResult>() as u64
@@ -358,8 +378,14 @@ mod tests {
         let input_tables = Arc::new(HashSet::new());
         let cached_at = Instant::now();
 
-        let cached_result =
-            CachedQueryResult::new(encoded_data.clone(), schema, input_tables, cached_at, None);
+        let cached_result = CachedQueryResult::new(
+            encoded_data.clone(),
+            schema,
+            input_tables,
+            cached_at,
+            cached_at,
+            None,
+        );
 
         let expected_size =
             std::mem::size_of::<CachedQueryResult>() as u64 + encoded_data.len() as u64;
@@ -378,7 +404,8 @@ mod tests {
         let input_tables = Arc::new(HashSet::new());
         let cached_at = Instant::now();
 
-        let cached_result = CachedQueryResult::new_raw(batches, schema, input_tables, cached_at);
+        let cached_result =
+            CachedQueryResult::new_raw(batches, schema, input_tables, cached_at, cached_at);
 
         let expected_size = std::mem::size_of::<CachedQueryResult>() as u64;
         let actual_size = cached_result.memory_size();
@@ -404,6 +431,7 @@ mod tests {
             vec![batch],
             Arc::clone(&schema),
             Arc::new(HashSet::new()),
+            Instant::now(),
             Instant::now(),
         );
 
@@ -432,6 +460,7 @@ mod tests {
             Arc::clone(&schema),
             Arc::new(HashSet::new()),
             Instant::now(),
+            Instant::now(),
         );
 
         assert_eq!(
@@ -455,6 +484,7 @@ mod tests {
             Vec::new(),
             Arc::clone(&schema),
             Arc::new(HashSet::new()),
+            Instant::now(),
             Instant::now(),
             None,
         )

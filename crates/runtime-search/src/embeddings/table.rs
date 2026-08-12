@@ -16,6 +16,7 @@ limitations under the License.
 
 #![allow(clippy::missing_errors_doc)]
 
+use spice_table::{LayerWalk, SpiceTable, TableLayer};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -26,13 +27,12 @@ use arrow_tools::schema;
 use async_trait::async_trait;
 use chunking::ChunkingConfig;
 use datafusion::catalog::Session;
-use datafusion::common::{Constraints, Statistics, project_schema};
+use datafusion::common::{Statistics, project_schema};
 use datafusion::error::Result as DataFusionResult;
 use datafusion::logical_expr::TableProviderFilterPushDown;
-use datafusion::logical_expr::dml::InsertOp;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::{
-    datasource::{TableProvider, TableType},
+    datasource::TableProvider,
     logical_expr::{Expr, LogicalPlan},
 };
 use itertools::Itertools;
@@ -52,6 +52,7 @@ use spicepod::component::embeddings::{
 use tokio::sync::RwLock;
 
 use super::common::{is_valid_embedding_type, is_valid_offset_type, vector_length};
+use datafusion::catalog::{ScanArgs, ScanResult};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -160,6 +161,76 @@ enum SourceShape {
 /// query time per-element similarities are aggregated into a single
 /// per-row score via `aggregation`.
 impl EmbeddingTable {
+    /// The schema this layer presents over the table it was constructed with.
+    ///
+    /// For a caller that holds only the layer. Anything holding the stack should
+    /// ask the table itself, so a rebuild that replaced what this layer sits over
+    /// is reflected.
+    #[must_use]
+    pub fn schema(&self) -> SchemaRef {
+        self.schema_over(&self.base_table)
+    }
+
+    /// The schema this layer presents over `base`: that table's, with the
+    /// synthetic embedding columns appended.
+    ///
+    /// Takes the table rather than reading `self.base_table` because a rebuild
+    /// can replace what this layer sits over (metadata enrichment is pushed to
+    /// the base), and a schema computed from the stale field would drop whatever
+    /// the rebuild added.
+    #[must_use]
+    pub fn schema_over(&self, base: &Arc<dyn TableProvider>) -> SchemaRef {
+        let base_schema = base.schema();
+        let mut base_fields: Vec<_> = (0..base_schema.fields.len())
+            .filter_map(|i| base_schema.fields.get(i).cloned())
+            .collect();
+
+        let mut computed_columns_meta: HashMap<String, Vec<String>> = HashMap::new();
+
+        // Important to be kept alphabetical for fast lookup in [`EmbeddingTable::columns_to_embed`]
+        let mut embedding_fields: Vec<_> = self
+            .get_additional_embedding_columns_sorted()
+            .iter()
+            .filter_map(|base_column_name| {
+                base_schema
+                    .column_with_name(base_column_name)
+                    .map(|(_, field)| {
+                        let embedding_fields = self.embedding_fields(field);
+                        computed_columns_meta.insert(
+                            base_column_name.clone(),
+                            embedding_fields.iter().map(|f| f.name().clone()).collect(),
+                        );
+                        embedding_fields
+                    })
+            })
+            .flatten()
+            .collect();
+
+        // Deduplicate: if the base table already stores the embedding column (e.g. after a
+        // refresh writes it to DuckDB while in_base_table was set to false at startup), skip
+        // re-appending it to avoid a duplicate field that corrupts column-index resolution.
+        let base_field_names: std::collections::HashSet<_> =
+            base_fields.iter().map(|f| f.name().clone()).collect();
+        embedding_fields.retain(|f| !base_field_names.contains(f.name()));
+        base_fields.append(&mut embedding_fields);
+
+        // Carry the base table's schema-level metadata. Spicepod table metadata is
+        // enriched onto the base table (see `table_provider_with_spicepod_metadata`),
+        // so rebuilding with an empty metadata map would drop it.
+        let mut schema = Schema::new_with_metadata(base_fields, base_schema.metadata().clone());
+
+        schema::set_computed_columns_meta(&mut schema, &computed_columns_meta);
+
+        Arc::new(schema)
+    }
+
+    /// Presents this layer over the table it augments.
+    #[must_use]
+    pub fn into_table(self: Arc<Self>) -> Arc<SpiceTable> {
+        let below = Arc::clone(&self.base_table);
+        SpiceTable::over(self, below)
+    }
+
     pub async fn from_spicepod_columns(
         base_table: Arc<dyn TableProvider>,
         embeddings: Vec<ColumnEmbeddingConfig>,
@@ -234,7 +305,7 @@ impl EmbeddingTable {
         )
         .await?;
 
-        Ok(Arc::new(embedding_table) as Arc<dyn TableProvider>)
+        Ok(Arc::new(embedding_table).into_table() as Arc<dyn TableProvider>)
     }
 
     /// When creating a new [`EmbeddingTable`], the provided columns (in `embed_columns`) must be checked to see if they are already in the base table.
@@ -661,13 +732,17 @@ impl EmbeddingTable {
     ///     - Any projection index >=6 is an embedding column.
     ///
     /// The order of the additionally-generated embedding columns in [`Self::Schema`] is alphabetical.
-    fn columns_to_embed(&self, projection: Option<&Vec<usize>>) -> Vec<String> {
+    fn columns_to_embed(
+        &self,
+        base: &Arc<dyn TableProvider>,
+        projection: Option<&Vec<usize>>,
+    ) -> Vec<String> {
         // Order of embedding columns in [`Self::Schema`] is alphabetical.
         match projection {
             None => self.get_additional_embedding_columns_sorted(),
             Some(column_idx) => {
                 let additional_fields = self.get_additional_embedding_field_names();
-                let base_cols = self.base_table.schema().fields.len();
+                let base_cols = base.schema().fields.len();
 
                 column_idx
                     .iter()
@@ -756,88 +831,21 @@ impl EmbeddingTable {
     }
 }
 
-#[deny(clippy::missing_trait_methods)]
-#[async_trait]
-impl TableProvider for EmbeddingTable {
-    fn constraints(&self) -> Option<&Constraints> {
-        self.base_table.constraints()
-    }
-
-    fn table_type(&self) -> TableType {
-        self.base_table.table_type()
-    }
-
-    fn get_column_default(&self, column: &str) -> Option<&Expr> {
-        self.base_table.get_column_default(column)
-    }
-
-    fn get_table_definition(&self) -> Option<&str> {
-        self.base_table.get_table_definition()
-    }
-
-    fn get_logical_plan(&self) -> Option<Cow<'_, LogicalPlan>> {
-        // EmbeddingTable augments the base table's schema with computed
-        // embedding columns. The base table's logical plan does not represent
-        // those columns, so forwarding it would cause `LogicalPlanBuilder::scan`
-        // to inline a plan whose schema is missing the embedding columns —
-        // any subsequent projection of those columns then fails.
-        None
-    }
-
-    fn schema(&self) -> SchemaRef {
-        let base_schema = self.base_table.schema();
-        let mut base_fields: Vec<_> = (0..base_schema.fields.len())
-            .filter_map(|i| base_schema.fields.get(i).cloned())
-            .collect();
-
-        let mut computed_columns_meta: HashMap<String, Vec<String>> = HashMap::new();
-
-        // Important to be kept alphabetical for fast lookup in [`EmbeddingTable::columns_to_embed`]
-        let mut embedding_fields: Vec<_> = self
-            .get_additional_embedding_columns_sorted()
-            .iter()
-            .filter_map(|base_column_name| {
-                base_schema
-                    .column_with_name(base_column_name)
-                    .map(|(_, field)| {
-                        let embedding_fields = self.embedding_fields(field);
-                        computed_columns_meta.insert(
-                            base_column_name.clone(),
-                            embedding_fields.iter().map(|f| f.name().clone()).collect(),
-                        );
-                        embedding_fields
-                    })
-            })
-            .flatten()
-            .collect();
-
-        // Deduplicate: if the base table already stores the embedding column (e.g. after a
-        // refresh writes it to DuckDB while in_base_table was set to false at startup), skip
-        // re-appending it to avoid a duplicate field that corrupts column-index resolution.
-        let base_field_names: std::collections::HashSet<_> =
-            base_fields.iter().map(|f| f.name().clone()).collect();
-        embedding_fields.retain(|f| !base_field_names.contains(f.name()));
-        base_fields.append(&mut embedding_fields);
-
-        // Carry the base table's schema-level metadata. Spicepod table metadata is
-        // enriched onto the base table (see `table_provider_with_spicepod_metadata`),
-        // so rebuilding with an empty metadata map would drop it.
-        let mut schema = Schema::new_with_metadata(base_fields, base_schema.metadata().clone());
-
-        schema::set_computed_columns_meta(&mut schema, &computed_columns_meta);
-
-        Arc::new(schema)
-    }
-
-    async fn scan(
+impl EmbeddingTable {
+    /// Builds the plan for a scan of this layer.
+    ///
+    /// Reached only through this type's `TableLayer::scan_with_args`, which is
+    /// the single scan entry point a layer exposes.
+    async fn scan_plan(
         &self,
+        below: &Arc<dyn TableProvider>,
         state: &dyn Session,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        let columns_to_embed = self.columns_to_embed(projection);
-        let num_base_cols = self.base_table.schema().fields.len();
+        let columns_to_embed = self.columns_to_embed(below, projection);
+        let num_base_cols = below.schema().fields.len();
 
         // No embedding work is needed.
         if columns_to_embed.is_empty() {
@@ -865,7 +873,7 @@ impl TableProvider for EmbeddingTable {
         tracing::trace!(
             "For `EmbeddingTable`, additional embedding columns to compute: {columns_to_embed:?}"
         );
-        let schema = &self.schema();
+        let schema = &self.schema_over(below);
 
         let scan_embed_columns: HashMap<String, EmbeddingColumnConfig> = self
             .embedded_columns
@@ -893,7 +901,7 @@ impl TableProvider for EmbeddingTable {
             }
         };
 
-        let projected_schema = project_schema(&self.schema(), projection)?;
+        let projected_schema = project_schema(schema, projection)?;
         let base_plan = self
             .base_table
             .scan(state, projection_for_base_table.as_ref(), filters, limit)
@@ -908,10 +916,49 @@ impl TableProvider for EmbeddingTable {
             Arc::clone(&self.embedding_models),
         )) as Arc<dyn ExecutionPlan>)
     }
+}
+
+#[async_trait]
+impl TableLayer for EmbeddingTable {
+    /// Merges synthetic `<col>_embedding` columns into the schema, so a walk whose
+    /// query must not see them stops here: CDC detection looks *for* this layer,
+    /// and a source connector's bootstrap `SELECT` must never reference a
+    /// synthetic column. Reads and source peeling see past it.
+    fn route<'a>(
+        &'a self,
+        walk: LayerWalk,
+        below: &'a Arc<dyn TableProvider>,
+    ) -> Option<&'a Arc<dyn TableProvider>> {
+        // Exhaustive on purpose: a wildcard would answer a future walk kind
+        // for this layer without anyone deciding what it should say.
+        match walk {
+            LayerWalk::Read | LayerWalk::Source | LayerWalk::Index | LayerWalk::RetentionDelete => {
+                Some(below)
+            }
+            LayerWalk::CdcDetection | LayerWalk::Write => None,
+        }
+    }
+
+    fn get_logical_plan<'a>(
+        &'a self,
+        _below: &'a Arc<dyn TableProvider>,
+    ) -> Option<Cow<'a, LogicalPlan>> {
+        // EmbeddingTable augments the base table's schema with computed
+        // embedding columns. The base table's logical plan does not represent
+        // those columns, so forwarding it would cause `LogicalPlanBuilder::scan`
+        // to inline a plan whose schema is missing the embedding columns —
+        // any subsequent projection of those columns then fails.
+        None
+    }
+
+    fn schema(&self, below: &Arc<dyn TableProvider>) -> SchemaRef {
+        self.schema_over(below)
+    }
 
     /// Any filter in [`filters`] can still be exact
     fn supports_filters_pushdown(
         &self,
+        below: &Arc<dyn TableProvider>,
         filters: &[&Expr],
     ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
         let base_field_names: HashSet<String> = self
@@ -934,7 +981,7 @@ impl TableProvider for EmbeddingTable {
                     .count();
 
                 if additional_fields_count == 0 {
-                    self.base_table.supports_filters_pushdown(&[f]).map(|v| {
+                    below.supports_filters_pushdown(&[f]).map(|v| {
                         v.first()
                             .cloned()
                             .unwrap_or(TableProviderFilterPushDown::Unsupported)
@@ -947,54 +994,27 @@ impl TableProvider for EmbeddingTable {
         Ok(push_downs)
     }
 
-    fn statistics(&self) -> Option<Statistics> {
+    fn statistics(&self, _below: &Arc<dyn TableProvider>) -> Option<Statistics> {
         None
-    }
-
-    async fn insert_into(
-        &self,
-        state: &dyn Session,
-        input: Arc<dyn ExecutionPlan>,
-        overwrite: InsertOp,
-    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        self.base_table.insert_into(state, input, overwrite).await
-    }
-
-    async fn delete_from(
-        &self,
-        state: &dyn Session,
-        filters: Vec<Expr>,
-    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        self.base_table.delete_from(state, filters).await
-    }
-
-    async fn update(
-        &self,
-        state: &dyn Session,
-        assignments: Vec<(String, Expr)>,
-        filters: Vec<Expr>,
-    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        self.base_table.update(state, assignments, filters).await
     }
 
     async fn scan_with_args<'a>(
         &self,
+        below: &Arc<dyn TableProvider>,
         state: &dyn Session,
-        args: datafusion::catalog::ScanArgs<'a>,
-    ) -> DataFusionResult<datafusion::catalog::ScanResult> {
+        args: ScanArgs<'a>,
+    ) -> DataFusionResult<ScanResult> {
+        let projection = args.projection().map(<[usize]>::to_vec);
         let plan = self
-            .scan(
+            .scan_plan(
+                below,
                 state,
-                args.projection().map(<[usize]>::to_vec).as_ref(),
+                projection.as_ref(),
                 args.filters().unwrap_or(&[]),
                 args.limit(),
             )
             .await?;
         Ok(plan.into())
-    }
-
-    async fn truncate(&self, state: &dyn Session) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        self.base_table.truncate(state).await
     }
 }
 
