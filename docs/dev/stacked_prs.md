@@ -163,9 +163,11 @@ ls-files -u <path>` shows them):
 
 ```bash
 f=<path>
-if [ "$(git ls-files --stage -- "$f" | awk 'NR == 1 { print $1 }')" = 120000 ]; then
-  # Symlink: recreate the link, never cp onto it. Its blob content is the target path.
-  ln -sfn "$(git show ":2:$f")" "$f" && git add "$f"   # or stage 3, whichever target is right
+if git ls-files --stage -- "$f" | awk '{ print $1 }' | grep -qx 120000; then
+  # A symlink on ANY side — never cp onto it. A conflicted symlink's blob content is
+  # its target path, so recreate the link from whichever side is right, then stage it:
+  #   ln -sfn "$(git show ":2:$f")" "$f" && git add "$f"
+  echo "SYMLINK conflict on $f — resolve by hand"
 else
   git show ":2:$f" > /tmp/ours          # your side
   git show ":3:$f" > /tmp/theirs        # trunk's side
@@ -184,10 +186,15 @@ actually resolve the path. The staging must be *guarded* by the exit status (0 c
 else the number of conflicts left): an unguarded `cp` stages conflict markers the moment
 someone pastes the block.
 
-And the symlink branch has to be **control flow, not a warning**. `cp` follows a link
-and writes *through* it, so resolving a conflicted `CLAUDE.md` in the text-merge branch
-would silently overwrite `.github/copilot-instructions.md` while the link itself still
-looked untouched. A printed warning does not stop the `cp` that follows it.
+And the symlink branch has to be **control flow, not a warning** — a printed warning
+does not stop the `cp` that follows it — testing **every stage**, not the first line.
+`git ls-files --stage` lists an unmerged path as stages 1 (base), 2 (ours), 3 (theirs)
+in that order, so the first line is the *base's* mode: a path that was a regular file at
+the base and is a symlink on your side would fall through to the text merge. `cp` then
+follows the link and writes *through* it, so resolving a conflicted `CLAUDE.md` that way
+silently overwrites `.github/copilot-instructions.md` while the link itself still looks
+untouched. Any `120000` among the stages means resolve it by hand — a symlink on one
+side and a regular file on the other is a type conflict that wants a human anyway.
 
 **3. Audit for silent damage** — this is the step that catches the resurrection. It
 compares what the child *intended* against what the merge actually put on disk:
