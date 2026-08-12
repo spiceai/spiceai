@@ -134,6 +134,15 @@ pub enum Error {
         source: identity::Error,
     },
 
+    #[snafu(display(
+        "The Cloud Connect identity at {} cannot be used: {reason}. Stop spiced, run `spice connect remove --yes` from this instance directory, mint a new enrollment key in the Spice Cloud portal, and restart with `spiced --token <enrollment-key>`. See: https://spiceai.org/docs",
+        path.display()
+    ))]
+    IdentityUnusable {
+        path: std::path::PathBuf,
+        reason: &'static str,
+    },
+
     #[snafu(display("Invalid Cloud Connect endpoint: {endpoint}: {source}"))]
     InvalidEndpoint {
         endpoint: String,
@@ -177,7 +186,9 @@ impl CloudConnect {
     /// # Errors
     ///
     /// Returns [`Error::IdentityLoad`] if an identity file exists at
-    /// `config.identity_path` but cannot be read or parsed.
+    /// `config.identity_path` but cannot be read or parsed, or
+    /// [`Error::IdentityUnusable`] if its reconnect credentials are
+    /// internally inconsistent.
     #[expect(
         clippy::unused_async,
         reason = "spawns a background tokio task, so it must be called from within a tokio runtime context"
@@ -204,6 +215,14 @@ impl CloudConnect {
             );
             return Ok(None);
         };
+        if let Some(reason) =
+            identity.reconnect_validation_error(config.gateway_endpoint.as_deref())
+        {
+            return Err(Error::IdentityUnusable {
+                path: identity_path,
+                reason,
+            });
+        }
         let identity = Some(identity);
 
         let shutdown = Shutdown::new();

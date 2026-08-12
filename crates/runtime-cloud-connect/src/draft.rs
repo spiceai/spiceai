@@ -338,10 +338,30 @@ impl EnrollmentDraft {
         let mut options = std::fs::OpenOptions::new();
         options.create(true).read(true).write(true);
         #[cfg(unix)]
-        options.mode(0o600);
+        options
+            .mode(0o600)
+            // A hostile FIFO/device must never block a privileged caller
+            // before the descriptor's file type can be checked below.
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
         let file = options.open(lock_path).context(IoSnafu {
             path: lock_path.to_path_buf(),
         })?;
+        #[cfg(unix)]
+        if !file
+            .metadata()
+            .context(IoSnafu {
+                path: lock_path.to_path_buf(),
+            })?
+            .is_file()
+        {
+            return Err(Error::Io {
+                path: lock_path.to_path_buf(),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "the enrollment transaction lock must be a regular file",
+                ),
+            });
+        }
         #[cfg(unix)]
         file.set_permissions(std::fs::Permissions::from_mode(0o600))
             .context(IoSnafu {
@@ -806,6 +826,73 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(mode, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_publication_lock_rejects_symlinks_without_touching_the_target() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target_path = dir.path().join("unrelated");
+        std::fs::write(&target_path, "must remain unchanged").expect("write target");
+        std::fs::set_permissions(&target_path, std::fs::Permissions::from_mode(0o644))
+            .expect("set target mode");
+
+        let draft_path = EnrollmentDraft::path_in(dir.path());
+        let lock_path = EnrollmentDraft::lock_path(&draft_path);
+        symlink(&target_path, &lock_path).expect("create malicious lock symlink");
+
+        EnrollmentDraft::acquire_publication_lock(&lock_path)
+            .expect_err("a transaction lock must never follow a symlink");
+        assert_eq!(
+            std::fs::read_to_string(&target_path).expect("read target"),
+            "must remain unchanged"
+        );
+        let mode = std::fs::metadata(&target_path)
+            .expect("target metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o644, "the symlink target mode must not change");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_publication_lock_rejects_a_fifo_without_blocking_or_chmod() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt as _;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let draft_path = EnrollmentDraft::path_in(dir.path());
+        let lock_path = EnrollmentDraft::lock_path(&draft_path);
+        let lock_path_c =
+            CString::new(lock_path.as_os_str().as_bytes()).expect("lock path CString");
+        // SAFETY: `lock_path_c` is a live, NUL-terminated path and the mode is
+        // a valid `mode_t`; `mkfifo` does not retain either argument.
+        let result = unsafe { libc::mkfifo(lock_path_c.as_ptr(), 0o644) };
+        assert_eq!(
+            result,
+            0,
+            "create FIFO: {}",
+            std::io::Error::last_os_error()
+        );
+        let original_mode = std::fs::metadata(&lock_path)
+            .expect("FIFO metadata before acquisition")
+            .permissions()
+            .mode()
+            & 0o777;
+
+        EnrollmentDraft::acquire_publication_lock(&lock_path)
+            .expect_err("a FIFO must not become an enrollment transaction lock");
+        let metadata = std::fs::metadata(&lock_path).expect("FIFO metadata");
+        assert!(!metadata.is_file(), "the lock path must remain a FIFO");
+        assert_eq!(
+            metadata.permissions().mode() & 0o777,
+            original_mode,
+            "rejecting a FIFO must not change its mode"
+        );
     }
 
     #[test]

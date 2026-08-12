@@ -240,6 +240,15 @@ impl Identity {
         if certificate.public_key().raw != private_key.subject_public_key_info().as_slice() {
             return Some("the client identity certificate and private key do not match");
         }
+        let Ok(public_key_pem) = pem::parse(&self.public_key_pem) else {
+            return Some("the client identity public key is not valid PEM");
+        };
+        if public_key_pem.tag() != "PUBLIC KEY" {
+            return Some("the client identity public key has an invalid PEM label");
+        }
+        if public_key_pem.contents() != private_key.subject_public_key_info().as_slice() {
+            return Some("the client identity public and private keys do not match");
+        }
         if self.gateway_addr.trim().is_empty()
             && gateway_override.is_none_or(|endpoint| endpoint.trim().is_empty())
         {
@@ -1071,6 +1080,33 @@ mod tests {
         assert_eq!(
             identity.reconnect_validation_error(None),
             Some("the client identity certificate and private key do not match")
+        );
+    }
+
+    #[test]
+    fn reconnect_validation_rejects_a_malformed_or_mismatched_public_key() {
+        let mut identity = sample_identity();
+        identity.public_key_pem =
+            "-----BEGIN PUBLIC KEY-----\nnot-a-public-key\n-----END PUBLIC KEY-----\n".to_string();
+        assert_eq!(
+            identity.reconnect_validation_error(None),
+            Some("the client identity public key is not valid PEM")
+        );
+
+        let mut identity = sample_identity();
+        identity.public_key_pem = identity.private_key_pem.clone();
+        assert_eq!(
+            identity.reconnect_validation_error(None),
+            Some("the client identity public key has an invalid PEM label")
+        );
+
+        let mut identity = sample_identity();
+        identity.public_key_pem = KeyPair::generate()
+            .expect("generate mismatched public key")
+            .public_key_pem();
+        assert_eq!(
+            identity.reconnect_validation_error(None),
+            Some("the client identity public and private keys do not match")
         );
     }
 

@@ -66,6 +66,11 @@ uuid = { workspace = true, features = ["v4"] }
 # buffer never leaves plaintext in the heap.
 zeroize = "1.8"
 
+[target.'cfg(unix)'.dependencies]
+# Refuse symlink and special-file enrollment locks before privileged callers
+# change permissions or wait for the advisory lock.
+libc = "0.2"
+
 [build-dependencies]
 tonic-prost-build = "0.14"
 

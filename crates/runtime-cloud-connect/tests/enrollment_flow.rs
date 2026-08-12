@@ -68,6 +68,60 @@ use tonic::{Request, Response, Status, Streaming};
 const ENROLLMENT_KEY: &str = "spice-enroll-flow00000000000000000000000000aa";
 const ASSIGNED_ID: &str = "inst_unit_test";
 
+fn reconnect_identity(identifier: &str, gateway_addr: String) -> runtime_cloud_connect::Identity {
+    let key_pair = KeyPair::generate().expect("generate reconnect identity key");
+    let certificate = CertificateParams::new(Vec::<String>::new())
+        .expect("build reconnect certificate parameters")
+        .self_signed(&key_pair)
+        .expect("sign reconnect certificate");
+    runtime_cloud_connect::Identity {
+        identifier: identifier.to_string(),
+        identity_cert_pem: certificate.pem(),
+        private_key_pem: key_pair.serialize_pem(),
+        public_key_pem: key_pair.public_key_pem(),
+        ca_bundle_pem: String::new(),
+        gateway_addr,
+        not_after_unix: None,
+        app_id: None,
+        enc_private_key_pem: String::new(),
+        enc_public_key_pem: String::new(),
+        enc_previous_private_key_pem: String::new(),
+        cache_key_b64: String::new(),
+    }
+}
+
+#[tokio::test]
+async fn start_rejects_a_persisted_public_key_that_does_not_match_the_mtls_identity() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let identity_path = dir.path().join("identity.json");
+    let mut identity = reconnect_identity("inst_corrupt", "127.0.0.1:9".to_string());
+    identity.public_key_pem = KeyPair::generate()
+        .expect("generate mismatched persisted public key")
+        .public_key_pem();
+    IdentityStore::store(&identity_path, &identity).expect("store corrupt identity");
+
+    let config = enroll_config(
+        "127.0.0.1:9".parse().expect("parse unused endpoint"),
+        dir.path(),
+    );
+    let runtime: Arc<dyn RuntimeHandle> =
+        Arc::new(runtime_cloud_connect::handlers::NoopRuntimeHandle);
+    let error = match runtime_cloud_connect::CloudConnect::start(config, runtime).await {
+        Ok(_) => panic!("startup must fail closed before advertising a mismatched public key"),
+        Err(error) => error,
+    };
+    assert!(
+        matches!(
+            error,
+            runtime_cloud_connect::Error::IdentityUnusable {
+                reason: "the client identity public and private keys do not match",
+                ..
+            }
+        ),
+        "{error}"
+    );
+}
+
 #[derive(Default)]
 struct CapturedState {
     last_hello: Option<proto::Hello>,
@@ -551,20 +605,7 @@ async fn apply_spicepod_writes_file_and_acks() {
     // its issued gateway_addr at the mock. The transport is insecure (h2c)
     // here, so the cert/key PEMs are never used for a real handshake —
     // this test isolates the ApplySpicepod dispatch.
-    let identity = runtime_cloud_connect::identity::Identity {
-        identifier: "inst_pre_enrolled".to_string(),
-        identity_cert_pem: "PRE-ENROLLED-CERT".to_string(),
-        private_key_pem: "PRE-ENROLLED-KEY".to_string(),
-        public_key_pem: "PRE-ENROLLED-PUB".to_string(),
-        ca_bundle_pem: String::new(),
-        gateway_addr: addr.to_string(),
-        not_after_unix: None,
-        app_id: None,
-        enc_private_key_pem: String::new(),
-        enc_public_key_pem: String::new(),
-        enc_previous_private_key_pem: String::new(),
-        cache_key_b64: String::new(),
-    };
+    let identity = reconnect_identity("inst_pre_enrolled", addr.to_string());
     IdentityStore::store(&identity_path, &identity).unwrap();
 
     let captured = Arc::new(Mutex::new(None));
@@ -669,20 +710,7 @@ async fn attach_app_applies_complete_state_and_rejects_empty_ids() {
     let addr = spawn_server(mock).await;
     IdentityStore::store(
         &identity_path,
-        &runtime_cloud_connect::identity::Identity {
-            identifier: "inst_attachment".to_string(),
-            identity_cert_pem: "CERT".to_string(),
-            private_key_pem: "KEY".to_string(),
-            public_key_pem: "PUB".to_string(),
-            ca_bundle_pem: String::new(),
-            gateway_addr: addr.to_string(),
-            not_after_unix: None,
-            app_id: None,
-            enc_private_key_pem: String::new(),
-            enc_public_key_pem: String::new(),
-            enc_previous_private_key_pem: String::new(),
-            cache_key_b64: String::new(),
-        },
+        &reconnect_identity("inst_attachment", addr.to_string()),
     )
     .expect("store identity");
 
@@ -799,20 +827,7 @@ async fn unknown_command_is_nacked_rather_than_dropped() {
     let mock_state = Arc::clone(&mock.state);
     let addr = spawn_server(mock).await;
 
-    let identity = runtime_cloud_connect::identity::Identity {
-        identifier: "inst_pre_enrolled".to_string(),
-        identity_cert_pem: "PRE-ENROLLED-CERT".to_string(),
-        private_key_pem: "PRE-ENROLLED-KEY".to_string(),
-        public_key_pem: "PRE-ENROLLED-PUB".to_string(),
-        ca_bundle_pem: String::new(),
-        gateway_addr: addr.to_string(),
-        not_after_unix: None,
-        app_id: None,
-        enc_private_key_pem: String::new(),
-        enc_public_key_pem: String::new(),
-        enc_previous_private_key_pem: String::new(),
-        cache_key_b64: String::new(),
-    };
+    let identity = reconnect_identity("inst_pre_enrolled", addr.to_string());
     IdentityStore::store(&identity_path, &identity).unwrap();
 
     let config = CloudConnectConfig {
