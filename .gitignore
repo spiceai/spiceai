@@ -94,3 +94,7 @@ cluster_logs/
 
 # Distributed helper script working directory
 .distributed/
+
+# insta writes these when a snapshot assertion fails; they are the rejected
+# candidate, reviewed with `cargo insta review` and never committed.
+*.snap.new

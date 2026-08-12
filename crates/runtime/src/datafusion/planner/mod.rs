@@ -46,7 +46,6 @@ mod update;
 
 use std::sync::Arc;
 
-use data_components::MetadataEnrichedTableProvider;
 use datafusion::catalog::TableProvider;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::SessionState;
@@ -58,7 +57,6 @@ use datafusion::sql::sqlparser::ast::Statement as SQLStatement;
 use datafusion_dml::CatalogDmlHandler;
 use datafusion_expr::WriteOp;
 use datafusion_expr::dml::InsertOp;
-use datafusion_federation::FederatedTableProviderAdaptor;
 use tokio::runtime::Handle;
 
 use crate::accelerated::AcceleratedTable;
@@ -286,39 +284,11 @@ async fn is_distributed_insert_table(session: &SessionState, table_name: &TableR
 }
 
 fn is_dual_write_table_provider(table_provider: &Arc<dyn TableProvider>) -> bool {
-    peel_table_provider_wrappers(table_provider)
-        .downcast_ref::<AcceleratedTable>()
-        .is_some_and(AcceleratedTable::is_dual_write)
-}
-
-/// Peel the wrapper providers that dataset registration can insert between the
-/// catalog entry and the inner `AcceleratedTable`, so callers can downcast to it.
-///
-/// `PolyTableProvider`-backed accelerators are wrapped in a
-/// `FederatedTableProviderAdaptor`, and datasets that declare table- or
-/// column-level metadata are wrapped in a `MetadataEnrichedTableProvider` by
-/// `register_accelerated_table`.
-pub(crate) fn peel_table_provider_wrappers(
-    table_provider: &Arc<dyn TableProvider>,
-) -> Arc<dyn TableProvider> {
-    let mut current = Arc::clone(table_provider);
-    loop {
-        if let Some(adaptor) = current.downcast_ref::<FederatedTableProviderAdaptor>() {
-            let Some(inner) = adaptor.table_provider.clone() else {
-                break;
-            };
-            current = inner;
-            continue;
-        }
-
-        if let Some(enriched) = current.downcast_ref::<MetadataEnrichedTableProvider>() {
-            current = Arc::clone(enriched.get_inner_ref());
-            continue;
-        }
-
-        break;
-    }
-    current
+    spice_table::find_layer::<AcceleratedTable>(
+        table_provider.as_ref(),
+        spice_table::LayerWalk::Read,
+    )
+    .is_some_and(AcceleratedTable::is_dual_write)
 }
 
 fn matches_write_op(actual: &WriteOp, expected: &WriteOp) -> bool {
@@ -334,7 +304,7 @@ mod tests {
     use datafusion::catalog::TableProvider;
     use datafusion::datasource::MemTable;
 
-    use super::{MetadataEnrichedTableProvider, peel_table_provider_wrappers};
+    use data_components::MetadataEnrichedTableProvider;
 
     fn mem_table() -> Arc<dyn TableProvider> {
         let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
@@ -344,53 +314,47 @@ mod tests {
     fn enrich(inner: Arc<dyn TableProvider>) -> Arc<dyn TableProvider> {
         let mut metadata = HashMap::new();
         metadata.insert("source_owner".to_string(), "analytics".to_string());
-        Arc::new(MetadataEnrichedTableProvider::new(inner, metadata))
+        spice_table::SpiceTable::over(
+            Arc::new(MetadataEnrichedTableProvider::new(&inner, metadata)),
+            inner,
+        )
     }
 
+    /// A dataset declaring table- or column-level metadata carries a
+    /// metadata-enrichment layer, and `is_dual_write_table_provider` has to see
+    /// through it to reach the accelerated table. Missing it classifies a
+    /// dual-write table as not-dual-write, and its INSERTs skip the
+    /// distributed-insert rewrite.
+    ///
+    /// A `MemTable` stands in for the accelerated layer here — what matters is
+    /// that the walk crosses the enrichment, not what it finds.
     #[test]
-    fn peel_reaches_inner_through_metadata_wrapper() {
-        // Regression: a dataset that declares table-/column-level metadata is
-        // registered behind a `MetadataEnrichedTableProvider`. `is_dual_write_table_provider`
-        // (via `peel_table_provider_wrappers`) must see through that wrapper to reach the
-        // inner provider; otherwise a dual-write accelerated table with metadata is wrongly
-        // classified as not-dual-write and its INSERTs skip the distributed-insert rewrite.
-        let inner = mem_table();
-        let wrapped = enrich(Arc::clone(&inner));
+    fn a_layer_is_reachable_through_a_metadata_layer() {
+        let wrapped = enrich(mem_table());
         assert!(
-            wrapped
-                .downcast_ref::<MetadataEnrichedTableProvider>()
+            spice_table::find_layer::<MetadataEnrichedTableProvider>(
+                wrapped.as_ref(),
+                spice_table::LayerWalk::Read
+            )
+            .is_some(),
+            "the walk must reach a layer behind metadata enrichment"
+        );
+        assert!(
+            spice_table::find_concrete::<MemTable>(wrapped.as_ref(), spice_table::LayerWalk::Read)
                 .is_some(),
-            "precondition: provider is wrapped in MetadataEnrichedTableProvider"
-        );
-
-        let peeled = peel_table_provider_wrappers(&wrapped);
-        assert!(
-            peeled.is::<MemTable>(),
-            "peel must reach the inner provider through the metadata wrapper"
+            "and must continue past it to the provider beneath"
         );
     }
 
+    /// The layers nest (metadata over federated over metadata), so the walk must
+    /// keep going rather than stop at the first one.
     #[test]
-    fn peel_reaches_inner_through_nested_metadata_wrappers() {
-        // The wrappers can nest (e.g. metadata-over-federated-over-metadata); the loop
-        // must keep peeling until no known wrapper matches.
-        let inner = mem_table();
-        let wrapped = enrich(enrich(Arc::clone(&inner)));
-
-        let peeled = peel_table_provider_wrappers(&wrapped);
+    fn a_provider_is_reachable_through_nested_metadata_layers() {
+        let wrapped = enrich(enrich(mem_table()));
         assert!(
-            peeled.is::<MemTable>(),
-            "peel must unwrap every nested metadata wrapper"
-        );
-    }
-
-    #[test]
-    fn peel_is_identity_for_unwrapped_provider() {
-        let inner = mem_table();
-        let peeled = peel_table_provider_wrappers(&inner);
-        assert!(
-            peeled.is::<MemTable>(),
-            "an unwrapped provider must be returned unchanged"
+            spice_table::find_concrete::<MemTable>(wrapped.as_ref(), spice_table::LayerWalk::Read)
+                .is_some(),
+            "the walk must cross every nested enrichment layer"
         );
     }
 

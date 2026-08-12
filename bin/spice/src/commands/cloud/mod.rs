@@ -29,6 +29,7 @@ use dialoguer::{Input, Password, Select, theme::ColorfulTheme};
 use snafu::ResultExt;
 use std::{fmt, io::IsTerminal};
 
+pub(crate) use client::format_org_list;
 pub use client::{
     CloudClient, ProjectTarget, is_device_authorization_denied_error, parse_org_project,
 };

@@ -25,6 +25,7 @@ limitations under the License.
 //! Cayenne metastore (i.e. the data-inlining path was hit, not the file path).
 
 #![cfg(not(windows))]
+#![recursion_limit = "256"]
 #![allow(clippy::expect_used)]
 
 use std::sync::Arc;

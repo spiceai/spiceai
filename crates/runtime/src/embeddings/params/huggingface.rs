@@ -17,7 +17,7 @@ limitations under the License.
 use runtime_parameters::TypedParams;
 use secrecy::SecretString;
 
-use super::Pooling;
+use super::{Pooling, Truncation};
 
 /// Parameters for `from: huggingface` embedding models.
 #[derive(TypedParams)]
@@ -32,4 +32,9 @@ pub struct HuggingFaceEmbeddingParams {
     /// The maximum sequence length for the embedding model.
     #[param(runtime)]
     pub max_seq_length: Option<usize>,
+    /// How to handle an input longer than the model's maximum sequence length:
+    /// `NONE` (default) to reject it, `END` to discard the end of the input,
+    /// or `START` to discard the start of the input.
+    #[param(runtime)]
+    pub truncate: Option<Truncation>,
 }

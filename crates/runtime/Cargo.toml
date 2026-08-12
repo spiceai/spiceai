@@ -62,6 +62,7 @@ datafusion-spark.workspace = true
 datafusion-substrait = { workspace = true }
 datafusion-table-providers = { workspace = true }
 db_connection_pool = { path = "../db_connection_pool" }
+spice-table = { path = "../spice-table" }
 tokio-postgres = { workspace = true, optional = true }
 document_parse = { path = "../document_parse" }
 duckdb = { workspace = true, features = [
@@ -186,6 +187,7 @@ telemetry = { path = "../telemetry" }
 tera = { version = "1.17" }
 tiberius = { workspace = true, optional = true }
 token_provider = { path = "../token_provider" }
+tokenizers.workspace = true
 tokio.workspace = true
 tokio-rusqlite = { workspace = true, optional = true }
 tokio-rustls = "0.26.0"
@@ -198,6 +200,7 @@ tower.workspace = true
 tower-http.workspace = true
 tracing.workspace = true
 tracing-futures.workspace = true
+tracing-opentelemetry.workspace = true
 tracing-subscriber.workspace = true
 turso = { workspace = true, optional = true }
 turso-shared = { workspace = true }
@@ -293,7 +296,6 @@ test-framework = { path = "../test-framework" }
 tiberius.workspace = true
 tokio = { workspace = true, features = ["time", "test-util"] }
 rusqlite = { workspace = true }
-tracing-opentelemetry.workspace = true
 tracing-subscriber.workspace = true
 yaml = { path = "../yaml" }
 

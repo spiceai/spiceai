@@ -637,10 +637,22 @@ pub trait MetadataCatalog: Send + Sync {
     /// (separate) inlined-data clear would leave stale inlined rows that scan
     /// would union into the new snapshot's results.
     ///
+    /// `inlined` carries the overwrite's own replacement rows when the whole
+    /// refresh was small enough to live in the metastore instead of in Vortex
+    /// files. It is inserted AFTER the clear, inside the same transaction, so
+    /// clear-then-replace is atomic exactly as clear-then-flip is: a crash
+    /// mid-commit leaves the old snapshot and its old inline rows fully intact.
+    /// `None` for a file-backed (or empty) overwrite.
+    ///
     /// # Errors
     ///
     /// Returns an error if the transaction cannot be committed.
-    async fn commit_overwrite(&self, table_id: &str, new_snapshot_id: &str) -> CatalogResult<()>;
+    async fn commit_overwrite(
+        &self,
+        table_id: &str,
+        new_snapshot_id: &str,
+        inlined: Option<&InlinedData>,
+    ) -> CatalogResult<()>;
 
     /// Add a partition to a table.
     async fn add_partition(&self, partition: PartitionMetadata) -> CatalogResult<String>;

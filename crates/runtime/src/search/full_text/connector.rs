@@ -16,7 +16,6 @@ limitations under the License.
 use async_trait::async_trait;
 use data_components::cdc::ChangesStream;
 use datafusion::datasource::TableProvider;
-use runtime_datafusion_index::IndexedTableProvider;
 use search::generation::text_search::index::FullTextDatabaseIndex;
 use search::index::chunking::ChunkedSearchIndex;
 use search::index::compound::CompoundSearchIndex;
@@ -32,11 +31,11 @@ use crate::component::{
 use crate::dataconnector::{DataConnector, DataConnectorError, DataConnectorResult};
 use crate::federated::FederatedTable;
 use crate::search::full_text::table::add_full_text_search_to_table;
-use crate::search::util::find_concrete_table_provider;
 use futures::StreamExt;
 use runtime_metrics::component::MetricsProvider;
+use spice_table::LayerWalk;
 
-/// A [`DataConnector`] middleware that, for [`Dataset`]s needing full text search capabilies, creates a [`IndexedTableProvider`] using the underlying [`TableProvider`]s and a [`FullTextDatabaseIndex`](search::generation::text_search::index::FullTextDatabaseIndex). If no full text search capabilities are needed it is not unnecessarily nested.
+/// A [`DataConnector`] middleware that, for [`Dataset`]s needing full text search capabilies, creates a [`IndexLayer`] using the underlying [`TableProvider`]s and a [`FullTextDatabaseIndex`](search::generation::text_search::index::FullTextDatabaseIndex). If no full text search capabilities are needed it is not unnecessarily nested.
 #[derive(Debug)]
 pub struct FullTextConnector {
     inner_connector: Arc<dyn DataConnector>,
@@ -57,17 +56,18 @@ impl FullTextConnector {
         F: Fn(&Arc<dyn DataConnector>, Arc<FederatedTable>) -> Option<ChangesStream>,
     {
         let table_provider = federated_table.try_table_provider_sync()?;
-        let indexed_table = find_concrete_table_provider::<IndexedTableProvider>(&table_provider)?;
+        let indexed_table = spice_table::nodes(table_provider.as_ref(), LayerWalk::Index)
+            .find(|node| !node.indexes().is_empty())?;
 
         // This will process all `Index`s, including vector indexes if provided (i.e. from `EmbeddingConnector`).
-        // This is required so that [`IndexedTableProvider`] can be unwrapped (i.e. [`IndexedTableProvider::get_underlying`])
-        //  in both cases there is and isn't a `EmbeddingConnector` underneath.
-        let all_indexes = indexed_table.get_all_indexes();
+        // This is required so that the index layer can be peeled in both cases —
+        // whether or not there is an `EmbeddingConnector` underneath.
+        let all_indexes = indexed_table.indexes().to_vec();
 
         // A full-text index written by this change stream must not defer its commits
         // to the sink write lifecycle: the two share one tantivy writer, so a window
         // commit would publish a partial refresh and a window rollback would discard
-        // these change-stream documents. `IndexedTableProvider::get_all_indexes` returns
+        // these change-stream documents. A layer's indexes come back
         // whatever was registered, unpeeled, so the tantivy tier can be reached only
         // indirectly — nested as the primary of a `CompoundSearchIndex` (the warm/external
         // full-text compound, registered in place of its tiers) or wrapped in a
@@ -77,7 +77,7 @@ impl FullTextConnector {
         }
 
         let indexes = Indexes::new(all_indexes);
-        let ft = Arc::new(FederatedTable::Immediate(indexed_table.get_underlying()));
+        let ft = Arc::new(FederatedTable::Immediate(Arc::clone(indexed_table.below())));
 
         let stream = f(&self.inner_connector, ft)?;
         Some(
@@ -119,7 +119,7 @@ impl DataConnector for FullTextConnector {
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         let inner = self.inner_connector.read_provider(dataset).await?;
         add_full_text_search_to_table(&inner, &dataset.columns, &dataset.name)
-            .map(|idx| Arc::new(idx) as Arc<dyn TableProvider>)
+            .map(|idx| idx as Arc<dyn TableProvider>)
             .map_err(|e| DataConnectorError::InvalidConfiguration {
                 dataconnector: dataset.source().to_string(),
                 message: e.to_string(),
@@ -135,7 +135,7 @@ impl DataConnector for FullTextConnector {
         match self.inner_connector.read_write_provider(dataset).await {
             Some(Ok(inner)) => Some(
                 add_full_text_search_to_table(&inner, &dataset.columns, &dataset.name)
-                    .map(|idx| Arc::new(idx) as Arc<dyn TableProvider>)
+                    .map(|idx| idx as Arc<dyn TableProvider>)
                     .map_err(|e| DataConnectorError::InvalidConfiguration {
                         dataconnector: dataset.source().to_string(),
                         message: e.to_string(),
@@ -238,9 +238,9 @@ mod tests {
     use arrow::util::pretty::pretty_format_batches;
     use datafusion::datasource::MemTable;
     use futures::TryStreamExt;
-    use runtime_datafusion_index::{Index, WriteWindow};
     use search::index::SearchIndex;
     use search::index::compound::CompoundReadMode;
+    use spice_table::{Index, WriteWindow};
 
     fn test_table() -> Arc<dyn TableProvider> {
         let batch = record_batch!(("id", Int32, [1]), ("content", Utf8, ["seed"]))
@@ -263,7 +263,7 @@ mod tests {
     }
 
     /// Regression test for #12061: the warm/external full-text tier registers a
-    /// `CompoundSearchIndex` in place of its tiers, so `IndexedTableProvider::get_all_indexes`
+    /// `CompoundSearchIndex` in place of its tiers, so `IndexLayer::get_all_indexes`
     /// never surfaces the nested `FullTextDatabaseIndex` directly. `mark_full_text_cdc_attached`
     /// has to peel through the compound to reach it, or the tantivy tier keeps deferring
     /// commits and a failed refresh discards change-stream documents for good.
