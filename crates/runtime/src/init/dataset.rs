@@ -2012,6 +2012,11 @@ async fn update_cached_dataset_timestamps(dataset: &Dataset) {
     }
 }
 
+/// Whether a dataset's `drasi:` block is live.
+fn is_drasi_forwarding(drasi: &spicepod::drasi::Drasi) -> bool {
+    drasi.forwarding == spicepod::drasi::DrasiForwarding::Enabled
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2482,9 +2487,4 @@ mod tests {
             "teardown counted one load error before this change; counted {counted}"
         );
     }
-}
-
-/// Whether a dataset's `drasi:` block is live.
-fn is_drasi_forwarding(drasi: &spicepod::drasi::Drasi) -> bool {
-    drasi.forwarding == spicepod::drasi::DrasiForwarding::Enabled
 }
