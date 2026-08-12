@@ -59,11 +59,19 @@ impl RedisStreamTransport {
     ///
     /// Returns an error if the Redis URL is not a URL Redis understands.
     pub fn try_new(dataset: &str, source_id: &str, url: &str, stream_key: &str) -> Result<Self> {
+        // `RedisError`'s `Display` appends a detail string the client builds
+        // out of the URL it was given, so formatting the error would route
+        // part of a credential-bearing URL into a log line and the dataset's
+        // public `error_message` — the leak `redact_url` exists to prevent.
+        // `category()` is a fixed string, and the redacted URL is what makes
+        // the error actionable anyway.
         let client = redis::Client::open(url).map_err(|e| Error::InvalidConfiguration {
             dataset: dataset.to_string(),
             message: format!(
-                "Parameter 'drasi_redis_url' is not a valid Redis URL: {e}. \
-                Expected a value like 'redis://host:6379' (or 'rediss://' for TLS)."
+                "Parameter 'drasi_redis_url' ({}) is not a valid Redis URL ({}). \
+                Expected a value like 'redis://host:6379' (or 'rediss://' for TLS).",
+                redact_url(url),
+                e.category()
             ),
         })?;
 
@@ -257,6 +265,37 @@ mod tests {
         )
         .expect_err("an http:// URL is not a Redis URL");
         assert!(matches!(err, Error::InvalidConfiguration { .. }));
+    }
+
+    /// This message is logged and becomes the dataset's public
+    /// `error_message`, and `drasi_redis_url` carries its credentials in the
+    /// authority — so a rejected URL must be reported redacted, and the
+    /// underlying error must not be formatted into it.
+    #[test]
+    fn invalid_redis_url_error_does_not_leak_credentials() {
+        let err = RedisStreamTransport::try_new(
+            "orders",
+            "spice-cdc",
+            "http://admin:hunter2@not-redis:6379",
+            "drasi-events",
+        )
+        .expect_err("an http:// URL is not a Redis URL");
+
+        let Error::InvalidConfiguration { message, .. } = &err else {
+            panic!("expected an InvalidConfiguration error");
+        };
+        assert!(
+            !message.contains("hunter2"),
+            "the password reached the message: {message}"
+        );
+        assert!(
+            !message.contains("admin"),
+            "the username reached the message: {message}"
+        );
+        assert!(
+            message.contains("not-redis"),
+            "the host is what makes the error actionable: {message}"
+        );
     }
 
     #[test]
