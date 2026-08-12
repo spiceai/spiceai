@@ -24,7 +24,7 @@ use std::{collections::HashMap, fmt::Display};
 
 use crate::metric::Metrics;
 
-use super::{Nameable, WithDependsOn};
+use super::{Nameable, WithDependsOn, model::HUGGINGFACE_PATH_REGEX};
 #[cfg(feature = "schemars")]
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -91,6 +91,21 @@ impl Reranker {
         let prefix = self.get_prefix()?;
         match prefix {
             RerankerPrefix::Http => Some(self.from.clone()),
+            // Mirrors the `huggingface:` handling for embeddings/models: the
+            // repo id (and optional pinned `:revision`) is recovered from
+            // `huggingface:huggingface.co/<org>/<model>[:rev]` via the shared
+            // regex so a revision round-trips to the loader.
+            RerankerPrefix::HuggingFace => {
+                HUGGINGFACE_PATH_REGEX.captures(&self.from).map(|caps| {
+                    let model = format!("{}/{}", &caps["org"], &caps["model"]);
+                    if let Some(revision) = caps.name("revision") {
+                        format!("{}:{}", model, revision.as_str())
+                    } else {
+                        model
+                    }
+                })
+            }
+            RerankerPrefix::File => self.from.strip_prefix("file:").map(ToString::to_string),
             RerankerPrefix::Cohere => self
                 .from
                 .strip_prefix("cohere:")
@@ -117,12 +132,19 @@ impl Reranker {
 /// - `jina:<model-id>` — Jina Reranker (`jina-reranker-v2-base-multilingual`, …)
 /// - `http://…` / `https://…` — BYO reranker service with a Cohere-compatible
 ///   response shape (`{ results: [{ index, relevance_score }, ...] }`).
+/// - `huggingface:huggingface.co/<org>/<model>[:rev]` — native local
+///   cross-encoder reranker run in-process via the candle TEI backend
+///   (`BAAI/bge-reranker-base`, `Alibaba-NLP/gte-reranker-modernbert-base`, …).
+/// - `file:<path>` — native local reranker loaded from a directory of model
+///   artifacts (`config.json`, `tokenizer.json`, weights).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RerankerPrefix {
     Cohere,
     Voyage,
     Jina,
     Http,
+    HuggingFace,
+    File,
 }
 
 impl TryFrom<&str> for RerankerPrefix {
@@ -145,6 +167,10 @@ impl TryFrom<&str> for RerankerPrefix {
             Ok(RerankerPrefix::Voyage)
         } else if has_provider_delim("jina") {
             Ok(RerankerPrefix::Jina)
+        } else if has_provider_delim("huggingface") || has_provider_delim("hf") {
+            Ok(RerankerPrefix::HuggingFace)
+        } else if has_provider_delim("file") {
+            Ok(RerankerPrefix::File)
         } else if value.starts_with("http://") || value.starts_with("https://") {
             Ok(RerankerPrefix::Http)
         } else {
@@ -160,6 +186,8 @@ impl Display for RerankerPrefix {
             RerankerPrefix::Voyage => write!(f, "voyage"),
             RerankerPrefix::Jina => write!(f, "jina"),
             RerankerPrefix::Http => write!(f, "http"),
+            RerankerPrefix::HuggingFace => write!(f, "huggingface"),
+            RerankerPrefix::File => write!(f, "file"),
         }
     }
 }
@@ -225,6 +253,52 @@ mod tests {
         assert_eq!(
             http.get_model_id().as_deref(),
             Some("https://rerank.internal/v1/rerank")
+        );
+    }
+
+    #[test]
+    fn prefix_recognizes_local_sources() {
+        assert_eq!(
+            RerankerPrefix::try_from("huggingface:huggingface.co/BAAI/bge-reranker-base")
+                .expect("huggingface prefix"),
+            RerankerPrefix::HuggingFace
+        );
+        assert_eq!(
+            RerankerPrefix::try_from("hf:BAAI/bge-reranker-base").expect("hf alias"),
+            RerankerPrefix::HuggingFace
+        );
+        assert_eq!(
+            RerankerPrefix::try_from("file:/models/bge-reranker-base").expect("file prefix"),
+            RerankerPrefix::File
+        );
+    }
+
+    #[test]
+    fn get_model_id_strips_huggingface_prefix() {
+        let hf = Reranker::new("huggingface:huggingface.co/BAAI/bge-reranker-base", "r");
+        assert_eq!(hf.get_model_id().as_deref(), Some("BAAI/bge-reranker-base"));
+    }
+
+    #[test]
+    fn get_model_id_round_trips_huggingface_revision() {
+        // A pinned revision must survive so the loader can split it back out
+        // rather than requesting a repo named `org/model:rev`.
+        let hf = Reranker::new(
+            "huggingface:huggingface.co/BAAI/bge-reranker-base:v1.5",
+            "r",
+        );
+        assert_eq!(
+            hf.get_model_id().as_deref(),
+            Some("BAAI/bge-reranker-base:v1.5")
+        );
+    }
+
+    #[test]
+    fn get_model_id_strips_file_prefix() {
+        let f = Reranker::new("file:/models/bge-reranker-base", "r");
+        assert_eq!(
+            f.get_model_id().as_deref(),
+            Some("/models/bge-reranker-base")
         );
     }
 

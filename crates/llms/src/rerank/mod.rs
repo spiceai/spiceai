@@ -20,9 +20,10 @@ limitations under the License.
 //! A reranker scores a set of candidate documents against a query string and
 //! returns per-document relevance scores. Two kinds of rerankers are supported:
 //!
-//! - **Native** (future): dedicated cross-encoder or reranker-API providers
-//!   such as Cohere Rerank, Voyage Rerank, Jina Rerank, or local BGE. These
-//!   implement [`Rerank`] directly.
+//! - **Native**: dedicated cross-encoder or reranker-API providers such as
+//!   Cohere Rerank, Voyage Rerank, Jina Rerank, or a local BGE-style
+//!   cross-encoder ([`TeiRerank`], run in-process via the candle TEI backend).
+//!   These implement [`Rerank`] directly.
 //! - **LLM-backed**: any model in the chat-completion store can be used as a
 //!   reranker via [`LlmRerank`], which prompts the model listwise or
 //!   pointwise and parses JSON scores from the response.
@@ -46,9 +47,16 @@ pub mod http;
 pub mod jina;
 pub mod voyage;
 
+// The native local reranker rides the same candle backend as local embeddings,
+// so it is gated on the same feature.
+#[cfg(feature = "local_embed")]
+pub mod tei;
+
 pub use cohere::CohereReranker;
 pub use http::HttpReranker;
 pub use jina::JinaReranker;
+#[cfg(feature = "local_embed")]
+pub use tei::TeiRerank;
 pub use voyage::VoyageReranker;
 
 /// Name → reranker map. Holds native rerankers (e.g. Cohere, Voyage, BGE) once
@@ -89,6 +97,19 @@ pub enum Error {
         "Failed to build HTTP client for reranker '{model}' — standard timeout/TLS defaults are unavailable."
     ))]
     HttpClientCreationFailed { model: String },
+
+    #[snafu(display(
+        "Failed to load local reranker model '{model}': {source}. Check the model id/path and that the artifacts (config.json, tokenizer.json, weights) are present. See: https://spiceai.org/docs/components/rerankers"
+    ))]
+    LocalModelLoadFailed {
+        model: String,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(display(
+        "Reranker model '{model}' returned no score for a document. This usually means the model is not a cross-encoder/classifier reranker."
+    ))]
+    EmptyPrediction { model: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
