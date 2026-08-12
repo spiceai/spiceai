@@ -54,7 +54,10 @@ mod launchd;
 #[cfg_attr(not(target_os = "linux"), expect(dead_code))]
 mod systemd;
 
-use std::path::{Path, PathBuf};
+use std::{
+    io::Read as _,
+    path::{Path, PathBuf},
+};
 
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt as _;
@@ -665,20 +668,27 @@ fn copy_as_root_only_executable(source: &Path, dest: &Path) -> Result<()> {
         })
 }
 
-/// Identity of the source binary: length and modified time, which together
-/// change on any rebuild. `None` when the source cannot be described, in which
-/// case the caller always restages.
+/// Identity of the source binary: length, content digest, and path. Hashing the
+/// content prevents a same-length rebuild from being mistaken for an exact
+/// restage on filesystems that defer or coarsen modified-time updates. `None`
+/// when the source cannot be read, in which case the caller always restages.
 fn source_stamp(source: &Path) -> Option<String> {
-    let meta = source.metadata().ok()?;
-    let modified = meta
-        .modified()
-        .ok()?
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()?;
+    let mut file = std::fs::File::open(source).ok()?;
+    let length = file.metadata().ok()?.len();
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 16 * 1024];
+    loop {
+        let bytes_read = file.read(&mut buffer).ok()?;
+        if bytes_read == 0 {
+            break;
+        }
+        digest.update(&buffer[..bytes_read]);
+    }
+
     Some(format!(
-        "{} {} {}",
-        meta.len(),
-        modified.as_nanos(),
+        "{} {:x} {}",
+        length,
+        digest.finalize(),
         source.display()
     ))
 }
@@ -950,7 +960,7 @@ mod tests {
     }
 
     #[test]
-    fn source_stamp_distinguishes_length_and_mtime() {
+    fn source_stamp_distinguishes_content_and_path() {
         let dir = std::env::temp_dir().join(format!("spice-stamp-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("scratch dir");
