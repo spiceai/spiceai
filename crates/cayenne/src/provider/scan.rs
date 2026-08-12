@@ -1080,6 +1080,20 @@ impl ExecutionPlan for CayenneAccelerationExec {
 ///
 /// # What this does NOT bound
 ///
+/// **A batch bigger than the running estimate is allocated before it can be
+/// refused.** What is charged pre-poll is the estimate, not the batch: the first
+/// batch of every partition is charged at `INITIAL_BATCH_ESTIMATE_BYTES`, and
+/// any later batch that decodes larger than the high-water estimate is fully
+/// materialized by `inner.poll_next` before `try_resize` measures it — the
+/// refusal then drops the batch that already exists (which is the path
+/// `a_failed_settle_releases_the_charge_and_recharges_next_poll` exercises).
+/// So the bound is one batch behind on the way up: a single decode far larger
+/// than anything seen before can still exhaust the host. The estimate ratchets
+/// (`self.estimate.max(actual)`), so it is only the *growing* edge that is
+/// unbounded, not the steady state. Charging a defensible upper bound instead
+/// would mean knowing the decoded size before decoding it, which is what moving
+/// the reservation into the materializing leaf below would buy.
+///
 /// Accounting attaches to the outermost wrapper only (`scan_guard.is_some()`),
 /// so it charges one estimate per output partition. Under a base+delta plan the
 /// inner per-snapshot wrappers and the Vortex `DataSourceExec` beneath them can
