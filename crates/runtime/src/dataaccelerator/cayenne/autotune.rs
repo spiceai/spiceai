@@ -341,9 +341,10 @@ impl HardwareProfile {
     }
 
     /// Storage-aware target Vortex file size (MB), or `None` to keep the engine
-    /// default (256 MB). Smaller files reduce write amplification on EBS-class
-    /// network storage; larger files improve scan throughput on RAM-backed
-    /// mounts. `LocalSsd`/`Unknown` keep the engine default.
+    /// default (256 MB). Only a RAM-backed mount moves it: a tmpfs file competes
+    /// with the process for the same memory, so 64 MB bounds what one in-flight
+    /// file holds. `Ebs` pins 256 rather than deferring, since the size feeds both
+    /// file rolling and the size-tiered compaction picker on network storage.
     #[must_use]
     pub fn target_file_size_mb_override(&self) -> Option<usize> {
         match self.data_storage {
@@ -530,6 +531,47 @@ impl WorkloadProfile {
     }
 }
 
+/// The `cayenne_tuning` mode: how the knobs this module derives get their values.
+///
+/// [`Self::Adaptive`] is selected only by an explicit `adaptive`. Unset, `auto`,
+/// and anything unrecognized are all [`Self::Auto`], so no other signal — and no
+/// typo — can land a table in the closed loop. Shared by the accelerator and the
+/// catalog connector, which accept the same parameter and must agree on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum TuningMode {
+    /// Derive the knobs statically from the detected environment and, where
+    /// available, the inferred schema. No closed loop.
+    #[default]
+    Auto,
+    /// The static derivation as a warm start, plus the per-table closed-feedback
+    /// controller that moves the knobs within the derived bounds (preview).
+    Adaptive,
+}
+
+impl TuningMode {
+    /// Resolve a raw parameter value, ignoring case and surrounding whitespace.
+    ///
+    /// Returns the mode and whether the value was unrecognized, so a caller can
+    /// warn once about a typo while still running on the safe default rather than
+    /// failing the dataset over a tuning hint.
+    #[must_use]
+    pub(crate) fn parse(raw: Option<&str>) -> (Self, bool) {
+        let Some(mode) = raw.map(str::trim) else {
+            return (Self::Auto, false);
+        };
+        if mode.eq_ignore_ascii_case("adaptive") {
+            (Self::Adaptive, false)
+        } else {
+            (Self::Auto, !mode.eq_ignore_ascii_case("auto"))
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn is_adaptive(self) -> bool {
+        matches!(self, Self::Adaptive)
+    }
+}
+
 /// A numeric `cayenne_*` knob's value as configured by the operator, after
 /// honoring the literal `auto`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -633,6 +675,23 @@ mod tests {
 
     fn profile(cores: usize, mem: u64, storage: ResolvedAccelerationStorage) -> HardwareProfile {
         HardwareProfile::new(cores, mem, storage, storage)
+    }
+
+    // ---- TuningMode -------------------------------------------------------
+
+    #[test]
+    fn only_an_explicit_adaptive_value_enables_the_closed_loop() {
+        // Unset and `auto` are the same answer, and neither is flagged invalid.
+        assert_eq!(TuningMode::parse(None), (TuningMode::Auto, false));
+        assert_eq!(TuningMode::parse(Some("auto")), (TuningMode::Auto, false));
+        // `adaptive` matches case-insensitively, ignoring surrounding whitespace.
+        assert_eq!(
+            TuningMode::parse(Some("  Adaptive ")),
+            (TuningMode::Adaptive, false)
+        );
+        // An unrecognized value is reported, and can NEVER enable adaptive.
+        assert_eq!(TuningMode::parse(Some("nonsense")), (TuningMode::Auto, true));
+        assert!(!TuningMode::default().is_adaptive());
     }
 
     // ---- read_knob / auto_or_* --------------------------------------------

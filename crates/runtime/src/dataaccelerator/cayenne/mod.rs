@@ -449,29 +449,6 @@ impl Default for CayenneAccelerator {
     }
 }
 
-fn parse_u64_aliases_with_hint(
-    acceleration: &Acceleration,
-    keys: &[&str],
-    default: u64,
-    semantic_hint: &str,
-) -> u64 {
-    keys.iter()
-        .find_map(|&key| {
-            acceleration.params.get(key).and_then(|v| {
-                v.parse::<u64>().map_or_else(
-                    |_| {
-                        tracing::warn!(
-                            "An invalid '{key}' value was provided: '{v}'. Expected an unsigned integer{semantic_hint}, ignoring the value. For details, visit: https://spiceai.org/docs/components/data-accelerators/cayenne#configuration"
-                        );
-                        None
-                    },
-                    Some,
-                )
-            })
-        })
-        .unwrap_or(default)
-}
-
 /// Parse a goal duration param (e.g. `"5s"`, `"1m"`, `"250ms"`) to seconds, via
 /// `fundu` for consistency with the other Spice duration knobs (e.g.
 /// `retention_period`). `None` when unset; a warning + `None` when present but
@@ -524,32 +501,6 @@ fn parse_goal_f64(raw: Option<&str>, key: &str, source_desc: &str) -> Option<f64
             None
         }
     }
-}
-
-fn parse_optional_usize<'a>(
-    acceleration: &Acceleration,
-    keys: &'a [&'a str],
-) -> Option<(&'a str, usize)> {
-    keys.iter().find_map(|&key| {
-        acceleration.params.get(key).and_then(|v| {
-            v.parse::<usize>().map_or_else(|_| {
-                tracing::warn!(
-                    "An invalid '{key}' value was provided: '{v}'. Expected a positive integer, ignoring the value. For details, visit: https://spiceai.org/docs/components/data-accelerators/cayenne#configuration"
-                );
-                None
-            }, |value| Some((key, value)))
-            })
-    })
-}
-
-fn parse_usize_aliases(acceleration: &Acceleration, keys: &[&str], default: usize) -> usize {
-    parse_optional_usize(acceleration, keys).map_or(default, |(_, value)| value)
-}
-
-fn parse_usize_aliases_as_i64(acceleration: &Acceleration, keys: &[&str], default: i64) -> i64 {
-    let default_usize = usize::try_from(default).unwrap_or(usize::MAX);
-    let parsed = parse_usize_aliases(acceleration, keys, default_usize);
-    i64::try_from(parsed).unwrap_or(i64::MAX)
 }
 
 const SMALL_WRITE_COMPACTION_TRIGGER_FILES: usize = 4;
@@ -1458,7 +1409,7 @@ impl CayenneAccelerator {
             // `cdc_durability: memory` path). Default 1 = the unchanged serial
             // path; N>1 partitions the PK space into N independent serial
             // domains. Clamped to >=1 in `Table::new_internal`.
-            config.cdc_mem_tier_shards = parse_usize_aliases(
+            config.cdc_mem_tier_shards = autotune::auto_or_usize(
                 acceleration,
                 &["cayenne_cdc_mem_tier_shards", "cdc_mem_tier_shards"],
                 config.cdc_mem_tier_shards,
@@ -1549,18 +1500,17 @@ impl CayenneAccelerator {
                 }
                 config.cdc_durability = cayenne::metadata::CdcDurability::File;
             }
-            config.cdc_mem_tier_max_bytes = parse_usize_aliases_as_i64(
+            config.cdc_mem_tier_max_bytes = autotune::auto_or_i64(
                 acceleration,
                 &["cayenne_cdc_mem_tier_max_bytes", "cdc_mem_tier_max_bytes"],
                 config.cdc_mem_tier_max_bytes,
             );
-            config.cdc_mem_tier_max_age_ms = parse_u64_aliases_with_hint(
+            config.cdc_mem_tier_max_age_ms = autotune::auto_or_u64(
                 acceleration,
                 &["cayenne_cdc_mem_tier_max_age_ms", "cdc_mem_tier_max_age_ms"],
                 config.cdc_mem_tier_max_age_ms,
-                " (milliseconds)",
             );
-            config.cdc_mem_tier_min_flush_bytes = parse_usize_aliases_as_i64(
+            config.cdc_mem_tier_min_flush_bytes = autotune::auto_or_i64(
                 acceleration,
                 &[
                     "cayenne_cdc_mem_tier_min_flush_bytes",
@@ -1568,23 +1518,21 @@ impl CayenneAccelerator {
                 ],
                 config.cdc_mem_tier_min_flush_bytes,
             );
-            config.cdc_mem_tier_checkpoint_interval_ms = parse_u64_aliases_with_hint(
+            config.cdc_mem_tier_checkpoint_interval_ms = autotune::auto_or_u64(
                 acceleration,
                 &[
                     "cayenne_cdc_mem_tier_checkpoint_interval_ms",
                     "cdc_mem_tier_checkpoint_interval_ms",
                 ],
                 config.cdc_mem_tier_checkpoint_interval_ms,
-                " (milliseconds)",
             );
-            config.cdc_mem_tier_seal_age_ms = parse_u64_aliases_with_hint(
+            config.cdc_mem_tier_seal_age_ms = autotune::auto_or_u64(
                 acceleration,
                 &[
                     "cayenne_cdc_mem_tier_seal_age_ms",
                     "cdc_mem_tier_seal_age_ms",
                 ],
                 config.cdc_mem_tier_seal_age_ms,
-                " (milliseconds)",
             );
 
             // Widening schema evolution at table open is gated on the dataset's
@@ -1866,37 +1814,26 @@ impl CayenneAccelerator {
                 config.compaction_background_interval_ms,
             );
 
-            // Tuning mode (`cayenne_tuning`): `auto` (default) derives correct
-            // values statically from the detected environment + inferred schema;
-            // `adaptive` additionally runs the closed-feedback loop that adapts
-            // the knobs over time within the environment-derived [floor, ceiling].
-            // Independently, an explicit per-knob value always overrides the
-            // derived value — and under `adaptive` it *pins* that knob, so the
-            // loop leaves it alone (its bounds collapse to a point downstream).
-            // Normalize `cayenne_tuning` up front (see `normalize_cayenne_tuning`): an
-            // invalid value folds to `auto` so it behaves as the documented default
-            // everywhere downstream — including the goal-gate below (which tests
-            // `== "auto"`) — instead of slipping through as "not auto" and enabling
-            // adaptive.
+            // Tuning mode (`cayenne_tuning`): `auto` derives the knobs statically
+            // from the detected environment + inferred schema; `adaptive` also runs
+            // the closed-feedback loop that moves them within the environment-derived
+            // [floor, ceiling]. `adaptive` is reached ONLY by asking for it here —
+            // unset, unrecognized, and every other signal (inferred schema, a
+            // configured `cayenne_goal_*`) resolve to `auto`. Independently of the
+            // mode, an explicit per-knob value overrides the derived one, and under
+            // `adaptive` it *pins* that knob so the loop leaves it alone.
             let raw_tuning = acceleration
                 .params
                 .get("cayenne_tuning")
                 .map(String::as_str);
-            let (tuning_mode, tuning_was_invalid) = normalize_cayenne_tuning(raw_tuning);
+            let (tuning_mode, tuning_was_invalid) = autotune::TuningMode::parse(raw_tuning);
             if tuning_was_invalid {
                 tracing::warn!(
                     "Dataset '{table_name}' has an invalid `cayenne_tuning` value: '{}'. Expected 'auto' or 'adaptive'. Defaulting to 'auto'.",
                     raw_tuning.unwrap_or_default().trim()
                 );
             }
-            // Resolve the tuning mode. An explicit `cayenne_tuning` value always
-            // wins; when it is UNSET the default is `auto` (static derivation from
-            // the detected environment and inferred schema, no closed loop). Schema
-            // inference is always attempted now, so its presence is no longer a
-            // signal to auto-enable the closed loop — opt in explicitly with
-            // `cayenne_tuning: adaptive`. Inferred metadata still sharpens the
-            // adaptive warm start when the loop is enabled.
-            config.dynamic_tuning = matches!(tuning_mode.as_deref(), Some("adaptive"));
+            config.dynamic_tuning = tuning_mode.is_adaptive();
             // Inferred schema metadata SHARPENS the adaptive warm start (row_count/
             // table_bytes refine the memory sizing; inferred PK/index/sort metadata
             // feeds the query-health surface), but it is not REQUIRED for
@@ -1922,11 +1859,10 @@ impl CayenneAccelerator {
                 config.dynamic_tuning = false;
             }
             // Goal-driven tuning: parse the high-level SLO setpoints. Times are
-            // duration strings (`5s`/`1m`/`250ms`); QPH is a number. A configured
-            // goal IMPLIES the closed loop (a goal with tuning off is inert),
-            // unless the operator explicitly opted out with `cayenne_tuning: auto`,
-            // and provided the background compaction tick the controller rides is
-            // enabled. Query latency is stored in ms.
+            // duration strings (`5s`/`1m`/`250ms`); QPH is a number. The goals
+            // steer the closed loop but never ENABLE it: `adaptive` is reached
+            // only by an explicit `cayenne_tuning: adaptive`, so a goal set
+            // without it is inert and warns below. Query latency is stored in ms.
             // SLO setpoints resolve a GLOBAL default (`runtime.params`) with a
             // per-dataset (`acceleration.params`) override: set an SLO once for the
             // whole runtime and sharpen it per table where needed.
@@ -1972,21 +1908,15 @@ impl CayenneAccelerator {
                 || config.goal_freshness_secs.is_some()
                 || config.goal_query_latency_ms.is_some()
                 || config.goal_qph.is_some();
-            if any_goal && tuning_mode.as_deref() == Some("auto") {
+            // A goal never switches the mode: `adaptive` is a preview feature and
+            // is entered only by asking for it, so a goal configured while the
+            // loop is off is reported as ignored rather than silently promoting
+            // the table into a different tuning regime.
+            if any_goal && !config.dynamic_tuning {
                 tracing::warn!(
                     target: "spiced::acceleration::cayenne",
                     table = %table_name,
-                    "`cayenne_goal_*` set but `cayenne_tuning: auto` explicitly disables the closed loop; the goals will be ignored. Remove `cayenne_tuning: auto` (or set `adaptive`) to enable goal-seeking."
-                );
-            } else if any_goal
-                && !config.dynamic_tuning
-                && config.compaction_background_interval_ms != 0
-            {
-                config.dynamic_tuning = true;
-                tracing::info!(
-                    target: "spiced::acceleration::cayenne",
-                    table = %table_name,
-                    "`cayenne_goal_*` set: enabling adaptive tuning (goal-seeking closed loop)."
+                    "`cayenne_goal_*` is set but adaptive tuning is off, so the goals are ignored (`cayenne_tuning` defaults to 'auto'). Set `cayenne_tuning: adaptive` on this dataset to enable goal-seeking."
                 );
             }
             if config.dynamic_tuning {
@@ -2213,9 +2143,17 @@ impl CayenneAccelerator {
         config.inline_max_rows = 0;
         config.inline_max_bytes = 0;
         config.inline_max_buffer_bytes = 0;
+        // Only a NUMBER is an explicit limit. `auto` is a request for the derived
+        // default, which in memory mode is "no cap" — reading mere key presence
+        // would turn `cayenne_cdc_mem_tier_max_bytes: auto` into the file-mode
+        // host-derived cap, and memory mode has no spill path to fall back on, so
+        // crossing it fails the write. `is_pinned` is the same "explicitly set"
+        // test the tuning actuators use.
         let explicit_limit = acceleration.is_some_and(|a| {
-            a.params.contains_key("cayenne_cdc_mem_tier_max_bytes")
-                || a.params.contains_key("cdc_mem_tier_max_bytes")
+            autotune::is_pinned(
+                a,
+                &["cayenne_cdc_mem_tier_max_bytes", "cdc_mem_tier_max_bytes"],
+            )
         });
         if !explicit_limit {
             config.cdc_mem_tier_max_bytes = 0;
@@ -2851,14 +2789,15 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
         ParameterSpec::component("cdc_mem_tier_shards")
             .description("Number of PK-hash shards the in-RAM CDC tier is partitioned into, in cdc_durability: memory mode only (non-partitioned, key-based merge-on-read tables). Each shard is an independent serial validate->append domain keyed by the RowConverter OwnedRow bytes, so disjoint keys validate and append in parallel within one apply (intra-apply fan-out) while a key's whole version history — upserts AND delete tombstones — stays confined to its one owning shard (last-writer-wins preserved). Checkpoints are always all-shards-atomic on a single source-position axis. Default 1 (the byte-identical serial path). Raise (e.g. 4) on update/insert-heavy CDC tables to lift the per-apply serialization ceiling."),
         ParameterSpec::component("tuning")
-            .description("Auto-tuning mode. 'auto': derive the correct configuration values from the detected environment (cgroup-aware cores + memory, storage class) and the inferred schema (cardinality, row width, primary key) — no closed loop. 'adaptive': additionally run a per-table closed-feedback controller that measures the live CDC ingest rate, delete fraction, and arrival burstiness AND the runtime's whole-system response (apply latency vs offered load, read amplification that slows queries, cgroup-aware memory pressure) and adapts the inline-memtable flush caps, the in-memory CDC tier byte cap, compaction cadence/trigger, and write concurrency over time, within the environment-derived [floor, ceiling]. DEFAULT: when this is unset, the mode is 'auto' — except that a configured cayenne_goal_* SLO implies 'adaptive' unless you set 'auto' explicitly. Set 'cayenne_tuning: adaptive' explicitly to enable the closed loop without a goal. Schema inference is always attempted and sharpens the 'adaptive' warm-start (inferred cardinality/size) but is not required for it — without inferred metadata the controller relearns the row width from observed ingest and converges from the hardware-derived warm-start. In BOTH modes an explicit per-parameter value (e.g. cayenne_segment_cache_mb: 512) overrides the derived value; under 'adaptive' an explicitly-set actuator is pinned (the loop will not move it).")
-            .one_of(&["auto", "adaptive"]),
+            .description("Auto-tuning mode. 'auto': derive the correct configuration values from the detected environment (cgroup-aware cores + memory, storage class) and the inferred schema (cardinality, row width, primary key) — no closed loop. 'adaptive': additionally run a per-table closed-feedback controller that measures the live CDC ingest rate, delete fraction, and arrival burstiness AND the runtime's whole-system response (apply latency vs offered load, read amplification that slows queries, cgroup-aware memory pressure) and adapts the inline-memtable flush caps, the in-memory CDC tier byte cap, compaction cadence/trigger, and write concurrency over time, within the environment-derived [floor, ceiling]. DEFAULT: 'auto'. Nothing else turns the closed loop on — 'adaptive' is entered only by setting it here, and a configured cayenne_goal_* SLO is ignored (with a warning) until you do. Schema inference is always attempted and sharpens the 'adaptive' warm-start (inferred cardinality/size) but is not required for it — without inferred metadata the controller relearns the row width from observed ingest and converges from the hardware-derived warm-start. In BOTH modes an explicit per-parameter value (e.g. cayenne_segment_cache_mb: 512) overrides the derived value; under 'adaptive' an explicitly-set actuator is pinned (the loop will not move it).")
+            .one_of(&["auto", "adaptive"])
+            .default("auto"),
         ParameterSpec::component("goal_replication_lag")
-            .description("Goal-driven adaptive tuning: target end-to-end CDC replication lag as a duration (e.g. '5s'). Best set GLOBALLY at runtime.params (cayenne_goal_replication_lag) and overridden here per-dataset. When set (and cayenne_tuning is not 'auto'), the closed-loop controller converges toward this SLO in small, bounded steps."),
+            .description("Goal-driven adaptive tuning: target end-to-end CDC replication lag as a duration (e.g. '5s'). Best set GLOBALLY at runtime.params (cayenne_goal_replication_lag) and overridden here per-dataset. Requires cayenne_tuning: adaptive — under the 'auto' default the goal is ignored. With the loop enabled, it converges toward this SLO in small, bounded steps."),
         ParameterSpec::component("goal_freshness")
-            .description("Goal-driven adaptive tuning: target data freshness — age of the newest queryable data — as a duration (e.g. '30s'). Settable globally at runtime.params and overridden here per-dataset."),
+            .description("Goal-driven adaptive tuning: target data freshness — age of the newest queryable data — as a duration (e.g. '30s'). Settable globally at runtime.params and overridden here per-dataset. Requires cayenne_tuning: adaptive."),
         ParameterSpec::component("goal_query_latency")
-            .description("Goal-driven adaptive tuning: target p99 query latency on this table as a duration (e.g. '10s' or '250ms'). Settable globally at runtime.params and overridden here per-dataset."),
+            .description("Goal-driven adaptive tuning: target p99 query latency on this table as a duration (e.g. '10s' or '250ms'). Settable globally at runtime.params and overridden here per-dataset. Requires cayenne_tuning: adaptive."),
         // NOTE: there is no per-dataset `goal_qph` ParameterSpec — QPH is a
         // system-wide metric (a query/join spans datasets), so its goal is
         // configured globally only, under `runtime.params`.
@@ -3795,19 +3734,6 @@ fn serialize_partition_child_writes(
 
 data_accelerator_api::register_data_accelerator!(Engine::Cayenne, CayenneAccelerator);
 
-/// Normalize a raw `cayenne_tuning` value: trim + lowercase, mapping `auto`/`adaptive`
-/// through unchanged and any *other* value to `Some("auto")` (the documented default).
-/// Returns `(normalized_mode, was_invalid)`. Folding an invalid value to `auto` keeps
-/// it behaving as the default everywhere downstream — including the `cayenne_goal_*`
-/// gate that tests `== "auto"` — instead of slipping through as "not auto" and
-/// enabling adaptive.
-fn normalize_cayenne_tuning(raw: Option<&str>) -> (Option<String>, bool) {
-    match raw.map(|v| v.trim().to_ascii_lowercase()) {
-        Some(mode) if mode != "auto" && mode != "adaptive" => (Some("auto".to_string()), true),
-        other => (other, false),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3867,27 +3793,45 @@ mod tests {
         assert!(mask.value(1), "2008-01-01 is after the bound");
     }
 
+    /// In memory mode an unset mem-tier cap means "no cap", and `auto` asks for
+    /// that same derived default — so it must not be mistaken for an operator's
+    /// explicit hard limit, which memory mode (no spill path) enforces by failing
+    /// the write.
     #[test]
-    fn normalize_cayenne_tuning_folds_invalid_to_auto() {
-        // Unset stays unset; `auto`/`adaptive` pass through (trim + lowercase).
-        assert_eq!(normalize_cayenne_tuning(None), (None, false));
+    fn memory_mode_treats_an_auto_mem_tier_cap_as_unset() {
+        let mut config = cayenne::metadata::VortexConfig {
+            cdc_mem_tier_max_bytes: 512 * 1024 * 1024,
+            ..Default::default()
+        };
+        let auto = Acceleration {
+            params: [(
+                "cayenne_cdc_mem_tier_max_bytes".to_string(),
+                "AUTO".to_string(),
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        CayenneAccelerator::apply_memory_mode_overrides(&mut config, Some(&auto));
         assert_eq!(
-            normalize_cayenne_tuning(Some("auto")),
-            (Some("auto".to_string()), false)
+            config.cdc_mem_tier_max_bytes, 0,
+            "`auto` resolves identically to omitting the knob (no cap)"
         );
-        assert_eq!(
-            normalize_cayenne_tuning(Some("  Adaptive ")),
-            (Some("adaptive".to_string()), false)
-        );
-        // An invalid value folds to `auto` (flagged invalid), so it can NEVER enable
-        // adaptive, and the `cayenne_goal_*` gate (which tests `== "auto"`) treats it
-        // as auto rather than "not auto".
-        let (mode, invalid) = normalize_cayenne_tuning(Some("nonsense"));
-        assert!(invalid, "an unrecognized value is flagged invalid");
-        assert_eq!(mode.as_deref(), Some("auto"), "invalid folds to auto");
-        assert!(
-            !matches!(mode.as_deref(), Some("adaptive")),
-            "invalid must not enable adaptive tuning"
+
+        let mut config = cayenne::metadata::VortexConfig::default();
+        let pinned = Acceleration {
+            params: [(
+                "cayenne_cdc_mem_tier_max_bytes".to_string(),
+                "1048576".to_string(),
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        CayenneAccelerator::apply_memory_mode_overrides(&mut config, Some(&pinned));
+        assert_ne!(
+            config.cdc_mem_tier_max_bytes, 0,
+            "a number is still an explicit hard limit"
         );
     }
     use crate::component::dataset::acceleration::{Acceleration, Mode, RefreshMode};
@@ -5214,6 +5158,77 @@ mod tests {
         assert_eq!(
             config.pk_conflict_detection,
             cayenne::metadata::PkConflictDetection::None
+        );
+    }
+
+    /// `auto` is the tuning mode unless the operator asks for `adaptive` by name.
+    /// A `cayenne_goal_*` SLO — per-dataset or global — expresses a target, not a
+    /// choice of controller, so it must leave the closed loop off.
+    #[tokio::test]
+    async fn test_goals_do_not_enable_adaptive_tuning() {
+        let app = Arc::new(
+            AppBuilder::new("test")
+                .with_runtime_params(
+                    [(
+                        "cayenne_goal_replication_lag".to_string(),
+                        "5s".to_string(),
+                    )]
+                    .into_iter()
+                    .collect(),
+                )
+                .build(),
+        );
+        let rt = Arc::new(crate::Runtime::builder().build().await);
+
+        let cdc_dataset = |name: &str, params: Vec<(String, String)>| {
+            let mut dataset = DatasetBuilder::try_new(name.to_string(), name)
+                .expect("dataset builder")
+                .with_app(Arc::clone(&app))
+                .with_runtime(Arc::clone(&rt))
+                .build()
+                .expect("dataset");
+            dataset.acceleration = Some(Acceleration {
+                engine: Engine::Cayenne,
+                mode: Mode::File,
+                refresh_mode: Some(RefreshMode::Changes),
+                params: params.into_iter().collect(),
+                ..Default::default()
+            });
+            dataset
+        };
+
+        // Global goal only.
+        let global_goal = cdc_dataset("global_goal", vec![]);
+        let config = CayenneAccelerator::get_vortex_config("global_goal", &global_goal).await;
+        assert!(
+            !config.dynamic_tuning,
+            "a global cayenne_goal_* must not turn on the closed loop"
+        );
+        assert!(
+            config.goal_replication_lag_secs.is_some(),
+            "the goal is still parsed so an operator who enables adaptive gets it"
+        );
+
+        // Global + per-dataset goals.
+        let dataset_goal = cdc_dataset(
+            "dataset_goal",
+            vec![("cayenne_goal_freshness".to_string(), "30s".to_string())],
+        );
+        let config = CayenneAccelerator::get_vortex_config("dataset_goal", &dataset_goal).await;
+        assert!(
+            !config.dynamic_tuning,
+            "a per-dataset cayenne_goal_* must not turn on the closed loop"
+        );
+
+        // Only the explicit mode does.
+        let adaptive = cdc_dataset(
+            "adaptive",
+            vec![("cayenne_tuning".to_string(), "adaptive".to_string())],
+        );
+        let config = CayenneAccelerator::get_vortex_config("adaptive", &adaptive).await;
+        assert!(
+            config.dynamic_tuning,
+            "`cayenne_tuning: adaptive` enables the closed loop"
         );
     }
 
