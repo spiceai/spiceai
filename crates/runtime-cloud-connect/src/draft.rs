@@ -64,6 +64,11 @@ const LOCK_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis
 /// Current schema of the draft file.
 const DRAFT_SCHEMA_VERSION: u32 = 2;
 
+#[derive(Deserialize)]
+struct DraftSchemaHeader {
+    schema_version: u32,
+}
+
 /// Errors reading, writing, or generating an enrollment draft.
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -195,16 +200,22 @@ impl EnrollmentDraft {
     }
 
     fn parse_at(path: &Path, contents: &str) -> Result<Self> {
-        let draft = serde_json::from_str::<Self>(contents).context(ParseSnafu {
+        // Read only the version first. A future schema may add fields that the
+        // current strict draft parser deliberately rejects, but operators must
+        // still receive the unsupported-schema recovery guidance rather than a
+        // generic parse error that obscures the pending enrollment identity.
+        let header = serde_json::from_str::<DraftSchemaHeader>(contents).context(ParseSnafu {
             path: path.to_path_buf(),
         })?;
-        if draft.schema_version != DRAFT_SCHEMA_VERSION {
+        if header.schema_version != DRAFT_SCHEMA_VERSION {
             return Err(Error::UnsupportedSchema {
                 path: path.to_path_buf(),
-                found: draft.schema_version,
+                found: header.schema_version,
             });
         }
-        Ok(draft)
+        serde_json::from_str::<Self>(contents).context(ParseSnafu {
+            path: path.to_path_buf(),
+        })
     }
 
     fn load_published(path: &Path, contents: &str) -> Result<Self> {
@@ -564,6 +575,9 @@ mod tests {
             "enc_public_key_pem": "ep",
             "instance": test_instance("v3.0.0"),
             "region": null,
+            "future_retry_metadata": {
+                "cloud_operation_generation": 3
+            },
         });
         std::fs::write(&path, newer.to_string()).expect("write newer draft");
 

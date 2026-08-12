@@ -192,7 +192,7 @@ fi
 log "step 3/4: verifying the replacement pod reconnects from the stored identity"
 deadline=$(( $(date +%s) + WAIT_SECONDS ))
 until kubectl -n "${NAMESPACE}" logs -l "${SELECTOR}" --tail=-1 2>/dev/null \
-  | grep -q "Cloud Connect: stream established"; do
+  | grep -F "Cloud Connect: stream established" >/dev/null; do
   if [ "$(date +%s)" -ge "${deadline}" ]; then
     echo "error: the replacement pod did not establish its Cloud Connect stream within ${WAIT_TIMEOUT}; not deleting the Secret" >&2
     echo "hint: check 'kubectl -n ${NAMESPACE} logs -l ${SELECTOR}' — the identity should reconnect with no --token" >&2

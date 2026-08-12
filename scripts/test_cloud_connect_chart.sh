@@ -561,7 +561,10 @@ kubectl() {
   fi
   if printf '%s\n' "${arguments}" | grep -q ' logs -l app=test '; then
     printf '%s\n' 'Cloud Connect: stream established'
-    return 0
+    # Keep writing after the early match. With `set -o pipefail`, a `grep -q`
+    # consumer closes the pipe and makes this producer fail with SIGPIPE.
+    seq 1 100000
+    return $?
   fi
   if printf '%s\n' "${arguments}" | grep -q ' wait \| rollout status '; then
     return 0
@@ -570,9 +573,10 @@ kubectl() {
 }
 export -f helm kubectl
 TRANSITION_TEST_INSTALLED_VALUES="${connected_values}"
-if output="$(bash "${TRANSITION}" test default 2>&1)" \
+if output="$(SPICE_WAIT_TIMEOUT=2s bash "${TRANSITION}" test default 2>&1)" \
   && ! echo "${output}" | grep -q 'MOCK_UNAUTHORIZED_DELETE_REACHED' \
   && echo "${output}" | grep -q "was already absent; no deletion was authorized"; then
+  pass "stream detection consumes the full log pipe under pipefail"
   pass "a token-free absent-Secret rerun cannot delete a same-name Secret created during rollout"
 else
   fail "an absent token-free Secret remained a deletion target: ${output}"
