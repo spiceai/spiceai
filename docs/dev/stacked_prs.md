@@ -19,9 +19,10 @@ that is otherwise silent.
 
 Three commits get referred to throughout, and they are not the same one:
 
-- **Fork point** — the `trunk` commit the *parent* branched from. This is what
-  `git merge-base <child> origin/trunk` reports, both before and after the parent
-  lands.
+- **Fork point** — the newest `trunk` commit reachable from the child, which is what
+  `git merge-base <child> origin/trunk` reports, before and after the parent lands.
+  Usually that is where the parent branched from, but it advances if the parent merges
+  a newer `trunk` and the child takes that update.
 - **Parent head** (`$PARENT_HEAD`) — the parent branch's *final* tip, the state `trunk`
   squashed. Only the squash-equivalence check in step 1 uses this.
 - **Stack base** (`$STACKBASE`) — the **newest parent commit contained in the child**:
@@ -163,24 +164,30 @@ ls-files -u <path>` shows them):
 
 ```bash
 f=<path>
-t=$(mktemp -d)                          # never fixed /tmp names — see below
-if git ls-files --stage -- ":(literal)$f" | awk '{ print $1 }' | grep -qx 120000; then
-  # A symlink on ANY side — never cp onto it. Take whichever side is right through git,
-  # which restores the blob and the file mode exactly:
+m2=$(git ls-files --stage -- ":(literal)$f" | awk '$3 == 2 { print $1 }')   # your mode
+m3=$(git ls-files --stage -- ":(literal)$f" | awk '$3 == 3 { print $1 }')   # trunk's mode
+if ! t=$(mktemp -d); then                     # never fixed /tmp names — see below
+  echo "no private temp dir — stopping"
+elif [ "${m2:-none}" != "${m3:-none}" ] || [ "$m2" = 120000 ]; then
+  # Modes disagree, a side is missing, or it is a symlink. cp copies content only, so
+  # the result would keep whatever mode the worktree file already had. Take a side whole:
   #   git checkout --ours -- "$f" && git add -- "$f"      # or --theirs
-  echo "SYMLINK conflict on $f — resolve by hand"
+  echo "MODE/SIDE mismatch on $f (ours=${m2:-none} theirs=${m3:-none}) — resolve by hand"
 elif ! git show ":2:$f" > "$t/ours" ||         # your side
      ! git show ":3:$f" > "$t/theirs" ||       # trunk's side
      ! git show "$STACKBASE:$f" > "$t/base"    # the correct base — NOT git's stage 1
 then
-  # A side is missing — resolve by hand; see below for why this cannot be merged.
-  echo "MISSING SIDE for $f — resolve by hand: $(git ls-files -u -- ":(literal)$f" | wc -l) of 3 stages"
-elif git merge-file -p --diff3 "$t/ours" "$t/base" "$t/theirs" > "$t/merged"; then
+  echo "MISSING SIDE for $f — resolve by hand"
+elif git merge-file -p --diff3 -L ours -L "base ($STACKBASE)" -L trunk \
+       "$t/ours" "$t/base" "$t/theirs" > "$t/merged"; then
   cp -- "$t/merged" "$f" && git add -- "$f"                # clean — accept it
+elif [ -s "$t/merged" ]; then
+  cp -- "$t/merged" "$f"                                   # conflicted, correctly based —
+  grep -n '^<<<<<<<\|^|||||||\|^>>>>>>>' "$f"              # left UNSTAGED for you to fix
 else
-  grep -n '^<<<<<<<\|^|||||||\|^>>>>>>>' "$t/merged"       # real conflict — by hand first
+  echo "merge-file failed on $f — worktree left untouched"
 fi
-rm -rf "$t"                             # once you are done with this path
+[ -n "${t:-}" ] && rm -rf "$t"          # once you are done with this path
 ```
 
 The intermediates go in a private `mktemp -d`, never fixed `/tmp` paths: `> /tmp/ours`
@@ -210,15 +217,21 @@ actually resolve the path. The staging must be *guarded* by the exit status (0 c
 else the number of conflicts left): an unguarded `cp` stages conflict markers the moment
 someone pastes the block.
 
-And the symlink branch has to be **control flow, not a warning** — a printed warning
-does not stop the `cp` that follows it — testing **every stage**, not the first line.
-`git ls-files --stage` lists an unmerged path as stages 1 (base), 2 (ours), 3 (theirs)
-in that order, so the first line is the *base's* mode: a path that was a regular file at
-the base and is a symlink on your side would fall through to the text merge. `cp` then
-follows the link and writes *through* it, so resolving a conflicted `CLAUDE.md` that way
-silently overwrites `.github/copilot-instructions.md` while the link itself still looks
-untouched. Any `120000` among the stages means resolve it by hand — a symlink on one
-side and a regular file on the other is a type conflict that wants a human anyway.
+And the mode check has to be **control flow, not a warning** — a printed warning does
+not stop the `cp` that follows it — comparing **your stage against trunk's**, not the
+first line `git ls-files --stage` prints, which is stage 1, the *base's* mode. `cp`
+copies content and leaves the destination's existing mode alone, which breaks two ways:
+a symlink destination is followed and written *through*, so resolving a conflicted
+`CLAUDE.md` that way silently overwrites `.github/copilot-instructions.md` while the
+link still looks untouched; and a plain `100644` vs `100755` disagreement resolves to
+your mode, quietly dropping an executable bit `trunk` added. Comparing stage 2 to stage
+3 covers both, plus the missing-stage case, in one test.
+
+When `merge-file` does report conflicts, its output is the *correctly based* conflict —
+the thing this whole step exists to produce — so the block writes it into the worktree
+and deliberately leaves it unstaged. Throwing it away would send you back to resolving
+git's spurious-base conflict by hand. A fatal `merge-file` error writes nothing, so the
+worktree is left untouched rather than overwritten with an empty file.
 
 **3. Audit for silent damage** — this is the step that catches the resurrection. It
 compares what the child *intended* against what the merge actually put on disk:
