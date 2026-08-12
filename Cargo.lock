@@ -6046,6 +6046,7 @@ dependencies = [
  "snafu",
  "snowflake-api",
  "spark-connect-rs",
+ "spice-table",
  "telemetry",
  "tempfile",
  "tiberius",
@@ -16923,6 +16924,7 @@ dependencies = [
  "snowflake-api",
  "spice-cloud",
  "spice-cloud-client",
+ "spice-table",
  "spiceai",
  "spicepod",
  "sysinfo 0.38.4",
@@ -17237,6 +17239,7 @@ dependencies = [
  "search",
  "serde_json",
  "snafu",
+ "spice-table",
  "tokio",
  "tokio-stream",
  "tokio-util",
@@ -17257,6 +17260,7 @@ dependencies = [
  "futures",
  "itertools 0.14.0",
  "snafu",
+ "spice-table",
  "tokio",
  "tracing",
 ]
@@ -17511,6 +17515,7 @@ dependencies = [
  "serde",
  "serde_json",
  "snafu",
+ "spice-table",
  "spicepod",
  "telemetry",
  "tokio",
@@ -17615,6 +17620,7 @@ dependencies = [
  "search",
  "serde",
  "snafu",
+ "spice-table",
  "spicepod",
  "telemetry",
  "tokio",
@@ -18370,6 +18376,7 @@ dependencies = [
  "serde",
  "serde_json",
  "snafu",
+ "spice-table",
  "tantivy",
  "tempfile",
  "tokio",
@@ -19318,6 +19325,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "spice-table"
+version = "2.2.0-unstable"
+dependencies = [
+ "async-trait",
+ "datafusion",
+ "datafusion-federation",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "spiceai"
 version = "3.2.0"
 source = "git+https://github.com/spiceai/spice-rs.git?rev=93b75c3c7d1a812b23d00b45adf537d7a2415496#93b75c3c7d1a812b23d00b45adf537d7a2415496"
@@ -19414,6 +19432,7 @@ dependencies = [
  "runtime-cloud-connect",
  "runtime-datafusion",
  "runtime-query-engine",
+ "runtime-request-context",
  "rustls",
  "serde_json",
  "snafu",
