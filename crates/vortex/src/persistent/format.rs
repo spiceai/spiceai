@@ -419,15 +419,40 @@ impl VortexFormat {
         &self.opts
     }
 
-    /// Invalidates cached Vortex segments for the exact object-store paths.
+    /// Registers invalidation of cached Vortex segments for exact object-store paths.
+    ///
+    /// Callers performing blocking filesystem cleanup can register before unlinking
+    /// files, then await [`Self::run_pending_segment_cache_tasks`] after returning to
+    /// async code.
     ///
     /// # Errors
     ///
     /// Returns an error if path-predicate invalidation is unavailable.
-    pub fn invalidate_segment_cache_paths(&self, paths: HashSet<Path>) -> DFResult<()> {
+    pub fn register_segment_cache_path_invalidation(&self, paths: HashSet<Path>) -> DFResult<()> {
         self.segment_cache
             .as_ref()
-            .map_or(Ok(()), |cache| cache.invalidate_paths(paths))
+            .map_or(Ok(()), |cache| cache.register_path_invalidation(paths))
+    }
+
+    /// Invalidates cached Vortex segments for the exact object-store paths and
+    /// physically evicts them before returning.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if path-predicate invalidation is unavailable.
+    pub async fn invalidate_segment_cache_paths(&self, paths: HashSet<Path>) -> DFResult<()> {
+        match self.segment_cache.as_ref() {
+            Some(cache) => cache.invalidate_paths(paths).await,
+            None => Ok(()),
+        }
+    }
+
+    /// Completes pending physical evictions after a blocking cleanup registered
+    /// path invalidations with [`Self::register_segment_cache_path_invalidation`].
+    pub async fn run_pending_segment_cache_tasks(&self) {
+        if let Some(cache) = self.segment_cache.as_ref() {
+            cache.run_pending_tasks().await;
+        }
     }
 
     /// Returns the current number of cached Vortex segments, or `None` when the

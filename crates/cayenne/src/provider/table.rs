@@ -4051,7 +4051,8 @@ impl CayenneTableProvider {
         live_snapshot_ids.insert(current_snapshot.clone());
         let live_referenced = Self::live_referenced_relative_paths(&all_rows, &live_snapshot_ids);
         let task_table = table_id.clone();
-        tokio::task::spawn_blocking(move || {
+        let file_format_for_cleanup = Arc::clone(&file_format);
+        let cleanup_result = tokio::task::spawn_blocking(move || {
             Self::cleanup_old_snapshots_blocking(
                 &table_path,
                 &table_id,
@@ -4060,7 +4061,9 @@ impl CayenneTableProvider {
                 manifest_populated,
                 &live_referenced,
                 |paths| {
-                    if let Err(error) = file_format.invalidate_segment_cache_paths(paths) {
+                    if let Err(error) =
+                        file_format_for_cleanup.register_segment_cache_path_invalidation(paths)
+                    {
                         tracing::warn!(
                             table_id = %table_id,
                             %error,
@@ -4070,12 +4073,14 @@ impl CayenneTableProvider {
                 },
             )
         })
-        .await
-        .map_err(|source| Error::TaskPanicked {
-            table: task_table,
-            source,
-        })?
-        .map_err(|source| Error::Catalog { source })
+        .await;
+        file_format.run_pending_segment_cache_tasks().await;
+        cleanup_result
+            .map_err(|source| Error::TaskPanicked {
+                table: task_table,
+                source,
+            })?
+            .map_err(|source| Error::Catalog { source })
     }
 
     #[cfg(test)]
@@ -4449,8 +4454,8 @@ impl CayenneTableProvider {
                             &id_for_task,
                             &referenced,
                             |paths| {
-                                if let Err(error) =
-                                    file_format_for_task.invalidate_segment_cache_paths(paths)
+                                if let Err(error) = file_format_for_task
+                                    .register_segment_cache_path_invalidation(paths)
                                 {
                                     tracing::warn!(
                                         table_id = %table_id_for_task,
@@ -4465,7 +4470,7 @@ impl CayenneTableProvider {
                         // across snapshots — the whole dir is dead.
                         let paths = Self::segment_cache_paths_in_dir(&dir)?;
                         if let Err(error) =
-                            file_format_for_task.invalidate_segment_cache_paths(paths)
+                            file_format_for_task.register_segment_cache_path_invalidation(paths)
                         {
                             tracing::warn!(
                                 table_id = %table_id_for_task,
@@ -4481,6 +4486,7 @@ impl CayenneTableProvider {
                     }
                 })
                 .await;
+                file_format.run_pending_segment_cache_tasks().await;
                 match removed {
                     Ok(Ok(true)) => {
                         // Dir fully removed. Evict the cached listing AFTER the
@@ -4649,11 +4655,12 @@ impl CayenneTableProvider {
         Ok(Some(ObjectStorePath::from(path)))
     }
 
-    fn invalidate_segment_cache_paths(&self, paths: HashSet<ObjectStorePath>) {
+    async fn invalidate_segment_cache_paths(&self, paths: HashSet<ObjectStorePath>) {
         if let Err(error) = self
             .context
             .file_format()
             .invalidate_segment_cache_paths(paths)
+            .await
         {
             tracing::warn!(
                 table = self.table_metadata.table_name.as_str(),
@@ -4678,7 +4685,8 @@ impl CayenneTableProvider {
 
         self.invalidate_segment_cache_paths(
             objects.iter().map(|meta| meta.location.clone()).collect(),
-        );
+        )
+        .await;
 
         let store = Arc::clone(&config.store);
         let table_name = self.table_metadata.table_name.clone();
@@ -4827,7 +4835,8 @@ impl CayenneTableProvider {
 
         self.invalidate_segment_cache_paths(
             objects.iter().map(|meta| meta.location.clone()).collect(),
-        );
+        )
+        .await;
 
         let store = Arc::clone(&config.store);
         let table_name = self.table_metadata.table_name.clone();

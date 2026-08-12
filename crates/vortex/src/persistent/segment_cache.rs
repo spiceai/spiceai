@@ -114,7 +114,7 @@ impl SharedSegmentCache {
         })
     }
 
-    pub(crate) fn invalidate_paths(&self, paths: HashSet<Path>) -> DFResult<()> {
+    pub(crate) fn register_path_invalidation(&self, paths: HashSet<Path>) -> DFResult<()> {
         if paths.is_empty() {
             return Ok(());
         }
@@ -125,8 +125,18 @@ impl SharedSegmentCache {
             .map_err(|error| DataFusionError::External(Box::new(error)))
     }
 
-    pub(crate) async fn entry_count(&self) -> u64 {
+    pub(crate) async fn invalidate_paths(&self, paths: HashSet<Path>) -> DFResult<()> {
+        self.register_path_invalidation(paths)?;
+        self.run_pending_tasks().await;
+        Ok(())
+    }
+
+    pub(crate) async fn run_pending_tasks(&self) {
         self.cache.run_pending_tasks().await;
+    }
+
+    pub(crate) async fn entry_count(&self) -> u64 {
+        self.run_pending_tasks().await;
         self.cache.entry_count()
     }
 }
@@ -243,6 +253,7 @@ mod tests {
 
         shared
             .invalidate_paths(HashSet::from([path_a]))
+            .await
             .expect("path invalidation should be enabled");
 
         assert!(
@@ -260,6 +271,41 @@ mod tests {
                 .expect("get for live path should not error")
                 .is_some(),
             "an unrelated live path must remain cached"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalidation_physically_evicts_entries_without_later_cache_activity() {
+        let shared = SharedSegmentCache::new(1 << 20, None);
+        let retired_path = Path::from("snapshot-a/retired.vortex");
+        let live_path = Path::from("snapshot-b/live.vortex");
+        let retired = shared.for_path(retired_path.clone());
+        let live = shared.for_path(live_path);
+        let id = SegmentId::from(1);
+
+        retired
+            .put(id, ByteBuffer::from(vec![1u8, 2, 3, 4]))
+            .await
+            .expect("put for retired path should not error");
+        live.put(id, ByteBuffer::from(vec![5u8, 6, 7, 8]))
+            .await
+            .expect("put for live path should not error");
+        shared.run_pending_tasks().await;
+        assert_eq!(
+            shared.cache.entry_count(),
+            2,
+            "both paths should be resident"
+        );
+
+        shared
+            .invalidate_paths(HashSet::from([retired_path]))
+            .await
+            .expect("path invalidation should be enabled");
+
+        assert_eq!(
+            shared.cache.entry_count(),
+            1,
+            "invalidation must physically evict retired buffers before it returns"
         );
     }
 }
