@@ -446,6 +446,10 @@ impl PartialEq for DatasetSpec {
             && self.full_text_search == other.full_text_search
             && self.check_availability == other.check_availability
             && self.check_availability_interval == other.check_availability_interval
+            // Compared so a reload that only edits `drasi:` still recreates the
+            // dataset: the forwarder is built when the connector is, so an
+            // unequal-but-untracked block would leave the old one running.
+            && self.drasi == other.drasi
     }
 }
 

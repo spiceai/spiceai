@@ -38,10 +38,12 @@ use tokio::sync::mpsc;
 
 use crate::drasi::dead_letter::{DeadLetterStore, RETRY_INTERVAL};
 
-/// Batches a component may have awaiting delivery before new ones are dropped.
+/// Batches a component may hold in memory before overflow spills to the
+/// durable store.
 ///
-/// Bounded on purpose: the alternative to dropping is holding batches in memory
-/// for as long as Drasi is unreachable.
+/// Bounded on purpose: the alternative is holding batches in memory for as long
+/// as Drasi is unreachable. Overflow is retained on disk rather than dropped —
+/// see [`DeliveryQueue::enqueue`].
 pub(crate) const DEFAULT_QUEUE_DEPTH: usize = 64;
 
 /// One batch awaiting delivery.
@@ -122,16 +124,20 @@ impl DeliveryQueue {
     /// Queues `batch`, falling back to the durable store when the queue is full.
     ///
     /// Never blocks on Drasi. It *does* wait on one local file write when the
-    /// queue is full, which is the point: overflow used to be counted and
-    /// dropped, and under `queued` delivery the replication position has
-    /// already been released, so a dropped batch was unrecoverable. Bounded
-    /// backpressure onto a durable store is the correct trade against silent
-    /// loss.
+    /// queue is full, which is the point: under `queued` delivery the
+    /// replication position is released before delivery, so a batch dropped
+    /// here is unrecoverable. Bounded backpressure onto a durable store is the
+    /// correct trade against silent loss.
+    ///
+    /// The write is awaited rather than spawned so a later batch cannot reach
+    /// the sink ahead of it — redelivery is a full-state replace, so the
+    /// stop-the-line ordering has to hold from the moment of overflow.
     pub(crate) async fn enqueue(&self, batch: QueuedBatch) {
         let overflow = match self.jobs.try_send(batch) {
             Ok(()) => return,
-            Err(mpsc::error::TrySendError::Full(batch)
-            | mpsc::error::TrySendError::Closed(batch)) => batch,
+            Err(
+                mpsc::error::TrySendError::Full(batch) | mpsc::error::TrySendError::Closed(batch),
+            ) => batch,
         };
 
         let Some(store) = &self.store else {
@@ -314,9 +320,7 @@ mod tests {
     use super::*;
     use arrow::array::StringArray;
     use arrow::datatypes::{DataType, Field, Schema};
-    use runtime_drasi::{
-        DrasiSinkConfig, ElementMapping, OnDeliveryError, TransportConfig,
-    };
+    use runtime_drasi::{DrasiSinkConfig, ElementMapping, OnDeliveryError, TransportConfig};
     use std::time::Duration;
 
     fn batch() -> RecordBatch {
@@ -376,10 +380,9 @@ mod tests {
         );
     }
 
-    /// The regression this exists for: overflow used to be counted and dropped
-    /// even when a store was configured. Under `queued` delivery the
-    /// replication position is already released, so a dropped batch is
-    /// unrecoverable — it has to reach the disk.
+    /// Under `queued` delivery the replication position is released before
+    /// delivery, so overflow that never reaches the disk is unrecoverable: a
+    /// configured store must take it rather than the drop count.
     #[tokio::test]
     async fn a_full_queue_retains_overflow_in_the_store() {
         let dir = tempfile::tempdir().expect("tempdir");

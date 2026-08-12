@@ -152,13 +152,13 @@ const MISC_RUNTIME_PARAMS: &[&str] = &[
 fn known_runtime_params() -> Vec<&'static str> {
     let mut known = Vec::with_capacity(
         KNOWN_CAYENNE_RUNTIME_PARAMS.len()
-            + crate::accelerated_table::refresh_task::changes::CDC_RUNTIME_PARAMS.len()
+            + crate::accelerated::refresh_task::changes::CDC_RUNTIME_PARAMS.len()
             + dataconnector::http_rate_control::HTTP_RATE_CONTROL_RUNTIME_PARAMS.len()
             + crate::cluster::CLUSTER_GRPC_RUNTIME_PARAMS.len()
             + MISC_RUNTIME_PARAMS.len(),
     );
     known.extend_from_slice(KNOWN_CAYENNE_RUNTIME_PARAMS);
-    known.extend_from_slice(crate::accelerated_table::refresh_task::changes::CDC_RUNTIME_PARAMS);
+    known.extend_from_slice(crate::accelerated::refresh_task::changes::CDC_RUNTIME_PARAMS);
     known.extend_from_slice(dataconnector::http_rate_control::HTTP_RATE_CONTROL_RUNTIME_PARAMS);
     known.extend_from_slice(crate::cluster::CLUSTER_GRPC_RUNTIME_PARAMS);
     known.extend_from_slice(MISC_RUNTIME_PARAMS);
@@ -573,10 +573,8 @@ impl RuntimeBuilder {
         // `cdc_*` knobs from `runtime.params`; missing or rejected values
         // fall back to the matching `SPICE_CDC_*` env var, then to defaults,
         // with a warning for rejected explicit values.
-        crate::accelerated_table::refresh_task::changes::set_cdc_config(
-            crate::accelerated_table::refresh_task::changes::cdc_config_from_params(
-                &spicepod_rt.params,
-            ),
+        crate::accelerated::refresh_task::changes::set_cdc_config(
+            crate::accelerated::refresh_task::changes::cdc_config_from_params(&spicepod_rt.params),
         );
 
         // Create resource monitor early so it can be passed to DataFusion
@@ -807,6 +805,7 @@ impl RuntimeBuilder {
         let mut rt = Runtime {
             app: shared_app,
             apply_app_lock: Arc::new(tokio::sync::Mutex::new(())),
+            initial_load: Arc::new(crate::InitialLoad::default()),
             df,
             llm_runtime_stores: Arc::new(crate::model::LlmRuntimeStores::default()),
             http_rate_control_registry,
@@ -817,7 +816,7 @@ impl RuntimeBuilder {
             tool_factories: Arc::new(Mutex::new(HashMap::new())),
             pods_watcher: Arc::new(RwLock::new(self.pods_watcher)),
             secrets,
-            spaced_tracer: Arc::new(tracers::SpacedTracer::new(Duration::from_secs(15))),
+            spaced_tracer: Arc::new(util::tracers::SpacedTracer::new(Duration::from_secs(15))),
             autoload_extensions: Arc::new(self.autoload_extensions),
             extensions: Arc::new(RwLock::new(HashMap::new())),
             datasets_health_monitor,
@@ -1429,6 +1428,13 @@ fn cayenne_accelerations(
 /// * The **PK keyset, CDC coalesce buffer, and inline memtable** are write-path
 ///   state that only a small-write (CDC-profile) table populates, so they are
 ///   counted only for those.
+/// * The **inline-admission buffer plus the serialized entry it produces** are
+///   counted for every profile that inlines small writes, which now includes the
+///   whole-table replace. One of each per acceleration is exact for the overwrite
+///   path: `CayenneContext` hands out a single inline-admission slot, and a
+///   partitioned dataset's children share the parent's context
+///   (`CayennePartitionCreator::new`), so N concurrent partition overwrites still
+///   hold at most one buffer and one blob between them.
 ///
 /// The globally coordinated in-memory tier and the virtual (non-resident) metastore
 /// mmap are intentionally excluded: the tier is already capped at host/5 and the
@@ -1483,6 +1489,28 @@ fn estimate_cayenne_reservation_bytes(
                 |mb| mb.saturating_mul(MIB),
             );
         total = total.saturating_add(segment);
+
+        // Inline-admission state: the bounded Arrow buffer a write is admitted
+        // through, plus the Arrow IPC entry it serializes into. Byte-valued
+        // params, so no MB conversion; the accelerator's key lists (with the
+        // `cayenne_`-prefixed aliases) and its unset defaults are mirrored here.
+        if profile.inlines_small_writes() {
+            let inline_entry =
+                parse_u64(&params, &["cayenne_inline_max_bytes", "inline_max_bytes"]).unwrap_or(
+                    u64::try_from(cayenne::metadata::DEFAULT_INLINE_MAX_BYTES).unwrap_or(u64::MAX),
+                );
+            let inline_buffer = parse_u64(
+                &params,
+                &["cayenne_inline_max_buffer_bytes", "inline_max_buffer_bytes"],
+            )
+            .unwrap_or(
+                u64::try_from(cayenne::metadata::DEFAULT_INLINE_MAX_BUFFER_BYTES)
+                    .unwrap_or(u64::MAX),
+            );
+            total = total
+                .saturating_add(inline_entry)
+                .saturating_add(inline_buffer);
+        }
 
         if !profile.uses_cdc_tier() {
             continue;
@@ -3060,7 +3088,7 @@ mod test {
         let known = known_runtime_params();
         let family_keys = KNOWN_CAYENNE_RUNTIME_PARAMS
             .iter()
-            .chain(crate::accelerated_table::refresh_task::changes::CDC_RUNTIME_PARAMS)
+            .chain(crate::accelerated::refresh_task::changes::CDC_RUNTIME_PARAMS)
             .chain(dataconnector::http_rate_control::HTTP_RATE_CONTROL_RUNTIME_PARAMS)
             .chain(MISC_RUNTIME_PARAMS);
         for key in family_keys {

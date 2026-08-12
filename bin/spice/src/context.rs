@@ -17,11 +17,13 @@ limitations under the License.
 //! Runtime context for managing Spice runtime installation and configuration.
 
 use crate::error::{
-    CreateDirectorySnafu, HomeDirectoryNotFoundSnafu, Result, RuntimeExecutionSnafu,
-    RuntimeNotInstalledSnafu, RuntimeVersionSnafu, WindowsNativeRuntimeUnsupportedSnafu,
+    CreateDirectorySnafu, HomeDirectoryNotFoundSnafu, HttpClientBuildSnafu, Result,
+    RuntimeExecutionSnafu, RuntimeNotInstalledSnafu, RuntimeVersionSnafu,
+    WindowsNativeRuntimeUnsupportedSnafu,
 };
 use snafu::ResultExt;
 use spice_cloud_client::endpoints::data_endpoint as spice_cloud_data_endpoint;
+use spice_cloud_client::redirect::same_origin_redirect_policy;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Command;
@@ -38,6 +40,79 @@ const DOT_SPICE: &str = ".spice";
 const SPICED_FILENAME: &str = "spiced";
 const SPICEPODS_DIR: &str = "spicepods";
 const WSL_ENV_KEYS: [&str; 2] = ["WSL_DISTRO_NAME", "WSL_INTEROP"];
+
+/// How long a request waits for the connection itself to be established.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The deadline for the control-plane calls — health, dataset listings, the model list,
+/// registry downloads. Their duration is a function of the network, so a whole-request
+/// deadline is the right shape and a short one is a useful failure signal.
+const CONTROL_PLANE_DEADLINE: Deadline = Deadline::Total(Duration::from_secs(30));
+
+/// The deadline for requests whose duration is set by model inference — a chat completion,
+/// a text-to-SQL translation, a search that has to embed the query.
+///
+/// These have no useful upper bound: a long answer, a tool-calling chain, or a large local
+/// model on modest hardware all legitimately take minutes, and none of that is a failure.
+/// What is a failure is the endpoint going quiet, so the deadline measures silence. It is
+/// generous because the first byte can trail the request by a whole prompt evaluation.
+pub(crate) const INFERENCE_DEADLINE: Deadline = Deadline::Silence(Duration::from_mins(5));
+
+/// What an HTTP client's deadline measures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Deadline {
+    /// The whole request, from connecting until the response body has finished. Fires on a
+    /// healthy response that is simply long.
+    Total(Duration),
+    /// The gap between reads, reset by each one — so it fires only when nothing arrives,
+    /// whether that is before the response head or between two chunks of the body.
+    ///
+    /// Note that this counts *bytes*, so on a stream the server keeps alive it never fires;
+    /// a caller that needs the gap between meaningful events has to measure that itself.
+    Silence(Duration),
+}
+
+impl Deadline {
+    /// How long this deadline allows, whatever it is measuring.
+    pub(crate) const fn duration(self) -> Duration {
+        match self {
+            Self::Total(duration) | Self::Silence(duration) => duration,
+        }
+    }
+}
+
+/// The user agent a test context reports, so a server under test can tell it apart.
+#[cfg(test)]
+const TEST_USER_AGENT: &str = "spice/test (test; test)";
+
+/// Build an HTTP client for the CLI.
+///
+/// Both of the context's clients are built here, so a setting that has to hold for both —
+/// the user agent, the connect timeout, and the same-origin redirect policy — belongs on this
+/// builder rather than at a call site. Every `/v1/*` call the CLI makes goes through one of
+/// these clients, the context helpers and the per-command sites that build their own request
+/// from `ctx.http_client()` alike, so the redirect policy is set once here rather than per
+/// call site. (`commands::login` deliberately builds its own; it carries a credential in the
+/// request body and so refuses cross-origin redirects outright.)
+///
+/// # Errors
+///
+/// Returns an error if the client cannot be built. A default client is not substituted,
+/// because it would carry neither the deadline nor the same-origin redirect policy, and these
+/// clients send the API key in a header.
+fn build_http_client(user_agent: String, deadline: Deadline) -> Result<reqwest::Client> {
+    let builder = reqwest::Client::builder()
+        .user_agent(user_agent)
+        .connect_timeout(CONNECT_TIMEOUT)
+        .redirect(same_origin_redirect_policy());
+
+    let builder = match deadline {
+        Deadline::Total(duration) => builder.timeout(duration),
+        Deadline::Silence(duration) => builder.read_timeout(duration),
+    };
+
+    builder.build().context(HttpClientBuildSnafu)
+}
 
 /// Treat a blank credential as absent.
 ///
@@ -84,8 +159,17 @@ pub struct RuntimeContext {
     /// Extra headers for HTTP requests
     extra_headers: HashMap<String, String>,
 
-    /// HTTP client with default timeout
+    /// HTTP client for the control-plane calls, under a whole-request deadline
     http_client: reqwest::Client,
+
+    /// HTTP client for requests whose duration is set by model inference, under a
+    /// silence deadline
+    inference_http_client: reqwest::Client,
+
+    /// The deadline `inference_http_client` carries. Held so a caller that has to measure
+    /// progress itself — a streamed response, where the transport's own silence deadline is
+    /// reset by keep-alives — bounds it by the same value rather than a second constant.
+    inference_deadline: Deadline,
 
     /// TLS root certificate file path
     tls_root_certificate_file: Option<String>,
@@ -96,7 +180,9 @@ impl RuntimeContext {
     ///
     /// # Errors
     ///
-    /// Returns an error if the home directory cannot be determined.
+    /// Returns an error if the home directory cannot be determined, or if the HTTP client
+    /// cannot be built — the latter is not defaulted past, because a default client would
+    /// not carry the same-origin redirect policy.
     pub fn new() -> Result<Self> {
         let home_dir = dirs::home_dir().ok_or_else(|| HomeDirectoryNotFoundSnafu.build())?;
         let spice_runtime_dir = home_dir.join(DOT_SPICE);
@@ -105,12 +191,9 @@ impl RuntimeContext {
         let app_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let pods_dir = app_dir.join(SPICEPODS_DIR);
 
-        let http_client = reqwest::Client::builder()
-            .user_agent(Self::default_user_agent())
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(30))
-            .build()
-            .unwrap_or_default();
+        let http_client = build_http_client(Self::default_user_agent(), CONTROL_PLANE_DEADLINE)?;
+        let inference_http_client =
+            build_http_client(Self::default_user_agent(), INFERENCE_DEADLINE)?;
 
         Ok(Self {
             spice_runtime_dir,
@@ -124,8 +207,42 @@ impl RuntimeContext {
             user_agent: Self::default_user_agent(),
             extra_headers: HashMap::new(),
             http_client,
+            inference_http_client,
+            inference_deadline: INFERENCE_DEADLINE,
             tls_root_certificate_file: None,
         })
+    }
+
+    /// Create a context pointed at `http_endpoint` whose two HTTP clients carry the given
+    /// deadlines.
+    ///
+    /// The production deadlines are tens of seconds apart, so which client a call site
+    /// reached for is only observable after a request that runs that long. Shrinking both
+    /// makes the same difference observable in milliseconds.
+    #[cfg(test)]
+    pub(crate) fn with_deadlines_for_test(
+        http_endpoint: &str,
+        control_plane: Deadline,
+        inference: Deadline,
+    ) -> Self {
+        Self {
+            spice_runtime_dir: PathBuf::from("/test/.spice"),
+            spice_bin_dir: PathBuf::from("/test/.spice/bin"),
+            app_dir: PathBuf::from("/test/app"),
+            pods_dir: PathBuf::from("/test/app/spicepods"),
+            http_endpoint: http_endpoint.to_string(),
+            http_endpoint_chosen: true,
+            api_key: None,
+            cloud_region: None,
+            user_agent: TEST_USER_AGENT.to_string(),
+            extra_headers: HashMap::new(),
+            http_client: build_http_client(TEST_USER_AGENT.to_string(), control_plane)
+                .expect("the test control-plane client should build"),
+            inference_http_client: build_http_client(TEST_USER_AGENT.to_string(), inference)
+                .expect("the test inference client should build"),
+            inference_deadline: inference,
+            tls_root_certificate_file: None,
+        }
     }
 
     /// Create a runtime context from CLI arguments.
@@ -284,16 +401,41 @@ impl RuntimeContext {
         self.cloud_region.is_some()
     }
 
+    /// Get the TLS root certificate file if one was specified.
+    #[must_use]
+    pub fn tls_root_certificate_file(&self) -> Option<&str> {
+        self.tls_root_certificate_file.as_deref()
+    }
+
     /// Get the cloud region if one was specified.
     #[must_use]
     pub fn cloud_region(&self) -> Option<&str> {
         self.cloud_region.as_deref()
     }
 
-    /// Get the HTTP client.
+    /// Get the HTTP client for the control-plane calls.
     #[must_use]
     pub fn http_client(&self) -> &reqwest::Client {
         &self.http_client
+    }
+
+    /// Get the HTTP client for requests whose duration is set by model inference.
+    ///
+    /// Use this for anything that reaches a model — a chat completion, a text-to-SQL
+    /// translation, a search that embeds its query. [`RuntimeContext::http_client`] caps the
+    /// whole request, which cuts off a long answer that is still arriving.
+    #[must_use]
+    pub fn inference_http_client(&self) -> &reqwest::Client {
+        &self.inference_http_client
+    }
+
+    /// The deadline [`RuntimeContext::inference_http_client`] carries.
+    ///
+    /// A streamed response needs this: the client's deadline is reset by every byte, and the
+    /// runtime keeps an SSE stream alive with a comment every 30 seconds, so the caller has to
+    /// measure the gap between meaningful events against this value itself.
+    pub(crate) const fn inference_deadline(&self) -> Deadline {
+        self.inference_deadline
     }
 
     /// Get the user agent string.
@@ -308,10 +450,42 @@ impl RuntimeContext {
         self.spice_bin_dir.join(SPICED_FILENAME)
     }
 
-    /// Check if the runtime is installed.
+    /// Check if the runtime is installed, in this user's install directory or
+    /// (under `sudo`) the invoking user's — see [`Self::resolve_spiced_path`].
     #[must_use]
     pub fn is_runtime_installed(&self) -> bool {
-        self.spiced_path().exists()
+        self.resolve_spiced_path().is_some()
+    }
+
+    /// Locate the `spiced` binary to use, tolerating `sudo`.
+    ///
+    /// `sudo` resets `HOME` to `/root` on most distributions, so
+    /// [`Self::spiced_path`] — which is derived from `HOME` — points at
+    /// `/root/.spice/bin/spiced` under `sudo` and misses the runtime the
+    /// invoking user actually installed. That matters because
+    /// `sudo spice connect --install` is the documented way to install the
+    /// service: without this, every such run concludes the runtime is missing
+    /// and downloads the latest *release*, which on a machine tracking `trunk`
+    /// silently pairs a dev CLI with a released runtime.
+    ///
+    /// Preference order:
+    /// 1. `$HOME/.spice/bin/spiced` — the ordinary case, and a genuine root
+    ///    login's own install.
+    /// 2. `~<$SUDO_USER>/.spice/bin/spiced` — what the operator installed
+    ///    before elevating.
+    ///
+    /// Returns `None` when neither exists.
+    #[must_use]
+    pub fn resolve_spiced_path(&self) -> Option<PathBuf> {
+        let own = self.spiced_path();
+        if own.exists() {
+            return Some(own);
+        }
+        let candidate = sudo_invoker_home()?
+            .join(DOT_SPICE)
+            .join("bin")
+            .join(SPICED_FILENAME);
+        candidate.exists().then_some(candidate)
     }
 
     fn is_wsl_environment<F>(mut get_env: F) -> bool
@@ -350,11 +524,11 @@ impl RuntimeContext {
     ///
     /// Returns an error if the runtime is not installed or version cannot be determined.
     pub fn runtime_version(&self) -> Result<String> {
-        if !self.is_runtime_installed() {
+        let Some(spiced) = self.resolve_spiced_path() else {
             return Err(RuntimeNotInstalledSnafu.build());
-        }
+        };
 
-        let output = Command::new(self.spiced_path())
+        let output = Command::new(spiced)
             .arg("--version")
             .output()
             .context(RuntimeExecutionSnafu)?;
@@ -383,11 +557,11 @@ impl RuntimeContext {
         args: &[String],
         http_endpoint_override: Option<&str>,
     ) -> Result<Command> {
-        if !self.is_runtime_installed() {
+        let Some(spiced) = self.resolve_spiced_path() else {
             return Err(RuntimeNotInstalledSnafu.build());
-        }
+        };
 
-        let mut cmd = Command::new(self.spiced_path());
+        let mut cmd = Command::new(spiced);
         cmd.arg("--pods-watcher-enabled");
         cmd.args(args);
 
@@ -547,10 +721,255 @@ impl RuntimeContext {
     }
 }
 
+/// The home directory of the user who invoked `sudo`, or `None` when not
+/// running under `sudo` (or the user cannot be resolved).
+///
+/// Only consulted as a fallback by [`RuntimeContext::resolve_spiced_path`].
+#[cfg(unix)]
+fn sudo_invoker_home() -> Option<PathBuf> {
+    let user = std::env::var("SUDO_USER").ok()?;
+    // `sudo -u root` sets SUDO_USER=root, whose home is the `$HOME` branch we
+    // already tried — nothing new to look at.
+    if user.is_empty() || user == "root" {
+        return None;
+    }
+    passwd_home(&user).map(PathBuf::from)
+}
+
+#[cfg(not(unix))]
+fn sudo_invoker_home() -> Option<PathBuf> {
+    None
+}
+
+/// Absolute paths `getent` ships at, in the order they are tried.
+///
+/// Resolving it through `PATH` would be a privilege-escalation hole: this runs
+/// under `sudo` on the documented `spice connect --install` path, so a `PATH`
+/// entry the invoking user controls would have this process execute their binary
+/// as root. Only these known locations are accepted, and a host with `getent`
+/// somewhere else falls through to reading `/etc/passwd`.
+#[cfg(unix)]
+const GETENT_PATHS: &[&str] = &["/usr/bin/getent", "/bin/getent"];
+
+/// Absolute path to `dscl`, which is how macOS answers this question. Not
+/// resolved through `PATH`, for the reason given on [`GETENT_PATHS`].
+#[cfg(target_os = "macos")]
+const DSCL_PATH: &str = "/usr/bin/dscl";
+
+/// A user's home directory from the passwd database.
+///
+/// Asks `getent` first so NSS sources (LDAP, SSSD, systemd-homed) resolve, then
+/// `dscl`, then falls back to parsing `/etc/passwd` for the minimal images that
+/// ship neither. macOS needs `dscl`: it has no `getent`, and its `/etc/passwd`
+/// holds only system accounts, so every ordinary user resolves through
+/// Directory Services or not at all. Guessing `/home/<user>` is deliberately
+/// not a fallback: a wrong path would silently look for a runtime that was
+/// never there.
+#[cfg(unix)]
+fn passwd_home(user: &str) -> Option<String> {
+    for getent in GETENT_PATHS {
+        if !std::path::Path::new(getent).is_file() {
+            continue;
+        }
+        if let Ok(output) = Command::new(*getent).arg("passwd").arg(user).output()
+            && output.status.success()
+            && let Some(home) = passwd_entry_home(&String::from_utf8_lossy(&output.stdout), user)
+        {
+            return Some(home);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(home) = directory_services_home(user) {
+            return Some(home);
+        }
+    }
+
+    let contents = std::fs::read_to_string("/etc/passwd").ok()?;
+    passwd_entry_home(&contents, user)
+}
+
+/// A user's home directory from macOS Directory Services.
+#[cfg(target_os = "macos")]
+fn directory_services_home(user: &str) -> Option<String> {
+    if !std::path::Path::new(DSCL_PATH).is_file() {
+        return None;
+    }
+    let output = Command::new(DSCL_PATH)
+        .args([".", "-read"])
+        .arg(format!("/Users/{user}"))
+        .arg("NFSHomeDirectory")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    dscl_home(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Extract the home directory from `dscl . -read /Users/<user> NFSHomeDirectory`.
+///
+/// The answer is one `NFSHomeDirectory: <path>` line, except that `dscl` wraps
+/// a value containing a space onto the line below the key instead.
+#[cfg(target_os = "macos")]
+fn dscl_home(output: &str) -> Option<String> {
+    output
+        .split_once("NFSHomeDirectory:")?
+        .1
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(str::to_string)
+}
+
+/// Extract `user`'s home (field 6) from passwd-format `contents`.
+#[cfg(unix)]
+fn passwd_entry_home(contents: &str, user: &str) -> Option<String> {
+    contents.lines().find_map(|line| {
+        let mut fields = line.split(':');
+        if fields.next() != Some(user) {
+            return None;
+        }
+        // name:passwd:uid:gid:gecos:home:shell — home is index 5 of the rest.
+        let home = fields.nth(4)?;
+        (!home.is_empty()).then(|| home.to_string())
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::{TcpListener, TcpStream};
+
+    use crate::test_support::SlowServer;
     use tempfile::TempDir;
+
+    /// A response that takes about twice the deadline under test to arrive, while never being
+    /// quiet for longer than a tenth of it.
+    ///
+    /// The gap is a small fraction of the deadline on purpose: the server sleeps on the wall
+    /// clock, so a loaded CI runner that descheduled it for a moment must not be able to make
+    /// a healthy stream look stalled.
+    fn slow_but_never_quiet(deadline: Duration) -> SlowServer {
+        SlowServer::dribbling(
+            std::iter::repeat_n("data: token\n\n".to_string(), 20).collect(),
+            deadline / 10,
+        )
+    }
+
+    /// Read a response body in full, so a body-phase deadline is exercised rather than just
+    /// the wait for the response head.
+    async fn read_body(client: &reqwest::Client, url: &str) -> reqwest::Result<String> {
+        client.get(url).send().await?.text().await
+    }
+
+    #[tokio::test]
+    async fn a_total_deadline_cuts_off_a_response_that_is_still_arriving() {
+        let deadline = Duration::from_secs(1);
+        let server = slow_but_never_quiet(deadline);
+        let client = build_http_client("spice/test".to_string(), Deadline::Total(deadline))
+            .expect("the test client should build");
+
+        let error = read_body(&client, server.url())
+            .await
+            .expect_err("a total deadline should fire on a response that outlasts it");
+
+        assert!(
+            error.is_timeout(),
+            "expected a timeout, got: {error} ({error:?})"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_silence_deadline_lets_a_slow_response_finish() {
+        let deadline = Duration::from_secs(1);
+        let server = slow_but_never_quiet(deadline);
+        let client = build_http_client("spice/test".to_string(), Deadline::Silence(deadline))
+            .expect("the test client should build");
+
+        let body = read_body(&client, server.url())
+            .await
+            .expect("a response that keeps arriving should be read in full");
+
+        assert_eq!(
+            body.matches("data: token").count(),
+            20,
+            "every chunk should have been read: {body:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_silence_deadline_still_fires_when_the_body_goes_quiet() {
+        let deadline = Duration::from_millis(300);
+        let server = SlowServer::stalling_after_head();
+        let client = build_http_client("spice/test".to_string(), Deadline::Silence(deadline))
+            .expect("the test client should build");
+
+        let started = std::time::Instant::now();
+        let error = read_body(&client, server.url())
+            .await
+            .expect_err("a silence deadline should fire on a body that never arrives");
+
+        assert!(
+            error.is_timeout(),
+            "expected a timeout, got: {error} ({error:?})"
+        );
+        assert!(
+            started.elapsed() < deadline * 20,
+            "the deadline should have fired promptly, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// The wait for the response head is the one the connect timeout can no longer end: the
+    /// connection is established, so an endpoint that accepts and then blocks while it sets a
+    /// model up is holding an already-connected request. `read_timeout` has to cover it, and
+    /// reqwest's own documentation only promises per-read behaviour — so assert it.
+    #[tokio::test]
+    async fn a_silence_deadline_fires_before_the_response_head_arrives() {
+        let deadline = Duration::from_millis(300);
+        let server = SlowServer::stalling_before_head();
+        let client = build_http_client("spice/test".to_string(), Deadline::Silence(deadline))
+            .expect("the test client should build");
+
+        let started = std::time::Instant::now();
+        let error = client
+            .get(server.url())
+            .send()
+            .await
+            .expect_err("a silence deadline should fire while waiting for the response head");
+
+        assert!(
+            error.is_timeout(),
+            "expected a timeout, got: {error} ({error:?})"
+        );
+        assert!(
+            started.elapsed() < deadline * 20,
+            "the deadline should have fired promptly, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn the_inference_deadline_measures_silence_and_outlasts_the_control_plane_one() {
+        let Deadline::Silence(inference) = INFERENCE_DEADLINE else {
+            panic!(
+                "inference requests must not carry a whole-request deadline: {INFERENCE_DEADLINE:?}"
+            );
+        };
+        let Deadline::Total(control_plane) = CONTROL_PLANE_DEADLINE else {
+            panic!("control-plane requests should stay under a whole-request deadline");
+        };
+
+        // The silence deadline also bounds the wait for the response head, which for a
+        // model is a whole prompt evaluation — so it has to be the more generous of the two.
+        assert!(
+            inference > control_plane,
+            "a {inference:?} silence deadline is tighter than the {control_plane:?} deadline it replaces"
+        );
+    }
 
     /// Helper to create a `RuntimeContext` with a mocked spiced binary for testing.
     fn create_test_context() -> RuntimeContext {
@@ -566,6 +985,8 @@ mod tests {
             user_agent: "spice/test (test; test)".to_string(),
             extra_headers: HashMap::new(),
             http_client: reqwest::Client::new(),
+            inference_http_client: reqwest::Client::new(),
+            inference_deadline: INFERENCE_DEADLINE,
             tls_root_certificate_file: None,
         }
     }
@@ -591,10 +1012,148 @@ mod tests {
             user_agent: "spice/test (test; test)".to_string(),
             extra_headers: HashMap::new(),
             http_client: reqwest::Client::new(),
+            inference_http_client: reqwest::Client::new(),
+            inference_deadline: INFERENCE_DEADLINE,
             tls_root_certificate_file: None,
         };
 
         (ctx, temp_dir)
+    }
+
+    #[test]
+    fn passwd_entry_home_reads_the_home_field() {
+        let passwd = "root:x:0:0:root:/root:/bin/bash\n\
+                      owner:x:1000:1000:Owner,,,:/home/owner:/usr/bin/zsh\n\
+                      svc:x:998:998::/var/lib/svc:/usr/sbin/nologin\n";
+        assert_eq!(
+            passwd_entry_home(passwd, "owner").as_deref(),
+            Some("/home/owner")
+        );
+        assert_eq!(passwd_entry_home(passwd, "root").as_deref(), Some("/root"));
+        assert_eq!(
+            passwd_entry_home(passwd, "svc").as_deref(),
+            Some("/var/lib/svc"),
+            "an empty GECOS field must not shift the home field"
+        );
+        assert_eq!(passwd_entry_home(passwd, "nobody"), None);
+    }
+
+    #[test]
+    fn passwd_entry_home_ignores_prefix_matches_and_empty_homes() {
+        // `own` must not match the `owner` line — a prefix is not the user.
+        let passwd = "owner:x:1000:1000::/home/owner:/bin/sh\n";
+        assert_eq!(passwd_entry_home(passwd, "own"), None);
+
+        // A user with no home directory has nothing to look in.
+        let no_home = "ghost:x:1:1:::/bin/false\n";
+        assert_eq!(passwd_entry_home(no_home, "ghost"), None);
+    }
+
+    /// `passwd_home` runs `getent` while this process may be root under `sudo`,
+    /// so it must never be resolved through `PATH` — an entry the invoking user
+    /// controls would be executed as root.
+    #[cfg(unix)]
+    #[test]
+    fn getent_is_only_ever_run_from_an_absolute_path() {
+        assert!(!GETENT_PATHS.is_empty());
+        for candidate in GETENT_PATHS {
+            let path = std::path::Path::new(candidate);
+            assert!(
+                path.is_absolute(),
+                "{candidate} must be absolute, or PATH decides which binary runs as root"
+            );
+            assert_eq!(
+                path.file_name().and_then(std::ffi::OsStr::to_str),
+                Some("getent"),
+                "{candidate} must name getent itself"
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn dscl_home_reads_the_value_however_dscl_wrapped_it() {
+        assert_eq!(
+            dscl_home("NFSHomeDirectory: /Users/ada\n"),
+            Some("/Users/ada".to_string())
+        );
+        // `dscl` puts a value containing a space on its own line.
+        assert_eq!(
+            dscl_home("NFSHomeDirectory:\n /Users/ada lovelace\n"),
+            Some("/Users/ada lovelace".to_string())
+        );
+        assert_eq!(dscl_home("<dscl_cmd> DS Error: -14136\n"), None);
+        assert_eq!(dscl_home("NFSHomeDirectory:\n"), None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn passwd_home_resolves_a_user_macos_keeps_out_of_etc_passwd() {
+        // Every ordinary macOS account lives in Directory Services only, so
+        // without the `dscl` step `sudo spice connect --install` cannot find the
+        // runtime the invoking user installed.
+        let Ok(user) = std::env::var("USER") else {
+            return;
+        };
+        let passwd = std::fs::read_to_string("/etc/passwd").unwrap_or_default();
+        if user.is_empty() || passwd.contains(&format!("\n{user}:")) {
+            // An account `/etc/passwd` already answers for proves nothing here.
+            return;
+        }
+        let Some(home) = passwd_home(&user) else {
+            panic!("no home resolved for {user}, who is not in /etc/passwd");
+        };
+        assert!(PathBuf::from(&home).is_dir(), "{home}");
+    }
+
+    /// `sudo` rewrites `HOME`, so a runtime installed under the invoking user's
+    /// home must still be found — otherwise `sudo spice connect --install`
+    /// concludes the runtime is missing and downloads a release over the
+    /// operator's build.
+    #[test]
+    fn resolve_spiced_path_prefers_the_contexts_own_install() {
+        let (ctx, _temp) = create_test_context_with_runtime();
+        assert_eq!(
+            ctx.resolve_spiced_path(),
+            Some(ctx.spiced_path()),
+            "an install in this context's own bin dir wins outright"
+        );
+        assert!(ctx.is_runtime_installed());
+    }
+
+    #[test]
+    fn resolve_spiced_path_is_none_when_nothing_is_installed() {
+        // A context whose bin dir holds no runtime, and (in CI) no SUDO_USER
+        // install to fall back to.
+        let temp = TempDir::new().expect("create temp dir");
+        let ctx = RuntimeContext {
+            spice_runtime_dir: temp.path().to_path_buf(),
+            spice_bin_dir: temp.path().join("bin"),
+            app_dir: PathBuf::from("/test/app"),
+            pods_dir: PathBuf::from("/test/app/spicepods"),
+            http_endpoint: "http://127.0.0.1:8090".to_string(),
+            http_endpoint_chosen: false,
+            api_key: None,
+            cloud_region: None,
+            user_agent: "spice/test (test; test)".to_string(),
+            extra_headers: HashMap::new(),
+            http_client: reqwest::Client::new(),
+            inference_http_client: reqwest::Client::new(),
+            inference_deadline: INFERENCE_DEADLINE,
+            tls_root_certificate_file: None,
+        };
+        assert!(!ctx.spiced_path().exists());
+        // Without SUDO_USER there is no second place to look. (When the suite
+        // itself runs under sudo the fallback may legitimately find one, so
+        // assert the invariant rather than a bare `None`.)
+        match ctx.resolve_spiced_path() {
+            None => {}
+            Some(found) => assert_ne!(
+                found,
+                ctx.spiced_path(),
+                "a resolved path must come from the sudo fallback, not the empty bin dir"
+            ),
+        }
     }
 
     /// Convert Command args to a Vec<String> for testing.
@@ -1361,5 +1920,148 @@ mod tests {
             cloud_headers.contains_key("User-Agent"),
             "Cloud mode should include User-Agent"
         );
+    }
+
+    /// How long a request that must not hang is given before the test fails it. Well under
+    /// the context client's own 30-second timeout, so a regression fails fast instead of
+    /// stalling.
+    const TEST_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+    /// Read the request head so the client's write completes before we reply. Closing a
+    /// socket with unread request data still buffered can surface as a reset rather than the
+    /// response under test, which on Windows is packetisation dependent and so intermittent.
+    fn drain_request_head(stream: &mut TcpStream) {
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) | Err(_) => return,
+                Ok(_) => {}
+            }
+            if line == "\r\n" || line == "\n" {
+                return;
+            }
+        }
+    }
+
+    fn serve_once(listener: &TcpListener, response: &str) {
+        let Ok((mut stream, _)) = listener.accept() else {
+            return;
+        };
+        drain_request_head(&mut stream);
+        let _ = stream.write_all(response.as_bytes());
+        let _ = stream.flush();
+    }
+
+    fn localhost_listener() -> TcpListener {
+        TcpListener::bind("127.0.0.1:0").expect("test listener should bind")
+    }
+
+    fn local_port(listener: &TcpListener) -> u16 {
+        listener
+            .local_addr()
+            .expect("listener should have a local address")
+            .port()
+    }
+
+    /// Every request the CLI makes through this context carries the API key in an
+    /// `X-API-Key` header, which `reqwest` does not strip on a cross-origin redirect. A
+    /// runtime, proxy or ingress answering with an off-origin `Location` must therefore be
+    /// refused rather than handed the key (#12495).
+    ///
+    /// Goes through `with_args` so the client under test is the one `RuntimeContext::new`
+    /// builds — a test that assembled its own client would still pass if the policy were
+    /// dropped from the constructor.
+    #[tokio::test]
+    async fn test_context_client_does_not_follow_a_cross_origin_redirect() {
+        let runtime = localhost_listener();
+        let elsewhere = localhost_listener();
+        let elsewhere_port = local_port(&elsewhere);
+        let runtime_port = local_port(&runtime);
+
+        // Nothing should ever connect here; poll without blocking after the call returns.
+        elsewhere
+            .set_nonblocking(true)
+            .expect("listener should go non-blocking");
+
+        let response = format!(
+            "HTTP/1.1 307 Temporary Redirect\r\n\
+             Location: http://127.0.0.1:{elsewhere_port}/collect\r\n\
+             Content-Length: 0\r\n\
+             Connection: close\r\n\r\n"
+        );
+        let server = std::thread::spawn(move || serve_once(&runtime, &response));
+
+        let ctx = RuntimeContext::with_args(
+            Some(format!("http://127.0.0.1:{runtime_port}")),
+            Some("SECRETKEY".to_string()),
+            None,
+            None,
+        )
+        .expect("context should build");
+
+        // On the default policy the client follows the hop and then waits on a listener that
+        // never answers, so without this bound the regression surfaces only as a stall.
+        let got = tokio::time::timeout(TEST_REQUEST_TIMEOUT, ctx.get("/v1/status"))
+            .await
+            .expect("a refused redirect must return promptly, not hang")
+            .expect("the 307 should come back as a response");
+
+        // Stopped at the redirect rather than followed, and the 3xx is still diagnosable.
+        assert_eq!(got.status().as_u16(), 307);
+
+        // `WouldBlock` specifically: any other error would mean the listener itself failed,
+        // which is not evidence that nothing ever connected to it.
+        let contacted = elsewhere.accept();
+        let refused_kind = contacted.as_ref().err().map(std::io::Error::kind);
+        assert_eq!(
+            refused_kind,
+            Some(std::io::ErrorKind::WouldBlock),
+            "the off-origin listener must never be contacted"
+        );
+
+        server.join().expect("server thread should not panic");
+    }
+
+    /// The policy must not break a legitimate same-origin redirect on a runtime endpoint.
+    #[tokio::test]
+    async fn test_context_client_follows_a_same_origin_redirect() {
+        let listener = localhost_listener();
+        let port = local_port(&listener);
+
+        let redirect = format!(
+            "HTTP/1.1 307 Temporary Redirect\r\n\
+             Location: http://127.0.0.1:{port}/v1/status/retry\r\n\
+             Content-Length: 0\r\n\
+             Connection: close\r\n\r\n"
+        );
+        let ok = "HTTP/1.1 200 OK\r\n\
+                  Content-Type: application/json\r\n\
+                  Content-Length: 11\r\n\
+                  Connection: close\r\n\r\n\
+                  {\"ok\":true}";
+        let server = std::thread::spawn(move || {
+            serve_once(&listener, &redirect);
+            serve_once(&listener, ok);
+        });
+
+        let ctx = RuntimeContext::with_args(
+            Some(format!("http://127.0.0.1:{port}")),
+            Some("SECRETKEY".to_string()),
+            None,
+            None,
+        )
+        .expect("context should build");
+
+        let got = tokio::time::timeout(TEST_REQUEST_TIMEOUT, ctx.get("/v1/status"))
+            .await
+            .expect("the same-origin redirect chain must not hang")
+            .expect("the followed redirect should return a response");
+
+        assert_eq!(got.status().as_u16(), 200);
+
+        server.join().expect("server thread should not panic");
     }
 }

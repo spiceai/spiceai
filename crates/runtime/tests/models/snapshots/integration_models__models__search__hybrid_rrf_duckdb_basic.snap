@@ -11,16 +11,16 @@ expression: resp?
   {
     "id": 772,
     "question": "State the degree of the differential equation:\n$$\ny^{\\prime \\prime} = 6x + \\sin x\n$$",
-    "trunc(rrf(text_search(qs, Utf8(\"second\")), vector_search(qs, Utf8(\"second\")))._fused_score,Int64(3))": 0.017
+    "trunc(rrf(text_search(qs, Utf8(\"second\")), vector_search(qs, Utf8(\"second\")))._fused_score,Int64(3))": 0.016
+  },
+  {
+    "id": 9,
+    "question": "A Mission Control Officer at Cape Canaveral makes the statement \"lift-off, T minus 50 seconds.\" How long is it before lift-off?",
+    "trunc(rrf(text_search(qs, Utf8(\"second\")), vector_search(qs, Utf8(\"second\")))._fused_score,Int64(3))": 0.016
   },
   {
     "id": 361,
     "question": "Find the number of ways a judge can award first, second, and third places in a contest with 18 contestants.",
-    "trunc(rrf(text_search(qs, Utf8(\"second\")), vector_search(qs, Utf8(\"second\")))._fused_score,Int64(3))": 0.016
-  },
-  {
-    "id": 462,
-    "question": "How many groups of 2 are in 14?",
     "trunc(rrf(text_search(qs, Utf8(\"second\")), vector_search(qs, Utf8(\"second\")))._fused_score,Int64(3))": 0.016
   }
 ]

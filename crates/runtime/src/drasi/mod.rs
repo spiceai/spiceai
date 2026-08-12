@@ -33,8 +33,7 @@ use arrow::datatypes::ArrowNativeType;
 use data_components::cdc::{ChangeBatch, ChangeEnvelope, StreamError};
 use runtime_drasi::config::DEFAULT_REQUEST_TIMEOUT;
 use runtime_drasi::{
-    DrasiChangeRows, DrasiSink, DrasiSinkConfig, ElementMapping, OnDeliveryError,
-    TransportConfig,
+    DrasiChangeRows, DrasiSink, DrasiSinkConfig, ElementMapping, OnDeliveryError, TransportConfig,
 };
 
 use crate::drasi::dead_letter::{DEFAULT_MAX_BATCHES, DeadLetterStore, store_path};
@@ -295,12 +294,9 @@ fn op_codes(batch: &ChangeBatch) -> Result<Vec<&str>, StreamError> {
 /// replica identity may carry none), so this stays per-row rather than reading
 /// row 0 and assuming the rest match.
 fn primary_key_columns(batch: &ChangeBatch) -> Result<Vec<Vec<&str>>, StreamError> {
-    let column = batch
-        .record
-        .column_by_name("primary_keys")
-        .ok_or_else(|| {
-            StreamError::Arrow("change batch has no 'primary_keys' column".to_string())
-        })?;
+    let column = batch.record.column_by_name("primary_keys").ok_or_else(|| {
+        StreamError::Arrow("change batch has no 'primary_keys' column".to_string())
+    })?;
 
     let lists = column.as_any().downcast_ref::<ListArray>().ok_or_else(|| {
         StreamError::Arrow(format!(
@@ -392,16 +388,17 @@ pub(crate) async fn forward_change_envelope(
             DeliveryMode::Queued(queue) => {
                 // Hand over owned copies and return: the replication position
                 // advances without waiting for Drasi.
-                queue.enqueue(QueuedBatch {
-                    op_codes: op_codes.into_iter().map(ToString::to_string).collect(),
-                    primary_key_columns: primary_key_columns
-                        .into_iter()
-                        .map(|key| key.into_iter().map(ToString::to_string).collect())
-                        .collect(),
-                    data: data.clone(),
-                    source_commit_ts_ms: batch.source_commit_ts_ms(),
-                })
-                .await;
+                queue
+                    .enqueue(QueuedBatch {
+                        op_codes: op_codes.into_iter().map(ToString::to_string).collect(),
+                        primary_key_columns: primary_key_columns
+                            .into_iter()
+                            .map(|key| key.into_iter().map(ToString::to_string).collect())
+                            .collect(),
+                        data: data.clone(),
+                        source_commit_ts_ms: batch.source_commit_ts_ms(),
+                    })
+                    .await;
             }
         }
     }
@@ -431,10 +428,8 @@ mod tests {
     /// URL parsing as a confusing secondary error.
     #[test]
     fn empty_required_param_is_treated_as_missing() {
-        let params = std::collections::HashMap::from([(
-            HTTP_ENDPOINT_PARAM.to_string(),
-            String::new(),
-        )]);
+        let params =
+            std::collections::HashMap::from([(HTTP_ENDPOINT_PARAM.to_string(), String::new())]);
         required_param("orders", &params, HTTP_ENDPOINT_PARAM)
             .expect_err("an empty endpoint is not a usable endpoint");
     }

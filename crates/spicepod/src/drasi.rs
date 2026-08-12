@@ -300,7 +300,10 @@ tables:
         assert_eq!(drasi.transport, DrasiTransport::Http);
         assert_eq!(drasi.tables.len(), 1);
         assert_eq!(drasi.tables[0].name, "task_history");
-        assert!(drasi.tables[0].key.is_empty(), "key defaults to the table PK");
+        assert!(
+            drasi.tables[0].key.is_empty(),
+            "key defaults to the table PK"
+        );
     }
 
     /// The runtime surface deliberately has no `on_delivery_error`: blocking the
@@ -365,8 +368,7 @@ on_delivery_error: skip
     /// and a delivery failure that stalls rather than drops.
     #[test]
     fn minimal_config_defaults_to_http_and_block() {
-        let drasi: Drasi =
-            yaml::from_str("source_id: cdc-feed").expect("valid drasi config");
+        let drasi: Drasi = yaml::from_str("source_id: cdc-feed").expect("valid drasi config");
 
         assert_eq!(drasi.transport, DrasiTransport::Http);
         assert_eq!(drasi.on_delivery_error, OnDeliveryError::Block);

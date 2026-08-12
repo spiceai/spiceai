@@ -45,7 +45,7 @@ use runtime::dataaccelerator::spice_sys::{
     OpenOption,
     mysql_binlog::{MySqlBinlogCheckpoint, MySqlBinlogSys},
 };
-use runtime::federated_table::FederatedTable;
+use runtime::federated::FederatedTable;
 use runtime::parameters::Parameters;
 use runtime_metrics::component::{MetricSpec, MetricType, ObserveMetricCallback};
 use std::collections::hash_map::DefaultHasher;
@@ -476,6 +476,21 @@ pub(crate) const REPLICATION_METRICS: &[MetricSpec] = &[
          is the unambiguous signal for which dataset stalled the group.",
     )
     .auto_register(),
+    MetricSpec::new(
+        "replication_member_send_stalled_seconds_total",
+        MetricType::ObservableCounterU64,
+    )
+    .description(
+        "Cumulative seconds the shared binlog pump spent blocked delivering committed \
+         changes into this dataset's channel because its sink was not draining (a slow \
+         apply loop). The pump reads the dump socket for the whole group, so this is also \
+         how long the socket went undrained on this dataset's behalf: once a single stall \
+         exceeds the dump session's net_write_timeout the source aborts the connection and \
+         every changes-mode dataset on it resumes from its acked position, so a rising \
+         value names the dataset that will trigger the next reconnect. Paired with \
+         replication_reconnects_total.",
+    )
+    .auto_register(),
 ];
 
 /// Observation callback for one of the [`REPLICATION_METRICS`], or `None`
@@ -585,6 +600,11 @@ pub(crate) fn observe_replication_metric(
         "replication_member_attached" => ObserveMetricCallback::U64(Box::new(move |instrument| {
             instrument.observe(m.member_attached(), &attributes);
         })),
+        "replication_member_send_stalled_seconds_total" => {
+            ObserveMetricCallback::U64(Box::new(move |instrument| {
+                instrument.observe(m.member_send_stalled_seconds_total(), &attributes);
+            }))
+        }
         _ => return None,
     };
     Some(callback)

@@ -90,12 +90,7 @@ impl InternalForwarders {
             by_table.insert(
                 table_ref,
                 TableForwarder {
-                    queue: DeliveryQueue::spawn(
-                        sink,
-                        name,
-                        DEFAULT_QUEUE_DEPTH,
-                        store,
-                    ),
+                    queue: DeliveryQueue::spawn(sink, name, DEFAULT_QUEUE_DEPTH, store),
                     configured_key: table.key.clone(),
                 },
             );
@@ -195,7 +190,6 @@ impl TableForwarder {
             ))
         }
     }
-
 }
 
 /// Node labels for a runtime table, defaulting to its qualified name.
@@ -273,19 +267,24 @@ mod tests {
     /// carries user DML to accelerated tables.
     #[tokio::test]
     async fn only_named_tables_are_forwarded() {
-        let forwarders =
-            InternalForwarders::try_new(&spec(vec![table("task_history")]))
-                .await
-                .expect("builds");
+        let forwarders = InternalForwarders::try_new(&spec(vec![table("task_history")]))
+            .await
+            .expect("builds");
 
         assert!(forwarders.by_table.contains_key(&table_ref("task_history")));
         assert!(!forwarders.by_table.contains_key(&table_ref("metrics")));
-        assert!(!forwarders.by_table.contains_key(&TableReference::bare("orders")));
+        assert!(
+            !forwarders
+                .by_table
+                .contains_key(&TableReference::bare("orders"))
+        );
     }
 
     #[tokio::test]
     async fn no_configured_table_forwards_nothing() {
-        let forwarders = InternalForwarders::try_new(&spec(vec![])).await.expect("builds");
+        let forwarders = InternalForwarders::try_new(&spec(vec![]))
+            .await
+            .expect("builds");
         assert!(forwarders.by_table.is_empty());
     }
 
@@ -344,7 +343,9 @@ mod tests {
     async fn configured_key_overrides_the_declared_primary_key() {
         let mut metrics = table("metrics");
         metrics.key = vec!["trace_id".to_string()];
-        let forwarders = InternalForwarders::try_new(&spec(vec![metrics])).await.expect("builds");
+        let forwarders = InternalForwarders::try_new(&spec(vec![metrics]))
+            .await
+            .expect("builds");
         let forwarder = forwarders
             .by_table
             .get(&table_ref("metrics"))
@@ -365,7 +366,9 @@ mod tests {
     async fn configured_key_column_must_exist() {
         let mut metrics = table("metrics");
         metrics.key = vec!["nope".to_string()];
-        let forwarders = InternalForwarders::try_new(&spec(vec![metrics])).await.expect("builds");
+        let forwarders = InternalForwarders::try_new(&spec(vec![metrics]))
+            .await
+            .expect("builds");
         let forwarder = forwarders
             .by_table
             .get(&table_ref("metrics"))
@@ -407,10 +410,9 @@ mod tests {
     /// panic on the missing entry.
     #[tokio::test]
     async fn an_unconfigured_table_is_ignored() {
-        let forwarders =
-            InternalForwarders::try_new(&spec(vec![table("task_history")]))
-                .await
-                .expect("builds");
+        let forwarders = InternalForwarders::try_new(&spec(vec![table("task_history")]))
+            .await
+            .expect("builds");
 
         forwarders
             .forward(
@@ -427,10 +429,9 @@ mod tests {
     /// a drop rather than forwarded as inserts.
     #[tokio::test]
     async fn overwrite_is_dropped_and_counted() {
-        let forwarders =
-            InternalForwarders::try_new(&spec(vec![table("task_history")]))
-                .await
-                .expect("builds");
+        let forwarders = InternalForwarders::try_new(&spec(vec![table("task_history")]))
+            .await
+            .expect("builds");
 
         forwarders
             .forward(
@@ -454,10 +455,9 @@ mod tests {
     /// already committed these rows, so losing them here loses them for good.
     #[tokio::test]
     async fn a_full_queue_is_retained_rather_than_blocking_the_writer() {
-        let forwarders =
-            InternalForwarders::try_new(&spec(vec![table("task_history")]))
-                .await
-                .expect("builds");
+        let forwarders = InternalForwarders::try_new(&spec(vec![table("task_history")]))
+            .await
+            .expect("builds");
         let forwarder = forwarders
             .by_table
             .get(&table_ref("task_history"))

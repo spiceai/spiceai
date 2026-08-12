@@ -133,6 +133,24 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+impl Error {
+    /// Whether the Spicepod file is absent, as opposed to present but
+    /// unloadable.
+    ///
+    /// A caller that tolerates a missing Spicepod — a Cloud Connect instance
+    /// that has connected but not yet received a deployment — must not also
+    /// tolerate a malformed one: silently serving nothing because of a YAML
+    /// typo hides the mistake instead of reporting it.
+    #[must_use]
+    pub fn is_spicepod_missing(&self) -> bool {
+        match self {
+            Self::SpicepodNotFound { .. } => true,
+            Self::UnableToOpenSpicepod { source, .. } => source.is_not_found(),
+            _ => false,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Spicepod {
     pub version: SpicepodVersion,
@@ -411,6 +429,8 @@ impl Spicepod {
             let spicepod_rdr = fs
                 .open_yaml(path.clone(), "spicepod")
                 .await
+                .map_err(Box::new)
+                .context(UnableToOpenSpicepodSnafu { path: path.clone() })?
                 .context(SpicepodNotFoundSnafu { path: path.clone() })?;
             (spicepod_rdr, path.as_ref())
         };
@@ -431,6 +451,8 @@ impl Spicepod {
         let spicepod_rdr = fs
             .open_yaml(path.clone(), "spicepod")
             .await
+            .map_err(Box::new)
+            .context(UnableToOpenSpicepodSnafu { path: path.clone() })?
             .context(SpicepodNotFoundSnafu { path: path.clone() })?;
 
         let spicepod_definition: SpicepodDefinition =
@@ -1408,6 +1430,58 @@ mod version_tests {
             .await
             .expect("load_from should find spicepod.yaml in a directory");
         assert_eq!(pod.name, "test_pod");
+    }
+
+    #[tokio::test]
+    async fn is_spicepod_missing_distinguishes_absent_from_unloadable() {
+        struct PermissionDeniedFilesystem;
+
+        #[async_trait::async_trait]
+        impl reader::ReadablePath for PermissionDeniedFilesystem {
+            async fn open(
+                &self,
+                path: PathBuf,
+            ) -> reader::Result<Box<dyn std::io::Read + Send + Sync>> {
+                Err(reader::Error::UnableToOpenPath {
+                    source: std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+                    path,
+                })
+            }
+        }
+
+        impl reader::ReadableYaml for PermissionDeniedFilesystem {}
+
+        let dir = tempfile::tempdir().expect("create temp dir");
+
+        let absent_in_dir = Spicepod::load_from(&reader::StdFileSystem, dir.path())
+            .await
+            .expect_err("an empty directory has no spicepod.yaml");
+        assert!(absent_in_dir.is_spicepod_missing());
+
+        let absent_file = Spicepod::load_from(&reader::StdFileSystem, dir.path().join("pod.yaml"))
+            .await
+            .expect_err("a named file that does not exist cannot load");
+        assert!(absent_file.is_spicepod_missing());
+
+        std::fs::write(
+            dir.path().join("spicepod.yaml"),
+            "version: v1\nkind: Spicepod\n",
+        )
+        .expect("write spicepod.yaml");
+        let malformed = Spicepod::load_from(&reader::StdFileSystem, dir.path())
+            .await
+            .expect_err("a spicepod.yaml with no name does not match the schema");
+        assert!(!malformed.is_spicepod_missing());
+
+        let Err(unreadable) = Spicepod::load_from(&PermissionDeniedFilesystem, dir.path()).await
+        else {
+            panic!("permission denied must fail to load");
+        };
+        assert!(
+            matches!(unreadable, Error::UnableToOpenSpicepod { .. }),
+            "the original open error must be preserved: {unreadable}"
+        );
+        assert!(!unreadable.is_spicepod_missing());
     }
 
     /// A directory with dots/dashes in its name (e.g. `my.app-sample`)

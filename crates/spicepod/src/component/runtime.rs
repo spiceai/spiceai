@@ -1021,8 +1021,12 @@ pub enum OutputLevel {
 #[serde(rename_all = "snake_case")]
 pub struct Cpu {
     /// The CPU entitlement, as a Kubernetes CPU quantity: `4`, `3.5`, `3500m`.
-    /// `auto` (the default) detects it. Applied at startup only — the thread
-    /// pools it sizes cannot be resized on a spicepod reload.
+    /// `auto` (the default) detects it, which on a pod that declares a CPU
+    /// request means a bounded multiple of that request. `all` means every
+    /// available core regardless of the request — a CPU limit, if one is set, is
+    /// still respected, and a value set here still narrows an `all` coming from
+    /// `SPICE_CPU_CORES` or `--cpu-cores`. Applied at startup only — the thread pools it sizes
+    /// cannot be resized on a spicepod reload.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cores: Option<CpuQuantity>,
 }
@@ -1030,7 +1034,8 @@ pub struct Cpu {
 /// A CPU quantity, held verbatim so it can be echoed back in an error message.
 ///
 /// Accepts a YAML number (`cores: 4`, `cores: 3.5`) or a string
-/// (`cores: 3500m`, `cores: auto`); it always serializes as a string, so
+/// (`cores: 3500m`, `cores: auto`, `cores: all`); it always serializes as a
+/// string, so
 /// `--set-runtime cpu.cores=…` round-trips through YAML unchanged. Validation
 /// lives in `cpu_budget`, which is where the value is used.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]

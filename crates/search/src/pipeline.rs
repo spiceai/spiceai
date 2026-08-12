@@ -75,6 +75,21 @@ where
     engine: Arc<dyn QueryEngine>,
 }
 
+fn candidate_pool_limit<A: CandidateAggregation>(
+    aggregator: &A,
+    generator_count: usize,
+    limit: usize,
+) -> usize {
+    // A single generator is returned directly by RRF, so it must retain the
+    // user-visible limit. Only multiple generators can benefit from a wider
+    // pre-fusion candidate pool.
+    if generator_count > 1 {
+        aggregator.candidate_pool_size(limit)
+    } else {
+        limit
+    }
+}
+
 impl<A: CandidateAggregation> SearchPipeline<A> {
     #[must_use]
     pub fn new(
@@ -111,6 +126,8 @@ impl<A: CandidateAggregation> SearchPipeline<A> {
         .unique()
         .collect();
 
+        let candidate_limit = candidate_pool_limit(&self.aggregator, self.generators.len(), limit);
+
         let generation_results: Vec<VectorSearchGenerationResult> =
             futures::future::try_join_all(self.generators.iter().map(|g| async {
                 let content_col = g.value_derived_from();
@@ -132,7 +149,7 @@ impl<A: CandidateAggregation> SearchPipeline<A> {
                     columns,
                     filters,
                     &primary_keys,
-                    Some(limit),
+                    Some(candidate_limit),
                 )
                 .context(SearchRequestConstructionSnafu)?;
 
@@ -295,6 +312,15 @@ pub fn validate_keyword_to_ilike(k: &str, target_column: &str) -> Result<Expr, E
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::aggregation::reciprocal_rank::ReciprocalRankFusion;
+
+    /// Regression test for #12242: the HTTP pipeline gives every RRF leg a
+    /// wider candidate pool, but does not widen a direct single-leg response.
+    #[test]
+    fn rrf_candidate_limit_is_widened_only_for_fusion() {
+        assert_eq!(candidate_pool_limit(&ReciprocalRankFusion, 2, 10), 40);
+        assert_eq!(candidate_pool_limit(&ReciprocalRankFusion, 1, 10), 10);
+    }
 
     #[test]
     fn test_search_request_prepare_keywords() {

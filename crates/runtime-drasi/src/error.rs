@@ -18,7 +18,7 @@ use snafu::prelude::*;
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-const DOCS: &str = "https://spiceai.org/docs/components/data-connectors";
+const DOCS: &str = "https://spiceai.org/docs/reference/spicepod/datasets#drasi";
 
 /// Whether retrying an identical delivery could plausibly succeed.
 ///

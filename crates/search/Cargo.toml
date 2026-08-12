@@ -36,6 +36,7 @@ s3_vectors = { path = "../s3_vectors", optional = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 snafu.workspace = true
+spice-table = { path = "../spice-table" }
 tantivy = { workspace = true, optional = true }
 tokio.workspace = true
 tracing.workspace = true

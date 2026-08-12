@@ -298,20 +298,16 @@ mod tests {
 
     #[test]
     fn single_column_key_matches_the_drasi_convention() {
-        let id = element_id(&mapping(), &["id"], &row(&[("id", 12_345.into())]))
-            .expect("derives an id");
+        let id =
+            element_id(&mapping(), &["id"], &row(&[("id", 12_345.into())])).expect("derives an id");
         assert_eq!(id, "public.orders:12345");
     }
 
     /// A text key contributes its contents, not its JSON quoting.
     #[test]
     fn string_key_is_unquoted() {
-        let id = element_id(
-            &mapping(),
-            &["sku"],
-            &row(&[("sku", "ABC-1".into())]),
-        )
-        .expect("derives an id");
+        let id = element_id(&mapping(), &["sku"], &row(&[("sku", "ABC-1".into())]))
+            .expect("derives an id");
         assert_eq!(id, "public.orders:ABC-1");
     }
 
@@ -319,12 +315,8 @@ mod tests {
     /// survives verbatim and stays byte-identical to Drasi's convention.
     #[test]
     fn single_column_key_is_never_escaped() {
-        let id = element_id(
-            &mapping(),
-            &["sku"],
-            &row(&[("sku", "a_b".into())]),
-        )
-        .expect("derives an id");
+        let id = element_id(&mapping(), &["sku"], &row(&[("sku", "a_b".into())]))
+            .expect("derives an id");
         assert_eq!(id, "public.orders:a_b");
     }
 
@@ -393,12 +385,8 @@ mod tests {
     /// every such row onto a single node.
     #[test]
     fn null_key_is_rejected() {
-        let err = element_id(
-            &mapping(),
-            &["id"],
-            &row(&[("id", Value::Null)]),
-        )
-        .expect_err("a NULL key has no stable id");
+        let err = element_id(&mapping(), &["id"], &row(&[("id", Value::Null)]))
+            .expect_err("a NULL key has no stable id");
         assert!(matches!(err, Error::PrimaryKeyValueNull { .. }));
     }
 
@@ -419,8 +407,7 @@ mod tests {
     #[test]
     fn id_prefix_falls_back_to_the_dataset_name_without_labels() {
         let mapping = ElementMapping::new("orders".to_string(), vec![]);
-        let id = element_id(&mapping, &["id"], &row(&[("id", 7.into())]))
-            .expect("derives an id");
+        let id = element_id(&mapping, &["id"], &row(&[("id", 7.into())])).expect("derives an id");
         assert_eq!(id, "orders:7");
     }
 

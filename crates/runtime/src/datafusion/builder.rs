@@ -25,7 +25,7 @@ use super::{
     SPICE_RUNTIME_SCHEMA,
 };
 #[cfg(not(windows))]
-use crate::accelerated_table::AcceleratedTable;
+use crate::accelerated::AcceleratedTable;
 use crate::cluster::ExecutorRegistry;
 use crate::cluster::ResolvedClusterConfig;
 #[cfg(not(windows))]
@@ -1476,8 +1476,7 @@ fn is_cayenne_accelerated_table_provider(provider: &dyn TableProvider) -> bool {
         return true;
     }
 
-    provider
-        .downcast_ref::<AcceleratedTable>()
+    spice_table::find_layer::<AcceleratedTable>(provider, spice_table::LayerWalk::Read)
         .is_some_and(|table| is_cayenne_table_provider(table.get_accelerator().as_ref()))
 }
 
@@ -1487,7 +1486,9 @@ fn is_cayenne_table_provider(provider: &dyn TableProvider) -> bool {
         return true;
     }
 
-    if let Some(poly) = provider.downcast_ref::<PolyTableProvider>() {
+    if let Some(poly) =
+        spice_table::find_layer::<PolyTableProvider>(provider, spice_table::LayerWalk::Write)
+    {
         return is_cayenne_table_provider(poly.writer().as_ref())
             || is_cayenne_table_provider(poly.get_federated_table_provider().as_ref());
     }
@@ -2516,13 +2517,16 @@ mod tests {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
         let table =
             Arc::new(MemTable::try_new(Arc::clone(&schema), vec![vec![]]).expect("memtable"));
-        let provider = PolyTableProvider::new_with_schema_metadata(
+        let provider = Arc::new(PolyTableProvider::new_with_schema_metadata(
             Arc::clone(&table) as Arc<dyn TableProvider>,
             table,
             HashMap::from([("spice.accelerator".to_string(), "cayenne".to_string())]),
-        );
+        ))
+        .into_table();
 
-        assert!(super::is_cayenne_accelerated_table_provider(&provider));
+        assert!(super::is_cayenne_accelerated_table_provider(
+            provider.as_ref()
+        ));
     }
 
     /// Builds a full `DataFusion` instance and verifies the analyzer rules on

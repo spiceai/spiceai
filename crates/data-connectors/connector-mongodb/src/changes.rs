@@ -45,7 +45,7 @@ use runtime::{
         mongodb::{MongoCheckpointMetadata, MongoSys},
     },
     dataconnector::schema_projection::{ProjectionPolicy, parse_schema_projection},
-    federated_table::FederatedTable,
+    federated::FederatedTable,
     parameters::{ExposedParamLookup, Parameters},
 };
 use std::{sync::Arc, time::Duration};

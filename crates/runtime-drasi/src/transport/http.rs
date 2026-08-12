@@ -127,10 +127,9 @@ impl DrasiTransport for HttpTransport {
 
         let status = response.status();
         if !status.is_success() {
-            return Err(self.target.error(
-                format!("Drasi returned HTTP {status}."),
-                classify(status),
-            ));
+            return Err(self
+                .target
+                .error(format!("Drasi returned HTTP {status}."), classify(status)));
         }
 
         // A 200 does not mean every event landed: when only some fail, Drasi
@@ -193,9 +192,15 @@ mod tests {
             Retryable::Transient,
             "503 is what Drasi answers when its durability buffer is full"
         );
-        assert_eq!(classify(StatusCode::INTERNAL_SERVER_ERROR), Retryable::Transient);
+        assert_eq!(
+            classify(StatusCode::INTERNAL_SERVER_ERROR),
+            Retryable::Transient
+        );
         assert_eq!(classify(StatusCode::REQUEST_TIMEOUT), Retryable::Transient);
-        assert_eq!(classify(StatusCode::TOO_MANY_REQUESTS), Retryable::Transient);
+        assert_eq!(
+            classify(StatusCode::TOO_MANY_REQUESTS),
+            Retryable::Transient
+        );
     }
 
     /// A 400 is a source-id mismatch or a malformed payload; retrying it just

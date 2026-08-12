@@ -127,11 +127,7 @@ impl DeadLetterStore {
     /// # Errors
     ///
     /// Returns an error if the directory cannot be created or listed.
-    pub(crate) async fn open(
-        dir: PathBuf,
-        component: String,
-        max_batches: usize,
-    ) -> Result<Self> {
+    pub(crate) async fn open(dir: PathBuf, component: String, max_batches: usize) -> Result<Self> {
         tokio::fs::create_dir_all(&dir)
             .await
             .context(PrepareDirectorySnafu { path: dir.clone() })?;
@@ -192,7 +188,9 @@ impl DeadLetterStore {
 
         let sequence = self.next_sequence.fetch_add(1, Ordering::Relaxed);
         let path = self.dir.join(batch_file_name(sequence));
-        let temporary = self.dir.join(format!("{}.partial", batch_file_name(sequence)));
+        let temporary = self
+            .dir
+            .join(format!("{}.partial", batch_file_name(sequence)));
 
         let metadata = serde_json::to_string(&BatchMetadata {
             op_codes: batch.op_codes.clone(),
@@ -205,12 +203,11 @@ impl DeadLetterStore {
 
         let data = batch.data.clone();
         // Arrow IPC encoding is synchronous and CPU-bound.
-        let encoded =
-            tokio::task::spawn_blocking(move || encode(&data, &metadata))
-                .await
-                .map_err(|e| Error::EncodeBatch {
-                    source: arrow::error::ArrowError::ExternalError(Box::new(e)),
-                })??;
+        let encoded = tokio::task::spawn_blocking(move || encode(&data, &metadata))
+            .await
+            .map_err(|e| Error::EncodeBatch {
+                source: arrow::error::ArrowError::ExternalError(Box::new(e)),
+            })??;
 
         // Written to a sibling name and renamed, so a crash mid-write cannot
         // leave a truncated file that recovery would try to deliver.
@@ -377,8 +374,7 @@ fn encode(batch: &RecordBatch, metadata: &str) -> Result<Vec<u8>> {
     );
 
     let mut buffer = Vec::new();
-    let mut writer =
-        FileWriter::try_new(&mut buffer, &schema).context(EncodeBatchSnafu)?;
+    let mut writer = FileWriter::try_new(&mut buffer, &schema).context(EncodeBatchSnafu)?;
     writer.write(batch).context(EncodeBatchSnafu)?;
     writer.finish().context(EncodeBatchSnafu)?;
     drop(writer);
@@ -387,7 +383,9 @@ fn encode(batch: &RecordBatch, metadata: &str) -> Result<Vec<u8>> {
 }
 
 async fn read_batch(path: &Path) -> Result<QueuedBatch> {
-    let bytes = tokio::fs::read(path).await.context(WriteBatchSnafu { path })?;
+    let bytes = tokio::fs::read(path)
+        .await
+        .context(WriteBatchSnafu { path })?;
     let path = path.to_path_buf();
 
     tokio::task::spawn_blocking(move || decode(&bytes, &path))
@@ -398,8 +396,8 @@ async fn read_batch(path: &Path) -> Result<QueuedBatch> {
 }
 
 fn decode(bytes: &[u8], path: &Path) -> Result<QueuedBatch> {
-    let reader =
-        FileReader::try_new(std::io::Cursor::new(bytes), None).context(DecodeBatchSnafu { path })?;
+    let reader = FileReader::try_new(std::io::Cursor::new(bytes), None)
+        .context(DecodeBatchSnafu { path })?;
 
     let metadata: BatchMetadata = reader
         .schema()
@@ -450,9 +448,9 @@ pub(crate) fn store_path(component: &str) -> PathBuf {
 mod tests {
     use super::*;
     use arrow::array::Array;
-    use std::sync::Arc;
     use arrow::array::StringArray;
     use arrow::datatypes::{DataType, Field};
+    use std::sync::Arc;
 
     fn batch(id: &str) -> RecordBatch {
         RecordBatch::try_new(
@@ -478,7 +476,9 @@ mod tests {
             .as_any()
             .downcast_ref::<StringArray>()
             .expect("utf8");
-        (0..column.len()).map(|i| column.value(i).to_string()).collect()
+        (0..column.len())
+            .map(|i| column.value(i).to_string())
+            .collect()
     }
 
     #[tokio::test]
@@ -512,10 +512,15 @@ mod tests {
         store.append(&queued("row-1")).await.expect("appends");
         assert!(!store.is_empty().await);
 
-        let delivered = store.drain(|_| async { crate::drasi::queue::Outcome::Delivered }).await;
+        let delivered = store
+            .drain(|_| async { crate::drasi::queue::Outcome::Delivered })
+            .await;
 
         assert_eq!(delivered, 1);
-        assert!(store.is_empty().await, "a delivered batch must not be retried");
+        assert!(
+            store.is_empty().await,
+            "a delivered batch must not be retried"
+        );
     }
 
     #[tokio::test]
@@ -524,10 +529,15 @@ mod tests {
         let store = store(&dir, DEFAULT_MAX_BATCHES).await;
 
         store.append(&queued("row-1")).await.expect("appends");
-        let delivered = store.drain(|_| async { crate::drasi::queue::Outcome::Retain }).await;
+        let delivered = store
+            .drain(|_| async { crate::drasi::queue::Outcome::Retain })
+            .await;
 
         assert_eq!(delivered, 0);
-        assert!(!store.is_empty().await, "a failed batch must be retried later");
+        assert!(
+            !store.is_empty().await,
+            "a failed batch must be retried later"
+        );
     }
 
     /// The ordering guarantee: a full-state replace applied out of order would
@@ -586,7 +596,11 @@ mod tests {
 
         assert_eq!(
             *seen.lock().expect("not poisoned"),
-            vec!["row-1".to_string(), "row-2".to_string(), "row-3".to_string()]
+            vec![
+                "row-1".to_string(),
+                "row-2".to_string(),
+                "row-3".to_string()
+            ]
         );
     }
 
@@ -686,11 +700,17 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = store(&dir, DEFAULT_MAX_BATCHES).await;
 
-        tokio::fs::write(dir.path().join("00000000000000000007.arrow.partial"), b"garbage")
-            .await
-            .expect("writes");
+        tokio::fs::write(
+            dir.path().join("00000000000000000007.arrow.partial"),
+            b"garbage",
+        )
+        .await
+        .expect("writes");
 
-        assert!(store.is_empty().await, "a partial write is not a pending batch");
+        assert!(
+            store.is_empty().await,
+            "a partial write is not a pending batch"
+        );
     }
 
     /// An unreadable file would otherwise block the queue forever.
@@ -707,7 +727,9 @@ mod tests {
         let store = store(&dir, DEFAULT_MAX_BATCHES).await;
         store.append(&queued("row-1")).await.expect("appends");
 
-        let delivered = store.drain(|_| async { crate::drasi::queue::Outcome::Delivered }).await;
+        let delivered = store
+            .drain(|_| async { crate::drasi::queue::Outcome::Delivered })
+            .await;
 
         assert_eq!(delivered, 1, "the readable batch behind it still lands");
         assert_eq!(store.discarded(), 1);
@@ -749,7 +771,10 @@ mod tests {
     fn file_names_sort_numerically() {
         assert!(batch_file_name(2) < batch_file_name(10));
         assert_eq!(parse_batch_file_name(&batch_file_name(10)), Some(10));
-        assert_eq!(parse_batch_file_name("00000000000000000010.arrow.partial"), None);
+        assert_eq!(
+            parse_batch_file_name("00000000000000000010.arrow.partial"),
+            None
+        );
         assert_eq!(parse_batch_file_name("notes.txt"), None);
     }
 

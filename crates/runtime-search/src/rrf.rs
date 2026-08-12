@@ -13,7 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use ::search::aggregation::reciprocal_rank::DEFAULT_RRF_K;
+use ::search::aggregation::reciprocal_rank::{DEFAULT_RRF_K, rrf_candidate_pool_size};
 use arrow_schema::{DataType, SchemaRef};
 use async_trait::async_trait;
 use datafusion::catalog::{Session, TableFunctionImpl, TableProvider};
@@ -80,12 +80,6 @@ pub static RRF_FUSED_SCORE_COLUMN_NAME: &str = "_fused_score";
 /// Internal column name for the synthetic row ID used when no user-provided join key exists.
 const RRF_ROW_ID_COLUMN_NAME: &str = "__spice_rrf_row_id";
 
-/// When the user sets a fused-result `limit` on `rrf()`, each underlying search
-/// subquery is asked for `limit * RRF_CANDIDATE_POOL_FACTOR` rows so the
-/// rank-fusion has a wider pool of candidates to combine. The post-fuse
-/// `.limit(0, Some(l))` still caps the final result to exactly `l` rows. This
-/// trades a small amount of extra index work for materially better recall.
-pub const RRF_CANDIDATE_POOL_FACTOR: usize = 4;
 pub static DOCUMENTATION: LazyLock<Documentation> = LazyLock::new(|| {
     Documentation {
     doc_section: DocSection::default(),
@@ -98,7 +92,7 @@ pub static DOCUMENTATION: LazyLock<Documentation> = LazyLock::new(|| {
             "Inline text_search or vector_search UDTF invocations".to_string(),
         ),
         ("k".to_string(), "RRF smoothing parameter (default: 60.0)".to_string()),
-        ("limit".to_string(), "Upper bound on fused result rows. Also propagated to any nested search query that does not specify its own limit, reducing work in the underlying search indexes.".to_string()),
+        ("limit".to_string(), "Upper bound on fused result rows. Nested searches without an explicit limit contribute a wider RRF candidate pool before this final limit is applied.".to_string()),
         ("join_key".to_string(), "Column name to use for joining results instead of auto-generated row ID".to_string()),
         ("time_column".to_string(), "Column name containing timestamps for recency boosting".to_string()),
         ("recency_decay".to_string(), "Type of decay function: 'linear' or 'exponential' (default: 'exponential')".to_string()),
@@ -157,7 +151,7 @@ macro_rules! col_qualified {
     };
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 enum RecencyDecay {
     Linear,
     Exponential,
@@ -702,37 +696,52 @@ impl ReciprocalRankFusion {
         };
 
         // Defaults: exponential decay over days (86400s)
-        let recency_decay = args
-            .recency_decay
-            .clone()
-            .unwrap_or(RecencyDecay::Exponential);
+        let recency_decay = args.recency_decay.unwrap_or(RecencyDecay::Exponential);
         let decay_scale_secs = args.decay_scale_secs.unwrap_or(86400.0);
 
-        // Lots of casting annoyances are avoided by treating everything as `long`
+        // Lots of casting annoyances are avoided by treating everything as `long`.
         let today_epoch = to_unixtime(vec![now()]);
         let recency_col_epoch = to_unixtime(vec![qualified_recency_col]);
-        let age_in_units = (today_epoch - recency_col_epoch) / lit(decay_scale_secs);
+
+        Ok((score_expr
+            * Self::recency_boost_expr(
+                recency_decay,
+                args.decay_constant,
+                decay_scale_secs,
+                args.decay_window_secs,
+                today_epoch,
+                recency_col_epoch,
+            ))
+        .alias(RRF_FUSED_SCORE_COLUMN_NAME))
+    }
+
+    fn recency_boost_expr(
+        recency_decay: RecencyDecay,
+        decay_constant: Option<f64>,
+        decay_scale_secs: f64,
+        decay_window_secs: Option<f64>,
+        current_time_epoch: Expr,
+        recency_time_epoch: Expr,
+    ) -> Expr {
+        let age_in_seconds = current_time_epoch - recency_time_epoch;
 
         let recency_expr = match recency_decay {
             // e^(-alpha * age units)
             RecencyDecay::Exponential => {
-                let decay_constant = args.decay_constant.unwrap_or(0.01);
+                let decay_constant = decay_constant.unwrap_or(0.01);
                 #[expect(clippy::neg_multiply)]
-                exp(lit(-1.0f64 * decay_constant) * age_in_units)
+                exp(lit(-1.0f64 * decay_constant) * (age_in_seconds / lit(decay_scale_secs)))
             }
-            // 1 - (age units / boost window)
+            // The linear decay window is expressed in seconds.
             RecencyDecay::Linear => {
-                let decay_window_secs = args.decay_window_secs.unwrap_or(86400.0);
-                let boost = lit(1) - (age_in_units / lit(decay_window_secs));
-                greatest(vec![lit(0), boost])
+                let decay_window_secs = decay_window_secs.unwrap_or(86400.0);
+                let boost = lit(1.0) - (age_in_seconds / lit(decay_window_secs));
+                greatest(vec![lit(0.0), boost])
             }
         };
 
         // Fall back to the original score expression if a recency boost cannot be computed
-        Ok(
-            (score_expr * coalesce(vec![recency_expr, lit(1.0)]))
-                .alias(RRF_FUSED_SCORE_COLUMN_NAME),
-        )
+        coalesce(vec![recency_expr, lit(1.0)])
     }
 
     // Given arguments to n search calls: execute searches, generate row IDs, rank by score, JOIN,
@@ -943,7 +952,7 @@ impl ReciprocalRankFusion {
                 // The subquery search providers honor scan-level limits (pushed
                 // down through DataFusion's optimizer), so this reduces work in
                 // the underlying search indexes and network overhead. We
-                // multiply by RRF_CANDIDATE_POOL_FACTOR so the rank-fusion has
+                // use the shared RRF candidate-pool policy so the rank-fusion has
                 // enough overlap candidates to produce a stable top-`l` result;
                 // the final `.limit(0, Some(l))` after fusion still caps the
                 // user-visible output exactly.
@@ -962,7 +971,7 @@ impl ReciprocalRankFusion {
 
                 let df = match args.limit {
                     Some(l) if !subquery_has_explicit_limit => {
-                        let pool = l.saturating_mul(RRF_CANDIDATE_POOL_FACTOR);
+                        let pool = rrf_candidate_pool_size(l);
                         df.limit(0, Some(pool))?
                     }
                     _ => df,
@@ -1323,6 +1332,7 @@ impl TableProvider for ReciprocalRankFusion {
 
 #[cfg(test)]
 mod tests {
+    use crate::rrf::RecencyDecay;
     use crate::rrf::ReciprocalRankFusion;
     use crate::rrf::ReciprocalRankFusionArgs;
     use arrow::array::{Float64Array, StringArray};
@@ -1593,5 +1603,58 @@ mod tests {
                 "+----+\n", "| id |\n", "+----+\n", "| A  |\n", "| B  |\n", "+----+"
             )
         );
+    }
+
+    #[expect(clippy::float_cmp)]
+    #[tokio::test]
+    async fn linear_recency_decay_uses_second_window() {
+        let ctx = SessionContext::new();
+        let fixed_now_epoch_secs = 1_000_000_i64;
+        let decay_window_secs = 3_600.0;
+
+        let boost_at_window = ReciprocalRankFusion::recency_boost_expr(
+            RecencyDecay::Linear,
+            None,
+            86_400.0,
+            Some(decay_window_secs),
+            lit(fixed_now_epoch_secs),
+            lit(fixed_now_epoch_secs - 3_600),
+        )
+        .alias("boost_at_window");
+        let boost_halfway_through_window = ReciprocalRankFusion::recency_boost_expr(
+            RecencyDecay::Linear,
+            None,
+            86_400.0,
+            Some(decay_window_secs),
+            lit(fixed_now_epoch_secs),
+            lit(fixed_now_epoch_secs - 1_800),
+        )
+        .alias("boost_halfway_through_window");
+
+        let batches = ctx
+            .sql("SELECT 1")
+            .await
+            .expect("create single-row dataframe")
+            .select(vec![boost_at_window, boost_halfway_through_window])
+            .expect("select recency boosts")
+            .collect()
+            .await
+            .expect("collect recency boosts");
+        let boosts = &batches[0];
+        let boost_at_window = boosts
+            .column(0)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .expect("boost at window is a Float64 array")
+            .value(0);
+        let boost_halfway_through_window = boosts
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .expect("boost halfway through window is a Float64 array")
+            .value(0);
+
+        assert_eq!(boost_at_window, 0.0);
+        assert_eq!(boost_halfway_through_window, 0.5);
     }
 }

@@ -207,7 +207,10 @@ impl DrasiTransport for RedisStreamTransport {
             .await
             .map_err(|e| {
                 self.target.error(
-                    format!("Could not append to Redis stream '{}': {e}.", self.stream_key),
+                    format!(
+                        "Could not append to Redis stream '{}': {e}.",
+                        self.stream_key
+                    ),
                     Retryable::Transient,
                 )
             })?;
@@ -235,8 +238,13 @@ mod tests {
     }
 
     fn transport() -> RedisStreamTransport {
-        RedisStreamTransport::try_new("orders", "spice-cdc", "redis://127.0.0.1:6379", "drasi-events")
-            .expect("builds")
+        RedisStreamTransport::try_new(
+            "orders",
+            "spice-cdc",
+            "redis://127.0.0.1:6379",
+            "drasi-events",
+        )
+        .expect("builds")
     }
 
     #[test]

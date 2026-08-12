@@ -81,9 +81,12 @@ impl DrasiSink {
                 endpoint,
                 *request_timeout,
             )?),
-            TransportConfig::Redis { url, stream_key } => Arc::new(
-                RedisStreamTransport::try_new(&config.dataset, &config.source_id, url, stream_key)?,
-            ),
+            TransportConfig::Redis { url, stream_key } => Arc::new(RedisStreamTransport::try_new(
+                &config.dataset,
+                &config.source_id,
+                url,
+                stream_key,
+            )?),
         };
 
         Ok(Self {
@@ -215,10 +218,8 @@ impl DrasiSink {
     fn on_terminal_failure(&self, error: Error, changes: usize) -> Result<()> {
         match self.config.on_delivery_error {
             OnDeliveryError::Skip => {
-                let total = self
-                    .skipped
-                    .fetch_add(changes as u64, Ordering::Relaxed)
-                    + changes as u64;
+                let total =
+                    self.skipped.fetch_add(changes as u64, Ordering::Relaxed) + changes as u64;
                 tracing::warn!(
                     "Dropping {changes} undelivered change(s) for dataset {} (drasi, on_delivery_error: skip; {total} dropped so far): {error}",
                     self.config.dataset

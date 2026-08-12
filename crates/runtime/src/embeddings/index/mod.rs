@@ -47,10 +47,10 @@ pub mod tests {
         sql::TableReference,
     };
     use datafusion_expr::{LogicalPlan, TableScan};
-    use runtime_datafusion_index::Index;
     use search::index::VectorIndex;
     use search::{SEARCH_SCORE_COLUMN_NAME, generation::util::append_fields, index::SearchIndex};
     use snafu::ResultExt;
+    use spice_table::Index;
 
     use runtime_search::embedding_col;
 

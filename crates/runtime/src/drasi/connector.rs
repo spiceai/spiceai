@@ -23,14 +23,14 @@ use datafusion::datasource::TableProvider;
 use futures::StreamExt;
 use runtime_metrics::component::MetricsProvider;
 
-use crate::accelerated_table::{self, AcceleratedTable};
+use crate::accelerated::{self, AcceleratedTable};
 use crate::component::{
     ComponentInitialization,
     dataset::{Dataset, acceleration::RefreshMode},
 };
 use crate::dataconnector::{DataConnector, DataConnectorResult};
 use crate::drasi::{DeliveryMode, forward_change_envelope};
-use crate::federated_table::FederatedTable;
+use crate::federated::FederatedTable;
 
 /// A [`DataConnector`] middleware that publishes the wrapped connector's change
 /// stream to a Drasi source before it reaches the accelerator.
@@ -116,7 +116,7 @@ impl DataConnector for DrasiConnector {
     async fn on_accelerator_setup(
         &self,
         dataset: &Dataset,
-        builder: &mut accelerated_table::Builder,
+        builder: &mut accelerated::Builder,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.inner_connector
             .on_accelerator_setup(dataset, builder)
@@ -150,7 +150,10 @@ impl DataConnector for DrasiConnector {
         federated_table: Arc<FederatedTable>,
         dataset: &Dataset,
     ) -> Option<ChangesStream> {
-        self.with_forwarded_stream(self.inner_connector.changes_stream(federated_table, dataset))
+        self.with_forwarded_stream(
+            self.inner_connector
+                .changes_stream(federated_table, dataset),
+        )
     }
 
     fn supports_append_stream(&self) -> bool {
