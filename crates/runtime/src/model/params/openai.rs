@@ -23,6 +23,8 @@ use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+pub const CODEX_API_BASE: &str = "https://chatgpt.com/backend-api/codex";
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum OpenAiAuthMode {
     #[default]
@@ -147,9 +149,14 @@ impl TypedParams for OpenAiModelParams {
 
         let fields =
             OpenAiModelParamsFields::try_from_params(component_name, params, secrets).await?;
+        let endpoint = if auth.is_codex() && fields.endpoint == "https://api.openai.com/v1" {
+            CODEX_API_BASE.to_string()
+        } else {
+            fields.endpoint
+        };
 
         Ok(Self {
-            endpoint: fields.endpoint,
+            endpoint,
             auth,
             org_id: fields.org_id,
             project_id: fields.project_id,

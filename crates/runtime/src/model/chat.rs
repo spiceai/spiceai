@@ -642,12 +642,6 @@ fn openai(
 }
 
 pub(super) fn validate_codex_params(params: &OpenAiModelParams) -> Result<(), LlmError> {
-    if params.endpoint == "https://api.openai.com/v1" {
-        return Err(LlmError::FailedToLoadModel {
-            source: "Codex authentication requires `openai_endpoint` to be the Codex backend endpoint. Set `openai_endpoint`, for example `https://chatgpt.com/backend-api/codex`.".into(),
-        });
-    }
-
     if params.responses_api != llms::openai::ChatBackend::Responses {
         return Err(LlmError::FailedToLoadModel {
             source: "Codex authentication requires `openai_responses_api: enabled` so chat-completions requests use the Responses API.".into(),

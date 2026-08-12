@@ -146,6 +146,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn openai_codex_authentication_defaults_to_codex_endpoint() {
+        let typed = openai::OpenAiModelParams::try_from_params(
+            "model openai",
+            params(&[("openai_auth_mode", "codex")]),
+            &empty_secrets(),
+        )
+        .await
+        .expect("Codex authentication params should deserialize");
+
+        assert_eq!(typed.endpoint, openai::CODEX_API_BASE);
+    }
+
+    #[tokio::test]
+    async fn openai_codex_authentication_preserves_endpoint_override() {
+        let typed = openai::OpenAiModelParams::try_from_params(
+            "model openai",
+            params(&[
+                ("openai_auth_mode", "codex"),
+                ("openai_endpoint", "https://codex.example/v1"),
+            ]),
+            &empty_secrets(),
+        )
+        .await
+        .expect("Codex authentication params should deserialize");
+
+        assert_eq!(typed.endpoint, "https://codex.example/v1");
+    }
+
+    #[tokio::test]
     async fn openai_rejects_invalid_usage_tier() {
         let err = openai::OpenAiModelParams::try_from_params(
             "model openai",
