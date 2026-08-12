@@ -117,14 +117,20 @@ mod tests {
         let start = tokio::time::Instant::now();
 
         loop {
-            let found = store
+            // `next()` yields `Option<Result<_>>`, so a listing *error* must not
+            // read as "the object appeared" — fail on it instead of polling on.
+            let found = match store
                 .list(None)
                 .try_filter(|object| {
                     std::future::ready(object.location.as_ref().starts_with(&prefix))
                 })
                 .next()
                 .await
-                .is_some();
+            {
+                Some(Ok(_)) => true,
+                Some(Err(error)) => panic!("failed to list persisted state objects: {error}"),
+                None => false,
+            };
             if found {
                 return;
             }

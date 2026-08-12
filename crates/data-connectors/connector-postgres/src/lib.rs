@@ -44,7 +44,7 @@ use runtime::dataconnector::{
 };
 use runtime_datafusion::function_support::deny_spice_functions_for_postgres_table_providers;
 use runtime_metrics::component::MetricsProvider;
-use runtime_parameters::ParameterSpec;
+use runtime_parameters::{ParameterSpec, Parameters};
 use secrecy::SecretBox;
 use snafu::prelude::*;
 use std::any::Any;
@@ -66,7 +66,7 @@ pub enum Error {
 pub struct Postgres {
     factory: PostgresTableFactory,
     pool: Arc<PostgresConnectionPool>,
-    params: runtime::parameters::Parameters,
+    params: Parameters,
     replication_metrics:
         std::sync::Arc<data_components::postgres_replication::ReplicationMetricsCollector>,
 }

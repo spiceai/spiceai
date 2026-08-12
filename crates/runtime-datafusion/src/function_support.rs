@@ -50,8 +50,9 @@ pub fn deny_spice_functions_for_duckdb_table_providers() -> FunctionSupport {
 /// `DataFusion`'s nested array/list/map functions that `PostgreSQL` cannot
 /// evaluate are denied for `PostgreSQL` and PostgreSQL-wire backends (e.g.
 /// Redshift). The ones that match `PostgreSQL` exactly are listed here so they
-/// keep pushing down — this is `PostgreSQL`'s own knowledge of what it can run,
-/// which is why it lives beside the connector rather than in the registry.
+/// keep pushing down — this is dialect-level knowledge of what the backend can
+/// run, which is why it sits beside [`crate::dialect`] rather than in the UDF
+/// registry, whose entries are backend-agnostic.
 ///
 /// Public because it *is* the pushdown allowlist: a caller assembling its own
 /// PostgreSQL-flavored [`FunctionSupport`] needs to know which array functions

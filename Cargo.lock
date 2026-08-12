@@ -4869,6 +4869,7 @@ dependencies = [
  "percent-encoding",
  "reqwest 0.13.4",
  "runtime",
+ "runtime-datafusion",
  "runtime-object-store",
  "runtime-parameters",
  "secrecy",

@@ -1406,7 +1406,7 @@ mod tests {
                 ),
             ],
             "databricks",
-            Arc::new(tokio::sync::RwLock::new(runtime::secrets::Secrets::new())),
+            Arc::new(tokio::sync::RwLock::new(runtime_secrets::Secrets::new())),
             PARAMETERS,
         )
         .await

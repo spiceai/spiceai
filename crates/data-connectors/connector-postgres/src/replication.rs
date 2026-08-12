@@ -17,7 +17,7 @@ limitations under the License.
 //! Glue between Spice's connector params and the `postgres_replication` module.
 //!
 //! Responsibilities:
-//!   - Parse connection & replication params out of `runtime::parameters::Parameters`.
+//!   - Parse connection & replication params out of `runtime_parameters::Parameters`.
 //!   - Fall back to sensible per-replica defaults for slot & publication names.
 //!   - Look up the source table schema (via the federated table) and hand everything
 //!     off to `data_components::postgres_replication::start_replication_stream`.

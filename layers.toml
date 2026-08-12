@@ -130,7 +130,7 @@ runtime-component = "shared-utility"
 # `shared-utility`, NOT `extension-utility`, even though it is a connector-facing
 # building block: `runtime`'s own in-body https connector uses it, and
 # extension-utility may not be depended on by `runtime`. It becomes eligible to
-# move up once that connector is evacuated (see docs/dev/crate_layering_plan.md).
+# move up once that connector is evacuated (see docs/dev/crate_layering.md).
 data-connector-rate-control = "shared-utility"
 # The table-provider layers carved out of the `runtime` crate body: the
 # `AcceleratedTable` machinery (refresh/retention/CDC-apply/caching) and the
