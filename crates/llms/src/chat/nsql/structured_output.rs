@@ -66,7 +66,7 @@ impl SqlGeneration for StructuredOutputSqlGeneration {
                     name: "sql_mode".to_string(),
                     description: None,
                     strict: Some(true),
-                    schema: Some(structured_output_schema),
+                    schema: structured_output_schema,
                 },
             })
             .messages(messages)

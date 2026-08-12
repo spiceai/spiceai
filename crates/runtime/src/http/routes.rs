@@ -74,6 +74,7 @@ use axum::{
 use runtime_auth::{AuthRequestContext, layer::http::AuthLayer};
 use tokio::time::Instant;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
+use tower_http::decompression::RequestDecompressionLayer;
 use tower_http::limit::RequestBodyLimitLayer;
 
 #[cfg(feature = "openapi")]
@@ -493,6 +494,10 @@ pub(crate) fn routes(
     // This must be applied as a route layer before auth
     authenticated_router =
         authenticated_router.route_layer(RequestBodyLimitLayer::new(DEFAULT_REQUEST_BODY_LIMIT));
+
+    // Decode request bodies before applying the existing size limit so clients can use standard
+    // HTTP compression without allowing an expanded body to exceed the request limit.
+    authenticated_router = authenticated_router.route_layer(RequestDecompressionLayer::new());
 
     // If we have an auth layer, add it to the authenticated router
     if let Some(auth_layer) = auth_layer {
