@@ -233,14 +233,16 @@ stats look right while the commit still carries the wrong content.
 let `cargo metadata` re-add the branch's own crates:
 
 ```bash
-git checkout origin/trunk -- Cargo.lock &&
+git restore --source=origin/trunk -- Cargo.lock &&
   cargo metadata --format-version 1 >/dev/null &&
   git add -- Cargo.lock
 ```
 
-Chained deliberately: unchained, a failed `cargo metadata` still reaches the `git add`
-and stages `trunk`'s lockfile without the branch's own crates — the opposite of what
-this step is for.
+`restore`, not `checkout` — `git checkout <tree> -- <path>` writes the **index** as well
+as the worktree, so `trunk`'s lockfile would already be staged before `cargo metadata`
+ran, and chaining would protect nothing. `git restore --source` touches only the
+worktree, which leaves the `git add` as the single point where anything is staged, and
+the chain then means a failed resolve stages nothing at all.
 
 `cargo metadata` only re-adds what the branch's *manifests* require, so any lockfile
 change the branch made without a manifest change — a `cargo update` of a transitive

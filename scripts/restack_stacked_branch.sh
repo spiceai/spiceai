@@ -85,8 +85,13 @@ cmd_resolve() {
   theirs_mode=$(git ls-files --stage -- ":(literal)$path" | awk '$3 == 3 { print $1 }')
 
   if [ "${ours_mode:-none}" != "${theirs_mode:-none}" ] || [ "$ours_mode" = 120000 ]; then
+    # The suggestion is meant to be pasted, and this branch exists for the awkward
+    # paths, so escape rather than wrap in quotes: a path containing a single
+    # quote would otherwise produce a command that is not valid shell at all.
+    local quoted
+    quoted=$(printf '%q' ":(literal)$path")
     echo "MANUAL $path: ours=${ours_mode:-none} theirs=${theirs_mode:-none} (mode, symlink, or missing stage)"
-    echo "  take one side whole: git checkout --ours -- ':(literal)$path' && git add -- ':(literal)$path'"
+    echo "  take one side whole: git checkout --ours -- $quoted && git add -- $quoted"
     return 2
   fi
 

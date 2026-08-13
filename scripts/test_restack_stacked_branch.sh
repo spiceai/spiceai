@@ -419,6 +419,34 @@ STUB
     fail_test "the partial output of a failed run was written over the conflicted file"
 ) || failures=$((failures + 1))
 
+start_test "resolve's recovery suggestion is valid shell for a path with a quote in it"
+(
+  new_stack "$work_root/quoted"
+  awkward="it's[1].sh"
+  # A mode conflict, because that reaches the manual branch reliably: a path the
+  # parent *added* and the child deleted is restored without conflicting at all,
+  # which is the resurrection the audit catches rather than something to resolve.
+  printf 'script\n' > "$awkward" && commit_all "fork point"
+  git checkout --quiet -b parent
+  printf 'script\nparent\n' > "$awkward" && commit_all "parent edits"
+  stack_base=$(git rev-parse HEAD)
+  git checkout --quiet -b child
+  printf 'script\nparent\nchild\n' > "$awkward" && commit_all "child edits"
+  squash_parent_onto_trunk
+  chmod +x "$awkward" && commit_all "trunk marks it executable"
+  git checkout --quiet child
+  git merge --no-ff --no-commit trunk >/dev/null 2>&1
+
+  output=$("$subject" resolve "$stack_base" "$awkward" 2>/dev/null)
+  suggestion=${output#*take one side whole: }
+  [ "$suggestion" != "$output" ] || fail_test "no recovery suggestion was printed: $output"
+  # The suggestion is meant to be pasted, and this is the branch that handles
+  # exactly the paths a naive quoting scheme breaks on.
+  printf '%s\n' "$suggestion" > "$work_root/suggestion.sh"
+  bash -n "$work_root/suggestion.sh" 2>/dev/null ||
+    fail_test "the suggested command is not valid shell: $suggestion"
+) || failures=$((failures + 1))
+
 start_test "resolve stages only the named path when the name contains glob characters"
 (
   new_stack "$work_root/globby"
