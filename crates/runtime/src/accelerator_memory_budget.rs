@@ -109,6 +109,11 @@ pub struct DuckDbBudgetPublication {
     pub changed: bool,
     /// Aggregate retained ceiling for active and cached database identities.
     pub total_reservation_bytes: u64,
+    /// How many database identities the reservation covers, including cached pools
+    /// the app no longer declares. Compared against what the app declares, this is
+    /// what distinguishes "cached pools are holding memory" from "a new instance did
+    /// not fit" — two situations with different causes and different remedies.
+    pub retained_identities: usize,
 }
 
 /// Publishes `plan` for an app declaring `unset_instances` un-limited `DuckDB`
@@ -121,9 +126,13 @@ pub fn publish_duckdb_budget(
     duckdb_default_per_instance: u64,
 ) -> DuckDbBudgetPublication {
     let auto_ceiling = live_auto_ceiling(plan, duckdb_default_per_instance);
-    let total_reservation_bytes =
+    let (total_reservation_bytes, retained_identities) =
         retained_instance_reservation_bytes(&DUCKDB_INSTANCE_CEILINGS, inputs, auto_ceiling);
-    publish_retained(plan.per_instance_cap_bytes, total_reservation_bytes)
+    publish_retained(
+        plan.per_instance_cap_bytes,
+        total_reservation_bytes,
+        retained_identities,
+    )
 }
 
 /// What an un-limited instance created under `plan` can hold: the cap it publishes,
@@ -135,13 +144,15 @@ fn live_auto_ceiling(plan: &AcceleratorMemoryPlan, duckdb_default_per_instance: 
     }
 }
 
+/// The aggregate retained ceiling and how many database identities it covers.
 fn retained_instance_reservation_bytes(
     instance_ceilings: &Mutex<HashMap<DuckDbInstanceIdentity, u64>>,
     inputs: &DuckDbBudgetInputs,
     auto_ceiling: u64,
-) -> u64 {
+) -> (u64, usize) {
     let mut retained = instance_ceilings.lock();
-    update_retained_instance_ceilings(&mut retained, inputs, auto_ceiling)
+    let total = update_retained_instance_ceilings(&mut retained, inputs, auto_ceiling);
+    (total, retained.len())
 }
 
 fn update_retained_instance_ceilings(
@@ -192,8 +203,13 @@ pub fn plan_and_publish_reload(
     let auto_ceiling = live_auto_ceiling(&plan, duckdb_default_per_instance);
     let total_reservation_bytes =
         update_retained_instance_ceilings(&mut retained, inputs, auto_ceiling);
+    let retained_identities = retained.len();
     drop(retained);
-    let publication = publish_retained(plan.per_instance_cap_bytes, total_reservation_bytes);
+    let publication = publish_retained(
+        plan.per_instance_cap_bytes,
+        total_reservation_bytes,
+        retained_identities,
+    );
     (plan, publication)
 }
 
@@ -219,6 +235,19 @@ fn projected_retained_reservation_bytes(
 /// Reload-specific planner for an already-fixed query pool. Existing pool ceilings
 /// cannot shrink, so this water-fills a single cap for un-limited instances only
 /// after charging every retained identity and explicit increase.
+///
+/// Mirrors the two thresholds [`plan`] uses at startup, which answer different
+/// questions and must not be conflated:
+///
+/// * whether the ceilings ALREADY FIT, and so need no coordination at all, is
+///   judged against `total_memory`. Judging it against `base_query_budget` instead
+///   would report a configuration startup deliberately accepts — a query pool left
+///   at its default beside a modest explicit `DuckDB` limit, which the 10% headroom
+///   absorbs — as an OOM risk on every reload, including one that changes nothing;
+/// * whether the applied caps still overflow the splittable region
+///   (`residual_overcommit`, the louder warning) is judged against
+///   `base_query_budget`, which confines `DuckDB` to the query region rather than
+///   letting it claim the headroom the rest of the process needs.
 fn plan_reload(
     total_memory: u64,
     duckdb_default_per_instance: u64,
@@ -230,7 +259,7 @@ fn plan_reload(
     let projected_reservation =
         projected_retained_reservation_bytes(retained, inputs, duckdb_default_per_instance);
     let projected_ceiling_bytes = query_pool_ceiling_bytes.saturating_add(projected_reservation);
-    if total_memory == 0 || projected_ceiling_bytes <= base_query_budget {
+    if total_memory == 0 || projected_ceiling_bytes <= total_memory {
         return AcceleratorMemoryPlan::noop(
             query_pool_ceiling_bytes,
             projected_ceiling_bytes,
@@ -266,8 +295,24 @@ fn plan_reload(
             low.saturating_mul(MIB)
         }
     };
-    let duckdb_reservation_bytes =
-        projected_retained_reservation_bytes(retained, inputs, per_instance_cap_bytes);
+    // Report the aggregate at the ceiling that will actually be PUBLISHED: an
+    // un-limited instance created under a plan that caps nothing keeps DuckDB's own
+    // ~80%-of-host default, which `live_auto_ceiling` resolves the same way. Using
+    // the raw `per_instance_cap_bytes` here would understate a mixed identity — one
+    // whose components both set and omit `duckdb_memory_limit`, which counts as
+    // explicit and so leaves `per_instance_cap_bytes` at 0 — by the whole default.
+    let duckdb_reservation_bytes = projected_retained_reservation_bytes(
+        retained,
+        inputs,
+        if per_instance_cap_bytes == 0 {
+            duckdb_default_per_instance
+        } else {
+            per_instance_cap_bytes
+        },
+    );
+    // Against the splittable region, matching [`plan`]: `residual_overcommit` means
+    // the floors forced the applied ceilings past the query region, which is a
+    // louder warning than the fit test above and a different question from it.
     let residual_overcommit =
         query_pool_ceiling_bytes.saturating_add(duckdb_reservation_bytes) > base_query_budget;
 
@@ -310,12 +355,14 @@ pub fn retire_duckdb_cap() -> DuckDbBudgetPublication {
     DuckDbBudgetPublication {
         changed,
         total_reservation_bytes: DUCKDB_TOTAL_RESERVATION_BYTES.load(Ordering::Acquire),
+        retained_identities: DUCKDB_INSTANCE_CEILINGS.lock().len(),
     }
 }
 
 fn publish_retained(
     per_instance_cap_bytes: u64,
     total_reservation_bytes: u64,
+    retained_identities: usize,
 ) -> DuckDbBudgetPublication {
     let cap_moved = DUCKDB_AUTO_MEMORY_LIMIT_BYTES.swap(per_instance_cap_bytes, Ordering::AcqRel)
         != per_instance_cap_bytes;
@@ -324,6 +371,7 @@ fn publish_retained(
     DuckDbBudgetPublication {
         changed: cap_moved || total_reservation_bytes > previous_reservation,
         total_reservation_bytes: previous_reservation.max(total_reservation_bytes),
+        retained_identities,
     }
 }
 
@@ -340,6 +388,7 @@ fn publish_exact(
     DuckDbBudgetPublication {
         changed: cap_moved || reservation_moved,
         total_reservation_bytes,
+        retained_identities: DUCKDB_INSTANCE_CEILINGS.lock().len(),
     }
 }
 
@@ -1047,16 +1096,17 @@ mod tests {
                 &retained,
                 &inputs(&["one", "two"]),
                 128 * MIB,
-            ),
+            )
+            .0,
             256 * MIB
         );
         assert_eq!(
-            super::retained_instance_reservation_bytes(&retained, &inputs(&["one"]), 64 * MIB,),
+            super::retained_instance_reservation_bytes(&retained, &inputs(&["one"]), 64 * MIB).0,
             256 * MIB,
             "a partial removal must retain the removed pool and the earlier ceiling"
         );
         assert_eq!(
-            super::retained_instance_reservation_bytes(&retained, &inputs(&["three"]), 64 * MIB,),
+            super::retained_instance_reservation_bytes(&retained, &inputs(&["three"]), 64 * MIB).0,
             320 * MIB,
             "a replacement must reserve both the cached old pools and the new pool"
         );
@@ -1125,7 +1175,7 @@ mod tests {
         };
 
         assert_eq!(
-            super::retained_instance_reservation_bytes(&retained, &inputs, 128 * MIB),
+            super::retained_instance_reservation_bytes(&retained, &inputs, 128 * MIB).0,
             256 * MIB
         );
     }

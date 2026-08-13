@@ -136,8 +136,12 @@ pub mod builder;
 #[cfg(not(windows))]
 pub mod cayenne_ddl;
 pub use runtime_datafusion::composed_catalog;
-pub use runtime_datafusion::dialect;
-pub use runtime_datafusion::error;
+// `dialect`, `error` and `refresh_sql` below are named throughout the runtime
+// through these aliases, but they belong to `runtime-datafusion`. Crate-visible
+// so a crate outside the runtime has to depend on `runtime-datafusion` directly
+// rather than route through here.
+pub(crate) use runtime_datafusion::dialect;
+pub(crate) use runtime_datafusion::error;
 pub use runtime_table::filter_converter;
 pub mod flight_session_extension;
 pub mod iceberg_ddl;
@@ -147,7 +151,7 @@ pub use runtime_datafusion::param_utils;
 pub use runtime_datafusion::pg_catalog;
 #[cfg(not(windows))]
 pub mod planner;
-pub use runtime_datafusion::refresh_sql;
+pub(crate) use runtime_datafusion::refresh_sql;
 pub mod request_context_extension;
 pub use runtime_datafusion::retention_sql;
 pub use runtime_table::table_provider_with_spicepod_metadata;
@@ -867,9 +871,10 @@ pub struct DataFusion {
     // loop around the same limit the DuckDB planner just used without probing
     // sysinfo every two seconds.
     current_total_memory: Arc<AtomicU64>,
-    // High-water off-pool Cayenne cache reservation. Reload planning raises it before
-    // publishing the new total, and the live tier sampler subtracts its excess over
-    // the standard headroom before allowing the tier to float.
+    // Off-pool Cayenne cache reservation the current app holds. Reload planning
+    // republishes it before publishing the new total, and the live tier sampler
+    // subtracts its excess over the standard headroom before allowing the tier to
+    // float.
     current_cayenne_reservation_bytes: Arc<AtomicU64>,
     pub(crate) io_runtime: Handle,
     metrics: Option<Metrics>,
@@ -1815,12 +1820,23 @@ impl DataFusion {
                 // bulk-written has no tier to resize, but still needs the gauges
                 // below — they are general memory observability, not CDC-specific.
                 if let Some(ceiling) = static_ceiling_bytes {
+                    // Acquire the shared total FIRST. A reload publishes the DuckDB
+                    // and Cayenne reservations and then release-stores the total, so
+                    // every value read after this load belongs to the same
+                    // publication. Reading either reservation first would let a tick
+                    // pair a refreshed total with the reservation that preceded it
+                    // and size the tier as though the newly added caches were free.
+                    let total_memory = current_total_memory.load(Ordering::Acquire);
+                    let duckdb_reservation =
+                        crate::accelerator_memory_budget::duckdb_total_reservation_bytes();
+                    let cayenne_reservation =
+                        current_cayenne_reservation_bytes.load(Ordering::Acquire);
                     let dynamic = Self::sampled_mem_tier_budget(
-                        &current_total_memory,
+                        total_memory,
                         pool_used,
                         compaction_used,
-                        crate::accelerator_memory_budget::duckdb_total_reservation_bytes(),
-                        current_cayenne_reservation_bytes.load(Ordering::Acquire),
+                        duckdb_reservation,
+                        cayenne_reservation,
                         ceiling,
                     );
                     cayenne::update_global_mem_tier_total(dynamic);
@@ -1847,15 +1863,17 @@ impl DataFusion {
         });
     }
 
+    /// The tier budget for one sample, from values the caller has already read. Pure
+    /// so the ordering the shared atomics require lives at the single call site that
+    /// reads them (see [`Self::spawn_mem_tier_repartition_sampler`]).
     fn sampled_mem_tier_budget(
-        current_total_memory: &AtomicU64,
+        total_memory: u64,
         pool_used: u64,
         compaction_used: u64,
         external_reservation: u64,
         cayenne_reservation: u64,
         static_ceiling: u64,
     ) -> u64 {
-        let total_memory = current_total_memory.load(Ordering::Acquire);
         let external_reservation = external_reservation.saturating_add(
             builder::cayenne_reservation_excess_bytes(total_memory, cayenne_reservation),
         );
@@ -5506,51 +5524,77 @@ mod tests {
 
     use super::*;
 
+    /// The tier budget and the PK-keyset ceiling both follow the total they are given,
+    /// so a reload that observes a shrunken cgroup plans smaller. That the sampler
+    /// re-reads the shared total every tick is structural — the loads sit in the tick
+    /// loop of `DataFusion::spawn_mem_tier_repartition_sampler` — rather than
+    /// something this test can observe.
     #[test]
-    fn mem_tier_sampler_uses_refreshed_total_memory() {
+    fn sampled_mem_tier_budget_shrinks_with_the_total() {
         const GIB: u64 = 1024 * 1024 * 1024;
         let current_total_memory = AtomicU64::new(16 * GIB);
 
-        let before =
-            DataFusion::sampled_mem_tier_budget(&current_total_memory, GIB, 0, 0, 0, u64::MAX);
+        let before = DataFusion::sampled_mem_tier_budget(
+            current_total_memory.load(Ordering::Acquire),
+            GIB,
+            0,
+            0,
+            0,
+            u64::MAX,
+        );
         let pk_before =
             cayenne_pk_keyset_budget_bytes(current_total_memory.load(Ordering::Acquire));
         current_total_memory.store(8 * GIB, Ordering::Release);
-        let after =
-            DataFusion::sampled_mem_tier_budget(&current_total_memory, GIB, 0, 0, 0, u64::MAX);
+        let after = DataFusion::sampled_mem_tier_budget(
+            current_total_memory.load(Ordering::Acquire),
+            GIB,
+            0,
+            0,
+            0,
+            u64::MAX,
+        );
         let pk_after = cayenne_pk_keyset_budget_bytes(current_total_memory.load(Ordering::Acquire));
 
         assert!(
             after < before,
             "the sampler must shrink its budget after the shared cgroup ceiling shrinks"
         );
+        // Hand-computed rather than expressed through `coordinated_mem_tier_budget`,
+        // which would restate the implementation and hold for any version of it.
+        // At 16 GiB: remainder 16 − 1 − 1.6 = 13.4 GiB, float ceiling 16/4 = 4 GiB,
+        // float room 16 − 1 − 3.2 = 11.8 GiB ⇒ ceiling 4 GiB binds. At 8 GiB:
+        // remainder 8 − 1 − 0.8 = 6.2 GiB, float ceiling 2 GiB, float room
+        // 8 − 1 − 1.6 = 5.4 GiB ⇒ ceiling 2 GiB binds.
+        assert_eq!(before, 4 * GIB, "the tier is capped by the 16 GiB ceiling");
         assert_eq!(
             after,
-            builder::coordinated_mem_tier_budget(8 * GIB, GIB, 0, 0),
-            "the sampler must plan from the refreshed ceiling"
+            2 * GIB,
+            "the sampler must plan from the refreshed 8 GiB ceiling"
         );
         assert_eq!(pk_before, GIB);
         assert_eq!(pk_after, GIB / 2);
     }
 
+    /// A reload-added Cayenne cache reservation must shrink the tier: the sampler
+    /// subtracts the part above the standard host/10 headroom before letting a
+    /// query-light tier float upward, so caches a reload adds cannot be handed back
+    /// to the tier.
     #[test]
     fn mem_tier_sampler_enforces_reload_added_cayenne_cache_excess() {
         const GIB: u64 = 1024 * 1024 * 1024;
-        let current_total_memory = AtomicU64::new(10 * GIB);
+        let total_memory = 10 * GIB;
 
         let without_added_caches =
-            DataFusion::sampled_mem_tier_budget(&current_total_memory, GIB, 0, 0, GIB, u64::MAX);
-        let with_added_caches = DataFusion::sampled_mem_tier_budget(
-            &current_total_memory,
-            GIB,
-            0,
-            0,
-            8 * GIB,
-            u64::MAX,
-        );
+            DataFusion::sampled_mem_tier_budget(total_memory, GIB, 0, 0, GIB, u64::MAX);
+        let with_added_caches =
+            DataFusion::sampled_mem_tier_budget(total_memory, GIB, 0, 0, 8 * GIB, u64::MAX);
 
         assert_eq!(without_added_caches, 5 * GIB / 2);
         assert_eq!(with_added_caches, GIB);
+        assert!(
+            with_added_caches < without_added_caches,
+            "a reload-added cache reservation must shrink the tier"
+        );
     }
 
     #[test]

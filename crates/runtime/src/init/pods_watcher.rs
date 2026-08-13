@@ -258,10 +258,9 @@ impl Runtime {
     /// when what it changes is confined to the sections reconciled here (see
     /// `spiced`'s `cloud_connect` module).
     ///
-    /// Returns `true` if `new_app` differed from the current app and was applied.
-    /// Returns `false` if it was identical (a no-op), or if the accelerator-memory
-    /// preflight failed; a preflight failure is logged and leaves the app unchanged.
-    /// When there is no current app yet, `new_app` is installed and `true` is returned.
+    /// Returns `true` if `new_app` differed from the current app and was applied,
+    /// `false` if it was identical (a no-op). When there is no current app yet,
+    /// `new_app` is installed and `true` is returned.
     ///
     /// Diffs are computed while holding only a read lock on the app; the write
     /// lock is taken only for the final swap. The whole method is serialized by
@@ -289,7 +288,7 @@ impl Runtime {
     ///
     /// The caller holds `apply_app_lock`. `current_app` is what to reconcile
     /// *from*, which is not necessarily the installed app; `new_app` is installed
-    /// after its accelerator-memory preflight succeeds.
+    /// after its accelerator-memory budget has been re-planned for it.
     async fn apply_app_diff(
         self: Arc<Self>,
         current_app: Option<&Arc<App>>,
@@ -298,15 +297,16 @@ impl Runtime {
         // Re-split the coordinated DuckDB accelerator memory budget before the diffs
         // initialize any accelerator that reads it. Probing and planning run on the
         // blocking pool so cgroup and host-memory reads do not stall this Tokio worker.
-        if !self
-            .duckdb_budget_context
+        self.duckdb_budget_context
             .publish_for(current_app, &new_app)
-            .await
-        {
-            return false;
-        }
+            .await;
 
         if current_app.is_some_and(|current_app| *current_app == new_app) {
+            // No diffs to run, so nothing is ever in flight and the preflight's
+            // reservation settles immediately. Settling here as well as below keeps
+            // one rule — the standing reservation is what the applied app holds —
+            // rather than leaving this path on the preflight's transitional figure.
+            self.duckdb_budget_context.settle_cayenne_reservation();
             return false;
         }
 
@@ -336,6 +336,12 @@ impl Runtime {
                     .await;
             }
         }
+
+        // The diffs are done, so the providers a replacement or removal displaced are
+        // gone. Release the overlap the preflight charged for them; leaving it
+        // installed would keep the in-memory tier sized against caches that no longer
+        // exist until some later reload happened to recompute it.
+        self.duckdb_budget_context.settle_cayenne_reservation();
 
         *self.app.write().await = Some(new_app);
 

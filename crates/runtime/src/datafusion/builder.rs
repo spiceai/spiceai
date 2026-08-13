@@ -837,8 +837,17 @@ impl DataFusionBuilder {
         // Cayenne crate.
         let query_memory_pool_bytes = effective_memory_limit;
         let mem_tier_budget_bytes = cayenne_cdc_active.then(|| {
+            // The same two external reservations the live sampler subtracts (see
+            // `DataFusion::sampled_mem_tier_budget`), so the ceiling installed here
+            // is not looser than the one enforced from the first tick onward — a
+            // cache-heavy pod would otherwise admit CDC appends for up to one sample
+            // interval against a cap the coordinated partition does not support.
             let external_reservation_bytes =
-                crate::accelerator_memory_budget::duckdb_total_reservation_bytes();
+                crate::accelerator_memory_budget::duckdb_total_reservation_bytes()
+                    .saturating_add(cayenne_reservation_excess_bytes(
+                        total_memory,
+                        self.cayenne_reservation_bytes,
+                    ));
             let budget = coordinated_mem_tier_budget(
                 total_memory,
                 query_memory_pool_bytes,

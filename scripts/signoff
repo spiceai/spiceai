@@ -2366,7 +2366,7 @@ cmd_remote() {
   info "Dispatching GitHub Actions Remote Sign-off for ${branch} on ${repo}…"
   # --repo so non-colocated JJ workspaces (no .git) still resolve the remote;
   # --raw-field avoids shell re-quoting pitfalls; the branch was validated above.
-  gh workflow run signoff.yml --repo "$repo" --raw-field "branch=${branch}" \
+  gh workflow run signoff.yml --repo "$repo" --ref "${branch}" --raw-field "branch=${branch}" \
     || fail "failed to dispatch signoff.yml"
   echo "${OK} Dispatched. Watch with: gh run watch --repo ${repo} --workflow signoff.yml"
 }
