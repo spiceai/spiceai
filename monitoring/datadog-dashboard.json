@@ -2602,6 +2602,62 @@
               "width": 4,
               "height": 3
             }
+          },
+          {
+            "id": 1009,
+            "definition": {
+              "title": "Segment Cache Memory",
+              "title_size": "16",
+              "title_align": "left",
+              "show_legend": true,
+              "legend_layout": "auto",
+              "legend_columns": [
+                "avg",
+                "max",
+                "value"
+              ],
+              "type": "timeseries",
+              "requests": [
+                {
+                  "formulas": [
+                    {
+                      "alias": "used",
+                      "formula": "query1",
+                      "number_format": {
+                        "unit": {
+                          "type": "canonical_unit",
+                          "unit_name": "byte"
+                        }
+                      }
+                    }
+                  ],
+                  "queries": [
+                    {
+                      "data_source": "metrics",
+                      "name": "query1",
+                      "query": "sum:spiceai.cayenne_segment_cache_weighted_bytes{$instance,$env,$kube_namespace,$kube_cluster_name,$pod_name} by {service_instance_id}"
+                    }
+                  ],
+                  "response_format": "timeseries",
+                  "style": {
+                    "palette": "dog_classic",
+                    "line_type": "solid",
+                    "line_width": "normal"
+                  },
+                  "display_type": "line"
+                }
+              ],
+              "yaxis": {
+                "include_zero": true,
+                "scale": "linear"
+              }
+            },
+            "layout": {
+              "x": 0,
+              "y": 9,
+              "width": 4,
+              "height": 3
+            }
           }
         ]
       },
