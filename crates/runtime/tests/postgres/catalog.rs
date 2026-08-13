@@ -40,6 +40,13 @@ use crate::{
     postgres::common::{self, get_pg_params},
     utils::{register_test_connectors, run_query, runtime_ready_check, test_request_context},
 };
+use data_components::Read;
+use data_components::RefreshableCatalogProvider;
+use data_components::catalog_filter::TableSelector;
+use data_components::postgres::provider::PostgresCatalogProvider;
+use datafusion_table_providers::UnsupportedTypeAction;
+use datafusion_table_providers::sql::db_connection_pool::postgrespool::PostgresConnectionPool;
+use datafusion_table_providers::util::secrets::to_secret_map;
 
 const CATALOG_NAME: &str = "pg_e2e";
 
@@ -133,6 +140,28 @@ fn pg_catalog(port: usize) -> Catalog {
     catalog
 }
 
+/// The `(column_name, data_type)` pairs the catalog reports for `table`, ordered
+/// by column name.
+async fn catalog_columns(
+    rt: &Arc<Runtime>,
+    table: &str,
+) -> Result<Vec<(String, String)>, anyhow::Error> {
+    let batches = run_query(
+        rt,
+        &format!(
+            "SELECT column_name, data_type FROM information_schema.columns \
+             WHERE table_catalog = '{CATALOG_NAME}' AND table_schema = 'public' \
+             AND table_name = '{table}' ORDER BY column_name"
+        ),
+    )
+    .await?;
+
+    Ok(string_column_values(&batches, "column_name")
+        .into_iter()
+        .zip(string_column_values(&batches, "data_type"))
+        .collect())
+}
+
 /// Collect the values of a `Utf8` column across every batch, in row order.
 fn string_column_values(batches: &[RecordBatch], column: &str) -> Vec<String> {
     let mut values = Vec::new();
@@ -153,9 +182,15 @@ fn string_column_values(batches: &[RecordBatch], column: &str) -> Vec<String> {
     values
 }
 
-/// Seed a plain table, a materialized view over it, and (via `postgres_fdw`) a
-/// foreign table pointed at it, to confirm all three relation kinds are
+/// Seed a plain table, a materialized view over it, and (via `postgres_fdw`)
+/// foreign tables pointed at it, to confirm all three relation kinds are
 /// discovered (#11725).
+///
+/// Three foreign tables, each isolating a different property (#12585): one wraps
+/// a populated remote table, one wraps an empty one so the reported schema can be
+/// checked independently of whether any rows exist, and one points at a server
+/// that refuses every connection so that resolving its schema at all is only
+/// possible without reading its data.
 async fn seed_matview_and_foreign_table(port: usize) -> Result<(), anyhow::Error> {
     let pool = common::get_postgres_connection_pool(port, None).await?;
     let conn = pool
@@ -165,9 +200,10 @@ async fn seed_matview_and_foreign_table(port: usize) -> Result<(), anyhow::Error
 
     conn.conn
         .simple_query(
-            "CREATE TABLE source_data (id INT PRIMARY KEY, val TEXT); \
-             INSERT INTO source_data (id, val) VALUES (1, 'a'), (2, 'b'); \
-             CREATE MATERIALIZED VIEW mv_source_data AS SELECT * FROM source_data;",
+            "CREATE TABLE source_data (id INT PRIMARY KEY, val TEXT, amount NUMERIC(10,2)); \
+             INSERT INTO source_data (id, val, amount) VALUES (1, 'a', 1.50), (2, 'b', 2.25); \
+             CREATE MATERIALIZED VIEW mv_source_data AS SELECT * FROM source_data; \
+             CREATE TABLE empty_source (id INT, note TEXT);",
         )
         .await?;
 
@@ -178,10 +214,29 @@ async fn seed_matview_and_foreign_table(port: usize) -> Result<(), anyhow::Error
                  OPTIONS (host 'localhost', port '5432', dbname 'postgres'); \
              CREATE USER MAPPING FOR postgres SERVER loopback \
                  OPTIONS (user 'postgres', password '{}'); \
-             CREATE FOREIGN TABLE ft_source_data (id INT, val TEXT) \
-                 SERVER loopback OPTIONS (table_name 'source_data');",
+             CREATE FOREIGN TABLE ft_source_data (id INT, val TEXT, amount NUMERIC(10,2)) \
+                 SERVER loopback OPTIONS (table_name 'source_data'); \
+             CREATE FOREIGN TABLE ft_empty (id INT, note TEXT) \
+                 SERVER loopback OPTIONS (table_name 'empty_source');",
             common::PG_PASSWORD
         ))
+        .await?;
+
+    // A server that can never be reached: port 1 refuses immediately. A foreign
+    // table's columns are declared locally, so `pg_attribute` can describe this
+    // one in full, but *any* attempt to read its rows fails. Registering it with
+    // its declared schema is therefore only possible without a data query, which
+    // is what makes this table a check of the mechanism rather than the result.
+    // `CREATE SERVER` does not connect, so seeding stays fast.
+    conn.conn
+        .simple_query(
+            "CREATE SERVER unreachable FOREIGN DATA WRAPPER postgres_fdw \
+                 OPTIONS (host 'localhost', port '1', dbname 'postgres'); \
+             CREATE USER MAPPING FOR postgres SERVER unreachable \
+                 OPTIONS (user 'postgres', password 'unused'); \
+             CREATE FOREIGN TABLE ft_unreachable (id INT, label TEXT) \
+                 SERVER unreachable OPTIONS (table_name 'nonexistent');",
+        )
         .await?;
 
     Ok(())
@@ -323,11 +378,14 @@ async fn test_materialized_view_and_foreign_table_discovered() -> Result<(), any
             assert_eq!(
                 string_column_values(&tables, "table_name"),
                 vec![
+                    "empty_source".to_string(),
+                    "ft_empty".to_string(),
                     "ft_source_data".to_string(),
+                    "ft_unreachable".to_string(),
                     "mv_source_data".to_string(),
                     "source_data".to_string(),
                 ],
-                "the base table, materialized view, and foreign table should all be registered"
+                "the base tables, materialized view, and foreign tables should all be registered"
             );
 
             let mv_count = run_query(
@@ -343,6 +401,63 @@ async fn test_materialized_view_and_foreign_table_discovered() -> Result<(), any
             )
             .await?;
             assert_batches_eq!(&["+---+", "| n |", "+---+", "| 2 |", "+---+"], &ft_count);
+
+            // A foreign table's schema comes from its local `pg_attribute`
+            // definition, not from sampling its rows, so it carries the declared
+            // types rather than whatever a sample row happened to imply. An empty
+            // foreign table used to register with no columns at all, and a
+            // `NUMERIC(p,s)` column used to widen to the fallback precision.
+            assert_eq!(
+                catalog_columns(&rt, "ft_empty").await?,
+                vec![
+                    ("id".to_string(), "Int32".to_string()),
+                    ("note".to_string(), "Utf8".to_string()),
+                ],
+                "an empty foreign table must still expose its declared columns"
+            );
+
+            assert!(
+                catalog_columns(&rt, "ft_source_data")
+                    .await?
+                    .contains(&("amount".to_string(), "Decimal128(10, 2)".to_string())),
+                "a foreign table must report the declared precision of its remote column"
+            );
+
+            // `ft_unreachable` points at a server that refuses every connection.
+            // Its columns are declared locally, so `pg_attribute` can describe it
+            // in full while any read of its rows fails -- registering it with its
+            // declared schema is therefore possible only without a data query.
+            //
+            // The precondition is asserted rather than assumed: if the endpoint
+            // ever stopped refusing, this table would quietly stop distinguishing
+            // the two paths and the check below would pass for the wrong reason.
+            let source_pool = common::get_postgres_connection_pool(port, None).await?;
+            let source = source_pool
+                .connect_direct()
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let data_query = source
+                .conn
+                .simple_query("SELECT * FROM ft_unreachable LIMIT 1")
+                .await;
+            anyhow::ensure!(
+                data_query.is_err(),
+                "reading ft_unreachable must fail, otherwise it cannot show that \
+                 discovery avoided a data query"
+            );
+
+            // A regression that read rows instead would have had that read fail,
+            // so `build_table_providers_for_schema` would skip the table -- it
+            // would be missing from the listing above and have no columns here.
+            assert_eq!(
+                catalog_columns(&rt, "ft_unreachable").await?,
+                vec![
+                    ("id".to_string(), "Int32".to_string()),
+                    ("label".to_string(), "Utf8".to_string()),
+                ],
+                "a foreign table whose data is unreachable must still resolve its \
+                 schema, proving discovery issued no data query against it"
+            );
 
             Ok(())
         })
@@ -451,4 +566,291 @@ async fn test_unsupported_type_action_override_drops_table() -> Result<(), anyho
             Ok(())
         })
         .await
+}
+
+/// Catalog discovery must not be steerable by anything in the source database.
+///
+/// The connector classifies the server from its version and takes different
+/// catalog queries for Redshift, so the classification must depend only on the
+/// server. It reads `pg_catalog.version()`, which nothing in the database can
+/// shadow.
+///
+/// An unqualified `version()` would resolve through `search_path`, letting a
+/// `public.version()` in the source — which a user may define for any reason —
+/// decide the classification. That is the regression this guards: a `PostgreSQL`
+/// server misread as Redshift makes discovery issue `SHOW COLUMNS`, which it
+/// cannot answer, so every table fails to resolve.
+///
+/// The check lives here as well as in `datafusion-table-providers` because the
+/// qualification is the dependency's; a rev bump that lost it would otherwise
+/// surface as a catalog that fails to load for no visible reason. The shadow
+/// below is what an unqualified lookup would resolve to.
+#[tokio::test]
+async fn test_catalog_discovery_ignores_a_shadowed_version_function() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    test_request_context()
+        .scope(async {
+            let port = common::get_random_port()?;
+            let _container = common::start_postgres_docker_container(port).await?;
+
+            let pool = common::get_postgres_connection_pool(port, None).await?;
+            let conn = pool
+                .connect_direct()
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            conn.conn
+                .simple_query(
+                    "CREATE TABLE widgets (id INT PRIMARY KEY, name TEXT NOT NULL); \
+                     INSERT INTO widgets (id, name) VALUES (1, 'widget'); \
+                     CREATE FUNCTION public.version() RETURNS text LANGUAGE sql IMMUTABLE AS \
+                       $$ SELECT 'PostgreSQL 8.0.2 on i686-pc-linux-gnu, Redshift 1.0.12345'::text $$; \
+                     ALTER DATABASE postgres SET search_path = public, pg_catalog;",
+                )
+                .await?;
+
+            // Loading at all is the assertion: a server misclassified as
+            // Redshift cannot answer the queries discovery would then issue.
+            let rt = start_runtime(pg_catalog(port)).await?;
+
+            let tables = run_query(
+                &rt,
+                &format!(
+                    "SELECT table_name FROM information_schema.tables \
+                     WHERE table_catalog = '{CATALOG_NAME}' AND table_schema = 'public' \
+                     ORDER BY table_name"
+                ),
+            )
+            .await?;
+            assert_eq!(
+                string_column_values(&tables, "table_name"),
+                vec!["widgets".to_string()],
+                "discovery must classify the server from pg_catalog, not a shadowed version()"
+            );
+
+            let rows = run_query(
+                &rt,
+                &format!("SELECT COUNT(*) AS n FROM {CATALOG_NAME}.public.widgets"),
+            )
+            .await?;
+            assert_batches_eq!(&["+---+", "| n |", "+---+", "| 1 |", "+---+"], &rows);
+
+            Ok(())
+        })
+        .await
+}
+
+/// A recording [`Read`] that reports which construction path each table took.
+///
+/// Whether a table's schema came from the schema-wide lookup or from its own
+/// query is invisible in the resulting catalog — both register the same table —
+/// so a test that wants to assert it has to observe the call.
+#[derive(Default)]
+struct RecordingRead {
+    from_supplied_schema: std::sync::Mutex<Vec<String>>,
+    self_resolved: std::sync::Mutex<Vec<String>>,
+}
+
+impl RecordingRead {
+    fn built_from_supplied_schema(&self) -> Vec<String> {
+        self.from_supplied_schema
+            .lock()
+            .expect("mutex should not be poisoned")
+            .clone()
+    }
+
+    fn self_resolved(&self) -> Vec<String> {
+        self.self_resolved
+            .lock()
+            .expect("mutex should not be poisoned")
+            .clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl Read for RecordingRead {
+    async fn table_provider(
+        &self,
+        table_reference: datafusion::sql::TableReference,
+    ) -> Result<
+        Arc<dyn datafusion::datasource::TableProvider + 'static>,
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
+        self.self_resolved
+            .lock()
+            .expect("mutex should not be poisoned")
+            .push(table_reference.table().to_string());
+        Ok(Arc::new(datafusion::datasource::empty::EmptyTable::new(
+            Arc::new(arrow::datatypes::Schema::empty()),
+        )))
+    }
+
+    async fn table_provider_with_schema(
+        &self,
+        table_reference: datafusion::sql::TableReference,
+        schema: arrow::datatypes::SchemaRef,
+    ) -> Result<
+        Arc<dyn datafusion::datasource::TableProvider + 'static>,
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
+        self.from_supplied_schema
+            .lock()
+            .expect("mutex should not be poisoned")
+            .push(table_reference.table().to_string());
+        Ok(Arc::new(datafusion::datasource::empty::EmptyTable::new(
+            schema,
+        )))
+    }
+}
+
+/// Bulk schema resolution must honour the catalog's `unsupported_type_action`.
+///
+/// The schema-wide lookup runs on a pooled connection, and only the pool's own
+/// `connect` applies the configured action — a connection taken any other way
+/// rejects every unsupported column type. A schema holding one, `jsonb` being
+/// the ordinary case, then fails that lookup under the catalog's default
+/// `string`, and every table in the namespace resolves its own schema instead.
+///
+/// Nothing about the resulting catalog would look wrong: the per-table path
+/// registers the same tables. So this drives a real refresh and observes which
+/// path each table took, rather than re-creating the connection acquisition —
+/// which would prove only that the dependency *can* carry the action, and would
+/// stay green if the connector stopped asking it to.
+#[tokio::test]
+async fn test_bulk_schema_resolution_honors_unsupported_type_action() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    test_request_context()
+        .scope(async {
+            let port = common::get_random_port()?;
+            let _container = common::start_postgres_docker_container(port).await?;
+
+            seed_unsupported_type_table(port).await?;
+
+            // The pool as the catalog connector builds it: a `pg` catalog
+            // defaults to `string` (#11728).
+            let pool = Arc::new(
+                PostgresConnectionPool::new(to_secret_map(
+                    get_pg_params(port)
+                        .into_iter()
+                        .map(|(k, v)| (k, v.expose_secret().to_string()))
+                        .collect::<HashMap<String, String>>(),
+                ))
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?
+                .with_unsupported_type_action(UnsupportedTypeAction::String),
+            );
+
+            let recorder = Arc::new(RecordingRead::default());
+            let provider = PostgresCatalogProvider::new(
+                CATALOG_NAME.to_string(),
+                pool,
+                Arc::clone(&recorder) as Arc<dyn Read>,
+                TableSelector::select_all(),
+            );
+
+            provider
+                .refresh()
+                .await
+                .map_err(|e| anyhow::anyhow!("catalog refresh: {e}"))?;
+
+            assert!(
+                recorder
+                    .built_from_supplied_schema()
+                    .contains(&"widgets_jsonb".to_string()),
+                "the jsonb table should have been built from the schema-wide lookup; resolved individually: {:?}",
+                recorder.self_resolved()
+            );
+            // Taking the bulk path does not by itself mean the round trip was
+            // saved: a table built from a supplied schema that also resolved its
+            // own would satisfy the assertion above while costing exactly what
+            // this change removes.
+            assert!(
+                !recorder.self_resolved().contains(&"widgets_jsonb".to_string()),
+                "the jsonb table resolved its own schema as well as taking the schema-wide lookup, so the per-table query was not saved"
+            );
+
+            Ok(())
+        })
+        .await
+}
+
+/// A filtered catalog must still build its selected tables from the schema-wide
+/// lookup, and must not build the tables it rejected at all.
+///
+/// The refresh resolves the schemas it will need before it knows which provider
+/// each table gets, so a selection that reached only one of those two steps
+/// would show up here: an excluded table appearing on either construction path
+/// means the filter was consulted too late to save anything.
+#[tokio::test]
+async fn test_filtered_refresh_builds_only_selected_tables_from_the_bulk_lookup()
+-> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    test_request_context()
+        .scope(async {
+            let port = common::get_random_port()?;
+            let _container = common::start_postgres_docker_container(port).await?;
+
+            let pool = common::get_postgres_connection_pool(port, None).await?;
+            pool.connect_direct()
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?
+                .conn
+                .simple_query(
+                    "CREATE TABLE kept (id INT PRIMARY KEY, label TEXT); \
+                     CREATE TABLE rejected (id INT PRIMARY KEY, label TEXT);",
+                )
+                .await?;
+
+            let recorder = Arc::new(RecordingRead::default());
+            let provider = PostgresCatalogProvider::new(
+                CATALOG_NAME.to_string(),
+                Arc::new(
+                    PostgresConnectionPool::new(to_secret_map(
+                        get_pg_params(port)
+                            .into_iter()
+                            .map(|(k, v)| (k, v.expose_secret().to_string()))
+                            .collect::<HashMap<String, String>>(),
+                    ))
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))?,
+                ),
+                Arc::clone(&recorder) as Arc<dyn Read>,
+                TableSelector::new(Some(globset_of(&["public.kept"])), None),
+            );
+
+            provider
+                .refresh()
+                .await
+                .map_err(|e| anyhow::anyhow!("catalog refresh: {e}"))?;
+
+            let bulk = recorder.built_from_supplied_schema();
+            let individual = recorder.self_resolved();
+
+            assert!(
+                bulk.contains(&"kept".to_string()),
+                "the selected table should have been built from the schema-wide lookup; resolved individually: {individual:?}"
+            );
+            assert!(
+                !individual.contains(&"kept".to_string()),
+                "the selected table resolved its own schema as well, so the per-table query was not saved"
+            );
+            assert!(
+                !bulk.contains(&"rejected".to_string())
+                    && !individual.contains(&"rejected".to_string()),
+                "an excluded table should not be built at all; bulk: {bulk:?}, individual: {individual:?}"
+            );
+
+            Ok(())
+        })
+        .await
+}
+
+fn globset_of(patterns: &[&str]) -> globset::GlobSet {
+    let mut builder = globset::GlobSetBuilder::new();
+    for pattern in patterns {
+        builder.add(globset::Glob::new(pattern).expect("glob pattern should parse"));
+    }
+    builder.build().expect("glob set should build")
 }

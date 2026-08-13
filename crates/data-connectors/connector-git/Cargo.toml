@@ -17,6 +17,7 @@ globset.workspace = true
 linkme.workspace = true
 opentelemetry.workspace = true
 regex.workspace = true
+runtime-parameters = { path = "../../runtime-parameters" }
 tempfile.workspace = true
 url.workspace = true
 reqwest.workspace = true

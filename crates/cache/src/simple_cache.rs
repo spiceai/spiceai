@@ -126,6 +126,17 @@ impl<
         self.cache.get(key).await
     }
 
+    async fn get_raw_key_validated(
+        &self,
+        key: &u64,
+        is_valid: &(dyn for<'v> Fn(&'v V) -> bool + Send + Sync),
+    ) -> Option<V> {
+        // This cache records no hit/miss metrics, so there is nothing to
+        // misattribute; filtering the value is all that is needed.
+        let value = self.cache.get(key).await?;
+        if is_valid(&value) { Some(value) } else { None }
+    }
+
     async fn put_raw_key(&self, key: &u64, value: V) {
         self.cache.insert(*key, value).await;
     }
@@ -161,7 +172,7 @@ impl<
     H: Hasher + Send + Sync + 'static,
 > TabledCacheProvider<V> for SimpleCache<V, T, H>
 {
-    fn invalidate_for_table(&self, table_ref: TableReference) -> Result<()> {
+    async fn invalidate_for_table(&self, table_ref: TableReference) -> Result<()> {
         let table_name = match &table_ref {
             TableReference::Bare { table }
             | TableReference::Partial { table, .. }
@@ -213,6 +224,7 @@ mod tests {
             vec![record_batch],
             Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)])),
             Arc::new(input_tables),
+            std::time::Instant::now(),
             std::time::Instant::now(),
             encoder,
         )

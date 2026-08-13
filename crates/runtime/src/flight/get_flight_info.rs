@@ -21,7 +21,11 @@ use arrow_flight::{
 use prost::Message;
 use tonic::{Request, Response, Status};
 
-use crate::{datafusion::request_context_extension::get_current_datafusion, flight::metrics};
+use crate::{
+    datafusion::request_context_extension::get_current_datafusion,
+    flight::{metrics, traced_ticket, util::trace_id_app_metadata},
+    task_history::correlation,
+};
 use runtime_request_context::{AsyncMarker, RequestContext};
 
 use super::{Service, flightsql, to_tonic_err};
@@ -29,6 +33,38 @@ use super::{Service, flightsql, to_tonic_err};
 pub(crate) async fn handle(
     request: Request<FlightDescriptor>,
 ) -> Result<Response<FlightInfo>, Status> {
+    // Resolved before any handler runs, so a failure while planning is logged
+    // under the same id a successful call hands back. Every ticket this call
+    // emits then carries it to `do_get` — the request that actually runs the
+    // query — and the client reads it off the `FlightInfo`. Doing it here
+    // rather than in each handler is what makes that true of every command
+    // rather than of the ones someone remembered.
+    let trace_id =
+        correlation::publish_trace_id(&RequestContext::current(AsyncMarker::new().await));
+
+    dispatch(request)
+        .await
+        .map(|response| response.map(|info| trace(info, &trace_id)))
+}
+
+/// Puts `trace_id` where a client can read it: in `app_metadata`, and on every
+/// ticket the call hands out so the `do_get` that redeems one adopts it.
+fn trace(info: FlightInfo, trace_id: &str) -> FlightInfo {
+    FlightInfo {
+        endpoint: info
+            .endpoint
+            .into_iter()
+            .map(|endpoint| FlightEndpoint {
+                ticket: endpoint.ticket.map(|t| traced_ticket::wrap(&t, trace_id)),
+                ..endpoint
+            })
+            .collect(),
+        ..info
+    }
+    .with_app_metadata(trace_id_app_metadata(trace_id))
+}
+
+async fn dispatch(request: Request<FlightDescriptor>) -> Result<Response<FlightInfo>, Status> {
     let Ok(message) = Any::decode(&*request.get_ref().cmd) else {
         return get_flight_info_simple(request).await;
     };

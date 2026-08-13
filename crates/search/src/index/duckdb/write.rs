@@ -190,7 +190,8 @@ fn create_embedding_array(
                 });
             }
             None => {
-                builder.values().append_nulls(expected);
+                // Store `f32` child values, not `Option<f32>`; the list slot represents a null embedding.
+                builder.values().append_value_n(0.0, expected);
                 builder.append(false);
             }
         }

@@ -189,6 +189,10 @@ where
 /// The layer that writes the human-readable log to `writer`, `spiced`'s stdout
 /// in production.
 ///
+/// A query's trace id arrives as a field of an entered span, which the default
+/// event format renders ahead of the target — see
+/// `runtime::task_history::correlation`. Nothing here does that work.
+///
 /// `ansi` decides whether each line carries SGR escapes. It is a parameter
 /// rather than a literal because the answer depends on where the writer points:
 /// escapes are what make an interactive log readable, and what make a redirected
@@ -610,7 +614,7 @@ mod tests {
 
         tracing::subscriber::with_default(subscriber, || {
             tracing::warn!(
-                target: "runtime::accelerated_table::refresh_task",
+                target: "runtime::accelerated::refresh_task",
                 "Failed to load data for dataset taxi_trips"
             );
             tracing::info!(target: "task_history", "sql_query");
@@ -637,6 +641,57 @@ mod tests {
         assert!(
             !plain.contains("sql_query"),
             "task_history records belong to the task-history table, not the console, got: {plain}"
+        );
+    }
+
+    /// The point of the whole exercise: a query's records name the id that
+    /// finds them — including records from a crate that knows nothing about
+    /// task history — while a record outside any query claims no id.
+    #[test]
+    fn console_layer_names_the_trace_id_of_the_task_in_scope() {
+        let trace_id = "4bf92f3577b34da6a3ce929d0e0e4736";
+        let probe = ProbeWriter::default();
+        let subscriber = tracing_subscriber::registry().with(console_layer(false, probe.clone()));
+
+        let request_context = runtime_request_context::RequestContext::builder(
+            runtime_request_context::Protocol::Http,
+        )
+        .with_client_trace_id(Some(std::sync::Arc::from(trace_id)))
+        .build();
+
+        tracing::subscriber::with_default(subscriber, || {
+            let trace = runtime::task_history::correlation::begin_task_trace(
+                &tracing::Span::none(),
+                &request_context,
+            );
+            trace.in_scope(|| {
+                tracing::warn!(target: "data_components", "connection reset by peer");
+            });
+            tracing::warn!(target: "runtime", "loaded dataset taxi_trips");
+        });
+
+        let logged = probe.contents();
+        let named = format!(
+            "{}{{trace_id={trace_id}}}",
+            runtime::task_history::correlation::TRACE_SPAN_NAME
+        );
+
+        let inside = logged
+            .lines()
+            .find(|line| line.contains("connection reset"))
+            .expect("a record from another crate must reach the console");
+        assert!(
+            inside.contains(&named),
+            "a query-derived record must name the query's trace id, got: {inside}"
+        );
+
+        let outside = logged
+            .lines()
+            .find(|line| line.contains("taxi_trips"))
+            .expect("a record outside any task must reach the console");
+        assert!(
+            !outside.contains("trace_id"),
+            "a record emitted outside a task has no id to claim, got: {outside}"
         );
     }
 

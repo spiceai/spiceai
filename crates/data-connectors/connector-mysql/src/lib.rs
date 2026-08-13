@@ -33,10 +33,10 @@ use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult, NewDataConnectorResult,
 };
-use runtime::datafusion::udf::deny_spice_functions_for_table_providers;
-use runtime::parameters::{ParameterSpec, Parameters};
 use runtime_api_types::v1::ComponentType;
 use runtime_metrics::component::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback};
+use runtime_parameters::{ParameterSpec, Parameters};
+use runtime_udfs_api::deny_spice_functions_for_table_providers;
 use secrecy::{ExposeSecret, SecretBox};
 use snafu::prelude::*;
 use std::any::Any;
@@ -612,7 +612,7 @@ impl DataConnector for MySQL {
 
     fn changes_stream(
         &self,
-        federated_table: Arc<runtime::federated_table::FederatedTable>,
+        federated_table: Arc<runtime::federated::FederatedTable>,
         dataset: &Dataset,
     ) -> Option<data_components::cdc::ChangesStream> {
         Some(replication::build_changes_stream(

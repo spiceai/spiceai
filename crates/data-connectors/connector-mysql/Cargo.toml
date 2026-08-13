@@ -38,6 +38,8 @@ paste.workspace = true
 runtime = { path = "../../runtime", features = ["mysql"] }
 runtime-api-types = { path = "../../runtime-api-types" }
 runtime-metrics = { path = "../../runtime-metrics" }
+runtime-parameters = { path = "../../runtime-parameters" }
+runtime-udfs-api = { path = "../../runtime-udfs-api" }
 secrecy.workspace = true
 snafu.workspace = true
 tokio.workspace = true

@@ -46,6 +46,7 @@ mod args_inliner;
 mod arrow_type;
 #[cfg(feature = "http-functions")]
 pub mod remote;
+mod search_query_rewrite;
 pub mod sql;
 #[cfg(feature = "wasm-functions")]
 pub mod wasm;
