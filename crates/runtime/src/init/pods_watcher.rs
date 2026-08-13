@@ -258,9 +258,10 @@ impl Runtime {
     /// when what it changes is confined to the sections reconciled here (see
     /// `spiced`'s `cloud_connect` module).
     ///
-    /// Returns `true` if `new_app` differed from the current app and was
-    /// applied, `false` if it was identical (a no-op). When there is no
-    /// current app yet, `new_app` is installed and `true` is returned.
+    /// Returns `true` if `new_app` differed from the current app and was applied.
+    /// Returns `false` if it was identical (a no-op), or if the accelerator-memory
+    /// preflight failed; a preflight failure is logged and leaves the app unchanged.
+    /// When there is no current app yet, `new_app` is installed and `true` is returned.
     ///
     /// Diffs are computed while holding only a read lock on the app; the write
     /// lock is taken only for the final swap. The whole method is serialized by
@@ -287,21 +288,27 @@ impl Runtime {
     /// Diff-and-apply behind [`Runtime::apply_app`].
     ///
     /// The caller holds `apply_app_lock`. `current_app` is what to reconcile
-    /// *from*, which is not necessarily the installed app; `new_app` is
-    /// installed either way.
+    /// *from*, which is not necessarily the installed app; `new_app` is installed
+    /// after its accelerator-memory preflight succeeds.
     async fn apply_app_diff(
         self: Arc<Self>,
         current_app: Option<&Arc<App>>,
         new_app: Arc<App>,
     ) -> bool {
-        if current_app.is_some_and(|current_app| *current_app == new_app) {
+        // Re-split the coordinated DuckDB accelerator memory budget before the diffs
+        // initialize any accelerator that reads it. Probing and planning run on the
+        // blocking pool so cgroup and host-memory reads do not stall this Tokio worker.
+        if !self
+            .duckdb_budget_context
+            .publish_for(current_app, &new_app)
+            .await
+        {
             return false;
         }
 
-        // Re-split the coordinated DuckDB accelerator memory budget for the
-        // acceleration set `new_app` declares, before the diffs below initialize any
-        // accelerator that reads it.
-        self.duckdb_budget_context.publish_for(&new_app);
+        if current_app.is_some_and(|current_app| *current_app == new_app) {
+            return false;
+        }
 
         if let Some(current_app) = current_app {
             tracing::debug!("Updated pods information: {new_app:?}");
@@ -849,7 +856,7 @@ mod duckdb_budget_tests {
 
     use crate::Runtime;
     use crate::accelerator_memory_budget::{
-        DUCKDB_MIN_INSTANCE_CAP_BYTES, duckdb_auto_memory_limit_option,
+        DUCKDB_MIN_INSTANCE_CAP_BYTES, clear_duckdb_budget, duckdb_auto_memory_limit_option,
         duckdb_total_reservation_bytes,
     };
 
@@ -888,11 +895,12 @@ mod duckdb_budget_tests {
     }
 
     /// A reload changes which `DuckDB` instances exist, so it must republish the
-    /// coordinated budget: a second instance splits what the first one held to
-    /// itself, removing every `DuckDB` accelerator clears the budget rather than
-    /// leaving the reservation the removed instances held, and a pod that gains its
-    /// first accelerator on reload gets the per-instance floor — its query pool was
-    /// sized without coordinating for `DuckDB` and only a restart re-sizes it.
+    /// coordinated budget: a second instance is charged only after the retained first
+    /// pool and therefore receives the floor, removing every `DuckDB` accelerator
+    /// retires the cap while preserving
+    /// the cached instances' reservation, and a pod that gains its first accelerator
+    /// on reload gets the per-instance floor — its query pool was sized without
+    /// coordinating for `DuckDB` and only a restart re-sizes it.
     ///
     /// The budget is process-global and every `Runtime` built anywhere in this binary
     /// republishes it — an app with no `DuckDB` accelerator clears it — so a peer test
@@ -931,7 +939,11 @@ mod duckdb_budget_tests {
             };
         }
 
-        let dir = tempfile::tempdir().expect("temp dir");
+        clear_duckdb_budget();
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(error) => panic!("failed to create the temporary test directory: {error}"),
+        };
         let one = duckdb_dataset("one", &dir.path().join("one.db"));
         let two = duckdb_dataset("two", &dir.path().join("two.db"));
 
@@ -951,7 +963,7 @@ mod duckdb_budget_tests {
         );
 
         let both = AppBuilder::new("duckdb_budget_reload")
-            .with_dataset(one)
+            .with_dataset(one.clone())
             .with_dataset(two)
             .build();
         assert!(
@@ -963,13 +975,10 @@ mod duckdb_budget_tests {
             published_per_instance_mib(),
             "a reload that keeps a DuckDB accelerator keeps a per-instance cap"
         );
-        assert!(
-            two_instances < one_instance,
-            "the reload added a second DuckDB instance, so the published cap must shrink: {two_instances} MiB vs {one_instance} MiB"
-        );
-        assert!(
-            two_instances.abs_diff(one_instance / 2) <= 1,
-            "the two instances must split what the single instance held: {two_instances} MiB vs {one_instance} MiB"
+        assert_eq!(
+            two_instances,
+            DUCKDB_MIN_INSTANCE_CAP_BYTES / MIB,
+            "the first pool keeps its original ceiling, so the new identity receives only the per-instance floor"
         );
         // The instance that already exists keeps the memory_limit it was created
         // with, so the aggregate still has to cover it at the larger cap.
@@ -979,8 +988,26 @@ mod duckdb_budget_tests {
         )
         .get();
         assert!(
-            reservation_after_two >= 2 * one_instance * MIB,
-            "the reservation must cover the first instance at the cap it was created with: {reservation_after_two} bytes"
+            reservation_after_two >= (one_instance + two_instances) * MIB,
+            "the reservation must cover the first instance at its original cap and the second at its new cap: {reservation_after_two} bytes"
+        );
+
+        let one_again = AppBuilder::new("duckdb_budget_reload")
+            .with_dataset(one)
+            .build();
+        assert!(
+            Arc::clone(&rt).apply_app(Arc::new(one_again)).await,
+            "the reload removes one dataset, so it must be applied"
+        );
+        assert_eq!(
+            duckdb_total_reservation_bytes(),
+            reservation_after_two,
+            "a partial removal must keep reserving the removed instance's cached pool"
+        );
+        assert_eq!(
+            published_per_instance_mib(),
+            Some(DUCKDB_MIN_INSTANCE_CAP_BYTES / MIB),
+            "a partial removal cannot release either cached pool, so the creation cap remains at the floor"
         );
 
         let unaccelerated = AppBuilder::new("duckdb_budget_reload")
@@ -1044,6 +1071,7 @@ mod duckdb_budget_tests {
         );
 
         uncoordinated.shutdown().await;
+        clear_duckdb_budget();
         true
     }
 }

@@ -4206,6 +4206,7 @@ dependencies = [
  "linkme",
  "object_store 0.13.2",
  "runtime",
+ "runtime-parameters",
  "runtime-secrets",
  "secrecy",
  "snafu",
@@ -4231,6 +4232,7 @@ dependencies = [
  "linkme",
  "parking_lot",
  "runtime",
+ "runtime-parameters",
  "secrecy",
  "sha2 0.10.9",
  "snafu",
@@ -4257,6 +4259,8 @@ dependencies = [
  "ns_lookup",
  "paste",
  "runtime",
+ "runtime-parameters",
+ "runtime-udfs-api",
  "secrecy",
  "snafu",
  "url",
@@ -4279,6 +4283,7 @@ dependencies = [
  "runtime",
  "runtime-api-types",
  "runtime-metrics",
+ "runtime-parameters",
  "serde_json",
  "snafu",
  "tokio",
@@ -4292,6 +4297,7 @@ dependencies = [
  "app",
  "async-trait",
  "aws-sdk-credential-bridge",
+ "data-http-rate-control",
  "data_components",
  "datafusion",
  "futures",
@@ -4301,6 +4307,7 @@ dependencies = [
  "runtime",
  "runtime-api-types",
  "runtime-metrics",
+ "runtime-parameters",
  "runtime-rate-control",
  "runtime-secrets",
  "secrecy",
@@ -4323,6 +4330,8 @@ dependencies = [
  "linkme",
  "paste",
  "runtime",
+ "runtime-parameters",
+ "runtime-secrets",
  "secrecy",
  "snafu",
  "tokio",
@@ -4344,6 +4353,8 @@ dependencies = [
  "ns_lookup",
  "paste",
  "runtime",
+ "runtime-parameters",
+ "runtime-udfs-api",
  "snafu",
  "tracing",
 ]
@@ -4360,6 +4371,8 @@ dependencies = [
  "linkme",
  "paste",
  "runtime",
+ "runtime-datafusion",
+ "runtime-parameters",
  "snafu",
 ]
 
@@ -4374,6 +4387,8 @@ dependencies = [
  "duckdb",
  "linkme",
  "runtime",
+ "runtime-datafusion",
+ "runtime-parameters",
  "snafu",
  "tokio",
  "tracing",
@@ -4395,6 +4410,7 @@ dependencies = [
  "aws-smithy-types",
  "base64 0.22.1",
  "chrono",
+ "data-connector-api",
  "data_components",
  "datafusion",
  "dynamodb-streams",
@@ -4427,6 +4443,7 @@ dependencies = [
  "linkme",
  "paste",
  "runtime",
+ "runtime-parameters",
  "secrecy",
  "snafu",
  "tracing",
@@ -4445,6 +4462,8 @@ dependencies = [
  "linkme",
  "paste",
  "runtime",
+ "runtime-parameters",
+ "runtime-udfs-api",
  "snafu",
 ]
 
@@ -4455,6 +4474,7 @@ dependencies = [
  "linkme",
  "paste",
  "runtime",
+ "runtime-parameters",
  "snafu",
  "tokio",
  "url",
@@ -4468,6 +4488,7 @@ dependencies = [
  "linkme",
  "object_store 0.13.2",
  "runtime",
+ "runtime-parameters",
  "runtime-secrets",
  "secrecy",
  "snafu",
@@ -4493,6 +4514,7 @@ dependencies = [
  "runtime",
  "runtime-api-types",
  "runtime-metrics",
+ "runtime-parameters",
  "secrecy",
  "snafu",
  "tempfile",
@@ -4522,6 +4544,8 @@ dependencies = [
  "linkme",
  "reqwest 0.13.4",
  "runtime",
+ "runtime-datafusion",
+ "runtime-parameters",
  "runtime-rate-control",
  "runtime-secrets",
  "secrecy",
@@ -4552,6 +4576,7 @@ dependencies = [
  "app",
  "arrow",
  "async-trait",
+ "data-http-rate-control",
  "data_components",
  "datafusion",
  "futures",
@@ -4563,7 +4588,9 @@ dependencies = [
  "reqwest 0.13.4",
  "runtime",
  "runtime-metrics",
+ "runtime-parameters",
  "runtime-rate-control",
+ "runtime-secrets",
  "secrecy",
  "serde",
  "serde_json",
@@ -4591,6 +4618,7 @@ dependencies = [
  "paste",
  "regex",
  "runtime",
+ "runtime-parameters",
  "secrecy",
  "snafu",
 ]
@@ -4611,7 +4639,9 @@ dependencies = [
  "opentelemetry",
  "runtime",
  "runtime-api-types",
+ "runtime-datafusion",
  "runtime-metrics",
+ "runtime-parameters",
  "secrecy",
  "serde",
  "serde_json",
@@ -4630,6 +4660,7 @@ dependencies = [
  "async-stream",
  "async-trait",
  "criterion 0.7.0",
+ "data-connector-api",
  "data_components",
  "datafusion",
  "datafusion-table-providers",
@@ -4639,6 +4670,7 @@ dependencies = [
  "mongodb",
  "paste",
  "runtime",
+ "runtime-parameters",
  "secrecy",
  "serde_json",
  "snafu",
@@ -4657,6 +4689,7 @@ dependencies = [
  "linkme",
  "paste",
  "runtime",
+ "runtime-parameters",
  "snafu",
  "tiberius",
 ]
@@ -4680,6 +4713,8 @@ dependencies = [
  "runtime",
  "runtime-api-types",
  "runtime-metrics",
+ "runtime-parameters",
+ "runtime-udfs-api",
  "secrecy",
  "snafu",
  "tokio",
@@ -4693,6 +4728,7 @@ dependencies = [
  "linkme",
  "paste",
  "runtime",
+ "runtime-parameters",
  "snafu",
  "tokio",
  "url",
@@ -4715,6 +4751,8 @@ dependencies = [
  "odbc-api",
  "paste",
  "runtime",
+ "runtime-parameters",
+ "runtime-udfs-api",
  "secrecy",
  "sha2 0.10.9",
  "snafu",
@@ -4755,8 +4793,12 @@ dependencies = [
  "opentelemetry",
  "runtime",
  "runtime-api-types",
+ "runtime-datafusion",
  "runtime-metrics",
+ "runtime-parameters",
  "secrecy",
+ "serde",
+ "serde_json",
  "snafu",
  "tokio",
  "tokio-postgres",
@@ -4801,6 +4843,7 @@ dependencies = [
  "linkme",
  "paste",
  "runtime",
+ "runtime-parameters",
  "snafu",
  "tokio",
  "url",
@@ -4828,7 +4871,9 @@ dependencies = [
  "percent-encoding",
  "reqwest 0.13.4",
  "runtime",
+ "runtime-datafusion",
  "runtime-object-store",
+ "runtime-parameters",
  "secrecy",
  "serde",
  "serde_json",
@@ -4845,6 +4890,7 @@ dependencies = [
  "linkme",
  "paste",
  "runtime",
+ "runtime-parameters",
  "snafu",
  "tokio",
  "url",
@@ -4863,6 +4909,8 @@ dependencies = [
  "linkme",
  "paste",
  "runtime",
+ "runtime-parameters",
+ "runtime-udfs-api",
  "snafu",
  "snowflake-api",
 ]
@@ -5950,8 +5998,10 @@ dependencies = [
 name = "data-connector-api"
 version = "2.2.0-unstable"
 dependencies = [
+ "data_components",
  "globset",
  "runtime-component",
+ "serde_json",
  "snafu",
 ]
 
@@ -5960,6 +6010,26 @@ name = "data-encoding"
 version = "2.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a4ae5f15dda3c708c0ade84bfee31ccab44a3da4f88015ed22f63732abe300c8"
+
+[[package]]
+name = "data-http-rate-control"
+version = "2.2.0-unstable"
+dependencies = [
+ "data-connector-api",
+ "data_components",
+ "fundu",
+ "governor",
+ "object_store 0.13.2",
+ "opentelemetry",
+ "runtime-api-types",
+ "runtime-metrics",
+ "runtime-parameters",
+ "runtime-rate-control",
+ "tokio",
+ "tracing",
+ "url",
+ "uuid 1.23.2",
+]
 
 [[package]]
 name = "data_components"
@@ -6914,7 +6984,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/datafusion-table-providers.git?rev=894e2794ff285c0f0258e45bba693190cd84e0fb#894e2794ff285c0f0258e45bba693190cd84e0fb"
+source = "git+https://github.com/spiceai/datafusion-table-providers.git?rev=318492b8ae79162586ada08f7672563176bb0331#318492b8ae79162586ada08f7672563176bb0331"
 dependencies = [
  "adbc_core",
  "adbc_driver_manager",
@@ -16799,6 +16869,7 @@ dependencies = [
  "dashmap",
  "data-accelerator-api",
  "data-connector-api",
+ "data-http-rate-control",
  "data_components",
  "dataformat-json",
  "datafusion",
@@ -22786,6 +22857,10 @@ dependencies = [
  "moka",
  "object_store 0.13.2",
  "opentelemetry",
+ "opentelemetry-prometheus",
+ "opentelemetry_sdk",
+ "parking_lot",
+ "prometheus",
  "rstest 0.26.1",
  "tempfile",
  "tokio",

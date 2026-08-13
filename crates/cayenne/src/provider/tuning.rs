@@ -292,10 +292,10 @@ pub(crate) const GOAL_INFEASIBLE_STUCK_TICKS: u64 = 2 * STEPS_PER_WINDOW as u64;
 // Environment detection: process memory budget + cgroup-aware usage
 // ---------------------------------------------------------------------------
 
-/// Process memory budget in bytes (the cgroup-aware limit), injected once at
-/// startup by the runtime via [`set_global_memory_budget`]. `0` = unset, in
-/// which case memory pressure is reported as unknown and the controller runs
-/// without the memory rule. Process-wide because RAM is shared across tables.
+/// Process memory budget in bytes (the cgroup-aware limit), installed at startup
+/// and refreshed after an app reload observes a changed limit. `0` = unset, in which
+/// case memory pressure is reported as unknown and the controller runs without the
+/// memory rule. Process-wide because RAM is shared across tables.
 static GLOBAL_MEMORY_BUDGET: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(target_os = "linux")]
@@ -337,11 +337,10 @@ static CGROUP_V1_CPUACCT_USAGE_PATH: OnceLock<Option<String>> = OnceLock::new();
 static CPU_PREV_SAMPLE: LazyLock<Mutex<Option<(u64, Instant)>>> =
     LazyLock::new(|| Mutex::new(None));
 
-/// Install the process memory budget (cgroup-aware total) the dynamic tuner uses
-/// to compute memory pressure. Called once at startup by the runtime, mirroring
-/// the encode-concurrency budget.
+/// Install or refresh the cgroup-aware process memory budget the dynamic tuner uses
+/// to compute memory pressure.
 pub fn set_global_memory_budget(bytes: u64) {
-    GLOBAL_MEMORY_BUDGET.store(bytes, Ordering::Relaxed);
+    GLOBAL_MEMORY_BUDGET.store(bytes, Ordering::Release);
 }
 
 /// Record whether the host is a T-family burstable EC2 instance (from IMDS).
@@ -355,7 +354,7 @@ fn cpu_burstable() -> bool {
 }
 
 fn global_memory_budget() -> Option<u64> {
-    match GLOBAL_MEMORY_BUDGET.load(Ordering::Relaxed) {
+    match GLOBAL_MEMORY_BUDGET.load(Ordering::Acquire) {
         0 => None,
         b => Some(b),
     }

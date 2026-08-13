@@ -17,7 +17,10 @@ limitations under the License.
 use std::{
     collections::{HashMap, HashSet},
     num::NonZeroUsize,
-    sync::{Arc, OnceLock, RwLock, atomic::AtomicU64},
+    sync::{
+        Arc, OnceLock, RwLock,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use super::{
@@ -384,6 +387,12 @@ pub struct DataFusionBuilder {
     /// Applied as a `min`-cap on the DEFAULT query pool only (an explicit
     /// `runtime.query.memory_limit` still wins). `None` = no `DuckDB` coordination.
     duckdb_query_pool_cap: Option<u64>,
+    /// The one cgroup-aware ceiling shared by startup planning, the built runtime,
+    /// and reload-time consumers. When absent, this builder probes once at build.
+    current_total_memory: Option<Arc<AtomicU64>>,
+    /// Current high-water off-pool Cayenne reservation, shared with reload planning
+    /// and the live in-memory-tier sampler.
+    current_cayenne_reservation_bytes: Option<Arc<AtomicU64>>,
     cayenne_optimizer_rules: CayenneOptimizerRules,
     /// Arbitrary additional analyzer rules.
     additional_analyzer_rules: Vec<Arc<dyn AnalyzerRule + Send + Sync>>,
@@ -446,6 +455,8 @@ impl DataFusionBuilder {
             cayenne_workload: crate::builder::CayenneWorkload::default(),
             dedicated_thread_pools_enabled: true,
             duckdb_query_pool_cap: None,
+            current_total_memory: None,
+            current_cayenne_reservation_bytes: None,
             cayenne_optimizer_rules: CayenneOptimizerRules::default(),
             additional_analyzer_rules: vec![],
             executor_registry: None,
@@ -655,6 +666,18 @@ impl DataFusionBuilder {
         self
     }
 
+    #[must_use]
+    pub fn current_total_memory(mut self, memory: Arc<AtomicU64>) -> Self {
+        self.current_total_memory = Some(memory);
+        self
+    }
+
+    #[must_use]
+    pub fn current_cayenne_reservation_bytes(mut self, bytes: Arc<AtomicU64>) -> Self {
+        self.current_cayenne_reservation_bytes = Some(bytes);
+        self
+    }
+
     /// Sets the fraction of the query memory limit carved into a dedicated Cayenne
     /// compaction pool. The Runtime builder passes `Some` only when dedicated thread
     /// pools are enabled and at least one enabled acceleration can compact into the
@@ -726,6 +749,16 @@ impl DataFusionBuilder {
     #[must_use]
     pub fn build(self) -> DataFusion {
         let mut config = self.config;
+        let current_total_memory = self.current_total_memory.as_ref().map_or_else(
+            || Arc::new(AtomicU64::new(crate::resource_monitor::get_total_memory())),
+            Arc::clone,
+        );
+        let total_memory = current_total_memory.load(Ordering::Acquire);
+        let current_cayenne_reservation_bytes =
+            self.current_cayenne_reservation_bytes.as_ref().map_or_else(
+                || Arc::new(AtomicU64::new(self.cayenne_reservation_bytes)),
+                Arc::clone,
+            );
         // Request a dedicated compaction memory budget when a fraction is
         // configured. The Runtime builder sets it only when dedicated thread pools
         // are enabled AND a Cayenne acceleration can actually compact into it. The
@@ -755,6 +788,7 @@ impl DataFusionBuilder {
         let cayenne_cdc_active =
             self.dedicated_thread_pools_enabled && self.cayenne_workload.uses_cdc_tier();
         let effective_memory_limit = effective_query_memory_limit(
+            total_memory,
             self.memory_limit,
             cayenne_cdc_active,
             self.cayenne_reservation_bytes,
@@ -803,7 +837,6 @@ impl DataFusionBuilder {
         // Cayenne crate.
         let query_memory_pool_bytes = effective_memory_limit;
         let mem_tier_budget_bytes = cayenne_cdc_active.then(|| {
-            let total_memory = crate::resource_monitor::get_total_memory();
             let external_reservation_bytes =
                 crate::accelerator_memory_budget::duckdb_total_reservation_bytes();
             let budget = coordinated_mem_tier_budget(
@@ -1251,8 +1284,6 @@ impl DataFusionBuilder {
             SPICE_DEFAULT_CATALOG,
         )));
 
-        let total_memory = crate::resource_monitor::get_total_memory();
-
         DataFusion {
             runtime_status: self.status,
             ctx: Arc::new(ctx),
@@ -1288,7 +1319,8 @@ impl DataFusionBuilder {
             query_memory_pool_bytes,
             mem_tier_budget_bytes,
             cayenne_workload: self.cayenne_workload,
-            current_total_memory: Arc::new(AtomicU64::new(total_memory)),
+            current_total_memory,
+            current_cayenne_reservation_bytes,
             io_runtime: self.io_runtime,
             metrics: self.metrics,
             resource_monitor: self.resource_monitor,
@@ -1535,7 +1567,32 @@ const CAYENNE_QUERY_MEMORY_PERCENT: u64 = 70;
 /// memory mode leans on the per-table caps + spill/durable backstops.
 const CAYENNE_QUERY_MEMORY_FLOOR_PERCENT: u64 = 50;
 
+/// Query-memory default projected from a caller-provided cgroup ceiling. This is
+/// side-effect-free so reload planning can inspect the current region without
+/// emitting startup-only pool-sizing guidance for a pool that already exists.
+#[must_use]
+pub(crate) fn projected_query_memory_limit(
+    total_memory: u64,
+    cayenne_cdc_active: bool,
+    cayenne_reservation_bytes: u64,
+) -> u64 {
+    let floor = total_memory.saturating_mul(CAYENNE_QUERY_MEMORY_FLOOR_PERCENT) / 100;
+    if cayenne_cdc_active {
+        let base = total_memory.saturating_mul(CAYENNE_QUERY_MEMORY_PERCENT) / 100;
+        let base_headroom = total_memory / MEM_TIER_HEADROOM_FRACTION;
+        let reservation_excess = cayenne_reservation_bytes.saturating_sub(base_headroom);
+        base.saturating_sub(reservation_excess).max(floor)
+    } else if cayenne_reservation_bytes > 0 {
+        (total_memory.saturating_mul(DEFAULT_QUERY_MEMORY_PERCENT) / 100)
+            .saturating_sub(cayenne_reservation_bytes)
+            .max(floor)
+    } else {
+        total_memory.saturating_mul(DEFAULT_QUERY_MEMORY_PERCENT) / 100
+    }
+}
+
 pub(crate) fn effective_query_memory_limit(
+    total_memory: u64,
     memory_limit: Option<u64>,
     cayenne_cdc_active: bool,
     cayenne_reservation_bytes: u64,
@@ -1556,9 +1613,15 @@ pub(crate) fn effective_query_memory_limit(
         }
         limit
     } else {
-        let total_memory = crate::resource_monitor::get_total_memory();
-        let floor = total_memory.saturating_mul(CAYENNE_QUERY_MEMORY_FLOOR_PERCENT) / 100;
-        let default_limit = if cayenne_cdc_active {
+        let default_limit = projected_query_memory_limit(
+            total_memory,
+            cayenne_cdc_active,
+            cayenne_reservation_bytes,
+        );
+        let readable_default_limit =
+            util::human_readable_bytes(usize::try_from(default_limit).unwrap_or(usize::MAX));
+        if cayenne_cdc_active {
+            let floor = total_memory.saturating_mul(CAYENNE_QUERY_MEMORY_FLOOR_PERCENT) / 100;
             // Cayenne CDC active. Base is CAYENNE_QUERY_MEMORY_PERCENT of host, leaving
             // room for the off-pool in-memory tier (clamped to <= host/5 by
             // `coordinated_mem_tier_budget`) plus a host/10 headroom for the off-pool
@@ -1571,10 +1634,8 @@ pub(crate) fn effective_query_memory_limit(
             // within host. Floored at CAYENNE_QUERY_MEMORY_FLOOR_PERCENT so a very
             // cache-heavy config never starves queries (past the floor the tier
             // install-time check warns).
-            let base = total_memory.saturating_mul(CAYENNE_QUERY_MEMORY_PERCENT) / 100;
             let base_headroom = total_memory / MEM_TIER_HEADROOM_FRACTION;
             let reservation_excess = cayenne_reservation_bytes.saturating_sub(base_headroom);
-            let default_limit = base.saturating_sub(reservation_excess).max(floor);
 
             // The floor binding is the unfittable-configuration signal: the
             // reservation clawback is capped at (base - floor) percent of host,
@@ -1596,11 +1657,8 @@ pub(crate) fn effective_query_memory_limit(
                 cayenne_cdc_active,
                 cayenne_reservation_bytes,
                 reservation_excess,
-                "No query memory limit specified; Cayenne CDC base {CAYENNE_QUERY_MEMORY_PERCENT}% of total, reduced by the per-table CDC reservation above the host/10 headroom to: {}",
-                util::human_readable_bytes(default_limit as usize)
+                "No query memory limit specified; Cayenne CDC base {CAYENNE_QUERY_MEMORY_PERCENT}% of total, reduced by the per-table CDC reservation above the host/10 headroom to: {readable_default_limit}"
             );
-
-            default_limit
         } else if cayenne_reservation_bytes > 0 {
             // Cayenne configured but bulk-written only: the in-memory CDC tier is
             // unreachable, so there is nothing to fence 20% of host for and the pool
@@ -1610,24 +1668,15 @@ pub(crate) fn effective_query_memory_limit(
             // remaining 10% covers OS/allocator overhead alone. So subtract the FULL
             // reservation rather than only its excess, keeping
             // `query_pool + caches + overhead <= host`. Same floor as the CDC branch.
-            let base = total_memory.saturating_mul(DEFAULT_QUERY_MEMORY_PERCENT) / 100;
-            let default_limit = base.saturating_sub(cayenne_reservation_bytes).max(floor);
-
             tracing::debug!(
                 cayenne_reservation_bytes,
-                "No query memory limit specified; Cayenne configured without an in-memory CDC tier, so the standard {DEFAULT_QUERY_MEMORY_PERCENT}% base applies, reduced by the off-pool per-table cache reservation to: {}",
-                util::human_readable_bytes(default_limit as usize)
+                "No query memory limit specified; Cayenne configured without an in-memory CDC tier, so the standard {DEFAULT_QUERY_MEMORY_PERCENT}% base applies, reduced by the off-pool per-table cache reservation to: {readable_default_limit}"
             );
-
-            default_limit
         } else {
-            let default_limit = total_memory.saturating_mul(DEFAULT_QUERY_MEMORY_PERCENT) / 100;
             tracing::debug!(
-                "No query memory limit specified, defaulting to {DEFAULT_QUERY_MEMORY_PERCENT}% of total memory: {}",
-                util::human_readable_bytes(default_limit as usize)
+                "No query memory limit specified, defaulting to {DEFAULT_QUERY_MEMORY_PERCENT}% of total memory: {readable_default_limit}"
             );
-            default_limit
-        };
+        }
 
         // Coordinated DuckDB cap: when DuckDB file accelerators are present the
         // Runtime builder computes a reduced query-pool ceiling (see
@@ -1659,6 +1708,17 @@ pub(crate) fn effective_query_memory_limit(
 /// 70% / 20% / 10% = 100%.
 const MEM_TIER_CEILING_FRACTION: u64 = 5;
 const MEM_TIER_HEADROOM_FRACTION: u64 = 10;
+
+/// Portion of the off-pool Cayenne cache reservation not already covered by the
+/// standard host/10 headroom. The live tier sampler subtracts this before allowing
+/// a query-light tier to float upward.
+#[must_use]
+pub(crate) const fn cayenne_reservation_excess_bytes(
+    total_memory: u64,
+    cayenne_reservation_bytes: u64,
+) -> u64 {
+    cayenne_reservation_bytes.saturating_sub(total_memory / MEM_TIER_HEADROOM_FRACTION)
+}
 /// Raised tier ceiling (1/N of host, > the base `MEM_TIER_CEILING_FRACTION`) the
 /// tier may FLOAT up to on a query-light deployment — one where the operator set a
 /// low `runtime.query.memory_limit`, leaving RAM the default partition would not
@@ -1996,22 +2056,23 @@ mod tests {
     /// whether Cayenne is active — the coordinated default only applies when unset.
     #[test]
     fn effective_query_memory_limit_honors_explicit_value() {
+        let total = 256 << 30;
         assert_eq!(
-            effective_query_memory_limit(Some(123 << 30), true, 0, None),
+            effective_query_memory_limit(total, Some(123 << 30), true, 0, None),
             123 << 30
         );
         assert_eq!(
-            effective_query_memory_limit(Some(123 << 30), false, 0, None),
+            effective_query_memory_limit(total, Some(123 << 30), false, 0, None),
             123 << 30
         );
         // A nonzero CDC reservation never overrides an explicit limit.
         assert_eq!(
-            effective_query_memory_limit(Some(7), true, 1 << 30, None),
+            effective_query_memory_limit(total, Some(7), true, 1 << 30, None),
             7
         );
         // Nor does a DuckDB query-pool cap override an explicit limit.
         assert_eq!(
-            effective_query_memory_limit(Some(123 << 30), false, 0, Some(1 << 30)),
+            effective_query_memory_limit(total, Some(123 << 30), false, 0, Some(1 << 30),),
             123 << 30
         );
     }
@@ -2020,7 +2081,8 @@ mod tests {
     /// base host/10 headroom leaves the default at the base 70%; a reservation ABOVE
     /// the headroom reduces the default by exactly the excess; and a very large
     /// reservation floors at `CAYENNE_QUERY_MEMORY_FLOOR_PERCENT` (never 0). Reads
-    /// live host RAM, so it asserts the RELATIONSHIPS rather than absolute bytes.
+    /// the current cgroup-aware total, so it asserts the RELATIONSHIPS rather than
+    /// absolute bytes.
     #[test]
     fn effective_query_memory_limit_reduces_by_cdc_reservation() {
         let total = crate::resource_monitor::get_total_memory();
@@ -2029,28 +2091,32 @@ mod tests {
         let floor = total.saturating_mul(CAYENNE_QUERY_MEMORY_FLOOR_PERCENT) / 100;
 
         // Reservation within the base headroom -> no reduction, stays at base 70%.
-        assert_eq!(effective_query_memory_limit(None, true, 0, None), base);
         assert_eq!(
-            effective_query_memory_limit(None, true, headroom, None),
+            effective_query_memory_limit(total, None, true, 0, None),
+            base
+        );
+        assert_eq!(
+            effective_query_memory_limit(total, None, true, headroom, None),
             base
         );
 
         // Reservation above the headroom -> reduced by exactly the excess.
         let excess = headroom / 2;
         assert_eq!(
-            effective_query_memory_limit(None, true, headroom + excess, None),
+            effective_query_memory_limit(total, None, true, headroom + excess, None),
             base - excess
         );
 
         // A reservation larger than the whole host floors the pool, never 0.
-        let floored = effective_query_memory_limit(None, true, total.saturating_mul(2), None);
+        let floored =
+            effective_query_memory_limit(total, None, true, total.saturating_mul(2), None);
         assert_eq!(floored, floor);
         assert!(floored > 0);
 
         // A pod with no Cayenne acceleration reports a zero reservation and keeps
         // the standard default untouched.
         assert_eq!(
-            effective_query_memory_limit(None, false, 0, None),
+            effective_query_memory_limit(total, None, false, 0, None),
             total.saturating_mul(DEFAULT_QUERY_MEMORY_PERCENT) / 100
         );
 
@@ -2061,20 +2127,20 @@ mod tests {
         let bulk_base = total.saturating_mul(DEFAULT_QUERY_MEMORY_PERCENT) / 100;
         let bulk_reservation = total / 50;
         assert_eq!(
-            effective_query_memory_limit(None, false, bulk_reservation, None),
+            effective_query_memory_limit(total, None, false, bulk_reservation, None),
             bulk_base - bulk_reservation,
             "a bulk-only Cayenne pod subtracts its whole cache reservation"
         );
         assert!(
-            effective_query_memory_limit(None, false, bulk_reservation, None)
-                > effective_query_memory_limit(None, true, bulk_reservation, None),
+            effective_query_memory_limit(total, None, false, bulk_reservation, None)
+                > effective_query_memory_limit(total, None, true, bulk_reservation, None),
             "bulk-only must leave queries strictly more memory than the CDC partition"
         );
 
         // ...and is floored identically, so a pathological cache config cannot
         // starve queries on either branch.
         assert_eq!(
-            effective_query_memory_limit(None, false, total.saturating_mul(2), None),
+            effective_query_memory_limit(total, None, false, total.saturating_mul(2), None,),
             floor
         );
 
@@ -2082,12 +2148,12 @@ mod tests {
         let non_cayenne_default = total.saturating_mul(DEFAULT_QUERY_MEMORY_PERCENT) / 100;
         let half = non_cayenne_default / 2;
         assert_eq!(
-            effective_query_memory_limit(None, false, 0, Some(half)),
+            effective_query_memory_limit(total, None, false, 0, Some(half)),
             half,
             "a smaller cap reduces the default"
         );
         assert_eq!(
-            effective_query_memory_limit(None, false, 0, Some(non_cayenne_default * 2)),
+            effective_query_memory_limit(total, None, false, 0, Some(non_cayenne_default * 2),),
             non_cayenne_default,
             "a larger cap never raises the default"
         );

@@ -43,7 +43,15 @@ limitations under the License.
 //! coordination. There is no config knob — coordination is always on and always
 //! warns when it engages.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::{
+    collections::HashMap,
+    sync::{
+        LazyLock,
+        atomic::{AtomicU64, Ordering},
+    },
+};
+
+use parking_lot::Mutex;
 
 /// Share (%) of the splittable query region handed to the query pool when it is
 /// contested with un-limited `DuckDB` instances; the remainder is split equally
@@ -80,86 +88,198 @@ const MIB: u64 = 1024 * 1024;
 /// `cayenne::set_global_memory_budget`.
 static DUCKDB_AUTO_MEMORY_LIMIT_BYTES: AtomicU64 = AtomicU64::new(0);
 
-/// Process-global aggregate `DuckDB` ceiling (bytes) — the sum of all `DuckDB`
-/// instance limits after coordination, at the largest per-instance cap still in play
-/// (see [`DUCKDB_MAX_LIVE_CAP_BYTES`]). Read by the Cayenne in-memory CDC tier
-/// sampler so a co-resident Cayenne tier can't float back into `DuckDB`'s reserved
-/// room. `0` = no `DuckDB` accelerators.
+/// Process-global aggregate `DuckDB` ceiling (bytes), including cached instances
+/// whose datasets were removed. Read by the Cayenne in-memory CDC tier sampler so a
+/// co-resident Cayenne tier can't float back into memory `DuckDB` may still hold.
+/// `0` means no instance ceiling has been observed since the budget was cleared.
 static DUCKDB_TOTAL_RESERVATION_BYTES: AtomicU64 = AtomicU64::new(0);
 
-/// The largest per-instance ceiling any un-limited `DuckDB` instance may still hold,
-/// since the budget was last cleared. An instance keeps the `memory_limit` it was
-/// created with, so once a reload shrinks the cap the instances created under the
-/// larger one still hold it, and the aggregate reservation has to cover them. `0` =
-/// nothing in play.
-///
-/// Nothing here observes an instance being torn down, so this only rises while any
-/// `DuckDB` accelerator remains configured: after several reloads the aggregate
-/// over-reserves — the direction that keeps a co-resident consumer off memory
-/// `DuckDB` may hold.
-static DUCKDB_MAX_LIVE_CAP_BYTES: AtomicU64 = AtomicU64::new(0);
+/// Largest ceiling observed for each `DuckDB` database identity. Removing a dataset
+/// does not evict its cached pool, so identities remain here until the runtime budget
+/// is cleared before any accelerator is created. This can over-reserve after an
+/// explicit pool eviction, which is safer than releasing memory a cached pool still
+/// holds.
+static DUCKDB_INSTANCE_CEILINGS: LazyLock<Mutex<HashMap<DuckDbInstanceIdentity, u64>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
-/// Publishes `plan` for an app declaring `unset_instances` un-limited `DuckDB`
-/// instances, once at startup and on every `apply_app` reload. Returns whether
-/// either published value moved, so a reload that leaves the budget where it was can
-/// stay silent.
-///
-/// Every un-limited instance is charged at the largest ceiling any of them may still
-/// hold — the largest [`live_per_instance_ceiling`] seen since the budget was cleared
-/// — not at this plan's: an instance created under a cap a later reload shrank keeps
-/// the `memory_limit` it was created with, and a co-resident consumer reading
-/// [`duckdb_total_reservation_bytes`] has to leave that larger ceiling alone.
-///
-/// The charge follows the app's declaration, not instance identity, so an instance
-/// whose `duckdb_memory_limit` moved between explicit and un-limited across a reload
-/// is charged at what the new declaration gives it — which is what it holds only once
-/// it is recreated. Tracking that exactly needs per-instance ceilings, which live with
-/// the accelerator rather than the Spicepod.
-pub fn publish_duckdb_budget(
-    plan: &AcceleratorMemoryPlan,
-    unset_instances: u32,
-    duckdb_default_per_instance: u64,
-) -> bool {
-    let live_cap = live_per_instance_ceiling(plan, unset_instances, duckdb_default_per_instance);
-    let cap_still_in_play = DUCKDB_MAX_LIVE_CAP_BYTES
-        .fetch_max(live_cap, Ordering::Relaxed)
-        .max(live_cap);
-    publish(
-        plan.per_instance_cap_bytes,
-        reservation_at_cap_in_play(plan, live_cap, cap_still_in_play, unset_instances),
-    )
+/// Result of publishing the process-global `DuckDB` accelerator budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DuckDbBudgetPublication {
+    /// Whether the published cap or aggregate reservation changed.
+    pub changed: bool,
+    /// Aggregate retained ceiling for active and cached database identities.
+    pub total_reservation_bytes: u64,
 }
 
-/// What one un-limited instance created under `plan` ends up holding: the cap it
-/// publishes, or — when it caps nothing — `DuckDB`'s own ~80%-of-host default, which
-/// is what such an instance takes for itself. `0` when the app declares no un-limited
-/// instance, so an all-explicit plan puts no ceiling in play.
-fn live_per_instance_ceiling(
+/// Publishes `plan` for an app declaring `unset_instances` un-limited `DuckDB`
+/// instances, once at startup and on every `apply_app` reload. The aggregate retains
+/// the largest ceiling seen for every database identity, including identities no
+/// longer declared by the app, because their cached pools can remain live.
+pub fn publish_duckdb_budget(
     plan: &AcceleratorMemoryPlan,
-    unset_instances: u32,
+    inputs: &DuckDbBudgetInputs,
     duckdb_default_per_instance: u64,
-) -> u64 {
-    match (unset_instances, plan.per_instance_cap_bytes) {
-        (0, _) => 0,
-        (_, 0) => duckdb_default_per_instance,
-        (_, cap) => cap,
+) -> DuckDbBudgetPublication {
+    let auto_ceiling = live_auto_ceiling(plan, duckdb_default_per_instance);
+    let total_reservation_bytes =
+        retained_instance_reservation_bytes(&DUCKDB_INSTANCE_CEILINGS, inputs, auto_ceiling);
+    publish_retained(plan.per_instance_cap_bytes, total_reservation_bytes)
+}
+
+/// What an un-limited instance created under `plan` can hold: the cap it publishes,
+/// or `DuckDB`'s own ~80%-of-host default when the plan publishes no cap.
+fn live_auto_ceiling(plan: &AcceleratorMemoryPlan, duckdb_default_per_instance: u64) -> u64 {
+    match plan.per_instance_cap_bytes {
+        0 => duckdb_default_per_instance,
+        cap => cap,
     }
 }
 
-/// [`plan`]'s aggregate ceiling, with every un-limited instance charged at
-/// `cap_still_in_play` rather than at `live_cap`, the (never larger) ceiling this plan
-/// leaves one of them holding.
-fn reservation_at_cap_in_play(
-    plan: &AcceleratorMemoryPlan,
-    live_cap: u64,
-    cap_still_in_play: u64,
-    unset_instances: u32,
+fn retained_instance_reservation_bytes(
+    instance_ceilings: &Mutex<HashMap<DuckDbInstanceIdentity, u64>>,
+    inputs: &DuckDbBudgetInputs,
+    auto_ceiling: u64,
 ) -> u64 {
-    plan.duckdb_reservation_bytes.saturating_add(
-        cap_still_in_play
-            .saturating_sub(live_cap)
-            .saturating_mul(u64::from(unset_instances)),
-    )
+    let mut retained = instance_ceilings.lock();
+    update_retained_instance_ceilings(&mut retained, inputs, auto_ceiling)
+}
+
+fn update_retained_instance_ceilings(
+    retained: &mut HashMap<DuckDbInstanceIdentity, u64>,
+    inputs: &DuckDbBudgetInputs,
+    auto_ceiling: u64,
+) -> u64 {
+    for instance in &inputs.instances {
+        let current_ceiling = instance.ceiling_with_auto(auto_ceiling);
+        retained
+            .entry(instance.identity.clone())
+            .and_modify(|ceiling| *ceiling = (*ceiling).max(current_ceiling))
+            .or_insert(current_ceiling);
+    }
+    retained.values().copied().fold(0_u64, u64::saturating_add)
+}
+
+/// Plans and publishes a reload while accounting for every active or cached pool
+/// ceiling retained from earlier app versions. The fixed query pool and retained
+/// ceilings are charged first; only the remaining coordinated region is offered to
+/// new or recreated un-limited instances.
+pub fn plan_and_publish_reload(
+    total_memory: u64,
+    duckdb_default_per_instance: u64,
+    base_query_budget: u64,
+    query_pool_ceiling_bytes: u64,
+    inputs: &DuckDbBudgetInputs,
+) -> (AcceleratorMemoryPlan, DuckDbBudgetPublication) {
+    if inputs.is_empty() {
+        let retained = duckdb_total_reservation_bytes();
+        let plan = AcceleratorMemoryPlan::noop(
+            query_pool_ceiling_bytes,
+            query_pool_ceiling_bytes.saturating_add(retained),
+            retained,
+        );
+        return (plan, retire_duckdb_cap());
+    }
+
+    let mut retained = DUCKDB_INSTANCE_CEILINGS.lock();
+    let plan = plan_reload(
+        total_memory,
+        duckdb_default_per_instance,
+        base_query_budget,
+        query_pool_ceiling_bytes,
+        inputs,
+        &retained,
+    );
+    let auto_ceiling = live_auto_ceiling(&plan, duckdb_default_per_instance);
+    let total_reservation_bytes =
+        update_retained_instance_ceilings(&mut retained, inputs, auto_ceiling);
+    drop(retained);
+    let publication = publish_retained(plan.per_instance_cap_bytes, total_reservation_bytes);
+    (plan, publication)
+}
+
+fn projected_retained_reservation_bytes(
+    retained: &HashMap<DuckDbInstanceIdentity, u64>,
+    inputs: &DuckDbBudgetInputs,
+    auto_ceiling: u64,
+) -> u64 {
+    let retained_total = retained.values().copied().fold(0_u64, u64::saturating_add);
+    inputs
+        .instances
+        .iter()
+        .fold(retained_total, |total, instance| {
+            let previous = retained.get(&instance.identity).copied().unwrap_or(0);
+            total.saturating_add(
+                instance
+                    .ceiling_with_auto(auto_ceiling)
+                    .saturating_sub(previous),
+            )
+        })
+}
+
+/// Reload-specific planner for an already-fixed query pool. Existing pool ceilings
+/// cannot shrink, so this water-fills a single cap for un-limited instances only
+/// after charging every retained identity and explicit increase.
+fn plan_reload(
+    total_memory: u64,
+    duckdb_default_per_instance: u64,
+    base_query_budget: u64,
+    query_pool_ceiling_bytes: u64,
+    inputs: &DuckDbBudgetInputs,
+    retained: &HashMap<DuckDbInstanceIdentity, u64>,
+) -> AcceleratorMemoryPlan {
+    let projected_reservation =
+        projected_retained_reservation_bytes(retained, inputs, duckdb_default_per_instance);
+    let projected_ceiling_bytes = query_pool_ceiling_bytes.saturating_add(projected_reservation);
+    if total_memory == 0 || projected_ceiling_bytes <= base_query_budget {
+        return AcceleratorMemoryPlan::noop(
+            query_pool_ceiling_bytes,
+            projected_ceiling_bytes,
+            projected_reservation,
+        );
+    }
+
+    let unset = u64::from(inputs.num_unset_instances);
+    let per_instance_cap_bytes = if unset == 0 {
+        0
+    } else {
+        let floor_mib = DUCKDB_MIN_INSTANCE_CAP_BYTES / MIB;
+        let mut low = floor_mib;
+        let mut high = duckdb_default_per_instance.max(DUCKDB_MIN_INSTANCE_CAP_BYTES) / MIB;
+        let floor_reservation =
+            projected_retained_reservation_bytes(retained, inputs, DUCKDB_MIN_INSTANCE_CAP_BYTES);
+        if query_pool_ceiling_bytes.saturating_add(floor_reservation) > base_query_budget {
+            DUCKDB_MIN_INSTANCE_CAP_BYTES
+        } else {
+            while low < high {
+                let middle = low + (high - low).div_ceil(2);
+                let candidate = middle.saturating_mul(MIB);
+                let candidate_reservation =
+                    projected_retained_reservation_bytes(retained, inputs, candidate);
+                if query_pool_ceiling_bytes.saturating_add(candidate_reservation)
+                    <= base_query_budget
+                {
+                    low = middle;
+                } else {
+                    high = middle - 1;
+                }
+            }
+            low.saturating_mul(MIB)
+        }
+    };
+    let duckdb_reservation_bytes =
+        projected_retained_reservation_bytes(retained, inputs, per_instance_cap_bytes);
+    let residual_overcommit =
+        query_pool_ceiling_bytes.saturating_add(duckdb_reservation_bytes) > base_query_budget;
+
+    AcceleratorMemoryPlan {
+        outcome: PlanOutcome::Applied,
+        per_instance_cap_bytes,
+        query_pool_cap_bytes: None,
+        duckdb_reservation_bytes,
+        effective_query_pool_bytes: query_pool_ceiling_bytes,
+        projected_ceiling_bytes,
+        residual_overcommit,
+    }
 }
 
 /// Clears the budget — no `DuckDB` accelerator is configured and no instance of one
@@ -169,9 +289,10 @@ fn reservation_at_cap_in_play(
 /// Only a runtime being built may say this: it has created no `DuckDB` instance yet.
 /// A reload cannot, because deregistering a dataset does not evict the accelerator's
 /// pool — see [`retire_duckdb_cap`].
-pub fn clear_duckdb_budget() -> bool {
-    DUCKDB_MAX_LIVE_CAP_BYTES.store(0, Ordering::Relaxed);
-    publish(0, 0)
+#[cfg(test)]
+pub(crate) fn clear_duckdb_budget() -> bool {
+    DUCKDB_INSTANCE_CEILINGS.lock().clear();
+    publish_exact(0, 0).changed
 }
 
 /// Retires the per-instance cap for an app that declares no `DuckDB` accelerator,
@@ -184,17 +305,42 @@ pub fn clear_duckdb_budget() -> bool {
 /// the `memory_limit` it was created with — and a dataset re-added onto the same file
 /// gets that cached pool, at that same limit. Releasing the reservation here would
 /// hand a co-resident consumer memory `DuckDB` still has.
-pub fn retire_duckdb_cap() -> bool {
-    publish(0, DUCKDB_TOTAL_RESERVATION_BYTES.load(Ordering::Relaxed))
+pub fn retire_duckdb_cap() -> DuckDbBudgetPublication {
+    let changed = DUCKDB_AUTO_MEMORY_LIMIT_BYTES.swap(0, Ordering::AcqRel) != 0;
+    DuckDbBudgetPublication {
+        changed,
+        total_reservation_bytes: DUCKDB_TOTAL_RESERVATION_BYTES.load(Ordering::Acquire),
+    }
 }
 
-fn publish(per_instance_cap_bytes: u64, total_reservation_bytes: u64) -> bool {
-    let cap_moved = DUCKDB_AUTO_MEMORY_LIMIT_BYTES.swap(per_instance_cap_bytes, Ordering::Relaxed)
+fn publish_retained(
+    per_instance_cap_bytes: u64,
+    total_reservation_bytes: u64,
+) -> DuckDbBudgetPublication {
+    let cap_moved = DUCKDB_AUTO_MEMORY_LIMIT_BYTES.swap(per_instance_cap_bytes, Ordering::AcqRel)
+        != per_instance_cap_bytes;
+    let previous_reservation =
+        DUCKDB_TOTAL_RESERVATION_BYTES.fetch_max(total_reservation_bytes, Ordering::AcqRel);
+    DuckDbBudgetPublication {
+        changed: cap_moved || total_reservation_bytes > previous_reservation,
+        total_reservation_bytes: previous_reservation.max(total_reservation_bytes),
+    }
+}
+
+#[cfg(test)]
+fn publish_exact(
+    per_instance_cap_bytes: u64,
+    total_reservation_bytes: u64,
+) -> DuckDbBudgetPublication {
+    let cap_moved = DUCKDB_AUTO_MEMORY_LIMIT_BYTES.swap(per_instance_cap_bytes, Ordering::AcqRel)
         != per_instance_cap_bytes;
     let reservation_moved = DUCKDB_TOTAL_RESERVATION_BYTES
-        .swap(total_reservation_bytes, Ordering::Relaxed)
+        .swap(total_reservation_bytes, Ordering::AcqRel)
         != total_reservation_bytes;
-    cap_moved || reservation_moved
+    DuckDbBudgetPublication {
+        changed: cap_moved || reservation_moved,
+        total_reservation_bytes,
+    }
 }
 
 /// The coordinated per-instance `DuckDB` `memory_limit` as a DuckDB-accepted string
@@ -207,7 +353,7 @@ fn publish(per_instance_cap_bytes: u64, total_reservation_bytes: u64) -> bool {
 #[cfg(feature = "duckdb")]
 #[must_use]
 pub fn duckdb_auto_memory_limit_option() -> Option<String> {
-    format_duckdb_memory_limit(DUCKDB_AUTO_MEMORY_LIMIT_BYTES.load(Ordering::Relaxed))
+    format_duckdb_memory_limit(DUCKDB_AUTO_MEMORY_LIMIT_BYTES.load(Ordering::Acquire))
 }
 
 /// Formats a per-instance cap as a floored whole-MiB `DuckDB` `memory_limit` string
@@ -220,11 +366,11 @@ fn format_duckdb_memory_limit(bytes: u64) -> Option<String> {
     }
 }
 
-/// The coordinated aggregate `DuckDB` ceiling in bytes (`0` when no `DuckDB`
-/// accelerators are configured).
+/// The coordinated aggregate `DuckDB` ceiling in bytes, including retained
+/// reservations for cached pools whose datasets are no longer configured.
 #[must_use]
 pub fn duckdb_total_reservation_bytes() -> u64 {
-    DUCKDB_TOTAL_RESERVATION_BYTES.load(Ordering::Relaxed)
+    DUCKDB_TOTAL_RESERVATION_BYTES.load(Ordering::Acquire)
 }
 
 /// A deduped-by-instance summary of the `DuckDB` accelerators in an app. Built by a
@@ -249,6 +395,40 @@ pub struct DuckDbBudgetInputs {
     pub has_mixed_instance: bool,
     /// Human labels (in-memory / file path) of the un-limited instances, for the warning.
     pub unset_instance_labels: Vec<String>,
+    /// Per-database-identity inputs used to retain cached pool ceilings across
+    /// reloads and partial removals.
+    pub instances: Vec<DuckDbInstanceBudget>,
+}
+
+/// One database identity whose pool can remain cached across app reloads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DuckDbInstanceBudget {
+    /// Database identity matching the accelerator factory's instance key.
+    pub identity: DuckDbInstanceIdentity,
+    /// Largest explicit limit declared by a component sharing this identity.
+    pub explicit_limit_bytes: Option<u64>,
+    /// Whether any component sharing this identity omits its explicit limit.
+    pub has_unset_limit: bool,
+}
+
+impl DuckDbInstanceBudget {
+    fn ceiling_with_auto(&self, auto_ceiling: u64) -> u64 {
+        match (self.explicit_limit_bytes, self.has_unset_limit) {
+            (Some(explicit), true) => explicit.max(auto_ceiling),
+            (Some(explicit), false) => explicit,
+            (None, _) => auto_ceiling,
+        }
+    }
+}
+
+/// Typed identity matching the `DuckDB` factory's distinct memory and file keys.
+/// Keeping the variants separate prevents a valid file path from colliding with an
+/// in-memory or unresolved-component sentinel.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum DuckDbInstanceIdentity {
+    Memory,
+    File(String),
+    UnresolvedComponent(String),
 }
 
 impl DuckDbBudgetInputs {
@@ -328,7 +508,7 @@ pub fn duckdb_default_per_instance_bytes(host_memory: u64) -> u64 {
 ///   instance, from HOST RAM (see [`duckdb_default_per_instance_bytes`]) so the
 ///   projection is correct in containers, not the cgroup total.
 /// * `base_query_budget` — what the query pool WOULD be with no `DuckDB` coordination,
-///   i.e. `effective_query_memory_limit(None, cayenne_cdc_active, reservation, None)`
+///   i.e. `projected_query_memory_limit(total_memory, cayenne_cdc_active, reservation)`
 ///   — 90% of RAM, less any Cayenne off-pool cache reservation, or the reduced
 ///   70%-based region when a Cayenne table can reach the in-memory CDC tier.
 ///   Splitting *this* (not `total`) confines `DuckDB` to the query region and
@@ -465,7 +645,8 @@ pub fn plan(
 #[cfg(test)]
 mod tests {
     use super::{
-        AcceleratorMemoryPlan, DUCKDB_MIN_INSTANCE_CAP_BYTES, DuckDbBudgetInputs, PlanOutcome, plan,
+        AcceleratorMemoryPlan, DUCKDB_MIN_INSTANCE_CAP_BYTES, DuckDbBudgetInputs,
+        DuckDbInstanceBudget, DuckDbInstanceIdentity, PlanOutcome, plan,
     };
 
     const GIB: u64 = 1024 * 1024 * 1024;
@@ -843,92 +1024,109 @@ mod tests {
         }
     }
 
-    /// An instance created under a cap a later reload shrank still holds that cap, so
-    /// the aggregate charges every un-limited instance at the largest one still in
-    /// play — otherwise a co-resident consumer would read room that is not free.
+    /// Removed datasets leave their database pools cached. Reservations therefore
+    /// remain keyed by database identity across partial removals and replacements,
+    /// while a repeated identity retains only its largest observed ceiling.
     #[test]
-    fn reservation_charges_every_unset_instance_at_the_cap_still_in_play() {
-        let (total, base) = total_and_base();
-        let default_per_instance = total * 80 / 100;
-        let one = plan_bare(total, base, None, &unset(1));
-        let two = plan_bare(total, base, None, &unset(2));
-        let one_cap = super::live_per_instance_ceiling(&one, 1, default_per_instance);
-        let two_cap = super::live_per_instance_ceiling(&two, 2, default_per_instance);
-        assert_eq!(one_cap, one.per_instance_cap_bytes);
+    fn retained_reservation_tracks_cached_pools_by_identity() {
+        let retained = parking_lot::Mutex::new(std::collections::HashMap::new());
+        let inputs = |identities: &[&str]| DuckDbBudgetInputs {
+            instances: identities
+                .iter()
+                .map(|identity| DuckDbInstanceBudget {
+                    identity: DuckDbInstanceIdentity::File((*identity).to_string()),
+                    explicit_limit_bytes: None,
+                    has_unset_limit: true,
+                })
+                .collect(),
+            ..Default::default()
+        };
 
-        // Nothing larger has been published: the plan's own aggregate stands.
         assert_eq!(
-            super::reservation_at_cap_in_play(&one, one_cap, one_cap, 1),
-            one.duckdb_reservation_bytes
+            super::retained_instance_reservation_bytes(
+                &retained,
+                &inputs(&["one", "two"]),
+                128 * MIB,
+            ),
+            256 * MIB
         );
-
-        // A second instance halves the cap, but the first one still holds the whole
-        // half it was created with.
         assert_eq!(
-            super::reservation_at_cap_in_play(&two, two_cap, one_cap, 2),
-            one_cap * 2
+            super::retained_instance_reservation_bytes(&retained, &inputs(&["one"]), 64 * MIB,),
+            256 * MIB,
+            "a partial removal must retain the removed pool and the earlier ceiling"
         );
-        assert!(
-            super::reservation_at_cap_in_play(&two, two_cap, one_cap, 2)
-                > two.duckdb_reservation_bytes,
-            "charging the larger ceiling must reserve more than the plan's own aggregate"
-        );
-
-        // Explicit ceilings are honored as themselves, on top of the un-limited share.
-        let mixed = plan_bare(
-            total,
-            base,
-            None,
-            &DuckDbBudgetInputs {
-                num_unset_instances: 1,
-                num_explicit_instances: 1,
-                sum_explicit_bytes: GIB,
-                unset_instance_labels: vec!["db-unset".to_string()],
-                ..Default::default()
-            },
-        );
-        let mixed_cap = super::live_per_instance_ceiling(&mixed, 1, default_per_instance);
         assert_eq!(
-            super::reservation_at_cap_in_play(&mixed, mixed_cap, one_cap, 1),
-            GIB + one_cap
+            super::retained_instance_reservation_bytes(&retained, &inputs(&["three"]), 64 * MIB,),
+            320 * MIB,
+            "a replacement must reserve both the cached old pools and the new pool"
         );
     }
 
-    /// A plan that caps nothing leaves an un-limited instance holding `DuckDB`'s own
-    /// default, so that — not the `0` cap it publishes — is the ceiling still in play
-    /// once a later plan does cap. An all-explicit plan puts none in play at all.
     #[test]
-    fn an_uncapped_instance_puts_duckdbs_own_default_in_play() {
+    fn reload_charges_retained_pool_before_sizing_a_new_identity() {
         let (total, base) = total_and_base();
-        let default_per_instance = total * 80 / 100;
-        let noop = plan_bare(total, base, Some(total / 10), &unset(1));
-        assert_eq!(noop.outcome, PlanOutcome::NoOp);
-        assert_eq!(noop.per_instance_cap_bytes, 0);
-        assert_eq!(
-            super::live_per_instance_ceiling(&noop, 1, default_per_instance),
-            default_per_instance
-        );
-        // Charged at its own ceiling, an uncapped instance reserves what the plan
-        // already accounts for — no double count.
-        assert_eq!(
-            super::reservation_at_cap_in_play(&noop, default_per_instance, default_per_instance, 1),
-            noop.duckdb_reservation_bytes
+        let original_cap = base / 2;
+        let retained = std::collections::HashMap::from([(
+            DuckDbInstanceIdentity::File("one.db".to_string()),
+            original_cap,
+        )]);
+        let inputs = DuckDbBudgetInputs {
+            num_unset_instances: 2,
+            instances: vec![
+                DuckDbInstanceBudget {
+                    identity: DuckDbInstanceIdentity::File("one.db".to_string()),
+                    explicit_limit_bytes: None,
+                    has_unset_limit: true,
+                },
+                DuckDbInstanceBudget {
+                    identity: DuckDbInstanceIdentity::File("two.db".to_string()),
+                    explicit_limit_bytes: None,
+                    has_unset_limit: true,
+                },
+            ],
+            ..Default::default()
+        };
+
+        let plan = super::plan_reload(
+            total,
+            total * 80 / 100,
+            base,
+            original_cap,
+            &inputs,
+            &retained,
         );
 
-        let all_explicit = plan_bare(
-            total,
-            base,
-            None,
-            &DuckDbBudgetInputs {
-                num_explicit_instances: 1,
-                sum_explicit_bytes: 20 * GIB,
-                ..Default::default()
-            },
-        );
+        assert_eq!(plan.per_instance_cap_bytes, DUCKDB_MIN_INSTANCE_CAP_BYTES);
         assert_eq!(
-            super::live_per_instance_ceiling(&all_explicit, 0, default_per_instance),
-            0,
-            "no un-limited instance exists, so nothing un-limited is in play"
+            plan.duckdb_reservation_bytes,
+            original_cap + DUCKDB_MIN_INSTANCE_CAP_BYTES,
+            "the old pool is retained once and only the new pool receives the floor"
+        );
+        assert!(plan.residual_overcommit);
+    }
+
+    #[test]
+    fn typed_identity_keeps_memory_separate_from_same_named_file() {
+        let retained = parking_lot::Mutex::new(std::collections::HashMap::new());
+        let inputs = DuckDbBudgetInputs {
+            instances: vec![
+                DuckDbInstanceBudget {
+                    identity: DuckDbInstanceIdentity::Memory,
+                    explicit_limit_bytes: None,
+                    has_unset_limit: true,
+                },
+                DuckDbInstanceBudget {
+                    identity: DuckDbInstanceIdentity::File("<in-memory>".to_string()),
+                    explicit_limit_bytes: None,
+                    has_unset_limit: true,
+                },
+            ],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            super::retained_instance_reservation_bytes(&retained, &inputs, 128 * MIB),
+            256 * MIB
         );
     }
 

@@ -867,6 +867,10 @@ pub struct DataFusion {
     // loop around the same limit the DuckDB planner just used without probing
     // sysinfo every two seconds.
     current_total_memory: Arc<AtomicU64>,
+    // High-water off-pool Cayenne cache reservation. Reload planning raises it before
+    // publishing the new total, and the live tier sampler subtracts its excess over
+    // the standard headroom before allowing the tier to float.
+    current_cayenne_reservation_bytes: Arc<AtomicU64>,
     pub(crate) io_runtime: Handle,
     metrics: Option<Metrics>,
     resource_monitor: Option<crate::resource_monitor::ResourceMonitor>,
@@ -886,6 +890,13 @@ pub struct DataFusion {
     pub(crate) partition_load_tracker: Option<Arc<runtime_cluster::PartitionLoadTracker>>,
     #[cfg(not(windows))]
     pub(crate) cayenne_ddl_handler: Option<Arc<dyn datafusion_ddl::CatalogDdlHandler>>,
+}
+
+/// Aggregate Cayenne PK-keyset ceiling derived from the same current cgroup-aware
+/// total shared with `DuckDB` planning and the in-memory tier sampler.
+#[must_use]
+pub(crate) const fn cayenne_pk_keyset_budget_bytes(total_memory: u64) -> u64 {
+    total_memory / 16
 }
 
 impl std::fmt::Debug for DataFusion {
@@ -1618,7 +1629,7 @@ impl DataFusion {
         // Read the build-time seed rather than re-probing: `get_total_memory`
         // rebuilds a sysinfo System on every call. App reloads refresh this shared
         // value and the Cayenne tuner together.
-        let memory_budget = self.current_total_memory.load(Ordering::Relaxed);
+        let memory_budget = self.current_total_memory.load(Ordering::Acquire);
         cayenne::set_global_memory_budget(memory_budget);
         tracing::info!(
             memory_budget,
@@ -1669,11 +1680,11 @@ impl DataFusion {
         // clamps to its own figure anyway) while a fleet shares one bound
         // instead of multiplying it. Over the ceiling a table degrades to its
         // bloom, which is the fallback an over-budget table already takes.
-        let pk_keyset_budget_bytes = self.total_memory / 16;
+        let pk_keyset_budget_bytes = cayenne_pk_keyset_budget_bytes(memory_budget);
         cayenne::set_global_pk_keyset_bytes(pk_keyset_budget_bytes);
         tracing::info!(
             pk_keyset_budget_bytes,
-            total_memory = self.total_memory,
+            total_memory = memory_budget,
             "Cayenne global PK keyset byte budget active (bounds the SUM of per-table keyset caches, which are sized independently)"
         );
 
@@ -1708,6 +1719,7 @@ impl DataFusion {
                 .map(|env| Arc::downgrade(&env.memory_pool)),
             self.mem_tier_budget_bytes,
             Arc::clone(&self.current_total_memory),
+            Arc::clone(&self.current_cayenne_reservation_bytes),
         );
     }
 
@@ -1771,6 +1783,7 @@ impl DataFusion {
         >,
         static_ceiling_bytes: Option<u64>,
         current_total_memory: Arc<AtomicU64>,
+        current_cayenne_reservation_bytes: Arc<AtomicU64>,
     ) {
         // Short enough to react to a query-pool spike ahead of the slower per-table
         // controller tick, long enough that the sampling overhead is negligible.
@@ -1807,6 +1820,7 @@ impl DataFusion {
                         pool_used,
                         compaction_used,
                         crate::accelerator_memory_budget::duckdb_total_reservation_bytes(),
+                        current_cayenne_reservation_bytes.load(Ordering::Acquire),
                         ceiling,
                     );
                     cayenne::update_global_mem_tier_total(dynamic);
@@ -1838,10 +1852,15 @@ impl DataFusion {
         pool_used: u64,
         compaction_used: u64,
         external_reservation: u64,
+        cayenne_reservation: u64,
         static_ceiling: u64,
     ) -> u64 {
+        let total_memory = current_total_memory.load(Ordering::Acquire);
+        let external_reservation = external_reservation.saturating_add(
+            builder::cayenne_reservation_excess_bytes(total_memory, cayenne_reservation),
+        );
         builder::coordinated_mem_tier_budget(
-            current_total_memory.load(Ordering::Relaxed),
+            total_memory,
             pool_used,
             compaction_used,
             external_reservation,
@@ -5493,9 +5512,13 @@ mod tests {
         let current_total_memory = AtomicU64::new(16 * GIB);
 
         let before =
-            DataFusion::sampled_mem_tier_budget(&current_total_memory, GIB, 0, 0, u64::MAX);
-        current_total_memory.store(8 * GIB, Ordering::Relaxed);
-        let after = DataFusion::sampled_mem_tier_budget(&current_total_memory, GIB, 0, 0, u64::MAX);
+            DataFusion::sampled_mem_tier_budget(&current_total_memory, GIB, 0, 0, 0, u64::MAX);
+        let pk_before =
+            cayenne_pk_keyset_budget_bytes(current_total_memory.load(Ordering::Acquire));
+        current_total_memory.store(8 * GIB, Ordering::Release);
+        let after =
+            DataFusion::sampled_mem_tier_budget(&current_total_memory, GIB, 0, 0, 0, u64::MAX);
+        let pk_after = cayenne_pk_keyset_budget_bytes(current_total_memory.load(Ordering::Acquire));
 
         assert!(
             after < before,
@@ -5506,6 +5529,28 @@ mod tests {
             builder::coordinated_mem_tier_budget(8 * GIB, GIB, 0, 0),
             "the sampler must plan from the refreshed ceiling"
         );
+        assert_eq!(pk_before, GIB);
+        assert_eq!(pk_after, GIB / 2);
+    }
+
+    #[test]
+    fn mem_tier_sampler_enforces_reload_added_cayenne_cache_excess() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let current_total_memory = AtomicU64::new(10 * GIB);
+
+        let without_added_caches =
+            DataFusion::sampled_mem_tier_budget(&current_total_memory, GIB, 0, 0, GIB, u64::MAX);
+        let with_added_caches = DataFusion::sampled_mem_tier_budget(
+            &current_total_memory,
+            GIB,
+            0,
+            0,
+            8 * GIB,
+            u64::MAX,
+        );
+
+        assert_eq!(without_added_caches, 5 * GIB / 2);
+        assert_eq!(with_added_caches, GIB);
     }
 
     #[test]

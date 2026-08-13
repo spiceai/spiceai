@@ -37,8 +37,8 @@ use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult, NewDataConnectorResult,
 };
-use runtime::datafusion::udf::deny_spice_specific_functions;
-use runtime::parameters::ParameterSpec;
+use runtime_parameters::ParameterSpec;
+use runtime_udfs_api::deny_spice_specific_functions;
 use snafu::prelude::*;
 use snowflake_api::SnowflakeApi;
 use std::any::Any;

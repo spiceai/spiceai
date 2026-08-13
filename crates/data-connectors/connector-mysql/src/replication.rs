@@ -17,7 +17,7 @@ limitations under the License.
 //! Glue between Spice's connector params and the `mysql_replication` module.
 //!
 //! Responsibilities:
-//!   - Parse connection & replication params out of `runtime::parameters::Parameters`.
+//!   - Parse connection & replication params out of `runtime_parameters::Parameters`.
 //!   - Validate the dataset's PK/upsert configuration up front.
 //!   - Provide the [`PositionStore`] implementation over the accelerator's
 //!     `spice_sys_mysql_binlog` sidecar table.
@@ -46,8 +46,8 @@ use runtime::dataaccelerator::spice_sys::{
     mysql_binlog::{MySqlBinlogCheckpoint, MySqlBinlogSys},
 };
 use runtime::federated::FederatedTable;
-use runtime::parameters::Parameters;
 use runtime_metrics::component::{MetricSpec, MetricType, ObserveMetricCallback};
+use runtime_parameters::Parameters;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 

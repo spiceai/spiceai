@@ -23,8 +23,9 @@ use runtime::dataconnector::listing::{
 use runtime::dataconnector::parameters::{Validator, gcs::GcsAuthValidator};
 use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
-    DataConnectorResult, ParameterSpec, Parameters,
+    DataConnectorResult,
 };
+use runtime_parameters::{ParameterSpec, Parameters};
 use snafu::prelude::*;
 use std::any::Any;
 use std::clone::Clone;

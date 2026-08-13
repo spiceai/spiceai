@@ -54,7 +54,7 @@ use std::{
     net::SocketAddr,
     str::FromStr,
     sync::{
-        Arc, LazyLock,
+        Arc,
         atomic::{AtomicU64, Ordering},
     },
     time::Duration,
@@ -330,6 +330,13 @@ impl RuntimeBuilder {
         self
     }
 
+    /// Builds the runtime.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the blocking task used to probe the startup host/cgroup memory
+    /// budget panics. A failed probe indicates an internal runtime initialization
+    /// failure rather than an invalid Spicepod.
     pub async fn build(self) -> Runtime {
         // Initialize DataFusion tracer for span context propagation across async boundaries
         if let Err(e) = tracers::init_datafusion_tracer() {
@@ -493,14 +500,30 @@ impl RuntimeBuilder {
             dedicated_thread_pools_enabled,
         } = plan_cayenne_memory_budgets(self.app.as_ref(), &spicepod_rt.params);
 
+        let (total_memory, host_memory) = tokio::task::spawn_blocking(|| {
+            (
+                crate::resource_monitor::get_total_memory(),
+                crate::resource_monitor::get_host_memory(),
+            )
+        })
+        .await
+        .unwrap_or_else(|error| {
+            panic!("failed to probe the startup memory budget on the blocking pool: {error}")
+        });
+        let current_total_memory = Arc::new(AtomicU64::new(total_memory));
+
         // Estimate the off-pool per-table Cayenne cache reservation, summed over
         // every enabled Cayenne table. The DataFusion builder reduces the
         // query-memory default by it — by the excess over the host/10 headroom the
         // CDC base already reserves, or in full on the standard base, which reserves
         // no such slice — so the query pool + the in-memory tier + the per-table
         // caches stay within host RAM as the table count grows.
-        let cayenne_reservation_bytes =
-            estimate_cayenne_reservation_bytes(self.app.as_ref(), &spicepod_rt.params);
+        let cayenne_reservation_bytes = estimate_cayenne_reservation_bytes(
+            self.app.as_ref(),
+            &spicepod_rt.params,
+            total_memory,
+        );
+        let current_cayenne_reservation_bytes = Arc::new(AtomicU64::new(cayenne_reservation_bytes));
 
         // ---- Coordinated cgroup-aware memory budget for DuckDB accelerators ----
         // The DataFusion query pool defaults to 90% of RAM and EACH distinct DuckDB
@@ -519,36 +542,42 @@ impl RuntimeBuilder {
         let duckdb_budget_inputs = duckdb_budget_inputs(self.app.as_ref());
         let duckdb_query_pool_cap = if duckdb_budget_inputs.is_empty() {
             // No DuckDB accelerators (or the duckdb feature isn't compiled in): skip
-            // the cgroup/host memory probes and the planner entirely — the plan would
-            // NoOp anyway. Publish an empty budget so no reservation from a runtime
-            // built earlier in this process survives.
-            crate::accelerator_memory_budget::clear_duckdb_budget();
+            // the DuckDB host-memory probe and planner — the plan would NoOp anyway.
+            // Retire only the cap. Another embedded Runtime in this process may still
+            // own cached pools, so clearing the process-global retained reservation
+            // here could release memory that remains live. A process restart is the
+            // only universal eviction boundary.
+            crate::accelerator_memory_budget::retire_duckdb_cap();
             None
         } else {
-            let total_memory = crate::resource_monitor::get_total_memory();
-            let duckdb_default_per_instance = *DUCKDB_HOST_DEFAULT_BYTES;
+            let duckdb_default_per_instance =
+                crate::accelerator_memory_budget::duckdb_default_per_instance_bytes(host_memory);
+            let base_query_budget = crate::datafusion::builder::effective_query_memory_limit(
+                total_memory,
+                None,
+                cayenne_cdc_active,
+                cayenne_reservation_bytes,
+                None,
+            );
             let plan = crate::accelerator_memory_budget::plan(
                 total_memory,
                 duckdb_default_per_instance,
-                crate::datafusion::builder::effective_query_memory_limit(
-                    None,
-                    cayenne_cdc_active,
-                    cayenne_reservation_bytes,
-                    None,
-                ),
+                base_query_budget,
                 memory_limit,
                 &duckdb_budget_inputs,
             );
-            crate::accelerator_memory_budget::publish_duckdb_budget(
+            let publication = crate::accelerator_memory_budget::publish_duckdb_budget(
                 &plan,
-                duckdb_budget_inputs.num_unset_instances,
+                &duckdb_budget_inputs,
                 duckdb_default_per_instance,
             );
             emit_duckdb_memory_budget_warning(
                 &plan,
                 total_memory,
+                base_query_budget,
                 duckdb_default_per_instance,
                 &duckdb_budget_inputs,
+                publication.total_reservation_bytes,
                 QueryPoolSizing::Sizing,
             );
             plan.query_pool_cap_bytes
@@ -760,7 +789,9 @@ impl RuntimeBuilder {
         .cayenne_workload(cayenne_workload)
         .dedicated_thread_pools_enabled(dedicated_thread_pools_enabled)
         .cayenne_reservation_bytes(cayenne_reservation_bytes)
+        .current_cayenne_reservation_bytes(Arc::clone(&current_cayenne_reservation_bytes))
         .duckdb_query_pool_cap(duckdb_query_pool_cap)
+        .current_total_memory(Arc::clone(&current_total_memory))
         .cayenne_optimizer_rules(cayenne_optimizer_rules);
 
         if let Some(DistributedNode::Scheduler {
@@ -801,9 +832,8 @@ impl RuntimeBuilder {
             query_pool_ceiling_bytes: df.applied_query_memory_limit(),
             dedicated_thread_pools_enabled,
             current_total_memory: df.current_total_memory(),
-            cayenne_reservation_high_water_bytes: Arc::new(AtomicU64::new(
-                cayenne_reservation_bytes,
-            )),
+            current_cayenne_reservation_bytes,
+            last_app_cayenne_reservation_bytes: Arc::new(AtomicU64::new(cayenne_reservation_bytes)),
         };
 
         let datasets_health_monitor = if self.datasets_health_monitor_enabled {
@@ -1460,10 +1490,18 @@ fn cayenne_accelerations(
 /// except `full`, so a view never contributes the write-path tier, but it is
 /// classified through the same predicate rather than assumed.
 #[cfg(not(windows))]
-fn estimate_cayenne_reservation_bytes(
-    app: Option<&Arc<app::App>>,
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum CayenneReservationIdentity {
+    Dataset(String),
+    View(String),
+}
+
+#[cfg(not(windows))]
+fn estimate_cayenne_reservations(
+    app: &Arc<app::App>,
     runtime_params: &HashMap<String, String>,
-) -> u64 {
+    total_memory: u64,
+) -> HashMap<CayenneReservationIdentity, u64> {
     const MIB: u64 = 1024 * 1024;
     const GIB: u64 = 1024 * MIB;
     // Auto-derived per-table cap fractions (mirror of the accelerator's autotune).
@@ -1480,17 +1518,47 @@ fn estimate_cayenne_reservation_bytes(
             .and_then(|v| v.trim().parse::<u64>().ok())
     }
 
-    let Some(app) = app else {
-        return 0;
-    };
-    let total_memory = crate::resource_monitor::get_total_memory();
     // Global CDC coalesce-buffer size (default 128 MiB); a per-dataset
     // `cdc_max_coalesced_bytes` overlays it per table (see `cdc_config_overlay`).
     let global_coalesce_bytes =
         parse_u64(runtime_params, &["cdc_max_coalesced_bytes"]).unwrap_or(DEFAULT_COALESCE_BYTES);
 
-    let mut total: u64 = 0;
-    for (accel, profile) in cayenne_accelerations(app) {
+    let accelerations = app
+        .datasets
+        .iter()
+        .map(|dataset| {
+            (
+                CayenneReservationIdentity::Dataset(dataset.name.clone()),
+                dataset.acceleration.as_ref(),
+                connector_unset_refresh_mode(&dataset.from),
+            )
+        })
+        .chain(app.views.iter().map(|view| {
+            (
+                CayenneReservationIdentity::View(view.name.clone()),
+                view.acceleration.as_ref(),
+                RefreshMode::Full,
+            )
+        }))
+        .filter_map(|(identity, accel, unset)| accel.map(|accel| (identity, accel, unset)))
+        .filter(|(_, accel, _)| {
+            accel.enabled
+                && accel
+                    .engine
+                    .as_deref()
+                    .is_some_and(|engine| engine.eq_ignore_ascii_case("cayenne"))
+        })
+        .map(|(identity, accel, unset)| {
+            (
+                identity,
+                accel,
+                crate::dataaccelerator::cayenne::RefreshWriteProfile::from_spicepod(accel, unset),
+            )
+        });
+
+    let mut reservations = HashMap::new();
+    for (identity, accel, profile) in accelerations {
+        let mut reservation = 0_u64;
         let params = accel
             .params
             .as_ref()
@@ -1503,7 +1571,7 @@ fn estimate_cayenne_reservation_bytes(
                 || (total_memory / SEGMENT_CACHE_HOST_FRACTION).clamp(256 * MIB, GIB),
                 |mb| mb.saturating_mul(MIB),
             );
-        total = total.saturating_add(segment);
+        reservation = reservation.saturating_add(segment);
 
         // Inline-admission state: the bounded Arrow buffer a write is admitted
         // through, plus the Arrow IPC entry it serializes into. Byte-valued
@@ -1522,12 +1590,13 @@ fn estimate_cayenne_reservation_bytes(
                 u64::try_from(cayenne::metadata::DEFAULT_INLINE_MAX_BUFFER_BYTES)
                     .unwrap_or(u64::MAX),
             );
-            total = total
+            reservation = reservation
                 .saturating_add(inline_entry)
                 .saturating_add(inline_buffer);
         }
 
         if !profile.uses_cdc_tier() {
+            reservations.insert(identity, reservation);
             continue;
         }
         // Write-path state below: only a small-write (CDC-profile) table populates
@@ -1557,10 +1626,92 @@ fn estimate_cayenne_reservation_bytes(
         // Per-dataset coalesce override wins over the global (mirrors cdc_config_overlay).
         let coalesce =
             parse_u64(&params, &["cdc_max_coalesced_bytes"]).unwrap_or(global_coalesce_bytes);
-        total = total
+        reservation = reservation
             .saturating_add(keyset)
             .saturating_add(coalesce)
             .saturating_add(inline);
+        reservations.insert(identity, reservation);
+    }
+    reservations
+}
+
+#[cfg(not(windows))]
+fn estimate_cayenne_reservation_bytes(
+    app: Option<&Arc<app::App>>,
+    runtime_params: &HashMap<String, String>,
+    total_memory: u64,
+) -> u64 {
+    app.map_or(0, |app| {
+        estimate_cayenne_reservations(app, runtime_params, total_memory)
+            .values()
+            .copied()
+            .fold(0_u64, u64::saturating_add)
+    })
+}
+
+#[cfg(not(windows))]
+fn cayenne_component_unchanged(
+    identity: &CayenneReservationIdentity,
+    current_app: &Arc<app::App>,
+    new_app: &Arc<app::App>,
+) -> bool {
+    match identity {
+        CayenneReservationIdentity::Dataset(name) => {
+            let current = current_app
+                .datasets
+                .iter()
+                .find(|dataset| dataset.name == *name);
+            let new = new_app
+                .datasets
+                .iter()
+                .find(|dataset| dataset.name == *name);
+            current.is_some() && current == new
+        }
+        CayenneReservationIdentity::View(name) => {
+            let current = current_app.views.iter().find(|view| view.name == *name);
+            let new = new_app.views.iter().find(|view| view.name == *name);
+            current.is_some() && current == new
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn cayenne_components_unchanged(current_app: &Arc<app::App>, new_app: &Arc<app::App>) -> bool {
+    let current = estimate_cayenne_reservations(current_app, &current_app.runtime.params, 0);
+    let new = estimate_cayenne_reservations(new_app, &new_app.runtime.params, 0);
+    current.len() == new.len()
+        && current.keys().all(|identity| {
+            new.contains_key(identity)
+                && cayenne_component_unchanged(identity, current_app, new_app)
+        })
+}
+
+#[cfg(all(test, not(windows)))]
+fn estimate_cayenne_reload_reservation_bytes(
+    current_app: Option<&Arc<app::App>>,
+    new_app: &Arc<app::App>,
+    total_memory: u64,
+) -> u64 {
+    let new = estimate_cayenne_reservations(new_app, &new_app.runtime.params, total_memory);
+    let Some(current_app) = current_app else {
+        return new.values().copied().fold(0_u64, u64::saturating_add);
+    };
+    let current =
+        estimate_cayenne_reservations(current_app, &current_app.runtime.params, total_memory);
+    let mut total = 0_u64;
+    for (identity, current_bytes) in &current {
+        total = total.saturating_add(match new.get(identity) {
+            Some(new_bytes) if cayenne_component_unchanged(identity, current_app, new_app) => {
+                (*current_bytes).max(*new_bytes)
+            }
+            Some(new_bytes) => current_bytes.saturating_add(*new_bytes),
+            None => *current_bytes,
+        });
+    }
+    for (identity, new_bytes) in new {
+        if !current.contains_key(&identity) {
+            total = total.saturating_add(new_bytes);
+        }
     }
     total
 }
@@ -1571,24 +1722,15 @@ fn estimate_cayenne_reservation_bytes(
 fn estimate_cayenne_reservation_bytes(
     _app: Option<&Arc<app::App>>,
     _runtime_params: &HashMap<String, String>,
+    _total_memory: u64,
 ) -> u64 {
     0
 }
 
-/// `DuckDB`'s own per-instance default `memory_limit`, ~80% of HOST RAM. Probed once:
-/// rebuilding a sysinfo `System` is not free and the host's physical RAM does not
-/// change under a running process. `DuckDB` sizes this from host RAM rather than the
-/// cgroup limit, so a container (host RAM > cgroup) would otherwise under-estimate
-/// the ceiling and skip coordination exactly where the OOM risk is highest.
-///
-/// The cgroup-aware total is deliberately NOT cached beside it: a limit can be
-/// resized in place under a running process, and a re-plan plans against the memory
-/// available now.
-static DUCKDB_HOST_DEFAULT_BYTES: LazyLock<u64> = LazyLock::new(|| {
-    crate::accelerator_memory_budget::duckdb_default_per_instance_bytes(
-        crate::resource_monitor::get_host_memory(),
-    )
-});
+#[cfg(windows)]
+fn cayenne_components_unchanged(_current_app: &Arc<app::App>, _new_app: &Arc<app::App>) -> bool {
+    true
+}
 
 /// Whether the query memory pool is still being sized, or already exists at a ceiling
 /// the caller cannot move. Selects the guidance
@@ -1617,18 +1759,41 @@ pub(crate) struct DuckDbBudgetContext {
     /// publication refreshes it; the sampler reads it without a repeated sysinfo
     /// probe on its two-second interval.
     current_total_memory: Arc<AtomicU64>,
-    /// Largest off-pool Cayenne reservation observed by this runtime. Unchanged
-    /// tables retain the settings and caches they were created with when
-    /// start-time-only `runtime.params` change, so their aggregate reservation must
-    /// not fall during the process lifetime.
-    cayenne_reservation_high_water_bytes: Arc<AtomicU64>,
+    /// Largest off-pool Cayenne reservation observed by this runtime, shared with
+    /// the live in-memory-tier sampler so reload-added caches remain enforced.
+    current_cayenne_reservation_bytes: Arc<AtomicU64>,
+    /// Exact reservation projected for the app most recently preflighted, at the
+    /// cgroup total in effect then. Existing providers keep those creation-time
+    /// ceilings across an in-place cgroup resize.
+    last_app_cayenne_reservation_bytes: Arc<AtomicU64>,
 }
 
 impl DuckDbBudgetContext {
-    fn retained_cayenne_reservation_bytes(&self, app: &Arc<App>) -> u64 {
-        let current = estimate_cayenne_reservation_bytes(Some(app), &app.runtime.params);
-        self.cayenne_reservation_high_water_bytes
-            .fetch_max(current, Ordering::Relaxed)
+    fn retained_cayenne_reservation_bytes(
+        &self,
+        current_app: Option<&Arc<App>>,
+        new_app: &Arc<App>,
+        total_memory: u64,
+    ) -> u64 {
+        let new_reservation = estimate_cayenne_reservation_bytes(
+            Some(new_app),
+            &new_app.runtime.params,
+            total_memory,
+        );
+        let previous_reservation = self
+            .last_app_cayenne_reservation_bytes
+            .load(Ordering::Acquire);
+        let components_changed = current_app
+            .is_none_or(|current_app| !cayenne_components_unchanged(current_app, new_app));
+        let current = if components_changed {
+            self.last_app_cayenne_reservation_bytes
+                .store(new_reservation, Ordering::Release);
+            previous_reservation.saturating_add(new_reservation)
+        } else {
+            previous_reservation.max(new_reservation)
+        };
+        self.current_cayenne_reservation_bytes
+            .fetch_max(current, Ordering::AcqRel)
             .max(current)
     }
 
@@ -1646,55 +1811,105 @@ impl DuckDbBudgetContext {
     /// already claims the splittable region therefore caps them at the per-instance
     /// floor and warns that a restart is what re-splits it, rather than publishing a
     /// cap that fits nowhere.
-    pub(crate) fn publish_for(&self, app: &Arc<App>) {
+    pub(crate) async fn publish_for(&self, current_app: Option<&Arc<App>>, app: &Arc<App>) -> bool {
+        let context = self.clone();
+        let current_app = current_app.cloned();
+        let app = Arc::clone(app);
+        match tokio::task::spawn_blocking(move || {
+            context.publish_for_blocking(current_app.as_ref(), &app);
+        })
+        .await
+        {
+            Ok(()) => true,
+            Err(error) => {
+                tracing::error!(
+                    %error,
+                    "Failed to refresh the accelerator memory budget for the app reload; the reload was not applied and should be retried"
+                );
+                false
+            }
+        }
+    }
+
+    fn publish_for_blocking(&self, current_app: Option<&Arc<App>>, app: &Arc<App>) {
         // Probed per re-plan, not carried from the build: a cgroup limit can be
         // resized in place, and every coordinated consumer has to use the memory
-        // available now. The Cayenne pressure tuner and re-partition sampler share
-        // this refresh rather than retaining their startup ceiling.
+        // available now.
         let total_memory = crate::resource_monitor::get_total_memory();
-        self.current_total_memory
-            .store(total_memory, Ordering::Relaxed);
-        cayenne::set_global_memory_budget(total_memory);
+        let retained_cayenne_reservation_bytes =
+            self.retained_cayenne_reservation_bytes(current_app, app, total_memory);
 
         let inputs = duckdb_budget_inputs(Some(app));
-        if inputs.is_empty() {
-            crate::accelerator_memory_budget::retire_duckdb_cap();
-            return;
-        }
-
-        let duckdb_default_per_instance = *DUCKDB_HOST_DEFAULT_BYTES;
-        // The region the pool and the DuckDB instances come out of shrinks around the
-        // Cayenne caches the app declares, so new tables are measured from the app
-        // being applied. The retained high-water also covers unchanged tables whose
-        // start-time-only settings and cache ceilings remain in effect.
+        // The region the pool and any active or cached DuckDB instances come out of
+        // shrinks around the Cayenne caches the app declares. Compute it even when
+        // the new app declares no DuckDB accelerator: a cached pool can remain live,
+        // and a cgroup shrink can make that retained ceiling newly unsafe.
         let cayenne_cdc_active =
             self.dedicated_thread_pools_enabled && cayenne_workload(Some(app)).uses_cdc_tier();
-        let base_query_budget = crate::datafusion::builder::effective_query_memory_limit(
-            None,
+        let base_query_budget = crate::datafusion::builder::projected_query_memory_limit(
+            total_memory,
             cayenne_cdc_active,
-            self.retained_cayenne_reservation_bytes(app),
-            None,
+            retained_cayenne_reservation_bytes,
         );
-        let plan = crate::accelerator_memory_budget::plan(
+        let duckdb_default_per_instance =
+            crate::accelerator_memory_budget::duckdb_default_per_instance_bytes(
+                crate::resource_monitor::get_host_memory(),
+            );
+        let (plan, publication) = crate::accelerator_memory_budget::plan_and_publish_reload(
             total_memory,
             duckdb_default_per_instance,
             base_query_budget,
-            Some(self.query_pool_ceiling_bytes),
+            self.query_pool_ceiling_bytes,
             &inputs,
         );
-        // A reload that leaves the budget where it was repeats guidance the operator
-        // has already been given, so only a budget that moved is worth a warning.
-        if crate::accelerator_memory_budget::publish_duckdb_budget(
-            &plan,
-            inputs.num_unset_instances,
-            duckdb_default_per_instance,
-        ) {
+        let retained_overcommit = retained_duckdb_overcommit(
+            self.query_pool_ceiling_bytes,
+            publication.total_reservation_bytes,
+            base_query_budget,
+        );
+        if publication.total_reservation_bytes == 0
+            && fixed_query_region_overcommit(
+                self.query_pool_ceiling_bytes,
+                publication.total_reservation_bytes,
+                base_query_budget,
+            )
+        {
+            tracing::warn!(
+                total_memory_bytes = total_memory,
+                coordinated_region_bytes = base_query_budget,
+                query_pool_bytes = self.query_pool_ceiling_bytes,
+                retained_cayenne_reservation_bytes,
+                "The fixed query memory pool exceeds the memory region available after the current cgroup limit and off-pool Cayenne reservations are applied. A reload cannot resize the pool, so combined ceilings risk an OOM kill under load; restart spiced to size the query pool for the current limit and configuration. For details, visit: https://spiceai.org/docs/reference/memory"
+            );
+        }
+        if publication.changed || plan.residual_overcommit || retained_overcommit {
             emit_duckdb_memory_budget_warning(
                 &plan,
                 total_memory,
+                base_query_budget,
                 duckdb_default_per_instance,
                 &inputs,
+                publication.total_reservation_bytes,
                 QueryPoolSizing::Fixed,
+            );
+        }
+
+        // Publish the other coordinated consumers before exposing the refreshed
+        // ceiling to the sampler. The release swap pairs with the sampler's acquire
+        // load, so a sampler that observes a changed total also observes the DuckDB
+        // reservation and Cayenne ceilings derived from it.
+        cayenne::set_global_memory_budget(total_memory);
+        let pk_keyset_budget_bytes =
+            crate::datafusion::cayenne_pk_keyset_budget_bytes(total_memory);
+        cayenne::set_global_pk_keyset_bytes(pk_keyset_budget_bytes);
+        let previous_total_memory = self
+            .current_total_memory
+            .swap(total_memory, Ordering::Release);
+        if previous_total_memory != total_memory {
+            tracing::info!(
+                total_memory,
+                pk_keyset_budget_bytes,
+                "Refreshed the cgroup-aware Cayenne memory ceilings for the app reload"
             );
         }
     }
@@ -1724,7 +1939,9 @@ impl DuckDbBudgetContext {
 fn duckdb_budget_inputs(
     app: Option<&Arc<app::App>>,
 ) -> crate::accelerator_memory_budget::DuckDbBudgetInputs {
-    use crate::accelerator_memory_budget::DuckDbBudgetInputs;
+    use crate::accelerator_memory_budget::{
+        DuckDbBudgetInputs, DuckDbInstanceBudget, DuckDbInstanceIdentity,
+    };
 
     /// Per-instance aggregation while grouping accelerations by `DbInstanceKey`.
     #[derive(Default)]
@@ -1742,7 +1959,7 @@ fn duckdb_budget_inputs(
         return inputs;
     };
     let accelerator = crate::dataaccelerator::duckdb::DuckDBAccelerator::default();
-    let mut instances: HashMap<String, InstanceAgg> = HashMap::new();
+    let mut instances: HashMap<DuckDbInstanceIdentity, InstanceAgg> = HashMap::new();
 
     let accelerated_components = app
         .datasets
@@ -1769,11 +1986,12 @@ fn duckdb_budget_inputs(
         // Instance identity: memory-mode accelerations share ONE in-memory instance;
         // file-mode ones group by their resolved DuckDB file path.
         let key = if accel.mode == spicepod::acceleration::Mode::Memory {
-            "<in-memory>".to_string()
+            DuckDbInstanceIdentity::Memory
         } else {
-            accelerator
-                .spicepod_duckdb_file_path(accel)
-                .unwrap_or_else(|| format!("<file:{name}>"))
+            accelerator.spicepod_duckdb_file_path(accel).map_or_else(
+                || DuckDbInstanceIdentity::UnresolvedComponent(name.to_string()),
+                DuckDbInstanceIdentity::File,
+            )
         };
         let params = accel
             .params
@@ -1806,6 +2024,11 @@ fn duckdb_budget_inputs(
     }
 
     for (key, agg) in instances {
+        inputs.instances.push(DuckDbInstanceBudget {
+            identity: key.clone(),
+            explicit_limit_bytes: agg.explicit_max,
+            has_unset_limit: agg.has_unset,
+        });
         if let Some(bytes) = agg.explicit_max {
             inputs.num_explicit_instances += 1;
             inputs.sum_explicit_bytes = inputs.sum_explicit_bytes.saturating_add(bytes);
@@ -1817,7 +2040,13 @@ fn duckdb_budget_inputs(
             }
         } else {
             inputs.num_unset_instances += 1;
-            inputs.unset_instance_labels.push(key);
+            inputs.unset_instance_labels.push(match key {
+                DuckDbInstanceIdentity::Memory => "in-memory".to_string(),
+                DuckDbInstanceIdentity::File(path) => path,
+                DuckDbInstanceIdentity::UnresolvedComponent(name) => {
+                    format!("unresolved component {name}")
+                }
+            });
         }
     }
     // Deterministic warning output: `instances` is a `HashMap`, so its iteration
@@ -1825,6 +2054,9 @@ fn duckdb_budget_inputs(
     // Spicepods always log the same `duckdb_unset_instance_paths` list, keeping log
     // analysis and alert dedup stable.
     inputs.unset_instance_labels.sort();
+    inputs
+        .instances
+        .sort_by(|left, right| left.identity.cmp(&right.identity));
     inputs
 }
 
@@ -1839,19 +2071,18 @@ fn duckdb_budget_inputs(
 
 /// Emits the "auto-limit with warning" guidance when the coordinated `DuckDB`
 /// budget engaged. `NoOp` (no `DuckDB` accelerators, or the naive ceilings already
-/// fit) stays silent.
+/// fit) stays silent unless retained cached ceilings no longer fit beside the live
+/// query pool.
 fn emit_duckdb_memory_budget_warning(
     plan: &crate::accelerator_memory_budget::AcceleratorMemoryPlan,
     total_memory: u64,
+    base_query_budget: u64,
     duckdb_default_per_instance: u64,
     inputs: &crate::accelerator_memory_budget::DuckDbBudgetInputs,
+    retained_duckdb_reservation_bytes: u64,
     query_pool: QueryPoolSizing,
 ) {
     use crate::accelerator_memory_budget::PlanOutcome;
-
-    if plan.outcome != PlanOutcome::Applied {
-        return;
-    }
 
     let hb = |bytes: u64| util::human_readable_bytes(usize::try_from(bytes).unwrap_or(usize::MAX));
     let n = inputs.num_unset_instances;
@@ -1875,6 +2106,26 @@ fn emit_duckdb_memory_budget_warning(
         ""
     };
     let query_pool_fixed = query_pool == QueryPoolSizing::Fixed;
+    let retained_overcommit = retained_duckdb_overcommit(
+        plan.effective_query_pool_bytes,
+        retained_duckdb_reservation_bytes,
+        base_query_budget,
+    );
+
+    if query_pool_fixed && retained_overcommit {
+        tracing::warn!(
+            total_memory_bytes = total_memory,
+            coordinated_region_bytes = base_query_budget,
+            query_pool_bytes = plan.effective_query_pool_bytes,
+            retained_duckdb_reservation_bytes,
+            "The query memory pool already in effect plus the memory reserved for active or cached DuckDB instances exceed the coordinated region within the {total_h} available to this process. Existing DuckDB pools keep the memory_limit they were created with after a reload removes or replaces their datasets, so combined ceilings may approach or exceed available memory and risk an OOM kill under load. Reduce the number of distinct DuckDB files or their duckdb_memory_limit values, then restart spiced to discard cached pools and size the query pool alongside the current accelerators.{mixed} For details, visit: https://spiceai.org/docs/reference/memory"
+        );
+        return;
+    }
+
+    if plan.outcome != PlanOutcome::Applied {
+        return;
+    }
 
     if n == 0 {
         // Every DuckDB instance set an explicit duckdb_memory_limit — there are no
@@ -1944,6 +2195,27 @@ fn emit_duckdb_memory_budget_warning(
             "Detected potential memory over-commit from DuckDB accelerators and automatically capped memory to fit the {total_h} available to this process: {n} DuckDB instance(s) without an explicit duckdb_memory_limit — each would otherwise default to ~80% of host RAM (about {duckdb_default_h} here, or more in a container where DuckDB sees the host's RAM rather than this process's cgroup limit) — are capped at {per_instance_h} each, and the query memory limit at {query_h}. To customize, set runtime.query.memory_limit and/or per-dataset duckdb_memory_limit.{mixed} For details, visit: https://spiceai.org/docs/reference/memory"
         );
     }
+}
+
+const fn retained_duckdb_overcommit(
+    query_pool_bytes: u64,
+    retained_duckdb_reservation_bytes: u64,
+    coordinated_region_bytes: u64,
+) -> bool {
+    retained_duckdb_reservation_bytes > 0
+        && fixed_query_region_overcommit(
+            query_pool_bytes,
+            retained_duckdb_reservation_bytes,
+            coordinated_region_bytes,
+        )
+}
+
+const fn fixed_query_region_overcommit(
+    query_pool_bytes: u64,
+    external_reservation_bytes: u64,
+    coordinated_region_bytes: u64,
+) -> bool {
+    query_pool_bytes.saturating_add(external_reservation_bytes) > coordinated_region_bytes
 }
 
 fn parse_f64_runtime_param(params: &HashMap<String, String>, key: &str) -> Option<f64> {
@@ -2397,12 +2669,22 @@ mod test {
         let initial_app = app_with_coalesce("536870912");
         let smaller_app = app_with_coalesce("1");
         let larger_app = app_with_coalesce("1073741824");
-        let initial_reservation =
-            estimate_cayenne_reservation_bytes(Some(&initial_app), &initial_app.runtime.params);
-        let smaller_reservation =
-            estimate_cayenne_reservation_bytes(Some(&smaller_app), &smaller_app.runtime.params);
-        let larger_reservation =
-            estimate_cayenne_reservation_bytes(Some(&larger_app), &larger_app.runtime.params);
+        let total_memory = 32 * 1024 * 1024 * 1024;
+        let initial_reservation = estimate_cayenne_reservation_bytes(
+            Some(&initial_app),
+            &initial_app.runtime.params,
+            total_memory,
+        );
+        let smaller_reservation = estimate_cayenne_reservation_bytes(
+            Some(&smaller_app),
+            &smaller_app.runtime.params,
+            total_memory,
+        );
+        let larger_reservation = estimate_cayenne_reservation_bytes(
+            Some(&larger_app),
+            &larger_app.runtime.params,
+            total_memory,
+        );
         assert!(smaller_reservation < initial_reservation);
         assert!(initial_reservation < larger_reservation);
 
@@ -2410,18 +2692,125 @@ mod test {
             query_pool_ceiling_bytes: 0,
             dedicated_thread_pools_enabled: true,
             current_total_memory: Arc::new(AtomicU64::new(0)),
-            cayenne_reservation_high_water_bytes: Arc::new(AtomicU64::new(initial_reservation)),
+            current_cayenne_reservation_bytes: Arc::new(AtomicU64::new(initial_reservation)),
+            last_app_cayenne_reservation_bytes: Arc::new(AtomicU64::new(initial_reservation)),
         };
 
         assert_eq!(
-            context.retained_cayenne_reservation_bytes(&smaller_app),
+            context.retained_cayenne_reservation_bytes(
+                Some(&initial_app),
+                &smaller_app,
+                total_memory,
+            ),
             initial_reservation,
             "a smaller start-time-only value must not release memory to DuckDB"
         );
         assert_eq!(
-            context.retained_cayenne_reservation_bytes(&larger_app),
+            context.retained_cayenne_reservation_bytes(
+                Some(&initial_app),
+                &larger_app,
+                total_memory,
+            ),
             larger_reservation,
             "new tables with larger reservations must raise the high-water mark"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn cayenne_reload_reservation_covers_replacement_overlap() {
+        let app_with_segment_cache =
+            |mb: &str| {
+                let mut acceleration = cayenne_test_accel("cayenne", true);
+                acceleration.params = Some(spicepod::param::Params::from_string_map(
+                    HashMap::from([("cayenne_segment_cache_mb".to_string(), mb.to_string())]),
+                ));
+                Arc::new(
+                    app::AppBuilder::new("cayenne-replacement-reservation-test")
+                        .with_dataset(cayenne_test_dataset("changing_table", acceleration))
+                        .build(),
+                )
+            };
+        let current_app = app_with_segment_cache("256");
+        let new_app = app_with_segment_cache("512");
+        let total_memory = 32 * 1024 * 1024 * 1024;
+        let current = estimate_cayenne_reservation_bytes(
+            Some(&current_app),
+            &current_app.runtime.params,
+            total_memory,
+        );
+        let new = estimate_cayenne_reservation_bytes(
+            Some(&new_app),
+            &new_app.runtime.params,
+            total_memory,
+        );
+
+        assert_eq!(
+            estimate_cayenne_reload_reservation_bytes(Some(&current_app), &new_app, total_memory,),
+            current + new,
+            "a changed table's old and new providers can coexist during reload"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn cayenne_replacement_keeps_old_creation_ceiling_after_cgroup_shrink() {
+        let acceleration = cayenne_test_accel("cayenne", true);
+        let current_app = Arc::new(
+            app::AppBuilder::new("cayenne-shrink-overlap-test")
+                .with_dataset(cayenne_test_dataset_from(
+                    "dummy:old",
+                    "changing_table",
+                    acceleration.clone(),
+                ))
+                .build(),
+        );
+        let new_app = Arc::new(
+            app::AppBuilder::new("cayenne-shrink-overlap-test")
+                .with_dataset(cayenne_test_dataset_from(
+                    "dummy:new",
+                    "changing_table",
+                    acceleration,
+                ))
+                .build(),
+        );
+        let old_total = 128 * 1024 * 1024 * 1024;
+        let new_total = 8 * 1024 * 1024 * 1024;
+        let old_reservation = estimate_cayenne_reservation_bytes(
+            Some(&current_app),
+            &current_app.runtime.params,
+            old_total,
+        );
+        let new_reservation =
+            estimate_cayenne_reservation_bytes(Some(&new_app), &new_app.runtime.params, new_total);
+        assert!(new_reservation < old_reservation);
+
+        let context = DuckDbBudgetContext {
+            query_pool_ceiling_bytes: 0,
+            dedicated_thread_pools_enabled: true,
+            current_total_memory: Arc::new(AtomicU64::new(old_total)),
+            current_cayenne_reservation_bytes: Arc::new(AtomicU64::new(old_reservation)),
+            last_app_cayenne_reservation_bytes: Arc::new(AtomicU64::new(old_reservation)),
+        };
+
+        assert_eq!(
+            context.retained_cayenne_reservation_bytes(Some(&current_app), &new_app, new_total,),
+            old_reservation + new_reservation,
+            "replacement overlap must charge the old provider at its original ceiling"
+        );
+    }
+
+    #[test]
+    fn retained_duckdb_overcommit_requires_a_duckdb_reservation() {
+        assert!(retained_duckdb_overcommit(900, 200, 1_000));
+        assert!(!retained_duckdb_overcommit(800, 200, 1_000));
+        assert!(
+            !retained_duckdb_overcommit(1_100, 0, 1_000),
+            "a fixed query pool alone must not be reported as a cached DuckDB overcommit"
+        );
+        assert!(
+            fixed_query_region_overcommit(1_100, 0, 1_000),
+            "a fixed query pool can exceed a shrunken cgroup region without DuckDB"
         );
     }
 
