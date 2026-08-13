@@ -154,8 +154,7 @@ impl DataConnectorFactory for DeltaLakeFactory {
                 );
             }
 
-            let runtime = params.runtime();
-            let parquet_opts = build_table_parquet_options(runtime.as_deref()).await?;
+            let parquet_opts = build_table_parquet_options(params.app())?;
 
             tracing::debug!(
                 ?parquet_opts,

@@ -4856,6 +4856,7 @@ dependencies = [
 name = "connector-sharepoint"
 version = "2.2.0-unstable"
 dependencies = [
+ "app",
  "arrow",
  "async-stream",
  "async-trait",

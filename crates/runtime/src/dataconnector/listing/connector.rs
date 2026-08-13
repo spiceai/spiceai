@@ -53,13 +53,13 @@ use {
     datafusion_datasource::file_format::FileFormatFactory, vortex_datafusion::VortexFormatFactory,
 };
 
-use crate::Runtime;
 use crate::component::dataset::Dataset;
 use crate::dataconnector::{
     ConnectorComponent, DataConnector, DataConnectorError, DataConnectorResult,
     listing::infer::{infer_partitions_with_types_from_files, infer_partitions_with_types_prefix},
 };
 use crate::parameters::{ExposedParamLookup, Parameters};
+use app::App;
 use data_components::object::{
     metadata::{MetadataColumn, ObjectStoreMetadataTable},
     text::ObjectStoreTextTable,
@@ -547,7 +547,12 @@ pub trait ListingTableConnector: DataConnector {
             })
     }
 
-    fn get_runtime(&self) -> Option<Runtime> {
+    /// The loaded app, for the runtime-level configuration this connector's
+    /// reads consult (currently `runtime.params.parquet_page_index`).
+    ///
+    /// `None` where no runtime is attached — connector unit tests that build the
+    /// connector directly.
+    fn get_app(&self) -> Option<Arc<App>> {
         None
     }
 
@@ -997,16 +1002,13 @@ pub trait ListingTableConnector: DataConnector {
     where
         Self: Display,
     {
-        let runtime = self.get_runtime();
-        build_table_parquet_options(runtime.as_ref())
-            .await
-            .map_err(
-                |e| crate::dataconnector::DataConnectorError::UnableToConnectInternal {
-                    dataconnector: format!("{self}"),
-                    connector_component: ConnectorComponent::from(dataset),
-                    source: Box::new(e),
-                },
-            )
+        build_table_parquet_options(self.get_app()).map_err(|e| {
+            crate::dataconnector::DataConnectorError::UnableToConnectInternal {
+                dataconnector: format!("{self}"),
+                connector_component: ConnectorComponent::from(dataset),
+                source: Box::new(e),
+            }
+        })
     }
 
     /// A hook that is called when an accelerated table is registered to the
@@ -1817,14 +1819,14 @@ impl SensitiveListingTableUrl {
 /// `runtime.params.parquet_page_index` (`required` | `auto` | `skip`) and
 /// sets `enable_page_index` accordingly. When no runtime is available,
 /// `enable_page_index` retains the `DataFusion` default (`true`).
-pub async fn build_table_parquet_options(
-    runtime: Option<&Runtime>,
+pub fn build_table_parquet_options(
+    app: Option<Arc<App>>,
 ) -> std::result::Result<TableParquetOptions, DataFusionError> {
     let mut opts = TableParquetOptions::new();
     opts.set("pushdown_filters", "true")?;
 
-    if let Some(rt) = runtime {
-        let page_index_options = parquet_page_index_options(rt).await;
+    if app.is_some() {
+        let page_index_options = parquet_page_index_options(&app);
         opts.set(
             "enable_page_index",
             &page_index_options.enable_page_index.to_string(),
@@ -1855,11 +1857,9 @@ impl Default for ParquetPageIndexOptions {
 ///   params:
 ///     parquet_page_index: required # skip, auto
 /// ```
-async fn parquet_page_index_options(runtime: &Runtime) -> ParquetPageIndexOptions {
-    let runtime_app = runtime.app();
-    let app = runtime_app.read().await;
+fn parquet_page_index_options(app: &Option<Arc<App>>) -> ParquetPageIndexOptions {
     let parquet_page_index_param =
-        app::App::get_runtime_param(&app, "parquet_page_index", "required".to_string());
+        App::get_runtime_param(app, "parquet_page_index", "required".to_string());
 
     match parquet_page_index_param.as_str() {
         // Note: "auto" and "required" both enable page index now. The difference was that "auto"
