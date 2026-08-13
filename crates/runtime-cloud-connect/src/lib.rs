@@ -92,7 +92,7 @@ pub use handlers::{
     Capability, CommandError, MAX_QUERY_RESULT_BYTES, MAX_QUERY_ROWS, QueryOutcome, RestartMode,
     RuntimeHandle, RuntimePhase, SpicepodDeployment, StatusReport, effective_max_rows,
 };
-pub use identity::{Identity, IdentityStore};
+pub use identity::{AppAttachment, AttachmentState, Identity, IdentityStore};
 
 /// Revision of the `spice.cloud.v1` contract this client implements,
 /// announced in `Hello.protocol_version`.

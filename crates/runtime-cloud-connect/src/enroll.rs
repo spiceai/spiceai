@@ -546,9 +546,16 @@ pub(crate) async fn acquire_identity(
             &EnrollAttributes::from_config(config),
         )
         .await?;
+    // A successful enroll has already consumed the credential, so malformed
+    // optional portal metadata must not discard the issued identity. Normalize
+    // harmless surrounding whitespace and treat a blank org as absent.
+    let org_name = outcome
+        .org
+        .map(|org| org.trim().to_string())
+        .filter(|org| !org.is_empty());
     let registration = EnrollRegistration {
         app_name: outcome.app_name,
-        org: outcome.org,
+        org: org_name.clone(),
         region: outcome.region,
     };
     let identity = Identity {
@@ -560,6 +567,12 @@ pub(crate) async fn acquire_identity(
         gateway_addr: outcome.gateway_addr,
         not_after_unix: Some(outcome.not_after_unix),
         app_id: None,
+        // Enrollment establishes the instance-level org recovery destination.
+        // Project-scoped attachment metadata still arrives over the control
+        // stream (`AttachApp`), so a fresh enrollment starts detached.
+        org_name,
+        app_name: None,
+        monitor_url: None,
         enc_private_key_pem: material.enc_private_key_pem,
         enc_public_key_pem: material.enc_public_key_pem,
         // A fresh enrollment has no prior key to retain.
