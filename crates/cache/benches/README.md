@@ -11,21 +11,18 @@ This benchmark suite tests the performance of different cache implementations wi
 
 ### Engine / policy combinations (LruCache only)
 
-Benchmarked as named pairs rather than a cartesian product, because not every
-combination is real:
+Benchmarked as named pairs rather than a cartesian product:
 
-- **moka_lru**: Moka with standard Least Recently Used eviction
-- **moka_tinylfu**: Moka with frequency-based admission — better hit rates on some workloads
+- **moka_lru**: Moka with Least Recently Used eviction
+- **moka_tinylfu**: Moka with frequency-based admission
 - **pingora_lru**: Pingora-LRU, sharded. Requires `--features pingora`
 
-There is deliberately no `pingora_tinylfu`: Pingora has no TinyLFU admission, so
-requesting it logs a warning and builds an LRU. That arm would re-measure
-`pingora_lru` under a misleading name.
+There is no `pingora_tinylfu`: Pingora has no TinyLFU admission and builds an
+LRU instead, so that arm would duplicate `pingora_lru`.
 
-Without `--features pingora`, the Pingora arm is not generated at all. This is
-intentional — with the feature off, requesting the Pingora engine silently falls
-back to Moka, so a bench that included it anyway would publish Moka numbers
-labelled `pingora`.
+Without `--features pingora` the Pingora arm is not generated. With the feature
+off, requesting the engine falls back to Moka, so including it anyway would
+publish Moka numbers labelled `pingora`.
 
 ### Hash Algorithms (4 variants)
 
@@ -44,26 +41,21 @@ labelled `pingora`.
 
 ### invalidate_for_table
 
-Entries are spread over 8 tables and one table is invalidated, so the number
-removed stays a fixed share while the cache is sized at 50 / 1k / 10k / 50k
-entries.
-Cost that grows with the *total* rather than with the number of matches is the
-regression this is here to catch: Moka matches through its own index, while the
-Pingora path has no closure-based API and walks every key, reading each value to
-test it.
+Entries are spread over 8 tables and one is invalidated, so the share removed
+stays fixed while the cache is sized at 50 / 1k / 10k / 50k entries. Cache size
+is the axis because that is where the engines differ: Moka matches through its
+own index, while Pingora has no closure-based API and walks every key.
 
-Timing covers `invalidate_for_table` **and** `checkpoint()`. Moka's
-`invalidate_entries_if` only registers a predicate and applies it during later
+Timing covers `invalidate_for_table` and `checkpoint()`. Moka's
+`invalidate_entries_if` registers a predicate and applies it during later
 maintenance, so timing the call alone would compare registering a predicate
-against completing a scan. `checkpoint()` forces that deferred work; for Pingora
-the removals are already done and it only settles the weight.
+against completing a scan. For Pingora it only settles the weight.
 
-Unlike the throughput benchmarks this one is single-threaded and does not vary
-the hash algorithm — raw-key operations hand the `u64` straight to the backend
-without consulting the hasher, so it cannot move the measurement.
+This benchmark is single-threaded and uses one hash algorithm: raw-key
+operations bypass the hasher, so it cannot affect the measurement.
 
-The engines cross over, so a single cache size will not tell you which is
-faster. Measured on an M-series laptop, one table of eight invalidated:
+The engines cross over, so a single cache size does not tell you which is
+faster. Apple M-series, `--sample-size 10`:
 
 | entries | moka_lru | pingora_lru | ratio |
 | ------: | -------: | ----------: | ----: |
@@ -73,9 +65,9 @@ faster. Measured on an M-series laptop, one table of eight invalidated:
 |  50,000 |  5.39 ms |    18.44 ms | 3.42x |
 
 Below roughly a thousand entries Pingora's scan is cheaper than Moka's predicate
-registration and maintenance pass. Above it the walk dominates and the gap keeps
-widening — 5x the entries costs Moka 4.8x but Pingora 7.8x. Treat a change in
-where that crossover sits as the signal, not any single row.
+registration and maintenance pass. Above it the walk dominates: 5x the entries
+costs Moka 4.8x and Pingora 7.8x. Treat a shift in the crossover as the signal,
+not any single row.
 
 ## Thread Counts
 

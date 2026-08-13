@@ -75,17 +75,14 @@ impl AsTableRefs for BenchValue {
     }
 }
 
-/// Number of distinct tables entries are spread over in the invalidation
-/// benchmark. Mirrors a pod serving a handful of accelerated datasets, where a
-/// refresh of one table invalidates only the entries that read it.
+/// Tables the invalidation benchmark spreads entries over. Invalidating one
+/// removes an eighth of the cache.
 const INVALIDATION_TABLE_COUNT: u64 = 8;
 
-/// A value that reports the table it read, so `invalidate_for_table` can match
-/// it.
+/// A value that reports the table it read, so `invalidate_for_table` matches it.
 ///
-/// [`BenchValue`] reports an empty set, which no table reference matches, so
-/// invalidating against it would walk the cache and remove nothing — timing the
-/// scan but never the removals.
+/// [`BenchValue`] reports an empty set, which nothing matches, so invalidating
+/// against it would time the scan without any removals.
 #[derive(Clone)]
 struct TabledBenchValue {
     payload: String,
@@ -138,16 +135,13 @@ fn all_hash_algorithms() -> Vec<(&'static str, HashingAlgorithm)> {
     ]
 }
 
-/// The engine/policy combinations worth measuring.
+/// Engine and policy combinations to benchmark.
 ///
-/// Not a cartesian product of the two: Pingora has no `TinyLFU` admission, so
-/// `LruCache::new` warns and builds an LRU. A `pingora_tinylfu` arm would
-/// re-measure `pingora_lru` under a name claiming otherwise.
+/// Not a cartesian product: Pingora has no `TinyLFU` admission and builds an
+/// LRU instead, so a `pingora_tinylfu` arm would duplicate `pingora_lru`.
 ///
-/// Pingora is behind a feature flag, and when it is off `LruCache::new` falls
-/// back to Moka *silently* as far as a benchmark can tell. Gating the arm here
-/// rather than filtering later is what keeps a `cargo bench` without
-/// `--features pingora` from publishing Moka numbers labelled `pingora`.
+/// The Pingora arm is gated because with the feature off `LruCache::new` falls
+/// back to Moka, which would publish Moka results labelled `pingora`.
 fn all_engine_policy_pairs() -> Vec<(&'static str, CacheEngine, CachingPolicy)> {
     #[cfg_attr(
         not(feature = "pingora"),
@@ -590,39 +584,32 @@ fn bench_lru_cache_concurrent_mixed(c: &mut Criterion) {
     group.finish();
 }
 
-/// Invalidating one table's entries — what an accelerated refresh triggers on
-/// every cycle, once per dataset.
+/// Invalidating one table's entries, as an accelerated refresh does each cycle.
 ///
-/// Scaled by *total* entries while the number removed stays a fixed share:
-/// Moka matches through its own index, while the Pingora path has no
-/// closure-based API and walks every key, reading each value to test it
-/// (`LruCache::invalidate_for_table`). Cost that tracks cache size rather than
-/// match count is the difference this is here to catch, so cache size is the
-/// axis.
+/// Cache size is the axis because that is where the engines differ: Moka
+/// matches through its own index, while Pingora has no closure-based API and
+/// walks every key. The share removed stays fixed as the total grows.
 ///
-/// `checkpoint()` is inside the measured region deliberately. Moka's
-/// `invalidate_entries_if` only registers a predicate and applies it during
-/// later maintenance, so timing the call alone would compare registering a
-/// predicate against completing a scan. `checkpoint()` forces the deferred work
-/// for Moka; for Pingora the removals are already done and it only settles the
-/// weight.
+/// `checkpoint()` is measured alongside the call. Moka's
+/// `invalidate_entries_if` registers a predicate and applies it during later
+/// maintenance, so timing the call alone would compare registering a predicate
+/// against completing a scan. For Pingora it only settles the weight.
 fn bench_lru_cache_invalidate_for_table(c: &mut Criterion) {
     let mut group = c.benchmark_group("lru_cache_invalidate_for_table");
     let rt = create_bench_runtime();
     let handle = rt.handle().clone();
 
-    // Raw-key operations hand the u64 straight to the backend without consulting
-    // the hasher, so the hash algorithm cannot move this measurement.
+    // Raw-key operations bypass the hasher, so the hash algorithm cannot affect
+    // this measurement.
     let hash_builder =
         get_hash_builder(HashingAlgorithm::XXH3).expect("Failed to get hash builder");
 
     for (pair_name, engine, policy) in all_engine_policy_pairs() {
-        // 50 is not a rounding-down of the others: a pod whose workload has a
-        // small set of distinct queries holds a cache this size, and it is the
-        // point where a per-entry cost is still cheap enough to be invisible.
+        // Spans three orders of magnitude because the engines cross over: 50
+        // covers a cache holding a small set of distinct queries, where the
+        // per-entry cost is still negligible.
         for entry_count in [50u64, 1_000, 10_000, 50_000] {
-            // Elements are the entries the implementation may have to consider,
-            // which is what makes the per-entry cost readable off the throughput.
+            // Throughput is per entry considered, not per entry removed.
             group.throughput(Throughput::Elements(entry_count));
 
             let bench_name = format!("{pair_name}_{entry_count}entries");
@@ -634,9 +621,8 @@ fn bench_lru_cache_invalidate_for_table(c: &mut Criterion) {
                     let hash_builder = hash_builder.clone();
                     b.iter_batched(
                         || {
-                            // Capacity well above the population: an eviction
-                            // during setup would leave each iteration
-                            // invalidating a different-sized cache.
+                            // Capacity above the population so nothing is
+                            // evicted before the measured call.
                             let cache: Arc<
                                 LruCache<
                                     TabledBenchValue,
@@ -659,8 +645,8 @@ fn bench_lru_cache_invalidate_for_table(c: &mut Criterion) {
                                     );
                                     cache.put_raw_key(&i, value).await;
                                 }
-                                // Settle the population so the first
-                                // invalidation is not charged for setup work.
+                                // Settle the population so setup work is not
+                                // charged to the measured call.
                                 cache.checkpoint().await;
                             });
                             cache
