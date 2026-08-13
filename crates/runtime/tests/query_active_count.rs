@@ -45,9 +45,10 @@ use opentelemetry_sdk::{Resource, metrics::SdkMeterProvider};
 use runtime::datafusion::query::QueryActiveGuard;
 use runtime_request_context::{Protocol, RequestContext};
 
-/// How wide a fan-out to exercise beyond the two-query minimum. Every guard
-/// after the first is a nested one, so the count must stay at exactly one
-/// however many there are.
+/// How wide a fan-out to exercise beyond the two-query minimum. These are
+/// concurrent siblings rather than nested queries — the distinction this test
+/// exists to keep — and only the first of them finds the request idle, so the
+/// count must stay at exactly one however many overlap.
 const FAN_OUT: usize = 8;
 
 /// The one `MeterProvider` for this binary, installed before any instrument

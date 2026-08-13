@@ -1925,9 +1925,10 @@ fn attach_query_tracker_to_stream(
 /// query per table and per embedding column; NSQL samples datasets with
 /// `buffer_unordered`, which yields in completion order), so the guard that
 /// opened the request is not guaranteed to be the one that closes it. Anchoring
-/// the release on the guard instead of the edge either strands the decrement
-/// when that guard finishes last, or fires it early while siblings are still
-/// running.
+/// the release on that guard instead of on the edge fails whichever way it is
+/// written: releasing only when it is *also* the last one out strands the
+/// decrement every time it is not, and releasing unconditionally fires it while
+/// siblings are still running.
 ///
 /// Each guard keeps the dimensions it was built with, which pins the pair for
 /// a request that runs one query at a time. Across overlapping queries the two
