@@ -2606,7 +2606,7 @@
           {
             "id": 1009,
             "definition": {
-              "title": "Segment Cache Memory",
+              "title": "Cayenne Segment Cache Memory",
               "title_size": "16",
               "title_align": "left",
               "show_legend": true,
