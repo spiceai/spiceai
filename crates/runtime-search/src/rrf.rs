@@ -1377,6 +1377,7 @@ mod tests {
     use crate::rrf::RecencyDecay;
     use crate::rrf::ReciprocalRankFusion;
     use crate::rrf::ReciprocalRankFusionArgs;
+    use crate::rrf::{RRF_MAX_SOURCES, SIGNATURE};
     use arrow::array::{Float64Array, StringArray};
     use arrow::record_batch::RecordBatch;
     use datafusion::arrow::datatypes::DataType;
@@ -1574,7 +1575,7 @@ mod tests {
 
     #[tokio::test]
     async fn nested_rrf_named_arguments_do_not_fail_signature_validation() {
-        let ctx = SessionContext::new();
+        let ctx = Arc::new(SessionContext::new());
         let stub = |name| {
             create_udf(
                 name,
@@ -1608,7 +1609,7 @@ mod tests {
         // (the 2nd entry in SIGNATURE's un-padded parameter list) used to land
         // in the same resolved slot as the 2nd positional source, producing
         // "Parameter 'k' specified multiple times" instead of accepting the call.
-        let ctx = SessionContext::new();
+        let ctx = Arc::new(SessionContext::new());
         let stub = |name| {
             create_udf(
                 name,
