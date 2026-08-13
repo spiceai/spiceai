@@ -132,10 +132,9 @@ impl MemoryVectorStore {
         // Filter every overlapping batch before touching the stored ones. This store holds
         // the only copy of the rows it is filtering, so a partially applied delete would
         // lose the batches it had already consumed. `None` marks a batch with no overlap.
-        let mut filtered: Vec<Option<RecordBatch>> = Vec::with_capacity(self.batches.len());
         let target = self.write_target();
-        let mut retained = Vec::with_capacity(target.len() + 1);
-        for stored in target.drain(..) {
+        let mut filtered: Vec<Option<RecordBatch>> = Vec::with_capacity(target.len());
+        for stored in target.iter() {
             if !stored
                 .keys
                 .iter()
@@ -155,8 +154,9 @@ impl MemoryVectorStore {
         }
 
         // Every fallible step is done, so the store can be rebuilt without dropping rows.
-        let mut retained = Vec::with_capacity(self.batches.len());
-        for (stored, filtered) in self.batches.drain(..).zip(filtered) {
+        let target = self.write_target();
+        let mut retained = Vec::with_capacity(target.len());
+        for (stored, filtered) in target.drain(..).zip(filtered) {
             let Some(batch) = filtered else {
                 // No overlap — keep the batch untouched (zero-copy).
                 retained.push(stored);
@@ -175,7 +175,7 @@ impl MemoryVectorStore {
                 keys: kept_keys,
             });
         }
-        *self.write_target() = retained;
+        *target = retained;
         Ok(())
     }
 
@@ -332,6 +332,38 @@ mod tests {
             stored_ids(&store),
             vec![vec![1, 2], vec![3, 4], vec![5, 6]],
             "an upsert that could not delete the rows it supersedes must not add its own"
+        );
+    }
+
+    #[test]
+    fn a_failed_delete_inside_a_replace_window_leaves_every_staged_row_in_place() {
+        let mut store = store_of(&[&[1, 2]]);
+        store.begin_replace_window();
+        store
+            .upsert(batch(&[3, 4]), keys(&[3, 4]))
+            .expect("staging a batch inside a replace window succeeds");
+        store.write_target().push(StoredBatch {
+            batch: batch(&[5, 6]),
+            keys: keys(&[5, 6, 7]),
+        });
+
+        // "3" overlaps the first staged batch, so it filters successfully before "5" reaches
+        // the second and fails.
+        store
+            .delete_by_keys(&keys(&[3, 5]))
+            .expect_err("a batch whose mask does not match its rows cannot be filtered");
+
+        assert_eq!(
+            stored_ids(&store),
+            vec![vec![1, 2]],
+            "a failed delete inside a window must leave the published rows alone"
+        );
+
+        store.commit_replace_window();
+        assert_eq!(
+            stored_ids(&store),
+            vec![vec![3, 4], vec![5, 6]],
+            "a delete that could not be applied must not remove any staged row"
         );
     }
 }
