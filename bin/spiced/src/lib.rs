@@ -108,10 +108,10 @@ use runtime::config::ClusterRole;
 use runtime::config::Config as RuntimeConfig;
 use runtime::datafusion::DataFusion;
 use runtime::podswatcher::PodsWatcher;
-use runtime::secrets::ExposeSecret;
 use runtime::spice_metrics;
 use runtime::{Runtime, auth::EndpointAuth, extension::ExtensionFactory};
 use runtime_async::ManagedTokioRuntime;
+use runtime_secrets::ExposeSecret;
 use snafu::prelude::*;
 use spice_cloud::SpiceExtensionFactory;
 use spiced_tracing::LogVerbosity;
@@ -862,7 +862,7 @@ pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
     if needs_metrics {
         // Resolve secrets in OTEL exporter headers before initializing metrics
         let resolved_otel_headers = if let Some(config) = otel_config {
-            runtime::secrets::get_params_with_secrets(rt.secrets(), &config.headers)
+            runtime_secrets::get_params_with_secrets(rt.secrets(), &config.headers)
                 .await
                 .into_iter()
                 .map(|(key, value)| (key, value.expose_secret().to_string()))

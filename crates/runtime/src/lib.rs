@@ -127,14 +127,20 @@ pub mod resource_monitor {
     pub use runtime_resources::*;
 }
 
-pub use runtime_parameters as parameters;
+// Connector parameters live in `runtime-parameters`; the runtime names them
+// through this alias. Crate-visible so that a crate outside the runtime has to
+// depend on `runtime-parameters` directly rather than route through here — the
+// layering guard cannot see a path that hides inside a legal crate-level edge.
+pub(crate) use runtime_parameters as parameters;
 
 pub mod podswatcher;
 pub mod request;
 mod scheduling;
 pub(crate) use runtime_component::schema_evolution;
 pub mod search;
-pub mod secrets {
+// Secrets live in `runtime-secrets`. Crate-visible for the same reason as
+// `parameters` above: reach for `runtime-secrets` instead.
+pub(crate) mod secrets {
     pub use runtime_secrets::*;
 }
 pub mod cluster;

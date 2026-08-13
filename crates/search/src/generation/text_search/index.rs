@@ -1091,6 +1091,80 @@ mod tests {
         format!("{}", pretty_format_batches(&rb).expect("failed to format"))
     }
 
+    /// Search `content` for `query` and return the sorted `id`s of the matching documents.
+    /// Reloads the reader first so the searcher reflects the most recent commit (a delete
+    /// commits synchronously, so a reload after it is deterministic — no fixed sleep).
+    async fn search_ids(index: &FullTextDatabaseIndex, query: &str) -> Vec<i32> {
+        index.reader.reload().expect("failed to reload the reader");
+        let search_index = index
+            .full_text_search_field_index("content")
+            .expect("Failed to create FullTextSearchFieldIndex");
+        let batches: Vec<RecordBatch> = search_index
+            .search(query.to_string(), &[], 1000)
+            .expect("Failed to search")
+            .try_collect()
+            .await
+            .expect("Failed to collect search results");
+
+        let mut ids: Vec<i32> = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column_by_name("id")
+                    .expect("results carry the id column")
+                    .as_any()
+                    .downcast_ref::<arrow::array::Int32Array>()
+                    .expect("id is Int32")
+                    .iter()
+                    .flatten()
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// A direct `delete_by_keys` removes the matching documents from the tantivy index — the
+    /// deleted row stops matching a search, and the other rows still do.
+    #[tokio::test]
+    async fn delete_by_keys_removes_matching_documents() {
+        let index = new_test_index();
+        index
+            .compute_index(vec![
+                record_batch!(
+                    ("id", Int32, [1, 2, 3]),
+                    (
+                        "content",
+                        Utf8,
+                        ["apple banana", "cherry date", "elderberry fig"]
+                    )
+                )
+                .expect("Failed to create test batch"),
+            ])
+            .await
+            .expect("failed to compute_index");
+
+        assert_eq!(search_ids(&index, "apple").await, vec![1]);
+        assert_eq!(search_ids(&index, "cherry").await, vec![2]);
+        assert_eq!(search_ids(&index, "elderberry").await, vec![3]);
+
+        index
+            .delete_by_keys(record_batch!(("id", Int32, [2])).expect("key batch"))
+            .await
+            .expect("failed to delete_by_keys");
+
+        assert!(
+            search_ids(&index, "cherry").await.is_empty(),
+            "the deleted document must no longer match"
+        );
+        assert_eq!(search_ids(&index, "apple").await, vec![1], "id 1 stays");
+        assert_eq!(
+            search_ids(&index, "elderberry").await,
+            vec![3],
+            "id 3 stays"
+        );
+    }
+
     // Regression test for #12228.
     #[tokio::test]
     async fn test_search_preserves_all_nullable_stored_columns() {

@@ -198,6 +198,37 @@ impl VortexSource {
         self.allow_repartitioning = allow;
         self
     }
+
+    /// The number of splits this source decodes CONCURRENTLY inside one file scan
+    /// for `base_config`.
+    ///
+    /// Exposed so a caller that accounts scan memory against a pool can charge for
+    /// every in-flight decode rather than for a single emitted batch: a scan that
+    /// resolves to N holds up to N canonicalized batches at once. Resolution is
+    /// plan-time-stable — it reads only the file groups, the pushed-down limit, and
+    /// this source's target partitions — so an accounting caller sees the same value
+    /// `create_file_opener` will use.
+    ///
+    /// [`Self::create_file_opener`] resolves through this method, so the accounting
+    /// and the scan cannot drift apart.
+    #[must_use]
+    pub fn resolved_scan_concurrency(&self, base_config: &FileScanConfig) -> usize {
+        resolve_scan_concurrency(
+            self.options.scan_concurrency,
+            self.effective_target_partitions(base_config),
+            planned_file_count(&base_config.file_groups),
+            base_config.limit.is_some() && self.vortex_predicate.is_none(),
+            cpu_budget::cpu_budget().scan_split_concurrency(),
+        )
+    }
+
+    /// Partition count the concurrency derivation divides across the planned files:
+    /// the count the physical optimizer pushed in through [`Self::repartitioned`],
+    /// falling back to the planned group count when the scan was never repartitioned.
+    fn effective_target_partitions(&self, base_config: &FileScanConfig) -> usize {
+        self.target_partitions
+            .unwrap_or_else(|| base_config.file_groups.len().max(1))
+    }
 }
 
 impl FileSource for VortexSource {
@@ -222,15 +253,8 @@ impl FileSource for VortexSource {
         );
 
         let planned_file_count = planned_file_count(&base_config.file_groups);
-        let target_partitions = self
-            .target_partitions
-            .unwrap_or_else(|| base_config.file_groups.len().max(1));
-        let scan_concurrency = resolve_scan_concurrency(
-            self.options.scan_concurrency,
-            target_partitions,
-            planned_file_count,
-            base_config.limit.is_some() && self.vortex_predicate.is_none(),
-        );
+        let target_partitions = self.effective_target_partitions(base_config);
+        let scan_concurrency = self.resolved_scan_concurrency(base_config);
 
         tracing::debug!(
             scan_concurrency,
@@ -422,17 +446,33 @@ fn planned_file_count(file_groups: &[FileGroup]) -> usize {
     file_groups.iter().map(FileGroup::len).sum::<usize>().max(1)
 }
 
+/// Resolves the splits one file scan decodes concurrently.
+///
+/// `max_auto_concurrency` bounds the DERIVED count only. The derivation spreads
+/// the query fan-out across the planned files, so a scan reaching few files
+/// concentrates all of it into one file — and the fan-out tracks the CPU
+/// entitlement only while `runtime.query.target_partitions` is unset. Clamping
+/// keeps a scan from running more concurrent decodes than the process has cores
+/// to run them on, each of which holds a decoded batch charged to the query pool.
+///
+/// `Explicit` is deliberately not clamped: an operator naming a count outranks a
+/// derived ceiling, as every other explicitly-set knob does.
+///
+/// Pure by design — the entitlement arrives as an argument rather than being read
+/// from the process global here, so the arithmetic stays unit-testable.
 fn resolve_scan_concurrency(
     mode: ScanConcurrency,
     target_partitions: usize,
     planned_file_count: usize,
     has_limit_without_filter: bool,
+    max_auto_concurrency: usize,
 ) -> usize {
     match mode {
         ScanConcurrency::Auto if has_limit_without_filter => 1,
         ScanConcurrency::Auto => target_partitions
             .max(1)
             .div_ceil(planned_file_count.max(1))
+            .min(max_auto_concurrency)
             .max(1),
         ScanConcurrency::Off => 1,
         ScanConcurrency::Explicit(value) => value.max(1),
@@ -443,18 +483,21 @@ fn resolve_scan_concurrency(
 mod tests {
     use super::*;
 
+    /// A ceiling high enough not to bind, for the cases under test.
+    const UNCAPPED: usize = usize::MAX;
+
     #[test]
     fn auto_scan_concurrency_uses_file_count() {
         assert_eq!(
-            resolve_scan_concurrency(ScanConcurrency::Auto, 16, 1, false),
+            resolve_scan_concurrency(ScanConcurrency::Auto, 16, 1, false, UNCAPPED),
             16
         );
         assert_eq!(
-            resolve_scan_concurrency(ScanConcurrency::Auto, 16, 4, false),
+            resolve_scan_concurrency(ScanConcurrency::Auto, 16, 4, false, UNCAPPED),
             4
         );
         assert_eq!(
-            resolve_scan_concurrency(ScanConcurrency::Auto, 16, 32, false),
+            resolve_scan_concurrency(ScanConcurrency::Auto, 16, 32, false, UNCAPPED),
             1
         );
     }
@@ -462,7 +505,7 @@ mod tests {
     #[test]
     fn auto_scan_concurrency_clamps_limit_without_filter_to_serial() {
         assert_eq!(
-            resolve_scan_concurrency(ScanConcurrency::Auto, 16, 1, true),
+            resolve_scan_concurrency(ScanConcurrency::Auto, 16, 1, true, UNCAPPED),
             1
         );
     }
@@ -470,11 +513,42 @@ mod tests {
     #[test]
     fn explicit_and_off_scan_concurrency_override_auto() {
         assert_eq!(
-            resolve_scan_concurrency(ScanConcurrency::Explicit(3), 16, 1, true),
+            resolve_scan_concurrency(ScanConcurrency::Explicit(3), 16, 1, true, UNCAPPED),
             3
         );
         assert_eq!(
-            resolve_scan_concurrency(ScanConcurrency::Off, 16, 1, false),
+            resolve_scan_concurrency(ScanConcurrency::Off, 16, 1, false, UNCAPPED),
+            1
+        );
+    }
+
+    /// The derived count must never exceed the CPU entitlement.
+    ///
+    /// `target_partitions` follows the entitlement only while
+    /// `runtime.query.target_partitions` is unset. Set above it, the derivation
+    /// would otherwise put that many decodes in flight inside ONE file scan —
+    /// more than the process can run in parallel, each holding a decoded batch
+    /// charged to the query memory pool.
+    #[test]
+    fn auto_scan_concurrency_never_exceeds_the_cpu_entitlement() {
+        // 64-way query fan-out over a single file, on an 8-core entitlement.
+        assert_eq!(
+            resolve_scan_concurrency(ScanConcurrency::Auto, 64, 1, false, 8),
+            8
+        );
+        // Already under the ceiling: the file count still governs.
+        assert_eq!(
+            resolve_scan_concurrency(ScanConcurrency::Auto, 64, 16, false, 8),
+            4
+        );
+        // An operator naming a count outranks the ceiling.
+        assert_eq!(
+            resolve_scan_concurrency(ScanConcurrency::Explicit(32), 64, 1, false, 8),
+            32
+        );
+        // A degenerate ceiling must still leave a usable scan.
+        assert_eq!(
+            resolve_scan_concurrency(ScanConcurrency::Auto, 64, 1, false, 0),
             1
         );
     }

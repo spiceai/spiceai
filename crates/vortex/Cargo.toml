@@ -12,6 +12,9 @@ version = { workspace = true }
 [dependencies]
 arrow-schema = { workspace = true }
 async-trait = { workspace = true }
+# Sole source of the CPU entitlement, which caps the derived intra-file scan
+# concurrency (see `VortexSource::resolved_scan_concurrency`).
+cpu-budget = { workspace = true }
 datafusion-catalog = { workspace = true }
 datafusion-common = { workspace = true }
 datafusion-common-runtime = { workspace = true }
