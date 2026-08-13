@@ -178,7 +178,7 @@ arrow-json = "58.0.0"
 arrow-odbc = "22" # crates.io 22+ accepts arrow ">=29, <59" so it resolves to the workspace Arrow 58 (the prior git pin v21 was capped at arrow <58, which forced a separate Arrow-57 subtree + an IPC bridge)
 arrow-row = "58.0.0"
 arrow-schema = "58.0.0"
-async-openai = { git = "https://github.com/spiceai/async-openai", rev = "605ffc7e9aa2963a977b69da882d022c2889dea0", features = [
+async-openai = { git = "https://github.com/spiceai/async-openai", rev = "0f88b6be7d4a06a9c05a3223a380828c8b5c92f2", features = [
     "byot",
     "embedding",
     "chat-completion",
