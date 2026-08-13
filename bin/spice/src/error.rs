@@ -250,6 +250,33 @@ pub enum Error {
     /// Enrollment against the Spice Cloud control plane failed.
     #[snafu(display("Failed to enroll with Spice Cloud: {message}"))]
     CloudConnectEnroll { message: String },
+
+    /// A `spice connect service` action needs a service that is not installed
+    /// for the selected instance directory.
+    ///
+    /// Distinct from a generic failure because nothing went wrong: the request
+    /// cannot be carried out as asked, which is what exit code
+    /// [`Error::USAGE_EXIT_CODE`] means.
+    #[snafu(display("{message}"))]
+    ServiceNotInstalled { message: String },
+
+    /// The service supervisor could not be asked, or reports the service as
+    /// failed. The status report has already been written; this carries the
+    /// diagnosis and the non-zero exit.
+    #[snafu(display("{message}"))]
+    ServiceUnavailable { message: String },
+
+    /// The viewer was interrupted — `spice connect service logs --follow`
+    /// stopped following. The service is unchanged.
+    #[snafu(display("Interrupted."))]
+    Interrupted,
+
+    /// A callable path that this release does not implement yet.
+    ///
+    /// A typed error rather than a panic, so the CLI exits with a diagnosis and
+    /// a non-zero status instead of aborting.
+    #[snafu(display("{message}"))]
+    NotImplemented { message: String },
 }
 
 impl Error {
@@ -292,6 +319,58 @@ impl Error {
         match self {
             Self::Cloud { hint, .. } => hint.as_deref(),
             _ => None,
+        }
+    }
+
+    /// The operation failed. The default for anything without a more specific
+    /// meaning.
+    pub const FAILURE_EXIT_CODE: i32 = 1;
+
+    /// The request cannot be carried out as asked and the caller has to change
+    /// something. The same code clap uses for a usage error.
+    pub const USAGE_EXIT_CODE: i32 = 2;
+
+    /// Re-authenticate and retry, matching the convention `gh` uses
+    /// (<https://cli.github.com/manual/gh_help_exit-codes>).
+    pub const AUTH_EXIT_CODE: i32 = 4;
+
+    /// Interrupted by a signal: `128 + SIGINT`, the shell convention.
+    pub const INTERRUPTED_EXIT_CODE: i32 = 130;
+
+    /// The process exit code for this error.
+    ///
+    /// The contract automation branches on:
+    ///
+    /// - `0` — the command did what it was asked (never produced here).
+    /// - `1` — the operation failed.
+    /// - `2` — the request was invalid; change something and retry.
+    /// - `4` — authenticate again and retry.
+    /// - `130` — interrupted; nothing was changed.
+    #[must_use]
+    pub fn exit_code(&self) -> i32 {
+        if matches!(
+            self.cloud_code(),
+            Some(
+                CloudErrorCode::NotAuthenticated
+                    | CloudErrorCode::TokenExpired
+                    | CloudErrorCode::OrgCredentialMissing,
+            )
+        ) {
+            return Self::AUTH_EXIT_CODE;
+        }
+        match self {
+            Self::Unauthorized => Self::AUTH_EXIT_CODE,
+            // Both are refusals of the request rather than failures of an
+            // attempt: the caller has to change something. `InvalidArgument`
+            // covers argument conflicts, preflight refusals, and manifest
+            // validation, so it belongs on the same code clap already uses for
+            // a usage error — otherwise automation cannot tell bad input from
+            // an operation that tried and failed.
+            Self::InvalidArgument { .. } | Self::ServiceNotInstalled { .. } => {
+                Self::USAGE_EXIT_CODE
+            }
+            Self::Interrupted => Self::INTERRUPTED_EXIT_CODE,
+            _ => Self::FAILURE_EXIT_CODE,
         }
     }
 }
