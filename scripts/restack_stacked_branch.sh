@@ -117,18 +117,25 @@ cmd_resolve() {
   theirs_mode=$(git ls-files --stage -- ":(literal)$path" | awk '$3 == 3 { print $1 }')
 
   # The stages say what git recorded; the worktree says what cp would write
-  # through. A conflicted path replaced on disk by a symlink still has two
-  # regular-file stages, and copying onto it would follow the link and rewrite
-  # whatever it points at.
-  if [ -L "$path" ] ||
+  # into. A conflicted path replaced on disk by a symlink still has two
+  # regular-file stages, and copying onto it follows the link and rewrites
+  # whatever it points at. A directory, fifo, socket or device is no better: cp
+  # would write inside it, block on it, or overwrite it.
+  local worktree_oddity=""
+  if [ -L "$path" ]; then
+    worktree_oddity="a symlink"
+  elif [ -e "$path" ] && [ ! -f "$path" ]; then
+    worktree_oddity="not a regular file"
+  fi
+  if [ -n "$worktree_oddity" ] ||
      [ "${ours_mode:-none}" != "${theirs_mode:-none}" ] || [ "$ours_mode" = 120000 ]; then
     # The suggestion is meant to be pasted, and this branch exists for the awkward
     # paths, so escape rather than wrap in quotes: a path containing a single
     # quote would otherwise produce a command that is not valid shell at all.
     local quoted
     quoted=$(printf '%q' ":(literal)$path")
-    if [ -L "$path" ]; then
-      echo "MANUAL $path: the worktree entry is a symlink, whatever the index says"
+    if [ -n "$worktree_oddity" ]; then
+      echo "MANUAL $path: the worktree entry is $worktree_oddity, whatever the index says"
     else
       echo "MANUAL $path: ours=${ours_mode:-none} theirs=${theirs_mode:-none} (mode, symlink, or missing stage)"
     fi
@@ -146,14 +153,14 @@ cmd_resolve() {
   # pre-existing symlink at that path and truncate whatever it points at.
   local tmp rc
   tmp=$(mktemp -d) || die "could not create a private temp directory"
-  resolve_with_tmp "$stack_base" "$path" "$tmp"
+  resolve_with_tmp "$stack_base" "$path" "$tmp" "$ours_mode"
   rc=$?
   rm -rf "$tmp"
   return "$rc"
 }
 
 resolve_with_tmp() {
-  local stack_base="$1" path="$2" tmp="$3"
+  local stack_base="$1" path="$2" tmp="$3" agreed_mode="$4"
 
   # A redirection creates its file before git runs, so a failed `git show`
   # leaves an empty file that merge-file reads as "this side is empty" rather
@@ -179,7 +186,20 @@ resolve_with_tmp() {
   if [ "$merge_status" -eq 0 ]; then
     # `:(literal)` because git add takes a pathspec, not a filename: a conflicted
     # path containing *, ? or [] would otherwise stage every other path it matches.
-    cp -- "$tmp/merged" "$path" && git add -- ":(literal)$path" || die "could not stage $path"
+    # cp keeps an existing destination's permissions, and gives a new one the
+    # temporary file's, so the executable bit both sides agreed on can be lost or
+    # invented here. Set it from the stages before staging.
+    cp -- "$tmp/merged" "$path" || die "could not write $path"
+    git add -- ":(literal)$path" || die "could not stage $path"
+    # Set the recorded mode through git rather than chmod: the executable bit is
+    # the only part git keeps, and BSD chmod has no -- to protect a path that
+    # begins with a dash.
+    case "$agreed_mode" in
+      100755) git update-index --chmod=+x -- "$path" ||
+        die "could not restore the executable bit on $path" ;;
+      100644) git update-index --chmod=-x -- "$path" ||
+        die "could not clear the executable bit on $path" ;;
+    esac
     echo "RESOLVED $path"
     return 0
   fi
@@ -579,7 +599,7 @@ cmd_audit() {
     rm -rf "$tmp"
     die "could not read unmerged entries from the index"
   fi
-  local record last_unmerged="" theirs_now base_now theirs_add mine_add renamed_to theirs_here
+  local record last_unmerged="" theirs_now base_now theirs_add mine_add renamed_to child_moved_to theirs_here
   while IFS= read -r -d '' record; do
     path=${record#*$'\t'}
     [ "$path" = "$last_unmerged" ] && continue
@@ -599,6 +619,12 @@ cmd_audit() {
       base_now=$(tree_entry "$stack_base" "$path") || die "could not read $stack_base:$path"
       if [ -z "$theirs_now" ]; then
         if renamed_to=$(renamed_to "$RESTACK_RENAMES" "$path"); then
+          # Unless we moved it to the same place, in which case both sides agree
+          # and the addition audit checks what landed there.
+          child_moved_to=$(renamed_to "$RESTACK_CHILD_RENAMES" "$path") || child_moved_to=""
+          if [ "$child_moved_to" = "$renamed_to" ]; then
+            continue
+          fi
           accept_or_review "$path" "you deleted it and trunk renamed it to $renamed_to, which nothing has decided" ||
             findings=$((findings + 1))
           continue

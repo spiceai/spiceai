@@ -1128,6 +1128,54 @@ start_test "resolve refuses a symlink rather than writing through it"
     fail_test "the symlink's target was overwritten"
 ) || failures=$((failures + 1))
 
+start_test "resolve keeps the executable bit both sides agreed on"
+(
+  new_stack "$work_root/agreedmode"
+  printf 'l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\n' > run.sh && chmod +x run.sh && commit_all "fork point"
+  git checkout --quiet -b parent
+  printf 'l1\nPARENT\nl3\nl4\nl5\nl6\nl7\nl8\n' > run.sh && commit_all "parent edits"
+  stack_base=$(git rev-parse HEAD)
+  git checkout --quiet -b child
+  printf 'l1\nPARENT\nl3\nl4\nl5\nl6\nl7\nCHILD\n' > run.sh && commit_all "child edits"
+  squash_parent_onto_trunk
+  printf 'l1\nPARENT\nTRUNK\nl4\nl5\nl6\nl7\nl8\n' > run.sh && commit_all "trunk edits"
+  git checkout --quiet child
+  git merge --no-ff --no-commit trunk >/dev/null 2>&1
+  [ "$(git ls-files --stage -- run.sh | awk '$3 == 2 { print $1 }')" = 100755 ] ||
+    fail_test "the fixture lost the executable bit before the merge"
+  # Someone took the bit off the worktree copy; both sides still agree it is
+  # executable, and copying content over it would record whatever is on disk.
+  chmod -x run.sh
+
+  "$subject" resolve "$stack_base" run.sh >/dev/null 2>&1
+  status=$?
+  [ "$status" -eq 0 ] || fail_test "expected a clean resolve, got $status"
+  [ "$(git ls-files --stage -- run.sh | awk '{ print $1 }')" = 100755 ] ||
+    fail_test "the agreed executable bit was not staged: $(git ls-files --stage -- run.sh)"
+) || failures=$((failures + 1))
+
+start_test "resolve refuses a conflicted path replaced by a directory"
+(
+  new_stack "$work_root/worktree_dir"
+  printf 'l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\n' > f.txt && commit_all "fork point"
+  git checkout --quiet -b parent
+  printf 'l1\nPARENT\nl3\nl4\nl5\nl6\nl7\nl8\n' > f.txt && commit_all "parent edits"
+  stack_base=$(git rev-parse HEAD)
+  git checkout --quiet -b child
+  printf 'l1\nPARENT\nl3\nl4\nl5\nl6\nl7\nCHILD\n' > f.txt && commit_all "child edits"
+  squash_parent_onto_trunk
+  printf 'l1\nPARENT\nTRUNK\nl4\nl5\nl6\nl7\nl8\n' > f.txt && commit_all "trunk edits"
+  git checkout --quiet child
+  git merge --no-ff --no-commit trunk >/dev/null 2>&1
+  rm -f f.txt && mkdir f.txt
+
+  # cp would write *inside* the directory, under a name nobody is looking at.
+  output=$("$subject" resolve "$stack_base" f.txt 2>/dev/null)
+  status=$?
+  [ "$status" -eq 2 ] || fail_test "expected exit 2 for a directory, got $status ($output)"
+  [ -z "$(ls -A f.txt)" ] || fail_test "something was written inside the directory"
+) || failures=$((failures + 1))
+
 start_test "resolve refuses when the worktree entry is a symlink the index knows nothing about"
 (
   new_stack "$work_root/worktree_symlink"
