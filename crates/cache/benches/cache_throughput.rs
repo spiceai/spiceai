@@ -20,7 +20,7 @@ limitations under the License.
 
 use cache::{
     AsTableRefs, CacheMetrics, CacheProvider, EvictionReason, HashBuilder, LruCache, SimpleCache,
-    Sizeable, TabledCacheProvider, get_hash_builder,
+    Sizeable, get_hash_builder,
 };
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use datafusion::sql::TableReference;
@@ -37,6 +37,17 @@ use std::time::Duration;
 const CACHE_WEIGHT: u64 = 100_000;
 const KEY_SPACE: u64 = 100_000;
 const OPERATIONS_PER_THREAD: usize = 10_000;
+
+/// Bytes per cached value, from [`random_value`]. Used to size a cache in
+/// entries rather than in weight.
+const VALUE_BYTES: u64 = 32;
+
+/// Distinct keys the contention benchmark touches.
+const HOT_WORKING_SET: u64 = 20_000;
+
+/// Capacity for 80% of the working set, so the cache runs full and evicting
+/// while most reads still hit.
+const HOT_CACHE_WEIGHT: u64 = HOT_WORKING_SET * VALUE_BYTES * 8 / 10;
 
 /// Creates a runtime that can be shared across benchmark worker threads.
 fn create_bench_runtime() -> tokio::runtime::Runtime {
@@ -72,56 +83,6 @@ impl CacheMetrics for BenchValue {
 impl AsTableRefs for BenchValue {
     fn as_table_refs(&self) -> Arc<HashSet<TableReference>> {
         Arc::new(HashSet::new())
-    }
-}
-
-/// Tables the invalidation benchmark spreads entries over. Invalidating one
-/// removes an eighth of the cache.
-const INVALIDATION_TABLE_COUNT: u64 = 8;
-
-/// A value that reports the table it read, so `invalidate_for_table` matches it.
-///
-/// [`BenchValue`] reports an empty set, which nothing matches, so invalidating
-/// against it would time the scan without any removals.
-#[derive(Clone)]
-struct TabledBenchValue {
-    payload: String,
-    tables: Arc<HashSet<TableReference>>,
-}
-
-impl TabledBenchValue {
-    fn new(payload: String, table_idx: u64) -> Self {
-        let mut tables = HashSet::new();
-        tables.insert(TableReference::bare(format!("table_{table_idx}")));
-        Self {
-            payload,
-            tables: Arc::new(tables),
-        }
-    }
-}
-
-impl Sizeable for TabledBenchValue {
-    fn get_memory_size(&self) -> usize {
-        self.payload.len()
-    }
-}
-
-impl CacheMetrics for TabledBenchValue {
-    fn record_hit() {}
-    fn record_miss() {}
-    fn record_request() {}
-    fn record_item_count(_count: u64) {}
-    fn record_size(_size: u64) {}
-    fn record_max_size(_size: u64) {}
-    fn record_eviction(_reason: EvictionReason) {}
-    fn record_stale_rejection() {}
-    fn update_hit_ratio(_hits: u64, _total: u64) {}
-    fn publish_counters_at_zero() {}
-}
-
-impl AsTableRefs for TabledBenchValue {
-    fn as_table_refs(&self) -> Arc<HashSet<TableReference>> {
-        Arc::clone(&self.tables)
     }
 }
 
@@ -584,18 +545,19 @@ fn bench_lru_cache_concurrent_mixed(c: &mut Criterion) {
     group.finish();
 }
 
-/// Invalidating one table's entries, as an accelerated refresh does each cycle.
+/// Read/write contention on a full cache whose reads mostly hit.
 ///
-/// Cache size is the axis because that is where the engines differ: Moka
-/// matches through its own index, while Pingora has no closure-based API and
-/// walks every key. The share removed stays fixed as the total grows.
+/// The other `LruCache` benchmarks read a 100k key space holding at most 5,000
+/// entries, so ~95% of their reads miss. That matters for the engine comparison
+/// because a Pingora miss is one metadata lookup, while a hit removes the entry
+/// and re-admits it — `pingora-lru` has no `peek_value`. Reads that miss never
+/// reach the path where the engines differ.
 ///
-/// `checkpoint()` is measured alongside the call. Moka's
-/// `invalidate_entries_if` registers a predicate and applies it during later
-/// maintenance, so timing the call alone would compare registering a predicate
-/// against completing a scan. For Pingora it only settles the weight.
-fn bench_lru_cache_invalidate_for_table(c: &mut Criterion) {
-    let mut group = c.benchmark_group("lru_cache_invalidate_for_table");
+/// Here the read key space is the working set, so reads hit, and capacity holds
+/// 80% of it, so writes evict. Thread counts straddle the 16 metadata shards:
+/// at 16 threads shard collisions are incidental, at 32 they are structural.
+fn bench_lru_cache_hot_read_write(c: &mut Criterion) {
+    let mut group = c.benchmark_group("lru_cache_hot_read_write");
     let rt = create_bench_runtime();
     let handle = rt.handle().clone();
 
@@ -605,67 +567,84 @@ fn bench_lru_cache_invalidate_for_table(c: &mut Criterion) {
         get_hash_builder(HashingAlgorithm::XXH3).expect("Failed to get hash builder");
 
     for (pair_name, engine, policy) in all_engine_policy_pairs() {
-        // Spans three orders of magnitude because the engines cross over: 50
-        // covers a cache holding a small set of distinct queries, where the
-        // per-entry cost is still negligible.
-        for entry_count in [50u64, 1_000, 10_000, 50_000] {
-            // Throughput is per entry considered, not per entry removed.
-            group.throughput(Throughput::Elements(entry_count));
+        for (mix_name, read_percent) in [("95_5", 95u32), ("80_20", 80)] {
+            for thread_count in [16usize, 32] {
+                group.throughput(Throughput::Elements(
+                    (thread_count * OPERATIONS_PER_THREAD) as u64,
+                ));
 
-            let bench_name = format!("{pair_name}_{entry_count}entries");
+                let bench_name = format!("{pair_name}_{mix_name}_{thread_count}threads");
 
-            group.bench_with_input(
-                BenchmarkId::from_parameter(&bench_name),
-                &entry_count,
-                |b, &entries| {
-                    let hash_builder = hash_builder.clone();
-                    b.iter_batched(
-                        || {
-                            // Capacity above the population so nothing is
-                            // evicted before the measured call.
-                            let cache: Arc<
-                                LruCache<
-                                    TabledBenchValue,
-                                    HashBuilder,
-                                    Box<dyn Hasher + Send + Sync>,
-                                >,
-                            > = Arc::new(LruCache::new(
-                                entries * 128,
-                                Duration::from_mins(10),
-                                hash_builder.clone(),
-                                policy,
-                                engine,
-                            ));
-                            let mut rng = StdRng::seed_from_u64(42);
-                            handle.block_on(async {
-                                for i in 0..entries {
-                                    let value = TabledBenchValue::new(
-                                        random_value(&mut rng),
-                                        i % INVALIDATION_TABLE_COUNT,
-                                    );
-                                    cache.put_raw_key(&i, value).await;
+                group.bench_with_input(
+                    BenchmarkId::from_parameter(&bench_name),
+                    &thread_count,
+                    |b, &threads| {
+                        let hash_builder = hash_builder.clone();
+                        b.iter_batched(
+                            || {
+                                let cache: Arc<
+                                    LruCache<
+                                        BenchValue,
+                                        HashBuilder,
+                                        Box<dyn Hasher + Send + Sync>,
+                                    >,
+                                > = Arc::new(LruCache::new(
+                                    HOT_CACHE_WEIGHT,
+                                    Duration::from_mins(10),
+                                    hash_builder.clone(),
+                                    policy,
+                                    engine,
+                                ));
+                                let mut rng = StdRng::seed_from_u64(42);
+                                handle.block_on(async {
+                                    // Insert the whole working set; the cache
+                                    // evicts down to capacity and starts full.
+                                    for key in 0..HOT_WORKING_SET {
+                                        let value = BenchValue(random_value(&mut rng));
+                                        cache.put_raw_key(&key, value).await;
+                                    }
+                                    cache.checkpoint().await;
+                                });
+                                cache
+                            },
+                            |cache| {
+                                let handles: Vec<_> = (0..threads)
+                                    .map(|thread_id| {
+                                        let cache = Arc::clone(&cache);
+                                        let handle = handle.clone();
+                                        std::thread::spawn(move || {
+                                            let mut rng = StdRng::seed_from_u64(thread_id as u64);
+                                            handle.block_on(async {
+                                                for _ in 0..OPERATIONS_PER_THREAD {
+                                                    let key =
+                                                        rng.random_range(0..HOT_WORKING_SET);
+                                                    if rng.random_range(0..100) < read_percent {
+                                                        black_box(cache.get_raw_key(&key).await);
+                                                    } else {
+                                                        // Rewriting a key already in the
+                                                        // working set is what a refreshed
+                                                        // result does; it still evicts,
+                                                        // because the cache is full.
+                                                        let value =
+                                                            BenchValue(random_value(&mut rng));
+                                                        black_box(
+                                                            cache.put_raw_key(&key, value).await,
+                                                        );
+                                                    }
+                                                }
+                                            });
+                                        })
+                                    })
+                                    .collect();
+                                for handle in handles {
+                                    handle.join().expect("thread panicked");
                                 }
-                                // Settle the population so setup work is not
-                                // charged to the measured call.
-                                cache.checkpoint().await;
-                            });
-                            cache
-                        },
-                        |cache| {
-                            handle.block_on(async {
-                                black_box(
-                                    cache
-                                        .invalidate_for_table(TableReference::bare("table_3"))
-                                        .await,
-                                )
-                                .expect("invalidation failed");
-                                cache.checkpoint().await;
-                            });
-                        },
-                        criterion::BatchSize::LargeInput,
-                    );
-                },
-            );
+                            },
+                            criterion::BatchSize::LargeInput,
+                        );
+                    },
+                );
+            }
         }
     }
     group.finish();
@@ -679,6 +658,6 @@ criterion_group!(
     bench_lru_cache_concurrent_get,
     bench_lru_cache_concurrent_put,
     bench_lru_cache_concurrent_mixed,
-    bench_lru_cache_invalidate_for_table
+    bench_lru_cache_hot_read_write
 );
 criterion_main!(benches);

@@ -36,42 +36,57 @@ publish Moka numbers labelled `pingora`.
 - **concurrent_get**: Read-heavy workload (100% reads, pre-populated cache)
 - **concurrent_put**: Write-heavy workload (100% writes)
 - **concurrent_mixed_80_20**: Realistic workload (80% reads, 20% writes)
-- **invalidate_for_table**: Invalidating one table's entries — what an accelerated
-  refresh triggers every cycle, once per dataset
+- **hot_read_write**: Full cache whose reads mostly hit, 95/5 and 80/20 read/write
+  at 16 and 32 threads
 
-### invalidate_for_table
+### hot_read_write
 
-Entries are spread over 8 tables and one is invalidated, so the share removed
-stays fixed while the cache is sized at 50 / 1k / 10k / 50k entries. Cache size
-is the axis because that is where the engines differ: Moka matches through its
-own index, while Pingora has no closure-based API and walks every key.
+The other `LruCache` benchmarks read a 100,000 key space holding at most 5,000
+entries, so roughly 95% of their reads miss. That matters for the engine
+comparison: a Pingora miss is one metadata lookup, while a hit removes the entry
+and re-admits it, because `pingora-lru` has no `peek_value`. Reads that miss
+never reach the path where the engines differ.
 
-Timing covers `invalidate_for_table` and `checkpoint()`. Moka's
-`invalidate_entries_if` registers a predicate and applies it during later
-maintenance, so timing the call alone would compare registering a predicate
-against completing a scan. For Pingora it only settles the weight.
+This benchmark reads a key space equal to the working set, so reads hit, and
+sizes capacity at 80% of it, so writes evict and the cache runs full.
 
-This benchmark is single-threaded and uses one hash algorithm: raw-key
-operations bypass the hasher, so it cannot affect the measurement.
+Parameters:
 
-The engines cross over, so a single cache size does not tell you which is
-faster. Apple M-series, `--sample-size 10`:
+- **Threads**: 16 and 32, straddling the 16 metadata shards Pingora uses. At 16
+  shard collisions are incidental; at 32 they are structural.
+- **Mix**: 95/5 and 80/20 read/write. Writes rewrite a key already in the
+  working set, as a refreshed result does, and still evict because the cache is
+  full.
 
-| entries | moka_lru | pingora_lru | ratio |
-| ------: | -------: | ----------: | ----: |
-|      50 |  30.4 µs |     17.7 µs | 0.58x |
-|   1,000 |   178 µs |      237 µs | 1.33x |
-|  10,000 |  1.13 ms |     2.38 ms | 2.10x |
-|  50,000 |  5.39 ms |    18.44 ms | 3.42x |
+Uses one hash algorithm: raw-key operations bypass the hasher, so it cannot
+affect the measurement.
 
-Below roughly a thousand entries Pingora's scan is cheaper than Moka's predicate
-registration and maintenance pass. Above it the walk dominates: 5x the entries
-costs Moka 4.8x and Pingora 7.8x. Treat a shift in the crossover as the signal,
-not any single row.
+Neither engine wins outright. Apple M-series, `--sample-size 10`, total time for
+threads x 10,000 operations (lower is faster):
+
+| case | moka_lru | moka_tinylfu | pingora_lru |
+| ---: | ---: | ---: | ---: |
+| 95/5, 16 threads | 34.6 ms | 32.8 ms | 41.9 ms |
+| 95/5, 32 threads | 64.8 ms | 62.1 ms | 107.2 ms |
+| 80/20, 16 threads | 80.6 ms | 82.2 ms | 50.2 ms |
+| 80/20, 32 threads | 231.2 ms | 186.5 ms | 133.9 ms |
+
+Read-heavy favours Moka, and the gap widens with threads. Doubling threads
+doubles the work, so 2.0x is the break-even: Moka scales at 1.87x and Pingora at
+2.56x. Pingora expresses a read as a remove plus re-admit, so reads contend on
+the 16 shards in a way Moka's do not.
+
+Write-heavy reverses it, with Pingora 38-42% faster at both thread counts.
+TinyLFU also earns its keep here — it costs a little on read-heavy load and
+saves 19% over LRU at 80/20 and 32 threads.
+
+So the write fraction, not the engine, decides which is faster. Numbers are from
+a laptop at reduced sample size, where 32 threads oversubscribes the cores:
+adequate for the direction and the crossover, not for precise ratios.
 
 ## Thread Counts
 
-Tests scalability with: 1, 4, 8, 16 threads
+Tests scalability with: 1, 4, 8, 16 threads. `hot_read_write` uses 16 and 32.
 
 ## Running Benchmarks
 
@@ -90,8 +105,8 @@ cargo bench -p cache --bench cache_throughput -- lru_cache
 # Just get operations
 cargo bench -p cache --bench cache_throughput -- concurrent_get
 
-# Just the invalidation benchmark (needs the feature to include Pingora)
-cargo bench -p cache --features pingora --bench cache_throughput -- invalidate_for_table
+# Just the contention benchmark (needs the feature to include Pingora)
+cargo bench -p cache --features pingora --bench cache_throughput -- hot_read_write
 
 # Specific engine / policy pair
 cargo bench -p cache --bench cache_throughput -- moka_lru
@@ -155,6 +170,12 @@ lru_cache_concurrent_get/moka_lru_xxh3_8threads
 - Cache pre-population: 5,000 entries (for get/mixed benchmarks)
 - TTL: 60 seconds
 - Value size: 32 random alphanumeric characters per BenchValue
+
+`hot_read_write` sizes itself separately, in entries rather than weight:
+
+- `HOT_WORKING_SET`: 20,000 keys, all pre-populated and all read from
+- `HOT_CACHE_WEIGHT`: capacity for 80% of them, so the cache runs full
+- TTL: 10 minutes, so nothing expires mid-run
 
 ## Output
 
