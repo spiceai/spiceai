@@ -17266,6 +17266,11 @@ impl CayenneTableProvider {
             "Committing the datalake manifest + snapshot flip under fence"
         );
         let cold_files = Arc::new(cold_files);
+        // Captured BEFORE the commit: `commit_overwrite_to_cold` deletes this
+        // table's `cayenne_table_statistics` row, so the re-baseline below has to
+        // carry the min/max + NDV aggregate over from here rather than re-reading a
+        // row that no longer exists. See `write_rebaselined_row_count`.
+        let stats_baseline = self.load_persisted_table_statistics().await;
         {
             let _fence = self.listing_fence.write().await;
             self.catalog
@@ -17320,15 +17325,12 @@ impl CayenneTableProvider {
                 "Datalake manifest carries an unknown row count; leaving the maintained count inexact"
             );
         }
-        self.amend_persisted_row_count(if counts_known {
-            RowCountUpdate::Set(live_rows)
+        if counts_known {
+            self.set_persisted_row_count(stats_baseline, live_rows)
+                .await;
         } else {
-            RowCountUpdate::Delta {
-                delta: 0,
-                exact: false,
-            }
-        })
-        .await;
+            self.taint_persisted_row_count_exactness().await;
+        }
 
         if let Err(error) = self.prune_snapshot_manifest_to(&new_snapshot_id).await {
             tracing::warn!(
@@ -20540,99 +20542,81 @@ impl CayenneTableProvider {
             .await;
     }
 
-    /// Apply a [`RowCountUpdate`] to the persisted statistics **without** a
-    /// write accumulator to merge, for the callers that change how many rows are
-    /// live without producing one.
-    ///
-    /// The row-count arms are exactly [`Self::persist_table_stats_locked`]'s; the
-    /// min/max + NDV blob is carried forward verbatim. That is sound for both
-    /// kinds of caller: a delete can only narrow the live aggregate, so the
-    /// existing one stays a valid superset, and a datalake promotion writes
-    /// through the cold Vortex sink, which accumulates no column stats to merge.
-    ///
-    /// Two uses, both about the `num_rows_exact` invariant "an `Exact` count is
-    /// the live count":
-    /// - `Delta { delta: 0, exact: false }` taints exactness when rows were
-    ///   tombstoned but the count could not be re-derived, so no later fold of
-    ///   that tombstone can serve the stale count `Exact`. Persisting (not just
-    ///   caching) the taint is what makes it survive a restart.
-    /// - `Set(n)` re-establishes exactness from an authoritative live count, the
-    ///   way compaction and overwrite do from their accumulators.
-    ///
-    /// Best-effort like [`Self::persist_table_stats`]: a failure is logged and
-    /// the maintained count is left as it was. A table with no persisted stats
-    /// row yet serves no count at all, so there is nothing to amend.
-    pub(crate) async fn amend_persisted_row_count(&self, num_rows_update: RowCountUpdate) {
-        // Cheap pre-lock reject for the taint, which runs on every user `DELETE`
-        // statement: once the count is already inexact a taint cannot change
-        // anything, so skip the async mutex, the possible catalog read, and the
-        // derived-statistics rebuild. Racing with a concurrent persist only costs a
-        // redundant amend below, never a missed taint — a persist that restores
-        // exactness holds the same lock this then acquires.
-        if matches!(
-            num_rows_update,
-            RowCountUpdate::Delta {
-                delta: 0,
-                exact: false
-            }
-        ) && !self.table_statistics.read().count_exact
-        {
-            return;
+    /// Read the persisted statistics record, preferring the in-memory raw blob so
+    /// the common case costs no catalog round-trip. `None` means the table has no
+    /// statistics row (nothing serves a count) or the read failed.
+    async fn load_persisted_table_statistics(&self) -> Option<TableStatistics> {
+        if let Some(raw) = self.table_statistics.read().raw.clone() {
+            return Some(raw);
         }
+        match self
+            .catalog
+            .get_table_statistics(&self.table_metadata.table_id)
+            .await
+        {
+            Ok(stats) => stats,
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to load table stats for {} while amending the maintained row count: {e}",
+                    self.table_metadata.table_name
+                );
+                None
+            }
+        }
+    }
 
+    /// Write `baseline` back with `num_rows_update` applied, **without** a write
+    /// accumulator to merge — for the callers that change how many rows are live
+    /// without producing one.
+    ///
+    /// The row-count arms are [`Self::persist_table_stats_locked`]'s, shared via
+    /// [`Self::apply_row_count_update`]; the min/max + NDV blob is carried forward
+    /// from `baseline` verbatim. That is sound for both kinds of caller: a delete
+    /// can only narrow the live aggregate, so the existing one stays a valid
+    /// superset, and a datalake promotion writes through the cold Vortex sink,
+    /// which accumulates no column stats to merge.
+    ///
+    /// `baseline` is a parameter rather than something read here because datalake
+    /// promotion must capture it **before** its own commit: `commit_overwrite_to_cold`
+    /// routes through `commit_overwrite_in_txn`, which deletes the table's
+    /// `cayenne_table_statistics` row, so a read taken afterward finds nothing and
+    /// the re-baseline would silently no-op — leaving whatever the in-memory cache
+    /// still claims. Carrying a possibly-slightly-stale baseline is safe for that
+    /// caller: only the blob and NDV sketches ride along (both documented supersets),
+    /// and a [`RowCountUpdate::Set`] replaces the count outright.
+    ///
+    /// Best-effort like [`Self::persist_table_stats`], with one asymmetry: a failed
+    /// write still demotes this process's cached exactness, because continuing to
+    /// serve a count `Exact` is the wrong-answer direction.
+    async fn write_rebaselined_row_count(
+        &self,
+        baseline: TableStatistics,
+        num_rows_update: RowCountUpdate,
+    ) {
         let _stats_persistence_guard = self.table_statistics_persistence_lock.lock().await;
-
-        let cached_raw = {
-            let guard = self.table_statistics.read();
-            guard.raw.clone()
-        };
-        let existing = match cached_raw {
-            Some(raw) => raw,
-            None => match self
-                .catalog
-                .get_table_statistics(&self.table_metadata.table_id)
-                .await
-            {
-                // No persisted statistics row yet, so nothing serves a count and
-                // there is nothing to amend.
-                Ok(None) => return,
-                Ok(Some(stats)) => stats,
-                Err(e) => {
-                    tracing::warn!(
-                        "Failed to load existing table stats for {} before amending the maintained row count: {e}",
-                        self.table_metadata.table_name
-                    );
-                    return;
-                }
-            },
-        };
 
         let (num_rows, num_rows_exact) = Self::apply_row_count_update(
             num_rows_update,
-            existing.num_rows,
-            existing.num_rows_exact,
+            baseline.num_rows,
+            baseline.num_rows_exact,
         );
-        if num_rows == existing.num_rows && num_rows_exact == existing.num_rows_exact {
-            return;
-        }
-
         let stats = TableStatistics {
             num_rows,
             num_rows_exact,
-            ..existing
+            ..baseline
         };
         if let Err(e) = self.catalog.upsert_table_statistics(&stats).await {
             tracing::warn!(
                 "Failed to persist the amended maintained row count for {}: {e}",
                 self.table_metadata.table_name
             );
-            // The values stay as they were, but this process must not go on
-            // claiming exactness it failed to justify — whichever arm was being
+            // The persisted values stay as they were, but this process must not go
+            // on claiming exactness it failed to justify — whichever arm was being
             // applied. A taint that did not land would otherwise leave the stale
             // count `Exact`, and a `Set` that did not land leaves the count the
-            // rewrite superseded. Both are wrong-answer shapes; `Inexact` costs
-            // only the metadata `COUNT(*)` fold, and the next successful persist
-            // (or a reopen) re-establishes exactness.
+            // rewrite superseded. Both are wrong-answer shapes; `Inexact` costs only
+            // the metadata `COUNT(*)` fold, and the next successful persist (or a
+            // reopen) re-establishes exactness.
             self.table_statistics.write().count_exact = false;
             return;
         }
@@ -20640,6 +20624,56 @@ impl CayenneTableProvider {
         // `num_rows` feeds the derived `Statistics`, so both cached views are
         // rebuilt rather than only flipping `count_exact`.
         self.store_cached_table_statistics(stats);
+    }
+
+    /// Re-baseline the maintained live row count to an authoritative live count,
+    /// re-establishing exactness — the datalake-promotion counterpart to
+    /// compaction's and overwrite's `Set`. `baseline` must have been captured
+    /// before the promotion's commit; see [`Self::write_rebaselined_row_count`].
+    pub(crate) async fn set_persisted_row_count(
+        &self,
+        baseline: Option<TableStatistics>,
+        live_rows: i64,
+    ) {
+        let Some(baseline) = baseline else {
+            // No statistics record to carry a blob forward from, so there is no
+            // count being served and nothing to correct.
+            return;
+        };
+        self.write_rebaselined_row_count(baseline, RowCountUpdate::Set(live_rows))
+            .await;
+    }
+
+    /// Mark the maintained live row count as no longer a provably-exact live count,
+    /// durably, so no later fold of a tombstone can serve a stale count `Exact` and
+    /// the taint survives a restart.
+    pub(crate) async fn taint_persisted_row_count_exactness(&self) {
+        // Cheap pre-lock reject: this runs on every user `DELETE` statement, and
+        // once the count is already inexact the taint cannot change anything, so
+        // skip the async mutex, the possible catalog read, and the derived-statistics
+        // rebuild. Racing with a concurrent persist costs at most a redundant write
+        // below, never a missed taint — the write path holds the same lock.
+        if !self.table_statistics.read().count_exact {
+            return;
+        }
+        let Some(baseline) = self.load_persisted_table_statistics().await else {
+            // Nothing persisted (or the read failed). Demote locally regardless: the
+            // in-memory cache can still be serving an exact count loaded at open,
+            // which is exactly what must not survive this delete.
+            self.table_statistics.write().count_exact = false;
+            return;
+        };
+        if !baseline.num_rows_exact {
+            return;
+        }
+        self.write_rebaselined_row_count(
+            baseline,
+            RowCountUpdate::Delta {
+                delta: 0,
+                exact: false,
+            },
+        )
+        .await;
     }
 
     /// Resolve a [`RowCountUpdate`] against the previous count and its exactness.

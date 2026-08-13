@@ -437,12 +437,7 @@ impl DeletionSink for RowCountExactnessTaintingDeletionSink {
         // `PkKeysetInvalidatingDeletionSink`'s unconditional pre-delete
         // `mark_pk_keyset_occ_degraded`, and for the same reason: on this path the
         // conservative direction is free and the optimistic one is a wrong answer.
-        self.table
-            .amend_persisted_row_count(super::column_stats::RowCountUpdate::Delta {
-                delta: 0,
-                exact: false,
-            })
-            .await;
+        self.table.taint_persisted_row_count_exactness().await;
         self.inner.delete_from(context).await
     }
 }

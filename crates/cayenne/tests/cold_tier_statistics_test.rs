@@ -30,7 +30,7 @@ use arrow::array::Int64Array;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use cayenne::metadata::{CreateTableOptions, DeletionMode, VortexConfig};
-use cayenne::{CayenneTableProvider, MetadataCatalog};
+use cayenne::{CayenneCatalog, CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog};
 use datafusion::datasource::TableProvider;
 use datafusion::prelude::*;
 use datafusion_common::stats::Precision;
@@ -329,6 +329,63 @@ async fn test_a_delete_taints_the_maintained_count_exactness_impl(
     );
     table.flush_pending_maintenance().await?;
     assert_count_agrees(&table, &ctx, 209, "after a full rewrite re-baselined it").await?;
+
+    Ok(())
+}
+
+test_with_backends!(test_a_promotion_after_a_reopen_rebaselines_the_count_impl);
+
+/// A promotion whose statistics cache is cold must still re-baseline the count.
+///
+/// `commit_overwrite_to_cold` deletes the table's `cayenne_table_statistics` row,
+/// so a re-baseline that reads the record *after* the commit finds nothing and
+/// silently no-ops — while the in-memory cache goes on serving the count loaded at
+/// open. That is the #12846 failure again, reached through a reopen rather than a
+/// single session: the promotion must capture its baseline before committing.
+async fn test_a_promotion_after_a_reopen_rebaselines_the_count_impl(
+    fixture: common::TestFixture,
+) -> TestResult<()> {
+    let table_id = {
+        let ctx = SessionContext::new();
+        let table = create_table(&fixture, &ctx).await?;
+
+        insert_range(&table, 0..100).await?;
+        settle(&table).await?;
+        assert!(table.promote_warm_to_cold().await?, "promotion should fire");
+        table.flush_pending_maintenance().await?;
+        assert_count_agrees(&table, &ctx, 100, "before the reopen").await?;
+
+        // The tombstone this session leaves is what the next session's promotion
+        // folds — and what its count must stop including.
+        delete_id(&table, 42).await?;
+        insert_range(&table, 100..110).await?;
+        settle(&table).await?;
+        table.table_id().to_string()
+        // Session 1's provider and its background tasks drop here.
+    };
+
+    // Session 2: a fresh catalog connection over the same metastore, so the
+    // provider rebuilds its statistics cache from persisted state.
+    let catalog = Arc::new(CayenneCatalog::new(fixture.connection_string())?);
+    catalog.init().await?;
+    let ctx = SessionContext::new();
+    let reopened = Arc::new(
+        CayenneTableProviderBuilder::new(
+            Arc::clone(&catalog) as Arc<dyn MetadataCatalog>,
+            ctx.runtime_env(),
+        )
+        .open(TABLE)
+        .await?,
+    );
+    assert_eq!(reopened.table_id(), table_id, "reopen resolves same table");
+    ctx.register_table(TABLE, Arc::clone(&reopened) as Arc<dyn TableProvider>)?;
+
+    assert!(
+        reopened.promote_warm_to_cold().await?,
+        "the promotion folding the tombstone should fire after the reopen"
+    );
+    reopened.flush_pending_maintenance().await?;
+    assert_count_agrees(&reopened, &ctx, 109, "after a promotion post-reopen").await?;
 
     Ok(())
 }
