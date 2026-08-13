@@ -547,6 +547,34 @@ start_test "audit still reports a child-only addition the merge dropped"
   esac
 ) || failures=$((failures + 1))
 
+start_test "audit reports a rename of ours standing against a deletion on trunk"
+(
+  new_stack "$work_root/renamedelete"
+  printf 'keep\n' > keep.txt && commit_all "fork point"
+  git checkout --quiet -b parent
+  printf 'line one\nline two\nline three\nline four\n' > f.txt && commit_all "parent adds f.txt"
+  stack_base=$(git rev-parse HEAD)
+  git checkout --quiet -b child
+  git mv f.txt g.txt && commit_all "child moves it to g.txt"
+  pre=$(git rev-parse HEAD)
+  squash_parent_onto_trunk
+  git rm --quiet f.txt && commit_all "trunk deletes it"
+  git checkout --quiet child
+  git merge --no-ff --no-commit trunk >/dev/null 2>&1
+
+  # The intent diffs are read with --no-renames, so the move looks like a
+  # deletion of f.txt plus an addition of g.txt: f.txt then appears deleted by
+  # both sides, and g.txt looks like an ordinary child-only addition.
+  [ -e g.txt ] || fail_test "the fixture did not keep the moved file"
+  output=$("$subject" audit "$stack_base" "$pre" --trunk trunk 2>/dev/null)
+  status=$?
+  [ "$status" -ne 0 ] || fail_test "a rename against a deletion was reported clean: $output"
+  case "$output" in
+    *"REVIEW f.txt"*) ;;
+    *) fail_test "the rename/delete was not reported: $output" ;;
+  esac
+) || failures=$((failures + 1))
+
 start_test "audit reports a deletion trunk carried away under a new name"
 (
   new_stack "$work_root/renamed"

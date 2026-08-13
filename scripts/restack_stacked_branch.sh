@@ -236,9 +236,9 @@ index_entry() {
 # it keeps the content under another name, and from the older base -- where the
 # path never existed -- that lands as a clean addition while the child's deletion
 # looks honoured.
-trunk_renamed_to() {
-  local want="$1" status old new
-  [ -n "${RESTACK_RENAMES:-}" ] && [ -s "$RESTACK_RENAMES" ] || return 1
+renamed_to() {
+  local map="$1" want="$2" status old new
+  [ -n "$map" ] && [ -s "$map" ] || return 1
   while IFS= read -r -d '' status; do
     IFS= read -r -d '' old || return 1
     IFS= read -r -d '' new || return 1
@@ -246,7 +246,7 @@ trunk_renamed_to() {
       R*) [ "$old" = "$want" ] && { printf '%s' "$new"; return 0; } ;;
       *) ;;
     esac
-  done < "$RESTACK_RENAMES"
+  done < "$map"
   return 1
 }
 
@@ -474,11 +474,24 @@ cmd_audit() {
   # written for -- a path the parent added and the child deleted exists at
   # neither the fork point nor the child's tip, so no intent diff mentions it and
   # the merge can restore it in silence.
-  git merge-base --is-ancestor "$stack_base" "$pre" ||
-    die "$stack_base is not an ancestor of $pre, so it cannot be this branch's stack base"
-  if git merge-base --is-ancestor "$stack_base" "$trunk_rev"; then
-    die "$stack_base is already contained in $trunk_ref, so it is the fork point rather than the parent's tip; derive it with: $(basename "${BASH_SOURCE[0]}") stack-base <parent-pr>"
-  fi
+  # --is-ancestor answers with 0 or 1 and uses other statuses for failures, so
+  # the two must not be lumped together: an ancestry read that fails is not a
+  # licence to continue with a base this refuses to accept.
+  local ancestry
+  git merge-base --is-ancestor "$stack_base" "$pre"
+  ancestry=$?
+  case "$ancestry" in
+    0) ;;
+    1) die "$stack_base is not an ancestor of $pre, so it cannot be this branch's stack base" ;;
+    *) die "could not tell whether $stack_base is an ancestor of $pre (status $ancestry)" ;;
+  esac
+  git merge-base --is-ancestor "$stack_base" "$trunk_rev"
+  ancestry=$?
+  case "$ancestry" in
+    1) ;;
+    0) die "$stack_base is already contained in $trunk_ref, so it is the fork point rather than the parent's tip; derive it with: $(basename "${BASH_SOURCE[0]}") stack-base <parent-pr>" ;;
+    *) die "could not tell whether $stack_base is contained in $trunk_ref (status $ancestry)" ;;
+  esac
 
   local other incomplete=0
   if other=$(merge_other_side "$pre"); then
@@ -511,6 +524,16 @@ cmd_audit() {
     rm -rf "$tmp"
     die "could not list renames between $stack_base and $other"
   fi
+  # And the child's own renames: the intent diffs are read with --no-renames, so
+  # a move shows up there as a deletion plus an addition. That is what the audit
+  # wants for a path trunk left alone, but it hides a rename standing against a
+  # deletion or an edit on trunk's side, which no correctly based merge settles.
+  RESTACK_CHILD_RENAMES="$tmp/child_renames"
+  if ! git diff -z --name-status --find-renames --diff-filter=R \
+         "$stack_base" "$pre" -- > "$RESTACK_CHILD_RENAMES"; then
+    rm -rf "$tmp"
+    die "could not list renames between $stack_base and $pre"
+  fi
 
   local findings=0 path
 
@@ -541,9 +564,18 @@ cmd_audit() {
       theirs_now=$(tree_entry "$other" "$path") || die "could not read $other:$path"
       base_now=$(tree_entry "$stack_base" "$path") || die "could not read $stack_base:$path"
       if [ -z "$theirs_now" ]; then
-        renamed_to=$(trunk_renamed_to "$path") || continue   # trunk deleted it too
-        accept_or_review "$path" "you deleted it and trunk renamed it to $renamed_to, which nothing has decided" ||
-          findings=$((findings + 1))
+        if renamed_to=$(renamed_to "$RESTACK_RENAMES" "$path"); then
+          accept_or_review "$path" "you deleted it and trunk renamed it to $renamed_to, which nothing has decided" ||
+            findings=$((findings + 1))
+          continue
+        fi
+        # Trunk deleted it, and so did we -- unless what looks like our deletion
+        # is really a move, in which case the stack base sees a rename against a
+        # deletion and nothing has settled which wins.
+        if renamed_to=$(renamed_to "$RESTACK_CHILD_RENAMES" "$path"); then
+          accept_or_review "$path" "you renamed it to $renamed_to and trunk deleted it, which nothing has decided" ||
+            findings=$((findings + 1))
+        fi
         continue
       fi
       [ "$theirs_now" = "$base_now" ] && continue      # trunk left it alone
