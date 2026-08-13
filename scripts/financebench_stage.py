@@ -37,11 +37,13 @@ This job runs once, offline (never in CI or by testoperator). It:
   5. Writes `corpus_pages/`, `queries.parquet`, `relevance_data.parquet` to a
      `--dest` that is either a local directory or an `s3://` URI.
 
-The `corpus-id` in `relevance_data.parquet` MUST equal the `location` string
-Spice reports for the matching page-PDF. A single normalization rule
-(`corpus_id_for`) is shared by the parquet builder and the upload layout so the
-two never drift; set `--corpus-id-prefix` to whatever the `location` probe
-reports (see the README / issue #12858 Verification step 2).
+The `corpus-id` in `relevance_data.parquet` is the portable relative key
+`<doc>/pNNNN.pdf`. It does not have to equal the raw `location` string Spice
+reports (an absolute path for a `file:` source, a bucket-relative key for
+`s3:`): the FinanceBench spicepod exposes `corpus` as a view that normalizes
+`location` down to this same `<doc>/pNNNN.pdf` before search, so the corpus row
+id the harness sees always matches the Qrel. `corpus_id_for` is the single rule
+shared by the parquet builder and the upload layout so the two never drift.
 """
 
 from __future__ import annotations
@@ -73,16 +75,14 @@ def page_file_name(idx: int) -> str:
     return f"p{idx:04d}.pdf"
 
 
-def corpus_id_for(prefix: str, doc_name: str, page_idx: int) -> str:
-    """The single source of truth for the `location`/`corpus-id` string of a page.
+def corpus_id_for(doc_name: str, page_idx: int) -> str:
+    """The single source of truth for a page's portable corpus id.
 
     Both the on-disk / S3 layout (`<dest>/corpus_pages/<doc>/pNNNN.pdf`) and the
-    `corpus-id` column derive from this, so a Qrel always names the same string
-    Spice reports as `location`. `prefix` adapts the relative key to whatever the
-    connector reports for a given `--dest` (see the module docstring).
+    `corpus-id` column derive from this relative key, so a Qrel always names the
+    value the `corpus` view normalizes `location` to (see the module docstring).
     """
-    key = f"{doc_name}/{page_file_name(page_idx)}"
-    return f"{prefix}{key}" if prefix else key
+    return f"{doc_name}/{page_file_name(page_idx)}"
 
 
 # ---------------------------------------------------------------------------
@@ -334,7 +334,7 @@ def stage(args: argparse.Namespace) -> int:
         for record in records:
             fb_id = str(record.get("financebench_id"))
             for doc_name, page in evidence_pages(record):
-                corpus_id = corpus_id_for(args.corpus_id_prefix, doc_name, page)
+                corpus_id = corpus_id_for(doc_name, page)
                 key = (fb_id, corpus_id)
                 if key in seen:
                     continue
@@ -377,15 +377,6 @@ def parse_args(argv: Iterable[str]) -> argparse.Namespace:
         "--pdf-split-bin",
         default="target/release/pdf-split",
         help="Path to the built pdf-split binary (default: target/release/pdf-split).",
-    )
-    parser.add_argument(
-        "--corpus-id-prefix",
-        default="",
-        help=(
-            "Prefix prepended to the '<doc>/pNNNN.pdf' relative key to form the "
-            "corpus-id, so it matches the connector-reported `location`. Set from the "
-            "location probe (issue #12858 Verification step 2). Default: empty."
-        ),
     )
     parser.add_argument(
         "--limit-docs",
