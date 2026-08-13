@@ -46,7 +46,7 @@ use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult, NewDataConnectorResult,
 };
-use runtime::parameters::{ParameterSpec, Parameters};
+use runtime_parameters::{ParameterSpec, Parameters};
 
 #[derive(Debug, Snafu)]
 pub enum Error {

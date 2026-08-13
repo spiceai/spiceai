@@ -76,6 +76,10 @@ pub mod kafka;
 // `dynamodb::init_checkpoint_store` regardless of which accelerator backend is enabled.
 pub mod dynamodb;
 
+// Same driver-free shape, for the same reason: `connector-postgres` resolves the
+// replication watermark store without depending on the accelerator backends.
+pub mod postgres_replication;
+
 #[cfg(feature = "mongodb")]
 pub mod mongodb;
 

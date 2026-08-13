@@ -1066,8 +1066,9 @@ pub struct VortexConfig {
     /// signal-driven controller for that metric). When any is set, the closed loop
     /// drives that high-level SLO toward target with small incremental steps,
     /// converging within `goal_convergence_window_secs`. Set from the
-    /// `cayenne_goal_*` params; setting any goal implies `dynamic_tuning` (a goal
-    /// with the loop off is inert). Runtime-only — never compared by
+    /// `cayenne_goal_*` params. A goal declares a target, not a controller, so it
+    /// never turns `dynamic_tuning` on — set without it, the goal is inert (the
+    /// accelerator warns). Runtime-only — never compared by
     /// `configuration_matches` (does not affect data layout).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub goal_replication_lag_secs: Option<f64>,

@@ -13,6 +13,7 @@ async-trait.workspace = true
 datafusion.workspace = true
 reqwest.workspace = true
 runtime = { path = "../runtime" }
+runtime-secrets = { path = "../runtime-secrets", default-features = false }
 serde.workspace = true
 serde_json.workspace = true
 snafu.workspace = true

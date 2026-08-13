@@ -31,8 +31,8 @@ use datafusion::{
 use datafusion_expr::ident;
 use futures::future::try_join_all;
 use itertools::Itertools;
-use runtime_datafusion_index::{Index, WriteWindow, build_key_match_predicate};
 use snafu::{ResultExt, Snafu};
+use spice_table::{Index, WriteWindow, build_key_match_predicate};
 use util::{arrow::repeat, convert_string_arrow_to_iterator};
 
 /// Additional primary key column to uniquely identify chunks within a single database row.
@@ -2046,5 +2046,155 @@ mod tests {
         };
         assert_eq!(read_pair(0), (0, 5));
         assert_eq!(read_pair(1), (6, 11));
+    }
+
+    /// An inner index that materializes its chunk-keyed rows as a mutable set. Unlike
+    /// [`RecordingInner`], which records the keys handed to `delete_by_keys`, this one applies
+    /// them — so a test can assert the surviving `(id, chunk_id)` rows after a delete, which is
+    /// the property the chunked bridge exists to guarantee: every chunk of a deleted outer key
+    /// goes, and only those.
+    #[derive(Debug)]
+    struct StatefulChunkInner {
+        rows: std::sync::Mutex<Vec<(i64, u64)>>,
+        deletes_partial_key: bool,
+    }
+
+    impl StatefulChunkInner {
+        fn new(rows: &[(i64, u64)], deletes_partial_key: bool) -> Self {
+            Self {
+                rows: std::sync::Mutex::new(rows.to_vec()),
+                deletes_partial_key,
+            }
+        }
+
+        fn remaining(&self) -> Vec<(i64, u64)> {
+            let mut out = self.rows.lock().expect("mutex").clone();
+            out.sort_unstable();
+            out
+        }
+    }
+
+    #[async_trait]
+    impl Index for StatefulChunkInner {
+        fn name(&self) -> &'static str {
+            "StatefulChunkInner"
+        }
+        fn required_columns(&self) -> Vec<String> {
+            vec!["content".to_string()]
+        }
+        async fn delete_by_keys(&self, keys: RecordBatch) -> DataFusionResult<()> {
+            let ids = keys
+                .column_by_name("id")
+                .expect("delete keys carry the base key")
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("id is Int64");
+
+            // The bridge either hands over the base key alone (partial-key path) or the resolved
+            // chunk-keyed rows (exact-key path). Match on whichever columns are present.
+            let mut rows = self.rows.lock().expect("mutex");
+            if let Some(chunk_col) = keys.column_by_name(CHUNKED_INDEX_CHUNK_KEY) {
+                let chunks = chunk_col
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .expect("chunk id is UInt64");
+                let doomed: std::collections::HashSet<(i64, u64)> = (0..keys.num_rows())
+                    .map(|r| (ids.value(r), chunks.value(r)))
+                    .collect();
+                rows.retain(|pair| !doomed.contains(pair));
+            } else {
+                let doomed: std::collections::HashSet<i64> =
+                    (0..keys.num_rows()).map(|r| ids.value(r)).collect();
+                rows.retain(|(id, _)| !doomed.contains(id));
+            }
+            Ok(())
+        }
+        fn deletes_by_partial_key(&self) -> bool {
+            self.deletes_partial_key
+        }
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    #[async_trait]
+    impl VectorIndex for StatefulChunkInner {
+        fn list_table_provider(&self) -> Result<LogicalPlan, DataFusionError> {
+            let rows = self.rows.lock().expect("mutex");
+            let batch = chunk_keyed_rows(&rows);
+            let schema = batch.schema();
+            let table = datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]])?;
+            LogicalPlanBuilder::scan(
+                "inner",
+                Arc::new(datafusion::datasource::DefaultTableSource::new(Arc::new(
+                    table,
+                ))),
+                None,
+            )?
+            .build()
+        }
+        fn dimension(&self) -> i32 {
+            4
+        }
+    }
+
+    #[async_trait]
+    impl SearchIndex for StatefulChunkInner {
+        fn search_column(&self) -> String {
+            "content".to_string()
+        }
+        fn primary_fields(&self) -> Vec<Field> {
+            ChunkedSearchIndex::augment_primary_key(vec![Field::new("id", DataType::Int64, false)])
+        }
+        fn as_vector_index(self: Arc<Self>) -> Option<Arc<dyn VectorIndex>> {
+            Some(self)
+        }
+        async fn write(
+            &self,
+            _record: RecordBatch,
+        ) -> Result<RecordBatch, Box<dyn std::error::Error + Send + Sync>> {
+            Err(Box::new(DataFusionError::NotImplemented(
+                "unused in delete tests".into(),
+            )))
+        }
+        fn query_table_provider(&self, _query: &str) -> Result<Arc<LogicalPlan>, DataFusionError> {
+            Err(DataFusionError::NotImplemented(
+                "unused in delete tests".into(),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn deleting_an_outer_key_removes_its_every_chunk_from_a_partial_key_inner() {
+        // Partial-key inner: the bridge forwards the base key straight to `delete_by_keys`.
+        let inner = Arc::new(StatefulChunkInner::new(&[(1, 0), (1, 1), (2, 0)], true));
+        let idx = ChunkedSearchIndex::new(Arc::clone(&inner) as Arc<dyn SearchIndex>, chunker());
+
+        idx.delete_by_keys(outer_keys(&[1]))
+            .await
+            .expect("delete succeeds");
+
+        assert_eq!(
+            inner.remaining(),
+            vec![(2, 0)],
+            "both chunks of id 1 are gone; id 2's chunk stays"
+        );
+    }
+
+    #[tokio::test]
+    async fn deleting_an_outer_key_removes_its_every_chunk_from_an_exact_key_inner() {
+        // Exact-key inner: the bridge resolves the chunk-keyed rows first, then deletes them.
+        let inner = Arc::new(StatefulChunkInner::new(&[(1, 0), (1, 1), (2, 0)], false));
+        let idx = ChunkedSearchIndex::new(Arc::clone(&inner) as Arc<dyn SearchIndex>, chunker());
+
+        idx.delete_by_keys(outer_keys(&[1]))
+            .await
+            .expect("delete succeeds");
+
+        assert_eq!(
+            inner.remaining(),
+            vec![(2, 0)],
+            "both chunks of id 1 are resolved and removed; id 2's chunk stays"
+        );
     }
 }

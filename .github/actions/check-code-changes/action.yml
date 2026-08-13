@@ -56,6 +56,7 @@ inputs:
         - '**/nextest.toml'
         - '**/layers.toml'
         - 'scripts/check_crate_layers.py'
+        - 'scripts/check_table_layers.py'
         - 'scripts/check_rust_gate_paths.py'
         - 'scripts/check_module_reachability.py'
         # The reachability guard's own regression harness runs in `lint-rust`,

@@ -40,7 +40,6 @@ use datafusion::{
 use datafusion_table_providers::util::column_reference::ColumnReference;
 use futures::{StreamExt, TryStreamExt};
 use itertools::Itertools;
-use runtime_datafusion_index::IndexedTableProvider;
 #[cfg(test)]
 use runtime_datafusion_udfs::{
     bucket::BUCKET_SCALAR_UDF_NAME,
@@ -56,6 +55,7 @@ use runtime_request_context::RequestContext;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use snafu::Snafu;
+use spice_table::IndexLayer;
 use spicepod::{component::function::Function, semantic::Column};
 use tracing::Span;
 use tracing_futures::Instrument;
@@ -71,7 +71,6 @@ use crate::{
         request_context_extension::get_current_datafusion,
         udf::{UserFunctionInfo, effective_user_function_volatility, user_function_infos},
     },
-    search::util::find_concrete_table_provider,
     tools::{SpiceModelTool, utils::tool_call_error_response},
 };
 use runtime_query_engine::query_engine::QueryEngine;
@@ -655,9 +654,8 @@ fn runtime_indexes_from_provider(
         return vec![];
     };
 
-    find_concrete_table_provider::<IndexedTableProvider>(table_provider).map_or_else(
-        Vec::new,
-        |indexed_table| {
+    spice_table::find_layer::<IndexLayer>(table_provider.as_ref(), spice_table::LayerWalk::Index)
+        .map_or_else(Vec::new, |indexed_table| {
             indexed_table
                 .get_all_indexes()
                 .into_iter()
@@ -674,8 +672,7 @@ fn runtime_indexes_from_provider(
                     }
                 })
                 .collect()
-        },
-    )
+        })
 }
 
 fn search_function_availability(available_names: &HashSet<String>) -> SearchFunctionAvailability {
@@ -732,9 +729,7 @@ fn is_full_text_search_index(kind: &str) -> bool {
 /// vector-composing compound as `"CompoundVectorIndex"` (via [`SearchIndex::as_vector_index`]) so
 /// it is never misclassified as full-text; returns `None` for any other index, leaving the
 /// caller to use [`Index::name`].
-fn compound_index_kind(
-    index: &Arc<dyn runtime_datafusion_index::Index + Send + Sync>,
-) -> Option<String> {
+fn compound_index_kind(index: &Arc<dyn spice_table::Index + Send + Sync>) -> Option<String> {
     use search::index::SearchIndex;
     use search::index::compound::CompoundSearchIndex;
 
@@ -906,7 +901,9 @@ fn vector_search_contexts(
         return vec![];
     }
 
-    let embedding_table = table_provider.and_then(find_concrete_table_provider::<EmbeddingTable>);
+    let embedding_table = table_provider.and_then(|tbl| {
+        spice_table::find_layer::<EmbeddingTable>(tbl.as_ref(), spice_table::LayerWalk::Read)
+    });
 
     configured_vector_search_columns(app_context)
         .into_iter()

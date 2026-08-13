@@ -105,7 +105,8 @@ with `open_browser = !args.device`:
    leaving it to the user to open them on another device.
 4. Polls `POST {oauth_base_url}/auth/token/exchange` with body
    `{ "code": "<CODE>" }` once per second for up to 5 minutes. The server
-   returns `200 OK` with `{ access_token: null }` while pending (or
+   returns `404 Not Found` until the browser authorization for the code
+   exists, `200 OK` with `{ access_token: null }` while pending (or
    `202 Accepted`), and `200 OK` with `{ access_token, access_denied }`
    once complete.
 5. On success, runs the shared post-login flow.
@@ -247,11 +248,22 @@ Content-Type: application/json
 
 { "code": "ABCD1234" }
 
+404 Not Found                                                # not authorized yet
 202 Accepted                                                 # pending
 200 OK { "access_token": null }                              # pending
 200 OK { "access_token": "...", "access_denied": false }     # done
 200 OK { "access_token": null, "access_denied": true }       # rejected
 ```
+
+The code is minted client-side, so the exchange has not seen it when the first
+poll arrives and answers `404`. Both `spice login` and `spice cloud login
+subscription` keep polling through it and stop at their 5-minute deadline, by
+different routes: `spice login` classifies `404` as retriable in
+`classify_exchange_status`, while `auth_exchange_status_is_pending` in the
+client crate recognizes only `202` and the cloud poll loop retries every error
+that is not an explicit denial. A base URL that does not serve the exchange
+answers `404` to every attempt and is indistinguishable from an authorization
+the user never completed, so the `spice login` timeout error names both.
 
 ### Client credentials
 

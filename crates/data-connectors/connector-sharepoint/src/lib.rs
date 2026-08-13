@@ -61,7 +61,7 @@ use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult, NewDataConnectorResult,
 };
-use runtime::parameters::{ParameterSpec, Parameters};
+use runtime_parameters::{ParameterSpec, Parameters};
 use secrecy::SecretString;
 use snafu::{ResultExt, Snafu};
 use std::any::Any;
@@ -977,7 +977,7 @@ impl ListingTableConnector for SharepointListingConnector {
         // Fallback for contexts where the runtime isn't wired in (e.g. tests,
         // cluster schema-inference). Build a fresh session with a dedicated
         // RuntimeEnv and register the store on that.
-        let mut config = runtime::datafusion::builder::DEFAULT_DATAFUSION_CONFIG
+        let mut config = runtime_datafusion::session_config::DEFAULT_DATAFUSION_CONFIG
             .read()
             .map_or_else(|_| datafusion::prelude::SessionConfig::new(), |c| c.clone());
         config

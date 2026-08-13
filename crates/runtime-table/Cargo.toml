@@ -49,6 +49,7 @@ runtime-udfs-api = { path = "../runtime-udfs-api" }
 search = { path = "../search", default-features = false }
 serde.workspace = true
 snafu.workspace = true
+spice-table = { path = "../spice-table" }
 spicepod = { path = "../spicepod" }
 telemetry = { path = "../telemetry" }
 twox-hash.workspace = true

@@ -568,6 +568,7 @@ pub(crate) mod tests {
 
         provider
             .invalidate_for_table(TableReference::bare("customer"))
+            .await
             .expect("invalidation should succeed");
 
         assert!(
@@ -591,6 +592,7 @@ pub(crate) mod tests {
 
         provider
             .invalidate_for_table(TableReference::bare("customer"))
+            .await
             .expect("invalidation should succeed");
 
         assert!(
@@ -618,6 +620,7 @@ pub(crate) mod tests {
 
         provider
             .invalidate_for_table(TableReference::bare("orders"))
+            .await
             .expect("invalidation should succeed");
 
         assert!(

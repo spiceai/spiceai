@@ -126,6 +126,17 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+impl Error {
+    /// Whether the load failed because the Spicepod file is absent, rather than
+    /// present but unloadable. See [`spicepod::Error::is_spicepod_missing`].
+    #[must_use]
+    pub fn is_spicepod_missing(&self) -> bool {
+        match self {
+            Self::UnableToLoadSpicepod { source, .. } => source.is_spicepod_missing(),
+        }
+    }
+}
+
 pub struct AppBuilder {
     name: String,
     secrets: Vec<Secret>,

@@ -24,7 +24,7 @@ use datafusion::{
     logical_expr::LogicalPlan,
 };
 use futures::future::try_join_all;
-use runtime_datafusion_index::{Index, WriteWindow};
+use spice_table::{Index, WriteWindow};
 
 use crate::index::{SearchIndex, VectorIndex};
 

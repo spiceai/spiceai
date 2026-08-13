@@ -826,7 +826,7 @@ fn resolve_project_id(
 }
 
 /// Render org names as `'a'`, `'a' and 'b'`, or `'a', 'b', and 'c'`.
-fn format_org_list(orgs: &[String]) -> String {
+pub(crate) fn format_org_list(orgs: &[String]) -> String {
     let quoted: Vec<String> = orgs.iter().map(|org| format!("'{org}'")).collect();
     match quoted.split_last() {
         None => "no organizations".to_string(),
