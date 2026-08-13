@@ -200,6 +200,11 @@ resolve_with_tmp() {
       100644) git update-index --chmod=-x -- "$path" ||
         die "could not clear the executable bit on $path" ;;
     esac
+    # --chmod touches the index alone, which would leave the worktree disagreeing
+    # with it: an unstaged mode change that fails the clean-status check in step 5
+    # and that a later `git add` could restage the wrong way round. Write the file
+    # back out of the index so the two match.
+    git checkout-index -f -- "$path" || die "could not re-materialize $path"
     echo "RESOLVED $path"
     return 0
   fi

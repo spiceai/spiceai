@@ -1152,6 +1152,11 @@ start_test "resolve keeps the executable bit both sides agreed on"
   [ "$status" -eq 0 ] || fail_test "expected a clean resolve, got $status"
   [ "$(git ls-files --stage -- run.sh | awk '{ print $1 }')" = 100755 ] ||
     fail_test "the agreed executable bit was not staged: $(git ls-files --stage -- run.sh)"
+  # The worktree has to agree, or step 5's clean-status check fails and a later
+  # add can restage the mode the other way.
+  [ -x run.sh ] || fail_test "the worktree copy is not executable, so it disagrees with the index"
+  [ -z "$(git diff --name-only -- run.sh)" ] ||
+    fail_test "an unstaged mode change was left behind: $(git diff -- run.sh | head -3)"
 ) || failures=$((failures + 1))
 
 start_test "resolve refuses a conflicted path replaced by a directory"
