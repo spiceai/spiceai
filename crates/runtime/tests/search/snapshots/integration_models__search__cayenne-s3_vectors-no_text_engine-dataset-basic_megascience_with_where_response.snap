@@ -6,7 +6,7 @@ expression: normalize_search_response(resp)
   "duration_ms": "duration_ms_val",
   "results": [
     {
-      "_score": "0.64",
+      "_score": "0.28",
       "dataset": "spice.public.qs",
       "matches": {
         "answer": [
@@ -18,7 +18,7 @@ expression: normalize_search_response(resp)
       }
     },
     {
-      "_score": "0.62",
+      "_score": "0.24",
       "dataset": "spice.public.qs",
       "matches": {
         "answer": [
@@ -30,7 +30,7 @@ expression: normalize_search_response(resp)
       }
     },
     {
-      "_score": "0.61",
+      "_score": "0.23",
       "dataset": "spice.public.qs",
       "matches": {
         "answer": [
@@ -42,7 +42,7 @@ expression: normalize_search_response(resp)
       }
     },
     {
-      "_score": "0.60",
+      "_score": "0.20",
       "dataset": "spice.public.qs",
       "matches": {
         "answer": [
