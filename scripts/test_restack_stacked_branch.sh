@@ -275,6 +275,39 @@ start_test "audit accepts a path a person decided, so the re-run loop can finish
   esac
 ) || failures=$((failures + 1))
 
+start_test "audit accepts a path whose name contains a newline"
+(
+  new_stack "$work_root/acceptnl"
+  awkward=$(printf 'two\nlines.txt')
+  printf 'old\n' > "$awkward" && commit_all "fork point"
+  git checkout --quiet -b parent
+  printf 'new\n' > "$awkward" && commit_all "parent changes it"
+  stack_base=$(git rev-parse HEAD)
+  git checkout --quiet -b child
+  printf 'old\n' > "$awkward" && commit_all "child reverts it"
+  pre=$(git rev-parse HEAD)
+  squash_parent_onto_trunk
+  git checkout --quiet child
+  git merge --no-ff --no-commit trunk >/dev/null 2>&1
+
+  output=$("$subject" audit "$stack_base" "$pre" 2>/dev/null)
+  case "$output" in
+    *DISCARDED*) ;;
+    *) fail_test "the fixture did not produce a finding: $output" ;;
+  esac
+  # Delimited text cannot hold this path: it would be split into two records,
+  # clearing neither the finding nor anything else predictable.
+  output=$("$subject" audit "$stack_base" "$pre" --accept "$awkward" 2>/dev/null)
+  status=$?
+  [ "$status" -eq 0 ] || fail_test "accepting a path with a newline did not clear it: $output"
+
+  # The other direction, which is the dangerous one: delimited text would let a
+  # path named after one line of this one clear a finding about the whole path.
+  output=$("$subject" audit "$stack_base" "$pre" --accept two 2>/dev/null)
+  status=$?
+  [ "$status" -ne 0 ] || fail_test "accepting an unrelated path cleared this finding: $output"
+) || failures=$((failures + 1))
+
 start_test "resolve suggests a removal when the child is the side that deleted"
 (
   new_stack "$work_root/rmadvice"

@@ -70,7 +70,9 @@ carried — expect it to arrive with the merge, and do not read it as child inte
    into the child and push normally:
 
    ```bash
-   git fetch origin              # without this, origin/<parent> is stale and the merge is a no-op
+   # An explicit refspec for the same reason as trunk below: a bare fetch obeys
+   # remote.origin.fetch, and a --single-branch clone would leave this stale.
+   git fetch origin "+refs/heads/<parent>:refs/remotes/origin/<parent>"
    git checkout <child>
    git merge origin/<parent>
    git push

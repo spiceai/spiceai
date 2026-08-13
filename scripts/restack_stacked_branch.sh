@@ -224,10 +224,15 @@ index_entry() {
   printf '%s\n' "$out" | awk '$3 == 0 { print $1 " " $2 }'
 }
 
-# Was this path explicitly accepted by a person on the command line?
+# Was this path explicitly accepted by a person on the command line? The list is
+# an array rather than delimited text because a path may itself contain a
+# newline, which this command supports everywhere else.
 path_accepted() {
-  [ -n "$2" ] || return 1
-  printf '%s' "$2" | grep -Fxq -- "$1"
+  local candidate="$1" entry
+  for entry in ${RESTACK_ACCEPTED+"${RESTACK_ACCEPTED[@]}"}; do
+    [ "$entry" = "$candidate" ] && return 0
+  done
+  return 1
 }
 
 # A path the child added needs its content checked, not only its presence. If
@@ -235,8 +240,8 @@ path_accepted() {
 # base is an add/add conflict -- but from the older fork point, where the file
 # still existed, git can combine both sides' edits and call it resolved.
 audit_addition() {
-  local path="$1" pre="$2" other="$3" accepted="$4"
-  if path_accepted "$path" "$accepted"; then
+  local path="$1" pre="$2" other="$3"
+  if path_accepted "$path"; then
     echo "ACCEPTED $path"
     return 0
   fi
@@ -269,8 +274,8 @@ audit_addition() {
 # matches neither side -- so the comparison has to be against the correct merge,
 # not against either input.
 audit_modification() {
-  local path="$1" stack_base="$2" pre="$3" other="$4" tmp="$5" accepted="$6"
-  if path_accepted "$path" "$accepted"; then
+  local path="$1" stack_base="$2" pre="$3" other="$4" tmp="$5"
+  if path_accepted "$path"; then
     echo "ACCEPTED $path"
     return 0
   fi
@@ -375,13 +380,13 @@ cmd_audit() {
   # that a person decided this path, which is the one thing the audit cannot
   # infer -- git's silent old-base resolution and a considered human one look
   # identical in the index.
-  local accepted=""
+  RESTACK_ACCEPTED=()
   while [ $# -gt 0 ]; do
     case "$1" in
       --accept)
         shift
         [ -n "${1:-}" ] || die "--accept needs a path"
-        accepted="${accepted}${1}"$'\n'
+        RESTACK_ACCEPTED+=("$1")
         shift
         ;;
       *) die "unknown option for audit: $1" ;;
@@ -448,7 +453,7 @@ cmd_audit() {
       continue
     fi
     [ -n "$other" ] || continue
-    audit_addition "$path" "$pre" "$other" "$accepted" || findings=$((findings + 1))
+    audit_addition "$path" "$pre" "$other" || findings=$((findings + 1))
   done < "$tmp/added"
 
   # A modification disappears by the same mechanism as a deletion, and just as
@@ -458,7 +463,7 @@ cmd_audit() {
   # modification, and its content is simply gone.
   #
   while [ -n "$other" ] && IFS= read -r -d '' path; do
-    audit_modification "$path" "$stack_base" "$pre" "$other" "$tmp" "$accepted" ||
+    audit_modification "$path" "$stack_base" "$pre" "$other" "$tmp" ||
       findings=$((findings + 1))
   done < "$tmp/modified"
 
