@@ -552,11 +552,14 @@ fn bench_lru_cache_concurrent_mixed(c: &mut Criterion) {
 
 /// Read-through contention on a full cache, swept across hit rates.
 ///
-/// The other `LruCache` benchmarks read a 100,000 key space holding at most
-/// 5,000 entries, so roughly 95% of their reads miss. That matters for the
-/// engine comparison because a Pingora miss is one metadata lookup, while a hit
-/// removes the entry and re-admits it — `pingora-lru` has no `peek_value`.
-/// Reads that miss never reach the path where the engines differ.
+/// The other `LruCache` benchmarks read a 100,000 key space while the cache
+/// holds about 3,125 entries — 5,000 are inserted and capacity evicts to that —
+/// so roughly 97% of their reads miss.
+///
+/// The engines diverge on both paths, in opposite directions. A Pingora miss
+/// returns after one metadata lookup; a hit removes the entry and re-admits it,
+/// because `pingora-lru` has no `peek_value`. Measuring only the miss path
+/// therefore favours Pingora by construction.
 ///
 /// Reads and writes are not independent here, because they are not independent
 /// in the runtime: a miss executes the query and caches the result, so the

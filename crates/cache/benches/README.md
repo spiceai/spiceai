@@ -60,9 +60,10 @@ Apple M-series, `--sample-size 10`. Lower is faster.
 | 8 | 13.12 ms | 13.05 ms | 6.44 ms | 0.49x |
 | 16 | 29.91 ms | 29.43 ms | 13.78 ms | 0.46x |
 
-`concurrent_get` reads a 100,000 key space holding ~3,125 entries, so ~97% of
-its reads miss. A Pingora miss is one metadata lookup, while a hit removes the
-entry and re-admits it, so this measures the path where Pingora is cheapest.
+`concurrent_get` reads a 100,000 key space while the cache holds ~3,125 entries,
+so ~97% of its reads miss. A Pingora miss returns after one metadata lookup,
+which is why it wins here — the ~2x is a property of the miss path, not of reads
+in general.
 
 ### Pure reads across hit rates
 
