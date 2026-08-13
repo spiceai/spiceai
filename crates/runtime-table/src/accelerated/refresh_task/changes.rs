@@ -1951,18 +1951,26 @@ impl RefreshTask {
             "run must contain at least one envelope"
         );
 
+        // Runs before the heartbeat retain below: a signal may ride a zero-row
+        // envelope, which the retain would otherwise strip — and the rebuild
+        // would never happen. See `trim_to_rebuild_signal` for why the prefix
+        // goes with it.
+        let history_unavailable = trim_to_rebuild_signal(&mut envelopes);
+
+        // Read after the trim and before the retain. After, because a readiness
+        // flag from a discarded envelope must not survive it: the rebuild signal
+        // is deliberately not-ready, and honoring a stale flag would mark the
+        // dataset Ready the moment the replacement lands — before the source has
+        // reconnected at the captured head and caught up, which is exactly the
+        // stale-serving window lag-based readiness exists to prevent. Before,
+        // because the retain drops heartbeats whose ready flag IS meant to count.
+        //
         // Split envelopes into (committers, batches, ready_flags) preserving
         // arrival order. Committers will be drained sequentially in the
         // background commit task; per-source semantics (e.g., PG `Standby
         // Status Update` carrying the latest LSN, Kafka per-partition
         // offsets) require this ordering.
         let any_ready = envelopes.iter().any(cdc::ChangeEnvelope::is_dataset_ready);
-
-        // Read before the heartbeat retain below, for the same reason `any_ready`
-        // is: a signal may ride a zero-row envelope, which the retain would
-        // otherwise strip — and the rebuild would never happen. See
-        // `trim_to_rebuild_signal` for why the prefix goes with it.
-        let history_unavailable = trim_to_rebuild_signal(&mut envelopes);
 
         // Strip zero-row readiness heartbeats from the write/durability path
         // (#12007). Lag-based readiness (#11777) makes CDC connectors emit a
@@ -6855,7 +6863,11 @@ mod tests {
         // everything after it (post-capture changes, which DO replay) survive.
         let mut run = vec![
             make_tracked_envelope(1, Arc::clone(&log), false),
-            make_tracked_envelope(2, Arc::clone(&log), false),
+            // Ready, and discarded: `apply_envelope_run` reads `any_ready` from
+            // the TRIMMED run, so this flag must not survive to mark the dataset
+            // Ready the moment the replacement lands — before the source has
+            // reconnected at the captured head and caught up.
+            make_tracked_envelope(2, Arc::clone(&log), true),
             signal(),
             make_tracked_envelope(3, Arc::clone(&log), false),
         ];
@@ -6863,6 +6875,10 @@ mod tests {
         assert_eq!(run.len(), 2, "only the signal and its suffix survive");
         assert!(run[0].history_unavailable(), "the signal leads the run");
         assert!(!run[1].history_unavailable());
+        assert!(
+            !run.iter().any(cdc::ChangeEnvelope::is_dataset_ready),
+            "a readiness flag from a discarded envelope must not survive the trim"
+        );
 
         // Two signals in one coalesced run still get exactly one rebuild, so the
         // envelopes BETWEEN them are subsumed by it too and must not survive.

@@ -1270,7 +1270,8 @@ fn apply_invalid_checkpoint(
             message: format!(
                 "cannot resume mysql binlog for {dataset_name}: {reason}. Resuming could serve \
                  incorrect data. Set `mysql_replication_invalid_checkpoint_behavior: restart` to \
-                 drop the saved position and re-snapshot the table."
+                 rebuild the acceleration from the source instead. See: \
+                 https://spiceai.org/docs/components/data-connectors/mysql"
             ),
         }
         .fail(),
