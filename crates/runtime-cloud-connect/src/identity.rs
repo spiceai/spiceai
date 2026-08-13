@@ -649,30 +649,20 @@ fn acquire_removal_transaction(path: &Path) -> Result<crate::draft::EnrollmentTr
 pub(crate) fn read_regular_file_optional(path: &Path) -> std::io::Result<Option<String>> {
     use std::io::Read as _;
 
-    match validate_state_path_ancestors(path) {
-        Ok(()) => {}
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(source) => return Err(source),
-    }
-
     #[cfg(unix)]
-    let mut file = {
-        use std::os::unix::fs::OpenOptionsExt as _;
-
-        let mut options = std::fs::OpenOptions::new();
-        options
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-        match options.open(path) {
-            Ok(file) => file,
-            Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(source) => return Err(source),
-        }
+    let Some(mut file) = open_regular_file_optional_unix(path)? else {
+        return Ok(None);
     };
 
     #[cfg(windows)]
     let mut file = {
         use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
+
+        match validate_state_path_ancestors(path) {
+            Ok(()) => {}
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(source) => return Err(source),
+        }
 
         const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
         const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
@@ -715,35 +705,161 @@ pub(crate) fn read_regular_file_optional(path: &Path) -> std::io::Result<Option<
     Ok(Some(contents))
 }
 
-/// Reject a state path whose parent traversal can be redirected by an
-/// untrusted symlink or reparse point.
+/// Open a state file relative to verified directory descriptors, refusing a
+/// symlink or non-directory at every component.
 ///
 /// Unix has a small set of root-owned compatibility links in otherwise
 /// immutable directories (`/var` and `/tmp` on macOS are common examples).
 /// Those links cannot be replaced by the process running Spice and are safe to
-/// traverse. Every other symlink is rejected, including a root-owned link in a
-/// user-writable directory. The final component is still opened with
-/// `O_NOFOLLOW`, closing the leaf race after this full-path validation.
+/// resolve before descriptor traversal. Every other symlink is rejected,
+/// including a root-owned link in a user-writable directory. `openat` with
+/// `O_NOFOLLOW` then closes the rename race between inspecting and opening
+/// every ordinary component.
 #[cfg(unix)]
-fn validate_state_path_ancestors(path: &Path) -> std::io::Result<()> {
-    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+fn open_regular_file_optional_unix(path: &Path) -> std::io::Result<Option<std::fs::File>> {
+    open_regular_file_optional_unix_with(path, || {})
+}
 
+#[cfg(unix)]
+fn open_regular_file_optional_unix_with(
+    path: &Path,
+    before_descriptor_traversal: impl FnOnce(),
+) -> std::io::Result<Option<std::fs::File>> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let absolute = normalize_absolute_state_path(path)?;
+    let file_name = absolute.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "the state path has no file name",
+        )
+    })?;
+    let parent = absolute.parent().unwrap_or_else(|| Path::new("/"));
+    let parent = resolve_trusted_system_links(parent)?;
+    before_descriptor_traversal();
+    let mut directory = std::fs::File::open("/")?;
+
+    for component in parent.components() {
+        let std::path::Component::Normal(component) = component else {
+            continue;
+        };
+        let component = CString::new(component.as_bytes()).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "the state path contains a NUL byte",
+            )
+        })?;
+        // SAFETY: `component` is NUL-terminated, the directory descriptor is
+        // live for this call, and no pointer is retained. `O_NOFOLLOW` and
+        // `O_DIRECTORY` make a raced symlink/non-directory fail this step.
+        let descriptor = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                component.as_ptr(),
+                libc::O_RDONLY
+                    | libc::O_DIRECTORY
+                    | libc::O_NOFOLLOW
+                    | libc::O_NONBLOCK
+                    | libc::O_CLOEXEC,
+            )
+        };
+        if descriptor < 0 {
+            let source = std::io::Error::last_os_error();
+            if source.kind() == std::io::ErrorKind::NotFound {
+                return Ok(None);
+            }
+            return Err(source);
+        }
+        // SAFETY: `openat` returned a new owned descriptor on success.
+        directory = unsafe { std::fs::File::from_raw_fd(descriptor) };
+    }
+
+    let file_name = CString::new(file_name.as_bytes()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "the state path contains a NUL byte",
+        )
+    })?;
+    // SAFETY: `file_name` is NUL-terminated, the directory descriptor is live
+    // for this call, and no pointer is retained. The leaf cannot be followed.
+    let descriptor = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            file_name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        )
+    };
+    if descriptor < 0 {
+        let source = std::io::Error::last_os_error();
+        if source.kind() == std::io::ErrorKind::NotFound {
+            return Ok(None);
+        }
+        return Err(source);
+    }
+    // SAFETY: `openat` returned a new owned descriptor on success.
+    Ok(Some(unsafe { std::fs::File::from_raw_fd(descriptor) }))
+}
+
+#[cfg(unix)]
+fn normalize_absolute_state_path(path: &Path) -> std::io::Result<PathBuf> {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
         std::env::current_dir()?.join(path)
     };
-    let Some(parent) = absolute.parent() else {
-        return Ok(());
-    };
-    let mut current = PathBuf::new();
-    for component in parent.components() {
-        current.push(component.as_os_str());
-        let metadata = std::fs::symlink_metadata(&current)?;
+    let mut normalized = PathBuf::from("/");
+    for component in absolute.components() {
+        match component {
+            std::path::Component::RootDir | std::path::Component::CurDir => {}
+            std::path::Component::Normal(component) => normalized.push(component),
+            std::path::Component::ParentDir => {
+                if !normalized.pop() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "the state path escapes the filesystem root",
+                    ));
+                }
+            }
+            std::path::Component::Prefix(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "the state path has a non-Unix prefix",
+                ));
+            }
+        }
+    }
+    Ok(normalized)
+}
+
+#[cfg(unix)]
+fn resolve_trusted_system_links(path: &Path) -> std::io::Result<PathBuf> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    let mut resolved = PathBuf::from("/");
+    let mut components = path.components().filter_map(|component| match component {
+        std::path::Component::Normal(component) => Some(component),
+        _ => None,
+    });
+    while let Some(component) = components.next() {
+        let candidate = resolved.join(component);
+        let metadata = match std::fs::symlink_metadata(&candidate) {
+            Ok(metadata) => metadata,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                resolved.push(component);
+                for remaining in components {
+                    resolved.push(remaining);
+                }
+                return Ok(resolved);
+            }
+            Err(source) => return Err(source),
+        };
         if !metadata.file_type().is_symlink() {
+            resolved.push(component);
             continue;
         }
-        let containing = current.parent().unwrap_or_else(|| Path::new("/"));
+        let containing = candidate.parent().unwrap_or_else(|| Path::new("/"));
         let containing_metadata = std::fs::metadata(containing)?;
         let trusted_system_link = metadata.uid() == 0
             && containing_metadata.uid() == 0
@@ -753,12 +869,13 @@ fn validate_state_path_ancestors(path: &Path) -> std::io::Result<()> {
                 std::io::ErrorKind::InvalidInput,
                 format!(
                     "the state path has an untrusted symlink ancestor: {}",
-                    current.display()
+                    candidate.display()
                 ),
             ));
         }
+        resolved = std::fs::canonicalize(candidate)?;
     }
-    Ok(())
+    Ok(resolved)
 }
 
 #[cfg(windows)]
@@ -2712,6 +2829,35 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(target).expect("target remains readable"),
             "sensitive target"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn descriptor_traversal_rejects_a_parent_swapped_to_a_symlink_after_validation() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let config = dir.path().join("config");
+        std::fs::create_dir(&config).expect("create config directory");
+        std::fs::write(config.join("identity.json"), "safe identity").expect("write safe file");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir(&outside).expect("create target directory");
+        std::fs::write(outside.join("identity.json"), "redirected identity")
+            .expect("write redirected file");
+        let checked_config = dir.path().join("checked-config");
+        let identity_path = config.join("identity.json");
+
+        open_regular_file_optional_unix_with(&identity_path, || {
+            std::fs::rename(&config, &checked_config).expect("move checked directory");
+            symlink(&outside, &config).expect("replace parent with symlink");
+        })
+        .expect_err("descriptor-relative traversal must reject the raced parent symlink");
+
+        assert_eq!(
+            std::fs::read_to_string(outside.join("identity.json"))
+                .expect("redirected target remains readable"),
+            "redirected identity"
         );
     }
 
