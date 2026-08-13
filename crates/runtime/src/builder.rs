@@ -1100,7 +1100,10 @@ fn install_segment_cache(app: Option<&Arc<app::App>>, configured_mb: Option<usiz
     // that is not invented, and a single dataset's setting must not decide the
     // budget every other table reads from. They are reported as ignored where they
     // are read, against the dataset that set them.
-    #[cfg_attr(windows, expect(unreachable_code, reason = "Cayenne is not built on Windows"))]
+    #[cfg_attr(
+        windows,
+        expect(unreachable_code, reason = "Cayenne is not built on Windows")
+    )]
     let bytes = segment_cache_budget_bytes(configured_mb);
 
     if bytes == 0 {
@@ -1641,9 +1644,8 @@ fn estimate_cayenne_reservation_bytes(
     // Reading the installed capacity rather than recomputing the budget also
     // reports zero when caching is switched off.
     if has_cayenne_acceleration {
-        total = total.saturating_add(
-            vortex_datafusion::process_segment_cache_capacity_bytes().unwrap_or(0),
-        );
+        total = total
+            .saturating_add(vortex_datafusion::process_segment_cache_capacity_bytes().unwrap_or(0));
     }
     total
 }
@@ -2037,8 +2039,7 @@ mod test {
         name: &str,
         segment_cache_mb: Option<&str>,
     ) -> spicepod::component::dataset::Dataset {
-        let mut dataset =
-            spicepod::component::dataset::Dataset::new("postgres:public.t", name);
+        let mut dataset = spicepod::component::dataset::Dataset::new("postgres:public.t", name);
         let mut acceleration = spicepod::acceleration::Acceleration {
             enabled: true,
             engine: Some("cayenne".to_string()),

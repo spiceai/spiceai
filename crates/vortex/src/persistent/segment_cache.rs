@@ -12,11 +12,11 @@ use object_store::path::Path;
 use opentelemetry::global;
 use opentelemetry::metrics::{Meter, ObservableCounter, ObservableGauge};
 use parking_lot::Mutex;
-use vortex_utils::aliases::dash_map::{DashMap, Entry};
 use twox_hash::XxHash3_64;
 use vortex::buffer::ByteBuffer;
 use vortex::error::VortexResult;
 use vortex::layout::segments::{SegmentCache, SegmentId};
+use vortex_utils::aliases::dash_map::{DashMap, Entry};
 
 /// Hasher for the segment cache key. XXH3 matches the
 /// project-wide cache hashing default and is markedly faster than moka's default
@@ -294,14 +294,17 @@ impl SharedSegmentCache {
             // concurrent drop for the same path cannot unregister a state between
             // the lookup and the insert.
             match path_states.entry(path.clone()) {
-                Entry::Occupied(mut occupied) => match occupied.get().upgrade() {
-                    Some(live) => live,
-                    None => {
+                Entry::Occupied(mut occupied) => {
+                    if let Some(live) = occupied.get().upgrade() {
+                        live
+                    } else {
+                        // Registered but every opener has dropped: replace the
+                        // expired weak rather than leaving a dead entry behind.
                         let state = Arc::new(PathCacheState::default());
                         occupied.insert(Arc::downgrade(&state));
                         state
                     }
-                },
+                }
                 Entry::Vacant(vacant) => {
                     let state = Arc::new(PathCacheState::default());
                     vacant.insert(Arc::downgrade(&state));
@@ -366,7 +369,9 @@ impl SharedSegmentCache {
             scan_cache
                 .iter()
                 .filter_map(|(key, _)| {
-                    scan_paths.contains(key.1.as_ref()).then(|| key.as_ref().clone())
+                    scan_paths
+                        .contains(key.1.as_ref())
+                        .then(|| key.as_ref().clone())
                 })
                 .collect()
         })
@@ -1215,17 +1220,13 @@ mod tests {
             .expect("retirement tracking enabled");
 
         assert_eq!(
-            states
-                .get(&path)
-                .map_or(0, |state| state.strong_count()),
+            states.get(&path).map_or(0, |state| state.strong_count()),
             2,
             "both file-cache handles must share one registered path state"
         );
         drop(first);
         assert_eq!(
-            states
-                .get(&path)
-                .map_or(0, |state| state.strong_count()),
+            states.get(&path).map_or(0, |state| state.strong_count()),
             1,
             "dropping one opener must not unregister the state used by the other"
         );
