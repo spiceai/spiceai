@@ -49,6 +49,7 @@ pub(crate) async fn build_heartbeat(
         active_models,
         active_spicepods: 0,
         runtime_versions: std::collections::HashMap::new(),
+        standalone_runtime: None,
     }
 }
 

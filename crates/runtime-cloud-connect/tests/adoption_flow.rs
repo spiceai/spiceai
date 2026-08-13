@@ -628,6 +628,9 @@ async fn attach_app_applies_complete_state_and_rejects_empty_ids() {
             target: None,
             body: Some(proto::control_message::Body::AttachApp(proto::AttachApp {
                 app_id: app_id.map(str::to_string),
+                org_name: None,
+                app_name: None,
+                monitor_url: None,
             })),
         })
         .collect();

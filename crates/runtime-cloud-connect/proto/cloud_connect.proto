@@ -47,9 +47,7 @@
 // A oneof is its own group and numbers its arms contiguously from 1; the
 // enclosing message's remaining fields follow it. Every other message numbers
 // contiguously from 1 in declaration order. New fields take the next free
-// number. Nothing is skipped or reserved: the two sides of this contract ship
-// together, so a removed field's number is free to be reused rather than frozen
-// for a peer that does not exist.
+// number. Removed field and enum numbers are reserved and never reused.
 //
 // Protobuf shares one number space across a message and the oneofs inside it,
 // so a message whose oneof starts at 1 declares that oneof first and its own
@@ -240,6 +238,13 @@ message Heartbeat {
   uint32 active_models = 6;
   uint32 active_spicepods = 7;
   map<string, string> runtime_versions = 8;
+  // Presence distinguishes an unreported status from a reported empty status.
+  StandaloneRuntimeStatus standalone_runtime = 9;
+}
+
+message StandaloneRuntimeStatus {
+  // Configuration paths whose desired values require a restart to take effect.
+  repeated string restart_required = 1;
 }
 
 // Terminal reply to a command, correlated by `command_id`.
@@ -427,10 +432,12 @@ message ExecuteQuery {
   uint32 max_rows = 2;
 }
 
-// The app this instance is attached to, as the control plane currently sees it.
-// Absent means detached. If present it must be non-empty.
+// `app_id` absent means detached. Every present field must be non-empty.
 message AttachApp {
   optional string app_id = 1;
+  optional string org_name = 2;
+  optional string app_name = 3;
+  optional string monitor_url = 4;
 }
 
 // Sealed secrets delivery. A secret value is sealed TWICE with HPKE
