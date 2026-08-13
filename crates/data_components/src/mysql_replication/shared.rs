@@ -2286,12 +2286,19 @@ async fn rebootstrap_all_for_restart(
 }
 
 /// Rebuild one member in place after its resume position was purged and
-/// `invalid_position_behavior = Restart`. Drops the purged checkpoint first (a
-/// crash mid-rebuild must reload from scratch, never resume on a position whose
-/// rows were never applied), resets the slot to `head` held `SNAPSHOTTING`, then
-/// pushes one rebuild signal through the member's LIVE channel — delivered
-/// mid-stream because the runtime holds a single `ChangesStream` and never
-/// re-subscribes.
+/// `invalid_position_behavior = Restart`. Resets the slot to `head` held
+/// `SNAPSHOTTING`, then pushes one rebuild signal through the member's LIVE
+/// channel — delivered mid-stream because the runtime holds a single
+/// `ChangesStream` and never re-subscribes.
+///
+/// The purged checkpoint is deliberately left in place until the boundary
+/// committer replaces it with the new head. It is the only durable evidence that
+/// this acceleration holds rows no position explains: clearing it up front and
+/// then crashing mid-rebuild would leave a populated acceleration with no
+/// checkpoint, which the next start reads as a first load — and a first load
+/// empties the table and refills it from a snapshot, which is the very window
+/// this exists to close. Leaving it costs at most one repeated rebuild after a
+/// crash, since the next start re-detects it as unusable and lands here again.
 ///
 /// The member is serving rows here, so the acceleration is replaced rather than
 /// refilled: the consumer answers
@@ -2311,9 +2318,6 @@ async fn rebootstrap_member(
     head: &BinlogPosition,
     head_gtid: &GtidSet,
 ) -> Result<()> {
-    if let Err(e) = member.position_store.clear().await {
-        tracing::warn!(dataset = %member.dataset_name, error = %e, "failed to clear purged mysql binlog checkpoint before rebuild");
-    }
     // Reset to head, held SNAPSHOTTING so `persist_all`/promotion skip it until
     // the boundary lands — identical to a loading member.
     source
@@ -2473,6 +2477,33 @@ mod tests {
         }
     }
 
+    /// Stands in for a member's durable accelerator sidecar, so a test can read
+    /// back what the rebuild did (or did not) do to the persisted checkpoint.
+    #[derive(Default)]
+    struct MemoryPositionStore {
+        inner: Mutex<Option<PersistedPosition>>,
+    }
+
+    #[async_trait]
+    impl super::super::PositionStore for MemoryPositionStore {
+        async fn load(
+            &self,
+        ) -> std::result::Result<Option<PersistedPosition>, super::super::StoreError> {
+            Ok(lock(&self.inner).clone())
+        }
+        async fn save(
+            &self,
+            position: &PersistedPosition,
+        ) -> std::result::Result<(), super::super::StoreError> {
+            *lock(&self.inner) = Some(position.clone());
+            Ok(())
+        }
+        async fn clear(&self) -> std::result::Result<(), super::super::StoreError> {
+            *lock(&self.inner) = None;
+            Ok(())
+        }
+    }
+
     fn test_schema() -> SchemaRef {
         Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
@@ -2487,6 +2518,7 @@ mod tests {
     ) -> (
         Arc<SharedSource>,
         Arc<MemberHandle>,
+        Arc<MemoryPositionStore>,
         mpsc::Receiver<std::result::Result<ChangeEnvelope, StreamError>>,
     ) {
         let params = test_params();
@@ -2509,6 +2541,7 @@ mod tests {
             detached: Mutex::new(HashSet::new()),
         });
         let (sender, receiver) = mpsc::channel(8);
+        let position_store: Arc<MemoryPositionStore> = Arc::new(MemoryPositionStore::default());
         let member = Arc::new(MemberHandle {
             dataset_name: "orders".to_string(),
             schema: test_schema(),
@@ -2542,7 +2575,7 @@ mod tests {
             sender,
             metrics: MetricsCollector::new(),
             ready_lag: params.ready_lag,
-            position_store: Arc::new(super::super::NoopPositionStore),
+            position_store: Arc::clone(&position_store) as Arc<dyn PositionStore>,
             checkpoint_schema_json: None,
             cursor_type: CursorType::File,
         });
@@ -2552,7 +2585,7 @@ mod tests {
             .ack
             .register(member_key, pos("binlog.000001", 100), false);
         source.ack.promote_ready_members();
-        (source, member, receiver)
+        (source, member, position_store, receiver)
     }
 
     /// Every row's `op` in an envelope's built batch. `"t"` is the truncate that
@@ -2579,7 +2612,18 @@ mod tests {
         // the contents atomically instead, so a query issued mid-rebuild returns
         // either the pre-rebuild rows or the completed ones.
         let member_key = key("db", "orders");
-        let (source, member, mut receiver) = source_with_member(&member_key);
+        let (source, member, position_store, mut receiver) = source_with_member(&member_key);
+        // The purged checkpoint this member is recovering from.
+        let purged = PersistedPosition {
+            position: pos("binlog.000001", 100),
+            schema_json: None,
+            gtid_set: None,
+            cursor_type: CursorType::File,
+        };
+        position_store
+            .save(&purged)
+            .await
+            .expect("seed the purged checkpoint");
 
         rebootstrap_member(
             &source,
@@ -2621,6 +2665,19 @@ mod tests {
         let slot = source.ack.slot(&member_key).expect("member slot");
         assert!(slot.has(SNAPSHOTTING));
         assert_eq!(slot.committed(), pos("binlog.000004", 4));
+
+        // The unusable checkpoint stays until the signal's committer replaces it
+        // with the new head. It is the only durable evidence that this
+        // acceleration holds rows no position explains — clearing it up front and
+        // then crashing mid-rebuild would leave the next start reading a
+        // populated acceleration as a first load, and a first load empties it and
+        // refills it from a snapshot: the window this whole change closes.
+        let still_there = position_store
+            .load()
+            .await
+            .expect("store readable")
+            .expect("the purged checkpoint survives until the rebuild commits");
+        assert_eq!(still_there.position, purged.position);
     }
 
     #[tokio::test]
@@ -2629,7 +2686,7 @@ mod tests {
         // to preserve and must NOT trigger a rebuild — that would re-read the
         // source table on every cold start.
         let member_key = key("db", "orders");
-        let (source, member, _receiver) = source_with_member(&member_key);
+        let (source, member, _position_store, _receiver) = source_with_member(&member_key);
 
         for (history_unavailable, expected) in [(false, false), (true, true)] {
             let envelope = snapshot_boundary_envelope(
