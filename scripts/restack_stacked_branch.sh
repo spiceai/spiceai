@@ -377,12 +377,14 @@ cmd_audit() {
   # keeps trunk's version. Neither filter above lists such a path -- it is a
   # modification, and its content is simply gone.
   #
-  local other
+  local other incomplete=0
   if ! other=$(merge_other_side "$pre"); then
-    # Outside a merge there is no other side to compare against. Say so rather
-    # than reporting on a narrower check than the caller asked for: a quiet
-    # partial audit is the failure this whole helper is arguing against.
-    echo "note: no merge in progress or committed, so only additions and deletions were checked" >&2
+    # Outside a merge there is no other side to compare against, so the question
+    # this command answers -- did the merge do what you intended -- has no answer
+    # yet. Callers gate on the exit status, so it must not be success: a partial
+    # audit reporting clean is the failure this whole helper is arguing against.
+    echo "INCOMPLETE: no merge in progress or committed, so only additions and deletions were checked"
+    incomplete=1
     other=""
   fi
   while [ -n "$other" ] && IFS= read -r -d '' path; do
@@ -394,6 +396,10 @@ cmd_audit() {
 
   if [ "$findings" -ne 0 ]; then
     echo "audit found $findings path(s) the merge changed against the branch's intent" >&2
+    return 1
+  fi
+  if [ "$incomplete" -ne 0 ]; then
+    echo "audit did not check modifications, so it cannot report the merge as clean" >&2
     return 1
   fi
   echo "audit clean"

@@ -162,8 +162,10 @@ carry on regardless. Step 5's `git commit` then turns that staged change into an
 ordinary commit, so you push a branch that never took `trunk` plus a commit nobody
 reviewed, and the audit reports nothing because nothing was resurrected. Checking
 `git status` afterwards cannot see it either: by then the tree is clean. An *unstaged*
-change is harmless — the merge proceeds and a worktree-only edit stays out of the
-commit — but it is simpler to begin clean than to remember which kind you have.
+change to a path the merge does not touch is harmless — the merge proceeds and a
+worktree-only edit stays out of the commit — but git also aborts when an unstaged change
+sits on a path the merge would overwrite, so the reliable rule is simply to begin clean
+rather than to reason about which kind you have.
 
 **1. Confirm trunk's squash really matches the parent head** — `$PARENT_HEAD` here, not
 `$STACKBASE`, since the squash reflects the parent's final state. Restrict the

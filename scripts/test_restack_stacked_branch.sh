@@ -47,9 +47,9 @@ start_test() {
   echo "- $1"
 }
 
-# A repository with the shape this tooling is about: a fork point on trunk, a
-# parent branch off it, a child branch off the parent, and trunk taking the
-# parent as a squash merge. Echoes "<stack_base> <pre_merge_tip>".
+# An empty repository on trunk, ready for a case to build the history it needs:
+# a fork point, a parent branch off it, a child off the parent, and trunk taking
+# the parent as a squash merge. Each case records the revisions it cares about.
 new_stack() {
   local dir="$1"
   mkdir -p "$dir" && cd "$dir" || exit 1
@@ -313,6 +313,10 @@ start_test "audit will not mistake an earlier merge on the child for this one"
   # it for trunk would let the audit claim a check it never made.
 
   output=$("$subject" audit "$stack_base" "$pre" 2>&1)
+  status=$?
+  # Callers gate on the status, so an audit that could not check everything must
+  # not report success however clearly it explains itself.
+  [ "$status" -ne 0 ] || fail_test "an incomplete audit exited 0: $output"
   case "$output" in
     *"only additions and deletions were checked"*) ;;
     *) fail_test "an unrelated merge was mistaken for this one: $output" ;;
@@ -353,6 +357,10 @@ start_test "audit says so when it cannot check modifications, rather than implyi
   # No merge started, so there is no other side to compare against.
 
   output=$("$subject" audit "$stack_base" "$pre" 2>&1)
+  status=$?
+  # Callers gate on the status, so an audit that could not check everything must
+  # not report success however clearly it explains itself.
+  [ "$status" -ne 0 ] || fail_test "an incomplete audit exited 0: $output"
   case "$output" in
     *"only additions and deletions were checked"*) ;;
     *) fail_test "a narrowed audit did not say so: $output" ;;
@@ -382,17 +390,22 @@ start_test "audit is quiet and succeeds when the merge did what was intended"
   new_stack "$work_root/clean"
   printf 'old\n' > keep.txt && commit_all "fork point"
   git checkout --quiet -b parent
-  printf 'registry\n' > registry.rs && commit_all "parent adds registry.rs"
+  printf 'parent\n' > p.rs && commit_all "parent adds p.rs"
   stack_base=$(git rev-parse HEAD)
   git checkout --quiet -b child
-  git rm --quiet registry.rs && commit_all "child deletes registry.rs"
+  printf 'child\n' > c.rs && commit_all "child adds its own file"
   pre=$(git rev-parse HEAD)
+  squash_parent_onto_trunk
+  printf 'moved on\n' > t.rs && commit_all "trunk moves on elsewhere"
+  git checkout --quiet child
+  git merge --no-ff --no-commit trunk >/dev/null 2>&1
 
   output=$("$subject" audit "$stack_base" "$pre" 2>/dev/null)
   status=$?
-  [ "$status" -eq 0 ] || fail_test "expected exit 0 on a clean audit, got $status"
+  [ "$status" -eq 0 ] || fail_test "expected exit 0 on a clean audit, got $status ($output)"
   case "$output" in
-    *RESURRECTED* | *LOST*) fail_test "clean audit reported a finding: $output" ;;
+    *RESURRECTED* | *LOST* | *DISCARDED* | *REVIEW* | *INCOMPLETE*)
+      fail_test "clean audit reported a finding: $output" ;;
   esac
 ) || failures=$((failures + 1))
 
@@ -549,8 +562,14 @@ start_test "resolve writes correctly based conflict markers and leaves them unst
   grep -q '^<<<<<<< ours' f.txt || fail_test "conflict markers were not written to the worktree"
   grep -q '^>>>>>>> trunk' f.txt || fail_test "markers were not labelled (mktemp paths leak otherwise)"
   # The base shown must be the stack base, not git's older one: line 2 agrees on
-  # both sides against that base, so only line 3 is in conflict.
-  grep -q '^PARENT$' f.txt || fail_test "the parent's line was dragged into the conflict"
+  # both sides against it, so only line 3 conflicts. Under the older base PARENT
+  # appears inside both arms, so finding it somewhere proves nothing -- require
+  # exactly one, above the first marker.
+  [ "$(grep -c '^PARENT$' f.txt)" -eq 1 ] ||
+    fail_test "PARENT appears $(grep -c '^PARENT$' f.txt) times, so the wrong base was used"
+  [ "$(grep -n '^PARENT$' f.txt | head -1 | cut -d: -f1)" \
+    -lt "$(grep -n '^<<<<<<<' f.txt | head -1 | cut -d: -f1)" ] ||
+    fail_test "the parent's line was dragged inside the conflict markers"
   [ -n "$(git ls-files -u -- f.txt)" ] || fail_test "the path was resolved without a human"
 ) || failures=$((failures + 1))
 
@@ -669,6 +688,12 @@ start_test "resolve stages only the named path when the name contains glob chara
   printf 'modified but not staged\n' > weird1.txt
 
   "$subject" resolve "$stack_base" 'weird[1].txt' >/dev/null 2>&1
+  status=$?
+  # An unresolved path is listed by `diff --cached` too, so without these the
+  # case would pass on a resolve that staged nothing at all.
+  [ "$status" -eq 0 ] || fail_test "resolve did not succeed: exit $status"
+  [ -z "$(git ls-files -u -- ':(literal)weird[1].txt')" ] ||
+    fail_test "the named path is still unmerged, so nothing was staged"
   git diff --cached --name-only | grep -qx 'weird1.txt' &&
     fail_test "an unrelated path matching the glob was staged"
   git diff --cached --name-only | grep -qFx 'weird[1].txt' ||
