@@ -597,6 +597,27 @@ audit_modification() {
     return 1
   fi
 
+  # Three shapes need no merge at all: whichever side left the content alone, the
+  # other side's version is the answer, and both sides landing on the same content
+  # is its own answer. Calling those ambiguous would let --accept excuse a loss --
+  # and it would, for binary content, which merge-file cannot merge even when
+  # there is nothing to decide.
+  local expected_oid=""
+  if [ "$mine_oid" = "$base_oid" ]; then
+    expected_oid="$theirs_oid"
+  elif [ "$theirs_oid" = "$base_oid" ]; then
+    expected_oid="$mine_oid"
+  elif [ "$mine_oid" = "$theirs_oid" ]; then
+    expected_oid="$mine_oid"
+  fi
+  if [ -n "$expected_oid" ]; then
+    if [ "$staged_oid" != "$expected_oid" ]; then
+      echo "DISCARDED $path: the staged content is not what a merge from the stack base gives"
+      return 1
+    fi
+    return 0
+  fi
+
   git cat-file blob "$mine_oid" > "$tmp/m.ours" 2>/dev/null &&
     git cat-file blob "$base_oid" > "$tmp/m.base" 2>/dev/null &&
     git cat-file blob "$theirs_oid" > "$tmp/m.theirs" 2>/dev/null &&

@@ -1065,6 +1065,33 @@ start_test "audit will not let --accept carry a dropped mode change"
   esac
 ) || failures=$((failures + 1))
 
+start_test "audit reports a dropped binary change without calling it ambiguous"
+(
+  new_stack "$work_root/binary"
+  printf 'child\000bytes\n' > blob.bin && commit_all "fork point"
+  git checkout --quiet -b parent
+  printf 'parent\000bytes\n' > blob.bin && commit_all "parent changes the binary"
+  stack_base=$(git rev-parse HEAD)
+  git checkout --quiet -b child
+  printf 'child\000bytes\n' > blob.bin && commit_all "child reverts it"
+  pre=$(git rev-parse HEAD)
+  squash_parent_onto_trunk
+  git checkout --quiet child
+  git merge --no-ff --no-commit trunk >/dev/null 2>&1
+  [ -z "$(git ls-files -u)" ] || fail_test "the fixture left a conflict, so nothing was silent"
+
+  # Trunk left the file alone relative to the stack base, so the child's version
+  # is the answer and nothing is ambiguous — even though merge-file cannot merge
+  # these bytes at all.
+  output=$("$subject" audit "$stack_base" "$pre" --trunk trunk --accept blob.bin 2>/dev/null)
+  status=$?
+  [ "$status" -ne 0 ] || fail_test "--accept silenced a dropped binary change: $output"
+  case "$output" in
+    *"DISCARDED blob.bin"*) ;;
+    *) fail_test "expected a deterministic loss, got: $output" ;;
+  esac
+) || failures=$((failures + 1))
+
 start_test "audit will not let --accept silence a discarded edit"
 (
   new_stack "$work_root/acceptdiscard"
