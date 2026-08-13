@@ -435,11 +435,6 @@ impl DataSink for CayennePartitionedAppendSink {
             }
         };
 
-        let mut prepared_on_conflicts = prepared
-            .iter_mut()
-            .map(PreparedStagedAppend::take_prepared_on_conflict)
-            .collect::<Vec<_>>();
-
         // Apply the barrier on every partition. If any fails partway, the
         // top-level WAL stays on disk so the next process restart can
         // recover the set; we surface the error and stop. We do NOT attempt
@@ -458,6 +453,18 @@ impl DataSink for CayennePartitionedAppendSink {
                 return Err(DataFusionError::from(error));
             }
         }
+
+        // Take the on-conflict payload out only after the manifest is prepared.
+        // An on-conflict append (on_conflict: upsert) reserves its append
+        // sequence inside `prepared_on_conflict` and leaves `append_sequence`
+        // None, and `prepare_deferred_manifest` reads that sequence from
+        // `prepared_on_conflict`; moving the payload out first leaves the
+        // manifest with no reserved sequence. See #12779.
+        let mut prepared_on_conflicts = prepared
+            .iter_mut()
+            .map(PreparedStagedAppend::take_prepared_on_conflict)
+            .collect::<Vec<_>>();
+
         let mut fence_guards: Vec<tokio::sync::OwnedRwLockWriteGuard<()>> =
             Vec::with_capacity(prepared.len());
         for receipt in &prepared {

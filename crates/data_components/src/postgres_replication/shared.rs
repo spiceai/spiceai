@@ -145,9 +145,9 @@ use tokio::sync::Notify;
 use bytes::Bytes;
 
 use super::{
-    Error, ReplicationMetricsCollector, ReplicationStreamInput, Result, SchemaEvolutionPolicy,
-    bootstrap, changes::PgChangeRows, client, config::ReplicationParams, pgoutput, resilience,
-    schema_evolution::RelationSchemaTracker, slot,
+    AppliedLsn, AppliedLsnStore, Error, ReplicationMetricsCollector, ReplicationStreamInput,
+    Result, SchemaEvolutionPolicy, bootstrap, changes::PgChangeRows, client,
+    config::ReplicationParams, pgoutput, resilience, schema_evolution::RelationSchemaTracker, slot,
 };
 use rustc_hash::FxHashMap;
 
@@ -477,6 +477,9 @@ struct MemberHandle {
     /// source-commit time is within this of now, so the dataset becomes Ready
     /// only once it has caught up to the source head.
     ready_lag: std::time::Duration,
+    /// Where this member's applied-LSN watermark is recorded; cloned into each
+    /// envelope's committer. See `SharedLsnCommitter::applied_lsn_store`.
+    applied_lsn_store: Arc<dyn AppliedLsnStore>,
 }
 
 /// `LIVE`: the member is attached and routing to it is allowed. Cleared on
@@ -800,12 +803,40 @@ struct SharedLsnCommitter {
     /// Source-commit timestamp (ms since the Unix epoch) of the batch this
     /// commit acks; `None` when the transaction carried no commit time.
     source_commit_ts_ms: Option<i64>,
+    /// Where this member's applied-LSN watermark is recorded.
+    ///
+    /// Written from [`CommitChange::commit`] specifically, which is the only
+    /// point at which the acked changes are known durable: this committer
+    /// supports deferral, so under an in-memory CDC durability tier the runtime
+    /// holds it until the covering checkpoint is durable
+    /// (`SlotAdvancer::on_checkpoint_durable`). Recording the watermark anywhere
+    /// earlier — when a batch reaches the memory tier — would claim rows a
+    /// restart loses, and the next start would then resume *past* changes the
+    /// acceleration never durably received.
+    applied_lsn_store: Arc<dyn AppliedLsnStore>,
 }
 
 #[async_trait]
 impl CommitChange for SharedLsnCommitter {
     async fn commit(&self) -> std::result::Result<(), CommitError> {
         self.slot.commit(self.flush_to);
+        // Record the watermark alongside the slot ack, never ahead of it. A
+        // failure here is logged rather than surfaced: the ack already happened,
+        // so failing the commit would stall CDC over bookkeeping, and a stale
+        // watermark only ever costs a redundant rebuild on the next start —
+        // whereas a watermark ahead of durable data would resume past changes
+        // the acceleration does not hold.
+        if let Err(e) = self
+            .applied_lsn_store
+            .save(AppliedLsn { lsn: self.flush_to })
+            .await
+        {
+            tracing::warn!(
+                dataset = %self.dataset,
+                "could not record how far this acceleration has been advanced (lsn={}); if the process restarts before this succeeds, the acceleration is rebuilt from the source rather than resumed: {e}",
+                self.flush_to,
+            );
+        }
         crate::cdc::log_committer_progress(
             "postgres",
             &self.dataset,
@@ -849,11 +880,88 @@ impl CommitChange for SharedLsnCommitter {
 /// A shared-slot `PostgreSQL` envelope before it crosses the member stream
 /// boundary. It keeps pgoutput messages raw so adjacent source transactions can
 /// be folded without tuple decoding or Arrow construction on the pump.
+/// The zero-row boundary envelope that carries a
+/// [`SnapshotWatermarkCommitter`], or the stream error if its (empty) batch
+/// cannot be built.
+fn snapshot_watermark_envelope(
+    schema: &SchemaRef,
+    applied_lsn_store: Arc<dyn AppliedLsnStore>,
+    lsn: u64,
+    dataset: String,
+    history_unavailable: bool,
+) -> std::result::Result<ChangeEnvelope, StreamError> {
+    let (_, batch, _, _) = crate::cdc::build_heartbeat_envelope(schema, None, false)
+        .map_err(|e| StreamError::External(e.to_string()))?
+        .into_parts()
+        .map_err(|e| StreamError::External(e.to_string()))?;
+    Ok(ChangeEnvelope::from_parts(
+        Box::new(SnapshotWatermarkCommitter {
+            applied_lsn_store,
+            lsn,
+            dataset,
+        }),
+        batch,
+        // Readiness stays lag-based: an acceleration being loaded is not ready.
+        false,
+        history_unavailable,
+    ))
+}
+
+/// Records the watermark for a just-completed snapshot, as its own zero-row
+/// boundary envelope.
+///
+/// Without this the watermark is first written by the acknowledgement of a *WAL*
+/// change, so a restart in the window between "snapshot applied" and "first
+/// change acked" reads no watermark at all and treats a fully populated
+/// acceleration as a first load — appending a fresh snapshot over surviving rows,
+/// which is the silent divergence the watermark exists to prevent.
+///
+/// Deliberately does **not** override `supports_deferral`, so it inherits the
+/// conservative `false`: the consumer cannot hold this commit behind a later
+/// in-memory durability fence, which is what guarantees the snapshot's rows are
+/// durable before their watermark claims them. Same contract as
+/// `mysql_replication`'s snapshot-boundary committer.
+struct SnapshotWatermarkCommitter {
+    applied_lsn_store: Arc<dyn AppliedLsnStore>,
+    /// The LSN the snapshot's contents are complete as of: the slot's consistent
+    /// point, which is at or before the snapshot's visibility. Undershooting is
+    /// safe — replay from it re-delivers changes the snapshot already reflects —
+    /// whereas a later LSN could skip a change the snapshot did not see.
+    lsn: u64,
+    dataset: String,
+}
+
+#[async_trait]
+impl CommitChange for SnapshotWatermarkCommitter {
+    async fn commit(&self) -> std::result::Result<(), CommitError> {
+        if let Err(e) = self
+            .applied_lsn_store
+            .save(AppliedLsn { lsn: self.lsn })
+            .await
+        {
+            tracing::warn!(
+                dataset = %self.dataset,
+                "could not record the snapshot's applied position (lsn={}); the acceleration is correct, but a restart before the next acknowledgement will rebuild it from the source rather than resume: {e}",
+                self.lsn,
+            );
+        }
+        crate::cdc::log_committer_progress(
+            "postgres",
+            &self.dataset,
+            &format!("snapshot-complete lsn={}", self.lsn),
+            None,
+        );
+        Ok(())
+    }
+}
+
 struct PendingPgEnvelope {
     rows: PgChangeRows,
     slot: Arc<AckSlot>,
     flush_to: u64,
     dataset: String,
+    /// Cloned from the member; see `SharedLsnCommitter::applied_lsn_store`.
+    applied_lsn_store: Arc<dyn AppliedLsnStore>,
     is_dataset_ready: bool,
     first_received_at: std::time::Instant,
 }
@@ -886,6 +994,9 @@ impl PendingPgEnvelope {
             slot,
             flush_to,
             dataset,
+            // Same member (the `slot` pointer check above proves it), so both
+            // sides carry the same store; either may be kept.
+            applied_lsn_store,
             is_dataset_ready,
             first_received_at,
         } = other;
@@ -897,6 +1008,7 @@ impl PendingPgEnvelope {
                 slot,
                 flush_to,
                 dataset,
+                applied_lsn_store,
                 is_dataset_ready,
                 first_received_at,
             });
@@ -920,6 +1032,7 @@ impl PendingPgEnvelope {
                 flush_to: self.flush_to,
                 dataset: self.dataset,
                 source_commit_ts_ms,
+                applied_lsn_store: self.applied_lsn_store,
             }),
             Box::new(self.rows),
             self.is_dataset_ready,
@@ -1754,6 +1867,7 @@ async fn attach_member(
         table_name,
         metrics,
         policy,
+        applied_lsn_store,
     } = input;
     let member_key: MemberKey = (schema_name.clone(), table_name.clone());
 
@@ -1820,7 +1934,7 @@ async fn attach_member(
     }
 
     // Slot + publication DDL (idempotent, retried on transient errors).
-    let setup = slot::setup_shared_member(&source.params, &schema_name, &table_name).await?;
+    let mut setup = slot::setup_shared_member(&source.params, &schema_name, &table_name).await?;
     if setup.slot.created_fresh {
         source.slot_created_fresh.store(true, Ordering::Release);
     }
@@ -1850,6 +1964,86 @@ async fn attach_member(
         || (!rejoining && source.slot_created_fresh.load(Ordering::Acquire));
 
     let snapshotting = need_snapshot && params.initial_snapshot;
+
+    // Is there a gap this slot cannot supply?
+    //
+    // Computed, not inferred. The watermark records the LSN the acceleration's
+    // contents are complete as of; `restart_lsn` is the earliest LSN the slot can
+    // still stream from. A watermark older than that is a gap no stream can fill:
+    // a row deleted at the source in that window has no change event left to
+    // replay, so appending snapshot rows over the survivors would leave the
+    // deletion applied at the source and never here, in every later query.
+    //
+    // The three outcomes:
+    //
+    //   * no watermark -> this acceleration has never been loaded. A first
+    //     bootstrap, not a gap: snapshot-and-append is exactly right, and this is
+    //     also every ephemeral accelerator (their store records nothing, since
+    //     they boot empty and re-snapshot every start).
+    //   * watermark, and the slot still reaches it -> resume; the WAL between the
+    //     two is still there to replay.
+    //   * watermark the slot cannot reach (or no slot at all) -> hand the reload
+    //     to the consumer, which owns the accelerator and can replace its
+    //     contents atomically (see `cdc::ChangeEnvelope::history_unavailable`).
+    let watermark = match applied_lsn_store.load().await {
+        Ok(watermark) => watermark,
+        Err(e) => {
+            // Reading it failed, so we cannot prove the gap is fillable. Treat it
+            // the same as a position belonging to another source — unusable — so
+            // the acceleration is rebuilt: a needless rebuild costs a re-read,
+            // while a wrong resume silently keeps rows the source has deleted.
+            tracing::warn!(
+                dataset = %dataset_name,
+                "could not read how far this acceleration has been advanced, so it will be rebuilt from the source rather than resumed on an unproven position: {e}"
+            );
+            super::RecordedPosition::ForeignSource
+        }
+    };
+    // Absence of a watermark is evidence of a gap only when the acceleration
+    // could be holding rows this process did not load AND a position could have
+    // been recorded. An ephemeral acceleration boots empty, so absence means
+    // nothing is there; a store that cannot record (no durable sidecar) makes
+    // absence permanent, and rebuilding on it would re-read the whole table on
+    // every restart rather than once.
+    let tracks_positions = applied_lsn_store.records_positions();
+    if !params.ephemeral_accelerator && !tracks_positions {
+        tracing::warn!(
+            dataset = %dataset_name,
+            "this acceleration persists across restarts but has nowhere to record how far it has been advanced, so a replication slot that is dropped or invalidated cannot be detected and rows deleted at the source while it was gone would survive here"
+        );
+    }
+    let rebuild_via_consumer = super::needs_rebuild(
+        &watermark,
+        setup.slot_restart_lsn,
+        !params.ephemeral_accelerator && tracks_positions,
+    );
+
+    // Resume from the watermark, not from the server's acknowledged position,
+    // whenever the watermark is behind it.
+    //
+    // The two can disagree: the slot ack is advanced by the same commit that
+    // records the watermark, but the ack reaches the server through the pump's
+    // status updates while the watermark is a local write that can fail or be
+    // interrupted. The server's `confirmed_flush_lsn` is what streaming would
+    // otherwise resume from, so a watermark behind it means the interval between
+    // them was acknowledged but never recorded as applied — and resuming at the
+    // server's position would skip it silently. The WAL for that interval is
+    // still retained (`restart_lsn` is at or before the watermark, or this would
+    // have been a rebuild), so replaying it is both possible and idempotent
+    // through the primary-key upsert.
+    if let super::RecordedPosition::At(watermark) = &watermark
+        && !rebuild_via_consumer
+        && setup.slot.consistent_lsn > watermark.lsn
+    {
+        tracing::warn!(
+            dataset = %dataset_name,
+            server_position = %slot::format_lsn(setup.slot.consistent_lsn),
+            recorded_position = %slot::format_lsn(watermark.lsn),
+            "this slot was acknowledged past what the acceleration recorded as applied, so streaming resumes from the recorded position and replays the difference rather than skipping it"
+        );
+        setup.slot.consistent_lsn = watermark.lsn;
+    }
+
     let (sender, receiver) = member_mailbox(params.member_channel_capacity);
     // Grouping signal for the analysis: record which shared slot this dataset joined.
     // (Membership liveness is marked by `mark_member_attached` just below.)
@@ -1870,6 +2064,7 @@ async fn attach_member(
             sender,
             metrics: Arc::clone(&metrics),
             ready_lag: params.ready_lag,
+            applied_lsn_store: Arc::clone(&applied_lsn_store),
         }),
     );
     // Membership liveness is now observable (`dataset_postgres_replication_member_attached`):
@@ -1924,7 +2119,67 @@ async fn attach_member(
     // `bootstrap_finished` hook flips the member live and asks the pump to
     // reconnect — Postgres resumes from the held floor and replays the
     // member's gap (idempotent for everyone).
-    let head: ChangesStream = if snapshotting {
+    // Flips the member live and asks the pump to reconnect, so Postgres replays
+    // from the held floor. Shared by the two held-at-join arms below: after a
+    // clean snapshot, and after the consumer has been told to reload.
+    let live_flip_hook = |source: &Arc<SharedSource>, key: &MemberKey| {
+        let hook_source = Arc::clone(source);
+        let hook_key = key.clone();
+        let mut hook_fired = false;
+        stream::poll_fn(move |_| {
+            if !hook_fired {
+                hook_fired = true;
+                hook_source.ack.snapshot_finished(&hook_key);
+                hook_source.restart_requested.store(true, Ordering::Release);
+            }
+            std::task::Poll::Ready(None)
+        })
+    };
+
+    let head: ChangesStream = if rebuild_via_consumer {
+        // One zero-row envelope asking the consumer to replace the accelerator's
+        // contents from the source, then the same live-flip as a finished
+        // snapshot. The consumer applies nothing further until the reload
+        // completes, so the WAL that follows lands on top of it — back-pressure
+        // in the member mailbox is what orders the two.
+        // The signal carries the watermark committer, not a no-op one, so the
+        // position is recorded when the consumer finishes the rebuild and commits
+        // it. Without that, a rebuild would leave no watermark behind and the
+        // very next start would rebuild again — re-reading the whole table on
+        // every restart of a dataset whose source happens to be quiet.
+        //
+        // A real committer also keeps this envelope out of the consumer's
+        // heartbeat stripping (which requires a no-op committer), so it reaches
+        // the write path and is committed with the usual durability-then-commit
+        // ordering.
+        let signal_item = snapshot_watermark_envelope(
+            &schema,
+            Arc::clone(&applied_lsn_store),
+            setup.slot.consistent_lsn,
+            dataset_name.clone(),
+            true,
+        );
+        let signal = stream::once(async move { signal_item });
+        tracing::warn!(
+            dataset = %dataset_name,
+            table = %format_member(&member_key),
+            slot = %source.key.slot_name,
+            "this replication slot has no history for the table, and the acceleration persists across restarts, so it will be rebuilt from the source before changes are applied"
+        );
+        // No snapshot runs on this path — the consumer's reload replaces it — so
+        // the gauge's documented "finished, or skipped" state is reached here.
+        // Leaving it at 0 would strand every readiness probe reading it.
+        metrics.mark_bootstrap_complete();
+        Box::pin(signal.chain(live_flip_hook(source, &member_key)))
+    } else if snapshotting {
+        // Built before `dataset_name` is moved into the snapshot input below.
+        let watermark_boundary = snapshot_watermark_envelope(
+            &schema,
+            Arc::clone(&applied_lsn_store),
+            setup.slot.consistent_lsn,
+            dataset_name.clone(),
+            false,
+        );
         let snapshot = bootstrap::snapshot_stream(bootstrap::SnapshotInput {
             params: params.clone(),
             schema_name,
@@ -1949,17 +2204,39 @@ async fn attach_member(
         let hook_source = Arc::clone(source);
         let hook_key = member_key.clone();
         let mut hook_fired = false;
+        let flip_error_flag = Arc::clone(&saw_error);
         let bootstrap_finished = stream::poll_fn(move |_| {
             if !hook_fired {
                 hook_fired = true;
-                if !saw_error.load(Ordering::Acquire) {
+                if !flip_error_flag.load(Ordering::Acquire) {
                     hook_source.ack.snapshot_finished(&hook_key);
                     hook_source.restart_requested.store(true, Ordering::Release);
                 }
             }
             std::task::Poll::Ready(None)
         });
-        Box::pin(snapshot.chain(bootstrap_finished))
+        // Record the snapshot's position, but ONLY for a snapshot that completed
+        // cleanly — gated on the same flag as the live flip above.
+        //
+        // A failed snapshot ends its stream after yielding the error, so without
+        // this gate the boundary would still be reached and could record a
+        // watermark for an acceleration that is missing base rows. The next start
+        // would then find that watermark reachable, resume, and never load the
+        // rows the snapshot never delivered.
+        //
+        // The committer itself cannot be deferred, so when it does run, the
+        // snapshot's rows are already durable.
+        let mut boundary_item = Some(watermark_boundary);
+        let boundary = stream::poll_fn(move |_| {
+            let Some(item) = boundary_item.take() else {
+                return std::task::Poll::Ready(None);
+            };
+            if saw_error.load(Ordering::Acquire) {
+                return std::task::Poll::Ready(None);
+            }
+            std::task::Poll::Ready(Some(item))
+        });
+        Box::pin(snapshot.chain(boundary).chain(bootstrap_finished))
     } else {
         metrics.mark_bootstrap_complete();
         // Readiness is lag-based: a resuming member becomes Ready via lag-gated
@@ -3257,6 +3534,7 @@ async fn deliver_commit(
             slot: Arc::clone(slot),
             flush_to: boundary.end_lsn,
             dataset: member.dataset_name.clone(),
+            applied_lsn_store: Arc::clone(&member.applied_lsn_store),
             is_dataset_ready: is_ready,
             first_received_at: std::time::Instant::now(),
         };
@@ -3354,6 +3632,7 @@ mod tests {
                 Some(source_commit_ts_ms),
             ),
             slot: Arc::clone(slot),
+            applied_lsn_store: Arc::new(crate::postgres_replication::NoopAppliedLsnStore),
             flush_to,
             dataset: "ds".to_string(),
             is_dataset_ready: ready,
@@ -3394,6 +3673,7 @@ mod tests {
         tables: &[&str],
     ) -> slot::SharedMemberSetup {
         slot::SharedMemberSetup {
+            slot_restart_lsn: Some(0),
             slot: slot::SlotInfo {
                 slot_name: "slot".to_string(),
                 publication_name: "pub".to_string(),
@@ -3521,6 +3801,7 @@ mod tests {
             lock(&source.members).insert(
                 member_key.clone(),
                 Arc::new(MemberHandle {
+                    applied_lsn_store: Arc::new(crate::postgres_replication::NoopAppliedLsnStore),
                     dataset_name: format!("ds{i}"),
                     schema: Arc::clone(&schema),
                     primary_keys: vec![],
@@ -3558,6 +3839,7 @@ mod tests {
         lock(&source.members).insert(
             member_key.clone(),
             Arc::new(MemberHandle {
+                applied_lsn_store: Arc::new(crate::postgres_replication::NoopAppliedLsnStore),
                 dataset_name: "users".into(),
                 schema,
                 primary_keys: vec!["id".into()],
@@ -3676,6 +3958,7 @@ mod tests {
             lock(&source.members).insert(
                 member_key.clone(),
                 Arc::new(MemberHandle {
+                    applied_lsn_store: Arc::new(crate::postgres_replication::NoopAppliedLsnStore),
                     dataset_name: "users".into(),
                     schema,
                     primary_keys: vec!["id".into()],
@@ -4882,6 +5165,7 @@ mod tests {
         ack.seed(10);
         ack.register(&key("a"), false);
         let committer = SharedLsnCommitter {
+            applied_lsn_store: Arc::new(crate::postgres_replication::NoopAppliedLsnStore),
             slot: ack.slot(&key("a")).expect("slot registered"),
             flush_to: 42,
             dataset: "test".to_string(),

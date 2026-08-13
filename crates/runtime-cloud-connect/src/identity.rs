@@ -69,6 +69,12 @@ pub enum Error {
 
     #[snafu(display("Failed to remove the identity file: {source}"))]
     ClearTaskPanicked { source: tokio::task::JoinError },
+
+    #[snafu(display(
+        "Failed to acquire the identity update transaction for {}: {reason}",
+        path.display()
+    ))]
+    UpdateTransaction { path: PathBuf, reason: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -447,9 +453,10 @@ pub struct IdentityStore;
 /// already stopped accepting, which surfaces much later as a renewal that cannot
 /// authenticate.
 ///
-/// Process-wide because both writers live in this process. Two `spiced`
-/// processes sharing one config directory would still race, but that is already
-/// unsupported for every other reason.
+/// The config directory's persistent enrollment transaction additionally
+/// serializes these read-modify-writes against `spice connect remove` in a
+/// separate process. The process-wide lock remains necessary for writers that
+/// already own that transaction and for the runtime's in-process updates.
 ///
 /// Poisoning is ignored: the guarded data is the file, not memory, and a panic
 /// mid-write leaves it either fully old or fully new thanks to the atomic
@@ -459,6 +466,16 @@ fn write_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     LOCK.lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn acquire_update_transaction(path: &Path) -> Result<crate::draft::EnrollmentTransactionLock> {
+    let config_dir = path.parent().unwrap_or_else(|| Path::new("."));
+    crate::draft::EnrollmentTransactionLock::try_acquire(config_dir).map_err(|source| {
+        Error::UpdateTransaction {
+            path: path.to_path_buf(),
+            reason: source.to_string(),
+        }
+    })
 }
 
 impl IdentityStore {
@@ -533,6 +550,7 @@ impl IdentityStore {
     /// Returns an error if the existing file cannot be read or parsed, or if the
     /// updated identity cannot be written.
     pub fn set_app_id(path: &Path, app_id: Option<&str>) -> Result<bool> {
+        let _transaction = acquire_update_transaction(path)?;
         let _guard = write_lock();
         let Some(mut identity) = Self::load_optional(path)? else {
             return Ok(false);
@@ -564,6 +582,7 @@ impl IdentityStore {
         path: &Path,
         credential_update: &Identity,
     ) -> Result<Option<Identity>> {
+        let _transaction = acquire_update_transaction(path)?;
         let _guard = write_lock();
         let Some(current) = Self::load_optional(path)? else {
             return Ok(None);
@@ -587,12 +606,10 @@ impl IdentityStore {
 
     /// Remove the identity file. No-op if it doesn't exist.
     ///
-    /// Takes [`write_lock`] for the same reason [`IdentityStore::set_app_id`]
-    /// does, and it is what makes a release final: an update that read the file
-    /// a moment before the removal would otherwise write it back afterwards,
-    /// resurrecting an instance the control plane just released. Under the lock
-    /// the removal either precedes the read — leaving nothing to update — or
-    /// follows the write, and removes it.
+    /// Takes [`write_lock`] to serialize with updates in this process. The
+    /// caller performing `spice connect remove` owns the config directory's
+    /// enrollment transaction before calling this method, which serializes the
+    /// removal with updates from another process.
     ///
     /// # Errors
     ///
@@ -1473,6 +1490,48 @@ mod tests {
 
         assert!(stored.is_none());
         assert!(IdentityStore::load_optional(&path).expect("load").is_none());
+    }
+
+    #[test]
+    fn identity_updates_do_not_overlap_a_removal_transaction() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let config_dir = dir.path().join(".spice");
+        let path = config_dir.join("identity.json");
+        let identity = sample_identity();
+        IdentityStore::store(&path, &identity).expect("store");
+        let removal = crate::draft::EnrollmentTransactionLock::try_acquire(&config_dir)
+            .expect("hold the removal transaction");
+
+        let mut rotated = identity.clone();
+        rotated.private_key_pem = "ROTATED-KEY".to_string();
+        let credential_error = IdentityStore::store_credential_update(&path, &rotated)
+            .expect_err("credential update must not overlap removal");
+        let attachment_error = IdentityStore::set_app_id(&path, Some("4002"))
+            .expect_err("attachment update must not overlap removal");
+
+        assert!(
+            credential_error
+                .to_string()
+                .contains("Another live process"),
+            "{credential_error}"
+        );
+        assert!(
+            attachment_error
+                .to_string()
+                .contains("Another live process"),
+            "{attachment_error}"
+        );
+        let stored = IdentityStore::load_optional(&path)
+            .expect("load")
+            .expect("identity remains");
+        assert_eq!(stored.private_key_pem, identity.private_key_pem);
+        assert_eq!(stored.app_id, None);
+
+        drop(removal);
+        let merged = IdentityStore::store_credential_update(&path, &rotated)
+            .expect("store after removal transaction")
+            .expect("identity remains");
+        assert_eq!(merged.private_key_pem, "ROTATED-KEY");
     }
 
     #[test]

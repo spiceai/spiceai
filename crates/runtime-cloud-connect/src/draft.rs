@@ -135,6 +135,10 @@ impl EnrollmentTransactionLock {
         Self::acquire_with_budget(config_dir, LOCK_WAIT_BUDGET)
     }
 
+    pub(crate) fn try_acquire(config_dir: &Path) -> Result<Self> {
+        Self::acquire_with_budget(config_dir, std::time::Duration::ZERO)
+    }
+
     fn acquire_with_budget(config_dir: &Path, wait_budget: std::time::Duration) -> Result<Self> {
         let draft_path = EnrollmentDraft::path_in(config_dir);
         if let Some(parent) = draft_path.parent() {
@@ -160,11 +164,9 @@ impl EnrollmentTransactionLock {
     /// cannot be opened, or the blocking task panics.
     pub async fn try_acquire_async(config_dir: &Path) -> Result<Self> {
         let config_dir = config_dir.to_path_buf();
-        tokio::task::spawn_blocking(move || {
-            Self::acquire_with_budget(&config_dir, std::time::Duration::ZERO)
-        })
-        .await
-        .map_err(|source| Error::AcquireTaskPanicked { source })?
+        tokio::task::spawn_blocking(move || Self::try_acquire(&config_dir))
+            .await
+            .map_err(|source| Error::AcquireTaskPanicked { source })?
     }
 
     pub(crate) fn load_or_create(
