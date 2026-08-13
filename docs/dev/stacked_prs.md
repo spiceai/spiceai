@@ -172,15 +172,18 @@ worktree-only edit stays out of the commit — but git also aborts when an unsta
 sits on a path the merge would overwrite, so the reliable rule is simply to begin clean
 rather than to reason about which kind you have.
 
-**1. Confirm trunk's squash really matches the parent head** — `$PARENT_HEAD` here, not
-`$STACKBASE`, since the squash reflects the parent's final state. Restrict the
-comparison to the paths the parent touched, since `trunk` will have moved elsewhere;
-anything reported means the parent changed during merge and the assumptions below need
-rechecking:
+**1. Look at whether the parent's edits survived the squash** — against `$PARENT_HEAD`,
+not `$STACKBASE`, since the squash reflects the parent's final state. Restrict the
+comparison to the paths the parent touched, since `trunk` will have moved elsewhere:
 
 ```bash
 git diff --stat "$PARENT_HEAD" origin/trunk -- <paths the parent touched>
 ```
+
+This is an inspection, not a test: `origin/trunk` also carries the commits it took
+before and after the squash, so a difference here may be somebody else's change to a
+file the parent happened to touch rather than a change to the parent itself. Read it,
+and only worry if the parent's own edits are missing or altered.
 
 **2. Re-resolve each conflicted file three-way against the stack base**, not against
 the base git chose. Git's own attempt conflicted all 13 files in the case above; all

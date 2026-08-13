@@ -477,6 +477,35 @@ start_test "audit reports a surviving deletion that trunk had changed"
   [ "$status" -eq 0 ] || fail_test "the decision could not be accepted: $output"
 ) || failures=$((failures + 1))
 
+start_test "audit works the same from a subdirectory as from the root"
+(
+  new_stack "$work_root/subdir"
+  mkdir -p nested
+  printf 'old\n' > keep.txt && commit_all "fork point"
+  git checkout --quiet -b parent
+  printf 'registry\n' > registry.rs && commit_all "parent adds registry.rs at the root"
+  stack_base=$(git rev-parse HEAD)
+  git checkout --quiet -b child
+  git rm --quiet registry.rs && commit_all "child deletes it"
+  pre=$(git rev-parse HEAD)
+  squash_parent_onto_trunk
+  git checkout --quiet child
+  git merge --no-ff --no-commit trunk >/dev/null 2>&1
+  [ -e registry.rs ] || fail_test "the fixture did not restore the deleted file"
+
+  # Pathspecs are matched relative to the current directory, so a root-relative
+  # name looked up from here would find nothing and the restoration would look
+  # like agreement.
+  mkdir -p nested && cd nested || exit 1
+  output=$("$subject" audit "$stack_base" "$pre" --trunk trunk 2>/dev/null)
+  status=$?
+  [ "$status" -ne 0 ] || fail_test "run from a subdirectory, the audit reported clean: $output"
+  case "$output" in
+    *"RESURRECTED registry.rs"*) ;;
+    *) fail_test "the restored path was not reported from a subdirectory: $output" ;;
+  esac
+) || failures=$((failures + 1))
+
 start_test "audit refuses the fork point in place of the stack base"
 (
   new_stack "$work_root/forkpointarg"

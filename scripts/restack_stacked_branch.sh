@@ -27,6 +27,9 @@
 # failure mode named below, all of which report success while doing the wrong
 # thing, so nothing else would catch them.
 #
+# Paths are repository-relative, as git's own diffs report them; the commands move
+# to the worktree root before doing anything.
+#
 # Usage:
 #   scripts/restack_stacked_branch.sh stack-base <parent-pr> [--child <ref>]
 #   scripts/restack_stacked_branch.sh resolve <stack-base> <path>
@@ -36,7 +39,10 @@
 set -uo pipefail
 
 usage() {
-  sed -n '/^# Usage:/,/^$/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '/^# Paths are repository-relative, as git's own diffs report them; the commands move
+# to the worktree root before doing anything.
+#
+# Usage:/,/^$/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 die() {
@@ -782,6 +788,22 @@ cmd_audit() {
 main() {
   local subcommand="${1:-}"
   shift || true
+
+  # Everything here works in repository-relative paths: that is what git's diffs
+  # emit, what its pathspecs are matched against relative to the current
+  # directory, and what cp is handed. Run from a subdirectory and those three
+  # disagree -- a root-relative name is looked up under the wrong prefix, so a
+  # restored file outside that prefix looks absent from both the index and trunk
+  # and the audit reports clean. Move to the root instead of hoping.
+  local toplevel
+  case "$subcommand" in
+    -h | --help | help | "") ;;
+    *)
+      toplevel=$(git rev-parse --show-toplevel) ||
+        die "not inside a git worktree"
+      cd "$toplevel" || die "could not enter $toplevel"
+      ;;
+  esac
 
   case "$subcommand" in
     stack-base) cmd_stack_base "$@" ;;
