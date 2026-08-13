@@ -451,6 +451,10 @@ mod tests {
         RecordBatch::try_new(schema, vec![Arc::clone(batch.column(0))]).map_err(Into::into)
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "signature is fixed by TransformFn, which fallible transforms also implement"
+    )]
     fn fixed_output_schema(
         _batch: &RecordBatch,
     ) -> Result<RecordBatch, Box<dyn std::error::Error + Send + Sync>> {

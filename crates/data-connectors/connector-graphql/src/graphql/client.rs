@@ -956,7 +956,6 @@ impl GraphQLClient {
         .await
     }
 
-    #[expect(clippy::too_many_lines)]
     #[expect(clippy::too_many_arguments)]
     async fn execute_inner(
         &self,
