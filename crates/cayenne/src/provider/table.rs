@@ -46279,6 +46279,96 @@ mod tests {
         );
     }
 
+    /// Regression test for the duplicated `FilterExec` predicate seen in
+    /// benchmark snapshots (e.g. `n_name = GERMANY AND n_name = GERMANY`).
+    ///
+    /// A predicate-filtered scan over an inline-only table on its own collapses
+    /// to a single `FilterExec` (see
+    /// `test_inline_cdc_filtered_scan_returns_only_matching_rows`'s physical
+    /// pipeline), but when that same scan sits on a join's build side,
+    /// `ProjectionPushdown` folds the join's embedded projection onto the
+    /// outer `FilterExec` before the physical `FilterPushdown` `if_all` check
+    /// (`CayenneAccelerationExec::handle_child_pushdown_result`) can drop it as
+    /// redundant against the inner `FilterExec` that
+    /// `wrap_memory_branch_with_scan_filters` pre-attaches to the inline
+    /// branch — so the outer filter survives and merges with the inner one
+    /// into a single node carrying the predicate twice. `CayenneDedupFilterConjuncts`
+    /// (registered by the runtime's session builder alongside `DataFusion`'s own
+    /// physical optimizer rules) cleans up that duplicate; this test registers
+    /// it the same way and asserts the predicate is applied exactly once.
+    #[tokio::test]
+    async fn test_join_build_side_scan_filter_is_not_duplicated() {
+        use datafusion::execution::SessionStateBuilder;
+
+        let plain_ctx = SessionContext::new();
+        let state = SessionStateBuilder::new()
+            .with_default_features()
+            .with_runtime_env(plain_ctx.runtime_env())
+            .with_physical_optimizer_rule(Arc::new(
+                crate::optimizer_rules::CayenneDedupFilterConjuncts,
+            ))
+            .build();
+        let ctx = SessionContext::new_with_state(state);
+
+        let (provider, _catalog, _tmp) =
+            create_inline_enabled_upsert_table("join_build_side_filter_dedup", ctx.runtime_env())
+                .await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        for (id, value) in [(1_i64, 10_i64), (2, 20), (3, 30)] {
+            insert_batch(
+                &provider,
+                id_value_batch(Arc::clone(&schema), &[id], &[value]),
+            )
+            .await;
+        }
+
+        ctx.register_table(
+            "join_build_side_filter_dedup",
+            Arc::new(provider.clone_for_write()),
+        )
+        .expect("table registered");
+
+        // A second, plain in-memory table joined against the filtered Cayenne
+        // table as its build side — mirroring the shape of the benchmark
+        // queries where the duplicate showed up (a small dimension table,
+        // filtered, joined as the build side of a `HashJoinExec`).
+        let other_schema = Arc::new(arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("id", arrow_schema::DataType::Int64, false),
+            arrow_schema::Field::new("other_value", arrow_schema::DataType::Int64, false),
+        ]));
+        let other_batch = RecordBatch::try_new(
+            Arc::clone(&other_schema),
+            vec![
+                Arc::new(arrow::array::Int64Array::from(vec![3_i64, 4, 5])),
+                Arc::new(arrow::array::Int64Array::from(vec![100_i64, 200, 300])),
+            ],
+        )
+        .expect("build other batch");
+        ctx.register_batch("other_table", other_batch)
+            .expect("other table registered");
+
+        let df = ctx
+            .sql(
+                "SELECT o.other_value FROM join_build_side_filter_dedup t \
+                 JOIN other_table o ON t.id = o.id WHERE t.value = 30",
+            )
+            .await
+            .expect("query planned");
+        let physical_plan = df
+            .create_physical_plan()
+            .await
+            .expect("physical plan built");
+        let plan_str = datafusion::physical_plan::displayable(physical_plan.as_ref())
+            .indent(true)
+            .to_string();
+
+        assert!(
+            !plan_str.contains("value@1 = 30 AND value@1 = 30"),
+            "the scan filter must not be applied twice:\n{plan_str}"
+        );
+    }
+
     /// P1-2: `statistics()` must fold the live inline row count into `num_rows`
     /// (as `Inexact`) so the join planner gets a real cardinality, instead of
     /// returning `None`/an undercount, while inline CDC rows are live.

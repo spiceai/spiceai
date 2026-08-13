@@ -35,8 +35,9 @@ use crate::{dataaccelerator::AcceleratorEngineRegistry, datafusion::SPICE_SCP_SC
 use cache::Caching;
 #[cfg(not(windows))]
 use cayenne::optimizer_rules::{
-    CayenneAntiJoinSortMergeRewriter, CayenneDynamicFilterSharing, CayenneJoinRewriter,
-    CayenneMaintainedAggregateRewriter, CayenneOptimizerConfig, CayenneStatsAggregateRewriter,
+    CayenneAntiJoinSortMergeRewriter, CayenneDedupFilterConjuncts, CayenneDynamicFilterSharing,
+    CayenneJoinRewriter, CayenneMaintainedAggregateRewriter, CayenneOptimizerConfig,
+    CayenneStatsAggregateRewriter,
 };
 #[cfg(not(windows))]
 use cayenne::{
@@ -1037,6 +1038,12 @@ impl DataFusionBuilder {
             } else {
                 let _ = exact_join_filter_memory_limit;
             }
+            // Registered last among the Cayenne rules above (and after
+            // DataFusion's own `ProjectionPushdown`/`FilterPushdown`, which run
+            // as part of the default rule set already in `state`) so it cleans
+            // up a duplicated `FilterExec` predicate regardless of which
+            // upstream rewrite produced it.
+            state = state.with_physical_optimizer_rule(Arc::new(CayenneDedupFilterConjuncts));
         }
         #[cfg(windows)]
         let _ = exact_join_filter_memory_limit;

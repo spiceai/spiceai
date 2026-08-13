@@ -122,12 +122,14 @@ use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode};
+use datafusion::physical_plan::filter::{FilterExec, FilterExecBuilder};
 use datafusion::physical_plan::joins::{HashJoinExec, SortMergeJoinExec};
 use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion_common::stats::Precision;
 use datafusion_physical_expr::PhysicalExpr;
 use datafusion_physical_expr::expressions::Column;
+use datafusion_physical_expr::utils::{conjunction, split_conjunction};
 use datafusion_physical_plan::repartition::RepartitionExec;
 use runtime_datafusion::execution_plan::schema_cast::SchemaCastScanExec;
 use runtime_datafusion::extension::bytes_processed::BytesProcessedExec;
@@ -1592,6 +1594,80 @@ impl PhysicalOptimizerRule for CayenneJoinRewriter {
         })
         .data()
     }
+}
+
+/// Collapses a duplicated conjunct in a `FilterExec` predicate (e.g. `p AND
+/// p`) down to a single occurrence.
+///
+/// `CayenneAccelerationExec::handle_child_pushdown_result` relies on
+/// `DataFusion`'s physical `FilterPushdown` `if_all` mechanism to drop a
+/// redundant post-scan `FilterExec` once every union child — in particular the
+/// `FilterExec` that `wrap_memory_branch_with_scan_filters`
+/// (`provider/table.rs`) pre-attaches to an in-memory branch, specifically so
+/// that elimination can fire — already applies the same predicate. When the
+/// scan sits on a join's build side, `ProjectionPushdown` folds the join's
+/// embedded projection onto the outer `FilterExec` before that elimination
+/// runs, so the redundant outer filter survives and merges with the inner one
+/// into a single node carrying the predicate twice instead of being dropped —
+/// every row then pays for evaluating the same condition twice. This rule is a
+/// safety net that removes the duplicate after the fact; it does not address
+/// why the `if_all` elimination didn't fire in that shape.
+#[derive(Default, Debug)]
+pub struct CayenneDedupFilterConjuncts;
+
+impl PhysicalOptimizerRule for CayenneDedupFilterConjuncts {
+    fn name(&self) -> &'static str {
+        "CayenneDedupFilterConjuncts"
+    }
+
+    fn schema_check(&self) -> bool {
+        true
+    }
+
+    fn optimize(
+        &self,
+        plan: Arc<dyn ExecutionPlan>,
+        _config: &ConfigOptions,
+    ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
+        plan.transform_up(|node| {
+            let Some(filter) = node.downcast_ref::<FilterExec>() else {
+                return Ok(Transformed::no(node));
+            };
+            let Some(deduped) = dedup_conjunction(filter.predicate()) else {
+                return Ok(Transformed::no(node));
+            };
+            let rebuilt = FilterExecBuilder::new(deduped, Arc::clone(filter.input()))
+                .apply_projection_by_ref(filter.projection().as_ref())?
+                .with_default_selectivity(filter.default_selectivity())
+                .build()?;
+            Ok(Transformed::yes(Arc::new(rebuilt) as Arc<dyn ExecutionPlan>))
+        })
+        .data()
+    }
+}
+
+/// Splits `predicate` into its top-level `AND` conjuncts and, if any conjunct
+/// repeats (by expression equality, not just pointer identity), rebuilds the
+/// conjunction with only the first occurrence of each kept. Returns `None`
+/// when there is nothing to dedup, so callers can skip rebuilding the node.
+fn dedup_conjunction(predicate: &Arc<dyn PhysicalExpr>) -> Option<Arc<dyn PhysicalExpr>> {
+    let conjuncts = split_conjunction(predicate);
+    if conjuncts.len() < 2 {
+        return None;
+    }
+
+    let mut deduped: Vec<Arc<dyn PhysicalExpr>> = Vec::with_capacity(conjuncts.len());
+    for expr in &conjuncts {
+        if !deduped.iter().any(|kept| kept.as_ref() == expr.as_ref()) {
+            deduped.push(Arc::clone(expr));
+        }
+    }
+
+    if deduped.len() == conjuncts.len() {
+        return None;
+    }
+
+    Some(conjunction(deduped))
 }
 
 #[cfg(test)]
