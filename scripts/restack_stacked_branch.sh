@@ -251,7 +251,12 @@ audit_addition() {
   mine_entry=$(tree_entry "$pre" "$path") || die "could not read $pre:$path"
   theirs_entry=$(tree_entry "$other" "$path") || die "could not read $other:$path"
 
-  # No stage 0 means an open conflict somebody is already looking at.
+  local unmerged
+  unmerged=$(git ls-files -u -- ":(literal)$path") || die "could not read the index for $path"
+  if [ -n "$unmerged" ]; then
+    echo "REVIEW $path: still unmerged, so nothing has decided it"
+    return 1
+  fi
   [ -n "$staged_entry" ] && [ -n "$mine_entry" ] || return 0
 
   if [ -n "$theirs_entry" ] && [ "$mine_entry" != "$theirs_entry" ]; then
@@ -292,8 +297,10 @@ audit_modification() {
   local unmerged
   unmerged=$(git ls-files -u -- ":(literal)$path") || die "could not read the index for $path"
   if [ -n "$unmerged" ]; then
-    # An open conflict, which somebody is already looking at.
-    return 0
+    # Still unmerged. Nothing has decided this path, and the command's answer is
+    # about the whole merge, so it cannot be success while one is outstanding.
+    echo "REVIEW $path: still unmerged, so nothing has decided it"
+    return 1
   fi
   if [ -z "$theirs_entry" ]; then
     # You changed it, trunk deleted it. From the stack base that is a

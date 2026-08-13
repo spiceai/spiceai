@@ -242,6 +242,54 @@ start_test "audit reports an add/add the older base merged for you"
   esac
 ) || failures=$((failures + 1))
 
+start_test "audit refuses to call a merge clean while a path is still unmerged"
+(
+  new_stack "$work_root/unresolved"
+  printf 'a\nb\nc\n' > f.txt && commit_all "fork point"
+  git checkout --quiet -b parent
+  printf 'a\nPARENT\nc\n' > f.txt && commit_all "parent edits line 2"
+  stack_base=$(git rev-parse HEAD)
+  git checkout --quiet -b child
+  printf 'a\nCHILD\nc\n' > f.txt && commit_all "child edits line 2"
+  pre=$(git rev-parse HEAD)
+  squash_parent_onto_trunk
+  printf 'a\nTRUNK\nc\n' > f.txt && commit_all "trunk edits line 2"
+  git checkout --quiet child
+  git merge --no-ff --no-commit trunk >/dev/null 2>&1
+
+  [ -n "$(git ls-files -u -- f.txt)" ] || fail_test "the fixture did not leave a conflict"
+  # Leaving it for somebody else is not the same as the merge being right, and
+  # the caller gates on this status.
+  output=$("$subject" audit "$stack_base" "$pre" 2>/dev/null)
+  status=$?
+  [ "$status" -ne 0 ] || fail_test "an unresolved path was reported clean: $output"
+  case "$output" in
+    *"REVIEW f.txt"*) ;;
+    *) fail_test "the unresolved path was not named: $output" ;;
+  esac
+) || failures=$((failures + 1))
+
+start_test "audit refuses to call a merge clean while an added path is unmerged"
+(
+  new_stack "$work_root/unresolvedadd"
+  printf 'seed\n' > seed.txt && commit_all "fork point"
+  git checkout --quiet -b parent
+  git rm --quiet seed.txt && commit_all "parent deletes the seed"
+  stack_base=$(git rev-parse HEAD)
+  git checkout --quiet -b child
+  printf 'child version\n' > added.txt && commit_all "child adds a file"
+  pre=$(git rev-parse HEAD)
+  squash_parent_onto_trunk
+  printf 'trunk version\n' > added.txt && commit_all "trunk adds the same path differently"
+  git checkout --quiet child
+  git merge --no-ff --no-commit trunk >/dev/null 2>&1
+
+  [ -n "$(git ls-files -u -- added.txt)" ] || fail_test "the fixture did not leave an add/add conflict"
+  output=$("$subject" audit "$stack_base" "$pre" 2>/dev/null)
+  status=$?
+  [ "$status" -ne 0 ] || fail_test "an unresolved addition was reported clean: $output"
+) || failures=$((failures + 1))
+
 start_test "audit accepts a path a person decided, so the re-run loop can finish"
 (
   new_stack "$work_root/accept"
@@ -439,17 +487,22 @@ start_test "audit will not mistake an earlier merge on the child for this one"
 start_test "audit does not cry wolf when both sides' edits survive the merge"
 (
   new_stack "$work_root/nofalse"
-  printf 'l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\n' > f.txt && commit_all "fork point"
+  # The three edits are kept far apart. Adjacent ones conflict even when nothing
+  # about the merge is ambiguous, and a conflicted path would make this case pass
+  # without ever comparing a merged result.
+  printf 'a\nb\nc\nd\ne\nf\ng\nh\ni\nj\nk\nl\n' > f.txt && commit_all "fork point"
   git checkout --quiet -b parent
-  printf 'l1\nPARENT\nl3\nl4\nl5\nl6\nl7\nl8\n' > f.txt && commit_all "parent edits line 2"
+  printf 'a\nPARENT\nc\nd\ne\nf\ng\nh\ni\nj\nk\nl\n' > f.txt && commit_all "parent edits line 2"
   stack_base=$(git rev-parse HEAD)
   git checkout --quiet -b child
-  printf 'l1\nPARENT\nl3\nl4\nl5\nl6\nl7\nCHILD\n' > f.txt && commit_all "child edits line 8"
+  printf 'a\nPARENT\nc\nd\ne\nf\ng\nh\ni\nj\nk\nCHILD\n' > f.txt && commit_all "child edits line 12"
   pre=$(git rev-parse HEAD)
   squash_parent_onto_trunk
-  printf 'l1\nPARENT\nTRUNK\nl4\nl5\nl6\nl7\nl8\n' > f.txt && commit_all "trunk edits line 3"
+  printf 'a\nPARENT\nc\nd\nTRUNK\nf\ng\nh\ni\nj\nk\nl\n' > f.txt && commit_all "trunk edits line 5"
   git checkout --quiet child
   git merge --no-ff --no-commit trunk >/dev/null 2>&1
+  [ -z "$(git ls-files -u -- f.txt)" ] ||
+    fail_test "the fixture conflicts, so it never exercises a merged comparison"
 
   output=$("$subject" audit "$stack_base" "$pre" 2>/dev/null)
   status=$?
