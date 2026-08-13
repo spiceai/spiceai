@@ -271,7 +271,7 @@ async fn mock_enroll(
     }
     // The real cloud reports the region now stored on the row: the declared
     // one when the request carried it, otherwise whatever the row already
-    // held (a re-enrol with no `region` leaves it alone). The mock stands in
+    // held (a re-enroll with no `region` leaves it alone). The mock stands in
     // for that stored value.
     let stored_region = match body["region"].as_str() {
         Some(region) => {
@@ -1718,8 +1718,8 @@ async fn one_shot_enroll_records_the_declared_region() {
     );
 }
 
-/// Omitting `--region` on a re-enrol must leave the stored region alone.
-/// Re-enrolment is how a standalone instance recovers past its renewal grace
+/// Omitting `--region` on a re-enroll must leave the stored region alone.
+/// Re-enrollment is how a standalone instance recovers past its renewal grace
 /// window, so a request that unconditionally wrote the region would erase one
 /// set in the portal on every recovery.
 #[tokio::test]
@@ -1770,7 +1770,7 @@ async fn re_enroll_without_a_region_leaves_the_stored_region_untouched() {
     assert_eq!(
         second.registration.region.as_deref(),
         Some("us-west-2"),
-        "the region set by the first enroll must survive the re-enrol"
+        "the region set by the first enroll must survive the re-enroll"
     );
 }
 

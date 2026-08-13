@@ -1479,7 +1479,7 @@ mod connect {
 
     /// Omitting `--region` must send no `region` field at all. `null` would be
     /// read cloud-side as "clear it", silently erasing a region set in the
-    /// portal on every re-enrol.
+    /// portal on every re-enroll.
     #[cfg(unix)]
     #[test]
     fn test_connect_without_region_omits_the_field() {
