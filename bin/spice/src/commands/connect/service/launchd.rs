@@ -250,6 +250,9 @@ fn install(request: &InstallRequest<'_>) -> Result<InstalledService> {
         config_dir,
         spiced_path,
         scope,
+        // The launchd install gates on the job staying up rather than on the
+        // instance answering; the health gate arrives with its lifecycle.
+        health_url: _,
     } = *request;
 
     let account = super::service_account(instance_dir)?;
