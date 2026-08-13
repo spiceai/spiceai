@@ -336,16 +336,9 @@ jobs:
           fi
           echo "Seed complete: $DB_NAME on $PGHOST."
 
-      # Postgres-accelerator spicepods (file[parquet]-postgres, s3[parquet]-postgres,
-      # ...) write into a dedicated database on POSTGRES_RW_HOST (pg_db:
-      # *_accelerated). The accelerator creates its own tables but not the database
-      # itself, and the local postgres:16 service container starts empty - so every
-      # *_accelerated database the spicepod names must be created before spiced
-      # starts, or dataset acceleration fails with "database ... does not exist".
-      # Idempotent, and no schema is loaded: the accelerator manages its own tables.
-      # PGHOST must resolve identically to the POSTGRES_RW_HOST the benchmark step
-      # hands the spicepod (local container for SF1/SF10 and the clickbench
-      # acceleration run; the hosted cluster otherwise).
+      # Postgres-accelerator spicepods need a *_accelerated database that the
+      # empty postgres:16 container doesn't have yet - create it before spiced
+      # starts (idempotent), matching the PGHOST the spicepod will connect to.
       - name: Create postgres acceleration databases
         if: ${{ contains(github.event.inputs.spicepod_path, 'postgres') && !contains(github.event.inputs.spicepod_path, 'ducklake') }}
         env:
