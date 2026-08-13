@@ -215,6 +215,44 @@ start_test "audit fails loudly on an unusable revision instead of reporting clea
   esac
 ) || failures=$((failures + 1))
 
+start_test "audit fails loudly when the index cannot be read, rather than saying clean"
+(
+  new_stack "$work_root/badindex"
+  printf 'old\n' > keep.txt && commit_all "fork point"
+  git checkout --quiet -b parent
+  printf 'registry\n' > registry.rs && commit_all "parent adds registry.rs"
+  stack_base=$(git rev-parse HEAD)
+  git checkout --quiet -b child
+  git rm --quiet registry.rs && commit_all "child deletes registry.rs"
+  pre=$(git rev-parse HEAD)
+  squash_parent_onto_trunk
+  git checkout --quiet child
+  git merge --no-ff --no-commit trunk >/dev/null 2>&1
+
+  # A `git` whose `ls-files` fails the way a damaged index does. Treating that as
+  # "not in the index" would report a clean audit for a child whose entire
+  # contribution is a deletion — precisely the miss this guards against.
+  stub_dir="$work_root/badindex_stub"
+  mkdir -p "$stub_dir"
+  real_git=$(command -v git)
+  cat >"$stub_dir/git" <<STUB
+#!/usr/bin/env bash
+if [ "\$1" = "ls-files" ]; then
+  echo "fatal: index file corrupt" >&2
+  exit 128
+fi
+exec "$real_git" "\$@"
+STUB
+  chmod +x "$stub_dir/git"
+
+  output=$(PATH="$stub_dir:$PATH" "$subject" audit "$stack_base" "$pre" 2>&1)
+  status=$?
+  [ "$status" -ne 0 ] || fail_test "an unreadable index exited 0"
+  case "$output" in
+    *"audit clean"*) fail_test "an unreadable index reported a clean audit: $output" ;;
+  esac
+) || failures=$((failures + 1))
+
 start_test "resolve refuses a symlink rather than writing through it"
 (
   new_stack "$work_root/symlink"

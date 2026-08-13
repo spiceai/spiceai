@@ -149,6 +149,22 @@ resolve_with_tmp() {
   return 2
 }
 
+# Is the path in the index? 0 yes, 1 no -- and anything else is a broken
+# repository rather than an answer. `git ls-files --error-unmatch` returns 1 for
+# an absent path but 128 for a fatal problem such as an unreadable index, and
+# reading that as "absent" would report `audit clean` for a child whose work is
+# entirely deletions: the same false negative the audit exists to prevent.
+path_in_index() {
+  local candidate="$1" status
+  git ls-files --error-unmatch -- ":(literal)$candidate" >/dev/null 2>&1
+  status=$?
+  case "$status" in
+    0) return 0 ;;
+    1) return 1 ;;
+    *) die "git ls-files failed with status $status while checking $candidate" ;;
+  esac
+}
+
 # Exit status: 0 if the merge did what the child intended, 1 otherwise.
 #
 # The comparison is against the pre-merge tip, and membership is tested in the
@@ -194,14 +210,14 @@ cmd_audit() {
   local findings=0 path
 
   while IFS= read -r -d '' path; do
-    if git ls-files --error-unmatch -- ":(literal)$path" >/dev/null 2>&1; then
+    if path_in_index "$path"; then
       echo "RESURRECTED $path"
       findings=$((findings + 1))
     fi
   done < "$tmp/deleted"
 
   while IFS= read -r -d '' path; do
-    if ! git ls-files --error-unmatch -- ":(literal)$path" >/dev/null 2>&1; then
+    if ! path_in_index "$path"; then
       echo "LOST $path"
       findings=$((findings + 1))
     fi
