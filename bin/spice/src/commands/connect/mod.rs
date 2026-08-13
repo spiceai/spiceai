@@ -265,7 +265,7 @@ async fn connect_existing(
     install: bool,
     endpoint: Option<&str>,
 ) -> Result<()> {
-    if config_dir.join(IDENTITY_FILE).exists() {
+    if has_enrolled_identity(config_dir)? {
         if install {
             // The `--install`-after-a-prior-enroll path, and the in-place
             // upgrade path when a service is already installed.
@@ -285,6 +285,19 @@ async fn connect_existing(
             instance_dir_for(config_dir).display()
         ),
     })
+}
+
+/// Whether this directory holds a usable enrolled identity.
+///
+/// Existence alone is not enough: installing a service over a malformed or
+/// unreadable identity would report success, but every `spiced` restart would
+/// reject that identity and run without Cloud Connect.
+fn has_enrolled_identity(config_dir: &Path) -> Result<bool> {
+    runtime_cloud_connect::identity::IdentityStore::load_optional(&config_dir.join(IDENTITY_FILE))
+        .map(|identity| identity.is_some())
+        .map_err(|e| Error::CloudConnectIo {
+            message: format!("load identity: {e}"),
+        })
 }
 
 /// Install (or reinstall) the service for this instance directory and report
@@ -775,6 +788,17 @@ mod tests {
             instance_dir_for(Path::new("/var/lib/spice-state")),
             PathBuf::from("/var/lib/spice-state")
         );
+    }
+
+    #[test]
+    fn a_malformed_identity_is_not_accepted_as_enrolled_state() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        std::fs::write(dir.path().join(IDENTITY_FILE), "not valid JSON")
+            .expect("write malformed identity");
+
+        let error = has_enrolled_identity(dir.path())
+            .expect_err("a malformed identity must not enable service installation");
+        assert!(error.to_string().contains("load identity"), "{error}");
     }
 
     #[test]

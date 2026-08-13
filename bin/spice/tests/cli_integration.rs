@@ -834,6 +834,22 @@ mod connect {
                 .stderr(predicate::str::contains("unexpected argument"));
         }
     }
+
+    #[test]
+    fn install_rejects_a_malformed_persisted_identity_before_service_setup() {
+        let config_dir = TempDir::new().expect("create config directory");
+        fs::write(config_dir.path().join("identity.json"), "not valid JSON")
+            .expect("write malformed identity");
+
+        spice_cmd()
+            .env("SPICE_CONFIG_DIR", config_dir.path())
+            .arg("connect")
+            .arg("--install")
+            .assert()
+            .failure()
+            .stdout(predicate::str::contains("load identity"))
+            .stdout(predicate::str::contains("not valid JSON").not());
+    }
 }
 
 // ============================================================================
