@@ -140,13 +140,15 @@ impl CayennePhysicalOptimizerRules {
     const ANTI_JOIN_SORT_MERGE: u8 = 1 << 2;
     const EXACT_JOIN_FILTER: u8 = 1 << 3;
     const STATS_AGGREGATE: u8 = 1 << 4;
+    const DEDUP_FILTER_CONJUNCTS: u8 = 1 << 5;
 
     const fn auto_enabled() -> Self {
         Self {
             enabled_rules: Self::DYNAMIC_FILTER_SHARING
                 | Self::MAINTAINED_AGGREGATE
                 | Self::ANTI_JOIN_SORT_MERGE
-                | Self::STATS_AGGREGATE,
+                | Self::STATS_AGGREGATE
+                | Self::DEDUP_FILTER_CONJUNCTS,
         }
     }
 
@@ -156,7 +158,8 @@ impl CayennePhysicalOptimizerRules {
                 | Self::MAINTAINED_AGGREGATE
                 | Self::ANTI_JOIN_SORT_MERGE
                 | Self::EXACT_JOIN_FILTER
-                | Self::STATS_AGGREGATE,
+                | Self::STATS_AGGREGATE
+                | Self::DEDUP_FILTER_CONJUNCTS,
         }
     }
 
@@ -320,6 +323,19 @@ impl CayenneOptimizerRules {
     pub fn set_exact_join_filter(&mut self, enabled: bool) {
         self.physical
             .set(CayennePhysicalOptimizerRules::EXACT_JOIN_FILTER, enabled);
+    }
+
+    #[must_use]
+    pub const fn dedup_filter_conjuncts(self) -> bool {
+        self.physical
+            .is_enabled(CayennePhysicalOptimizerRules::DEDUP_FILTER_CONJUNCTS)
+    }
+
+    pub fn set_dedup_filter_conjuncts(&mut self, enabled: bool) {
+        self.physical.set(
+            CayennePhysicalOptimizerRules::DEDUP_FILTER_CONJUNCTS,
+            enabled,
+        );
     }
 }
 
@@ -1038,12 +1054,14 @@ impl DataFusionBuilder {
             } else {
                 let _ = exact_join_filter_memory_limit;
             }
-            // Registered last among the Cayenne rules above (and after
-            // DataFusion's own `ProjectionPushdown`/`FilterPushdown`, which run
-            // as part of the default rule set already in `state`) so it cleans
-            // up a duplicated `FilterExec` predicate regardless of which
-            // upstream rewrite produced it.
-            state = state.with_physical_optimizer_rule(Arc::new(CayenneDedupFilterConjuncts));
+            if self.cayenne_optimizer_rules.dedup_filter_conjuncts() {
+                // Registered last among the Cayenne rules above (and after
+                // DataFusion's own `ProjectionPushdown`/`FilterPushdown`, which
+                // run as part of the default rule set already in `state`) so it
+                // cleans up a duplicated `FilterExec` predicate regardless of
+                // which upstream rewrite produced it.
+                state = state.with_physical_optimizer_rule(Arc::new(CayenneDedupFilterConjuncts));
+            }
         }
         #[cfg(windows)]
         let _ = exact_join_filter_memory_limit;
@@ -2617,8 +2635,9 @@ mod tests {
                 "CayenneMaintainedAggregateRewriter",
                 "CayenneStatsAggregateRewriter",
                 "CayenneAntiJoinSortMergeRewriter",
+                "CayenneDedupFilterConjuncts",
             ],
-            "Default Cayenne physical optimizer selection should preserve prior safe defaults (now including the metadata-only stats aggregate fold) without re-enabling the exact join filter"
+            "Default Cayenne physical optimizer selection should preserve prior safe defaults (now including the metadata-only stats aggregate fold and the redundant-filter cleanup) without re-enabling the exact join filter"
         );
     }
 
@@ -2725,6 +2744,8 @@ mod tests {
         anti_join_sort_merge.set_anti_join_sort_merge(true);
         let mut exact_join_filter = CayenneOptimizerRules::none();
         exact_join_filter.set_exact_join_filter(true);
+        let mut dedup_filter_conjuncts = CayenneOptimizerRules::none();
+        dedup_filter_conjuncts.set_dedup_filter_conjuncts(true);
 
         let cases = [
             (
@@ -2769,6 +2790,11 @@ mod tests {
                 vec!["CayenneAntiJoinSortMergeRewriter"],
             ),
             (exact_join_filter, vec![], vec!["CayenneJoinRewriter"]),
+            (
+                dedup_filter_conjuncts,
+                vec![],
+                vec!["CayenneDedupFilterConjuncts"],
+            ),
         ];
 
         for (rules, expected_logical_rules, expected_physical_rules) in cases {

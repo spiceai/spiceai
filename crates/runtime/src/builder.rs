@@ -1904,6 +1904,9 @@ fn parse_cayenne_optimizer_rules(
             "stats_aggregate" | "metadata_aggregate" | "aggregate_pushdown" => {
                 rules.set_stats_aggregate(true);
             }
+            "dedup_filter_conjuncts" | "dedup_filter" | "filter_dedup" => {
+                rules.set_dedup_filter_conjuncts(true);
+            }
             _ => {
                 // Don't discard the rest of an explicit list because of one bad
                 // token; collect the unknown ones, keep the recognized rules,
@@ -3256,6 +3259,23 @@ mod test {
                 false,
             ),
             stats_aggregate_only
+        );
+
+        // `dedup_filter_conjuncts` is on under both `auto` and `all`, and is also
+        // selectable by token (including its aliases) without enabling anything else.
+        assert!(CayenneOptimizerRules::auto_enabled().dedup_filter_conjuncts());
+        assert!(CayenneOptimizerRules::all_enabled().dedup_filter_conjuncts());
+        let mut dedup_filter_conjuncts_only = CayenneOptimizerRules::none();
+        dedup_filter_conjuncts_only.set_dedup_filter_conjuncts(true);
+        assert_eq!(
+            parse_cayenne_optimizer_rules(
+                &HashMap::from([(
+                    CAYENNE_OPTIMIZER_RULES_PARAM.to_string(),
+                    "filter-dedup".to_string(),
+                )]),
+                false,
+            ),
+            dedup_filter_conjuncts_only
         );
 
         assert_eq!(
