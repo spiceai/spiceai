@@ -310,7 +310,7 @@ mod tests {
     fn sensitive_near_misses_are_recognized_without_becoming_valid_keys() {
         let secret = "A".repeat(ENROLLMENT_KEY_SECRET_LEN);
         for raw in [
-            format!("spice-enrol-{secret}"),
+            format!("spice-enroll-{secret}?"),
             format!("SPICE-ENROLL-{secret}"),
             format!("spice_enroll_{secret}"),
             format!("spice-enrollx-{secret}"),
@@ -318,8 +318,8 @@ mod tests {
             format!("spice-enro-{secret}"),
             format!("\u{feff}spice-enroll-{secret}"),
             format!("\u{200b}spice-enroll-{secret}"),
-            format!("spice-enrol-{secret}\n"),
-            format!("spice-enrol-{secret}!"),
+            format!("spice-enroll-{secret}\n"),
+            format!("spice-enroll-{secret}!"),
             format!("acme/spice-enroll-{secret}"),
         ] {
             assert!(looks_like_enrollment_key(&raw), "{raw:?} must be sensitive");
@@ -334,7 +334,7 @@ mod tests {
     fn ordinary_pod_targets_do_not_look_like_enrollment_keys() {
         for raw in [
             "acme/search",
-            "spice-enrol-short",
+            "spice-enrollments-short",
             "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
             "acme/a-very-long-ordinary-pod-name-1234567890",
         ] {

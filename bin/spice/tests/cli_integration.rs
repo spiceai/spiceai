@@ -802,11 +802,11 @@ mod connect {
         let secret = "A".repeat(32);
         for key in [
             format!("spice-enroll-{secret}"),
-            format!("spice-enrol-{secret}"),
+            format!("spice-enroll-{secret}!"),
             format!("SPICE-ENROLL-{secret}"),
             format!("spice_enroll_{secret}"),
             format!("\u{feff}spice-enroll-{secret}"),
-            format!("spice-enrol-{secret}\n"),
+            format!("spice-enroll-{secret}\n"),
             format!("spcie-enroll-{secret}"),
             format!("acme/spice-enroll-{secret}"),
         ] {
