@@ -469,8 +469,15 @@ audit_addition() {
   [ -n "$staged_entry" ] && [ -n "$mine_entry" ] || return 0
 
   if [ -n "$theirs_entry" ] && [ "$mine_entry" != "$theirs_entry" ]; then
-    accept_or_review "$path" "you and trunk each added this path differently, which nothing has decided"
-    return $?
+    # Unless trunk's entry is just what the stack base had -- a directory the
+    # child replaced with a file, say. Then trunk competes with nothing and the
+    # child's version wins outright, so a result without it is a plain loss.
+    local base_here
+    base_here=$(tree_entry "$stack_base" "$path") || die "could not read $stack_base:$path"
+    if [ "$theirs_entry" != "$base_here" ]; then
+      accept_or_review "$path" "you and trunk each added this path differently, which nothing has decided"
+      return $?
+    fi
   fi
   if [ "$staged_entry" != "$mine_entry" ]; then
     echo "DISCARDED $path: the staged version is not the one you added"
@@ -519,6 +526,14 @@ audit_modification() {
   # Reported by the index-wide scan, which also catches paths the child never
   # touched. Acceptance cannot apply: nothing has been staged to accept.
   [ -z "$unmerged" ] || return 0
+  # A directory where the other side has a file cannot be three-way merged at all:
+  # reading it as a blob aborts, and calling either choice deterministic is wrong.
+  if [ "${theirs_entry%% *}" = 040000 ] || [ "${mine_entry%% *}" = 040000 ] ||
+     [ "${base_entry%% *}" = 040000 ]; then
+    accept_or_review "$path" "one side has a directory where the other has a file, which nothing has decided"
+    return $?
+  fi
+
   if [ -z "$theirs_entry" ]; then
     # You changed it, trunk deleted it. From the stack base that is a
     # modify/delete conflict; from the older base the deletion applies unopposed.
@@ -763,7 +778,7 @@ cmd_audit() {
     rm -rf "$tmp"
     die "could not read unmerged entries from the index"
   fi
-  local record last_unmerged="" theirs_now base_now theirs_add mine_add theirs_here collision_ancestor trunk_blocker base_blocker
+  local record last_unmerged="" theirs_now base_now theirs_add mine_add base_add theirs_here collision_ancestor trunk_blocker base_blocker
   while IFS= read -r -d '' record; do
     path=${record#*$'\t'}
     [ "$path" = "$last_unmerged" ] && continue
@@ -841,9 +856,12 @@ cmd_audit() {
         mine_add=$(tree_entry "$pre" "$path") || die "could not read $pre:$path"
       fi
       if [ -n "$theirs_add" ] && [ "$theirs_add" != "$mine_add" ]; then
-        accept_or_review "$path" "you and trunk each added this path differently, and the result has neither" ||
-          findings=$((findings + 1))
-        continue
+        base_add=$(tree_entry "$stack_base" "$path") || die "could not read $stack_base:$path"
+        if [ "$theirs_add" != "$base_add" ]; then
+          accept_or_review "$path" "you and trunk each added this path differently, and the result has neither" ||
+            findings=$((findings + 1))
+          continue
+        fi
       fi
       if [ -n "$other" ] && blocking_ancestor "$other" "$path"; then
         # Only if trunk introduced or changed that blocker. One the stack base

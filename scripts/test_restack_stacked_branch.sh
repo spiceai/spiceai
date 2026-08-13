@@ -730,6 +730,79 @@ start_test "audit reports a collision when the merge kept your addition instead"
   esac
 ) || failures=$((failures + 1))
 
+start_test "audit reports a lost directory-to-file replacement as a loss"
+(
+  new_stack "$work_root/dir_to_file"
+  printf 'seed\n' > seed.txt && commit_all "fork point"
+  git checkout --quiet -b parent
+  mkdir -p thing && printf 'inside\n' > thing/inner && commit_all "parent adds a directory"
+  stack_base=$(git rev-parse HEAD)
+  git checkout --quiet -b child
+  git rm --quiet -r thing && printf 'now a file\n' > thing && commit_all "child makes it a file"
+  pre=$(git rev-parse HEAD)
+  squash_parent_onto_trunk
+  git checkout --quiet child
+  git merge --no-ff --no-commit trunk >/dev/null 2>&1
+  # A wrong resolution that keeps trunk's directory. Trunk never changed it, so
+  # from the stack base the child's file wins and this is a loss.
+  git rm --quiet --cached thing >/dev/null 2>&1 || true
+  rm -rf thing && mkdir -p thing && printf 'inside\n' > thing/inner && git add thing
+  for artifact in 'thing~trunk' 'thing~HEAD'; do
+    git rm --quiet --cached -- "$artifact" >/dev/null 2>&1 || true
+    rm -rf -- "$artifact"
+  done
+  [ -z "$(git ls-files -u)" ] || fail_test "the fixture left something unmerged: $(git ls-files -u)"
+
+  output=$("$subject" audit "$stack_base" "$pre" --trunk trunk --accept thing 2>/dev/null)
+  status=$?
+  [ "$status" -ne 0 ] || fail_test "--accept excused a lost replacement: $output"
+  case "$output" in
+    *"LOST thing"*) ;;
+    *) fail_test "expected a plain loss, got: $output" ;;
+  esac
+) || failures=$((failures + 1))
+
+start_test "audit survives trunk turning a file the child edited into a directory"
+(
+  new_stack "$work_root/file_to_dir"
+  printf 'a\nb\nc\n' > thing && commit_all "fork point"
+  git checkout --quiet -b parent
+  printf 'a\nPARENT\nc\n' > thing && commit_all "parent edits it"
+  stack_base=$(git rev-parse HEAD)
+  git checkout --quiet -b child
+  printf 'a\nCHILD\nc\n' > thing && commit_all "child edits it"
+  pre=$(git rev-parse HEAD)
+  squash_parent_onto_trunk
+  git rm --quiet thing && mkdir -p thing && printf 'inside\n' > thing/inner &&
+    commit_all "trunk turns it into a directory"
+  git checkout --quiet child
+  git merge --no-ff --no-commit trunk >/dev/null 2>&1
+  # Settle it by keeping trunk's directory, as a reviewer might.
+  git rm --quiet --cached thing >/dev/null 2>&1 || true
+  rm -rf thing && mkdir -p thing && printf 'inside\n' > thing/inner && git add thing
+  for artifact in 'thing~trunk' 'thing~HEAD'; do
+    git rm --quiet --cached -- "$artifact" >/dev/null 2>&1 || true
+    rm -rf -- "$artifact"
+  done
+  [ -z "$(git ls-files -u)" ] || fail_test "the fixture left something unmerged: $(git ls-files -u)"
+
+  # A directory where the child has a file cannot be three-way merged: reading it
+  # as a blob would abort, and neither choice is deterministic.
+  output=$("$subject" audit "$stack_base" "$pre" --trunk trunk 2>&1)
+  status=$?
+  case "$output" in
+    *"fatal"*|*"cat-file"*) fail_test "the audit crashed on a directory: $output" ;;
+  esac
+  [ "$status" -ne 0 ] || fail_test "a file-versus-directory conflict was reported clean: $output"
+  case "$output" in
+    *"REVIEW thing"*) ;;
+    *) fail_test "expected a decision, got: $output" ;;
+  esac
+  output=$("$subject" audit "$stack_base" "$pre" --trunk trunk --accept thing 2>/dev/null)
+  status=$?
+  [ "$status" -eq 0 ] || fail_test "the resolution could not be accepted: $output"
+) || failures=$((failures + 1))
+
 start_test "audit will not let a pre-existing blocker excuse a lost replacement"
 (
   new_stack "$work_root/blocker_unchanged"
