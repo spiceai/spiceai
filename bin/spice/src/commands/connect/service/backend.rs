@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 
 use super::model::{LogSource, ServiceScope, ServiceStarts, ServiceState, Supervisor};
 use super::{InstalledService, PreflightFailure, manifest::ServiceManifest};
-use crate::error::{Error, Result};
+use crate::error::Result;
 
 /// What an install needs to know, resolved by the caller so the back end
 /// never derives a path from the environment.
@@ -44,6 +44,9 @@ pub(crate) struct InstallRequest<'a> {
     pub(crate) spiced_path: &'a Path,
     /// The service domain to install into.
     pub(crate) scope: ServiceScope,
+    /// Where this instance answers a health probe, so an install can prove the
+    /// service it just started is actually serving before it reports success.
+    pub(crate) health_url: &'a str,
 }
 
 /// One fresh reading of what the supervisor says about a service.
@@ -183,15 +186,15 @@ pub(crate) trait ServiceBackend {
 ///
 /// A typed error rather than a panic: the CLI has to exit with a diagnosis and
 /// a non-zero status, and a caller that reaches an unfinished path should
-/// degrade rather than abort. The grammar, manifest, and status model land
-/// first so the systemd and launchd lifecycle work has one interface to fill
-/// in.
+/// degrade rather than abort. Compiled only where a back end still has
+/// operations to fill in, so the day none does the compiler says so.
+#[cfg(target_os = "macos")]
 pub(crate) fn lifecycle_pending(
     backend: &dyn ServiceBackend,
     action: &str,
     manifest: &ServiceManifest,
-) -> Error {
-    Error::NotImplemented {
+) -> crate::error::Error {
+    crate::error::Error::NotImplemented {
         message: format!(
             "Failed to {action} the Spice Cloud Connect service {name} ({supervisor}): \
              {supervisor} lifecycle control is not available in this release. \
