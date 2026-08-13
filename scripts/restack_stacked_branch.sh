@@ -30,7 +30,7 @@
 # Usage:
 #   scripts/restack_stacked_branch.sh stack-base <parent-pr>
 #   scripts/restack_stacked_branch.sh resolve <stack-base> <path>
-#   scripts/restack_stacked_branch.sh audit <stack-base> <pre-merge-tip>
+#   scripts/restack_stacked_branch.sh audit <stack-base> <pre-merge-tip> [--accept <path>]...
 
 set -uo pipefail
 
@@ -97,7 +97,13 @@ cmd_resolve() {
     local quoted
     quoted=$(printf '%q' ":(literal)$path")
     echo "MANUAL $path: ours=${ours_mode:-none} theirs=${theirs_mode:-none} (mode, symlink, or missing stage)"
-    echo "  take one side whole: git checkout --ours -- $quoted && git add -- $quoted"
+    if [ -z "$ours_mode" ]; then
+      # There is no --ours entry to check out; the child deleted this path, so
+      # the command that keeps the child's side is a removal.
+      echo "  keep your deletion: git rm -- $quoted"
+    else
+      echo "  take one side whole: git checkout --ours -- $quoted && git add -- $quoted"
+    fi
     return 2
   fi
 
@@ -218,6 +224,42 @@ index_entry() {
   printf '%s\n' "$out" | awk '$3 == 0 { print $1 " " $2 }'
 }
 
+# Was this path explicitly accepted by a person on the command line?
+path_accepted() {
+  [ -n "$2" ] || return 1
+  printf '%s' "$2" | grep -Fxq -- "$1"
+}
+
+# A path the child added needs its content checked, not only its presence. If
+# trunk added the same path with different content, the merge from the stack
+# base is an add/add conflict -- but from the older fork point, where the file
+# still existed, git can combine both sides' edits and call it resolved.
+audit_addition() {
+  local path="$1" pre="$2" other="$3" accepted="$4"
+  if path_accepted "$path" "$accepted"; then
+    echo "ACCEPTED $path"
+    return 0
+  fi
+
+  local staged_entry mine_entry theirs_entry
+  staged_entry=$(index_entry "$path") || die "could not read the index entry for $path"
+  mine_entry=$(tree_entry "$pre" "$path") || die "could not read $pre:$path"
+  theirs_entry=$(tree_entry "$other" "$path") || die "could not read $other:$path"
+
+  # No stage 0 means an open conflict somebody is already looking at.
+  [ -n "$staged_entry" ] && [ -n "$mine_entry" ] || return 0
+
+  if [ -n "$theirs_entry" ] && [ "$mine_entry" != "$theirs_entry" ]; then
+    echo "REVIEW $path: you and trunk each added this path differently, which nothing has decided"
+    return 1
+  fi
+  if [ "$staged_entry" != "$mine_entry" ]; then
+    echo "DISCARDED $path: the staged version is not the one you added"
+    return 1
+  fi
+  return 0
+}
+
 # Does the staged result for one path match what a merge based on the stack base
 # would have produced? Prints a finding and returns 1 if not.
 #
@@ -227,7 +269,11 @@ index_entry() {
 # matches neither side -- so the comparison has to be against the correct merge,
 # not against either input.
 audit_modification() {
-  local path="$1" stack_base="$2" pre="$3" other="$4" tmp="$5"
+  local path="$1" stack_base="$2" pre="$3" other="$4" tmp="$5" accepted="$6"
+  if path_accepted "$path" "$accepted"; then
+    echo "ACCEPTED $path"
+    return 0
+  fi
   local staged_entry mine_entry theirs_entry base_entry
   staged_entry=$(index_entry "$path") || die "could not read the index entry for $path"
   mine_entry=$(tree_entry "$pre" "$path") || die "could not read $pre:$path"
@@ -320,7 +366,27 @@ audit_modification() {
 # backslash, or non-ASCII byte, and that quoted string names no file.
 cmd_audit() {
   local stack_base="${1:-}" pre="${2:-}"
-  [ -n "$stack_base" ] && [ -n "$pre" ] || die "usage: audit <stack-base> <pre-merge-tip>"
+  [ -n "$stack_base" ] && [ -n "$pre" ] || die "usage: audit <stack-base> <pre-merge-tip> [--accept <path>]..."
+  shift 2
+
+  # A path this reports as REVIEW stays reported: the inputs do not change when
+  # you resolve it, so re-running would keep failing and the "run it again until
+  # it is clean" loop could never end for a genuine conflict. --accept records
+  # that a person decided this path, which is the one thing the audit cannot
+  # infer -- git's silent old-base resolution and a considered human one look
+  # identical in the index.
+  local accepted=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --accept)
+        shift
+        [ -n "${1:-}" ] || die "--accept needs a path"
+        accepted="${accepted}${1}"$'\n'
+        shift
+        ;;
+      *) die "unknown option for audit: $1" ;;
+    esac
+  done
 
   # Both revisions are checked first, and each diff is written to a file whose
   # exit status is tested, because a process substitution discards it: a
@@ -355,6 +421,17 @@ cmd_audit() {
     die "could not diff $stack_base..$pre for modifications"
   fi
 
+  local other incomplete=0
+  if ! other=$(merge_other_side "$pre"); then
+    # Outside a merge there is no other side to compare against, so the question
+    # this command answers -- did the merge do what you intended -- has no answer
+    # yet. Callers gate on the exit status, so it must not be success: a partial
+    # audit reporting clean is the failure this whole helper is arguing against.
+    echo "INCOMPLETE: no merge in progress or committed, so only additions and deletions were checked"
+    incomplete=1
+    other=""
+  fi
+
   local findings=0 path
 
   while IFS= read -r -d '' path; do
@@ -368,7 +445,10 @@ cmd_audit() {
     if ! path_in_index "$path"; then
       echo "LOST $path"
       findings=$((findings + 1))
+      continue
     fi
+    [ -n "$other" ] || continue
+    audit_addition "$path" "$pre" "$other" "$accepted" || findings=$((findings + 1))
   done < "$tmp/added"
 
   # A modification disappears by the same mechanism as a deletion, and just as
@@ -377,18 +457,8 @@ cmd_audit() {
   # keeps trunk's version. Neither filter above lists such a path -- it is a
   # modification, and its content is simply gone.
   #
-  local other incomplete=0
-  if ! other=$(merge_other_side "$pre"); then
-    # Outside a merge there is no other side to compare against, so the question
-    # this command answers -- did the merge do what you intended -- has no answer
-    # yet. Callers gate on the exit status, so it must not be success: a partial
-    # audit reporting clean is the failure this whole helper is arguing against.
-    echo "INCOMPLETE: no merge in progress or committed, so only additions and deletions were checked"
-    incomplete=1
-    other=""
-  fi
   while [ -n "$other" ] && IFS= read -r -d '' path; do
-    audit_modification "$path" "$stack_base" "$pre" "$other" "$tmp" ||
+    audit_modification "$path" "$stack_base" "$pre" "$other" "$tmp" "$accepted" ||
       findings=$((findings + 1))
   done < "$tmp/modified"
 

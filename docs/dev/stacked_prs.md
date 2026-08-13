@@ -230,6 +230,14 @@ result that matches neither side. `REVIEW` is the case where that correct merge 
 git resolved the path without asking only because it used the older base, so nobody has
 actually decided what belongs there.
 
+Resolving a `REVIEW` path does not change what the audit sees — the inputs are the same
+commits either way, and a considered decision looks exactly like git's silent one in the
+index. Say so explicitly once you have made the call, so the re-run can finish:
+
+```bash
+scripts/restack_stacked_branch.sh audit "$STACKBASE" "$PRE" --accept <path>
+```
+
 Two properties are worth knowing, because both were bugs that reported success:
 
 - It compares against `$PRE`, the pre-merge tip. A resurrected file is no longer a

@@ -217,6 +217,86 @@ start_test "audit reports a partial loss, where the result matches neither side"
   esac
 ) || failures=$((failures + 1))
 
+start_test "audit reports an add/add the older base merged for you"
+(
+  new_stack "$work_root/addadd"
+  printf 'l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\n' > f.txt && commit_all "fork point"
+  git checkout --quiet -b parent
+  git rm --quiet f.txt && commit_all "parent deletes it"
+  stack_base=$(git rev-parse HEAD)
+  git checkout --quiet -b child
+  printf 'l1\nCHILD\nl3\nl4\nl5\nl6\nl7\nl8\n' > f.txt && commit_all "child brings it back, edited"
+  pre=$(git rev-parse HEAD)
+  squash_parent_onto_trunk
+  printf 'l1\nl2\nl3\nl4\nl5\nl6\nTRUNK\nl8\n' > f.txt && commit_all "trunk brings it back differently"
+  git checkout --quiet child
+  git merge --no-ff --no-commit trunk >/dev/null 2>&1
+
+  # From the fork point the file still existed, so git treats these as two edits
+  # to one file and combines them. From the stack base, where the parent had
+  # deleted it, both sides add the same path and nothing has decided which wins.
+  output=$("$subject" audit "$stack_base" "$pre" 2>/dev/null)
+  case "$output" in
+    *"REVIEW f.txt"*) ;;
+    *) fail_test "a divergent add/add was not reported: $output" ;;
+  esac
+) || failures=$((failures + 1))
+
+start_test "audit accepts a path a person decided, so the re-run loop can finish"
+(
+  new_stack "$work_root/accept"
+  printf 'l1\nl2\nl3\n' > f.txt && commit_all "fork point"
+  git checkout --quiet -b parent
+  printf 'l1\nPARENT\nl3\n' > f.txt && commit_all "parent edits line 2"
+  stack_base=$(git rev-parse HEAD)
+  git checkout --quiet -b child
+  printf 'l1\nCHILD\nl3\n' > f.txt && commit_all "child edits line 2 too"
+  pre=$(git rev-parse HEAD)
+  squash_parent_onto_trunk
+  printf 'l1\nTRUNK\nl3\n' > f.txt && commit_all "trunk edits line 2 as well"
+  git checkout --quiet child
+  git merge --no-ff --no-commit trunk >/dev/null 2>&1
+  # Resolve it the way a person would, and stage that decision.
+  printf 'l1\nDECIDED BY A HUMAN\nl3\n' > f.txt && git add f.txt
+
+  output=$("$subject" audit "$stack_base" "$pre" 2>/dev/null)
+  case "$output" in
+    *"REVIEW f.txt"* | *"DISCARDED f.txt"*) ;;
+    *) fail_test "a hand-resolved conflict was not raised at all: $output" ;;
+  esac
+  # Without a way to accept it the audit could never come back clean, so the
+  # documented "re-run until clean" loop would not terminate.
+  output=$("$subject" audit "$stack_base" "$pre" --accept f.txt 2>/dev/null)
+  status=$?
+  [ "$status" -eq 0 ] || fail_test "accepting the path did not clear the audit: $output ($status)"
+  case "$output" in
+    *"ACCEPTED f.txt"*) ;;
+    *) fail_test "the accepted path was not named: $output" ;;
+  esac
+) || failures=$((failures + 1))
+
+start_test "resolve suggests a removal when the child is the side that deleted"
+(
+  new_stack "$work_root/rmadvice"
+  printf 'OLD\n' > p.txt && commit_all "fork point"
+  git checkout --quiet -b parent
+  printf 'PARENT VERSION\n' > p.txt && commit_all "parent rewrites it"
+  stack_base=$(git rev-parse HEAD)
+  git checkout --quiet -b child
+  git rm --quiet p.txt && commit_all "child deletes it"
+  squash_parent_onto_trunk
+  git checkout --quiet child
+  git merge --no-ff --no-commit trunk >/dev/null 2>&1
+
+  output=$("$subject" resolve "$stack_base" p.txt 2>/dev/null)
+  # There is no --ours entry to check out when the child deleted the path, so
+  # advising checkout --ours would hand over a command that cannot work.
+  case "$output" in
+    *"git rm --"*) ;;
+    *) fail_test "expected a removal to be suggested, got: $output" ;;
+  esac
+) || failures=$((failures + 1))
+
 start_test "audit reports a path you changed that trunk deleted"
 (
   new_stack "$work_root/modifydelete"
