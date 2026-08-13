@@ -7,12 +7,25 @@ This benchmark suite tests the performance of different cache implementations wi
 ### Cache Implementations
 
 - **SimpleCache**: Pingora-based simple cache (legacy, baseline)
-- **LruCache**: Moka-based LRU cache with configurable caching policies
+- **LruCache**: the results cache, run against both of its engines
 
-### Caching Policies (LruCache only)
+### Engine / policy combinations (LruCache only)
 
-- **LRU**: Standard Least Recently Used eviction policy
-- **TinyLFU**: Frequency-based admission policy with better hit rates for some workloads
+Benchmarked as named pairs rather than a cartesian product, because not every
+combination is real:
+
+- **moka_lru**: Moka with standard Least Recently Used eviction
+- **moka_tinylfu**: Moka with frequency-based admission — better hit rates on some workloads
+- **pingora_lru**: Pingora-LRU, sharded. Requires `--features pingora`
+
+There is deliberately no `pingora_tinylfu`: Pingora has no TinyLFU admission, so
+requesting it logs a warning and builds an LRU. That arm would re-measure
+`pingora_lru` under a misleading name.
+
+Without `--features pingora`, the Pingora arm is not generated at all. This is
+intentional — with the feature off, requesting the Pingora engine silently falls
+back to Moka, so a bench that included it anyway would publish Moka numbers
+labelled `pingora`.
 
 ### Hash Algorithms (4 variants)
 
@@ -26,6 +39,43 @@ This benchmark suite tests the performance of different cache implementations wi
 - **concurrent_get**: Read-heavy workload (100% reads, pre-populated cache)
 - **concurrent_put**: Write-heavy workload (100% writes)
 - **concurrent_mixed_80_20**: Realistic workload (80% reads, 20% writes)
+- **invalidate_for_table**: Invalidating one table's entries — what an accelerated
+  refresh triggers every cycle, once per dataset
+
+### invalidate_for_table
+
+Entries are spread over 8 tables and one table is invalidated, so the number
+removed stays a fixed share while the cache is sized at 50 / 1k / 10k / 50k
+entries.
+Cost that grows with the *total* rather than with the number of matches is the
+regression this is here to catch: Moka matches through its own index, while the
+Pingora path has no closure-based API and walks every key, reading each value to
+test it.
+
+Timing covers `invalidate_for_table` **and** `checkpoint()`. Moka's
+`invalidate_entries_if` only registers a predicate and applies it during later
+maintenance, so timing the call alone would compare registering a predicate
+against completing a scan. `checkpoint()` forces that deferred work; for Pingora
+the removals are already done and it only settles the weight.
+
+Unlike the throughput benchmarks this one is single-threaded and does not vary
+the hash algorithm — raw-key operations hand the `u64` straight to the backend
+without consulting the hasher, so it cannot move the measurement.
+
+The engines cross over, so a single cache size will not tell you which is
+faster. Measured on an M-series laptop, one table of eight invalidated:
+
+| entries | moka_lru | pingora_lru | ratio |
+| ------: | -------: | ----------: | ----: |
+|      50 |  30.4 µs |     17.7 µs | 0.58x |
+|   1,000 |   178 µs |      237 µs | 1.33x |
+|  10,000 |  1.13 ms |     2.38 ms | 2.10x |
+|  50,000 |  5.39 ms |    18.44 ms | 3.42x |
+
+Below roughly a thousand entries Pingora's scan is cheaper than Moka's predicate
+registration and maintenance pass. Above it the walk dominates and the gap keeps
+widening — 5x the entries costs Moka 4.8x but Pingora 7.8x. Treat a change in
+where that crossover sits as the signal, not any single row.
 
 ## Thread Counts
 
@@ -48,9 +98,13 @@ cargo bench -p cache --bench cache_throughput -- lru_cache
 # Just get operations
 cargo bench -p cache --bench cache_throughput -- concurrent_get
 
-# Specific caching policy
-cargo bench -p cache --bench cache_throughput -- lru
-cargo bench -p cache --bench cache_throughput -- tinylfu
+# Just the invalidation benchmark (needs the feature to include Pingora)
+cargo bench -p cache --features pingora --bench cache_throughput -- invalidate_for_table
+
+# Specific engine / policy pair
+cargo bench -p cache --bench cache_throughput -- moka_lru
+cargo bench -p cache --bench cache_throughput -- moka_tinylfu
+cargo bench -p cache --features pingora --bench cache_throughput -- pingora_lru
 
 # Specific hash algorithm
 cargo bench -p cache --bench cache_throughput -- xxh3
@@ -78,7 +132,7 @@ cargo bench -p cache --bench cache_throughput --features xxhash
 Criterion outputs results like:
 
 ```text
-lru_cache_concurrent_get/lru_xxh3_8threads
+lru_cache_concurrent_get/moka_lru_xxh3_8threads
                         time:   [125.43 ms 126.89 ms 128.52 ms]
                         thrpt:  [623.18 Kelem/s 631.31 Kelem/s 638.52 Kelem/s]
 ```

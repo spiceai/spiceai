@@ -20,7 +20,7 @@ limitations under the License.
 
 use cache::{
     AsTableRefs, CacheMetrics, CacheProvider, EvictionReason, HashBuilder, LruCache, SimpleCache,
-    Sizeable, get_hash_builder,
+    Sizeable, TabledCacheProvider, get_hash_builder,
 };
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use datafusion::sql::TableReference;
@@ -75,6 +75,59 @@ impl AsTableRefs for BenchValue {
     }
 }
 
+/// Number of distinct tables entries are spread over in the invalidation
+/// benchmark. Mirrors a pod serving a handful of accelerated datasets, where a
+/// refresh of one table invalidates only the entries that read it.
+const INVALIDATION_TABLE_COUNT: u64 = 8;
+
+/// A value that reports the table it read, so `invalidate_for_table` can match
+/// it.
+///
+/// [`BenchValue`] reports an empty set, which no table reference matches, so
+/// invalidating against it would walk the cache and remove nothing — timing the
+/// scan but never the removals.
+#[derive(Clone)]
+struct TabledBenchValue {
+    payload: String,
+    tables: Arc<HashSet<TableReference>>,
+}
+
+impl TabledBenchValue {
+    fn new(payload: String, table_idx: u64) -> Self {
+        let mut tables = HashSet::new();
+        tables.insert(TableReference::bare(format!("table_{table_idx}")));
+        Self {
+            payload,
+            tables: Arc::new(tables),
+        }
+    }
+}
+
+impl Sizeable for TabledBenchValue {
+    fn get_memory_size(&self) -> usize {
+        self.payload.len()
+    }
+}
+
+impl CacheMetrics for TabledBenchValue {
+    fn record_hit() {}
+    fn record_miss() {}
+    fn record_request() {}
+    fn record_item_count(_count: u64) {}
+    fn record_size(_size: u64) {}
+    fn record_max_size(_size: u64) {}
+    fn record_eviction(_reason: EvictionReason) {}
+    fn record_stale_rejection() {}
+    fn update_hit_ratio(_hits: u64, _total: u64) {}
+    fn publish_counters_at_zero() {}
+}
+
+impl AsTableRefs for TabledBenchValue {
+    fn as_table_refs(&self) -> Arc<HashSet<TableReference>> {
+        Arc::clone(&self.tables)
+    }
+}
+
 // Get all hash algorithms to benchmark
 fn all_hash_algorithms() -> Vec<(&'static str, HashingAlgorithm)> {
     vec![
@@ -85,12 +138,28 @@ fn all_hash_algorithms() -> Vec<(&'static str, HashingAlgorithm)> {
     ]
 }
 
-// Get all caching policies to benchmark
-fn all_caching_policies() -> Vec<(&'static str, CachingPolicy)> {
-    vec![
-        ("lru", CachingPolicy::Lru),
-        ("tinylfu", CachingPolicy::TinyLfu),
-    ]
+/// The engine/policy combinations worth measuring.
+///
+/// Not a cartesian product of the two: Pingora has no `TinyLFU` admission, so
+/// `LruCache::new` warns and builds an LRU. A `pingora_tinylfu` arm would
+/// re-measure `pingora_lru` under a name claiming otherwise.
+///
+/// Pingora is behind a feature flag, and when it is off `LruCache::new` falls
+/// back to Moka *silently* as far as a benchmark can tell. Gating the arm here
+/// rather than filtering later is what keeps a `cargo bench` without
+/// `--features pingora` from publishing Moka numbers labelled `pingora`.
+fn all_engine_policy_pairs() -> Vec<(&'static str, CacheEngine, CachingPolicy)> {
+    #[cfg_attr(
+        not(feature = "pingora"),
+        expect(unused_mut, reason = "only the pingora arm below pushes")
+    )]
+    let mut pairs = vec![
+        ("moka_lru", CacheEngine::Moka, CachingPolicy::Lru),
+        ("moka_tinylfu", CacheEngine::Moka, CachingPolicy::TinyLfu),
+    ];
+    #[cfg(feature = "pingora")]
+    pairs.push(("pingora_lru", CacheEngine::Pingora, CachingPolicy::Lru));
+    pairs
 }
 
 fn random_value(rng: &mut StdRng) -> String {
@@ -298,7 +367,7 @@ fn bench_lru_cache_concurrent_get(c: &mut Criterion) {
     let handle = rt.handle().clone();
 
     // Benchmark all combinations of caching policy and hash algorithm
-    for (policy_name, policy) in all_caching_policies() {
+    for (pair_name, engine, policy) in all_engine_policy_pairs() {
         for (hash_name, hash_algo) in all_hash_algorithms() {
             let hash_builder = get_hash_builder(hash_algo).expect("Failed to get hash builder");
 
@@ -307,7 +376,7 @@ fn bench_lru_cache_concurrent_get(c: &mut Criterion) {
                     (thread_count * OPERATIONS_PER_THREAD) as u64,
                 ));
 
-                let bench_name = format!("{policy_name}_{hash_name}_{thread_count}threads");
+                let bench_name = format!("{pair_name}_{hash_name}_{thread_count}threads");
 
                 group.bench_with_input(
                     BenchmarkId::from_parameter(&bench_name),
@@ -327,7 +396,7 @@ fn bench_lru_cache_concurrent_get(c: &mut Criterion) {
                                     Duration::from_mins(1),
                                     hash_builder.clone(),
                                     policy,
-                                    CacheEngine::Moka,
+                                    engine,
                                 ));
                                 let mut rng = StdRng::seed_from_u64(42);
                                 handle.block_on(async {
@@ -375,7 +444,7 @@ fn bench_lru_cache_concurrent_put(c: &mut Criterion) {
     let handle = rt.handle().clone();
 
     // Benchmark all combinations of caching policy and hash algorithm
-    for (policy_name, policy) in all_caching_policies() {
+    for (pair_name, engine, policy) in all_engine_policy_pairs() {
         for (hash_name, hash_algo) in all_hash_algorithms() {
             let hash_builder = get_hash_builder(hash_algo).expect("Failed to get hash builder");
 
@@ -384,7 +453,7 @@ fn bench_lru_cache_concurrent_put(c: &mut Criterion) {
                     (thread_count * OPERATIONS_PER_THREAD) as u64,
                 ));
 
-                let bench_name = format!("{policy_name}_{hash_name}_{thread_count}threads");
+                let bench_name = format!("{pair_name}_{hash_name}_{thread_count}threads");
 
                 group.bench_with_input(
                     BenchmarkId::from_parameter(&bench_name),
@@ -402,7 +471,7 @@ fn bench_lru_cache_concurrent_put(c: &mut Criterion) {
                                     Duration::from_mins(1),
                                     hash_builder.clone(),
                                     policy,
-                                    CacheEngine::Moka,
+                                    engine,
                                 ))
                             },
                             |cache| {
@@ -442,7 +511,7 @@ fn bench_lru_cache_concurrent_mixed(c: &mut Criterion) {
     let handle = rt.handle().clone();
 
     // Benchmark all combinations of caching policy and hash algorithm
-    for (policy_name, policy) in all_caching_policies() {
+    for (pair_name, engine, policy) in all_engine_policy_pairs() {
         for (hash_name, hash_algo) in all_hash_algorithms() {
             let hash_builder = get_hash_builder(hash_algo).expect("Failed to get hash builder");
 
@@ -451,7 +520,7 @@ fn bench_lru_cache_concurrent_mixed(c: &mut Criterion) {
                     (thread_count * OPERATIONS_PER_THREAD) as u64,
                 ));
 
-                let bench_name = format!("{policy_name}_{hash_name}_{thread_count}threads");
+                let bench_name = format!("{pair_name}_{hash_name}_{thread_count}threads");
 
                 group.bench_with_input(
                     BenchmarkId::from_parameter(&bench_name),
@@ -471,7 +540,7 @@ fn bench_lru_cache_concurrent_mixed(c: &mut Criterion) {
                                     Duration::from_mins(1),
                                     hash_builder.clone(),
                                     policy,
-                                    CacheEngine::Moka,
+                                    engine,
                                 ));
                                 let mut rng = StdRng::seed_from_u64(42);
                                 handle.block_on(async {
@@ -521,6 +590,101 @@ fn bench_lru_cache_concurrent_mixed(c: &mut Criterion) {
     group.finish();
 }
 
+/// Invalidating one table's entries — what an accelerated refresh triggers on
+/// every cycle, once per dataset.
+///
+/// Scaled by *total* entries while the number removed stays a fixed share:
+/// Moka matches through its own index, while the Pingora path has no
+/// closure-based API and walks every key, reading each value to test it
+/// (`LruCache::invalidate_for_table`). Cost that tracks cache size rather than
+/// match count is the difference this is here to catch, so cache size is the
+/// axis.
+///
+/// `checkpoint()` is inside the measured region deliberately. Moka's
+/// `invalidate_entries_if` only registers a predicate and applies it during
+/// later maintenance, so timing the call alone would compare registering a
+/// predicate against completing a scan. `checkpoint()` forces the deferred work
+/// for Moka; for Pingora the removals are already done and it only settles the
+/// weight.
+fn bench_lru_cache_invalidate_for_table(c: &mut Criterion) {
+    let mut group = c.benchmark_group("lru_cache_invalidate_for_table");
+    let rt = create_bench_runtime();
+    let handle = rt.handle().clone();
+
+    // Raw-key operations hand the u64 straight to the backend without consulting
+    // the hasher, so the hash algorithm cannot move this measurement.
+    let hash_builder =
+        get_hash_builder(HashingAlgorithm::XXH3).expect("Failed to get hash builder");
+
+    for (pair_name, engine, policy) in all_engine_policy_pairs() {
+        // 50 is not a rounding-down of the others: a pod whose workload has a
+        // small set of distinct queries holds a cache this size, and it is the
+        // point where a per-entry cost is still cheap enough to be invisible.
+        for entry_count in [50u64, 1_000, 10_000, 50_000] {
+            // Elements are the entries the implementation may have to consider,
+            // which is what makes the per-entry cost readable off the throughput.
+            group.throughput(Throughput::Elements(entry_count));
+
+            let bench_name = format!("{pair_name}_{entry_count}entries");
+
+            group.bench_with_input(
+                BenchmarkId::from_parameter(&bench_name),
+                &entry_count,
+                |b, &entries| {
+                    let hash_builder = hash_builder.clone();
+                    b.iter_batched(
+                        || {
+                            // Capacity well above the population: an eviction
+                            // during setup would leave each iteration
+                            // invalidating a different-sized cache.
+                            let cache: Arc<
+                                LruCache<
+                                    TabledBenchValue,
+                                    HashBuilder,
+                                    Box<dyn Hasher + Send + Sync>,
+                                >,
+                            > = Arc::new(LruCache::new(
+                                entries * 128,
+                                Duration::from_mins(10),
+                                hash_builder.clone(),
+                                policy,
+                                engine,
+                            ));
+                            let mut rng = StdRng::seed_from_u64(42);
+                            handle.block_on(async {
+                                for i in 0..entries {
+                                    let value = TabledBenchValue::new(
+                                        random_value(&mut rng),
+                                        i % INVALIDATION_TABLE_COUNT,
+                                    );
+                                    cache.put_raw_key(&i, value).await;
+                                }
+                                // Settle the population so the first
+                                // invalidation is not charged for setup work.
+                                cache.checkpoint().await;
+                            });
+                            cache
+                        },
+                        |cache| {
+                            handle.block_on(async {
+                                black_box(
+                                    cache
+                                        .invalidate_for_table(TableReference::bare("table_3"))
+                                        .await,
+                                )
+                                .expect("invalidation failed");
+                                cache.checkpoint().await;
+                            });
+                        },
+                        criterion::BatchSize::LargeInput,
+                    );
+                },
+            );
+        }
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_simple_cache_concurrent_get,
@@ -528,6 +692,7 @@ criterion_group!(
     bench_simple_cache_concurrent_mixed,
     bench_lru_cache_concurrent_get,
     bench_lru_cache_concurrent_put,
-    bench_lru_cache_concurrent_mixed
+    bench_lru_cache_concurrent_mixed,
+    bench_lru_cache_invalidate_for_table
 );
 criterion_main!(benches);
