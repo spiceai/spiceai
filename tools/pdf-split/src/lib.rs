@@ -175,31 +175,31 @@ fn retain_single_page(doc: &mut Document, keep_page_id: ObjectId) -> Result<(), 
     Err(lopdf::Error::ReferenceCycle(child))
 }
 
-/// Remove document-catalog entries that reference pages other than the one being
-/// kept, so `prune_objects` can drop the other pages' content.
+/// Reduce the document catalog to just `Type` and `Pages`, dropping every other
+/// entry that can reach pages other than the one being kept.
 ///
-/// Tagged PDFs (SEC filings are tagged) carry a `/StructTreeRoot` accessibility
-/// tree that reaches every page's marked content; named destinations, outlines,
-/// and forms do the same. Left in place, these keep every content stream
-/// reachable and defeat pruning — one split page then re-serializes the whole
-/// document. None of them are needed to extract a page's text, so they are
-/// dropped. The kept page's own `/Contents` and `/Resources` are referenced by
-/// the page itself and are unaffected.
+/// A document catalog holds many entries that transitively reference every page:
+/// a tagged PDF's `/StructTreeRoot` accessibility tree, optional-content layers
+/// (`/OCProperties`), named destinations, outlines, forms, an `/OpenAction`, and
+/// vendor-specific keys (preflight/color profiles). Any one of them keeps every
+/// page's content reachable, so `prune_objects` reclaims nothing and one split
+/// page re-serializes the whole document. Rather than deny-list the known
+/// offenders (fragile — vendors add their own keys), keep only what renders the
+/// page tree: `Type` and the `Pages` reference. None of the dropped entries are
+/// needed to extract a page's text; the kept page's own `/Contents` and
+/// `/Resources` hang off the page object and are untouched.
 fn strip_cross_page_catalog_refs(doc: &mut Document) {
     let Ok(catalog_id) = doc.trailer.get(b"Root").and_then(Object::as_reference) else {
         return;
     };
     if let Ok(catalog) = doc.get_object_mut(catalog_id).and_then(Object::as_dict_mut) {
-        for key in [
-            b"StructTreeRoot".as_slice(),
-            b"Outlines",
-            b"Names",
-            b"Dests",
-            b"AcroForm",
-            b"MarkInfo",
-        ] {
-            catalog.remove(key);
+        let pages = catalog.get(b"Pages").ok().cloned();
+        let mut trimmed = lopdf::Dictionary::new();
+        trimmed.set("Type", Object::Name(b"Catalog".to_vec()));
+        if let Some(pages) = pages {
+            trimmed.set("Pages", pages);
         }
+        *catalog = trimmed;
     }
 }
 
