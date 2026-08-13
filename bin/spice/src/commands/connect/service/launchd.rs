@@ -322,29 +322,37 @@ fn uninstall(manifest: &ServiceManifest) -> Result<()> {
     unloaded
 }
 
-/// The service installed for `instance_dir` in `scope`, if the definition under
-/// this directory's derived label names this directory as its working directory.
+/// The service installed for `instance_dir` in `scope`, if something that knows
+/// what the job actually runs states that its working directory is this one.
 ///
-/// A job launchd is still holding counts, even with no definition on disk:
-/// `uninstall` deletes the definition whether or not the job could be stopped,
-/// so if this looked only at the file, the state that leaves behind would be
-/// invisible to the removal that has to clean it up, and the released instance
-/// would keep restarting until the host rebooted.
+/// The label proves nothing on its own: it is derived from the directory, so a
+/// job anyone else created under it carries the same label. Adoption therefore
+/// needs the working directory *stated* by a source that knows — the definition
+/// on disk, or launchd's own report of the job it is holding — and it has to
+/// match exactly. Neither available means no service is resolved, which is the
+/// safe answer: the alternative is uninstalling a foreign job under a label this
+/// directory happens to derive.
+///
+/// launchd's report is consulted because a job it is still holding counts even
+/// with no definition on disk: `uninstall` deletes the definition whether or not
+/// the job could be stopped, so if this looked only at the file, the state that
+/// leaves behind would be invisible to the removal that has to clean it up, and
+/// the released instance would keep restarting until the host rebooted.
 fn find_for_dir(instance_dir: &Path, scope: ServiceScope) -> Option<InstalledService> {
     let label = job_label_for_dir(instance_dir);
     let path = plist_path(&label, scope);
     let plist = std::fs::read_to_string(&path).ok();
 
-    match plist.as_deref().and_then(parse_working_dir) {
-        // A definition that names another directory is another instance's
-        // service, whatever label it carries.
-        Some(working_dir) if working_dir != instance_dir => return None,
-        Some(_) => {}
-        // No readable definition: only a job launchd is still holding keeps
-        // this directory's service resolvable, and only in the domain the
-        // definition would have used.
-        None if !(scope == ServiceScope::System && launchd_holds(&label)) => return None,
-        None => {}
+    // The definition is asked first because it is what an uninstall deletes. A
+    // definition that names another directory settles the question on its own —
+    // launchd is not consulted to overrule it — and one that names no directory
+    // at all leaves launchd as the only source that can still answer.
+    let working_dir = plist
+        .as_deref()
+        .and_then(parse_working_dir)
+        .or_else(|| launchd_working_dir(&label, scope))?;
+    if working_dir != instance_dir {
+        return None;
     }
 
     let runtime = plist
@@ -354,9 +362,25 @@ fn find_for_dir(instance_dir: &Path, scope: ServiceScope) -> Option<InstalledSer
     Some(InstalledService {
         name: label,
         path,
-        working_dir: instance_dir.to_path_buf(),
+        working_dir,
         runtime,
     })
+}
+
+/// The working directory launchd reports for the job it is holding under
+/// `label` in `scope`, or `None` when there is no such job, launchd could not be
+/// asked, or it named no directory.
+///
+/// This is the independent statement that lets an orphaned job — one whose
+/// definition is already deleted — still be adopted and removed, without
+/// inferring anything from the label.
+fn launchd_working_dir(label: &str, scope: ServiceScope) -> Option<PathBuf> {
+    let printed = print_job(label, scope)?;
+    // `launchctl print` has spelled this field both ways across macOS releases.
+    ["working directory", "cwd"]
+        .into_iter()
+        .find_map(|key| top_level_field(&printed, key))
+        .map(PathBuf::from)
 }
 
 /// The stdout/stderr files a definition names, when it names any.
@@ -379,10 +403,10 @@ fn plist_log_source(label: &str, scope: ServiceScope) -> Option<LogSource> {
 /// The job's state as `launchctl print` reports it (`running`, `waiting`,
 /// `not running`, …), [`NOT_LOADED`] when launchd has no such job, or `None`
 /// when launchd could not be asked.
-fn is_active(label: &str) -> Option<String> {
+fn is_active(label: &str, scope: ServiceScope) -> Option<String> {
     let output = std::process::Command::new(LAUNCHCTL)
         .arg("print")
-        .arg(service_target(label))
+        .arg(service_target_in(label, scope))
         .output()
         .ok()?;
 
@@ -418,7 +442,7 @@ fn recovery_hints(manifest: &ServiceManifest) -> Vec<String> {
 /// Observe the job: the state launchd reports plus whether it comes back on
 /// its own.
 fn observe(manifest: &ServiceManifest) -> ServiceObservation {
-    let Some(reported) = is_active(&manifest.name) else {
+    let Some(reported) = is_active(&manifest.name, manifest.scope) else {
         return ServiceObservation::unavailable(format!(
             "launchctl could not be asked about {}. Check that this account may query the \
              {} domain (`{}`).",
@@ -603,36 +627,29 @@ fn folded(err: Error) -> String {
     }
 }
 
+/// Asks the system domain: installing and unloading is a `LaunchDaemon`
+/// operation in this release, which [`preflight`] enforces.
 fn job_is_absent(label: &str) -> bool {
-    state_is_absent(is_active(label).as_deref())
-}
-
-fn launchd_holds(label: &str) -> bool {
-    state_is_held(is_active(label).as_deref())
+    state_is_absent(is_active(label, ServiceScope::System).as_deref())
 }
 
 /// `true` only when launchd said, in as many words, that it has no such job.
 ///
-/// Deliberately not `!state_is_held`: an unanswerable `launchctl print` must
-/// never be read as proof the job is gone, because that is exactly how a daemon
-/// survives its own removal. The two predicates are therefore both false for
-/// `None`, and the callers fail closed on it — `unload` keeps waiting and then
-/// errors, `find_for_dir` reports nothing it cannot see a definition for.
+/// Deliberately not "anything that is not a job launchd named": an unanswerable
+/// `launchctl print` must never be read as proof the job is gone, because that
+/// is exactly how a daemon survives its own removal. `None` is therefore false
+/// here, and the caller fails closed on it — `unload` keeps waiting and then
+/// errors rather than reporting a job it cannot see as stopped.
 fn state_is_absent(state: Option<&str>) -> bool {
     state == Some(NOT_LOADED)
 }
 
-/// `true` only when launchd answered and named a job it is holding.
-fn state_is_held(state: Option<&str>) -> bool {
-    state.is_some_and(|state| state != NOT_LOADED)
-}
-
-/// `launchctl print`'s report for this job, or `None` when launchd has no such
-/// job or could not be asked.
-fn print_job(label: &str) -> Option<String> {
+/// `launchctl print`'s report for this job in `scope`, or `None` when launchd has
+/// no such job or could not be asked.
+fn print_job(label: &str, scope: ServiceScope) -> Option<String> {
     let output = std::process::Command::new(LAUNCHCTL)
         .arg("print")
-        .arg(service_target(label))
+        .arg(service_target_in(label, scope))
         .output()
         .ok()?;
     output
@@ -890,7 +907,8 @@ fn confirm_running(label: &str) -> Result<()> {
     let pid = wait_for_running(label)?;
     std::thread::sleep(SETTLE_INTERVAL);
 
-    let settled = print_job(label).and_then(|printed| top_level_field(&printed, "pid"));
+    let settled =
+        print_job(label, ServiceScope::System).and_then(|printed| top_level_field(&printed, "pid"));
     if settled.as_deref() == Some(pid.as_str()) {
         return Ok(());
     }
@@ -912,7 +930,7 @@ fn confirm_running(label: &str) -> Result<()> {
 /// moment.
 fn wait_for_running(label: &str) -> Result<String> {
     for attempt in 0..RUNNING_ATTEMPTS {
-        if let Some(printed) = print_job(label)
+        if let Some(printed) = print_job(label, ServiceScope::System)
             && top_level_field(&printed, "state").as_deref() == Some(RUNNING)
             && let Some(pid) = top_level_field(&printed, "pid")
         {
@@ -937,7 +955,7 @@ fn wait_for_running(label: &str) -> Result<String> {
 
 /// launchd's own account of a job that is not running as it should be.
 fn job_report(label: &str) -> String {
-    let Some(printed) = print_job(label) else {
+    let Some(printed) = print_job(label, ServiceScope::System) else {
         return String::new();
     };
 
@@ -1384,6 +1402,72 @@ mod tests {
     }
 
     #[test]
+    fn adoption_needs_a_stated_working_directory_that_matches() {
+        // The label is derived from the directory, so any job created under it
+        // carries the same one. Only a source that knows what the job runs — the
+        // definition, or launchd's own report — may settle the question, and
+        // neither available must resolve nothing rather than adopt a foreign
+        // job under a label this directory happens to derive.
+        let dir = Path::new("/opt/edge-1");
+        let plist = render_plist(
+            &job_label_for_dir(dir),
+            dir,
+            &dir.join(".spice"),
+            Path::new("/usr/local/lib/spice/spiced"),
+            "alice",
+            "staff",
+        );
+        assert_eq!(parse_working_dir(&plist), Some(dir.to_path_buf()));
+
+        // A definition naming somewhere else settles it on its own; launchd is
+        // never consulted to overrule what the definition says.
+        let foreign = render_plist(
+            &job_label_for_dir(dir),
+            Path::new("/opt/somewhere-else"),
+            Path::new("/opt/somewhere-else/.spice"),
+            Path::new("/usr/local/lib/spice/spiced"),
+            "alice",
+            "staff",
+        );
+        assert_eq!(
+            parse_working_dir(&foreign),
+            Some(PathBuf::from("/opt/somewhere-else"))
+        );
+
+        // A definition that states no working directory leaves launchd as the
+        // only source that can answer.
+        assert_eq!(parse_working_dir("<plist><dict></dict></plist>"), None);
+    }
+
+    #[test]
+    fn launchds_own_report_states_the_working_directory() {
+        // The independent statement that lets an orphaned job — one whose
+        // definition is already deleted — still be adopted and removed.
+        let printed =
+            "system/ai.spice.x = {\n\tstate = running\n\tworking directory = /opt/edge-1\n}\n";
+        assert_eq!(
+            top_level_field(printed, "working directory"),
+            Some("/opt/edge-1".to_string())
+        );
+        // Older releases spell it `cwd`, and both are accepted.
+        let older = "system/ai.spice.x = {\n\tcwd = /opt/edge-1\n}\n";
+        assert_eq!(
+            ["working directory", "cwd"]
+                .into_iter()
+                .find_map(|key| top_level_field(older, key)),
+            Some("/opt/edge-1".to_string())
+        );
+        // A report that names no directory cannot verify anything.
+        let silent = "system/ai.spice.x = {\n\tstate = running\n}\n";
+        assert_eq!(
+            ["working directory", "cwd"]
+                .into_iter()
+                .find_map(|key| top_level_field(silent, key)),
+            None
+        );
+    }
+
+    #[test]
     fn a_definition_naming_no_output_paths_reports_no_log_source() {
         // The plist this release writes configures none, so claiming a file
         // would name something nothing writes to.
@@ -1399,7 +1483,7 @@ mod tests {
             preflight(ServiceScope::User),
             Err(PreflightFailure::UserScopePending)
         ));
-        assert!(preflight(ServiceScope::System).is_ok());
+        preflight(ServiceScope::System).expect("a system daemon is what this release installs");
     }
 
     #[test]
@@ -1424,28 +1508,23 @@ mod tests {
     }
 
     #[test]
-    fn an_unanswerable_launchd_is_neither_gone_nor_held() {
-        // These two decide whether `unload` may stop waiting and whether
-        // `find_for_dir` can see an orphaned job, so `None` — launchd could not
-        // be asked — has to be false for both. Reading it as "gone" is how a
-        // daemon survives its own removal; reading it as "held" would invent
-        // services on a host with no launchd.
+    fn an_unanswerable_launchd_is_never_read_as_a_job_that_is_gone() {
+        // This decides whether `unload` may stop waiting, so `None` — launchd
+        // could not be asked — has to be false. Reading it as "gone" is how a
+        // daemon survives its own removal.
         assert!(!state_is_absent(None));
-        assert!(!state_is_held(None));
-
         assert!(state_is_absent(Some(NOT_LOADED)));
-        assert!(!state_is_held(Some(NOT_LOADED)));
-
-        for state in [RUNNING, "waiting", "not running", "spawn scheduled"] {
-            assert!(state_is_held(Some(state)), "{state}");
+        for state in [RUNNING, "waiting", "not running"] {
             assert!(!state_is_absent(Some(state)), "{state}");
         }
     }
-
     #[test]
     fn a_job_launchd_does_not_have_is_reported_as_such() {
         // The one end of the mapping a real launchd can answer here.
-        let answer = is_active("ai.spice.cloud-connect.definitely-not-installed-0000");
+        let answer = is_active(
+            "ai.spice.cloud-connect.definitely-not-installed-0000",
+            ServiceScope::System,
+        );
         assert!(
             answer.is_none() || answer.as_deref() == Some(NOT_LOADED),
             "unexpected state for a job that does not exist: {answer:?}"
