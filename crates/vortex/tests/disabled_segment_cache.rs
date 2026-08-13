@@ -38,8 +38,8 @@ fn a_disabled_process_cache_is_not_replaced_by_private_per_table_caches() {
         ..Default::default()
     };
 
-    let format = VortexFormat::new_with_options(VortexSession::default(), opts.clone())
-        .with_process_segment_cache();
+    let format =
+        VortexFormat::new_with_process_segment_cache(VortexSession::default(), opts.clone());
     assert_eq!(
         format.segment_cache_capacity_bytes(),
         None,
@@ -47,8 +47,8 @@ fn a_disabled_process_cache_is_not_replaced_by_private_per_table_caches() {
     );
 
     // Every table, not just the first.
-    let second = VortexFormat::new_with_options(VortexSession::default(), opts.clone())
-        .with_process_segment_cache();
+    let second =
+        VortexFormat::new_with_process_segment_cache(VortexSession::default(), opts.clone());
     assert_eq!(second.segment_cache_capacity_bytes(), None);
 
     // A format that never opts in is not governed by the Cayenne setting: a

@@ -1079,10 +1079,10 @@ impl CayenneContext {
         // Cayenne opts into the shared cache: its data files carry a uuid7 write
         // id beneath a uuid7 snapshot directory, so a path is written once and
         // never reused, and retirement invalidates it explicitly.
-        Arc::new(
-            VortexFormat::new_with_options(vortex_session, Self::vortex_table_options(config))
-                .with_process_segment_cache(),
-        )
+        Arc::new(VortexFormat::new_with_process_segment_cache(
+            vortex_session,
+            Self::vortex_table_options(config),
+        ))
     }
 
     /// Table options shared by the base format and any per-write format

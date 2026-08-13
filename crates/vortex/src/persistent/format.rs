@@ -315,6 +315,9 @@ impl Eq for VortexTableOptions {}
 pub struct VortexFormatFactory {
     session: VortexSession,
     options: Option<VortexTableOptions>,
+    /// Names the segment cache a created format may size for itself, so its
+    /// metrics identify the table rather than a bare sequence number.
+    cache_name: Option<Arc<str>>,
 }
 
 impl GetExt for VortexFormatFactory {
@@ -334,6 +337,7 @@ impl VortexFormatFactory {
         Self {
             session: VortexSession::default(),
             options: None,
+            cache_name: None,
         }
     }
 
@@ -345,6 +349,7 @@ impl VortexFormatFactory {
         Self {
             session,
             options: Some(options),
+            cache_name: None,
         }
     }
 
@@ -359,6 +364,17 @@ impl VortexFormatFactory {
     #[must_use]
     pub fn with_options(mut self, options: VortexTableOptions) -> Self {
         self.options = Some(options);
+        self
+    }
+
+    /// Name the segment cache a created format may size for itself.
+    ///
+    /// Only reached when the table sets `segment_cache_size_bytes`; without a
+    /// name such a cache reports under a sequence number, which tells an operator
+    /// that a cache exists but not which table owns it.
+    #[must_use]
+    pub fn with_cache_name(mut self, name: impl Into<Arc<str>>) -> Self {
+        self.cache_name = Some(name.into());
         self
     }
 }
@@ -378,14 +394,19 @@ impl FileFormatFactory for VortexFormatFactory {
             }
         }
 
-        Ok(Arc::new(VortexFormat::new_with_options(
+        Ok(Arc::new(VortexFormat::new_with_options_named(
             self.session.clone(),
             opts,
+            self.cache_name.clone(),
         )))
     }
 
     fn default(&self) -> Arc<dyn FileFormat> {
-        Arc::new(VortexFormat::new(self.session.clone()))
+        Arc::new(VortexFormat::new_with_options_named(
+            self.session.clone(),
+            self.options.clone().unwrap_or_default(),
+            self.cache_name.clone(),
+        ))
     }
 }
 
@@ -403,11 +424,25 @@ impl VortexFormat {
     /// because caching is only sound for a caller whose file paths are immutable.
     #[must_use]
     pub fn new_with_options(session: VortexSession, opts: VortexTableOptions) -> Self {
+        Self::new_with_options_named(session, opts, None)
+    }
+
+    /// Like [`Self::new_with_options`], but a cache built from
+    /// `segment_cache_size_bytes` reports under `name` instead of a bare
+    /// sequence number. Callers that know which table they are opening — the
+    /// listing connector does — should pass it.
+    #[must_use]
+    pub fn new_with_options_named(
+        session: VortexSession,
+        opts: VortexTableOptions,
+        cache_name: Option<Arc<str>>,
+    ) -> Self {
+        let self_cache_name = cache_name;
         let segment_cache = opts
             .segment_cache_size_bytes
             .and_then(|bytes| u64::try_from(bytes).ok())
             .filter(|bytes| *bytes > 0)
-            .map(|bytes| Arc::new(SharedSegmentCache::new(bytes, true)));
+            .map(|bytes| SharedSegmentCache::new_private(bytes, self_cache_name.clone()));
 
         Self {
             session,
@@ -487,13 +522,37 @@ impl VortexFormat {
     /// caching decision (an embedded host that skips the runtime builder), and
     /// caches nothing when the decision was to disable it.
     #[must_use]
-    pub fn with_process_segment_cache(mut self) -> Self {
+    pub fn new_with_process_segment_cache(
+        session: VortexSession,
+        opts: VortexTableOptions,
+    ) -> Self {
+        // Decide before constructing, so a caller that ends up on the shared
+        // cache never builds — and immediately discards — a private one.
         if let Some(process) = segment_cache::process_segment_cache() {
-            self.segment_cache = Some(Arc::clone(process));
-        } else if segment_cache::segment_caching_disabled() {
-            self.segment_cache = None;
+            let mut format = Self::new_with_options_named(
+                session,
+                VortexTableOptions {
+                    segment_cache_size_bytes: None,
+                    ..opts
+                },
+                None,
+            );
+            format.segment_cache = Some(Arc::clone(process));
+            return format;
         }
-        self
+        if segment_cache::segment_caching_disabled() {
+            return Self::new_with_options_named(
+                session,
+                VortexTableOptions {
+                    segment_cache_size_bytes: None,
+                    ..opts
+                },
+                None,
+            );
+        }
+        // No decision: an embedded host that skipped the runtime builder keeps
+        // the cache its own options asked for.
+        Self::new_with_options_named(session, opts, None)
     }
 
     /// Byte capacity of the segment cache backing this format's scans, or `None`

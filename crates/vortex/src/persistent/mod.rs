@@ -22,7 +22,7 @@ pub use format::VortexTableOptions;
 pub use format::WriteShardConfig;
 pub use segment_cache::{
     install_process_segment_cache, process_segment_cache_capacity_bytes,
-    register_process_segment_cache_metrics,
+    register_segment_cache_metrics,
 };
 pub use source::VortexSource;
 
