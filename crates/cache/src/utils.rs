@@ -218,12 +218,21 @@ pub fn to_cached_record_batch_stream(
                 // Keep a compacted copy rather than the batch as it arrives: a
                 // `LIMIT`/`OFFSET` plan yields zero-copy slices, so retaining
                 // one holds its whole scan batch alive for as long as the entry
-                // lives, and bills the entry for it. Compacting here also makes
-                // `records_size` — which decides whether the result can be
-                // cached at all — the size the entry will actually occupy.
-                let batch = arrow_tools::record_batch::compact_retained_buffers(batch);
-                records_size = records_size.saturating_add(batch.get_array_memory_size());
-                records.push(batch);
+                // lives, and bills the entry for it.
+                //
+                // Bill the batch what it will occupy once compacted, and pay
+                // for the copy only once the result is known to still fit. The
+                // budget is what bounds this work: a result already too large
+                // to cache is abandoned here rather than copied in full and
+                // then discarded.
+                records_size = records_size
+                    .saturating_add(arrow_tools::record_batch::compacted_memory_size(batch));
+                if records_size < raw_size_limit {
+                    records.push(arrow_tools::record_batch::compact_retained_buffers(batch));
+                } else if !records.is_empty() {
+                    records.clear();
+                    records.shrink_to_fit();
+                }
             } else if !records.is_empty() && records_size >= raw_size_limit {
                 // The result can no longer fit in the cache: eagerly drop the
                 // accumulated batches. Caching must be abandoned entirely —
