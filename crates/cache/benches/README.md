@@ -37,34 +37,34 @@ LRU instead, so that arm would duplicate `pingora_lru`.
 
 ### hot_read_write
 
-The other `LruCache` benchmarks read a 100,000 key space holding at most 5,000
-entries, so roughly 95% of their reads miss. That matters for the engine
-comparison: a Pingora miss is one metadata lookup, while a hit removes the entry
-and re-admits it, because `pingora-lru` has no `peek_value`. Reads that miss
-never reach the path where the engines differ.
+Reads and writes are not independent knobs, because they are not independent in
+the runtime: a miss executes the query and caches the result, so the write rate
+is the miss rate. This benchmark reads, and refills on a miss, so hit rate is
+the only knob and the write rate follows from it.
 
-Reads and writes are not independent knobs here, because they are not
-independent in the runtime: a miss executes the query and caches the result, so
-the write rate *is* the miss rate. Setting a read/write mix separately from a
-hit rate describes states a results cache cannot be in. This benchmark reads,
-and refills on a miss, so hit rate is the only knob and the write rate follows
-from it.
+Hit rate is set by sizing: capacity is fixed at 16,000 entries and the working
+set is `capacity / hit_rate`, since an LRU holding `C` of a `W`-key working set
+hits about `C/W` under uniform access. The cache starts full. Threads are 16 and
+32, straddling the 16 metadata shards Pingora uses.
 
-Parameters:
+## Engine Comparison Results
 
-- **Hit rate**: 50%, 95% and 99%. Under uniform access an LRU holding `C` of a
-  `W`-key working set hits about `C/W`, so capacity is fixed at 16,000 entries
-  and the working set is sized against it. 50% is the thrashing regime the older
-  benchmarks sit in; 99% is where a results cache worth enabling runs.
-- **Threads**: 16 and 32, straddling the 16 metadata shards Pingora uses. At 16
-  shard collisions are incidental; at 32 they are structural.
+Apple M-series, `--sample-size 10`. Lower is faster.
 
-The cache starts full: the whole working set is inserted, then evicted down to
-capacity. One hash algorithm, since raw-key operations bypass the hasher.
+### Pure reads (`concurrent_get`)
 
-Hit rate decides the winner, and it flips between 50% and 95%. Apple M-series,
-`--sample-size 10`, total time for threads x 10,000 operations (lower is
-faster):
+| threads | moka_lru | moka_tinylfu | pingora_lru | pingora vs moka_lru |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 2.70 ms | 2.82 ms | 1.27 ms | 0.47x |
+| 4 | 7.62 ms | 7.30 ms | 3.80 ms | 0.50x |
+| 8 | 13.12 ms | 13.05 ms | 6.44 ms | 0.49x |
+| 16 | 29.91 ms | 29.43 ms | 13.78 ms | 0.46x |
+
+`concurrent_get` reads a 100,000 key space holding ~3,125 entries, so ~97% of
+its reads miss. A Pingora miss is one metadata lookup, while a hit removes the
+entry and re-admits it, so this measures the path where Pingora is cheapest.
+
+### Read-through across hit rates (`hot_read_write`)
 
 | hit rate | threads | moka_lru | moka_tinylfu | pingora_lru | pingora vs moka_lru |
 | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -75,42 +75,35 @@ faster):
 | 99% | 16 | 38.3 ms | 38.1 ms | 43.7 ms | 1.14x |
 | 99% | 32 | 73.3 ms | 73.2 ms | 99.6 ms | 1.36x |
 
-At 50% every other operation is a refill, so the run is dominated by insert and
-eviction, and Pingora is 3-3.7x faster. At 95% and 99% the work is nearly all
-reads, and Moka leads by 1.14-2.32x because Pingora expresses a read as a remove
-plus re-admit.
+Hit rate decides the winner. At 50% every other operation is a refill, the run
+is dominated by insert and eviction, and Pingora is 3-3.7x faster. At 95% and
+99% the work is nearly all reads and Moka leads.
 
-Pingora scales worse with threads at every hit rate. Doubling threads doubles
-the work, so 2.0x is break-even:
+Pingora also scales worse with threads. Doubling threads doubles the work, so
+2.0x is break-even: Moka runs 1.81-2.28x, Pingora 2.28-2.76x.
 
-| hit rate | moka_lru | pingora_lru |
-| ---: | ---: | ---: |
-| 50% | 2.28x | 2.76x |
-| 95% | 1.81x | 2.64x |
-| 99% | 1.91x | 2.28x |
+### Does cache size matter?
 
-TinyLFU earns its keep where admission control matters: 13% ahead of LRU at 50%,
-7% at 95%, and level at 99%, where almost nothing is evicted.
+Largely no. A separate pure-read sweep over 1,000 / 5,000 / 30,000 entries put
+the crossover between 80% and 95% at every capacity, and Pingora's timings were
+within 3% of each other across the whole 30x range.
 
-Numbers are from a laptop at reduced sample size, where 32 threads oversubscribes
-the cores.
+One exception, outside the range these benchmarks use: at 3% hits with 30,000
+entries — a 1,000,000-key working set — Moka's pure-read time jumps 2.4x while
+Pingora is unchanged. That corner scales capacity and key space together, so it
+does not separate the two causes.
 
-Moka is far noisier than Pingora. A separate run measuring run-to-run spread
-over five repetitions found Moka varying up to 30% between repetitions while
-Pingora stayed within 1-3%, most likely Moka's background maintenance landing
-differently. Treat differences under roughly 15% against Moka as unresolved at
-this sample size: the 50% gaps are real, the 99% ones are directional. Pingora's
-reproducibility is itself a result, and arguably matters more for tail latency
-than the median either way.
+### Precision
 
-The `C/W` sizing was checked separately against measured hit rates. Achieved
-rates land within half a point of target (3.0 / 50.3 / 80.0 / 95.0 / 99.0) and
-the resident set matches capacity exactly, for both engines. The crossover also
-holds across a 30x capacity range - 1,000, 5,000 and 30,000 entries all put it
-between 80% and 95% - so the single capacity used here does not bias it.
+Moka is far noisier than Pingora. Over five repetitions Moka varied up to 30%
+between runs while Pingora stayed within 1-3%, most likely Moka's background
+maintenance landing differently. Treat differences under roughly 15% against
+Moka as unresolved at this sample size. Pingora's reproducibility is itself a
+result, and arguably matters more for tail latency than the median either way.
 
-This benchmark asserts its hit rates through sizing rather than measuring them.
-That was verified once by hand, as above, but it is an assumption in the code.
+The `C/W` sizing is an assumption in the code, checked once by hand: achieved
+hit rates land within half a point of target (3.0 / 50.3 / 80.0 / 95.0 / 99.0)
+and the resident set matches capacity exactly, for both engines.
 
 ## Thread Counts
 
