@@ -116,13 +116,22 @@ cmd_resolve() {
   ours_mode=$(git ls-files --stage -- ":(literal)$path" | awk '$3 == 2 { print $1 }')
   theirs_mode=$(git ls-files --stage -- ":(literal)$path" | awk '$3 == 3 { print $1 }')
 
-  if [ "${ours_mode:-none}" != "${theirs_mode:-none}" ] || [ "$ours_mode" = 120000 ]; then
+  # The stages say what git recorded; the worktree says what cp would write
+  # through. A conflicted path replaced on disk by a symlink still has two
+  # regular-file stages, and copying onto it would follow the link and rewrite
+  # whatever it points at.
+  if [ -L "$path" ] ||
+     [ "${ours_mode:-none}" != "${theirs_mode:-none}" ] || [ "$ours_mode" = 120000 ]; then
     # The suggestion is meant to be pasted, and this branch exists for the awkward
     # paths, so escape rather than wrap in quotes: a path containing a single
     # quote would otherwise produce a command that is not valid shell at all.
     local quoted
     quoted=$(printf '%q' ":(literal)$path")
-    echo "MANUAL $path: ours=${ours_mode:-none} theirs=${theirs_mode:-none} (mode, symlink, or missing stage)"
+    if [ -L "$path" ]; then
+      echo "MANUAL $path: the worktree entry is a symlink, whatever the index says"
+    else
+      echo "MANUAL $path: ours=${ours_mode:-none} theirs=${theirs_mode:-none} (mode, symlink, or missing stage)"
+    fi
     if [ -z "$ours_mode" ]; then
       # There is no --ours entry to check out; the child deleted this path, so
       # the command that keeps the child's side is a removal.

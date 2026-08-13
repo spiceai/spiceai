@@ -1128,6 +1128,32 @@ start_test "resolve refuses a symlink rather than writing through it"
     fail_test "the symlink's target was overwritten"
 ) || failures=$((failures + 1))
 
+start_test "resolve refuses when the worktree entry is a symlink the index knows nothing about"
+(
+  new_stack "$work_root/worktree_symlink"
+  printf 'TARGET CONTENT\n' > target.txt
+  printf 'l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\n' > f.txt && commit_all "fork point"
+  git checkout --quiet -b parent
+  printf 'l1\nPARENT\nl3\nl4\nl5\nl6\nl7\nl8\n' > f.txt && commit_all "parent edits"
+  stack_base=$(git rev-parse HEAD)
+  git checkout --quiet -b child
+  printf 'l1\nPARENT\nl3\nl4\nl5\nl6\nl7\nCHILD\n' > f.txt && commit_all "child edits"
+  squash_parent_onto_trunk
+  printf 'l1\nPARENT\nTRUNK\nl4\nl5\nl6\nl7\nl8\n' > f.txt && commit_all "trunk edits"
+  git checkout --quiet child
+  git merge --no-ff --no-commit trunk >/dev/null 2>&1
+
+  # Both stages are regular files; only the worktree entry is a link, so a guard
+  # that reads the index alone would let cp follow it.
+  rm -f f.txt && ln -s target.txt f.txt
+
+  output=$("$subject" resolve "$stack_base" f.txt 2>/dev/null)
+  status=$?
+  [ "$status" -eq 2 ] || fail_test "expected exit 2 for a symlinked worktree entry, got $status ($output)"
+  [ "$(cat target.txt)" = "TARGET CONTENT" ] ||
+    fail_test "the link's target was overwritten"
+) || failures=$((failures + 1))
+
 start_test "resolve refuses a mode conflict rather than dropping the exec bit"
 (
   new_stack "$work_root/mode"
