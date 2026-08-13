@@ -2695,7 +2695,13 @@
                 {
                   "formulas": [
                     {
-                      "formula": "query1"
+                      "formula": "query1 / 1000000",
+                      "number_format": {
+                        "unit": {
+                          "type": "canonical_unit",
+                          "unit_name": "millicore"
+                        }
+                      }
                     }
                   ],
                   "queries": [
@@ -2903,10 +2909,10 @@
                       "number_format": {
                         "unit": {
                           "type": "canonical_unit",
-                          "unit_name": "percent_nano"
+                          "unit_name": "percent"
                         }
                       },
-                      "formula": "(query1 / query2) * 100"
+                      "formula": "(query1 / 1000000000) / query2 * 100"
                     }
                   ],
                   "queries": [
@@ -2933,7 +2939,7 @@
               "markers": [
                 {
                   "label": " > 80% ",
-                  "value": "y > 80000000000",
+                  "value": "y > 80",
                   "display_type": "error dashed"
                 }
               ],
