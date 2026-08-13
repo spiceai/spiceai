@@ -288,7 +288,15 @@ impl SharedSegmentCache {
             track_retirement,
             name.as_ref(),
         ));
-        REGISTERED_CACHES.lock().push(Arc::downgrade(&cache));
+        {
+            // Prune here, not only in `live_caches`: that runs from the metric
+            // callbacks, so with metrics disabled a process that repeatedly built
+            // and dropped private formats would grow this vector without bound —
+            // a leak, in the code meant to fix one.
+            let mut registered = REGISTERED_CACHES.lock();
+            registered.retain(|registered| registered.strong_count() > 0);
+            registered.push(Arc::downgrade(&cache));
+        }
         cache
     }
 

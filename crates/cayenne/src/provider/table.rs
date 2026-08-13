@@ -3903,21 +3903,27 @@ impl CayenneTableProvider {
                 }
             }
         }
-        // Cold scans use the same shared Vortex format as warm scans. Evict
-        // exactly the successfully absent objects after the physical sweep so
-        // superseded generations cannot occupy the bounded segment cache, which
-        // is process-wide: what they hold is taken from every other table too.
-        self.invalidate_segment_cache_paths(retired_cache_paths)
-            .await;
         // Key-delete scans build one `ListingTable` per live cold directory.
         // A directory can contain both live manifest files and an orphan from
         // an earlier generation, so deleting only that orphan leaves the
         // directory in service. Evict its infinite-TTL listing after the
         // physical delete; otherwise the next delete can try to open the now
         // absent file even though the manifest no longer references it.
+        //
+        // Before the segment cache below, deliberately: this eviction is
+        // synchronous while segment invalidation enumerates a cache holding every
+        // table's segments on the blocking pool. Leaving the stale listing in
+        // place across that await is long enough for a concurrent key-delete scan
+        // to pick it up and fail opening an object this sweep already removed.
         for dir in retired_listing_dirs {
             Self::invalidate_list_files_cache(self.context.runtime_env(), &dir);
         }
+        // Cold scans use the same shared Vortex format as warm scans. Evict
+        // exactly the successfully absent objects after the physical sweep so
+        // superseded generations cannot occupy the bounded segment cache, which
+        // is process-wide: what they hold is taken from every other table too.
+        self.invalidate_segment_cache_paths(retired_cache_paths)
+            .await;
         if deleted > 0 || skipped_errors > 0 {
             tracing::info!(
                 target: "cayenne::compaction",
