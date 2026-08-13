@@ -1127,7 +1127,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "sum:spiceai.results_cache_items_count{$instance,$env,$kube_namespace,$kube_cluster_name,$pod_name}"
+                      "query": "sum:spiceai.results_cache_items_count{$instance,$env,$kube_namespace,$kube_cluster_name,$pod_name} by {service_instance_id}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -1388,7 +1388,7 @@
                     {
                       "name": "query1",
                       "data_source": "metrics",
-                      "query": "sum:spiceai.dataset_acceleration_snapshot_bootstrap_duration_ms.count{$instance,$env,$kube_namespace,$kube_cluster_name,$pod_name} by {dataset}.as_count()"
+                      "query": "sum:spiceai.dataset_acceleration_snapshot_bootstrap_duration_ms.count{$instance,$env,$kube_namespace,$kube_cluster_name,$pod_name} by {dataset,service_instance_id}.as_count()"
                     }
                   ],
                   "formulas": [
@@ -2708,7 +2708,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "avg:kubernetes.cpu.usage.total{pod_name:$instance.value,$env,$kube_namespace,$kube_cluster_name,$pod_name} by {pod_name}"
+                      "query": "sum:kubernetes.cpu.usage.total{pod_name:$instance.value,$env,$kube_namespace,$kube_cluster_name,$pod_name} by {pod_name}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -2757,7 +2757,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "avg:kubernetes.memory.working_set{pod_name:$instance.value,$env,$kube_namespace,$kube_cluster_name,$pod_name} by {pod_name}"
+                      "query": "sum:kubernetes.memory.working_set{pod_name:$instance.value,$env,$kube_namespace,$kube_cluster_name,$pod_name} by {pod_name}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -2986,12 +2986,12 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "max:kubernetes.memory.working_set{pod_name:$instance.value,$env,$kube_namespace,$kube_cluster_name,$pod_name} by {pod_name}"
+                      "query": "sum:kubernetes.memory.working_set{pod_name:$instance.value,$env,$kube_namespace,$kube_cluster_name,$pod_name} by {pod_name}"
                     },
                     {
                       "data_source": "metrics",
                       "name": "query2",
-                      "query": "max:kubernetes.memory.limits{pod_name:$instance.value,$env,$kube_namespace,$kube_cluster_name,$pod_name} by {pod_name}"
+                      "query": "sum:kubernetes.memory.limits{pod_name:$instance.value,$env,$kube_namespace,$kube_cluster_name,$pod_name} by {pod_name}"
                     }
                   ],
                   "response_format": "timeseries",
