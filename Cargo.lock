@@ -14502,6 +14502,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "pdf-split"
+version = "2.2.0-unstable"
+dependencies = [
+ "clap",
+ "lopdf",
+ "snafu",
+]
+
+[[package]]
 name = "pem"
 version = "3.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
