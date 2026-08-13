@@ -16,7 +16,9 @@ limitations under the License.
 
 use llms::openai::{ChatBackend, UsageTier};
 use runtime_parameters::{ParameterSpec, TypedParams};
-use runtime_parameters_typed::{ParamsError, SecretAutoload, autoload_secret, parse_param};
+use runtime_parameters_typed::{
+    ParamsError, SecretAutoload, TypedParams, autoload_secret, parse_param,
+};
 use secrecy::SecretString;
 use std::collections::HashMap;
 use std::str::FromStr;

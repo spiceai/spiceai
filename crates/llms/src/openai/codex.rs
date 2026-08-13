@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use std::any::Any;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use async_openai::Client;
 use async_openai::error::OpenAIError;
@@ -28,6 +28,7 @@ use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName
 use runtime_rate_control::RateController;
 use runtime_request_context::{AsyncMarker, Extension, RequestContext};
 
+use crate::chat::nsql::SqlGeneration;
 use crate::chat::{Chat, Error as ChatError};
 use crate::config::HostedModelConfig;
 use crate::openai::responses_adapter;
@@ -42,20 +43,22 @@ const X_CODEX_BETA_FEATURES: HeaderName = HeaderName::from_static("x-codex-beta-
 const X_CODEX_TURN_METADATA: HeaderName = HeaderName::from_static("x-codex-turn-metadata");
 const X_CODEX_WINDOW_ID: HeaderName = HeaderName::from_static("x-codex-window-id");
 
-const FORWARDED_HEADERS: &[HeaderName] = &[
-    ACCEPT,
-    AUTHORIZATION,
-    CHATGPT_ACCOUNT_ID,
-    CONTENT_TYPE,
-    ORIGINATOR,
-    SESSION_ID,
-    THREAD_ID,
-    USER_AGENT,
-    X_CLIENT_REQUEST_ID,
-    X_CODEX_BETA_FEATURES,
-    X_CODEX_TURN_METADATA,
-    X_CODEX_WINDOW_ID,
-];
+static FORWARDED_HEADERS: LazyLock<[HeaderName; 12]> = LazyLock::new(|| {
+    [
+        ACCEPT,
+        AUTHORIZATION,
+        CHATGPT_ACCOUNT_ID,
+        CONTENT_TYPE,
+        ORIGINATOR,
+        SESSION_ID,
+        THREAD_ID,
+        USER_AGENT,
+        X_CLIENT_REQUEST_ID,
+        X_CODEX_BETA_FEATURES,
+        X_CODEX_TURN_METADATA,
+        X_CODEX_WINDOW_ID,
+    ]
+});
 
 /// The Codex request headers that may be forwarded to the Codex backend.
 ///
@@ -70,7 +73,7 @@ impl CodexRequestHeaders {
     #[must_use]
     pub fn from_headers(source: &HeaderMap) -> Self {
         let mut headers = HeaderMap::with_capacity(FORWARDED_HEADERS.len());
-        for name in FORWARDED_HEADERS {
+        for name in FORWARDED_HEADERS.iter() {
             for value in source.get_all(name).iter() {
                 headers.append(name.clone(), value.clone());
             }
@@ -102,6 +105,22 @@ pub struct Codex {
     http_client: reqwest::Client,
     model: String,
     rate_controller: Arc<RateController>,
+}
+
+fn normalize_codex_error(error: OpenAIError) -> OpenAIError {
+    let OpenAIError::JSONDeserialize(parse_error, body) = error else {
+        return error;
+    };
+
+    #[derive(serde::Deserialize)]
+    struct CodexErrorDetail {
+        detail: String,
+    }
+
+    match serde_json::from_str::<CodexErrorDetail>(&body) {
+        Ok(error) => OpenAIError::InvalidArgument(error.detail),
+        Err(_) => OpenAIError::JSONDeserialize(parse_error, body),
+    }
 }
 
 impl Codex {
@@ -156,7 +175,11 @@ impl Responses for Codex {
             .acquire()
             .await
             .map_err(|e| OpenAIError::InvalidArgument(e.to_string()))?;
-        let stream = client.responses().create_stream(req).await?;
+        let stream = client
+            .responses()
+            .create_stream(req)
+            .await
+            .map_err(normalize_codex_error)?;
         drop(permit);
         Ok(Box::pin(stream))
     }
@@ -172,7 +195,11 @@ impl Responses for Codex {
             .acquire()
             .await
             .map_err(|e| OpenAIError::InvalidArgument(e.to_string()))?;
-        let response = client.responses().create(req).await?;
+        let response = client
+            .responses()
+            .create(req)
+            .await
+            .map_err(normalize_codex_error)?;
         drop(permit);
         Ok(response)
     }
@@ -180,6 +207,10 @@ impl Responses for Codex {
 
 #[async_trait]
 impl Chat for Codex {
+    fn as_sql(&self) -> Option<&dyn SqlGeneration> {
+        None
+    }
+
     async fn chat_stream(
         &self,
         req: CreateChatCompletionRequest,
@@ -193,7 +224,11 @@ impl Chat for Codex {
             .acquire()
             .await
             .map_err(|e| OpenAIError::InvalidArgument(e.to_string()))?;
-        let stream = client.responses().create_stream(inner_req).await?;
+        let stream = client
+            .responses()
+            .create_stream(inner_req)
+            .await
+            .map_err(normalize_codex_error)?;
         drop(permit);
         Ok(responses_adapter::chat_completion_stream_from_response_stream(stream, outer_model))
     }
@@ -215,7 +250,11 @@ impl Chat for Codex {
             .acquire()
             .await
             .map_err(|e| OpenAIError::InvalidArgument(e.to_string()))?;
-        let response = client.responses().create(inner_req).await?;
+        let response = client
+            .responses()
+            .create(inner_req)
+            .await
+            .map_err(normalize_codex_error)?;
         drop(permit);
         responses_adapter::chat_completion_response_from_response(response, outer_model)
     }
@@ -248,5 +287,20 @@ mod tests {
         assert!(!forwarded.contains_key("host"));
         assert!(!forwarded.contains_key("content-length"));
         assert!(!forwarded.contains_key("x-unrelated"));
+    }
+
+    #[test]
+    fn normalizes_codex_backend_detail_errors() {
+        let error = OpenAIError::JSONDeserialize(
+            serde_json::from_str::<serde_json::Value>("not json")
+                .expect_err("invalid JSON should produce a parse error"),
+            r#"{"detail":"The model is not supported for this account."}"#.to_string(),
+        );
+
+        assert!(matches!(
+            normalize_codex_error(error),
+            OpenAIError::InvalidArgument(message)
+                if message == "The model is not supported for this account."
+        ));
     }
 }
