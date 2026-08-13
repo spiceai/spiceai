@@ -2,11 +2,11 @@
 #
 # Unit tests for `scripts/restack_stacked_branch.sh`.
 #
-# Every case here is a defect the script had at some point, and each one failed
-# the same way: by printing nothing. That is what makes them worth pinning. An
-# audit that reports a clean restack when the merge reverted a deletion is worse
-# than no audit, because the reader stops looking -- and the whole reason this
-# tooling exists is that git already reports such a merge as conflict-free.
+# Every case here pins a way the subject can fail while printing nothing, which
+# is what makes them worth a test rather than a reading. An audit that reports a
+# clean restack when the merge reverted a deletion is worse than no audit,
+# because the reader stops looking -- and the whole reason this tooling exists is
+# that git already reports such a merge as conflict-free.
 #
 # No network and no fixtures: each case builds a throwaway repository whose
 # history has the shape being tested -- fork point, parent branch, child branch,
@@ -157,6 +157,73 @@ start_test "audit tests the index, not the worktree (unstaged correction)"
   case "$output" in
     *"RESURRECTED registry.rs"*) ;;
     *) fail_test "unstaged removal read as clean; got: $output" ;;
+  esac
+) || failures=$((failures + 1))
+
+start_test "audit reports a child edit the merge discarded (a revert of the parent)"
+(
+  new_stack "$work_root/revert"
+  printf 'old\n' > f.txt && commit_all "fork point"
+  git checkout --quiet -b parent
+  printf 'new\n' > f.txt && commit_all "parent changes it"
+  stack_base=$(git rev-parse HEAD)
+  git checkout --quiet -b child
+  # Reverting the parent's change makes the child's side match the fork point, so
+  # the merge sees nothing to preserve and keeps trunk's version. No conflict is
+  # reported, and the path is a modification, so neither the add nor the delete
+  # filter lists it.
+  printf 'old\n' > f.txt && commit_all "child deliberately reverts it"
+  pre=$(git rev-parse HEAD)
+  squash_parent_onto_trunk
+  git checkout --quiet child
+  git merge --no-ff --no-commit trunk >/dev/null 2>&1
+
+  output=$("$subject" audit "$stack_base" "$pre" 2>/dev/null)
+  status=$?
+  [ "$status" -eq 1 ] || fail_test "expected exit 1, got $status ($output)"
+  case "$output" in
+    *"DISCARDED f.txt"*) ;;
+    *) fail_test "the discarded revert was not reported: $output" ;;
+  esac
+) || failures=$((failures + 1))
+
+start_test "audit does not cry wolf when both sides' edits survive the merge"
+(
+  new_stack "$work_root/nofalse"
+  printf 'l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\n' > f.txt && commit_all "fork point"
+  git checkout --quiet -b parent
+  printf 'l1\nPARENT\nl3\nl4\nl5\nl6\nl7\nl8\n' > f.txt && commit_all "parent edits line 2"
+  stack_base=$(git rev-parse HEAD)
+  git checkout --quiet -b child
+  printf 'l1\nPARENT\nl3\nl4\nl5\nl6\nl7\nCHILD\n' > f.txt && commit_all "child edits line 8"
+  pre=$(git rev-parse HEAD)
+  squash_parent_onto_trunk
+  printf 'l1\nPARENT\nTRUNK\nl4\nl5\nl6\nl7\nl8\n' > f.txt && commit_all "trunk edits line 3"
+  git checkout --quiet child
+  git merge --no-ff --no-commit trunk >/dev/null 2>&1
+
+  output=$("$subject" audit "$stack_base" "$pre" 2>/dev/null)
+  status=$?
+  [ "$status" -eq 0 ] || fail_test "a merge that kept both edits was reported: $output"
+  case "$output" in
+    *DISCARDED*) fail_test "false positive on a normally merged edit: $output" ;;
+  esac
+) || failures=$((failures + 1))
+
+start_test "audit says so when it cannot check modifications, rather than implying it did"
+(
+  new_stack "$work_root/nomerge"
+  printf 'old\n' > f.txt && commit_all "fork point"
+  git checkout --quiet -b parent && printf 'new\n' > f.txt && commit_all "parent"
+  stack_base=$(git rev-parse HEAD)
+  git checkout --quiet -b child && printf 'old\n' > f.txt && commit_all "child reverts"
+  pre=$(git rev-parse HEAD)
+  # No merge started, so there is no other side to compare against.
+
+  output=$("$subject" audit "$stack_base" "$pre" 2>&1)
+  case "$output" in
+    *"only additions and deletions were checked"*) ;;
+    *) fail_test "a narrowed audit did not say so: $output" ;;
   esac
 ) || failures=$((failures + 1))
 

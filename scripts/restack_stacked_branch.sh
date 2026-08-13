@@ -13,18 +13,19 @@
 # crates/runtime-table/src/table_layers.rs back -- half of the registry #12891
 # was written to delete -- and the conflict list never mentioned it.
 #
-# Two subcommands do the mechanical parts, both of which have failed in ways that
-# print nothing:
+# Two subcommands do the mechanical parts, both of which fail silently when done
+# by hand:
 #
 #   resolve  Re-resolve one conflicted path three-way against the stack base
 #            rather than the base git chose.
-#   audit    Report paths the merge resurrected or lost, against what the child
-#            intended.
+#   audit    Report paths the merge resurrected, lost, or discarded the content
+#            of, against what the child intended.
 #
 # The reasoning -- when to rebase instead, what the stack base is, why the audit
 # is not optional -- is in docs/dev/stacked_prs.md. This script is the part worth
-# testing rather than retyping; scripts/test_restack_stacked_branch.sh covers
-# every failure mode named below, each of which was a real defect.
+# testing rather than retyping: scripts/test_restack_stacked_branch.sh pins every
+# failure mode named below, all of which report success while doing the wrong
+# thing, so nothing else would catch them.
 #
 # Usage:
 #   scripts/restack_stacked_branch.sh stack-base <parent-pr>
@@ -175,6 +176,18 @@ path_in_index() {
   esac
 }
 
+# The commit being merged in, which the modification check compares against:
+# MERGE_HEAD while the merge is open, the second parent once it is committed.
+merge_other_side() {
+  local git_dir
+  git_dir=$(git rev-parse --git-dir) || return 1
+  if [ -f "$git_dir/MERGE_HEAD" ]; then
+    git rev-parse --verify --quiet MERGE_HEAD
+    return $?
+  fi
+  git rev-parse --verify --quiet "HEAD^2"
+}
+
 # Exit status: 0 if the merge did what the child intended, 1 otherwise.
 #
 # The comparison is against the pre-merge tip, and membership is tested in the
@@ -216,6 +229,11 @@ cmd_audit() {
     rm -rf "$tmp"
     die "could not diff $stack_base..$pre for additions"
   fi
+  if ! git diff --name-only -z --no-renames --diff-filter=M \
+         "$stack_base" "$pre" -- > "$tmp/modified"; then
+    rm -rf "$tmp"
+    die "could not diff $stack_base..$pre for modifications"
+  fi
 
   local findings=0 path
 
@@ -232,6 +250,35 @@ cmd_audit() {
       findings=$((findings + 1))
     fi
   done < "$tmp/added"
+
+  # A modification disappears by the same mechanism as a deletion, and just as
+  # quietly: when the child's edit reverts something the parent did, the child's
+  # side matches the fork point, so the merge sees no change to preserve and
+  # keeps trunk's version. Neither filter above lists such a path -- it is a
+  # modification, and its content is simply gone.
+  #
+  # The signature is that the staged blob is byte-identical to trunk's while the
+  # child's differs: the child's edit is not represented in the result at all. An
+  # edit that merged normally leaves a result matching neither side exactly.
+  local other staged theirs mine
+  if ! other=$(merge_other_side); then
+    # Outside a merge there is no other side to compare against. Say so rather
+    # than reporting on a narrower check than the caller asked for: a quiet
+    # partial audit is the failure this whole helper is arguing against.
+    echo "note: no merge in progress or committed, so only additions and deletions were checked" >&2
+    other=""
+  fi
+  while [ -n "$other" ] && IFS= read -r -d '' path; do
+    # An unmerged path has no stage 0 and is somebody's open conflict, not a
+    # silent loss.
+    staged=$(git rev-parse --verify --quiet ":0:$path") || continue
+    theirs=$(git rev-parse --verify --quiet "$other:$path") || continue
+    mine=$(git rev-parse --verify --quiet "$pre:$path") || continue
+    if [ "$staged" = "$theirs" ] && [ "$mine" != "$theirs" ]; then
+      echo "DISCARDED $path"
+      findings=$((findings + 1))
+    fi
+  done < "$tmp/modified"
 
   rm -rf "$tmp"
 

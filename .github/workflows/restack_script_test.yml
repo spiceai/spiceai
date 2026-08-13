@@ -6,11 +6,11 @@ name: Restack Script Tests
 # base, and auditing what the merge did to paths the branch meant to add or
 # delete.
 #
-# Every case in the test file is a defect the script had, and all of them failed
-# by printing nothing -- a restore reported as clean, a dropped executable bit,
-# a deletion staged as a 0-byte file. An audit that says "clean" when the merge
-# reverted a deletion is worse than no audit, because git already reports that
-# merge as conflict-free and the reader stops looking.
+# Every case in the test file pins a failure that would otherwise print nothing:
+# a restore reported as clean, a dropped executable bit, a deletion staged as a
+# 0-byte file. An audit that says "clean" when the merge reverted a deletion is
+# worse than no audit, because git already reports that merge as conflict-free
+# and the reader stops looking.
 on:
   # No `branches:` filter, unlike its neighbours. That key matches the PR's base
   # branch, and a stacked child is based on its parent branch rather than on

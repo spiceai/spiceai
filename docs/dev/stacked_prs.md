@@ -211,7 +211,14 @@ scripts/restack_stacked_branch.sh audit "$STACKBASE" "$PRE"
 ```
 
 It compares what the child *intended* against what the merge actually staged, and exits
-non-zero on any `RESURRECTED` or `LOST` path. Run it again after every correction.
+non-zero on any `RESURRECTED`, `LOST`, or `DISCARDED` path. Run it again after every
+correction.
+
+`DISCARDED` is the same failure as `RESURRECTED`, in content rather than existence: when
+the child's edit *reverts* something the parent did, the child's side matches the fork
+point, so the merge sees nothing to preserve and keeps `trunk`'s version. No conflict is
+reported, and the path is a modification, so listing added and deleted paths alone would
+never surface it.
 
 Two properties are worth knowing, because both were bugs that reported success:
 
