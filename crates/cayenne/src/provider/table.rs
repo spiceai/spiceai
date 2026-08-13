@@ -49102,7 +49102,9 @@ mod tests {
             Some(CachedPkIndex::Exact(keyset)) => match keyset.location_by_digest(committed_digest)
             {
                 Some(RowLocation::FileUnlocated) => {}
-                Some(other) => panic!("id=7 must be replayed at the location it was committed at, got {other:?}"),
+                Some(other) => panic!(
+                    "id=7 must be replayed at the location it was committed at, got {other:?}"
+                ),
                 None => panic!(
                     "the restored keyset must know id=7: a concurrent commit's existence entry \
                      was dropped, so the next upsert would keep both rows"
