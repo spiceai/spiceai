@@ -548,6 +548,29 @@ mod tests {
         )
     }
 
+    /// A table registered in the same metastore as `fixture`'s, rooted outside
+    /// its data directory — the shape an operator gets by accelerating a second
+    /// dataset into one metastore.
+    async fn unrelated_table(fixture: &Fixture, table_name: &str, dir: &str) {
+        fixture
+            .catalog
+            .create_table(CreateTableOptions {
+                table_name: table_name.to_string(),
+                schema: Arc::clone(&fixture.schema),
+                primary_key: vec![],
+                on_conflict: None,
+                base_path: fixture
+                    .base_path
+                    .with_file_name(dir)
+                    .to_string_lossy()
+                    .to_string(),
+                partition_column: None,
+                vortex_config: VortexConfig::default(),
+            })
+            .await
+            .unwrap_or_else(|error| panic!("the table {table_name} is created: {error}"));
+    }
+
     fn bucket(value: &str) -> ScalarValue {
         ScalarValue::Utf8(Some(value.to_string()))
     }
@@ -835,23 +858,7 @@ mod tests {
     async fn dropping_a_table_leaves_an_unrelated_same_prefix_table_alone() {
         let fixture = fixture().await;
         let sibling = format!("{TABLE}_p0000");
-        fixture
-            .catalog
-            .create_table(CreateTableOptions {
-                table_name: sibling.clone(),
-                schema: Arc::clone(&fixture.schema),
-                primary_key: vec![],
-                on_conflict: None,
-                base_path: fixture
-                    .base_path
-                    .with_file_name("sibling")
-                    .to_string_lossy()
-                    .to_string(),
-                partition_column: None,
-                vortex_config: VortexConfig::default(),
-            })
-            .await
-            .expect("the sibling table is created");
+        unrelated_table(&fixture, &sibling, "sibling").await;
 
         assert!(
             fixture
@@ -904,23 +911,7 @@ mod tests {
             TABLE,
             &partition.partition_values,
         );
-        fixture
-            .catalog
-            .create_table(CreateTableOptions {
-                table_name: impostor.clone(),
-                schema: Arc::clone(&fixture.schema),
-                primary_key: vec![],
-                on_conflict: None,
-                base_path: fixture
-                    .base_path
-                    .with_file_name("unrelated")
-                    .to_string_lossy()
-                    .to_string(),
-                partition_column: None,
-                vortex_config: VortexConfig::default(),
-            })
-            .await
-            .expect("the unrelated table is created");
+        unrelated_table(&fixture, &impostor, "unrelated").await;
 
         assert!(
             fixture
