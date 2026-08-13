@@ -86,12 +86,10 @@ use runtime_cloud_connect::handlers::{
     ApplyOutcome, Capability, CommandError, MAX_QUERY_RESULT_BYTES, QueryOutcome, RuntimeHandle,
     RuntimePhase, SpicepodDeployment, StatusReport, effective_max_rows,
 };
+use runtime_cloud_connect::identity::CacheKey;
 use runtime_cloud_connect::supervisor::Supervisor;
 use runtime_cloud_connect::{CloudConnect, identity::IdentityStore};
-// Reached through the `runtime` re-export rather than a direct dependency, the
-// same way `runtime::status` is.
-use runtime::secrets::stores::cloud_delivered::{CLOUD_DELIVERED_STORE, CloudDeliveredSecretStore};
-use runtime_cloud_connect::identity::CacheKey;
+use runtime_secrets::stores::cloud_delivered::{CLOUD_DELIVERED_STORE, CloudDeliveredSecretStore};
 
 use crate::log_capture::LogRingBuffer;
 
@@ -238,7 +236,7 @@ pub async fn restore_delivered_secrets(
     let store = Arc::new(CloudDeliveredSecretStore::new());
     runtime.secrets().write().await.register_builtin_store(
         CLOUD_DELIVERED_STORE,
-        Arc::clone(&store) as Arc<dyn runtime::secrets::SecretStore>,
+        Arc::clone(&store) as Arc<dyn runtime_secrets::SecretStore>,
     );
 
     load_cached_secrets(&config, &store);
@@ -351,7 +349,7 @@ pub async fn maybe_start(
         let store = Arc::new(CloudDeliveredSecretStore::new());
         runtime.secrets().write().await.register_builtin_store(
             CLOUD_DELIVERED_STORE,
-            Arc::clone(&store) as Arc<dyn runtime::secrets::SecretStore>,
+            Arc::clone(&store) as Arc<dyn runtime_secrets::SecretStore>,
         );
         load_cached_secrets(&config, &store);
         store
