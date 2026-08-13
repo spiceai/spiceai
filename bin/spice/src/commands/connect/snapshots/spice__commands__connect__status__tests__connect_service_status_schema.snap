@@ -1,0 +1,26 @@
+---
+source: bin/spice/src/commands/connect/status.rs
+expression: json
+---
+{
+  "schema_version": 1,
+  "service": {
+    "installed": true,
+    "state": "running",
+    "scope": "system",
+    "supervisor": "systemd",
+    "starts": "boot_without_login",
+    "owner": "alice",
+    "name": "spiced-cloud-connect-edge-analytics-59e8c853e76c15ba.service",
+    "working_dir": "/srv/edge-analytics",
+    "definition_path": "/etc/systemd/system/spiced-cloud-connect-edge-analytics-59e8c853e76c15ba.service",
+    "runtime_path": "/usr/local/lib/spice/spiced",
+    "log_source": {
+      "kind": "journal",
+      "unit": "spiced-cloud-connect-edge-analytics-59e8c853e76c15ba.service",
+      "scope": "system"
+    },
+    "diagnostic": null,
+    "starts_action": null
+  }
+}

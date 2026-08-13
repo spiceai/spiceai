@@ -232,7 +232,10 @@ async fn install(
             ctx.spiced_path().display()
         ),
     })?;
-    let runtime_version = ctx.runtime_version().unwrap_or_default();
+    // Propagated, not defaulted: the manifest records the version installed, so
+    // a lookup that failed has to fail the install rather than publish a
+    // manifest that claims no version at all.
+    let runtime_version = ctx.runtime_version()?;
     let health_url = format!("{}/health", ctx.http_endpoint().trim_end_matches('/'));
 
     let manifest = super::install(
@@ -342,20 +345,10 @@ fn resolve_or_report(
 /// The report is already on stdout by the time this runs: the diagnosis travels
 /// as the process's error on stderr, so a `--output json` run stays parseable.
 fn degraded_error(status: &ConnectStatus) -> Result<()> {
-    if !status.is_degraded() {
-        return Ok(());
+    match status.degradation() {
+        Some(message) => Err(Error::ServiceUnavailable { message }),
+        None => Ok(()),
     }
-    Err(Error::ServiceUnavailable {
-        message: format!(
-            "The Spice Cloud Connect service for {} is {}{}",
-            status.connection.directory.display(),
-            status.service.state,
-            match &status.service.diagnostic {
-                Some(diagnostic) => format!(": {diagnostic}"),
-                None => ".".to_string(),
-            }
-        ),
-    })
 }
 
 #[cfg(test)]

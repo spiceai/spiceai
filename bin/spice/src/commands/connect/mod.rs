@@ -145,6 +145,14 @@ pub struct ConnectArgs {
     #[arg(long, short = 'y', global = true)]
     pub yes: bool,
 
+    /// Clear this directory's local state even when Spice Cloud could not
+    /// confirm the release. Applies to `remove`, which otherwise keeps the
+    /// identity so a retry can finish. Use it when the instance is already
+    /// deleted in the portal, or when the control plane that issued it is gone:
+    /// the portal-side delete is authoritative either way.
+    #[arg(long, global = true)]
+    pub force: bool,
+
     /// The global `--cloud-region`, forwarded by the dispatcher rather than
     /// declared here (the flag is global; clap would reject a second definition
     /// of the same name).
@@ -234,7 +242,7 @@ pub async fn execute(ctx: &RuntimeContext, args: ConnectArgs) -> Result<()> {
                 print_status(&config_dir, args.endpoint.as_deref(), status_args.output).await
             }
             ConnectCommand::Remove => {
-                remove_identity(&config_dir, args.endpoint.as_deref(), args.yes).await
+                remove_identity(&config_dir, args.endpoint.as_deref(), args.yes, args.force).await
             }
             ConnectCommand::Service(service_args) => {
                 service::cli::execute(
@@ -352,18 +360,57 @@ fn has_enrolled_identity(config_dir: &Path) -> Result<bool> {
         })
 }
 
-/// The instance directory a config dir belongs to: `<dir>/.spice` → `<dir>`.
+/// The canonical instance directory a config dir belongs to: `<dir>/.spice` →
+/// `<dir>`.
 ///
 /// `SPICE_CONFIG_DIR` can point anywhere, so a config dir that is not named
 /// `.spice` has no instance directory above it — in that case the config dir
 /// itself is the best available answer for the service's working directory.
+///
+/// The result is canonicalized because it *is* the service's identity: the
+/// service name is a digest of this path, so `/srv/edge`, `/srv/./edge`,
+/// `/srv/other/../edge`, and a symlink to any of them have to reduce to one
+/// answer. Without that, one instance directory can install a second service
+/// under a second name, or reject the valid manifest of the one it already has.
 fn instance_dir_for(config_dir: &Path) -> PathBuf {
-    if config_dir.file_name() == Some(std::ffi::OsStr::new(".spice"))
+    let dir = if config_dir.file_name() == Some(std::ffi::OsStr::new(".spice"))
         && let Some(parent) = config_dir.parent().filter(|p| !p.as_os_str().is_empty())
     {
-        return parent.to_path_buf();
+        parent.to_path_buf()
+    } else {
+        config_dir.to_path_buf()
+    };
+    canonicalize_instance_dir(&dir)
+}
+
+/// Reduce an instance directory to the one spelling every command must derive
+/// its service name from.
+///
+/// `fs::canonicalize` is the authoritative answer — it resolves symlinks, which
+/// a purely textual normalization cannot — but it needs the directory to exist.
+/// A directory that is not there yet still has to produce a stable name (that
+/// is how `status` reports on a directory before anything is created in it), so
+/// the fallback normalizes `.` and `..` textually. Resolving `..` without the
+/// filesystem is only safe because the input is already absolute.
+fn canonicalize_instance_dir(dir: &Path) -> PathBuf {
+    if let Ok(canonical) = std::fs::canonicalize(dir) {
+        return canonical;
     }
-    config_dir.to_path_buf()
+    let mut normalized = PathBuf::new();
+    for component in dir.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                // A leading `..` has nothing to pop, so it is kept: dropping it
+                // would silently rewrite the path to a different directory.
+                if !normalized.pop() {
+                    normalized.push(component.as_os_str());
+                }
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
 }
 
 /// Collect and render one status snapshot.
@@ -380,44 +427,49 @@ async fn print_status(
     )
     .await;
     status::render(&status, output)?;
-    if status.is_degraded() {
-        return Err(Error::ServiceUnavailable {
-            message: format!(
-                "The Spice Cloud Connect service for {} is {}{}",
-                status.connection.directory.display(),
-                status.service.state,
-                match &status.service.diagnostic {
-                    Some(diagnostic) => format!(": {diagnostic}"),
-                    None => ".".to_string(),
-                }
-            ),
-        });
+    // The report is already on stdout; the diagnosis travels as the command's
+    // error so a `--output json` run stays parseable.
+    match status.degradation() {
+        Some(message) => Err(Error::ServiceUnavailable { message }),
+        None => Ok(()),
     }
-    Ok(())
 }
 
 /// What Spice Cloud said about the release, reduced to the only question that
 /// decides whether local state may be cleared.
 #[derive(Debug)]
 enum ReleaseVerdict {
-    /// The cloud confirmed the release, or confirmed this instance is not
-    /// there. Either way the credential on disk is no longer usable and can go.
+    /// The cloud confirmed the release, or stated that this instance is
+    /// permanently gone. Either way the credential on disk is no longer usable
+    /// and can go.
     Confirmed {
         outcome: runtime_cloud_connect::release::ReleaseOutcome,
     },
-    /// The cloud could not be reached, or refused in a way that leaves the
-    /// instance registered. Local state must survive so a retry can finish the
-    /// removal.
+    /// The cloud could not be reached, or refused in a way that does not
+    /// establish what happened to the instance. Local state must survive so a
+    /// retry can finish the removal.
     Unconfirmed { reason: String },
 }
+
+/// The status the control plane uses to say an instance existed and is
+/// permanently gone. Unlike a bare not-found, it cannot also mean "you asked
+/// the wrong control plane" or "you may not see this instance".
+const RELEASE_GONE_STATUS: u16 = 410;
 
 /// Report this instance's release to Spice Cloud and classify the answer.
 ///
 /// The classification is the whole point: clearing the identity is what makes a
 /// removal unrecoverable, so it happens only once the cloud has said the
-/// instance is released or already gone. A network blip must leave a directory
-/// a retry can finish from — the alternative silently orphans a registry row
-/// that nobody local can release any more.
+/// instance is released or permanently gone. A network blip, or an answer that
+/// does not establish what happened, must leave a directory a retry can finish
+/// from — the alternative silently orphans a registry row that nobody local can
+/// release any more.
+///
+/// A `404` deliberately does **not** confirm anything. The release endpoint
+/// answers not-found for an instance that belongs to another organization, and
+/// for a request aimed at a control plane that never issued this identity, so
+/// reading it as absence lets a mistyped `--endpoint` clear the only credential
+/// for an instance that is alive in its real registry.
 async fn release_instance(
     config_dir: &Path,
     endpoint: Option<&str>,
@@ -426,13 +478,25 @@ async fn release_instance(
     let endpoint = resolved_endpoint(config_dir, endpoint);
     let ca = (!identity.ca_bundle_pem.is_empty()).then_some(identity.ca_bundle_pem.as_str());
 
-    match runtime_cloud_connect::release::release(&endpoint, identity, ca).await {
+    classify_release(
+        runtime_cloud_connect::release::release(&endpoint, identity, ca).await,
+        &endpoint,
+    )
+}
+
+/// [`release_instance`] without the request: the classification of what the
+/// control plane answered.
+///
+/// Separated so every branch — including the `404` that must *not* confirm
+/// anything — is tested without key material or a control plane.
+fn classify_release(
+    result: runtime_cloud_connect::release::Result<runtime_cloud_connect::release::ReleaseOutcome>,
+    endpoint: &str,
+) -> ReleaseVerdict {
+    match result {
         Ok(outcome) => ReleaseVerdict::Confirmed { outcome },
-        // The cloud has no such instance: the same end state the release was
-        // asking for, including the case where it was already deleted in the
-        // portal.
         Err(runtime_cloud_connect::release::Error::Rejected { status, .. })
-            if status == 404 || status == 410 =>
+            if status == RELEASE_GONE_STATUS =>
         {
             ReleaseVerdict::Confirmed {
                 outcome: runtime_cloud_connect::release::ReleaseOutcome {
@@ -444,11 +508,11 @@ async fn release_instance(
         Err(err) => ReleaseVerdict::Unconfirmed {
             reason: format!(
                 "{err} Nothing was removed locally: the identity, delivered secrets, and any \
-                 installed service are intact so `spice connect remove` can finish the removal. \
-                 If Spice Cloud cannot accept the release at all, delete the instance in the \
-                 Spice Cloud portal and re-run this command — a released instance is confirmed \
-                 absent and its local state is then cleared. \
-                 See: https://spiceai.org/docs"
+                 installed service are intact, so `spice connect remove` can finish the removal \
+                 once {endpoint} can be reached. If this instance is already deleted in the \
+                 Spice Cloud portal — or that control plane is the wrong one for it — pass \
+                 --force to clear this directory's local state without a confirmed release; the \
+                 portal-side delete stays authoritative. See: https://spiceai.org/docs"
             ),
         },
     }
@@ -459,13 +523,16 @@ async fn release_instance(
 ///
 /// Ordered so that no step is taken on the strength of a guess. The release is
 /// reported first and its answer decides everything after it: a confirmed
-/// release (or a confirmed absence) is what makes the local credential dead and
-/// safe to delete, while an unconfirmed one leaves the directory exactly as it
-/// was for a retry to finish.
+/// release, or a stated permanent absence, is what makes the local credential
+/// dead and safe to delete, while an unconfirmed one leaves the directory
+/// exactly as it was for a retry to finish. `force` is the operator saying they
+/// have decided for themselves — it is honoured only after the unconfirmed
+/// reason has been printed.
 async fn remove_identity(
     config_dir: &Path,
     endpoint: Option<&str>,
     assume_yes: bool,
+    force: bool,
 ) -> Result<()> {
     // Own the complete state transition before inspecting any file. Without
     // this boundary, removal can clear old state while enrollment is still
@@ -543,10 +610,19 @@ async fn remove_identity(
                     );
                 }
             }
-            ReleaseVerdict::Unconfirmed { reason } => {
+            ReleaseVerdict::Unconfirmed { reason } if !force => {
                 return Err(Error::CloudConnectIo {
                     message: format!("release this instance in Spice Cloud: {reason}"),
                 });
+            }
+            // Asked for explicitly, and only ever after the operator has been
+            // told what could not be confirmed: the local state goes and the
+            // portal-side delete is what actually releases the instance.
+            ReleaseVerdict::Unconfirmed { reason } => {
+                println!(
+                    "Could not confirm the release with Spice Cloud: {reason} Clearing this \
+                     directory's local state anyway because --force was given."
+                );
             }
         }
     }
@@ -940,6 +1016,54 @@ mod tests {
     }
 
     #[test]
+    fn equivalent_spellings_reduce_to_one_instance_directory() {
+        // The service name is a digest of this path, so two spellings of one
+        // directory must not become two services.
+        for spelling in [
+            "/srv/edge/.spice",
+            "/srv/./edge/.spice",
+            "/srv/other/../edge/.spice",
+            "/srv//edge/.spice",
+        ] {
+            assert_eq!(
+                instance_dir_for(Path::new(spelling)),
+                PathBuf::from("/srv/edge"),
+                "{spelling}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_symlinked_instance_directory_resolves_to_its_target() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let real = dir.path().join("real");
+        std::fs::create_dir_all(real.join(".spice")).expect("create the instance directory");
+        let link = dir.path().join("link");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real, &link).expect("symlink the instance directory");
+        #[cfg(not(unix))]
+        std::fs::create_dir_all(&link).expect("stand in for a symlink");
+
+        // Both spellings name one directory, so both must derive one service.
+        let through_link = instance_dir_for(&link.join(".spice"));
+        let direct = instance_dir_for(&real.join(".spice"));
+        #[cfg(unix)]
+        assert_eq!(through_link, direct);
+        #[cfg(not(unix))]
+        assert_ne!(through_link, direct);
+    }
+
+    #[test]
+    fn a_leading_parent_component_is_not_silently_dropped() {
+        // Nothing to pop, and rewriting the path would name a different
+        // directory than the caller asked for.
+        assert_eq!(
+            canonicalize_instance_dir(Path::new("../unresolvable/edge")),
+            PathBuf::from("../unresolvable/edge")
+        );
+    }
+
+    #[test]
     fn a_malformed_identity_is_not_reported_as_enrolled() {
         let dir = tempfile::tempdir().expect("create tempdir");
         std::fs::write(dir.path().join(IDENTITY_FILE), "not valid JSON")
@@ -1009,7 +1133,7 @@ mod tests {
             std::fs::write(path, contents).expect("write active state");
         }
 
-        let error = remove_identity(&config_dir, None, true)
+        let error = remove_identity(&config_dir, None, true, false)
             .await
             .expect_err("active enrollment owns removal transaction");
         assert!(
@@ -1030,6 +1154,76 @@ mod tests {
         );
 
         drop(active);
+    }
+
+    #[test]
+    fn a_not_found_release_never_confirms_an_absence() {
+        // The release endpoint answers not-found for an instance in another
+        // organization, and for a request aimed at a control plane that never
+        // issued this identity. Reading either as absence lets a mistyped
+        // --endpoint clear the only credential for a live instance.
+        for status in [400, 401, 403, 404, 409, 500, 503] {
+            let verdict = classify_release(
+                Err(runtime_cloud_connect::release::Error::Rejected {
+                    status,
+                    message: "not found".to_string(),
+                }),
+                "https://api.example",
+            );
+            assert!(
+                matches!(verdict, ReleaseVerdict::Unconfirmed { .. }),
+                "HTTP {status} must not confirm anything: {verdict:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_a_stated_permanent_absence_confirms_without_a_release() {
+        // `410 Gone` says the instance existed and is permanently gone, which a
+        // cross-organization or wrong-control-plane request does not produce.
+        let verdict = classify_release(
+            Err(runtime_cloud_connect::release::Error::Rejected {
+                status: RELEASE_GONE_STATUS,
+                message: "gone".to_string(),
+            }),
+            "https://api.example",
+        );
+        match verdict {
+            ReleaseVerdict::Confirmed { outcome } => assert_eq!(outcome.status, "removed"),
+            other @ ReleaseVerdict::Unconfirmed { .. } => {
+                panic!("410 must confirm the end state: {other:?}")
+            }
+        }
+
+        // And an accepted release confirms, which is the ordinary path.
+        let verdict = classify_release(
+            Ok(runtime_cloud_connect::release::ReleaseOutcome {
+                status: "removed".to_string(),
+                app_name: Some("edge-analytics".to_string()),
+            }),
+            "https://api.example",
+        );
+        assert!(
+            matches!(verdict, ReleaseVerdict::Confirmed { .. }),
+            "{verdict:?}"
+        );
+    }
+
+    #[test]
+    fn an_unconfirmed_release_names_the_way_to_finish_it() {
+        let verdict = classify_release(
+            Err(runtime_cloud_connect::release::Error::Rejected {
+                status: 404,
+                message: "no such instance".to_string(),
+            }),
+            "https://api.example",
+        );
+        let ReleaseVerdict::Unconfirmed { reason } = verdict else {
+            panic!("404 must not confirm");
+        };
+        assert!(reason.contains("Nothing was removed locally"), "{reason}");
+        assert!(reason.contains("--force"), "{reason}");
+        assert!(reason.contains("https://api.example"), "{reason}");
     }
 
     #[tokio::test]
@@ -1053,7 +1247,7 @@ mod tests {
 
         // A port nothing listens on: the release cannot be reported, which is
         // exactly the transient failure under test.
-        let error = remove_identity(&config_dir, Some("http://127.0.0.1:1"), true)
+        let error = remove_identity(&config_dir, Some("http://127.0.0.1:1"), true, false)
             .await
             .expect_err("an unconfirmed release must fail the removal");
         assert!(

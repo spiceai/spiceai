@@ -310,22 +310,37 @@ fn main() {
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"))
     };
 
-    // The subscriber writes to stdout, so stdout's terminal-ness decides colour.
-    // The builder default would honour `NO_COLOR` but still paint a redirected
-    // stdout; this is the same decision the CLI's own painted output already uses.
-    tracing_subscriber::fmt()
+    // Whether stdout is reserved for one JSON document. Decided before the
+    // subscriber is built, because it decides where log output may go.
+    let json_stdout = is_json_output(&mut cli.command);
+
+    // A JSON run must leave stdout parseable, so every log line goes to stderr
+    // instead — including the final error, which a command that has already
+    // written its report would otherwise append to the JSON. Otherwise the
+    // subscriber writes to stdout, so stdout's terminal-ness decides colour:
+    // the builder default would honour `NO_COLOR` but still paint a redirected
+    // stdout, and this is the same decision the CLI's own painted output uses.
+    let subscriber = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
-        .without_time()
-        .with_ansi(ansi_colors::colors_enabled_for(ansi_colors::Target::Stdout))
-        .init();
+        .without_time();
+    if json_stdout {
+        subscriber
+            .with_ansi(ansi_colors::colors_enabled_for(ansi_colors::Target::Stderr))
+            .with_writer(std::io::stderr)
+            .init();
+    } else {
+        subscriber
+            .with_ansi(ansi_colors::colors_enabled_for(ansi_colors::Target::Stdout))
+            .init();
+    }
 
     // Version banner: stderr-only so it doesn't foul pipes, and only for interactive stderr.
     // Suppressed for commands that produce JSON (scripting) or where it's just noise.
     if std::io::stderr().is_terminal()
         && !cli.machine
         && !matches!(cli.command, Commands::Version(_) | Commands::Completions(_))
-        && !is_json_output(&mut cli.command)
+        && !json_stdout
     {
         eprintln!("Spice.ai OSS CLI {}", version::cli_version());
     }

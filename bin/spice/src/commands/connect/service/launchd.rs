@@ -429,20 +429,108 @@ fn observe(manifest: &ServiceManifest) -> ServiceObservation {
                 .map_or("launchctl print", String::as_str),
         ));
     };
+    let state = normalize_launchd_state(&reported);
+    let (starts, starts_action) = observe_persistence(manifest);
     ServiceObservation {
-        state: normalize_launchd_state(&reported),
-        // A daemon is bootstrapped into the system domain and runs before
-        // anyone logs in; an agent is bootstrapped into its owner's GUI domain
-        // and cannot run before that owner is there. macOS offers no non-root
-        // way to make an agent start earlier, so there is no remediation to
-        // name for the agent case.
-        starts: match manifest.scope {
-            ServiceScope::System => ServiceStarts::BootWithoutLogin,
-            ServiceScope::User => ServiceStarts::LoginOnly,
-        },
-        diagnostic: None,
-        starts_action: None,
+        state,
+        starts,
+        // An `unavailable` state always says why. `not loaded` is the one that
+        // matters most: launchd has no such job while its definition is on
+        // disk, which is a different repair from a word this release does not
+        // recognise.
+        diagnostic: (state == ServiceState::Unavailable)
+            .then(|| unrecognized_state_diagnostic(&reported, manifest)),
+        starts_action,
     }
+}
+
+/// Why a state Spice does not recognise is reported as `unavailable`, naming
+/// launchd's own answer and the command that produced it.
+fn unrecognized_state_diagnostic(reported: &str, manifest: &ServiceManifest) -> String {
+    format!(
+        "`launchctl print {target}` reported state `{reported}`, which is not a state Spice can \
+         act on. Run it to see what launchd holds for this job.",
+        target = service_target_in(&manifest.name, manifest.scope),
+        reported = reported.trim(),
+    )
+}
+
+/// Whether the job will start on its own, and what to run when it will not.
+///
+/// The scope decides the ceiling: a daemon is bootstrapped into the system
+/// domain and runs before anyone logs in, while an agent lives in its owner's
+/// GUI domain and cannot run before that owner is there — macOS offers no
+/// non-root way to make an agent start earlier, so there is nothing to advise.
+///
+/// The ceiling is not the answer on its own, though. launchd keeps a *separate*
+/// disabled database, so a definition that is installed and correct can still be
+/// held down by `launchctl disable`, and inferring persistence from the scope
+/// alone would report `boot_without_login` for a daemon that will not start at
+/// all.
+fn observe_persistence(manifest: &ServiceManifest) -> (ServiceStarts, Option<String>) {
+    match job_is_disabled(&manifest.name, manifest.scope) {
+        Some(true) => (
+            ServiceStarts::Disabled,
+            Some(format!(
+                "{sudo}launchctl enable {target}",
+                sudo = if manifest.scope == ServiceScope::System && !super::is_root() {
+                    "sudo "
+                } else {
+                    ""
+                },
+                target = service_target_in(&manifest.name, manifest.scope),
+            )),
+        ),
+        Some(false) => match manifest.scope {
+            ServiceScope::System => (ServiceStarts::BootWithoutLogin, None),
+            ServiceScope::User => (ServiceStarts::LoginOnly, None),
+        },
+        // The database could not be read, so persistence is not knowable. A
+        // guess here is the claim of boot persistence this check exists to
+        // avoid making.
+        None => (ServiceStarts::Unavailable, None),
+    }
+}
+
+/// Whether launchd's disabled database holds this label down in `scope`.
+///
+/// `None` when the database could not be read at all — distinct from a label it
+/// simply does not list, which is `Some(false)`.
+fn job_is_disabled(label: &str, scope: ServiceScope) -> Option<bool> {
+    let domain = match scope {
+        ServiceScope::System => "system".to_string(),
+        ServiceScope::User => format!("user/{}", nix::unistd::Uid::effective().as_raw()),
+    };
+    let output = std::process::Command::new(LAUNCHCTL)
+        .arg("print-disabled")
+        .arg(&domain)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(parse_disabled(
+        &String::from_utf8_lossy(&output.stdout),
+        label,
+    ))
+}
+
+/// Whether `print-disabled` output lists `label` as disabled.
+///
+/// The output is a list of `"<label>" => <value>` lines, where the value has
+/// been spelled `true`/`false` and `disabled`/`enabled` across macOS releases.
+/// A label the list does not mention is not disabled.
+fn parse_disabled(printed: &str, label: &str) -> bool {
+    let quoted = format!("\"{label}\"");
+    printed
+        .lines()
+        .map(str::trim)
+        .filter_map(|line| line.split_once("=>"))
+        .find(|(name, _)| name.trim() == quoted)
+        .is_some_and(|(_, value)| {
+            let value = value.trim().trim_end_matches(';').trim();
+            value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("disabled")
+        })
 }
 
 /// The macOS back end.
@@ -1243,6 +1331,55 @@ mod tests {
         assert!(
             agent.to_string_lossy().contains(LAUNCH_AGENT_SUBDIR),
             "{agent:?}"
+        );
+    }
+
+    #[test]
+    fn the_disabled_database_decides_boot_persistence() {
+        // launchd keeps this list separately from the definition, so a daemon
+        // that is installed and correct can still be held down by
+        // `launchctl disable` — and must not be reported as starting at boot.
+        let printed = "\
+\"com.apple.something\" => false
+\"ai.spice.cloud-connect.edge-1-2962fca679ae993a\" => true
+\"com.apple.other\" => disabled
+";
+        assert!(parse_disabled(
+            printed,
+            "ai.spice.cloud-connect.edge-1-2962fca679ae993a"
+        ));
+        assert!(
+            parse_disabled(printed, "com.apple.other"),
+            "the `disabled` spelling counts too"
+        );
+        assert!(!parse_disabled(printed, "com.apple.something"));
+        assert!(
+            !parse_disabled(printed, "ai.spice.cloud-connect.absent"),
+            "a label the list does not mention is not disabled"
+        );
+        // A substring of another label must not match.
+        assert!(!parse_disabled(
+            "\"ai.spice.cloud-connect.edge-1-2962fca679ae993a.extra\" => true\n",
+            "ai.spice.cloud-connect.edge-1-2962fca679ae993a"
+        ));
+    }
+
+    #[test]
+    fn an_unrecognized_launchd_state_explains_itself() {
+        // The model promises every `unavailable` state says why, and `not
+        // loaded` is the answer that matters: launchd has no such job while the
+        // definition is on disk.
+        let manifest = manifest(ServiceScope::System);
+        let diagnostic = unrecognized_state_diagnostic(NOT_LOADED, &manifest);
+        assert!(diagnostic.contains(NOT_LOADED), "{diagnostic}");
+        assert!(
+            diagnostic.contains("launchctl print system/"),
+            "{diagnostic}"
+        );
+        assert_eq!(
+            normalize_launchd_state(NOT_LOADED),
+            ServiceState::Unavailable,
+            "the diagnostic only reaches the report for an unavailable state"
         );
     }
 

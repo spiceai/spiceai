@@ -367,15 +367,43 @@ fn observe(manifest: &ServiceManifest) -> ServiceObservation {
         ));
     };
     let (starts, starts_action) = observe_persistence(manifest);
+    let state = normalize_systemd_state(&reported);
     ServiceObservation {
-        state: normalize_systemd_state(&reported),
+        state,
         starts,
-        diagnostic: None,
+        // An `unavailable` state always says why. Carrying systemd's own answer
+        // is what makes the report actionable: `unknown` means systemd has no
+        // record of a unit whose file is on disk, which is a different repair
+        // from a word this release does not recognise.
+        diagnostic: (state == ServiceState::Unavailable)
+            .then(|| unrecognized_state_diagnostic(&reported, manifest)),
         starts_action,
     }
 }
 
+/// Why a state Spice does not recognise is reported as `unavailable`, naming
+/// systemd's own answer and the command that produced it.
+fn unrecognized_state_diagnostic(reported: &str, manifest: &ServiceManifest) -> String {
+    format!(
+        "`{command}` answered `{reported}`, which is not a state Spice can act on. Run it to \
+         see what systemd reports for this unit.",
+        command = systemctl_command(manifest.scope, &["is-active", &manifest.name]),
+        reported = reported.trim(),
+    )
+}
+
 /// Whether the unit is enabled, translated into the operator outcome.
+///
+/// Only a plain `enabled` establishes persistence. `enabled-runtime` is
+/// deliberately not enough: its link lives under `/run` and is gone after a
+/// reboot, so reporting boot persistence for it would promise exactly the thing
+/// that will not happen. Everything else systemd can answer here — `disabled`,
+/// `linked`, `static`, `indirect`, `alias`, `generated` — leaves the unit
+/// without a persistent boot-time link too, so all of them report `disabled`
+/// with the command that fixes it.
+///
+/// A *masked* unit cannot be enabled until it is unmasked, so its remediation
+/// says so rather than printing an `enable` that is guaranteed to fail.
 ///
 /// A system unit that is enabled comes up at boot with nobody logged in. A
 /// *user* unit that is enabled comes up when its owner logs in and no earlier
@@ -383,31 +411,43 @@ fn observe(manifest: &ServiceManifest) -> ServiceObservation {
 /// plus the command that changes it — claiming boot persistence that is not
 /// there is the failure this avoids.
 fn observe_persistence(manifest: &ServiceManifest) -> (ServiceStarts, Option<String>) {
-    let Some(enabled) = systemctl_query(manifest.scope, &["is-enabled", &manifest.name]) else {
+    let Some(reported) = systemctl_query(manifest.scope, &["is-enabled", &manifest.name]) else {
         return (ServiceStarts::Unavailable, None);
     };
-    let enabled = matches!(
-        enabled.as_str(),
-        "enabled" | "enabled-runtime" | "static" | "alias" | "indirect" | "generated"
-    );
-    if !enabled {
-        return (
+    classify_persistence(&reported, manifest)
+}
+
+/// [`observe_persistence`] without the process: the classification of what
+/// `systemctl is-enabled` answered, so every branch is testable on a host that
+/// has no systemd.
+fn classify_persistence(
+    reported: &str,
+    manifest: &ServiceManifest,
+) -> (ServiceStarts, Option<String>) {
+    let enable = || systemctl_command(manifest.scope, &["enable", &manifest.name]);
+    match reported.trim() {
+        "enabled" => match manifest.scope {
+            ServiceScope::System => (ServiceStarts::BootWithoutLogin, None),
+            ServiceScope::User => (
+                ServiceStarts::LoginOnly,
+                Some(format!(
+                    "loginctl enable-linger {}",
+                    manifest.owner.describe()
+                )),
+            ),
+        },
+        "masked" | "masked-runtime" => (
             ServiceStarts::Disabled,
-            Some(systemctl_command(
-                manifest.scope,
-                &["enable", &manifest.name],
-            )),
-        );
-    }
-    match manifest.scope {
-        ServiceScope::System => (ServiceStarts::BootWithoutLogin, None),
-        ServiceScope::User => (
-            ServiceStarts::LoginOnly,
             Some(format!(
-                "loginctl enable-linger {}",
-                manifest.owner.describe()
+                "{} && {}",
+                systemctl_command(manifest.scope, &["unmask", &manifest.name]),
+                enable()
             )),
         ),
+        // Includes the empty answer of a query that ran and said nothing, which
+        // is not a state to invent an outcome for.
+        "" => (ServiceStarts::Unavailable, None),
+        _ => (ServiceStarts::Disabled, Some(enable())),
     }
 }
 
@@ -816,6 +856,72 @@ mod tests {
                 scope: ServiceScope::User
             })
         );
+    }
+
+    #[test]
+    fn only_a_persistent_enable_reports_boot_persistence() {
+        // `enabled-runtime` links live under /run and are gone after a reboot,
+        // so reporting boot persistence for it would promise exactly what will
+        // not happen. The rest leave no persistent boot-time link either.
+        for reported in [
+            "enabled-runtime",
+            "disabled",
+            "linked",
+            "linked-runtime",
+            "static",
+            "indirect",
+            "alias",
+            "generated",
+            "transient",
+        ] {
+            let (starts, action) = classify_persistence(reported, &manifest(ServiceScope::System));
+            assert_eq!(starts, ServiceStarts::Disabled, "{reported}");
+            let action = action.unwrap_or_else(|| panic!("{reported} needs a remediation"));
+            assert!(action.contains("systemctl"), "{reported}: {action}");
+            assert!(action.contains("enable"), "{reported}: {action}");
+        }
+    }
+
+    #[test]
+    fn a_masked_unit_is_told_to_unmask_before_enabling() {
+        // `systemctl enable` on a masked unit fails, so printing it alone would
+        // hand the operator a command that cannot work.
+        for reported in ["masked", "masked-runtime"] {
+            let (starts, action) = classify_persistence(reported, &manifest(ServiceScope::System));
+            assert_eq!(starts, ServiceStarts::Disabled, "{reported}");
+            let action = action.unwrap_or_else(|| panic!("{reported} needs a remediation"));
+            assert!(action.contains("unmask"), "{reported}: {action}");
+            assert!(action.contains("enable"), "{reported}: {action}");
+        }
+    }
+
+    #[test]
+    fn an_unanswerable_enablement_query_is_not_an_outcome() {
+        let (starts, action) = classify_persistence("", &manifest(ServiceScope::System));
+        assert_eq!(starts, ServiceStarts::Unavailable);
+        assert_eq!(action, None, "there is nothing to advise yet");
+    }
+
+    #[test]
+    fn a_user_service_is_login_only_until_its_account_lingers() {
+        let (starts, action) = classify_persistence("enabled", &manifest(ServiceScope::User));
+        assert_eq!(starts, ServiceStarts::LoginOnly);
+        let action = action.expect("a user service needs a remediation");
+        assert!(action.contains("enable-linger"), "{action}");
+
+        // Trailing newline from `systemctl` output, and the system answer.
+        let (starts, action) = classify_persistence("enabled\n", &manifest(ServiceScope::System));
+        assert_eq!(starts, ServiceStarts::BootWithoutLogin);
+        assert_eq!(action, None, "nothing to fix");
+    }
+
+    #[test]
+    fn an_unrecognized_active_state_explains_itself() {
+        // The model promises every `unavailable` state says why.
+        let manifest = manifest(ServiceScope::System);
+        let diagnostic = unrecognized_state_diagnostic("maintenance", &manifest);
+        assert!(diagnostic.contains("maintenance"), "{diagnostic}");
+        assert!(diagnostic.contains("is-active"), "{diagnostic}");
     }
 
     #[test]

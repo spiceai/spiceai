@@ -360,7 +360,15 @@ impl Error {
         }
         match self {
             Self::Unauthorized => Self::AUTH_EXIT_CODE,
-            Self::ServiceNotInstalled { .. } => Self::USAGE_EXIT_CODE,
+            // Both are refusals of the request rather than failures of an
+            // attempt: the caller has to change something. `InvalidArgument`
+            // covers argument conflicts, preflight refusals, and manifest
+            // validation, so it belongs on the same code clap already uses for
+            // a usage error — otherwise automation cannot tell bad input from
+            // an operation that tried and failed.
+            Self::InvalidArgument { .. } | Self::ServiceNotInstalled { .. } => {
+                Self::USAGE_EXIT_CODE
+            }
             Self::Interrupted => Self::INTERRUPTED_EXIT_CODE,
             _ => Self::FAILURE_EXIT_CODE,
         }

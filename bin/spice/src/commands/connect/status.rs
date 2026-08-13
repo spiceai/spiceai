@@ -54,6 +54,11 @@ pub(crate) enum ConnectionState {
     EnrollmentIncomplete,
     /// An enrolled identity is present.
     Enrolled,
+    /// An identity file is present and could not be read. Reported rather than
+    /// folded into `not_connected`: every `spiced` start in this directory will
+    /// reject the same file and run unmanaged, which is a failure to fix, not
+    /// an absence to ignore.
+    Unreadable,
 }
 
 /// Whether a Cloud deployment has landed in this directory.
@@ -111,6 +116,8 @@ pub(crate) struct ConnectionStatus {
     /// states a wrong clock explains. `null` when it was not measured or was
     /// insignificant.
     pub(crate) clock: Option<String>,
+    /// Why the state is `unreadable`, when it is. `null` otherwise.
+    pub(crate) diagnostic: Option<String>,
 }
 
 /// What has been deployed to this instance.
@@ -164,10 +171,11 @@ impl ConnectStatus {
     ) -> Self {
         let identity_path = config_dir.join(IDENTITY_FILE);
         let draft_path = runtime_cloud_connect::EnrollmentDraft::path_in(config_dir);
+        // An identity that is present but unreadable is its own state. Reading
+        // the error as "nothing here" would report a directory as unconnected
+        // while every `spiced` start in it keeps rejecting the same file.
         let identity =
-            runtime_cloud_connect::identity::IdentityStore::load_optional(&identity_path)
-                .ok()
-                .flatten();
+            runtime_cloud_connect::identity::IdentityStore::load_optional(&identity_path);
 
         let mut connection = ConnectionStatus {
             state: ConnectionState::NotConnected,
@@ -183,6 +191,21 @@ impl ConnectStatus {
             expired: false,
             draft_path: draft_path.exists().then(|| draft_path.clone()),
             clock: None,
+            diagnostic: None,
+        };
+
+        let identity = match identity {
+            Ok(identity) => identity,
+            Err(err) => {
+                connection.state = ConnectionState::Unreadable;
+                connection.diagnostic = Some(format!(
+                    "The Spice Cloud Connect identity at {} could not be read: {err}. \
+                     Re-enroll this directory with `spiced --token <enrollment-key>`, or \
+                     release it with `spice connect remove`. See: https://spiceai.org/docs",
+                    connection.identity_path.display()
+                ));
+                None
+            }
         };
 
         if let Some(id) = identity {
@@ -223,15 +246,39 @@ impl ConnectStatus {
         }
     }
 
-    /// Whether this snapshot describes a state the reporting command should
-    /// exit non-zero for.
+    /// The one-line diagnosis for a degraded snapshot, naming whichever part of
+    /// it is degraded, or `None` when there is nothing wrong.
     ///
     /// A service that is merely stopped, or a directory that is not connected,
-    /// is a fact and exits `0`. A supervisor that could not be asked, or one
-    /// reporting a failed service, is a problem and exits non-zero so
-    /// automation does not read a degraded instance as healthy.
-    pub(crate) fn is_degraded(&self) -> bool {
-        self.service.state.is_degraded()
+    /// is a fact and leaves this `None`. A supervisor that could not be asked,
+    /// one reporting a failed service, and an identity that cannot be read are
+    /// problems, so the reporting command exits non-zero and automation does
+    /// not read a degraded instance as healthy.
+    ///
+    /// The report is already on stdout by the time a caller asks, so this is
+    /// what travels as the command's error — which keeps a `--output json` run
+    /// parseable and still exits non-zero.
+    pub(crate) fn degradation(&self) -> Option<String> {
+        if self.connection.state == ConnectionState::Unreadable {
+            return Some(self.connection.diagnostic.clone().unwrap_or_else(|| {
+                format!(
+                    "The Spice Cloud Connect identity at {} could not be read.",
+                    self.connection.identity_path.display()
+                )
+            }));
+        }
+        if self.service.state.is_degraded() {
+            return Some(format!(
+                "The Spice Cloud Connect service for {} is {}{}",
+                self.connection.directory.display(),
+                self.service.state,
+                match &self.service.diagnostic {
+                    Some(diagnostic) => format!(": {diagnostic}"),
+                    None => ".".to_string(),
+                }
+            ));
+        }
+        None
     }
 }
 
@@ -363,6 +410,13 @@ fn render_connection(connection: &ConnectionStatus) {
                 connection.directory.display()
             );
         }
+        ConnectionState::Unreadable => {
+            println!("Spice Cloud Connect: identity unreadable");
+            println!("  identity:    {}", connection.identity_path.display());
+        }
+    }
+    if let Some(diagnostic) = &connection.diagnostic {
+        println!("  diagnostic:  {diagnostic}");
     }
     if let Some(clock) = &connection.clock {
         println!("  clock:       {clock}");
@@ -493,8 +547,9 @@ mod tests {
             status.deployment.restart_required, None,
             "an unobserved runtime must not read as nothing pending"
         );
-        assert!(
-            !status.is_degraded(),
+        assert_eq!(
+            status.degradation(),
+            None,
             "a directory with no service is not degraded"
         );
     }
@@ -538,10 +593,38 @@ mod tests {
 
         let status = snapshot(dir.path(), &instance_dir, &config_dir).await;
         assert!(
-            status.is_degraded(),
+            status.degradation().is_some(),
             "a service that cannot be resolved must not read as healthy"
         );
         assert!(status.service.diagnostic.is_some());
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_identity_is_reported_rather_than_read_as_absent() {
+        // "Not connected" would be wrong and would hide the failure: every
+        // `spiced` start in this directory rejects the same file and runs
+        // unmanaged.
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let instance_dir = dir.path().join("edge-1");
+        let config_dir = instance_dir.join(".spice");
+        std::fs::create_dir_all(&config_dir).expect("create config dir");
+        std::fs::write(config_dir.join(IDENTITY_FILE), "not valid JSON")
+            .expect("write a malformed identity");
+
+        let status = snapshot(dir.path(), &instance_dir, &config_dir).await;
+        assert_eq!(status.connection.state, ConnectionState::Unreadable);
+        assert!(status.connection.identifier.is_none());
+        let diagnostic = status
+            .connection
+            .diagnostic
+            .as_deref()
+            .expect("an unreadable identity must say why");
+        assert!(diagnostic.contains("could not be read"), "{diagnostic}");
+        // The diagnosis names the identity, not a service that is fine.
+        let degradation = status
+            .degradation()
+            .expect("an unreadable identity must not exit zero");
+        assert!(degradation.contains("identity"), "{degradation}");
     }
 
     #[tokio::test]
@@ -559,6 +642,93 @@ mod tests {
         let status = snapshot(dir.path(), &instance_dir, &config_dir).await;
         assert_eq!(status.deployment.state, DeploymentState::Deployed);
         assert!(status.deployment.spicepod_path.is_some());
+    }
+
+    /// A fully-populated report built from fixed values, so the golden
+    /// fixtures pin every field and enum spelling rather than whatever a
+    /// tempdir happened to produce.
+    fn golden_status() -> ConnectStatus {
+        use super::super::service::model::{
+            LogSource, ServiceScope, ServiceStarts, ServiceState, Supervisor,
+        };
+
+        ConnectStatus {
+            schema_version: STATUS_SCHEMA_VERSION,
+            connection: ConnectionStatus {
+                state: ConnectionState::Enrolled,
+                directory: PathBuf::from("/srv/edge-analytics"),
+                identity_path: PathBuf::from("/srv/edge-analytics/.spice/identity.json"),
+                endpoint: "https://api.spice.ai".to_string(),
+                identifier: Some("inst_0123456789".to_string()),
+                org_name: Some("acme".to_string()),
+                app_name: Some("edge-analytics".to_string()),
+                monitor_url: Some("https://spice.ai/acme/edge-analytics/monitor".to_string()),
+                gateway_addr: Some("connect.aws.spiceai.io:443".to_string()),
+                expires_at_unix: Some(1_800_000_000),
+                expired: false,
+                draft_path: None,
+                clock: None,
+                diagnostic: None,
+            },
+            service: ServiceStatus {
+                installed: true,
+                state: ServiceState::Running,
+                scope: Some(ServiceScope::System),
+                supervisor: Some(Supervisor::Systemd),
+                starts: ServiceStarts::BootWithoutLogin,
+                owner: Some("alice".to_string()),
+                name: Some(
+                    "spiced-cloud-connect-edge-analytics-59e8c853e76c15ba.service".to_string(),
+                ),
+                working_dir: Some(PathBuf::from("/srv/edge-analytics")),
+                definition_path: Some(PathBuf::from(
+                    "/etc/systemd/system/spiced-cloud-connect-edge-analytics-59e8c853e76c15ba.service",
+                )),
+                runtime_path: Some(PathBuf::from("/usr/local/lib/spice/spiced")),
+                log_source: Some(LogSource::Journal {
+                    unit: "spiced-cloud-connect-edge-analytics-59e8c853e76c15ba.service"
+                        .to_string(),
+                    scope: ServiceScope::System,
+                }),
+                diagnostic: None,
+                starts_action: None,
+            },
+            deployment: DeploymentStatus {
+                state: DeploymentState::Deployed,
+                spicepod_path: Some(PathBuf::from(
+                    "/srv/edge-analytics/.spice/spicepod-cloud-managed.yml",
+                )),
+                secrets: SecretsState::Delivered,
+                secret_names: vec!["pg_password".to_string(), "s3_key".to_string()],
+                restart_required: Some(vec!["runtime.cpu".to_string(), "runtime.tls".to_string()]),
+            },
+        }
+    }
+
+    #[test]
+    fn the_full_json_document_matches_its_golden_schema() {
+        // `schema_version` alone cannot catch a renamed nested field or a
+        // changed enum spelling. This fixture can: a diff here means the public
+        // automation surface changed and the version has to change with it.
+        let json = serde_json::to_string_pretty(&golden_status()).expect("serialize");
+        insta::assert_snapshot!("connect_status_schema", json);
+    }
+
+    #[test]
+    fn the_filtered_service_json_document_matches_its_golden_schema() {
+        let status = golden_status();
+        let json = serde_json::to_string_pretty(&status.service_document()).expect("serialize");
+        insta::assert_snapshot!("connect_service_status_schema", json);
+    }
+
+    #[test]
+    fn every_service_field_of_the_full_document_appears_in_the_filtered_one() {
+        // The two fixtures are reviewed separately, so this is what keeps them
+        // from drifting into two schemas between reviews.
+        let status = golden_status();
+        let full = serde_json::to_value(&status).expect("serialize full");
+        let filtered = serde_json::to_value(status.service_document()).expect("serialize filtered");
+        assert_eq!(full["service"], filtered["service"]);
     }
 
     #[tokio::test]

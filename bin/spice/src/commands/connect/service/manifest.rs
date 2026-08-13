@@ -183,6 +183,13 @@ impl ServiceManifest {
                 self.schema_version
             ));
         }
+        if !self.directory.is_absolute() {
+            return reject(format!(
+                "records a relative instance directory ({}), so the service it names depends \
+                 on where a command was run",
+                self.directory.display()
+            ));
+        }
         if self.directory != instance_dir {
             return reject(format!(
                 "describes the service for {} instead",
@@ -201,6 +208,22 @@ impl ServiceManifest {
             return reject(format!(
                 "names the service {} where this directory derives {derived}",
                 self.name
+            ));
+        }
+        // The definition path is what an uninstall deletes, so it is not enough
+        // for it to look plausible: it has to be the exact path this back end
+        // would write for this name in this scope. Otherwise a corrupted or
+        // hand-edited manifest can pair the derived name with any absolute path
+        // and have `uninstall` remove an unrelated file.
+        let expected_definition = backend.definition_path(&derived, self.scope);
+        if self.definition_path != expected_definition {
+            return reject(format!(
+                "records the definition {} where a {scope} {supervisor} service for this \
+                 directory is {expected}",
+                self.definition_path.display(),
+                scope = self.scope,
+                supervisor = self.supervisor,
+                expected = expected_definition.display(),
             ));
         }
         for (label, recorded) in [
@@ -495,6 +518,47 @@ mod tests {
             .expect_err("a relative runtime path must not resolve");
         assert!(
             error.to_string().contains("relative runtime path"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_manifest_pointing_at_an_unrelated_definition_is_refused() {
+        // An uninstall deletes this path, so a manifest that pairs the derived
+        // name with any absolute path could have Spice remove an unrelated file.
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let fake = FakeBackend::new(dir.path());
+        let instance_dir = dir.path().join("edge-1");
+        let config_dir = instance_dir.join(".spice");
+        let mut manifest = manifest_for(&fake, &instance_dir);
+        manifest.definition_path = PathBuf::from("/etc/passwd");
+        manifest.write(&config_dir).expect("write manifest");
+
+        let error = ServiceManifest::load(&config_dir, &instance_dir, &fake)
+            .expect_err("an unrelated definition path must not resolve");
+        assert!(error.to_string().contains("/etc/passwd"), "{error}");
+        assert!(
+            error.to_string().contains("records the definition"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_manifest_recording_a_relative_instance_directory_is_refused() {
+        // A relative instance directory makes the service's name depend on the
+        // process working directory, so the same instance derives two names.
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let fake = FakeBackend::new(dir.path());
+        let instance_dir = PathBuf::from("edge-1");
+        let config_dir = dir.path().join("edge-1").join(".spice");
+        let mut manifest = manifest_for(&fake, &instance_dir);
+        manifest.directory = instance_dir.clone();
+        manifest.write(&config_dir).expect("write manifest");
+
+        let error = ServiceManifest::load(&config_dir, &instance_dir, &fake)
+            .expect_err("a relative instance directory must not resolve");
+        assert!(
+            error.to_string().contains("relative instance directory"),
             "{error}"
         );
     }
