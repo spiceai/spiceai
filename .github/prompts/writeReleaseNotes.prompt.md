@@ -92,9 +92,12 @@ STE constrains sentence construction, never technical depth. Keep every setting 
    python3 .github/prompts/scripts/check_ste.py docs/release_notes/v<version>.md
    ```
 
-   The script reads only the authored prose and reports STE violations with line numbers. **Fix every error** — sentence length, semicolons, participle clauses, vague wording. **Read every warning and decide** — passive voice, noun stacks, paragraph length, and inconsistent terminology all have defensible exceptions, so judge each one rather than rewriting on reflex. Re-run until the errors are zero. If a fix would cost a technical fact, keep the fact and leave the warning; never delete information to satisfy the checker.
+   The script reads only the authored prose and reports STE violations with line numbers. **Fix every error** — sentence length, semicolons, participle clauses, vague wording. **Read every warning and decide** — passive voice, noun stacks, paragraph length, and inconsistent terminology all have defensible exceptions, so judge each one rather than rewriting on reflex. If a fix would cost a technical fact, keep the fact and leave the warning; never delete information to satisfy the checker.
 
-   In update mode, run the checker on the whole file but only fix findings in the sections you added. Existing prose is the user's editorial decision and stays as it is unless they ask otherwise.
+   What counts as done depends on the mode:
+
+   - **Create**: re-run until the whole file reports zero errors.
+   - **Update**: the checker reads the whole file, but only the sections you added are yours to fix. Re-run until **those sections** report zero errors. The file itself can still report errors, because an existing file may predate these rules. Match each finding's line number against the lines you added to tell the two apart. Leave every error in prose you did not touch — existing prose is the user's editorial decision — and report it instead of rewriting it.
 
 ## Ordering
 
@@ -136,4 +139,4 @@ Verify any new doc link you introduce actually resolves. If a deep link cannot b
 
 Save the release notes as `docs/release_notes/v<version>.md`. In update mode, edit the existing file in place and commit with a `docs(release): update v<version> notes with latest trunk PRs` style message.
 
-Report the checker result with the file. State the error count (zero, once fixed) and name any warning you chose to keep, with the reason. A silent pass tells the reviewer nothing about which judgements you made.
+Report the checker result with the file. State the error count for the prose you authored (zero, once fixed) and name any warning you chose to keep, with the reason. In update mode, list the pre-existing errors you left in place as a separate count, so a reader does not read your zero as a whole-file zero. A silent pass tells the reviewer nothing about which judgements you made.

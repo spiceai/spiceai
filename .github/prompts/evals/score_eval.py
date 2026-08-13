@@ -59,12 +59,6 @@ def ste_metrics(path: str) -> dict:
     return payload[0]
 
 
-def narrative(text: str) -> str:
-    """The authored part of the document: everything before `## Contributors`."""
-    index = text.find("## Contributors")
-    return text[:index] if index != -1 else text
-
-
 def changelog(text: str) -> str:
     index = text.find("### Changelog")
     return text[index:] if index != -1 else ""
@@ -126,7 +120,6 @@ def style_expectations(path: str, max_passive_pct: float = 15.0) -> list[dict]:
 
 def score_create(path: str) -> list[dict]:
     text = read(path)
-    story = narrative(text)
     log = changelog(text)
     checks = style_expectations(path)
 
@@ -139,13 +132,20 @@ def score_create(path: str) -> list[dict]:
         )
     )
 
-    shipped = ["12010", "12014", "12019", "12021", "12025", "12031", "12038", "12042"]
+    # 12027 is a dependency bump, but it moves the vendored DuckDB to a release
+    # a user can observe, so it belongs in the changelog with the rest.
+    shipped = [
+        "12010", "12014", "12019", "12021", "12025",
+        "12027", "12031", "12038", "12042",
+    ]
     absent = [pr for pr in shipped if f"#{pr}" not in log]
     checks.append(
         expectation(
             "Every user-visible PR appears in the changelog",
             not absent,
-            f"missing from changelog: {absent}" if absent else "all 8 present",
+            f"missing from changelog: {absent}"
+            if absent
+            else f"all {len(shipped)} present",
         )
     )
 
@@ -165,12 +165,17 @@ def score_create(path: str) -> list[dict]:
         "12040": "revert of an unshipped change",
         "12044": "disabled flaky benchmark",
     }
-    leaked = [f"#{pr} ({why})" for pr, why in noise.items() if f"#{pr}" in story]
+    # The prompt excludes these from the changelog as well as the narrative, so
+    # the whole document is searched. Scanning only the narrative would pass an
+    # output that listed all five under `### Changelog`.
+    leaked = [f"#{pr} ({why})" for pr, why in noise.items() if f"#{pr}" in text]
     checks.append(
         expectation(
-            "Noise commits stay out of the narrative",
+            "Noise commits stay out of the notes",
             not leaked,
-            f"leaked into What's New: {leaked}" if leaked else "all five filtered",
+            f"leaked into the notes: {leaked}"
+            if leaked
+            else f"all {len(noise)} filtered",
         )
     )
 
@@ -262,16 +267,20 @@ def score_rewrite(path: str) -> list[dict]:
     )
 
     def yaml_blocks(doc: str) -> list[str]:
-        return re.findall(r"```yaml\n(.*?)```", doc, re.DOTALL)
+        return [b.strip() for b in re.findall(r"```yaml\n(.*?)```", doc, re.DOTALL)]
 
+    # Compare block to block, not block to document. Searching the raw text
+    # passes an output that unfenced the sample or retyped the fence, and the
+    # sample is only usable if a reader can copy it out of a YAML block.
     source_yaml = yaml_blocks(source)
     output_yaml = yaml_blocks(text)
+    dropped = [b for b in source_yaml if b not in output_yaml]
     checks.append(
         expectation(
-            "The YAML sample is reproduced unchanged",
-            bool(source_yaml) and source_yaml[0].strip() in text,
-            "YAML preserved" if source_yaml and source_yaml[0].strip() in text
-            else f"source had {len(source_yaml)} block(s), output has {len(output_yaml)}",
+            "The YAML sample is reproduced unchanged, still in a YAML block",
+            bool(source_yaml) and not dropped and len(output_yaml) == len(source_yaml),
+            f"source has {len(source_yaml)} block(s), output has {len(output_yaml)}"
+            + (f"; {len(dropped)} not reproduced verbatim" if dropped else ""),
         )
     )
 
@@ -360,11 +369,12 @@ def score_update(path: str) -> list[dict]:
         )
     )
 
-    story = narrative(text)
-    leaked = [pr for pr in ("12074", "12079") if f"#{pr}" in story]
+    # Excluded from the changelog as well as the narrative, so search the whole
+    # document rather than the part above `## Contributors`.
+    leaked = [pr for pr in ("12074", "12079") if f"#{pr}" in text]
     checks.append(
         expectation(
-            "Snapshot and dependency noise stays out of the narrative",
+            "Snapshot and dependency noise stays out of the notes",
             not leaked,
             f"leaked: {leaked}" if leaked else "both filtered",
         )

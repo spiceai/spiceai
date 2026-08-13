@@ -24,7 +24,7 @@
         "All required sections present",
         "Every user-visible PR appears in the changelog",
         "No PR is listed twice in the changelog",
-        "Noise commits stay out of the narrative",
+        "Noise commits stay out of the notes",
         "Breaking change documented with before/after migration",
         "User-visible DuckDB v1.6.0 upgrade recorded",
         "Contributors lists every human author and no bots",
@@ -45,7 +45,7 @@
         "Passive voice under 15% of authored sentences",
         "Average sentence length at or under 20 words",
         "Every identifier, error code, and version from the source survives",
-        "The YAML sample is reproduced unchanged",
+        "The YAML sample is reproduced unchanged, still in a YAML block",
         "Content is rewritten, not deleted (word count within 80-160% of source)",
         "Section headings are preserved",
         "Marketing metaphors from the source are gone"
@@ -54,7 +54,7 @@
     {
       "id": "update-in-progress-notes",
       "prompt": "Update the in-progress release notes at `.github/prompts/evals/fixtures/update/v2.2.0-rc.1.md` with the PRs that have landed since the file was last edited.\n\nDo not run `git log` or `gh` — the new history has been captured for you:\n\n- `.github/prompts/evals/fixtures/update/new_commits.txt` — the commits since the file was last edited\n- `.github/prompts/evals/fixtures/update/new_pull_requests.json` — the title, body, author, and labels for each\n\nThe existing file is the source of truth for tone, ordering, and editorial decisions. Copy it to the outputs directory as `v2.2.0-rc.1.md` and edit the copy; leave the fixture itself untouched.",
-      "expected_output": "The original file with new material added: a What's New subsection or entries for Anthropic prompt caching, the rrf() tie-break fix, and the MongoDB resume-token fix; Jeadie and karifabri added to Contributors; three new changelog lines. The two pre-existing subsections are untouched. Snapshot and dependency-bump PRs do not appear in the narrative.",
+      "expected_output": "The original file with new material added: a What's New subsection or entries for Anthropic prompt caching, the rrf() tie-break fix, and the MongoDB resume-token fix; Jeadie and karifabri added to Contributors; three new changelog lines. The two pre-existing subsections are untouched. Snapshot and dependency-bump PRs do not appear anywhere in the notes.",
       "files": [
         ".github/prompts/evals/fixtures/update/v2.2.0-rc.1.md",
         ".github/prompts/evals/fixtures/update/new_commits.txt",
@@ -71,7 +71,7 @@
         "Pre-existing subsections are left byte-identical",
         "New PRs added to the changelog",
         "Original changelog entries are retained",
-        "Snapshot and dependency noise stays out of the narrative",
+        "Snapshot and dependency noise stays out of the notes",
         "New contributors added, bots excluded",
         "New entries carry the substance from the PR bodies"
       ]

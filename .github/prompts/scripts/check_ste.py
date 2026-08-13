@@ -207,9 +207,9 @@ def strip_markdown(text: str) -> str:
 def prose_lines(lines: list[str]) -> list[tuple[int, str, bool]]:
     """Yield (line_number, prose, is_list_item) for author-written prose only.
 
-    The list flag matters for the paragraph-length rule: a run of bullets is
-    already the structure that rule asks for, so bullets must not be counted
-    together as one long paragraph.
+    The list flag bounds a block: a run of bullets is already the structure the
+    paragraph-length rule asks for, so bullets must neither be counted together
+    as one long paragraph nor joined into one long sentence.
     """
     out: list[tuple[int, str, bool]] = []
     in_code = False
@@ -277,6 +277,65 @@ def split_sentences(text: str) -> list[str]:
     return [restore(p).strip() for p in parts if restore(p).strip()]
 
 
+@dataclass
+class Block:
+    """A run of physical lines that a reader reads as one unit."""
+
+    start_line: int
+    lines: list[tuple[int, str]] = field(default_factory=list)
+
+    @property
+    def text(self) -> str:
+        return " ".join(text for _, text in self.lines)
+
+
+def group_blocks(entries: list[tuple[int, str, bool]]) -> list[Block]:
+    """Group prose lines into the units the rules are written about.
+
+    Markdown soft-wraps a paragraph across several physical lines, so one
+    sentence can span three of them. The rules count sentences, not lines, so
+    the lines have to be joined before the text is split. A blank line, a
+    heading, a table, or a code fence ends a block because `prose_lines` drops
+    those, which breaks the run of consecutive line numbers. A list item always
+    starts its own block, and its own soft-wrapped continuation lines join it.
+    """
+    blocks: list[Block] = []
+    previous_line = -10
+    for line_no, text, is_list_item in entries:
+        if not blocks or is_list_item or line_no != previous_line + 1:
+            blocks.append(Block(start_line=line_no))
+        blocks[-1].lines.append((line_no, text))
+        previous_line = line_no
+    return blocks
+
+
+def block_sentences(block: Block) -> list[tuple[int, str]]:
+    """Split a block into sentences, each attributed to the line it starts on."""
+    joined = block.text
+    # Where each source line begins inside `joined`, to map a sentence back to
+    # the line an author has to edit. The +1 is the joining space.
+    offsets: list[tuple[int, int]] = []
+    cursor = 0
+    for line_no, text in block.lines:
+        offsets.append((cursor, line_no))
+        cursor += len(text) + 1
+
+    out: list[tuple[int, str]] = []
+    searched_to = 0
+    for sentence in split_sentences(joined):
+        start = joined.find(sentence, searched_to)
+        if start == -1:
+            start = searched_to
+        searched_to = start + len(sentence)
+        line_no = block.start_line
+        for offset, candidate in offsets:
+            if offset > start:
+                break
+            line_no = candidate
+        out.append((line_no, sentence))
+    return out
+
+
 def word_count(sentence: str) -> int:
     tokens = re.findall(r"[A-Za-z0-9][A-Za-z0-9'`/._-]*", sentence)
     return len(tokens)
@@ -317,10 +376,9 @@ def check_file(path: str) -> Report:
     entries = prose_lines(lines)
     lowered_doc = " ".join(text.lower() for _, text, _ in entries)
 
-    sentences: list[tuple[int, str]] = []
-    for line_no, text, _ in entries:
-        for sentence in split_sentences(text):
-            sentences.append((line_no, sentence))
+    blocks = group_blocks(entries)
+    per_block = [block_sentences(block) for block in blocks]
+    sentences: list[tuple[int, str]] = [pair for group in per_block for pair in group]
 
     over_limit = 0
     passive = 0
@@ -375,7 +433,10 @@ def check_file(path: str) -> Report:
         gerund_hits: list[str] = []
         if first_word and first_word.group(1).lower() in PARTICIPLE_CONNECTIVES:
             gerund_hits.append(first_word.group(1))
-        for match in re.finditer(r",\s+(\w+ing)\b", sentence, re.IGNORECASE):
+        # A comma and an opening parenthesis both introduce the clause:
+        # "the upgrade to DataFusion v54 (including v53)" hides the actor the
+        # same way "..., including v53" does.
+        for match in re.finditer(r"[,(]\s*(\w+ing)\b", sentence, re.IGNORECASE):
             if match.group(1).lower() in PARTICIPLE_CONNECTIVES:
                 gerund_hits.append(match.group(1))
         for match in BY_GERUND_RE.finditer(sentence):
@@ -425,31 +486,18 @@ def check_file(path: str) -> Report:
             )
 
     long_paragraphs = 0
-    paragraph: list[str] = []
-    paragraph_line = 0
-    previous_line = -10
-    for line_no, text, is_list_item in entries + [(-1, "", False)]:
-        # A bullet starts its own unit, and so does any line that is not
-        # directly continuing the line above it.
-        if line_no != previous_line + 1 or line_no == -1 or is_list_item:
-            if len(paragraph) > 0:
-                count = sum(len(split_sentences(p)) for p in paragraph)
-                if count > MAX_PARAGRAPH_SENTENCES:
-                    long_paragraphs += 1
-                    report.warnings.append(
-                        Finding(
-                            paragraph_line,
-                            "paragraph-length",
-                            f"{count} sentences in one paragraph (limit "
-                            f"{MAX_PARAGRAPH_SENTENCES}). Split it or use a list.",
-                            paragraph[0][:117],
-                        )
-                    )
-            paragraph = []
-            paragraph_line = line_no
-        if line_no != -1:
-            paragraph.append(text)
-        previous_line = line_no
+    for block, group in zip(blocks, per_block):
+        if len(group) > MAX_PARAGRAPH_SENTENCES:
+            long_paragraphs += 1
+            report.warnings.append(
+                Finding(
+                    block.start_line,
+                    "paragraph-length",
+                    f"{len(group)} sentences in one paragraph (limit "
+                    f"{MAX_PARAGRAPH_SENTENCES}). Split it or use a list.",
+                    block.text[:117],
+                )
+            )
 
     inconsistencies = 0
     for canonical, variant in TERM_VARIANTS:
