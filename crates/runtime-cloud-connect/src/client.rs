@@ -211,24 +211,13 @@ impl ClientDriver {
         }
     }
 
-    /// Pre-connect credential phase: drop an unrenewable identity and renew
-    /// a due one. Returns what the connect loop should do next.
+    /// Pre-connect credential phase: renew a due identity. Returns what the
+    /// connect loop should do next.
     ///
     /// The driver never enrolls — enrollment is an explicit pre-runtime
     /// step ([`crate::enroll::enroll_now`]) — so running out of usable
     /// credentials exits the task with re-enrollment guidance.
     async fn ensure_credentials(&mut self, enroll_client: &EnrollClient) -> CredentialStep {
-        // An identity past the renewal grace window can no longer be
-        // renewed by the cloud — only a fresh enrollment key helps.
-        if let Some(ref id) = self.identity
-            && enroll::past_renewal_grace(id)
-        {
-            tracing::warn!(
-                "Cloud Connect: the stored identity expired past the renewal grace window and can no longer be renewed"
-            );
-            self.identity = None;
-        }
-
         if self.identity.is_none() {
             tracing::error!(
                 "Cloud Connect: cannot connect (no usable identity); exiting cloud-connect. Mint a new enrollment key in the Spice Cloud portal and restart spiced with `--token <enrollment-key>` to re-enroll. See: https://spiceai.org/docs"
@@ -236,9 +225,10 @@ impl ClientDriver {
             return CredentialStep::Exit;
         }
 
-        // Renew before connecting when due — this covers the
-        // expired-within-grace startup case, where the gateway would
-        // reject the old leaf but /renew still accepts it.
+        // Renew before connecting when due. The control plane, not the host
+        // clock, decides whether the credential remains renewable: dropping it
+        // locally on a calculated grace deadline could destroy a valid identity
+        // on a fast-clock host.
         if self
             .identity
             .as_ref()
@@ -302,19 +292,7 @@ impl ClientDriver {
     /// `None` when the identity carries no gateway address (a pre-split
     /// identity file) — non-recoverable without re-enrolling.
     fn stream_endpoint(&self) -> Option<String> {
-        if let Some(ref endpoint) = self.config.gateway_endpoint {
-            return Some(endpoint.clone());
-        }
-        let identity = self.identity.as_ref()?;
-        if identity.gateway_addr.is_empty() {
-            return None;
-        }
-        let scheme = if self.config.insecure {
-            "http"
-        } else {
-            "https"
-        };
-        Some(format!("{scheme}://{}", identity.gateway_addr))
+        self.config.stream_endpoint(self.identity.as_ref()?)
     }
 
     /// Renew the identity against the cloud `/renew` endpoint with a fresh
@@ -368,11 +346,18 @@ impl ClientDriver {
         // a payload sealed moments before this point is still addressed to it and
         // cannot be re-sealed in flight.
         rotated.rotate_encryption_key(material.enc_private_key_pem, material.enc_public_key_pem);
-        if let Some(reason) =
-            rotated.reconnect_validation_error(self.config.gateway_endpoint.as_deref())
-        {
-            return Err(client.invalid_renew_response(reason));
-        }
+        // The signed leaf, not the response's unsigned `not_after`, is the
+        // authority for both acceptance and the next renewal deadline. The
+        // shared reconnectability gate also normalizes the cached field to the
+        // signed value before this identity reaches persistence or scheduling.
+        let (validated, _endpoint) =
+            crate::validate_reconnectable_credential_async(&self.config, rotated)
+                .await
+                .map_err(|error| client.invalid_renew_response(error.to_string()))?;
+        rotated = validated;
+        // Channel construction happens in the reconnect loop. It must remain
+        // retryable host state rather than deciding whether the cloud-committed
+        // credential is adopted here.
         // The cloud has already pinned the new public key: even if
         // persistence fails, the rotated identity must be used in memory
         // (the old key can no longer renew). Persistence logs the failure;
@@ -452,7 +437,7 @@ impl ClientDriver {
     /// Delay until the next renewal attempt, or `None` when the identity
     /// carries no expiry and renewal is moot.
     fn next_renewal_delay(&self) -> Option<Duration> {
-        let not_after = self.identity.as_ref()?.not_after_unix?;
+        let not_after = self.identity.as_ref()?.effective_not_after_unix()?;
         let due_at = not_after.saturating_sub(self.config.renewal_lead.as_secs());
         let due_in = Duration::from_secs(due_at.saturating_sub(now_unix()));
         // After a transient failure, pace retries instead of spinning on a
@@ -1368,7 +1353,7 @@ async fn sleep_or_never(delay: Option<Duration>) {
 /// `true` when the identity should be renewed now: within `lead` of its
 /// `not_after` (or already past it). An identity with no expiry never renews.
 fn renewal_due(identity: &Identity, lead: Duration) -> bool {
-    let Some(not_after) = identity.not_after_unix else {
+    let Some(not_after) = identity.effective_not_after_unix() else {
         return false;
     };
     now_unix().saturating_add(lead.as_secs()) >= not_after
@@ -1412,11 +1397,11 @@ fn server_trust<'a>(ca_bundle_pem: &'a str, dev_ca_pem: Option<&'a str>) -> Serv
     }
 }
 
-fn build_channel(
+fn build_endpoint(
     config: &CloudConnectConfig,
     endpoint_url: &str,
     identity: &Identity,
-) -> Result<Channel> {
+) -> Result<Endpoint> {
     let mut endpoint = Endpoint::from_shared(endpoint_url.to_string())
         .map_err(|source| Error::InvalidEndpoint {
             endpoint: endpoint_url.to_string(),
@@ -1455,7 +1440,15 @@ fn build_channel(
         endpoint = endpoint.tls_config(tls).context(TransportSnafu)?;
     }
 
-    Ok(endpoint.connect_lazy())
+    Ok(endpoint)
+}
+
+fn build_channel(
+    config: &CloudConnectConfig,
+    endpoint_url: &str,
+    identity: &Identity,
+) -> Result<Channel> {
+    build_endpoint(config, endpoint_url, identity).map(|endpoint| endpoint.connect_lazy())
 }
 
 fn build_hello(
@@ -1714,7 +1707,6 @@ fn renewal_rejection_revokes_identity(error: &enroll::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::enroll::past_renewal_grace;
 
     #[test]
     fn backoff_doubles_until_cap() {
@@ -1881,11 +1873,26 @@ mod tests {
         }
     }
 
+    fn identity_with_signed_expiry(
+        signed_validity: Duration,
+        cached_not_after_unix: u64,
+    ) -> Identity {
+        let key = rcgen::KeyPair::generate().expect("generate identity key");
+        let now = std::time::SystemTime::now();
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new())
+            .expect("build identity certificate parameters");
+        params.not_before = (now - Duration::from_mins(1)).into();
+        params.not_after = (now + signed_validity).into();
+        let certificate = params.self_signed(&key).expect("sign identity certificate");
+        let mut identity = identity_with_not_after(Some(cached_not_after_unix));
+        identity.identity_cert_pem = certificate.pem();
+        identity
+    }
+
     #[test]
     fn renewal_never_due_for_unbounded_identity() {
         let id = identity_with_not_after(None);
         assert!(!renewal_due(&id, Duration::from_hours(12)));
-        assert!(!past_renewal_grace(&id));
     }
 
     #[test]
@@ -1897,18 +1904,37 @@ mod tests {
         // Expires in 24h with a 12h lead: not yet due.
         let later = identity_with_not_after(Some(now_unix() + 24 * 60 * 60));
         assert!(!renewal_due(&later, lead));
-        // Already expired: due (renewable within the grace window).
+        // Already expired: due; the control plane decides whether it remains
+        // renewable.
         let expired = identity_with_not_after(Some(now_unix().saturating_sub(60)));
         assert!(renewal_due(&expired, lead));
-        assert!(!past_renewal_grace(&expired));
     }
 
     #[test]
-    fn identity_past_grace_cannot_renew() {
-        let long_dead = identity_with_not_after(Some(
-            now_unix().saturating_sub(crate::enroll::RENEWAL_GRACE.as_secs() + 60),
-        ));
-        assert!(past_renewal_grace(&long_dead));
+    fn renewal_scheduling_uses_the_signed_expiry_over_the_unsigned_cache() {
+        let identity = identity_with_signed_expiry(
+            Duration::from_mins(1),
+            now_unix().saturating_add(Duration::from_hours(24).as_secs()),
+        );
+        let lead = Duration::from_hours(12);
+
+        assert!(
+            renewal_due(&identity, lead),
+            "the signed leaf is due even though the response cache claims another day"
+        );
+
+        let runtime: Arc<dyn RuntimeHandle> = Arc::new(crate::handlers::NoopRuntimeHandle);
+        let driver = ClientDriver::new(
+            CloudConnectConfig::from_env("test-runtime"),
+            runtime,
+            crate::shutdown::Shutdown::new(),
+            Some(identity),
+        );
+        assert_eq!(
+            driver.next_renewal_delay(),
+            Some(Duration::ZERO),
+            "the live-stream timer must also use the signed leaf deadline"
+        );
     }
 
     #[test]

@@ -83,15 +83,6 @@ const RETRY_BACKOFF_BASE: Duration = Duration::from_secs(1);
 /// Full-jitter backoff ceiling: no retry window grows past this.
 const RETRY_BACKOFF_CAP: Duration = Duration::from_secs(30);
 
-/// `true` when the identity expired longer than [`RENEWAL_GRACE`] ago —
-/// the cloud refuses to renew it, so only a fresh enrollment helps.
-#[must_use]
-pub fn past_renewal_grace(identity: &Identity) -> bool {
-    identity.not_after_unix.is_some_and(|not_after| {
-        crate::heartbeat::now_unix() >= not_after.saturating_add(RENEWAL_GRACE.as_secs())
-    })
-}
-
 /// A logged-in Spice Cloud session's bearer token, wrapped so it cannot
 /// leak through `Debug` and is wiped on drop. Constructed by callers that
 /// own a login session; this crate only ever places it in the one
@@ -223,6 +214,11 @@ pub enum Error {
     #[snafu(display("Failed to reach the Spice Cloud endpoint {url}: {source}"))]
     Http { url: String, source: reqwest::Error },
 
+    #[snafu(display(
+        "Failed to construct the Spice Cloud request for {url}: the endpoint URL or request headers are invalid"
+    ))]
+    InvalidRequest { url: String },
+
     #[snafu(display("Failed to read the Spice Cloud response from {url}: {source}"))]
     ResponseBody { url: String, source: reqwest::Error },
 
@@ -269,25 +265,26 @@ impl Error {
     /// `true` only when the cloud *authoritatively rejected* the request
     /// ([`Error::Denied`]): retrying the same request cannot succeed.
     ///
-    /// Everything else is retryable: transport failures and 408/429/5xx are
-    /// transient, [`Error::CertificateValidity`] (a skewed host clock) is
-    /// fixable and the request never reached the cloud, and a local
-    /// proof-of-possession failure never left this host.
+    /// Every other variant is a local failure, a transient response, or an
+    /// unusable response rather than an authoritative cloud rejection.
     #[must_use]
     pub fn is_authoritative_rejection(&self) -> bool {
         matches!(self, Error::Denied { .. })
     }
 
     /// `true` when retrying the same enrollment operation cannot produce a
-    /// different outcome. A denied request is authoritative, while a malformed
-    /// decoded successful response with invalid required fields is committed
-    /// under the operation's idempotency key and will therefore replay the same
-    /// unusable semantics. Body transport and JSON decode failures remain
-    /// retryable because an unframed partial body is indistinguishable from
-    /// response loss.
+    /// different outcome. A locally invalid request was never sent, a denied
+    /// request is authoritative, and a decoded successful response with
+    /// invalid required fields is committed under the operation's idempotency
+    /// key and will therefore replay the same unusable semantics. Body
+    /// transport and JSON decode failures remain retryable because an unframed
+    /// partial body is indistinguishable from response loss.
     #[must_use]
     pub fn is_terminal_enrollment_failure(&self) -> bool {
-        matches!(self, Error::Denied { .. } | Error::InvalidResponse { .. })
+        matches!(
+            self,
+            Error::Denied { .. } | Error::InvalidRequest { .. } | Error::InvalidResponse { .. }
+        )
     }
 
     /// `true` only when the *credential itself* was rejected (HTTP 401).
@@ -654,10 +651,10 @@ impl EnrollClient {
 
     /// Classify a syntactically successful renewal response whose issued
     /// credential cannot be used with the key material sent in the request.
-    pub(crate) fn invalid_renew_response(&self, reason: &'static str) -> Error {
+    pub(crate) fn invalid_renew_response(&self, reason: impl Into<String>) -> Error {
         Error::InvalidResponse {
             url: self.renew_url.clone(),
-            reason: format!("issued identity cannot reconnect: {reason}"),
+            reason: format!("issued identity cannot reconnect: {}", reason.into()),
         }
     }
 
@@ -671,6 +668,11 @@ impl EnrollClient {
         let response = match builder.send().await {
             Ok(response) => response,
             Err(source) => {
+                if source.is_builder() {
+                    return Err(Error::InvalidRequest {
+                        url: url.to_string(),
+                    });
+                }
                 // A TLS validity rejection is the shape a wrong host clock
                 // produces at every layer of this flow. Diagnose it here
                 // rather than handing the operator a bare certificate error.
@@ -942,7 +944,16 @@ pub enum EnrollNowError {
     ))]
     IdentityUnusable {
         path: std::path::PathBuf,
-        reason: &'static str,
+        reason: String,
+    },
+
+    #[snafu(display(
+        "The existing Cloud Connect identity at {} could not be activated because the local gateway environment is unavailable: {source}. The supplied enrollment authority was not redeemed. Fix the host trust or transport configuration and retry. See: https://spiceai.org/docs",
+        path.display()
+    ))]
+    IdentityEnvironment {
+        path: std::path::PathBuf,
+        source: crate::Error,
     },
 
     #[snafu(display(
@@ -965,6 +976,9 @@ fn denial_remediation(source: &Error) -> &'static str {
         Error::Denied { code, .. } => code.remediation(),
         Error::InvalidResponse { .. } => {
             "Spice Cloud returned unusable data for this pending operation. Preserve enrollment-draft.json and contact Spice Cloud support before removing it or starting a new enrollment"
+        }
+        Error::InvalidRequest { .. } => {
+            "Fix the configured Spice Cloud endpoint or organization name and retry"
         }
         _ => "Fix the reported problem and retry",
     }
@@ -1003,12 +1017,12 @@ pub enum EnrollNowOutcome {
 /// Operation-aware one-shot enrollment: the typed entry point `spiced
 /// --token` uses directly.
 ///
-/// 1. **Existing identity wins.** A readable identity that is not past the
-///    renewal grace window short-circuits to
-///    [`EnrollNowOutcome::AlreadyEnrolled`]; the supplied authority is not
-///    redeemed and not persisted. (An expired-but-in-grace identity still
-///    wins — the driver renews it.) A readable but unusable identity fails
-///    closed with removal guidance; it never causes implicit re-enrollment.
+/// 1. **Existing identity wins.** A readable, structurally valid identity
+///    short-circuits to [`EnrollNowOutcome::AlreadyEnrolled`]; the supplied
+///    authority is not redeemed and not persisted. The driver asks the control
+///    plane to renew an expired identity, so a skewed host clock can never
+///    trigger implicit re-enrollment. A malformed identity fails closed with
+///    removal guidance.
 /// 2. The per-directory [`EnrollmentDraft`] is loaded or created: the same
 ///    operation ID and key material back every retry, so a lost response —
 ///    or a fresh key presented after the first one expired — recovers the
@@ -1033,8 +1047,9 @@ pub enum EnrollNowOutcome {
 /// - [`EnrollNowError::InvalidRegion`] — the declared region label is
 ///   malformed (checked before any request).
 /// - [`EnrollNowError::IdentityUnreadable`] / [`EnrollNowError::IdentityUnusable`]
-///   — an identity file exists but cannot be safely reused; refusing to guess
-///   beats silently re-enrolling over a live instance.
+///   / [`EnrollNowError::IdentityEnvironment`] — an identity file exists but
+///   cannot be safely reused; refusing to guess beats silently re-enrolling
+///   over a live instance.
 /// - [`EnrollNowError::Draft`] / [`EnrollNowError::Client`] /
 ///   [`EnrollNowError::Persist`] — local state or client construction
 ///   failures.
@@ -1082,24 +1097,24 @@ pub async fn enroll_now(
         source,
     })?;
     if let Some(identity) = existing {
-        if past_renewal_grace(&identity) {
-            tracing::warn!(
-                "Cloud Connect: the stored identity at {} expired past the renewal grace window; enrolling this instance again",
-                identity_path.display()
-            );
-        } else {
-            if let Some(reason) =
-                identity.reconnect_validation_error(config.gateway_endpoint.as_deref())
-            {
-                return Err(EnrollNowError::IdentityUnusable {
-                    path: identity_path,
-                    reason,
-                });
-            }
-            cleanup_enrollment_draft(&enrollment_transaction).await;
-            drop(enrollment_transaction);
-            return Ok(EnrollNowOutcome::AlreadyEnrolled { identity });
-        }
+        let (identity, _endpoint) =
+            crate::validate_reconnectable_credential_async(config, identity)
+                .await
+                .map_err(|error| match error {
+                    crate::Error::IdentityUnusable { reason, .. } => {
+                        EnrollNowError::IdentityUnusable {
+                            path: identity_path.clone(),
+                            reason: reason.to_string(),
+                        }
+                    }
+                    source => EnrollNowError::IdentityEnvironment {
+                        path: identity_path.clone(),
+                        source,
+                    },
+                })?;
+        cleanup_enrollment_draft(&enrollment_transaction).await;
+        drop(enrollment_transaction);
+        return Ok(EnrollNowOutcome::AlreadyEnrolled { identity });
     }
 
     if let Some(ref region) = config.instance_region
@@ -1181,15 +1196,14 @@ pub async fn enroll_now(
     // retryable draft. The operation is already committed under its
     // idempotency key, making this a terminal response error with support
     // guidance rather than an instruction to discard the draft.
-    if let Some(reason) = identity.reconnect_validation_error(config.gateway_endpoint.as_deref()) {
-        return Err(EnrollNowError::Rejected {
+    let (identity, _endpoint) = crate::validate_reconnectable_credential_async(config, identity)
+        .await
+        .map_err(|error| EnrollNowError::Rejected {
             source: Error::InvalidResponse {
                 url: client.enroll_url.clone(),
-                reason: format!("issued identity cannot reconnect: {reason}"),
+                reason: format!("issued identity cannot reconnect: {error}"),
             },
-        });
-    }
-
+        })?;
     let to_store = identity.clone();
     let store_path = config.identity_path.clone();
     let stored = tokio::task::spawn_blocking(move || IdentityStore::store(&store_path, &to_store))
@@ -1444,6 +1458,15 @@ mod tests {
             "an invalid response is not a credential revocation signal"
         );
 
+        let invalid_request = Error::InvalidRequest {
+            url: "not a URL".to_string(),
+        };
+        assert!(
+            invalid_request.is_terminal_enrollment_failure(),
+            "a locally invalid request cannot improve on retry"
+        );
+        assert!(!invalid_request.is_authoritative_rejection());
+
         let pop = Error::ProofOfPossession {
             reason: "key material generation failed".to_string(),
         };
@@ -1460,6 +1483,42 @@ mod tests {
             skew.to_string().contains("clock"),
             "the message must name the clock: {skew}"
         );
+    }
+
+    #[tokio::test]
+    async fn invalid_request_construction_is_terminal_without_network_retry() {
+        let client = EnrollClient::new(&test_config("http://127.0.0.1:9")).expect("client");
+        let invalid_url = "://not-a-url";
+        let request = client.http.get(invalid_url);
+        let Err(error) = client
+            .send::<EnrollResponseWire>(invalid_url, request, None)
+            .await
+        else {
+            panic!("an invalid URL must fail locally");
+        };
+
+        assert!(matches!(error, Error::InvalidRequest { .. }), "{error}");
+        assert!(error.is_terminal_enrollment_failure());
+    }
+
+    #[tokio::test]
+    async fn invalid_organization_header_is_terminal_and_redacted() {
+        let client = EnrollClient::new(&test_config("http://127.0.0.1:9")).expect("client");
+        let authority = EnrollmentAuthority::AuthenticatedSession {
+            access_token: SessionToken::new("session-secret-never-printed".to_string()),
+            org: "invalid\norganization".to_string(),
+        };
+        let material = IdentityStore::generate_enrollment().expect("enrollment material");
+        let error = client
+            .enroll(&authority, "test-operation", &material, &test_facts(), None)
+            .await
+            .expect_err("an invalid header must fail locally");
+
+        assert!(matches!(error, Error::InvalidRequest { .. }), "{error}");
+        assert!(error.is_terminal_enrollment_failure());
+        let rendered = error.to_string();
+        assert!(!rendered.contains("session-secret-never-printed"));
+        assert!(!rendered.contains("invalid\norganization"));
     }
 
     #[tokio::test]

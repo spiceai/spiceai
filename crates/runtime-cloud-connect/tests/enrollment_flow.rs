@@ -306,6 +306,7 @@ struct EnrollMockState {
     /// When set, every request is rejected with this (status, code, error).
     reject: Option<(u16, &'static str, &'static str)>,
     ca: Arc<EnrollCa>,
+    reported_not_after: Arc<Mutex<Vec<String>>>,
 }
 
 struct EnrollCa {
@@ -334,17 +335,21 @@ impl EnrollCa {
         }
     }
 
-    fn sign_csr(&self, csr_pem: &str) -> String {
-        CertificateSigningRequestParams::from_pem(csr_pem)
-            .expect("parse enrollment CSR")
+    fn sign_csr(&self, csr_pem: &str, validity: Duration) -> (String, String) {
+        let now = std::time::SystemTime::now();
+        let not_after = now + validity;
+        let mut request =
+            CertificateSigningRequestParams::from_pem(csr_pem).expect("parse enrollment CSR");
+        request.params.not_before = (now - Duration::from_mins(1)).into();
+        request.params.not_after = not_after.into();
+        let certificate = request
             .signed_by(&self.issuer)
             .expect("sign enrollment CSR")
-            .pem()
+            .pem();
+        let reported_not_after = chrono::DateTime::<chrono::Utc>::from(not_after)
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        (certificate, reported_not_after)
     }
-}
-
-fn not_after_in(hours: i64) -> String {
-    (chrono::Utc::now() + chrono::Duration::hours(hours)).to_rfc3339()
 }
 
 async fn enroll_handler(
@@ -358,9 +363,15 @@ async fn enroll_handler(
             Json(serde_json::json!({ "code": code, "error": error, "retryable": false })),
         );
     }
-    let identity_certificate = state
-        .ca
-        .sign_csr(body["csr_pem"].as_str().expect("CSR is a string"));
+    let (identity_certificate, not_after) = state.ca.sign_csr(
+        body["csr_pem"].as_str().expect("CSR is a string"),
+        Duration::from_hours(24),
+    );
+    state
+        .reported_not_after
+        .lock()
+        .await
+        .push(not_after.clone());
     (
         StatusCode::OK,
         Json(serde_json::json!({
@@ -368,7 +379,7 @@ async fn enroll_handler(
             "identity_cert_pem": identity_certificate,
             "ca_bundle_pem": state.ca.certificate_pem.clone(),
             "gateway_addr": state.gateway_addr,
-            "not_after": not_after_in(24),
+            "not_after": not_after,
             "organization": {"id": 7, "name": "unit-org"},
             "portal": {"new_project_url": "https://cloud.test/unit-org/new?instance=inst_unit_test"},
             "attachment": null,
@@ -381,13 +392,15 @@ async fn enroll_handler(
 async fn spawn_enroll_server(
     gateway_addr: String,
     reject: Option<(u16, &'static str, &'static str)>,
-) -> (SocketAddr, Arc<Mutex<Vec<Value>>>) {
+) -> (SocketAddr, Arc<Mutex<Vec<Value>>>, Arc<Mutex<Vec<String>>>) {
     let requests = Arc::new(Mutex::new(Vec::new()));
+    let reported_not_after = Arc::new(Mutex::new(Vec::new()));
     let state = EnrollMockState {
         requests: Arc::clone(&requests),
         gateway_addr,
         reject,
         ca: Arc::new(EnrollCa::new()),
+        reported_not_after: Arc::clone(&reported_not_after),
     };
     let app = Router::new()
         .route("/v1/cloud-connect/enroll", post(enroll_handler))
@@ -397,7 +410,7 @@ async fn spawn_enroll_server(
     tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
     });
-    (addr, requests)
+    (addr, requests, reported_not_after)
 }
 
 fn enroll_config(enroll_addr: SocketAddr, dir: &std::path::Path) -> CloudConnectConfig {
@@ -452,7 +465,8 @@ async fn pre_runtime_enroll_persists_identity_and_connects() {
     let mock_state = Arc::clone(&mock.state);
     let gateway_addr = spawn_server(mock).await;
 
-    let (enroll_addr, enroll_requests) = spawn_enroll_server(gateway_addr.to_string(), None).await;
+    let (enroll_addr, enroll_requests, reported_not_after) =
+        spawn_enroll_server(gateway_addr.to_string(), None).await;
 
     let config = enroll_config(enroll_addr, dir.path());
 
@@ -487,9 +501,18 @@ async fn pre_runtime_enroll_persists_identity_and_connects() {
         1,
         "enroll ca_bundle_pem should be persisted into identity.json"
     );
-    assert!(
-        identity.not_after_unix.is_some_and(|secs| secs > 0),
-        "not_after must be parsed"
+    let reported_not_after = reported_not_after.lock().await;
+    let reported_not_after = chrono::DateTime::parse_from_rfc3339(
+        reported_not_after
+            .first()
+            .expect("the mock records its response expiry"),
+    )
+    .expect("parse the reported response expiry")
+    .timestamp();
+    assert_eq!(
+        identity.not_after_unix,
+        Some(u64::try_from(reported_not_after).expect("reported expiry is after the Unix epoch")),
+        "the signed durable renewal deadline must match the independently captured response expiry"
     );
 
     // The enroll request carried the canonical contract shape: kind + token
@@ -567,7 +590,7 @@ async fn a_terminal_rejection_creates_no_identity_and_stops_immediately() {
 
     // The cloud terminally rejects the key (unknown/consumed). No gateway
     // is involved.
-    let (enroll_addr, enroll_requests) = spawn_enroll_server(
+    let (enroll_addr, enroll_requests, _reported_not_after) = spawn_enroll_server(
         String::new(),
         Some((401, "invalid_token", "unknown enrollment key")),
     )

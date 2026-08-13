@@ -89,6 +89,7 @@ const NAME_DIGEST_HEX: usize = 16;
 
 /// Marks a booted systemd system. Present only when systemd is PID 1 and
 /// running, which is exactly the condition `systemctl` needs.
+#[cfg(target_os = "linux")]
 const SYSTEMD_RUNTIME_MARKER: &str = "/run/systemd/system";
 
 /// Root-owned directory the installed service's `spiced` is staged into.
@@ -301,6 +302,7 @@ pub(crate) enum PreflightFailure {
     /// Neither Linux nor macOS — there is no supervisor to install into.
     UnsupportedPlatform,
     /// Linux, but systemd is not the running init.
+    #[cfg(target_os = "linux")]
     SystemdUnavailable,
     /// A user-scope service was asked for, and the back end does not install
     /// one yet.
@@ -319,6 +321,7 @@ impl PreflightFailure {
                  See: https://spiceai.org/docs",
                 std::env::consts::OS
             ),
+            #[cfg(target_os = "linux")]
             Self::SystemdUnavailable => format!(
                 "Failed to install the Spice Cloud Connect service: systemd is not running on \
                  this host ({SYSTEMD_RUNTIME_MARKER} is absent). This is normal inside a \
@@ -1275,18 +1278,21 @@ mod tests {
                 .contains("sudo"),
             "the deferred user-scope failure must name the path that does work"
         );
-        assert!(
-            PreflightFailure::SystemdUnavailable
-                .message()
-                .contains("restart policy"),
-            "the no-systemd failure must point containers at the --token flow"
-        );
-        assert!(
-            PreflightFailure::SystemdUnavailable
-                .message()
-                .contains("spiced --token"),
-            "containers enroll directly with the runtime, not this installer"
-        );
+        #[cfg(target_os = "linux")]
+        {
+            assert!(
+                PreflightFailure::SystemdUnavailable
+                    .message()
+                    .contains("restart policy"),
+                "the no-systemd failure must point containers at the --token flow"
+            );
+            assert!(
+                PreflightFailure::SystemdUnavailable
+                    .message()
+                    .contains("spiced --token"),
+                "containers enroll directly with the runtime, not this installer"
+            );
+        }
         assert!(
             PreflightFailure::UnsupportedPlatform
                 .message()

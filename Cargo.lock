@@ -17184,6 +17184,7 @@ dependencies = [
  "fs4",
  "gethostname",
  "getrandom 0.3.4",
+ "http 1.4.1",
  "libc",
  "pem",
  "prost",

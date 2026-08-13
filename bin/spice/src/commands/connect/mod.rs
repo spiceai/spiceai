@@ -47,7 +47,7 @@ use crate::output::OutputFormat;
 use clap::{Args, Subcommand};
 use runtime_cloud_connect::config::{CloudConnectConfig, IDENTITY_FILE};
 
-use status::ConnectStatus;
+use status::{ConnectStatus, ConnectionState};
 
 /// File (relative to the config dir) holding a `--endpoint` override so later
 /// `spiced` starts reach the same control plane the enroll did.
@@ -330,10 +330,13 @@ fn reject_cloud_region(cloud_region: Option<&str>) -> Result<()> {
 /// enrollment belongs to the runtime — so it errors with the exact command that
 /// does enroll.
 async fn connect_existing(config_dir: &Path, endpoint: Option<&str>) -> Result<()> {
-    if has_enrolled_identity(config_dir)? {
-        println!("This host is already enrolled with Spice Cloud.");
-        println!();
-        return print_status(config_dir, endpoint, OutputFormat::Table).await;
+    let status = collect_status(config_dir, endpoint).await;
+    if status.connection.state != ConnectionState::NotConnected {
+        if status.connection.state == ConnectionState::Enrolled {
+            println!("This host is already enrolled with Spice Cloud.");
+            println!();
+        }
+        return render_status(&status, OutputFormat::Table);
     }
 
     Err(Error::InvalidArgument {
@@ -347,17 +350,26 @@ async fn connect_existing(config_dir: &Path, endpoint: Option<&str>) -> Result<(
     })
 }
 
-/// Whether this directory holds a usable enrolled identity.
-///
-/// Existence alone is not enough: an unreadable identity would be reported as
-/// enrolled, but every `spiced` restart would reject it and run without Cloud
-/// Connect.
-fn has_enrolled_identity(config_dir: &Path) -> Result<bool> {
-    runtime_cloud_connect::identity::IdentityStore::load_optional(&config_dir.join(IDENTITY_FILE))
-        .map(|identity| identity.is_some())
-        .map_err(|e| Error::CloudConnectIo {
-            message: format!("load identity: {e}"),
-        })
+/// Collect the one status snapshot used by the bare and explicit status forms.
+async fn collect_status(config_dir: &Path, endpoint: Option<&str>) -> ConnectStatus {
+    ConnectStatus::collect(
+        service::backend(),
+        &instance_dir_for(config_dir),
+        config_dir,
+        &resolved_endpoint(config_dir, endpoint),
+    )
+    .await
+}
+
+/// Render an already-collected snapshot and preserve its degraded exit status.
+fn render_status(status: &ConnectStatus, output: OutputFormat) -> Result<()> {
+    status::render(status, output)?;
+    // The report is already on stdout; the diagnosis travels as the command's
+    // error so a `--output json` run stays parseable.
+    match status.degradation() {
+        Some(message) => Err(Error::ServiceUnavailable { message }),
+        None => Ok(()),
+    }
 }
 
 /// The canonical instance directory a config dir belongs to: `<dir>/.spice` →
@@ -419,20 +431,8 @@ async fn print_status(
     endpoint: Option<&str>,
     output: OutputFormat,
 ) -> Result<()> {
-    let status = ConnectStatus::collect(
-        service::backend(),
-        &instance_dir_for(config_dir),
-        config_dir,
-        &resolved_endpoint(config_dir, endpoint),
-    )
-    .await;
-    status::render(&status, output)?;
-    // The report is already on stdout; the diagnosis travels as the command's
-    // error so a `--output json` run stays parseable.
-    match status.degradation() {
-        Some(message) => Err(Error::ServiceUnavailable { message }),
-        None => Ok(()),
-    }
+    let status = collect_status(config_dir, endpoint).await;
+    render_status(&status, output)
 }
 
 /// What Spice Cloud said about the release, reduced to the only question that
@@ -552,10 +552,12 @@ async fn remove_identity(
     let instance_dir = instance_dir_for(config_dir);
     let backend = service::backend();
 
-    let identity = runtime_cloud_connect::identity::IdentityStore::load_optional(&identity_path)
-        .map_err(|e| Error::CloudConnectIo {
-            message: format!("load identity: {e}"),
-        })?;
+    let identity =
+        runtime_cloud_connect::identity::IdentityStore::load_optional_async(identity_path.clone())
+            .await
+            .map_err(|e| Error::CloudConnectIo {
+                message: format!("load identity: {e}"),
+            })?;
     let installed = service::resolve(backend, &instance_dir, config_dir)?;
 
     let had_identity = identity.is_some();
@@ -657,10 +659,13 @@ async fn remove_identity(
 
     if had_identity {
         // Clearing this also destroys the cache key, which is only in this file.
-        runtime_cloud_connect::identity::IdentityStore::clear(&identity_path).map_err(|e| {
-            Error::CloudConnectIo {
-                message: format!("clear identity: {e}"),
-            }
+        runtime_cloud_connect::identity::IdentityStore::clear_with_transaction_async(
+            identity_path.clone(),
+            Arc::clone(&enrollment_transaction),
+        )
+        .await
+        .map_err(|e| Error::CloudConnectIo {
+            message: format!("clear identity: {e}"),
         })?;
     }
 
@@ -1061,17 +1066,6 @@ mod tests {
             canonicalize_instance_dir(Path::new("../unresolvable/edge")),
             PathBuf::from("../unresolvable/edge")
         );
-    }
-
-    #[test]
-    fn a_malformed_identity_is_not_reported_as_enrolled() {
-        let dir = tempfile::tempdir().expect("create tempdir");
-        std::fs::write(dir.path().join(IDENTITY_FILE), "not valid JSON")
-            .expect("write malformed identity");
-
-        let error = has_enrolled_identity(dir.path())
-            .expect_err("a malformed identity must not read as enrolled");
-        assert!(error.to_string().contains("load identity"), "{error}");
     }
 
     #[test]

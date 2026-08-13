@@ -140,6 +140,58 @@ pub struct CloudConnectConfig {
 }
 
 impl CloudConnectConfig {
+    /// Resolve the control-stream endpoint for a persisted identity.
+    ///
+    /// A configured override is already a complete URL. Otherwise the enroll
+    /// response supplies `host:port`, and transport mode supplies the scheme.
+    #[must_use]
+    pub fn stream_endpoint(&self, identity: &crate::identity::Identity) -> Option<String> {
+        if let Some(ref endpoint) = self.gateway_endpoint {
+            return Some(endpoint.clone());
+        }
+        if identity.gateway_addr.trim().is_empty() {
+            return None;
+        }
+        let scheme = if self.insecure { "http" } else { "https" };
+        Some(format!("{scheme}://{}", identity.gateway_addr))
+    }
+
+    /// Resolve and validate the exact control-stream endpoint shape accepted
+    /// by the client transport.
+    ///
+    /// Both persisted gateway addresses and explicit overrides identify one
+    /// network authority, not a URL subtree or alternate transport. Requiring
+    /// an explicit port also keeps a persisted `host:port` from being
+    /// reinterpreted through a scheme or path embedded in untrusted state.
+    pub(crate) fn validated_stream_endpoint(
+        &self,
+        identity: &crate::identity::Identity,
+    ) -> Result<String, &'static str> {
+        let endpoint = self
+            .stream_endpoint(identity)
+            .ok_or("the gateway address is empty")?;
+        let uri = endpoint
+            .parse::<http::Uri>()
+            .map_err(|_| "the gateway endpoint is invalid")?;
+        let expected_scheme = if self.insecure { "http" } else { "https" };
+        if uri.scheme_str() != Some(expected_scheme) {
+            return Err("the gateway endpoint uses the wrong transport scheme");
+        }
+        if uri.host().is_none() {
+            return Err("the gateway endpoint has no host");
+        }
+        if uri.port_u16().is_none() {
+            return Err("the gateway endpoint has no explicit port");
+        }
+        if uri
+            .path_and_query()
+            .is_some_and(|path_and_query| path_and_query.as_str() != "/")
+        {
+            return Err("the gateway endpoint must not contain a path or query");
+        }
+        Ok(endpoint)
+    }
+
     /// Resolve the Cloud Connect config directory to its canonical location.
     ///
     /// Precedence:
