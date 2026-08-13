@@ -1004,6 +1004,28 @@ async fn test_refresh_registers_a_table_created_at_the_source() -> Result<(), an
                 &rows
             );
 
+            // Values alone do not pin the discovered schema: `1` renders the
+            // same whether it arrived as Int32 or Int64, and `1.50` the same at
+            // any precision with scale 2. The RC criterion is about types, so
+            // assert them.
+            let discovered: Vec<(String, String)> = rows
+                .first()
+                .expect("the query should return a batch")
+                .schema()
+                .fields()
+                .iter()
+                .map(|field| (field.name().clone(), field.data_type().to_string()))
+                .collect();
+            assert_eq!(
+                discovered,
+                vec![
+                    ("id".to_string(), "Int32".to_string()),
+                    ("label".to_string(), "Utf8".to_string()),
+                    ("amount".to_string(), "Decimal128(10, 2)".to_string()),
+                ],
+                "the discovered column types should match the source's INT / TEXT / NUMERIC(10,2)"
+            );
+
             Ok(())
         })
         .await
@@ -1193,13 +1215,13 @@ async fn test_refresh_sees_a_rename_as_a_removal_and_an_addition() -> Result<(),
 ///
 /// The accelerated path fails loud in this situation; the federated path warns,
 /// because a federated catalog can legitimately be configured before the tables
-/// it names exist. The warning's wording is asserted in the provider's unit
-/// tests -- here the observable behavior is pinned: the catalog loads, and it is
-/// empty.
+/// it names exist. The exact wording is asserted in the provider's unit tests;
+/// what this pins is that a real refresh reaches it -- the catalog loads, it is
+/// empty, and it says so once.
 #[tokio::test]
 async fn test_refresh_registers_nothing_when_include_matches_no_table() -> Result<(), anyhow::Error>
 {
-    let _tracing = init_tracing(Some("integration=debug,info"));
+    // No `init_tracing` here: this test installs its own capturing subscriber.
 
     test_request_context()
         .scope(async {
@@ -1226,10 +1248,14 @@ async fn test_refresh_registers_nothing_when_include_matches_no_table() -> Resul
                     .with_include_patterns(&["public.absent".to_string()]),
             );
 
-            provider
-                .refresh()
-                .await
-                .map_err(|e| anyhow::anyhow!("refresh: {e}"))?;
+            // Both refreshes are captured: the first must report the empty
+            // catalog, and the second must not repeat it. Asserting only that
+            // the catalog is empty would leave the report itself untested --
+            // deleting it would keep every assertion here passing.
+            let (first, first_refresh) = capture_logs(provider.refresh()).await;
+            first.map_err(|e| anyhow::anyhow!("refresh: {e}"))?;
+            let (second, second_refresh) = capture_logs(provider.refresh()).await;
+            second.map_err(|e| anyhow::anyhow!("second refresh: {e}"))?;
 
             assert!(
                 catalog_tables(&provider, "public").is_empty(),
@@ -1242,7 +1268,72 @@ async fn test_refresh_registers_nothing_when_include_matches_no_table() -> Resul
                 "the schema should still be registered, empty"
             );
 
+            assert!(
+                first_refresh.contains("registered no tables"),
+                "the first refresh should report the empty catalog: {first_refresh}"
+            );
+            assert!(
+                first_refresh.contains("public.absent"),
+                "the report should name the pattern that matched nothing: {first_refresh}"
+            );
+            assert!(
+                !second_refresh.contains("registered no tables"),
+                "a catalog that is still empty should not report it again: {second_refresh}"
+            );
+
             Ok(())
         })
         .await
+}
+
+/// Captures what is logged while `f` runs.
+///
+/// `set_default` scopes the subscriber to this thread, which is where these
+/// tests' current-thread runtime polls the refresh.
+async fn capture_logs<F, T>(f: F) -> (T, String)
+where
+    F: std::future::Future<Output = T>,
+{
+    let logs = CapturedLogs::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_writer(logs.clone())
+        .finish();
+
+    let value = {
+        let _guard = tracing::subscriber::set_default(subscriber);
+        f.await
+    };
+
+    let captured = logs
+        .0
+        .lock()
+        .expect("log mutex should not be poisoned")
+        .clone();
+    (value, String::from_utf8_lossy(&captured).into_owned())
+}
+
+#[derive(Clone, Default)]
+struct CapturedLogs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for CapturedLogs {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .expect("log mutex should not be poisoned")
+            .extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+    type Writer = Self;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
 }
