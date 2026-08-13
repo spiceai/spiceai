@@ -17311,12 +17311,18 @@ impl CayenneTableProvider {
         // non-positive count therefore reads as unknown; a genuinely empty file
         // costs the metadata `COUNT(*)` fast path until the next full rewrite,
         // which is the safe direction to be wrong in.
-        let mut live_rows = 0i64;
+        // `checked_add`, not `saturating_add`: a clamp to `i64::MAX` would publish an
+        // undercount as exact. An overflowing total reads as unknown like any other
+        // unreadable count. (Unreachable for a real table — it needs more live rows
+        // than `i64::MAX` — but the exactness claim should not rest on that.)
+        let mut live_rows: Option<i64> = Some(0);
         let mut counts_known = true;
         for file in cold_files.iter() {
-            live_rows = live_rows.saturating_add(file.row_count.max(0));
+            live_rows = live_rows.and_then(|sum| sum.checked_add(file.row_count.max(0)));
             counts_known &= file.row_count > 0;
         }
+        let counts_known = counts_known && live_rows.is_some();
+        let live_rows = live_rows.unwrap_or(0);
         if !counts_known {
             tracing::debug!(
                 target: "cayenne::compaction",
@@ -20615,9 +20621,22 @@ impl CayenneTableProvider {
             // applied. A taint that did not land would otherwise leave the stale
             // count `Exact`, and a `Set` that did not land leaves the count the
             // rewrite superseded. Both are wrong-answer shapes; `Inexact` costs only
-            // the metadata `COUNT(*)` fold, and the next successful persist (or a
-            // reopen) re-establishes exactness.
-            self.table_statistics.write().count_exact = false;
+            // the metadata `COUNT(*)` fold.
+            //
+            // `raw` is DROPPED rather than patched, which does two things at once.
+            // `persist_table_stats_locked` merges onto `raw` and reads its
+            // `num_rows_exact` as the prior exactness, so leaving the optimistic
+            // record there would let the next pure-append `Delta { exact: true }`
+            // republish the stale count as exact — undoing this demotion. And
+            // because the durable flag is unchanged, the next attempt must still
+            // retry: dropping `raw` sends it back to the catalog, which reports the
+            // untainted value and drives the write again, whereas a locally-patched
+            // record would look already-tainted and silence the retry forever.
+            {
+                let mut cache = self.table_statistics.write();
+                cache.count_exact = false;
+                cache.raw = None;
+            }
             return;
         }
 
@@ -20630,14 +20649,26 @@ impl CayenneTableProvider {
     /// re-establishing exactness — the datalake-promotion counterpart to
     /// compaction's and overwrite's `Set`. `baseline` must have been captured
     /// before the promotion's commit; see [`Self::write_rebaselined_row_count`].
+    ///
+    /// Carrying the previous column aggregate forward alongside an exact count is
+    /// deliberate and safe: the metadata-only `MIN`/`MAX`/`SUM` fold
+    /// ([`crate::stats_aggregate`]) consumes the *scan's* statistics, which come
+    /// from the live files' footers, and the table-level aggregate only refills
+    /// columns the scan leaves `Absent` (`restore_absent_column_statistics`). So the
+    /// carried blob — a documented superset whose min/max only ever widened — cannot
+    /// displace a live footer value and be folded into an answer.
     pub(crate) async fn set_persisted_row_count(
         &self,
         baseline: Option<TableStatistics>,
         live_rows: i64,
     ) {
         let Some(baseline) = baseline else {
-            // No statistics record to carry a blob forward from, so there is no
-            // count being served and nothing to correct.
+            // Either no statistics record exists or the read failed —
+            // `load_persisted_table_statistics` cannot distinguish the two. Both
+            // demote: the derived cache can still be serving an exact count loaded
+            // at open even when the raw blob is absent, and this promotion has just
+            // cleared the tombstones that were masking it.
+            self.table_statistics.write().count_exact = false;
             return;
         };
         self.write_rebaselined_row_count(baseline, RowCountUpdate::Set(live_rows))
@@ -20648,12 +20679,23 @@ impl CayenneTableProvider {
     /// durably, so no later fold of a tombstone can serve a stale count `Exact` and
     /// the taint survives a restart.
     pub(crate) async fn taint_persisted_row_count_exactness(&self) {
-        // Cheap pre-lock reject: this runs on every user `DELETE` statement, and
-        // once the count is already inexact the taint cannot change anything, so
-        // skip the async mutex, the possible catalog read, and the derived-statistics
-        // rebuild. Racing with a concurrent persist costs at most a redundant write
-        // below, never a missed taint — the write path holds the same lock.
-        if !self.table_statistics.read().count_exact {
+        // Cheap pre-lock reject: this runs on every user `DELETE` statement, so once
+        // the taint cannot change anything, skip the async mutex, the possible
+        // catalog read, and the derived-statistics rebuild. The evidence has to be
+        // the cached *record*, not `count_exact`: a failed persist demotes
+        // `count_exact` locally while the durable flag stays true, so gating on it
+        // would stop every later `DELETE` from retrying the write and a restart
+        // would reload the untainted flag. A cached record that already reads
+        // inexact does prove the durable write landed. Racing with a concurrent
+        // persist costs at most a redundant write below, never a missed taint — the
+        // write path holds the same lock.
+        if self
+            .table_statistics
+            .read()
+            .raw
+            .as_ref()
+            .is_some_and(|raw| !raw.num_rows_exact)
+        {
             return;
         }
         let Some(baseline) = self.load_persisted_table_statistics().await else {
@@ -20679,7 +20721,7 @@ impl CayenneTableProvider {
     /// Resolve a [`RowCountUpdate`] against the previous count and its exactness.
     ///
     /// Shared by [`Self::persist_table_stats_locked`] and
-    /// [`Self::amend_persisted_row_count`] so the two cannot drift: a `Set` is
+    /// [`Self::write_rebaselined_row_count`] so the two cannot drift: a `Set` is
     /// authoritative and re-establishes exactness, an `exact` `Delta` preserves the
     /// prior exactness, a best-effort `Delta` taints it, and `Unchanged` preserves
     /// both. The count never goes negative.

@@ -389,3 +389,59 @@ async fn test_a_promotion_after_a_reopen_rebaselines_the_count_impl(
 
     Ok(())
 }
+
+test_with_backends!(test_a_promotion_does_not_fold_a_stale_extremum_impl);
+
+/// A metadata-folded `MAX` must reflect deletes a promotion just folded.
+///
+/// Re-baselining the count restores `num_rows_exact`, which re-opens the
+/// metadata-only `MIN`/`MAX`/`SUM` fold ([`cayenne::stats_aggregate`]) — while the
+/// table-level column aggregate carried across the promotion is a superset whose
+/// min/max only ever widened, so it still names the deleted extremum. This pins
+/// that the fold answers from the live files' footer statistics rather than that
+/// superset: the plan folds to a constant (`ProjectionExec: expr=[108 as m]`) and
+/// the constant is right.
+async fn test_a_promotion_does_not_fold_a_stale_extremum_impl(
+    fixture: common::TestFixture,
+) -> TestResult<()> {
+    let ctx = SessionContext::new();
+    let table = create_table(&fixture, &ctx).await?;
+
+    insert_range(&table, 0..100).await?;
+    settle(&table).await?;
+    assert!(table.promote_warm_to_cold().await?, "promotion should fire");
+    table.flush_pending_maintenance().await?;
+
+    // id=99 is the table's maximum and lives only in the datalake, so the carried
+    // aggregate's max still names it after the delete.
+    delete_id(&table, 99).await?;
+    insert_range(&table, 100..110).await?;
+    delete_id(&table, 109).await?;
+    settle(&table).await?;
+    assert!(
+        table.promote_warm_to_cold().await?,
+        "the promotion folding the tombstones should fire"
+    );
+    table.flush_pending_maintenance().await?;
+
+    // 100 - 1 + 10 - 1 = 108 live rows, with 99 and 109 both gone.
+    assert_count_agrees(&table, &ctx, 108, "after the tombstones were folded").await?;
+
+    let batches = ctx
+        .sql(&format!("SELECT MAX(id) AS m FROM {TABLE}"))
+        .await?
+        .collect()
+        .await?;
+    let max = batches
+        .first()
+        .and_then(|b| b.column(0).as_any().downcast_ref::<Int64Array>())
+        .and_then(|a| a.values().first())
+        .copied();
+    assert_eq!(
+        max,
+        Some(108),
+        "MAX(id) must reflect the deletes, not the carried aggregate's stale extremum"
+    );
+
+    Ok(())
+}
