@@ -19,10 +19,12 @@ limitations under the License.
 //!
 //! A deployment applies to the running instance and never ends its process, so
 //! the supervisor is what keeps the instance up across the things that do end
-//! it — a host reboot, an OOM kill, an unhandled failure. Both back ends
-//! therefore bring a failed runtime back — systemd with `Restart=on-failure`,
-//! launchd with `KeepAlive` — while leaving a clean exit alone, because a clean
-//! exit is what an operator's `stop` produces.
+//! it — a host reboot, an OOM kill, an unhandled failure.
+//!
+//! The two back ends do not promise the same thing about a *clean* exit, so
+//! neither does this. systemd uses `Restart=on-failure`: a failure comes back,
+//! and an exit an operator asked for stays down. launchd uses `KeepAlive`,
+//! which brings the job back from any exit at all, including a clean one.
 //!
 //! ## Support matrix
 //!

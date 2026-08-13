@@ -43,12 +43,14 @@ limitations under the License.
 use std::io::{Read as _, Write as _};
 use std::net::{TcpStream, ToSocketAddrs as _};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::backend::{InstallRequest, LogRequest, ServiceBackend, ServiceObservation};
 use super::manifest::ServiceManifest;
 use super::model::{LogSource, ServiceScope, ServiceStarts, ServiceState, Supervisor};
-use super::{InstalledService, PreflightFailure, SYSTEMD_RUNTIME_MARKER, ServiceAccount};
+use super::{
+    InstalledService, PreflightFailure, SYSTEMD_RUNTIME_MARKER, ServiceAccount, ServiceOwner,
+};
 use crate::error::{Error, Result};
 
 /// Directory systemd reads administrator-provided unit files from.
@@ -89,10 +91,8 @@ const LOGINCTL: &str = "loginctl";
 /// rolled back.
 const HEALTH_GATE: Duration = Duration::from_secs(30);
 
-/// How often the health gate asks. Bounded by attempts rather than by a clock
-/// so the whole gate is exercised deterministically in tests.
+/// How often the health gate asks.
 const HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(500);
-const HEALTH_ATTEMPTS: u32 = 60;
 
 /// How long a `start`, `stop`, or `restart` has to reach the state it asked
 /// for. systemd returns from these once the job is *done*, so this only covers
@@ -107,10 +107,11 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 /// Bytes of a health response read before giving up on finding a status line.
 const PROBE_READ_LIMIT: usize = 512;
 
-/// Consecutive `active` readings that stand in for an unanswered health probe:
-/// a runtime that has served uninterrupted for this long is up, whatever the
-/// recorded health URL points at.
-const SETTLE_ATTEMPTS: u32 = 20;
+/// How long one uninterrupted run stands in for an unanswered health probe: a
+/// runtime that has served this long on the same start is up, whatever the
+/// recorded health URL points at. Measured on the clock and against systemd's
+/// own restart count, not by counting polls.
+const SETTLE_WINDOW: Duration = Duration::from_secs(10);
 
 /// Consecutive `failed` readings that end the health gate early.
 ///
@@ -183,6 +184,13 @@ pub(super) trait SystemdHost {
     /// Whether the instance answers `url` right now.
     fn probe_health(&self, url: &str) -> bool;
 
+    /// Now, on a clock that only moves forward.
+    ///
+    /// The gates are bounded by this rather than by a count of polls: a health
+    /// probe can block for seconds, so counting attempts would promise a
+    /// 30-second gate and take minutes.
+    fn now(&self) -> Instant;
+
     /// Wait before polling again.
     fn sleep(&self, duration: Duration);
 }
@@ -208,6 +216,10 @@ impl SystemdHost for ProcessHost {
 
     fn probe_health(&self, url: &str) -> bool {
         probe_http_health(url)
+    }
+
+    fn now(&self) -> Instant {
+        Instant::now()
     }
 
     fn sleep(&self, duration: Duration) {
@@ -281,9 +293,13 @@ fn probe_http_health(url: &str) -> bool {
     status_line_is_success(&String::from_utf8_lossy(&response))
 }
 
-/// Whether an HTTP response begins with a `2xx` status line.
+/// Whether an HTTP response begins with a complete `2xx` status line.
+///
+/// The terminator is required: a response that ended before one arrived is a
+/// connection that was cut mid-answer, and reading `HTTP/1.1 20` as a success
+/// would report an instance healthy on the strength of a truncated read.
 fn status_line_is_success(response: &str) -> bool {
-    let Some(line) = response.lines().next() else {
+    let Some((line, _)) = response.split_once('\n') else {
         return false;
     };
     let mut fields = line.split_whitespace();
@@ -328,6 +344,11 @@ fn render_unit(
          Documentation=https://spiceai.org/docs\n\
          After=network-online.target\n\
          Wants=network-online.target\n\
+         # A crash loop must not be given up on: an instance that lost its\n\
+         # network for an hour has to come back on its own. This is a [Unit]\n\
+         # directive — systemd ignores it under [Service], which would leave\n\
+         # the default rate limit in force and stop the service for good.\n\
+         StartLimitIntervalSec=0\n\
          \n\
          [Service]\n\
          Type=simple\n",
@@ -349,9 +370,6 @@ fn render_unit(
          # left alone: it is what an operator's `stop` produces.\n\
          Restart=on-failure\n\
          RestartSec=5\n\
-         # A crash loop must not be given up on: an instance that lost its\n\
-         # network for an hour has to come back on its own.\n\
-         StartLimitIntervalSec=0\n\
          KillSignal=SIGTERM\n\
          TimeoutStopSec=30\n\
          \n\
@@ -540,7 +558,7 @@ fn install_at(
 
     // Captured before anything is overwritten: an upgrade that does not come up
     // has to be able to put back exactly what was serving before it.
-    let rollback = Rollback::capture(paths)?;
+    let rollback = Rollback::capture(host, paths, name, request.scope)?;
 
     let applied = apply(host, request, name, paths, account);
     let verdict = match applied {
@@ -551,6 +569,15 @@ fn install_at(
     match verdict {
         Ok(()) => {
             rollback.discard();
+            if request.scope == ServiceScope::User {
+                // After the gate, not before: lingering is an account-wide
+                // setting that outlives this service, and an install that is
+                // about to be rolled back must not leave it behind. Best effort
+                // either way — a policy that refuses it is reported by `status`
+                // as `login_only` with the command to run, not as a failed
+                // install.
+                let _ = enable_linger(host);
+            }
             Ok(InstalledService {
                 name: name.to_string(),
                 path: paths.unit.clone(),
@@ -598,29 +625,25 @@ fn apply(
     // a rewritten unit and an upgraded binary, and starts a service that was
     // not running. `enable --now` alone would leave the old process up.
     systemctl(host, request.scope, &["enable", name])?;
-    systemctl(host, request.scope, &["restart", name])?;
-
-    if request.scope == ServiceScope::User {
-        // Best effort: a policy that refuses lingering is reported by `status`
-        // as `login_only` with the command to run, not as a failed install.
-        let _ = enable_linger(host);
-    }
-    Ok(())
+    systemctl(host, request.scope, &["restart", name])
 }
 
 /// Wait for the service to prove it is serving, or say what it is doing
 /// instead.
 ///
 /// Two things count as proof, and both have to be here. Answering the health
-/// URL is the strongest, and ends the gate as soon as it happens. Staying
-/// `active` without interruption for [`SETTLE_ATTEMPTS`] polls is the other,
-/// and it is what a healthy instance whose endpoint this CLI cannot reach
-/// looks like: the recorded health URL is the address the *CLI* was pointed at,
-/// while the service serves whatever its spicepod configures, so refusing an
-/// install because a probe went unanswered would fail an instance that is
-/// working. What neither accepts is the failure this gate exists for — a
-/// runtime that exits and is restarted, which never accumulates an
-/// uninterrupted run and never answers.
+/// URL is the strongest, and ends the gate as soon as it happens. One
+/// uninterrupted run of [`SETTLE_WINDOW`] is the other, and it is what a
+/// healthy instance whose endpoint this CLI cannot reach looks like: the
+/// recorded health URL is the address the *CLI* was pointed at, while the
+/// service serves whatever its spicepod configures, so refusing an install
+/// because a probe went unanswered would fail an instance that is working.
+///
+/// What neither accepts is the failure this gate exists for — a runtime that
+/// exits and is restarted. Sampling `is-active` cannot see that on its own,
+/// because systemd may well be back to `active` by the next poll, so the run is
+/// identified by systemd's restart count and the start time of the current run:
+/// a restart between two samples changes it, and the window starts again.
 fn health_gate(
     host: &dyn SystemdHost,
     name: &str,
@@ -628,35 +651,44 @@ fn health_gate(
     health_url: &str,
 ) -> std::result::Result<(), String> {
     let probeable = is_probeable(health_url);
+    let deadline = host.now() + HEALTH_GATE;
     let mut failures = 0;
-    let mut settled = 0;
+    // When the run that is up now began, and which run it is.
+    let mut running_since: Option<(Instant, Option<String>)> = None;
     let mut last = format!(
         "systemd did not report {name} as running within {}s",
         HEALTH_GATE.as_secs()
     );
 
-    for attempt in 0..HEALTH_ATTEMPTS {
-        if attempt > 0 {
-            host.sleep(HEALTH_POLL_INTERVAL);
-        }
+    loop {
+        let sampled_at = host.now();
         let reported = is_active(host, name, scope).unwrap_or_default();
         match normalize_systemd_state(&reported) {
             ServiceState::Running => {
                 failures = 0;
-                settled += 1;
+                let identity = run_identity(host, name, scope);
+                if running_since
+                    .as_ref()
+                    .is_none_or(|(_, running)| *running != identity)
+                {
+                    running_since = Some((sampled_at, identity));
+                }
                 if probeable && host.probe_health(health_url) {
                     return Ok(());
                 }
-                if settled >= SETTLE_ATTEMPTS {
+                let uninterrupted = running_since.as_ref().map_or(Duration::ZERO, |(since, _)| {
+                    host.now().saturating_duration_since(*since)
+                });
+                if uninterrupted >= SETTLE_WINDOW {
                     return Ok(());
                 }
                 last = format!(
-                    "{name} did not stay running for {}s, and did not answer {health_url}",
-                    settle_window().as_secs()
+                    "{name} has not stayed running for {}s, and has not answered {health_url}",
+                    SETTLE_WINDOW.as_secs()
                 );
             }
             ServiceState::Failed => {
-                settled = 0;
+                running_since = None;
                 failures += 1;
                 last = format!("systemd reports {name} as failed");
                 if failures >= FAILED_READINGS_BEFORE_GIVING_UP {
@@ -664,29 +696,51 @@ fn health_gate(
                 }
             }
             other => {
-                settled = 0;
+                running_since = None;
                 failures = 0;
-                last = format!(
-                    "systemd reports {name} as {other} rather than running, {}s after it was \
-                     started",
-                    HEALTH_GATE.as_secs()
-                );
+                last = format!("systemd reports {name} as {other} rather than running");
             }
         }
+
+        // Checked after the sample, so a probe that blocked past the deadline
+        // still ends the gate rather than buying another round.
+        if host.now() >= deadline {
+            return Err(format!(
+                "{last}, {}s after it was started",
+                HEALTH_GATE.as_secs()
+            ));
+        }
+        host.sleep(HEALTH_POLL_INTERVAL);
     }
-    Err(last)
 }
 
-/// How long a service has to run without interruption to count as up.
-fn settle_window() -> Duration {
-    SETTLE_ATTEMPTS * HEALTH_POLL_INTERVAL
+/// Which run of the unit is up: how many times systemd has restarted it, and
+/// when the current run began.
+///
+/// `None` when systemd could not be asked, in which case the gate falls back to
+/// what sampling alone can see.
+fn run_identity(host: &dyn SystemdHost, name: &str, scope: ServiceScope) -> Option<String> {
+    let identity = systemctl_query(
+        host,
+        scope,
+        &[
+            "show",
+            name,
+            "--property=NRestarts",
+            "--property=ActiveEnterTimestampMonotonic",
+            "--value",
+        ],
+    )?;
+    (!identity.is_empty()).then_some(identity)
 }
 
 /// What an install has to be able to put back.
 ///
-/// The unit and the runtime together decide what the host runs, so both are
-/// captured: restoring one without the other would leave a unit pointing at a
-/// binary that is no longer the one it was written for.
+/// The unit and the runtime together decide what the host *runs*, and the
+/// enablement and the running state decide *whether* it runs — so all four are
+/// captured. Restoring the files alone would leave a service that was
+/// deliberately stopped, or deliberately not enabled, started and enabled by a
+/// rolled-back upgrade.
 struct Rollback {
     unit: PathBuf,
     /// The unit file that was in force, or `None` when nothing was installed.
@@ -695,6 +749,11 @@ struct Rollback {
     /// A second name for the runtime that was in force, or `None` when there
     /// was none.
     previous_runtime: Option<PathBuf>,
+    /// Whether the service was enabled for boot, and whether it was running.
+    /// `None` for either means systemd could not be asked, and that part of the
+    /// state is left as the install found it rather than guessed at.
+    was_enabled: Option<bool>,
+    was_running: Option<bool>,
 }
 
 impl Rollback {
@@ -712,30 +771,92 @@ impl Rollback {
     /// copy where it does not. A capture that cannot be made fails the install
     /// rather than proceeding: an upgrade nobody can undo is exactly the one
     /// that must not start.
-    fn capture(paths: &InstallPaths) -> Result<Self> {
-        let previous_unit = std::fs::read(&paths.unit).ok();
-        let previous_runtime = if paths.runtime.is_file() {
-            let backup = Self::backup_name(&paths.runtime);
-            let _ = std::fs::remove_file(&backup);
-            if std::fs::hard_link(&paths.runtime, &backup).is_err() {
-                std::fs::copy(&paths.runtime, &backup).map_err(|e| Error::CloudConnectIo {
+    ///
+    /// Only a genuinely absent file reads as "nothing was installed". A unit or
+    /// runtime that exists but cannot be read is reported, because taking it for
+    /// an empty slot would have the rollback *delete* the installation it was
+    /// supposed to protect.
+    fn capture(
+        host: &dyn SystemdHost,
+        paths: &InstallPaths,
+        name: &str,
+        scope: ServiceScope,
+    ) -> Result<Self> {
+        let previous_unit = match std::fs::read(&paths.unit) {
+            Ok(unit) => Some(unit),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => {
+                return Err(Error::CloudConnectIo {
                     message: format!(
-                        "keep a copy of the Spice runtime {} before upgrading it: {e}. The \
-                         upgrade was not started, so the installed service is untouched.",
-                        paths.runtime.display()
+                        "read the installed systemd unit {} before replacing it: {e}. The upgrade \
+                         was not started, so the installed service is untouched.",
+                        paths.unit.display()
                     ),
-                })?;
+                });
             }
-            Some(backup)
-        } else {
-            None
         };
+        let previous_runtime = Self::capture_runtime(paths)?;
+        // Only meaningful when there is something to restore, and asking about a
+        // unit that does not exist yet would record systemd's answer for a unit
+        // it has no record of.
+        let (was_enabled, was_running) = if previous_unit.is_some() {
+            (
+                systemctl_query(host, scope, &["is-enabled", name])
+                    .filter(|reported| !reported.is_empty())
+                    .map(|reported| reported.trim().starts_with("enabled")),
+                is_active(host, name, scope)
+                    .map(|reported| normalize_systemd_state(&reported) == ServiceState::Running),
+            )
+        } else {
+            (None, None)
+        };
+
         Ok(Self {
             unit: paths.unit.clone(),
             previous_unit,
             runtime: paths.runtime.clone(),
             previous_runtime,
+            was_enabled,
+            was_running,
         })
+    }
+
+    /// Hold on to the runtime that is in force, so an upgrade can be undone.
+    fn capture_runtime(paths: &InstallPaths) -> Result<Option<PathBuf>> {
+        let io_error = |e: std::io::Error| Error::CloudConnectIo {
+            message: format!(
+                "keep a copy of the Spice runtime {} before upgrading it: {e}. The upgrade was \
+                 not started, so the installed service is untouched.",
+                paths.runtime.display()
+            ),
+        };
+
+        match std::fs::symlink_metadata(&paths.runtime) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(io_error(e)),
+            Ok(metadata) if !metadata.is_file() => {
+                return Err(Error::InvalidArgument {
+                    message: format!(
+                        "Failed to install the Spice Cloud Connect service: {} is not a regular \
+                         file, so the runtime it stands for cannot be preserved across the \
+                         upgrade. Remove it and re-run `spice connect service install`.",
+                        paths.runtime.display()
+                    ),
+                });
+            }
+            Ok(_) => {}
+        }
+
+        let backup = Self::backup_name(&paths.runtime);
+        match std::fs::remove_file(&backup) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(io_error(e)),
+        }
+        if std::fs::hard_link(&paths.runtime, &backup).is_err() {
+            std::fs::copy(&paths.runtime, &backup).map_err(io_error)?;
+        }
+        Ok(Some(backup))
     }
 
     /// Let go of the captured runtime, after the new one proved healthy.
@@ -745,42 +866,120 @@ impl Rollback {
         }
     }
 
-    /// Put back what was in force, and describe what an operator is left with.
+    /// Put back what was in force, and say exactly what an operator is left
+    /// with.
     ///
-    /// Best effort by design: this already runs on a failure path, and a
-    /// restoration step that also fails must not replace the diagnosis of the
-    /// original failure with its own.
+    /// Every step is attempted even after an earlier one fails — a unit that
+    /// could not be rewritten must not stop the runtime from being put back —
+    /// but nothing is *claimed*: a restoration that did not fully succeed
+    /// reports which steps failed and the commands that finish the job by hand,
+    /// because an operator told recovery worked will not go looking.
     fn restore(&self, host: &dyn SystemdHost, name: &str, scope: ServiceScope) -> String {
+        let mut failed: Vec<String> = Vec::new();
+        let mut manual: Vec<String> = Vec::new();
+
         match &self.previous_unit {
             Some(unit) => {
-                let _ = write_unit_bytes(&self.unit, unit);
+                if let Err(err) = write_unit_bytes(&self.unit, unit) {
+                    failed.push(format!("rewrite the unit {}", self.unit.display()));
+                    tracing::debug!("restore {}: {err}", self.unit.display());
+                }
             }
-            None => {
-                let _ = std::fs::remove_file(&self.unit);
-            }
+            None => Self::remove_file(&self.unit, "remove the unit", &mut failed),
         }
+
         match &self.previous_runtime {
             Some(backup) => {
-                let _ = std::fs::rename(backup, &self.runtime);
+                if let Err(err) = std::fs::rename(backup, &self.runtime) {
+                    failed.push(format!(
+                        "put the previous runtime back as {} (it is at {})",
+                        self.runtime.display(),
+                        backup.display()
+                    ));
+                    tracing::debug!("restore {}: {err}", self.runtime.display());
+                }
             }
-            None => {
-                let _ = std::fs::remove_file(&self.runtime);
-            }
+            None => Self::remove_file(&self.runtime, "remove the staged runtime", &mut failed),
         }
         // The stamp describes the source the staged runtime was copied from,
         // and the restored binary did not come from it. Dropping it is what
         // makes the next install copy again instead of trusting a stamp that
         // now describes the runtime this rollback just removed.
-        let _ = std::fs::remove_file(self.runtime.with_extension("stamp"));
+        Self::remove_file(
+            &self.runtime.with_extension("stamp"),
+            "remove the staging stamp",
+            &mut failed,
+        );
 
-        let _ = systemctl(host, scope, &["daemon-reload"]);
-        if self.previous_unit.is_some() {
-            let _ = systemctl(host, scope, &["restart", name]);
-            "The service and runtime that were installed before have been put back.".to_string()
+        // The service is put back the way it was found, not the way an install
+        // leaves one: a service that was deliberately stopped, or deliberately
+        // not enabled for boot, must not come back started and enabled.
+        let mut supervisor_steps: Vec<Vec<&str>> = vec![vec!["daemon-reload"]];
+        if self.previous_unit.is_none() {
+            supervisor_steps.push(vec!["disable", "--now", name]);
         } else {
-            let _ = systemctl(host, scope, &["disable", "--now", name]);
-            "Nothing was left installed for this directory.".to_string()
+            if self.was_enabled == Some(false) {
+                supervisor_steps.push(vec!["disable", name]);
+            }
+            supervisor_steps.push(if self.was_running == Some(false) {
+                vec!["stop", name]
+            } else {
+                vec!["restart", name]
+            });
         }
+        for step in supervisor_steps {
+            if let Err(err) = systemctl(host, scope, &step) {
+                failed.push(format!("run `{}`", systemctl_command(scope, &step)));
+                manual.push(systemctl_command(scope, &step));
+                tracing::debug!("restore: {err}");
+            }
+        }
+
+        Self::describe(
+            if self.previous_unit.is_none() {
+                "Nothing was left installed for this directory."
+            } else {
+                "The service and runtime that were installed before have been put back."
+            },
+            &failed,
+            &manual,
+        )
+    }
+
+    /// Delete a file this rollback owns, recording the failure rather than
+    /// swallowing it.
+    fn remove_file(path: &Path, what: &str, failed: &mut Vec<String>) {
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                failed.push(format!("{what} {}", path.display()));
+                tracing::debug!("restore {}: {e}", path.display());
+            }
+        }
+    }
+
+    /// The sentence the install failure carries: what the rollback achieved,
+    /// and what it could not.
+    fn describe(succeeded: &str, failed: &[String], manual: &[String]) -> String {
+        if failed.is_empty() {
+            return succeeded.to_string();
+        }
+        let mut message = format!(
+            "The previous installation could not be fully restored: this could not {}.",
+            failed.join("; ")
+        );
+        if !manual.is_empty() {
+            use std::fmt::Write as _;
+            // Writing into a String is infallible; the Result exists only to
+            // satisfy the `Write` trait.
+            let _ = write!(
+                message,
+                " Finish it by hand with `{}`.",
+                manual.join("` and `")
+            );
+        }
+        message
     }
 }
 
@@ -900,13 +1099,11 @@ fn uninstall(host: &dyn SystemdHost, manifest: &ServiceManifest) -> Result<()> {
         }
     }
 
-    remove_staged_runtime(manifest);
-
     if let Err(err) = systemctl(host, manifest.scope, &["daemon-reload"]) {
         tracing::debug!("systemctl daemon-reload: {err}");
     }
 
-    Ok(())
+    remove_staged_runtime(manifest)
 }
 
 /// The staging directory holding the runtime this service — and only this
@@ -921,18 +1118,30 @@ fn owned_runtime_dir(manifest: &ServiceManifest) -> Option<PathBuf> {
 }
 
 /// Delete the runtime staged for this service, and nothing else.
-fn remove_staged_runtime(manifest: &ServiceManifest) {
+///
+/// A failure is reported rather than logged: the caller deletes the manifest
+/// once this returns, and a manifest that is gone while the staged runtime is
+/// still on disk leaves nobody who knows what the orphan belongs to.
+fn remove_staged_runtime(manifest: &ServiceManifest) -> Result<()> {
     let Some(owned) = owned_runtime_dir(manifest) else {
         tracing::debug!(
             "leaving {} in place: it is not this service's own staged runtime",
             manifest.runtime_path.display()
         );
-        return;
+        return Ok(());
     };
-    if let Err(e) = std::fs::remove_dir_all(&owned)
-        && e.kind() != std::io::ErrorKind::NotFound
-    {
-        tracing::debug!("remove staged runtime {}: {e}", owned.display());
+    match std::fs::remove_dir_all(&owned) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(Error::CloudConnectIo {
+            message: format!(
+                "remove the runtime staged for the Spice Cloud Connect service {name} at {}: {e}. \
+                 The service definition is already gone, so nothing runs it — remove the \
+                 directory and re-run `spice connect service uninstall`.",
+                owned.display(),
+                name = manifest.name,
+            ),
+        }),
     }
 }
 
@@ -1286,9 +1495,19 @@ fn observe_persistence(
     };
     let lingers = match manifest.scope {
         ServiceScope::System => None,
-        ServiceScope::User => account_lingers(host, &manifest.owner.describe()),
+        ServiceScope::User => account_lingers(host, &linger_account(&manifest.owner)),
     };
     classify_persistence(&reported, lingers, manifest)
+}
+
+/// How this owner is named to `loginctl`.
+///
+/// The account name when the host has one, and the bare uid otherwise — which
+/// logind accepts just as well. Not [`ServiceOwner::describe`]: that produces
+/// `uid 1000` for human output, which is two arguments and not a user logind
+/// can be asked about.
+fn linger_account(owner: &ServiceOwner) -> String {
+    owner.name.clone().unwrap_or_else(|| owner.uid.to_string())
 }
 
 /// [`observe_persistence`] without the process: the classification of what
@@ -1326,7 +1545,7 @@ fn classify_persistence(
                 ServiceStarts::LoginOnly,
                 Some(format!(
                     "loginctl enable-linger {}",
-                    manifest.owner.describe()
+                    linger_account(&manifest.owner)
                 )),
             ),
         },
@@ -1352,7 +1571,10 @@ fn classify_persistence(
 /// an install that assumed it worked would promise boot persistence the host
 /// will not deliver.
 fn enable_linger(host: &dyn SystemdHost) -> Option<bool> {
-    let account = super::account_name(nix::unistd::Uid::effective().as_raw())?;
+    let uid = nix::unistd::Uid::effective().as_raw();
+    // The uid is a name logind accepts, so an account NSS cannot resolve is
+    // still asked about rather than skipped.
+    let account = super::account_name(uid).unwrap_or_else(|| uid.to_string());
     let _ = host.output(LOGINCTL, &["enable-linger", &account]);
     account_lingers(host, &account)
 }
@@ -1571,6 +1793,10 @@ mod tests {
         calls: RefCell<Vec<String>>,
         streamed: RefCell<Vec<String>>,
         stream_code: Option<i32>,
+        /// The scripted clock: it starts here and only what this host is asked
+        /// to wait for moves it, so a gate bounded by a deadline runs in the
+        /// time a test takes rather than in the time it measures.
+        started: Instant,
         slept: RefCell<Duration>,
     }
 
@@ -1582,6 +1808,7 @@ mod tests {
                 calls: RefCell::new(Vec::new()),
                 streamed: RefCell::new(Vec::new()),
                 stream_code: Some(0),
+                started: Instant::now(),
                 slept: RefCell::new(Duration::ZERO),
             }
         }
@@ -1686,6 +1913,10 @@ mod tests {
             }
         }
 
+        fn now(&self) -> Instant {
+            self.started + *self.slept.borrow()
+        }
+
         fn sleep(&self, duration: Duration) {
             *self.slept.borrow_mut() += duration;
         }
@@ -1697,6 +1928,11 @@ mod tests {
     };
 
     const HEALTH_URL: &str = "http://127.0.0.1:8090/health";
+
+    /// How many times a gate samples before its deadline, for the scripted
+    /// answers a whole-gate test has to supply. Pinned against the constants it
+    /// is derived from by [`the_gates_are_bounded_by_the_windows_they_promise`].
+    const SAMPLES_IN_A_GATE: u32 = 61;
 
     fn rendered(instance_dir: &str, config_dir: &str, spiced_path: &str) -> String {
         render_unit(
@@ -1825,8 +2061,16 @@ mod tests {
             .expect("render unit");
             assert!(unit.contains("\nRestart=on-failure\n"), "{scope}");
             assert!(unit.contains("\nRestartSec=5\n"), "{scope}");
-            // A rate limit would let a crash loop give up permanently.
-            assert!(unit.contains("\nStartLimitIntervalSec=0\n"), "{scope}");
+            // A rate limit would let a crash loop give up permanently — and
+            // systemd only honours this directive under [Unit], so a copy that
+            // drifted into [Service] would be silently ignored.
+            let limit = unit
+                .find("\nStartLimitIntervalSec=0\n")
+                .unwrap_or_else(|| panic!("{scope}: no start-rate limit override"));
+            let service_section = unit
+                .find("\n[Service]\n")
+                .unwrap_or_else(|| panic!("{scope}: no [Service] section"));
+            assert!(limit < service_section, "{scope}: {unit}");
         }
     }
 
@@ -2391,7 +2635,7 @@ mod tests {
         health_gate(&host, &name, ServiceScope::User, HEALTH_URL)
             .expect("a service that stays up is up");
         assert!(
-            *host.slept.borrow() >= settle_window(),
+            *host.slept.borrow() >= SETTLE_WINDOW,
             "it may only be accepted after it has stayed up: {:?}",
             host.slept
         );
@@ -2413,25 +2657,33 @@ mod tests {
 
     #[test]
     fn the_health_gate_rejects_a_runtime_that_keeps_being_restarted() {
-        // A crash loop never accumulates an uninterrupted run and never
-        // answers, which is exactly what the gate has to refuse.
+        // The failure sampling alone cannot see: every poll finds the unit
+        // `active`, because systemd has already restarted it by the time the
+        // next sample lands. systemd's own restart count is what gives it away.
         let name = unit_name_for_dir(Path::new("/opt/edge-1"));
-        let flapping: Vec<&str> = (0..HEALTH_ATTEMPTS)
-            .map(|attempt| {
-                if attempt % 2 == 0 {
-                    "active"
-                } else {
-                    "activating"
-                }
-            })
+        let restarts: Vec<String> = (0..SAMPLES_IN_A_GATE)
+            .map(|restart| format!("{restart}\n{restart}00"))
             .collect();
+        let restarts: Vec<&str> = restarts.iter().map(String::as_str).collect();
         let host = ScriptedHost::new()
-            .sequence(&format!("systemctl --user is-active {name}"), &flapping)
+            .says(&format!("systemctl --user is-active {name}"), "active")
+            .sequence(
+                &format!(
+                    "systemctl --user show {name} --property=NRestarts \
+                     --property=ActiveEnterTimestampMonotonic --value"
+                ),
+                &restarts,
+            )
             .health(&[false]);
 
         let why = health_gate(&host, &name, ServiceScope::User, HEALTH_URL)
-            .expect_err("a restarting runtime must not pass");
-        assert!(!why.is_empty(), "the refusal has to say what it saw");
+            .expect_err("a runtime that is restarted between samples must not pass");
+        assert!(why.contains("has not stayed running"), "{why}");
+        assert!(
+            *host.slept.borrow() >= HEALTH_GATE,
+            "the gate runs to its deadline before giving up: {:?}",
+            host.slept
+        );
     }
 
     #[test]
@@ -2471,10 +2723,14 @@ mod tests {
     fn only_a_success_status_line_counts_as_healthy() {
         assert!(status_line_is_success("HTTP/1.1 200 OK\r\nDate: now\r\n"));
         assert!(status_line_is_success("HTTP/1.0 204 No Content\r\n"));
-        assert!(!status_line_is_success("HTTP/1.1 503 Service Unavailable"));
-        assert!(!status_line_is_success("HTTP/1.1 200"), "no reason phrase");
+        assert!(!status_line_is_success(
+            "HTTP/1.1 503 Service Unavailable\r\n"
+        ));
+        // A response that ended before the status line did is a cut
+        // connection, not a healthy instance.
+        assert!(!status_line_is_success("HTTP/1.1 200"), "no terminator");
         assert!(!status_line_is_success(""));
-        assert!(!status_line_is_success("garbage"));
+        assert!(!status_line_is_success("garbage\r\n"));
     }
 
     /// An install request pointing at a runtime and directories under `root`.
@@ -2580,10 +2836,18 @@ mod tests {
         .expect("the first install");
         let installed_unit = std::fs::read(&paths.unit).expect("read unit");
 
-        // The upgrade: a new binary systemd cannot keep running.
+        // The upgrade: a new binary systemd cannot keep running. The first
+        // answer is what the rollback captures — a service that was running and
+        // has to be running again afterwards — and the rest is the upgrade
+        // failing.
         std::fs::write(&spiced, b"runtime-v2-broken").expect("write the upgrade");
+        let restart = format!("systemctl --user restart {name}");
         let broken = ScriptedHost::new()
-            .says(&format!("systemctl --user is-active {name}"), "failed")
+            .sequence(
+                &format!("systemctl --user is-active {name}"),
+                &["active", "failed"],
+            )
+            .says(&format!("systemctl --user is-enabled {name}"), "enabled")
             .health(&[false]);
         let error = install_at(
             &broken,
@@ -2609,10 +2873,136 @@ mod tests {
             !paths.runtime.with_extension("previous").exists(),
             "the rollback copy is consumed"
         );
-        assert!(
-            broken.ran(&format!("systemctl --user restart {name}")),
-            "the restored service is started again: {:?}",
+        // Twice: the upgrade's own restart, and the one that brings the
+        // restored service back — it was running before, so it has to be
+        // running after.
+        assert_eq!(
+            broken
+                .calls()
+                .iter()
+                .filter(|call| **call == restart)
+                .count(),
+            2,
+            "{:?}",
             broken.calls()
+        );
+        assert!(
+            !broken
+                .calls()
+                .iter()
+                .any(|call| call.contains(&format!("stop {name}"))),
+            "a service that was running must not be left stopped: {:?}",
+            broken.calls()
+        );
+    }
+
+    #[test]
+    fn a_rolled_back_upgrade_leaves_a_stopped_service_stopped() {
+        // The state an install would otherwise impose on a service that was
+        // deliberately down: `apply` always enables and restarts, so a rollback
+        // that only put the files back would leave it running and enabled.
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let instance_dir = dir.path().join("edge-1");
+        let config_dir = instance_dir.join(".spice");
+        let spiced = dir.path().join("spiced");
+        std::fs::create_dir_all(&instance_dir).expect("create instance dir");
+        std::fs::write(&spiced, b"runtime-v1").expect("write runtime");
+
+        let name = unit_name_for_dir(&instance_dir);
+        let paths = install_paths_under(dir.path(), &name);
+        install_at(
+            &ScriptedHost::new()
+                .says(&format!("systemctl --user is-active {name}"), "active")
+                .health(&[true]),
+            &install_request(&instance_dir, &config_dir, &spiced),
+            &name,
+            &paths,
+            None,
+        )
+        .expect("the first install");
+
+        std::fs::write(&spiced, b"runtime-v2-broken").expect("write the upgrade");
+        let broken = ScriptedHost::new()
+            // Stopped and not enabled when the upgrade found it, then failing.
+            .sequence(
+                &format!("systemctl --user is-active {name}"),
+                &["inactive", "failed"],
+            )
+            .says(&format!("systemctl --user is-enabled {name}"), "disabled")
+            .health(&[false]);
+        install_at(
+            &broken,
+            &install_request(&instance_dir, &config_dir, &spiced),
+            &name,
+            &paths,
+            None,
+        )
+        .expect_err("an upgrade that does not serve must fail");
+
+        assert!(
+            broken.ran(&format!("systemctl --user stop {name}")),
+            "a service that was stopped must be stopped again: {:?}",
+            broken.calls()
+        );
+        assert!(
+            broken.ran(&format!("systemctl --user disable {name}")),
+            "a service that was not enabled must not be left enabled: {:?}",
+            broken.calls()
+        );
+    }
+
+    #[test]
+    fn a_rollback_that_could_not_finish_says_so_rather_than_claiming_recovery() {
+        // An operator told that recovery worked will not go looking, so a
+        // restoration step that failed has to be named along with the command
+        // that finishes it by hand.
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let instance_dir = dir.path().join("edge-1");
+        let config_dir = instance_dir.join(".spice");
+        let spiced = dir.path().join("spiced");
+        std::fs::create_dir_all(&instance_dir).expect("create instance dir");
+        std::fs::write(&spiced, b"runtime-v1").expect("write runtime");
+
+        let name = unit_name_for_dir(&instance_dir);
+        let paths = install_paths_under(dir.path(), &name);
+        install_at(
+            &ScriptedHost::new()
+                .says(&format!("systemctl --user is-active {name}"), "active")
+                .health(&[true]),
+            &install_request(&instance_dir, &config_dir, &spiced),
+            &name,
+            &paths,
+            None,
+        )
+        .expect("the first install");
+
+        std::fs::write(&spiced, b"runtime-v2-broken").expect("write the upgrade");
+        let restart = format!("systemctl --user restart {name}");
+        let broken = ScriptedHost::new()
+            .says(&format!("systemctl --user is-active {name}"), "active")
+            .says(&format!("systemctl --user is-enabled {name}"), "enabled")
+            .fails(&restart, "Failed to restart: Unit not found.")
+            .health(&[false]);
+
+        let error = install_at(
+            &broken,
+            &install_request(&instance_dir, &config_dir, &spiced),
+            &name,
+            &paths,
+            None,
+        )
+        .expect_err("an upgrade whose service will not restart must fail");
+
+        assert!(
+            error.to_string().contains("could not be fully restored"),
+            "{error}"
+        );
+        assert!(error.to_string().contains(&restart), "{error}");
+        assert!(!error.to_string().contains("put back"), "{error}");
+        // The files are still restored, even though the supervisor step failed.
+        assert_eq!(
+            std::fs::read(&paths.runtime).expect("read staged runtime"),
+            b"runtime-v1"
         );
     }
 
@@ -2741,15 +3131,21 @@ mod tests {
     }
 
     #[test]
-    fn the_gates_poll_for_exactly_as_long_as_they_promise() {
-        // The messages both gates print name a duration, and the loops are
-        // bounded by attempts — so the two have to be kept in step here rather
-        // than in a comment.
-        assert_eq!(HEALTH_POLL_INTERVAL * HEALTH_ATTEMPTS, HEALTH_GATE);
+    fn the_gates_are_bounded_by_the_windows_they_promise() {
+        assert!(
+            SETTLE_WINDOW < HEALTH_GATE,
+            "an install cannot wait longer for a settled run than its whole gate lasts"
+        );
         assert_eq!(
             LIFECYCLE_POLL_INTERVAL * LIFECYCLE_ATTEMPTS,
-            Duration::from_secs(10)
+            Duration::from_secs(10),
+            "the lifecycle wait names this duration in its failure"
         );
+        // What the whole-gate tests script answers for.
+        let samples = u32::try_from(HEALTH_GATE.as_millis() / HEALTH_POLL_INTERVAL.as_millis())
+            .expect("a gate is a small number of polls")
+            + 1;
+        assert_eq!(samples, SAMPLES_IN_A_GATE);
     }
 
     #[test]
