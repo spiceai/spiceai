@@ -39,7 +39,7 @@
                       {
                         "type": "formula",
                         "index": 0,
-                        "order": "desc"
+                        "order": "asc"
                       }
                     ]
                   }
@@ -85,7 +85,7 @@
                       {
                         "type": "formula",
                         "index": 0,
-                        "order": "desc"
+                        "order": "asc"
                       }
                     ]
                   }
@@ -131,7 +131,7 @@
                       {
                         "type": "formula",
                         "index": 0,
-                        "order": "desc"
+                        "order": "asc"
                       }
                     ]
                   }
@@ -177,7 +177,7 @@
                       {
                         "type": "formula",
                         "index": 0,
-                        "order": "desc"
+                        "order": "asc"
                       }
                     ]
                   }
@@ -1906,7 +1906,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "sum:spiceai.dataset_kafka_records_consumed_total.count{$instance,$env,$kube_namespace,$kube_cluster_name,$pod_name} by {name}"
+                      "query": "sum:spiceai.dataset_kafka_records_consumed_total.count{$instance,$env,$kube_namespace,$kube_cluster_name,$pod_name} by {name}.as_count()"
                     }
                   ],
                   "response_format": "timeseries",
@@ -2020,7 +2020,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "sum:spiceai.dataset_dynamodb_records_consumed_total.count{$instance,$env,$kube_namespace,$kube_cluster_name,$pod_name} by {name}"
+                      "query": "sum:spiceai.dataset_dynamodb_records_consumed_total.count{$instance,$env,$kube_namespace,$kube_cluster_name,$pod_name} by {name}.as_count()"
                     }
                   ],
                   "response_format": "timeseries",
@@ -2116,7 +2116,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "sum:spiceai.dataset_dynamodb_errors_transient_total.count{$instance,$env,$kube_namespace,$kube_cluster_name,$pod_name} by {name}"
+                      "query": "sum:spiceai.dataset_dynamodb_errors_transient_total.count{$instance,$env,$kube_namespace,$kube_cluster_name,$pod_name} by {name}.as_count()"
                     }
                   ],
                   "response_format": "timeseries",
