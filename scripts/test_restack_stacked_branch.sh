@@ -1227,30 +1227,32 @@ start_test "audit reports a discarded mode revert, where every blob is identical
 start_test "audit will not text-merge a symlink target"
 (
   new_stack "$work_root/symlink_merge"
-  # A multiline link target, which is what makes the textual merge look plausible.
-  ln -s "$(printf 'a\ny')" link && printf 'seed\n' > seed.txt && commit_all "fork point"
+  # A multiline target whose differing line is in the middle. That matters: link
+  # blobs have no trailing newline, so a change to the final line makes the
+  # textual merge conflict of its own accord and hides the point.
+  ln -s "$(printf 'a\nb\nc')" link && printf 'seed\n' > seed.txt && commit_all "fork point"
   git checkout --quiet -b parent
-  rm link && ln -s "$(printf 'x\ny')" link && git add -A && commit_all "parent retargets it"
+  rm link && ln -s "$(printf 'X\nb\nc')" link && git add -A && commit_all "parent retargets it"
   stack_base=$(git rev-parse HEAD)
   git checkout --quiet -b child
-  rm link && ln -s "$(printf 'a\ny')" link && git add -A && commit_all "child restores the first line"
+  rm link && ln -s "$(printf 'a\nb\nc')" link && git add -A && commit_all "child restores the first line"
   pre=$(git rev-parse HEAD)
   squash_parent_onto_trunk
-  rm link && ln -s "$(printf 'a\nz')" link && git add -A && commit_all "trunk has that change and another"
+  rm link && ln -s "$(printf 'a\nB\nc')" link && git add -A && commit_all "trunk has that change and another"
   git checkout --quiet child
   git merge --no-ff --no-commit trunk >/dev/null 2>&1
   [ -z "$(git ls-files -u)" ] || fail_test "the fixture left a conflict, so nothing was silent"
 
   # From the fork point our side looks unchanged, so trunk's target is staged
-  # without a word. Merged as text against the stack base the result is byte for
-  # byte trunk's target too -- but git never merges links, so a correctly based
-  # merge asks a person.
+  # without a word. git never merges link targets, so a correctly based merge asks
+  # a person -- and the reason has to say so rather than describing a text
+  # conflict, which is a different claim about a different kind of object.
   output=$("$subject" audit "$stack_base" "$pre" --trunk trunk 2>/dev/null)
   status=$?
-  [ "$status" -ne 0 ] || fail_test "a symlink merged as text was reported clean: $output"
+  [ "$status" -ne 0 ] || fail_test "a changed symlink was reported clean: $output"
   case "$output" in
-    *"REVIEW link"*) ;;
-    *) fail_test "expected a decision on the link, got: $output" ;;
+    *"REVIEW link: both sides changed this symlink"*) ;;
+    *) fail_test "expected the link to be judged as a link, got: $output" ;;
   esac
   output=$("$subject" audit "$stack_base" "$pre" --trunk trunk --accept link 2>/dev/null)
   status=$?
