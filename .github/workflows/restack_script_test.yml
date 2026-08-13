@@ -12,12 +12,11 @@ name: Restack Script Tests
 # reverted a deletion is worse than no audit, because git already reports that
 # merge as conflict-free and the reader stops looking.
 on:
+  # No `branches:` filter, unlike its neighbours. That key matches the PR's base
+  # branch, and a stacked child is based on its parent branch rather than on
+  # trunk -- so filtering by base would skip this check on exactly the PRs most
+  # likely to touch a restack helper. The path filter keeps it cheap regardless.
   pull_request:
-    branches:
-      - trunk
-      - release-*
-      - release/*
-      - feature-*
     paths:
       - 'scripts/restack_stacked_branch.sh'
       - 'scripts/test_restack_stacked_branch.sh'

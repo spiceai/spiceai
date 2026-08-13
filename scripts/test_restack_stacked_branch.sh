@@ -22,7 +22,14 @@ subject="$script_dir/restack_stacked_branch.sh"
 tests_run=0
 failures=0
 
-work_root="$(mktemp -d)"
+# Guarded because an empty work_root turns every fixture path below into an
+# absolute one — `/resurrect`, `/mode` — which a privileged run would create and
+# modify at the filesystem root.
+work_root="$(mktemp -d)" || exit 1
+[ -n "$work_root" ] && [ -d "$work_root" ] || {
+  echo "could not create a private work directory" >&2
+  exit 1
+}
 trap 'rm -rf "$work_root"' EXIT
 
 # Each case runs in a subshell so it can cd into its own repository, which means
@@ -193,6 +200,20 @@ start_test "audit is quiet and succeeds when the merge did what was intended"
 # ---------------------------------------------------------------------------
 # resolve
 # ---------------------------------------------------------------------------
+
+start_test "audit fails loudly on an unusable revision instead of reporting clean"
+(
+  new_stack "$work_root/badrev"
+  printf 'old\n' > keep.txt && commit_all "fork point"
+  pre=$(git rev-parse HEAD)
+
+  output=$("$subject" audit does-not-exist "$pre" 2>&1)
+  status=$?
+  [ "$status" -ne 0 ] || fail_test "a bad revision exited 0"
+  case "$output" in
+    *"audit clean"*) fail_test "a bad revision reported a clean audit: $output" ;;
+  esac
+) || failures=$((failures + 1))
 
 start_test "resolve refuses a symlink rather than writing through it"
 (

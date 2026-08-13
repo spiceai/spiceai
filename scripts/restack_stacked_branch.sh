@@ -159,6 +159,31 @@ cmd_audit() {
   local stack_base="${1:-}" pre="${2:-}"
   [ -n "$stack_base" ] && [ -n "$pre" ] || die "usage: audit <stack-base> <pre-merge-tip>"
 
+  # Both revisions are checked first, and each diff is written to a file whose
+  # exit status is tested, because a process substitution discards it: a
+  # mistyped or unreachable revision would otherwise feed the loops zero paths
+  # and this would print `audit clean` — the precise false negative the audit
+  # exists to prevent. The diffs cannot go through a variable instead, since a
+  # shell cannot hold the NUL bytes that keep odd filenames intact.
+  git rev-parse --verify --quiet "$stack_base^{commit}" >/dev/null ||
+    die "not a commit: $stack_base"
+  git rev-parse --verify --quiet "$pre^{commit}" >/dev/null ||
+    die "not a commit: $pre"
+
+  local tmp
+  tmp=$(mktemp -d) || die "could not create a private temp directory"
+
+  if ! git diff --name-only -z --no-renames --diff-filter=D \
+         "$stack_base" "$pre" -- > "$tmp/deleted"; then
+    rm -rf "$tmp"
+    die "could not diff $stack_base..$pre for deletions"
+  fi
+  if ! git diff --name-only -z --no-renames --diff-filter=A \
+         "$stack_base" "$pre" -- > "$tmp/added"; then
+    rm -rf "$tmp"
+    die "could not diff $stack_base..$pre for additions"
+  fi
+
   local findings=0 path
 
   while IFS= read -r -d '' path; do
@@ -166,14 +191,16 @@ cmd_audit() {
       echo "RESURRECTED $path"
       findings=$((findings + 1))
     fi
-  done < <(git diff --name-only -z --no-renames --diff-filter=D "$stack_base" "$pre" --)
+  done < "$tmp/deleted"
 
   while IFS= read -r -d '' path; do
     if ! git ls-files --error-unmatch -- ":(literal)$path" >/dev/null 2>&1; then
       echo "LOST $path"
       findings=$((findings + 1))
     fi
-  done < <(git diff --name-only -z --no-renames --diff-filter=A "$stack_base" "$pre" --)
+  done < "$tmp/added"
+
+  rm -rf "$tmp"
 
   if [ "$findings" -ne 0 ]; then
     echo "audit found $findings path(s) the merge changed against the branch's intent" >&2
