@@ -1,0 +1,45 @@
+# Local repro of the SF100 nightly q97 OOM at laptop scale.
+#
+# The failure is a ratio, not an absolute: a non-spillable hash-join build side
+# vs the query memory pool. SF10 data (build sides ~10x smaller than SF100's
+# 144M rows) with a ~10x smaller pool (5GiB vs the runner's 51GiB) reproduces
+# the same physics: without the sort-merge spill rewrite the full-outer join
+# exhausts the pool; with it, the gate fires and the query completes by
+# spilling. Only q97's three tables are accelerated so setup stays in minutes.
+#
+# Mirrors test/spicepods/tpcds/sf10/accelerated/s3[parquet]-cayenne[file].yaml
+# (same name so plans/logs read the same), pointed at the local MinIO from
+# 10-setup-storage.sh.
+version: v1
+kind: Spicepod
+name: s3[parquet]-cayenne[file]
+runtime:
+  query:
+    memory_limit: 5GiB
+    # The spilled sort-merge join runs several concurrent external sorts; under
+    # the default greedy pool they starve each other (early sorters buffer the
+    # whole pool, a late one cannot get its first allocation). Fair-spill gives
+    # each spill-capable operator its share and forces spilling at that share.
+    memory_pool: fair_spill
+datasets:
+  - from: s3://benchmarks/tpcds_sf10/store_sales/
+    name: store_sales
+    params: &s3_params
+      file_format: parquet
+      allow_http: true
+      s3_auth: key
+      s3_endpoint: ${secrets:S3_ENDPOINT}
+      s3_key: ${secrets:S3_KEY}
+      s3_secret: ${secrets:S3_SECRET}
+    acceleration: &acceleration
+      enabled: true
+      engine: cayenne
+      mode: file
+  - from: s3://benchmarks/tpcds_sf10/catalog_sales/
+    name: catalog_sales
+    params: *s3_params
+    acceleration: *acceleration
+  - from: s3://benchmarks/tpcds_sf10/date_dim/
+    name: date_dim
+    params: *s3_params
+    acceleration: *acceleration
