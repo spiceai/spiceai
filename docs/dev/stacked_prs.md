@@ -214,7 +214,8 @@ It compares what the child *intended* against what the merge actually staged, an
 non-zero on any `RESURRECTED`, `LOST`, or `DISCARDED` path. Run it again after every
 correction.
 
-`DISCARDED` is the same failure as `RESURRECTED`, in content rather than existence: when
+`DISCARDED` is the same failure as `RESURRECTED`, in content or file mode rather than
+existence — a reverted executable bit counts, and every blob involved is identical: when
 the child's edit *reverts* something the parent did, the child's side matches the fork
 point, so the merge sees nothing to preserve and keeps `trunk`'s version. No conflict is
 reported, and the path is a modification, so listing added and deleted paths alone would

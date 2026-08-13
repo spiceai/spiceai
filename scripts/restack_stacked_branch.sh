@@ -178,14 +178,33 @@ path_in_index() {
 
 # The commit being merged in, which the modification check compares against:
 # MERGE_HEAD while the merge is open, the second parent once it is committed.
+#
+# HEAD^2 is only this merge's other side when HEAD is the merge *of the pre-merge
+# tip*. A child that merged its parent while the parent PR was open is itself a
+# merge commit, so without that check an older merge's second parent would be
+# mistaken for trunk and the audit would claim a full check it did not make.
 merge_other_side() {
-  local git_dir
+  local pre_tip="$1" git_dir first
   git_dir=$(git rev-parse --git-dir) || return 1
   if [ -f "$git_dir/MERGE_HEAD" ]; then
     git rev-parse --verify --quiet MERGE_HEAD
     return $?
   fi
+  first=$(git rev-parse --verify --quiet "HEAD^1") || return 1
+  [ "$first" = "$(git rev-parse --verify --quiet "$pre_tip")" ] || return 1
   git rev-parse --verify --quiet "HEAD^2"
+}
+
+# "<mode> <oid>" for a path in a commit, and in the index at stage 0. Mode and
+# object together, because a revert can be entirely in the mode: parent adds +x,
+# child takes it away, and every blob involved is byte-identical while the
+# executable bit the child removed survives in the result.
+tree_entry() {
+  git ls-tree "$1" -- ":(literal)$2" | awk '{ print $1 " " $3 }'
+}
+
+index_entry() {
+  git ls-files --stage -- ":(literal)$1" | awk '$3 == 0 { print $1 " " $2 }'
 }
 
 # Exit status: 0 if the merge did what the child intended, 1 otherwise.
@@ -229,7 +248,10 @@ cmd_audit() {
     rm -rf "$tmp"
     die "could not diff $stack_base..$pre for additions"
   fi
-  if ! git diff --name-only -z --no-renames --diff-filter=M \
+  # M and T together: a type change (a file the child turned back into a symlink,
+  # or the reverse) is reported as T and would otherwise appear in none of these
+  # three lists at all.
+  if ! git diff --name-only -z --no-renames --diff-filter=MT \
          "$stack_base" "$pre" -- > "$tmp/modified"; then
     rm -rf "$tmp"
     die "could not diff $stack_base..$pre for modifications"
@@ -257,11 +279,11 @@ cmd_audit() {
   # keeps trunk's version. Neither filter above lists such a path -- it is a
   # modification, and its content is simply gone.
   #
-  # The signature is that the staged blob is byte-identical to trunk's while the
+  # The signature is that the staged entry is identical to trunk's while the
   # child's differs: the child's edit is not represented in the result at all. An
   # edit that merged normally leaves a result matching neither side exactly.
   local other staged theirs mine
-  if ! other=$(merge_other_side); then
+  if ! other=$(merge_other_side "$pre"); then
     # Outside a merge there is no other side to compare against. Say so rather
     # than reporting on a narrower check than the caller asked for: a quiet
     # partial audit is the failure this whole helper is arguing against.
@@ -269,11 +291,12 @@ cmd_audit() {
     other=""
   fi
   while [ -n "$other" ] && IFS= read -r -d '' path; do
-    # An unmerged path has no stage 0 and is somebody's open conflict, not a
-    # silent loss.
-    staged=$(git rev-parse --verify --quiet ":0:$path") || continue
-    theirs=$(git rev-parse --verify --quiet "$other:$path") || continue
-    mine=$(git rev-parse --verify --quiet "$pre:$path") || continue
+    staged=$(index_entry "$path")
+    theirs=$(tree_entry "$other" "$path")
+    mine=$(tree_entry "$pre" "$path")
+    # An unmerged path has no stage 0 and is somebody's open conflict; a path
+    # missing from either side is an add or a delete, already covered above.
+    [ -n "$staged" ] && [ -n "$theirs" ] && [ -n "$mine" ] || continue
     if [ "$staged" = "$theirs" ] && [ "$mine" != "$theirs" ]; then
       echo "DISCARDED $path"
       findings=$((findings + 1))

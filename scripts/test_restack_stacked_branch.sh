@@ -187,6 +187,80 @@ start_test "audit reports a child edit the merge discarded (a revert of the pare
   esac
 ) || failures=$((failures + 1))
 
+start_test "audit reports a discarded mode revert, where every blob is identical"
+(
+  new_stack "$work_root/moderevert"
+  printf 'script\n' > run.sh && commit_all "fork point"
+  git checkout --quiet -b parent
+  chmod +x run.sh && commit_all "parent marks it executable"
+  stack_base=$(git rev-parse HEAD)
+  git checkout --quiet -b child
+  chmod -x run.sh && commit_all "child takes the executable bit back off"
+  pre=$(git rev-parse HEAD)
+  squash_parent_onto_trunk
+  git checkout --quiet child
+  git merge --no-ff --no-commit trunk >/dev/null 2>&1
+
+  # Content never changed, so comparing object ids alone sees three identical
+  # blobs and reports nothing while the bit the child removed survives.
+  output=$("$subject" audit "$stack_base" "$pre" 2>/dev/null)
+  case "$output" in
+    *"DISCARDED run.sh"*) ;;
+    *) fail_test "a mode-only revert was not reported: $output" ;;
+  esac
+) || failures=$((failures + 1))
+
+start_test "audit reports a discarded type change (symlink back to a regular file)"
+(
+  new_stack "$work_root/typerevert"
+  printf 'target\n' > target.txt
+  printf 'regular\n' > p.md && commit_all "fork point"
+  git checkout --quiet -b parent
+  rm p.md && ln -s target.txt p.md && git add -A && commit_all "parent makes it a symlink"
+  stack_base=$(git rev-parse HEAD)
+  git checkout --quiet -b child
+  rm p.md && printf 'regular\n' > p.md && git add -A && commit_all "child puts the file back"
+  pre=$(git rev-parse HEAD)
+  squash_parent_onto_trunk
+  git checkout --quiet child
+  git merge --no-ff --no-commit trunk >/dev/null 2>&1
+
+  # git calls this a type change, so it appears under neither M nor A nor D.
+  output=$("$subject" audit "$stack_base" "$pre" 2>/dev/null)
+  case "$output" in
+    *"DISCARDED p.md"*) ;;
+    *) fail_test "a discarded type change was not reported: $output" ;;
+  esac
+) || failures=$((failures + 1))
+
+start_test "audit will not mistake an earlier merge on the child for this one"
+(
+  new_stack "$work_root/childmerge"
+  printf 'old\n' > f.txt && commit_all "fork point"
+  git checkout --quiet -b parent && printf 'new\n' > f.txt && commit_all "parent changes it"
+  stack_base=$(git rev-parse HEAD)
+  git checkout --quiet -b child && printf 'child\n' > c.txt && commit_all "child work"
+  # The parent takes a review fix after the child split off, and the child merges
+  # it — exactly what the documented workflow says to do while the parent PR is
+  # open. The child's tip is then a merge commit whose second parent is the
+  # parent branch, so HEAD^2 resolves to something that is not trunk.
+  git checkout --quiet parent && printf 'review fix\n' > fix.txt && commit_all "parent review fix"
+  stack_base=$(git rev-parse HEAD)
+  git checkout --quiet child
+  git merge --no-ff --no-edit parent >/dev/null 2>&1
+  pre=$(git rev-parse HEAD)
+  squash_parent_onto_trunk
+  git checkout --quiet child
+  # No trunk merge started. HEAD^2 exists from the child's own merge, and taking
+  # it for trunk would let the audit claim a check it never made.
+
+  output=$("$subject" audit "$stack_base" "$pre" 2>&1)
+  case "$output" in
+    *"only additions and deletions were checked"*) ;;
+    *) fail_test "an unrelated merge was mistaken for this one: $output" ;;
+  esac
+) || failures=$((failures + 1))
+
 start_test "audit does not cry wolf when both sides' edits survive the merge"
 (
   new_stack "$work_root/nofalse"
