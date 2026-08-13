@@ -182,32 +182,28 @@ pub async fn execute(
             status::render_service(&status, args.output)?;
             degraded_error(&status)
         }
-        ServiceCommand::Start => backend.start(&require_installed(
-            backend,
-            instance_dir,
-            config_dir,
-            action,
-        )?),
+        ServiceCommand::Start => {
+            let manifest = require_installed(backend, instance_dir, config_dir, action)?;
+            with_recovery_detail(backend, &manifest, backend.start(&manifest))
+        }
         ServiceCommand::Stop => match resolve_or_report(backend, instance_dir, config_dir, action)?
         {
-            Some(manifest) => backend.stop(&manifest),
+            Some(manifest) => with_recovery_detail(backend, &manifest, backend.stop(&manifest)),
             None => Ok(()),
         },
-        ServiceCommand::Restart => backend.restart(&require_installed(
-            backend,
-            instance_dir,
-            config_dir,
-            action,
-        )?),
+        ServiceCommand::Restart => {
+            let manifest = require_installed(backend, instance_dir, config_dir, action)?;
+            with_recovery_detail(backend, &manifest, backend.restart(&manifest))
+        }
         ServiceCommand::Logs(args) => {
             match resolve_or_report(backend, instance_dir, config_dir, action)? {
-                Some(manifest) => backend.logs(
-                    &manifest,
-                    super::LogRequest {
+                Some(manifest) => {
+                    let request = super::LogRequest {
                         number: args.number,
                         follow: args.follow,
-                    },
-                ),
+                    };
+                    with_recovery_detail(backend, &manifest, backend.logs(&manifest, request))
+                }
                 None => Ok(()),
             }
         }
@@ -371,6 +367,33 @@ fn resolve_or_report(
         );
     }
     Ok(resolved)
+}
+
+/// Name the supervisor's own commands for this service when a Spice command
+/// could not complete.
+///
+/// Recovery detail, never the primary interface: the hints are printed only on
+/// a failure, on stderr so a `--output json` run stays parseable, and ahead of
+/// the diagnosis the process exits with. An interruption is not a failure —
+/// the viewer stopped and the service is unchanged — so it gets none.
+fn with_recovery_detail(
+    backend: &dyn ServiceBackend,
+    manifest: &ServiceManifest,
+    result: Result<()>,
+) -> Result<()> {
+    if matches!(result, Err(ref err) if !matches!(err, Error::Interrupted)) {
+        let hints = backend.recovery_hints(manifest);
+        if !hints.is_empty() {
+            eprintln!(
+                "If you need to drive {} directly, its supervisor's own commands are:",
+                manifest.name
+            );
+            for hint in hints {
+                eprintln!("  {hint}");
+            }
+        }
+    }
+    result
 }
 
 /// Turn a degraded snapshot into the non-zero exit automation needs.

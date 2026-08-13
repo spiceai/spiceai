@@ -19,9 +19,12 @@ limitations under the License.
 //!
 //! A deployment applies to the running instance and never ends its process, so
 //! the supervisor is what keeps the instance up across the things that do end
-//! it — a host reboot, an OOM kill, an operator's `systemctl restart`. Both
-//! back ends therefore restart the runtime unconditionally — systemd with
-//! `Restart=always`, launchd with `KeepAlive`.
+//! it — a host reboot, an OOM kill, an unhandled failure.
+//!
+//! The two back ends do not promise the same thing about a *clean* exit, so
+//! neither does this. systemd uses `Restart=on-failure`: a failure comes back,
+//! and an exit an operator asked for stays down. launchd uses `KeepAlive`,
+//! which brings the job back from any exit at all, including a clean one.
 //!
 //! ## Support matrix
 //!
@@ -102,7 +105,8 @@ const SYSTEMD_RUNTIME_MARKER: &str = "/run/systemd/system";
 #[cfg(target_os = "macos")]
 const RUNTIME_STAGE_DIR: &str = "/Library/Spice";
 
-/// Root-owned directory the installed service's `spiced` is staged into.
+/// Root-owned directory holding the per-service directories a system service's
+/// `spiced` is staged into.
 #[cfg(not(target_os = "macos"))]
 const RUNTIME_STAGE_DIR: &str = "/usr/local/lib/spice";
 
@@ -214,7 +218,9 @@ fn provision_config_ownership(path: &Path, account: ServiceAccount) -> Result<()
     })
 }
 
-/// The `spiced` the installed service runs.
+/// The `spiced` an installed service runs, for a back end that stages one copy
+/// per host rather than one per instance.
+#[cfg(target_os = "macos")]
 fn staged_runtime_path() -> PathBuf {
     Path::new(RUNTIME_STAGE_DIR).join(STAGED_RUNTIME_FILE)
 }
@@ -297,6 +303,10 @@ fn sanitize_fragment(name: &str) -> String {
 ///
 /// Distinguished from a generic error so the caller can run the check before
 /// touching any state: a failed preflight must change nothing.
+///
+/// Each supervisor's own reasons are compiled only where that supervisor is, so
+/// a message can name a concrete fix without hedging about the host it is
+/// printed on.
 #[derive(Debug)]
 pub(crate) enum PreflightFailure {
     /// Neither Linux nor macOS — there is no supervisor to install into.
@@ -304,8 +314,13 @@ pub(crate) enum PreflightFailure {
     /// Linux, but systemd is not the running init.
     #[cfg(target_os = "linux")]
     SystemdUnavailable,
+    /// Linux with systemd, but the account has no user manager for a user
+    /// service to live in.
+    #[cfg(target_os = "linux")]
+    SystemdUserManagerUnavailable,
     /// A user-scope service was asked for, and the back end does not install
     /// one yet.
+    #[cfg(target_os = "macos")]
     UserScopePending,
 }
 
@@ -329,17 +344,20 @@ impl PreflightFailure {
                  runtime's restart policy (`docker run --restart unless-stopped`) \
                  instead. See: https://spiceai.org/docs"
             ),
-            Self::UserScopePending => format!(
-                "Failed to install the Spice Cloud Connect service: a {} is not available in \
-                 this release. Install a system service instead: \
-                 `sudo spice connect service install`. \
-                 See: https://spiceai.org/docs",
-                if cfg!(target_os = "macos") {
-                    "user LaunchAgent"
-                } else {
-                    "systemd user service"
-                }
+            #[cfg(target_os = "linux")]
+            Self::SystemdUserManagerUnavailable => format!(
+                "Failed to install the Spice Cloud Connect service: this account has no systemd \
+                 user manager to install a user service into (no {}). Log in as the account that \
+                 will run the instance and re-run `spice connect service install`, enable one for \
+                 it (`sudo loginctl enable-linger <user>`), or install a host-wide service with \
+                 `sudo spice connect service install`. See: https://spiceai.org/docs",
+                std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/run/user/<uid>".to_string())
             ),
+            #[cfg(target_os = "macos")]
+            Self::UserScopePending => "Failed to install the Spice Cloud Connect service: a user \
+                 LaunchAgent is not available in this release. Install a system service instead: \
+                 `sudo spice connect service install`. See: https://spiceai.org/docs"
+                .to_string(),
         }
     }
 }
@@ -416,12 +434,18 @@ pub(crate) fn resolve(
 /// reportable and removable instead of invisible. It is not a fallback search:
 /// the name is still derived from the canonical directory, and the definition
 /// is accepted only if it names that same directory as its working directory.
+///
+/// Both domains are asked, because either can hold this directory's service.
+/// The least-privileged one is asked first: an operator's own user service is
+/// the common case, and a host-wide definition under the same derived name is
+/// the one that needs elevation to act on.
 fn adopt_installed_definition(
     backend: &dyn ServiceBackend,
     instance_dir: &Path,
 ) -> Option<ServiceManifest> {
-    let scope = ServiceScope::System;
-    let installed = backend.find_installed(instance_dir, scope)?;
+    let (scope, installed) = [ServiceScope::User, ServiceScope::System]
+        .into_iter()
+        .find_map(|scope| Some((scope, backend.find_installed(instance_dir, scope)?)))?;
     let owner = installed_owner(instance_dir);
     Some(ServiceManifest {
         schema_version: manifest::MANIFEST_SCHEMA_VERSION,
@@ -532,8 +556,9 @@ pub(crate) fn install(
     // directory's derived name that belongs to somewhere else, has to fail
     // before anything is written.
     let existing = resolve(backend, instance_dir, config_dir)?;
-    if existing.is_none() {
-        ensure_name_unclaimed(backend, instance_dir, scope)?;
+    match &existing {
+        Some(existing) => ensure_same_domain(existing, scope, instance_dir)?,
+        None => ensure_name_unclaimed(backend, instance_dir, scope)?,
     }
 
     let installed = backend.install(&InstallRequest {
@@ -541,6 +566,7 @@ pub(crate) fn install(
         config_dir,
         spiced_path,
         scope,
+        health_url,
     })?;
 
     let owner = install_owner(instance_dir)?;
@@ -576,6 +602,43 @@ fn install_owner(instance_dir: &Path) -> Result<ServiceOwner> {
 #[cfg(not(unix))]
 fn install_owner(instance_dir: &Path) -> Result<ServiceOwner> {
     Ok(installed_owner(instance_dir))
+}
+
+/// Refuse to install a service into a different domain from the one this
+/// directory already has a service in.
+///
+/// The domain follows the privilege of the invocation, so an unprivileged
+/// re-install of a host-wide service would otherwise install a *second*
+/// service — a user one — for the same directory, leave the system one running,
+/// and rewrite the manifest to describe only the new one. The elevation is the
+/// operator's to give, so this names it instead.
+fn ensure_same_domain(
+    existing: &ServiceManifest,
+    scope: ServiceScope,
+    instance_dir: &Path,
+) -> Result<()> {
+    if existing.scope == scope {
+        return Ok(());
+    }
+    let retry = match existing.scope {
+        ServiceScope::System => format!(
+            "Re-run it as `sudo spice connect service install --dir {}`",
+            instance_dir.display()
+        ),
+        ServiceScope::User => format!("Run it as {} without sudo", existing.owner.describe()),
+    };
+    Err(Error::InvalidArgument {
+        message: format!(
+            "Failed to install the Spice Cloud Connect service for {instance}: a {existing_scope} \
+             service ({name}) is already installed for this directory, and this invocation would \
+             install a {scope} one alongside it. {retry}, or remove the installed service first \
+             with `spice connect service uninstall`. Nothing was changed. \
+             See: https://spiceai.org/docs",
+            instance = instance_dir.display(),
+            existing_scope = existing.scope,
+            name = existing.name,
+        ),
+    })
 }
 
 /// Refuse to install over a definition that already carries this directory's
@@ -728,6 +791,7 @@ fn is_root() -> bool {
 /// already executes, so a runtime that turns out to be unusable must never
 /// reach it: publishing first and checking afterwards would take out the
 /// instances that were working.
+#[cfg(target_os = "macos")]
 fn stage_runtime<F>(source: &Path, verify_staged: F) -> Result<PathBuf>
 where
     F: Fn(&Path, &Path) -> Result<()> + Copy,
@@ -1058,26 +1122,27 @@ mod tests {
     }
 
     #[test]
-    fn staged_runtime_is_not_under_a_user_home() {
-        // The service runs it as root, so it must never be a path its operator
-        // could later replace.
-        let staged = staged_runtime_path();
-        let staged = staged.to_string_lossy();
-        assert!(!staged.contains("/home/"), "{staged}");
-        assert!(!staged.contains("/Users/"), "{staged}");
+    fn the_root_owned_staging_directory_is_not_under_a_user_home() {
+        // A system service runs its staged runtime as root, so the directory it
+        // is staged into must never be a path its operator could later replace.
+        assert!(!RUNTIME_STAGE_DIR.contains("/home/"), "{RUNTIME_STAGE_DIR}");
+        assert!(
+            !RUNTIME_STAGE_DIR.contains("/Users/"),
+            "{RUNTIME_STAGE_DIR}"
+        );
     }
 
     #[test]
-    fn staged_runtime_path_has_no_whitespace() {
+    fn the_staging_paths_have_no_whitespace() {
         // Every remedy this module prints names this path, and a
         // `sudo chown root <path>` with a space in it is two arguments and the
         // wrong instruction. systemd's `ExecStart` splits on it too.
-        let staged = staged_runtime_path();
-        let staged = staged.to_string_lossy();
-        assert!(
-            !staged.contains(char::is_whitespace),
-            "the staged runtime path must be usable verbatim in a command: {staged}"
-        );
+        for path in [RUNTIME_STAGE_DIR, STAGED_RUNTIME_FILE] {
+            assert!(
+                !path.contains(char::is_whitespace),
+                "a staging path must be usable verbatim in a command: {path}"
+            );
+        }
     }
 
     #[test]
@@ -1270,29 +1335,43 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
-    fn preflight_failures_name_the_fix() {
+    fn a_deferred_user_scope_failure_names_the_path_that_works() {
         assert!(
             PreflightFailure::UserScopePending
                 .message()
                 .contains("sudo"),
             "the deferred user-scope failure must name the path that does work"
         );
-        #[cfg(target_os = "linux")]
-        {
-            assert!(
-                PreflightFailure::SystemdUnavailable
-                    .message()
-                    .contains("restart policy"),
-                "the no-systemd failure must point containers at the --token flow"
-            );
-            assert!(
-                PreflightFailure::SystemdUnavailable
-                    .message()
-                    .contains("spiced --token"),
-                "containers enroll directly with the runtime, not this installer"
-            );
-        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_systemd_preflight_failures_name_their_fixes() {
+        assert!(
+            PreflightFailure::SystemdUnavailable
+                .message()
+                .contains("restart policy"),
+            "the no-systemd failure must point containers at the --token flow"
+        );
+        assert!(
+            PreflightFailure::SystemdUnavailable
+                .message()
+                .contains("spiced --token"),
+            "containers enroll directly with the runtime, not this installer"
+        );
+        // A host with no user manager still has a way to install: say which.
+        let no_manager = PreflightFailure::SystemdUserManagerUnavailable.message();
+        assert!(
+            no_manager.contains("sudo spice connect service install"),
+            "{no_manager}"
+        );
+        assert!(no_manager.contains("enable-linger"), "{no_manager}");
+    }
+
+    #[test]
+    fn preflight_failures_name_the_fix() {
         assert!(
             PreflightFailure::UnsupportedPlatform
                 .message()
@@ -1404,6 +1483,69 @@ mod tests {
     }
 
     #[test]
+    fn install_refuses_to_add_a_second_service_in_the_other_domain() {
+        // The domain follows the privilege of the invocation, so without this
+        // an unprivileged re-install of a host-wide service would install a
+        // user service beside it, leave the system one running, and rewrite the
+        // manifest to describe only the new one.
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let instance_dir = dir.path().join("edge-1");
+        let fake = FakeBackend::new(dir.path());
+        let mut installed = manifest_for(&fake, &instance_dir);
+
+        for (existing, invoked) in [
+            (ServiceScope::System, ServiceScope::User),
+            (ServiceScope::User, ServiceScope::System),
+        ] {
+            installed.scope = existing;
+            let error = ensure_same_domain(&installed, invoked, &instance_dir)
+                .expect_err("a domain switch must be refused");
+            assert!(error.to_string().contains("already installed"), "{error}");
+            assert!(
+                error
+                    .to_string()
+                    .contains("spice connect service uninstall"),
+                "{error}"
+            );
+            // The retry is the operator's to run, never an elevation Spice
+            // performs for them.
+            let expected_retry = match existing {
+                ServiceScope::System => "sudo spice connect service install",
+                ServiceScope::User => "without sudo",
+            };
+            assert!(error.to_string().contains(expected_retry), "{error}");
+        }
+
+        installed.scope = ServiceScope::User;
+        ensure_same_domain(&installed, ServiceScope::User, &instance_dir)
+            .expect("re-installing in the same domain is the upgrade path");
+    }
+
+    /// The manifest a fake back end would write for `instance_dir`.
+    fn manifest_for(backend: &FakeBackend, instance_dir: &Path) -> ServiceManifest {
+        let scope = ServiceScope::System;
+        let name = backend.name_for_dir(instance_dir);
+        ServiceManifest {
+            schema_version: manifest::MANIFEST_SCHEMA_VERSION,
+            directory: instance_dir.to_path_buf(),
+            name: name.clone(),
+            scope,
+            supervisor: backend.supervisor(),
+            owner: ServiceOwner {
+                uid: 1000,
+                gid: 1000,
+                name: Some("alice".to_string()),
+            },
+            definition_path: backend.definition_path(&name, scope),
+            runtime_path: PathBuf::from("/usr/local/lib/spice/edge-1/spiced"),
+            log_source: backend.log_source(&name, scope),
+            runtime_digest: "0".repeat(64),
+            runtime_version: "v2.2.0".to_string(),
+            health_url: "http://127.0.0.1:8090/health".to_string(),
+        }
+    }
+
+    #[test]
     fn a_service_installed_without_a_manifest_is_still_resolved() {
         // A directory that lost its manifest must not lose the service it
         // still has installed — resolution is still by canonical directory,
@@ -1418,6 +1560,7 @@ mod tests {
             config_dir: &config_dir,
             spiced_path: Path::new("/usr/bin/spiced"),
             scope: ServiceScope::System,
+            health_url: "http://127.0.0.1:8090/health",
         })
         .expect("install without writing a manifest");
 
@@ -1548,28 +1691,9 @@ mod tests {
     /// manifest write, the owner, the log source — is exercised without a
     /// supervisor.
     fn write_manifest_for(backend: &FakeBackend, instance_dir: &Path, config_dir: &Path) {
-        let name = backend.name_for_dir(instance_dir);
-        let scope = ServiceScope::System;
-        ServiceManifest {
-            schema_version: manifest::MANIFEST_SCHEMA_VERSION,
-            directory: instance_dir.to_path_buf(),
-            name: name.clone(),
-            scope,
-            supervisor: backend.supervisor(),
-            owner: ServiceOwner {
-                uid: 1000,
-                gid: 1000,
-                name: Some("alice".to_string()),
-            },
-            definition_path: backend.definition_path(&name, scope),
-            runtime_path: PathBuf::from("/usr/local/lib/spice/spiced"),
-            log_source: backend.log_source(&name, scope),
-            runtime_digest: "0".repeat(64),
-            runtime_version: "v2.2.0".to_string(),
-            health_url: "http://127.0.0.1:8090/health".to_string(),
-        }
-        .write(config_dir)
-        .expect("write manifest");
+        manifest_for(backend, instance_dir)
+            .write(config_dir)
+            .expect("write manifest");
     }
 
     #[test]
