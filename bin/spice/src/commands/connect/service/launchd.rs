@@ -144,11 +144,11 @@ pub(super) fn render_plist(
 	</dict>
 	<key>RunAtLoad</key>
 	<true/>
-	<!-- Every deployment applies by restart: the runtime validates and persists
-	     the new spicepod, exits 0, and launchd relaunches it on the new
-	     configuration. Without KeepAlive a deployment would stop the instance
-	     instead of updating it. launchd never gives up on a KeepAlive job, so a
-	     crash loop is throttled rather than abandoned. -->
+	<!-- A deployment applies to the running instance, so this is not what makes
+	     one land: it is what brings the instance back from the things that do
+	     end it — a reboot, an OOM kill, an unhandled failure. launchd never
+	     gives up on a KeepAlive job, so a crash loop is throttled rather than
+	     abandoned. -->
 	<key>KeepAlive</key>
 	<true/>
 	<key>ThrottleInterval</key>
@@ -915,7 +915,8 @@ mod tests {
     fn rendered_plist_is_a_daemon_that_always_restarts() {
         let (label, plist) = rendered("/opt/edge-1");
         assert!(plist.contains(&format!("<string>{label}</string>")));
-        // KeepAlive is the Restart=always analogue every deployment depends on.
+        // KeepAlive is the Restart=always analogue: what brings an enrolled
+        // instance back from a reboot or an unhandled failure.
         assert!(plist.contains("<key>KeepAlive</key>\n\t<true/>"), "{plist}");
         assert!(plist.contains("<key>RunAtLoad</key>\n\t<true/>"), "{plist}");
         // Background would have macOS throttle the runtime's I/O.

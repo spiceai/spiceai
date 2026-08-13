@@ -62,7 +62,7 @@ use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint};
 use crate::config::CloudConnectConfig;
 use crate::enroll::EnrollClient;
 use crate::handlers::{
-    Capability, CommandError, MAX_QUERY_RESULT_BYTES, PostApply, RestartMode, RuntimeHandle,
+    Capability, CommandError, MAX_QUERY_RESULT_BYTES, RestartMode, RuntimeHandle,
     SpicepodDeployment, advertised_capabilities, effective_max_rows,
 };
 use crate::heartbeat::{build_heartbeat, build_telemetry, now_unix};
@@ -83,15 +83,6 @@ const RENEW_RETRY_INTERVAL: Duration = Duration::from_mins(5);
 
 /// Outbound channel size: bounded to keep memory predictable.
 const CLIENT_CHANNEL_SIZE: usize = 64;
-
-/// How long the client waits for the outbound channel to drain before exiting
-/// the process to apply a deployment, and how often it re-checks.
-///
-/// Best-effort by design: the spicepod is already persisted and the restart is
-/// what makes it live, so a slow gateway delays the exit by at most this budget
-/// rather than stalling the deployment on a result nobody is waiting for.
-const APPLY_FLUSH_BUDGET: Duration = Duration::from_secs(5);
-const APPLY_FLUSH_POLL: Duration = Duration::from_millis(25);
 
 /// State held by the driver across reconnects.
 pub(crate) struct ClientDriver {
@@ -1084,12 +1075,9 @@ impl ClientDriver {
     /// every referencing component with a missing-parameter error naming
     /// nothing.
     ///
-    /// A deployment applies by restart, so a successful apply usually ends with
-    /// this process exiting: the result is sent and flushed first, then the
-    /// runtime handle exits and the supervisor relaunches it on the persisted
-    /// spicepod. Sending the result first is what lets a caller see the
-    /// validation outcome at all — once the process is gone the stream is too,
-    /// so a result that has not been flushed by then is lost.
+    /// A deployment applies to the running instance: the handle answers with the
+    /// document the control plane reads, and this process keeps serving either
+    /// way. Nothing here ends or restarts it.
     ///
     /// `command_id` comes from the `ControlMessage` envelope, not from the
     /// command body — and it is part of the outer AAD, so an envelope cannot be
@@ -1136,8 +1124,8 @@ impl ClientDriver {
             })
             .await;
 
-        let outcome = match outcome {
-            Ok(outcome) => outcome,
+        let document = match outcome {
+            Ok(document) => document,
             Err(err) => {
                 tracing::warn!(
                     command_id,
@@ -1152,22 +1140,7 @@ impl ClientDriver {
             "Spice Cloud Connect: applied the deployed Spicepod"
         );
 
-        send_ok_json(tx, command_id, &outcome.document).await;
-
-        if outcome.post_apply == PostApply::ExitToApply {
-            tracing::info!(
-                "Cloud Connect: the deployed spicepod is persisted; exiting so the supervisor restarts spiced on it"
-            );
-            flush_outbound(tx).await;
-            self.runtime.exit_to_apply().await;
-            // Reaching here means the handle did not exit. The spicepod stays
-            // persisted and takes effect on the next start, so say what state
-            // the instance is actually in rather than letting the control plane
-            // infer it from a deployment that never goes live.
-            tracing::error!(
-                "Cloud Connect: the runtime did not exit to apply the deployment; it is persisted but NOT live, and takes effect the next time spiced starts. Restart it via your process manager. See: https://spiceai.org/docs"
-            );
-        }
+        send_ok_json(tx, command_id, &document).await;
     }
 
     /// Open a delivered payload against this instance's keys.
@@ -1483,32 +1456,6 @@ fn build_channel(
     }
 
     Ok(endpoint.connect_lazy())
-}
-
-/// Wait for everything queued on the outbound channel to be handed to tonic,
-/// bounded by [`APPLY_FLUSH_BUDGET`].
-///
-/// Called before the process exits to apply a deployment. Full capacity means
-/// the transport took every queued frame — including the `CommandResult` just
-/// sent — which is as close to "it is on the wire" as a channel can report. The
-/// budget is what keeps a stalled gateway from holding up the deployment, which
-/// is already persisted and takes effect on the restart either way.
-async fn flush_outbound(tx: &mpsc::Sender<proto::ClientMessage>) {
-    let deadline = time::Instant::now() + APPLY_FLUSH_BUDGET;
-    while tx.capacity() < tx.max_capacity() {
-        if time::Instant::now() >= deadline {
-            tracing::warn!(
-                "Cloud Connect: the deployment result was still queued after {}; exiting anyway (the control plane reconciles the deployment from the version reported on reconnect)",
-                humanize(APPLY_FLUSH_BUDGET)
-            );
-            return;
-        }
-        if tx.is_closed() {
-            // The stream is gone, so nothing more will be sent from this queue.
-            return;
-        }
-        time::sleep(APPLY_FLUSH_POLL).await;
-    }
 }
 
 fn build_hello(

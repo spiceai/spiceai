@@ -68,7 +68,6 @@ pub mod identity;
 pub mod release;
 pub mod sealed_secrets;
 pub mod secret_cache;
-pub mod supervisor;
 
 mod client;
 mod fingerprint;
@@ -105,12 +104,10 @@ pub use enroll::{
 };
 pub use enrollment_key::{EnrollmentKey, InvalidEnrollmentKey};
 pub use handlers::{
-    ApplyOutcome, Capability, CommandError, MAX_QUERY_RESULT_BYTES, MAX_QUERY_ROWS, PostApply,
-    QueryOutcome, RestartMode, RuntimeHandle, RuntimePhase, SpicepodDeployment, StatusReport,
-    effective_max_rows,
+    Capability, CommandError, MAX_QUERY_RESULT_BYTES, MAX_QUERY_ROWS, QueryOutcome, RestartMode,
+    RuntimeHandle, RuntimePhase, SpicepodDeployment, StatusReport, effective_max_rows,
 };
 pub use identity::{AppAttachment, AttachmentState, Identity, IdentityStore};
-pub use supervisor::Supervisor;
 
 /// Revision of the `spice.cloud.v1` contract this client implements,
 /// announced in `Hello.protocol_version`.

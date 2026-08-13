@@ -1124,10 +1124,11 @@ pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
     // Restore control-plane-delivered secrets from the local cache and register
     // their store BEFORE loading components. Component initialization is what
     // resolves `${ secrets:… }`, so a store installed after this point would
-    // arrive too late for every component that referenced one — and a
-    // deployment that delivers secrets applies by restarting, so that is the
-    // path they arrive by. Local files only, no control-plane round trip, so
-    // this neither blocks nor fails when the gateway is unreachable.
+    // arrive too late for every component that referenced one — and a value a
+    // deployment rotates reaches the components holding the old one only by
+    // loading them again, which is this path. Local files only, no
+    // control-plane round trip, so this neither blocks nor fails when the
+    // gateway is unreachable.
     let delivered_secrets = cloud_connect::restore_delivered_secrets(
         env!("CARGO_PKG_VERSION"),
         &rt,
@@ -1146,8 +1147,8 @@ pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
     // satisfy lock out the very deployment that would fix it, with no way back
     // short of an operator editing files on the host. Commands are answered
     // during the load and `GetStatus` reports the runtime as progressing until
-    // it finishes; an `ApplySpicepod` abandons the load and restarts onto the
-    // configuration it just persisted.
+    // it finishes; an `ApplySpicepod` waits for the load, under a bound of its
+    // own, so it reconciles against a fully-registered app.
     let cloud_connect_handle = cloud_connect::maybe_start(
         env!("CARGO_PKG_VERSION"),
         Arc::clone(&rt),

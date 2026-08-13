@@ -76,8 +76,8 @@ use runtime_cloud_connect::enroll::{
 };
 use runtime_cloud_connect::enrollment_key::EnrollmentKey;
 use runtime_cloud_connect::handlers::{
-    ApplyOutcome, Capability, CommandError, MAX_QUERY_RESULT_BYTES, MAX_QUERY_ROWS, QueryOutcome,
-    RuntimeHandle, SpicepodDeployment,
+    Capability, CommandError, MAX_QUERY_RESULT_BYTES, MAX_QUERY_ROWS, QueryOutcome, RuntimeHandle,
+    SpicepodDeployment,
 };
 use runtime_cloud_connect::identity::IdentityStore;
 use runtime_cloud_connect::proto;
@@ -897,10 +897,6 @@ struct E2eRuntimeState {
     /// Names of the secrets delivered with the last applied spicepod, never
     /// values. `None` when the deployment carried no payload at all.
     delivered_secret_names: Option<Vec<String>>,
-    /// Set when the client asked the runtime to exit and apply. The real
-    /// adapter ends the process here; a test one records that it was asked, so
-    /// the test can assert the result was flushed first.
-    exit_requested: bool,
 }
 
 struct E2eRuntime {
@@ -935,15 +931,15 @@ impl RuntimeHandle for E2eRuntime {
     async fn apply_spicepod(
         &self,
         deployment: SpicepodDeployment<'_>,
-    ) -> Result<ApplyOutcome, CommandError> {
+    ) -> Result<serde_json::Value, CommandError> {
         // Record the delivered names (never values) so a test can assert the
         // payload reached the runtime adapter.
         self.state.lock().await.delivered_secret_names = deployment
             .delivered_secrets
             .as_ref()
             .map(|secrets| secrets.keys().cloned().collect());
-        // Persist to the canonical path and ask for the restart that makes it
-        // live, mirroring the spiced adapter's observable behavior.
+        // Persist to the canonical path and report what could not be put into
+        // effect here, mirroring the spiced adapter's observable behavior.
         let path = deployment
             .config_dir
             .join(runtime_cloud_connect::config::CLOUD_MANAGED_SPICEPOD_FILE);
@@ -958,16 +954,12 @@ impl RuntimeHandle for E2eRuntime {
             deployment.spicepod_yaml.to_string(),
             deployment.app_id.map(str::to_string),
         ));
-        Ok(ApplyOutcome::exit_to_apply(serde_json::json!({
+        Ok(serde_json::json!({
             "path": path.display().to_string(),
             "applied": true,
             "live": false,
-            "restart": "required",
-        })))
-    }
-
-    async fn exit_to_apply(&self) {
-        self.state.lock().await.exit_requested = true;
+            "restart_required": ["runtime"],
+        }))
     }
 }
 
@@ -3143,12 +3135,12 @@ async fn apply_spicepod_refuses_an_unopenable_payload() {
     handle.shutdown().await;
 }
 
-/// A deployment persists the spicepod and applies it by restarting — and the
-/// result reaches the gateway *before* the runtime is asked to exit. If the
-/// client exited first, every deployment would lose its validation outcome, and
-/// an operator watching a deploy would see nothing at all.
+/// A deployment persists the spicepod, is answered on the same stream, and
+/// leaves the client connected and serving. A deployment that took the process
+/// with it would drop the stream, and an operator watching a deploy would see
+/// the instance disappear rather than the outcome of what they deployed.
 #[tokio::test]
-async fn apply_spicepod_persists_then_exits_to_restart() {
+async fn apply_spicepod_persists_and_answers_without_ending_the_client() {
     let harness = Harness::new(24 * 60 * 60).await;
     let dir = tempfile::tempdir().unwrap();
     let config = harness.config(
@@ -3169,25 +3161,27 @@ async fn apply_spicepod_persists_then_exits_to_restart() {
         }),
     ));
 
-    // Wait on the exit request, not on the result: the exit is the *last* step
-    // of the apply, so once it has happened the result must already be out.
-    let exited = wait_until_async(Duration::from_secs(5), || {
-        let state = Arc::clone(&rt_state);
-        async move { state.lock().await.exit_requested }
+    let captured = Arc::clone(&harness.gateway.captured);
+    let answered = wait_until_async(Duration::from_secs(5), || {
+        let captured = Arc::clone(&captured);
+        async move {
+            captured
+                .lock()
+                .await
+                .results
+                .iter()
+                .any(|r| r.command_id == "cmd-apply")
+        }
     })
     .await;
-    assert!(
-        exited,
-        "a persisted deployment must ask the runtime to exit so the supervisor restarts it"
-    );
+    assert!(answered, "every deployment must be answered on the stream");
 
-    let captured = Arc::clone(&harness.gateway.captured);
     let result = with_captured!(captured, c => c
         .results
         .iter()
         .find(|r| r.command_id == "cmd-apply")
         .cloned())
-    .expect("the apply result must be flushed to the gateway before the runtime exits");
+    .expect("the apply result must reach the gateway");
     assert_eq!(
         result.code,
         proto::ResultCode::Ok as i32,
@@ -3204,12 +3198,12 @@ async fn apply_spicepod_persists_then_exits_to_restart() {
     assert_eq!(meta["applied"], true);
     assert_eq!(
         meta["live"], false,
-        "the deployment is persisted, not yet serving — the restart is what makes it live"
+        "this handle cannot put the whole deployment into effect, and says so"
     );
-    assert_eq!(meta["restart"], "required");
+    assert_eq!(meta["restart_required"], serde_json::json!(["runtime"]));
 
     // The runtime persisted the YAML to the canonical cloud-managed path, which
-    // is what the restart comes back up on.
+    // is what the next start comes up on.
     let (path, written, app_id) = rt_state
         .lock()
         .await
@@ -3221,6 +3215,30 @@ async fn apply_spicepod_persists_then_exits_to_restart() {
     // The app id rides the deploy: it is the only way the runtime learns which
     // app to attribute its metrics to, and it exports none until it has one.
     assert_eq!(app_id.as_deref(), Some("4002"));
+
+    // The stream the deployment arrived on is still up: a second command is
+    // dispatched and answered on it. Asserting only on the apply result would
+    // pass for a client that answered and then took the process down.
+    harness.gateway.outbound.lock().await.push_back(ctrl_id(
+        "cmd-after-apply",
+        proto::control_message::Body::GetRuntimeInfo(proto::GetRuntimeInfo {}),
+    ));
+    let still_serving = wait_until_async(Duration::from_secs(5), || {
+        let captured = Arc::clone(&captured);
+        async move {
+            captured
+                .lock()
+                .await
+                .results
+                .iter()
+                .any(|r| r.command_id == "cmd-after-apply")
+        }
+    })
+    .await;
+    assert!(
+        still_serving,
+        "the instance must keep answering after a deployment it could not fully apply"
+    );
 
     handle.shutdown().await;
 }

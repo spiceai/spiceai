@@ -69,10 +69,9 @@ fn render_unit(
          WorkingDirectory=\"{instance_dir}\"\n\
          Environment=\"SPICE_CONFIG_DIR={config_dir}\"\n\
          ExecStart=\"{spiced}\"\n\
-         # Every deployment applies by restart: the runtime validates and\n\
-         # persists the new spicepod, exits 0, and this relaunches it on the\n\
-         # new configuration. Without Restart=always a deployment would stop\n\
-         # the instance instead of updating it.\n\
+         # A deployment applies to the running instance, so this is not what\n\
+         # makes one land: it is what brings the instance back from the things\n\
+         # that do end it — a reboot, an OOM kill, an unhandled failure.\n\
          Restart=always\n\
          RestartSec=5\n\
          # A crash loop must not be given up on: an instance that lost its\n\
@@ -449,8 +448,9 @@ mod tests {
 
     #[test]
     fn rendered_unit_always_restarts() {
-        // `Restart=always` is the contract every deployment depends on: the
-        // runtime exits 0 to apply an update and systemd relaunches it.
+        // `Restart=always` is what keeps an enrolled instance reachable: a
+        // deployment applies without ending the process, but a reboot or an
+        // unhandled failure does end it, and the instance has to come back.
         let unit = rendered("/opt/edge-1", "/opt/edge-1/.spice", "/usr/bin/spiced");
         assert!(unit.contains("\nRestart=always\n"));
         // A rate limit would let a crash loop give up permanently.

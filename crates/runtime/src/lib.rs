@@ -541,10 +541,12 @@ pub struct LogErrors(pub bool);
 /// The load has no deadline: `load_dataset` retries a transient failure for as
 /// long as the runtime is up, so a spicepod the runtime cannot satisfy — an
 /// unreachable source, a `${ secrets:… }` reference nothing resolves — leaves
-/// the load running indefinitely. A caller holding the configuration that fixes
-/// that (Spice Cloud Connect applying a deployment) needs to supersede the load
-/// rather than race it: a load left running keeps registering datasets from the
-/// app it started against, after a new app has replaced it.
+/// the load running indefinitely. A caller that must not reconcile against a
+/// half-registered app therefore waits on it with a bound of its own
+/// ([`Runtime::wait_for_initial_load`]), or supersedes it
+/// ([`Runtime::supersede_initial_load`]) — a load left running keeps
+/// registering datasets from the app it started against, after a new app has
+/// replaced it.
 ///
 /// `in_flight` starts `true` — a load is pending from the moment the runtime
 /// exists — so a supersede that lands before the load begins still stops it,
@@ -552,6 +554,9 @@ pub struct LogErrors(pub bool);
 struct InitialLoad {
     cancel: CancellationToken,
     in_flight: AtomicBool,
+    /// Cancelled once the load is over, however it ended, so a waiter is woken
+    /// rather than left polling `in_flight`.
+    settled: CancellationToken,
 }
 
 impl Default for InitialLoad {
@@ -559,6 +564,7 @@ impl Default for InitialLoad {
         Self {
             cancel: CancellationToken::new(),
             in_flight: AtomicBool::new(true),
+            settled: CancellationToken::new(),
         }
     }
 }
@@ -1675,10 +1681,9 @@ impl Runtime {
     /// Abandon the initial component load.
     ///
     /// The load has no deadline — `load_dataset` retries a transient failure for
-    /// as long as the runtime is up — so a process that is on its way out (a
-    /// Spice Cloud deployment restarting onto a new spicepod) has to be able to
-    /// stop it: left running it keeps registering datasets from the
-    /// configuration being replaced, for the whole of the shutdown drain.
+    /// as long as the runtime is up — so a caller that is replacing the app the
+    /// load is installing has to be able to stop it: left running it keeps
+    /// registering datasets from the configuration being replaced.
     ///
     /// Returns `true` only when this call is the one that stopped a pending or
     /// running load, and `false` once the load has finished or was already
@@ -1692,6 +1697,7 @@ impl Runtime {
                 "Superseding the initial component load: a new configuration replaces the one being loaded"
             );
             self.initial_load.cancel.cancel();
+            self.initial_load.settled.cancel();
             true
         } else {
             false
@@ -1707,6 +1713,21 @@ impl Runtime {
     #[must_use]
     pub fn initial_load_in_flight(&self) -> bool {
         self.initial_load.in_flight.load(Ordering::SeqCst)
+    }
+
+    /// Wait for the initial component load to be over — finished, failed,
+    /// cancelled, or superseded — and report whether it is.
+    ///
+    /// `false` means the wait ran out with the load still running, which a
+    /// spicepod the runtime cannot satisfy can do indefinitely. The caller
+    /// chose the bound, so it is the caller's to report: reconciling anyway
+    /// would diff a new app against an app whose components are only partly
+    /// registered, and the load would go on installing the configuration it
+    /// replaced.
+    pub async fn wait_for_initial_load(&self, within: Duration) -> bool {
+        tokio::time::timeout(within, self.initial_load.settled.cancelled())
+            .await
+            .is_ok()
     }
 
     /// Will load all of the components of the Runtime, including `secret_stores`, `catalogs`, `datasets`, `models`, and `embeddings`.
@@ -1826,8 +1847,10 @@ impl Runtime {
         let load_outcome = load_result.await;
 
         // The initial load is over — completed, failed, or cancelled — so a
-        // later deployment has nothing left to supersede and applies normally.
+        // later deployment has nothing left to supersede and applies normally,
+        // and anything waiting on the load runs now.
         self.initial_load.in_flight.store(false, Ordering::SeqCst);
+        self.initial_load.settled.cancel();
 
         if let Err(err) = load_outcome {
             if !matches!(err, Error::ComponentsInitializationCancelled) {
