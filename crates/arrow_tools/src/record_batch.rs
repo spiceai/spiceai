@@ -15,7 +15,10 @@ limitations under the License.
 */
 
 use arrow::{
-    array::{Array, ArrayRef, ListArray, RecordBatch, StructArray, new_null_array},
+    array::{
+        Array, ArrayRef, ListArray, MutableArrayData, RecordBatch, RecordBatchOptions, StructArray,
+        make_array, new_null_array,
+    },
     buffer::{Buffer, OffsetBuffer},
     datatypes::{DataType, Field, SchemaRef, TimeUnit},
     error::ArrowError,
@@ -427,6 +430,118 @@ pub fn replace_column_in_record(
         .collect::<Vec<_>>();
 
     RecordBatch::try_new(schema.into(), columns)
+}
+
+/// How many times its own rows' worth of memory a column may retain before a
+/// compact copy is worth making. A slice that keeps twice what it needs is
+/// still cheaper to hold than to rebuild.
+const COMPACTION_RETENTION_RATIO: usize = 2;
+
+/// How many bytes a compaction must actually reclaim to be worth its copy.
+const COMPACTION_MIN_RECLAIMED_BYTES: usize = 64 * 1024;
+
+/// Whether a type keeps data in buffers that
+/// [`ArrayData::get_slice_memory_size`] does not walk.
+///
+/// The view types hold their bytes in variadic data buffers, which the layout
+/// used by `get_slice_memory_size` does not describe — it counts only the
+/// 16-byte views. Every view column would therefore look like it retains far
+/// more than its rows need, and be copied on every store for nothing.
+fn retains_unmeasured_buffers(data_type: &DataType) -> bool {
+    match data_type {
+        DataType::Utf8View | DataType::BinaryView => true,
+        DataType::List(field)
+        | DataType::LargeList(field)
+        | DataType::ListView(field)
+        | DataType::LargeListView(field)
+        | DataType::FixedSizeList(field, _)
+        | DataType::Map(field, _)
+        | DataType::RunEndEncoded(_, field) => retains_unmeasured_buffers(field.data_type()),
+        DataType::Struct(fields) => fields
+            .iter()
+            .any(|field| retains_unmeasured_buffers(field.data_type())),
+        DataType::Union(fields, _) => fields
+            .iter()
+            .any(|(_, field)| retains_unmeasured_buffers(field.data_type())),
+        DataType::Dictionary(_, value_type) => retains_unmeasured_buffers(value_type),
+        _ => false,
+    }
+}
+
+/// How many bytes compacting `column` would reclaim, or `None` when the copy
+/// would not pay for itself.
+fn reclaimable_bytes(column: &ArrayRef) -> Option<usize> {
+    if retains_unmeasured_buffers(column.data_type()) {
+        return None;
+    }
+
+    let retained = column.get_array_memory_size();
+    // `Err` means the type's buffers cannot be measured from its layout, which
+    // is the same situation as a view type: there is no honest comparison to
+    // make, so leave the column alone.
+    let needed = column.to_data().get_slice_memory_size().ok()?;
+
+    let reclaimed = retained.checked_sub(needed)?;
+    (reclaimed >= COMPACTION_MIN_RECLAIMED_BYTES
+        && retained >= needed.saturating_mul(COMPACTION_RETENTION_RATIO))
+    .then_some(reclaimed)
+}
+
+/// Copies `column`'s rows into buffers sized for exactly those rows.
+///
+/// This is what [`arrow::compute::concat`] does for more than one array; it
+/// cannot be used here because `concat` returns a single input untouched.
+fn compact_column(column: &ArrayRef) -> ArrayRef {
+    let data = column.to_data();
+    let mut compacted = MutableArrayData::new(vec![&data], false, column.len());
+    compacted.extend(0, 0, column.len());
+    make_array(compacted.freeze())
+}
+
+/// Returns `batch` with every column that retains substantially more memory
+/// than its own rows need replaced by a compact copy.
+///
+/// [`RecordBatch::slice`] is zero-copy by design: a sliced batch keeps its
+/// parent's whole buffers alive, and `get_array_memory_size` reports those
+/// retained buffers rather than the rows the slice contains. A single row
+/// carved out of a scan batch — what `LIMIT`/`OFFSET` produces — therefore
+/// costs, and is billed, the entire batch it came from. Anything that holds a
+/// batch past the scan that produced it (the SQL results cache, an in-memory
+/// index) should compact it first, so the memory it pins is proportional to
+/// the rows it kept.
+///
+/// Columns that are already compact are shared, not copied, so a batch with
+/// nothing to reclaim costs a reference-count clone.
+#[must_use]
+pub fn compact_retained_buffers(batch: &RecordBatch) -> RecordBatch {
+    let mut columns: Option<Vec<ArrayRef>> = None;
+
+    for (idx, column) in batch.columns().iter().enumerate() {
+        if reclaimable_bytes(column).is_none() {
+            continue;
+        }
+        let compacted = compact_column(column);
+        let columns = columns.get_or_insert_with(|| batch.columns().to_vec());
+        if let Some(slot) = columns.get_mut(idx) {
+            *slot = compacted;
+        }
+    }
+
+    let Some(columns) = columns else {
+        return batch.clone();
+    };
+
+    // The row count is carried explicitly so a batch with no columns keeps it.
+    let options = RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
+    match RecordBatch::try_new_with_options(batch.schema(), columns, &options) {
+        Ok(compacted) => compacted,
+        Err(e) => {
+            // Compaction preserves every column's type and length, so this is
+            // unreachable; keeping the original is always safe.
+            tracing::warn!("Failed to compact a record batch, keeping it as read: {e}");
+            batch.clone()
+        }
+    }
 }
 
 #[cfg(test)]
@@ -982,5 +1097,210 @@ mod test {
             result.is_err(),
             "non-timestamp overflow should still return an error"
         );
+    }
+
+    /// A batch of wide strings, big enough that slicing one row out of it
+    /// retains far more than that row needs.
+    fn wide_string_batch(rows: usize, value_len: usize) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("payload", DataType::Utf8, true),
+        ]));
+        let ids: Vec<i32> = (0..i32::try_from(rows).expect("rows fits in i32")).collect();
+        let payloads: Vec<String> = (0..rows)
+            .map(|row| {
+                std::iter::repeat_n(
+                    char::from(b'a' + u8::try_from(row % 26).unwrap_or_default()),
+                    value_len,
+                )
+                .collect()
+            })
+            .collect();
+
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(ids)),
+                Arc::new(StringArray::from(payloads)),
+            ],
+        )
+        .expect("valid batch")
+    }
+
+    fn row_payload(batch: &RecordBatch, row: usize) -> String {
+        batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("payload is a StringArray")
+            .value(row)
+            .to_string()
+    }
+
+    /// Regression test for <https://github.com/spiceai/spiceai/issues/12921>.
+    /// A one-row slice of a large batch must not keep the whole batch alive.
+    #[test]
+    fn compact_retained_buffers_releases_a_slices_parent_buffers() {
+        let batch = wide_string_batch(2_000, 4_096);
+        let sliced = batch.slice(1_000, 1);
+        assert_eq!(
+            sliced.get_array_memory_size(),
+            batch.get_array_memory_size(),
+            "a slice retains its parent's buffers, which is the defect under test"
+        );
+
+        let compacted = compact_retained_buffers(&sliced);
+
+        assert_eq!(compacted.num_rows(), 1);
+        assert_eq!(compacted.schema(), sliced.schema());
+        assert_eq!(
+            row_payload(&compacted, 0),
+            row_payload(&sliced, 0),
+            "compaction must preserve the row's value"
+        );
+        assert!(
+            compacted.get_array_memory_size() * 100 < sliced.get_array_memory_size(),
+            "a one-row slice of a 2000-row batch should retain a small fraction of it, got {} of {}",
+            compacted.get_array_memory_size(),
+            sliced.get_array_memory_size()
+        );
+    }
+
+    /// Every row of a multi-row slice survives, in order.
+    #[test]
+    fn compact_retained_buffers_preserves_every_row_of_a_slice() {
+        let batch = wide_string_batch(500, 1_024);
+        let sliced = batch.slice(100, 300);
+
+        let compacted = compact_retained_buffers(&sliced);
+
+        assert_eq!(compacted.num_rows(), sliced.num_rows());
+        for row in 0..sliced.num_rows() {
+            assert_eq!(
+                row_payload(&compacted, row),
+                row_payload(&sliced, row),
+                "row {row} changed under compaction"
+            );
+        }
+        let ids = compacted
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("id is an Int32Array");
+        assert_eq!(ids.value(0), 100, "the slice's first row must be preserved");
+    }
+
+    /// Nulls inside the slice survive, and nulls outside it are not adopted.
+    #[test]
+    fn compact_retained_buffers_preserves_nulls_within_the_slice() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "payload",
+            DataType::Utf8,
+            true,
+        )]));
+        let values: Vec<Option<String>> = (0..2_000)
+            .map(|row| {
+                if row % 3 == 0 {
+                    None
+                } else {
+                    Some(std::iter::repeat_n('x', 4_096).collect())
+                }
+            })
+            .collect();
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(values))])
+            .expect("valid batch");
+        let sliced = batch.slice(999, 3);
+
+        let compacted = compact_retained_buffers(&sliced);
+
+        let before = sliced
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("StringArray");
+        let after = compacted
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("StringArray");
+        assert_eq!(after.null_count(), before.null_count());
+        for row in 0..before.len() {
+            assert_eq!(after.is_null(row), before.is_null(row), "row {row} nullity");
+            if !before.is_null(row) {
+                assert_eq!(after.value(row), before.value(row), "row {row} value");
+            }
+        }
+    }
+
+    /// A batch that retains nothing extra is shared, not copied.
+    #[test]
+    fn compact_retained_buffers_leaves_a_compact_batch_untouched() {
+        let batch = wide_string_batch(4, 16);
+
+        let compacted = compact_retained_buffers(&batch);
+
+        for (idx, column) in batch.columns().iter().enumerate() {
+            assert!(
+                Arc::ptr_eq(column, compacted.column(idx)),
+                "column {idx} of an already-compact batch was copied"
+            );
+        }
+    }
+
+    /// A slice small enough that copying it would not pay for itself is left
+    /// alone, so the common case of many small batches costs no copies.
+    #[test]
+    fn compact_retained_buffers_ignores_a_slice_below_the_reclaim_floor() {
+        let batch = wide_string_batch(64, 64);
+        let sliced = batch.slice(1, 1);
+
+        let compacted = compact_retained_buffers(&sliced);
+
+        assert!(
+            Arc::ptr_eq(sliced.column(1), compacted.column(1)),
+            "a slice retaining under the floor should not be copied"
+        );
+    }
+
+    /// View columns hold their bytes in buffers `get_slice_memory_size` does
+    /// not walk, so they must be left alone rather than copied on every store.
+    #[test]
+    fn compact_retained_buffers_leaves_view_columns_alone() {
+        use arrow::array::StringViewArray;
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "payload",
+            DataType::Utf8View,
+            true,
+        )]));
+        let values: Vec<String> = (0..2_000)
+            .map(|_| std::iter::repeat_n('v', 4_096).collect())
+            .collect();
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StringViewArray::from_iter_values(values))],
+        )
+        .expect("valid batch");
+        let sliced = batch.slice(1_000, 1);
+
+        let compacted = compact_retained_buffers(&sliced);
+
+        assert!(
+            Arc::ptr_eq(sliced.column(0), compacted.column(0)),
+            "a view column must not be compacted"
+        );
+    }
+
+    /// A batch with no columns keeps its row count.
+    #[test]
+    fn compact_retained_buffers_preserves_a_column_less_row_count() {
+        let options = RecordBatchOptions::new().with_row_count(Some(7));
+        let batch =
+            RecordBatch::try_new_with_options(Arc::new(Schema::empty()), Vec::new(), &options)
+                .expect("valid batch");
+
+        let compacted = compact_retained_buffers(&batch);
+
+        assert_eq!(compacted.num_rows(), 7);
     }
 }
