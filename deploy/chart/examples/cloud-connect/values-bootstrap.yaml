@@ -1,0 +1,64 @@
+# Spice Cloud Connect — phase 1 of 2: one-time enrollment bootstrap.
+#
+# Enrolls this single-replica instance with Spice Cloud on first start using a
+# one-time `spice-enroll-` enrollment key held in a Kubernetes Secret. The
+# runtime enrolls BEFORE it reports ready, persists the issued identity at
+# SPICE_CONFIG_DIR on the persistent volume, and never reports ready on a
+# failed enrollment — so a Ready pod is the durable-identity signal.
+#
+# One enrollment key enrolls exactly one identity: template validation
+# rejects replicaCount != 1, non-persistent storage, or a SPICE_CONFIG_DIR
+# outside the stateful mount. No chart value accepts a literal key — the
+# `--token` argument must expand an environment variable.
+#
+# Usage:
+#   kubectl create secret generic spice-cloud-connect \
+#     --from-literal=enroll-key=<enrollment key from the Spice Cloud portal>
+#   helm install spiceai deploy/chart -f deploy/chart/examples/cloud-connect/values-bootstrap.yaml
+#
+# After the pod is Ready, run phase 2 to drop the key from the pod spec and
+# delete the Secret (the key is single-use and already consumed). The phase-1
+# pod retains the expanded value in its argv/spec until this replacement:
+#   deploy/chart/examples/cloud-connect/transition-to-connected.sh spiceai
+#
+# For the default example, values-connected.yaml documents the token-free
+# shape. Customized releases must preserve their installed values; use the
+# transition script and --reuse-values (or a maintained custom values file).
+#
+# See: https://spiceai.org/docs
+
+replicaCount: 1
+
+cloudConnect:
+  mode: bootstrap
+
+stateful:
+  enabled: true
+  mountPath: /data
+
+# Enrollment retries transient failures for up to ten minutes before exiting.
+# Keep the startup-probe budget longer than that retry window so Kubernetes
+# leaves the process unready instead of restarting it mid-operation.
+startupProbe:
+  periodSeconds: 10
+  failureThreshold: 67
+
+command:
+  - /usr/local/bin/spiced
+  - --token
+  - "$(SPICE_ENROLL_KEY)"
+  - --http
+  - 0.0.0.0:8090
+  - --metrics
+  - 0.0.0.0:9090
+  - --flight
+  - 0.0.0.0:50051
+
+additionalEnv:
+  - name: SPICE_ENROLL_KEY
+    valueFrom:
+      secretKeyRef:
+        name: spice-cloud-connect
+        key: enroll-key
+  - name: SPICE_CONFIG_DIR
+    value: /data/.spice

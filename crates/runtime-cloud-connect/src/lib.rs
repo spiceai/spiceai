@@ -20,40 +20,49 @@ limitations under the License.
 //! discovered and managed by Spice Cloud (or any compatible control plane)
 //! using the enroll-first flow shipped for BYOC (DR-025):
 //!
-//! 1. Admin in Spice Cloud generates a single-use adoption code.
-//! 2. User runs `spice connect <code>` (or sets `SPICE_CONNECT_ADOPT_CODE`).
-//! 3. **State plane (out-of-band enroll)**: `spiced` generates an ECDSA
-//!    P-256 keypair + PKCS#10 CSR and presents the adoption code, the
-//!    CSR, and its host facts to the cloud enroll endpoint over plain
-//!    HTTPS (no bearer — the code is the credential). The cloud atomically
-//!    consumes the code, provisions the instance registry row, signs the
-//!    CSR with the cloud KMS CA, and returns the leaf certificate, the
-//!    CA bundle, the gateway address, and the stable `instance_id` —
-//!    persisted at `$SPICE_CONFIG_DIR/identity.json`.
-//! 4. **Control plane (mTLS stream)**: with the issued identity as its
+//! 1. Enrollment happens **before the runtime exists**, driven by exactly
+//!    one [`enroll::EnrollmentAuthority`]: a one-time `spice-enroll-`
+//!    enrollment key (`spiced --token`, parsed by
+//!    [`enrollment_key::EnrollmentKey`]), or a logged-in session enrolling
+//!    directly through a caller-provided authenticated-session authority.
+//! 2. **State plane (out-of-band enroll)**: [`enroll::enroll_now`] loads or
+//!    creates the per-directory [`draft::EnrollmentDraft`] — provisional
+//!    ECDSA P-256 + X25519 key material and a stable enrollment operation
+//!    ID — and presents the authority, the CSR, and the host facts to the
+//!    cloud enroll endpoint over plain HTTPS under that operation's
+//!    `Idempotency-Key`. The cloud consumes the authority, provisions the
+//!    instance registry row, signs the CSR with the cloud KMS CA, and
+//!    returns the leaf certificate, the CA bundle, the gateway address,
+//!    and the stable `instance_id` — atomically promoted to
+//!    `$SPICE_CONFIG_DIR/identity.json`. A lost response is safe: an exact
+//!    operation replay returns the same instance instead of a sibling.
+//! 3. **Control plane (mTLS stream)**: with the issued identity as its
 //!    TLS client certificate, `spiced` connects to the stateless gateway
 //!    and holds the long-lived `CloudConnect` stream. The gateway never
 //!    signs and holds no state; certless connections are rejected.
-//! 5. Admin clicks "Adopt"; cloud sends an `Adopt` command — a
-//!    trust/marker message the client acknowledges with `AdoptAck`
-//!    (the cert was already issued at enroll).
-//! 6. On future starts, the identity is reused; no code needed. The
-//!    identity is renewed on a ~12h cadence against the cloud `/renew`
-//!    endpoint (dual proof-of-possession; every renewal rotates the
-//!    keypair) and remains renewable up to 30 days past expiry.
+//! 4. On future starts, the identity alone activates the client — no flag
+//!    and no key. A valid identity always wins: a `--token` supplied
+//!    beside one is not redeemed. The identity is renewed on a ~12h
+//!    cadence against the cloud `/renew` endpoint (dual
+//!    proof-of-possession; every renewal rotates the keypair) and remains
+//!    renewable up to 30 days past expiry.
 //!
-//! The client is **default off**: with no adoption code and no identity it
-//! does nothing — existing OSS users see no change.
+//! The client is **default off**: with no identity on disk it does
+//! nothing — existing OSS users see no change.
 //!
-//! ## Public entry point
+//! ## Public entry points
 //!
-//! Call [`CloudConnect::start`] from the runtime bootstrap. It returns a
-//! handle whose tokio task crashes/disconnects are isolated from the rest
-//! of the process; the runtime stays up.
+//! Call [`enroll::enroll_now`] before runtime construction to redeem an
+//! enrollment authority, then [`CloudConnect::start`] from the runtime
+//! bootstrap. `start` returns a handle whose tokio task
+//! crashes/disconnects are isolated from the rest of the process; the
+//! runtime stays up.
 
 pub mod clock_skew;
 pub mod config;
+pub mod draft;
 pub mod enroll;
+pub mod enrollment_key;
 pub mod handlers;
 pub mod identity;
 pub mod release;
@@ -88,6 +97,12 @@ use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
 pub use config::CloudConnectConfig;
+pub use draft::{EnrollmentDraft, EnrollmentTransactionLock};
+pub use enroll::{
+    EnrollNowError, EnrollNowOutcome, EnrollmentAuthority, EnrollmentMetadata, RetryPolicy,
+    SessionToken, enroll_now,
+};
+pub use enrollment_key::{EnrollmentKey, InvalidEnrollmentKey};
 pub use handlers::{
     Capability, CommandError, MAX_QUERY_RESULT_BYTES, MAX_QUERY_ROWS, QueryOutcome, RestartMode,
     RuntimeHandle, RuntimePhase, SpicepodDeployment, StatusReport, effective_max_rows,
@@ -114,6 +129,15 @@ pub enum Error {
     IdentityLoad {
         path: std::path::PathBuf,
         source: identity::Error,
+    },
+
+    #[snafu(display(
+        "The Cloud Connect identity at {} cannot be used: {reason}. Stop spiced, run `spice connect remove --yes` from this instance directory, mint a new enrollment key in the Spice Cloud portal, and restart with `spiced --token <enrollment-key>`. See: https://spiceai.org/docs",
+        path.display()
+    ))]
+    IdentityUnusable {
+        path: std::path::PathBuf,
+        reason: &'static str,
     },
 
     #[snafu(display("Invalid Cloud Connect endpoint: {endpoint}: {source}"))]
@@ -146,22 +170,22 @@ pub struct CloudConnect {
 impl CloudConnect {
     /// Start the Cloud Connect client.
     ///
-    /// Behavior depends on the contents of [`CloudConnectConfig`] and on
-    /// state on disk:
+    /// Activation is driven purely by the per-directory identity:
     ///
     /// - If `identity_path` contains a valid identity, the client connects
     ///   to the gateway over mTLS using the stored identity (renewing it
-    ///   first when due).
-    /// - Otherwise, if `adoption_code` is `Some`, the client enrolls
-    ///   out-of-band against the cloud enroll endpoint, then connects to
-    ///   the gateway with the issued identity.
-    /// - If both are absent, this function returns `Ok(None)` and the client
-    ///   is **not started** — i.e. `CloudConnect` is disabled.
+    ///   first when due). No flag opts in — the identity is the signal.
+    /// - Otherwise this function returns `Ok(None)` and the client is
+    ///   **not started** — i.e. `CloudConnect` is disabled. Enrollment is
+    ///   an explicit, pre-runtime step ([`enroll::enroll_now`]); the
+    ///   running client never enrolls.
     ///
     /// # Errors
     ///
     /// Returns [`Error::IdentityLoad`] if an identity file exists at
-    /// `config.identity_path` but cannot be read or parsed.
+    /// `config.identity_path` but cannot be read or parsed, or
+    /// [`Error::IdentityUnusable`] if its reconnect credentials are
+    /// internally inconsistent.
     #[expect(
         clippy::unused_async,
         reason = "spawns a background tokio task, so it must be called from within a tokio runtime context"
@@ -173,17 +197,6 @@ impl CloudConnect {
         let identity_path = config.identity_path.clone();
         let identity = match IdentityStore::load_optional(&identity_path) {
             Ok(identity) => identity,
-            // A corrupt/unreadable identity file must not wedge re-adoption:
-            // when an adoption code is available, proceed without the stored
-            // identity (a successful adoption rewrites identity.json). Only
-            // surface the load error when there is no code to fall back to.
-            Err(source) if config.adoption_code.is_some() => {
-                tracing::warn!(
-                    "Cloud Connect: identity at {} is unreadable ({source}); proceeding with the adoption code",
-                    identity_path.display()
-                );
-                None
-            }
             Err(source) => {
                 return Err(Error::IdentityLoad {
                     path: identity_path,
@@ -192,13 +205,22 @@ impl CloudConnect {
             }
         };
 
-        if identity.is_none() && config.adoption_code.is_none() {
+        let Some(identity) = identity else {
             tracing::debug!(
-                "Cloud Connect disabled: no identity at {} and no adoption code",
+                "Cloud Connect disabled: no identity at {}",
                 identity_path.display()
             );
             return Ok(None);
+        };
+        if let Some(reason) =
+            identity.reconnect_validation_error(config.gateway_endpoint.as_deref())
+        {
+            return Err(Error::IdentityUnusable {
+                path: identity_path,
+                reason,
+            });
         }
+        let identity = Some(identity);
 
         let shutdown = Shutdown::new();
         let shutdown_for_task = Arc::clone(&shutdown);
@@ -239,49 +261,7 @@ impl CloudConnect {
     }
 }
 
-/// Validate an adoption code shape.
-///
-/// Accepts either shape a portal may mint:
-/// - a raw 32-byte hex string (64 hex digits) — what the cloud portal
-///   currently mints (`randomBytes(32).toString('hex')`), or
-/// - the grouped form `SPICE-ADOPT-XXXXX-XXXXX-...` where each `XXXXX` segment
-///   is 5 uppercase ASCII alphanumerics, with 2–5 segments.
-///
-/// This is a client-side sanity check to tell an adoption code apart from a
-/// Spicepod path (`<org>/<pod>`); the code is validated authoritatively
-/// server-side at enroll.
-#[must_use]
-pub fn is_valid_adoption_code(code: &str) -> bool {
-    // Raw 32-byte hex (64 hex digits) — the format the cloud portal mints today.
-    if code.len() == 64 && code.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return true;
-    }
-    let mut parts = code.split('-');
-    if parts.next() != Some("SPICE") {
-        return false;
-    }
-    if parts.next() != Some("ADOPT") {
-        return false;
-    }
-    let mut segments = 0_usize;
-    for part in parts {
-        if part.len() != 5
-            || !part
-                .chars()
-                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
-        {
-            return false;
-        }
-        segments += 1;
-        if segments > 5 {
-            return false;
-        }
-    }
-    (2..=5).contains(&segments)
-}
-
-/// Validate an instance region label (`spice connect --region` /
-/// `SPICE_CONNECT_ADOPT_REGION`).
+/// Validate an instance region label (`--region`).
 ///
 /// This is a **charset and length check only** — deliberately not a lookup
 /// against the AWS region catalog. A standalone host may sit in a region newer
@@ -343,45 +323,5 @@ mod tests {
                 "{region:?} must be rejected"
             );
         }
-    }
-
-    #[test]
-    fn rejects_codes_with_wrong_prefix() {
-        assert!(!is_valid_adoption_code("FOO-BAR-AAAAA-BBBBB"));
-        assert!(!is_valid_adoption_code("SPICE-CONNECT-AAAAA-BBBBB"));
-    }
-
-    #[test]
-    fn accepts_canonical_adoption_code() {
-        // The portal mints four 5-char base32 segments.
-        assert!(is_valid_adoption_code(
-            "SPICE-ADOPT-7K2PX-9XYZ2-A1B2C-D3E4F"
-        ));
-        assert!(is_valid_adoption_code("SPICE-ADOPT-AAAAA-BBBBB"));
-        assert!(is_valid_adoption_code(
-            "SPICE-ADOPT-11111-22222-33333-44444-55555"
-        ));
-    }
-
-    #[test]
-    fn accepts_raw_hex_adoption_code() {
-        // The cloud portal mints randomBytes(32).toString('hex') — 64 hex chars.
-        assert!(is_valid_adoption_code(
-            "9f500bdec2f2dcf06e50f255d6d8291603e9b10f5abf500a5de5ad6d2069837d"
-        ));
-        assert!(!is_valid_adoption_code("9f500bde")); // too short
-        assert!(!is_valid_adoption_code(&"z".repeat(64))); // 64 chars but non-hex
-    }
-
-    #[test]
-    fn rejects_codes_with_lowercase_or_wrong_length() {
-        assert!(!is_valid_adoption_code("SPICE-ADOPT-aaaaa-BBBBB"));
-        assert!(!is_valid_adoption_code("SPICE-ADOPT-AAAA-BBBBB")); // 4-char segment
-        assert!(!is_valid_adoption_code("SPICE-ADOPT-AAAAAA-BBBBB")); // 6-char segment
-        assert!(!is_valid_adoption_code("SPICE-ADOPT"));
-        // 6 segments — too many.
-        assert!(!is_valid_adoption_code(
-            "SPICE-ADOPT-11111-22222-33333-44444-55555-66666"
-        ));
     }
 }

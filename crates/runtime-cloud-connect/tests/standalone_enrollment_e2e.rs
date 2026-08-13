@@ -14,43 +14,36 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Full standalone-adoption end-to-end suite for Spice Cloud Connect
+//! Full standalone-enrollment end-to-end suite for Spice Cloud Connect
 //! (enroll-first model, DR-025).
 //!
-//! Unlike `adoption_flow.rs` (which runs the gateway over an insecure h2c
+//! Unlike `enrollment_flow.rs` (which runs the gateway over an insecure h2c
 //! channel and returns canned enroll responses), this suite
-//! stands up the full split control plane:
+//! stands up the full split control plane against the frozen canonical
+//! Cloud Connect contract:
 //!
-//! - a **cloud mock** (axum, HTTP): `/v1/cloud-connect/enroll` atomically
-//!   consumes single-use adoption codes and **signs the client's CSR** with
-//!   a throwaway CA; `/v1/cloud-connect/renew` verifies the current-key
+//! - a **cloud mock** (axum, HTTP) implementing the canonical
+//!   `/v1/cloud-connect/enroll` semantics: exactly one enrollment
+//!   authority per request (a single-use `spice-enroll-` token, or a
+//!   bearer session with `X-Org-Name`), a retry-safe **operation store**
+//!   keyed by `Idempotency-Key` whose exact replay returns the same
+//!   instance (evaluated before ordinary token rejection), token
+//!   expiry/consumption/`expected_org` checks with the canonical
+//!   `{code, error, retryable}` bodies, and CSR signing with a throwaway
+//!   CA. `/v1/cloud-connect/renew` verifies the current-key
 //!   proof-of-possession signature and re-issues over the new CSR
 //!   (rotating the pinned key);
 //! - a **gateway** (real TLS tonic server) that **requires mTLS** — the
 //!   post-DR-025 gateway holds no CA and rejects certless connections —
 //!   and multiplexes control commands.
 //!
-//! The suite drives the real [`runtime_cloud_connect::CloudConnect`]
-//! client through the whole lifecycle:
-//!
-//! 1. `enrollment` — out-of-band HTTP enroll (code + CSR + host facts) →
-//!    identity (leaf + key + CA bundle + gateway addr) persisted →
-//!    mTLS stream to the gateway with the assigned identifier.
-//! 2. `single-use codes` — a consumed code is rejected and never retried.
-//! 3. `identity_reuse_across_restart` — a fresh client with no adoption
-//!    code loads the persisted identity and reconnects over mTLS.
-//! 4. `heartbeat_and_telemetry_cadence` — periodic frames on their
-//!    configured cadences.
-//! 5. `apply_spicepod` — the YAML is persisted, the runtime applies what it can,
-//!    and the result reaches the gateway with the instance still serving.
-//! 6. `reconnect_over_mtls` — after the server drops the stream, the
-//!    client reconnects, presenting its client certificate again.
-//! 7. `renewal` — a short-lived leaf triggers the renewal loop: a fresh
-//!    keypair + CSR + PoP signature against `/renew`, and the rotated
-//!    identity is persisted.
-//! 8. `remove` — the server sends `Remove`, the client clears
-//!    `identity.json` and the cloud-connect task exits while the
-//!    (simulated) runtime stays up.
+//! The suite drives [`runtime_cloud_connect::enroll::enroll_now`] (the
+//! typed enrollment entry `spiced --token` uses) and the real
+//! [`runtime_cloud_connect::CloudConnect`] client through the whole
+//! lifecycle: enrollment, response-loss replay, new-token recovery of a
+//! pending operation, existing-identity precedence, authority
+//! exclusivity, redaction, identity reuse across restarts, heartbeats,
+//! spicepod deployment, reconnect, renewal, and removal.
 //!
 //! Determinism: no fixed sleeps for correctness — every wait polls a
 //! captured condition with a bounded timeout. Heartbeat / telemetry
@@ -63,13 +56,14 @@ limitations under the License.
     reason = "integration-test harness — readability over lint strictness"
 )]
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use axum::http::HeaderMap;
 use axum::{Json, Router, extract::State, http::StatusCode, routing::post};
 use base64::Engine as _;
 use rcgen::{
@@ -77,6 +71,10 @@ use rcgen::{
     ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair, KeyUsagePurpose, PublicKeyData as _, SanType,
 };
 use runtime_cloud_connect::config::CloudConnectConfig;
+use runtime_cloud_connect::enroll::{
+    EnrollNowOutcome, EnrollmentAuthority, RetryPolicy, enroll_now,
+};
+use runtime_cloud_connect::enrollment_key::EnrollmentKey;
 use runtime_cloud_connect::handlers::{
     Capability, CommandError, MAX_QUERY_RESULT_BYTES, MAX_QUERY_ROWS, QueryOutcome, RuntimeHandle,
     SpicepodDeployment,
@@ -86,13 +84,40 @@ use runtime_cloud_connect::proto;
 use runtime_cloud_connect::proto::cloud_connect_server::{CloudConnect, CloudConnectServer};
 use serde_json::Value;
 use tokio::net::TcpListener;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, Notify, mpsc};
 use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
 use tonic::transport::{Certificate, Identity as TonicIdentity, Server, ServerTlsConfig};
 use tonic::{Request, Response, Status, Streaming};
 
-const ADOPTION_CODE: &str = "SPICE-ADOPT-E2E11-E2E22";
-const ASSIGNED_ID: &str = "inst_e2e_standalone";
+/// The canonical single-use enrollment key the mock pre-registers.
+const ENROLLMENT_KEY: &str = "spice-enroll-E2E0aaaabbbbccccddddeeeeffff0001";
+/// A second registered key, for tests that need a fresh unconsumed one.
+const SECOND_ENROLLMENT_KEY: &str = "spice-enroll-E2E0aaaabbbbccccddddeeeeffff0002";
+/// The organization both registered keys are scoped to.
+const ORG_NAME: &str = "acme";
+/// The id the mock assigns to the first instance row it creates.
+const ASSIGNED_ID: &str = "inst_e2e_1";
+/// The bearer token the mock accepts for authenticated (logged-in) enrollment.
+const SESSION_BEARER: &str = "session-bearer-e2e";
+
+fn parse_key(raw: &str) -> EnrollmentKey {
+    EnrollmentKey::parse(raw).expect("test key is canonical")
+}
+
+fn token_authority(raw: &str) -> EnrollmentAuthority {
+    EnrollmentAuthority::Token {
+        key: parse_key(raw),
+        expected_org: None,
+    }
+}
+
+/// The retry policy most tests use: generous enough for one transient
+/// retry, far below the test timeout.
+fn test_retry() -> RetryPolicy {
+    RetryPolicy {
+        deadline: Duration::from_secs(15),
+    }
+}
 
 // --------------------------------------------------------------------------
 // Throwaway PKI: a CA that signs the gateway's server cert AND the client
@@ -182,8 +207,31 @@ fn p256_point(der: &[u8]) -> Vec<u8> {
 }
 
 // --------------------------------------------------------------------------
-// Cloud mock: HTTP enroll + renew (state plane), backed by the TestCa.
+// Cloud mock: the canonical enroll + renew contract (state plane), backed by
+// the TestCa. This is the frozen CLOUD-1/CLOUD-2 fixture the client is
+// implemented against: an operation store keyed by `Idempotency-Key` whose
+// exact replay returns the same instance, single-use org-scoped tokens with
+// expiry/consumption/`expected_org` semantics, exactly one enrollment
+// authority per request, and `{code, error, retryable}` error bodies.
 // --------------------------------------------------------------------------
+
+/// The registry-side state of one minted enrollment token.
+#[derive(Clone)]
+struct TokenState {
+    org: String,
+    expired: bool,
+    /// The operation that consumed this token, when one has.
+    consumed_by: Option<String>,
+}
+
+/// One stored enrollment operation: the canonical request hash
+/// (fingerprint + identity public key, mirroring CLOUD-1) and the exact
+/// response it produced, replayed verbatim for an exact retry.
+#[derive(Clone)]
+struct OperationRecord {
+    request_hash: String,
+    response: Value,
+}
 
 #[derive(Clone)]
 struct CloudMock {
@@ -192,8 +240,28 @@ struct CloudMock {
     gateway_addr: String,
     /// Validity (seconds) of issued leaves, as reported in `not_after`.
     leaf_validity_secs: i64,
-    /// Unconsumed adoption codes; enroll consumes atomically.
-    codes: Arc<Mutex<HashSet<String>>>,
+    /// Minted tokens by plaintext value (the real cloud stores hashes; the
+    /// mock's lookup semantics are identical).
+    tokens: Arc<Mutex<HashMap<String, TokenState>>>,
+    /// Enrollment operations by `Idempotency-Key`.
+    operations: Arc<Mutex<HashMap<String, OperationRecord>>>,
+    /// Number of instance registry rows created — the sibling detector.
+    instances_created: Arc<Mutex<u32>>,
+    /// While > 0, an enroll request is fully processed (operation stored,
+    /// instance created, token consumed) but the response is replaced with a
+    /// 503 — simulating a response lost on the wire. Decremented per use.
+    drop_responses: Arc<Mutex<u32>>,
+    /// While > 0, an enroll request is refused 503 BEFORE any processing —
+    /// a plain transient outage. Decremented per use.
+    unavailable_responses: Arc<Mutex<u32>>,
+    /// Test-only gate that pauses one request after capture but before cloud
+    /// processing, making overlapping local enrollment deterministic.
+    pause_next_enroll: Arc<AtomicBool>,
+    enroll_paused: Arc<Notify>,
+    resume_enroll: Arc<Notify>,
+    /// When set, enrollment returns a valid X.509 leaf for a different key
+    /// than the submitted CSR, modeling an unusable committed response.
+    issue_mismatched_enroll_certificate: Arc<AtomicBool>,
     /// The public key pinned at the last enroll/renew — the only key whose
     /// PoP signature authorizes a rotation (mirrors the cloud's pinning).
     pinned_point: Arc<Mutex<Option<Vec<u8>>>>,
@@ -201,19 +269,45 @@ struct CloudMock {
     /// column: an enroll declaring a region writes it, one that declares none
     /// leaves it untouched.
     stored_region: Arc<Mutex<Option<String>>>,
-    enroll_requests: Arc<Mutex<Vec<Value>>>,
+    /// Captured request bodies and the headers that rode them.
+    enroll_requests: Arc<Mutex<Vec<(Value, CapturedHeaders)>>>,
     renew_requests: Arc<Mutex<Vec<Value>>>,
+}
+
+/// The header facts the contract cares about, captured per enroll request.
+#[derive(Clone, Debug)]
+struct CapturedHeaders {
+    idempotency_key: Option<String>,
+    authorization: Option<String>,
+    org_name: Option<String>,
 }
 
 impl CloudMock {
     fn new(ca: Arc<TestCa>, gateway_addr: String, leaf_validity_secs: i64) -> Self {
-        let mut codes = HashSet::new();
-        codes.insert(ADOPTION_CODE.to_string());
+        let mut tokens = HashMap::new();
+        for key in [ENROLLMENT_KEY, SECOND_ENROLLMENT_KEY] {
+            tokens.insert(
+                key.to_string(),
+                TokenState {
+                    org: ORG_NAME.to_string(),
+                    expired: false,
+                    consumed_by: None,
+                },
+            );
+        }
         Self {
             ca,
             gateway_addr,
             leaf_validity_secs,
-            codes: Arc::new(Mutex::new(codes)),
+            tokens: Arc::new(Mutex::new(tokens)),
+            operations: Arc::new(Mutex::new(HashMap::new())),
+            instances_created: Arc::new(Mutex::new(0)),
+            drop_responses: Arc::new(Mutex::new(0)),
+            unavailable_responses: Arc::new(Mutex::new(0)),
+            pause_next_enroll: Arc::new(AtomicBool::new(false)),
+            enroll_paused: Arc::new(Notify::new()),
+            resume_enroll: Arc::new(Notify::new()),
+            issue_mismatched_enroll_certificate: Arc::new(AtomicBool::new(false)),
             pinned_point: Arc::new(Mutex::new(None)),
             stored_region: Arc::new(Mutex::new(None)),
             enroll_requests: Arc::new(Mutex::new(Vec::new())),
@@ -224,54 +318,245 @@ impl CloudMock {
     fn not_after(&self) -> String {
         (chrono::Utc::now() + chrono::Duration::seconds(self.leaf_validity_secs)).to_rfc3339()
     }
+
+    /// Mark a registered token expired (its plaintext still known, so a
+    /// request presenting it is told `expired_token` rather than unknown).
+    async fn expire_token(&self, token: &str) {
+        if let Some(state) = self.tokens.lock().await.get_mut(token) {
+            state.expired = true;
+        }
+    }
 }
 
-fn error_json(status: StatusCode, message: &str) -> (StatusCode, Json<Value>) {
-    (status, Json(serde_json::json!({ "error": message })))
+/// The canonical error body: `{code, error, retryable}`.
+fn error_json(status: StatusCode, code: &str, message: &str) -> (StatusCode, Json<Value>) {
+    let retryable = status.is_server_error()
+        || status == StatusCode::TOO_MANY_REQUESTS
+        || status == StatusCode::REQUEST_TIMEOUT;
+    (
+        status,
+        Json(serde_json::json!({ "code": code, "error": message, "retryable": retryable })),
+    )
 }
 
 async fn mock_enroll(
     State(mock): State<CloudMock>,
+    headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> (StatusCode, Json<Value>) {
-    mock.enroll_requests.lock().await.push(body.clone());
-
-    let Some(code) = body["adoption_code"].as_str() else {
-        return error_json(StatusCode::BAD_REQUEST, "Validation error");
+    let captured = CapturedHeaders {
+        idempotency_key: headers
+            .get("idempotency-key")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string),
+        authorization: headers
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string),
+        org_name: headers
+            .get("x-org-name")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string),
     };
-    // Atomic consume: a code redeems exactly once.
-    if !mock.codes.lock().await.remove(code) {
-        return error_json(StatusCode::UNAUTHORIZED, "Adoption code already used");
+    mock.enroll_requests
+        .lock()
+        .await
+        .push((body.clone(), captured.clone()));
+
+    if mock.pause_next_enroll.swap(false, Ordering::SeqCst) {
+        mock.enroll_paused.notify_one();
+        mock.resume_enroll.notified().await;
     }
+
+    // A plain transient outage: refused before any processing.
+    {
+        let mut unavailable = mock.unavailable_responses.lock().await;
+        if *unavailable > 0 {
+            *unavailable -= 1;
+            return error_json(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "internal",
+                "temporarily unavailable",
+            );
+        }
+    }
+
+    if body["kind"].as_str() != Some("standalone") {
+        return error_json(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "kind must be standalone or cluster",
+        );
+    }
+    // The deleted enrollment-time project authority is rejected before any
+    // token could be consumed.
+    if body.get("app_name").is_some() || body.get("create_app").is_some() {
+        return error_json(
+            StatusCode::BAD_REQUEST,
+            "unsupported_enrollment_field",
+            "app_name/create_app are not accepted by this endpoint",
+        );
+    }
+    // Exactly one enrollment authority.
+    let has_token = body.get("token").is_some();
+    let has_session = captured.authorization.is_some();
+    if has_token == has_session {
+        return error_json(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "exactly one of a login authorization or a token is required",
+        );
+    }
+    let Some(operation_id) = captured.idempotency_key.clone().filter(|k| !k.is_empty()) else {
+        return error_json(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "Idempotency-Key is required",
+        );
+    };
     let Some(csr_pem) = body["csr_pem"].as_str() else {
-        return error_json(StatusCode::BAD_REQUEST, "Validation error");
+        return error_json(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "csr_pem is required",
+        );
     };
     // Host facts are NOT NULL registry columns.
     for field in ["fingerprint", "hostname", "os", "arch", "runtime_version"] {
         if body["instance"][field].as_str().is_none_or(str::is_empty) {
-            return error_json(StatusCode::BAD_REQUEST, "Validation error");
+            return error_json(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "Validation error",
+            );
         }
     }
-    let Ok((leaf_pem, point)) = mock.ca.sign_csr(csr_pem) else {
-        return error_json(StatusCode::BAD_REQUEST, "Malformed CSR");
-    };
-    *mock.pinned_point.lock().await = Some(point);
-    let mut response = serde_json::json!({
-        "instance_id": ASSIGNED_ID,
-        "identity_cert_pem": leaf_pem,
-        "ca_bundle_pem": mock.ca.ca_cert_pem,
-        "gateway_addr": mock.gateway_addr,
-        "not_after": mock.not_after(),
-        "org": " acme ",
-    });
-    // Attach-at-connect: the real cloud validates and attaches; the mock
-    // echoes the requested app back, matching the response contract.
-    if let Some(app_name) = body["app_name"].as_str() {
-        response["app_name"] = serde_json::Value::String(app_name.to_string());
+    if let Some(region) = body["region"].as_str()
+        && !runtime_cloud_connect::is_valid_instance_region(region)
+    {
+        return error_json(
+            StatusCode::BAD_REQUEST,
+            "invalid_region",
+            "region must be 2-64 lowercase letters, digits, or hyphens",
+        );
     }
+
+    // CLOUD-1: SHA-256 of the canonical fingerprint/public-key tuple. The
+    // CSR carries the identity public key, so it stands in for it here.
+    let request_hash = format!(
+        "{}\u{1}{}",
+        body["instance"]["fingerprint"].as_str().unwrap_or(""),
+        csr_pem
+    );
+
+    // An exact operation/request replay is evaluated BEFORE ordinary
+    // used/expiry rejection: it returns the recorded instance identity and
+    // cannot create or retarget an instance. A new token presented with the
+    // same operation recovers it the same way (consumed against the existing
+    // instance rather than creating a sibling).
+    {
+        let operations = mock.operations.lock().await;
+        if let Some(record) = operations.get(&operation_id) {
+            if record.request_hash == request_hash {
+                let response = record.response.clone();
+                drop(operations);
+                if let Some(token) = body["token"].as_str()
+                    && let Some(state) = mock.tokens.lock().await.get_mut(token)
+                    && state.consumed_by.is_none()
+                {
+                    state.consumed_by = Some(operation_id.clone());
+                }
+                return (StatusCode::OK, Json(response));
+            }
+            return error_json(
+                StatusCode::CONFLICT,
+                "idempotency_mismatch",
+                "this operation exists with a different request",
+            );
+        }
+    }
+
+    // Resolve the authority to an organization.
+    let org = if let Some(token) = body["token"].as_str() {
+        let tokens = mock.tokens.lock().await;
+        let Some(state) = tokens.get(token) else {
+            // Deliberately model a hostile proxy/server that echoes the
+            // rejected bearer. The client must redact it before constructing
+            // any user-facing error even though the real cloud never echoes
+            // credentials.
+            let message = format!("unknown enrollment key {token}");
+            return error_json(StatusCode::UNAUTHORIZED, "invalid_token", &message);
+        };
+        // expected_org is asserted BEFORE the key could be consumed.
+        if let Some(expected) = body["expected_org"].as_str()
+            && expected != state.org
+        {
+            return error_json(
+                StatusCode::CONFLICT,
+                "org_mismatch",
+                "the enrollment key does not belong to the asserted organization; the key was not consumed",
+            );
+        }
+        if state.expired {
+            return error_json(
+                StatusCode::GONE,
+                "expired_token",
+                "the enrollment key expired",
+            );
+        }
+        if state.consumed_by.is_some() {
+            return error_json(
+                StatusCode::CONFLICT,
+                "consumed_token",
+                "the enrollment key was already used",
+            );
+        }
+        state.org.clone()
+    } else {
+        // Authenticated session: the bearer must be known and the org header
+        // names the selected organization. No minted key exists on this path.
+        if captured.authorization.as_deref() != Some(&format!("Bearer {SESSION_BEARER}")) {
+            return error_json(
+                StatusCode::UNAUTHORIZED,
+                "unauthenticated",
+                "unknown session",
+            );
+        }
+        let Some(org) = captured.org_name.clone().filter(|o| !o.is_empty()) else {
+            return error_json(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "X-Org-Name is required for authenticated enrollment",
+            );
+        };
+        org
+    };
+    let Ok((mut leaf_pem, point)) = mock.ca.sign_csr(csr_pem) else {
+        return error_json(StatusCode::BAD_REQUEST, "invalid_request", "Malformed CSR");
+    };
+    if mock
+        .issue_mismatched_enroll_certificate
+        .load(Ordering::SeqCst)
+    {
+        let unrelated_key = KeyPair::generate().expect("generate mismatched response key");
+        leaf_pem = CertificateParams::new(Vec::<String>::new())
+            .expect("build mismatched response certificate")
+            .self_signed(&unrelated_key)
+            .expect("sign mismatched response certificate")
+            .pem();
+    }
+    *mock.pinned_point.lock().await = Some(point);
+
+    // Create the instance registry row.
+    let instance_id = {
+        let mut created = mock.instances_created.lock().await;
+        *created += 1;
+        format!("inst_e2e_{created}")
+    };
+
     // The real cloud reports the region now stored on the row: the declared
     // one when the request carried it, otherwise whatever the row already
-    // held (a re-enrol with no `region` leaves it alone). The mock stands in
+    // held (a re-enroll with no `region` leaves it alone). The mock stands in
     // for that stored value.
     let stored_region = match body["region"].as_str() {
         Some(region) => {
@@ -280,9 +565,49 @@ async fn mock_enroll(
         }
         None => mock.stored_region.lock().await.clone(),
     };
+
+    let mut response = serde_json::json!({
+        "instance_id": instance_id,
+        "identity_cert_pem": leaf_pem,
+        "ca_bundle_pem": mock.ca.ca_cert_pem,
+        "gateway_addr": mock.gateway_addr,
+        "not_after": mock.not_after(),
+        "organization": {"id": 42, "name": format!(" {org} ")},
+        "portal": {"new_project_url": format!("https://cloud.test/{org}/new?instance={instance_id}")},
+        "attachment": null,
+    });
     if let Some(region) = stored_region {
         response["region"] = serde_json::Value::String(region);
     }
+
+    // Store the operation, consume the token: the mutation is durable
+    // whether or not the response below reaches the client.
+    mock.operations.lock().await.insert(
+        operation_id.clone(),
+        OperationRecord {
+            request_hash,
+            response: response.clone(),
+        },
+    );
+    if let Some(token) = body["token"].as_str()
+        && let Some(state) = mock.tokens.lock().await.get_mut(token)
+    {
+        state.consumed_by = Some(operation_id);
+    }
+
+    // Response loss: everything above happened, but the client never hears.
+    {
+        let mut drops = mock.drop_responses.lock().await;
+        if *drops > 0 {
+            *drops -= 1;
+            return error_json(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "internal",
+                "response lost after the enrollment was processed",
+            );
+        }
+    }
+
     (StatusCode::OK, Json(response))
 }
 
@@ -297,10 +622,18 @@ async fn mock_renew(
         body["csr_pem"].as_str(),
         body["pop_sig"].as_str(),
     ) else {
-        return error_json(StatusCode::BAD_REQUEST, "Validation error");
+        return error_json(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "Validation error",
+        );
     };
     if cert_pem.is_empty() || csr_pem.is_empty() || pop_sig.is_empty() {
-        return error_json(StatusCode::BAD_REQUEST, "Validation error");
+        return error_json(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "Validation error",
+        );
     }
 
     // Current-key proof-of-possession against the PINNED key (a cert is not
@@ -309,17 +642,19 @@ async fn mock_renew(
     let Some(pinned_point) = pinned else {
         return error_json(
             StatusCode::UNAUTHORIZED,
+            "invalid_pop",
             "Current-key proof-of-possession failed",
         );
     };
     let Ok(signature) = base64::engine::general_purpose::STANDARD.decode(pop_sig) else {
         return error_json(
             StatusCode::UNAUTHORIZED,
+            "invalid_pop",
             "Current-key proof-of-possession failed",
         );
     };
     let Ok(csr_der) = pem::parse(csr_pem) else {
-        return error_json(StatusCode::BAD_REQUEST, "Malformed CSR");
+        return error_json(StatusCode::BAD_REQUEST, "invalid_request", "Malformed CSR");
     };
     let verifier = aws_lc_rs::signature::UnparsedPublicKey::new(
         &aws_lc_rs::signature::ECDSA_P256_SHA256_ASN1,
@@ -328,13 +663,14 @@ async fn mock_renew(
     if verifier.verify(csr_der.contents(), &signature).is_err() {
         return error_json(
             StatusCode::UNAUTHORIZED,
+            "invalid_pop",
             "Current-key proof-of-possession failed",
         );
     }
 
     // Re-issue over the CSR's NEW key and pin it (the rotation).
     let Ok((leaf_pem, point)) = mock.ca.sign_csr(csr_pem) else {
-        return error_json(StatusCode::BAD_REQUEST, "Malformed CSR");
+        return error_json(StatusCode::BAD_REQUEST, "invalid_request", "Malformed CSR");
     };
     *mock.pinned_point.lock().await = Some(point);
     (
@@ -756,7 +1092,6 @@ async fn enroll_query_runtime_with_deadline(
     let mut config = harness.config(
         dir.path().join("identity.json"),
         dir.path().to_path_buf(),
-        Some(ADOPTION_CODE.to_string()),
         Duration::from_hours(12),
     );
     config.query_deadline = query_deadline;
@@ -1329,7 +1664,6 @@ impl Harness {
         &self,
         identity_path: std::path::PathBuf,
         config_dir: std::path::PathBuf,
-        adoption_code: Option<String>,
         renewal_lead: Duration,
     ) -> CloudConnectConfig {
         CloudConnectConfig {
@@ -1344,10 +1678,6 @@ impl Harness {
             insecure: false,
             identity_path,
             config_dir,
-            adoption_code,
-            pending_adopt_code_path: None,
-            adopt_app_name: None,
-            adopt_create_app: false,
             instance_region: None,
             runtime_version: "v0.0.0-e2e".to_string(),
             // Sub-second cadences keep the suite fast while still exercising
@@ -1411,8 +1741,10 @@ macro_rules! with_captured {
     }};
 }
 
-/// Drive enrollment to completion (identity persisted + mTLS Hello observed
-/// by the gateway) and return the loaded identity.
+/// Enroll with a one-time key (the pre-runtime step `spiced --token`
+/// performs), then start the client and wait for the mTLS Hello — the
+/// production sequence, condensed for test setup. Returns the running
+/// client and the enrolled identity.
 async fn enroll(
     harness: &Harness,
     config: &CloudConnectConfig,
@@ -1421,35 +1753,55 @@ async fn enroll(
     runtime_cloud_connect::CloudConnect,
     runtime_cloud_connect::identity::Identity,
 ) {
+    enroll_with_key(harness, config, runtime, ENROLLMENT_KEY).await
+}
+
+/// As [`enroll`], with the enrollment key chosen by the test.
+async fn enroll_with_key(
+    harness: &Harness,
+    config: &CloudConnectConfig,
+    runtime: Arc<dyn RuntimeHandle>,
+    key: &str,
+) -> (
+    runtime_cloud_connect::CloudConnect,
+    runtime_cloud_connect::identity::Identity,
+) {
+    let outcome = enroll_now(config, &token_authority(key), test_retry())
+        .await
+        .expect("enrollment succeeds");
+    let identity = match outcome {
+        runtime_cloud_connect::EnrollNowOutcome::Enrolled { identity, .. }
+        | runtime_cloud_connect::EnrollNowOutcome::AlreadyEnrolled { identity } => identity,
+    };
+    assert!(
+        config.identity_path.exists(),
+        "the enrolled identity must be durable before the client starts"
+    );
+
     let handle = runtime_cloud_connect::CloudConnect::start(config.clone(), runtime)
         .await
         .expect("start")
         .expect("started");
 
-    let identity_path = config.identity_path.clone();
-    let enrolled = wait_until(Duration::from_secs(10), || identity_path.exists()).await;
-    assert!(enrolled, "identity.json must be written within 10s");
-
     // Wait for the gateway to observe the mTLS Hello so the handshake is
     // fully settled before the test proceeds.
+    let expected = identity.identifier.clone();
     let captured = Arc::clone(&harness.gateway.captured);
     let connected = wait_until_async(Duration::from_secs(10), || {
         let captured = Arc::clone(&captured);
+        let expected = expected.clone();
         async move {
             captured
                 .lock()
                 .await
                 .hellos
                 .iter()
-                .any(|(h, mtls)| h.identifier == ASSIGNED_ID && *mtls)
+                .any(|(h, mtls)| h.identifier == expected && *mtls)
         }
     })
     .await;
     assert!(connected, "gateway must observe the mTLS Hello within 10s");
 
-    let identity = IdentityStore::load_optional(&identity_path)
-        .expect("load identity")
-        .expect("identity present");
     (handle, identity)
 }
 
@@ -1461,22 +1813,44 @@ async fn enroll(
 async fn enrollment_issues_identity_and_streams_over_mtls() {
     let harness = Harness::new(24 * 60 * 60).await;
     let dir = tempfile::tempdir().unwrap();
-    let config = harness.config(
+    let mut config = harness.config(
         dir.path().join("identity.json"),
         dir.path().to_path_buf(),
-        Some(ADOPTION_CODE.to_string()),
         Duration::from_hours(12),
     );
+    config.instance_region = Some("us-west-2".to_string());
 
     let (runtime, _rt_state) = E2eRuntime::new();
     let (handle, identity) = enroll(&harness, &config, runtime).await;
 
-    // The enroll request carried the out-of-band contract: adoption code +
-    // CSR + host facts under `instance` — no bearer token field.
+    // The enroll request carried the canonical contract: kind + token +
+    // CSR + encryption key + host facts under `instance`, under an
+    // Idempotency-Key, with no login authorization and none of the deleted
+    // enrollment-time project fields.
     let requests = harness.cloud.enroll_requests.lock().await.clone();
     assert_eq!(requests.len(), 1, "exactly one enroll request");
-    let body = &requests[0];
-    assert_eq!(body["adoption_code"], ADOPTION_CODE);
+    let (body, headers) = &requests[0];
+    assert_eq!(body["kind"], "standalone");
+    assert_eq!(body["token"], ENROLLMENT_KEY);
+    assert!(
+        headers
+            .idempotency_key
+            .as_deref()
+            .is_some_and(|k| !k.is_empty()),
+        "every enrollment attempt carries its operation as Idempotency-Key"
+    );
+    assert!(
+        headers.authorization.is_none(),
+        "a token enrollment must not also carry login authorization"
+    );
+    assert!(
+        body.get("app_name").is_none() && body.get("create_app").is_none(),
+        "the deleted enrollment-time project fields must not exist on the wire"
+    );
+    assert!(
+        body.get("expected_org").is_none(),
+        "no expected_org was asserted, so none may be sent"
+    );
     assert!(
         body["csr_pem"]
             .as_str()
@@ -1534,42 +1908,39 @@ async fn enrollment_issues_identity_and_streams_over_mtls() {
     handle.shutdown().await;
 }
 
-/// The `spice connect` enroll-and-exit contract: a one-shot `enroll_now`
-/// issues and persists the identity with no client running (no gateway
-/// connection), discards the staged pending-code file, and a later
-/// `CloudConnect::start` with **no adoption code** connects using the
-/// persisted identity — enroll and run as two separate steps.
+/// The pre-runtime bootstrap contract: `enroll_now` issues and persists the
+/// identity with no client running (no gateway connection), promotes the
+/// draft away, and returns the canonical response metadata; a later
+/// `CloudConnect::start` with no key connects using the persisted identity
+/// alone — enroll and run as two separate steps.
 #[tokio::test]
-async fn one_shot_enroll_then_separate_run_connects_with_stored_identity() {
+async fn enrollment_precedes_the_client_and_reconnects_from_identity() {
     let harness = Harness::new(24 * 60 * 60).await;
     let dir = tempfile::tempdir().unwrap();
-
-    // Stage the code the way `spice connect` does.
-    let pending_path = dir.path().join("pending-adopt-code");
-    std::fs::write(&pending_path, ADOPTION_CODE).unwrap();
-
-    let mut config = harness.config(
+    let config = harness.config(
         dir.path().join("identity.json"),
         dir.path().to_path_buf(),
-        Some(ADOPTION_CODE.to_string()),
         Duration::from_hours(12),
     );
-    config.pending_adopt_code_path = Some(pending_path.clone());
 
-    // Phase 1: one-shot enroll — no client task, no stream.
-    let outcome = runtime_cloud_connect::enroll::enroll_now(&config)
+    // Phase 1: pre-runtime enrollment — no client task, no stream.
+    let outcome = enroll_now(&config, &token_authority(ENROLLMENT_KEY), test_retry())
         .await
-        .expect("one-shot enroll succeeds");
-    assert_eq!(outcome.identity.identifier, ASSIGNED_ID);
-    assert_eq!(outcome.identity.org_name.as_deref(), Some("acme"));
-    assert_eq!(outcome.registration.org.as_deref(), Some("acme"));
+        .expect("enrollment succeeds");
+    let runtime_cloud_connect::EnrollNowOutcome::Enrolled { identity, metadata } = outcome else {
+        panic!("a fresh directory must enroll, not reuse");
+    };
+    assert_eq!(identity.identifier, ASSIGNED_ID);
+    assert_eq!(identity.org_name.as_deref(), Some(ORG_NAME));
+    assert_eq!(metadata.organization.name, ORG_NAME);
     assert_eq!(
-        outcome.registration.app_name, None,
-        "no attachment was requested"
+        metadata.new_project_url.as_deref(),
+        Some("https://cloud.test/acme/new?instance=inst_e2e_1"),
+        "the canonical response's portal link must reach the caller"
     );
     assert!(
         config.identity_path.exists(),
-        "identity must be persisted by the one-shot enroll"
+        "identity must be persisted by the pre-runtime enrollment"
     );
     assert_eq!(
         IdentityStore::load_optional(&config.identity_path)
@@ -1581,19 +1952,18 @@ async fn one_shot_enroll_then_separate_run_connects_with_stored_identity() {
         "enrollment org must survive in the canonical identity file"
     );
     assert!(
-        !pending_path.exists(),
-        "the staged code must be discarded once consumed"
+        !runtime_cloud_connect::EnrollmentDraft::path_in(dir.path()).exists(),
+        "a successful enrollment promotes the draft away"
     );
     let captured_after_enroll = Arc::clone(&harness.gateway.captured);
     let hellos = with_captured!(captured_after_enroll, c => c.hellos.len());
-    assert_eq!(hellos, 0, "one-shot enroll must not connect to the gateway");
+    assert_eq!(hellos, 0, "enrollment must not connect to the gateway");
 
-    // Phase 2: a separate start with NO adoption code connects with the
-    // stored identity.
+    // Phase 2: a separate start with NO key connects with the stored
+    // identity — the identity alone is the activation signal.
     let run_config = harness.config(
         config.identity_path.clone(),
         dir.path().to_path_buf(),
-        None,
         Duration::from_hours(12),
     );
     let (runtime, _rt_state) = E2eRuntime::new();
@@ -1626,296 +1996,841 @@ async fn one_shot_enroll_then_separate_run_connects_with_stored_identity() {
     handle.shutdown().await;
 }
 
-/// An authoritative cloud rejection of a one-shot enroll burns the staged
-/// code file (a dead code must not be re-presented by a later `spiced`
-/// start) and persists no identity.
+/// A terminal cloud rejection stops immediately: one request, no identity,
+/// and the retry-safe draft kept for a later attempt with a fresh key.
 #[tokio::test]
-async fn one_shot_enroll_discards_staged_code_on_rejection() {
+async fn a_terminal_rejection_persists_no_identity_and_is_not_retried() {
     let harness = Harness::new(24 * 60 * 60).await;
     let dir = tempfile::tempdir().unwrap();
-    let pending_path = dir.path().join("pending-adopt-code");
-    std::fs::write(&pending_path, "SPICE-ADOPT-DEADD-BEEFF").unwrap();
-
-    let mut config = harness.config(
+    let config = harness.config(
         dir.path().join("identity.json"),
         dir.path().to_path_buf(),
-        // Not registered with the cloud mock — rejected as unknown/consumed.
-        Some("SPICE-ADOPT-DEADD-BEEFF".to_string()),
         Duration::from_hours(12),
     );
-    config.pending_adopt_code_path = Some(pending_path.clone());
 
-    let err = runtime_cloud_connect::enroll::enroll_now(&config)
+    // Canonically shaped but never minted: the mock answers 401 invalid_token.
+    let unknown = "spice-enroll-neverminted0000000000000000000aa";
+    let err = enroll_now(&config, &token_authority(unknown), test_retry())
         .await
-        .expect_err("an unknown code must be rejected");
+        .expect_err("an unknown key is terminally rejected");
     assert!(
-        err.is_authoritative_rejection(),
-        "a 4xx cloud rejection is authoritative: {err}"
+        matches!(err, runtime_cloud_connect::EnrollNowError::Rejected { .. }),
+        "{err}"
     );
-    assert!(
-        !pending_path.exists(),
-        "a dead code must not stay staged for retry"
-    );
-    assert!(
-        !config.identity_path.exists(),
-        "no identity may be persisted on a rejected enroll"
-    );
-}
-
-/// Attach-at-connect: `adopt_app_name`/`adopt_create_app` ride the enroll
-/// request (`app_name`/`create_app` on the wire, omitted when unset) and
-/// the response's attached app comes back in the outcome.
-#[tokio::test]
-async fn one_shot_enroll_carries_app_attachment() {
-    let harness = Harness::new(24 * 60 * 60).await;
-    let dir = tempfile::tempdir().unwrap();
-
-    let mut config = harness.config(
-        dir.path().join("identity.json"),
-        dir.path().to_path_buf(),
-        Some(ADOPTION_CODE.to_string()),
-        Duration::from_hours(12),
-    );
-    config.adopt_app_name = Some("e2e-app".to_string());
-    config.adopt_create_app = true;
-
-    let outcome = runtime_cloud_connect::enroll::enroll_now(&config)
-        .await
-        .expect("enroll with attachment succeeds");
-    assert_eq!(outcome.registration.app_name.as_deref(), Some("e2e-app"));
-
-    let requests = harness.cloud.enroll_requests.lock().await.clone();
-    assert_eq!(requests.len(), 1, "exactly one enroll request");
-    assert_eq!(requests[0]["app_name"], "e2e-app");
-    assert_eq!(requests[0]["create_app"], true);
-}
-
-/// The declared instance region rides the enroll request as a **sibling of
-/// the probed host facts** and comes back on the registry row. Any
-/// syntactically valid label enrolls — including one no region catalog knows —
-/// because a standalone host may not be in a cloud region at all.
-#[tokio::test]
-async fn one_shot_enroll_records_the_declared_region() {
-    let harness = Harness::new(24 * 60 * 60).await;
-    let dir = tempfile::tempdir().unwrap();
-
-    let mut config = harness.config(
-        dir.path().join("identity.json"),
-        dir.path().to_path_buf(),
-        Some(ADOPTION_CODE.to_string()),
-        Duration::from_hours(12),
-    );
-    config.instance_region = Some("on-prem-syd".to_string());
-
-    let outcome = runtime_cloud_connect::enroll::enroll_now(&config)
-        .await
-        .expect("enroll with a non-catalog region succeeds");
-    assert_eq!(outcome.registration.region.as_deref(), Some("on-prem-syd"));
-
-    let requests = harness.cloud.enroll_requests.lock().await.clone();
-    assert_eq!(requests.len(), 1, "exactly one enroll request");
-    assert_eq!(requests[0]["region"], "on-prem-syd");
-    assert!(
-        requests[0]["instance"].get("region").is_none(),
-        "the declared region must not be nested inside the probed host facts"
-    );
-}
-
-/// Omitting `--region` on a re-enrol must leave the stored region alone.
-/// Re-enrolment is how a standalone instance recovers past its renewal grace
-/// window, so a request that unconditionally wrote the region would erase one
-/// set in the portal on every recovery.
-#[tokio::test]
-async fn re_enroll_without_a_region_leaves_the_stored_region_untouched() {
-    // A second code stands in for the re-issued one a past-grace recovery uses.
-    const SECOND_CODE: &str = "SPICE-ADOPT-22222-22222-22222-22222";
-
-    let harness = Harness::new(24 * 60 * 60).await;
-    let dir = tempfile::tempdir().unwrap();
-
-    // First enroll declares the region.
-    let mut config = harness.config(
-        dir.path().join("identity.json"),
-        dir.path().to_path_buf(),
-        Some(ADOPTION_CODE.to_string()),
-        Duration::from_hours(12),
-    );
-    config.instance_region = Some("us-west-2".to_string());
-    let first = runtime_cloud_connect::enroll::enroll_now(&config)
-        .await
-        .expect("first enroll succeeds");
-    assert_eq!(first.registration.region.as_deref(), Some("us-west-2"));
-
-    harness
-        .cloud
-        .codes
-        .lock()
-        .await
-        .insert(SECOND_CODE.to_string());
-
-    let mut re_enroll = harness.config(
-        dir.path().join("identity.json"),
-        dir.path().to_path_buf(),
-        Some(SECOND_CODE.to_string()),
-        Duration::from_hours(12),
-    );
-    re_enroll.instance_region = None;
-    let second = runtime_cloud_connect::enroll::enroll_now(&re_enroll)
-        .await
-        .expect("re-enroll without a region succeeds");
-
-    let requests = harness.cloud.enroll_requests.lock().await.clone();
-    assert_eq!(requests.len(), 2, "two enroll requests");
-    assert!(
-        requests[1].get("region").is_none(),
-        "an omitted region must not appear on the wire at all — `null` would clear it"
-    );
-    assert_eq!(
-        second.registration.region.as_deref(),
-        Some("us-west-2"),
-        "the region set by the first enroll must survive the re-enrol"
-    );
-}
-
-/// `create_app` is meaningless without an app to name, so it must never
-/// reach the wire alone — an invalid enroll request. Reachable by setting
-/// `SPICE_CONNECT_ADOPT_CREATE` with no `SPICE_CONNECT_ADOPT_APP_NAME`
-/// (the `--create` flag pair is guarded by clap, the env pair is not).
-#[tokio::test]
-async fn one_shot_enroll_omits_create_app_without_app_name() {
-    let harness = Harness::new(24 * 60 * 60).await;
-    let dir = tempfile::tempdir().unwrap();
-
-    let mut config = harness.config(
-        dir.path().join("identity.json"),
-        dir.path().to_path_buf(),
-        Some(ADOPTION_CODE.to_string()),
-        Duration::from_hours(12),
-    );
-    config.adopt_app_name = None;
-    config.adopt_create_app = true;
-
-    let outcome = runtime_cloud_connect::enroll::enroll_now(&config)
-        .await
-        .expect("enroll succeeds unattached");
-    assert_eq!(outcome.registration.app_name, None, "nothing was attached");
-
-    let requests = harness.cloud.enroll_requests.lock().await.clone();
-    assert_eq!(requests.len(), 1, "exactly one enroll request");
-    assert!(
-        requests[0].get("app_name").is_none(),
-        "no app name was configured"
-    );
-    assert!(
-        requests[0].get("create_app").is_none(),
-        "create_app must not ride without app_name"
-    );
-}
-
-/// A persistence failure lands *after* the cloud consumed the code to issue
-/// the identity, so the staged copy is spent: it must be discarded, not left
-/// for `status` to report as redeemable and a later `spiced` start to
-/// re-present for a 401.
-#[tokio::test]
-async fn one_shot_enroll_discards_staged_code_when_identity_cannot_persist() {
-    let harness = Harness::new(24 * 60 * 60).await;
-    let dir = tempfile::tempdir().unwrap();
-    let pending_path = dir.path().join("pending-adopt-code");
-    std::fs::write(&pending_path, ADOPTION_CODE).unwrap();
-
-    // The identity's parent is a regular file, so the directory for it
-    // cannot be created and the issued identity cannot be written.
-    let blocker = dir.path().join("blocker");
-    std::fs::write(&blocker, b"not a directory").unwrap();
-
-    let mut config = harness.config(
-        blocker.join("identity.json"),
-        dir.path().to_path_buf(),
-        Some(ADOPTION_CODE.to_string()),
-        Duration::from_hours(12),
-    );
-    config.pending_adopt_code_path = Some(pending_path.clone());
-
-    let err = runtime_cloud_connect::enroll::enroll_now(&config)
-        .await
-        .expect_err("an unwritable identity path must fail the enroll");
-    assert!(
-        matches!(
-            err,
-            runtime_cloud_connect::enroll::EnrollNowError::Persist { .. }
-        ),
-        "expected a persistence failure, got: {err}"
-    );
-    assert!(
-        !err.is_authoritative_rejection(),
-        "a local persistence failure is not a cloud rejection"
-    );
-    assert!(
-        !pending_path.exists(),
-        "the code was consumed to issue the identity, so it must not stay staged"
-    );
+    assert!(err.is_terminal_rejection());
     assert_eq!(
         harness.cloud.enroll_requests.lock().await.len(),
         1,
-        "the code was presented exactly once"
+        "a terminal rejection must not be retried"
+    );
+    assert!(!config.identity_path.exists(), "no identity may be issued");
+    assert!(
+        runtime_cloud_connect::EnrollmentDraft::path_in(dir.path()).exists(),
+        "the draft survives so a fresh key can resume the same operation"
+    );
+    // The rejection is actionable and never echoes the key.
+    let message = err.to_string();
+    assert!(
+        !message.contains(unknown),
+        "the error must not echo the key: {message}"
     );
 }
 
+/// A 200 response is not enrollment success unless the issued leaf is usable
+/// with the locally-generated private key. Preserve the operation draft so
+/// support can diagnose/recover the committed response; never promote the bad
+/// credential into `identity.json`.
 #[tokio::test]
-async fn adoption_code_is_single_use() {
+async fn a_mismatched_issued_certificate_is_rejected_before_persistence() {
+    let harness = Harness::new(24 * 60 * 60).await;
+    harness
+        .cloud
+        .issue_mismatched_enroll_certificate
+        .store(true, Ordering::SeqCst);
+    let dir = tempfile::tempdir().unwrap();
+    let config = harness.config(
+        dir.path().join("identity.json"),
+        dir.path().to_path_buf(),
+        Duration::from_hours(12),
+    );
+
+    let err = enroll_now(&config, &token_authority(ENROLLMENT_KEY), test_retry())
+        .await
+        .expect_err("a leaf for another private key must be rejected");
+
+    assert!(
+        matches!(err, runtime_cloud_connect::EnrollNowError::Rejected { .. }),
+        "unexpected error: {err}"
+    );
+    let message = err.to_string();
+    assert!(
+        message.contains("certificate and private key do not match"),
+        "unexpected validation error: {message}"
+    );
+    assert!(message.contains("contact Spice Cloud support"), "{message}");
+    assert!(
+        !config.identity_path.exists(),
+        "an unusable issued credential must not become durable"
+    );
+    assert!(
+        runtime_cloud_connect::EnrollmentDraft::path_in(dir.path()).exists(),
+        "the committed operation draft must survive for recovery"
+    );
+    assert_eq!(
+        *harness.cloud.instances_created.lock().await,
+        1,
+        "the response was committed server-side before validation"
+    );
+}
+
+/// Response loss is the reason enrollment is operation-aware: the first
+/// request lands (instance created, key consumed) but its response never
+/// arrives. The retry re-presents the same operation and material, and the
+/// cloud replays the recorded identity instead of creating a sibling.
+#[tokio::test]
+async fn response_loss_replay_does_not_create_a_second_instance() {
+    let harness = Harness::new(24 * 60 * 60).await;
+    let dir = tempfile::tempdir().unwrap();
+    let config = harness.config(
+        dir.path().join("identity.json"),
+        dir.path().to_path_buf(),
+        Duration::from_hours(12),
+    );
+
+    *harness.cloud.drop_responses.lock().await = 1;
+
+    let outcome = enroll_now(&config, &token_authority(ENROLLMENT_KEY), test_retry())
+        .await
+        .expect("the retried enrollment succeeds");
+    let runtime_cloud_connect::EnrollNowOutcome::Enrolled { identity, .. } = outcome else {
+        panic!("a fresh directory must enroll");
+    };
+
+    let requests = harness.cloud.enroll_requests.lock().await.clone();
+    assert!(
+        requests.len() >= 2,
+        "the lost response must have forced a retry"
+    );
+    let first_key = requests[0].1.idempotency_key.clone().expect("first op id");
+    for (_, headers) in &requests {
+        assert_eq!(
+            headers.idempotency_key.as_deref(),
+            Some(first_key.as_str()),
+            "every retry must present the SAME operation"
+        );
+    }
+    assert_eq!(
+        *harness.cloud.instances_created.lock().await,
+        1,
+        "a replayed operation must not create a sibling instance"
+    );
+    assert_eq!(identity.identifier, ASSIGNED_ID);
+    assert!(config.identity_path.exists());
+}
+
+/// A key that expires while its operation is stuck mid-retry is recoverable:
+/// a NEW key presented with the SAME persisted draft/operation is consumed
+/// against the existing instance rather than enrolling a sibling.
+#[tokio::test]
+async fn a_new_enrollment_key_recovers_the_pending_operation() {
+    let harness = Harness::new(24 * 60 * 60).await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = harness.config(
+        dir.path().join("identity.json"),
+        dir.path().to_path_buf(),
+        Duration::from_hours(12),
+    );
+    config.instance_region = Some("us-west-2".to_string());
+
+    // Phase 1: every processed attempt loses its response until the tight
+    // retry budget expires — the operation and instance exist server-side,
+    // the client has nothing.
+    *harness.cloud.drop_responses.lock().await = 99;
+    let err = enroll_now(
+        &config,
+        &token_authority(ENROLLMENT_KEY),
+        RetryPolicy {
+            // The first request is always made. The retry loop's non-zero
+            // pacing floor then makes this budget deterministically expire
+            // before a second attempt, leaving the committed operation for
+            // the fresh key below to recover.
+            deadline: Duration::from_millis(1),
+        },
+    )
+    .await
+    .expect_err("the budget expires with every response lost");
+    assert!(
+        matches!(
+            err,
+            runtime_cloud_connect::EnrollNowError::DeadlineExceeded { .. }
+        ),
+        "{err}"
+    );
+    assert!(!config.identity_path.exists());
+    assert!(
+        runtime_cloud_connect::EnrollmentDraft::path_in(dir.path()).exists(),
+        "the draft must survive the failed run"
+    );
+
+    // The first key then expires before anyone retries.
+    *harness.cloud.drop_responses.lock().await = 0;
+    harness.cloud.expire_token(ENROLLMENT_KEY).await;
+
+    // Model a replacement container and image upgrade. The pending draft owns
+    // the canonical non-authority request, so a changed runtime version or
+    // region cannot turn the same operation into an idempotency mismatch.
+    config.runtime_version = "v9.9.9-replacement".to_string();
+    config.instance_region = Some("eu-west-1".to_string());
+
+    // Phase 2: a fresh key with the same directory (same draft, same
+    // operation) recovers the SAME instance.
+    let outcome = enroll_now(
+        &config,
+        &token_authority(SECOND_ENROLLMENT_KEY),
+        test_retry(),
+    )
+    .await
+    .expect("a new key recovers the pending operation");
+    let runtime_cloud_connect::EnrollNowOutcome::Enrolled { identity, .. } = outcome else {
+        panic!("phase 2 must enroll");
+    };
+    assert_eq!(
+        identity.identifier, ASSIGNED_ID,
+        "the recovered enrollment must return the operation's instance"
+    );
+    assert_eq!(
+        *harness.cloud.instances_created.lock().await,
+        1,
+        "recovery must not create a sibling instance"
+    );
+    assert!(config.identity_path.exists());
+    let requests = harness.cloud.enroll_requests.lock().await.clone();
+    let first = &requests.first().expect("phase 1 request").0;
+    let recovered = &requests.last().expect("phase 2 request").0;
+    for field in ["csr_pem", "enc_pubkey_pem", "instance", "region"] {
+        assert_eq!(
+            first[field], recovered[field],
+            "{field} must be replayed from the pending draft"
+        );
+    }
+    assert_eq!(recovered["instance"]["runtime_version"], "v0.0.0-e2e");
+    assert_eq!(recovered["region"], "us-west-2");
+    assert!(
+        !runtime_cloud_connect::EnrollmentDraft::path_in(dir.path()).exists(),
+        "success promotes the draft away"
+    );
+}
+
+/// An enrollment key redeems exactly once: a second instance directory
+/// presenting the consumed key (a different operation) is refused with
+/// `consumed_token`, terminally.
+#[tokio::test]
+async fn an_enrollment_key_is_single_use_across_instances() {
     let harness = Harness::new(24 * 60 * 60).await;
 
-    // First machine redeems the code.
+    // First directory redeems the key.
     let dir1 = tempfile::tempdir().unwrap();
     let config1 = harness.config(
         dir1.path().join("identity.json"),
         dir1.path().to_path_buf(),
-        Some(ADOPTION_CODE.to_string()),
         Duration::from_hours(12),
     );
-    let (runtime1, _s1) = E2eRuntime::new();
-    let (handle1, _identity) = enroll(&harness, &config1, runtime1).await;
-    handle1.shutdown().await;
-
-    // A replay of the consumed code is rejected (401) and never retried;
-    // no identity is created.
-    let dir2 = tempfile::tempdir().unwrap();
-    let identity_path2 = dir2.path().join("identity.json");
-    let config2 = harness.config(
-        identity_path2.clone(),
-        dir2.path().to_path_buf(),
-        Some(ADOPTION_CODE.to_string()),
-        Duration::from_hours(12),
-    );
-    let (runtime2, _s2) = E2eRuntime::new();
-    let handle2 = runtime_cloud_connect::CloudConnect::start(config2, runtime2)
+    enroll_now(&config1, &token_authority(ENROLLMENT_KEY), test_retry())
         .await
-        .expect("start")
-        .expect("started");
+        .expect("first redemption succeeds");
 
-    // The replayed enroll arrives at the cloud mock...
-    let cloud = harness.cloud.clone();
-    let replay_seen = wait_until_async(Duration::from_secs(5), || {
-        let cloud = cloud.clone();
-        async move { cloud.enroll_requests.lock().await.len() >= 2 }
-    })
-    .await;
-    assert!(replay_seen, "the replayed enroll must reach the cloud");
-
-    // ...is rejected, and the rejection is terminal: give the driver a
-    // moment and confirm no identity appeared and no retry was sent.
-    let retried = wait_until_async(Duration::from_secs(2), || {
-        let cloud = cloud.clone();
-        async move { cloud.enroll_requests.lock().await.len() > 2 }
-    })
-    .await;
-    assert!(!retried, "a consumed code must not be retried");
+    // A second directory is a different operation, so the replay path does
+    // not apply and the consumed key is refused terminally.
+    let dir2 = tempfile::tempdir().unwrap();
+    let config2 = harness.config(
+        dir2.path().join("identity.json"),
+        dir2.path().to_path_buf(),
+        Duration::from_hours(12),
+    );
+    let requests_before = harness.cloud.enroll_requests.lock().await.len();
+    let err = enroll_now(&config2, &token_authority(ENROLLMENT_KEY), test_retry())
+        .await
+        .expect_err("a consumed key must be refused");
+    assert!(err.is_terminal_rejection(), "{err}");
+    assert_eq!(
+        harness.cloud.enroll_requests.lock().await.len(),
+        requests_before + 1,
+        "a consumed key must not be retried"
+    );
     assert!(
-        !identity_path2.exists(),
-        "no identity may be issued for a consumed code"
+        !config2.identity_path.exists(),
+        "no identity may be issued for a consumed key"
+    );
+    assert_eq!(
+        *harness.cloud.instances_created.lock().await,
+        1,
+        "the consumed key must not have created a second instance"
+    );
+}
+
+/// `expected_org` is an assertion checked before the key is consumed: a
+/// mismatch is terminal, and the untouched key still redeems afterwards
+/// against the correct organization.
+#[tokio::test]
+async fn an_expected_org_mismatch_is_terminal_and_leaves_the_key_unconsumed() {
+    let harness = Harness::new(24 * 60 * 60).await;
+    let dir = tempfile::tempdir().unwrap();
+    let config = harness.config(
+        dir.path().join("identity.json"),
+        dir.path().to_path_buf(),
+        Duration::from_hours(12),
     );
 
-    handle2.shutdown().await;
+    let mismatched = EnrollmentAuthority::Token {
+        key: parse_key(ENROLLMENT_KEY),
+        expected_org: Some("someone-else".to_string()),
+    };
+    let err = enroll_now(&config, &mismatched, test_retry())
+        .await
+        .expect_err("an org mismatch is refused");
+    assert!(err.is_terminal_rejection(), "{err}");
+    assert!(!config.identity_path.exists());
+
+    // The key was NOT consumed: asserting the right organization succeeds.
+    let matched = EnrollmentAuthority::Token {
+        key: parse_key(ENROLLMENT_KEY),
+        expected_org: Some(ORG_NAME.to_string()),
+    };
+    let outcome = enroll_now(&config, &matched, test_retry())
+        .await
+        .expect("the unconsumed key redeems with the correct org asserted");
+    let runtime_cloud_connect::EnrollNowOutcome::Enrolled { metadata, .. } = outcome else {
+        panic!("must enroll");
+    };
+    assert_eq!(metadata.organization.name, ORG_NAME);
+    // The asserted org rode the request both times.
+    let requests = harness.cloud.enroll_requests.lock().await.clone();
+    assert_eq!(requests[0].0["expected_org"], "someone-else");
+    assert_eq!(requests[1].0["expected_org"], ORG_NAME);
+}
+
+/// Logged-in enrollment: the session rides the headers (bearer +
+/// `X-Org-Name`), the body carries no minted key, and the two authorities
+/// are mutually exclusive — unrepresentable client-side, rejected
+/// server-side.
+#[tokio::test]
+async fn authenticated_enrollment_carries_the_session_and_no_key() {
+    let harness = Harness::new(24 * 60 * 60).await;
+    let dir = tempfile::tempdir().unwrap();
+    let config = harness.config(
+        dir.path().join("identity.json"),
+        dir.path().to_path_buf(),
+        Duration::from_hours(12),
+    );
+
+    let session = EnrollmentAuthority::AuthenticatedSession {
+        access_token: runtime_cloud_connect::SessionToken::new(SESSION_BEARER.to_string()),
+        org: ORG_NAME.to_string(),
+    };
+    let outcome = enroll_now(&config, &session, test_retry())
+        .await
+        .expect("authenticated enrollment succeeds");
+    let runtime_cloud_connect::EnrollNowOutcome::Enrolled { metadata, .. } = outcome else {
+        panic!("must enroll");
+    };
+    assert_eq!(metadata.organization.name, ORG_NAME);
+
+    let requests = harness.cloud.enroll_requests.lock().await.clone();
+    assert_eq!(requests.len(), 1);
+    let (body, headers) = &requests[0];
+    assert_eq!(
+        headers.authorization.as_deref(),
+        Some(format!("Bearer {SESSION_BEARER}").as_str()),
+        "the session must ride the Authorization header"
+    );
+    assert_eq!(headers.org_name.as_deref(), Some(ORG_NAME));
+    assert!(
+        body.get("token").is_none() && body.get("expected_org").is_none(),
+        "no minted key may exist on the authenticated path"
+    );
+
+    // The server side of the exclusivity contract: a hand-crafted request
+    // carrying BOTH a login authorization and a token is rejected before
+    // anything is consumed. (The typed client cannot even represent it.)
+    let both = reqwest::Client::new()
+        .post(format!("http://{}/v1/cloud-connect/enroll", harness.cloud_addr))
+        .header("Idempotency-Key", "op-carrying-both-authorities")
+        .bearer_auth(SESSION_BEARER)
+        .header("X-Org-Name", ORG_NAME)
+        .json(&serde_json::json!({
+            "kind": "standalone",
+            "token": SECOND_ENROLLMENT_KEY,
+            "csr_pem": "irrelevant",
+            "enc_pubkey_pem": "irrelevant",
+            "instance": {"fingerprint": "f", "hostname": "h", "os": "o", "arch": "a", "runtime_version": "v"},
+        }))
+        .send()
+        .await
+        .expect("the mock answers");
+    assert_eq!(
+        both.status(),
+        reqwest::StatusCode::BAD_REQUEST,
+        "a request carrying both authorities must be rejected"
+    );
+    assert_eq!(
+        *harness.cloud.instances_created.lock().await,
+        1,
+        "the rejected dual-authority request must not have enrolled"
+    );
+}
+
+/// An existing valid identity always wins: the supplied key is not
+/// redeemed, nothing about it is persisted, and no request is made — the
+/// key stays usable elsewhere.
+#[tokio::test]
+async fn an_existing_identity_wins_without_redeeming_the_key() {
+    let harness = Harness::new(24 * 60 * 60).await;
+    let dir = tempfile::tempdir().unwrap();
+    let config = harness.config(
+        dir.path().join("identity.json"),
+        dir.path().to_path_buf(),
+        Duration::from_hours(12),
+    );
+    enroll_now(&config, &token_authority(ENROLLMENT_KEY), test_retry())
+        .await
+        .expect("first enrollment succeeds");
+    let requests_after_first = harness.cloud.enroll_requests.lock().await.len();
+
+    // Simulate cleanup failing after promotion. Reusing the identity must
+    // scrub this provisional private material without contacting the cloud.
+    runtime_cloud_connect::EnrollmentDraft::load_or_create(
+        dir.path(),
+        &runtime_cloud_connect::enroll::InstanceFacts::gather(&config.runtime_version),
+        config.instance_region.as_deref(),
+    )
+    .expect("create a stale enrollment draft");
+    assert!(
+        runtime_cloud_connect::EnrollmentDraft::path_in(dir.path()).exists(),
+        "test setup must leave a stale draft"
+    );
+
+    // A second bootstrap with a fresh, valid key: the identity wins.
+    let outcome = enroll_now(
+        &config,
+        &token_authority(SECOND_ENROLLMENT_KEY),
+        test_retry(),
+    )
+    .await
+    .expect("the existing identity short-circuits");
+    assert!(
+        matches!(
+            outcome,
+            runtime_cloud_connect::EnrollNowOutcome::AlreadyEnrolled { ref identity }
+                if identity.identifier == ASSIGNED_ID
+        ),
+        "the stored identity must be returned unredeemed"
+    );
+    assert_eq!(
+        harness.cloud.enroll_requests.lock().await.len(),
+        requests_after_first,
+        "the supplied key must not be presented at all"
+    );
+    assert!(
+        !runtime_cloud_connect::EnrollmentDraft::path_in(dir.path()).exists(),
+        "identity reuse must scrub stale provisional key material"
+    );
+
+    // Not redeemed means still usable: the same key enrolls another
+    // directory afterwards.
+    let dir2 = tempfile::tempdir().unwrap();
+    let config2 = harness.config(
+        dir2.path().join("identity.json"),
+        dir2.path().to_path_buf(),
+        Duration::from_hours(12),
+    );
+    enroll_now(
+        &config2,
+        &token_authority(SECOND_ENROLLMENT_KEY),
+        test_retry(),
+    )
+    .await
+    .expect("the unredeemed key still enrolls a fresh directory");
+}
+
+/// Two processes sharing one config directory must serialize the complete
+/// enrollment transaction. The contender cannot submit a second authority
+/// while the owner is between its identity check and durable promotion.
+#[tokio::test]
+async fn concurrent_enrollment_is_serialized_through_identity_promotion() {
+    let harness = Harness::new(24 * 60 * 60).await;
+    let dir = tempfile::tempdir().expect("create shared enrollment directory");
+    let config = harness.config(
+        dir.path().join("identity.json"),
+        dir.path().to_path_buf(),
+        Duration::from_hours(12),
+    );
+
+    harness
+        .cloud
+        .pause_next_enroll
+        .store(true, Ordering::SeqCst);
+    let first_config = config.clone();
+    let first = tokio::spawn(async move {
+        enroll_now(
+            &first_config,
+            &token_authority(ENROLLMENT_KEY),
+            test_retry(),
+        )
+        .await
+    });
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        harness.cloud.enroll_paused.notified(),
+    )
+    .await
+    .expect("the first request reaches the deterministic cloud gate");
+
+    let second_config = config.clone();
+    let mut second = tokio::spawn(async move {
+        enroll_now(
+            &second_config,
+            &token_authority(SECOND_ENROLLMENT_KEY),
+            test_retry(),
+        )
+        .await
+    });
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(250), &mut second)
+            .await
+            .is_err(),
+        "the contender must wait for the transaction owner"
+    );
+    assert_eq!(
+        harness.cloud.enroll_requests.lock().await.len(),
+        1,
+        "the contender must not submit another authority before promotion"
+    );
+
+    harness.cloud.resume_enroll.notify_one();
+    let first_outcome = tokio::time::timeout(Duration::from_secs(5), first)
+        .await
+        .expect("the transaction owner finishes")
+        .expect("the transaction owner task joins")
+        .expect("the transaction owner enrolls");
+    let second_outcome = tokio::time::timeout(Duration::from_secs(5), second)
+        .await
+        .expect("the contender finishes after promotion")
+        .expect("the contender task joins")
+        .expect("the contender reuses the promoted identity");
+
+    assert!(matches!(first_outcome, EnrollNowOutcome::Enrolled { .. }));
+    assert!(matches!(
+        second_outcome,
+        EnrollNowOutcome::AlreadyEnrolled { .. }
+    ));
+    assert_eq!(harness.cloud.enroll_requests.lock().await.len(), 1);
+    assert_eq!(*harness.cloud.instances_created.lock().await, 1);
+    assert!(
+        harness
+            .cloud
+            .tokens
+            .lock()
+            .await
+            .get(SECOND_ENROLLMENT_KEY)
+            .is_some_and(|token| token.consumed_by.is_none()),
+        "the waiting contender's key must remain unredeemed"
+    );
+}
+
+/// A readable but unusable identity fails closed. The caller receives the
+/// exact removal recovery step, while the supplied key remains unredeemed.
+#[tokio::test]
+async fn an_unusable_existing_identity_refuses_to_redeem_the_key() {
+    let harness = Harness::new(24 * 60 * 60).await;
+    let dir = tempfile::tempdir().unwrap();
+    let config = harness.config(
+        dir.path().join("identity.json"),
+        dir.path().to_path_buf(),
+        Duration::from_hours(12),
+    );
+    enroll_now(&config, &token_authority(ENROLLMENT_KEY), test_retry())
+        .await
+        .expect("first enrollment succeeds");
+
+    let mut identity = IdentityStore::load_optional(&config.identity_path)
+        .expect("load identity")
+        .expect("identity exists");
+    let gateway_addr = identity.gateway_addr.clone();
+    identity.gateway_addr.clear();
+    IdentityStore::store(&config.identity_path, &identity).expect("store unusable identity");
+    let requests_before_recovery = harness.cloud.enroll_requests.lock().await.len();
+
+    let err = enroll_now(
+        &config,
+        &token_authority(SECOND_ENROLLMENT_KEY),
+        test_retry(),
+    )
+    .await
+    .expect_err("an unusable identity must fail closed");
+    assert!(
+        matches!(
+            err,
+            runtime_cloud_connect::EnrollNowError::IdentityUnusable { .. }
+        ),
+        "unexpected error: {err}"
+    );
+    let message = err.to_string();
+    assert!(message.contains("remove this identity file"), "{message}");
+    assert!(
+        !message.contains(SECOND_ENROLLMENT_KEY),
+        "recovery error leaked the supplied key: {message}"
+    );
+    assert_eq!(
+        harness.cloud.enroll_requests.lock().await.len(),
+        requests_before_recovery,
+        "an unusable identity must not cause implicit re-enrollment"
+    );
+
+    identity.gateway_addr = gateway_addr;
+    identity.private_key_pem = KeyPair::generate()
+        .expect("generate a mismatched identity key")
+        .serialize_pem();
+    IdentityStore::store(&config.identity_path, &identity)
+        .expect("store identity with mismatched credentials");
+
+    let err = enroll_now(
+        &config,
+        &token_authority(SECOND_ENROLLMENT_KEY),
+        test_retry(),
+    )
+    .await
+    .expect_err("mismatched identity credentials must fail closed");
+    assert!(
+        err.to_string()
+            .contains("certificate and private key do not match"),
+        "unexpected mismatch error: {err}"
+    );
+    assert_eq!(
+        harness.cloud.enroll_requests.lock().await.len(),
+        requests_before_recovery,
+        "mismatched identity credentials must not cause implicit re-enrollment"
+    );
+}
+
+/// The enrollment key exists only in the one request that consumes it:
+/// nothing under the config directory may contain it, and neither may the
+/// typed authority's Debug or a rejection's message.
+#[tokio::test]
+async fn the_enrollment_key_never_reaches_disk_or_debug() {
+    let harness = Harness::new(24 * 60 * 60).await;
+    let dir = tempfile::tempdir().unwrap();
+    let config = harness.config(
+        dir.path().join("identity.json"),
+        dir.path().to_path_buf(),
+        Duration::from_hours(12),
+    );
+
+    let authority = token_authority(ENROLLMENT_KEY);
+    assert!(
+        !format!("{authority:?}").contains(ENROLLMENT_KEY),
+        "the authority's Debug must redact the key"
+    );
+
+    enroll_now(&config, &authority, test_retry())
+        .await
+        .expect("enrollment succeeds");
+
+    // Every file the enrollment left behind — identity.json and anything
+    // else — must be free of the key.
+    for entry in std::fs::read_dir(dir.path()).expect("read config dir") {
+        let path = entry.expect("dir entry").path();
+        if path.is_file() {
+            let contents = std::fs::read_to_string(&path).unwrap_or_default();
+            assert!(
+                !contents.contains("spice-enroll-"),
+                "{} must not contain an enrollment key",
+                path.display()
+            );
+        }
+    }
+
+    // A denial's message must not echo the key either.
+    let dir2 = tempfile::tempdir().unwrap();
+    let config2 = harness.config(
+        dir2.path().join("identity.json"),
+        dir2.path().to_path_buf(),
+        Duration::from_hours(12),
+    );
+    let err = enroll_now(&config2, &token_authority(ENROLLMENT_KEY), test_retry())
+        .await
+        .expect_err("the consumed key is refused");
+    assert!(
+        !err.to_string().contains(ENROLLMENT_KEY),
+        "the rejection must not echo the key: {err}"
+    );
+}
+
+/// A plain transient outage (503 before any processing) is retried within
+/// the budget and succeeds without operator involvement.
+#[tokio::test]
+async fn a_transient_outage_is_retried_to_success() {
+    let harness = Harness::new(24 * 60 * 60).await;
+    let dir = tempfile::tempdir().unwrap();
+    let config = harness.config(
+        dir.path().join("identity.json"),
+        dir.path().to_path_buf(),
+        Duration::from_hours(12),
+    );
+
+    *harness.cloud.unavailable_responses.lock().await = 1;
+    let outcome = enroll_now(&config, &token_authority(ENROLLMENT_KEY), test_retry())
+        .await
+        .expect("the retried enrollment succeeds");
+    assert!(matches!(
+        outcome,
+        runtime_cloud_connect::EnrollNowOutcome::Enrolled { .. }
+    ));
+    assert!(
+        harness.cloud.enroll_requests.lock().await.len() >= 2,
+        "the outage must have been retried"
+    );
+    assert_eq!(*harness.cloud.instances_created.lock().await, 1);
+}
+
+/// The declared instance region rides the enroll request as a **sibling of
+/// the probed host facts** and comes back on the registry row. Any
+/// syntactically valid label enrolls — including one no region catalog
+/// knows — because a standalone host may not be in a cloud region at all.
+#[tokio::test]
+async fn enrollment_records_the_declared_region() {
+    let harness = Harness::new(24 * 60 * 60).await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = harness.config(
+        dir.path().join("identity.json"),
+        dir.path().to_path_buf(),
+        Duration::from_hours(12),
+    );
+    config.instance_region = Some("on-prem-syd".to_string());
+
+    let outcome = enroll_now(&config, &token_authority(ENROLLMENT_KEY), test_retry())
+        .await
+        .expect("enrollment succeeds");
+    let runtime_cloud_connect::EnrollNowOutcome::Enrolled { metadata, .. } = outcome else {
+        panic!("must enroll");
+    };
+    assert_eq!(metadata.region.as_deref(), Some("on-prem-syd"));
+
+    let requests = harness.cloud.enroll_requests.lock().await.clone();
+    let body = &requests[0].0;
+    assert_eq!(body["region"], "on-prem-syd");
+    assert!(
+        body["instance"].get("region").is_none(),
+        "the declared region is a sibling of the probed facts, never one of them"
+    );
+}
+
+/// Omitting the region must leave the stored region alone. Region-less
+/// enrollment is the common case, and a request that unconditionally wrote
+/// the column would erase a region set in the portal.
+#[tokio::test]
+async fn enrolling_without_a_region_leaves_the_stored_region_untouched() {
+    let harness = Harness::new(24 * 60 * 60).await;
+
+    // First enrollment declares a region, which the registry stores.
+    let dir1 = tempfile::tempdir().unwrap();
+    let mut config1 = harness.config(
+        dir1.path().join("identity.json"),
+        dir1.path().to_path_buf(),
+        Duration::from_hours(12),
+    );
+    config1.instance_region = Some("us-west-2".to_string());
+    enroll_now(&config1, &token_authority(ENROLLMENT_KEY), test_retry())
+        .await
+        .expect("first enrollment succeeds");
+
+    // A second enrollment declares none: the wire must omit the field (not
+    // null it), and the registry's stored value must survive.
+    let dir2 = tempfile::tempdir().unwrap();
+    let config2 = harness.config(
+        dir2.path().join("identity.json"),
+        dir2.path().to_path_buf(),
+        Duration::from_hours(12),
+    );
+    let outcome = enroll_now(
+        &config2,
+        &token_authority(SECOND_ENROLLMENT_KEY),
+        test_retry(),
+    )
+    .await
+    .expect("second enrollment succeeds");
+    let runtime_cloud_connect::EnrollNowOutcome::Enrolled { metadata, .. } = outcome else {
+        panic!("must enroll");
+    };
+    let requests = harness.cloud.enroll_requests.lock().await.clone();
+    assert!(
+        requests[1].0.get("region").is_none(),
+        "an undeclared region must be omitted from the wire entirely"
+    );
+    assert_eq!(
+        metadata.region.as_deref(),
+        Some("us-west-2"),
+        "the stored region must be reported back untouched"
+    );
+}
+
+/// A persistence failure lands *after* the cloud recorded the operation and
+/// issued the identity — and because the operation is durable server-side,
+/// fixing the directory and retrying recovers the SAME instance instead of
+/// creating a duplicate (exactly what the error message promises).
+#[cfg(unix)]
+#[tokio::test]
+async fn a_persistence_failure_is_terminal_and_recoverable_by_replay() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let harness = Harness::new(24 * 60 * 60).await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = harness.config(
+        dir.path().join("identity.json"),
+        dir.path().to_path_buf(),
+        Duration::from_hours(12),
+    );
+
+    // The draft is written first (needs the dir writable); the identity
+    // write then fails against a read-only directory placed at the identity
+    // path's parent.
+    let sealed = dir.path().join("sealed");
+    std::fs::create_dir_all(&sealed).unwrap();
+    std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o555)).unwrap();
+    config.identity_path = sealed.join("identity.json");
+
+    let err = enroll_now(&config, &token_authority(ENROLLMENT_KEY), test_retry())
+        .await
+        .expect_err("the identity cannot be persisted");
+    assert!(
+        matches!(err, runtime_cloud_connect::EnrollNowError::Persist { .. }),
+        "{err}"
+    );
+    assert!(
+        err.to_string().contains("pending operation"),
+        "the failure must say a retry resumes the operation: {err}"
+    );
+    assert_eq!(*harness.cloud.instances_created.lock().await, 1);
+
+    // Fix the directory; the first key is spent, so retry with a fresh one:
+    // the same draft/operation replays the same instance.
+    std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let outcome = enroll_now(
+        &config,
+        &token_authority(SECOND_ENROLLMENT_KEY),
+        test_retry(),
+    )
+    .await
+    .expect("the retried enrollment recovers");
+    let runtime_cloud_connect::EnrollNowOutcome::Enrolled { identity, .. } = outcome else {
+        panic!("must enroll");
+    };
+    assert_eq!(identity.identifier, ASSIGNED_ID);
+    assert_eq!(
+        *harness.cloud.instances_created.lock().await,
+        1,
+        "recovery must not create a sibling instance"
+    );
 }
 
 #[tokio::test]
@@ -1924,11 +2839,10 @@ async fn identity_is_reused_across_restart_over_mtls() {
     let dir = tempfile::tempdir().unwrap();
     let identity_path = dir.path().join("identity.json");
 
-    // First boot: enroll with the adoption code.
+    // First boot: enroll with a one-time enrollment key.
     let enroll_cfg = harness.config(
         identity_path.clone(),
         dir.path().to_path_buf(),
-        Some(ADOPTION_CODE.to_string()),
         Duration::from_hours(12),
     );
     let (runtime, _s) = E2eRuntime::new();
@@ -1938,14 +2852,13 @@ async fn identity_is_reused_across_restart_over_mtls() {
     let captured = Arc::clone(&harness.gateway.captured);
     let hellos_before = with_captured!(captured, c => c.hellos.len());
 
-    // Second boot: NO adoption code — the client must load the persisted
+    // Second boot: NO enrollment key — the client must load the persisted
     // identity and reconnect over mTLS, presenting its client certificate,
     // without touching the enroll endpoint again.
     let enrolls_before = harness.cloud.enroll_requests.lock().await.len();
     let reuse_cfg = harness.config(
         identity_path.clone(),
         dir.path().to_path_buf(),
-        None,
         Duration::from_hours(12),
     );
     let (runtime2, _s2) = E2eRuntime::new();
@@ -1987,7 +2900,6 @@ async fn heartbeat_and_telemetry_cadence() {
     let config = harness.config(
         dir.path().join("identity.json"),
         dir.path().to_path_buf(),
-        Some(ADOPTION_CODE.to_string()),
         Duration::from_hours(12),
     );
     let (runtime, _s) = E2eRuntime::new();
@@ -2053,7 +2965,6 @@ async fn apply_spicepod_delivers_double_sealed_secrets() {
     let config = harness.config(
         identity_path.clone(),
         dir.path().to_path_buf(),
-        Some(ADOPTION_CODE.to_string()),
         Duration::from_hours(12),
     );
     let (runtime, rt_state) = E2eRuntime::new();
@@ -2184,7 +3095,6 @@ async fn apply_spicepod_refuses_an_unopenable_payload() {
     let config = harness.config(
         dir.path().join("identity.json"),
         dir.path().to_path_buf(),
-        Some(ADOPTION_CODE.to_string()),
         Duration::from_hours(12),
     );
     let (runtime, rt_state) = E2eRuntime::new();
@@ -2236,7 +3146,6 @@ async fn apply_spicepod_persists_and_answers_without_ending_the_client() {
     let config = harness.config(
         dir.path().join("identity.json"),
         dir.path().to_path_buf(),
-        Some(ADOPTION_CODE.to_string()),
         Duration::from_hours(12),
     );
     let (runtime, rt_state) = E2eRuntime::new();
@@ -2348,23 +3257,17 @@ async fn reconnects_over_mtls_after_disconnect() {
     let config = harness.config(
         dir.path().join("identity.json"),
         dir.path().to_path_buf(),
-        Some(ADOPTION_CODE.to_string()),
         Duration::from_hours(12),
     );
+    enroll_now(&config, &token_authority(ENROLLMENT_KEY), test_retry())
+        .await
+        .expect("enrollment succeeds");
     let (runtime, _s) = E2eRuntime::new();
 
     let handle = runtime_cloud_connect::CloudConnect::start(config.clone(), runtime)
         .await
         .expect("start")
         .expect("started");
-
-    // The identity is persisted by the out-of-band enroll regardless of the
-    // (soon-dropped) first stream.
-    let identity_path = config.identity_path.clone();
-    assert!(
-        wait_until(Duration::from_secs(10), || identity_path.exists()).await,
-        "identity must persist before the reconnect"
-    );
 
     // After the drop + backoff, the client reconnects with its identifier
     // over a second mutually-authenticated stream — without re-enrolling.
@@ -2407,26 +3310,23 @@ async fn renewal_rotates_keypair_and_persists() {
     let config = harness.config(
         identity_path.clone(),
         dir.path().to_path_buf(),
-        Some(ADOPTION_CODE.to_string()),
         Duration::from_secs(2),
     );
     let (runtime, _s) = E2eRuntime::new();
 
-    // Start the client directly (not via the `enroll` helper): the
-    // pre-rotation identity must be snapshotted as soon as it lands on
-    // disk, before the renewal timer can fire and overwrite it.
-    let handle = runtime_cloud_connect::CloudConnect::start(config, runtime)
+    // Enroll first, snapshotting the pre-rotation identity before the
+    // client's renewal timer can fire and overwrite it.
+    enroll_now(&config, &token_authority(ENROLLMENT_KEY), test_retry())
         .await
-        .expect("start")
-        .expect("started");
-    assert!(
-        wait_until(Duration::from_secs(10), || identity_path.exists()).await,
-        "identity.json must be written within 10s"
-    );
+        .expect("enrollment succeeds");
     let enrolled_identity = IdentityStore::load_optional(&identity_path)
         .expect("load identity")
         .expect("identity present");
     assert_eq!(enrolled_identity.identifier, ASSIGNED_ID);
+    let handle = runtime_cloud_connect::CloudConnect::start(config, runtime)
+        .await
+        .expect("start")
+        .expect("started");
 
     // The renewal request must arrive and be verified (the mock rejects any
     // PoP signature that does not verify against the pinned key).
@@ -2581,7 +3481,6 @@ async fn remove_clears_identity_and_exits() {
     let config = harness.config(
         identity_path.clone(),
         dir.path().to_path_buf(),
-        Some(ADOPTION_CODE.to_string()),
         Duration::from_hours(12),
     );
     let (runtime, _s) = E2eRuntime::new();

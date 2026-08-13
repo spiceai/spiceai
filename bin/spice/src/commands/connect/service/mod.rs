@@ -14,8 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! `spice connect --install`: run `spiced --cloud-connect` as a persistent
-//! system service.
+//! `spice connect --install`: run `spiced` as a persistent system service
+//! for an enrolled instance directory.
 //!
 //! A deployment applies to the running instance and never ends its process, so
 //! the supervisor is what keeps the instance up across the things that do end
@@ -27,8 +27,8 @@ limitations under the License.
 //!
 //! `--install` is Linux with systemd and macOS with launchd, and needs root on
 //! both. Containers get the same guarantee from their runtime's restart policy
-//! (`docker run --restart unless-stopped`) and use the env-var flow instead.
-//! Windows enrolls and runs `spiced --cloud-connect` under the user's own
+//! (`docker run --restart unless-stopped`) and enroll directly with
+//! `spiced --token`. Windows enrolls and runs `spiced` under the user's own
 //! supervisor.
 //!
 //! macOS installs a `LaunchDaemon`, not a `LaunchAgent`: an agent runs only
@@ -273,9 +273,8 @@ fn sanitize_fragment(name: &str) -> String {
 
 /// Why a host cannot have a service installed on it.
 ///
-/// Distinguished from a generic error so the caller can run the check *before*
-/// the HTTPS enroll: a failed preflight must consume nothing, leaving the
-/// adoption code valid.
+/// Distinguished from a generic error so the caller can run the check before
+/// touching any state: a failed preflight must change nothing.
 #[derive(Debug)]
 pub(crate) enum PreflightFailure {
     /// Neither Linux nor macOS — `--install` has no supervisor to install into.
@@ -293,17 +292,17 @@ impl PreflightFailure {
         match self {
             Self::UnsupportedPlatform => format!(
                 "Failed to install the Spice Cloud Connect service: --install requires \
-                 Linux with systemd or macOS with launchd (this host is {}). Enroll without \
-                 --install and run `spiced --cloud-connect` under your own supervisor, or run \
-                 Spice in a container with a restart policy (`docker run --restart unless-stopped`). \
+                 Linux with systemd or macOS with launchd (this host is {}). Run `spiced` from \
+                 the enrolled directory under your own supervisor, or run Spice in a container \
+                 with a restart policy (`docker run --restart unless-stopped`). \
                  See: https://spiceai.org/docs",
                 std::env::consts::OS
             ),
             Self::SystemdUnavailable => format!(
                 "Failed to install the Spice Cloud Connect service: systemd is not running on \
                  this host ({SYSTEMD_RUNTIME_MARKER} is absent). This is normal inside a \
-                 container: set SPICE_CONNECT_ADOPT_CODE and run `spiced --cloud-connect` under \
-                 the container runtime's restart policy (`docker run --restart unless-stopped`) \
+                 container: run `spiced --token <enrollment-key>` under the container \
+                 runtime's restart policy (`docker run --restart unless-stopped`) \
                  instead of --install. See: https://spiceai.org/docs"
             ),
             Self::NotRoot => format!(
@@ -331,8 +330,8 @@ impl From<PreflightFailure> for Error {
 /// Check that this host can have a service installed, **before** anything
 /// irreversible happens.
 ///
-/// Called ahead of the HTTPS enroll so a host with no supervisor or without
-/// root fails with nothing installed and the adoption code still redeemable.
+/// Called before any service files are written so a host with no supervisor
+/// or without root fails with nothing installed.
 pub(crate) fn preflight() -> std::result::Result<(), PreflightFailure> {
     if !cfg!(any(target_os = "linux", target_os = "macos")) {
         return Err(PreflightFailure::UnsupportedPlatform);
@@ -1019,12 +1018,18 @@ mod tests {
             PreflightFailure::SystemdUnavailable
                 .message()
                 .contains("restart policy"),
-            "the no-systemd failure must point containers at the env-var flow"
+            "the no-systemd failure must point containers at the --token flow"
+        );
+        assert!(
+            PreflightFailure::SystemdUnavailable
+                .message()
+                .contains("spiced --token"),
+            "containers enroll directly with the runtime, not this installer"
         );
         assert!(
             PreflightFailure::UnsupportedPlatform
                 .message()
-                .contains("spiced --cloud-connect"),
+                .contains("spiced"),
             "an unsupported host must be told the supported way to run"
         );
         assert!(
