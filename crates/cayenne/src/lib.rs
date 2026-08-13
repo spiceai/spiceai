@@ -78,6 +78,7 @@ pub mod __bench_zorder {
 pub mod optimizer_rules;
 #[cfg(feature = "partition-table-provider")]
 pub(crate) mod partition_creator;
+pub(crate) mod partition_naming;
 pub mod provider;
 pub(crate) mod resource_starvation;
 pub mod row_converter;
