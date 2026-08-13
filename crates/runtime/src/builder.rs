@@ -739,6 +739,7 @@ impl RuntimeBuilder {
             io_runtime.clone(),
         )
         .memory_limit(memory_limit)
+        .query_memory_pool(query.memory_pool.unwrap_or_default())
         .target_partitions(target_partitions)
         .max_concurrent_queries(max_concurrent_queries)
         .prefer_hash_join(query.prefer_hash_join)

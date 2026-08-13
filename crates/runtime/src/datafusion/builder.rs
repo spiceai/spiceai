@@ -58,7 +58,7 @@ use datafusion::{
     execution::{
         DiskManager, FunctionRegistry, SessionStateBuilder,
         disk_manager::DiskManagerMode,
-        memory_pool::{GreedyMemoryPool, TrackConsumersPool},
+        memory_pool::{FairSpillPool, GreedyMemoryPool, MemoryPool, TrackConsumersPool},
         object_store::ObjectStoreRegistry,
         runtime_env::{RuntimeEnv, RuntimeEnvBuilder},
     },
@@ -104,6 +104,7 @@ use runtime_datafusion::{
 use runtime_datafusion_index::analyzer::IndexTableScanExtensionPlanner;
 use runtime_metrics::telemetry::track_bytes_processed;
 use runtime_object_store::registry::SpiceObjectStoreRegistry;
+use spicepod::component::runtime::QueryMemoryPool;
 use spicepod::component::runtime::SpillCompression as SpiceSpillCompression;
 use spicepod::metric::Metrics;
 use tokio::{
@@ -334,6 +335,7 @@ pub struct DataFusionBuilder {
     status: Arc<status::RuntimeStatus>,
     accelerator_engine_registry: Arc<AcceleratorEngineRegistry>,
     memory_limit: Option<u64>,
+    query_memory_pool: QueryMemoryPool,
     target_partitions: Option<usize>,
     prefer_hash_join: Option<bool>,
     eager_aggregation: Option<bool>,
@@ -423,6 +425,7 @@ impl DataFusionBuilder {
             status,
             accelerator_engine_registry,
             memory_limit: None,
+            query_memory_pool: QueryMemoryPool::default(),
             target_partitions: None,
             prefer_hash_join: None,
             eager_aggregation: None,
@@ -476,6 +479,12 @@ impl DataFusionBuilder {
     #[must_use]
     pub fn memory_limit(mut self, memory_limit: Option<u64>) -> Self {
         self.memory_limit = memory_limit;
+        self
+    }
+
+    #[must_use]
+    pub fn query_memory_pool(mut self, query_memory_pool: QueryMemoryPool) -> Self {
+        self.query_memory_pool = query_memory_pool;
         self
     }
 
@@ -951,6 +960,7 @@ impl DataFusionBuilder {
 
         let query_runtime_env = runtime_env_with_effective_memory_limit_and_object_store_registry(
             effective_memory_limit,
+            self.query_memory_pool,
             self.temp_directory.clone(),
             object_store_registry,
             self.cayenne_footer_cache_mb
@@ -1831,6 +1841,7 @@ fn configure_hash_join_memory_limits(config: &mut SessionConfig, effective_memor
 
 fn runtime_env_with_effective_memory_limit_and_object_store_registry(
     effective_memory_limit: u64,
+    query_memory_pool: QueryMemoryPool,
     temp_directory: Option<String>,
     object_store_registry: Arc<dyn ObjectStoreRegistry>,
     metadata_cache_limit_bytes: Option<usize>,
@@ -1850,12 +1861,22 @@ fn runtime_env_with_effective_memory_limit_and_object_store_registry(
     #[expect(clippy::cast_possible_truncation)]
     let effective_memory_bytes = effective_memory_limit as usize;
 
-    let memory_pool = Arc::new(TrackConsumersPool::new(
-        // The runtime supports only 64-bit platforms, so casting u64 to usize
-        // will not truncate on supported targets.
-        GreedyMemoryPool::new(effective_memory_bytes),
-        topn,
-    ));
+    // The runtime supports only 64-bit platforms, so casting u64 to usize
+    // will not truncate on supported targets.
+    let memory_pool: Arc<dyn MemoryPool> = match query_memory_pool {
+        QueryMemoryPool::Greedy => Arc::new(TrackConsumersPool::new(
+            GreedyMemoryPool::new(effective_memory_bytes),
+            topn,
+        )),
+        // Divides the budget fairly among spill-capable consumers so several
+        // concurrent external sorts (e.g. the inputs of a spilled sort-merge
+        // join) each spill at their share instead of one buffering the whole
+        // pool and denying a later sorter its first allocation.
+        QueryMemoryPool::FairSpill => Arc::new(TrackConsumersPool::new(
+            FairSpillPool::new(effective_memory_bytes),
+            topn,
+        )),
+    };
 
     let mut runtime_env_builder = RuntimeEnvBuilder::default()
         .with_object_store_registry(object_store_registry)
@@ -2266,6 +2287,7 @@ mod tests {
         );
         let runtime_env = runtime_env_with_effective_memory_limit_and_object_store_registry(
             1024 * 1024,
+            QueryMemoryPool::Greedy,
             None,
             object_store_registry,
             Some(8 * 1024 * 1024),
@@ -2284,6 +2306,7 @@ mod tests {
         );
         let query_env = runtime_env_with_effective_memory_limit_and_object_store_registry(
             1024 * 1024 * 1024,
+            QueryMemoryPool::Greedy,
             None,
             object_store_registry,
             None,

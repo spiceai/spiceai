@@ -1082,6 +1082,24 @@ impl<'de> Deserialize<'de> for CpuQuantity {
     }
 }
 
+/// Query memory-pool accounting strategy (`runtime.query.memory_pool`).
+///
+/// `greedy` grants memory first-come-first-served: simple and fast, but a
+/// spill-capable operator that filled its buffers holds them until it decides
+/// to spill on its own, so several concurrent sorts can occupy the whole pool
+/// and deny a later operator its very first allocation. `fair_spill` divides
+/// the budget fairly among spill-capable operators, forcing each to spill at
+/// its share — the appropriate mode for workloads whose plans spill (external
+/// sorts, sort-merge joins over large inputs).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum QueryMemoryPool {
+    #[default]
+    Greedy,
+    FairSpill,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 #[serde(rename_all = "snake_case")]
@@ -1090,6 +1108,14 @@ pub struct Query {
     /// for supported queries larger than memory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_limit: Option<String>,
+
+    /// Selects how the query memory pool grants its budget to operators.
+    /// `greedy` is first-come-first-served; `fair_spill` divides the budget
+    /// fairly among spill-capable operators (sorts, spillable joins) so
+    /// concurrent spilling operators each spill at their share instead of one
+    /// buffering the whole pool and starving the rest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_pool: Option<QueryMemoryPool>,
 
     /// Configures where the runtime will store temporary files needed for operations like
     /// spilling to disk for queries & accelerations that are larger than memory.

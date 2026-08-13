@@ -1,6 +1,13 @@
 version: v1
 kind: Spicepod
 name: s3[parquet]-cayenne[file]
+runtime:
+  query:
+    # TPC-DS q97's full-outer join is rewritten to a spillable sort-merge join
+    # (crates/cayenne/src/optimizer_rules.rs); its concurrent external sorts
+    # starve each other under the default greedy pool. Fair-spill divides the
+    # budget among spill-capable operators so each spills at its share.
+    memory_pool: fair_spill
 datasets:
   - from: s3://benchmarks/tpcds_sf100/catalog_sales.parquet
     name: catalog_sales
