@@ -802,8 +802,11 @@ cmd_audit() {
   # from trunk can be told apart from one trunk carried elsewhere.
   RESTACK_RENAMES="$tmp/renames"
   : > "$RESTACK_RENAMES"
+  # diff.renameLimit=0 for unlimited: past the limit git skips inexact detection
+  # with a warning on stderr and exit 0, so a low local setting would quietly
+  # empty these maps and a rename would read as a deletion both sides agreed on.
   if [ -n "$other" ] &&
-     ! git diff -z --name-status --find-renames --diff-filter=R \
+     ! git -c diff.renameLimit=0 diff -z --name-status --find-renames --diff-filter=R \
          "$stack_base" "$other" -- > "$RESTACK_RENAMES"; then
     rm -rf "$tmp"
     die "could not list renames between $stack_base and $other"
@@ -813,7 +816,7 @@ cmd_audit() {
   # wants for a path trunk left alone, but it hides a rename standing against a
   # deletion or an edit on trunk's side, which no correctly based merge settles.
   RESTACK_CHILD_RENAMES="$tmp/child_renames"
-  if ! git diff -z --name-status --find-renames --diff-filter=R \
+  if ! git -c diff.renameLimit=0 diff -z --name-status --find-renames --diff-filter=R \
          "$stack_base" "$pre" -- > "$RESTACK_CHILD_RENAMES"; then
     rm -rf "$tmp"
     die "could not list renames between $stack_base and $pre"

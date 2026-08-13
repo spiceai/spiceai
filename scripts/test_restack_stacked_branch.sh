@@ -899,6 +899,44 @@ start_test "audit still reports a child-only addition the merge dropped"
   esac
 ) || failures=$((failures + 1))
 
+start_test "audit finds renames even where the repository caps rename detection"
+(
+  new_stack "$work_root/renamelimit"
+  # A low local limit makes git skip inexact rename detection entirely: it warns
+  # on stderr and exits 0, so the maps come back empty and a move reads as a
+  # deletion both sides agreed on.
+  git config diff.renameLimit 1
+  for i in 1 2 3; do
+    printf 'file %s line one\nline two\nline three\nline four\nline five\n' "$i" > "f$i.txt"
+  done
+  commit_all "fork point"
+  git checkout --quiet -b parent
+  printf 'p\n' > p.txt && commit_all "parent work"
+  stack_base=$(git rev-parse HEAD)
+  git checkout --quiet -b child
+  # Inexact renames: moved and edited, which is what the limit gates.
+  for i in 1 2 3; do
+    git mv "f$i.txt" "g$i.txt"
+    printf 'file %s line one CHANGED\nline two\nline three\nline four\nline five\n' "$i" > "g$i.txt"
+  done
+  commit_all "child moves and edits them"
+  pre=$(git rev-parse HEAD)
+  squash_parent_onto_trunk
+  git rm --quiet f1.txt f2.txt f3.txt && commit_all "trunk deletes the old names"
+  git checkout --quiet child
+  git merge --no-ff --no-commit trunk >/dev/null 2>&1
+
+  # Each old name looks deleted by both sides, and each new name looks like an
+  # ordinary child addition, unless the renames are seen.
+  output=$("$subject" audit "$stack_base" "$pre" --trunk trunk 2>/dev/null)
+  status=$?
+  [ "$status" -ne 0 ] || fail_test "a capped rename scan reported clean: $output"
+  case "$output" in
+    *"REVIEW f1.txt"*) ;;
+    *) fail_test "the rename against a deletion was not reported: $output" ;;
+  esac
+) || failures=$((failures + 1))
+
 start_test "audit reports a rename of ours standing against a deletion on trunk"
 (
   new_stack "$work_root/renamedelete"
