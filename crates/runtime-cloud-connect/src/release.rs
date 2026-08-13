@@ -297,6 +297,9 @@ mod tests {
             gateway_addr: String::new(),
             not_after_unix: None,
             app_id: None,
+            org_name: None,
+            app_name: None,
+            monitor_url: None,
             enc_private_key_pem: String::new(),
             enc_public_key_pem: String::new(),
             enc_previous_private_key_pem: String::new(),
@@ -444,6 +447,9 @@ mod tests {
             enc_previous_private_key_pem: String::new(),
             cache_key_b64: String::new(),
             app_id: None,
+            org_name: None,
+            app_name: None,
+            monitor_url: None,
         };
         let public_key_pem = key_pair.public_key_pem();
         (identity, public_key_pem)
