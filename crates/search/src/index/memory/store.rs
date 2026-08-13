@@ -128,7 +128,7 @@ impl MemoryVectorStore {
         }
 
         let delete_keys: HashSet<&str> = keys.iter().map(String::as_str).collect();
-      
+
         // Filter every overlapping batch before touching the stored ones. This store holds
         // the only copy of the rows it is filtering, so a partially applied delete would
         // lose the batches it had already consumed. `None` marks a batch with no overlap.
