@@ -215,8 +215,14 @@ scripts/restack_stacked_branch.sh audit "$STACKBASE" "$PRE"
 ```
 
 It compares what the child *intended* against what the merge actually staged, and exits
-non-zero on any `RESURRECTED`, `LOST`, `DISCARDED`, or `REVIEW` path. Run it again after
-every correction.
+non-zero on any `RESURRECTED`, `LOST`, `DISCARDED`, or `REVIEW` path — including one that
+is simply still unmerged, since nothing has decided that either. Run it again after every
+correction.
+
+It checks that the merge in progress is the one you think it is: the side being merged
+must be `origin/trunk`, or whatever `--trunk <rev>` names. Auditing some other merge would
+compare against the wrong side, and the parent count in step 5 cannot tell the difference
+— a merge of anything has two parents.
 
 `DISCARDED` is the same failure as `RESURRECTED`, in content or file mode rather than
 existence — a reverted executable bit counts, and every blob involved is identical: when

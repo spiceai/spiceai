@@ -88,7 +88,7 @@ start_test "audit reports a path the merge restored (the case this exists for)"
   git checkout --quiet child
   git merge --no-ff --no-commit trunk >/dev/null 2>&1
 
-  output=$("$subject" audit "$stack_base" "$pre" 2>/dev/null)
+  output=$("$subject" audit "$stack_base" "$pre" --trunk trunk 2>/dev/null)
   status=$?
   [ "$status" -eq 1 ] || fail_test "expected exit 1, got $status"
   case "$output" in
@@ -112,7 +112,7 @@ start_test "audit sees through rename detection (a moved path is still audited)"
   # addition of it, and the audit would print nothing.
   git checkout --quiet "$stack_base" -- old_path.rs
 
-  output=$("$subject" audit "$stack_base" "$pre" 2>/dev/null)
+  output=$("$subject" audit "$stack_base" "$pre" --trunk trunk 2>/dev/null)
   case "$output" in
     *"RESURRECTED old_path.rs"*) ;;
     *) fail_test "rename detection hid the restored path; got: $output" ;;
@@ -131,7 +131,7 @@ start_test "audit handles paths git C-quotes (newline, non-ASCII)"
   pre=$(git rev-parse HEAD)
   git checkout --quiet "$stack_base" -- "$awkward"
 
-  output=$("$subject" audit "$stack_base" "$pre" 2>/dev/null)
+  output=$("$subject" audit "$stack_base" "$pre" --trunk trunk 2>/dev/null)
   case "$output" in
     *RESURRECTED*) ;;
     *) fail_test "C-quoted path was not reported; got: $output" ;;
@@ -153,7 +153,7 @@ start_test "audit tests the index, not the worktree (unstaged correction)"
   # still carry the file. A filesystem test would call this clean.
   rm registry.rs
 
-  output=$("$subject" audit "$stack_base" "$pre" 2>/dev/null)
+  output=$("$subject" audit "$stack_base" "$pre" --trunk trunk 2>/dev/null)
   case "$output" in
     *"RESURRECTED registry.rs"*) ;;
     *) fail_test "unstaged removal read as clean; got: $output" ;;
@@ -178,7 +178,7 @@ start_test "audit reports a child edit the merge discarded (a revert of the pare
   git checkout --quiet child
   git merge --no-ff --no-commit trunk >/dev/null 2>&1
 
-  output=$("$subject" audit "$stack_base" "$pre" 2>/dev/null)
+  output=$("$subject" audit "$stack_base" "$pre" --trunk trunk 2>/dev/null)
   status=$?
   [ "$status" -eq 1 ] || fail_test "expected exit 1, got $status ($output)"
   case "$output" in
@@ -210,7 +210,7 @@ start_test "audit reports a partial loss, where the result matches neither side"
     *PARENT*) ;;
     *) fail_test "the fixture did not reproduce the partial loss" ;;
   esac
-  output=$("$subject" audit "$stack_base" "$pre" 2>/dev/null)
+  output=$("$subject" audit "$stack_base" "$pre" --trunk trunk 2>/dev/null)
   case "$output" in
     *"DISCARDED f.txt"*) ;;
     *) fail_test "a partial loss was not reported: $output" ;;
@@ -235,7 +235,7 @@ start_test "audit reports an add/add the older base merged for you"
   # From the fork point the file still existed, so git treats these as two edits
   # to one file and combines them. From the stack base, where the parent had
   # deleted it, both sides add the same path and nothing has decided which wins.
-  output=$("$subject" audit "$stack_base" "$pre" 2>/dev/null)
+  output=$("$subject" audit "$stack_base" "$pre" --trunk trunk 2>/dev/null)
   case "$output" in
     *"REVIEW f.txt"*) ;;
     *) fail_test "a divergent add/add was not reported: $output" ;;
@@ -260,7 +260,7 @@ start_test "audit refuses to call a merge clean while a path is still unmerged"
   [ -n "$(git ls-files -u -- f.txt)" ] || fail_test "the fixture did not leave a conflict"
   # Leaving it for somebody else is not the same as the merge being right, and
   # the caller gates on this status.
-  output=$("$subject" audit "$stack_base" "$pre" 2>/dev/null)
+  output=$("$subject" audit "$stack_base" "$pre" --trunk trunk 2>/dev/null)
   status=$?
   [ "$status" -ne 0 ] || fail_test "an unresolved path was reported clean: $output"
   case "$output" in
@@ -285,9 +285,58 @@ start_test "audit refuses to call a merge clean while an added path is unmerged"
   git merge --no-ff --no-commit trunk >/dev/null 2>&1
 
   [ -n "$(git ls-files -u -- added.txt)" ] || fail_test "the fixture did not leave an add/add conflict"
-  output=$("$subject" audit "$stack_base" "$pre" 2>/dev/null)
+  output=$("$subject" audit "$stack_base" "$pre" --trunk trunk 2>/dev/null)
   status=$?
   [ "$status" -ne 0 ] || fail_test "an unresolved addition was reported clean: $output"
+) || failures=$((failures + 1))
+
+start_test "audit will not audit a merge of something other than trunk"
+(
+  new_stack "$work_root/othermerge"
+  printf 'seed\n' > seed.txt && commit_all "fork point"
+  git checkout --quiet -b parent && printf 'p\n' > p.txt && commit_all "parent"
+  stack_base=$(git rev-parse HEAD)
+  git checkout --quiet -b child && printf 'c\n' > c.txt && commit_all "child adds a file"
+  pre=$(git rev-parse HEAD)
+  squash_parent_onto_trunk
+  # An unrelated branch, merged instead of trunk. It touches nothing the child
+  # touched, so every per-path check would pass and the resulting commit has two
+  # parents, which is all the documented parent count looks at.
+  git checkout --quiet -b sidebranch trunk
+  printf 'unrelated\n' > unrelated.txt && commit_all "an unrelated branch"
+  git checkout --quiet child
+  git merge --no-ff --no-commit sidebranch >/dev/null 2>&1
+
+  output=$("$subject" audit "$stack_base" "$pre" --trunk trunk 2>/dev/null)
+  status=$?
+  [ "$status" -ne 0 ] || fail_test "auditing a merge of something else reported clean: $output"
+  case "$output" in
+    *INCOMPLETE*) ;;
+    *) fail_test "the wrong merge was not called out: $output" ;;
+  esac
+) || failures=$((failures + 1))
+
+start_test "audit will not accept a path that is still unmerged"
+(
+  new_stack "$work_root/acceptunmerged"
+  printf 'a\nb\nc\n' > f.txt && commit_all "fork point"
+  git checkout --quiet -b parent
+  printf 'a\nPARENT\nc\n' > f.txt && commit_all "parent edits line 2"
+  stack_base=$(git rev-parse HEAD)
+  git checkout --quiet -b child
+  printf 'a\nCHILD\nc\n' > f.txt && commit_all "child edits line 2"
+  pre=$(git rev-parse HEAD)
+  squash_parent_onto_trunk
+  printf 'a\nTRUNK\nc\n' > f.txt && commit_all "trunk edits line 2"
+  git checkout --quiet child
+  git merge --no-ff --no-commit trunk >/dev/null 2>&1
+  [ -n "$(git ls-files -u -- f.txt)" ] || fail_test "the fixture did not leave a conflict"
+
+  # Accepting is a statement about a decision that was staged. Nothing is staged
+  # here, so it must not be honoured.
+  output=$("$subject" audit "$stack_base" "$pre" --trunk trunk --accept f.txt 2>/dev/null)
+  status=$?
+  [ "$status" -ne 0 ] || fail_test "an unmerged path was accepted: $output"
 ) || failures=$((failures + 1))
 
 start_test "audit accepts a path a person decided, so the re-run loop can finish"
@@ -307,14 +356,14 @@ start_test "audit accepts a path a person decided, so the re-run loop can finish
   # Resolve it the way a person would, and stage that decision.
   printf 'l1\nDECIDED BY A HUMAN\nl3\n' > f.txt && git add f.txt
 
-  output=$("$subject" audit "$stack_base" "$pre" 2>/dev/null)
+  output=$("$subject" audit "$stack_base" "$pre" --trunk trunk 2>/dev/null)
   case "$output" in
     *"REVIEW f.txt"* | *"DISCARDED f.txt"*) ;;
     *) fail_test "a hand-resolved conflict was not raised at all: $output" ;;
   esac
   # Without a way to accept it the audit could never come back clean, so the
   # documented "re-run until clean" loop would not terminate.
-  output=$("$subject" audit "$stack_base" "$pre" --accept f.txt 2>/dev/null)
+  output=$("$subject" audit "$stack_base" "$pre" --trunk trunk --accept f.txt 2>/dev/null)
   status=$?
   [ "$status" -eq 0 ] || fail_test "accepting the path did not clear the audit: $output ($status)"
   case "$output" in
@@ -338,20 +387,20 @@ start_test "audit accepts a path whose name contains a newline"
   git checkout --quiet child
   git merge --no-ff --no-commit trunk >/dev/null 2>&1
 
-  output=$("$subject" audit "$stack_base" "$pre" 2>/dev/null)
+  output=$("$subject" audit "$stack_base" "$pre" --trunk trunk 2>/dev/null)
   case "$output" in
     *DISCARDED*) ;;
     *) fail_test "the fixture did not produce a finding: $output" ;;
   esac
   # Delimited text cannot hold this path: it would be split into two records,
   # clearing neither the finding nor anything else predictable.
-  output=$("$subject" audit "$stack_base" "$pre" --accept "$awkward" 2>/dev/null)
+  output=$("$subject" audit "$stack_base" "$pre" --trunk trunk --accept "$awkward" 2>/dev/null)
   status=$?
   [ "$status" -eq 0 ] || fail_test "accepting a path with a newline did not clear it: $output"
 
   # The other direction, which is the dangerous one: delimited text would let a
   # path named after one line of this one clear a finding about the whole path.
-  output=$("$subject" audit "$stack_base" "$pre" --accept two 2>/dev/null)
+  output=$("$subject" audit "$stack_base" "$pre" --trunk trunk --accept two 2>/dev/null)
   status=$?
   [ "$status" -ne 0 ] || fail_test "accepting an unrelated path cleared this finding: $output"
 ) || failures=$((failures + 1))
@@ -397,7 +446,7 @@ start_test "audit reports a path you changed that trunk deleted"
   # without a conflict. From the stack base it is a modify/delete that nobody has
   # decided, and the path is in neither the add nor the delete list.
   [ -e f.txt ] && fail_test "the fixture did not reproduce the silent deletion"
-  output=$("$subject" audit "$stack_base" "$pre" 2>/dev/null)
+  output=$("$subject" audit "$stack_base" "$pre" --trunk trunk 2>/dev/null)
   status=$?
   [ "$status" -eq 1 ] || fail_test "expected exit 1, got $status ($output)"
   case "$output" in
@@ -422,7 +471,7 @@ start_test "audit reports a discarded mode revert, where every blob is identical
 
   # Content never changed, so comparing object ids alone sees three identical
   # blobs and reports nothing while the bit the child removed survives.
-  output=$("$subject" audit "$stack_base" "$pre" 2>/dev/null)
+  output=$("$subject" audit "$stack_base" "$pre" --trunk trunk 2>/dev/null)
   case "$output" in
     *"DISCARDED run.sh"*) ;;
     *) fail_test "a mode-only revert was not reported: $output" ;;
@@ -445,7 +494,7 @@ start_test "audit reports a discarded type change (symlink back to a regular fil
   git merge --no-ff --no-commit trunk >/dev/null 2>&1
 
   # git calls this a type change, so it appears under neither M nor A nor D.
-  output=$("$subject" audit "$stack_base" "$pre" 2>/dev/null)
+  output=$("$subject" audit "$stack_base" "$pre" --trunk trunk 2>/dev/null)
   case "$output" in
     *"DISCARDED p.md"*) ;;
     *) fail_test "a discarded type change was not reported: $output" ;;
@@ -473,7 +522,7 @@ start_test "audit will not mistake an earlier merge on the child for this one"
   # No trunk merge started. HEAD^2 exists from the child's own merge, and taking
   # it for trunk would let the audit claim a check it never made.
 
-  output=$("$subject" audit "$stack_base" "$pre" 2>&1)
+  output=$("$subject" audit "$stack_base" "$pre" --trunk trunk 2>&1)
   status=$?
   # Callers gate on the status, so an audit that could not check everything must
   # not report success however clearly it explains itself.
@@ -504,7 +553,7 @@ start_test "audit does not cry wolf when both sides' edits survive the merge"
   [ -z "$(git ls-files -u -- f.txt)" ] ||
     fail_test "the fixture conflicts, so it never exercises a merged comparison"
 
-  output=$("$subject" audit "$stack_base" "$pre" 2>/dev/null)
+  output=$("$subject" audit "$stack_base" "$pre" --trunk trunk 2>/dev/null)
   status=$?
   [ "$status" -eq 0 ] || fail_test "a merge that kept both edits was reported: $output"
   case "$output" in
@@ -522,7 +571,7 @@ start_test "audit says so when it cannot check modifications, rather than implyi
   pre=$(git rev-parse HEAD)
   # No merge started, so there is no other side to compare against.
 
-  output=$("$subject" audit "$stack_base" "$pre" 2>&1)
+  output=$("$subject" audit "$stack_base" "$pre" --trunk trunk 2>&1)
   status=$?
   # Callers gate on the status, so an audit that could not check everything must
   # not report success however clearly it explains itself.
@@ -544,7 +593,7 @@ start_test "audit reports a path the merge dropped"
   pre=$(git rev-parse HEAD)
   git rm --quiet --cached added_by_child.rs >/dev/null
 
-  output=$("$subject" audit "$stack_base" "$pre" 2>/dev/null)
+  output=$("$subject" audit "$stack_base" "$pre" --trunk trunk 2>/dev/null)
   case "$output" in
     *"LOST added_by_child.rs"*) ;;
     *) fail_test "expected LOST added_by_child.rs, got: $output" ;;
@@ -566,7 +615,7 @@ start_test "audit is quiet and succeeds when the merge did what was intended"
   git checkout --quiet child
   git merge --no-ff --no-commit trunk >/dev/null 2>&1
 
-  output=$("$subject" audit "$stack_base" "$pre" 2>/dev/null)
+  output=$("$subject" audit "$stack_base" "$pre" --trunk trunk 2>/dev/null)
   status=$?
   [ "$status" -eq 0 ] || fail_test "expected exit 0 on a clean audit, got $status ($output)"
   case "$output" in
@@ -585,7 +634,7 @@ start_test "audit fails loudly on an unusable revision instead of reporting clea
   printf 'old\n' > keep.txt && commit_all "fork point"
   pre=$(git rev-parse HEAD)
 
-  output=$("$subject" audit does-not-exist "$pre" 2>&1)
+  output=$("$subject" audit does-not-exist "$pre" --trunk trunk 2>&1)
   status=$?
   [ "$status" -ne 0 ] || fail_test "a bad revision exited 0"
   case "$output" in
@@ -623,7 +672,7 @@ exec "$real_git" "\$@"
 STUB
   chmod +x "$stub_dir/git"
 
-  output=$(PATH="$stub_dir:$PATH" "$subject" audit "$stack_base" "$pre" 2>&1)
+  output=$(PATH="$stub_dir:$PATH" "$subject" audit "$stack_base" "$pre" --trunk trunk 2>&1)
   status=$?
   [ "$status" -ne 0 ] || fail_test "an unreadable index exited 0"
   case "$output" in

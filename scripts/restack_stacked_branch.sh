@@ -30,7 +30,8 @@
 # Usage:
 #   scripts/restack_stacked_branch.sh stack-base <parent-pr>
 #   scripts/restack_stacked_branch.sh resolve <stack-base> <path>
-#   scripts/restack_stacked_branch.sh audit <stack-base> <pre-merge-tip> [--accept <path>]...
+#   scripts/restack_stacked_branch.sh audit <stack-base> <pre-merge-tip>
+#            [--trunk <rev>] [--accept <path>]...
 
 set -uo pipefail
 
@@ -241,11 +242,6 @@ path_accepted() {
 # still existed, git can combine both sides' edits and call it resolved.
 audit_addition() {
   local path="$1" pre="$2" other="$3"
-  if path_accepted "$path"; then
-    echo "ACCEPTED $path"
-    return 0
-  fi
-
   local staged_entry mine_entry theirs_entry
   staged_entry=$(index_entry "$path") || die "could not read the index entry for $path"
   mine_entry=$(tree_entry "$pre" "$path") || die "could not read $pre:$path"
@@ -256,6 +252,10 @@ audit_addition() {
   if [ -n "$unmerged" ]; then
     echo "REVIEW $path: still unmerged, so nothing has decided it"
     return 1
+  fi
+  if path_accepted "$path"; then
+    echo "ACCEPTED $path"
+    return 0
   fi
   [ -n "$staged_entry" ] && [ -n "$mine_entry" ] || return 0
 
@@ -280,10 +280,6 @@ audit_addition() {
 # not against either input.
 audit_modification() {
   local path="$1" stack_base="$2" pre="$3" other="$4" tmp="$5"
-  if path_accepted "$path"; then
-    echo "ACCEPTED $path"
-    return 0
-  fi
   local staged_entry mine_entry theirs_entry base_entry
   staged_entry=$(index_entry "$path") || die "could not read the index entry for $path"
   mine_entry=$(tree_entry "$pre" "$path") || die "could not read $pre:$path"
@@ -298,9 +294,15 @@ audit_modification() {
   unmerged=$(git ls-files -u -- ":(literal)$path") || die "could not read the index for $path"
   if [ -n "$unmerged" ]; then
     # Still unmerged. Nothing has decided this path, and the command's answer is
-    # about the whole merge, so it cannot be success while one is outstanding.
+    # about the whole merge, so it cannot be success while one is outstanding --
+    # not even with --accept, which says a person decided something that is by
+    # definition not yet staged.
     echo "REVIEW $path: still unmerged, so nothing has decided it"
     return 1
+  fi
+  if path_accepted "$path"; then
+    echo "ACCEPTED $path"
+    return 0
   fi
   if [ -z "$theirs_entry" ]; then
     # You changed it, trunk deleted it. From the stack base that is a
@@ -378,7 +380,7 @@ audit_modification() {
 # backslash, or non-ASCII byte, and that quoted string names no file.
 cmd_audit() {
   local stack_base="${1:-}" pre="${2:-}"
-  [ -n "$stack_base" ] && [ -n "$pre" ] || die "usage: audit <stack-base> <pre-merge-tip> [--accept <path>]..."
+  [ -n "$stack_base" ] && [ -n "$pre" ] || die "usage: audit <stack-base> <pre-merge-tip> [--trunk <rev>] [--accept <path>]..."
   shift 2
 
   # A path this reports as REVIEW stays reported: the inputs do not change when
@@ -387,9 +389,16 @@ cmd_audit() {
   # that a person decided this path, which is the one thing the audit cannot
   # infer -- git's silent old-base resolution and a considered human one look
   # identical in the index.
+  local trunk_ref="origin/trunk"
   RESTACK_ACCEPTED=()
   while [ $# -gt 0 ]; do
     case "$1" in
+      --trunk)
+        shift
+        [ -n "${1:-}" ] || die "--trunk needs a revision"
+        trunk_ref="$1"
+        shift
+        ;;
       --accept)
         shift
         [ -n "${1:-}" ] || die "--accept needs a path"
@@ -433,8 +442,22 @@ cmd_audit() {
     die "could not diff $stack_base..$pre for modifications"
   fi
 
+  local trunk_rev
+  trunk_rev=$(git rev-parse --verify --quiet "$trunk_ref^{commit}") ||
+    die "cannot resolve $trunk_ref; pass --trunk <rev> to say what this merge brings in"
+
   local other incomplete=0
-  if ! other=$(merge_other_side "$pre"); then
+  if other=$(merge_other_side "$pre"); then
+    # An active merge is not necessarily *this* merge. Merging anything else and
+    # then auditing would otherwise compare against the wrong side and could
+    # report clean, and the parent count on the resulting commit would look right
+    # too, since it is a merge either way.
+    if [ "$other" != "$trunk_rev" ]; then
+      echo "INCOMPLETE: the merge in progress brings in ${other} rather than $trunk_ref, so modifications were not checked"
+      incomplete=1
+      other=""
+    fi
+  else
     # Outside a merge there is no other side to compare against, so the question
     # this command answers -- did the merge do what you intended -- has no answer
     # yet. Callers gate on the exit status, so it must not be success: a partial
