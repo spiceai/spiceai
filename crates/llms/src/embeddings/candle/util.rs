@@ -185,11 +185,8 @@ pub(crate) async fn download_hf_artifacts(
         .await
         .context(FailedWithHFApiSnafu)?;
 
-    // Mirror the `safetensors` -> `pytorch_model.bin` fallback that TEI applies
-    // in its private `init_backend` (backends/src/lib.rs). Some popular repos
-    // (e.g. `BAAI/bge-m3`) ship only `pytorch_model.bin`, which the Candle
-    // backend loads once the file is on disk. Keep this in sync with TEI when
-    // adding new weight formats (sharded pytorch, ONNX, GGUF).
+    // Fallback to `pytorch_model.bin` if no safetensors. 
+    // Supported by text-embedding-inference, but must be kept in sync manually (if new weight formats).
     if download_safetensors(Arc::clone(&api_repo)).await.is_err() {
         tracing::warn!(
             "safetensors weights not found; falling back to `pytorch_model.bin`. Model loading is significantly slower."
