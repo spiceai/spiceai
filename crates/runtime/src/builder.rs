@@ -402,7 +402,7 @@ impl RuntimeBuilder {
         let cayenne_segment_cache_mb =
             parse_usize_runtime_param(&spicepod_rt.params, CAYENNE_SEGMENT_CACHE_MB_PARAM);
         log_applied_cayenne_param(CAYENNE_SEGMENT_CACHE_MB_PARAM, cayenne_segment_cache_mb);
-        install_segment_cache(cayenne_segment_cache_mb);
+        install_segment_cache(self.app.as_ref(), cayenne_segment_cache_mb);
         let cayenne_filter_propagation = parse_cayenne_filter_propagation(&spicepod_rt.params);
 
         // Process-global SQLite metastore pragma tuning (cache, mmap, busy
@@ -1046,6 +1046,14 @@ fn parse_memory_limit(memory_limit: Option<String>) -> Option<u64> {
 /// somewhat more than the old per-table share, while a fleet of tables can no
 /// longer multiply it. `0` disables segment caching.
 ///
+/// The floor matches the old per-table floor on purpose, and is not a regression
+/// against it: the old default floored at 256 MiB *per table*, so below 16 GiB —
+/// where `RAM/64` is still under the floor — this whole-process budget is at most
+/// what a single table used to take, and strictly less for any pod with two or
+/// more. A deployment that set an explicit per-table value smaller than the floor
+/// is the one case this does not cover, and no floor would: the fix there is to
+/// set `runtime.params.cayenne_segment_cache_mb`.
+///
 /// Note `get_total_memory()` prefers the cgroup limit but falls back to host RAM,
 /// so a pod with `requests.memory` and no `limits.memory` still derives from the
 /// node's memory; that entitlement gap is tracked separately.
@@ -1063,13 +1071,42 @@ fn segment_cache_budget_bytes(configured_mb: Option<usize>) -> u64 {
 }
 
 /// Install the process-wide Vortex segment cache before any Cayenne table is
-/// registered, so every format shares one budget.
-fn install_segment_cache(configured_mb: Option<usize>) {
-    let bytes = segment_cache_budget_bytes(configured_mb);
-    if bytes == 0 {
-        tracing::info!(
-            "Vortex segment cache disabled by runtime.params.{CAYENNE_SEGMENT_CACHE_MB_PARAM}=0"
+/// Install the process-wide Vortex segment cache, if this app has a Cayenne table
+/// to use it.
+///
+/// Gated on an actual Cayenne acceleration because the reservation planner counts
+/// the cache against the query memory pool: installing one for an app that can
+/// never read from it would shrink every other query's budget for nothing.
+fn install_segment_cache(app: Option<&Arc<app::App>>, configured_mb: Option<usize>) {
+    let Some(app) = app else {
+        return;
+    };
+    #[cfg(not(windows))]
+    if cayenne_accelerations(app).next().is_none() {
+        tracing::debug!(
+            "No Cayenne acceleration configured; skipping the Vortex segment cache install"
         );
+        return;
+    }
+    #[cfg(windows)]
+    {
+        // Cayenne is not compiled on Windows, so nothing can read the cache.
+        let _ = app;
+        return;
+    }
+
+    // `runtime.params.cayenne_segment_cache_mb` is the only input. Per-table values
+    // sized a per-table cache; there is no conversion from them to a shared budget
+    // that is not invented, and a single dataset's setting must not decide the
+    // budget every other table reads from. They are reported as ignored where they
+    // are read, against the dataset that set them.
+    #[cfg_attr(windows, expect(unreachable_code, reason = "Cayenne is not built on Windows"))]
+    let bytes = segment_cache_budget_bytes(configured_mb);
+
+    if bytes == 0 {
+        // Install the decision, not just the absence of one: a format must not
+        // substitute a private cache for one the operator switched off.
+        vortex_datafusion::install_process_segment_cache(0);
         return;
     }
     if vortex_datafusion::install_process_segment_cache(bytes) {
@@ -1529,18 +1566,10 @@ fn estimate_cayenne_reservation_bytes(
     let global_coalesce_bytes =
         parse_u64(runtime_params, &["cdc_max_coalesced_bytes"]).unwrap_or(DEFAULT_COALESCE_BYTES);
 
-    // Scan-path cache: one process-wide cache shared by every table, so its
-    // budget is counted once rather than per acceleration. Prefer the installed
-    // capacity — the estimate then describes the cache that exists, including
-    // when an earlier runtime in this process installed a different budget.
-    let mut total: u64 =
-        vortex_datafusion::process_segment_cache_capacity_bytes().unwrap_or_else(|| {
-            segment_cache_budget_bytes(parse_usize_runtime_param(
-                runtime_params,
-                CAYENNE_SEGMENT_CACHE_MB_PARAM,
-            ))
-        });
+    let mut total: u64 = 0;
+    let mut has_cayenne_acceleration = false;
     for (accel, profile) in cayenne_accelerations(app) {
+        has_cayenne_acceleration = true;
         let params = accel
             .params
             .as_ref()
@@ -1602,6 +1631,19 @@ fn estimate_cayenne_reservation_bytes(
             .saturating_add(keyset)
             .saturating_add(coalesce)
             .saturating_add(inline);
+    }
+
+    // Scan-path cache: one process-wide cache shared by every table, so it is
+    // counted once rather than per acceleration — and only when a Cayenne table
+    // exists to use it. `install_segment_cache` is gated the same way, so an app
+    // with no Cayenne acceleration has no cache to reserve against, and reserving
+    // anyway would shrink the query pool for memory that is never allocated.
+    // Reading the installed capacity rather than recomputing the budget also
+    // reports zero when caching is switched off.
+    if has_cayenne_acceleration {
+        total = total.saturating_add(
+            vortex_datafusion::process_segment_cache_capacity_bytes().unwrap_or(0),
+        );
     }
     total
 }
@@ -1989,6 +2031,50 @@ fn parse_cayenne_optimizer_rules(
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[cfg(not(windows))]
+    fn dataset_with_cayenne(
+        name: &str,
+        segment_cache_mb: Option<&str>,
+    ) -> spicepod::component::dataset::Dataset {
+        let mut dataset =
+            spicepod::component::dataset::Dataset::new("postgres:public.t", name);
+        let mut acceleration = spicepod::acceleration::Acceleration {
+            enabled: true,
+            engine: Some("cayenne".to_string()),
+            ..Default::default()
+        };
+        if let Some(mb) = segment_cache_mb {
+            acceleration.params = Some(spicepod::param::Params::from_string_map(
+                [("cayenne_segment_cache_mb".to_string(), mb.to_string())]
+                    .into_iter()
+                    .collect(),
+            ));
+        }
+        dataset.acceleration = Some(acceleration);
+        dataset
+    }
+
+    /// A pod with no Cayenne acceleration must reserve nothing. The reservation is
+    /// subtracted from the query memory limit, so counting a cache that is never
+    /// installed would shrink every query's budget for memory nothing allocates.
+    #[cfg(not(windows))]
+    #[test]
+    fn no_cayenne_acceleration_reserves_nothing() {
+        let app = Arc::new(
+            app::AppBuilder::new("test")
+                .with_dataset(spicepod::component::dataset::Dataset::new(
+                    "postgres:public.t",
+                    "plain",
+                ))
+                .build(),
+        );
+        assert_eq!(
+            estimate_cayenne_reservation_bytes(Some(&app), &HashMap::new()),
+            0,
+            "a pod with no Cayenne table reserves nothing, segment cache included"
+        );
+    }
 
     #[test]
     fn segment_cache_budget_honours_an_explicit_value() {

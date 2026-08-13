@@ -1359,8 +1359,8 @@ impl CayenneAccelerator {
             if let autotune::Knob::Set(requested_mb) =
                 autotune::read_knob(acceleration, &["cayenne_segment_cache_mb"])
             {
-                tracing::info!(
-                    "Dataset {table_name}: acceleration.params.cayenne_segment_cache_mb={requested_mb} is no longer applied per table — the Vortex segment cache is shared by every table under one budget. Set runtime.params.cayenne_segment_cache_mb to size it. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+                tracing::warn!(
+                    "Dataset {table_name}: acceleration.params.cayenne_segment_cache_mb={requested_mb} is ignored. The Vortex segment cache is now a single budget shared by every table instead of one cache per table, so a per-table size has nothing to size. To control it, set runtime.params.cayenne_segment_cache_mb (in MB; 0 disables caching). See: https://spiceai.org/docs/components/data-accelerators/cayenne"
                 );
             }
 
@@ -2689,7 +2689,7 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
             .one_of(&["string", "error", "ignore", "warn"])
             .default("string"),
         ParameterSpec::component("segment_cache_mb")
-            .description("Deprecated and no longer applied per table: the in-memory Vortex decompressed-segment cache is shared by every Cayenne table under a single budget. Set runtime.params.cayenne_segment_cache_mb to size it (unset: ~1/64 of the available memory, clamped to [256 MB, 2048 MB]; 0 disables caching). A value set here is ignored with a log line."),
+            .description("Ignored: the in-memory Vortex decompressed-segment cache is now one budget shared by every Cayenne table rather than a cache per table, so a per-table size no longer has anything to size. Set runtime.params.cayenne_segment_cache_mb instead (unset: ~1/64 of the available memory, clamped to [256 MB, 2048 MB]; 0 disables caching). A value set here is reported at startup and otherwise has no effect."),
         ParameterSpec::component("pk_keyset_cache_mb")
             .description("Byte budget (in MB) for the in-memory primary-key index used to detect upsert conflicts during CDC ingestion. Within budget an exact keyset is kept; over budget, upsert tables fall back to a bounded bloom existence filter (avoiding the per-batch full-table rebuild) while DoNothing tables rebuild from a scan. When unset, an optimal default is derived from available machine memory."),
         ParameterSpec::component("target_file_size_mb")
