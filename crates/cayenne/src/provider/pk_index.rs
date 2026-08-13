@@ -732,6 +732,235 @@ impl CachedPkIndex {
     }
 }
 
+/// One committed key batch held while a PK existence index was checked out of
+/// its cache. Carries the recorded [`RowLocation`] and commit sequence verbatim
+/// so replaying it into the restored index is byte-identical to having recorded
+/// it directly.
+struct PendingPkKeyBatch {
+    keys: PkDigestSet,
+    location: RowLocation,
+    sequence: i64,
+}
+
+/// Divisor applied to a PK cache's byte budget to bound its pending-key log.
+/// The log is transient (it lives only while an index is checked out) and holds
+/// the same per-key payload as the cache, so a quarter keeps the worst case a
+/// fraction of the index it protects.
+const PENDING_PK_KEYS_BUDGET_DIVISOR: usize = 4;
+
+/// Keys committed by other writers while a PK existence index was checked out
+/// of its cache for validation.
+///
+/// A validation stream takes the shared index out of its cache cell and holds it
+/// for the whole lazily-consumed stream, so a writer that commits during that
+/// window finds the cell empty. Recording its keys there is a no-op, and an
+/// existence entry that never lands leaves the index a strict UNDER-approximation
+/// of the live rows — a later upsert probes the restored index, misses, and
+/// classifies the key as new, so it emits no supersede and the table ends up with
+/// two live rows for one primary key. (Over-approximation is the safe direction:
+/// a stale-present entry only costs a redundant tombstone.)
+///
+/// The keys are therefore held here instead, and are both:
+/// - merged into the index when it is restored, so the cache regains every key, and
+/// - probed by the in-flight validation that holds the checked-out index, so a key
+///   committed mid-stream is not read as a new primary key by the writer whose
+///   snapshot predates it.
+///
+/// Bounded by a byte cap. Past it the log stops recording, its snapshot reports
+/// [`PendingPkExistence::is_incomplete`], and the restore discards the index
+/// (forcing an authoritative rebuild) rather than caching one that is silently
+/// missing keys.
+#[derive(Default)]
+pub(crate) struct PendingPkKeys {
+    /// How many indexes are currently checked out over this cache. Distinguishes
+    /// "checked out" from "no cache at all": a cold cache needs no log, because the
+    /// next validation rebuilds the index from the table and sees every committed
+    /// key. Normally 0 or 1 (writers are serialized by the table write lock); see
+    /// [`Self::begin_checkout`] for what a second one means.
+    outstanding: usize,
+    batches: Vec<PendingPkKeyBatch>,
+    approx_bytes: usize,
+    /// The log hit its byte cap and stopped recording, so it no longer holds every
+    /// key committed during the checkout.
+    overflowed: bool,
+    /// The cache was invalidated while the index was checked out, so the index
+    /// describes a table state that has since been superseded (a DELETE, a
+    /// compaction, a recovery) and must not be cached when it comes back.
+    invalidated: bool,
+}
+
+impl PendingPkKeys {
+    /// Byte cap for a log protecting a cache with `cache_budget` bytes.
+    pub(crate) fn budget_from_cache_budget(cache_budget: usize) -> usize {
+        cache_budget / PENDING_PK_KEYS_BUDGET_DIVISOR
+    }
+
+    /// Open a checkout window: keys committed from here until [`Self::end_checkout`]
+    /// are recorded. Any residue from an abandoned checkout is dropped — that index
+    /// was never stored back, so the next validation rebuilds from the table and
+    /// already sees those keys.
+    ///
+    /// Opening a SECOND window while one is outstanding puts two independently-aged
+    /// indexes over one cache: each was read at a different point, so whichever is
+    /// stored last silently reverts the other's keys. Neither is trustworthy, so both
+    /// are marked for discard and the cache goes cold — one rebuild instead of a
+    /// cache that answers "absent" for a live key. Writers are serialized by the
+    /// table write lock, so this is a backstop, not a routine path.
+    pub(crate) fn begin_checkout(&mut self) {
+        if self.outstanding == 0 {
+            self.overflowed = false;
+            self.invalidated = false;
+        } else {
+            self.invalidated = true;
+        }
+        self.batches.clear();
+        self.approx_bytes = 0;
+        self.outstanding = self.outstanding.saturating_add(1);
+    }
+
+    /// Report that the cache was invalidated while an index was checked out, so the
+    /// restore drops that index instead of resurrecting a superseded one. A no-op
+    /// when nothing is checked out — there is then no index in flight, and the flag
+    /// would otherwise leak into the next checkout.
+    pub(crate) fn invalidate(&mut self) {
+        if self.outstanding == 0 {
+            return;
+        }
+        self.invalidated = true;
+        self.batches.clear();
+        self.approx_bytes = 0;
+    }
+
+    /// Hold one committed key batch. A no-op when no index is checked out, or once
+    /// the log has stopped recording. Callers read [`Self::approx_bytes`] around the
+    /// call to account the change.
+    pub(crate) fn record(
+        &mut self,
+        keys: &PkDigestSet,
+        location: &RowLocation,
+        sequence: i64,
+        max_bytes: usize,
+    ) {
+        if self.outstanding == 0 || self.overflowed || self.invalidated {
+            return;
+        }
+        let batch_bytes = keys
+            .iter()
+            .map(approx_pk_keyset_entry_bytes)
+            .fold(0, usize::saturating_add);
+        if self.approx_bytes.saturating_add(batch_bytes) > max_bytes {
+            // Stop holding keys rather than grow without bound, and release the ones
+            // already held: the index this log protects is now unrecoverable either
+            // way, and `end_checkout` reports that so it is discarded instead of
+            // being stored back missing entries.
+            self.overflowed = true;
+            self.batches.clear();
+            self.approx_bytes = 0;
+            return;
+        }
+        self.approx_bytes = self.approx_bytes.saturating_add(batch_bytes);
+        self.batches.push(PendingPkKeyBatch {
+            keys: keys.clone(),
+            location: location.clone(),
+            sequence,
+        });
+    }
+
+    /// Close the checkout window and hand back everything committed during it. With
+    /// several windows outstanding every one of them reports a discard, and the flags
+    /// only reset once the last closes.
+    pub(crate) fn end_checkout(&mut self) -> RestoredPkKeys {
+        let restored = RestoredPkKeys {
+            batches: std::mem::take(&mut self.batches),
+            discard_index: self.overflowed || self.invalidated,
+        };
+        self.approx_bytes = 0;
+        self.outstanding = self.outstanding.saturating_sub(1);
+        if self.outstanding == 0 {
+            self.overflowed = false;
+            self.invalidated = false;
+        }
+        restored
+    }
+
+    /// Existence view over the keys held so far, for the validation that holds the
+    /// checked-out index. `None` when nothing was committed during this checkout —
+    /// the overwhelmingly common case, which costs one uncontended lock.
+    pub(crate) fn existence(&self) -> Option<PendingPkExistence> {
+        if self.batches.is_empty() && !self.overflowed {
+            return None;
+        }
+        let capacity = self
+            .batches
+            .iter()
+            .map(|batch| batch.keys.len())
+            .fold(0, usize::saturating_add);
+        let mut locations: HashMap<u128, RowLocation, PrehashedBuildHasher> =
+            HashMap::with_capacity_and_hasher(capacity, PrehashedBuildHasher);
+        // Later batches win: a key committed twice during the checkout lives where
+        // its most recent commit put it.
+        for batch in &self.batches {
+            for (digest, _) in batch.keys.iter_with_digest() {
+                locations.insert(digest, batch.location.clone());
+            }
+        }
+        Some(PendingPkExistence {
+            locations,
+            incomplete: self.overflowed,
+        })
+    }
+
+    /// Bytes currently held, for memory accounting.
+    pub(crate) fn approx_bytes(&self) -> usize {
+        self.approx_bytes
+    }
+}
+
+/// Keys committed while an index was checked out, handed to the restore.
+pub(crate) struct RestoredPkKeys {
+    batches: Vec<PendingPkKeyBatch>,
+    discard_index: bool,
+}
+
+impl RestoredPkKeys {
+    /// Whether the index that was checked out must be dropped rather than cached:
+    /// keys committed during the checkout went unheld (the log hit its cap), or the
+    /// cache was invalidated while the index was out. Caching it either way would
+    /// answer "absent" for a live key, which reads as a new primary key.
+    pub(crate) fn index_must_be_discarded(&self) -> bool {
+        self.discard_index
+    }
+
+    /// Replay every held batch, oldest first, so a key committed twice ends on its
+    /// most recent location and sequence.
+    pub(crate) fn batches(&self) -> impl Iterator<Item = (&PkDigestSet, &RowLocation, i64)> {
+        self.batches
+            .iter()
+            .map(|batch| (&batch.keys, &batch.location, batch.sequence))
+    }
+}
+
+/// Snapshot of a [`PendingPkKeys`] log handed to per-batch validation alongside
+/// the checked-out index, so an index miss can still see a concurrent commit.
+pub(crate) struct PendingPkExistence {
+    locations: HashMap<u128, RowLocation, PrehashedBuildHasher>,
+    incomplete: bool,
+}
+
+impl PendingPkExistence {
+    /// Where a key committed during this checkout lives, or `None` if no such key
+    /// was recorded.
+    pub(crate) fn location_by_digest(&self, digest: u128) -> Option<&RowLocation> {
+        self.locations.get(&digest)
+    }
+
+    /// Whether keys committed during this checkout went unrecorded, so a miss here
+    /// does not prove the key is absent from the table.
+    pub(crate) fn is_incomplete(&self) -> bool {
+        self.incomplete
+    }
+}
+
 /// Streaming, budget-bounded builder for the cold PK-index rebuild
 /// (`load_existing_pk_index`). Routes every scanned key to its shard
 /// (`shard_of_pk`) as it arrives and, when a byte budget is set (upsert tables,
