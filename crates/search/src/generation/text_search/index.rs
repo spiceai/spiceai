@@ -1105,7 +1105,7 @@ mod tests {
     /// applied. With `id = 47` pushed down, the matching document remains available even when
     /// `limit = 1`. Regression test for #12231.
     #[tokio::test]
-    #[allow(
+    #[expect(
         clippy::float_cmp,
         reason = "asserts the relevance score is bit-identical whether or not a pushed SQL filter is applied"
     )]
