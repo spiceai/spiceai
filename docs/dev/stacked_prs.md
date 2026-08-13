@@ -217,8 +217,13 @@ before the script existed:
 one not to skip:
 
 ```bash
-scripts/restack_stacked_branch.sh audit "$STACKBASE" "$PRE"
+scripts/restack_stacked_branch.sh audit "$STACKBASE" "$PRE" --parent-head "$PARENT_HEAD"
 ```
+
+Pass `--parent-head`: without it the stack base can only be checked by ancestry, and an
+*earlier* parent commit passes that test while leaving everything the parent added after
+it out of the comparison entirely — so the merge could restore a file the child deleted
+and the audit would have nothing to say. It reports when it could not make that check.
 
 It compares what the child *intended* against what the merge actually staged, and exits
 non-zero on any `RESURRECTED`, `LOST`, `DISCARDED`, or `REVIEW` path — including one that

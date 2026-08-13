@@ -34,7 +34,7 @@
 #   scripts/restack_stacked_branch.sh stack-base <parent-pr> [--child <ref>]
 #   scripts/restack_stacked_branch.sh resolve <stack-base> <path>
 #   scripts/restack_stacked_branch.sh audit <stack-base> <pre-merge-tip>
-#            [--trunk <rev>] [--accept <path>]...
+#            [--trunk <rev>] [--parent-head <rev>] [--accept <path>]...
 
 set -uo pipefail
 
@@ -245,14 +245,8 @@ resolve_with_tmp() {
 # reading that as "absent" would report `audit clean` for a child whose work is
 # entirely deletions: the same false negative the audit exists to prevent.
 path_in_index() {
-  local candidate="$1" status
-  git ls-files --error-unmatch -- ":(literal)$candidate" >/dev/null 2>&1
-  status=$?
-  case "$status" in
-    0) return 0 ;;
-    1) return 1 ;;
-    *) die "git ls-files failed with status $status while checking $candidate" ;;
-  esac
+  index_fatal_check "$1"
+  git rev-parse --verify --quiet ":0:$1" >/dev/null 2>&1
 }
 
 # The commit being merged in, which the modification check compares against:
@@ -297,10 +291,22 @@ tree_entry() {
 }
 
 index_entry() {
-  local out
-  out=$(git ls-files --stage -- ":(literal)$1") || return 1
-  [ -n "$out" ] || return 0
-  printf '%s\n' "$out" | awk '$3 == 0 { print $1 " " $2 }'
+  local want="$1" oid record fields stage mode=""
+  index_fatal_check "$want"
+  oid=$(git rev-parse --verify --quiet ":0:$want") || return 0
+  # The mode has to come from ls-files, read NUL-delimited: without -z git
+  # C-quotes a path containing a newline and no exact comparison would match. The
+  # pathspec can also have matched children, so take only this exact path.
+  while IFS= read -r -d '' record; do
+    [ "${record#*$'\t'}" = "$want" ] || continue
+    fields=${record%%$'\t'*}
+    stage=${fields##* }
+    [ "$stage" = 0 ] || continue
+    mode=${fields%% *}
+    break
+  done < <(git ls-files --stage -z -- ":(literal)$want")
+  [ -n "$mode" ] || return 0
+  printf '%s %s' "$mode" "$oid"
 }
 
 # Did trunk rename this path away rather than delete it? Prints the new name.
@@ -425,6 +431,19 @@ accept_or_review() {
 # Was this path explicitly accepted by a person on the command line? The list is
 # an array rather than delimited text because a path may itself contain a
 # newline, which this command supports everywhere else.
+# A pathspec matches a whole directory, so `-- :(literal)dir` succeeds when the
+# index holds only dir/file. These two ask about the exact path instead, through
+# the :0: index syntax, while still separating "not there" from "could not look".
+index_fatal_check() {
+  local status
+  git ls-files --stage -- ":(literal)$1" >/dev/null 2>&1
+  status=$?
+  case "$status" in
+    0 | 1) return 0 ;;
+    *) die "git ls-files failed with status $status while checking $1" ;;
+  esac
+}
+
 path_accepted() {
   local candidate="$1" entry
   for entry in ${RESTACK_ACCEPTED+"${RESTACK_ACCEPTED[@]}"}; do
@@ -576,7 +595,7 @@ audit_modification() {
 # backslash, or non-ASCII byte, and that quoted string names no file.
 cmd_audit() {
   local stack_base="${1:-}" pre="${2:-}"
-  [ -n "$stack_base" ] && [ -n "$pre" ] || die "usage: audit <stack-base> <pre-merge-tip> [--trunk <rev>] [--accept <path>]..."
+  [ -n "$stack_base" ] && [ -n "$pre" ] || die "usage: audit <stack-base> <pre-merge-tip> [--trunk <rev>] [--parent-head <rev>] [--accept <path>]..."
   shift 2
 
   # A path this reports as REVIEW stays reported: the inputs do not change when
@@ -585,10 +604,16 @@ cmd_audit() {
   # that a person decided this path, which is the one thing the audit cannot
   # infer -- git's silent old-base resolution and a considered human one look
   # identical in the index.
-  local trunk_ref="origin/trunk"
+  local trunk_ref="origin/trunk" parent_head_ref=""
   RESTACK_ACCEPTED=()
   while [ $# -gt 0 ]; do
     case "$1" in
+      --parent-head)
+        shift
+        [ -n "${1:-}" ] || die "--parent-head needs a revision"
+        parent_head_ref="$1"
+        shift
+        ;;
       --trunk)
         shift
         [ -n "${1:-}" ] || die "--trunk needs a revision"
@@ -668,6 +693,24 @@ cmd_audit() {
     *) die "could not tell whether $stack_base is contained in $trunk_ref (status $ancestry)" ;;
   esac
 
+  # Ancestry alone cannot tell the parent's tip from an earlier parent commit:
+  # both are ancestors of the child and absent from a squash-merged trunk. An
+  # earlier one leaves its own additions out of every intent diff, so the merge
+  # can restore what the child deleted and nothing here would notice. Given the
+  # parent's head, the answer is exact.
+  if [ -z "$parent_head_ref" ]; then
+    echo "note: no --parent-head given, so the stack base was checked only by ancestry" >&2
+  fi
+  if [ -n "$parent_head_ref" ]; then
+    local parent_head_rev expected_base
+    parent_head_rev=$(git rev-parse --verify --quiet "$parent_head_ref^{commit}") ||
+      die "cannot resolve $parent_head_ref"
+    expected_base=$(git merge-base "$pre" "$parent_head_rev") ||
+      die "no common commit between $pre and $parent_head_ref"
+    [ "$(git rev-parse --verify --quiet "$stack_base^{commit}")" = "$expected_base" ] ||
+      die "$stack_base is not the newest commit of $parent_head_ref contained in $pre; that is $expected_base"
+  fi
+
   local other incomplete=0
   if other=$(merge_other_side "$pre"); then
     # An active merge is not necessarily *this* merge. Merging anything else and
@@ -731,6 +774,9 @@ cmd_audit() {
 
   while IFS= read -r -d '' path; do
     if ! path_in_index "$path"; then
+      # An unmerged path has no stage 0 either, and the index-wide scan above has
+      # already reported it.
+      [ -z "$(git ls-files -u -- ":(literal)$path")" ] || continue
       # The deletion survived, which is right unless trunk changed the file after
       # the stack base: then the correct merge is a delete/modify, and the older
       # base only made it look settled -- trunk's change is invisible from there

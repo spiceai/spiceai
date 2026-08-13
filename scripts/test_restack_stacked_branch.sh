@@ -532,6 +532,72 @@ start_test "audit works the same from a subdirectory as from the root"
   esac
 ) || failures=$((failures + 1))
 
+start_test "audit does not confuse a directory prefix with the path itself"
+(
+  new_stack "$work_root/prefix"
+  printf 'a file, not a directory\n' > dir && printf 'seed\n' > seed.txt && commit_all "fork point"
+  git checkout --quiet -b parent
+  printf 'p\n' > p.txt && commit_all "parent work"
+  stack_base=$(git rev-parse HEAD)
+  git checkout --quiet -b child
+  # Replace the file with a directory of the same name: a legitimate change, and
+  # one where a pathspec for `dir` also matches `dir/file`.
+  git rm --quiet dir && mkdir -p dir && printf 'child\n' > dir/file && commit_all "child makes dir a directory"
+  pre=$(git rev-parse HEAD)
+  squash_parent_onto_trunk
+  git checkout --quiet child
+  git merge --no-ff --no-commit trunk >/dev/null 2>&1
+  [ -f dir/file ] || fail_test "the fixture did not keep the directory"
+  [ ! -f dir ] || fail_test "the fixture still has a file called dir"
+
+  # The child deleted `dir`, and the index contains only `dir/file`. Asking with a
+  # pathspec would say `dir` is present and call this a resurrection.
+  output=$("$subject" audit "$stack_base" "$pre" --trunk trunk 2>/dev/null)
+  status=$?
+  [ "$status" -eq 0 ] || fail_test "a file-to-directory replacement was reported: $output"
+) || failures=$((failures + 1))
+
+start_test "audit rejects an earlier parent commit when it knows the parent head"
+(
+  new_stack "$work_root/stalebase"
+  printf 'old\n' > keep.txt && commit_all "fork point"
+  git checkout --quiet -b parent
+  printf 'p1\n' > p1.txt && commit_all "parent commit one"
+  earlier=$(git rev-parse HEAD)
+  printf 'registry\n' > registry.rs && commit_all "parent commit two adds registry.rs"
+  parent_head=$(git rev-parse HEAD)
+  git checkout --quiet -b child
+  git rm --quiet registry.rs && commit_all "child deletes registry.rs"
+  pre=$(git rev-parse HEAD)
+  squash_parent_onto_trunk
+  git checkout --quiet child
+  git merge --no-ff --no-commit trunk >/dev/null 2>&1
+  [ -e registry.rs ] || fail_test "the fixture did not restore the deleted file"
+
+  # The earlier parent commit is an ancestor of the child and absent from trunk,
+  # so ancestry alone accepts it — and registry.rs, added after it, appears in no
+  # intent diff at all.
+  # Ancestry cannot tell: it says so rather than implying the base was verified.
+  output=$("$subject" audit "$earlier" "$pre" --trunk trunk 2>&1)
+  case "$output" in
+    *"checked only by ancestry"*) ;;
+    *) fail_test "an unverifiable base was not called out: $output" ;;
+  esac
+  output=$("$subject" audit "$earlier" "$pre" --trunk trunk --parent-head "$parent_head" 2>&1)
+  status=$?
+  [ "$status" -ne 0 ] || fail_test "the parent head did not expose the wrong base: $output"
+  case "$output" in
+    *"is not the newest commit"*) ;;
+    *) fail_test "expected the base to be named as wrong, got: $output" ;;
+  esac
+  # And the right base with the same check still works.
+  output=$("$subject" audit "$parent_head" "$pre" --trunk trunk --parent-head "$parent_head" 2>/dev/null)
+  case "$output" in
+    *"RESURRECTED registry.rs"*) ;;
+    *) fail_test "the correct base did not report the resurrection: $output" ;;
+  esac
+) || failures=$((failures + 1))
+
 start_test "audit refuses the fork point in place of the stack base"
 (
   new_stack "$work_root/forkpointarg"
