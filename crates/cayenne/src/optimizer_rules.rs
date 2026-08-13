@@ -60,8 +60,9 @@ limitations under the License.
 //!    of the pool (the smaller of an absolute fraction and an even split across
 //!    all hash joins in the plan). With no pool configured it falls back to the
 //!    original conservative scope: same-source semi/anti joins above a 10M-row
-//!    exact build-side threshold. Joins carrying an embedded projection are left
-//!    alone and fall back to the `runtime.query.prefer_hash_join` knob.
+//!    exact build-side threshold. A join carrying an embedded projection is
+//!    rewritten to a `ProjectionExec` over the sort-merge join, hoisting the
+//!    projection back out of the join.
 //!
 //! The ordinary inner-join probe side is handled by `DataFusion`'s *native*
 //! hash-join dynamic-filter pushdown. For inner joins (the only shape
@@ -246,10 +247,10 @@ impl std::fmt::Debug for CayenneDynamicFilterSharing {
 /// estimated build side would not fit its share of the pool is rewritten to a
 /// `SortMergeJoinExec` with spillable `SortExec` inputs. Smaller joins, and
 /// (when no pool is configured) everything but same-source semi/anti joins, are
-/// left as hash joins because that is usually the faster plan. Joins that carry
-/// an embedded output projection are also left alone — `HashJoinExec` exposes
-/// no accessor to reconstruct the projection onto a sort-merge join — and fall
-/// back to the deterministic `runtime.query.prefer_hash_join` knob.
+/// left as hash joins because that is usually the faster plan. A join that
+/// carries an embedded output projection is rewritten to a `ProjectionExec`
+/// over the sort-merge join: the projection indices are hoisted back out of
+/// the join, preserving the output schema exactly.
 #[derive(Default)]
 pub struct CayenneAntiJoinSortMergeRewriter;
 
@@ -778,11 +779,7 @@ fn try_rewrite_oversized_join(
         return Ok(None);
     }
 
-    // `SortMergeJoinExec` carries no embedded output projection and
-    // `HashJoinExec` exposes no accessor to read one back, so a projected join
-    // cannot be rewritten without changing the output schema; leave it to the
-    // deterministic `runtime.query.prefer_hash_join` knob.
-    if hash_join.contains_projection() || hash_join.on().is_empty() {
+    if hash_join.on().is_empty() {
         return Ok(None);
     }
 
@@ -895,12 +892,51 @@ fn try_rewrite_oversized_join(
         hash_join.null_equality(),
     )?;
 
+    // A projected hash join emits only a subset of the combined join columns
+    // (`ProjectionPushdown` folds the trivial projection into the join).
+    // `SortMergeJoinExec` has no embedded projection, so hoist the index list
+    // back out into an explicit `ProjectionExec` over the sort-merge join —
+    // the plan shape that existed before the pushdown. The indices apply to
+    // the combined join schema, which the sort-merge join builds identically
+    // from the same inputs and join type, so they carry over unchanged. TPC-DS
+    // q97's full-outer join arrives here only in this projected form.
+    let rewritten: Arc<dyn ExecutionPlan> = match hash_join.projection.as_ref() {
+        Some(projection) => {
+            let join: Arc<dyn ExecutionPlan> = Arc::new(join);
+            let join_schema = join.schema();
+            let mut exprs: Vec<(Arc<dyn PhysicalExpr>, String)> =
+                Vec::with_capacity(projection.len());
+            for &index in projection.iter() {
+                let Some(field) = join_schema.fields().get(index) else {
+                    // An index past the combined join schema cannot be
+                    // reconstructed; keep the original join rather than risk a
+                    // wrong schema.
+                    return Ok(None);
+                };
+                exprs.push((
+                    Arc::new(Column::new(field.name(), index)),
+                    field.name().clone(),
+                ));
+            }
+            let projected = Arc::new(ProjectionExec::try_new(exprs, join)?);
+            // The rewrite must be schema-preserving: every parent operator
+            // addresses columns by position. Decline rather than emit a
+            // mismatched plan.
+            if projected.schema() != hash_join.schema() {
+                return Ok(None);
+            }
+            projected
+        }
+        None => Arc::new(join),
+    };
+
     tracing::debug!(
         join_type = ?hash_join.join_type(),
+        projected = hash_join.contains_projection(),
         "Replaced large Cayenne HashJoinExec with spillable SortMergeJoinExec"
     );
 
-    Ok(Some(Arc::new(join)))
+    Ok(Some(rewritten))
 }
 
 /// Build-side (LEFT input) row count for the spillable rewrite, accepting an
@@ -3454,6 +3490,58 @@ mod tests {
         assert!(
             optimized.is::<SortMergeJoinExec>(),
             "a large full-outer hash join over the memory gate should become a sort-merge join"
+        );
+    }
+
+    /// A hash join carrying an embedded output projection (`ProjectionPushdown`
+    /// folds one in whenever downstream needs a column subset — TPC-DS q97's
+    /// full-outer join always arrives in this form) must still be rewritten:
+    /// the projection is hoisted into a `ProjectionExec` over the sort-merge
+    /// join, and the output schema must survive byte-for-byte. The projection
+    /// here selects a subset, reorders it, and drops the join keys — the same
+    /// shape the q97 plan exhibits.
+    #[test]
+    fn rewrites_projected_full_outer_hash_join_hoisting_projection() {
+        let schema = order_line_schema();
+        let left = large_exact_cayenne_file_exec(&schema, "store_sales.vortex");
+        let right = large_exact_cayenne_file_exec(&schema, "catalog_sales.vortex");
+        let on = vec![(
+            col("order_id", &left.schema()).expect("left join key should exist"),
+            col("order_id", &right.schema()).expect("right join key should exist"),
+        )];
+        // Combined Full-join schema: left [order_id, warehouse_id, line_number]
+        // ++ right [order_id, warehouse_id, line_number]. Keep right.warehouse_id
+        // then left.line_number - a reordered subset without the join keys.
+        let join = Arc::new(
+            HashJoinExec::try_new(
+                left,
+                right,
+                on,
+                None,
+                &JoinType::Full,
+                Some(vec![4, 2]),
+                PartitionMode::Partitioned,
+                NullEquality::NullEqualsNothing,
+                false,
+            )
+            .expect("projected hash join should be valid"),
+        );
+        let original_schema = join.schema();
+        let config = config_with_cayenne_optimizer(None, Some(0.125), Some(64 * 1024 * 1024));
+
+        let optimized = optimize_anti_join_sort_merge_with_config(join, &config);
+
+        let projection = optimized
+            .downcast_ref::<datafusion::physical_plan::projection::ProjectionExec>()
+            .expect("a projected oversized hash join should become a ProjectionExec over the sort-merge join");
+        assert!(
+            projection.input().is::<SortMergeJoinExec>(),
+            "the hoisted projection's input should be the spillable sort-merge join"
+        );
+        assert_eq!(
+            optimized.schema(),
+            original_schema,
+            "the rewrite must preserve the projected output schema exactly"
         );
     }
 
