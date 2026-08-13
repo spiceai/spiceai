@@ -1002,7 +1002,7 @@ pub trait ListingTableConnector: DataConnector {
     where
         Self: Display,
     {
-        build_table_parquet_options(self.get_app()).map_err(|e| {
+        build_table_parquet_options(self.get_app().as_ref()).map_err(|e| {
             crate::dataconnector::DataConnectorError::UnableToConnectInternal {
                 dataconnector: format!("{self}"),
                 connector_component: ConnectorComponent::from(dataset),
@@ -1820,13 +1820,13 @@ impl SensitiveListingTableUrl {
 /// sets `enable_page_index` accordingly. When no runtime is available,
 /// `enable_page_index` retains the `DataFusion` default (`true`).
 pub fn build_table_parquet_options(
-    app: Option<Arc<App>>,
+    app: Option<&Arc<App>>,
 ) -> std::result::Result<TableParquetOptions, DataFusionError> {
     let mut opts = TableParquetOptions::new();
     opts.set("pushdown_filters", "true")?;
 
-    if app.is_some() {
-        let page_index_options = parquet_page_index_options(&app);
+    if let Some(app) = app {
+        let page_index_options = parquet_page_index_options(app);
         opts.set(
             "enable_page_index",
             &page_index_options.enable_page_index.to_string(),
@@ -1857,9 +1857,11 @@ impl Default for ParquetPageIndexOptions {
 ///   params:
 ///     parquet_page_index: required # skip, auto
 /// ```
-fn parquet_page_index_options(app: &Option<Arc<App>>) -> ParquetPageIndexOptions {
+fn parquet_page_index_options(app: &Arc<App>) -> ParquetPageIndexOptions {
+    // `App::get_runtime_param` reads the `Option<Arc<App>>` the runtime stores.
+    let app = Some(Arc::clone(app));
     let parquet_page_index_param =
-        App::get_runtime_param(app, "parquet_page_index", "required".to_string());
+        App::get_runtime_param(&app, "parquet_page_index", "required".to_string());
 
     match parquet_page_index_param.as_str() {
         // Note: "auto" and "required" both enable page index now. The difference was that "auto"
