@@ -133,8 +133,12 @@ pub mod builder;
 #[cfg(not(windows))]
 pub mod cayenne_ddl;
 pub use runtime_datafusion::composed_catalog;
-pub use runtime_datafusion::dialect;
-pub use runtime_datafusion::error;
+// `dialect`, `error` and `refresh_sql` below are named throughout the runtime
+// through these aliases, but they belong to `runtime-datafusion`. Crate-visible
+// so a crate outside the runtime has to depend on `runtime-datafusion` directly
+// rather than route through here.
+pub(crate) use runtime_datafusion::dialect;
+pub(crate) use runtime_datafusion::error;
 pub use runtime_table::filter_converter;
 pub mod flight_session_extension;
 pub mod iceberg_ddl;
@@ -144,7 +148,7 @@ pub use runtime_datafusion::param_utils;
 pub use runtime_datafusion::pg_catalog;
 #[cfg(not(windows))]
 pub mod planner;
-pub use runtime_datafusion::refresh_sql;
+pub(crate) use runtime_datafusion::refresh_sql;
 pub mod request_context_extension;
 pub use runtime_datafusion::retention_sql;
 pub use runtime_table::table_provider_with_spicepod_metadata;

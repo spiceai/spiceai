@@ -29,7 +29,6 @@ use crate::executor_table::{EXECUTOR_TABLE_UDTF_NAME, ExecutorTableFunc};
 use datafusion::execution::FunctionRegistry;
 use datafusion::logical_expr::ScalarUDF;
 use datafusion::prelude::SessionContext;
-use datafusion_table_providers::util::supported_functions::FunctionSupport;
 use parking_lot::RwLock;
 #[cfg(feature = "models")]
 use runtime_datafusion_udfs::{ai::Ai, embed};
@@ -623,61 +622,14 @@ pub fn is_code_executing_function(name: &str) -> bool {
         .any(|function_name| function_name.eq_ignore_ascii_case(name))
 }
 
+pub use runtime_datafusion::function_support::{
+    deny_spice_functions_for_duckdb, deny_spice_functions_for_duckdb_table_providers,
+    deny_spice_functions_for_postgres_table_providers,
+};
 pub use runtime_udfs_api::{
     deny_spice_functions_for_table_providers, deny_spice_specific_functions,
     deny_spice_specific_functions_excluding,
 };
-
-/// The [`FunctionSupport`] for `DuckDB` connectors and accelerators: allows
-/// every function the `DuckDB` dialect can rewrite into native SQL (e.g.
-/// `cosine_distance` → `array_cosine_distance`, `rand` → `random()`), derived
-/// from the dialect so it tracks it automatically.
-#[must_use]
-pub fn deny_spice_functions_for_duckdb() -> Arc<FunctionSupport> {
-    deny_spice_specific_functions_excluding(
-        &crate::datafusion::dialect::duckdb_native_function_names(),
-    )
-}
-
-/// `DuckDB` deny-list as a value, for
-/// `DuckDBTableFactory::with_function_support`. See issue #10703.
-#[must_use]
-pub fn deny_spice_functions_for_duckdb_table_providers() -> FunctionSupport {
-    runtime_udfs_api::FunctionSupportBuilder::new()
-        .native(&crate::datafusion::dialect::duckdb_native_function_names())
-        .build()
-}
-
-/// `DataFusion`'s nested array/list/map functions that `PostgreSQL` cannot
-/// evaluate are denied for `PostgreSQL` and PostgreSQL-wire backends (e.g.
-/// Redshift). The ones that match `PostgreSQL` exactly are listed here so they
-/// keep pushing down — this is `PostgreSQL`'s own knowledge of what it can run,
-/// which is why it lives beside the connector rather than in the registry.
-const POSTGRES_PUSHABLE_ARRAY_FUNCTIONS: &[&str] = &[
-    "array_append",    // (array, element) — identical to PostgreSQL
-    "array_prepend",   // (element, array) — identical to PostgreSQL
-    "array_ndims",     // (array) -> int
-    "array_position",  // (array, element[, start]) -> int
-    "array_positions", // (array, element) -> int[]
-    "array_to_string", // (array, delimiter[, null_string]) -> text
-    "cardinality",     // (array) -> int
-    "string_to_array", // (string, delimiter[, null_string]) -> text[]
-];
-
-/// Postgres-flavored deny-list as a value: every Spice function, plus the
-/// `DataFusion` array functions `PostgreSQL` can't execute. Used with
-/// `PostgresTableProviderFactory::with_function_support` (accelerator) and the
-/// `PostgreSQL` connector's federation deny-list. See issue #10703.
-#[must_use]
-pub fn deny_spice_functions_for_postgres_table_providers() -> FunctionSupport {
-    let unsupported_arrays = runtime_udfs_api::datafusion_nested_function_names()
-        .iter()
-        .filter(|name| !POSTGRES_PUSHABLE_ARRAY_FUNCTIONS.contains(&name.as_str()))
-        .cloned();
-    runtime_udfs_api::FunctionSupportBuilder::new()
-        .deny_also(unsupported_arrays)
-        .build()
-}
 
 #[cfg(test)]
 mod deny_list_registration_tests {
@@ -772,6 +724,7 @@ mod tests {
         json_as_text_udf, json_contains_udf, json_get_bool_udf, json_get_float_udf,
         json_get_int_udf, json_get_json_udf, json_get_str_udf, json_get_udf, json_length_udf,
     };
+    use runtime_datafusion::function_support::POSTGRES_PUSHABLE_ARRAY_FUNCTIONS;
     use runtime_datafusion_udfs::cosine_distance::COSINE_DISTANCE_UDF_NAME;
     use runtime_datafusion_udfs::inner_product::{DOT_PRODUCT_UDF_ALIAS, INNER_PRODUCT_UDF_NAME};
     use runtime_datafusion_udfs::{
@@ -993,7 +946,7 @@ mod tests {
     }
 
     /// Build a no-arg scalar-function expression with the given name so we can
-    /// probe a [`FunctionSupport`] by name regardless of the real UDF impl.
+    /// probe a `FunctionSupport` by name regardless of the real UDF impl.
     fn make_named_expr(name: &str) -> Expr {
         Expr::ScalarFunction(ScalarFunction::new_udf(
             Arc::new(stub_scalar_udf(name)),

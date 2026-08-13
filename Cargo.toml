@@ -17,6 +17,7 @@ members = [
     "crates/datafusion-dml",
     "crates/datafusion-optimizer-rules",
     "crates/data-connector-api",
+    "crates/data-http-rate-control",
     "crates/data_components",
     "crates/dataformat-json",
     "crates/document_parse",
@@ -258,7 +259,7 @@ datafusion-proto-common = "54.1.0"
 datafusion-pruning = "54.1.0"
 datafusion-spark = "54.1.0"
 datafusion-substrait = "54.1.0"
-datafusion-table-providers = { git = "https://github.com/spiceai/datafusion-table-providers.git", rev = "894e2794ff285c0f0258e45bba693190cd84e0fb" } # spiceai-54
+datafusion-table-providers = { git = "https://github.com/spiceai/datafusion-table-providers.git", rev = "318492b8ae79162586ada08f7672563176bb0331" } # spiceai-54
 delta_kernel = { version = "0.23.0", features = [
     "default-engine-rustls",
     "arrow-58",

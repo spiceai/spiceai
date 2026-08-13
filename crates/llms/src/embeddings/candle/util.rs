@@ -185,9 +185,17 @@ pub(crate) async fn download_hf_artifacts(
         .await
         .context(FailedWithHFApiSnafu)?;
 
-    let _ = download_safetensors(Arc::clone(&api_repo))
-        .await
-        .context(FailedWithHFApiSnafu)?;
+    // Fallback to `pytorch_model.bin` if no safetensors.
+    // Supported by text-embedding-inference, but must be kept in sync manually (if new weight formats).
+    if download_safetensors(Arc::clone(&api_repo)).await.is_err() {
+        tracing::warn!(
+            "safetensors weights not found; falling back to `pytorch_model.bin`. Model loading is significantly slower."
+        );
+        api_repo
+            .get("pytorch_model.bin")
+            .await
+            .context(FailedWithHFApiSnafu)?;
+    }
 
     Ok(root_dir)
 }

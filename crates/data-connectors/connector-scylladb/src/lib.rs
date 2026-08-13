@@ -42,8 +42,7 @@ use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult,
 };
-use runtime::parameters::ParameterSpec;
-use runtime_parameters::Parameters;
+use runtime_parameters::{ParameterSpec, Parameters};
 use scylla::client::session::Session;
 use scylla::client::session_builder::SessionBuilder;
 use snafu::prelude::*;

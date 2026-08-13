@@ -58,7 +58,8 @@ pub async fn index_change_envelope(
     // Materialize a deferred batch here (this index wrapper transforms the
     // stream before the accelerator consumes it). Offload the synchronous build
     // so a large deferred burst can't stall this async worker.
-    let (change_committer, batch, is_dataset_ready) = envelope.into_parts_offloaded().await?;
+    let (change_committer, batch, is_dataset_ready, history_unavailable) =
+        envelope.into_parts_offloaded().await?;
     let mut batches = vec![batch.data_batch()];
 
     for index in &indexes.0 {
@@ -71,10 +72,15 @@ pub async fn index_change_envelope(
     let new_change_batch = replace_change_batch_data(&batches[0], &batch)
         .map_err(|e| StreamError::Arrow(e.to_string()))?;
 
-    Ok(ChangeEnvelope::new(
+    // `from_parts` rather than `new`: this wrapper transforms the batch and must
+    // carry every envelope flag through untouched. A rebuild request dropped here
+    // would let the accelerator keep applying changes after the source lost the
+    // history that explains them.
+    Ok(ChangeEnvelope::from_parts(
         change_committer,
         new_change_batch,
         is_dataset_ready,
+        history_unavailable,
     ))
 }
 

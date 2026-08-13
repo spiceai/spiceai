@@ -22,6 +22,7 @@ use data_components::cdc::{
     ChangeEnvelope, ChangesStream, CommitChange, CommitError, InitialSnapshotMode,
     InvalidCheckpointBehavior, NoOpCommitter,
 };
+use data_connector_api::schema_projection::{ProjectionPolicy, parse_schema_projection};
 use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
 use dynamodb_streams::{Checkpoint, Metrics, MetricsCollector};
@@ -30,16 +31,15 @@ use opentelemetry::KeyValue;
 use runtime::component::dataset::Dataset;
 use runtime::component::dataset::acceleration::RefreshMode;
 use runtime::dataaccelerator::spice_sys::dynamodb::init_checkpoint_store;
-use runtime::dataconnector::schema_projection::{ProjectionPolicy, parse_schema_projection};
 use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
-    ParameterSpec, Parameters, parameters::aws::initiate_config_with_auth_method,
+    parameters::aws::initiate_config_with_auth_method,
 };
 use runtime::federated::FederatedTable;
 use runtime_api_types::v1::ComponentType;
 use runtime_checkpoint_api::BlobCheckpointStore;
 use runtime_metrics::component::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback};
-use runtime_parameters::ExposedParamLookup;
+use runtime_parameters::{ExposedParamLookup, ParameterSpec, Parameters};
 use snafu::ResultExt;
 use std::str::FromStr;
 use std::time::{Duration, SystemTime};
@@ -694,6 +694,7 @@ async fn emit_overwrite_then_live(
         )),
         checkpoint_batch,
         false, // readiness comes from the live stream, preserving prior behavior
+        false, // not a history-unavailable signal: this is the bootstrap checkpoint barrier
     );
 
     let live = match changes_stream_from_checkpoint(

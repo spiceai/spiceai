@@ -13,30 +13,41 @@
           {
             "id": 102,
             "definition": {
-              "title": "Active Datasets",
+              "title": "Active Datasets (by instance)",
               "title_size": "16",
               "title_align": "left",
-              "type": "query_value",
+              "type": "toplist",
               "requests": [
                 {
+                  "queries": [
+                    {
+                      "data_source": "metrics",
+                      "name": "query1",
+                      "query": "sum:spiceai.dataset_active_count{$instance,$env,$kube_namespace,$kube_cluster_name,$pod_name} by {service_instance_id}",
+                      "aggregator": "last"
+                    }
+                  ],
+                  "response_format": "scalar",
                   "formulas": [
                     {
                       "formula": "query1"
                     }
                   ],
-                  "queries": [
-                    {
-                      "data_source": "metrics",
-                      "name": "query1",
-                      "query": "sum:spice.dataset_active_count{$instance}",
-                      "aggregator": "last"
-                    }
-                  ],
-                  "response_format": "scalar"
+                  "sort": {
+                    "count": 10,
+                    "order_by": [
+                      {
+                        "type": "formula",
+                        "index": 0,
+                        "order": "asc"
+                      }
+                    ]
+                  }
                 }
               ],
-              "autoscale": true,
-              "precision": 0
+              "time": {
+                "live_span": "5m"
+              }
             },
             "layout": {
               "x": 0,
@@ -48,30 +59,41 @@
           {
             "id": 103,
             "definition": {
-              "title": "Active Models",
+              "title": "Active Models (by instance)",
               "title_size": "16",
               "title_align": "left",
-              "type": "query_value",
+              "type": "toplist",
               "requests": [
                 {
+                  "queries": [
+                    {
+                      "data_source": "metrics",
+                      "name": "query1",
+                      "query": "sum:spiceai.model_active_count{$instance,$env,$kube_namespace,$kube_cluster_name,$pod_name} by {service_instance_id}",
+                      "aggregator": "last"
+                    }
+                  ],
+                  "response_format": "scalar",
                   "formulas": [
                     {
                       "formula": "query1"
                     }
                   ],
-                  "queries": [
-                    {
-                      "data_source": "metrics",
-                      "name": "query1",
-                      "query": "sum:spice.model_active_count{$instance}",
-                      "aggregator": "last"
-                    }
-                  ],
-                  "response_format": "scalar"
+                  "sort": {
+                    "count": 10,
+                    "order_by": [
+                      {
+                        "type": "formula",
+                        "index": 0,
+                        "order": "asc"
+                      }
+                    ]
+                  }
                 }
               ],
-              "autoscale": true,
-              "precision": 0
+              "time": {
+                "live_span": "5m"
+              }
             },
             "layout": {
               "x": 3,
@@ -83,30 +105,41 @@
           {
             "id": 104,
             "definition": {
-              "title": "Active Embeddings",
+              "title": "Active Embeddings (by instance)",
               "title_size": "16",
               "title_align": "left",
-              "type": "query_value",
+              "type": "toplist",
               "requests": [
                 {
+                  "queries": [
+                    {
+                      "data_source": "metrics",
+                      "name": "query1",
+                      "query": "sum:spiceai.embeddings_active_count{$instance,$env,$kube_namespace,$kube_cluster_name,$pod_name} by {service_instance_id}",
+                      "aggregator": "last"
+                    }
+                  ],
+                  "response_format": "scalar",
                   "formulas": [
                     {
                       "formula": "query1"
                     }
                   ],
-                  "queries": [
-                    {
-                      "data_source": "metrics",
-                      "name": "query1",
-                      "query": "sum:spice.embeddings_active_count{$instance}",
-                      "aggregator": "last"
-                    }
-                  ],
-                  "response_format": "scalar"
+                  "sort": {
+                    "count": 10,
+                    "order_by": [
+                      {
+                        "type": "formula",
+                        "index": 0,
+                        "order": "asc"
+                      }
+                    ]
+                  }
                 }
               ],
-              "autoscale": true,
-              "precision": 0
+              "time": {
+                "live_span": "5m"
+              }
             },
             "layout": {
               "x": 6,
@@ -118,30 +151,41 @@
           {
             "id": 105,
             "definition": {
-              "title": "Active Tools",
+              "title": "Active Tools (by instance)",
               "title_size": "16",
               "title_align": "left",
-              "type": "query_value",
+              "type": "toplist",
               "requests": [
                 {
+                  "queries": [
+                    {
+                      "data_source": "metrics",
+                      "name": "query1",
+                      "query": "sum:spiceai.tool_active_count{$instance,$env,$kube_namespace,$kube_cluster_name,$pod_name} by {service_instance_id}",
+                      "aggregator": "last"
+                    }
+                  ],
+                  "response_format": "scalar",
                   "formulas": [
                     {
                       "formula": "query1"
                     }
                   ],
-                  "queries": [
-                    {
-                      "data_source": "metrics",
-                      "name": "query1",
-                      "query": "sum:spice.tool_active_count{$instance}",
-                      "aggregator": "last"
-                    }
-                  ],
-                  "response_format": "scalar"
+                  "sort": {
+                    "count": 10,
+                    "order_by": [
+                      {
+                        "type": "formula",
+                        "index": 0,
+                        "order": "asc"
+                      }
+                    ]
+                  }
                 }
               ],
-              "autoscale": true,
-              "precision": 0
+              "time": {
+                "live_span": "5m"
+              }
             },
             "layout": {
               "x": 9,
@@ -170,7 +214,7 @@
           {
             "id": 201,
             "definition": {
-              "title": "Query Duration by Protocol",
+              "title": "Query Duration p99 by Protocol",
               "title_size": "16",
               "title_align": "left",
               "show_legend": true,
@@ -198,7 +242,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "avg:spice.query_duration_ms_summary.quantile{$instance,$percentile} by {protocol}"
+                      "query": "p99:spiceai.query_duration_ms{$instance,$env,$kube_namespace,$kube_cluster_name,$pod_name} by {protocol,service_instance_id}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -249,7 +293,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "sum:spice.query_executions.count{$instance} by {protocol}.as_count()"
+                      "query": "sum:spiceai.query_executions.count{$instance,$env,$kube_namespace,$kube_cluster_name,$pod_name} by {protocol}.as_count()"
                     }
                   ],
                   "response_format": "timeseries",
@@ -298,7 +342,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "sum:spice.query_active_count{$instance} by {protocol}"
+                      "query": "sum:spiceai.query_active_count{$instance,$env,$kube_namespace,$kube_cluster_name,$pod_name} by {protocol,service_instance_id}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -346,7 +390,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "sum:spice.query_failures.count{$instance} by {err_code}.as_count()"
+                      "query": "sum:spiceai.query_failures.count{$instance,$env,$kube_namespace,$kube_cluster_name,$pod_name} by {err_code,service_instance_id}.as_count()"
                     }
                   ],
                   "response_format": "timeseries",
@@ -394,7 +438,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "avg:spice.query_returned_rows_summary.quantile{$instance,$percentile} by {protocol}"
+                      "query": "avg:spiceai.query_returned_rows_summary.quantile{$instance,$percentile,$env,$kube_namespace,$kube_cluster_name,$pod_name} by {protocol}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -453,24 +497,36 @@
                 {
                   "formulas": [
                     {
-                      "alias": "Processed",
-                      "formula": "per_second(query1)"
+                      "alias": "Processed B/s",
+                      "formula": "per_second(query1)",
+                      "number_format": {
+                        "unit": {
+                          "type": "canonical_unit",
+                          "unit_name": "byte"
+                        }
+                      }
                     },
                     {
-                      "alias": "Returned",
-                      "formula": "per_second(query2)"
+                      "alias": "Returned B/s",
+                      "formula": "per_second(query2)",
+                      "number_format": {
+                        "unit": {
+                          "type": "canonical_unit",
+                          "unit_name": "byte"
+                        }
+                      }
                     }
                   ],
                   "queries": [
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "sum:spice.query_processed_bytes.count{$instance}"
+                      "query": "sum:spiceai.query_processed_bytes.count{$instance,$env,$kube_namespace,$kube_cluster_name,$pod_name}.as_count()"
                     },
                     {
                       "data_source": "metrics",
                       "name": "query2",
-                      "query": "sum:spice.query_returned_bytes.count{$instance}"
+                      "query": "sum:spiceai.query_returned_bytes.count{$instance,$env,$kube_namespace,$kube_cluster_name,$pod_name}.as_count()"
                     }
                   ],
                   "response_format": "timeseries",
@@ -512,15 +568,21 @@
                 {
                   "formulas": [
                     {
-                      "alias": "Spilled Bytes",
-                      "formula": "query1"
+                      "alias": "Spilled B/s",
+                      "formula": "per_second(query1)",
+                      "number_format": {
+                        "unit": {
+                          "type": "canonical_unit",
+                          "unit_name": "byte"
+                        }
+                      }
                     }
                   ],
                   "queries": [
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "sum:spice.query_spilled_bytes.count{$instance}.as_count()"
+                      "query": "sum:spiceai.query_spilled_bytes.count{$instance,$env,$kube_namespace,$kube_cluster_name,$pod_name} by {service_instance_id}.as_count()"
                     }
                   ],
                   "response_format": "timeseries",
@@ -574,7 +636,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "avg:spice.dataset_acceleration_last_refresh_unix_time_ms{$instance,!dataset:runtime.*} by {dataset}",
+                      "query": "min:spiceai.dataset_acceleration_last_refresh_unix_time_ms{$instance,!dataset:runtime.*,$env,$kube_namespace,$kube_cluster_name,$pod_name} by {dataset,service_instance_id}",
                       "aggregator": "last"
                     }
                   ],
@@ -598,7 +660,7 @@
                   ],
                   "formulas": [
                     {
-                      "formula": "time() * 1000 - query1",
+                      "formula": "(time() * 1000 - query1) * (query1 / query1)",
                       "number_format": {
                         "unit": {
                           "type": "canonical_unit",
@@ -618,7 +680,10 @@
                     ]
                   }
                 }
-              ]
+              ],
+              "time": {
+                "live_span": "5m"
+              }
             },
             "layout": {
               "x": 0,
@@ -658,7 +723,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "avg:spice.dataset_acceleration_refresh_duration_ms_summary.quantile{$instance,!dataset:runtime.*,$percentile} by {dataset}"
+                      "query": "avg:spiceai.dataset_acceleration_refresh_duration_ms_summary.quantile{$instance,!dataset:runtime.*,$percentile,$env,$kube_namespace,$kube_cluster_name,$pod_name} by {dataset}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -706,7 +771,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "sum:spice.dataset_acceleration_refresh_errors.count{$instance} by {dataset}.as_count()"
+                      "query": "sum:spiceai.dataset_acceleration_refresh_errors.count{$instance,!dataset:runtime.*,$env,$kube_namespace,$kube_cluster_name,$pod_name} by {dataset,service_instance_id}.as_count()"
                     }
                   ],
                   "response_format": "timeseries",
@@ -736,7 +801,9 @@
               "title": "Refresh Staleness",
               "title_size": "16",
               "title_align": "left",
-              "time": {},
+              "time": {
+                "live_span": "5m"
+              },
               "type": "toplist",
               "requests": [
                 {
@@ -744,7 +811,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "avg:spice.dataset_acceleration_ingestion_lag_ms{$instance,!dataset:runtime.*} by {dataset}",
+                      "query": "max:spiceai.dataset_acceleration_ingestion_lag_ms{$instance,!dataset:runtime.*,$env,$kube_namespace,$kube_cluster_name,$pod_name} by {dataset,service_instance_id}",
                       "aggregator": "last"
                     }
                   ],
@@ -804,7 +871,9 @@
               "title": "Refresh Timestamp Advancement",
               "title_size": "16",
               "title_align": "left",
-              "time": {},
+              "time": {
+                "live_span": "5m"
+              },
               "type": "toplist",
               "requests": [
                 {
@@ -812,8 +881,8 @@
                     {
                       "name": "query1",
                       "data_source": "metrics",
-                      "query": "avg:spice.dataset_acceleration_refresh_lag_ms{$instance,!dataset:runtime.*} by {dataset}",
-                      "aggregator": "avg"
+                      "query": "max:spiceai.dataset_acceleration_refresh_lag_ms{$instance,!dataset:runtime.*,$env,$kube_namespace,$kube_cluster_name,$pod_name} by {dataset,service_instance_id}",
+                      "aggregator": "last"
                     }
                   ],
                   "response_format": "scalar",
@@ -881,7 +950,7 @@
                 {
                   "formulas": [
                     {
-                      "formula": "query1 * 100",
+                      "formula": "(query1 / query2) * 100",
                       "number_format": {
                         "unit": {
                           "type": "canonical_unit",
@@ -894,8 +963,14 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "avg:spice.results_cache_hit_ratio{$instance}",
-                      "aggregator": "last"
+                      "query": "sum:spiceai.results_cache_hits.count{$instance,$env,$kube_namespace,$kube_cluster_name,$pod_name}.as_count()",
+                      "aggregator": "sum"
+                    },
+                    {
+                      "data_source": "metrics",
+                      "name": "query2",
+                      "query": "sum:spiceai.results_cache_requests.count{$instance,$env,$kube_namespace,$kube_cluster_name,$pod_name}.as_count()",
+                      "aggregator": "sum"
                     }
                   ],
                   "response_format": "scalar",
@@ -959,12 +1034,12 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "sum:spice.results_cache_hits.count{$instance}.as_count()"
+                      "query": "sum:spiceai.results_cache_hits.count{$instance,$env,$kube_namespace,$kube_cluster_name,$pod_name}.as_count()"
                     },
                     {
                       "data_source": "metrics",
                       "name": "query2",
-                      "query": "sum:spice.results_cache_requests.count{$instance}.as_count()"
+                      "query": "sum:spiceai.results_cache_requests.count{$instance,$env,$kube_namespace,$kube_cluster_name,$pod_name}.as_count()"
                     }
                   ],
                   "response_format": "timeseries",
@@ -1021,12 +1096,12 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "sum:spice.results_cache_size_bytes{$instance}"
+                      "query": "avg:spiceai.results_cache_size_bytes{$instance,$env,$kube_namespace,$kube_cluster_name,$pod_name} by {service_instance_id}"
                     },
                     {
                       "data_source": "metrics",
                       "name": "query2",
-                      "query": "sum:spice.results_cache_max_size_bytes{$instance}"
+                      "query": "avg:spiceai.results_cache_max_size_bytes{$instance,$env,$kube_namespace,$kube_cluster_name,$pod_name} by {service_instance_id}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -1070,7 +1145,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "sum:spice.results_cache_items_count{$instance}"
+                      "query": "sum:spiceai.results_cache_items_count{$instance,$env,$kube_namespace,$kube_cluster_name,$pod_name} by {service_instance_id}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -1114,7 +1189,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "sum:spice.results_cache_evictions.count{$instance}.as_count()"
+                      "query": "sum:spiceai.results_cache_evictions.count{$instance,$env,$kube_namespace,$kube_cluster_name,$pod_name}.as_count()"
                     }
                   ],
                   "response_format": "timeseries",
@@ -1158,7 +1233,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "sum:spice.results_cache_swr_background_query_count.count{$instance}.as_count()"
+                      "query": "sum:spiceai.results_cache_swr_background_query_count.count{$instance,$env,$kube_namespace,$kube_cluster_name,$pod_name}.as_count()"
                     }
                   ],
                   "response_format": "timeseries",
@@ -1223,7 +1298,7 @@
                     {
                       "name": "query1",
                       "data_source": "metrics",
-                      "query": "avg:spice.dataset_acceleration_snapshot_write_duration_ms_summary.quantile{$instance,$percentile} by {dataset}"
+                      "query": "avg:spiceai.dataset_acceleration_snapshot_write_duration_ms_summary.quantile{$instance,$percentile,$env,$kube_namespace,$kube_cluster_name,$pod_name} by {dataset}"
                     }
                   ],
                   "formulas": [
@@ -1277,7 +1352,7 @@
                     {
                       "name": "query1",
                       "data_source": "metrics",
-                      "query": "avg:spice.dataset_acceleration_snapshot_write_bytes{$instance} by {dataset}"
+                      "query": "avg:spiceai.dataset_acceleration_snapshot_write_bytes{$instance,$env,$kube_namespace,$kube_cluster_name,$pod_name} by {dataset}"
                     }
                   ],
                   "formulas": [
@@ -1331,7 +1406,7 @@
                     {
                       "name": "query1",
                       "data_source": "metrics",
-                      "query": "avg:spice.dataset_acceleration_snapshot_bootstrap_duration_ms.count{$instance} by {dataset}"
+                      "query": "sum:spiceai.dataset_acceleration_snapshot_bootstrap_duration_ms.count{$instance,$env,$kube_namespace,$kube_cluster_name,$pod_name} by {dataset,service_instance_id}.as_count()"
                     }
                   ],
                   "formulas": [
@@ -1351,7 +1426,7 @@
                     "line_type": "solid",
                     "line_width": "normal"
                   },
-                  "display_type": "line"
+                  "display_type": "bars"
                 }
               ]
             },
@@ -1410,7 +1485,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "avg:spice.http_requests_duration_ms_summary.quantile{$instance,$percentile} by {method,path}"
+                      "query": "max:spiceai.http_requests_duration_ms_summary.quantile{$instance,$percentile,$env,$kube_namespace,$kube_cluster_name,$pod_name} by {method,path,service_instance_id}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -1458,7 +1533,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "sum:spice.http_requests.count{$instance} by {method,path,status}.as_count()"
+                      "query": "sum:spiceai.http_requests.count{$instance,$env,$kube_namespace,$kube_cluster_name,$pod_name} by {method,path,status}.as_count()"
                     }
                   ],
                   "response_format": "timeseries",
@@ -1530,7 +1605,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "avg:spice.flight_request_duration_ms_summary.quantile{$instance,method:do_get,$percentile} by {command}"
+                      "query": "avg:spiceai.flight_request_duration_ms_summary.quantile{$instance,method:do_get,$percentile,$env,$kube_namespace,$kube_cluster_name,$pod_name} by {command}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -1585,7 +1660,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "avg:spice.flight_request_duration_ms_summary.quantile{$instance,method:do_put,$percentile} by {command}"
+                      "query": "avg:spiceai.flight_request_duration_ms_summary.quantile{$instance,method:do_put,$percentile,$env,$kube_namespace,$kube_cluster_name,$pod_name} by {command}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -1640,7 +1715,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "avg:spice.flight_request_duration_ms_summary.quantile{$instance,method:get_flight_info,$percentile} by {command}"
+                      "query": "avg:spiceai.flight_request_duration_ms_summary.quantile{$instance,method:get_flight_info,$percentile,$env,$kube_namespace,$kube_cluster_name,$pod_name} by {command}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -1688,7 +1763,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "sum:spice.flight_requests.count{$instance} by {method}.as_count()"
+                      "query": "sum:spiceai.flight_requests.count{$instance,$env,$kube_namespace,$kube_cluster_name,$pod_name} by {method}.as_count()"
                     }
                   ],
                   "response_format": "timeseries",
@@ -1737,7 +1812,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "sum:spice.flight_do_exchange_data_updates_sent.count{$instance}.as_count()"
+                      "query": "sum:spiceai.flight_do_exchange_data_updates_sent.count{$instance,$env,$kube_namespace,$kube_cluster_name,$pod_name}.as_count()"
                     }
                   ],
                   "response_format": "timeseries",
@@ -1802,7 +1877,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "avg:spice.dataset_kafka_records_lag{$instance} by {name}"
+                      "query": "avg:spiceai.dataset_kafka_records_lag{$instance,$env,$kube_namespace,$kube_cluster_name,$pod_name} by {name}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -1849,7 +1924,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "sum:spice.dataset_kafka_records_consumed_total.count{$instance} by {name}"
+                      "query": "sum:spiceai.dataset_kafka_records_consumed_total.count{$instance,$env,$kube_namespace,$kube_cluster_name,$pod_name} by {name}.as_count()"
                     }
                   ],
                   "response_format": "timeseries",
@@ -1915,7 +1990,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "avg:spice.dataset_dynamodb_lag_ms{$instance} by {name}"
+                      "query": "avg:spiceai.dataset_dynamodb_lag_ms{$instance,$env,$kube_namespace,$kube_cluster_name,$pod_name} by {name}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -1963,7 +2038,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "sum:spice.dataset_dynamodb_records_consumed_total.count{$instance} by {name}"
+                      "query": "sum:spiceai.dataset_dynamodb_records_consumed_total.count{$instance,$env,$kube_namespace,$kube_cluster_name,$pod_name} by {name}.as_count()"
                     }
                   ],
                   "response_format": "timeseries",
@@ -2011,7 +2086,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "avg:spice.dataset_dynamodb_shards_active{$instance} by {name}"
+                      "query": "avg:spiceai.dataset_dynamodb_shards_active{$instance,$env,$kube_namespace,$kube_cluster_name,$pod_name} by {name}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -2059,7 +2134,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "sum:spice.dataset_dynamodb_errors_transient_total.count{$instance} by {name}"
+                      "query": "sum:spiceai.dataset_dynamodb_errors_transient_total.count{$instance,$env,$kube_namespace,$kube_cluster_name,$pod_name} by {name}.as_count()"
                     }
                   ],
                   "response_format": "timeseries",
@@ -2126,7 +2201,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "avg:spice.spiced_cpu_budget_cores{$instance} by {service_instance_id,source}"
+                      "query": "avg:spiceai.spiced_cpu_budget_cores{$instance,$env,$kube_namespace,$kube_cluster_name,$pod_name} by {source,service_instance_id}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -2169,32 +2244,50 @@
                   "formulas": [
                     {
                       "formula": "query1",
-                      "alias": "budget"
+                      "alias": "budget",
+                      "number_format": {
+                        "unit": {
+                          "type": "canonical_unit",
+                          "unit_name": "millicore"
+                        }
+                      }
                     },
                     {
                       "formula": "query2",
-                      "alias": "limit"
+                      "alias": "limit",
+                      "number_format": {
+                        "unit": {
+                          "type": "canonical_unit",
+                          "unit_name": "millicore"
+                        }
+                      }
                     },
                     {
                       "formula": "query3",
-                      "alias": "request"
+                      "alias": "request",
+                      "number_format": {
+                        "unit": {
+                          "type": "canonical_unit",
+                          "unit_name": "millicore"
+                        }
+                      }
                     }
                   ],
                   "queries": [
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "avg:spice.spiced_cpu_budget_millicores{$instance} by {service_instance_id,source}"
+                      "query": "avg:spiceai.spiced_cpu_budget_millicores{$instance,$env,$kube_namespace,$kube_cluster_name,$pod_name} by {source,service_instance_id}"
                     },
                     {
                       "data_source": "metrics",
                       "name": "query2",
-                      "query": "avg:spice.spiced_cpu_limit_millicores{$instance} by {service_instance_id}"
+                      "query": "avg:spiceai.spiced_cpu_limit_millicores{$instance,$env,$kube_namespace,$kube_cluster_name,$pod_name} by {service_instance_id}"
                     },
                     {
                       "data_source": "metrics",
                       "name": "query3",
-                      "query": "avg:spice.spiced_cpu_request_millicores{$instance} by {service_instance_id}"
+                      "query": "avg:spiceai.spiced_cpu_request_millicores{$instance,$env,$kube_namespace,$kube_cluster_name,$pod_name} by {service_instance_id}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -2243,7 +2336,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "avg:spice.tokio_runtime_workers{$instance} by {service_instance_id,runtime}"
+                      "query": "avg:spiceai.tokio_runtime_workers{$instance,$env,$kube_namespace,$kube_cluster_name,$pod_name} by {runtime,service_instance_id}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -2292,7 +2385,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "avg:spice.tokio_runtime_alive_tasks{$instance} by {service_instance_id,runtime}"
+                      "query": "avg:spiceai.tokio_runtime_alive_tasks{$instance,$env,$kube_namespace,$kube_cluster_name,$pod_name} by {runtime,service_instance_id}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -2341,7 +2434,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "avg:spice.tokio_runtime_global_queue_depth{$instance} by {service_instance_id,runtime}"
+                      "query": "avg:spiceai.tokio_runtime_global_queue_depth{$instance,$env,$kube_namespace,$kube_cluster_name,$pod_name} by {runtime,service_instance_id}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -2396,7 +2489,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "avg:spice.process_resident_memory_bytes{$instance} by {service_instance_id}"
+                      "query": "avg:spiceai.process_resident_memory_bytes{$instance,$env,$kube_namespace,$kube_cluster_name,$pod_name} by {service_instance_id}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -2451,7 +2544,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "avg:spice.query_memory_pool_used_bytes{$instance} by {service_instance_id}"
+                      "query": "avg:spiceai.query_memory_pool_used_bytes{$instance,$env,$kube_namespace,$kube_cluster_name,$pod_name} by {service_instance_id}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -2517,12 +2610,12 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "avg:spice.cayenne_compaction_memory_pool_used_bytes{$instance} by {service_instance_id}"
+                      "query": "avg:spiceai.cayenne_compaction_memory_pool_used_bytes{$instance,$env,$kube_namespace,$kube_cluster_name,$pod_name} by {service_instance_id}"
                     },
                     {
                       "data_source": "metrics",
                       "name": "query2",
-                      "query": "avg:spice.cayenne_compaction_memory_pool_bytes{$instance} by {service_instance_id}"
+                      "query": "avg:spiceai.cayenne_compaction_memory_pool_bytes{$instance,$env,$kube_namespace,$kube_cluster_name,$pod_name} by {service_instance_id}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -2542,6 +2635,62 @@
             "layout": {
               "x": 8,
               "y": 6,
+              "width": 4,
+              "height": 3
+            }
+          },
+          {
+            "id": 1009,
+            "definition": {
+              "title": "Cayenne Segment Cache Memory",
+              "title_size": "16",
+              "title_align": "left",
+              "show_legend": true,
+              "legend_layout": "auto",
+              "legend_columns": [
+                "avg",
+                "max",
+                "value"
+              ],
+              "type": "timeseries",
+              "requests": [
+                {
+                  "formulas": [
+                    {
+                      "alias": "used",
+                      "formula": "query1",
+                      "number_format": {
+                        "unit": {
+                          "type": "canonical_unit",
+                          "unit_name": "byte"
+                        }
+                      }
+                    }
+                  ],
+                  "queries": [
+                    {
+                      "data_source": "metrics",
+                      "name": "query1",
+                      "query": "sum:spiceai.cayenne_segment_cache_weighted_bytes{$instance,$env,$kube_namespace,$kube_cluster_name,$pod_name} by {service_instance_id}"
+                    }
+                  ],
+                  "response_format": "timeseries",
+                  "style": {
+                    "palette": "dog_classic",
+                    "line_type": "solid",
+                    "line_width": "normal"
+                  },
+                  "display_type": "line"
+                }
+              ],
+              "yaxis": {
+                "include_zero": true,
+                "scale": "linear"
+              }
+            },
+            "layout": {
+              "x": 0,
+              "y": 9,
               "width": 4,
               "height": 3
             }
@@ -2582,14 +2731,20 @@
                 {
                   "formulas": [
                     {
-                      "formula": "query1"
+                      "formula": "query1 / 1000000",
+                      "number_format": {
+                        "unit": {
+                          "type": "canonical_unit",
+                          "unit_name": "millicore"
+                        }
+                      }
                     }
                   ],
                   "queries": [
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "avg:k8s.pod.cpu.usage{pod_name:$instance.value} by {pod_name}"
+                      "query": "sum:kubernetes.cpu.usage.total{pod_name:$instance.value,$env,$kube_namespace,$kube_cluster_name,$pod_name} by {pod_name}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -2638,7 +2793,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "avg:k8s.pod.memory.working_set{pod_name:$instance.value} by {pod_name}"
+                      "query": "sum:kubernetes.memory.working_set{pod_name:$instance.value,$env,$kube_namespace,$kube_cluster_name,$pod_name} by {pod_name}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -2686,12 +2841,12 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "avg:k8s.volume.capacity{pod_name:$instance.value,!persistentvolumeclaim:kube-api-access-*,!persistentvolumeclaim:default-token-*} by {pod_name,persistentvolumeclaim}"
+                      "query": "avg:kubernetes.kubelet.volume.stats.capacity_bytes{pod_name:$instance.value,!persistentvolumeclaim:kube-api-access-*,!persistentvolumeclaim:default-token-*,$env,$kube_namespace,$kube_cluster_name,$pod_name} by {pod_name,persistentvolumeclaim}"
                     },
                     {
                       "data_source": "metrics",
                       "name": "query2",
-                      "query": "avg:k8s.volume.available{pod_name:$instance.value,!persistentvolumeclaim:kube-api-access-*,!persistentvolumeclaim:default-token-*} by {pod_name,persistentvolumeclaim}"
+                      "query": "avg:kubernetes.kubelet.volume.stats.available_bytes{pod_name:$instance.value,!persistentvolumeclaim:kube-api-access-*,!persistentvolumeclaim:default-token-*,$env,$kube_namespace,$kube_cluster_name,$pod_name} by {pod_name,persistentvolumeclaim}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -2739,12 +2894,12 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "avg:k8s.volume.capacity{pod_name:$instance.value,!persistentvolumeclaim:kube-api-access-*,!persistentvolumeclaim:default-token-*} by {pod_name,persistentvolumeclaim}"
+                      "query": "avg:kubernetes.kubelet.volume.stats.capacity_bytes{pod_name:$instance.value,!persistentvolumeclaim:kube-api-access-*,!persistentvolumeclaim:default-token-*,$env,$kube_namespace,$kube_cluster_name,$pod_name} by {pod_name,persistentvolumeclaim}"
                     },
                     {
                       "data_source": "metrics",
                       "name": "query2",
-                      "query": "avg:k8s.volume.available{pod_name:$instance.value,!persistentvolumeclaim:kube-api-access-*,!persistentvolumeclaim:default-token-*} by {pod_name,persistentvolumeclaim}"
+                      "query": "avg:kubernetes.kubelet.volume.stats.available_bytes{pod_name:$instance.value,!persistentvolumeclaim:kube-api-access-*,!persistentvolumeclaim:default-token-*,$env,$kube_namespace,$kube_cluster_name,$pod_name} by {pod_name,persistentvolumeclaim}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -2765,6 +2920,140 @@
             "layout": {
               "x": 6,
               "y": 3,
+              "width": 6,
+              "height": 3
+            }
+          },
+          {
+            "id": 914,
+            "definition": {
+              "title": "CPU Utilization Percentage (by Pod)",
+              "title_size": "16",
+              "title_align": "left",
+              "show_legend": true,
+              "legend_layout": "auto",
+              "legend_columns": [
+                "avg",
+                "max",
+                "value"
+              ],
+              "type": "timeseries",
+              "requests": [
+                {
+                  "formulas": [
+                    {
+                      "number_format": {
+                        "unit": {
+                          "type": "canonical_unit",
+                          "unit_name": "percent"
+                        }
+                      },
+                      "formula": "(query1 / 1000000000) / query2 * 100"
+                    }
+                  ],
+                  "queries": [
+                    {
+                      "data_source": "metrics",
+                      "name": "query1",
+                      "query": "sum:kubernetes.cpu.usage.total{pod_name:$instance.value,$env,$kube_namespace,$kube_cluster_name,$pod_name} by {pod_name}"
+                    },
+                    {
+                      "data_source": "metrics",
+                      "name": "query2",
+                      "query": "sum:kubernetes.cpu.requests{pod_name:$instance.value,$env,$kube_namespace,$kube_cluster_name,$pod_name} by {pod_name}"
+                    }
+                  ],
+                  "response_format": "timeseries",
+                  "style": {
+                    "palette": "dog_classic",
+                    "line_type": "solid",
+                    "line_width": "normal"
+                  },
+                  "display_type": "line"
+                }
+              ],
+              "markers": [
+                {
+                  "label": " > 80% ",
+                  "value": "y > 80",
+                  "display_type": "error dashed"
+                }
+              ],
+              "yaxis": {
+                "include_zero": true,
+                "scale": "linear"
+              }
+            },
+            "layout": {
+              "x": 0,
+              "y": 6,
+              "width": 6,
+              "height": 3
+            }
+          },
+          {
+            "id": 915,
+            "definition": {
+              "title": "Memory Limit Utilization Percentage (by Pod)",
+              "title_size": "16",
+              "title_align": "left",
+              "show_legend": true,
+              "legend_layout": "auto",
+              "legend_columns": [
+                "avg",
+                "max",
+                "value"
+              ],
+              "type": "timeseries",
+              "requests": [
+                {
+                  "formulas": [
+                    {
+                      "number_format": {
+                        "unit": {
+                          "type": "canonical_unit",
+                          "unit_name": "percent"
+                        }
+                      },
+                      "formula": "(query1 / query2) * 100"
+                    }
+                  ],
+                  "queries": [
+                    {
+                      "data_source": "metrics",
+                      "name": "query1",
+                      "query": "sum:kubernetes.memory.working_set{pod_name:$instance.value,$env,$kube_namespace,$kube_cluster_name,$pod_name} by {pod_name}"
+                    },
+                    {
+                      "data_source": "metrics",
+                      "name": "query2",
+                      "query": "sum:kubernetes.memory.limits{pod_name:$instance.value,$env,$kube_namespace,$kube_cluster_name,$pod_name} by {pod_name}"
+                    }
+                  ],
+                  "response_format": "timeseries",
+                  "style": {
+                    "palette": "dog_classic",
+                    "line_type": "solid",
+                    "line_width": "normal"
+                  },
+                  "display_type": "line"
+                }
+              ],
+              "markers": [
+                {
+                  "label": " > 80% ",
+                  "value": "y > 80",
+                  "display_type": "error dashed"
+                }
+              ],
+              "yaxis": {
+                "include_zero": true,
+                "scale": "linear"
+              }
+            },
+            "layout": {
+              "x": 6,
+              "y": 6,
               "width": 6,
               "height": 3
             }
@@ -2794,6 +3083,30 @@
         "0.99"
       ],
       "default": "0.99"
+    },
+    {
+      "name": "env",
+      "prefix": "env",
+      "available_values": [],
+      "default": "*"
+    },
+    {
+      "name": "kube_namespace",
+      "prefix": "kube_namespace",
+      "available_values": [],
+      "default": "*"
+    },
+    {
+      "name": "kube_cluster_name",
+      "prefix": "kube_cluster_name",
+      "available_values": [],
+      "default": "*"
+    },
+    {
+      "name": "pod_name",
+      "prefix": "pod_name",
+      "available_values": [],
+      "default": "*"
     }
   ],
   "layout_type": "ordered",

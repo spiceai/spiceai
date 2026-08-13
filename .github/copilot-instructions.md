@@ -30,9 +30,10 @@ make lint-rust-fix      # Auto-fix lint issues
 ## Git & PRs
 
 - **Never force-push** — not on `trunk`, not on feature branches, not with `--force-with-lease` (it can't see pushes since your last fetch). Force-pushing destroys collaborator commits and orphans PR review history. Instead: `git pull --rebase` or merge, then push normally; fix reviewed history with follow-up commits and squash on merge; never `--amend` after pushing.
+- **Stacked PRs are supported and need no force-push.** Base the child branch on the parent branch; once the parent squash-merges, restack an *unpushed* child with `git rebase --onto`, and a *pushed* one by merging `trunk` and then auditing — that merge can silently restore files the child deleted: `docs/dev/stacked_prs.md`.
 - Never bypass hooks or signing (`--no-verify`, `--no-gpg-sign`) — fix the underlying failure.
 - Investigate before destructive ops (`reset --hard`, `checkout --`, `clean -f`): unfamiliar files or branches may be in-progress work.
-- Branch from `trunk`, link the issue, add tests. Style: `docs/dev/style_guide.md`, `docs/dev/error_handling.md`.
+- Branch from `trunk` (or from the parent branch when stacking, per the bullet above), link the issue, add tests. Style: `docs/dev/style_guide.md`, `docs/dev/error_handling.md`.
 - If a PR's checks stop triggering (only ~2 checks appear), check for a merge conflict first (`mergeStateStatus: DIRTY`) — merge `trunk` into the branch to re-trigger.
 - **PR descriptions** *may* describe the old behavior and what was wrong with it — that context is what makes the `git` history worth reading. But never use internal/local tracking labels in a PR (title, body, or commits): phase/step numbers, plan-item IDs, or any shorthand coined in a planning doc or working session (e.g. `PR 6.1`, `Phase 3`, `step 2b`) mean nothing to a reviewer or a future reader and must stay in your local notes.
 - **Code comments describe how the code works or *why it is the way it is* — never how it *used to* work** (that is what `git` history is for). Drop "previously/originally/historically/moved from…" narration. A comment may cite a GitHub issue when it adds context the code can't — especially a regression test that exists because of that issue (`// regression test for #NNNN`).
@@ -161,4 +162,4 @@ For any feature: check whether it needs a new extension point; test correctness 
 
 `brew install rust cmake protobuf && make install-dev`; `export PATH="$PATH:$HOME/.spice/bin"`. Copy `.vscode/settings.json.template` → `.vscode/settings.json` (gitignored): rust-analyzer runs clippy with `-Dclippy::pedantic -Dclippy::unwrap_used -Dclippy::clone_on_ref_ptr`, so lints fail locally, not just in CI.
 
-Key docs: `docs/PRINCIPLES.md`, `docs/EXTENSIBILITY.md`, `docs/dev/style_guide.md`, `docs/dev/error_handling.md`, `CONTRIBUTING.md`, `docs/decisions/`, `docs/threat_models/`; [Spice docs](https://spiceai.org/docs), [Cookbook](https://github.com/spiceai/cookbook).
+Key docs: `docs/PRINCIPLES.md`, `docs/EXTENSIBILITY.md`, `docs/dev/style_guide.md`, `docs/dev/error_handling.md`, `docs/dev/stacked_prs.md`, `CONTRIBUTING.md`, `docs/decisions/`, `docs/threat_models/`; [Spice docs](https://spiceai.org/docs), [Cookbook](https://github.com/spiceai/cookbook).
