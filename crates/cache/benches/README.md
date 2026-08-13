@@ -112,11 +112,6 @@ Largely no. The same harness swept 1,000 / 5,000 / 30,000 entries and put the
 crossover between 80% and 95% at every capacity, with Pingora's timings within
 3% of each other across the whole 30x range.
 
-One exception, outside the range these benchmarks use: at 3% hits with 30,000
-entries — a 1,000,000-key working set — Moka's pure-read time jumps 2.4x while
-Pingora is unchanged. That corner scales capacity and key space together, so it
-does not separate the two causes.
-
 ### Precision
 
 Moka is far noisier than Pingora. Over five repetitions Moka varied up to 30%
