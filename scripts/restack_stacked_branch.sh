@@ -249,10 +249,7 @@ audit_addition() {
 
   local unmerged
   unmerged=$(git ls-files -u -- ":(literal)$path") || die "could not read the index for $path"
-  if [ -n "$unmerged" ]; then
-    echo "REVIEW $path: still unmerged, so nothing has decided it"
-    return 1
-  fi
+  [ -z "$unmerged" ] || return 0
   if path_accepted "$path"; then
     echo "ACCEPTED $path"
     return 0
@@ -292,14 +289,9 @@ audit_modification() {
   # and neither list would mention it.
   local unmerged
   unmerged=$(git ls-files -u -- ":(literal)$path") || die "could not read the index for $path"
-  if [ -n "$unmerged" ]; then
-    # Still unmerged. Nothing has decided this path, and the command's answer is
-    # about the whole merge, so it cannot be success while one is outstanding --
-    # not even with --accept, which says a person decided something that is by
-    # definition not yet staged.
-    echo "REVIEW $path: still unmerged, so nothing has decided it"
-    return 1
-  fi
+  # Reported by the index-wide scan, which also catches paths the child never
+  # touched. Acceptance cannot apply: nothing has been staged to accept.
+  [ -z "$unmerged" ] || return 0
   if path_accepted "$path"; then
     echo "ACCEPTED $path"
     return 0
@@ -469,11 +461,41 @@ cmd_audit() {
 
   local findings=0 path
 
+  # Any unmerged path means the merge is undecided, and the three intent lists
+  # only cover paths the child changed. One it inherited untouched can conflict
+  # all the same -- the parent changed a line before the split, trunk changed it
+  # after -- and would otherwise sit unresolved while this reported clean.
+  if ! git ls-files -u -z > "$tmp/unmerged"; then
+    rm -rf "$tmp"
+    die "could not read unmerged entries from the index"
+  fi
+  local record last_unmerged=""
+  while IFS= read -r -d '' record; do
+    path=${record#*$'\t'}
+    [ "$path" = "$last_unmerged" ] && continue
+    last_unmerged="$path"
+    echo "REVIEW $path: still unmerged, so nothing has decided it"
+    findings=$((findings + 1))
+  done < "$tmp/unmerged"
+
   while IFS= read -r -d '' path; do
-    if path_in_index "$path"; then
-      echo "RESURRECTED $path"
-      findings=$((findings + 1))
+    path_in_index "$path" || continue
+    # Already reported by the scan above, and its stages are not a decision.
+    [ -z "$(git ls-files -u -- ":(literal)$path")" ] || continue
+    if path_accepted "$path"; then
+      echo "ACCEPTED $path"
+      continue
     fi
+    # If trunk changed the file after the stack base, a correctly based merge is
+    # a delete/modify conflict rather than a silent restoration, and keeping
+    # trunk's version is a decision somebody may legitimately have made.
+    if [ -n "$other" ] &&
+       [ "$(tree_entry "$other" "$path")" != "$(tree_entry "$stack_base" "$path")" ]; then
+      echo "REVIEW $path: you deleted it and trunk changed it, which nothing has decided"
+    else
+      echo "RESURRECTED $path"
+    fi
+    findings=$((findings + 1))
   done < "$tmp/deleted"
 
   while IFS= read -r -d '' path; do

@@ -290,6 +290,61 @@ start_test "audit refuses to call a merge clean while an added path is unmerged"
   [ "$status" -ne 0 ] || fail_test "an unresolved addition was reported clean: $output"
 ) || failures=$((failures + 1))
 
+start_test "audit reports a conflict on a path the child never touched"
+(
+  new_stack "$work_root/untouched"
+  printf 'a\nb\nc\n' > shared.txt && commit_all "fork point"
+  git checkout --quiet -b parent
+  printf 'a\nPARENT\nc\n' > shared.txt && commit_all "parent edits it before the split"
+  stack_base=$(git rev-parse HEAD)
+  git checkout --quiet -b child
+  printf 'child\n' > c.txt && commit_all "child works elsewhere entirely"
+  pre=$(git rev-parse HEAD)
+  squash_parent_onto_trunk
+  printf 'a\nTRUNK\nc\n' > shared.txt && commit_all "trunk edits the same line after"
+  git checkout --quiet child
+  git merge --no-ff --no-commit trunk >/dev/null 2>&1
+
+  # stack_base..pre contains no change to shared.txt, so it is in none of the
+  # three intent lists, yet the merge left it conflicted.
+  [ -n "$(git ls-files -u -- shared.txt)" ] || fail_test "the fixture did not leave a conflict"
+  output=$("$subject" audit "$stack_base" "$pre" --trunk trunk 2>/dev/null)
+  status=$?
+  [ "$status" -ne 0 ] || fail_test "an unmerged path outside the child's changes was ignored: $output"
+  case "$output" in
+    *"REVIEW shared.txt"*) ;;
+    *) fail_test "the conflicted path was not named: $output" ;;
+  esac
+) || failures=$((failures + 1))
+
+start_test "audit separates a delete/modify from a silent restoration, and can accept it"
+(
+  new_stack "$work_root/deletemodify"
+  printf 'old\n' > f.txt && commit_all "fork point"
+  git checkout --quiet -b parent
+  printf 'parent\n' > f.txt && commit_all "parent rewrites it"
+  stack_base=$(git rev-parse HEAD)
+  git checkout --quiet -b child
+  git rm --quiet f.txt && commit_all "child deletes it"
+  pre=$(git rev-parse HEAD)
+  squash_parent_onto_trunk
+  printf 'trunk moved it on\n' > f.txt && commit_all "trunk changes it after the stack base"
+  git checkout --quiet child
+  git merge --no-ff --no-commit trunk >/dev/null 2>&1
+  # Resolve the delete/modify by keeping trunk's version, as a reviewer might.
+  git checkout --quiet trunk -- f.txt 2>/dev/null; git add f.txt
+
+  output=$("$subject" audit "$stack_base" "$pre" --trunk trunk 2>/dev/null)
+  case "$output" in
+    *"REVIEW f.txt"*) ;;
+    *) fail_test "a delete/modify was not distinguished from a restoration: $output" ;;
+  esac
+  # And the decision must be expressible, or the re-run loop cannot end.
+  output=$("$subject" audit "$stack_base" "$pre" --trunk trunk --accept f.txt 2>/dev/null)
+  status=$?
+  [ "$status" -eq 0 ] || fail_test "the decision could not be accepted: $output"
+) || failures=$((failures + 1))
+
 start_test "audit will not audit a merge of something other than trunk"
 (
   new_stack "$work_root/othermerge"
