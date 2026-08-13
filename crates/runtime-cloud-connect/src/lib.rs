@@ -109,7 +109,7 @@ pub use handlers::{
     QueryOutcome, RestartMode, RuntimeHandle, RuntimePhase, SpicepodDeployment, StatusReport,
     effective_max_rows,
 };
-pub use identity::{Identity, IdentityStore};
+pub use identity::{AppAttachment, AttachmentState, Identity, IdentityStore};
 pub use supervisor::Supervisor;
 
 /// Revision of the `spice.cloud.v1` contract this client implements,

@@ -86,7 +86,10 @@ use runtime_cloud_connect::handlers::{
     RuntimePhase, SpicepodDeployment, StatusReport, effective_max_rows,
 };
 use runtime_cloud_connect::supervisor::Supervisor;
-use runtime_cloud_connect::{CloudConnect, identity::IdentityStore};
+use runtime_cloud_connect::{
+    CloudConnect,
+    identity::{AppAttachment, AttachmentState, IdentityStore},
+};
 // Reached through the `runtime` re-export rather than a direct dependency, the
 // same way `runtime::status` is.
 use runtime::secrets::stores::cloud_delivered::{CLOUD_DELIVERED_STORE, CloudDeliveredSecretStore};
@@ -931,11 +934,18 @@ impl SpicedRuntimeHandle {
         );
     }
 
-    async fn persist_attachment(&self, app_id: Option<&str>) -> Result<(), CommandError> {
+    /// Persist the attachment tuple and return the attachment state now on
+    /// disk — which is what the command result reports, since absence
+    /// preserves (a detach keeps the org) and echoing the command instead
+    /// would misreport the instance.
+    async fn persist_attachment(
+        &self,
+        attachment: Option<&AppAttachment>,
+    ) -> Result<AttachmentState, CommandError> {
         let path = self.identity_path.clone();
-        let app_id = app_id.map(str::to_string);
-        let result = tokio::task::spawn_blocking(move || {
-            IdentityStore::set_app_id(&path, app_id.as_deref())
+        let attachment = attachment.cloned();
+        let persisted = tokio::task::spawn_blocking(move || {
+            IdentityStore::set_attachment(&path, attachment.as_ref())
         })
         .await
         .map_err(|error| {
@@ -947,12 +957,11 @@ impl SpicedRuntimeHandle {
                 self.identity_path.display()
             ))
         })?;
-        if !result {
-            return Err(CommandError::failed(
+        persisted.ok_or_else(|| {
+            CommandError::failed(
                 "Failed to save the cloud app attachment because the Cloud Connect identity is missing. Reconnect the instance and retry.",
-            ));
-        }
-        Ok(())
+            )
+        })
     }
 
     /// The local delivered-secrets cache key, read fresh from `identity.json`.
@@ -1559,10 +1568,15 @@ impl RuntimeHandle for SpicedRuntimeHandle {
             .map_err(|err| CommandError::internal(err.to_string()))
     }
 
-    async fn attach_app(&self, app_id: Option<&str>) -> Result<serde_json::Value, CommandError> {
-        self.persist_attachment(app_id).await?;
-        *self.app_id.write() = app_id.map(str::to_string);
-        Ok(serde_json::json!({ "app_id": app_id }))
+    async fn attach_app(
+        &self,
+        attachment: Option<&AppAttachment>,
+    ) -> Result<serde_json::Value, CommandError> {
+        let persisted = self.persist_attachment(attachment).await?;
+        (*self.app_id.write()).clone_from(&persisted.app_id);
+        // The result reports the persisted state, not the command: the two
+        // differ where absence preserves (a detach keeps the stored org).
+        Ok(serde_json::json!(persisted))
     }
 
     /// Execute an `ExecuteQuery` against the in-process runtime.
@@ -2700,7 +2714,7 @@ views:
     /// Give the instance an identity carrying a cache key, which is what makes
     /// the delivered-secrets cache writable — without one the cache is skipped
     /// and a test asserting on it would pass for the wrong reason.
-    fn enrol_with_a_cache_key(identity_path: &Path) {
+    fn enroll_with_a_cache_key(identity_path: &Path) {
         let mock_pem = "-----BEGIN PRIVATE KEY-----\nMOCK\n-----END PRIVATE KEY-----\n".to_string();
         let mut identity = runtime_cloud_connect::identity::Identity {
             identifier: "inst_test".to_string(),
@@ -2713,6 +2727,9 @@ views:
             gateway_addr: "gateway.test.spice.ai:443".to_string(),
             not_after_unix: None,
             app_id: None,
+            org_name: None,
+            app_name: None,
+            monitor_url: None,
             enc_private_key_pem: mock_pem,
             enc_public_key_pem: "-----BEGIN PUBLIC KEY-----\nMOCKENC\n-----END PUBLIC KEY-----\n"
                 .to_string(),
@@ -3054,7 +3071,7 @@ views:
     async fn a_malformed_deployment_leaves_the_cached_secrets_alone() {
         let dir = scratch_dir("malformed-cache");
         let handle = handle_serving(&dir, SERVING).await;
-        enrol_with_a_cache_key(&dir.join(IDENTITY_FILE));
+        enroll_with_a_cache_key(&dir.join(IDENTITY_FILE));
 
         handle
             .apply_spicepod(SpicepodDeployment {
@@ -3104,7 +3121,7 @@ views:
         handle
             .delivered_secrets
             .replace(delivered("api_key", b"value-one"));
-        enrol_with_a_cache_key(&dir.join(IDENTITY_FILE));
+        enroll_with_a_cache_key(&dir.join(IDENTITY_FILE));
         assert!(cached_secrets(&dir).is_none(), "nothing is cached yet");
 
         let outcome = handle

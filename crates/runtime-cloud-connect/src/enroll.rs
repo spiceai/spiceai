@@ -1129,7 +1129,7 @@ pub async fn enroll_now(
     let client = EnrollClient::new(config).context(ClientSnafu)?;
     let material = draft.material();
 
-    let outcome = retry_until_deadline(retry, || {
+    let mut outcome = retry_until_deadline(retry, || {
         client.enroll(
             authority,
             &draft.enrollment_operation_id,
@@ -1139,6 +1139,13 @@ pub async fn enroll_now(
         )
     })
     .await?;
+
+    // A successful enroll has already consumed the credential, so malformed
+    // optional portal metadata must not discard the issued identity. Normalize
+    // harmless surrounding whitespace and treat a blank org as absent.
+    let normalized_org_name = outcome.metadata.organization.name.trim().to_string();
+    let org_name = (!normalized_org_name.is_empty()).then(|| normalized_org_name.clone());
+    outcome.metadata.organization.name = normalized_org_name;
 
     // Atomic promotion: the draft's provisional key material becomes the
     // identity, written owner-only via atomic rename; the draft is deleted
@@ -1152,6 +1159,12 @@ pub async fn enroll_now(
         gateway_addr: outcome.gateway_addr,
         not_after_unix: Some(outcome.not_after_unix),
         app_id: None,
+        // Enrollment establishes the instance-level org recovery destination.
+        // Project-scoped attachment metadata still arrives over the control
+        // stream (`AttachApp`), so a fresh enrollment starts detached.
+        org_name,
+        app_name: None,
+        monitor_url: None,
         enc_private_key_pem: material.enc_private_key_pem,
         enc_public_key_pem: material.enc_public_key_pem,
         // A fresh enrollment has no prior key to retain.

@@ -531,7 +531,6 @@ async fn mock_enroll(
         };
         org
     };
-
     let Ok((mut leaf_pem, point)) = mock.ca.sign_csr(csr_pem) else {
         return error_json(StatusCode::BAD_REQUEST, "invalid_request", "Malformed CSR");
     };
@@ -573,7 +572,7 @@ async fn mock_enroll(
         "ca_bundle_pem": mock.ca.ca_cert_pem,
         "gateway_addr": mock.gateway_addr,
         "not_after": mock.not_after(),
-        "organization": {"id": 42, "name": org},
+        "organization": {"id": 42, "name": format!(" {org} ")},
         "portal": {"new_project_url": format!("https://cloud.test/{org}/new?instance={instance_id}")},
         "attachment": null,
     });
@@ -1940,6 +1939,7 @@ async fn enrollment_precedes_the_client_and_reconnects_from_identity() {
         panic!("a fresh directory must enroll, not reuse");
     };
     assert_eq!(identity.identifier, ASSIGNED_ID);
+    assert_eq!(identity.org_name.as_deref(), Some(ORG_NAME));
     assert_eq!(metadata.organization.name, ORG_NAME);
     assert_eq!(
         metadata.new_project_url.as_deref(),
@@ -1949,6 +1949,15 @@ async fn enrollment_precedes_the_client_and_reconnects_from_identity() {
     assert!(
         config.identity_path.exists(),
         "identity must be persisted by the pre-runtime enrollment"
+    );
+    assert_eq!(
+        IdentityStore::load_optional(&config.identity_path)
+            .expect("load stored identity")
+            .expect("stored identity exists")
+            .org_name
+            .as_deref(),
+        Some("acme"),
+        "enrollment org must survive in the canonical identity file"
     );
     assert!(
         !runtime_cloud_connect::EnrollmentDraft::path_in(dir.path()).exists(),
