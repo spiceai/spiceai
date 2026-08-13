@@ -25,7 +25,9 @@ paste.workspace = true
 percent-encoding.workspace = true
 reqwest.workspace = true
 runtime = { path = "../../runtime" }
+runtime-datafusion = { path = "../../runtime-datafusion" }
 runtime-object-store = { path = "../../runtime-object-store" }
+runtime-parameters = { path = "../../runtime-parameters" }
 secrecy.workspace = true
 serde.workspace = true
 serde_json.workspace = true

@@ -19,7 +19,9 @@ futures.workspace = true
 opentelemetry.workspace = true
 runtime = { path = "../../runtime", features = ["kafka"] }
 runtime-api-types = { path = "../../runtime-api-types" }
+runtime-datafusion = { path = "../../runtime-datafusion" }
 runtime-metrics = { path = "../../runtime-metrics" }
+runtime-parameters = { path = "../../runtime-parameters" }
 secrecy.workspace = true
 serde.workspace = true
 serde_json.workspace = true

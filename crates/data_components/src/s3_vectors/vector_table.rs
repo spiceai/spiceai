@@ -905,4 +905,66 @@ mod tests {
 
         Ok(())
     }
+
+    #[tokio::test]
+    async fn delete_by_keys_removes_only_the_targeted_keys()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mock_client = Arc::new(MockClient::new());
+        let table = create_test_table(
+            Arc::clone(&mock_client) as Arc<dyn S3Vectors + Send + Sync>,
+            "test-index",
+        );
+
+        table
+            .client
+            .create_vector_bucket(
+                &CreateVectorBucketInput::builder()
+                    .vector_bucket_name("test-bucket")
+                    .build()?,
+            )
+            .await?;
+        table
+            .client
+            .create_index(
+                &CreateIndexInput::builder()
+                    .index_name("test-index")
+                    .vector_bucket_name("test-bucket")
+                    .data_type(S3DataType::Float32)
+                    .dimension(3)
+                    .distance_metric(DistanceMetric::Cosine)
+                    .build()?,
+            )
+            .await?;
+
+        table
+            .write_chunk_with_spilling(&create_test_vectors(3), None)
+            .await
+            .expect("seed write should succeed");
+        assert_eq!(
+            mock_client.vector_keys("test-index"),
+            vec!["key0", "key1", "key2"]
+        );
+
+        table
+            .delete_by_keys(vec!["key1".to_string()])
+            .await
+            .expect("delete should succeed");
+        assert_eq!(mock_client.vector_keys("test-index"), vec!["key0", "key2"]);
+
+        // Deleting a key that is not present is a no-op, matching the real `DeleteVectors`.
+        table
+            .delete_by_keys(vec!["absent".to_string()])
+            .await
+            .expect("deleting an absent key should succeed");
+        assert_eq!(mock_client.vector_keys("test-index"), vec!["key0", "key2"]);
+
+        // An empty key set short-circuits before any client call and changes nothing.
+        table
+            .delete_by_keys(vec![])
+            .await
+            .expect("empty delete should succeed");
+        assert_eq!(mock_client.vector_keys("test-index"), vec!["key0", "key2"]);
+
+        Ok(())
+    }
 }

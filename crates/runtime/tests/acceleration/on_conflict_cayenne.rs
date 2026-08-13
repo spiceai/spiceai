@@ -507,9 +507,11 @@ async fn test_cayenne_primary_key_delete() -> Result<(), anyhow::Error> {
                 .ok_or_else(|| anyhow::anyhow!("Table pk_test not found"))?;
 
             // Get the AcceleratedTable, then its underlying accelerator (which may be wrapped)
-            let accelerated_table = table
-                .downcast_ref::<AcceleratedTable>()
-                .ok_or_else(|| anyhow::anyhow!("Table is not an AcceleratedTable"))?;
+            let accelerated_table = spice_table::find_layer::<AcceleratedTable>(
+                table.as_ref(),
+                spice_table::LayerWalk::Read,
+            )
+            .ok_or_else(|| anyhow::anyhow!("Table is not an AcceleratedTable"))?;
 
             let accelerator = accelerated_table.get_accelerator();
 

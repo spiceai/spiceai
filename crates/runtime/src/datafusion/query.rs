@@ -93,6 +93,7 @@ use crate::datafusion::{
     query::cache::RequestCacheManager,
     sql_validator::{validate_sql_query_operations, validate_sql_query_read_only},
 };
+use crate::task_history::correlation;
 use managed_runtime::ManagedRuntimeError;
 use opentelemetry::KeyValue;
 use runtime_auth::AuthRequestContext;
@@ -601,17 +602,17 @@ impl Query {
             total_executor_ms = tracing::field::Empty,
         );
 
-        if let Some(traceparent) = request_context.trace_parent() {
-            crate::http::traceparent::override_task_history_with_trace_parent(&span, traceparent);
-        }
+        let trace_span = correlation::begin_task_trace(&span, &request_context);
 
         let result = self
             .submit_distributed_internal(
                 job_id,
                 request_context,
                 span.clone(),
+                trace_span.clone(),
                 DistributedSubmitMode::New,
             )
+            .instrument(trace_span)
             .await;
         if let Err(e) = &result {
             tracing::error!(target: "task_history", parent: &span, "{e}");
@@ -640,17 +641,17 @@ impl Query {
             total_executor_ms = tracing::field::Empty,
         );
 
-        if let Some(traceparent) = request_context.trace_parent() {
-            crate::http::traceparent::override_task_history_with_trace_parent(&span, traceparent);
-        }
+        let trace_span = correlation::begin_task_trace(&span, &request_context);
 
         let result = self
             .submit_distributed_internal(
                 job_id,
                 request_context,
                 span.clone(),
+                trace_span.clone(),
                 DistributedSubmitMode::Resume,
             )
+            .instrument(trace_span)
             .await;
         if let Err(e) = &result {
             tracing::error!(target: "task_history", parent: &span, "{e}");
@@ -664,6 +665,7 @@ impl Query {
         job_id: &str,
         request_context: Arc<RequestContext>,
         span: Span,
+        trace_span: Span,
         mode: DistributedSubmitMode,
     ) -> Result<QueryHandle> {
         // Get the scheduler server
@@ -776,6 +778,7 @@ impl Query {
                                 None, // Cache key already used for lookup
                                 cached_result.data,
                                 Arc::clone(&request_context),
+                                trace_span,
                                 Arc::clone(&sql_preview),
                             ));
                         }
@@ -833,6 +836,7 @@ impl Query {
                             None,
                             Box::pin(stream),
                             Arc::clone(&request_context),
+                            trace_span,
                             Arc::clone(&sql_preview),
                         ));
                     }
@@ -935,6 +939,7 @@ impl Query {
             tracker,
             request_context,
             span,
+            trace_span,
             sql_preview,
             query_start,
             plan_capture::logical_plan_is_explain(&plan),
@@ -991,9 +996,12 @@ impl Query {
         let query_start = std::time::Instant::now();
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "sql_query", input = %self.sql, runtime_query = false);
 
-        if let Some(traceparent) = request_context.trace_parent() {
-            crate::http::traceparent::override_task_history_with_trace_parent(&span, traceparent);
-        }
+        // Carries this query's trace id onto every log record it produces — its
+        // own and those of everything it reaches — for the whole of planning,
+        // execution and result streaming. Unlike `span` above, it survives
+        // `runtime.task_history.enabled: false`, which is the case that
+        // otherwise leaves a failure with nothing to correlate on.
+        let trace_span = correlation::begin_task_trace(&span, &request_context);
 
         // Resolve the cancellation token for this query. An explicit token on
         // the `Query` takes precedence; otherwise the query inherits the
@@ -1256,7 +1264,11 @@ impl Query {
                 // - plans cache must be cleared so future queries re-resolve table
                 //   providers with up-to-date in-memory state.
                 if let Some(dml_table) = extract_dml_target_table(&plan)
-                    && let Err(e) = ctx.df.caching().invalidate_for_table(dml_table.clone())
+                    && let Err(e) = ctx
+                        .df
+                        .caching()
+                        .invalidate_for_table(dml_table.clone())
+                        .await
                 {
                     tracing::warn!(
                         "Failed to invalidate caches for table {dml_table} before DML: {e}",
@@ -1605,7 +1617,8 @@ impl Query {
                     cache_manager.cache_status,
                 ))
             }
-            .instrument(span.clone());
+            .instrument(span.clone())
+            .instrument(trace_span.clone());
 
         // Keep this large async block out of callers' state machines. This
         // preserves the concrete future type, avoiding dynamic dispatch while
@@ -1613,7 +1626,14 @@ impl Query {
         let query_result = Box::pin(query_result).await;
 
         match query_result {
-            Ok(result) => Ok(result),
+            Ok(result) => {
+                // The result stream outlives this call — Flight drains it
+                // lazily, the managed runtime drives it on another task — and a
+                // query fails mid-stream as readily as during planning, so the
+                // trace id has to travel with the stream, not just the future
+                // that produced it.
+                Ok(instrument_query_result(result, trace_span))
+            }
             Err(e) => {
                 tracing::error!(target: "task_history", parent: &span, "{e}");
                 Err(e)
@@ -1721,10 +1741,11 @@ impl Query {
     fn handle_schema_error(self, request_context: &RequestContext, e: &DataFusionError) {
         // If there is an error getting the schema, we still want to track it in task history
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "sql_query", input = %self.sql, runtime_query = false);
+        let trace_span = correlation::begin_task_trace(&span, request_context);
         let error_code = ErrorCode::from(e);
-        span.in_scope(|| {
-            self.finish_with_error(request_context, e.to_string(), error_code);
-        });
+        let _trace = trace_span.enter();
+        let _task = span.enter();
+        self.finish_with_error(request_context, e.to_string(), error_code);
     }
 }
 
@@ -1771,6 +1792,29 @@ fn parameter_schema_for_plan(plan: &LogicalPlan) -> Result<Option<Schema>, DataF
     };
 
     Ok(maybe_schema)
+}
+
+/// Collapses the control characters in a query error message so it logs as a
+/// single record.
+///
+/// A memory-pool refusal spreads its top-consumer breakdown over several lines,
+/// and a record that breaks mid-message is one a log collector cannot group or
+/// alert on. Every control character is replaced rather than dropped, so
+/// offsets into the logged line still match the message the response carries.
+/// Only the logged copy is collapsed — the body keeps what the engine wrote —
+/// and a message with nothing to collapse is borrowed, so the common path does
+/// not allocate.
+pub(crate) fn single_line(message: &str) -> Cow<'_, str> {
+    if message.contains(char::is_control) {
+        Cow::Owned(
+            message
+                .chars()
+                .map(|c| if c.is_control() { ' ' } else { c })
+                .collect(),
+        )
+    } else {
+        Cow::Borrowed(message)
+    }
 }
 
 /// The `err_code` a failure raised while batches are being polled is recorded
@@ -1925,6 +1969,27 @@ fn attach_query_active_guard_to_stream(
         schema,
         Box::pin(updated_stream.instrument(span)),
     ))
+}
+
+/// Enters `span` for every poll of a result stream, so records emitted while
+/// batches are produced are attributed to the query that asked for them.
+pub(crate) fn instrument_record_batch_stream(
+    stream: SendableRecordBatchStream,
+    span: Span,
+) -> SendableRecordBatchStream {
+    // `RecordBatchStreamAdapter` pin-projects its stream, so no inner `Box::pin`
+    // is needed — one fewer allocation and one fewer virtual call per poll.
+    let schema = stream.schema();
+    Box::pin(RecordBatchStreamAdapter::new(
+        schema,
+        stream.instrument(span),
+    ))
+}
+
+/// [`instrument_record_batch_stream`] applied to a whole [`QueryResult`].
+fn instrument_query_result(query_result: QueryResult, span: Span) -> QueryResult {
+    let QueryResult { data, cache_status } = query_result;
+    QueryResult::new(instrument_record_batch_stream(data, span), cache_status)
 }
 
 fn attach_cancellation_to_query_result<G>(
@@ -3262,6 +3327,58 @@ mod tests {
             } => assert_eq!(cancelled, query_id.to_string()),
             other => panic!("expected QueryCancelled, got: {other:?}"),
         }
+    }
+
+    /// A query fails mid-stream as readily as during planning, and the result
+    /// stream is drained long after `run` returns — by Flight, or by the
+    /// managed runtime on another task. So the trace span has to be entered on
+    /// every poll of the stream, not merely while the query is being built.
+    #[tokio::test]
+    async fn instrumented_query_result_enters_the_trace_span_while_streaming() {
+        use futures::StreamExt as _;
+
+        // A registry is enough: the span only has to exist for `Span::current()`
+        // to report it — nothing here formats or exports it. Installed before
+        // the span is created, or the span would be a no-op.
+        let _guard = tracing::subscriber::set_default(tracing_subscriber::registry());
+
+        let schema = Arc::new(Schema::empty());
+        let spans_seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+
+        let recorder = Arc::clone(&spans_seen);
+        let batches = futures::stream::iter(vec![
+            Ok(RecordBatch::new_empty(Arc::clone(&schema))),
+            Ok(RecordBatch::new_empty(Arc::clone(&schema))),
+        ])
+        .inspect(move |_| {
+            recorder
+                .lock()
+                .push(Span::current().metadata().map(tracing::Metadata::name));
+        });
+
+        let result = QueryResult::new(
+            Box::pin(RecordBatchStreamAdapter::new(Arc::clone(&schema), batches)),
+            CacheStatus::CacheDisabled,
+        );
+        let request_context = RequestContext::builder(Protocol::Http)
+            .with_client_trace_id(Some(Arc::from("4bf92f3577b34da6a3ce929d0e0e4736")))
+            .build();
+        let instrumented = instrument_query_result(
+            result,
+            correlation::begin_task_trace(&Span::none(), &request_context),
+        );
+
+        let batches: Vec<_> = instrumented.data.collect().await;
+        assert_eq!(batches.len(), 2, "both batches must still reach the caller");
+
+        assert_eq!(
+            *spans_seen.lock(),
+            vec![
+                Some(correlation::TRACE_SPAN_NAME),
+                Some(correlation::TRACE_SPAN_NAME)
+            ],
+            "every poll of the result stream must run inside the query's trace span"
+        );
     }
 
     /// [query timeout] A query still QUEUED for an admission permit when the

@@ -42,6 +42,7 @@ limitations under the License.
 //! configures a keyed `refresh_mode: changes` Cayenne dataset.
 
 #![cfg(not(windows))]
+#![recursion_limit = "256"]
 #![allow(clippy::expect_used)]
 
 use std::sync::Arc;

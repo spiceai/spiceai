@@ -53,7 +53,8 @@ fn cluster_table_wrapper(catalog_name: &str) -> CatalogTableWrapper {
     Arc::new(move |schema: &str, table: &str, provider| {
         let table_ref =
             TableReference::full(catalog_name.clone(), schema.to_string(), table.to_string());
-        Arc::new(IcebergClusterTableProvider::new(table_ref, provider)) as Arc<dyn TableProvider>
+        Arc::new(IcebergClusterTableProvider::new(table_ref, provider)).into_table()
+            as Arc<dyn TableProvider>
     })
 }
 use iceberg::{CatalogBuilder, Namespace, NamespaceIdent, io::StorageFactory};
