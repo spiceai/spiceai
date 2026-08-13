@@ -30,7 +30,7 @@ use datafusion::{
     physical_plan::ExecutionPlan,
     prelude::SessionContext,
 };
-use runtime_datafusion_index::{Index, WriteWindow};
+use spice_table::{Index, WriteWindow};
 
 use super::{CompoundReadMode, CompoundSearchIndex, CompoundVectorIndex, Error};
 use crate::index::{SearchIndex, VectorIndex};
@@ -56,6 +56,7 @@ struct MockIndex {
     write_output_rows: Option<usize>,
     fail_write: bool,
     fail_on_write_start: bool,
+    fail_on_write_complete: bool,
     /// What this mock reports from `Index::write_start_failure_is_fatal`.
     write_start_fatal: bool,
     /// What this mock reports from `Index::write_complete_failure_is_fatal`.
@@ -78,6 +79,7 @@ impl MockIndex {
             write_output_rows: None,
             fail_write: false,
             fail_on_write_start: false,
+            fail_on_write_complete: false,
             write_start_fatal: false,
             write_complete_fatal: false,
             deletes_partial_key: false,
@@ -172,6 +174,12 @@ impl Index for MockIndex {
 
     async fn on_write_complete(&self) -> Result<(), DataFusionError> {
         self.record("on_write_complete");
+        if self.fail_on_write_complete {
+            return Err(DataFusionError::Execution(format!(
+                "{} refuses to finalize a write",
+                self.label
+            )));
+        }
         Ok(())
     }
 
@@ -549,127 +557,43 @@ async fn replace_all_window_forwards_to_both_indexes() {
     }
 }
 
-/// A compound index is stale if *either* half fails to finalize, so the fatality flag
-/// must be the union of both halves rather than the trait default (#12038).
+/// A compound applies each half's own fatality to that half's own failure and swallows the
+/// best-effort ones, so every error it returns is already fatal — whatever the halves report
+/// individually. The trait default (`false`) would still downgrade a fatal half (#12421), which is
+/// why both are `true` rather than inherited (#12038 for the finalize half).
 #[test]
-fn write_complete_fatality_is_the_union_of_both_search_halves() {
+fn fatality_is_reported_for_the_compound_not_the_halves() {
     let events = Arc::new(Mutex::new(vec![]));
 
-    for (primary_fatal, secondary_fatal, expected) in [
-        (false, false, false),
-        (true, false, true),
-        (false, true, true),
-        (true, true, true),
-    ] {
-        let mut primary = MockIndex::new("primary", &events);
-        primary.write_complete_fatal = primary_fatal;
-        let mut secondary = MockIndex::new("secondary", &events);
-        secondary.write_complete_fatal = secondary_fatal;
+    for (primary_fatal, secondary_fatal) in
+        [(false, false), (true, false), (false, true), (true, true)]
+    {
+        let mock = |label: &'static str, fatal: bool, dimension: Option<i32>| {
+            let mut idx = MockIndex::new(label, &events);
+            idx.dimension = dimension;
+            idx.write_start_fatal = fatal;
+            idx.write_complete_fatal = fatal;
+            idx
+        };
+        let case = format!("primary_fatal={primary_fatal}, secondary_fatal={secondary_fatal}");
 
-        let idx = compound(primary, secondary, CompoundReadMode::PrimaryOnly);
-        assert_eq!(
-            idx.write_complete_failure_is_fatal(),
-            expected,
-            "primary_fatal={primary_fatal}, secondary_fatal={secondary_fatal}"
+        let search = compound(
+            mock("primary", primary_fatal, None),
+            mock("secondary", secondary_fatal, None),
+            CompoundReadMode::PrimaryOnly,
         );
-    }
-}
+        assert!(search.write_start_failure_is_fatal(), "search: {case}");
+        assert!(search.write_complete_failure_is_fatal(), "search: {case}");
 
-#[test]
-fn write_complete_fatality_is_the_union_of_both_vector_halves() {
-    let events = Arc::new(Mutex::new(vec![]));
-
-    for (primary_fatal, secondary_fatal, expected) in [
-        (false, false, false),
-        (true, false, true),
-        (false, true, true),
-        (true, true, true),
-    ] {
-        let mut primary = MockIndex::new("primary", &events);
-        primary.dimension = Some(4);
-        primary.write_complete_fatal = primary_fatal;
-        let mut secondary = MockIndex::new("secondary", &events);
-        secondary.dimension = Some(4);
-        secondary.write_complete_fatal = secondary_fatal;
-
-        let idx = CompoundVectorIndex::try_new(
-            Arc::new(primary) as Arc<dyn VectorIndex>,
-            Arc::new(secondary) as Arc<dyn VectorIndex>,
+        let vector = CompoundVectorIndex::try_new(
+            Arc::new(mock("primary", primary_fatal, Some(4))) as Arc<dyn VectorIndex>,
+            Arc::new(mock("secondary", secondary_fatal, Some(4))) as Arc<dyn VectorIndex>,
             CompoundReadMode::PrimaryOnly,
         )
         .expect("compatible vector indexes");
 
-        assert_eq!(
-            idx.write_complete_failure_is_fatal(),
-            expected,
-            "primary_fatal={primary_fatal}, secondary_fatal={secondary_fatal}"
-        );
-    }
-}
-
-/// `compound_on_write_start` fails if either half fails to start, so the start-fatality flag
-/// is the union of both halves rather than the trait default (#12421).
-#[test]
-fn write_start_fatality_is_the_union_of_both_search_halves() {
-    let events = Arc::new(Mutex::new(vec![]));
-
-    for (primary_fatal, secondary_fatal, expected) in [
-        (false, false, false),
-        (true, false, true),
-        (false, true, true),
-        (true, true, true),
-    ] {
-        let mut primary = MockIndex::new("primary", &events);
-        primary.write_start_fatal = primary_fatal;
-        let mut secondary = MockIndex::new("secondary", &events);
-        secondary.write_start_fatal = secondary_fatal;
-
-        let idx = compound(primary, secondary, CompoundReadMode::PrimaryOnly);
-        assert_eq!(
-            idx.write_start_failure_is_fatal(),
-            expected,
-            "primary_fatal={primary_fatal}, secondary_fatal={secondary_fatal}"
-        );
-        assert!(
-            !idx.write_complete_failure_is_fatal(),
-            "a fatal start must not be reported as a fatal finalize"
-        );
-    }
-}
-
-#[test]
-fn write_start_fatality_is_the_union_of_both_vector_halves() {
-    let events = Arc::new(Mutex::new(vec![]));
-
-    for (primary_fatal, secondary_fatal, expected) in [
-        (false, false, false),
-        (true, false, true),
-        (false, true, true),
-        (true, true, true),
-    ] {
-        let mut primary = MockIndex::new("primary", &events);
-        primary.dimension = Some(4);
-        primary.write_start_fatal = primary_fatal;
-        let mut secondary = MockIndex::new("secondary", &events);
-        secondary.dimension = Some(4);
-        secondary.write_start_fatal = secondary_fatal;
-
-        let idx = CompoundVectorIndex::try_new(
-            Arc::new(primary) as Arc<dyn VectorIndex>,
-            Arc::new(secondary) as Arc<dyn VectorIndex>,
-            CompoundReadMode::PrimaryOnly,
-        )
-        .expect("compatible vector indexes");
-
-        assert_eq!(
-            idx.write_start_failure_is_fatal(),
-            expected,
-            "primary_fatal={primary_fatal}, secondary_fatal={secondary_fatal}"
-        );
-        assert!(
-            !idx.write_complete_failure_is_fatal(),
-            "a fatal start must not be reported as a fatal finalize"
-        );
+        assert!(vector.write_start_failure_is_fatal(), "vector: {case}");
+        assert!(vector.write_complete_failure_is_fatal(), "vector: {case}");
     }
 }
 
@@ -721,22 +645,182 @@ fn partial_key_deletion_requires_both_halves() {
     }
 }
 
+/// A secondary whose *own* start failure is best-effort must not close the primary's window.
+/// The write runs anyway, so closing the window the primary staged silently downgrades a
+/// [`WriteWindow::ReplaceAll`] to an in-place write: readers observe a partially rebuilt index
+/// and rows the source dropped are never cleared (#12826).
 #[tokio::test]
-async fn on_write_start_rolls_back_primary_when_secondary_fails() {
+async fn on_write_start_keeps_the_primary_window_when_a_best_effort_secondary_fails() {
+    let events = Arc::new(Mutex::new(vec![]));
+    let mut primary = MockIndex::new("primary", &events);
+    primary.dimension = Some(4);
+    let mut secondary = MockIndex::new("secondary", &events);
+    secondary.dimension = Some(4);
+    secondary.fail_on_write_start = true;
+
+    let idx = CompoundVectorIndex::try_new(
+        Arc::new(primary) as Arc<dyn VectorIndex>,
+        Arc::new(secondary) as Arc<dyn VectorIndex>,
+        CompoundReadMode::PrimaryOnly,
+    )
+    .expect("compatible vector indexes");
+    idx.on_write_start(WriteWindow::ReplaceAll)
+        .await
+        .expect("a best-effort secondary start failure must not fail the start");
+
+    let events = events.lock().expect("event log mutex").clone();
+    assert!(
+        !events.contains(&"primary:on_write_failed".to_string()),
+        "the primary's staged window must stay open for the write that follows: {events:?}"
+    );
+}
+
+/// The mirror case: a secondary that declares its own start failure fatal *does* abandon the
+/// write, so the primary's window must close with it.
+#[tokio::test]
+async fn on_write_start_rolls_back_the_primary_when_a_fatal_secondary_fails() {
     let events = Arc::new(Mutex::new(vec![]));
     let primary = MockIndex::new("primary", &events);
     let mut secondary = MockIndex::new("secondary", &events);
     secondary.fail_on_write_start = true;
+    secondary.write_start_fatal = true;
 
     let idx = compound(primary, secondary, CompoundReadMode::PrimaryOnly);
     idx.on_write_start(WriteWindow::Append)
         .await
-        .expect_err("secondary start failure must propagate");
+        .expect_err("a fatal secondary start failure must propagate");
 
     let events = events.lock().expect("event log mutex").clone();
     assert!(
         events.contains(&"primary:on_write_failed".to_string()),
         "primary write window must be rolled back: {events:?}"
+    );
+}
+
+/// A best-effort *primary* start failure must not abandon the write either, even next to a
+/// fatal secondary. Reporting the union of the two flags escalated it: the sink saw "fatal"
+/// from the secondary and rejected a write only the primary's advisory tuning had failed
+/// (#12826).
+#[tokio::test]
+async fn on_write_start_continues_past_a_best_effort_primary_failure() {
+    let events = Arc::new(Mutex::new(vec![]));
+    let mut primary = MockIndex::new("primary", &events);
+    primary.fail_on_write_start = true;
+    let mut secondary = MockIndex::new("secondary", &events);
+    secondary.write_start_fatal = true;
+
+    let idx = compound(primary, secondary, CompoundReadMode::PrimaryOnly);
+    idx.on_write_start(WriteWindow::Append)
+        .await
+        .expect("a best-effort primary start failure must not fail the start");
+
+    let events = events.lock().expect("event log mutex").clone();
+    assert!(
+        events.contains(&"secondary:on_write_start:Append".to_string()),
+        "the secondary must still be started: {events:?}"
+    );
+    assert!(
+        !events.contains(&"primary:on_write_failed".to_string()),
+        "a start that failed partway owns its own cleanup: {events:?}"
+    );
+}
+
+/// Both halves failing to start is the only path that reaches the rollback branch with the
+/// primary's window never opened. The write is still abandoned — the secondary declares its own
+/// start failure fatal — but the primary must not be rolled back: a start that failed partway
+/// owns its cleanup, so `on_write_failed` would "restore" settings it never overrode (#12826).
+#[tokio::test]
+async fn on_write_start_does_not_roll_back_a_primary_whose_own_start_failed() {
+    let events = Arc::new(Mutex::new(vec![]));
+    let mut primary = MockIndex::new("primary", &events);
+    primary.fail_on_write_start = true;
+    let mut secondary = MockIndex::new("secondary", &events);
+    secondary.fail_on_write_start = true;
+    secondary.write_start_fatal = true;
+
+    let idx = compound(primary, secondary, CompoundReadMode::PrimaryOnly);
+    idx.on_write_start(WriteWindow::ReplaceAll)
+        .await
+        .expect_err("a fatal secondary start failure must propagate");
+
+    let events = events.lock().expect("event log mutex").clone();
+    assert!(
+        !events.contains(&"primary:on_write_failed".to_string()),
+        "a primary whose own start failed must not be rolled back: {events:?}"
+    );
+}
+
+/// The finalize hook has the same shape as the start hook: a half that declares its own finalize
+/// failure best-effort must not fail the write just because the *other* half declares its own
+/// fatal. Elasticsearch's `_forcemerge` beside a tantivy primary is the live pairing (#12826).
+#[tokio::test]
+async fn on_write_complete_swallows_a_best_effort_half_failure() {
+    let events = Arc::new(Mutex::new(vec![]));
+    let mut primary = MockIndex::new("primary", &events);
+    primary.write_complete_fatal = true;
+    let mut secondary = MockIndex::new("secondary", &events);
+    secondary.fail_on_write_complete = true;
+
+    let idx = compound(primary, secondary, CompoundReadMode::PrimaryOnly);
+    idx.on_write_complete()
+        .await
+        .expect("a best-effort half's finalize failure must not fail the write");
+
+    let events = events.lock().expect("event log mutex").clone();
+    for side in ["primary", "secondary"] {
+        assert!(
+            events.contains(&format!("{side}:on_write_complete")),
+            "both halves must be finalized: {events:?}"
+        );
+    }
+}
+
+/// The mirror case: the half that declares its own finalize fatal does fail the write, and the
+/// other half is still finalized rather than skipped.
+#[tokio::test]
+async fn on_write_complete_reports_a_fatal_half_failure() {
+    let events = Arc::new(Mutex::new(vec![]));
+    let mut primary = MockIndex::new("primary", &events);
+    primary.fail_on_write_complete = true;
+    primary.write_complete_fatal = true;
+    let secondary = MockIndex::new("secondary", &events);
+
+    let idx = compound(primary, secondary, CompoundReadMode::PrimaryOnly);
+    let err = idx
+        .on_write_complete()
+        .await
+        .expect_err("a fatal half's finalize failure must fail the write");
+    assert!(err.to_string().contains("primary"), "{err}");
+
+    let events = events.lock().expect("event log mutex").clone();
+    assert!(
+        events.contains(&"secondary:on_write_complete".to_string()),
+        "the other half must still be finalized: {events:?}"
+    );
+}
+
+/// A fatal primary start failure stops before the secondary is started at all.
+#[tokio::test]
+async fn on_write_start_stops_at_a_fatal_primary_failure() {
+    let events = Arc::new(Mutex::new(vec![]));
+    let mut primary = MockIndex::new("primary", &events);
+    primary.fail_on_write_start = true;
+    primary.write_start_fatal = true;
+    let secondary = MockIndex::new("secondary", &events);
+
+    let idx = compound(primary, secondary, CompoundReadMode::PrimaryOnly);
+    idx.on_write_start(WriteWindow::Append)
+        .await
+        .expect_err("a fatal primary start failure must propagate");
+
+    let events = events.lock().expect("event log mutex").clone();
+    assert!(
+        !events.contains(&"secondary:on_write_start:Append".to_string()),
+        "the secondary must not be started after a fatal primary failure: {events:?}"
+    );
+    assert!(
+        !events.contains(&"primary:on_write_failed".to_string()),
+        "a start that failed partway owns its own cleanup: {events:?}"
     );
 }
 

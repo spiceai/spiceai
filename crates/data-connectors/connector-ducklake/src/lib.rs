@@ -34,9 +34,10 @@ use duckdb::AccessMode;
 use runtime::component::dataset::Dataset;
 use runtime::dataconnector::{
     AnyErrorResult, ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError,
-    DataConnectorFactory, ParameterSpec,
+    DataConnectorFactory,
 };
-use runtime::datafusion::dialect::new_duckdb_dialect;
+use runtime_datafusion::dialect::new_duckdb_dialect;
+use runtime_parameters::ParameterSpec;
 use snafu::prelude::*;
 use std::any::Any;
 use std::future::Future;

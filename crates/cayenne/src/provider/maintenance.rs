@@ -172,6 +172,11 @@ pub(crate) struct PostWriteMaintenanceState {
     /// [`PostWriteMaintenance::outstanding_live_rows_deltas`]. Zero when no
     /// delta has been queued since the last drain.
     pub(crate) live_rows_delta_count: u64,
+    /// Set when a write wants the metastore WAL drained but has no other
+    /// maintenance to contribute. Every pass ends in a WAL checkpoint, so this
+    /// only has to keep the pass from being skipped as empty. Coalesces with the
+    /// rest of the debounce window: a burst of writes drains the WAL once.
+    pub(crate) wal_checkpoint_requested: bool,
 }
 
 impl PostWriteMaintenanceState {
@@ -180,6 +185,7 @@ impl PostWriteMaintenanceState {
             && !self.refresh_listing
             && !self.retention_requested
             && self.live_rows_delta == 0
+            && !self.wal_checkpoint_requested
     }
 }
 

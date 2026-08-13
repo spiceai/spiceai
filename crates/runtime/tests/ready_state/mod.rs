@@ -56,8 +56,8 @@ use runtime::{
         self, ConnectorComponent, DataConnector, DataConnectorError, DataConnectorFactory,
         NewDataConnectorResult, parameters::ConnectorParams,
     },
-    parameters::ParameterSpec,
 };
+use runtime_parameters::ParameterSpec;
 use runtime_request_context::{AsyncMarker, Protocol, RequestContext};
 use spicepod::{
     acceleration::Acceleration,

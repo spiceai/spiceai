@@ -1,0 +1,21 @@
+[package]
+description = "The table a Spice dataset presents: a stack of layers over a connector's own provider"
+edition.workspace = true
+homepage.workspace = true
+license-file.workspace = true
+name = "spice-table"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+datafusion.workspace = true
+datafusion-federation.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+
+[lints]
+workspace = true

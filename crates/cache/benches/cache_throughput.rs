@@ -19,8 +19,8 @@ limitations under the License.
 #![allow(clippy::unit_arg)]
 
 use cache::{
-    AsTableRefs, CacheMetrics, CacheProvider, HashBuilder, LruCache, SimpleCache, Sizeable,
-    get_hash_builder,
+    AsTableRefs, CacheMetrics, CacheProvider, EvictionReason, HashBuilder, LruCache, SimpleCache,
+    Sizeable, get_hash_builder,
 };
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use datafusion::sql::TableReference;
@@ -63,8 +63,10 @@ impl CacheMetrics for BenchValue {
     fn record_item_count(_count: u64) {}
     fn record_size(_size: u64) {}
     fn record_max_size(_size: u64) {}
-    fn record_eviction() {}
+    fn record_eviction(_reason: EvictionReason) {}
+    fn record_stale_rejection() {}
     fn update_hit_ratio(_hits: u64, _total: u64) {}
+    fn publish_counters_at_zero() {}
 }
 
 impl AsTableRefs for BenchValue {

@@ -20,7 +20,7 @@ jobs:
       group: testoperator-dispatch-search-${{ github.event.schedule || github.event.ref }}
       cancel-in-progress: false
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -68,15 +68,17 @@ jobs:
             "$SPICEPOD_VALIDATOR" "$file"
           done
 
-      # --max-concurrent 1 serializes the dispatched runs: configurations that share an
-      # embedding model provider throttle each other when run concurrently
-      # (https://github.com/spiceai/spiceai/issues/6653). The slot wait must exceed one
-      # run's wall clock (up to 60 minutes) so the queue drains instead of giving up.
+      # --max-concurrent caps how many dispatched runs execute at once. Configurations
+      # that share an embedding model provider throttle each other when run concurrently
+      # (https://github.com/spiceai/spiceai/issues/6653), so this stays bounded rather than
+      # unbounded; 4 trades some of that throttling for a shorter overall dispatch. The
+      # slot wait must exceed one run's wall clock (up to 60 minutes) so the queue drains
+      # instead of giving up.
       - name: Dispatch Testoperator - Search - MTEB
         run: |
           testoperator dispatch ./tools/testoperator/dispatch/search \
             --workflow search \
-            --max-concurrent 1 \
+            --max-concurrent 4 \
             --max-concurrent-wait-timeout-mins 90
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

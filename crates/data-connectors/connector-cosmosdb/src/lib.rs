@@ -41,10 +41,10 @@ use tokio::sync::Semaphore;
 use runtime::component::dataset::Dataset;
 use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
-    ParameterSpec, Parameters,
 };
 use runtime_api_types::v1::ComponentType;
 use runtime_metrics::component::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback};
+use runtime_parameters::{ParameterSpec, Parameters};
 
 type SemaphoreEntry = (Arc<Semaphore>, usize);
 

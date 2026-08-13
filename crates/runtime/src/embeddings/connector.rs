@@ -13,7 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use crate::accelerated_table::{self, AcceleratedTable};
+use crate::accelerated::{self, AcceleratedTable};
 use crate::changes::Indexes;
 use crate::changes::index_change_envelope;
 use crate::component::ComponentInitialization;
@@ -27,24 +27,21 @@ use crate::embeddings::execution_plan::{
     compute_additional_embedding_columns, construct_record_batch,
 };
 use crate::embeddings::index::table::wrap_table_as_index;
-use crate::federated_table::FederatedTable;
+use crate::federated::FederatedTable;
 use crate::model::ENABLE_MODEL_SUPPORT_MESSAGE;
 use crate::model::EmbeddingModelStore;
 use crate::secrets::Secrets;
-use crate::table_layers::TABLE_PROVIDER_LAYERS;
 use async_trait::async_trait;
 use data_components::cdc::{ChangeEnvelope, ChangesStream, StreamError, replace_change_batch_data};
 use datafusion::datasource::TableProvider;
 use futures::StreamExt;
 use itertools::Itertools;
-use runtime_datafusion_index::{
-    IndexedTableProvider, LayerWalk, find_concrete_table_provider_in, peel_to_innermost,
-};
 use runtime_metrics::component::MetricsProvider;
 use search::generation::text_search::index::FullTextDatabaseIndex;
 use search::index::SearchIndex;
 use search::index::VectorScanTableProvider;
 use search::index::compound::CompoundSearchIndex;
+use spice_table::{IndexLayer, LayerWalk, find_layer, peel_to};
 use spicepod::component::embeddings::ColumnEmbeddingConfig;
 use spicepod::semantic::Column;
 #[cfg(feature = "duckdb")]
@@ -198,7 +195,8 @@ impl EmbeddingConnector {
         // this wrapper sits between a (possibly multiplexed) source and the
         // accelerator, so it must build the deferred rows before augmenting them.
         // Offload the synchronous build so a large burst can't stall this worker.
-        let (change_committer, batch, is_dataset_ready) = envelope.into_parts_offloaded().await?;
+        let (change_committer, batch, is_dataset_ready, history_unavailable) =
+            envelope.into_parts_offloaded().await?;
         let data_batch = batch.data_batch();
 
         let embeddings = compute_additional_embedding_columns(
@@ -226,10 +224,13 @@ impl EmbeddingConnector {
         let new_change_batch = replace_change_batch_data(&embedded_batch, &batch)
             .map_err(|e| StreamError::Arrow(e.to_string()))?;
 
-        Ok(ChangeEnvelope::new(
+        // `from_parts` rather than `new`, so every envelope flag survives this
+        // wrapper — see the same forwarding in `crate::changes`.
+        Ok(ChangeEnvelope::from_parts(
             change_committer,
             new_change_batch,
             is_dataset_ready,
+            history_unavailable,
         ))
     }
 }
@@ -288,7 +289,7 @@ impl DataConnector for EmbeddingConnector {
     async fn on_accelerator_setup(
         &self,
         dataset: &Dataset,
-        builder: &mut accelerated_table::Builder,
+        builder: &mut accelerated::Builder,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.inner_connector
             .on_accelerator_setup(dataset, builder)
@@ -349,12 +350,8 @@ impl DataConnector for EmbeddingConnector {
         dataset: &Dataset,
     ) -> Option<ChangesStream> {
         let table_provider = federated_table.try_table_provider_sync()?;
-        if let Some(indexed_table) = find_concrete_table_provider_in::<IndexedTableProvider>(
-            &table_provider,
-            TABLE_PROVIDER_LAYERS,
-            LayerWalk::CdcDetection,
-        )
-        .cloned()
+        if let Some(indexed_table) =
+            find_layer::<IndexLayer>(table_provider.as_ref(), LayerWalk::CdcDetection).cloned()
         {
             let underlying_federated_table =
                 underlying_federated_table_for_indexed_table(&table_provider);
@@ -392,23 +389,19 @@ impl DataConnector for EmbeddingConnector {
 
             Some(stream)
 
-        // `VectorScanTableProvider` is generally wrapped by a `IndexedTableProvider` (as above), but in the case both [`Self`] and the [`FullTextConnector`] exist, the latter will unwrap the `IndexedTableProvider` first. It will correctly handle indexing vector indexes as that point.
-        } else if let Some(vector_scan) = find_concrete_table_provider_in::<VectorScanTableProvider>(
-            &table_provider,
-            TABLE_PROVIDER_LAYERS,
-            LayerWalk::CdcDetection,
-        ) {
+        // `VectorScanTableProvider` is generally wrapped by a `IndexLayer` (as above), but in the case both [`Self`] and the [`FullTextConnector`] exist, the latter will unwrap the `IndexLayer` first. It will correctly handle indexing vector indexes as that point.
+        } else if let Some(vector_scan) =
+            find_layer::<VectorScanTableProvider>(table_provider.as_ref(), LayerWalk::CdcDetection)
+        {
             self.inner_connector.changes_stream(
                 Arc::new(FederatedTable::Immediate(Arc::clone(
                     &vector_scan.table_provider,
                 ))),
                 dataset,
             )
-        } else if let Some(embedding_table) = find_concrete_table_provider_in::<EmbeddingTable>(
-            &table_provider,
-            TABLE_PROVIDER_LAYERS,
-            LayerWalk::CdcDetection,
-        ) {
+        } else if let Some(embedding_table) =
+            find_layer::<EmbeddingTable>(table_provider.as_ref(), LayerWalk::CdcDetection)
+        {
             let embedding_table = Arc::new(embedding_table.clone());
             let underlying_table = Arc::clone(&embedding_table.base_table);
             let underlying_federated_table = Arc::new(FederatedTable::Immediate(underlying_table));
@@ -433,12 +426,8 @@ impl DataConnector for EmbeddingConnector {
     fn append_stream(&self, federated_table: Arc<FederatedTable>) -> Option<ChangesStream> {
         let table_provider = federated_table.try_table_provider_sync()?;
 
-        if let Some(indexed_table) = find_concrete_table_provider_in::<IndexedTableProvider>(
-            &table_provider,
-            TABLE_PROVIDER_LAYERS,
-            LayerWalk::CdcDetection,
-        )
-        .cloned()
+        if let Some(indexed_table) =
+            find_layer::<IndexLayer>(table_provider.as_ref(), LayerWalk::CdcDetection).cloned()
         {
             let indexed_table = Arc::new(indexed_table);
             let underlying_federated_table =
@@ -455,15 +444,13 @@ impl DataConnector for EmbeddingConnector {
             return Some(stream);
         }
 
-        // A `VectorScanTableProvider` is usually wrapped by an `IndexedTableProvider` (as
+        // A `VectorScanTableProvider` is usually wrapped by an `IndexLayer` (as
         // above), but when a `FullTextConnector` also exists it peels that layer off before
         // delegating here, so the vector scan is what we see. Mirror `changes_stream`: hand
         // the scan's inner provider down and let the outer connector re-apply the indexes.
-        if let Some(vector_scan) = find_concrete_table_provider_in::<VectorScanTableProvider>(
-            &table_provider,
-            TABLE_PROVIDER_LAYERS,
-            LayerWalk::CdcDetection,
-        ) {
+        if let Some(vector_scan) =
+            find_layer::<VectorScanTableProvider>(table_provider.as_ref(), LayerWalk::CdcDetection)
+        {
             return self
                 .inner_connector
                 .append_stream(Arc::new(FederatedTable::Immediate(Arc::clone(
@@ -472,12 +459,7 @@ impl DataConnector for EmbeddingConnector {
         }
 
         let embedding_table = Arc::new(
-            find_concrete_table_provider_in::<EmbeddingTable>(
-                &table_provider,
-                TABLE_PROVIDER_LAYERS,
-                LayerWalk::CdcDetection,
-            )?
-            .clone(),
+            find_layer::<EmbeddingTable>(table_provider.as_ref(), LayerWalk::CdcDetection)?.clone(),
         );
         let underlying_table = Arc::clone(&embedding_table.base_table);
         let underlying_federated_table = Arc::new(FederatedTable::Immediate(underlying_table));
@@ -699,7 +681,7 @@ pub(crate) fn duckdb_embedding_columns_from_view(
 pub(crate) async fn try_wrap_view_accelerator_with_hnsw(
     view: &View,
     table: &datafusion::sql::TableReference,
-    builder: &mut crate::accelerated_table::Builder,
+    builder: &mut crate::accelerated::Builder,
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     let Some(vector_engine) = duckdb_vector_store_for_view(view) else {
         return Ok(false);
@@ -732,14 +714,14 @@ pub(crate) async fn try_wrap_view_accelerator_with_hnsw(
     Ok(true)
 }
 
-/// Peel an [`IndexedTableProvider`]'s index and enrichment layers down to the raw
+/// Peel an [`IndexLayer`]'s index and enrichment layers down to the raw
 /// source provider, so the source connector's changes stream sees the schema of the
 /// table it actually reads from — only real source columns, never the synthetic
 /// `<col>_embedding` columns that a `VectorScanTableProvider` or `EmbeddingTable` merges
 /// into its schema (which would make the source's bootstrap `SELECT` reference a column
 /// that does not exist in the source table). A metadata-enrichment layer can sit between
-/// the `IndexedTableProvider` and its inner provider, so it is peeled too — see
-/// [`LayerWalk::Source`] and the layer table in [`crate::table_layers`].
+/// the `IndexLayer` and its inner provider, so it is peeled too — see
+/// [`LayerWalk::Source`], which each layer answers for itself.
 ///
 /// This always resolves to a source provider (never `None`): the caller re-applies the
 /// index writes over the returned stream, so a missing source table would otherwise
@@ -747,7 +729,7 @@ pub(crate) async fn try_wrap_view_accelerator_with_hnsw(
 fn underlying_federated_table_for_indexed_table(
     src_table_provider: &Arc<dyn TableProvider>,
 ) -> Arc<FederatedTable> {
-    let source = peel_to_innermost(src_table_provider, TABLE_PROVIDER_LAYERS, LayerWalk::Source);
+    let source = peel_to(src_table_provider, LayerWalk::Source);
     Arc::new(FederatedTable::Immediate(Arc::clone(source)))
 }
 
@@ -807,7 +789,7 @@ mod tests {
     }
 
     /// The provider stack an `EmbeddingConnector` is handed when the dataset also has
-    /// full-text search: the outer `FullTextConnector` peels its own `IndexedTableProvider`
+    /// full-text search: the outer `FullTextConnector` peels its own `IndexLayer`
     /// off before delegating, leaving the vector scan on top.
     fn vector_scan_over_memtable() -> Arc<FederatedTable> {
         let vector_scan = VectorScanTableProvider {
@@ -819,7 +801,7 @@ mod tests {
             primary_key: vec!["id".to_string()],
         };
         Arc::new(FederatedTable::Immediate(
-            Arc::new(vector_scan) as Arc<dyn TableProvider>
+            Arc::new(vector_scan).into_table() as Arc<dyn TableProvider>,
         ))
     }
 
@@ -858,7 +840,7 @@ mod tests {
             embedding_models: Arc::new(RwLock::new(EmbeddingModelStore::default())),
         };
         let federated_table = Arc::new(FederatedTable::Immediate(
-            Arc::new(embedding_table) as Arc<dyn TableProvider>
+            Arc::new(embedding_table).into_table() as Arc<dyn TableProvider>,
         ));
 
         assert!(

@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// Retrieval-quality metrics computed over a full search run, each evaluated at the same rank
 /// cutoff `k` (see [`calculate_retrieval_metrics`]).
@@ -85,6 +85,76 @@ pub(crate) fn calculate_retrieval_metrics<S: ::std::hash::BuildHasher>(
         mrr: average(&mrr_values),
         precision: average(&precision_values),
     })
+}
+
+/// One query's precomputed rank-ordered relevance grades (see [`score_sorted_relevance`]),
+/// paired with its full relevance judgments so per-k metrics can be recomputed cheaply.
+struct QueryRankedRelevance<'a, S> {
+    ranked_relevance: Vec<f64>,
+    relevance: &'a HashMap<String, i32, S>,
+}
+
+/// Computes [`RetrievalMetrics`] at every rank cutoff `k` in `1..=n`, where `n` is the largest
+/// number of results returned for any evaluated query. Because the top-`n` results for a query are
+/// already retrieved, evaluating every `k` is pure post-processing over the ranked relevance list —
+/// no additional search is required — so the full metric-vs-`k` curve comes for free.
+///
+/// Each query's ranked relevance is computed once (via [`score_sorted_relevance`]) and reused across
+/// all `k`, and the same per-metric helpers as [`calculate_retrieval_metrics`] are applied, so the
+/// value at any `k` here equals `calculate_retrieval_metrics(qrels, results, k)` by construction. A
+/// query returning fewer than `k` results contributes its saturated (`take(k)`) list, exactly as the
+/// single-cutoff path already does when a query returns fewer than `k` documents.
+///
+/// The result is keyed by `k` (ascending); an empty map means no query had any results to evaluate.
+#[must_use]
+pub(crate) fn calculate_retrieval_metrics_at_all_k<S: ::std::hash::BuildHasher>(
+    qrels: &HashMap<String, HashMap<String, i32, S>, S>,
+    results: &HashMap<String, HashMap<String, f64, S>, S>,
+) -> BTreeMap<usize, RetrievalMetrics> {
+    // Precompute each evaluated query's ranked relevance once, plus the max list length (`n`).
+    let mut per_query: Vec<QueryRankedRelevance<'_, S>> = Vec::new();
+    let mut max_k = 0;
+
+    for (query_id, relevance) in qrels {
+        let Some(ranked_results) = results.get(query_id) else {
+            println!("No search results found for test query {query_id}");
+            continue;
+        };
+
+        let ranked_relevance = score_sorted_relevance(ranked_results, relevance);
+        max_k = max_k.max(ranked_relevance.len());
+        per_query.push(QueryRankedRelevance {
+            ranked_relevance,
+            relevance,
+        });
+    }
+
+    let mut metrics_by_k = BTreeMap::new();
+    for k in 1..=max_k {
+        let mut ndcg_values = Vec::with_capacity(per_query.len());
+        let mut recall_values = Vec::with_capacity(per_query.len());
+        let mut mrr_values = Vec::with_capacity(per_query.len());
+        let mut precision_values = Vec::with_capacity(per_query.len());
+
+        for query in &per_query {
+            ndcg_values.push(ndcg_at_k(&query.ranked_relevance, query.relevance, k));
+            recall_values.push(recall_at_k(&query.ranked_relevance, query.relevance, k));
+            mrr_values.push(mrr_at_k(&query.ranked_relevance, k));
+            precision_values.push(precision_at_k(&query.ranked_relevance, k));
+        }
+
+        metrics_by_k.insert(
+            k,
+            RetrievalMetrics {
+                ndcg: average(&ndcg_values),
+                recall: average(&recall_values),
+                mrr: average(&mrr_values),
+                precision: average(&precision_values),
+            },
+        );
+    }
+
+    metrics_by_k
 }
 
 /// Orders a query's search results by score (descending) and returns the relevance grade of each
@@ -188,7 +258,7 @@ fn mrr_at_k(ranked_relevance: &[f64], k: usize) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::calculate_retrieval_metrics;
+    use super::{calculate_retrieval_metrics, calculate_retrieval_metrics_at_all_k};
     use std::collections::HashMap;
 
     type Qrels = HashMap<String, HashMap<String, i32>>;
@@ -311,6 +381,82 @@ mod tests {
             "precision@3 = {}",
             metrics.precision
         );
+    }
+
+    #[test]
+    fn all_k_covers_every_cutoff_and_agrees_with_single_k() {
+        let (qrels, results) = perfectly_ranked_query();
+
+        let all_k = calculate_retrieval_metrics_at_all_k(&qrels, &results);
+
+        // Six results were returned, so metrics exist for every cutoff 1..=6 and no more.
+        assert_eq!(
+            all_k.keys().copied().collect::<Vec<_>>(),
+            vec![1, 2, 3, 4, 5, 6]
+        );
+
+        // Every cutoff must match the dedicated single-k computation exactly.
+        for (&k, metrics) in &all_k {
+            assert_eq!(
+                *metrics,
+                calculate_retrieval_metrics(&qrels, &results, k)
+                    .expect("metrics are calculable for a non-empty qrels"),
+                "all-k metrics disagree with single-k metrics at k={k}"
+            );
+        }
+
+        // On a perfectly ranked query precision@k is 1.0 at every k, and recall@k is k/6.
+        for (&k, metrics) in &all_k {
+            assert!(
+                (metrics.precision - 1.0).abs() < 1e-9,
+                "precision@{k} = {}",
+                metrics.precision
+            );
+            #[expect(clippy::cast_precision_loss)]
+            let expected_recall = k as f64 / 6.0;
+            assert!(
+                (metrics.recall - expected_recall).abs() < 1e-9,
+                "recall@{k} = {}, expected {expected_recall}",
+                metrics.recall
+            );
+        }
+    }
+
+    #[test]
+    fn all_k_spans_the_longest_result_list_across_queries() {
+        // q1 returns 3 results, q2 returns 1; the longest list drives the max cutoff.
+        let qrels = HashMap::from([
+            (
+                "q1".to_string(),
+                HashMap::from([("doc0".to_string(), 1), ("doc2".to_string(), 1)]),
+            ),
+            ("q2".to_string(), HashMap::from([("docA".to_string(), 1)])),
+        ]);
+        let results = HashMap::from([
+            (
+                "q1".to_string(),
+                HashMap::from([
+                    ("doc0".to_string(), 0.9),
+                    ("doc1".to_string(), 0.8),
+                    ("doc2".to_string(), 0.7),
+                ]),
+            ),
+            ("q2".to_string(), HashMap::from([("docA".to_string(), 0.5)])),
+        ]);
+
+        let all_k = calculate_retrieval_metrics_at_all_k(&qrels, &results);
+        assert_eq!(all_k.keys().copied().collect::<Vec<_>>(), vec![1, 2, 3]);
+
+        // Beyond q2's single result the `take(k)` list saturates, so its per-query metrics stay
+        // fixed while q1's continue to evolve — agreement with single-k proves the averaging.
+        for (&k, metrics) in &all_k {
+            assert_eq!(
+                *metrics,
+                calculate_retrieval_metrics(&qrels, &results, k)
+                    .expect("metrics are calculable for a non-empty qrels"),
+                "all-k metrics disagree with single-k metrics at k={k}"
+            );
+        }
     }
 
     /// The ideal DCG must rank every *judged* document, not just the retrieved ones: search

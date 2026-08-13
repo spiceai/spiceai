@@ -60,7 +60,7 @@ runs:
 
     - name: Install CUDA Toolkit (Linux)
       if: ${{ inputs.target_os != 'windows'}}
-      uses: Jimver/cuda-toolkit@3d45d157f327c09c04b50ee6ccdea2d9d017ec76 # v0.2.35
+      uses: Jimver/cuda-toolkit@b8bf9c6c28f8a92fbb04dcfcaee872e60c57462d # v0.2.36
       id: cuda-toolkit-linux
       with:
         cuda: ${{ inputs.cuda-version }}
@@ -71,7 +71,7 @@ runs:
 
     - name: Install CUDA Toolkit (Windows)
       if: ${{ inputs.target_os == 'windows'}}
-      uses: Jimver/cuda-toolkit@3d45d157f327c09c04b50ee6ccdea2d9d017ec76 # v0.2.35
+      uses: Jimver/cuda-toolkit@b8bf9c6c28f8a92fbb04dcfcaee872e60c57462d # v0.2.36
       id: cuda-toolkit-windows
       with:
         cuda: ${{ inputs.cuda-version }}
