@@ -5279,7 +5279,9 @@ mod tests {
 
         // Global goal only.
         let global_goal = cdc_dataset("global_goal", vec![]);
-        let config = CayenneAccelerator::get_vortex_config("global_goal", &global_goal).await;
+        let config = CayenneAccelerator::get_vortex_config("global_goal", &global_goal)
+            .await
+            .expect("config should be valid");
         assert!(
             !config.dynamic_tuning,
             "a global cayenne_goal_* must not turn on the closed loop"
@@ -5294,7 +5296,9 @@ mod tests {
             "dataset_goal",
             vec![("cayenne_goal_freshness".to_string(), "30s".to_string())],
         );
-        let config = CayenneAccelerator::get_vortex_config("dataset_goal", &dataset_goal).await;
+        let config = CayenneAccelerator::get_vortex_config("dataset_goal", &dataset_goal)
+            .await
+            .expect("config should be valid");
         assert!(
             !config.dynamic_tuning,
             "a per-dataset cayenne_goal_* must not turn on the closed loop"
@@ -5305,7 +5309,9 @@ mod tests {
             "adaptive",
             vec![("cayenne_tuning".to_string(), "adaptive".to_string())],
         );
-        let config = CayenneAccelerator::get_vortex_config("adaptive", &adaptive).await;
+        let config = CayenneAccelerator::get_vortex_config("adaptive", &adaptive)
+            .await
+            .expect("config should be valid");
         assert!(
             config.dynamic_tuning,
             "`cayenne_tuning: adaptive` enables the closed loop"
