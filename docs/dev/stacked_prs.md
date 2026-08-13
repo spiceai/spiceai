@@ -213,7 +213,27 @@ before the script existed:
 - **A path absent from `$STACKBASE`.** `$STACKBASE` is deliberately newer than git's
   stage 1, so a path can be genuinely conflicted and still not exist at that base.
 
-**3. Audit for silent damage** — this is the step that catches the resurrection, and the
+**3. Take `trunk`'s `Cargo.lock` wholesale** rather than resolving it by hand, then
+let `cargo metadata` re-add the branch's own crates:
+
+```bash
+git restore --source=origin/trunk -- Cargo.lock &&
+  cargo metadata --format-version 1 >/dev/null &&
+  git add -- Cargo.lock
+```
+
+`restore`, not `checkout` — `git checkout <tree> -- <path>` writes the **index** as well
+as the worktree, so `trunk`'s lockfile would already be staged before `cargo metadata`
+ran, and chaining would protect nothing. `git restore --source` touches only the
+worktree, which leaves the `git add` as the single point where anything is staged, and
+the chain then means a failed resolve stages nothing at all.
+
+`cargo metadata` only re-adds what the branch's *manifests* require, so any lockfile
+change the branch made without a manifest change — a `cargo update` of a transitive
+dependency, say — is discarded here and has to be re-applied by hand. Check with
+`git diff --stat "$STACKBASE" "$PRE" -- Cargo.lock` before taking `trunk`'s copy.
+
+**4. Audit for silent damage** — this is the step that catches the resurrection, and the
 one not to skip:
 
 ```bash
@@ -229,6 +249,11 @@ It compares what the child *intended* against what the merge actually staged, an
 non-zero on any `RESURRECTED`, `LOST`, `DISCARDED`, or `REVIEW` path — including one that
 is simply still unmerged, since nothing has decided that either. Run it again after every
 correction.
+
+It comes last for a reason: it reports on the index as it stands, so anything staged
+afterwards — the lockfile above included — is in the commit without having been looked
+at. If you touch the tree after this passes, run it again, with the same `--accept`
+arguments as before.
 
 It checks that the merge in progress is the one you think it is: the side being merged
 must be `origin/trunk`, or whatever `--trunk <rev>` names. Auditing some other merge would
@@ -282,26 +307,6 @@ other. `--cached` for the same reason as above — it compares `trunk` against t
 which is what the merge commit will record; without it an unstaged correction makes the
 stats look right while the commit still carries the wrong content.
 
-**4. Take `trunk`'s `Cargo.lock` wholesale** rather than resolving it by hand, then
-let `cargo metadata` re-add the branch's own crates:
-
-```bash
-git restore --source=origin/trunk -- Cargo.lock &&
-  cargo metadata --format-version 1 >/dev/null &&
-  git add -- Cargo.lock
-```
-
-`restore`, not `checkout` — `git checkout <tree> -- <path>` writes the **index** as well
-as the worktree, so `trunk`'s lockfile would already be staged before `cargo metadata`
-ran, and chaining would protect nothing. `git restore --source` touches only the
-worktree, which leaves the `git add` as the single point where anything is staged, and
-the chain then means a failed resolve stages nothing at all.
-
-`cargo metadata` only re-adds what the branch's *manifests* require, so any lockfile
-change the branch made without a manifest change — a `cargo update` of a transitive
-dependency, say — is discarded here and has to be re-applied by hand. Check with
-`git diff --stat "$STACKBASE" "$PRE" -- Cargo.lock` before taking `trunk`'s copy.
-
 **5. Commit, push, then re-run `make signoff`.** Sign-off attests the *pushed* HEAD
 from a clean checkout (`docs/dev/ci_signoff.md`), and the merge is a new commit, so the
 previous attestation no longer covers it:
@@ -327,6 +332,7 @@ happened. `git status` cannot tell you that — it is clean either way.
 - [ ] Stack base derived with `git merge-base`, not assumed to be the parent's final head.
 - [ ] After the parent lands: rebased if unpushed, `merge --no-ff --no-commit` if pushed.
 - [ ] Conflicts re-resolved against the stack base with `restack_stacked_branch.sh resolve`.
-- [ ] `restack_stacked_branch.sh audit` clean before the merge is committed.
-- [ ] `Cargo.lock` taken from `trunk` and re-resolved by cargo.
+- [ ] `Cargo.lock` taken from `trunk` and re-resolved by cargo — before the audit, so the
+      audit sees it.
+- [ ] `restack_stacked_branch.sh audit` clean, and re-run if anything changed after it.
 - [ ] Merge committed and pushed, then `make signoff` re-run on the new pushed HEAD.
