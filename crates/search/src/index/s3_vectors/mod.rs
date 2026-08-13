@@ -527,7 +527,7 @@ mod tests {
     use llms::embeddings::EmbeddingInput;
     use s3_vectors::{
         CreateIndexInput, CreateVectorBucketInput, DataType as S3DataType, DistanceMetric,
-        S3Vectors, mock::MockClient,
+        PutInputVector, PutVectorsInput, S3Vectors, mock::MockClient,
     };
 
     #[derive(Debug)]
@@ -733,5 +733,74 @@ mod tests {
             .expect("ARN + partitioning must fall back, not error");
 
         assert_eq!(tables.len(), 1);
+    }
+
+    async fn seed_keys(client: &Arc<dyn S3Vectors + Send + Sync>, index_name: &str, keys: &[&str]) {
+        let vectors: Vec<PutInputVector> = keys
+            .iter()
+            .map(|k| {
+                PutInputVector::builder()
+                    .key(*k)
+                    .build()
+                    .expect("valid put input vector")
+            })
+            .collect();
+        client
+            .put_vectors(
+                &PutVectorsInput::builder()
+                    .index_name(index_name)
+                    .vector_bucket_name("test-bucket")
+                    .set_vectors(Some(vectors))
+                    .build()
+                    .expect("valid put vectors input"),
+            )
+            .await
+            .expect("seed put_vectors should succeed");
+    }
+
+    fn id_key_batch(ids: &[&str]) -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, false)])),
+            vec![Arc::new(StringArray::from(ids.to_vec()))],
+        )
+        .expect("valid key batch")
+    }
+
+    #[tokio::test]
+    async fn delete_by_keys_removes_only_matching_vectors() {
+        let mock_client = Arc::new(MockClient::new());
+        let client = Arc::clone(&mock_client) as Arc<dyn S3Vectors + Send + Sync>;
+        let index = test_s3_vector(Arc::clone(&client)).await;
+
+        seed_keys(&client, "virtual-index", &["a", "b", "c"]).await;
+
+        index
+            .delete_by_keys(id_key_batch(&["b"]))
+            .await
+            .expect("delete should succeed");
+
+        assert_eq!(mock_client.vector_keys("virtual-index"), vec!["a", "c"]);
+    }
+
+    #[tokio::test]
+    async fn delete_by_keys_broadcasts_the_delete_to_every_spill_index() {
+        let mock_client = Arc::new(MockClient::new());
+        let client = Arc::clone(&mock_client) as Arc<dyn S3Vectors + Send + Sync>;
+        let mut index = test_s3_vector(Arc::clone(&client)).await;
+        index = index.enable_spill_writes();
+
+        create_index(&client, "virtual-index-01").await;
+        seed_keys(&client, "virtual-index", &["a", "b"]).await;
+        seed_keys(&client, "virtual-index-01", &["b", "c"]).await;
+
+        index
+            .delete_by_keys(id_key_batch(&["b"]))
+            .await
+            .expect("delete should succeed");
+
+        // The delete broadcasts to every physical index because a resolved key does not carry
+        // which spill index its vector landed in. Key "b" leaves both; the rest stay.
+        assert_eq!(mock_client.vector_keys("virtual-index"), vec!["a"]);
+        assert_eq!(mock_client.vector_keys("virtual-index-01"), vec!["c"]);
     }
 }

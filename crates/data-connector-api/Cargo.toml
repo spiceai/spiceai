@@ -10,8 +10,10 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+data_components = { path = "../data_components" }
 globset = { workspace = true }
 runtime-component = { path = "../runtime-component" }
+serde_json.workspace = true
 snafu.workspace = true
 
 [lints]

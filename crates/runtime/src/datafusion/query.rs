@@ -1264,7 +1264,11 @@ impl Query {
                 // - plans cache must be cleared so future queries re-resolve table
                 //   providers with up-to-date in-memory state.
                 if let Some(dml_table) = extract_dml_target_table(&plan)
-                    && let Err(e) = ctx.df.caching().invalidate_for_table(dml_table.clone())
+                    && let Err(e) = ctx
+                        .df
+                        .caching()
+                        .invalidate_for_table(dml_table.clone())
+                        .await
                 {
                     tracing::warn!(
                         "Failed to invalidate caches for table {dml_table} before DML: {e}",

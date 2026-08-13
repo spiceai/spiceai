@@ -35,12 +35,12 @@ use runtime::{
         DataConnectorResult, InvalidConfigurationNoSourceSnafu, NewDataConnectorResult,
         UnableToGetReadProviderSnafu, parameters::ConnectorParams,
     },
-    datafusion::refresh_sql,
     federated::FederatedTable,
-    parameters::{ExposedParamLookup, ParameterSpec, Parameters},
 };
 use runtime_api_types::v1::ComponentType;
+use runtime_datafusion::refresh_sql;
 use runtime_metrics::component::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback};
+use runtime_parameters::{ExposedParamLookup, ParameterSpec, Parameters};
 use snafu::prelude::*;
 use tonic::async_trait;
 

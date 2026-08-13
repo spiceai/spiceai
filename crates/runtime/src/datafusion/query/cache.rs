@@ -1136,6 +1136,7 @@ mod tests {
         // The revalidated entry must still be tied to its input table.
         df.caching()
             .invalidate_for_table(TableReference::bare("swr_table"))
+            .await
             .expect("invalidation should succeed");
         if let Some(cache_provider) = df.results_cache_provider() {
             cache_provider.run_pending_tasks().await;
@@ -1184,6 +1185,7 @@ mod tests {
         // ...and a refresh invalidates the table before the result is stored.
         df.caching()
             .invalidate_for_table(TableReference::bare("revalidated_table"))
+            .await
             .expect("invalidation should succeed");
 
         let invalidated_key = RawCacheKey::new(11);

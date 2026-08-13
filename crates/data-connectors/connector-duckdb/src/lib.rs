@@ -37,9 +37,9 @@ use runtime::dataconnector::{
     AnyErrorResult, ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError,
     DataConnectorFactory, DataConnectorResult,
 };
-use runtime::datafusion::dialect::new_duckdb_dialect;
-use runtime::datafusion::udf::deny_spice_functions_for_duckdb_table_providers;
-use runtime::parameters::ParameterSpec;
+use runtime_datafusion::dialect::new_duckdb_dialect;
+use runtime_datafusion::function_support::deny_spice_functions_for_duckdb_table_providers;
+use runtime_parameters::ParameterSpec;
 use snafu::prelude::*;
 use std::any::Any;
 use std::future::Future;

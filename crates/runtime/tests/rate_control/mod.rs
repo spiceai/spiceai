@@ -28,7 +28,7 @@ use app::{App, AppBuilder};
 use runtime::{
     Runtime,
     component::dataset::{Dataset, builder::DatasetBuilder},
-    dataconnector::http_rate_control::HttpRateControlConfig,
+    dataconnector::{ConnectorComponent, http_rate_control::HttpRateControlConfig},
 };
 use spicepod::component::runtime::{Runtime as SpicepodRuntime, SourceRateControl};
 use url::Url;
@@ -102,12 +102,24 @@ async fn cluster_lease_caps_combined_throughput_under_saturation() {
 
     let shared_a = runtime_a
         .http_rate_control_registry()
-        .shared_rate_controller(&origin_url, &config, &dataset_a, "https")
+        .shared_rate_controller_for_component(
+            &origin_url,
+            &config,
+            dataset_a.app.name.as_str(),
+            &ConnectorComponent::from(&dataset_a),
+            "https",
+        )
         .await
         .expect("controller a");
     let shared_b = runtime_b
         .http_rate_control_registry()
-        .shared_rate_controller(&origin_url, &config, &dataset_b, "https")
+        .shared_rate_controller_for_component(
+            &origin_url,
+            &config,
+            dataset_b.app.name.as_str(),
+            &ConnectorComponent::from(&dataset_b),
+            "https",
+        )
         .await
         .expect("controller b");
 
