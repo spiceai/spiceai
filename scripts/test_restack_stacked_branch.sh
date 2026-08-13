@@ -345,6 +345,39 @@ start_test "audit separates a delete/modify from a silent restoration, and can a
   [ "$status" -eq 0 ] || fail_test "the decision could not be accepted: $output"
 ) || failures=$((failures + 1))
 
+start_test "audit reports a surviving deletion that trunk had changed"
+(
+  new_stack "$work_root/deletionkept"
+  printf 'fork\n' > f.txt && commit_all "fork point"
+  git checkout --quiet -b parent
+  printf 'parent\n' > f.txt && commit_all "parent changes it"
+  stack_base=$(git rev-parse HEAD)
+  git checkout --quiet -b child
+  git rm --quiet f.txt && commit_all "child deletes it"
+  pre=$(git rev-parse HEAD)
+  squash_parent_onto_trunk
+  # Trunk changes it back to the fork-point content, which is invisible from the
+  # fork point: git sees trunk as unchanged and keeps the deletion without asking.
+  printf 'fork\n' > f.txt && commit_all "trunk restores the fork-point content"
+  git checkout --quiet child
+  git merge --no-ff --no-commit trunk >/dev/null 2>&1
+  [ -e f.txt ] && fail_test "the fixture did not keep the deletion"
+
+  # From the stack base, trunk's version differs, so this is a delete/modify that
+  # nobody decided — and the path is absent from the result, so a check that only
+  # looked for restored files would pass it.
+  output=$("$subject" audit "$stack_base" "$pre" --trunk trunk 2>/dev/null)
+  status=$?
+  [ "$status" -ne 0 ] || fail_test "a delete/modify resolved by the older base was reported clean: $output"
+  case "$output" in
+    *"REVIEW f.txt"*) ;;
+    *) fail_test "the path was not named: $output" ;;
+  esac
+  output=$("$subject" audit "$stack_base" "$pre" --trunk trunk --accept f.txt 2>/dev/null)
+  status=$?
+  [ "$status" -eq 0 ] || fail_test "the decision could not be accepted: $output"
+) || failures=$((failures + 1))
+
 start_test "audit will not report clean when handed the wrong pre-merge tip"
 (
   new_stack "$work_root/wrongpre"

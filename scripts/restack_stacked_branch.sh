@@ -475,7 +475,7 @@ cmd_audit() {
     rm -rf "$tmp"
     die "could not read unmerged entries from the index"
   fi
-  local record last_unmerged=""
+  local record last_unmerged="" theirs_now base_now
   while IFS= read -r -d '' record; do
     path=${record#*$'\t'}
     [ "$path" = "$last_unmerged" ] && continue
@@ -485,7 +485,24 @@ cmd_audit() {
   done < "$tmp/unmerged"
 
   while IFS= read -r -d '' path; do
-    path_in_index "$path" || continue
+    if ! path_in_index "$path"; then
+      # The deletion survived, which is right unless trunk changed the file after
+      # the stack base: then the correct merge is a delete/modify, and the older
+      # base only made it look settled -- trunk's change is invisible from there
+      # if it happens to restore the fork-point content.
+      [ -n "$other" ] || continue
+      theirs_now=$(tree_entry "$other" "$path")
+      base_now=$(tree_entry "$stack_base" "$path")
+      [ -n "$theirs_now" ] || continue                 # trunk deleted it too
+      [ "$theirs_now" = "$base_now" ] && continue      # trunk left it alone
+      if path_accepted "$path"; then
+        echo "ACCEPTED $path"
+        continue
+      fi
+      echo "REVIEW $path: you deleted it and trunk changed it, which nothing has decided"
+      findings=$((findings + 1))
+      continue
+    fi
     # Already reported by the scan above, and its stages are not a decision.
     [ -z "$(git ls-files -u -- ":(literal)$path")" ] || continue
     if path_accepted "$path"; then
