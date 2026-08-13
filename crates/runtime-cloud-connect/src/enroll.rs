@@ -55,7 +55,10 @@ use snafu::{ResultExt, Snafu};
 use zeroize::Zeroizing;
 
 use crate::config::CloudConnectConfig;
-use crate::draft::{EnrollmentDraft, EnrollmentTransactionLock};
+use crate::draft::{
+    EnrollmentAuthorityBinding, EnrollmentDraft, EnrollmentRequestBinding,
+    EnrollmentTransactionLock,
+};
 use crate::enrollment_key::EnrollmentKey;
 use crate::identity::{EnrollmentMaterial, Identity, IdentityStore};
 
@@ -83,7 +86,6 @@ const RETRY_BACKOFF_CAP: Duration = Duration::from_secs(30);
 /// a misconfigured or hostile self-hosted control plane cannot make the
 /// runtime buffer an unbounded response.
 const MAX_ENROLL_RESPONSE_BODY_BYTES: usize = 64 * 1024;
-
 /// A logged-in Spice Cloud session's bearer token, wrapped so it cannot
 /// leak through `Debug` and is wiped on drop. Constructed by callers that
 /// own a login session; this crate only ever places it in the one
@@ -220,12 +222,16 @@ pub enum Error {
     #[snafu(display("Failed to reach the Spice Cloud endpoint {url}: {source}"))]
     Http { url: String, source: reqwest::Error },
 
+    #[snafu(display(
+        "Failed to construct the Spice Cloud request for {url}: the endpoint URL or request headers are invalid"
+    ))]
+    InvalidRequest { url: String },
+
     #[snafu(display("Failed to read the Spice Cloud response from {url}: {source}"))]
     ResponseBody { url: String, source: reqwest::Error },
 
     #[snafu(display("Spice Cloud response from {url} exceeded the {limit_bytes}-byte limit"))]
     ResponseTooLarge { url: String, limit_bytes: usize },
-
     #[snafu(display("Failed to decode the Spice Cloud response from {url}: {reason}"))]
     ResponseDecode { url: String, reason: String },
 
@@ -269,25 +275,26 @@ impl Error {
     /// `true` only when the cloud *authoritatively rejected* the request
     /// ([`Error::Denied`]): retrying the same request cannot succeed.
     ///
-    /// Everything else is retryable: transport failures and 408/429/5xx are
-    /// transient, [`Error::CertificateValidity`] (a skewed host clock) is
-    /// fixable and the request never reached the cloud, and a local
-    /// proof-of-possession failure never left this host.
+    /// Every other variant is a local failure, a transient response, or an
+    /// unusable response rather than an authoritative cloud rejection.
     #[must_use]
     pub fn is_authoritative_rejection(&self) -> bool {
         matches!(self, Error::Denied { .. })
     }
 
     /// `true` when retrying the same enrollment operation cannot produce a
-    /// different outcome. A denied request is authoritative, while a malformed
-    /// decoded successful response with invalid required fields is committed
-    /// under the operation's idempotency key and will therefore replay the same
-    /// unusable semantics. Body transport and JSON decode failures remain
-    /// retryable because an unframed partial body is indistinguishable from
-    /// response loss.
+    /// different outcome. A locally invalid request was never sent, a denied
+    /// request is authoritative, and a decoded successful response with
+    /// invalid required fields is committed under the operation's idempotency
+    /// key and will therefore replay the same unusable semantics. Body
+    /// transport and JSON decode failures remain retryable because an unframed
+    /// partial body is indistinguishable from response loss.
     #[must_use]
     pub fn is_terminal_enrollment_failure(&self) -> bool {
-        matches!(self, Error::Denied { .. } | Error::InvalidResponse { .. })
+        matches!(
+            self,
+            Error::Denied { .. } | Error::InvalidRequest { .. } | Error::InvalidResponse { .. }
+        )
     }
 
     /// `true` only when the *credential itself* was rejected (HTTP 401).
@@ -454,7 +461,6 @@ struct RenewRequest<'a> {
 #[derive(Deserialize)]
 struct RenewResponseWire {
     identity_cert_pem: String,
-    not_after: String,
 }
 
 /// Parsed result of a successful renewal (the CA bundle and gateway address
@@ -462,8 +468,6 @@ struct RenewResponseWire {
 #[derive(Debug)]
 pub struct RenewOutcome {
     pub identity_cert_pem: String,
-    /// New leaf expiry, Unix seconds.
-    pub not_after_unix: u64,
 }
 
 /// Error body shape the cloud endpoints return:
@@ -691,7 +695,6 @@ impl EnrollClient {
         };
         let builder = self.http.post(&self.renew_url).json(&request);
         let wire: RenewResponseWire = self.send(&self.renew_url, builder, None).await?;
-        let not_after_unix = parse_not_after(&self.renew_url, &wire.not_after)?;
         ensure_response_field(
             &self.renew_url,
             "identity_cert_pem",
@@ -699,16 +702,15 @@ impl EnrollClient {
         )?;
         Ok(RenewOutcome {
             identity_cert_pem: wire.identity_cert_pem,
-            not_after_unix,
         })
     }
 
     /// Classify a syntactically successful renewal response whose issued
     /// credential cannot be used with the key material sent in the request.
-    pub(crate) fn invalid_renew_response(&self, reason: &str) -> Error {
+    pub(crate) fn invalid_renew_response(&self, reason: impl Into<String>) -> Error {
         Error::InvalidResponse {
             url: self.renew_url.clone(),
-            reason: format!("issued identity cannot reconnect: {reason}"),
+            reason: format!("issued identity cannot reconnect: {}", reason.into()),
         }
     }
 
@@ -722,6 +724,11 @@ impl EnrollClient {
         let response = match builder.send().await {
             Ok(response) => response,
             Err(source) => {
+                if source.is_builder() {
+                    return Err(Error::InvalidRequest {
+                        url: url.to_string(),
+                    });
+                }
                 // A TLS validity rejection is the shape a wrong host clock
                 // produces at every layer of this flow. Diagnose it here
                 // rather than handing the operator a bare certificate error.
@@ -836,7 +843,6 @@ async fn read_bounded_response_body(mut response: reqwest::Response, url: &str) 
     }
     Ok(body)
 }
-
 fn redact_sensitive(text: &str, sensitive: Option<&str>) -> String {
     match sensitive.filter(|value| !value.is_empty()) {
         Some(value) => text.replace(value, "[REDACTED]"),
@@ -1062,6 +1068,36 @@ where
     }
 }
 
+/// The caller's authority with a token assertion restored from `draft`, or
+/// `None` when there is nothing to restore.
+///
+/// This only ever fills in what the draft recorded. A caller that names an
+/// organization keeps it: that is how a first attempt naming the wrong one is
+/// corrected on a later attempt, which the draft's token binding deliberately
+/// permits.
+fn restored_token_assertion(
+    caller: &EnrollmentAuthority,
+    draft: &EnrollmentDraft,
+) -> Option<EnrollmentAuthority> {
+    let EnrollmentAuthority::Token {
+        key,
+        expected_org: None,
+    } = caller
+    else {
+        return None;
+    };
+    let EnrollmentAuthorityBinding::Token {
+        expected_org: Some(persisted),
+    } = &draft.binding.authority
+    else {
+        return None;
+    };
+    Some(EnrollmentAuthority::Token {
+        key: key.clone(),
+        expected_org: Some(persisted.clone()),
+    })
+}
+
 /// Errors from the one-shot [`enroll_now`] flow.
 #[derive(Debug, Snafu)]
 pub enum EnrollNowError {
@@ -1116,6 +1152,15 @@ pub enum EnrollNowError {
     },
 
     #[snafu(display(
+        "The existing Cloud Connect identity at {} could not be validated because the validation task failed: {source}. The supplied enrollment authority was not redeemed. Retry; if the failure persists, report it with this error. See: https://spiceai.org/docs",
+        path.display()
+    ))]
+    IdentityValidation {
+        path: std::path::PathBuf,
+        source: crate::Error,
+    },
+
+    #[snafu(display(
         "Enrollment succeeded but the identity could not be persisted at {}: {source}. \
          Fix the directory (permissions/disk space) and retry with a new enrollment key; \
          the retried enrollment resumes this instance's pending operation instead of \
@@ -1135,6 +1180,9 @@ fn denial_remediation(source: &Error) -> &'static str {
         Error::Denied { code, .. } => code.remediation(),
         Error::InvalidResponse { .. } => {
             "Spice Cloud returned unusable data for this pending operation. Preserve enrollment-draft.json and contact Spice Cloud support before removing it or starting a new enrollment"
+        }
+        Error::InvalidRequest { .. } => {
+            "Fix the configured Spice Cloud endpoint or organization name and retry"
         }
         _ => "Fix the reported problem and retry",
     }
@@ -1197,9 +1245,9 @@ pub enum EnrollNowOutcome {
 /// 1. **Existing identity wins.** A readable, structurally valid identity
 ///    short-circuits to [`EnrollNowOutcome::AlreadyEnrolled`]; the supplied
 ///    authority is not redeemed and not persisted. The driver asks the control
-///    plane to renew an expired identity. A readable but unusable identity
-///    fails closed with removal guidance; it never causes implicit
-///    re-enrollment.
+///    plane to renew an expired identity, so a skewed host clock can never
+///    trigger implicit re-enrollment. A malformed identity fails closed with
+///    removal guidance.
 /// 2. The per-directory [`EnrollmentDraft`] is loaded or created: the same
 ///    operation ID and key material back every retry, so a lost response —
 ///    or a fresh key presented after the first one expired — recovers the
@@ -1224,8 +1272,9 @@ pub enum EnrollNowOutcome {
 /// - [`EnrollNowError::InvalidRegion`] — the declared region label is
 ///   malformed (checked before any request).
 /// - [`EnrollNowError::IdentityUnreadable`] / [`EnrollNowError::IdentityUnusable`]
-///   — an identity file exists but cannot be safely reused; refusing to guess
-///   beats silently re-enrolling over a live instance.
+///   / [`EnrollNowError::IdentityValidation`] — an identity file exists but
+///   cannot be safely reused; refusing to guess beats silently re-enrolling
+///   over a live instance.
 /// - [`EnrollNowError::Draft`] / [`EnrollNowError::Client`] /
 ///   [`EnrollNowError::Persist`] — local state or client construction
 ///   failures.
@@ -1288,6 +1337,38 @@ where
                 })
             })
             .context(DraftSnafu)?;
+    enroll_now_with_transaction_factory(config, retry, enrollment_transaction, authority).await
+}
+
+/// Enroll while retaining a transaction acquired by the caller.
+///
+/// This entry point lets a caller bind its own crash-recovery journal to the
+/// exact enrollment draft before any request is sent. The supplied guard is
+/// held through identity promotion and draft cleanup.
+///
+/// # Errors
+///
+/// Returns the same errors as [`enroll_now`].
+pub async fn enroll_now_with_transaction(
+    config: &CloudConnectConfig,
+    authority: &EnrollmentAuthority,
+    retry: RetryPolicy,
+    enrollment_transaction: EnrollmentTransactionLock,
+) -> std::result::Result<EnrollNowOutcome, EnrollNowError> {
+    let authority = authority.clone();
+    enroll_now_with_transaction_factory(config, retry, enrollment_transaction, || Ok(authority))
+        .await
+}
+
+async fn enroll_now_with_transaction_factory<F>(
+    config: &CloudConnectConfig,
+    retry: RetryPolicy,
+    enrollment_transaction: EnrollmentTransactionLock,
+    authority: F,
+) -> std::result::Result<EnrollNowOutcome, EnrollNowError>
+where
+    F: FnOnce() -> std::result::Result<EnrollmentAuthority, EnrollNowError>,
+{
     let enrollment_transaction = Arc::new(enrollment_transaction);
     let mut pinned_config = config.clone();
     let pinned_config_dir = enrollment_transaction
@@ -1297,6 +1378,15 @@ where
     pinned_config.pin_config_dir(pinned_config_dir);
     let config = &pinned_config;
     let config_dir = config.config_dir.clone();
+    let normalized_endpoint = crate::config::normalize_control_plane_endpoint(
+        &config.enroll_endpoint,
+    )
+    .map_err(|source| EnrollNowError::Client {
+        source: Error::InvalidResponse {
+            url: config.enroll_endpoint.clone(),
+            reason: source.to_string(),
+        },
+    })?;
 
     // Existing identity wins without redeeming the supplied authority.
     if let Some(identity) = existing_enrollment(config).await? {
@@ -1317,9 +1407,22 @@ where
     let facts = InstanceFacts::gather(&config.runtime_version);
     let draft_facts = facts.clone();
     let draft_region = config.instance_region.clone();
+    let draft_binding = EnrollmentRequestBinding {
+        endpoint: normalized_endpoint,
+        authority: match &authority {
+            EnrollmentAuthority::Token { expected_org, .. } => EnrollmentAuthorityBinding::Token {
+                expected_org: expected_org.clone(),
+            },
+            EnrollmentAuthority::AuthenticatedSession { org, .. } => {
+                EnrollmentAuthorityBinding::AuthenticatedSession {
+                    organization: org.clone(),
+                }
+            }
+        },
+    };
     let draft_transaction = Arc::clone(&enrollment_transaction);
     let draft = tokio::task::spawn_blocking(move || {
-        draft_transaction.load_or_create(&draft_facts, draft_region.as_deref())
+        draft_transaction.load_or_create(&draft_facts, draft_region.as_deref(), &draft_binding)
     })
     .await
     .unwrap_or_else(|join| {
@@ -1330,12 +1433,22 @@ where
     })
     .context(DraftSnafu)?;
 
+    // The organization the operation was published with rides every replay of
+    // it, including one from a caller that names none. `spiced --token` is that
+    // caller: it enrolls with a key and no assertion, and a draft's token binding
+    // matches any token request, so without this a resumed operation would be
+    // replayed with its assertion dropped and the response checked against
+    // nothing — the defect the CLI's resume closes, reopened by the other caller
+    // of the same operation.
+    let restored = restored_token_assertion(&authority, &draft);
+    let authority = restored.as_ref().unwrap_or(&authority);
+
     let client = EnrollClient::new(config).context(ClientSnafu)?;
     let material = draft.material();
 
     let mut outcome = retry_until_deadline(retry, || {
         client.enroll(
-            &authority,
+            authority,
             &draft.enrollment_operation_id,
             &material,
             &draft.instance,
@@ -1348,8 +1461,39 @@ where
     // optional portal metadata must not discard the issued identity. Normalize
     // harmless surrounding whitespace and treat a blank org as absent.
     let normalized_org_name = outcome.metadata.organization.name.trim().to_string();
+    let expected_org = match authority {
+        EnrollmentAuthority::AuthenticatedSession { org, .. } => Some(org.as_str()),
+        EnrollmentAuthority::Token { expected_org, .. } => expected_org.as_deref(),
+    }
+    .filter(|org| !org.is_empty());
+    validate_enrollment_organization(&client.enroll_url, expected_org, &normalized_org_name)
+        .map_err(|source| EnrollNowError::Rejected { source })?;
+    validate_enrollment_region(
+        &client.enroll_url,
+        draft.region.as_deref(),
+        outcome.metadata.region.as_deref(),
+    )
+    .map_err(|source| EnrollNowError::Rejected { source })?;
+    for (field, value) in [
+        ("instance_id", outcome.instance_id.as_str()),
+        ("gateway_addr", outcome.gateway_addr.as_str()),
+        ("organization", normalized_org_name.as_str()),
+    ] {
+        if value.chars().any(char::is_control) {
+            return Err(EnrollNowError::Rejected {
+                source: Error::InvalidResponse {
+                    url: client.enroll_url.clone(),
+                    reason: format!("{field} contained control characters"),
+                },
+            });
+        }
+    }
     let org_name = (!normalized_org_name.is_empty()).then(|| normalized_org_name.clone());
     outcome.metadata.organization.name = normalized_org_name;
+    // PR1 sanitizes this peer-controlled link at the response boundary. PR2
+    // adds the durable identity field, so carry only that already-vetted value
+    // forward without reinterpreting the URL in a later layer.
+    let new_project_url = outcome.metadata.new_project_url.clone();
 
     // Atomic promotion: the draft's provisional key material becomes the
     // identity, written owner-only via atomic rename; the draft is deleted
@@ -1370,6 +1514,10 @@ where
         org_name,
         app_name: None,
         monitor_url: None,
+        // Where a still-unattached instance is sent to create a project.
+        // Recorded now because the enroll response is the only place it is
+        // reported, and every later start has to name the same page.
+        new_project_url,
         enc_private_key_pem: material.enc_private_key_pem,
         enc_public_key_pem: material.enc_public_key_pem,
         // A fresh enrollment has no prior key to retain.
@@ -1386,38 +1534,30 @@ where
     // retryable draft. The operation is already committed under its
     // idempotency key, making this a terminal response error with support
     // guidance rather than an instruction to discard the draft.
-    if let Some(reason) = identity.reconnect_validation_error(config.gateway_endpoint.as_deref()) {
-        return Err(EnrollNowError::Rejected {
+    let (identity, _endpoint) = crate::validate_reconnectable_credential_async(config, identity)
+        .await
+        .map_err(|error| EnrollNowError::Rejected {
             source: Error::InvalidResponse {
                 url: client.enroll_url.clone(),
-                reason: format!("issued identity cannot reconnect: {reason}"),
+                reason: format!("issued identity cannot reconnect: {error}"),
             },
-        });
-    }
-    if let Err(reason) = crate::client::validate_stream_endpoint(config, &identity) {
-        return Err(EnrollNowError::Rejected {
-            source: Error::InvalidResponse {
-                url: client.enroll_url.clone(),
-                reason: format!("issued identity cannot reconnect: {reason}"),
-            },
-        });
-    }
-
+        })?;
     let to_store = identity.clone();
     let store_path = config.identity_path.clone();
     enrollment_transaction
         .ensure_directory_stable()
         .context(DraftSnafu)?;
-    let stored = tokio::task::spawn_blocking(move || IdentityStore::store(&store_path, &to_store))
-        .await
-        .unwrap_or_else(|join| {
-            Err(crate::identity::Error::Io {
-                path: config.identity_path.clone(),
-                source: std::io::Error::other(format!(
-                    "identity persistence task panicked: {join}"
-                )),
-            })
-        });
+    let store_transaction = Arc::clone(&enrollment_transaction);
+    let stored = tokio::task::spawn_blocking(move || {
+        IdentityStore::store_with_transaction(&store_path, &to_store, &store_transaction)
+    })
+    .await
+    .unwrap_or_else(|join| {
+        Err(crate::identity::Error::Io {
+            path: config.identity_path.clone(),
+            source: std::io::Error::other(format!("identity persistence task panicked: {join}")),
+        })
+    });
     stored.context(PersistSnafu {
         path: config.identity_path.clone(),
     })?;
@@ -1473,27 +1613,48 @@ pub async fn existing_enrollment(
     let Some(identity) = existing else {
         return Ok(None);
     };
-    if let Some(endpoint) = identity.control_plane_endpoint.as_deref()
-        && let Err(source) = crate::config::normalize_control_plane_endpoint(endpoint)
-    {
-        return Err(EnrollNowError::IdentityUnusable {
-            path: identity_path,
-            reason: format!("the stored control-plane endpoint is invalid: {source}"),
-        });
-    }
-    if let Some(reason) = identity.reconnect_validation_error(config.gateway_endpoint.as_deref()) {
-        return Err(EnrollNowError::IdentityUnusable {
-            path: identity_path,
-            reason: reason.to_string(),
-        });
-    }
-    if let Err(reason) = crate::client::validate_stream_endpoint(config, &identity) {
-        return Err(EnrollNowError::IdentityUnusable {
-            path: identity_path,
-            reason,
-        });
-    }
+    let (identity, _endpoint) = crate::validate_reconnectable_credential_async(config, identity)
+        .await
+        .map_err(|error| match error {
+            crate::Error::IdentityUnusable { reason, .. } => EnrollNowError::IdentityUnusable {
+                path: identity_path.clone(),
+                reason,
+            },
+            source => EnrollNowError::IdentityValidation {
+                path: identity_path.clone(),
+                source,
+            },
+        })?;
     Ok(Some(identity))
+}
+
+fn validate_enrollment_organization(url: &str, expected: Option<&str>, actual: &str) -> Result<()> {
+    if expected
+        .filter(|expected| !expected.is_empty())
+        .is_some_and(|expected| !actual.eq_ignore_ascii_case(expected))
+    {
+        return Err(Error::InvalidResponse {
+            url: url.to_string(),
+            reason: "organization did not match the authenticated enrollment authority".to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_enrollment_region(
+    url: &str,
+    expected: Option<&str>,
+    actual: Option<&str>,
+) -> Result<()> {
+    if let Some(expected) = expected
+        && actual != Some(expected)
+    {
+        return Err(Error::InvalidResponse {
+            url: url.to_string(),
+            reason: "region did not match the durable enrollment request".to_string(),
+        });
+    }
+    Ok(())
 }
 
 async fn cleanup_enrollment_draft(
@@ -1552,8 +1713,22 @@ pub(crate) fn sign_pop_payload(
     Ok(base64::engine::general_purpose::STANDARD.encode(signature.as_ref()))
 }
 
-/// Parse an RFC 3339 `not_after` timestamp from an enroll/renew response
-/// into Unix seconds.
+/// Sign a domain-separated control-plane request with an enrolled identity.
+/// Servers verify the signature against `identity_cert_pem` before mutating
+/// state, so knowing an instance identifier is not sufficient authority.
+///
+/// # Errors
+///
+/// Returns a redaction-safe reason when the stored private key is unusable.
+pub fn sign_identity_proof(
+    private_key_pem: &str,
+    payload: &[u8],
+) -> std::result::Result<String, String> {
+    sign_pop_payload(private_key_pem, payload)
+}
+
+/// Parse an RFC 3339 `not_after` timestamp from an enroll response into Unix
+/// seconds. Renewal derives this value from the signed leaf instead.
 pub(crate) fn parse_not_after(url: &str, value: &str) -> Result<u64> {
     let parsed =
         chrono::DateTime::parse_from_rfc3339(value).map_err(|source| Error::InvalidResponse {
@@ -1673,6 +1848,17 @@ mod tests {
     }
 
     #[test]
+    fn renewal_response_does_not_trust_the_unsigned_expiry_hint() {
+        let response: RenewResponseWire = serde_json::from_value(serde_json::json!({
+            "identity_cert_pem": "signed-leaf",
+            "not_after": "not-a-timestamp"
+        }))
+        .expect("the unsigned hint cannot reject a committed renewal");
+
+        assert_eq!(response.identity_cert_pem, "signed-leaf");
+    }
+
+    #[test]
     fn required_response_fields_reject_empty_or_whitespace_values() {
         for (name, value) in [
             ("instance_id", ""),
@@ -1686,6 +1872,16 @@ mod tests {
                 "{name}: {err}"
             );
         }
+    }
+
+    #[test]
+    fn enrollment_response_organization_must_match_the_authority() {
+        validate_enrollment_organization("https://api.spice.ai", Some("acme"), "ACME")
+            .expect("organization comparison is case-insensitive");
+        let error =
+            validate_enrollment_organization("https://api.spice.ai", Some("acme"), "globex")
+                .expect_err("cross-organization identity must fail closed");
+        assert!(matches!(error, Error::InvalidResponse { .. }));
     }
 
     #[test]
@@ -1722,6 +1918,15 @@ mod tests {
             "an invalid response is not a credential revocation signal"
         );
 
+        let invalid_request = Error::InvalidRequest {
+            url: "not a URL".to_string(),
+        };
+        assert!(
+            invalid_request.is_terminal_enrollment_failure(),
+            "a locally invalid request cannot improve on retry"
+        );
+        assert!(!invalid_request.is_authoritative_rejection());
+
         let pop = Error::ProofOfPossession {
             reason: "key material generation failed".to_string(),
         };
@@ -1738,6 +1943,42 @@ mod tests {
             skew.to_string().contains("clock"),
             "the message must name the clock: {skew}"
         );
+    }
+
+    #[tokio::test]
+    async fn invalid_request_construction_is_terminal_without_network_retry() {
+        let client = EnrollClient::new(&test_config("https://127.0.0.1:9")).expect("client");
+        let invalid_url = "://not-a-url";
+        let request = client.http.get(invalid_url);
+        let Err(error) = client
+            .send::<EnrollResponseWire>(invalid_url, request, None)
+            .await
+        else {
+            panic!("an invalid URL must fail locally");
+        };
+
+        assert!(matches!(error, Error::InvalidRequest { .. }), "{error}");
+        assert!(error.is_terminal_enrollment_failure());
+    }
+
+    #[tokio::test]
+    async fn invalid_organization_header_is_terminal_and_redacted() {
+        let client = EnrollClient::new(&test_config("https://127.0.0.1:9")).expect("client");
+        let authority = EnrollmentAuthority::AuthenticatedSession {
+            access_token: SessionToken::new("session-secret-never-printed".to_string()),
+            org: "invalid\norganization".to_string(),
+        };
+        let material = IdentityStore::generate_enrollment().expect("enrollment material");
+        let error = client
+            .enroll(&authority, "test-operation", &material, &test_facts(), None)
+            .await
+            .expect_err("an invalid header must fail locally");
+
+        assert!(matches!(error, Error::InvalidRequest { .. }), "{error}");
+        assert!(error.is_terminal_enrollment_failure());
+        let rendered = error.to_string();
+        assert!(!rendered.contains("session-secret-never-printed"));
+        assert!(!rendered.contains("invalid\norganization"));
     }
 
     #[tokio::test]
@@ -1775,6 +2016,42 @@ mod tests {
             !err.is_terminal_enrollment_failure(),
             "an incomplete response can succeed when the operation is replayed"
         );
+    }
+
+    #[tokio::test]
+    async fn oversized_enrollment_responses_are_bounded() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let address = listener.local_addr().expect("test server address");
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept request");
+            let mut request = [0_u8; 4096];
+            let _ = socket.read(&mut request).await.expect("read request");
+            let body = vec![b'x'; MAX_ENROLL_RESPONSE_BODY_BYTES + 1];
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            socket
+                .write_all(headers.as_bytes())
+                .await
+                .expect("write headers");
+            socket.write_all(&body).await.expect("write body");
+        });
+
+        let base = format!("http://{address}");
+        let url = format!("{base}/oversized");
+        let client = EnrollClient::new_allowing_http_for_test(&test_config(&base)).expect("client");
+        let request = client.http.get(&url);
+        let error = client
+            .send::<serde_json::Value>(&url, request, None)
+            .await
+            .expect_err("oversized body must fail");
+        server.await.expect("test server task");
+        assert!(matches!(error, Error::ResponseTooLarge { .. }));
     }
 
     #[tokio::test]
@@ -2641,6 +2918,69 @@ mod tests {
         assert!(matches!(error, Error::Denied { status, .. } if status == expected_status));
     }
 
+    /// A caller that names no organization inherits the one the operation was
+    /// published with; a caller that names one keeps it, which is what lets a
+    /// wrong first assertion be corrected on a later attempt.
+    #[test]
+    fn a_token_assertion_is_restored_from_the_draft_but_never_replaced() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let published = EnrollmentDraft::load_or_create(
+            dir.path(),
+            &InstanceFacts::gather("v0.0.0-assertion-test"),
+            None,
+            &EnrollmentRequestBinding {
+                endpoint: "https://api.spice.ai".to_string(),
+                authority: EnrollmentAuthorityBinding::Token {
+                    expected_org: Some("acme".to_string()),
+                },
+            },
+        )
+        .expect("publish a pending draft");
+        let key = EnrollmentKey::parse("spice-enroll-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+            .expect("fixture enrollment key");
+
+        let restored = restored_token_assertion(
+            &EnrollmentAuthority::Token {
+                key: key.clone(),
+                expected_org: None,
+            },
+            &published,
+        )
+        .expect("an unasserted caller inherits the operation's organization");
+        match restored {
+            EnrollmentAuthority::Token { expected_org, .. } => {
+                assert_eq!(expected_org.as_deref(), Some("acme"));
+            }
+            other @ EnrollmentAuthority::AuthenticatedSession { .. } => {
+                panic!("unexpected authority: {other:?}")
+            }
+        }
+
+        assert!(
+            restored_token_assertion(
+                &EnrollmentAuthority::Token {
+                    key,
+                    expected_org: Some("globex".to_string()),
+                },
+                &published,
+            )
+            .is_none(),
+            "an explicit assertion must not be replaced by the persisted one"
+        );
+
+        assert!(
+            restored_token_assertion(
+                &EnrollmentAuthority::AuthenticatedSession {
+                    access_token: SessionToken::new("t".to_string()),
+                    org: "acme".to_string(),
+                },
+                &published,
+            )
+            .is_none(),
+            "a login authority has no token assertion to restore"
+        );
+    }
+
     #[tokio::test]
     async fn enrollment_authority_never_follows_cross_origin_redirects() {
         for status in [
@@ -2675,7 +3015,7 @@ mod tests {
         // points at an unroutable endpoint, so reaching the network would
         // hang/fail differently than the typed error asserted here.
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut config = test_config("http://127.0.0.1:9");
+        let mut config = test_config("https://127.0.0.1:9");
         config.config_dir = dir.path().to_path_buf();
         config.identity_path = dir.path().join("identity.json");
         config.instance_region = Some("US_WEST_2".to_string());
