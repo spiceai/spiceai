@@ -492,6 +492,108 @@ start_test "audit will not audit a merge of something other than trunk"
   esac
 ) || failures=$((failures + 1))
 
+start_test "audit lets an add/add settled by removing the path be accepted"
+(
+  new_stack "$work_root/addadd_rm"
+  printf 'seed\n' > seed.txt && commit_all "fork point"
+  git checkout --quiet -b parent
+  printf 'p\n' > p.txt && commit_all "parent work"
+  stack_base=$(git rev-parse HEAD)
+  git checkout --quiet -b child
+  printf 'child version\n' > added.txt && commit_all "child adds a file"
+  pre=$(git rev-parse HEAD)
+  squash_parent_onto_trunk
+  printf 'trunk version\n' > added.txt && commit_all "trunk adds the same path differently"
+  git checkout --quiet child
+  git merge --no-ff --no-commit trunk >/dev/null 2>&1
+  # Settle the add/add by deciding the path should not exist at all.
+  git rm --quiet -f added.txt >/dev/null 2>&1
+
+  # Absent from the result, but not a plain loss: trunk had its own version, so
+  # this was ambiguous and a person resolved it.
+  output=$("$subject" audit "$stack_base" "$pre" --trunk trunk 2>/dev/null)
+  case "$output" in
+    *"REVIEW added.txt"*) ;;
+    *) fail_test "an add/add settled by removal was not treated as a decision: $output" ;;
+  esac
+  output=$("$subject" audit "$stack_base" "$pre" --trunk trunk --accept added.txt 2>/dev/null)
+  status=$?
+  [ "$status" -eq 0 ] || fail_test "the resolution could not be accepted: $output"
+) || failures=$((failures + 1))
+
+start_test "audit still reports a child-only addition the merge dropped"
+(
+  new_stack "$work_root/addadd_lost"
+  printf 'seed\n' > seed.txt && commit_all "fork point"
+  git checkout --quiet -b parent
+  printf 'p\n' > p.txt && commit_all "parent work"
+  stack_base=$(git rev-parse HEAD)
+  git checkout --quiet -b child
+  printf 'child only\n' > mine.txt && commit_all "child adds a file trunk never had"
+  pre=$(git rev-parse HEAD)
+  squash_parent_onto_trunk
+  git checkout --quiet child
+  git merge --no-ff --no-commit trunk >/dev/null 2>&1
+  git rm --quiet --cached mine.txt >/dev/null
+
+  # Trunk never had this path, so nothing was ambiguous: it is a plain loss and
+  # --accept must not touch it.
+  output=$("$subject" audit "$stack_base" "$pre" --trunk trunk --accept mine.txt 2>/dev/null)
+  status=$?
+  [ "$status" -ne 0 ] || fail_test "--accept silenced a dropped addition: $output"
+  case "$output" in
+    *"LOST mine.txt"*) ;;
+    *) fail_test "the dropped addition was not reported: $output" ;;
+  esac
+) || failures=$((failures + 1))
+
+start_test "audit will not let --accept silence a plain resurrection"
+(
+  new_stack "$work_root/acceptresurrect"
+  printf 'old\n' > keep.txt && commit_all "fork point"
+  git checkout --quiet -b parent
+  printf 'registry\n' > registry.rs && commit_all "parent adds registry.rs"
+  stack_base=$(git rev-parse HEAD)
+  git checkout --quiet -b child
+  git rm --quiet registry.rs && commit_all "child deletes registry.rs"
+  pre=$(git rev-parse HEAD)
+  squash_parent_onto_trunk
+  git checkout --quiet child
+  git merge --no-ff --no-commit trunk >/dev/null 2>&1
+  [ -e registry.rs ] || fail_test "the fixture did not restore the deleted file"
+
+  # Trunk never touched this file, so nothing was ambiguous and nothing was
+  # decided: the deletion was simply undone. --accept is for decisions, not for
+  # silencing the finding this tooling exists to make.
+  output=$("$subject" audit "$stack_base" "$pre" --trunk trunk --accept registry.rs 2>/dev/null)
+  status=$?
+  [ "$status" -ne 0 ] || fail_test "--accept silenced a resurrection: $output"
+  case "$output" in
+    *"RESURRECTED registry.rs"*) ;;
+    *) fail_test "the resurrection was not reported: $output" ;;
+  esac
+) || failures=$((failures + 1))
+
+start_test "audit will not let --accept silence a discarded edit"
+(
+  new_stack "$work_root/acceptdiscard"
+  printf 'old\n' > f.txt && commit_all "fork point"
+  git checkout --quiet -b parent
+  printf 'new\n' > f.txt && commit_all "parent changes it"
+  stack_base=$(git rev-parse HEAD)
+  git checkout --quiet -b child
+  printf 'old\n' > f.txt && commit_all "child reverts it"
+  pre=$(git rev-parse HEAD)
+  squash_parent_onto_trunk
+  git checkout --quiet child
+  git merge --no-ff --no-commit trunk >/dev/null 2>&1
+
+  # The correct merge is unambiguous here: the child's revert simply lost.
+  output=$("$subject" audit "$stack_base" "$pre" --trunk trunk --accept f.txt 2>/dev/null)
+  status=$?
+  [ "$status" -ne 0 ] || fail_test "--accept silenced a discarded edit: $output"
+) || failures=$((failures + 1))
+
 start_test "audit will not accept a path that is still unmerged"
 (
   new_stack "$work_root/acceptunmerged"
@@ -552,21 +654,25 @@ start_test "audit accepts a path whose name contains a newline"
 (
   new_stack "$work_root/acceptnl"
   awkward=$(printf 'two\nlines.txt')
-  printf 'old\n' > "$awkward" && commit_all "fork point"
+  printf 'a\nb\nc\n' > "$awkward" && commit_all "fork point"
   git checkout --quiet -b parent
-  printf 'new\n' > "$awkward" && commit_all "parent changes it"
+  printf 'a\nPARENT\nc\n' > "$awkward" && commit_all "parent edits line 2"
   stack_base=$(git rev-parse HEAD)
   git checkout --quiet -b child
-  printf 'old\n' > "$awkward" && commit_all "child reverts it"
+  printf 'a\nCHILD\nc\n' > "$awkward" && commit_all "child edits line 2"
   pre=$(git rev-parse HEAD)
   squash_parent_onto_trunk
+  printf 'a\nTRUNK\nc\n' > "$awkward" && commit_all "trunk edits line 2"
   git checkout --quiet child
   git merge --no-ff --no-commit trunk >/dev/null 2>&1
+  # Decide it by hand and stage that, which is the only situation --accept is
+  # for: an ambiguous path, resolved by a person.
+  printf 'a\nDECIDED\nc\n' > "$awkward" && git add -- ":(literal)$awkward"
 
   output=$("$subject" audit "$stack_base" "$pre" --trunk trunk 2>/dev/null)
   case "$output" in
-    *DISCARDED*) ;;
-    *) fail_test "the fixture did not produce a finding: $output" ;;
+    *REVIEW*) ;;
+    *) fail_test "the fixture did not produce an ambiguous finding: $output" ;;
   esac
   # Delimited text cannot hold this path: it would be split into two records,
   # clearing neither the finding nor anything else predictable.

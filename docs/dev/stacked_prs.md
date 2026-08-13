@@ -246,6 +246,10 @@ index. Say so explicitly once you have made the call, so the re-run can finish:
 scripts/restack_stacked_branch.sh audit "$STACKBASE" "$PRE" --accept <path>
 ```
 
+`--accept` applies only to `REVIEW`. A `RESURRECTED`, `LOST`, or `DISCARDED` path is not
+ambiguous — nothing was decided there, something was lost — so it stays a finding until
+the tree is corrected, whatever you pass.
+
 Two properties are worth knowing, because both were bugs that reported success:
 
 - It compares against `$PRE`, the pre-merge tip. A resurrected file is no longer a

@@ -231,6 +231,18 @@ index_entry() {
   printf '%s\n' "$out" | awk '$3 == 0 { print $1 " " $2 }'
 }
 
+# Report an ambiguous path, unless a person has said they decided it. Only cases
+# a correctly based merge could not settle by itself come through here: a
+# deterministic loss is never something --accept may silence.
+accept_or_review() {
+  if path_accepted "$1"; then
+    echo "ACCEPTED $1"
+    return 0
+  fi
+  echo "REVIEW $1: $2"
+  return 1
+}
+
 # Was this path explicitly accepted by a person on the command line? The list is
 # an array rather than delimited text because a path may itself contain a
 # newline, which this command supports everywhere else.
@@ -256,15 +268,11 @@ audit_addition() {
   local unmerged
   unmerged=$(git ls-files -u -- ":(literal)$path") || die "could not read the index for $path"
   [ -z "$unmerged" ] || return 0
-  if path_accepted "$path"; then
-    echo "ACCEPTED $path"
-    return 0
-  fi
   [ -n "$staged_entry" ] && [ -n "$mine_entry" ] || return 0
 
   if [ -n "$theirs_entry" ] && [ "$mine_entry" != "$theirs_entry" ]; then
-    echo "REVIEW $path: you and trunk each added this path differently, which nothing has decided"
-    return 1
+    accept_or_review "$path" "you and trunk each added this path differently, which nothing has decided"
+    return $?
   fi
   if [ "$staged_entry" != "$mine_entry" ]; then
     echo "DISCARDED $path: the staged version is not the one you added"
@@ -298,15 +306,11 @@ audit_modification() {
   # Reported by the index-wide scan, which also catches paths the child never
   # touched. Acceptance cannot apply: nothing has been staged to accept.
   [ -z "$unmerged" ] || return 0
-  if path_accepted "$path"; then
-    echo "ACCEPTED $path"
-    return 0
-  fi
   if [ -z "$theirs_entry" ]; then
     # You changed it, trunk deleted it. From the stack base that is a
     # modify/delete conflict; from the older base the deletion applies unopposed.
-    echo "REVIEW $path: you changed it and trunk deleted it, which nothing has decided"
-    return 1
+    accept_or_review "$path" "you changed it and trunk deleted it, which nothing has decided"
+    return $?
   fi
   if [ -z "$staged_entry" ]; then
     echo "DISCARDED $path: your change is gone, and so is the path"
@@ -338,18 +342,18 @@ audit_modification() {
     fi
   elif [ "$expected_status" -ge 1 ] && [ "$expected_status" -le 127 ]; then
     # git resolved this without a conflict only because it used the older base.
-    echo "REVIEW $path: a merge from the stack base conflicts here, so the staged result was never decided"
-    return 1
+    accept_or_review "$path" "a merge from the stack base conflicts here, so the staged result was never decided"
+    return $?
   else
-    echo "REVIEW $path: the expected merge could not be computed (binary content?)"
-    return 1
+    accept_or_review "$path" "the expected merge could not be computed (binary content?)"
+    return $?
   fi
 
   local expected_mode
   if [ "$mine_mode" != "$base_mode" ] && [ "$theirs_mode" != "$base_mode" ] &&
      [ "$mine_mode" != "$theirs_mode" ]; then
-    echo "REVIEW $path: both sides changed the file mode, to $mine_mode and $theirs_mode"
-    return 1
+    accept_or_review "$path" "both sides changed the file mode, to $mine_mode and $theirs_mode"
+    return $?
   fi
   if [ "$mine_mode" != "$base_mode" ]; then
     expected_mode="$mine_mode"
@@ -488,7 +492,7 @@ cmd_audit() {
     rm -rf "$tmp"
     die "could not read unmerged entries from the index"
   fi
-  local record last_unmerged="" theirs_now base_now
+  local record last_unmerged="" theirs_now base_now theirs_add mine_add
   while IFS= read -r -d '' record; do
     path=${record#*$'\t'}
     [ "$path" = "$last_unmerged" ] && continue
@@ -508,20 +512,12 @@ cmd_audit() {
       base_now=$(tree_entry "$stack_base" "$path") || die "could not read $stack_base:$path"
       [ -n "$theirs_now" ] || continue                 # trunk deleted it too
       [ "$theirs_now" = "$base_now" ] && continue      # trunk left it alone
-      if path_accepted "$path"; then
-        echo "ACCEPTED $path"
-        continue
-      fi
-      echo "REVIEW $path: you deleted it and trunk changed it, which nothing has decided"
-      findings=$((findings + 1))
+      accept_or_review "$path" "you deleted it and trunk changed it, which nothing has decided" ||
+        findings=$((findings + 1))
       continue
     fi
     # Already reported by the scan above, and its stages are not a decision.
     [ -z "$(git ls-files -u -- ":(literal)$path")" ] || continue
-    if path_accepted "$path"; then
-      echo "ACCEPTED $path"
-      continue
-    fi
     # If trunk changed the file after the stack base, a correctly based merge is
     # a delete/modify conflict rather than a silent restoration, and keeping
     # trunk's version is a decision somebody may legitimately have made.
@@ -533,15 +529,31 @@ cmd_audit() {
       base_now=""
     fi
     if [ -n "$other" ] && [ "$theirs_now" != "$base_now" ]; then
-      echo "REVIEW $path: you deleted it and trunk changed it, which nothing has decided"
+      accept_or_review "$path" "you deleted it and trunk changed it, which nothing has decided" ||
+        findings=$((findings + 1))
     else
+      # Unambiguous: trunk did not touch it, so nothing was decided here and the
+      # deletion was simply undone. That stays a finding until it is corrected.
       echo "RESURRECTED $path"
+      findings=$((findings + 1))
     fi
-    findings=$((findings + 1))
   done < "$tmp/deleted"
 
   while IFS= read -r -d '' path; do
     if ! path_in_index "$path"; then
+      # Absent from the result. If trunk added the same path differently, that is
+      # an add/add somebody may have settled by staging a removal, so it is a
+      # decision; if trunk never had it, the child's addition was simply dropped.
+      theirs_add=""
+      if [ -n "$other" ]; then
+        theirs_add=$(tree_entry "$other" "$path") || die "could not read $other:$path"
+        mine_add=$(tree_entry "$pre" "$path") || die "could not read $pre:$path"
+      fi
+      if [ -n "$theirs_add" ] && [ "$theirs_add" != "$mine_add" ]; then
+        accept_or_review "$path" "you and trunk each added this path differently, and the result has neither" ||
+          findings=$((findings + 1))
+        continue
+      fi
       echo "LOST $path"
       findings=$((findings + 1))
       continue
