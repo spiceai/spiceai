@@ -1,0 +1,46 @@
+version: v1
+kind: Spicepod
+name: custom-search-example
+
+# Example of a customer-supplied search spicepod for `testoperator run search` with no
+# `--benchmark-dataset`. The harness tests the three fixed tables it queries — `corpus`,
+# `test_queries`, and `relevance_data` — against whatever this spicepod defines. Point the `from:`
+# fields at your own sources; `views:` map real column names onto the names/types the harness needs.
+#
+#   testoperator run search -p test/spicepods/search/custom/example.yaml
+#
+# See https://github.com/spiceai/spiceai/issues/12935 for the required schema.
+
+datasets:
+  # The searchable corpus. `corpus` must be a dataset (it carries the search configuration).
+  # Declare `row_id:` explicitly — a primary key from the source system is not discovered
+  # automatically. The `row_id` column is what `relevance_data."corpus-id"` must match.
+  - from: <your corpus source>          # e.g. postgres:documents, file:./corpus.parquet
+    name: corpus
+    acceleration:
+      enabled: true
+    columns:
+      - name: text                       # or another column used by the search config
+        embeddings:
+          - from: example_embed
+            row_id:
+              - id                        # the corpus row-id column
+
+views:
+  # Query set: the harness reads `SELECT _id as id, text FROM test_queries`.
+  - name: test_queries
+    sql: SELECT query_id AS "_id", query_text AS text FROM <your query table>
+
+  # Relevance judgments (qrels): the harness reads
+  # `SELECT "query-id", "corpus-id", CAST(score AS BIGINT) AS score FROM relevance_data`.
+  # `score` must be a whole-number grade (0, 1, 2, ...) — NDCG uses it as a weight. Round or
+  # bucket non-integer scores here.
+  - name: relevance_data
+    sql: SELECT query_id AS "query-id", doc_id AS "corpus-id", relevance AS score
+         FROM <your qrels table>
+
+embeddings:
+  - from: huggingface:huggingface.co/sentence-transformers/all-MiniLM-L6-v2
+    name: example_embed
+    params:
+      truncate: END

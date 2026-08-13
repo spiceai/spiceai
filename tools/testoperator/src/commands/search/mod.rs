@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 mod dataset;
+mod harness;
 mod mteb;
 use self::dataset::SearchDataset;
 use super::{duration_millis_between, get_app_and_start_request};
@@ -42,6 +43,10 @@ use tokio::time::sleep;
 pub(crate) async fn run(args: &SearchTestArgs) -> anyhow::Result<()> {
     let dataset = SearchDataset::from(args.benchmark_dataset);
     let (app, start_request) = get_app_and_start_request(&args.common).await?;
+
+    if matches!(dataset, SearchDataset::Custom) {
+        validate_custom_spicepod(&app)?;
+    }
 
     dataset
         .prepare(
@@ -228,6 +233,38 @@ fn print_retrieval_metrics_table(metrics_by_k: &BTreeMap<usize, RetrievalMetrics
             metrics.ndcg, metrics.recall, metrics.mrr, metrics.precision
         );
     }
+}
+
+/// Fails fast with an actionable message when a custom run's spicepod is missing one of the fixed
+/// tables the harness queries. `corpus` must be a dataset (it carries the search configuration),
+/// while `test_queries` and `relevance_data` may be datasets or views. Without this check the run
+/// would fail later with a raw `table not found` from the harness SQL.
+fn validate_custom_spicepod(app: &App) -> anyhow::Result<()> {
+    let has_dataset = |name: &str| app.datasets.iter().any(|ds| ds.name == name);
+    let has_table = |name: &str| has_dataset(name) || app.views.iter().any(|v| v.name == name);
+
+    let mut missing = Vec::new();
+    if !has_dataset("corpus") {
+        missing.push("corpus (dataset)");
+    }
+    if !has_table("test_queries") {
+        missing.push("test_queries (dataset or view)");
+    }
+    if !has_table("relevance_data") {
+        missing.push("relevance_data (dataset or view)");
+    }
+
+    if !missing.is_empty() {
+        return Err(anyhow::anyhow!(
+            "Failed to run custom search test ({}): spicepod is missing required table(s): {}. \
+            A custom search run (no --benchmark-dataset) must define `corpus`, `test_queries`, and \
+            `relevance_data`. See: https://github.com/spiceai/spiceai/issues/12935",
+            app.name,
+            missing.join(", ")
+        ));
+    }
+
+    Ok(())
 }
 
 fn search_dataset_attributes(app: &App) -> Vec<KeyValue> {

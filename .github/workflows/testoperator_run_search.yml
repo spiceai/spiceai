@@ -21,11 +21,12 @@ on:
           - 'spiceai-dev-runners'
           - 'spiceai-dev-large-runners'
       benchmark_dataset:
-        description: 'Search benchmark dataset to run against'
-        required: true
-        default: 'quora_retrieval'
+        description: 'Built-in MTEB dataset to run against. Select "custom" to test the spicepod as-is.'
+        required: false
+        default: 'custom'
         type: choice
         options:
+          - 'custom'
           - 'quora_retrieval'
           - 'miracl_en_retrieval'
           - 'fiqa_retrieval'
@@ -101,12 +102,20 @@ jobs:
           echo "SPICEPOD_FILENAME=${SPICEPOD_FILENAME}" >> $GITHUB_OUTPUT
 
       - name: Run the benchmark test - ${{ steps.extract_spicepod_filename.outputs.SPICEPOD_FILENAME }}
+        env:
+          BENCHMARK_DATASET: ${{ github.event.inputs.benchmark_dataset }}
         run: |
           rm -rf .spice/data
+          # A "custom" (or empty) selection tests the spicepod as-is: omit --benchmark-dataset so the
+          # tool runs a custom search rather than downloading an MTEB dataset.
+          dataset_flag=""
+          if [ -n "$BENCHMARK_DATASET" ] && [ "$BENCHMARK_DATASET" != "custom" ]; then
+            dataset_flag="--benchmark-dataset $BENCHMARK_DATASET"
+          fi
           testoperator run search \
             --ready-wait ${{ github.event.inputs.ready_wait }} \
             --concurrency 10 \
-            --benchmark-dataset ${{ github.event.inputs.benchmark_dataset }} \
+            $dataset_flag \
             --metrics \
             -p "${{ github.event.inputs.spicepod_path }}"
         env:
