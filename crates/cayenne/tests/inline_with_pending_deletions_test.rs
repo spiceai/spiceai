@@ -936,7 +936,11 @@ async fn assert_no_duplicate_pk_under_concurrent_upserts(
     // A regressed publish surfaces a duplicate within the first second under this
     // contention; 5s keeps a healthy safety margin while bounding CI time. A
     // shorter run can only reduce detection power, never cause a false failure.
-    const DEADLINE: Duration = Duration::from_secs(5);
+    // Scalable via `CAYENNE_PROPTEST_OPS_SCALE` (see `common::env_scale`) for a
+    // lighter per-PR pass or a deeper nightly run; floored at 500ms.
+    let deadline = Duration::from_secs(5)
+        .mul_f64(common::env_scale("CAYENNE_PROPTEST_OPS_SCALE"))
+        .max(Duration::from_millis(500));
 
     let schema = composite_pk_schema();
     let vortex_config = cayenne::metadata::VortexConfig {
@@ -980,7 +984,7 @@ async fn assert_no_duplicate_pk_under_concurrent_upserts(
         writers.push(tokio::spawn(async move {
             let start = Instant::now();
             let mut round: i64 = 1;
-            while !stop.load(Ordering::Relaxed) && start.elapsed() < DEADLINE {
+            while !stop.load(Ordering::Relaxed) && start.elapsed() < deadline {
                 let key = (writer_id + round * NUM_WRITERS) % NUM_KEYS;
                 let batch = RecordBatch::try_new(
                     Arc::clone(&schema),

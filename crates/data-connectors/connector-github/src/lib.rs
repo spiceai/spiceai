@@ -66,7 +66,7 @@ use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult, NewDataConnectorResult,
 };
-use runtime::parameters::{ParameterSpec, Parameters};
+use runtime_parameters::{ParameterSpec, Parameters};
 
 pub mod github;
 
@@ -1909,7 +1909,7 @@ mod tests {
     use runtime::dataconnector::{
         ConnectorComponent, ConnectorParams, DataConnectorError, DataConnectorFactory,
     };
-    use runtime::parameters::Parameters;
+    use runtime_parameters::Parameters;
     use runtime_secrets::Secrets;
     use std::sync::Arc;
     use tokio::sync::RwLock;

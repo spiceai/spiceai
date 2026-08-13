@@ -40,6 +40,13 @@ use crate::{
     postgres::common::{self, get_pg_params},
     utils::{register_test_connectors, run_query, runtime_ready_check, test_request_context},
 };
+use data_components::Read;
+use data_components::RefreshableCatalogProvider;
+use data_components::catalog_filter::TableSelector;
+use data_components::postgres::provider::PostgresCatalogProvider;
+use datafusion_table_providers::UnsupportedTypeAction;
+use datafusion_table_providers::sql::db_connection_pool::postgrespool::PostgresConnectionPool;
+use datafusion_table_providers::util::secrets::to_secret_map;
 
 const CATALOG_NAME: &str = "pg_e2e";
 
@@ -559,4 +566,291 @@ async fn test_unsupported_type_action_override_drops_table() -> Result<(), anyho
             Ok(())
         })
         .await
+}
+
+/// Catalog discovery must not be steerable by anything in the source database.
+///
+/// The connector classifies the server from its version and takes different
+/// catalog queries for Redshift, so the classification must depend only on the
+/// server. It reads `pg_catalog.version()`, which nothing in the database can
+/// shadow.
+///
+/// An unqualified `version()` would resolve through `search_path`, letting a
+/// `public.version()` in the source — which a user may define for any reason —
+/// decide the classification. That is the regression this guards: a `PostgreSQL`
+/// server misread as Redshift makes discovery issue `SHOW COLUMNS`, which it
+/// cannot answer, so every table fails to resolve.
+///
+/// The check lives here as well as in `datafusion-table-providers` because the
+/// qualification is the dependency's; a rev bump that lost it would otherwise
+/// surface as a catalog that fails to load for no visible reason. The shadow
+/// below is what an unqualified lookup would resolve to.
+#[tokio::test]
+async fn test_catalog_discovery_ignores_a_shadowed_version_function() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    test_request_context()
+        .scope(async {
+            let port = common::get_random_port()?;
+            let _container = common::start_postgres_docker_container(port).await?;
+
+            let pool = common::get_postgres_connection_pool(port, None).await?;
+            let conn = pool
+                .connect_direct()
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            conn.conn
+                .simple_query(
+                    "CREATE TABLE widgets (id INT PRIMARY KEY, name TEXT NOT NULL); \
+                     INSERT INTO widgets (id, name) VALUES (1, 'widget'); \
+                     CREATE FUNCTION public.version() RETURNS text LANGUAGE sql IMMUTABLE AS \
+                       $$ SELECT 'PostgreSQL 8.0.2 on i686-pc-linux-gnu, Redshift 1.0.12345'::text $$; \
+                     ALTER DATABASE postgres SET search_path = public, pg_catalog;",
+                )
+                .await?;
+
+            // Loading at all is the assertion: a server misclassified as
+            // Redshift cannot answer the queries discovery would then issue.
+            let rt = start_runtime(pg_catalog(port)).await?;
+
+            let tables = run_query(
+                &rt,
+                &format!(
+                    "SELECT table_name FROM information_schema.tables \
+                     WHERE table_catalog = '{CATALOG_NAME}' AND table_schema = 'public' \
+                     ORDER BY table_name"
+                ),
+            )
+            .await?;
+            assert_eq!(
+                string_column_values(&tables, "table_name"),
+                vec!["widgets".to_string()],
+                "discovery must classify the server from pg_catalog, not a shadowed version()"
+            );
+
+            let rows = run_query(
+                &rt,
+                &format!("SELECT COUNT(*) AS n FROM {CATALOG_NAME}.public.widgets"),
+            )
+            .await?;
+            assert_batches_eq!(&["+---+", "| n |", "+---+", "| 1 |", "+---+"], &rows);
+
+            Ok(())
+        })
+        .await
+}
+
+/// A recording [`Read`] that reports which construction path each table took.
+///
+/// Whether a table's schema came from the schema-wide lookup or from its own
+/// query is invisible in the resulting catalog — both register the same table —
+/// so a test that wants to assert it has to observe the call.
+#[derive(Default)]
+struct RecordingRead {
+    from_supplied_schema: std::sync::Mutex<Vec<String>>,
+    self_resolved: std::sync::Mutex<Vec<String>>,
+}
+
+impl RecordingRead {
+    fn built_from_supplied_schema(&self) -> Vec<String> {
+        self.from_supplied_schema
+            .lock()
+            .expect("mutex should not be poisoned")
+            .clone()
+    }
+
+    fn self_resolved(&self) -> Vec<String> {
+        self.self_resolved
+            .lock()
+            .expect("mutex should not be poisoned")
+            .clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl Read for RecordingRead {
+    async fn table_provider(
+        &self,
+        table_reference: datafusion::sql::TableReference,
+    ) -> Result<
+        Arc<dyn datafusion::datasource::TableProvider + 'static>,
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
+        self.self_resolved
+            .lock()
+            .expect("mutex should not be poisoned")
+            .push(table_reference.table().to_string());
+        Ok(Arc::new(datafusion::datasource::empty::EmptyTable::new(
+            Arc::new(arrow::datatypes::Schema::empty()),
+        )))
+    }
+
+    async fn table_provider_with_schema(
+        &self,
+        table_reference: datafusion::sql::TableReference,
+        schema: arrow::datatypes::SchemaRef,
+    ) -> Result<
+        Arc<dyn datafusion::datasource::TableProvider + 'static>,
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
+        self.from_supplied_schema
+            .lock()
+            .expect("mutex should not be poisoned")
+            .push(table_reference.table().to_string());
+        Ok(Arc::new(datafusion::datasource::empty::EmptyTable::new(
+            schema,
+        )))
+    }
+}
+
+/// Bulk schema resolution must honour the catalog's `unsupported_type_action`.
+///
+/// The schema-wide lookup runs on a pooled connection, and only the pool's own
+/// `connect` applies the configured action — a connection taken any other way
+/// rejects every unsupported column type. A schema holding one, `jsonb` being
+/// the ordinary case, then fails that lookup under the catalog's default
+/// `string`, and every table in the namespace resolves its own schema instead.
+///
+/// Nothing about the resulting catalog would look wrong: the per-table path
+/// registers the same tables. So this drives a real refresh and observes which
+/// path each table took, rather than re-creating the connection acquisition —
+/// which would prove only that the dependency *can* carry the action, and would
+/// stay green if the connector stopped asking it to.
+#[tokio::test]
+async fn test_bulk_schema_resolution_honors_unsupported_type_action() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    test_request_context()
+        .scope(async {
+            let port = common::get_random_port()?;
+            let _container = common::start_postgres_docker_container(port).await?;
+
+            seed_unsupported_type_table(port).await?;
+
+            // The pool as the catalog connector builds it: a `pg` catalog
+            // defaults to `string` (#11728).
+            let pool = Arc::new(
+                PostgresConnectionPool::new(to_secret_map(
+                    get_pg_params(port)
+                        .into_iter()
+                        .map(|(k, v)| (k, v.expose_secret().to_string()))
+                        .collect::<HashMap<String, String>>(),
+                ))
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?
+                .with_unsupported_type_action(UnsupportedTypeAction::String),
+            );
+
+            let recorder = Arc::new(RecordingRead::default());
+            let provider = PostgresCatalogProvider::new(
+                CATALOG_NAME.to_string(),
+                pool,
+                Arc::clone(&recorder) as Arc<dyn Read>,
+                TableSelector::select_all(),
+            );
+
+            provider
+                .refresh()
+                .await
+                .map_err(|e| anyhow::anyhow!("catalog refresh: {e}"))?;
+
+            assert!(
+                recorder
+                    .built_from_supplied_schema()
+                    .contains(&"widgets_jsonb".to_string()),
+                "the jsonb table should have been built from the schema-wide lookup; resolved individually: {:?}",
+                recorder.self_resolved()
+            );
+            // Taking the bulk path does not by itself mean the round trip was
+            // saved: a table built from a supplied schema that also resolved its
+            // own would satisfy the assertion above while costing exactly what
+            // this change removes.
+            assert!(
+                !recorder.self_resolved().contains(&"widgets_jsonb".to_string()),
+                "the jsonb table resolved its own schema as well as taking the schema-wide lookup, so the per-table query was not saved"
+            );
+
+            Ok(())
+        })
+        .await
+}
+
+/// A filtered catalog must still build its selected tables from the schema-wide
+/// lookup, and must not build the tables it rejected at all.
+///
+/// The refresh resolves the schemas it will need before it knows which provider
+/// each table gets, so a selection that reached only one of those two steps
+/// would show up here: an excluded table appearing on either construction path
+/// means the filter was consulted too late to save anything.
+#[tokio::test]
+async fn test_filtered_refresh_builds_only_selected_tables_from_the_bulk_lookup()
+-> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    test_request_context()
+        .scope(async {
+            let port = common::get_random_port()?;
+            let _container = common::start_postgres_docker_container(port).await?;
+
+            let pool = common::get_postgres_connection_pool(port, None).await?;
+            pool.connect_direct()
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?
+                .conn
+                .simple_query(
+                    "CREATE TABLE kept (id INT PRIMARY KEY, label TEXT); \
+                     CREATE TABLE rejected (id INT PRIMARY KEY, label TEXT);",
+                )
+                .await?;
+
+            let recorder = Arc::new(RecordingRead::default());
+            let provider = PostgresCatalogProvider::new(
+                CATALOG_NAME.to_string(),
+                Arc::new(
+                    PostgresConnectionPool::new(to_secret_map(
+                        get_pg_params(port)
+                            .into_iter()
+                            .map(|(k, v)| (k, v.expose_secret().to_string()))
+                            .collect::<HashMap<String, String>>(),
+                    ))
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))?,
+                ),
+                Arc::clone(&recorder) as Arc<dyn Read>,
+                TableSelector::new(Some(globset_of(&["public.kept"])), None),
+            );
+
+            provider
+                .refresh()
+                .await
+                .map_err(|e| anyhow::anyhow!("catalog refresh: {e}"))?;
+
+            let bulk = recorder.built_from_supplied_schema();
+            let individual = recorder.self_resolved();
+
+            assert!(
+                bulk.contains(&"kept".to_string()),
+                "the selected table should have been built from the schema-wide lookup; resolved individually: {individual:?}"
+            );
+            assert!(
+                !individual.contains(&"kept".to_string()),
+                "the selected table resolved its own schema as well, so the per-table query was not saved"
+            );
+            assert!(
+                !bulk.contains(&"rejected".to_string())
+                    && !individual.contains(&"rejected".to_string()),
+                "an excluded table should not be built at all; bulk: {bulk:?}, individual: {individual:?}"
+            );
+
+            Ok(())
+        })
+        .await
+}
+
+fn globset_of(patterns: &[&str]) -> globset::GlobSet {
+    let mut builder = globset::GlobSetBuilder::new();
+    for pattern in patterns {
+        builder.add(globset::Glob::new(pattern).expect("glob pattern should parse"));
+    }
+    builder.build().expect("glob set should build")
 }

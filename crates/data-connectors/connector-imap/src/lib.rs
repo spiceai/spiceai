@@ -33,7 +33,7 @@ use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult, NewDataConnectorResult,
 };
-use runtime::parameters::ParameterSpec;
+use runtime_parameters::ParameterSpec;
 use secrecy::SecretString;
 use snafu::prelude::*;
 use std::{
