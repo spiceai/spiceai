@@ -128,6 +128,10 @@ mod tests {
         assert_eq!(hb.sequence, 42);
         // A handle that cannot report status must not claim a phase.
         assert_eq!(hb.phase, proto::RuntimePhase::Unspecified as i32);
+        // A runtime with no restart-state source of truth reports no
+        // standalone detail — absent, never a present-but-empty placeholder,
+        // since the control plane reads those as different states.
+        assert_eq!(hb.standalone_runtime, None);
     }
 
     #[tokio::test]

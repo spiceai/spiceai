@@ -157,10 +157,9 @@ pub struct Identity {
     /// The app this instance's telemetry is attributed to, as delivered by the
     /// control plane and stamped on exported metrics as `scp_app_id`.
     ///
-    /// The one field here that is not credential material. It lives alongside
-    /// the credential because it shares the credential's lifetime — both are
-    /// control-plane facts about this enrolled instance, and both are cleared
-    /// together when the instance is released.
+    /// Portal metadata, not credential material. It lives alongside the
+    /// credential because both are control-plane facts about this enrolled
+    /// instance and leave disk together when the instance is released.
     ///
     /// Persisted rather than held only in memory so a restart does not silence
     /// the export before the next control-stream reconciliation.
@@ -169,6 +168,67 @@ pub struct Identity {
     /// enrolled instance starts in.
     #[serde(default)]
     pub app_id: Option<String>,
+    /// The Spice Cloud organization this instance belongs to, as the control
+    /// plane last reported it. Portal metadata, not credential material: it is
+    /// what lets local surfaces name the org destination without constructing
+    /// portal routes themselves.
+    ///
+    /// Instance-level, not attachment-scoped: the org an instance is enrolled
+    /// in owns every attachment it can ever have (the control plane never
+    /// attaches one credential across organizations), so this is **updated
+    /// only when a command names an org and never cleared by omission** — not
+    /// by detach, and not by an attach that carries no org. That is what
+    /// keeps the org's new-project page reachable as the recovery path for a
+    /// detached instance, including under a control plane that still sends
+    /// app-id-only attachments. It leaves disk only when the whole identity
+    /// does.
+    #[serde(default)]
+    pub org_name: Option<String>,
+    /// The attached app (project) name inside [`Identity::org_name`]. Scoped to
+    /// the attachment, so a detach clears it along with the app id.
+    #[serde(default)]
+    pub app_name: Option<String>,
+    /// Cloud-constructed portal URL for the attached app's monitor page,
+    /// delivered rather than derived because the Cloud owns environment and
+    /// route metadata. Scoped to the attachment; cleared on detach.
+    #[serde(default)]
+    pub monitor_url: Option<String>,
+}
+
+/// The control plane's app attachment state for this instance, as one tuple:
+/// the attached app plus the portal metadata that describes it. Delivered by
+/// an `AttachApp` command and persisted into the [`Identity`] as a unit — the
+/// pieces are only meaningful together, so they are applied together.
+///
+/// An absent optional member means the command did not name it. The org is
+/// preserved; project metadata is preserved only for the same app and is
+/// cleared on an app change — see [`IdentityStore::set_attachment`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppAttachment {
+    /// The attached app. Always non-empty: a detached instance is represented
+    /// by the absence of the whole tuple, not an empty id.
+    pub app_id: String,
+    /// The organization the instance belongs to, when the control plane named
+    /// it.
+    pub org_name: Option<String>,
+    /// The app (project) name, when the control plane named it.
+    pub app_name: Option<String>,
+    /// Portal monitor URL for the app, when the control plane supplied it.
+    pub monitor_url: Option<String>,
+}
+
+/// The attachment-related fields of the identity **as persisted** — what a
+/// command handler reports back after an update, so the reply reflects the
+/// state on disk rather than echoing the command that produced it (the two
+/// differ exactly where absence preserves: a detach keeps the org, an
+/// app-id-only attach keeps the org it already had).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AttachmentState {
+    /// `None` means detached.
+    pub app_id: Option<String>,
+    pub org_name: Option<String>,
+    pub app_name: Option<String>,
+    pub monitor_url: Option<String>,
 }
 
 /// Read the persisted `not_after_unix`, mapping a missing, null, or `0` value
@@ -361,8 +421,9 @@ pub struct IdentityStore;
 ///
 /// [`atomic_write`] already makes any single write all-or-nothing, so no reader
 /// ever sees a half-file. What this adds is protection against a LOST UPDATE:
-/// [`IdentityStore::set_app_id`] reads the file, edits one field, and writes it
-/// back, while the renewal path replaces the credential fields.
+/// [`IdentityStore::set_app_id`] and [`IdentityStore::set_attachment`] read the
+/// file, edit attachment fields, and write it back, while the renewal path
+/// replaces the credential fields.
 /// Interleave those and the rotated credential is silently replaced by the copy
 /// the app-id update read a moment earlier — leaving on disk a key the cloud has
 /// already stopped accepting, which surfaces much later as a renewal that cannot
@@ -416,8 +477,9 @@ impl IdentityStore {
         Self::store_locked(path, identity)
     }
 
-    /// Record the app this instance's telemetry belongs to, leaving every other
-    /// field as it is on disk.
+    /// Record the app this instance's telemetry belongs to, preserving the org
+    /// and credential fields. An app change clears the previous app's name and
+    /// monitor URL because they cannot describe the new app.
     ///
     /// A read-modify-write, which is why it runs under [`write_lock`]. Complete
     /// credential updates use [`IdentityStore::store_credential_update`] under
@@ -439,7 +501,8 @@ impl IdentityStore {
     }
 
     /// Set or clear the app this instance's telemetry belongs to, leaving every
-    /// credential field as it is on disk.
+    /// credential field and the enrollment org as they are on disk. An app
+    /// change clears the previous app's name and monitor URL.
     ///
     /// Returns `Ok(false)` when the identity file no longer exists. Callers
     /// handling a control command must not acknowledge a durable update in that
@@ -458,8 +521,105 @@ impl IdentityStore {
             return Ok(true);
         }
         identity.app_id = app_id.map(str::to_string);
+        // The stored app name and monitor URL describe the app this instance
+        // was attached to a moment ago. Under a different app id they would
+        // present one app's monitor page as another's, so they go with the old
+        // id; the next `AttachApp` delivers the new app's metadata. The org is
+        // not attachment-scoped and stays.
+        identity.app_name = None;
+        identity.monitor_url = None;
         Self::store_locked(path, &identity)?;
         Ok(true)
+    }
+
+    /// Apply the control plane's app attachment state — the app id and the
+    /// portal metadata that describes it — as one atomic update, leaving every
+    /// credential field as it is on disk.
+    ///
+    /// The whole tuple is resolved, compared, and written together: an update
+    /// that changes only one member (a renamed app, a moved monitor URL) must
+    /// still persist, and a partial write could pair one app's id with
+    /// another's metadata. Each member resolves by one rule — **presence
+    /// updates, absence preserves, except that project-scoped metadata never
+    /// survives an app change**:
+    ///
+    /// - [`Identity::org_name`] is instance-level (see its field docs): a
+    ///   present `org_name` updates it, an absent one leaves it — on attach
+    ///   *and* on detach — so a control plane that sends app-id-only
+    ///   attachments cannot wipe the org a fuller one recorded.
+    /// - [`Identity::app_name`] / [`Identity::monitor_url`] describe exactly
+    ///   one app. Re-attaching the *same* app updates them when present and
+    ///   preserves them when absent; attaching a *different* app takes the
+    ///   command's values verbatim, so one app's monitor page can never be
+    ///   presented as another's. `None` detaches and clears both along with
+    ///   the app id.
+    ///
+    /// Returns the attachment state now on disk, or `Ok(None)` when the
+    /// identity file no longer exists — nothing is written and no file is
+    /// created. Callers handling a control command must not acknowledge a
+    /// durable update in that case; the identity may have been removed
+    /// concurrently, and re-creating it from attachment state would resurrect
+    /// an instance the control plane just released.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the existing file cannot be read or parsed, or if the
+    /// updated identity cannot be written.
+    pub fn set_attachment(
+        path: &Path,
+        attachment: Option<&AppAttachment>,
+    ) -> Result<Option<AttachmentState>> {
+        let _guard = write_lock();
+        let Some(mut identity) = Self::load_optional(path)? else {
+            return Ok(None);
+        };
+        let resolved = match attachment {
+            Some(attachment) => {
+                let same_app = identity.app_id.as_deref() == Some(attachment.app_id.as_str());
+                let (app_name, monitor_url) = if same_app {
+                    (
+                        attachment
+                            .app_name
+                            .clone()
+                            .or_else(|| identity.app_name.clone()),
+                        attachment
+                            .monitor_url
+                            .clone()
+                            .or_else(|| identity.monitor_url.clone()),
+                    )
+                } else {
+                    (attachment.app_name.clone(), attachment.monitor_url.clone())
+                };
+                AttachmentState {
+                    app_id: Some(attachment.app_id.clone()),
+                    org_name: attachment
+                        .org_name
+                        .clone()
+                        .or_else(|| identity.org_name.clone()),
+                    app_name,
+                    monitor_url,
+                }
+            }
+            None => AttachmentState {
+                app_id: None,
+                org_name: identity.org_name.clone(),
+                app_name: None,
+                monitor_url: None,
+            },
+        };
+        if identity.app_id == resolved.app_id
+            && identity.org_name == resolved.org_name
+            && identity.app_name == resolved.app_name
+            && identity.monitor_url == resolved.monitor_url
+        {
+            return Ok(Some(resolved));
+        }
+        identity.app_id.clone_from(&resolved.app_id);
+        identity.org_name.clone_from(&resolved.org_name);
+        identity.app_name.clone_from(&resolved.app_name);
+        identity.monitor_url.clone_from(&resolved.monitor_url);
+        Self::store_locked(path, &identity)?;
+        Ok(Some(resolved))
     }
 
     /// Persist a complete identity update without overwriting an attachment
@@ -486,7 +646,13 @@ impl IdentityStore {
             return Ok(None);
         };
         let mut merged = credential_update.clone();
+        // The whole attachment tuple, not just the app id: a command handler
+        // may have written any of these after the caller cloned its identity,
+        // and a credential update must not revert them.
         merged.app_id = current.app_id;
+        merged.org_name = current.org_name;
+        merged.app_name = current.app_name;
+        merged.monitor_url = current.monitor_url;
         Self::store_locked(path, &merged)?;
         Ok(Some(merged))
     }
@@ -767,6 +933,9 @@ mod tests {
             gateway_addr: "gateway.test.spice.ai:443".to_string(),
             not_after_unix: None,
             app_id: None,
+            org_name: None,
+            app_name: None,
+            monitor_url: None,
             enc_private_key_pem:
                 "-----BEGIN PRIVATE KEY-----\nMOCKENC\n-----END PRIVATE KEY-----\n".to_string(),
             enc_public_key_pem: "-----BEGIN PUBLIC KEY-----\nMOCKENC\n-----END PUBLIC KEY-----\n"
@@ -875,6 +1044,336 @@ mod tests {
         assert_eq!(loaded.enc_private_key_pem, identity.enc_private_key_pem);
     }
 
+    fn sample_attachment() -> AppAttachment {
+        AppAttachment {
+            app_id: "4002".to_string(),
+            org_name: Some("acme".to_string()),
+            app_name: Some("retail-analytics".to_string()),
+            monitor_url: Some("https://spice.ai/acme/retail-analytics/monitor".to_string()),
+        }
+    }
+
+    #[test]
+    fn attachment_state_json_reports_every_persisted_member() {
+        let state = AttachmentState {
+            app_id: Some("4002".to_string()),
+            org_name: Some("acme".to_string()),
+            app_name: Some("retail-analytics".to_string()),
+            monitor_url: Some("https://spice.ai/acme/retail-analytics/monitor".to_string()),
+        };
+
+        assert_eq!(
+            serde_json::json!(state),
+            serde_json::json!({
+                "app_id": "4002",
+                "org_name": "acme",
+                "app_name": "retail-analytics",
+                "monitor_url": "https://spice.ai/acme/retail-analytics/monitor",
+            })
+        );
+    }
+
+    #[test]
+    fn set_attachment_persists_the_full_tuple_and_preserves_the_credential() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join("identity.json");
+        let identity = sample_identity();
+        IdentityStore::store(&path, &identity).expect("store");
+
+        let attachment = sample_attachment();
+        let persisted = IdentityStore::set_attachment(&path, Some(&attachment))
+            .expect("attach")
+            .expect("identity present");
+        assert_eq!(persisted.app_id.as_deref(), Some("4002"));
+        assert_eq!(persisted.org_name.as_deref(), Some("acme"));
+
+        let loaded = IdentityStore::load_optional(&path)
+            .expect("load")
+            .expect("present");
+        assert_eq!(loaded.app_id.as_deref(), Some("4002"));
+        assert_eq!(loaded.org_name.as_deref(), Some("acme"));
+        assert_eq!(loaded.app_name.as_deref(), Some("retail-analytics"));
+        assert_eq!(
+            loaded.monitor_url.as_deref(),
+            Some("https://spice.ai/acme/retail-analytics/monitor")
+        );
+        assert_eq!(loaded.identity_cert_pem, identity.identity_cert_pem);
+        assert_eq!(loaded.private_key_pem, identity.private_key_pem);
+        assert_eq!(loaded.enc_private_key_pem, identity.enc_private_key_pem);
+        assert_eq!(loaded.cache_key_b64, identity.cache_key_b64);
+    }
+
+    /// Attachment equality covers the whole tuple: an update that changes only
+    /// one member (here the monitor URL) must still persist. Comparing only the
+    /// app id would skip the write and leave stale metadata on disk.
+    #[test]
+    fn set_attachment_applies_a_change_to_any_tuple_member() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join("identity.json");
+        IdentityStore::store(&path, &sample_identity()).expect("store");
+        let attachment = sample_attachment();
+        IdentityStore::set_attachment(&path, Some(&attachment)).expect("attach");
+
+        let moved = AppAttachment {
+            monitor_url: Some("https://spice.ai/acme/retail-analytics-2/monitor".to_string()),
+            ..attachment
+        };
+        IdentityStore::set_attachment(&path, Some(&moved))
+            .expect("update")
+            .expect("identity present");
+
+        let loaded = IdentityStore::load_optional(&path)
+            .expect("load")
+            .expect("present");
+        assert_eq!(
+            loaded.monitor_url.as_deref(),
+            Some("https://spice.ai/acme/retail-analytics-2/monitor")
+        );
+        assert_eq!(loaded.app_id.as_deref(), Some("4002"));
+    }
+
+    /// Attaching a *different* app takes the command's project metadata
+    /// verbatim — absent members come out absent, so one app's monitor page is
+    /// never carried under another app's id. The org is instance-level and an
+    /// app-id-only attach must not wipe it: a control plane predating the
+    /// metadata fields sends exactly this shape on every reconciliation.
+    #[test]
+    fn attaching_a_different_app_replaces_project_metadata_but_keeps_the_org() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join("identity.json");
+        IdentityStore::store(&path, &sample_identity()).expect("store");
+        IdentityStore::set_attachment(&path, Some(&sample_attachment())).expect("attach");
+
+        let bare = AppAttachment {
+            app_id: "3387".to_string(),
+            org_name: None,
+            app_name: None,
+            monitor_url: None,
+        };
+        IdentityStore::set_attachment(&path, Some(&bare))
+            .expect("re-attach")
+            .expect("identity present");
+
+        let loaded = IdentityStore::load_optional(&path)
+            .expect("load")
+            .expect("present");
+        assert_eq!(loaded.app_id.as_deref(), Some("3387"));
+        assert_eq!(
+            loaded.org_name.as_deref(),
+            Some("acme"),
+            "an app-id-only attach must not clear the instance's org"
+        );
+        assert_eq!(loaded.app_name, None);
+        assert_eq!(loaded.monitor_url, None);
+    }
+
+    /// Re-attaching the app the instance already holds updates the members the
+    /// command names and preserves the ones it omits — so a mixed-version
+    /// control plane re-asserting an attachment with fewer fields cannot strip
+    /// metadata a fuller command recorded.
+    #[test]
+    fn re_attaching_the_same_app_preserves_omitted_members() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join("identity.json");
+        IdentityStore::store(&path, &sample_identity()).expect("store");
+        let attachment = sample_attachment();
+        IdentityStore::set_attachment(&path, Some(&attachment)).expect("attach");
+
+        let sparse = AppAttachment {
+            app_id: attachment.app_id,
+            org_name: None,
+            app_name: None,
+            monitor_url: Some("https://spice.ai/acme/retail-analytics/monitor2".to_string()),
+        };
+        let persisted = IdentityStore::set_attachment(&path, Some(&sparse))
+            .expect("re-attach")
+            .expect("identity present");
+        assert_eq!(persisted.org_name.as_deref(), Some("acme"));
+
+        let loaded = IdentityStore::load_optional(&path)
+            .expect("load")
+            .expect("present");
+        assert_eq!(loaded.org_name.as_deref(), Some("acme"));
+        assert_eq!(loaded.app_name.as_deref(), Some("retail-analytics"));
+        assert_eq!(
+            loaded.monitor_url.as_deref(),
+            Some("https://spice.ai/acme/retail-analytics/monitor2"),
+            "a present member still updates"
+        );
+    }
+
+    /// The org survives the detach → app-id-only re-attach cycle end to end:
+    /// this is the mixed-version reconciliation sequence that must not lose
+    /// the recovery pointer.
+    #[test]
+    fn the_org_survives_detach_and_a_bare_re_attach() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join("identity.json");
+        IdentityStore::store(&path, &sample_identity()).expect("store");
+        IdentityStore::set_attachment(&path, Some(&sample_attachment())).expect("attach");
+        IdentityStore::set_attachment(&path, None).expect("detach");
+
+        let bare = AppAttachment {
+            app_id: "3387".to_string(),
+            org_name: None,
+            app_name: None,
+            monitor_url: None,
+        };
+        IdentityStore::set_attachment(&path, Some(&bare)).expect("re-attach");
+
+        let loaded = IdentityStore::load_optional(&path)
+            .expect("load")
+            .expect("present");
+        assert_eq!(loaded.org_name.as_deref(), Some("acme"));
+        assert_eq!(loaded.app_id.as_deref(), Some("3387"));
+    }
+
+    /// Detach clears the attachment-scoped fields but keeps the org: the org
+    /// outlives the attachment, and is what lets a detached instance still
+    /// point at the org's new-project page as its recovery path. The
+    /// credential is untouched either way.
+    #[test]
+    fn detach_clears_project_and_monitor_but_preserves_the_org() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join("identity.json");
+        let identity = sample_identity();
+        IdentityStore::store(&path, &identity).expect("store");
+        IdentityStore::set_attachment(&path, Some(&sample_attachment())).expect("attach");
+
+        let persisted = IdentityStore::set_attachment(&path, None)
+            .expect("detach")
+            .expect("the identity still exists");
+        // The returned state is what a command handler reports, and must match
+        // the disk: detached, org retained.
+        assert_eq!(persisted.app_id, None);
+        assert_eq!(persisted.org_name.as_deref(), Some("acme"));
+
+        let loaded = IdentityStore::load_optional(&path)
+            .expect("load")
+            .expect("present");
+        assert_eq!(loaded.app_id, None);
+        assert_eq!(loaded.app_name, None);
+        assert_eq!(loaded.monitor_url, None);
+        assert_eq!(loaded.org_name.as_deref(), Some("acme"));
+        assert_eq!(loaded.identity_cert_pem, identity.identity_cert_pem);
+        assert_eq!(loaded.private_key_pem, identity.private_key_pem);
+    }
+
+    /// The attachment arrives over an established stream, which requires an
+    /// identity — so a missing file means one was cleared concurrently by a
+    /// `Remove`, and the update must not resurrect it.
+    #[test]
+    fn set_attachment_does_not_create_an_identity() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join("identity.json");
+
+        let persisted = IdentityStore::set_attachment(&path, Some(&sample_attachment()))
+            .expect("no-op on a missing identity");
+
+        assert!(
+            persisted.is_none(),
+            "the caller must not acknowledge a durable update"
+        );
+        assert!(
+            IdentityStore::load_optional(&path).expect("load").is_none(),
+            "a released instance must not be resurrected by attachment state"
+        );
+    }
+
+    /// A release racing attachment updates must win, exactly as it does for
+    /// app-id updates: both writers take the same lock, so the file is either
+    /// removed before the read (nothing to update) or after the write (removed
+    /// again).
+    #[test]
+    fn a_release_wins_over_concurrent_attachment_updates() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join("identity.json");
+        IdentityStore::store(&path, &sample_identity()).expect("store");
+
+        std::thread::scope(|scope| {
+            let updater = scope.spawn(|| {
+                for i in 0..200 {
+                    let attachment = AppAttachment {
+                        app_id: format!("400{i}"),
+                        ..sample_attachment()
+                    };
+                    IdentityStore::set_attachment(&path, Some(&attachment)).expect("attach");
+                }
+            });
+            IdentityStore::clear(&path).expect("clear");
+            updater.join().expect("updater thread");
+        });
+
+        assert!(
+            IdentityStore::load_optional(&path).expect("load").is_none(),
+            "a released instance must stay released"
+        );
+    }
+
+    /// The identity file holds the mTLS private key, so every writer —
+    /// including the attachment update — must leave it owner-only.
+    #[cfg(unix)]
+    #[test]
+    fn set_attachment_keeps_owner_only_perms() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join("identity.json");
+        IdentityStore::store(&path, &sample_identity()).expect("store");
+
+        IdentityStore::set_attachment(&path, Some(&sample_attachment())).expect("attach");
+
+        let mode = std::fs::metadata(&path)
+            .expect("read metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    /// Switching the attributed app without an `AttachApp` (the `ApplySpicepod`
+    /// path carries only the id) must not keep the previous app's name and
+    /// monitor URL: under a different app id they would present one app's
+    /// monitor page as another's. The org is not attachment-scoped and stays.
+    #[test]
+    fn changing_the_app_id_drops_the_stale_project_metadata() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join("identity.json");
+        IdentityStore::store(&path, &sample_identity()).expect("store");
+        IdentityStore::set_attachment(&path, Some(&sample_attachment())).expect("attach");
+
+        IdentityStore::store_app_id(&path, "9999").expect("re-attribute");
+
+        let loaded = IdentityStore::load_optional(&path)
+            .expect("load")
+            .expect("present");
+        assert_eq!(loaded.app_id.as_deref(), Some("9999"));
+        assert_eq!(loaded.app_name, None);
+        assert_eq!(loaded.monitor_url, None);
+        assert_eq!(loaded.org_name.as_deref(), Some("acme"));
+    }
+
+    /// Re-delivering the id the instance already holds is a no-op, so the
+    /// project metadata delivered by the last `AttachApp` survives it.
+    #[test]
+    fn restating_the_same_app_id_keeps_the_project_metadata() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join("identity.json");
+        IdentityStore::store(&path, &sample_identity()).expect("store");
+        let attachment = sample_attachment();
+        IdentityStore::set_attachment(&path, Some(&attachment)).expect("attach");
+
+        IdentityStore::store_app_id(&path, &attachment.app_id).expect("re-attribute");
+
+        let loaded = IdentityStore::load_optional(&path)
+            .expect("load")
+            .expect("present");
+        assert_eq!(loaded.app_name.as_deref(), Some("retail-analytics"));
+        assert_eq!(
+            loaded.monitor_url.as_deref(),
+            Some("https://spice.ai/acme/retail-analytics/monitor")
+        );
+    }
+
     /// The app id arrives over an established stream, which requires an
     /// identity — so a missing file means one was cleared concurrently by a
     /// `Remove`. Writing a fresh file here would resurrect an instance the
@@ -953,6 +1452,39 @@ mod tests {
         assert_eq!(merged.app_id.as_deref(), Some("4002"));
     }
 
+    /// The merge covers the whole attachment tuple, not just the app id: a
+    /// credential rotation racing an `AttachApp` must not clobber the portal
+    /// metadata that command just wrote.
+    #[test]
+    fn credential_update_merges_the_full_attachment_tuple() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join("identity.json");
+        IdentityStore::store(&path, &sample_identity()).expect("store");
+        let stale = IdentityStore::load_optional(&path)
+            .expect("load stale clone")
+            .expect("present");
+        IdentityStore::set_attachment(&path, Some(&sample_attachment())).expect("attach");
+
+        let mut rotated = stale;
+        rotated.private_key_pem = "ROTATED-KEY".to_string();
+        let merged = IdentityStore::store_credential_update(&path, &rotated)
+            .expect("store rotated")
+            .expect("identity still present");
+
+        let loaded = IdentityStore::load_optional(&path)
+            .expect("load")
+            .expect("present");
+        assert_eq!(loaded.private_key_pem, "ROTATED-KEY");
+        assert_eq!(loaded.app_id.as_deref(), Some("4002"));
+        assert_eq!(loaded.org_name.as_deref(), Some("acme"));
+        assert_eq!(loaded.app_name.as_deref(), Some("retail-analytics"));
+        assert_eq!(
+            loaded.monitor_url.as_deref(),
+            Some("https://spice.ai/acme/retail-analytics/monitor")
+        );
+        assert_eq!(merged.org_name.as_deref(), Some("acme"));
+    }
+
     #[test]
     fn credential_update_does_not_recreate_a_removed_identity() {
         let dir = tempfile::tempdir().expect("create tempdir");
@@ -984,6 +1516,11 @@ mod tests {
             .expect("load")
             .expect("present");
         assert_eq!(loaded.app_id, None);
+        // The portal metadata defaults the same way: an identity written
+        // before the fields existed loads as detached-with-no-metadata.
+        assert_eq!(loaded.org_name, None);
+        assert_eq!(loaded.app_name, None);
+        assert_eq!(loaded.monitor_url, None);
     }
 
     #[test]

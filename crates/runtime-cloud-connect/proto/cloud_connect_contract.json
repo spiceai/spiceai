@@ -1,0 +1,68 @@
+{
+  "note": "Shared Cloud Connect contract fixture. The proto file in this directory is the authoritative copy of the wire contract; this fixture pins the field numbers, types, and presence semantics of the pinned messages — the two stream envelopes (whose oneof arm numbers are the dispatch surface every peer decodes) plus the messages this contract's consumers (this runtime, the Spice Cloud gateway/API, and the Kubernetes operator) interpret in common. Each consuming repository is expected to run a CI test of its own generated code against this document, so an incompatible change to a pinned message fails in the repository that made it instead of surfacing as a runtime wire break; messages not listed here are pinned only by review of the proto file, and a message becoming shared should be added. Change this file only together with proto/cloud_connect.proto, and never reuse a field number. Presence values: 'implicit' (proto3 singular scalar/enum, no presence tracking), 'explicit' (optional keyword, oneof arm, or singular message field, presence tracked), 'repeated', 'map'.",
+  "package": "spice.cloud.v1",
+  "protocol_version": 1,
+  "messages": {
+    "ClientMessage": {
+      "fields": [
+        { "name": "hello", "number": 1, "type": "message:spice.cloud.v1.Hello", "presence": "explicit" },
+        { "name": "heartbeat", "number": 2, "type": "message:spice.cloud.v1.Heartbeat", "presence": "explicit" },
+        { "name": "result", "number": 3, "type": "message:spice.cloud.v1.CommandResult", "presence": "explicit" },
+        { "name": "telemetry", "number": 4, "type": "message:spice.cloud.v1.Telemetry", "presence": "explicit" },
+        { "name": "event", "number": 5, "type": "message:spice.cloud.v1.EventLog", "presence": "explicit" },
+        { "name": "adopt_ack", "number": 6, "type": "message:spice.cloud.v1.AdoptAck", "presence": "explicit" },
+        { "name": "secrets_key", "number": 7, "type": "message:spice.cloud.v1.SecretsKey", "presence": "explicit" },
+        { "name": "export_metrics", "number": 8, "type": "message:spice.cloud.v1.ExportMetrics", "presence": "explicit" }
+      ]
+    },
+    "ControlMessage": {
+      "fields": [
+        { "name": "ack", "number": 1, "type": "message:spice.cloud.v1.Ack", "presence": "explicit" },
+        { "name": "get_runtime_info", "number": 2, "type": "message:spice.cloud.v1.GetRuntimeInfo", "presence": "explicit" },
+        { "name": "restart", "number": 3, "type": "message:spice.cloud.v1.Restart", "presence": "explicit" },
+        { "name": "apply_spicepod", "number": 4, "type": "message:spice.cloud.v1.ApplySpicepod", "presence": "explicit" },
+        { "name": "upgrade_runtime", "number": 5, "type": "message:spice.cloud.v1.UpgradeRuntime", "presence": "explicit" },
+        { "name": "adopt", "number": 6, "type": "message:spice.cloud.v1.Adopt", "presence": "explicit" },
+        { "name": "remove", "number": 7, "type": "message:spice.cloud.v1.Remove", "presence": "explicit" },
+        { "name": "get_status", "number": 8, "type": "message:spice.cloud.v1.GetStatus", "presence": "explicit" },
+        { "name": "get_logs", "number": 9, "type": "message:spice.cloud.v1.GetLogs", "presence": "explicit" },
+        { "name": "apply_manifest", "number": 10, "type": "message:spice.cloud.v1.ApplyManifest", "presence": "explicit" },
+        { "name": "delete_manifest", "number": 11, "type": "message:spice.cloud.v1.DeleteManifest", "presence": "explicit" },
+        { "name": "drain", "number": 12, "type": "message:spice.cloud.v1.Drain", "presence": "explicit" },
+        { "name": "pause", "number": 13, "type": "message:spice.cloud.v1.Pause", "presence": "explicit" },
+        { "name": "apply_secrets", "number": 14, "type": "message:spice.cloud.v1.ApplySecrets", "presence": "explicit" },
+        { "name": "delete_secrets", "number": 15, "type": "message:spice.cloud.v1.DeleteSecrets", "presence": "explicit" },
+        { "name": "command_id", "number": 16, "type": "string", "presence": "implicit" },
+        { "name": "target", "number": 17, "type": "message:spice.cloud.v1.WorkloadRef", "presence": "explicit" },
+        { "name": "execute_query", "number": 18, "type": "message:spice.cloud.v1.ExecuteQuery", "presence": "explicit" },
+        { "name": "attach_app", "number": 19, "type": "message:spice.cloud.v1.AttachApp", "presence": "explicit" }
+      ]
+    },
+    "Heartbeat": {
+      "fields": [
+        { "name": "identifier", "number": 1, "type": "string", "presence": "implicit" },
+        { "name": "sequence", "number": 2, "type": "uint64", "presence": "implicit" },
+        { "name": "phase", "number": 3, "type": "enum:spice.cloud.v1.RuntimePhase", "presence": "implicit" },
+        { "name": "warnings", "number": 4, "type": "string", "presence": "repeated" },
+        { "name": "active_datasets", "number": 5, "type": "uint32", "presence": "implicit" },
+        { "name": "active_models", "number": 6, "type": "uint32", "presence": "implicit" },
+        { "name": "active_spicepods", "number": 7, "type": "uint32", "presence": "implicit" },
+        { "name": "runtime_versions", "number": 8, "type": "map<string, string>", "presence": "map" },
+        { "name": "standalone_runtime", "number": 9, "type": "message:spice.cloud.v1.StandaloneRuntimeStatus", "presence": "explicit" }
+      ]
+    },
+    "StandaloneRuntimeStatus": {
+      "fields": [
+        { "name": "restart_required", "number": 1, "type": "string", "presence": "repeated" }
+      ]
+    },
+    "AttachApp": {
+      "fields": [
+        { "name": "app_id", "number": 1, "type": "string", "presence": "explicit" },
+        { "name": "org_name", "number": 2, "type": "string", "presence": "explicit" },
+        { "name": "app_name", "number": 3, "type": "string", "presence": "explicit" },
+        { "name": "monitor_url", "number": 4, "type": "string", "presence": "explicit" }
+      ]
+    }
+  }
+}
