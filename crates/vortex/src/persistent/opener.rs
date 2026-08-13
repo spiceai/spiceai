@@ -407,7 +407,13 @@ impl FileOpener for VortexOpener {
             }
 
             if let Some(concurrency) = scan_concurrency {
-                scan_builder = scan_builder.with_concurrency(concurrency);
+                // Absolute, not per-worker: this count is charged to the query
+                // memory pool one decoded batch at a time, and it is capped
+                // against the process's CPU entitlement. The per-worker form
+                // multiplies by `available_parallelism`, which reports the
+                // machine's cores rather than the share a cgroup granted, so
+                // neither the charge nor the cap would mean what it says.
+                scan_builder = scan_builder.with_absolute_concurrency(concurrency);
             }
 
             let stream_target_field = Field::new_struct("", stream_schema.fields().clone(), false);

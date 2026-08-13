@@ -1,6 +1,6 @@
 ---
 name: writeReleaseNotes
-description: Write or update release notes for a new version based on git history and previous release notes style.
+description: Write or update Spice release notes for a version from git history, in Simplified Technical English. Use this whenever the user asks to write, draft, cut, update, or refresh release notes, release candidate notes, or a changelog entry under docs/release_notes/ — including "notes for vX.Y.Z", "what shipped since <tag>", or "add the new PRs to the release notes".
 argument-hint: The new version tag and the previous version tag to diff against, or the literal word "update" to refresh an existing in-progress release notes file with new commits since it was last edited (e.g. "v2.0.0-rc.5 since v2.0.0-rc.4", or "update").
 ---
 
@@ -17,9 +17,30 @@ To detect update mode and find the relevant commit range:
 - Find when it was last edited: `git log -1 --format='%H' docs/release_notes/<version>.md`
 - New commits to consider: `git fetch origin && git log <last-edit-sha>..origin/trunk --no-merges --format='%h | %an | %s'`
 
+## Writing style: Simplified Technical English
+
+Write every sentence you author in Simplified Technical English (ASD-STE100 writing rules). Release notes are read fast, by people deciding whether to upgrade, often in a second language or through a machine translator, and re-read months later by someone bisecting a behaviour change. A 50-word sentence with three subordinate clauses fails all of those readers. Short declarative sentences do not make the content less technical — they make each technical claim separately checkable.
+
+Read `.github/prompts/references/simplified_technical_english.md` before writing prose. It carries the full rules, the rewrite patterns, the terminology table, and worked before/after examples from real Spice releases. The short version:
+
+- **One idea per sentence, 25 words or fewer.** Split where the subject changes. The total gets longer; that is the trade.
+- **Active voice, named actor.** "The runtime derives memory budgets from its cgroup limit", not "Memory budgets are derived". Passive is acceptable only when the actor is genuinely unknown.
+- **No participle clauses** — no `using`, `enabling`, `including`, `allowing`, `by improving`. Use a finite verb in its own sentence. Established technical nouns that end in `-ing` (caching, sharding, CPU sizing) are fine.
+- **Simple tenses.** Present for current behaviour, past for what a release changed.
+- **One word, one meaning.** Hold each term for the whole document — `setting`, not a rotation of knob/option/param.
+- **Keep `that`, articles, and prepositions.** Dropping them is the ambiguity STE exists to prevent.
+- **At most three stacked nouns.** Break longer stacks with a preposition or hyphen.
+- **Give the number, not the intensifier.** No `significantly`, `various`, `seamless`, `powerful`, `unlocks`, `under the hood`, `headlined by`. If no measurement exists, describe the mechanism.
+- **No semicolons**, and at most one em-dash aside per sentence.
+- **Bug fixes in a fixed order**: symptom, then cause, then current behaviour.
+
+This governs the summary paragraph, the Highlights bullets, every `## What's New` subsection, breaking-change and migration text, and bug-fix descriptions. It does not govern `### Changelog` bullets (they quote PR titles verbatim so they stay greppable against git history), `## Contributors`, `## Upgrading`, `## Cookbook Updates`, the dependency table, code blocks, or any inline identifier.
+
+STE constrains sentence construction, never technical depth. Keep every setting name, metric name, error variant, version number, and YAML sample exact. Never trade a specific mechanism for a vague summary to shorten a sentence.
+
 ## Steps
 
-1. **Study previous release notes** in `docs/release_notes/` to understand the structure, tone, and style used by the project. Pay attention to:
+1. **Study previous release notes** in `docs/release_notes/` for **structure and format only** — the sections, their order, the header and date convention, how features are grouped, and the changelog line format. Do **not** copy their sentence construction: the published files predate Simplified Technical English, so their long multi-clause sentences are the pattern to break, not to match. Pay attention to:
    - Header format and date conventions (e.g. `# Spice vX.Y.Z (Month D, YYYY)`)
    - Opening summary paragraph that names the release-defining themes
    - Bulleted "Highlights in this release candidate include:" list right under the summary
@@ -53,7 +74,7 @@ To detect update mode and find the relevant commit range:
    - Breaking changes (with before/after migration guidance).
    - Bug fixes (grouped by area, e.g. `### Connector Bug Fixes`).
 
-5. **Write the release notes** matching the established style:
+5. **Write the release notes** in the established structure, with every authored sentence in [Simplified Technical English](#writing-style-simplified-technical-english):
    - `# Spice v<version> (<Month D, YYYY>)` header followed by a one-paragraph summary naming the headline themes.
    - `Highlights in this release candidate include:` bullet list.
    - `## What's New in v<version>` with subsections for each major feature.
@@ -64,6 +85,19 @@ To detect update mode and find the relevant commit range:
    - `## What's Changed` → `### Changelog` with one bullet per included PR in the form
      `- <title> by [@handle](https://github.com/<handle>) in [#<num>](https://github.com/spiceai/spiceai/pull/<num>)`
    - `**Full Changelog**: <https://github.com/spiceai/spiceai/compare/<prev-tag>...<new-tag>>`
+
+6. **Check the prose** before you report the file as finished:
+
+   ```bash
+   python3 .github/prompts/scripts/check_ste.py docs/release_notes/v<version>.md
+   ```
+
+   The script reads only the authored prose and reports STE violations with line numbers. **Fix every error** — sentence length, semicolons, participle clauses, vague wording. **Read every warning and decide** — passive voice, noun stacks, paragraph length, and inconsistent terminology all have defensible exceptions, so judge each one rather than rewriting on reflex. If a fix would cost a technical fact, keep the fact and leave the warning; never delete information to satisfy the checker.
+
+   What counts as done depends on the mode:
+
+   - **Create**: re-run until the whole file reports zero errors.
+   - **Update**: the checker reads the whole file, but only the sections you added are yours to fix. Re-run until **those sections** report zero errors. The file itself can still report errors, because an existing file may predate these rules. Match each finding's line number against the lines you added to tell the two apart. Leave every error in prose you did not touch — existing prose is the user's editorial decision — and report it instead of rewriting it.
 
 ## Ordering
 
@@ -89,6 +123,7 @@ Default thematic order for highlights/subsections, top to bottom:
 - Use `## What's Changed` then `### Changelog` (not `## Changelog`) to match the GitHub auto-generated layout that prior releases mirror.
 - Verify each PR is referenced at most once in the changelog and at most once in the narrative `## What's New`. Use `grep -c '#<num>' <file>` to spot-check.
 - When updating an existing file, also update the **Contributors** list if the new commits introduce a new author. Skip bots and `claudespice`.
+- The terminology table in `.github/prompts/references/simplified_technical_english.md` fixes one term per concept (dataset, accelerator, the runtime, setting, flag, release). Hold each term for the whole document.
 
 ## Documentation links
 
@@ -103,3 +138,5 @@ Verify any new doc link you introduce actually resolves. If a deep link cannot b
 ## Output
 
 Save the release notes as `docs/release_notes/v<version>.md`. In update mode, edit the existing file in place and commit with a `docs(release): update v<version> notes with latest trunk PRs` style message.
+
+Report the checker result with the file. State the error count for the prose you authored (zero, once fixed) and name any warning you chose to keep, with the reason. In update mode, list the pre-existing errors you left in place as a separate count, so a reader does not read your zero as a whole-file zero. A silent pass tells the reviewer nothing about which judgements you made.

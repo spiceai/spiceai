@@ -1780,10 +1780,8 @@ impl DataConnectorFactory for HttpsFactory {
         Box::pin(async move {
             let runtime_rate_control_params = params.app().map(|app| app.runtime.params.clone());
             let rate_control_registry = params
-                .runtime()
-                .map_or_else(http_rate_control::global_registry, |runtime| {
-                    runtime.http_rate_control_registry()
-                });
+                .http_rate_control_registry()
+                .unwrap_or_else(http_rate_control::global_registry);
             let (metrics, emit_rate_control_metrics, rate_control_metric_source) =
                 if let ConnectorComponent::Dataset(dataset) = &params.component {
                     let structured_format = {

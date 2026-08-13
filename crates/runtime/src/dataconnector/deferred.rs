@@ -105,7 +105,7 @@ impl DataConnector for DeferredConnector {
 
     fn changes_stream(
         &self,
-        _federated_table: Arc<crate::federated::FederatedTable>,
+        _federated_table: Arc<dyn data_connector_api::federated::FederatedTableProvider>,
         _dataset: &Dataset,
     ) -> Option<data_components::cdc::ChangesStream> {
         None
@@ -117,7 +117,7 @@ impl DataConnector for DeferredConnector {
 
     fn append_stream(
         &self,
-        _federated_table: Arc<crate::federated::FederatedTable>,
+        _federated_table: Arc<dyn data_connector_api::federated::FederatedTableProvider>,
     ) -> Option<data_components::cdc::ChangesStream> {
         None
     }
@@ -132,15 +132,15 @@ impl DataConnector for DeferredConnector {
     async fn on_accelerator_setup(
         &self,
         dataset: &Dataset,
-        builder: &mut crate::accelerated::Builder,
+        accelerator: &mut dyn data_connector_api::accelerated::AcceleratorSetup,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.inner.on_accelerator_setup(dataset, builder).await
+        self.inner.on_accelerator_setup(dataset, accelerator).await
     }
 
     async fn on_accelerated_table_registration(
         &self,
         dataset: &Dataset,
-        accelerated_table: &mut crate::accelerated::AcceleratedTable,
+        accelerated_table: &mut dyn data_connector_api::accelerated::RegisteredAcceleratedTable,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.inner
             .on_accelerated_table_registration(dataset, accelerated_table)
