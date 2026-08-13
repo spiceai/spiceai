@@ -634,6 +634,36 @@ start_test "audit lets an add/add settled by removing the path be accepted"
   [ "$status" -eq 0 ] || fail_test "the resolution could not be accepted: $output"
 ) || failures=$((failures + 1))
 
+start_test "audit reports a collision when the merge kept your addition instead"
+(
+  new_stack "$work_root/dircollision_kept"
+  printf 'fork version\n' > dir && printf 'seed\n' > seed.txt && commit_all "fork point has a file called dir"
+  git checkout --quiet -b parent
+  git rm --quiet dir && commit_all "parent removes it"
+  stack_base=$(git rev-parse HEAD)
+  git checkout --quiet -b child
+  mkdir -p dir && printf 'child\n' > dir/file && commit_all "child adds dir/file"
+  pre=$(git rev-parse HEAD)
+  squash_parent_onto_trunk
+  # Trunk puts the fork's file back, unchanged, so from the fork point trunk
+  # looks untouched and the merge keeps the child's directory without asking.
+  printf 'fork version\n' > dir && commit_all "trunk restores the file called dir"
+  git checkout --quiet child
+  git merge --no-ff --no-commit trunk >/dev/null 2>&1
+  [ -f dir/file ] || fail_test "the fixture did not keep the child's directory"
+  [ -z "$(git ls-files -u)" ] || fail_test "the fixture left a conflict, so nothing was silent"
+
+  # dir/file is intact, and trunk has no entry by that name, so the pair is only
+  # visible by asking about dir itself.
+  output=$("$subject" audit "$stack_base" "$pre" --trunk trunk 2>/dev/null)
+  status=$?
+  [ "$status" -ne 0 ] || fail_test "a file-versus-directory collision was reported clean: $output"
+  case "$output" in
+    *"REVIEW dir/file"*) ;;
+    *) fail_test "the collision was not reported: $output" ;;
+  esac
+) || failures=$((failures + 1))
+
 start_test "audit treats a file-versus-directory collision as a decision"
 (
   new_stack "$work_root/dircollision"

@@ -438,7 +438,7 @@ path_accepted() {
 # base is an add/add conflict -- but from the older fork point, where the file
 # still existed, git can combine both sides' edits and call it resolved.
 audit_addition() {
-  local path="$1" pre="$2" other="$3"
+  local path="$1" stack_base="$2" pre="$3" other="$4"
   local staged_entry mine_entry theirs_entry
   staged_entry=$(index_entry "$path") || die "could not read the index entry for $path"
   mine_entry=$(tree_entry "$pre" "$path") || die "could not read $pre:$path"
@@ -456,6 +456,21 @@ audit_addition() {
   if [ "$staged_entry" != "$mine_entry" ]; then
     echo "DISCARDED $path: the staged version is not the one you added"
     return 1
+  fi
+
+  # The addition can be intact and still be half of a collision: trunk may have
+  # put a file where one of this path's directories has to be. Looked up by its
+  # own name there is no trunk entry at all, so the pair only shows up by asking
+  # about the ancestors -- and if the stack base already had the same thing
+  # there, the collision is not something this merge introduced.
+  if [ -n "$other" ] && blocking_ancestor "$other" "$path"; then
+    local ancestor="$BLOCKING_ANCESTOR" trunk_ancestor base_ancestor
+    trunk_ancestor=$(tree_entry "$other" "$ancestor") || die "could not read $other:$ancestor"
+    base_ancestor=$(tree_entry "$stack_base" "$ancestor") || die "could not read $stack_base:$ancestor"
+    if [ "$trunk_ancestor" != "$base_ancestor" ]; then
+      accept_or_review "$path" "trunk put something other than a directory at $ancestor, so this addition and trunk cannot both exist"
+      return $?
+    fi
   fi
   return 0
 }
@@ -794,7 +809,7 @@ cmd_audit() {
       continue
     fi
     [ -n "$other" ] || continue
-    audit_addition "$path" "$pre" "$other" || findings=$((findings + 1))
+    audit_addition "$path" "$stack_base" "$pre" "$other" || findings=$((findings + 1))
   done < "$tmp/added"
 
   # A modification disappears by the same mechanism as a deletion, and just as
