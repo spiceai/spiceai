@@ -185,7 +185,7 @@ pub(crate) async fn download_hf_artifacts(
         .await
         .context(FailedWithHFApiSnafu)?;
 
-    // Fallback to `pytorch_model.bin` if no safetensors. 
+    // Fallback to `pytorch_model.bin` if no safetensors.
     // Supported by text-embedding-inference, but must be kept in sync manually (if new weight formats).
     if download_safetensors(Arc::clone(&api_repo)).await.is_err() {
         tracing::warn!(
