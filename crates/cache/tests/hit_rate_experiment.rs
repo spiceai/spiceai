@@ -11,10 +11,10 @@
 //! Ignored by default: it takes a few minutes, and it prints a table rather than
 //! asserting.
 //!
+//! ```text
 //! cargo test -p cache --features pingora --release --test hit_rate_experiment \
 //!   -- --ignored --nocapture
-
-#![allow(clippy::expect_used)]
+//! ```
 
 use cache::{
     AsTableRefs, CacheMetrics, CacheProvider, EvictionReason, HashBuilder, LruCache, Sizeable,
@@ -85,7 +85,7 @@ fn run(
         get_hash_builder(HashingAlgorithm::XXH3).expect("Failed to get hash builder");
     let cache: Arc<Cache> = Arc::new(LruCache::new(
         capacity * VALUE_BYTES,
-        Duration::from_secs(600),
+        Duration::from_mins(10),
         hash_builder,
         policy,
         engine,
@@ -129,8 +129,13 @@ fn run(
     }
     let elapsed = start.elapsed();
 
-    let total = (THREADS * OPS) as f64;
-    let hit_rate = 1.0 - misses.load(Ordering::Relaxed) as f64 / total;
+    // Bounded by THREADS * OPS, so u32 holds them and the widening to f64 is
+    // lossless.
+    let total = f64::from(u32::try_from(THREADS * OPS).expect("operation count fits in u32"));
+    let miss_count = f64::from(
+        u32::try_from(misses.load(Ordering::Relaxed)).expect("miss count fits in u32"),
+    );
+    let hit_rate = 1.0 - miss_count / total;
     (elapsed, hit_rate, resident)
 }
 
@@ -143,6 +148,10 @@ fn pure_read_vs_hit_rate() {
         .expect("runtime");
     let handle = rt.handle().clone();
 
+    #[cfg_attr(
+        not(feature = "pingora"),
+        expect(unused_mut, reason = "only the pingora arm below pushes")
+    )]
     let mut engines: Vec<(&str, CacheEngine, CachingPolicy)> = vec![
         ("moka_lru", CacheEngine::Moka, CachingPolicy::Lru),
         ("moka_tinylfu", CacheEngine::Moka, CachingPolicy::TinyLfu),

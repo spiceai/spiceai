@@ -4,10 +4,15 @@
 
 Enhanced the cache throughput benchmarks to comprehensively test all combinations of:
 
-### 1. **Caching Policies** (2 variants)
+### 1. **Engine / policy pairs** (3, or 2 without `--features pingora`)
 
-- LRU: Standard Least Recently Used eviction policy
-- TinyLFU: Frequency-based admission policy with better hit rates for some workloads
+- `moka_lru`: Moka with Least Recently Used eviction
+- `moka_tinylfu`: Moka with frequency-based admission
+- `pingora_lru`: Pingora-LRU, sharded. Requires `--features pingora`
+
+Named pairs rather than a cartesian product: Pingora has no TinyLFU admission
+and builds an LRU instead, so a `pingora_tinylfu` arm would duplicate
+`pingora_lru`.
 
 ### 2. **Hash Algorithms** (4 variants)
 
@@ -16,11 +21,13 @@ Enhanced the cache throughput benchmarks to comprehensively test all combination
 - `xxh3`: xxHash3 64-bit ⚡ **FASTEST**
 - `xxh64`: xxHash 64-bit
 
-### 3. **Workload Patterns** (3 types)
+### 3. **Workload Patterns** (4 types)
 
-- `concurrent_get`: 100% reads (pre-populated cache)
+- `concurrent_get`: 100% reads (pre-populated cache, ~3% hit rate)
 - `concurrent_put`: 100% writes
 - `concurrent_mixed_80_20`: 80% reads, 20% writes
+- `hot_read_write`: read-through on a full cache, swept across 50/95/99% hit
+  rates at 16 and 32 threads
 
 ### 4. **Thread Counts** (4 levels)
 
@@ -28,15 +35,22 @@ Enhanced the cache throughput benchmarks to comprehensively test all combination
 
 ## Total Benchmark Combinations
 
-**LruCache benchmarks:**
+Counts below are with `--features pingora`; without it the Pingora arm is not
+generated and each LruCache figure drops by a third.
 
-- 2 caching policies × 4 hash algos × 4 thread counts × 3 workloads = **96 benchmark configurations**
+**LruCache throughput benchmarks:**
+
+- 3 engine/policy pairs × 4 hash algos × 4 thread counts × 3 workloads = **144 configurations**
+
+**`hot_read_write`:**
+
+- 3 engine/policy pairs × 3 hit rates × 2 thread counts = **18 configurations**
 
 **SimpleCache benchmarks:**
 
-- 1 hash algo × 4 thread counts × 3 workloads = **12 benchmark configurations**
+- 1 hash algo × 4 thread counts × 3 workloads = **12 configurations**
 
-**Total: 108 benchmark configurations**
+**Total: 174 configurations** (120 without `--features pingora`)
 
 ## Code Changes
 
@@ -47,11 +61,13 @@ Enhanced the cache throughput benchmarks to comprehensively test all combination
    - Added `get_hash_builder` import from cache crate
    - Added `HashingAlgorithm` and `CachingPolicy` imports from spicepod
    - Created `all_hash_algorithms()` helper returning 4 hash algorithm variants
-   - Created `all_caching_policies()` helper returning LRU and TinyLFU policies
+   - Created `all_engine_policy_pairs()` helper returning the engine/policy pairs
    - Updated `bench_lru_cache_concurrent_get()` to iterate over all combinations
    - Updated `bench_lru_cache_concurrent_put()` to iterate over all combinations
    - Updated `bench_lru_cache_concurrent_mixed()` to iterate over all combinations
-   - Benchmark naming: `{policy}_{hash}_{threads}threads` (e.g., `lru_xxh3_8threads`)
+   - Added `bench_lru_cache_hot_read_write()`, swept across hit rates
+   - Benchmark naming: `{pair}_{hash}_{threads}threads` (e.g. `moka_lru_xxh3_8threads`),
+     and `{pair}_{hit_rate}_{threads}threads` for `hot_read_write`
 
 2. **`crates/cache/benches/README.md`** (NEW)
 
@@ -65,19 +81,10 @@ Enhanced the cache throughput benchmarks to comprehensively test all combination
    - Overview of implementation
    - Summary of all combinations tested
 
-## Sample Results (Preliminary - 8 threads)
+## Results
 
-From initial benchmark runs:
-
-| Configuration         | Throughput  | Notes          |
-| --------------------- | ----------- | -------------- |
-| lru_xxh3_8threads     | ~10 Melem/s | Fastest hash   |
-| lru_xxh64_8threads    | ~10 Melem/s |                |
-| lru_ahash_8threads    | ~9 Melem/s  |                |
-| tinylfu_xxh3_8threads | ~10 Melem/s | TinyLFU policy |
-| lru_siphash_8threads  | ~7 Melem/s  | Slowest hash   |
-
-**Key Finding:** Hash algorithm choice significantly impacts throughput, with xxh3/xxh64 being fastest.
+Measured engine comparisons, including the Moka/Pingora crossover, live in
+[README.md](README.md) under "Engine Comparison Results".
 
 ## Running the Benchmarks
 
@@ -100,9 +107,10 @@ cargo bench -p cache --bench cache_throughput -- --sample-size 10
 ### Filtering by Component
 
 ```bash
-# Specific caching policy
-cargo bench -p cache -- lru
-cargo bench -p cache -- tinylfu
+# Specific engine / policy pair
+cargo bench -p cache -- moka_lru
+cargo bench -p cache -- moka_tinylfu
+cargo bench -p cache --features pingora -- pingora_lru
 
 # Specific hash algorithm
 cargo bench -p cache -- xxh3
