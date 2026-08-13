@@ -42,12 +42,17 @@ const OPERATIONS_PER_THREAD: usize = 10_000;
 /// entries rather than in weight.
 const VALUE_BYTES: u64 = 32;
 
-/// Distinct keys the contention benchmark touches.
-const HOT_WORKING_SET: u64 = 20_000;
+/// Entries the contention benchmark keeps resident. Capacity is set from this,
+/// and the working set is sized against it to reach a target hit rate.
+const HOT_RESIDENT_ENTRIES: u64 = 16_000;
 
-/// Capacity for 80% of the working set, so the cache runs full and evicting
-/// while most reads still hit.
-const HOT_CACHE_WEIGHT: u64 = HOT_WORKING_SET * VALUE_BYTES * 8 / 10;
+/// Hit rates to sweep, as percentages.
+///
+/// Under uniform access an LRU holding `C` entries of a `W`-key working set hits
+/// about `C/W` of the time, so the working set is `C` scaled by the inverse.
+/// 50% is the thrashing regime the older benchmarks sit in; 99% is where a
+/// results cache worth enabling actually runs.
+const HOT_HIT_RATES: [(&str, u64); 3] = [("50pct", 50), ("95pct", 95), ("99pct", 99)];
 
 /// Creates a runtime that can be shared across benchmark worker threads.
 fn create_bench_runtime() -> tokio::runtime::Runtime {
@@ -545,17 +550,22 @@ fn bench_lru_cache_concurrent_mixed(c: &mut Criterion) {
     group.finish();
 }
 
-/// Read/write contention on a full cache whose reads mostly hit.
+/// Read-through contention on a full cache, swept across hit rates.
 ///
-/// The other `LruCache` benchmarks read a 100k key space holding at most 5,000
-/// entries, so ~95% of their reads miss. That matters for the engine comparison
-/// because a Pingora miss is one metadata lookup, while a hit removes the entry
-/// and re-admits it — `pingora-lru` has no `peek_value`. Reads that miss never
-/// reach the path where the engines differ.
+/// The other `LruCache` benchmarks read a 100,000 key space holding at most
+/// 5,000 entries, so roughly 95% of their reads miss. That matters for the
+/// engine comparison because a Pingora miss is one metadata lookup, while a hit
+/// removes the entry and re-admits it — `pingora-lru` has no `peek_value`.
+/// Reads that miss never reach the path where the engines differ.
 ///
-/// Here the read key space is the working set, so reads hit, and capacity holds
-/// 80% of it, so writes evict. Thread counts straddle the 16 metadata shards:
-/// at 16 threads shard collisions are incidental, at 32 they are structural.
+/// Reads and writes are not independent here, because they are not independent
+/// in the runtime: a miss executes the query and caches the result, so the
+/// write rate is the miss rate. Dialling a read/write mix separately from a hit
+/// rate describes states a results cache cannot be in. This loop reads, and
+/// refills on a miss, so hit rate is the only knob and the write rate follows.
+///
+/// Thread counts straddle the 16 metadata shards Pingora uses: at 16 shard
+/// collisions are incidental, at 32 they are structural.
 fn bench_lru_cache_hot_read_write(c: &mut Criterion) {
     let mut group = c.benchmark_group("lru_cache_hot_read_write");
     let rt = create_bench_runtime();
@@ -567,13 +577,15 @@ fn bench_lru_cache_hot_read_write(c: &mut Criterion) {
         get_hash_builder(HashingAlgorithm::XXH3).expect("Failed to get hash builder");
 
     for (pair_name, engine, policy) in all_engine_policy_pairs() {
-        for (mix_name, read_percent) in [("95_5", 95u32), ("80_20", 80)] {
+        for (hit_name, hit_percent) in HOT_HIT_RATES {
+            let working_set = HOT_RESIDENT_ENTRIES * 100 / hit_percent;
+
             for thread_count in [16usize, 32] {
                 group.throughput(Throughput::Elements(
                     (thread_count * OPERATIONS_PER_THREAD) as u64,
                 ));
 
-                let bench_name = format!("{pair_name}_{mix_name}_{thread_count}threads");
+                let bench_name = format!("{pair_name}_{hit_name}_{thread_count}threads");
 
                 group.bench_with_input(
                     BenchmarkId::from_parameter(&bench_name),
@@ -589,7 +601,7 @@ fn bench_lru_cache_hot_read_write(c: &mut Criterion) {
                                         Box<dyn Hasher + Send + Sync>,
                                     >,
                                 > = Arc::new(LruCache::new(
-                                    HOT_CACHE_WEIGHT,
+                                    HOT_RESIDENT_ENTRIES * VALUE_BYTES,
                                     Duration::from_mins(10),
                                     hash_builder.clone(),
                                     policy,
@@ -599,7 +611,7 @@ fn bench_lru_cache_hot_read_write(c: &mut Criterion) {
                                 handle.block_on(async {
                                     // Insert the whole working set; the cache
                                     // evicts down to capacity and starts full.
-                                    for key in 0..HOT_WORKING_SET {
+                                    for key in 0..working_set {
                                         let value = BenchValue(random_value(&mut rng));
                                         cache.put_raw_key(&key, value).await;
                                     }
@@ -616,15 +628,11 @@ fn bench_lru_cache_hot_read_write(c: &mut Criterion) {
                                             let mut rng = StdRng::seed_from_u64(thread_id as u64);
                                             handle.block_on(async {
                                                 for _ in 0..OPERATIONS_PER_THREAD {
-                                                    let key =
-                                                        rng.random_range(0..HOT_WORKING_SET);
-                                                    if rng.random_range(0..100) < read_percent {
-                                                        black_box(cache.get_raw_key(&key).await);
-                                                    } else {
-                                                        // Rewriting a key already in the
-                                                        // working set is what a refreshed
-                                                        // result does; it still evicts,
-                                                        // because the cache is full.
+                                                    let key = rng.random_range(0..working_set);
+                                                    if cache.get_raw_key(&key).await.is_none() {
+                                                        // Refill on miss, as the
+                                                        // runtime does after
+                                                        // executing the query.
                                                         let value =
                                                             BenchValue(random_value(&mut rng));
                                                         black_box(

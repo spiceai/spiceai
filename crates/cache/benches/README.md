@@ -36,8 +36,8 @@ publish Moka numbers labelled `pingora`.
 - **concurrent_get**: Read-heavy workload (100% reads, pre-populated cache)
 - **concurrent_put**: Write-heavy workload (100% writes)
 - **concurrent_mixed_80_20**: Realistic workload (80% reads, 20% writes)
-- **hot_read_write**: Full cache whose reads mostly hit, 95/5 and 80/20 read/write
-  at 16 and 32 threads
+- **hot_read_write**: Read-through on a full cache, swept across 50/95/99% hit
+  rates at 16 and 32 threads
 
 ### hot_read_write
 
@@ -47,42 +47,60 @@ comparison: a Pingora miss is one metadata lookup, while a hit removes the entry
 and re-admits it, because `pingora-lru` has no `peek_value`. Reads that miss
 never reach the path where the engines differ.
 
-This benchmark reads a key space equal to the working set, so reads hit, and
-sizes capacity at 80% of it, so writes evict and the cache runs full.
+Reads and writes are not independent knobs here, because they are not
+independent in the runtime: a miss executes the query and caches the result, so
+the write rate *is* the miss rate. Setting a read/write mix separately from a
+hit rate describes states a results cache cannot be in. This benchmark reads,
+and refills on a miss, so hit rate is the only knob and the write rate follows
+from it.
 
 Parameters:
 
+- **Hit rate**: 50%, 95% and 99%. Under uniform access an LRU holding `C` of a
+  `W`-key working set hits about `C/W`, so capacity is fixed at 16,000 entries
+  and the working set is sized against it. 50% is the thrashing regime the older
+  benchmarks sit in; 99% is where a results cache worth enabling runs.
 - **Threads**: 16 and 32, straddling the 16 metadata shards Pingora uses. At 16
   shard collisions are incidental; at 32 they are structural.
-- **Mix**: 95/5 and 80/20 read/write. Writes rewrite a key already in the
-  working set, as a refreshed result does, and still evict because the cache is
-  full.
 
-Uses one hash algorithm: raw-key operations bypass the hasher, so it cannot
-affect the measurement.
+The cache starts full: the whole working set is inserted, then evicted down to
+capacity. One hash algorithm, since raw-key operations bypass the hasher.
 
-Neither engine wins outright. Apple M-series, `--sample-size 10`, total time for
-threads x 10,000 operations (lower is faster):
+Hit rate decides the winner, and it flips between 50% and 95%. Apple M-series,
+`--sample-size 10`, total time for threads x 10,000 operations (lower is
+faster):
 
-| case | moka_lru | moka_tinylfu | pingora_lru |
-| ---: | ---: | ---: | ---: |
-| 95/5, 16 threads | 34.6 ms | 32.8 ms | 41.9 ms |
-| 95/5, 32 threads | 64.8 ms | 62.1 ms | 107.2 ms |
-| 80/20, 16 threads | 80.6 ms | 82.2 ms | 50.2 ms |
-| 80/20, 32 threads | 231.2 ms | 186.5 ms | 133.9 ms |
+| hit rate | threads | moka_lru | moka_tinylfu | pingora_lru | pingora vs moka_lru |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 50% | 16 | 275.9 ms | 239.6 ms | 74.9 ms | 0.27x |
+| 50% | 32 | 628.0 ms | 529.3 ms | 206.7 ms | 0.33x |
+| 95% | 16 | 33.6 ms | 31.3 ms | 53.5 ms | 1.59x |
+| 95% | 32 | 60.8 ms | 61.1 ms | 141.1 ms | 2.32x |
+| 99% | 16 | 38.3 ms | 38.1 ms | 43.7 ms | 1.14x |
+| 99% | 32 | 73.3 ms | 73.2 ms | 99.6 ms | 1.36x |
 
-Read-heavy favours Moka, and the gap widens with threads. Doubling threads
-doubles the work, so 2.0x is the break-even: Moka scales at 1.87x and Pingora at
-2.56x. Pingora expresses a read as a remove plus re-admit, so reads contend on
-the 16 shards in a way Moka's do not.
+At 50% every other operation is a refill, so the run is dominated by insert and
+eviction, and Pingora is 3-3.7x faster. At 95% and 99% the work is nearly all
+reads, and Moka leads by 1.14-2.32x because Pingora expresses a read as a remove
+plus re-admit.
 
-Write-heavy reverses it, with Pingora 38-42% faster at both thread counts.
-TinyLFU also earns its keep here — it costs a little on read-heavy load and
-saves 19% over LRU at 80/20 and 32 threads.
+Pingora scales worse with threads at every hit rate. Doubling threads doubles
+the work, so 2.0x is break-even:
 
-So the write fraction, not the engine, decides which is faster. Numbers are from
-a laptop at reduced sample size, where 32 threads oversubscribes the cores:
-adequate for the direction and the crossover, not for precise ratios.
+| hit rate | moka_lru | pingora_lru |
+| ---: | ---: | ---: |
+| 50% | 2.28x | 2.76x |
+| 95% | 1.81x | 2.64x |
+| 99% | 1.91x | 2.28x |
+
+TinyLFU earns its keep where admission control matters: 13% ahead of LRU at 50%,
+7% at 95%, and level at 99%, where almost nothing is evicted.
+
+Numbers are from a laptop at reduced sample size, where 32 threads oversubscribes
+the cores. Intervals run to roughly +/-8%, so the 50% and 95% gaps are solid and
+the 14% figure at 99% and 16 threads is near the noise floor. Moka reading
+slower at 99% than at 95% is within that margin and should not be read as a
+trend.
 
 ## Thread Counts
 
@@ -173,8 +191,9 @@ lru_cache_concurrent_get/moka_lru_xxh3_8threads
 
 `hot_read_write` sizes itself separately, in entries rather than weight:
 
-- `HOT_WORKING_SET`: 20,000 keys, all pre-populated and all read from
-- `HOT_CACHE_WEIGHT`: capacity for 80% of them, so the cache runs full
+- `HOT_RESIDENT_ENTRIES`: 16,000, the capacity the cache is built with
+- `HOT_HIT_RATES`: 50 / 95 / 99%, each setting the working set to
+  `HOT_RESIDENT_ENTRIES` divided by that rate
 - TTL: 10 minutes, so nothing expires mid-run
 
 ## Output
