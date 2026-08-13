@@ -20,10 +20,6 @@ Benchmarked as named pairs rather than a cartesian product:
 There is no `pingora_tinylfu`: Pingora has no TinyLFU admission and builds an
 LRU instead, so that arm would duplicate `pingora_lru`.
 
-Without `--features pingora` the Pingora arm is not generated. With the feature
-off, requesting the engine falls back to Moka, so including it anyway would
-publish Moka numbers labelled `pingora`.
-
 ### Hash Algorithms (4 variants)
 
 - **siphash**: Rust's default hasher (cryptographically secure, slower)
