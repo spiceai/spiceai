@@ -1949,6 +1949,18 @@ impl DuckDbBudgetContext {
         // resized in place, and every coordinated consumer has to use the memory
         // available now.
         let total_memory = crate::resource_monitor::get_total_memory();
+        // A zero total means the probe could not read a limit, not that the host has
+        // no memory. Stop before touching any tracked or published state: planning
+        // from zero would publish no per-instance cap, letting accelerators this
+        // apply creates fall back to `DuckDB`'s own ~80%-of-host default, and would
+        // clear the fleet-wide PK-keyset ceiling outright. Everything already in
+        // effect stays in effect, which is what a failed probe should cost.
+        if total_memory == 0 {
+            tracing::warn!(
+                "Could not read the memory limit while reloading; keeping the accelerator memory ceilings already in effect"
+            );
+            return;
+        }
         let retained_cayenne_reservation_bytes =
             self.retained_cayenne_reservation_bytes(current_app, app, total_memory);
 
@@ -2034,20 +2046,6 @@ impl DuckDbBudgetContext {
         // ceiling to the sampler. The release swap pairs with the sampler's acquire
         // load, so a sampler that observes a changed total also observes the DuckDB
         // reservation and Cayenne ceilings derived from it.
-        //
-        // A zero total means the probe could not read one, not that the host has no
-        // memory — the same degenerate case the planners above treat as NoOp. Keep
-        // the ceilings the runtime already has: publishing zero would uninstall the
-        // fleet-wide PK-keyset ceiling entirely (`set_global_pk_keyset_bytes(0)`
-        // clears it, letting per-table keysets sum unbounded) and switch off the
-        // tuner's memory rule, both until some later reload happened to read a
-        // nonzero total.
-        if total_memory == 0 {
-            tracing::warn!(
-                "Could not read the memory limit while reloading; keeping the ceilings already in effect"
-            );
-            return;
-        }
         cayenne::set_global_memory_budget(total_memory);
         let pk_keyset_budget_bytes =
             crate::datafusion::cayenne_pk_keyset_budget_bytes(total_memory);
