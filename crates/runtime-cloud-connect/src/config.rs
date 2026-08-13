@@ -159,7 +159,7 @@ pub struct CloudConnectConfig {
     /// than as one of them. The cloud records it on the registry row and
     /// resolves the instance's gateway stamp from it.
     ///
-    /// `None` means "leave the stored value alone": a re-enrol (the recovery
+    /// `None` means "leave the stored value alone": a re-enroll (the recovery
     /// path once the renewal grace window has passed) must not erase a region
     /// set in the portal.
     pub instance_region: Option<String>,

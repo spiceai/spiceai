@@ -188,7 +188,7 @@ struct EnrollRequest<'a> {
     /// `spice connect --region`.
     ///
     /// Omitted (never `null`) when unset — the cloud reads absence as "leave
-    /// the stored region alone", so a re-enrol cannot erase a region set in
+    /// the stored region alone", so a re-enroll cannot erase a region set in
     /// the portal.
     #[serde(skip_serializing_if = "Option::is_none")]
     region: Option<&'a str>,
@@ -1023,7 +1023,7 @@ mod tests {
         .expect("serialize request without a region");
 
         // Absence means "leave the stored region alone". Sending `null` would
-        // make every re-enrol — the recovery path past the renewal grace
+        // make every re-enroll — the recovery path past the renewal grace
         // window — silently erase a region set in the portal.
         assert!(
             omitted.get("region").is_none(),

@@ -2616,7 +2616,7 @@ views:
     /// Give the instance an identity carrying a cache key, which is what makes
     /// the delivered-secrets cache writable — without one the cache is skipped
     /// and a test asserting on it would pass for the wrong reason.
-    fn enrol_with_a_cache_key(identity_path: &Path) {
+    fn enroll_with_a_cache_key(identity_path: &Path) {
         let mock_pem = "-----BEGIN PRIVATE KEY-----\nMOCK\n-----END PRIVATE KEY-----\n".to_string();
         let mut identity = runtime_cloud_connect::identity::Identity {
             identifier: "inst_test".to_string(),
@@ -2973,7 +2973,7 @@ views:
     async fn a_malformed_deployment_leaves_the_cached_secrets_alone() {
         let dir = scratch_dir("malformed-cache");
         let handle = handle_serving(&dir, SERVING).await;
-        enrol_with_a_cache_key(&dir.join(IDENTITY_FILE));
+        enroll_with_a_cache_key(&dir.join(IDENTITY_FILE));
 
         handle
             .apply_spicepod(SpicepodDeployment {
@@ -3023,7 +3023,7 @@ views:
         handle
             .delivered_secrets
             .replace(delivered("api_key", b"value-one"));
-        enrol_with_a_cache_key(&dir.join(IDENTITY_FILE));
+        enroll_with_a_cache_key(&dir.join(IDENTITY_FILE));
         assert!(cached_secrets(&dir).is_none(), "nothing is cached yet");
 
         let outcome = handle
