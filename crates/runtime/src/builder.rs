@@ -2077,6 +2077,23 @@ mod test {
         );
     }
 
+    /// The counterpart to the no-Cayenne case: a pod that does have a Cayenne
+    /// table reserves its write-path state, so the gate above is what decides,
+    /// not an empty estimator.
+    #[cfg(not(windows))]
+    #[test]
+    fn a_cayenne_acceleration_reserves_its_write_path_state() {
+        let app = Arc::new(
+            app::AppBuilder::new("test")
+                .with_dataset(dataset_with_cayenne("accelerated", None))
+                .build(),
+        );
+        assert!(
+            estimate_cayenne_reservation_bytes(Some(&app), &HashMap::new()) > 0,
+            "a Cayenne table reserves against the query pool"
+        );
+    }
+
     #[test]
     fn segment_cache_budget_honours_an_explicit_value() {
         const MIB: u64 = 1024 * 1024;
