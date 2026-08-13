@@ -1053,6 +1053,21 @@ fn fractional_bytes(bytes: usize, fraction: f64) -> usize {
 const HASH_JOIN_BUILD_SIDE_OVERHEAD_NUM: usize = 5;
 const HASH_JOIN_BUILD_SIDE_OVERHEAD_DEN: usize = 2;
 
+/// Fixed per-row overhead added on top of the payload multiplier.
+///
+/// A multiplicative model alone collapses for narrow build sides: TPC-DS q97's
+/// full-outer join builds over two 4-byte keys, so 2.5× the payload predicted
+/// 20 B/row (2.9 GB total) while the run's `HashJoinInput` reservations
+/// consumed hundreds of bytes per row (~51 GB) — the per-entry costs
+/// (hashbrown slot ≈ 18 B at its load factor, chain link 8 B, batch
+/// bookkeeping and growth headroom) do not scale with payload width and
+/// dominate it for key-only rows. 64 B/row covers those with headroom; the
+/// asymmetry is deliberate (an over-estimate merely spills a join that would
+/// have fit, an under-estimate OOMs the query) while staying far below any
+/// gate for genuinely small dimension builds (73K-row `date_dim` estimates
+/// ~9 MB against multi-GB gates).
+const HASH_JOIN_BUILD_SIDE_FIXED_OVERHEAD_BYTES_PER_ROW: usize = 64;
+
 fn build_side_memory_estimate(plan: &dyn ExecutionPlan, build_rows: usize) -> Option<usize> {
     let row_width = plan
         .schema()
@@ -1063,13 +1078,15 @@ fn build_side_memory_estimate(plan: &dyn ExecutionPlan, build_rows: usize) -> Op
         })?;
 
     let payload_bytes = row_width.saturating_mul(build_rows);
-    // (payload * 5) / 2 ≈ 2.5× payload, computed in u128 so a saturated payload
-    // stays monotonic: a plain usize `* 5` would saturate to usize::MAX and then
-    // HALVE on `/ 2`, dropping the estimate for extreme/unknown row counts. Clamp
-    // back to usize::MAX. (`usize as u128` is always lossless; std has no
+    // (payload * 5) / 2 ≈ 2.5× payload, plus the fixed per-row hash-table
+    // overhead, computed in u128 so a saturated payload stays monotonic: a
+    // plain usize `* 5` would saturate to usize::MAX and then HALVE on `/ 2`,
+    // dropping the estimate for extreme/unknown row counts. Clamp back to
+    // usize::MAX. (`usize as u128` is always lossless; std has no
     // `From<usize>` for the platform-dependent usize.)
     let estimated = payload_bytes as u128 * HASH_JOIN_BUILD_SIDE_OVERHEAD_NUM as u128
-        / HASH_JOIN_BUILD_SIDE_OVERHEAD_DEN as u128;
+        / HASH_JOIN_BUILD_SIDE_OVERHEAD_DEN as u128
+        + build_rows as u128 * HASH_JOIN_BUILD_SIDE_FIXED_OVERHEAD_BYTES_PER_ROW as u128;
     Some(usize::try_from(estimated).unwrap_or(usize::MAX))
 }
 
@@ -1735,7 +1752,8 @@ mod tests {
     use super::{
         ANTI_JOIN_SORT_MERGE_MIN_EXACT_ROWS, CayenneAntiJoinSortMergeRewriter,
         CayenneDynamicFilterSharing, CayenneMaintainedAggregateRewriter, CayenneOptimizerConfig,
-        CayenneStatsAggregateRewriter, FilterAddition, HASH_JOIN_BUILD_SIDE_OVERHEAD_DEN,
+        CayenneStatsAggregateRewriter, FilterAddition,
+        HASH_JOIN_BUILD_SIDE_FIXED_OVERHEAD_BYTES_PER_ROW, HASH_JOIN_BUILD_SIDE_OVERHEAD_DEN,
         HASH_JOIN_BUILD_SIDE_OVERHEAD_NUM, apply_filter_additions, build_side_memory_estimate,
         plan_schema_fields,
     };
@@ -3239,10 +3257,10 @@ mod tests {
             cayenne_file_exec_with_num_rows(&schema, "order_line.vortex", Precision::Exact(1_000));
         let estimated = build_side_memory_estimate(plan.as_ref(), 1_000)
             .expect("known fixed-width schema must estimate");
-        // payload = 1000 × 24 = 24_000; with 5/2 overhead → 60_000.
+        // payload = 1000 × 24 = 24_000; ×5/2 → 60_000; +1000 × 64 fixed → 124_000.
         assert_eq!(
-            estimated, 60_000,
-            "HT overhead must be exactly 2.5× the Arrow payload for Int64×3"
+            estimated, 124_000,
+            "estimate must be 2.5× the Arrow payload plus 64 B/row fixed overhead for Int64×3"
         );
         // Zero rows → zero estimate (and must not panic on divide path).
         let zero = build_side_memory_estimate(plan.as_ref(), 0).expect("zero rows");
@@ -3251,9 +3269,48 @@ mod tests {
         let huge_rows = usize::MAX / 16;
         let huge = build_side_memory_estimate(plan.as_ref(), huge_rows).expect("huge");
         assert!(huge > 0, "saturating estimate must stay positive");
-        // Factor itself is the documented 5/2.
+        // Factors themselves are the documented 5/2 and 64 B/row.
         assert_eq!(HASH_JOIN_BUILD_SIDE_OVERHEAD_NUM, 5);
         assert_eq!(HASH_JOIN_BUILD_SIDE_OVERHEAD_DEN, 2);
+        assert_eq!(HASH_JOIN_BUILD_SIDE_FIXED_OVERHEAD_BYTES_PER_ROW, 64);
+    }
+
+    /// Pinned to the SF100 benchmark's actual gate log (run 31666796112): the
+    /// q97 full-outer build side — 143,997,065 rows of two 4-byte keys — was
+    /// estimated at 2.88 GB against a 6.87 GB gate and left as a non-spillable
+    /// hash join that then consumed ~51 GB. With the fixed per-row overhead the
+    /// same inputs must clear the same gate, while the 73K-row `date_dim`
+    /// dimension build stays far below it.
+    #[test]
+    fn build_side_memory_estimate_clears_q97_gate_for_narrow_wide_builds() {
+        let q97_gate_bytes = 6_869_640_806_usize;
+        let key_pair_schema = Arc::new(Schema::new(vec![
+            Field::new("customer_sk", DataType::Int32, true),
+            Field::new("item_sk", DataType::Int32, true),
+        ]));
+        let build = cayenne_file_exec_with_num_rows(
+            &key_pair_schema,
+            "ssci.vortex",
+            Precision::Inexact(143_997_065),
+        );
+        let estimated = build_side_memory_estimate(build.as_ref(), 143_997_065)
+            .expect("two Int32 keys must estimate");
+        assert!(
+            estimated > q97_gate_bytes,
+            "q97's 144M-row key-only build side must clear the 6.87 GB gate (estimated {estimated})"
+        );
+
+        let dimension = cayenne_file_exec_with_num_rows(
+            &key_pair_schema,
+            "date_dim.vortex",
+            Precision::Exact(73_049),
+        );
+        let small = build_side_memory_estimate(dimension.as_ref(), 73_049)
+            .expect("dimension build must estimate");
+        assert!(
+            small < q97_gate_bytes / 100,
+            "a 73K-row dimension build must stay far below the gate (estimated {small})"
+        );
     }
 
     #[test]
@@ -3298,11 +3355,11 @@ mod tests {
             JoinType::LeftAnti,
             NullEquality::NullEqualsNothing,
         ));
-        // 10M rows × ~24 B/row × 2.5 HT overhead ≈ 600 MiB estimated. Gate is
-        // fraction 0.125 of the pool, so 8 GiB × 0.125 = 1 GiB keeps this a hash
-        // join (was 4 GiB / 512 MiB gate before the overhead factor, which now
-        // under-fires and rewrites).
-        let config = config_with_cayenne_optimizer(None, Some(0.125), Some(8 * 1024 * 1024 * 1024));
+        // 10M rows × (24 B/row × 2.5 HT overhead + 64 B/row fixed) ≈ 1.24 GB
+        // estimated. Gate is fraction 0.125 of the pool, so 16 GiB × 0.125 =
+        // 2 GiB keeps this a hash join.
+        let config =
+            config_with_cayenne_optimizer(None, Some(0.125), Some(16 * 1024 * 1024 * 1024));
 
         let optimized = optimize_anti_join_sort_merge_with_config(join, &config);
 
@@ -3745,10 +3802,11 @@ mod tests {
             JoinType::Inner,
             NullEquality::NullEqualsNothing,
         ));
-        // ~240 MB raw build → ~600 MB with the 2.5× HT overhead, still under the
-        // 0.9 × 1 GiB ≈ 921 MiB absolute gate (and its full-pool fair share for a
-        // lone join), so the join keeps its non-spillable hash join.
-        let config = config_with_cayenne_optimizer(None, Some(0.9), Some(1024 * 1024 * 1024));
+        // ~240 MB raw build → ~1.24 GB with the 2.5× HT overhead plus the 64 B/row
+        // fixed term, still under the 0.9 × 2 GiB ≈ 1.8 GiB absolute gate (and its
+        // full-pool fair share for a lone join), so the join keeps its
+        // non-spillable hash join.
+        let config = config_with_cayenne_optimizer(None, Some(0.9), Some(2 * 1024 * 1024 * 1024));
 
         let optimized = optimize_anti_join_sort_merge_with_config(join, &config);
 
