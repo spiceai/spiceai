@@ -344,23 +344,11 @@ fn main() {
 
 /// Exit code for a failed command.
 ///
-/// Authentication failures get their own code so automation can re-authenticate
-/// and retry without parsing the message, matching the convention `gh` uses
-/// (<https://cli.github.com/manual/gh_help_exit-codes>).
+/// The mapping lives on the error type so every caller — this dispatcher and
+/// the machine-mode writer — reports the same code. See
+/// [`spice::error::Error::exit_code`] for the contract.
 fn exit_code_for(error: &spice::error::Error) -> i32 {
-    use spice::error::CloudErrorCode;
-
-    match error.cloud_code() {
-        Some(
-            CloudErrorCode::NotAuthenticated
-            | CloudErrorCode::TokenExpired
-            | CloudErrorCode::OrgCredentialMissing,
-        ) => 4,
-        _ => match error {
-            spice::error::Error::Unauthorized => 4,
-            _ => 1,
-        },
-    }
+    error.exit_code()
 }
 
 fn normalize_direct_command_args(args: impl IntoIterator<Item = OsString>) -> Vec<OsString> {
@@ -673,6 +661,7 @@ fn apply_machine_mode(command: &mut Commands) {
         Commands::Chat(args) => args.output = OutputFormat::Json,
         Commands::Refresh(args) => args.output = OutputFormat::Json,
         Commands::Cloud(args) => apply_machine_cloud_mode(&mut args.command),
+        Commands::Connect(args) => args.apply_machine_mode(),
         // `Nsql` is intentionally excluded: it is always an interactive REPL with
         // no one-shot/non-interactive mode, so there is no JSON output format to apply.
         // The remaining commands are lifecycle/manifest-editing commands with no
@@ -683,7 +672,6 @@ fn apply_machine_mode(command: &mut Commands) {
         | Commands::Upgrade(_)
         | Commands::Run(_)
         | Commands::Add(_)
-        | Commands::Connect(_)
         | Commands::Validate(_)
         | Commands::Dataset(_)
         | Commands::Catalog(_)
@@ -821,6 +809,10 @@ fn machine_error_code(error: &spice::error::Error) -> &'static str {
         spice::error::Error::NoModelsConfigured => "no_models_configured",
         spice::error::Error::CloudConnectIo { .. } => "cloud_connect_io",
         spice::error::Error::CloudConnectEnroll { .. } => "cloud_connect_enroll",
+        spice::error::Error::ServiceNotInstalled { .. } => "service_not_installed",
+        spice::error::Error::ServiceUnavailable { .. } => "service_unavailable",
+        spice::error::Error::Interrupted => "interrupted",
+        spice::error::Error::NotImplemented { .. } => "not_implemented",
     }
 }
 
@@ -850,6 +842,8 @@ fn is_json_output(cmd: &mut Commands) -> bool {
         }) => *output == OutputFormat::Json,
         // Cloud commands answer for themselves, from the one match in cloud::mod.
         Commands::Cloud(a) => a.command.produces_json(),
+        // Both `connect status` and `connect service status` have a JSON form.
+        Commands::Connect(a) => a.produces_json(),
         _ => false,
     }
 }

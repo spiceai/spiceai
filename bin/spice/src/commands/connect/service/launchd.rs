@@ -33,11 +33,20 @@ limitations under the License.
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use super::backend::{
+    InstallRequest, LogRequest, ServiceBackend, ServiceObservation, lifecycle_pending,
+};
+use super::manifest::ServiceManifest;
+use super::model::{LogSource, ServiceScope, ServiceStarts, ServiceState, Supervisor};
 use super::{InstalledService, PreflightFailure};
 use crate::error::{Error, Result};
 
 /// Directory launchd reads administrator-provided daemon definitions from.
 const LAUNCH_DAEMON_DIR: &str = "/Library/LaunchDaemons";
+
+/// Directory launchd reads a user's own agent definitions from, relative to
+/// the account's home directory.
+const LAUNCH_AGENT_SUBDIR: &str = "Library/LaunchAgents";
 
 /// Shared prefix of every job label this command installs. Also the prefix used
 /// to discover installed instances.
@@ -95,14 +104,31 @@ pub(super) fn job_label_for_dir(dir: &Path) -> String {
     )
 }
 
-/// The daemon definition a label is installed as.
-fn plist_path(label: &str) -> PathBuf {
-    Path::new(LAUNCH_DAEMON_DIR).join(format!("{label}{PLIST_SUFFIX}"))
+/// The definition a label is installed as, in the domain `scope` selects.
+fn plist_path(label: &str, scope: ServiceScope) -> PathBuf {
+    let dir = match scope {
+        ServiceScope::System => PathBuf::from(LAUNCH_DAEMON_DIR),
+        ServiceScope::User => dirs::home_dir()
+            .unwrap_or_default()
+            .join(LAUNCH_AGENT_SUBDIR),
+    };
+    dir.join(format!("{label}{PLIST_SUFFIX}"))
 }
 
-/// How `launchctl` is asked about a job in the system domain.
+/// How `launchctl` is asked about a job. Agents live in their owner's GUI
+/// domain, daemons in the system domain, and naming the wrong one is how a
+/// command reports on a job that is not the one installed.
+fn service_target_in(label: &str, scope: ServiceScope) -> String {
+    match scope {
+        ServiceScope::System => format!("system/{label}"),
+        ServiceScope::User => format!("gui/{}/{label}", nix::unistd::Uid::effective().as_raw()),
+    }
+}
+
+/// How `launchctl` is asked about a system daemon — the only domain this
+/// release installs into.
 fn service_target(label: &str) -> String {
-    format!("system/{label}")
+    service_target_in(label, ServiceScope::System)
 }
 
 /// Render the daemon definition for an instance.
@@ -194,18 +220,38 @@ fn account_names(account: super::ServiceAccount) -> Result<(String, String)> {
     Ok((user.name, group.name))
 }
 
-pub(super) fn preflight() -> std::result::Result<(), PreflightFailure> {
-    if !super::is_root() {
-        return Err(PreflightFailure::NotRoot);
+/// Map a `launchctl print` `state` value onto the normalized vocabulary.
+fn normalize_launchd_state(reported: &str) -> ServiceState {
+    match reported.trim() {
+        "running" => ServiceState::Running,
+        "spawn scheduled" | "spawning" => ServiceState::Starting,
+        "exiting" | "stopping" => ServiceState::Stopping,
+        // launchd's word for a `KeepAlive` job it is holding but not running:
+        // installed and down.
+        "waiting" | "not running" => ServiceState::Stopped,
+        "error" | "exited" => ServiceState::Failed,
+        // Everything else, including launchd's `not loaded` for a job it does
+        // not have. The definition file decides `not_installed`, so this is a
+        // supervisor that disagrees with disk rather than an absence.
+        _ => ServiceState::Unavailable,
+    }
+}
+
+fn preflight(scope: ServiceScope) -> std::result::Result<(), PreflightFailure> {
+    if scope == ServiceScope::User {
+        return Err(PreflightFailure::UserScopePending);
     }
     Ok(())
 }
 
-pub(super) fn install(
-    instance_dir: &Path,
-    config_dir: &Path,
-    spiced_path: &Path,
-) -> Result<InstalledService> {
+fn install(request: &InstallRequest<'_>) -> Result<InstalledService> {
+    let InstallRequest {
+        instance_dir,
+        config_dir,
+        spiced_path,
+        scope,
+    } = *request;
+
     let account = super::service_account(instance_dir)?;
     let (user_name, group_name) = account_names(account)?;
     super::provision_config_ownership(config_dir, account)?;
@@ -215,7 +261,7 @@ pub(super) fn install(
     })?;
 
     let label = job_label_for_dir(instance_dir);
-    let path = plist_path(&label);
+    let path = plist_path(&label, scope);
     write_daemon_plist(
         &path,
         &render_plist(
@@ -244,18 +290,15 @@ pub(super) fn install(
     })
 }
 
-/// Unload the job and delete its definition, touching nothing else.
-pub(super) fn uninstall(instance_dir: &Path) -> Result<Option<InstalledService>> {
-    let Some(installed) = find_for_dir(instance_dir) else {
-        return Ok(None);
-    };
-
-    let unloaded = unload(&installed.name);
+/// Unload the job the manifest describes and delete its definition, touching
+/// nothing else.
+fn uninstall(manifest: &ServiceManifest) -> Result<()> {
+    let unloaded = unload(&manifest.name);
 
     // Deleting the definition is what must happen even when the job would not
     // stop: one left on disk starts the runtime again at the next boot, against
     // a released identity. Already gone is the retry of exactly that case.
-    if let Err(e) = std::fs::remove_file(&installed.path)
+    if let Err(e) = std::fs::remove_file(&manifest.definition_path)
         && e.kind() != std::io::ErrorKind::NotFound
     {
         // The unload failure is lost otherwise, and a job still running is the
@@ -266,8 +309,9 @@ pub(super) fn uninstall(instance_dir: &Path) -> Result<Option<InstalledService>>
         return Err(Error::CloudConnectIo {
             message: format!(
                 "remove the launchd daemon definition {}: {e}. The daemon would start again at \
-                 boot against a released identity — re-run `sudo spice connect remove`.{also}",
-                installed.path.display()
+                 boot against a released identity — re-run \
+                 `sudo spice connect service uninstall`.{also}",
+                manifest.definition_path.display()
             ),
         });
     }
@@ -275,29 +319,34 @@ pub(super) fn uninstall(instance_dir: &Path) -> Result<Option<InstalledService>>
     // Surfaced after the deletion, not instead of it: a job launchd is still
     // holding keeps restarting against the released identity until the host
     // reboots, and the operator has to be told.
-    unloaded?;
-
-    Ok(Some(installed))
+    unloaded
 }
 
-/// The service installed for `instance_dir`, if any.
+/// The service installed for `instance_dir` in `scope`, if the definition under
+/// this directory's derived label names this directory as its working directory.
 ///
-/// A job launchd is still holding counts, even with no definition on disk.
-/// `uninstall` deletes the definition whether or not the job could be stopped —
+/// A job launchd is still holding counts, even with no definition on disk:
+/// `uninstall` deletes the definition whether or not the job could be stopped,
 /// so if this looked only at the file, the state that leaves behind would be
-/// invisible to the `remove` that has to clean it up, and the released
-/// instance would keep restarting until the host rebooted.
-pub(super) fn find_for_dir(instance_dir: &Path) -> Option<InstalledService> {
+/// invisible to the removal that has to clean it up, and the released instance
+/// would keep restarting until the host rebooted.
+fn find_for_dir(instance_dir: &Path, scope: ServiceScope) -> Option<InstalledService> {
     let label = job_label_for_dir(instance_dir);
-    let path = plist_path(&label);
-    if !path.is_file() && !launchd_holds(&label) {
-        return None;
-    }
+    let path = plist_path(&label, scope);
     let plist = std::fs::read_to_string(&path).ok();
-    let working_dir = plist
-        .as_deref()
-        .and_then(parse_working_dir)
-        .unwrap_or_else(|| instance_dir.to_path_buf());
+
+    match plist.as_deref().and_then(parse_working_dir) {
+        // A definition that names another directory is another instance's
+        // service, whatever label it carries.
+        Some(working_dir) if working_dir != instance_dir => return None,
+        Some(_) => {}
+        // No readable definition: only a job launchd is still holding keeps
+        // this directory's service resolvable, and only in the domain the
+        // definition would have used.
+        None if !(scope == ServiceScope::System && launchd_holds(&label)) => return None,
+        None => {}
+    }
+
     let runtime = plist
         .as_deref()
         .and_then(parse_program)
@@ -305,47 +354,32 @@ pub(super) fn find_for_dir(instance_dir: &Path) -> Option<InstalledService> {
     Some(InstalledService {
         name: label,
         path,
-        working_dir,
+        working_dir: instance_dir.to_path_buf(),
         runtime,
     })
 }
 
-pub(super) fn discover_all() -> Vec<InstalledService> {
-    let Ok(entries) = std::fs::read_dir(LAUNCH_DAEMON_DIR) else {
-        return Vec::new();
-    };
-
-    let mut services: Vec<InstalledService> = entries
-        .filter_map(std::result::Result::ok)
-        .filter_map(|entry| {
-            let path = entry.path();
-            let label = path
-                .file_name()?
-                .to_str()?
-                .strip_suffix(PLIST_SUFFIX)?
-                .to_string();
-            if !label.starts_with(LABEL_PREFIX) || !path.is_file() {
-                return None;
-            }
-            let plist = std::fs::read_to_string(&path).ok()?;
-            let working_dir = parse_working_dir(&plist)?;
-            let runtime = parse_program(&plist).unwrap_or_else(super::staged_runtime_path);
-            Some(InstalledService {
-                name: label,
-                path,
-                working_dir,
-                runtime,
-            })
-        })
-        .collect();
-    services.sort_by(|a, b| a.name.cmp(&b.name));
-    services
+/// The stdout/stderr files a definition names, when it names any.
+///
+/// `None` is the honest answer for a definition that configures no output
+/// paths: launchd then sends the job's output to the unified system log, which
+/// is not a source `spice connect service logs` reads. Configuring explicit
+/// paths is the launchd lifecycle work.
+fn plist_log_source(label: &str, scope: ServiceScope) -> Option<LogSource> {
+    let plist = std::fs::read_to_string(plist_path(label, scope)).ok()?;
+    let stdout = first_string_after_key(&plist, "StandardOutPath")?;
+    let stderr =
+        first_string_after_key(&plist, "StandardErrorPath").unwrap_or_else(|| stdout.clone());
+    Some(LogSource::Files {
+        stdout: PathBuf::from(stdout),
+        stderr: PathBuf::from(stderr),
+    })
 }
 
 /// The job's state as `launchctl print` reports it (`running`, `waiting`,
 /// `not running`, …), [`NOT_LOADED`] when launchd has no such job, or `None`
 /// when launchd could not be asked.
-pub(super) fn is_active(label: &str) -> Option<String> {
+fn is_active(label: &str) -> Option<String> {
     let output = std::process::Command::new(LAUNCHCTL)
         .arg("print")
         .arg(service_target(label))
@@ -368,12 +402,108 @@ pub(super) fn is_active(label: &str) -> Option<String> {
         .then(|| NOT_LOADED.to_string())
 }
 
-pub(super) fn manage_hints(label: &str) -> Vec<String> {
-    let target = service_target(label);
+fn recovery_hints(manifest: &ServiceManifest) -> Vec<String> {
+    let target = service_target_in(&manifest.name, manifest.scope);
+    let sudo = if manifest.scope == ServiceScope::System && !super::is_root() {
+        "sudo "
+    } else {
+        ""
+    };
     vec![
-        format!("sudo launchctl print {target}"),
-        format!("sudo launchctl kickstart -k {target}"),
+        format!("{sudo}launchctl print {target}"),
+        format!("{sudo}launchctl kickstart -k {target}"),
     ]
+}
+
+/// Observe the job: the state launchd reports plus whether it comes back on
+/// its own.
+fn observe(manifest: &ServiceManifest) -> ServiceObservation {
+    let Some(reported) = is_active(&manifest.name) else {
+        return ServiceObservation::unavailable(format!(
+            "launchctl could not be asked about {}. Check that this account may query the \
+             {} domain (`{}`).",
+            manifest.name,
+            manifest.scope,
+            recovery_hints(manifest)
+                .first()
+                .map_or("launchctl print", String::as_str),
+        ));
+    };
+    ServiceObservation {
+        state: normalize_launchd_state(&reported),
+        // A daemon is bootstrapped into the system domain and runs before
+        // anyone logs in; an agent is bootstrapped into its owner's GUI domain
+        // and cannot run before that owner is there. macOS offers no non-root
+        // way to make an agent start earlier, so there is no remediation to
+        // name for the agent case.
+        starts: match manifest.scope {
+            ServiceScope::System => ServiceStarts::BootWithoutLogin,
+            ServiceScope::User => ServiceStarts::LoginOnly,
+        },
+        diagnostic: None,
+        starts_action: None,
+    }
+}
+
+/// The macOS back end.
+pub(super) struct LaunchdBackend;
+
+impl ServiceBackend for LaunchdBackend {
+    fn supervisor(&self) -> Supervisor {
+        Supervisor::Launchd
+    }
+
+    fn preflight(&self, scope: ServiceScope) -> std::result::Result<(), PreflightFailure> {
+        preflight(scope)
+    }
+
+    fn name_for_dir(&self, instance_dir: &Path) -> String {
+        job_label_for_dir(instance_dir)
+    }
+
+    fn definition_path(&self, name: &str, scope: ServiceScope) -> PathBuf {
+        plist_path(name, scope)
+    }
+
+    fn log_source(&self, name: &str, scope: ServiceScope) -> Option<LogSource> {
+        plist_log_source(name, scope)
+    }
+
+    fn find_installed(&self, instance_dir: &Path, scope: ServiceScope) -> Option<InstalledService> {
+        find_for_dir(instance_dir, scope)
+    }
+
+    fn install(&self, request: &InstallRequest<'_>) -> Result<InstalledService> {
+        install(request)
+    }
+
+    fn uninstall(&self, manifest: &ServiceManifest) -> Result<()> {
+        uninstall(manifest)
+    }
+
+    fn start(&self, manifest: &ServiceManifest) -> Result<()> {
+        Err(lifecycle_pending(self, "start", manifest))
+    }
+
+    fn stop(&self, manifest: &ServiceManifest) -> Result<()> {
+        Err(lifecycle_pending(self, "stop", manifest))
+    }
+
+    fn restart(&self, manifest: &ServiceManifest) -> Result<()> {
+        Err(lifecycle_pending(self, "restart", manifest))
+    }
+
+    fn observe(&self, manifest: &ServiceManifest) -> ServiceObservation {
+        observe(manifest)
+    }
+
+    fn logs(&self, manifest: &ServiceManifest, _request: LogRequest) -> Result<()> {
+        Err(lifecycle_pending(self, "read the logs of", manifest))
+    }
+
+    fn recovery_hints(&self, manifest: &ServiceManifest) -> Vec<String> {
+        recovery_hints(manifest)
+    }
 }
 
 /// The text of an error being folded into another one, without the second
@@ -575,7 +705,7 @@ fn write_daemon_plist(path: &Path, plist: &str) -> Result<()> {
                  uid {uid} gid {gid} with mode {mode:04o}. launchd silently refuses to load a \
                  daemon that is not owned by root:wheel and writable only by root. Fix it with \
                  `sudo chown root:wheel {plist_path}` and `sudo chmod 644 {plist_path}`, then \
-                 re-run `sudo spice connect --install`.",
+                 re-run `sudo spice connect service install`.",
                 plist_path = path.display(),
                 uid = meta.uid(),
                 gid = meta.gid(),
@@ -646,7 +776,7 @@ fn verify_staged_runtime_executes(
              was installed and any service already on this host keeps the runtime it has.\
              {quarantine} Check the binary with `codesign --verify {source}` and \
              `spctl --assess --type execute {source}`, then re-run \
-             `sudo spice connect --install`.",
+             `sudo spice connect service install`.",
             source = source.display(),
         ),
     })
@@ -840,6 +970,29 @@ fn xml_unescape(value: &str) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn every_launchd_state_normalizes() {
+        for (reported, expected) in [
+            ("running", ServiceState::Running),
+            ("spawn scheduled", ServiceState::Starting),
+            ("exiting", ServiceState::Stopping),
+            ("waiting", ServiceState::Stopped),
+            ("not running", ServiceState::Stopped),
+            ("error", ServiceState::Failed),
+            ("not loaded", ServiceState::Unavailable),
+            ("", ServiceState::Unavailable),
+            ("something new", ServiceState::Unavailable),
+        ] {
+            assert_eq!(
+                normalize_launchd_state(reported),
+                expected,
+                "launchd `{reported}`"
+            );
+        }
+        // `launchctl print` values arrive with surrounding whitespace.
+        assert_eq!(normalize_launchd_state(" running "), ServiceState::Running);
+    }
+
     const TEST_USER: &str = "spice-operator";
     const TEST_GROUP: &str = "spice-users";
 
@@ -873,7 +1026,10 @@ mod tests {
         let a = job_label_for_dir(Path::new("/opt/edge-1"));
         let b = job_label_for_dir(Path::new("/opt/edge-2"));
         assert_ne!(a, b);
-        assert_ne!(plist_path(&a), plist_path(&b));
+        assert_ne!(
+            plist_path(&a, ServiceScope::System),
+            plist_path(&b, ServiceScope::System)
+        );
     }
 
     #[test]
@@ -896,13 +1052,13 @@ mod tests {
     #[test]
     fn plist_path_lives_in_the_daemon_directory() {
         let label = "ai.spice.cloud-connect.edge-1-1a2b3c4d";
-        let path = plist_path(label);
+        let path = plist_path(label, ServiceScope::System);
         assert_eq!(
             path,
             PathBuf::from("/Library/LaunchDaemons/ai.spice.cloud-connect.edge-1-1a2b3c4d.plist")
         );
-        // The label carries dots of its own, so `discover_all` has to recover
-        // it by dropping the suffix rather than by splitting on the last dot.
+        // The label carries dots of its own, so recovering it from a file name
+        // means dropping the suffix rather than splitting on the last dot.
         assert_eq!(
             path.file_name()
                 .and_then(|name| name.to_str())
@@ -1034,16 +1190,100 @@ mod tests {
         assert_eq!(top_level_field(printed, "pid"), None);
     }
 
+    /// A manifest for the job under test, without touching the filesystem.
+    fn manifest(scope: ServiceScope) -> ServiceManifest {
+        let name = job_label_for_dir(Path::new("/opt/edge-1"));
+        ServiceManifest {
+            schema_version: super::super::manifest::MANIFEST_SCHEMA_VERSION,
+            directory: PathBuf::from("/opt/edge-1"),
+            name: name.clone(),
+            scope,
+            supervisor: Supervisor::Launchd,
+            owner: super::super::ServiceOwner {
+                uid: 501,
+                gid: 20,
+                name: Some("alice".to_string()),
+            },
+            definition_path: plist_path(&name, scope),
+            runtime_path: super::super::staged_runtime_path(),
+            log_source: None,
+            runtime_digest: String::new(),
+            runtime_version: "v2.2.0".to_string(),
+            health_url: "http://127.0.0.1:8090/health".to_string(),
+        }
+    }
+
     #[test]
-    fn manage_hints_name_the_job_in_the_system_domain() {
-        let hints = manage_hints("ai.spice.cloud-connect.edge-1-1a2b3c4d");
-        assert_eq!(
-            hints,
-            vec![
-                "sudo launchctl print system/ai.spice.cloud-connect.edge-1-1a2b3c4d",
-                "sudo launchctl kickstart -k system/ai.spice.cloud-connect.edge-1-1a2b3c4d",
-            ]
+    fn recovery_hints_name_the_job_in_its_own_domain() {
+        let hints = recovery_hints(&manifest(ServiceScope::System));
+        assert!(
+            hints[0]
+                .ends_with("launchctl print system/ai.spice.cloud-connect.edge-1-2962fca679ae993a"),
+            "{hints:?}"
         );
+        assert!(hints[1].contains("kickstart -k system/"), "{hints:?}");
+
+        // An agent lives in its owner's GUI domain, and naming the system
+        // domain would report on a job that is not the one installed.
+        let user = recovery_hints(&manifest(ServiceScope::User));
+        assert!(user[0].contains("launchctl print gui/"), "{user:?}");
+        assert!(
+            !user.iter().any(|hint| hint.starts_with("sudo")),
+            "an agent is managed by its owner, never through sudo: {user:?}"
+        );
+    }
+
+    #[test]
+    fn an_agent_definition_lives_under_the_owners_home() {
+        let label = job_label_for_dir(Path::new("/opt/edge-1"));
+        let daemon = plist_path(&label, ServiceScope::System);
+        let agent = plist_path(&label, ServiceScope::User);
+        assert!(daemon.starts_with(LAUNCH_DAEMON_DIR), "{daemon:?}");
+        assert_ne!(daemon, agent);
+        assert!(
+            agent.to_string_lossy().contains(LAUNCH_AGENT_SUBDIR),
+            "{agent:?}"
+        );
+    }
+
+    #[test]
+    fn a_definition_naming_no_output_paths_reports_no_log_source() {
+        // The plist this release writes configures none, so claiming a file
+        // would name something nothing writes to.
+        assert_eq!(
+            plist_log_source("ai.spice.cloud-connect.absent", ServiceScope::System),
+            None
+        );
+    }
+
+    #[test]
+    fn a_user_scope_install_is_refused_rather_than_half_performed() {
+        assert!(matches!(
+            preflight(ServiceScope::User),
+            Err(PreflightFailure::UserScopePending)
+        ));
+        assert!(preflight(ServiceScope::System).is_ok());
+    }
+
+    #[test]
+    fn every_lifecycle_action_reports_itself_as_pending_rather_than_panicking() {
+        let manifest = manifest(ServiceScope::System);
+        for result in [
+            LaunchdBackend.start(&manifest),
+            LaunchdBackend.stop(&manifest),
+            LaunchdBackend.restart(&manifest),
+            LaunchdBackend.logs(
+                &manifest,
+                super::super::LogRequest {
+                    number: 100,
+                    follow: false,
+                },
+            ),
+        ] {
+            let error = result.expect_err("the lifecycle is not implemented yet");
+            assert!(matches!(error, Error::NotImplemented { .. }), "{error}");
+            assert!(error.to_string().contains("launchctl"), "{error}");
+        }
     }
 
     #[test]

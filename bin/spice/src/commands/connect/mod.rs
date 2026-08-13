@@ -24,8 +24,8 @@ limitations under the License.
 //!    it (`spiced --token <enrollment-key>`); a directory with an enrolled
 //!    identity reconnects automatically on every later start. This command
 //!    inspects and manages that per-directory state: `status` reports it,
-//!    `remove` releases the instance and clears it, and `--install` wraps
-//!    an already-enrolled directory in a persistent system service.
+//!    `service` installs and manages the persistent service that keeps it
+//!    running, and `remove` releases the instance and clears it.
 //!
 //! 2. **Deprecated pod-add behavior**: when the argument is a Spicepod
 //!    path on Spice.ai Cloud (e.g. `spiceai/quickstart`), this prints a
@@ -33,6 +33,7 @@ limitations under the License.
 //!    Cloud authentication headers.
 
 mod service;
+mod status;
 
 use std::{
     path::{Path, PathBuf},
@@ -42,8 +43,11 @@ use std::{
 use crate::commands::add::{AddArgs, execute_add_or_connect};
 use crate::context::RuntimeContext;
 use crate::error::{Error, Result};
+use crate::output::OutputFormat;
 use clap::{Args, Subcommand};
 use runtime_cloud_connect::config::{CloudConnectConfig, IDENTITY_FILE};
+
+use status::ConnectStatus;
 
 /// File (relative to the config dir) holding a `--endpoint` override so later
 /// `spiced` starts reach the same control plane the enroll did.
@@ -64,15 +68,20 @@ The runtime enrolls before it serves traffic, stores the issued identity under
 `.spice/`, and every later `spiced` or `spice run` start in that directory
 reconnects automatically from the identity alone.
 
-  spice connect status                    Show the current enrollment state.
-  sudo spice connect --install            Install `spiced` as a persistent
-                                          system service for an already
-                                          enrolled directory — systemd on
-                                          Linux, a launchd daemon on macOS.
-                                          Re-run to upgrade in place: latest
-                                          binary, rewritten service definition,
-                                          service restarted, identity
-                                          untouched.
+  spice connect status                    Show this directory's Cloud
+                                          connection, service, and deployment
+                                          state. `--output json` prints the
+                                          same report for automation.
+  spice connect service install           Install and start `spiced` as a
+                                          persistent service so the instance
+                                          survives reboots and closed
+                                          terminals. Re-run to upgrade in
+                                          place: latest binary, rewritten
+                                          service definition, service
+                                          restarted, identity untouched.
+  spice connect service ...               The rest of the service lifecycle:
+                                          uninstall, start, stop, restart,
+                                          status, logs.
   spice connect remove                    Release this instance: report the
                                           release to Spice Cloud, uninstall the
                                           service when one was installed, and
@@ -90,17 +99,18 @@ per-instance state lives under `<dir>/.spice`, so multiple instances on one
 host enroll independently. `SPICE_CONFIG_DIR` overrides the derived location
 entirely and wins over `--dir`.
 
-`--install` requires root, and either Linux with systemd or macOS with
-launchd. Containers pass the enrollment key directly to the runtime
-(`spiced --token`) under the container runtime's restart policy; Windows
-enrolls and runs under the user's own supervisor.
+A service needs either Linux with systemd or macOS with launchd. Containers
+pass the enrollment key directly to the runtime (`spiced --token`) under the
+container runtime's restart policy; Windows enrolls and runs under the user's
+own supervisor.
 
 DEPRECATED POD-ADD BEHAVIOR:
   spice connect <org>/<pod>               Deprecated; use `spice add <org>/<pod>`.
 
 EXAMPLES
   spice connect status
-  sudo spice connect --install
+  spice connect status --output json
+  sudo spice connect service install
   sudo spice connect remove
 
 Docs: https://spiceai.org/docs"#
@@ -126,20 +136,12 @@ pub struct ConnectArgs {
     /// The instance directory: per-instance Cloud Connect state (the
     /// enrolled identity) lives under `<dir>/.spice`. Defaults to the
     /// current directory. `SPICE_CONFIG_DIR` overrides the derived `.spice`
-    /// location entirely. Applies to `status`, `remove`, and `--install`.
+    /// location entirely. Applies to `status`, `remove`, and `service`.
     #[arg(long, value_name = "PATH", global = true)]
     pub dir: Option<PathBuf>,
 
-    /// Install and start `spiced` as a persistent system service running
-    /// from an already-enrolled instance directory, so the instance
-    /// survives reboots and closed terminals. Requires root, and either
-    /// Linux with systemd or macOS with launchd. Re-running is the
-    /// idempotent in-place upgrade path.
-    #[arg(long, global = true)]
-    pub install: bool,
-
     /// Skip the confirmation prompt. Applies to `remove`, which otherwise
-    /// asks before stopping and uninstalling a service.
+    /// asks before releasing the instance and stopping its service.
     #[arg(long, short = 'y', global = true)]
     pub yes: bool,
 
@@ -158,13 +160,62 @@ pub struct ConnectArgs {
 /// Cloud-connect subcommands.
 #[derive(Subcommand, Debug)]
 pub enum ConnectCommand {
-    /// Show the current Spice Cloud Connect enrollment state.
-    Status,
+    /// Show this directory's Spice Cloud Connect state: connection, service,
+    /// and deployment, from one snapshot.
+    Status(StatusArgs),
 
     /// Release this instance: report the release to Spice Cloud, uninstall an
     /// installed service, and clear the local identity. spiced will continue
     /// running unmanaged after the next restart.
     Remove,
+
+    /// Install and manage the persistent service for this instance directory.
+    ///
+    /// `svc` is a hidden alias for interactive typing; `service` is the only
+    /// documented spelling.
+    #[command(alias = "svc")]
+    Service(service::cli::ServiceArgs),
+}
+
+/// Arguments for `spice connect status`.
+#[derive(Args, Debug)]
+pub struct StatusArgs {
+    /// Output format. `json` writes one report and nothing else to stdout.
+    #[arg(long, short = 'o', value_enum, default_value_t = OutputFormat::Table)]
+    pub output: OutputFormat,
+}
+
+impl ConnectArgs {
+    /// Whether this invocation writes JSON to stdout, so the dispatcher can
+    /// suppress the version banner that would otherwise foul it.
+    #[must_use]
+    pub fn produces_json(&self) -> bool {
+        match &self.command {
+            Some(ConnectCommand::Status(args)) => args.output == OutputFormat::Json,
+            Some(ConnectCommand::Service(args)) => matches!(
+                &args.command,
+                Some(service::cli::ServiceCommand::Status(args))
+                    if args.output == OutputFormat::Json
+            ),
+            _ => false,
+        }
+    }
+
+    /// Select JSON output wherever this command has a structured form.
+    pub fn apply_machine_mode(&mut self) {
+        match &mut self.command {
+            Some(ConnectCommand::Status(args)) => args.output = OutputFormat::Json,
+            Some(ConnectCommand::Service(args)) => {
+                if let Some(service::cli::ServiceCommand::Status(args)) = &mut args.command {
+                    args.output = OutputFormat::Json;
+                }
+            }
+            // `remove` and the service lifecycle actions report progress rather
+            // than structured data, and the deprecated pod-add fallthrough has
+            // no JSON form.
+            _ => {}
+        }
+    }
 }
 
 /// Execute the `spice connect` command.
@@ -179,9 +230,21 @@ pub async fn execute(ctx: &RuntimeContext, args: ConnectArgs) -> Result<()> {
     if let Some(cmd) = args.command {
         reject_cloud_region(args.cloud_region.as_deref())?;
         return match cmd {
-            ConnectCommand::Status => print_status(&config_dir, args.endpoint.as_deref()).await,
+            ConnectCommand::Status(status_args) => {
+                print_status(&config_dir, args.endpoint.as_deref(), status_args.output).await
+            }
             ConnectCommand::Remove => {
                 remove_identity(&config_dir, args.endpoint.as_deref(), args.yes).await
+            }
+            ConnectCommand::Service(service_args) => {
+                service::cli::execute(
+                    ctx,
+                    service_args,
+                    &instance_dir_for(&config_dir),
+                    &config_dir,
+                    &resolved_endpoint(&config_dir, args.endpoint.as_deref()),
+                )
+                .await
             }
         };
     }
@@ -191,7 +254,7 @@ pub async fn execute(ctx: &RuntimeContext, args: ConnectArgs) -> Result<()> {
     // always been meaningful, so refusing it there would be a regression.
     let Some(target) = args.target.as_deref() else {
         reject_cloud_region(args.cloud_region.as_deref())?;
-        return connect_existing(ctx, &config_dir, args.install, args.endpoint.as_deref()).await;
+        return connect_existing(&config_dir, args.endpoint.as_deref()).await;
     };
 
     // A secret must never ride a positional argument. Reject canonical keys
@@ -252,28 +315,17 @@ fn reject_cloud_region(cloud_region: Option<&str>) -> Result<()> {
     })
 }
 
-/// Bare `spice connect` (no subcommand, no pod path): act on the existing
+/// Bare `spice connect` (no subcommand, no pod path): report the existing
 /// per-directory state.
 ///
-/// An enrolled directory reports its status, or installs the persistent
-/// service when `--install` asks for one. A directory with no identity has
-/// nothing this command can act on — enrollment belongs to the runtime — so
-/// it errors with the exact command that does enroll.
-async fn connect_existing(
-    ctx: &RuntimeContext,
-    config_dir: &Path,
-    install: bool,
-    endpoint: Option<&str>,
-) -> Result<()> {
+/// A directory with no identity has nothing this command can act on —
+/// enrollment belongs to the runtime — so it errors with the exact command that
+/// does enroll.
+async fn connect_existing(config_dir: &Path, endpoint: Option<&str>) -> Result<()> {
     if has_enrolled_identity(config_dir)? {
-        if install {
-            // The `--install`-after-a-prior-enroll path, and the in-place
-            // upgrade path when a service is already installed.
-            return install_service(ctx, config_dir);
-        }
         println!("This host is already enrolled with Spice Cloud.");
         println!();
-        return print_status(config_dir, endpoint).await;
+        return print_status(config_dir, endpoint, OutputFormat::Table).await;
     }
 
     Err(Error::InvalidArgument {
@@ -289,9 +341,9 @@ async fn connect_existing(
 
 /// Whether this directory holds a usable enrolled identity.
 ///
-/// Existence alone is not enough: installing a service over a malformed or
-/// unreadable identity would report success, but every `spiced` restart would
-/// reject that identity and run without Cloud Connect.
+/// Existence alone is not enough: an unreadable identity would be reported as
+/// enrolled, but every `spiced` restart would reject it and run without Cloud
+/// Connect.
 fn has_enrolled_identity(config_dir: &Path) -> Result<bool> {
     runtime_cloud_connect::identity::IdentityStore::load_optional(&config_dir.join(IDENTITY_FILE))
         .map(|identity| identity.is_some())
@@ -300,61 +352,11 @@ fn has_enrolled_identity(config_dir: &Path) -> Result<bool> {
         })
 }
 
-/// Install (or reinstall) the service for this instance directory and report
-/// its name and how to manage it.
-fn install_service(ctx: &RuntimeContext, config_dir: &Path) -> Result<()> {
-    service::preflight()?;
-
-    // The service runs from the *instance* directory, not the `.spice` config
-    // dir beneath it: that directory is the spicepod root the runtime loads
-    // from.
-    let instance_dir = instance_dir_for(config_dir);
-    // Resolved, not derived from `$HOME`: `sudo` rewrites `HOME` to `/root`, and
-    // the runtime the operator installed is normally under their own home.
-    let spiced_path = ctx.resolve_spiced_path().ok_or_else(|| Error::InvalidArgument {
-        message: format!(
-            "Failed to install the Spice Cloud Connect service: no Spice runtime was found at {}. \
-             Install it with `spice install` and re-run `sudo spice connect --install`. \
-             See: https://spiceai.org/docs",
-            ctx.spiced_path().display()
-        ),
-    })?;
-
-    let installed = service::install(&instance_dir, config_dir, &spiced_path)?;
-
-    println!("Installed the Spice Cloud Connect service.");
-    println!("  service:   {}", installed.name);
-    println!("  file:      {}", installed.path.display());
-    println!("  directory: {}", instance_dir.display());
-    // Name both paths: the operator needs to know which build was installed and
-    // that the service runs a root-owned copy of it, not the original.
-    println!("  runtime:   {}", installed.runtime.display());
-    if installed.runtime != spiced_path {
-        println!("             staged from {}", spiced_path.display());
-    }
-    if let Ok(version) = ctx.runtime_version() {
-        println!("  version:   {version}");
-    }
-    if let Some(state) = service::is_active(&installed.name) {
-        println!("  state:     {state}");
-    }
-    println!();
-    println!("Manage it with:");
-    for hint in service::manage_hints(&installed.name) {
-        println!("  {hint}");
-    }
-    println!(
-        "Re-run `sudo spice connect --install` to upgrade the runtime in place; \
-         `sudo spice connect remove` to release this instance and uninstall the service."
-    );
-    Ok(())
-}
-
 /// The instance directory a config dir belongs to: `<dir>/.spice` → `<dir>`.
 ///
 /// `SPICE_CONFIG_DIR` can point anywhere, so a config dir that is not named
 /// `.spice` has no instance directory above it — in that case the config dir
-/// itself is the best available answer for `WorkingDirectory`.
+/// itself is the best available answer for the service's working directory.
 fn instance_dir_for(config_dir: &Path) -> PathBuf {
     if config_dir.file_name() == Some(std::ffi::OsStr::new(".spice"))
         && let Some(parent) = config_dir.parent().filter(|p| !p.as_os_str().is_empty())
@@ -364,170 +366,102 @@ fn instance_dir_for(config_dir: &Path) -> PathBuf {
     config_dir.to_path_buf()
 }
 
-async fn print_status(config_dir: &Path, endpoint: Option<&str>) -> Result<()> {
-    let identity_path = config_dir.join(IDENTITY_FILE);
-
-    let identity = runtime_cloud_connect::identity::IdentityStore::load_optional(&identity_path)
-        .map_err(|e| Error::CloudConnectIo {
-            message: format!("load identity: {e}"),
-        })?;
-
-    if let Some(id) = identity {
-        let expiry = id.not_after_unix.map_or_else(
-            || "unbounded".to_string(),
-            |secs| format!("unix={secs} (expired={})", id.is_expired()),
-        );
-        println!("Spice Cloud Connect: enrolled");
-        println!("  identifier:  {}", id.identifier);
-        println!("  identity:    {}", identity_path.display());
-        if !id.gateway_addr.is_empty() {
-            println!("  gateway:     {}", id.gateway_addr);
-        }
-        println!("  expiry:      {expiry}");
-        print_deployed_spicepod(config_dir);
-        print_delivered_secrets(config_dir);
-        print_service_for_dir(config_dir);
-        // An identity that reads as expired on a host whose clock is wrong is
-        // not actually expired — measure before the operator goes chasing a
-        // renewal problem that does not exist. A live identity needs no probe,
-        // which keeps the common `status` offline and instant.
-        if id.is_expired() {
-            report_clock_skew(&resolved_endpoint(config_dir, endpoint)).await;
-        }
-        return Ok(());
+/// Collect and render one status snapshot.
+async fn print_status(
+    config_dir: &Path,
+    endpoint: Option<&str>,
+    output: OutputFormat,
+) -> Result<()> {
+    let status = ConnectStatus::collect(
+        service::backend(),
+        &instance_dir_for(config_dir),
+        config_dir,
+        &resolved_endpoint(config_dir, endpoint),
+    )
+    .await;
+    status::render(&status, output)?;
+    if status.is_degraded() {
+        return Err(Error::ServiceUnavailable {
+            message: format!(
+                "The Spice Cloud Connect service for {} is {}{}",
+                status.connection.directory.display(),
+                status.service.state,
+                match &status.service.diagnostic {
+                    Some(diagnostic) => format!(": {diagnostic}"),
+                    None => ".".to_string(),
+                }
+            ),
+        });
     }
-
-    // An enrollment that started but never completed leaves its retry-safe
-    // draft behind. The draft is non-secret apart from the provisional keys
-    // (never printed); the operation ID names what a retried enrollment
-    // resumes.
-    let draft_path = runtime_cloud_connect::EnrollmentDraft::path_in(config_dir);
-    if draft_path.exists() {
-        println!("Spice Cloud Connect: enrollment incomplete");
-        println!("  draft:       {}", draft_path.display());
-        println!(
-            "  a previous enrollment did not finish. Mint a new enrollment key in the Spice \
-             Cloud portal and start the runtime with it (`spiced --token <enrollment-key>`); \
-             the retried enrollment resumes the same pending operation instead of creating a \
-             duplicate instance."
-        );
-        print_service_for_dir(config_dir);
-        // A stuck enrollment is a state a wrong clock explains: the enroll
-        // keeps failing on certificate validity.
-        report_clock_skew(&resolved_endpoint(config_dir, endpoint)).await;
-        return Ok(());
-    }
-
-    // No state in this directory. A host can still be connected from another
-    // instance directory, so report the installed services rather than a
-    // misleading "not connected".
-    let installed = service::discover_all();
-    if !installed.is_empty() {
-        println!(
-            "Spice Cloud Connect: no instance in this directory ({}).",
-            instance_dir_for(config_dir).display()
-        );
-        println!("Installed services on this host:");
-        for service in &installed {
-            let state = service::is_active(&service.name).unwrap_or_else(|| "unknown".to_string());
-            println!(
-                "  {} (dir {}) — {state}",
-                service.name,
-                service.working_dir.display()
-            );
-        }
-        println!();
-        println!(
-            "Run `spice connect status --dir <directory>` to inspect one of them, or enroll \
-             this directory as a new instance with `spiced --token <enrollment-key>`."
-        );
-        return Ok(());
-    }
-
-    println!("Spice Cloud Connect: not connected");
-    println!(
-        "Mint an enrollment key in the Spice Cloud portal and start the runtime with it: \
-         `spiced --token <enrollment-key>`."
-    );
     Ok(())
 }
 
-/// Report whether a deployed spicepod is what this instance comes up on.
-///
-/// Reads the config dir only, so it answers on a host with no network.
-fn print_deployed_spicepod(config_dir: &Path) {
-    let spicepod = config_dir.join(runtime_cloud_connect::config::CLOUD_MANAGED_SPICEPOD_FILE);
-    if spicepod.exists() {
-        println!("  deployment:  {}", spicepod.display());
-    } else {
-        println!(
-            "  deployment:  none yet — this instance runs its local spicepod until an app is deployed to it"
-        );
-    }
+/// What Spice Cloud said about the release, reduced to the only question that
+/// decides whether local state may be cleared.
+#[derive(Debug)]
+enum ReleaseVerdict {
+    /// The cloud confirmed the release, or confirmed this instance is not
+    /// there. Either way the credential on disk is no longer usable and can go.
+    Confirmed {
+        outcome: runtime_cloud_connect::release::ReleaseOutcome,
+    },
+    /// The cloud could not be reached, or refused in a way that leaves the
+    /// instance registered. Local state must survive so a retry can finish the
+    /// removal.
+    Unconfirmed { reason: String },
 }
 
-/// Report the delivered secrets held in the local cache.
+/// Report this instance's release to Spice Cloud and classify the answer.
 ///
-/// Reads only the cache's plaintext header, so this works without the key and
-/// **cannot** print a value. Names are what diagnose the common failure: a
-/// component referencing a secret the last deployment did not deliver.
-fn print_delivered_secrets(config_dir: &Path) {
-    let path = config_dir.join(runtime_cloud_connect::secret_cache::SECRET_CACHE_FILE);
-    let Some(header) = runtime_cloud_connect::secret_cache::read_header(&path) else {
-        if path.exists() {
-            println!(
-                "  secrets:     cache present but unreadable — deploy the app to re-deliver them"
-            );
-        } else {
-            println!("  secrets:     none delivered yet — deploy the app to deliver them");
+/// The classification is the whole point: clearing the identity is what makes a
+/// removal unrecoverable, so it happens only once the cloud has said the
+/// instance is released or already gone. A network blip must leave a directory
+/// a retry can finish from — the alternative silently orphans a registry row
+/// that nobody local can release any more.
+async fn release_instance(
+    config_dir: &Path,
+    endpoint: Option<&str>,
+    identity: &runtime_cloud_connect::Identity,
+) -> ReleaseVerdict {
+    let endpoint = resolved_endpoint(config_dir, endpoint);
+    let ca = (!identity.ca_bundle_pem.is_empty()).then_some(identity.ca_bundle_pem.as_str());
+
+    match runtime_cloud_connect::release::release(&endpoint, identity, ca).await {
+        Ok(outcome) => ReleaseVerdict::Confirmed { outcome },
+        // The cloud has no such instance: the same end state the release was
+        // asking for, including the case where it was already deleted in the
+        // portal.
+        Err(runtime_cloud_connect::release::Error::Rejected { status, .. })
+            if status == 404 || status == 410 =>
+        {
+            ReleaseVerdict::Confirmed {
+                outcome: runtime_cloud_connect::release::ReleaseOutcome {
+                    status: "removed".to_string(),
+                    app_name: None,
+                },
+            }
         }
-        return;
-    };
-    if header.names.is_empty() {
-        println!("  secrets:     none (the last deployment delivered no secrets)");
-        return;
-    }
-    println!(
-        "  secrets:     {} delivered: {}",
-        header.names.len(),
-        header.names.join(", ")
-    );
-}
-
-/// Report the service installed for this instance directory, when there is one.
-fn print_service_for_dir(config_dir: &Path) {
-    let instance_dir = instance_dir_for(config_dir);
-    let Some(installed) = service::find_for_dir(&instance_dir) else {
-        // Not an error: containers and foreground runs are supported ways to
-        // run, and `--install` needs a supported supervisor.
-        return;
-    };
-    let state = service::is_active(&installed.name).unwrap_or_else(|| "unknown".to_string());
-    println!("  service:     {} — {state}", installed.name);
-}
-
-/// Measure the host clock against Spice Cloud and report a significant skew.
-///
-/// Called only from the states a wrong clock explains — an identity that reads
-/// as expired, or an enrollment stuck pending — so a healthy `status` makes no
-/// network request at all. Best-effort and silent on failure: `status` must
-/// stay usable on a host with no network.
-async fn report_clock_skew(endpoint: &str) {
-    if let Some(skew) = runtime_cloud_connect::clock_skew::diagnose(endpoint, None).await
-        && skew.is_significant()
-    {
-        println!("  clock:       {}", skew.advice());
+        Err(err) => ReleaseVerdict::Unconfirmed {
+            reason: format!(
+                "{err} Nothing was removed locally: the identity, delivered secrets, and any \
+                 installed service are intact so `spice connect remove` can finish the removal. \
+                 If Spice Cloud cannot accept the release at all, delete the instance in the \
+                 Spice Cloud portal and re-run this command — a released instance is confirmed \
+                 absent and its local state is then cleared. \
+                 See: https://spiceai.org/docs"
+            ),
+        },
     }
 }
 
 /// Release this instance: report the release to Spice Cloud, uninstall an
 /// installed service, and clear the local identity and staged state.
 ///
-/// Local state is cleared whether or not the cloud could be reached — the host
-/// is being decommissioned, and a `remove` that failed because the network was
-/// down would leave a credential behind. Unreachable, the registry row reads
-/// `disconnected` until it is deleted in the portal; the portal-side delete is
-/// authoritative either way.
+/// Ordered so that no step is taken on the strength of a guess. The release is
+/// reported first and its answer decides everything after it: a confirmed
+/// release (or a confirmed absence) is what makes the local credential dead and
+/// safe to delete, while an unconfirmed one leaves the directory exactly as it
+/// was for a retry to finish.
 async fn remove_identity(
     config_dir: &Path,
     endpoint: Option<&str>,
@@ -549,12 +483,13 @@ async fn remove_identity(
     let endpoint_path = config_dir.join(CLOUD_ENDPOINT_FILE);
     let cache_path = config_dir.join(runtime_cloud_connect::secret_cache::SECRET_CACHE_FILE);
     let instance_dir = instance_dir_for(config_dir);
+    let backend = service::backend();
 
     let identity = runtime_cloud_connect::identity::IdentityStore::load_optional(&identity_path)
         .map_err(|e| Error::CloudConnectIo {
             message: format!("load identity: {e}"),
         })?;
-    let installed = service::find_for_dir(&instance_dir);
+    let installed = service::resolve(backend, &instance_dir, config_dir)?;
 
     let had_identity = identity.is_some();
     let had_draft = draft_path.exists();
@@ -569,11 +504,11 @@ async fn remove_identity(
     // Confirm before touching a running service: stopping it takes the
     // instance offline, and an operator who ran this in the wrong directory
     // needs the chance to say no. Name what will be affected.
-    if let Some(ref installed) = installed
-        && !assume_yes
-    {
+    if !assume_yes {
         println!("This will release this instance from Spice Cloud and remove it from this host:");
-        println!("  service:   {} (stopped and uninstalled)", installed.name);
+        if let Some(ref installed) = installed {
+            println!("  service:   {} (stopped and uninstalled)", installed.name);
+        }
         println!("  directory: {}", instance_dir.display());
         if had_identity {
             println!("  identity:  {} (deleted)", identity_path.display());
@@ -592,26 +527,44 @@ async fn remove_identity(
         }
     }
 
-    // Report the release before clearing anything: the identity leaf is the
-    // credential that authorises it, so it has to still exist.
+    // Reported before anything is cleared: the identity leaf is the credential
+    // that authorises the release, so it has to still exist.
     if let Some(ref identity) = identity {
-        report_release(config_dir, endpoint, identity).await;
+        match release_instance(config_dir, endpoint, identity).await {
+            ReleaseVerdict::Confirmed { outcome } => {
+                println!("Released this instance in Spice Cloud.");
+                if !outcome.status.is_empty() {
+                    println!("  registry status: {}", outcome.status);
+                }
+                if let Some(app) = outcome.app_name {
+                    println!(
+                        "  app {app} is paused — its deploy target was removed. Move it to \
+                         another instance, or delete it, in the Spice Cloud portal."
+                    );
+                }
+            }
+            ReleaseVerdict::Unconfirmed { reason } => {
+                return Err(Error::CloudConnectIo {
+                    message: format!("release this instance in Spice Cloud: {reason}"),
+                });
+            }
+        }
     }
 
     // A service left running against a released identity restarts forever, so
     // this is the step that most needs to happen — but a failure must not abort
     // the command before the identity is cleared. The cloud has already
     // released the instance by this point, so keeping a dead credential on disk
-    // is strictly worse than reporting the uninstall failure at the end.
-    let uninstall_failure = match installed {
-        Some(ref installed) => match service::uninstall(&instance_dir) {
-            Ok(_) => {
-                println!("Stopped and uninstalled {}.", installed.name);
-                None
-            }
-            Err(err) => Some(err),
-        },
-        None => None,
+    // is strictly worse than reporting the uninstall failure at the end. The
+    // uninstall primitive is shared with `spice connect service uninstall`;
+    // what is not shared is the identity, which only this command releases.
+    let uninstall_failure = match service::uninstall(backend, &instance_dir, config_dir) {
+        Ok(Some(removed)) => {
+            println!("Stopped and uninstalled {}.", removed.name);
+            None
+        }
+        Ok(None) => None,
+        Err(err) => Some(err),
     };
 
     // Before the identity: the cache holds the app's secrets and the identity
@@ -670,42 +623,6 @@ async fn remove_identity(
     match uninstall_failure {
         Some(err) => Err(err),
         None => Ok(()),
-    }
-}
-
-/// Tell Spice Cloud this instance is released, and report what happened.
-///
-/// Never fails the command: the release moves the registry row to `removed`
-/// immediately when it lands. Unreachable, the row reads `disconnected` until it
-/// is deleted in the portal, and the operator is told so.
-async fn report_release(
-    config_dir: &Path,
-    endpoint: Option<&str>,
-    identity: &runtime_cloud_connect::Identity,
-) {
-    let endpoint = resolved_endpoint(config_dir, endpoint);
-    let ca = (!identity.ca_bundle_pem.is_empty()).then_some(identity.ca_bundle_pem.as_str());
-
-    match runtime_cloud_connect::release::release(&endpoint, identity, ca).await {
-        Ok(outcome) => {
-            println!("Released this instance in Spice Cloud.");
-            if !outcome.status.is_empty() {
-                println!("  registry status: {}", outcome.status);
-            }
-            if let Some(app) = outcome.app_name {
-                println!(
-                    "  app {app} is paused — its deploy target was removed. Move it to another \
-                     instance, or delete it, in the Spice Cloud portal."
-                );
-            }
-        }
-        Err(err) => {
-            println!(
-                "Could not report the release to Spice Cloud at {endpoint}: {err} \
-                 Clearing local state anyway. The instance reads as disconnected in the portal \
-                 until you delete it there."
-            );
-        }
     }
 }
 
@@ -771,6 +688,238 @@ fn resolved_endpoint(config_dir: &Path, explicit: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::{CommandFactory as _, Parser as _};
+
+    /// A parser standing in for the real CLI, so the grammar under test is
+    /// exactly the one `spice connect ...` presents.
+    #[derive(clap::Parser, Debug)]
+    #[command(name = "spice")]
+    struct Harness {
+        #[command(subcommand)]
+        command: HarnessCommand,
+    }
+
+    #[derive(Subcommand, Debug)]
+    enum HarnessCommand {
+        Connect(ConnectArgs),
+    }
+
+    fn parse(args: &[&str]) -> Result<ConnectArgs, clap::Error> {
+        let harness = Harness::try_parse_from(args)?;
+        let HarnessCommand::Connect(connect) = harness.command;
+        Ok(connect)
+    }
+
+    fn service_command(args: &[&str]) -> service::cli::ServiceCommand {
+        let connect = parse(args).expect("the grammar must accept this");
+        match connect.command {
+            Some(ConnectCommand::Service(service_args)) => {
+                service_args.command.expect("an action was given")
+            }
+            other => panic!("expected a service action, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn every_service_action_parses() {
+        for action in [
+            "install",
+            "uninstall",
+            "start",
+            "stop",
+            "restart",
+            "status",
+            "logs",
+        ] {
+            let parsed = service_command(&["spice", "connect", "service", action]);
+            assert!(
+                format!("{parsed:?}").to_lowercase().starts_with(action),
+                "`spice connect service {action}` parsed as {parsed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn service_without_an_action_parses_and_selects_nothing() {
+        let connect = parse(&["spice", "connect", "service"]).expect("no action is valid");
+        match connect.command {
+            Some(ConnectCommand::Service(args)) => assert!(args.command.is_none()),
+            other => panic!("expected the service group, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn svc_is_a_hidden_alias_for_service() {
+        // The alias exists for interactive typing. It is asserted only here, so
+        // nothing else in the CLI can start documenting it as a second
+        // spelling.
+        let parsed = service_command(&["spice", "connect", "svc", "status"]);
+        assert!(matches!(parsed, service::cli::ServiceCommand::Status(_)));
+
+        let group = Harness::command();
+        let connect = group
+            .get_subcommands()
+            .find(|c| c.get_name() == "connect")
+            .expect("connect exists");
+        let service = connect
+            .get_subcommands()
+            .find(|c| c.get_name() == "service")
+            .expect("service exists");
+        assert!(
+            service.get_visible_aliases().next().is_none(),
+            "`svc` must not appear in generated help"
+        );
+    }
+
+    #[test]
+    fn install_is_a_subcommand_and_never_a_flag() {
+        // `--install` was the previous spelling; it must be gone so the
+        // documented grammar is the only one.
+        parse(&["spice", "connect", "--install"]).expect_err("--install must not parse");
+        assert!(matches!(
+            service_command(&["spice", "connect", "service", "install"]),
+            service::cli::ServiceCommand::Install
+        ));
+    }
+
+    #[test]
+    fn logs_defaults_to_one_hundred_lines() {
+        let service::cli::ServiceCommand::Logs(args) =
+            service_command(&["spice", "connect", "service", "logs"])
+        else {
+            panic!("expected logs");
+        };
+        assert_eq!(args.number, 100);
+        assert!(!args.follow);
+    }
+
+    #[test]
+    fn logs_accepts_a_count_and_a_follow_flag() {
+        for args in [
+            ["spice", "connect", "service", "logs", "-n", "500"],
+            ["spice", "connect", "service", "logs", "--number", "500"],
+        ] {
+            let service::cli::ServiceCommand::Logs(parsed) = service_command(&args) else {
+                panic!("expected logs");
+            };
+            assert_eq!(parsed.number, 500);
+        }
+
+        for args in [
+            ["spice", "connect", "service", "logs", "-f"],
+            ["spice", "connect", "service", "logs", "--follow"],
+        ] {
+            let service::cli::ServiceCommand::Logs(parsed) = service_command(&args) else {
+                panic!("expected logs");
+            };
+            assert!(parsed.follow);
+            assert_eq!(parsed.number, 100);
+        }
+
+        // `-n 0 -f` follows only new lines.
+        let service::cli::ServiceCommand::Logs(parsed) =
+            service_command(&["spice", "connect", "service", "logs", "-n", "0", "-f"])
+        else {
+            panic!("expected logs");
+        };
+        assert_eq!(parsed.number, 0);
+        assert!(parsed.follow);
+    }
+
+    #[test]
+    fn logs_rejects_tail_and_an_out_of_range_count() {
+        parse(&["spice", "connect", "service", "logs", "--tail"])
+            .expect_err("--tail is intentionally absent");
+        parse(&["spice", "connect", "service", "logs", "--tail", "50"])
+            .expect_err("--tail is intentionally absent");
+        parse(&["spice", "connect", "service", "logs", "-n", "100001"])
+            .expect_err("a count beyond the ceiling must be refused");
+        parse(&["spice", "connect", "service", "logs", "-n", "-1"])
+            .expect_err("a negative count must be refused");
+    }
+
+    #[test]
+    fn both_status_commands_accept_the_same_output_flag() {
+        for args in [
+            ["spice", "connect", "status", "--output", "json"],
+            ["spice", "connect", "status", "-o", "json"],
+        ] {
+            let connect = parse(&args).expect("status accepts --output");
+            assert!(connect.produces_json());
+        }
+
+        for args in [
+            ["spice", "connect", "service", "status", "--output", "json"],
+            ["spice", "connect", "service", "status", "-o", "json"],
+        ] {
+            let connect = parse(&args).expect("service status accepts --output");
+            assert!(connect.produces_json());
+        }
+
+        // Table is the default, and only `status` produces JSON.
+        assert!(
+            !parse(&["spice", "connect", "status"])
+                .expect("parse")
+                .produces_json()
+        );
+        assert!(
+            !parse(&["spice", "connect", "service", "logs"])
+                .expect("parse")
+                .produces_json()
+        );
+    }
+
+    #[test]
+    fn machine_mode_selects_json_for_both_status_commands() {
+        let mut connect = parse(&["spice", "connect", "status"]).expect("parse");
+        connect.apply_machine_mode();
+        assert!(connect.produces_json());
+
+        let mut connect = parse(&["spice", "connect", "service", "status"]).expect("parse");
+        connect.apply_machine_mode();
+        assert!(connect.produces_json());
+
+        // A lifecycle action has no structured form, so machine mode leaves it
+        // alone rather than inventing one.
+        let mut connect = parse(&["spice", "connect", "service", "restart"]).expect("parse");
+        connect.apply_machine_mode();
+        assert!(!connect.produces_json());
+    }
+
+    #[test]
+    fn dir_is_global_across_every_service_action() {
+        for action in [
+            "install",
+            "uninstall",
+            "start",
+            "stop",
+            "restart",
+            "status",
+            "logs",
+        ] {
+            let connect = parse(&["spice", "connect", "service", action, "--dir", "/srv/edge"])
+                .unwrap_or_else(|e| panic!("`--dir` must apply to `{action}`: {e}"));
+            assert_eq!(connect.dir.as_deref(), Some(Path::new("/srv/edge")));
+        }
+    }
+
+    #[test]
+    fn a_service_action_never_accepts_a_supervisor_name() {
+        // Resolution is by instance directory. Accepting a unit or label would
+        // let a command control a service belonging to another instance.
+        for args in [
+            ["spice", "connect", "service", "restart", "some.service"],
+            [
+                "spice",
+                "connect",
+                "service",
+                "logs",
+                "ai.spice.cloud-connect.x",
+            ],
+        ] {
+            parse(&args).expect_err("a service name must not be accepted");
+        }
+    }
 
     #[test]
     fn instance_dir_is_the_parent_of_a_dot_spice_config_dir() {
@@ -791,52 +940,52 @@ mod tests {
     }
 
     #[test]
-    fn a_malformed_identity_is_not_accepted_as_enrolled_state() {
+    fn a_malformed_identity_is_not_reported_as_enrolled() {
         let dir = tempfile::tempdir().expect("create tempdir");
         std::fs::write(dir.path().join(IDENTITY_FILE), "not valid JSON")
             .expect("write malformed identity");
 
         let error = has_enrolled_identity(dir.path())
-            .expect_err("a malformed identity must not enable service installation");
+            .expect_err("a malformed identity must not read as enrolled");
         assert!(error.to_string().contains("load identity"), "{error}");
     }
 
     #[test]
     fn resolved_endpoint_prefers_the_explicit_flag() {
-        let dir = std::env::temp_dir().join(format!("spice-connect-ep-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
+        let dir = tempfile::tempdir().expect("create tempdir");
         assert_eq!(
-            resolved_endpoint(&dir, Some("https://explicit.example")),
+            resolved_endpoint(dir.path(), Some("https://explicit.example")),
             "https://explicit.example"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn resolved_endpoint_reads_the_on_disk_override_then_the_default() {
-        let dir = std::env::temp_dir().join(format!("spice-connect-ep2-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("create scratch dir");
+        let dir = tempfile::tempdir().expect("create tempdir");
 
         // Nothing on disk: the built-in default.
         assert_eq!(
-            resolved_endpoint(&dir, None),
+            resolved_endpoint(dir.path(), None),
             runtime_cloud_connect::config::DEFAULT_ENDPOINT
         );
 
         // The override file wins over the default.
-        std::fs::write(dir.join(CLOUD_ENDPOINT_FILE), "https://override.example\n")
-            .expect("write override");
-        assert_eq!(resolved_endpoint(&dir, None), "https://override.example");
-
-        // A blank override is not an endpoint.
-        std::fs::write(dir.join(CLOUD_ENDPOINT_FILE), "  \n").expect("write blank override");
+        std::fs::write(
+            dir.path().join(CLOUD_ENDPOINT_FILE),
+            "https://override.example\n",
+        )
+        .expect("write override");
         assert_eq!(
-            resolved_endpoint(&dir, None),
-            runtime_cloud_connect::config::DEFAULT_ENDPOINT
+            resolved_endpoint(dir.path(), None),
+            "https://override.example"
         );
 
-        let _ = std::fs::remove_dir_all(&dir);
+        // A blank override is not an endpoint.
+        std::fs::write(dir.path().join(CLOUD_ENDPOINT_FILE), "  \n").expect("write blank override");
+        assert_eq!(
+            resolved_endpoint(dir.path(), None),
+            runtime_cloud_connect::config::DEFAULT_ENDPOINT
+        );
     }
 
     #[tokio::test]
@@ -881,5 +1030,62 @@ mod tests {
         );
 
         drop(active);
+    }
+
+    #[tokio::test]
+    async fn an_unconfirmed_release_keeps_every_piece_of_local_state() {
+        // The acceptance criterion: a transient Cloud failure must leave a
+        // directory a retry can finish the removal from. Clearing the identity
+        // first would orphan a registry row nobody local can release any more.
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let config_dir = dir.path().join(".spice");
+        std::fs::create_dir_all(&config_dir).expect("create config dir");
+
+        let identity_path = config_dir.join(IDENTITY_FILE);
+        let identity = runtime_cloud_connect::Identity {
+            identifier: "inst_test".to_string(),
+            ..test_identity()
+        };
+        runtime_cloud_connect::identity::IdentityStore::store(&identity_path, &identity)
+            .expect("store identity");
+        let cache_path = config_dir.join(runtime_cloud_connect::secret_cache::SECRET_CACHE_FILE);
+        std::fs::write(&cache_path, b"delivered-secrets").expect("write cache");
+
+        // A port nothing listens on: the release cannot be reported, which is
+        // exactly the transient failure under test.
+        let error = remove_identity(&config_dir, Some("http://127.0.0.1:1"), true)
+            .await
+            .expect_err("an unconfirmed release must fail the removal");
+        assert!(
+            error.to_string().contains("Nothing was removed locally"),
+            "{error}"
+        );
+        assert!(identity_path.exists(), "the identity must survive");
+        assert!(cache_path.exists(), "the delivered secrets must survive");
+    }
+
+    /// A syntactically complete identity whose key material is never used: the
+    /// removal path under test fails before it can sign anything.
+    fn test_identity() -> runtime_cloud_connect::Identity {
+        runtime_cloud_connect::Identity {
+            identifier: "inst_test".to_string(),
+            identity_cert_pem: "-----BEGIN CERTIFICATE-----\nAA==\n-----END CERTIFICATE-----\n"
+                .to_string(),
+            private_key_pem: "-----BEGIN PRIVATE KEY-----\nAA==\n-----END PRIVATE KEY-----\n"
+                .to_string(),
+            public_key_pem: "-----BEGIN PUBLIC KEY-----\nAA==\n-----END PUBLIC KEY-----\n"
+                .to_string(),
+            ca_bundle_pem: String::new(),
+            gateway_addr: "gateway.example:443".to_string(),
+            not_after_unix: None,
+            enc_private_key_pem: String::new(),
+            enc_public_key_pem: String::new(),
+            enc_previous_private_key_pem: String::new(),
+            cache_key_b64: String::new(),
+            app_id: None,
+            org_name: None,
+            app_name: None,
+            monitor_url: None,
+        }
     }
 }

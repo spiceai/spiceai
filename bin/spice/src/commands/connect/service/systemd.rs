@@ -18,11 +18,20 @@ limitations under the License.
 
 use std::path::{Path, PathBuf};
 
+use super::backend::{
+    InstallRequest, LogRequest, ServiceBackend, ServiceObservation, lifecycle_pending,
+};
+use super::manifest::ServiceManifest;
+use super::model::{LogSource, ServiceScope, ServiceStarts, ServiceState, Supervisor};
 use super::{InstalledService, PreflightFailure, SYSTEMD_RUNTIME_MARKER, ServiceAccount};
 use crate::error::{Error, Result};
 
 /// Directory systemd reads administrator-provided unit files from.
 const SYSTEMD_UNIT_DIR: &str = "/etc/systemd/system";
+
+/// Directory systemd reads a user's own unit files from, relative to the
+/// account's XDG config directory.
+const SYSTEMD_USER_UNIT_SUBDIR: &str = "systemd/user";
 
 /// Shared prefix of every unit this command installs. Also the glob root used
 /// to discover installed instances.
@@ -120,21 +129,45 @@ fn escape_systemd_path(path: &Path) -> Result<String> {
     Ok(escaped)
 }
 
-pub(super) fn preflight() -> std::result::Result<(), PreflightFailure> {
+/// Map a systemd `is-active` word onto the normalized vocabulary.
+///
+/// systemd's transient states are the reason this mapping exists: reporting
+/// `activating` verbatim would make every backend's words part of the public
+/// schema.
+fn normalize_systemd_state(reported: &str) -> ServiceState {
+    match reported.trim() {
+        // `reloading` is a running service applying a new configuration.
+        "active" | "active (reloading)" | "reloading" => ServiceState::Running,
+        "activating" => ServiceState::Starting,
+        "deactivating" => ServiceState::Stopping,
+        "inactive" => ServiceState::Stopped,
+        "failed" => ServiceState::Failed,
+        // Everything else, including systemd's own `unknown` for a unit it has
+        // no record of and the empty answer of a query that did not run. The
+        // definition file is what decides `not_installed`, so a unit systemd
+        // cannot account for is a reading, not an absence.
+        _ => ServiceState::Unavailable,
+    }
+}
+
+fn preflight(scope: ServiceScope) -> std::result::Result<(), PreflightFailure> {
     if !Path::new(SYSTEMD_RUNTIME_MARKER).is_dir() {
         return Err(PreflightFailure::SystemdUnavailable);
     }
-    if !super::is_root() {
-        return Err(PreflightFailure::NotRoot);
+    if scope == ServiceScope::User {
+        return Err(PreflightFailure::UserScopePending);
     }
     Ok(())
 }
 
-pub(super) fn install(
-    instance_dir: &Path,
-    config_dir: &Path,
-    spiced_path: &Path,
-) -> Result<InstalledService> {
+fn install(request: &InstallRequest<'_>) -> Result<InstalledService> {
+    let InstallRequest {
+        instance_dir,
+        config_dir,
+        spiced_path,
+        scope,
+    } = *request;
+
     let account = super::service_account(instance_dir)?;
     super::provision_config_ownership(config_dir, account)?;
 
@@ -143,25 +176,28 @@ pub(super) fn install(
     let staged_runtime = super::stage_runtime(spiced_path, |_, _| Ok(()))?;
 
     let name = unit_name_for_dir(instance_dir);
-    let path = PathBuf::from(SYSTEMD_UNIT_DIR).join(&name);
+    let dir = unit_dir(scope).ok_or_else(|| Error::CloudConnectIo {
+        message: "locate the systemd unit directory for this account".to_string(),
+    })?;
+    let path = dir.join(&name);
     let unit = render_unit(instance_dir, config_dir, &staged_runtime, account)?;
 
     std::fs::write(&path, unit).map_err(|e| Error::CloudConnectIo {
         message: format!(
             "write systemd unit {}: {e}. The identity is staged at {} — fix the problem \
-             and re-run `sudo spice connect --install` to finish.",
+             and re-run `spice connect service install` to finish.",
             path.display(),
             config_dir.display()
         ),
     })?;
 
-    systemctl(&["daemon-reload"])?;
+    systemctl(scope, &["daemon-reload"])?;
     // `enable --now` starts the service and persists the boot-time link in one
     // step. On a reinstall the unit is already enabled and already running, so
     // follow with an explicit restart to pick up the rewritten unit and the
     // upgraded binary — `enable --now` alone would leave the old process up.
-    systemctl(&["enable", "--now", &name])?;
-    systemctl(&["restart", &name])?;
+    systemctl(scope, &["enable", "--now", &name])?;
+    systemctl(scope, &["restart", &name])?;
 
     Ok(InstalledService {
         name,
@@ -171,91 +207,73 @@ pub(super) fn install(
     })
 }
 
-/// Stop, disable, and delete the unit for `instance_dir`.
+/// Stop, disable, and delete the unit the manifest describes.
 ///
 /// Stop/disable failures are tolerated — a unit file left on disk would restart
 /// a service against a released identity forever, so the deletion is what must
 /// happen.
-pub(super) fn uninstall(instance_dir: &Path) -> Result<Option<InstalledService>> {
-    let Some(unit) = find_for_dir(instance_dir) else {
-        return Ok(None);
-    };
-
+fn uninstall(manifest: &ServiceManifest) -> Result<()> {
     // Best-effort: a unit that is already stopped, already disabled, or whose
     // systemd is not running must not block removing the file.
-    if let Err(err) = systemctl(&["disable", "--now", &unit.name]) {
-        tracing::debug!("systemctl disable --now {}: {err}", unit.name);
+    if let Err(err) = systemctl(manifest.scope, &["disable", "--now", &manifest.name]) {
+        tracing::debug!("systemctl disable --now {}: {err}", manifest.name);
     }
 
-    std::fs::remove_file(&unit.path).map_err(|e| Error::CloudConnectIo {
-        message: format!(
-            "remove systemd unit {}: {e}. The service would keep restarting against a released \
-             identity — delete the file and run `sudo systemctl daemon-reload`.",
-            unit.path.display()
-        ),
-    })?;
+    match std::fs::remove_file(&manifest.definition_path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(Error::CloudConnectIo {
+                message: format!(
+                    "remove systemd unit {}: {e}. The service would keep restarting against a \
+                     released identity — delete the file and run `sudo systemctl daemon-reload`.",
+                    manifest.definition_path.display()
+                ),
+            });
+        }
+    }
 
-    if let Err(err) = systemctl(&["daemon-reload"]) {
+    if let Err(err) = systemctl(manifest.scope, &["daemon-reload"]) {
         tracing::debug!("systemctl daemon-reload: {err}");
     }
 
-    Ok(Some(unit))
+    Ok(())
 }
 
-pub(super) fn find_for_dir(instance_dir: &Path) -> Option<InstalledService> {
+/// The unit installed for `instance_dir` in `scope`, if the definition under
+/// this directory's derived name names this directory as its working directory.
+///
+/// The working-directory check is what makes this a verification rather than a
+/// search: a unit left behind by a directory that has since moved carries the
+/// same derived name, and taking it over would control an instance nobody asked
+/// about.
+pub(super) fn find_for_dir(instance_dir: &Path, scope: ServiceScope) -> Option<InstalledService> {
     let name = unit_name_for_dir(instance_dir);
-    let path = PathBuf::from(SYSTEMD_UNIT_DIR).join(&name);
+    let path = unit_dir(scope)?.join(&name);
     if !path.is_file() {
         return None;
     }
-    let unit = std::fs::read_to_string(&path).ok();
-    let working_dir = unit
-        .as_deref()
-        .and_then(parse_working_dir)
-        .unwrap_or_else(|| instance_dir.to_path_buf());
-    let runtime = unit
-        .as_deref()
-        .and_then(parse_exec_runtime)
-        .unwrap_or_else(super::staged_runtime_path);
+    let unit = std::fs::read_to_string(&path).ok()?;
+    if parse_working_dir(&unit)? != instance_dir {
+        return None;
+    }
+    let runtime = parse_exec_runtime(&unit).unwrap_or_else(super::staged_runtime_path);
     Some(InstalledService {
         name,
         path,
-        working_dir,
+        working_dir: instance_dir.to_path_buf(),
         runtime,
     })
 }
 
-pub(super) fn discover_all() -> Vec<InstalledService> {
-    let Ok(entries) = std::fs::read_dir(SYSTEMD_UNIT_DIR) else {
-        return Vec::new();
-    };
-
-    let mut units: Vec<InstalledService> = entries
-        .filter_map(std::result::Result::ok)
-        .filter_map(|entry| {
-            let path = entry.path();
-            let name = path.file_name()?.to_str()?.to_string();
-            if !name.starts_with(UNIT_PREFIX) || !name.ends_with(UNIT_SUFFIX) {
-                return None;
-            }
-            // Skip a symlink systemd itself created (the `multi-user.target.wants`
-            // links live elsewhere, but a hand-made alias here would double-report).
-            if !path.is_file() {
-                return None;
-            }
-            let unit = std::fs::read_to_string(&path).ok()?;
-            let working_dir = parse_working_dir(&unit)?;
-            let runtime = parse_exec_runtime(&unit).unwrap_or_else(super::staged_runtime_path);
-            Some(InstalledService {
-                name,
-                path,
-                working_dir,
-                runtime,
-            })
-        })
-        .collect();
-    units.sort_by(|a, b| a.name.cmp(&b.name));
-    units
+/// Where units of `scope` live. `None` when the account has no discoverable
+/// configuration directory, which is the one case a user unit path cannot be
+/// derived from.
+fn unit_dir(scope: ServiceScope) -> Option<PathBuf> {
+    match scope {
+        ServiceScope::System => Some(PathBuf::from(SYSTEMD_UNIT_DIR)),
+        ServiceScope::User => Some(dirs::config_dir()?.join(SYSTEMD_USER_UNIT_SUBDIR)),
+    }
 }
 
 /// Parse the `WorkingDirectory=` value out of a rendered unit.
@@ -330,34 +348,126 @@ fn unit_directive<'a>(unit: &'a str, key: &str) -> Option<&'a str> {
 
 /// The service's current state as `systemctl is-active` reports it
 /// (`active`, `inactive`, `failed`, …), or `None` when it cannot be determined.
-pub(super) fn is_active(unit_name: &str) -> Option<String> {
-    let output = std::process::Command::new("systemctl")
-        .arg("is-active")
-        .arg(unit_name)
-        .output()
-        .ok()?;
+fn is_active(unit_name: &str, scope: ServiceScope) -> Option<String> {
     // `is-active` exits non-zero for anything but `active`, and prints the
     // state either way — so read stdout regardless of the exit status.
-    let state = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let state = systemctl_query(scope, &["is-active", unit_name])?;
     (!state.is_empty()).then_some(state)
 }
 
-pub(super) fn manage_hints(unit_name: &str) -> Vec<String> {
+/// Observe the unit: the state systemd reports plus whether it will come back
+/// on its own.
+fn observe(manifest: &ServiceManifest) -> ServiceObservation {
+    let Some(reported) = is_active(&manifest.name, manifest.scope) else {
+        return ServiceObservation::unavailable(format!(
+            "systemctl could not be asked about {}. Check that systemd is running and that this \
+             account may query it ({}).",
+            manifest.name,
+            systemctl_command(manifest.scope, &["is-active", &manifest.name])
+        ));
+    };
+    let (starts, starts_action) = observe_persistence(manifest);
+    ServiceObservation {
+        state: normalize_systemd_state(&reported),
+        starts,
+        diagnostic: None,
+        starts_action,
+    }
+}
+
+/// Whether the unit is enabled, translated into the operator outcome.
+///
+/// A system unit that is enabled comes up at boot with nobody logged in. A
+/// *user* unit that is enabled comes up when its owner logs in and no earlier
+/// unless that account lingers, so the conservative answer is `login_only`
+/// plus the command that changes it — claiming boot persistence that is not
+/// there is the failure this avoids.
+fn observe_persistence(manifest: &ServiceManifest) -> (ServiceStarts, Option<String>) {
+    let Some(enabled) = systemctl_query(manifest.scope, &["is-enabled", &manifest.name]) else {
+        return (ServiceStarts::Unavailable, None);
+    };
+    let enabled = matches!(
+        enabled.as_str(),
+        "enabled" | "enabled-runtime" | "static" | "alias" | "indirect" | "generated"
+    );
+    if !enabled {
+        return (
+            ServiceStarts::Disabled,
+            Some(systemctl_command(
+                manifest.scope,
+                &["enable", &manifest.name],
+            )),
+        );
+    }
+    match manifest.scope {
+        ServiceScope::System => (ServiceStarts::BootWithoutLogin, None),
+        ServiceScope::User => (
+            ServiceStarts::LoginOnly,
+            Some(format!(
+                "loginctl enable-linger {}",
+                manifest.owner.describe()
+            )),
+        ),
+    }
+}
+
+fn recovery_hints(manifest: &ServiceManifest) -> Vec<String> {
+    let scope = manifest.scope;
+    let name = &manifest.name;
     vec![
-        format!("systemctl status {unit_name}"),
-        format!("journalctl -u {unit_name} -f"),
+        systemctl_command(scope, &["status", name]),
+        match scope {
+            ServiceScope::System => format!("journalctl -u {name} -f"),
+            ServiceScope::User => format!("journalctl --user -u {name} -f"),
+        },
     ]
+}
+
+/// The `--user` flag every `systemctl` invocation for a user service needs.
+fn scope_args(scope: ServiceScope) -> &'static [&'static str] {
+    match scope {
+        ServiceScope::System => &[],
+        ServiceScope::User => &["--user"],
+    }
+}
+
+/// The command line as an operator would type it, for messages that ask them
+/// to run it themselves.
+fn systemctl_command(scope: ServiceScope, args: &[&str]) -> String {
+    let mut parts = Vec::with_capacity(args.len() + 2);
+    if scope == ServiceScope::System && !super::is_root() {
+        parts.push("sudo");
+    }
+    parts.push("systemctl");
+    parts.extend(scope_args(scope));
+    parts.extend(args);
+    parts.join(" ")
+}
+
+/// Ask `systemctl` a question and return its trimmed stdout.
+///
+/// The exit status is ignored on purpose: the query commands report their
+/// answer on stdout and use the exit status to encode that answer. `None`
+/// means `systemctl` could not be run at all.
+fn systemctl_query(scope: ServiceScope, args: &[&str]) -> Option<String> {
+    let output = std::process::Command::new("systemctl")
+        .args(scope_args(scope))
+        .args(args)
+        .output()
+        .ok()?;
+    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
 /// Run `systemctl <args>`, turning a non-zero exit into an error carrying
 /// systemd's own stderr — which names the actual problem far better than an
 /// exit code.
-fn systemctl(args: &[&str]) -> Result<()> {
+fn systemctl(scope: ServiceScope, args: &[&str]) -> Result<()> {
     let output = std::process::Command::new("systemctl")
+        .args(scope_args(scope))
         .args(args)
         .output()
         .map_err(|e| Error::CloudConnectIo {
-            message: format!("run `systemctl {}`: {e}", args.join(" ")),
+            message: format!("run `{}`: {e}", systemctl_command(scope, args)),
         })?;
 
     if output.status.success() {
@@ -367,8 +477,8 @@ fn systemctl(args: &[&str]) -> Result<()> {
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
     Err(Error::CloudConnectIo {
         message: format!(
-            "`systemctl {}` failed: {}",
-            args.join(" "),
+            "`{}` failed: {}",
+            systemctl_command(scope, args),
             if stderr.is_empty() {
                 format!("exit status {}", output.status)
             } else {
@@ -378,9 +488,99 @@ fn systemctl(args: &[&str]) -> Result<()> {
     })
 }
 
+/// The Linux back end.
+pub(super) struct SystemdBackend;
+
+impl ServiceBackend for SystemdBackend {
+    fn supervisor(&self) -> Supervisor {
+        Supervisor::Systemd
+    }
+
+    fn preflight(&self, scope: ServiceScope) -> std::result::Result<(), PreflightFailure> {
+        preflight(scope)
+    }
+
+    fn name_for_dir(&self, instance_dir: &Path) -> String {
+        unit_name_for_dir(instance_dir)
+    }
+
+    fn definition_path(&self, name: &str, scope: ServiceScope) -> PathBuf {
+        unit_dir(scope)
+            .unwrap_or_else(|| PathBuf::from(SYSTEMD_UNIT_DIR))
+            .join(name)
+    }
+
+    fn log_source(&self, name: &str, scope: ServiceScope) -> Option<LogSource> {
+        Some(LogSource::Journal {
+            unit: name.to_string(),
+            scope,
+        })
+    }
+
+    fn find_installed(&self, instance_dir: &Path, scope: ServiceScope) -> Option<InstalledService> {
+        find_for_dir(instance_dir, scope)
+    }
+
+    fn install(&self, request: &InstallRequest<'_>) -> Result<InstalledService> {
+        install(request)
+    }
+
+    fn uninstall(&self, manifest: &ServiceManifest) -> Result<()> {
+        uninstall(manifest)
+    }
+
+    fn start(&self, manifest: &ServiceManifest) -> Result<()> {
+        Err(lifecycle_pending(self, "start", manifest))
+    }
+
+    fn stop(&self, manifest: &ServiceManifest) -> Result<()> {
+        Err(lifecycle_pending(self, "stop", manifest))
+    }
+
+    fn restart(&self, manifest: &ServiceManifest) -> Result<()> {
+        Err(lifecycle_pending(self, "restart", manifest))
+    }
+
+    fn observe(&self, manifest: &ServiceManifest) -> ServiceObservation {
+        observe(manifest)
+    }
+
+    fn logs(&self, manifest: &ServiceManifest, _request: LogRequest) -> Result<()> {
+        Err(lifecycle_pending(self, "read the logs of", manifest))
+    }
+
+    fn recovery_hints(&self, manifest: &ServiceManifest) -> Vec<String> {
+        recovery_hints(manifest)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_systemd_state_normalizes() {
+        for (reported, expected) in [
+            ("active", ServiceState::Running),
+            ("reloading", ServiceState::Running),
+            ("activating", ServiceState::Starting),
+            ("deactivating", ServiceState::Stopping),
+            ("inactive", ServiceState::Stopped),
+            ("failed", ServiceState::Failed),
+            ("unknown", ServiceState::Unavailable),
+            ("", ServiceState::Unavailable),
+            // A word a future systemd invents must not be published raw.
+            ("maintenance", ServiceState::Unavailable),
+        ] {
+            assert_eq!(
+                normalize_systemd_state(reported),
+                expected,
+                "systemd `{reported}`"
+            );
+        }
+        // `is-active` output arrives with a trailing newline.
+        assert_eq!(normalize_systemd_state("active\n"), ServiceState::Running);
+    }
 
     const TEST_ACCOUNT: ServiceAccount = ServiceAccount {
         uid: 1000,
@@ -544,15 +744,109 @@ mod tests {
         );
     }
 
+    /// A manifest for the unit under test, without touching the filesystem.
+    fn manifest(scope: ServiceScope) -> ServiceManifest {
+        let name = unit_name_for_dir(Path::new("/opt/edge-1"));
+        ServiceManifest {
+            schema_version: super::super::manifest::MANIFEST_SCHEMA_VERSION,
+            directory: PathBuf::from("/opt/edge-1"),
+            name: name.clone(),
+            scope,
+            supervisor: Supervisor::Systemd,
+            owner: super::super::ServiceOwner {
+                uid: 1000,
+                gid: 1000,
+                name: Some("alice".to_string()),
+            },
+            definition_path: SystemdBackend.definition_path(&name, scope),
+            runtime_path: super::super::staged_runtime_path(),
+            log_source: SystemdBackend.log_source(&name, scope),
+            runtime_digest: String::new(),
+            runtime_version: "v2.2.0".to_string(),
+            health_url: "http://127.0.0.1:8090/health".to_string(),
+        }
+    }
+
     #[test]
-    fn manage_hints_name_the_unit() {
-        let hints = manage_hints("spiced-cloud-connect-edge-1-1a2b3c4d.service");
-        assert_eq!(
-            hints,
-            vec![
-                "systemctl status spiced-cloud-connect-edge-1-1a2b3c4d.service",
-                "journalctl -u spiced-cloud-connect-edge-1-1a2b3c4d.service -f",
-            ]
+    fn recovery_hints_name_the_unit_in_its_own_domain() {
+        let system = recovery_hints(&manifest(ServiceScope::System));
+        assert!(
+            system[0].ends_with(&format!(
+                "systemctl status {}",
+                manifest(ServiceScope::System).name
+            )),
+            "{system:?}"
         );
+        assert!(system[1].starts_with("journalctl -u "), "{system:?}");
+
+        // A user service is managed by its owning account's own manager, so
+        // every command has to name that manager rather than root's.
+        let user = recovery_hints(&manifest(ServiceScope::User));
+        assert!(user[0].contains("systemctl --user status"), "{user:?}");
+        assert!(user[1].starts_with("journalctl --user -u "), "{user:?}");
+        assert!(
+            !user.iter().any(|hint| hint.starts_with("sudo")),
+            "a user service must never be driven through sudo: {user:?}"
+        );
+    }
+
+    #[test]
+    fn a_user_unit_lives_under_the_accounts_own_configuration() {
+        let name = unit_name_for_dir(Path::new("/opt/edge-1"));
+        let system = SystemdBackend.definition_path(&name, ServiceScope::System);
+        let user = SystemdBackend.definition_path(&name, ServiceScope::User);
+        assert!(system.starts_with(SYSTEMD_UNIT_DIR), "{system:?}");
+        assert_ne!(system, user);
+    }
+
+    #[test]
+    fn the_log_source_is_the_journal_for_the_units_own_domain() {
+        let name = unit_name_for_dir(Path::new("/opt/edge-1"));
+        assert_eq!(
+            SystemdBackend.log_source(&name, ServiceScope::System),
+            Some(LogSource::Journal {
+                unit: name.clone(),
+                scope: ServiceScope::System
+            })
+        );
+        assert_eq!(
+            SystemdBackend.log_source(&name, ServiceScope::User),
+            Some(LogSource::Journal {
+                unit: name,
+                scope: ServiceScope::User
+            })
+        );
+    }
+
+    #[test]
+    fn a_user_scope_install_is_refused_rather_than_half_performed() {
+        // The systemd user lifecycle is separate work; asking for it must name
+        // the path that does work instead of writing a unit nothing manages.
+        assert!(matches!(
+            preflight(ServiceScope::User),
+            Err(PreflightFailure::UserScopePending | PreflightFailure::SystemdUnavailable)
+        ));
+    }
+
+    #[test]
+    fn every_lifecycle_action_reports_itself_as_pending_rather_than_panicking() {
+        let manifest = manifest(ServiceScope::System);
+        for result in [
+            SystemdBackend.start(&manifest),
+            SystemdBackend.stop(&manifest),
+            SystemdBackend.restart(&manifest),
+            SystemdBackend.logs(
+                &manifest,
+                super::super::LogRequest {
+                    number: 100,
+                    follow: false,
+                },
+            ),
+        ] {
+            let error = result.expect_err("the lifecycle is not implemented yet");
+            assert!(matches!(error, Error::NotImplemented { .. }), "{error}");
+            // The refusal has to leave the operator with something they can run.
+            assert!(error.to_string().contains("systemctl"), "{error}");
+        }
     }
 }

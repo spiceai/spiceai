@@ -43,7 +43,7 @@ dotenv.workspace = true
 # Cross-platform directories
 dirs = "6"
 
-# Deterministic per-instance-directory service names (`spice connect --install`)
+# Deterministic per-instance-directory service names (`spice connect service`)
 sha2.workspace = true
 
 # Semver comparison
@@ -110,7 +110,7 @@ test-framework = { path = "../../crates/test-framework" }
 # Tracing/opentelemetry for trace ID handling
 opentelemetry.workspace = true
 
-# Unix signal handling, and the effective-uid check `spice connect --install` gates on
+# Unix signal handling, and the effective-uid check `spice connect service` gates on
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.29", features = ["signal", "process", "user"] }
 [build-dependencies]
