@@ -223,6 +223,14 @@ resolve_with_tmp() {
   # interrupted or failed run over the file.
   if [ "$merge_status" -ge 1 ] && [ "$merge_status" -le 127 ]; then
     cp -- "$tmp/merged" "$path" || die "could not write $path"
+    # The mode both sides agreed on has to survive here too, or staging the
+    # resolved conflict later records whatever the worktree happened to have.
+    # chmod rather than update-index, because this path stays unmerged on
+    # purpose; ./ because BSD chmod has no -- for a name beginning with a dash.
+    case "$agreed_mode" in
+      100755) chmod +x "./$path" || die "could not restore the executable bit on $path" ;;
+      100644) chmod -x "./$path" || die "could not clear the executable bit on $path" ;;
+    esac
     echo "CONFLICT $path: correctly based markers written, left unstaged"
     return 1
   fi

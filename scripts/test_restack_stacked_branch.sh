@@ -1336,6 +1336,30 @@ start_test "resolve refuses a conflicted path that is a hard link"
     fail_test "the other name for the inode was rewritten"
 ) || failures=$((failures + 1))
 
+start_test "resolve keeps the agreed executable bit on a real conflict too"
+(
+  new_stack "$work_root/conflictmode"
+  printf 'a\nb\nc\n' > run.sh && chmod +x run.sh && commit_all "fork point"
+  git checkout --quiet -b parent
+  printf 'a\nPARENT\nc\n' > run.sh && commit_all "parent edits line 2"
+  stack_base=$(git rev-parse HEAD)
+  git checkout --quiet -b child
+  printf 'a\nCHILD\nc\n' > run.sh && commit_all "child edits line 2"
+  squash_parent_onto_trunk
+  printf 'a\nTRUNK\nc\n' > run.sh && commit_all "trunk edits line 2"
+  git checkout --quiet child
+  git merge --no-ff --no-commit trunk >/dev/null 2>&1
+  chmod -x run.sh
+
+  output=$("$subject" resolve "$stack_base" run.sh 2>/dev/null)
+  status=$?
+  [ "$status" -eq 1 ] || fail_test "expected exit 1 for a real conflict, got $status ($output)"
+  # The markers are written for a person to resolve, and staging that resolution
+  # must not record a mode neither side asked for.
+  [ -x run.sh ] || fail_test "the conflicted worktree copy is not executable"
+  [ -n "$(git ls-files -u -- run.sh)" ] || fail_test "the path was resolved without a human"
+) || failures=$((failures + 1))
+
 start_test "resolve refuses a conflicted path replaced by a directory"
 (
   new_stack "$work_root/worktree_dir"
