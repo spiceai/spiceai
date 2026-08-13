@@ -112,18 +112,10 @@ impl TeiRerank {
         .into_iter()
         .collect();
 
-        // Hard-linking the artifacts into a scratch directory is synchronous filesystem
-        // I/O; run it on a blocking-safe thread so it doesn't stall the Tokio worker.
-        let model_root = tokio::task::spawn_blocking(move || link_files_into_tmp_dir(files))
-            .await
-            .map_err(|e| Error::LocalModelLoadFailed {
-                model: name.clone(),
-                source: Box::new(e),
-            })?
-            .map_err(|e| Error::LocalModelLoadFailed {
-                model: name.clone(),
-                source: Box::new(e),
-            })?;
+        let model_root = link_files_into_tmp_dir(files).map_err(|e| Error::LocalModelLoadFailed {
+            model: name.clone(),
+            source: Box::new(e),
+        })?;
         Self::from_dir(name, &model_root, max_seq_length_overwrite, truncation).await
     }
 
@@ -137,12 +129,11 @@ impl TeiRerank {
     ) -> Result<Self> {
         let name = name.into();
 
-        let (_, _, token) = load_tokenization(root, max_seq_length_overwrite)
-            .await
-            .boxed()
-            .context(LocalModelLoadFailedSnafu {
+        let (_, _, token) = load_tokenization(root, max_seq_length_overwrite).boxed().context(
+            LocalModelLoadFailedSnafu {
                 model: name.clone(),
-            })?;
+            },
+        )?;
 
         // A cross-encoder reranker is a sequence-classification model: load it
         // with `Classifier` (no pooling) so `Infer::predict` — gated on

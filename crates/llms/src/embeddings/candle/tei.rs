@@ -85,12 +85,7 @@ impl TeiEmbed {
         .into_iter()
         .collect();
 
-        // Hard-linking the artifacts into a scratch directory is synchronous filesystem
-        // I/O; run it on a blocking-safe thread so it doesn't stall the Tokio worker.
-        let model_root = tokio::task::spawn_blocking(move || link_files_into_tmp_dir(files))
-            .await
-            .boxed()
-            .context(FailedToInstantiateEmbeddingModelSnafu)??;
+        let model_root = link_files_into_tmp_dir(files)?;
         tracing::trace!(
             "Embedding model has files linked at location={:?}",
             model_root
@@ -154,7 +149,7 @@ impl TeiEmbed {
         max_seq_length_overwrite: Option<usize>,
         truncation: Option<TruncationDirection>,
     ) -> Result<Self> {
-        let (tokenizer, config, token) = load_tokenization(root, max_seq_length_overwrite).await?;
+        let (tokenizer, config, token) = load_tokenization(root, max_seq_length_overwrite)?;
 
         // Load [`Backend`]
         // TODO: add pooling parameter from https://github.com/spiceai/spiceai/pull/3174
