@@ -86,6 +86,9 @@ fn shared_params(port: u16) -> ReplicationParams {
         pg_output_format: PgOutputFormat::Binary,
         unclaimed_reservation_grace:
             data_components::postgres_replication::shared::DEFAULT_UNCLAIMED_RESERVATION_GRACE,
+        // Short enough that the idle carry-forward is exercised within a test rather
+        // than waited on; the production default is coarse on purpose.
+        watermark_flush_interval: Duration::from_secs(1),
         ready_lag: Duration::from_secs(2),
     }
 }
@@ -127,6 +130,9 @@ fn independent_input(port: u16, table: &str) -> ReplicationStreamInput {
 #[derive(Default)]
 struct InMemoryAppliedLsnStore {
     recorded: std::sync::Mutex<Option<AppliedLsn>>,
+    /// Successful writes, so a test can assert on how *often* a position is
+    /// recorded and not only on its value.
+    saves: std::sync::atomic::AtomicUsize,
 }
 
 impl InMemoryAppliedLsnStore {
@@ -150,6 +156,10 @@ impl InMemoryAppliedLsnStore {
             .expect("watermark mutex")
             .map(|applied| applied.lsn)
     }
+
+    fn saves(&self) -> usize {
+        self.saves.load(std::sync::atomic::Ordering::Acquire)
+    }
 }
 
 #[async_trait::async_trait]
@@ -169,6 +179,7 @@ impl AppliedLsnStore for InMemoryAppliedLsnStore {
         applied: AppliedLsn,
     ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
         *self.recorded.lock().expect("watermark mutex") = Some(applied);
+        self.saves.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         Ok(())
     }
 
@@ -1136,6 +1147,11 @@ async fn shared_and_independent_slots_coexist() -> Result<(), anyhow::Error> {
     Ok(())
 }
 
+/// Postgres `pg_lsn` text form of a numeric LSN, for comparisons in SQL.
+fn lsn_text(lsn: u64) -> String {
+    format!("{:X}/{:X}", lsn >> 32, lsn & 0xFFFF_FFFF)
+}
+
 /// Whether the slot has acknowledged everything up to `lsn` — the point past
 /// which Postgres is free to recycle that WAL. Returns the verdict and the
 /// slot's current `confirmed_flush_lsn` for the assertion message.
@@ -1218,6 +1234,140 @@ async fn a_bootstrap_lost_before_it_was_durable_is_reloaded_not_resumed()
          history_unavailable={}",
         num_rows(&envelope),
         envelope.history_unavailable()
+    );
+    envelope.commit().await?;
+
+    drop(restarted);
+    wait_for_walsender_count(&source, 0).await?;
+    drop_replication_slot_when_inactive(&source, SLOT).await?;
+    source
+        .simple_query(&format!("DROP PUBLICATION IF EXISTS {PUBLICATION}"))
+        .await?;
+    Ok(())
+}
+
+/// The counterpart to the rebuild tests: a dataset that simply restarts must
+/// **resume**, not rebuild. Without this, a rule that classifies gaps too eagerly
+/// passes every rebuild test while re-reading the whole table on every restart.
+///
+/// The case that makes this easy to get wrong is a *quiet* table. The slot's
+/// acknowledgement is advanced for an idle member by the pump's keepalive crediting,
+/// which routes no envelope and therefore records no watermark — so the slot's
+/// `confirmed_flush_lsn` legitimately drifts ahead of the last position the
+/// acceleration recorded as applied. That drift is not a gap: crediting only covers
+/// WAL that contained no changes for this table. Treating it as one would rebuild a
+/// healthy acceleration on every restart.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_quiet_dataset_resumes_across_a_restart_rather_than_rebuilding()
+-> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("data_components::postgres_replication=debug,info"));
+
+    let port = common::get_random_port()?;
+    let _container = common::start_postgres_docker_container_with_logical_wal(port).await?;
+    let port = u16::try_from(port).expect("port fits in u16");
+    let source = pg_client(port).await?;
+
+    create_table(&source, "quiet", &[(1, "one")]).await?;
+
+    // --- 1. Bootstrap and commit, so a position is recorded, then let the table go
+    // quiet while a second table's traffic keeps the slot acknowledging forward. ---
+    let store = InMemoryAppliedLsnStore::shared();
+    let mut quiet = start_replication_stream(input_with_watermark(port, "quiet", &store));
+    next_envelope(&mut quiet, "bootstrap quiet")
+        .await?
+        .commit()
+        .await?;
+    wait_for_ready(&mut quiet, "quiet readiness")
+        .await?
+        .commit()
+        .await?;
+    let recorded = store
+        .recorded_lsn()
+        .ok_or_else(|| anyhow::anyhow!("the member must record a position while attached"))?;
+
+    // Drive the slot's acknowledgement past the quiet table's recorded position using
+    // WAL that contains nothing for it. This is the benign drift the rule must not
+    // mistake for a gap; the test asserts it was actually reached.
+    let flush_every = input_for(port, "quiet").params.watermark_flush_interval;
+    let drift_started = std::time::Instant::now();
+    create_table(&source, "noisy", &[(1, "n1")]).await?;
+    let mut noisy = start_replication_stream(input_for(port, "noisy"));
+    next_envelope(&mut noisy, "bootstrap noisy")
+        .await?
+        .commit()
+        .await?;
+
+    let deadline = std::time::Instant::now() + Duration::from_mins(1);
+    let mut drifted = false;
+    let mut churn_id = 100;
+    while std::time::Instant::now() < deadline {
+        churn_id += 1;
+        source
+            .execute(
+                "INSERT INTO public.noisy (id, name) VALUES ($1, 'churn')",
+                &[&churn_id],
+            )
+            .await?;
+        if let Ok(envelope) = next_envelope(&mut noisy, "noisy churn").await {
+            envelope.commit().await?;
+        }
+        if let Ok(envelope) = next_envelope(&mut quiet, "quiet heartbeat").await {
+            envelope.commit().await?;
+        }
+        let (past, _) = slot_acked_past(&source, &lsn_text(recorded)).await?;
+        if past {
+            drifted = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    anyhow::ensure!(
+        drifted,
+        "the test could not reach the state it exists to cover: the slot never acknowledged past \
+         the quiet table's recorded position, so no drift was constructed"
+    );
+
+    // --- 2. Restart the quiet dataset against the position it recorded. The slot is
+    // acknowledged past it, but only over WAL that held nothing for this table. ---
+    drop(quiet);
+    drop(noisy);
+    wait_for_walsender_count(&source, 0).await?;
+
+    // The carry-forward has to have actually run — otherwise this test would also
+    // pass on a build that simply never rebuilds — and it has to be paced by
+    // `watermark_flush_interval` rather than firing on every keepalive. The quiet
+    // table sees no changes, so every save past its boundary envelope is a
+    // carry-forward.
+    let saves = store.saves();
+    let elapsed_ticks = drift_started.elapsed().as_secs_f64() / flush_every.as_secs_f64();
+    anyhow::ensure!(
+        saves > 1,
+        "the quiet table's recorded position was never carried forward ({saves} write(s) total), \
+         so this test would pass for the wrong reason"
+    );
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "counter is small; the comparison is a loose bound"
+    )]
+    let saves_f = saves as f64;
+    // Integration-test worker logs are dropped, so print the measurement.
+    eprintln!(
+        "quiet-member position writes: {saves} over {elapsed_ticks:.1} flush interval(s) of {flush_every:?}"
+    );
+    anyhow::ensure!(
+        saves_f <= elapsed_ticks + 3.0,
+        "the recorded position is being written far more often than once per flush interval \
+         ({saves} writes over {elapsed_ticks:.1} intervals), which would put avoidable I/O on \
+         every idle member of every shared slot"
+    );
+
+    let mut restarted = start_replication_stream(input_with_watermark(port, "quiet", &store));
+    let envelope = next_envelope(&mut restarted, "first envelope after the restart").await?;
+    anyhow::ensure!(
+        !envelope.history_unavailable(),
+        "a quiet dataset was asked to rebuild after an ordinary restart. The slot's acknowledgement \
+         drifting ahead of the recorded position through idle crediting is not a gap, and treating \
+         it as one re-reads the whole table on every restart"
     );
     envelope.commit().await?;
 
@@ -1319,9 +1469,6 @@ async fn a_dataset_re_added_after_its_reservation_lapsed_does_not_silently_skip_
     // for the absent table; after the grace lapses, its own traffic carries the
     // slot's acknowledgement past the missed change. ---
     let mut mate = start_replication_stream(short_grace(input_for(port, "lapsed_mate")));
-    expect_single_change(&mut mate, "mate resume", "c", 1)
-        .await
-        .or_else(|_| Ok::<(), anyhow::Error>(()))?;
 
     // Committing the mate's envelopes — including its idle heartbeats — is what
     // carries the slot's acknowledgement forward; the reservation for the absent
@@ -1353,23 +1500,46 @@ async fn a_dataset_re_added_after_its_reservation_lapsed_does_not_silently_skip_
          the absent table's change, so the reservation never lapsed"
     );
 
-    // --- 5. The dataset is re-added, carrying the position it recorded before it
+    // --- 5. Releasing the hold also drops the table from the publication, which
+    // on its own would send a returning dataset through the initial-snapshot path
+    // (`table_added = true`) and recover it for a reason that has nothing to do
+    // with its recorded position. Put the table back with no member attached, so
+    // the re-add sees `table_added = false` and recovery has to come from the
+    // recorded position — either replaying from it, or reporting that the history
+    // it needs is gone.
+    source
+        .simple_query(&format!(
+            "ALTER PUBLICATION {PUBLICATION} ADD TABLE public.lapsed_absent"
+        ))
+        .await
+        .ok();
+
+    // --- 6. The dataset is re-added, carrying the position it recorded before it
     // left. Either outcome is correct; resuming into live traffic is not. ---
     let mut re_added = start_replication_stream(short_grace(input_with_watermark(
         port,
         "lapsed_absent",
         &InMemoryAppliedLsnStore::seeded(recorded),
     )));
-    let envelope = next_envelope(&mut re_added, "re-added dataset's first envelope").await?;
-    let recovered = envelope.history_unavailable() || ids_of(&envelope).contains(&2);
+    // Idle heartbeats carry no rows and are not an answer either way, so commit
+    // past them and wait for one of the two acceptable outcomes: the missed change
+    // replayed, or a report that the history needed to replay it is gone.
+    let deadline = std::time::Instant::now() + Duration::from_secs(45);
+    let mut recovered = false;
+    while std::time::Instant::now() < deadline {
+        let envelope = next_envelope(&mut re_added, "re-added dataset envelope").await?;
+        recovered = envelope.history_unavailable() || ids_of(&envelope).contains(&2);
+        envelope.commit().await?;
+        if recovered {
+            break;
+        }
+    }
     anyhow::ensure!(
         recovered,
         "a dataset re-added after its reservation lapsed neither received the change committed \
          while it was gone (id=2) nor asked to be rebuilt — it resumed as if nothing were missing \
-         (#11289). First envelope carried ids {:?}",
-        ids_of(&envelope)
+         (#11289)"
     );
-    envelope.commit().await?;
 
     drop(mate);
     drop(re_added);

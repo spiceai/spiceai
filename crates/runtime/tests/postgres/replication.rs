@@ -80,6 +80,8 @@ fn params_for(port: u16, slot_name: &str, publication_name: &str) -> Replication
         pg_output_format: PgOutputFormat::Binary,
         unclaimed_reservation_grace:
             data_components::postgres_replication::shared::DEFAULT_UNCLAIMED_RESERVATION_GRACE,
+        watermark_flush_interval:
+            data_components::postgres_replication::shared::DEFAULT_WATERMARK_FLUSH_INTERVAL,
         ready_lag: Duration::from_secs(2),
     }
 }

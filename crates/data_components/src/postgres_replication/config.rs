@@ -97,6 +97,18 @@ pub struct ReplicationParams {
     /// slot would be wrong.
     pub ephemeral_accelerator: bool,
     pub status_interval: Duration,
+    /// How often an idle member's durably-recorded applied position is carried
+    /// forward to what the slot has acknowledged on its behalf (see
+    /// `shared::flush_idle_watermarks`). Internal, not a user param.
+    ///
+    /// Coarse on purpose. The record only has to be current enough that the *next*
+    /// start does not mistake ordinary idle drift for a gap, and a graceful shutdown
+    /// flushes once more regardless — so this interval governs only how much a
+    /// *crash* can leave behind, where the cost is one rebuild and never a wrong
+    /// resume. Each tick writes at most one small blob per member whose position
+    /// actually moved, into that dataset's own accelerator; a busy member records its
+    /// position through its own commits and costs nothing here.
+    pub watermark_flush_interval: Duration,
     /// Lag-based readiness threshold: the dataset is marked Ready once its
     /// replication lag (now minus the newest applied commit's source time)
     /// falls below this, so a snapshotting or backlog-draining dataset stays
@@ -843,6 +855,7 @@ TXTE85+Or9IUwDI9543jsyCvuQ8=
             snapshot_on_resume: false,
             ephemeral_accelerator: false,
             status_interval: Duration::from_secs(5),
+            watermark_flush_interval: Duration::from_secs(30),
             ready_lag: Duration::from_secs(2),
             bootstrap_batch_size: 1024,
             shared: false,
