@@ -110,6 +110,16 @@ pub enum Error {
         "Reranker model '{model}' returned no score for a document. This usually means the model is not a cross-encoder/classifier reranker."
     ))]
     EmptyPrediction { model: String },
+
+    #[snafu(display(
+        "Reranker model '{model}' returned {actual} scores for a document (expected exactly 1). This usually means the model is a multi-class classifier rather than a single-class cross-encoder/classifier reranker."
+    ))]
+    UnexpectedScoreCount { model: String, actual: usize },
+
+    #[snafu(display(
+        "Reranker model '{model}' returned a non-finite score for a document. This usually means the model's classification head produced an invalid (NaN/Inf) logit."
+    ))]
+    NonFiniteScore { model: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

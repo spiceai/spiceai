@@ -28,15 +28,15 @@ use std::path::Path;
 
 use async_trait::async_trait;
 use futures::future::join_all;
+use snafu::ResultExt;
 use tei_backend::{Backend, DType, ModelType};
-use tei_core::{infer::Infer, queue::Queue, tokenization::Tokenization};
+use tei_core::{infer::Infer, queue::Queue};
 use tokenizers::TruncationDirection;
 
 use crate::embeddings::candle::util::{
-    download_hf_artifacts, link_files_into_tmp_dir, load_config, load_tokenizer,
-    max_seq_length_from_st_config, position_offset,
+    download_hf_artifacts, link_files_into_tmp_dir, load_tokenization,
 };
-use crate::rerank::{Error, Rerank, Result};
+use crate::rerank::{Error, LocalModelLoadFailedSnafu, Rerank, Result};
 
 /// A cross-encoder reranker running in-process via the candle TEI backend.
 ///
@@ -112,8 +112,15 @@ impl TeiRerank {
         .into_iter()
         .collect();
 
-        let model_root =
-            link_files_into_tmp_dir(files).map_err(|e| Error::LocalModelLoadFailed {
+        // Hard-linking the artifacts into a scratch directory is synchronous filesystem
+        // I/O; run it on a blocking-safe thread so it doesn't stall the Tokio worker.
+        let model_root = tokio::task::spawn_blocking(move || link_files_into_tmp_dir(files))
+            .await
+            .map_err(|e| Error::LocalModelLoadFailed {
+                model: name.clone(),
+                source: Box::new(e),
+            })?
+            .map_err(|e| Error::LocalModelLoadFailed {
                 model: name.clone(),
                 source: Box::new(e),
             })?;
@@ -130,31 +137,12 @@ impl TeiRerank {
     ) -> Result<Self> {
         let name = name.into();
 
-        let load = |source: Box<dyn std::error::Error + Send + Sync>| Error::LocalModelLoadFailed {
-            model: name.clone(),
-            source,
-        };
-
-        let tokenizer = load_tokenizer(root).map_err(|e| load(Box::new(e)))?;
-        let config = load_config(root).map_err(|e| load(Box::new(e)))?;
-
-        let position_offset = position_offset(&config);
-
-        let max_input_length = if let Some(max_seq_length) = max_seq_length_overwrite {
-            max_seq_length
-        } else {
-            match max_seq_length_from_st_config(root) {
-                Ok(max_seq_length_opt) => {
-                    max_seq_length_opt.unwrap_or(config.max_position_embeddings - position_offset)
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to load max_seq_length from ST config: {e}");
-                    config.max_position_embeddings - position_offset
-                }
-            }
-        };
-
-        let token = Tokenization::new(1, tokenizer, max_input_length, position_offset, None, None);
+        let (_, _, token) = load_tokenization(root, max_seq_length_overwrite)
+            .await
+            .boxed()
+            .context(LocalModelLoadFailedSnafu {
+                model: name.clone(),
+            })?;
 
         // A cross-encoder reranker is a sequence-classification model: load it
         // with `Classifier` (no pooling) so `Infer::predict` — gated on
@@ -174,7 +162,10 @@ impl TeiRerank {
             String::new(), // Not used
         )
         .await
-        .map_err(|e| load(Box::new(e)))?;
+        .boxed()
+        .context(LocalModelLoadFailedSnafu {
+            model: name.clone(),
+        })?;
 
         let max_concurrent_requests = 512;
         let max_batch_tokens = 16384;
@@ -235,15 +226,7 @@ impl Rerank for TeiRerank {
                         source: Box::new(e),
                     })?;
 
-                // The reranker classification head returns its relevance score
-                // first, exactly as the TEI router reads it. Guard the index so
-                // a backend that returned nothing surfaces a structured error
-                // rather than panicking.
-                response
-                    .results
-                    .first()
-                    .copied()
-                    .ok_or(Error::EmptyPrediction { model: name })
+                extract_single_score(&response.results, &name)
             });
         }
 
@@ -272,5 +255,74 @@ impl Rerank for TeiRerank {
 
     fn is_remote(&self) -> bool {
         false
+    }
+}
+
+/// Reads the reranker classification head's relevance score out of a `predict` response.
+///
+/// The TEI `/rerank` route only serves single-class reranker/cross-encoder models, so exactly one
+/// finite score is expected per document. An ordinary multi-class classifier would return several
+/// logits, and a broken or incompatible model can return `NaN`; both are rejected here as a
+/// structured error instead of silently reading `results[0]` as if it were a relevance score.
+fn extract_single_score(results: &[f32], model: &str) -> Result<f32> {
+    let &[score] = results else {
+        return if results.is_empty() {
+            Err(Error::EmptyPrediction {
+                model: model.to_string(),
+            })
+        } else {
+            Err(Error::UnexpectedScoreCount {
+                model: model.to_string(),
+                actual: results.len(),
+            })
+        };
+    };
+
+    if !score.is_finite() {
+        return Err(Error::NonFiniteScore {
+            model: model.to_string(),
+        });
+    }
+
+    Ok(score)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::extract_single_score;
+    use crate::rerank::Error;
+
+    #[test]
+    fn extract_single_score_accepts_one_finite_score() {
+        let score = extract_single_score(&[0.42], "m").expect("single finite score");
+        assert!((score - 0.42).abs() < 1e-6);
+    }
+
+    #[test]
+    fn extract_single_score_rejects_empty_results() {
+        let err = extract_single_score(&[], "m").expect_err("empty results must error");
+        assert!(matches!(err, Error::EmptyPrediction { .. }));
+    }
+
+    #[test]
+    fn extract_single_score_rejects_multi_class_output() {
+        // An ordinary multi-class classifier returns one logit per class; a reranker
+        // must not silently treat the first one as the relevance score.
+        let err =
+            extract_single_score(&[0.1, 0.2, 0.7], "m").expect_err("multi-logit output must error");
+        assert!(matches!(err, Error::UnexpectedScoreCount { actual: 3, .. }));
+    }
+
+    #[test]
+    fn extract_single_score_rejects_nan() {
+        let err = extract_single_score(&[f32::NAN], "m").expect_err("NaN must error");
+        assert!(matches!(err, Error::NonFiniteScore { .. }));
+    }
+
+    #[test]
+    fn extract_single_score_rejects_infinite() {
+        let err =
+            extract_single_score(&[f32::INFINITY], "m").expect_err("infinite score must error");
+        assert!(matches!(err, Error::NonFiniteScore { .. }));
     }
 }

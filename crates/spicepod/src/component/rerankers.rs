@@ -24,7 +24,7 @@ use std::{collections::HashMap, fmt::Display};
 
 use crate::metric::Metrics;
 
-use super::{Nameable, WithDependsOn, model::HUGGINGFACE_PATH_REGEX};
+use super::{Nameable, WithDependsOn, model::huggingface_model_id};
 #[cfg(feature = "schemars")]
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -94,18 +94,23 @@ impl Reranker {
             // Mirrors the `huggingface:` handling for embeddings/models: the
             // repo id (and optional pinned `:revision`) is recovered from
             // `huggingface:huggingface.co/<org>/<model>[:rev]` via the shared
-            // regex so a revision round-trips to the loader.
+            // regex so a revision round-trips to the loader. `TryFrom` also
+            // accepts a `/` after the provider name (`huggingface/…`,
+            // `hf/…`), which the regex itself does not — normalize that form
+            // to the colon form it does accept before parsing.
             RerankerPrefix::HuggingFace => {
-                HUGGINGFACE_PATH_REGEX.captures(&self.from).map(|caps| {
-                    let model = format!("{}/{}", &caps["org"], &caps["model"]);
-                    if let Some(revision) = caps.name("revision") {
-                        format!("{}:{}", model, revision.as_str())
-                    } else {
-                        model
-                    }
-                })
+                let normalized = self
+                    .from
+                    .strip_prefix("huggingface/")
+                    .or_else(|| self.from.strip_prefix("hf/"))
+                    .map(|rest| format!("huggingface:{rest}"));
+                huggingface_model_id(normalized.as_deref().unwrap_or(&self.from))
             }
-            RerankerPrefix::File => self.from.strip_prefix("file:").map(ToString::to_string),
+            RerankerPrefix::File => self
+                .from
+                .strip_prefix("file:")
+                .or_else(|| self.from.strip_prefix("file/"))
+                .map(ToString::to_string),
             RerankerPrefix::Cohere => self
                 .from
                 .strip_prefix("cohere:")
@@ -307,5 +312,25 @@ mod tests {
         // `cohere/rerank-v3.5` is the style used by some provider libraries.
         let c = Reranker::new("cohere/rerank-v3.5", "c");
         assert_eq!(c.get_model_id().as_deref(), Some("rerank-v3.5"));
+    }
+
+    #[test]
+    fn get_model_id_accepts_slash_separator_for_local_sources() {
+        // `TryFrom` accepts `/` after `huggingface`/`hf`/`file` too — `get_model_id`
+        // must recognize the same forms or loading fails with `UnknownSource`.
+        let hf = Reranker::new("huggingface/BAAI/bge-reranker-base", "r");
+        assert_eq!(hf.get_model_id().as_deref(), Some("BAAI/bge-reranker-base"));
+
+        let hf_alias = Reranker::new("hf/BAAI/bge-reranker-base", "r");
+        assert_eq!(
+            hf_alias.get_model_id().as_deref(),
+            Some("BAAI/bge-reranker-base")
+        );
+
+        let f = Reranker::new("file/models/bge-reranker-base", "r");
+        assert_eq!(
+            f.get_model_id().as_deref(),
+            Some("models/bge-reranker-base")
+        );
     }
 }
