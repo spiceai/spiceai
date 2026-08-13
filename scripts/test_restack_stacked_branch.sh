@@ -524,6 +524,9 @@ start_test "stack-base refreshes origin/trunk rather than only FETCH_HEAD"
 
   git fetch --quiet origin
   stale=$(git rev-parse origin/trunk)
+  # Narrow the refspec the way `git clone --single-branch` does: origin/trunk
+  # exists but a bare `git fetch origin` will never touch it again.
+  git config remote.origin.fetch '+refs/heads/child:refs/remotes/origin/child'
 
   # trunk advances elsewhere, exactly as it does while a stack is in review.
   helper="$work_root/helper"

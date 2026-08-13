@@ -55,7 +55,12 @@ cmd_stack_base() {
   local parent_pr="${1:-}"
   [ -n "$parent_pr" ] || die "usage: stack-base <parent-pr>"
 
-  git fetch --quiet origin || die "could not fetch origin"
+  # An explicit refspec rather than a bare `git fetch origin`, which obeys
+  # `remote.origin.fetch`: a --single-branch clone narrows that to the checked-out
+  # branch, so origin/trunk would stay stale or missing while this claimed to have
+  # refreshed it -- and everything downstream would then use the wrong base.
+  git fetch --quiet origin "+refs/heads/trunk:refs/remotes/origin/trunk" ||
+    die "could not fetch trunk from origin"
   git fetch --quiet origin "refs/pull/${parent_pr}/head" ||
     die "could not fetch refs/pull/${parent_pr}/head"
 
