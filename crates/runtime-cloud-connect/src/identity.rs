@@ -18,7 +18,7 @@ limitations under the License.
 //!
 //! The identity file lives at `$SPICE_CONFIG_DIR/identity.json` with
 //! `0600` perms on Unix. On first boot the client generates a keypair
-//! (ECDSA P-256) and a PKCS#10 CSR, presents the adoption code + CSR to
+//! (ECDSA P-256) and a PKCS#10 CSR, presents the enrollment authority + CSR to
 //! the **cloud enroll endpoint** over plain HTTPS (out-of-band, before
 //! any gRPC stream), and receives back the signed leaf certificate, the
 //! issuing-CA bundle, and the gateway address. The leaf, the matching
@@ -37,7 +37,7 @@ limitations under the License.
 use std::path::{Path, PathBuf};
 
 use base64::Engine as _;
-use rcgen::{CertificateParams, DnType, ExtendedKeyUsagePurpose, KeyPair};
+use rcgen::{CertificateParams, DnType, ExtendedKeyUsagePurpose, KeyPair, PublicKeyData};
 use serde::{Deserialize, Serialize};
 use snafu::{ResultExt, Snafu};
 use zeroize::Zeroizing;
@@ -69,12 +69,18 @@ pub enum Error {
 
     #[snafu(display("Failed to remove the identity file: {source}"))]
     ClearTaskPanicked { source: tokio::task::JoinError },
+
+    #[snafu(display(
+        "Failed to acquire the identity update transaction for {}: {reason}",
+        path.display()
+    ))]
+    UpdateTransaction { path: PathBuf, reason: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// Persisted runtime identity. Treat as opaque outside this crate.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Identity {
     /// Cloud-assigned stable instance identifier (`instance_id` from the
     /// enroll response, e.g. `inst_...`).
@@ -102,8 +108,8 @@ pub struct Identity {
     /// the address the mTLS `CloudConnect` stream connects to. Defaulted
     /// so identity files written before this field existed still load;
     /// an empty value means the identity predates the enroll-first flow
-    /// and cannot be used to reach the gateway (re-adopt with a fresh
-    /// code).
+    /// and cannot be used to reach the gateway (re-enroll with a fresh
+    /// enrollment key).
     #[serde(default)]
     pub gateway_addr: String,
     /// Unix timestamp (seconds) after which the identity cert is no longer
@@ -231,6 +237,28 @@ pub struct AttachmentState {
     pub monitor_url: Option<String>,
 }
 
+impl std::fmt::Debug for Identity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Identity")
+            .field("identifier", &self.identifier)
+            .field("identity_cert_pem", &"[CERTIFICATE]")
+            .field("private_key_pem", &"[REDACTED]")
+            .field("public_key_pem", &"[PUBLIC KEY]")
+            .field("ca_bundle_pem", &"[CERTIFICATE BUNDLE]")
+            .field("gateway_addr", &self.gateway_addr)
+            .field("not_after_unix", &self.not_after_unix)
+            .field("enc_private_key_pem", &"[REDACTED]")
+            .field("enc_public_key_pem", &"[PUBLIC KEY]")
+            .field("enc_previous_private_key_pem", &"[REDACTED]")
+            .field("cache_key_b64", &"[REDACTED]")
+            .field("app_id", &self.app_id)
+            .field("org_name", &self.org_name)
+            .field("app_name", &self.app_name)
+            .field("monitor_url", &self.monitor_url)
+            .finish()
+    }
+}
+
 /// Read the persisted `not_after_unix`, mapping a missing, null, or `0` value
 /// to "no expiry" so identity files written before the field carried presence
 /// keep their meaning.
@@ -242,6 +270,62 @@ where
 }
 
 impl Identity {
+    /// Why this identity cannot establish a control stream, if any.
+    ///
+    /// Enrollment uses this as a fail-closed gate before honoring the
+    /// existing-identity precedence rule. An explicit gateway override makes
+    /// a legacy identity with no stored gateway usable, but credentials and
+    /// the cloud identifier are always required.
+    pub(crate) fn reconnect_validation_error(
+        &self,
+        gateway_override: Option<&str>,
+    ) -> Option<&'static str> {
+        if self.identifier.trim().is_empty() {
+            return Some("the cloud-assigned instance identifier is empty");
+        }
+        if self.identity_cert_pem.trim().is_empty() {
+            return Some("the client identity certificate is empty");
+        }
+        if self.private_key_pem.trim().is_empty() {
+            return Some("the client identity private key is empty");
+        }
+        let Ok(certificate_pem) = pem::parse(&self.identity_cert_pem) else {
+            return Some("the client identity certificate is not valid PEM");
+        };
+        if certificate_pem.tag() != "CERTIFICATE" {
+            return Some("the client identity certificate has an invalid PEM label");
+        }
+        let Ok((remaining, certificate)) =
+            x509_parser::prelude::parse_x509_certificate(certificate_pem.contents())
+        else {
+            return Some("the client identity certificate is not valid X.509");
+        };
+        if !remaining.is_empty() {
+            return Some("the client identity certificate has trailing DER data");
+        }
+        let Ok(private_key) = KeyPair::from_pem(&self.private_key_pem) else {
+            return Some("the client identity private key is not valid PKCS key material");
+        };
+        if certificate.public_key().raw != private_key.subject_public_key_info().as_slice() {
+            return Some("the client identity certificate and private key do not match");
+        }
+        let Ok(public_key_pem) = pem::parse(&self.public_key_pem) else {
+            return Some("the client identity public key is not valid PEM");
+        };
+        if public_key_pem.tag() != "PUBLIC KEY" {
+            return Some("the client identity public key has an invalid PEM label");
+        }
+        if public_key_pem.contents() != private_key.subject_public_key_info().as_slice() {
+            return Some("the client identity public and private keys do not match");
+        }
+        if self.gateway_addr.trim().is_empty()
+            && gateway_override.is_none_or(|endpoint| endpoint.trim().is_empty())
+        {
+            return Some("the gateway address is empty");
+        }
+        None
+    }
+
     /// Returns `true` if the identity has an expiry that is in the past
     /// relative to the system clock. An identity with no expiry never expires.
     #[must_use]
@@ -279,8 +363,12 @@ impl Identity {
             EncKeyGenerationSnafu {
                 reason:
                     "this identity holds no encryption key; it enrolled before encrypted secret \
-                     delivery existed. It is re-keyed by the next renewal (~12h), or immediately \
-                     by re-running `spice connect <code>`."
+                     delivery existed. If this identity has a certificate expiry, its scheduled \
+                     renewal will re-key it when due. To recover immediately, or if it has no \
+                     renewal deadline, stop spiced, run `spice connect remove --yes` from this \
+                     instance directory, mint a new enrollment key in the Spice Cloud portal, \
+                     and restart with `spiced --token <enrollment-key>`. The existing identity \
+                     always wins, so supplying --token before removing it cannot re-enroll."
                         .to_string(),
             }
         );
@@ -429,9 +517,10 @@ pub struct IdentityStore;
 /// already stopped accepting, which surfaces much later as a renewal that cannot
 /// authenticate.
 ///
-/// Process-wide because both writers live in this process. Two `spiced`
-/// processes sharing one config directory would still race, but that is already
-/// unsupported for every other reason.
+/// The config directory's persistent enrollment transaction additionally
+/// serializes these read-modify-writes against `spice connect remove` in a
+/// separate process. The process-wide lock remains necessary for writers that
+/// already own that transaction and for the runtime's in-process updates.
 ///
 /// Poisoning is ignored: the guarded data is the file, not memory, and a panic
 /// mid-write leaves it either fully old or fully new thanks to the atomic
@@ -443,6 +532,16 @@ fn write_lock() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+fn acquire_update_transaction(path: &Path) -> Result<crate::draft::EnrollmentTransactionLock> {
+    let config_dir = path.parent().unwrap_or_else(|| Path::new("."));
+    crate::draft::EnrollmentTransactionLock::try_acquire(config_dir).map_err(|source| {
+        Error::UpdateTransaction {
+            path: path.to_path_buf(),
+            reason: source.to_string(),
+        }
+    })
+}
+
 impl IdentityStore {
     /// Read an identity file, returning `Ok(None)` if it does not exist.
     ///
@@ -451,6 +550,10 @@ impl IdentityStore {
     /// Returns an error if the file exists but cannot be read (for any reason
     /// other than not-found) or its contents fail to parse as an [`Identity`].
     pub fn load_optional(path: &Path) -> Result<Option<Identity>> {
+        #[cfg(not(unix))]
+        cleanup_stale_identity_backups(path).context(IoSnafu {
+            path: path.to_path_buf(),
+        })?;
         match std::fs::read_to_string(path) {
             Ok(s) => {
                 let identity: Identity = serde_json::from_str(&s).context(ParseSnafu {
@@ -513,6 +616,7 @@ impl IdentityStore {
     /// Returns an error if the existing file cannot be read or parsed, or if the
     /// updated identity cannot be written.
     pub fn set_app_id(path: &Path, app_id: Option<&str>) -> Result<bool> {
+        let _transaction = acquire_update_transaction(path)?;
         let _guard = write_lock();
         let Some(mut identity) = Self::load_optional(path)? else {
             return Ok(false);
@@ -569,6 +673,7 @@ impl IdentityStore {
         path: &Path,
         attachment: Option<&AppAttachment>,
     ) -> Result<Option<AttachmentState>> {
+        let _transaction = acquire_update_transaction(path)?;
         let _guard = write_lock();
         let Some(mut identity) = Self::load_optional(path)? else {
             return Ok(None);
@@ -641,6 +746,7 @@ impl IdentityStore {
         path: &Path,
         credential_update: &Identity,
     ) -> Result<Option<Identity>> {
+        let _transaction = acquire_update_transaction(path)?;
         let _guard = write_lock();
         let Some(current) = Self::load_optional(path)? else {
             return Ok(None);
@@ -670,12 +776,10 @@ impl IdentityStore {
 
     /// Remove the identity file. No-op if it doesn't exist.
     ///
-    /// Takes [`write_lock`] for the same reason [`IdentityStore::set_app_id`]
-    /// does, and it is what makes a release final: an update that read the file
-    /// a moment before the removal would otherwise write it back afterwards,
-    /// resurrecting an instance the control plane just released. Under the lock
-    /// the removal either precedes the read — leaving nothing to update — or
-    /// follows the write, and removes it.
+    /// Takes [`write_lock`] to serialize with updates in this process. The
+    /// caller performing `spice connect remove` owns the config directory's
+    /// enrollment transaction before calling this method, which serializes the
+    /// removal with updates from another process.
     ///
     /// # Errors
     ///
@@ -789,7 +893,7 @@ fn generate_enc_keypair_pem() -> Result<(String, String)> {
 /// PKCS#10 CSR built from it. The private key is retained locally and, on
 /// successful enroll/renew, persisted into the [`Identity`] alongside the
 /// signed leaf; the CSR is sent in the HTTP enroll (or renew) request.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct EnrollmentMaterial {
     pub private_key_pem: String,
     pub public_key_pem: String,
@@ -803,6 +907,18 @@ pub struct EnrollmentMaterial {
     pub enc_public_key_pem: String,
 }
 
+impl std::fmt::Debug for EnrollmentMaterial {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EnrollmentMaterial")
+            .field("private_key_pem", &"[REDACTED]")
+            .field("public_key_pem", &"[PUBLIC KEY]")
+            .field("csr_pem", &"[CERTIFICATE REQUEST]")
+            .field("enc_private_key_pem", &"[REDACTED]")
+            .field("enc_public_key_pem", &"[PUBLIC KEY]")
+            .finish()
+    }
+}
+
 /// Write the identity file, mapping I/O failures onto the identity error type.
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     atomic_write_owner_only(path, bytes).context(IoSnafu {
@@ -810,49 +926,147 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     })
 }
 
+/// A newly-created writer gets ample time to acquire its advisory lock before
+/// another process may consider its temp file abandoned. The lock remains the
+/// authoritative liveness signal after this age; time alone never authorizes
+/// deletion of an active writer.
+const ABANDONED_TEMP_MIN_AGE: std::time::Duration = std::time::Duration::from_hours(1);
+
+/// Reclaim secret-bearing temp files left by a process that exited before
+/// promotion.
+///
+/// Temp names are unique per writer. Each live writer holds an exclusive
+/// advisory lock from creation through rename, so cleanup removes only an old
+/// exact-name match whose lock can be acquired. This bounds credential debris
+/// without allowing concurrent writers to delete one another's files.
+fn cleanup_abandoned_atomic_temps(
+    path: &Path,
+    minimum_age: std::time::Duration,
+) -> std::io::Result<()> {
+    cleanup_abandoned_atomic_temps_with(path, minimum_age, |_, _| Ok(()))
+}
+
+fn cleanup_abandoned_atomic_temps_with<F>(
+    path: &Path,
+    minimum_age: std::time::Duration,
+    before_remove: F,
+) -> std::io::Result<()>
+where
+    F: Fn(&std::fs::File, &Path) -> std::io::Result<()>,
+{
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("identity.json");
+    let prefix = format!(".{file_name}.");
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+
+    for entry in entries {
+        let entry = entry?;
+        let entry_name = entry.file_name();
+        let Some(entry_name) = entry_name.to_str() else {
+            continue;
+        };
+        let is_temp = Path::new(entry_name)
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("tmp"));
+        if !entry_name.starts_with(&prefix)
+            || !is_temp
+            || entry_name.len() <= prefix.len() + ".tmp".len()
+            || !entry.file_type()?.is_file()
+        {
+            continue;
+        }
+
+        let old_enough = entry
+            .metadata()?
+            .modified()?
+            .elapsed()
+            .is_ok_and(|age| age >= minimum_age);
+        if !old_enough {
+            continue;
+        }
+
+        let file = match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(entry.path())
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        if !fs4::fs_std::FileExt::try_lock_exclusive(&file)? {
+            continue;
+        }
+        // Keep the lock through unlink: acquiring it establishes that no live
+        // writer owns this inode, and releasing it before removal would split
+        // that liveness decision from the destructive action.
+        before_remove(&file, &entry.path())?;
+        let removal = std::fs::remove_file(entry.path());
+        drop(file);
+        match removal {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
 /// Atomically write `bytes` to `path` with owner-only permissions.
 ///
 /// Shared with [`crate::secret_cache`]: both files hold secret material and need
 /// the same guarantees — never world-readable, never observed half-written.
+/// The file contents and parent directory entry are both synchronized before
+/// success is reported, so a successful enrollment remains durable across a
+/// power loss after the atomic rename.
 #[cfg(unix)]
 pub(crate) fn atomic_write_owner_only(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write as _;
     use std::os::unix::fs::OpenOptionsExt as _;
     use std::os::unix::fs::PermissionsExt as _;
 
+    cleanup_abandoned_atomic_temps(path, ABANDONED_TEMP_MIN_AGE)?;
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     let file_name = path
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("identity.json");
-    let tmp_path = dir.join(format!(".{file_name}.tmp"));
+    let tmp_path = dir.join(format!(".{file_name}.{}.tmp", uuid::Uuid::new_v4()));
 
-    // `OpenOptions::mode` only applies to *newly created* files. If a stale
-    // `.<file>.tmp` from a previous crashed run still exists with broader
-    // permissions, `create(true).truncate(true)` would reuse it and then
-    // `rename` would publish the private key under those wider permissions.
-    // Defend against that by removing any stale temp first, refusing to
-    // reuse an existing inode (`create_new`), and explicitly enforcing
-    // `0o600` on the opened file before writing the sensitive bytes.
-    if let Err(err) = std::fs::remove_file(&tmp_path)
-        && err.kind() != std::io::ErrorKind::NotFound
-    {
-        return Err(err);
-    }
-
-    {
+    // Every writer owns a distinct temp inode. Concurrent processes may safely
+    // promote complete files to the same destination without truncating or
+    // deleting one another's in-progress write.
+    let result = (|| {
         let mut file = std::fs::OpenOptions::new()
             .create_new(true)
+            .read(true)
             .write(true)
             .mode(0o600)
             .open(&tmp_path)?;
+        fs4::fs_std::FileExt::lock_exclusive(&file)?;
         // Re-assert mode in case umask/file-creation flags interfered.
         file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
         file.write_all(bytes)?;
         file.sync_all()?;
-    }
+        std::fs::rename(&tmp_path, path)?;
+        // The unique temp name no longer exists, so cleanup cannot target this
+        // inode. Release the lock before publishing success (especially on
+        // Windows, where range locks are mandatory for readers).
+        drop(file);
+        sync_parent_directory(path)
+    })();
 
-    std::fs::rename(&tmp_path, path)
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+    result
 }
 
 /// As the Unix variant, minus the permission enforcement: Windows ACLs are not
@@ -861,24 +1075,98 @@ pub(crate) fn atomic_write_owner_only(path: &Path, bytes: &[u8]) -> std::io::Res
 #[cfg(not(unix))]
 pub(crate) fn atomic_write_owner_only(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write as _;
+    cleanup_stale_identity_backups(path)?;
+    cleanup_abandoned_atomic_temps(path, ABANDONED_TEMP_MIN_AGE)?;
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     let file_name = path
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("identity.json");
-    let tmp_path = dir.join(format!(".{file_name}.tmp"));
-    {
-        let mut file = std::fs::File::create(&tmp_path)?;
+    let tmp_path = dir.join(format!(".{file_name}.{}.tmp", uuid::Uuid::new_v4()));
+    let result = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&tmp_path)?;
+        fs4::fs_std::FileExt::lock_exclusive(&file)?;
         file.write_all(bytes)?;
         file.sync_all()?;
+        promote_temp(&tmp_path, path)?;
+        drop(file);
+        sync_parent_directory(path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
     }
-    promote_temp(&tmp_path, path)
+    result
+}
+
+/// Synchronize the directory entry containing `path` after a rename, hard
+/// link, or removal. Synchronizing only the file contents does not make the
+/// directory metadata durable across power loss.
+#[cfg(unix)]
+pub(crate) fn sync_parent_directory(path: &Path) -> std::io::Result<()> {
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::File::open(dir)?.sync_all()
+}
+
+/// Windows does not expose a portable directory handle through `std::fs` that
+/// can be synchronized. File contents are still flushed before promotion.
+#[cfg(not(unix))]
+pub(crate) fn sync_parent_directory(_path: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+/// Remove stale non-Unix replacement backups once the canonical identity is
+/// present. A failed cleanup is fail-closed: backups contain the complete old
+/// credential, so silently accumulating them is not acceptable. If the
+/// canonical identity is absent, preserve the backup and return an error — it
+/// may be the only recoverable identity after an interrupted rollback.
+#[cfg(any(not(unix), test))]
+fn cleanup_stale_identity_backups(path: &Path) -> std::io::Result<()> {
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("identity.json");
+    let prefix = format!(".{file_name}.");
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err),
+    };
+
+    for entry in entries {
+        let entry = entry?;
+        let entry_name = entry.file_name();
+        let Some(entry_name) = entry_name.to_str() else {
+            continue;
+        };
+        let is_backup = Path::new(entry_name)
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("bak"));
+        if !entry_name.starts_with(&prefix) || !is_backup {
+            continue;
+        }
+        if !path.exists() {
+            return Err(std::io::Error::other(
+                "A stale identity backup exists without the canonical identity; restore or remove the backup before retrying",
+            ));
+        }
+        match std::fs::remove_file(entry.path()) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(())
 }
 
 /// Promote a freshly-written temp file into its final location on non-Unix
 /// platforms, where `std::fs::rename` does **not** atomically replace an
 /// existing destination (it errors if the target already exists). A rotated
-/// or re-adopted identity must be able to overwrite an existing
+/// or re-enrolled identity must be able to overwrite an existing
 /// `identity.json`, so when the plain rename fails we move the existing file
 /// to a backup, retry the rename, and roll the backup back if the retry
 /// fails. The backup is removed on success.
@@ -891,18 +1179,18 @@ fn promote_temp(tmp_path: &Path, path: &Path) -> std::io::Result<()> {
             return Err(err);
         }
 
-        let backup_path = path.with_extension("bak");
-        // Clear any stale backup so the rename below can't fail on a leftover.
-        if let Err(rm_err) = std::fs::remove_file(&backup_path)
-            && rm_err.kind() != std::io::ErrorKind::NotFound
-        {
-            return Err(rm_err);
-        }
+        let dir = path.parent().unwrap_or_else(|| Path::new("."));
+        let file_name = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("identity.json");
+        let backup_path = dir.join(format!(".{file_name}.{}.bak", uuid::Uuid::new_v4()));
         std::fs::rename(path, &backup_path)?;
         match std::fs::rename(tmp_path, path) {
             Ok(()) => {
-                // Promotion succeeded; drop the backup (best-effort).
-                let _ = std::fs::remove_file(&backup_path);
+                // Promotion succeeded; the old credential must not remain on
+                // disk under a backup name.
+                std::fs::remove_file(&backup_path)?;
             }
             Err(promote_err) => {
                 // Roll the original file back into place so we don't leave the
@@ -920,14 +1208,16 @@ mod tests {
     use super::*;
 
     fn sample_identity() -> Identity {
+        let key_pair = KeyPair::generate().expect("generate sample identity key");
+        let certificate = CertificateParams::new(Vec::<String>::new())
+            .expect("build sample identity certificate parameters")
+            .self_signed(&key_pair)
+            .expect("sign sample identity certificate");
         Identity {
             identifier: "inst_test".to_string(),
-            identity_cert_pem: "-----BEGIN CERTIFICATE-----\nMOCK\n-----END CERTIFICATE-----\n"
-                .to_string(),
-            private_key_pem: "-----BEGIN PRIVATE KEY-----\nMOCK\n-----END PRIVATE KEY-----\n"
-                .to_string(),
-            public_key_pem: "-----BEGIN PUBLIC KEY-----\nMOCK\n-----END PUBLIC KEY-----\n"
-                .to_string(),
+            identity_cert_pem: certificate.pem(),
+            private_key_pem: key_pair.serialize_pem(),
+            public_key_pem: key_pair.public_key_pem(),
             ca_bundle_pem: "-----BEGIN CERTIFICATE-----\nMOCKCA\n-----END CERTIFICATE-----\n"
                 .to_string(),
             gateway_addr: "gateway.test.spice.ai:443".to_string(),
@@ -943,6 +1233,71 @@ mod tests {
             enc_previous_private_key_pem: String::new(),
             cache_key_b64: String::new(),
         }
+    }
+
+    #[test]
+    fn reconnect_validation_accepts_a_matching_certificate_and_private_key() {
+        assert_eq!(sample_identity().reconnect_validation_error(None), None);
+    }
+
+    #[test]
+    fn reconnect_validation_rejects_malformed_certificate_and_private_key() {
+        let mut identity = sample_identity();
+        identity.identity_cert_pem =
+            "-----BEGIN CERTIFICATE-----\nnot-a-certificate\n-----END CERTIFICATE-----\n"
+                .to_string();
+        assert_eq!(
+            identity.reconnect_validation_error(None),
+            Some("the client identity certificate is not valid PEM")
+        );
+
+        let mut identity = sample_identity();
+        identity.private_key_pem =
+            "-----BEGIN PRIVATE KEY-----\nnot-a-private-key\n-----END PRIVATE KEY-----\n"
+                .to_string();
+        assert_eq!(
+            identity.reconnect_validation_error(None),
+            Some("the client identity private key is not valid PKCS key material")
+        );
+    }
+
+    #[test]
+    fn reconnect_validation_rejects_a_mismatched_private_key() {
+        let mut identity = sample_identity();
+        identity.private_key_pem = KeyPair::generate()
+            .expect("generate mismatched private key")
+            .serialize_pem();
+        assert_eq!(
+            identity.reconnect_validation_error(None),
+            Some("the client identity certificate and private key do not match")
+        );
+    }
+
+    #[test]
+    fn reconnect_validation_rejects_a_malformed_or_mismatched_public_key() {
+        let mut identity = sample_identity();
+        identity.public_key_pem =
+            "-----BEGIN PUBLIC KEY-----\nnot-a-public-key\n-----END PUBLIC KEY-----\n".to_string();
+        assert_eq!(
+            identity.reconnect_validation_error(None),
+            Some("the client identity public key is not valid PEM")
+        );
+
+        let mut identity = sample_identity();
+        identity.public_key_pem = identity.private_key_pem.clone();
+        assert_eq!(
+            identity.reconnect_validation_error(None),
+            Some("the client identity public key has an invalid PEM label")
+        );
+
+        let mut identity = sample_identity();
+        identity.public_key_pem = KeyPair::generate()
+            .expect("generate mismatched public key")
+            .public_key_pem();
+        assert_eq!(
+            identity.reconnect_validation_error(None),
+            Some("the client identity public and private keys do not match")
+        );
     }
 
     #[test]
@@ -984,6 +1339,179 @@ mod tests {
         assert_eq!(loaded.public_key_pem, identity.public_key_pem);
         assert_eq!(loaded.ca_bundle_pem, identity.ca_bundle_pem);
         assert_eq!(loaded.gateway_addr, identity.gateway_addr);
+    }
+
+    /// Exercise the write primitive directly, outside [`write_lock`], to model
+    /// separate `spiced` processes sharing a persistent config directory.
+    /// Each promotion must publish one complete payload and must not remove or
+    /// truncate another writer's in-progress temp file.
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_atomic_writers_publish_one_complete_file() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join("identity.json");
+        let first = vec![b'a'; 128 * 1024];
+        let second = vec![b'b'; 128 * 1024];
+        let barrier = std::sync::Barrier::new(3);
+
+        std::thread::scope(|scope| {
+            let first_writer = scope.spawn(|| {
+                barrier.wait();
+                atomic_write_owner_only(&path, &first).expect("first atomic write");
+            });
+            let second_writer = scope.spawn(|| {
+                barrier.wait();
+                atomic_write_owner_only(&path, &second).expect("second atomic write");
+            });
+            barrier.wait();
+            first_writer.join().expect("first writer thread");
+            second_writer.join().expect("second writer thread");
+        });
+
+        let published = std::fs::read(&path).expect("read published file");
+        assert!(
+            published == first || published == second,
+            "the destination must equal one complete writer payload"
+        );
+        let leftovers = std::fs::read_dir(dir.path())
+            .expect("read tempdir")
+            .filter_map(std::result::Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".identity.json.")
+            })
+            .collect::<Vec<_>>();
+        assert!(leftovers.is_empty(), "temporary writes must be cleaned up");
+    }
+
+    #[test]
+    fn abandoned_atomic_temp_cleanup_preserves_a_locked_writer() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join("identity.json");
+        let active_temp = dir.path().join(".identity.json.active.tmp");
+        let abandoned_temp = dir.path().join(".identity.json.abandoned.tmp");
+        let unrelated = dir.path().join(".different.json.abandoned.tmp");
+        let active = std::fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&active_temp)
+            .expect("create active temp");
+        fs4::fs_std::FileExt::lock_exclusive(&active).expect("lock active temp");
+        std::fs::write(&abandoned_temp, "abandoned private credential")
+            .expect("write abandoned temp");
+        std::fs::write(&unrelated, "unrelated").expect("write unrelated temp");
+
+        let observed_locked_removal = std::cell::Cell::new(false);
+        cleanup_abandoned_atomic_temps_with(&path, std::time::Duration::ZERO, |_, candidate| {
+            let contender = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(candidate)?;
+            assert!(
+                !fs4::fs_std::FileExt::try_lock_exclusive(&contender)?,
+                "the cleanup lock must remain held through removal"
+            );
+            observed_locked_removal.set(true);
+            Ok(())
+        })
+        .expect("clean abandoned temps");
+
+        assert!(active_temp.exists(), "a live writer must not be deleted");
+        assert!(
+            !abandoned_temp.exists(),
+            "an unlocked abandoned credential must be reclaimed"
+        );
+        assert!(unrelated.exists(), "cleanup must stay scoped to one target");
+        assert!(
+            observed_locked_removal.get(),
+            "the abandoned temp must be inspected while its cleanup lock is held"
+        );
+
+        drop(active);
+        cleanup_abandoned_atomic_temps(&path, std::time::Duration::ZERO)
+            .expect("clean released temp");
+        assert!(
+            !active_temp.exists(),
+            "a writer temp becomes reclaimable after its process releases the lock"
+        );
+    }
+
+    #[test]
+    fn stale_identity_backups_are_removed_only_when_the_identity_is_present() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join("identity.json");
+        let backup = dir.path().join(".identity.json.interrupted.bak");
+        std::fs::write(&path, "current identity").expect("write identity");
+        std::fs::write(&backup, "stale private credential").expect("write stale backup");
+
+        cleanup_stale_identity_backups(&path).expect("remove stale backup");
+
+        assert!(!backup.exists(), "stale credential backup must be removed");
+    }
+
+    #[test]
+    fn an_orphaned_identity_backup_is_preserved_for_recovery() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join("identity.json");
+        let backup = dir.path().join(".identity.json.interrupted.bak");
+        std::fs::write(&backup, "only recoverable identity").expect("write backup");
+
+        cleanup_stale_identity_backups(&path)
+            .expect_err("an orphaned backup must stop identity creation");
+
+        assert!(backup.exists(), "the only recoverable identity must remain");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_sync_surfaces_an_unopenable_parent() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join("missing-parent/identity.json");
+
+        let err = sync_parent_directory(&path).expect_err("missing parent cannot be synced");
+
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn debug_redacts_all_private_identity_material() {
+        let mut identity = sample_identity();
+        identity.enc_previous_private_key_pem = "PREVIOUS-PRIVATE-KEY".to_string();
+        identity.cache_key_b64 = "CACHE-KEY-SECRET".to_string();
+        let private_values = [
+            identity.private_key_pem.clone(),
+            identity.enc_private_key_pem.clone(),
+            identity.enc_previous_private_key_pem.clone(),
+            identity.cache_key_b64.clone(),
+        ];
+
+        let debug = format!("{identity:?}");
+        for private in private_values {
+            assert!(!debug.contains(&private), "Debug leaked private material");
+        }
+        assert!(debug.contains("inst_test"));
+        assert!(debug.contains("REDACTED"));
+    }
+
+    #[test]
+    fn enrollment_material_debug_redacts_private_keys() {
+        let material = IdentityStore::generate_enrollment().expect("generate material");
+        let private_key = material.private_key_pem.clone();
+        let enc_private_key = material.enc_private_key_pem.clone();
+
+        let debug = format!("{material:?}");
+        assert!(
+            !debug.contains(&private_key),
+            "Debug leaked the identity key"
+        );
+        assert!(
+            !debug.contains(&enc_private_key),
+            "Debug leaked the encryption key"
+        );
+        assert!(debug.contains("REDACTED"));
     }
 
     /// `store_app_id` is a read-modify-write, and everything it does not touch
@@ -1501,6 +2029,60 @@ mod tests {
     }
 
     #[test]
+    fn identity_updates_do_not_overlap_a_removal_transaction() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let config_dir = dir.path().join(".spice");
+        let path = config_dir.join("identity.json");
+        let identity = sample_identity();
+        IdentityStore::store(&path, &identity).expect("store");
+        let removal = crate::draft::EnrollmentTransactionLock::try_acquire(&config_dir)
+            .expect("hold the removal transaction");
+
+        let mut rotated = identity.clone();
+        rotated.private_key_pem = "ROTATED-KEY".to_string();
+        let credential_error = IdentityStore::store_credential_update(&path, &rotated)
+            .expect_err("credential update must not overlap removal");
+        let app_id_error = IdentityStore::set_app_id(&path, Some("4002"))
+            .expect_err("app id update must not overlap removal");
+        let attachment = AppAttachment {
+            app_id: "4002".to_string(),
+            org_name: Some("acme".to_string()),
+            app_name: Some("retail-analytics".to_string()),
+            monitor_url: Some("https://spice.ai/acme/retail-analytics/monitor".to_string()),
+        };
+        let attachment_error = IdentityStore::set_attachment(&path, Some(&attachment))
+            .expect_err("attachment tuple update must not overlap removal");
+
+        assert!(
+            credential_error
+                .to_string()
+                .contains("Another live process"),
+            "{credential_error}"
+        );
+        assert!(
+            app_id_error.to_string().contains("Another live process"),
+            "{app_id_error}"
+        );
+        assert!(
+            attachment_error
+                .to_string()
+                .contains("Another live process"),
+            "{attachment_error}"
+        );
+        let stored = IdentityStore::load_optional(&path)
+            .expect("load")
+            .expect("identity remains");
+        assert_eq!(stored.private_key_pem, identity.private_key_pem);
+        assert_eq!(stored.app_id, None);
+
+        drop(removal);
+        let merged = IdentityStore::store_credential_update(&path, &rotated)
+            .expect("store after removal transaction")
+            .expect("identity remains");
+        assert_eq!(merged.private_key_pem, "ROTATED-KEY");
+    }
+
+    #[test]
     fn load_tolerates_identity_without_an_app_id() {
         let dir = tempfile::tempdir().expect("create tempdir");
         let path = dir.path().join("identity.json");
@@ -1593,7 +2175,12 @@ mod tests {
         let err = loaded
             .encryption_keyring()
             .expect_err("an identity with no encryption key cannot open secrets");
-        assert!(err.to_string().contains("renewal"), "{err}");
+        let guidance = err.to_string();
+        assert!(guidance.contains("scheduled renewal"), "{err}");
+        assert!(guidance.contains("no renewal deadline"), "{err}");
+        assert!(guidance.contains("stop spiced"), "{err}");
+        assert!(guidance.contains("spice connect remove --yes"), "{err}");
+        assert!(guidance.contains("existing identity always wins"), "{err}");
     }
 
     #[test]

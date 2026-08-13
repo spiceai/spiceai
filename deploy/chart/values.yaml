@@ -49,6 +49,18 @@ serviceAccount:
 #   - --flight
 #   - 0.0.0.0:50051
 
+# Direct Cloud Connect is opt-in so the chart never has to infer security
+# policy from an arbitrary shell program. `bootstrap` requires a direct
+# Secret-expanded `--token` command, one replica, and persistent identity
+# storage. After enrollment, the transition script changes the mode to
+# `connected` and removes the token reference before deleting the Secret.
+cloudConnect:
+  mode: disabled
+  # Internal recovery marker written by the phase-transition script. It
+  # contains only a Kubernetes Secret name, never the enrollment key, and lets
+  # an interrupted transition resume after the token reference is removed.
+  bootstrapSecretName:
+
 # Configure Kubernetes probes for the Spice.ai runtime container.
 # Omitted probe fields keep these defaults, so overrides can be partial.
 # If a probe value is omitted entirely, the template renders these defaults.

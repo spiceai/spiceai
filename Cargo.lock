@@ -17181,8 +17181,10 @@ dependencies = [
  "chrono",
  "cloud-connect-crypto",
  "dirs",
+ "fs4",
  "gethostname",
  "getrandom 0.3.4",
+ "libc",
  "pem",
  "prost",
  "prost-types",
@@ -17194,6 +17196,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "snafu",
+ "spice-cloud-client",
  "tempfile",
  "tokio",
  "tokio-stream",
@@ -17201,6 +17204,8 @@ dependencies = [
  "tonic-prost",
  "tonic-prost-build",
  "tracing",
+ "uuid 1.23.2",
+ "x509-parser 0.18.1",
  "zeroize",
 ]
 
@@ -19325,7 +19330,6 @@ dependencies = [
  "flate2",
  "fundu",
  "futures",
- "gethostname",
  "http 1.4.1",
  "humantime",
  "insta",
@@ -19491,6 +19495,7 @@ dependencies = [
  "otel-arrow",
  "parking_lot",
  "prometheus",
+ "rcgen",
  "repl",
  "reqwest 0.13.4",
  "runtime",
@@ -19516,6 +19521,7 @@ dependencies = [
  "tracing-subscriber",
  "util",
  "yaml",
+ "zeroize",
 ]
 
 [[package]]

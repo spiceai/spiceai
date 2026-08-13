@@ -1,0 +1,41 @@
+# Spice Cloud Connect — phase 2 of 2: steady state for an enrolled instance.
+#
+# Identical to values-bootstrap.yaml minus the `--token` argument and its
+# Secret-backed SPICE_ENROLL_KEY environment reference. The enrolled identity
+# on the persistent volume (SPICE_CONFIG_DIR) is what reconnects the instance
+# on every start — no flag and no key. Keep the volume; lose the volume and
+# the instance needs a fresh enrollment key.
+#
+# This is the token-free default example. Apply it through
+# transition-to-connected.sh after the bootstrap pod is Ready. For an
+# uncustomized default-example release it is also equivalent to:
+#   helm upgrade spiceai deploy/chart -f deploy/chart/examples/cloud-connect/values-connected.yaml
+# Do not apply this static file to a customized release: use the transition
+# script so installed command, environment, PVC, and other values are retained.
+#
+# Delete the bootstrap Secret only AFTER this upgrade has rolled out: deleting
+# a Secret a pod template still references breaks pod (re)creation.
+#
+# See: https://spiceai.org/docs
+
+replicaCount: 1
+
+cloudConnect:
+  mode: connected
+
+stateful:
+  enabled: true
+  mountPath: /data
+
+command:
+  - /usr/local/bin/spiced
+  - --http
+  - 0.0.0.0:8090
+  - --metrics
+  - 0.0.0.0:9090
+  - --flight
+  - 0.0.0.0:50051
+
+additionalEnv:
+  - name: SPICE_CONFIG_DIR
+    value: /data/.spice

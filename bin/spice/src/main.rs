@@ -1336,13 +1336,7 @@ mod tests {
     /// command's own refusal is covered in `cli_integration`.
     #[test]
     fn cloud_region_is_left_to_connect_to_diagnose() {
-        let cli = parse_normalized(&[
-            "spice",
-            "connect",
-            "SPICE-ADOPT-7K2PX-9XYZ2-A1B2C-D3E4F",
-            "--cloud-region",
-            "us-west-2",
-        ]);
+        let cli = parse_normalized(&["spice", "connect", "status", "--cloud-region", "us-west-2"]);
         assert!(!cli.cloud);
         assert_eq!(cli.cloud_region.as_deref(), Some("us-west-2"));
         validate_cloud_region_usage(&cli)

@@ -130,7 +130,6 @@ pub(super) fn render_plist(
 	<key>ProgramArguments</key>
 	<array>
 		<string>{spiced}</string>
-		<string>--cloud-connect</string>
 	</array>
 	<key>WorkingDirectory</key>
 	<string>{instance_dir}</string>
@@ -682,7 +681,7 @@ fn confirm_running(label: &str) -> Result<()> {
         message: format!(
             "The Spice Cloud Connect daemon {label} started as pid {pid} and did not stay \
              up{report}. It is installed and launchd keeps relaunching it: find out why with \
-             `sudo launchctl print {target}`, or run `spiced --cloud-connect` in the instance \
+             `sudo launchctl print {target}`, or run `spiced` in the instance \
              directory to watch it fail in the foreground. `sudo spice connect remove` stops it.",
             report = job_report(label),
             target = service_target(label),
@@ -957,7 +956,7 @@ mod tests {
     }
 
     #[test]
-    fn rendered_plist_runs_the_staged_runtime_with_cloud_connect() {
+    fn rendered_plist_runs_the_staged_runtime_from_the_enrolled_directory() {
         let (_, plist) = rendered("/opt/edge-1");
         // The daemon is unprivileged, but the program remains the staged
         // root-owned copy, never the operator's replaceable runtime.
@@ -965,7 +964,9 @@ mod tests {
             parse_program(&plist),
             Some(super::super::staged_runtime_path())
         );
-        assert!(plist.contains("<string>--cloud-connect</string>"));
+        // No flag: the enrolled identity under SPICE_CONFIG_DIR is what
+        // activates Cloud Connect on every start.
+        assert!(!plist.contains("--cloud-connect"));
     }
 
     #[test]
@@ -1002,7 +1003,7 @@ mod tests {
     #[test]
     fn parsing_a_program_takes_the_binary_and_not_its_arguments() {
         let plist = "<key>ProgramArguments</key>\n<array>\n<string>/usr/bin/spiced</string>\n\
-                     <string>--cloud-connect</string>\n</array>";
+                     <string>--metrics</string>\n</array>";
         assert_eq!(parse_program(plist), Some(PathBuf::from("/usr/bin/spiced")));
     }
 
