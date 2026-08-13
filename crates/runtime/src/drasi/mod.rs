@@ -355,7 +355,8 @@ pub(crate) async fn forward_change_envelope(
     // Materialize a deferred batch here, off this async worker — the same
     // trade-off the index decorator makes, for the same reason: a large deferred
     // burst would otherwise stall the stream while it is built.
-    let (committer, batch, is_dataset_ready) = envelope.into_parts_offloaded().await?;
+    let (committer, batch, is_dataset_ready, history_unavailable) =
+        envelope.into_parts_offloaded().await?;
 
     let data = batch.data_batch();
 
@@ -406,7 +407,18 @@ pub(crate) async fn forward_change_envelope(
     // Re-wrap with the original committer: acknowledging the source's position
     // stays the accelerator's job, and it must happen after the accelerator
     // applies the change, not after Drasi accepts it.
-    Ok(ChangeEnvelope::new(committer, batch, is_dataset_ready))
+    //
+    // `from_parts` rather than `new`: this wrapper forwards the stream and must
+    // carry every envelope flag through untouched. `new` hardcodes
+    // `history_unavailable: false`, so a rebuild request dropped here would let
+    // the accelerator keep applying changes after the source lost the history
+    // that explains them.
+    Ok(ChangeEnvelope::from_parts(
+        committer,
+        batch,
+        is_dataset_ready,
+        history_unavailable,
+    ))
 }
 
 #[cfg(test)]
