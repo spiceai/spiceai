@@ -205,12 +205,16 @@ merge_other_side() {
 tree_entry() {
   local out
   out=$(git ls-tree "$1" -- ":(literal)$2") || return 1
+  # An absent path must stay empty: printf would emit a blank line, and awk turns
+  # that into " ", which reads as present everywhere downstream.
+  [ -n "$out" ] || return 0
   printf '%s\n' "$out" | awk '{ print $1 " " $3 }'
 }
 
 index_entry() {
   local out
   out=$(git ls-files --stage -- ":(literal)$1") || return 1
+  [ -n "$out" ] || return 0
   printf '%s\n' "$out" | awk '$3 == 0 { print $1 " " $2 }'
 }
 
@@ -230,10 +234,27 @@ audit_modification() {
   theirs_entry=$(tree_entry "$other" "$path") || die "could not read $other:$path"
   base_entry=$(tree_entry "$stack_base" "$path") || die "could not read $stack_base:$path"
 
-  # An unmerged path has no stage 0 and is somebody's open conflict; a path
-  # missing on a side is an add or a delete, which the filters above cover.
-  [ -n "$staged_entry" ] && [ -n "$mine_entry" ] &&
-    [ -n "$theirs_entry" ] && [ -n "$base_entry" ] || return 0
+  # A missing entry is not automatically somebody else's problem. The add and
+  # delete lists classify stack_base..pre, so they say nothing about what trunk
+  # did: a path the child modified can be absent from trunk, or from the result,
+  # and neither list would mention it.
+  local unmerged
+  unmerged=$(git ls-files -u -- ":(literal)$path") || die "could not read the index for $path"
+  if [ -n "$unmerged" ]; then
+    # An open conflict, which somebody is already looking at.
+    return 0
+  fi
+  if [ -z "$theirs_entry" ]; then
+    # You changed it, trunk deleted it. From the stack base that is a
+    # modify/delete conflict; from the older base the deletion applies unopposed.
+    echo "REVIEW $path: you changed it and trunk deleted it, which nothing has decided"
+    return 1
+  fi
+  if [ -z "$staged_entry" ]; then
+    echo "DISCARDED $path: your change is gone, and so is the path"
+    return 1
+  fi
+  [ -n "$mine_entry" ] && [ -n "$base_entry" ] || return 0
 
   local staged_mode staged_oid mine_mode mine_oid theirs_mode theirs_oid base_mode base_oid
   read -r staged_mode staged_oid <<< "$staged_entry"

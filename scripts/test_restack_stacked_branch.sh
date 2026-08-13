@@ -217,6 +217,34 @@ start_test "audit reports a partial loss, where the result matches neither side"
   esac
 ) || failures=$((failures + 1))
 
+start_test "audit reports a path you changed that trunk deleted"
+(
+  new_stack "$work_root/modifydelete"
+  printf 'old\n' > f.txt && commit_all "fork point"
+  git checkout --quiet -b parent
+  printf 'new\n' > f.txt && commit_all "parent changes it"
+  stack_base=$(git rev-parse HEAD)
+  git checkout --quiet -b child
+  printf 'old\n' > f.txt && commit_all "child reverts it"
+  pre=$(git rev-parse HEAD)
+  squash_parent_onto_trunk
+  git rm --quiet f.txt && commit_all "trunk deletes it"
+  git checkout --quiet child
+  git merge --no-ff --no-commit trunk >/dev/null 2>&1
+
+  # From the fork point the child's side looks unchanged, so the deletion applies
+  # without a conflict. From the stack base it is a modify/delete that nobody has
+  # decided, and the path is in neither the add nor the delete list.
+  [ -e f.txt ] && fail_test "the fixture did not reproduce the silent deletion"
+  output=$("$subject" audit "$stack_base" "$pre" 2>/dev/null)
+  status=$?
+  [ "$status" -eq 1 ] || fail_test "expected exit 1, got $status ($output)"
+  case "$output" in
+    *"REVIEW f.txt"*) ;;
+    *) fail_test "a modify/delete against trunk was not reported: $output" ;;
+  esac
+) || failures=$((failures + 1))
+
 start_test "audit reports a discarded mode revert, where every blob is identical"
 (
   new_stack "$work_root/moderevert"
