@@ -334,10 +334,21 @@ unsafe_worktree_path() {
     esac
   done
   if [ -f "$target" ] && [ ! -L "$target" ]; then
-    links=$(stat -f %l -- "$target" 2>/dev/null) ||
-      links=$(stat -c %h -- "$target" 2>/dev/null) || links=""
+    # GNU form first: its -c takes a format, while BSD stat rejects -c outright.
+    # The other order is unsafe, because GNU -f means "report filesystem status"
+    # and takes no format, so %l would be read as another path to stat -- and a
+    # repository containing a file called %l would make that succeed and return
+    # filesystem prose. The ./ prefix keeps a path starting with a dash from
+    # being read as an option, which BSD stat has no -- to prevent.
+    links=$(stat -c %h "./$target" 2>/dev/null) ||
+      links=$(stat -f %l "./$target" 2>/dev/null) || links=""
     case "$links" in
-      "" | 1) ;;
+      1) ;;
+      "" | *[!0-9]*)
+        # No usable link count. Refuse rather than assume one name.
+        printf 'a path whose link count could not be read'
+        return 0
+        ;;
       *) printf 'a hard link with %s names' "$links"; return 0 ;;
     esac
   fi

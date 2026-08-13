@@ -1243,6 +1243,39 @@ start_test "resolve refuses a path whose directory is a symlink"
     fail_test "a file outside the worktree was overwritten"
 ) || failures=$((failures + 1))
 
+start_test "resolve refuses when the link count cannot be read"
+(
+  new_stack "$work_root/statless"
+  printf 'l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\n' > f.txt && commit_all "fork point"
+  git checkout --quiet -b parent
+  printf 'l1\nPARENT\nl3\nl4\nl5\nl6\nl7\nl8\n' > f.txt && commit_all "parent edits"
+  stack_base=$(git rev-parse HEAD)
+  git checkout --quiet -b child
+  printf 'l1\nPARENT\nl3\nl4\nl5\nl6\nl7\nCHILD\n' > f.txt && commit_all "child edits"
+  squash_parent_onto_trunk
+  printf 'l1\nPARENT\nTRUNK\nl4\nl5\nl6\nl7\nl8\n' > f.txt && commit_all "trunk edits"
+  git checkout --quiet child
+  git merge --no-ff --no-commit trunk >/dev/null 2>&1
+  before=$(cat f.txt)
+
+  # A stat that answers with prose rather than a number, which is what the wrong
+  # implementation order produces. An unreadable count must not read as "one
+  # name, safe to overwrite".
+  stub_dir="$work_root/statless_stub"
+  mkdir -p "$stub_dir"
+  cat >"$stub_dir/stat" <<'STUB'
+#!/usr/bin/env bash
+echo "Filesystem 1024-blocks Used Available Capacity Mounted on"
+exit 0
+STUB
+  chmod +x "$stub_dir/stat"
+
+  output=$(PATH="$stub_dir:$PATH" "$subject" resolve "$stack_base" f.txt 2>/dev/null)
+  status=$?
+  [ "$status" -eq 2 ] || fail_test "expected exit 2 when the link count is unreadable, got $status ($output)"
+  [ "$(cat f.txt)" = "$before" ] || fail_test "the file was written anyway"
+) || failures=$((failures + 1))
+
 start_test "resolve refuses a conflicted path that is a hard link"
 (
   new_stack "$work_root/hardlink"
