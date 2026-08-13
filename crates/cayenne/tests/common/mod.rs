@@ -258,6 +258,20 @@ pub async fn poll_inlined_data_count_zero(
     }
 }
 
+/// Read `var` as a positive scale multiplier for fuzz/stress-test depth
+/// (iteration counts, attempt counts, deadlines). Accepts fractions below 1
+/// (e.g. `0.25` for a lighter per-PR pass); a missing, non-positive, or
+/// unparseable value is treated as `1.0` (the default, full-depth run).
+/// Mirrors `mutation_property_test`'s `env_scale`, shared here so every
+/// hand-rolled race/stress test can dial CI depth the same way.
+pub fn env_scale(var: &str) -> f64 {
+    std::env::var(var)
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|&v| v > 0.0)
+        .unwrap_or(1.0)
+}
+
 /// Extract the row count from insert result batches.
 fn extract_row_count(results: &[RecordBatch]) -> u64 {
     use arrow::datatypes::DataType;

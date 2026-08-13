@@ -101,7 +101,7 @@ pub(crate) async fn do_put(
 
     if let Some(table_name) = dml_table {
         let table_name_display = table_name.to_string();
-        if let Err(e) = datafusion.caching().invalidate_for_table(table_name) {
+        if let Err(e) = datafusion.caching().invalidate_for_table(table_name).await {
             tracing::warn!(
                 "Failed to invalidate caches for table {} after statement update: {e}",
                 table_name_display

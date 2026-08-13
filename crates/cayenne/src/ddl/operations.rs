@@ -344,6 +344,7 @@ pub fn create_schema(
         Arc::clone(cayenne_provider.metadata_catalog()),
         schema_name.to_string(),
         runtime_env,
+        cayenne_provider.table_selector().clone(),
     ));
     cayenne_provider
         .register_schema_provider(
@@ -375,6 +376,7 @@ fn ensure_schema_provider(
         Arc::clone(metadata_catalog),
         schema_name.to_string(),
         Arc::clone(runtime_env),
+        cayenne_provider.table_selector().clone(),
     ));
     cayenne_provider
         .register_schema_provider(

@@ -381,13 +381,15 @@ impl IcebergSchemaProvider {
                     // Wrap in IcebergDeletionProvider so that
                     // catalog tables support DELETE FROM via equality delete files.
                     // Access control is handled by the SQL validator, not here.
+                    let inner: Arc<dyn TableProvider> = Arc::new(provider);
                     let deletion_provider = crate::iceberg::delete::IcebergDeletionProvider::new(
                         Arc::clone(&catalog),
                         table_name.namespace().clone(),
                         table_name.name().to_string(),
-                        Arc::new(provider),
+                        Arc::clone(&inner),
                     );
-                    let adapted: Arc<dyn TableProvider> = Arc::new(deletion_provider);
+                    let adapted: Arc<dyn TableProvider> =
+                        spice_table::SpiceTable::over(Arc::new(deletion_provider), inner);
 
                     // Wrap so catalog-sourced Iceberg scans can cross Ballista
                     // node boundaries. The schema name is the (single-level)

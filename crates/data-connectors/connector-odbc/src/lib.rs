@@ -38,8 +38,8 @@ use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorFactory, DataConnectorResult,
     NewDataConnectorResult,
 };
-use runtime::datafusion::udf::deny_spice_specific_functions;
-use runtime::parameters::{ParameterSpec, Parameters};
+use runtime_parameters::{ParameterSpec, Parameters};
+use runtime_udfs_api::deny_spice_specific_functions;
 use snafu::prelude::*;
 use std::any::Any;
 use std::future::Future;

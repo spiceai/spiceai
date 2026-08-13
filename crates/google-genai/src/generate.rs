@@ -200,6 +200,24 @@ impl Client {
 // answer as a whole one is the behavior this module exists to keep. Sharing one decoder across the
 // workspace's SSE readers is worth doing - see #12597 - but it belongs in its own change.
 
+/// The most bytes one unterminated event may occupy before the reader refuses to keep buffering.
+///
+/// A server that never terminates an event would otherwise grow the buffer until the process runs
+/// out of memory, and this reader is reached from `crates/llms`, so that growth happens inside
+/// `spiced` rather than only in a CLI.
+///
+/// A Gemini event is normally a few hundred bytes of JSON. The realistic upper end is a candidate
+/// part carrying `inlineData`, which is base64 and so a third larger than the bytes it encodes,
+/// putting this cap above roughly 6 MiB of inline payload - well past what a response returns
+/// inline. Sizing it under that upper end would turn a valid long response into a failure, which is
+/// the same class of defect as the growth it bounds.
+///
+/// What this bounds is one unterminated event - the quantity an endpoint can grow without limit.
+/// The buffer as a whole may sit above it in passing, since it also holds whole events waiting to
+/// be drained and its allocation carries spare capacity beyond the bytes in use, so peak memory for
+/// one stream is somewhat above this figure rather than equal to it.
+const MAX_EVENT_BYTES: usize = 8 * 1024 * 1024;
+
 /// What begins at `buf[i]`.
 enum Terminator {
     /// A `\n`, or a `\r\n` whose `\n` is present: the line ends here and the next one starts a
@@ -246,8 +264,12 @@ struct EventBoundary {
 /// decoding each network read as text and searching that - is what makes the decode below land on a
 /// character boundary: a multi-byte UTF-8 sequence never contains `\n` or `\r`, so an event never
 /// ends inside one.
-fn find_event_boundary(buf: &[u8]) -> Option<EventBoundary> {
-    let mut i = 0;
+///
+/// Scanning starts at `from`, which callers use to skip a prefix an earlier scan already rejected.
+/// Only `SseReader::next_boundary` is in a position to know such a prefix exists; everything else
+/// passes 0 and reads the whole buffer.
+fn find_event_boundary(buf: &[u8], from: usize) -> Option<EventBoundary> {
+    let mut i = from;
     while i < buf.len() {
         // A trailing `\r` has nothing after it, so no blank line starts here yet.
         let Terminator::Complete(first) = terminator_at(buf, i) else {
@@ -317,11 +339,48 @@ fn event_data(event: &str) -> Option<String> {
 struct SseReader {
     /// Bytes read but not yet framed into an event.
     bytes: Vec<u8>,
+    /// How many leading bytes of `bytes` are known to begin no event boundary, so a later scan can
+    /// start there instead of at zero. Maintained by `next_boundary` and `consume`.
+    scanned: usize,
     /// The last event's blank line ended with a `\r` that was then the final byte, so a `\n` read
     /// next completes that terminator instead of starting a line.
     skip_leading_lf: bool,
     /// The body has ended. Held so the inner stream is not polled again after it has finished.
     ended: bool,
+}
+
+impl SseReader {
+    /// The event the buffer holds, if it holds a complete one.
+    ///
+    /// An unsuccessful scan records where it got to, so the bytes it rejected are not read again
+    /// when the next read arrives. Without that, a peer dribbling one unterminated event in small
+    /// pieces costs a full rescan per read - work quadratic in the bytes it sends, off a modest
+    /// amount of traffic, inside `spiced`.
+    fn next_boundary(&mut self) -> Option<EventBoundary> {
+        let boundary = find_event_boundary(&self.bytes, self.scanned);
+
+        if boundary.is_none() {
+            // Two bytes back, because `terminator_at` reads the byte after the one it classifies:
+            // the last two positions are the only ones a later read can reclassify - a `\r` last in
+            // the buffer, and a terminator whose blank-line successor has not arrived yet.
+            self.scanned = self.bytes.len().saturating_sub(2);
+        }
+
+        boundary
+    }
+
+    /// Drop the first `n` bytes, keeping `scanned` on the byte it was already on.
+    fn consume(&mut self, n: usize) {
+        self.bytes.drain(..n);
+        self.scanned = self.scanned.saturating_sub(n);
+    }
+
+    /// Drop every buffered byte, releasing the capacity behind them now rather than holding it
+    /// until the stream is dropped.
+    fn discard(&mut self) {
+        self.bytes = Vec::new();
+        self.scanned = 0;
+    }
 }
 
 fn parse_sse_stream(
@@ -336,7 +395,7 @@ fn parse_sse_stream(
                 // the terminator it belongs to is settled either way.
                 if reader.skip_leading_lf && (!reader.bytes.is_empty() || reader.ended) {
                     if reader.bytes.first() == Some(&b'\n') {
-                        reader.bytes.drain(..1);
+                        reader.consume(1);
                     }
                     reader.skip_leading_lf = false;
                 }
@@ -345,14 +404,14 @@ fn parse_sse_stream(
                 // carry a comment or keep-alive ahead of a data event, and awaiting another read
                 // would hold that event back until the server happened to send more - or, at the
                 // end of the body, report the stream as truncated instead.
-                while let Some(boundary) = find_event_boundary(&reader.bytes) {
+                while let Some(boundary) = reader.next_boundary() {
                     // Read the event's fields while its bytes are still in the buffer, so nothing
                     // has to be copied out of it first.
                     let data = std::str::from_utf8(&reader.bytes[..boundary.end]).map(event_data);
 
                     // Consume the event either way, so a stream carrying one undecodable event
                     // reports it once and then continues rather than repeating it forever.
-                    reader.bytes.drain(..boundary.next_start);
+                    reader.consume(boundary.next_start);
                     reader.skip_leading_lf = boundary.may_skip_lf;
 
                     let data = match data {
@@ -385,6 +444,27 @@ fn parse_sse_stream(
                     return Some((result, (stream, reader)));
                 }
 
+                // Asked after draining, so this measures one event the server never terminated
+                // rather than however many whole events a single read happened to carry.
+                // Refusing ends the stream: those bytes cannot become an event, and reading on
+                // would resume the growth this bounds.
+                if reader.bytes.len() > MAX_EVENT_BYTES {
+                    let buffered = reader.bytes.len();
+
+                    reader.discard();
+                    reader.ended = true;
+
+                    return Some((
+                        StreamSnafu {
+                            message: format!(
+                                "SSE event grew to {buffered} bytes without being terminated"
+                            ),
+                        }
+                        .fail(),
+                        (stream, reader),
+                    ));
+                }
+
                 // Every event the body held has been delivered by now, so whatever is left is a
                 // tail the server never terminated. Report it once and end there: consumers
                 // forward each item rather than stopping at the first error, so keeping the tail
@@ -394,7 +474,7 @@ fn parse_sse_stream(
                         return None;
                     }
 
-                    reader.bytes.clear();
+                    reader.discard();
 
                     return Some((
                         StreamSnafu {
@@ -775,6 +855,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_unterminated_event_past_the_cap_ends_the_stream() {
+        // A live connection that keeps sending without ever ending an event. Nothing here is
+        // deliverable, so the only question is whether the reader stops buffering it.
+        let mut body = Vec::with_capacity(MAX_EVENT_BYTES + 1);
+        body.extend_from_slice(b"data: {\"candidates\":[");
+        body.resize(MAX_EVENT_BYTES + 1, b'x');
+
+        let mut parsed_stream = Box::pin(parse_sse_stream(dribble_then_pending(vec![&body])));
+
+        let error = tokio::time::timeout(std::time::Duration::from_secs(30), parsed_stream.next())
+            .await
+            .expect("the cap must fire on the bytes already held, not await another read")
+            .expect("stream should yield one item")
+            .expect_err("an event past the cap should be an error");
+
+        assert!(
+            error.to_string().contains("without being terminated"),
+            "the error should say the event was never terminated, got: {error}"
+        );
+
+        // Timed too: the body never ends, so a reader that kept reading it would hang here rather
+        // than fail, and take the whole run's budget with it.
+        let end = tokio::time::timeout(std::time::Duration::from_secs(30), parsed_stream.next())
+            .await
+            .expect("the stream must not read on after refusing");
+
+        assert!(
+            end.is_none(),
+            "the stream must end after refusing, not keep reading the body it refused"
+        );
+    }
+
+    /// The cap bounds one unterminated event, not what a read happens to carry. A read holding
+    /// whole events plus a modest remainder can exceed it in total while no single event does,
+    /// and rejecting that would fail a stream in which every event was properly terminated.
+    #[tokio::test]
+    async fn whole_events_plus_a_small_remainder_are_not_measured_against_the_cap() {
+        // Sized so the event clears the cap by a wide enough margin that the framing `text_event`
+        // adds around the payload cannot silently push it over.
+        let payload = MAX_EVENT_BYTES - (64 * 1024);
+        let big_event = text_event(&"x".repeat(payload));
+        assert!(
+            big_event.len() < MAX_EVENT_BYTES,
+            "the event itself is under the cap"
+        );
+
+        let mut body = big_event.into_bytes();
+        body.extend_from_slice(b"data: {\"candidates\":[");
+        body.resize(body.len() + 2 * 1024 * 1024, b'y');
+
+        assert!(
+            body.len() > MAX_EVENT_BYTES,
+            "the read must exceed the cap in total for this to test anything"
+        );
+
+        let mut parsed_stream = Box::pin(parse_sse_stream(dribble(vec![&body])));
+
+        let first = parsed_stream
+            .next()
+            .await
+            .expect("stream should yield one item")
+            .expect("a terminated event under the cap should parse");
+        assert_eq!(text_of(&first).len(), payload);
+
+        let error = parsed_stream
+            .next()
+            .await
+            .expect("stream should yield one item")
+            .expect_err("the unterminated remainder should be an error");
+        assert!(
+            error.to_string().contains("Unexpected end of stream"),
+            "a remainder under the cap ends as a truncated tail, not a refusal, got: {error}"
+        );
+    }
+
+    #[tokio::test]
     async fn a_cr_terminated_event_is_not_held_back_by_a_live_connection() {
         // SSE allows a bare `\r` line ending, so `\r\r` is a blank line and the event before it is
         // complete. Whether that second `\r` later turns out to be the start of a `\r\n` decides
@@ -846,7 +1002,7 @@ mod tests {
     fn an_event_is_framed_without_regard_for_whether_more_bytes_may_arrive() {
         // A `\r\n` blank line: both terminators are complete, so the next event starts after them.
         assert_eq!(
-            find_event_boundary(b"data: a\r\n\r\n"),
+            find_event_boundary(b"data: a\r\n\r\n", 0),
             Some(EventBoundary {
                 end: 7,
                 next_start: 11,
@@ -857,7 +1013,7 @@ mod tests {
         // only whether a `\n` follows it is unknown, so the next event provisionally starts right
         // after it and a `\n` read next is recognized as part of that terminator.
         assert_eq!(
-            find_event_boundary(b"data: a\r\n\r"),
+            find_event_boundary(b"data: a\r\n\r", 0),
             Some(EventBoundary {
                 end: 7,
                 next_start: 10,
@@ -865,7 +1021,7 @@ mod tests {
             })
         );
         assert_eq!(
-            find_event_boundary(b"data: a\r\r"),
+            find_event_boundary(b"data: a\r\r", 0),
             Some(EventBoundary {
                 end: 7,
                 next_start: 9,
@@ -874,7 +1030,7 @@ mod tests {
         );
         // A following byte settles it: that second `\r` was bare.
         assert_eq!(
-            find_event_boundary(b"data: a\r\rx"),
+            find_event_boundary(b"data: a\r\rx", 0),
             Some(EventBoundary {
                 end: 7,
                 next_start: 9,
@@ -882,8 +1038,97 @@ mod tests {
             })
         );
         // One terminator is not a blank line, and neither is none.
-        assert_eq!(find_event_boundary(b"data: a\r"), None);
-        assert_eq!(find_event_boundary(b"data: a\r\nb"), None);
-        assert_eq!(find_event_boundary(b"data: a"), None);
+        assert_eq!(find_event_boundary(b"data: a\r", 0), None);
+        assert_eq!(find_event_boundary(b"data: a\r\nb", 0), None);
+        assert_eq!(find_event_boundary(b"data: a", 0), None);
+    }
+
+    /// Resuming is only sound if it never changes what a scan finds. Growing each body one byte at
+    /// a time puts the resumption point at every offset in turn - including inside a `\r\n` pair
+    /// and between the two terminators of a blank line, the positions a later read reclassifies.
+    #[test]
+    fn a_resumed_scan_frames_the_same_events_as_one_from_the_start() {
+        let bodies: [&[u8]; 6] = [
+            b"data: a\r\n\r\ndata: b\r\n\r\n",
+            b"data: a\n\ndata: b\n\n",
+            b"data: a\r\rdata: b\r\r",
+            b"data: a\r\n\rdata: b\r\n\r\n",
+            b": keep-alive\n\ndata: a\r\n\r\n",
+            b"\r\n\r\n\r\n",
+        ];
+
+        for body in bodies {
+            let mut reader = SseReader::default();
+
+            for byte in body {
+                reader.bytes.push(*byte);
+
+                let resumed = reader.next_boundary();
+                let from_the_start = find_event_boundary(&reader.bytes, 0);
+
+                assert_eq!(
+                    resumed,
+                    from_the_start,
+                    "resuming at {} disagreed with a full scan of {:?}",
+                    reader.scanned,
+                    String::from_utf8_lossy(&reader.bytes)
+                );
+
+                // Take the event off the front the way the stream loop does, so the next byte is
+                // scanned against a buffer that has had one consumed.
+                if let Some(boundary) = resumed {
+                    reader.consume(boundary.next_start);
+                }
+            }
+        }
+    }
+
+    /// The scan used to restart at zero on every read, so a peer dribbling one unterminated event
+    /// paid a full rescan per read - work quadratic in the bytes it sent, off a modest amount of
+    /// traffic. An unsuccessful scan now leaves behind where it stopped.
+    #[test]
+    fn an_unterminated_event_is_not_rescanned_from_the_start() {
+        let mut reader = SseReader::default();
+
+        for _ in 0..16 {
+            reader.bytes.extend_from_slice(b"0123456789");
+
+            assert_eq!(reader.next_boundary(), None);
+
+            // Only the two positions a later read can reclassify are left to re-examine, so what
+            // one more read costs does not grow with the bytes already buffered.
+            assert_eq!(reader.scanned, reader.bytes.len().saturating_sub(2));
+        }
+    }
+
+    async fn text_of_each(stream: ByteStream) -> Vec<String> {
+        let mut parsed_stream = Box::pin(parse_sse_stream(stream));
+        let mut texts = Vec::new();
+
+        while let Some(response) = parsed_stream.next().await {
+            texts.push(text_of(&response.expect("the event should parse")));
+        }
+
+        texts
+    }
+
+    /// The scan offset is state carried across reads, and the reader also drops bytes off the front
+    /// - an event it framed, and the `\n` of a `\r\n` split across two reads. Delivering a body one
+    /// byte at a time puts a read boundary at every one of those points at once.
+    #[tokio::test]
+    async fn a_body_delivered_one_byte_at_a_time_reads_the_same_as_one_delivered_whole() {
+        // The comment ahead of the data events makes the reader frame an event, yield nothing for
+        // it and scan on - the path a stale offset would survive into the next read on.
+        let body = format!(
+            ": keep-alive\r\n\r\n{}{}",
+            text_event("first"),
+            text_event("second")
+        );
+
+        let whole = text_of_each(dribble(vec![body.as_bytes()])).await;
+        let one_byte_at_a_time = text_of_each(dribble(body.as_bytes().chunks(1).collect())).await;
+
+        assert_eq!(whole, ["first", "second"]);
+        assert_eq!(one_byte_at_a_time, whole);
     }
 }

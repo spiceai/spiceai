@@ -56,6 +56,7 @@ inputs:
         - '**/nextest.toml'
         - '**/layers.toml'
         - 'scripts/check_crate_layers.py'
+        - 'scripts/check_table_layers.py'
         - 'scripts/check_rust_gate_paths.py'
         - 'rust-toolchain'
         - 'rust-toolchain.toml'
@@ -70,7 +71,7 @@ runs:
   steps:
     - name: Detect all code changes
       id: changed-code-files
-      uses: dorny/paths-filter@7b450fff21473bca461d4b92ce414b9d0420d706 # v4.0.2
+      uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
       with:
         filters: ${{ inputs.filters }}
 

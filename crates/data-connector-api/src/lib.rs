@@ -22,6 +22,8 @@ limitations under the License.
 //! reports ([`DataConnectorError`]), so a connector crate can name both without
 //! depending on the runtime that orchestrates it.
 
+pub mod schema_projection;
+
 use std::sync::Arc;
 
 use runtime_component::catalog::CatalogSpec;
@@ -42,6 +44,12 @@ pub enum ConnectorComponent {
 impl From<&Arc<DatasetSpec>> for ConnectorComponent {
     fn from(dataset: &Arc<DatasetSpec>) -> Self {
         ConnectorComponent::Dataset(Arc::clone(dataset))
+    }
+}
+
+impl From<&DatasetSpec> for ConnectorComponent {
+    fn from(dataset: &DatasetSpec) -> Self {
+        ConnectorComponent::Dataset(Arc::new(dataset.clone()))
     }
 }
 

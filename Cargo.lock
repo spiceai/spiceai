@@ -3035,7 +3035,7 @@ version = "3.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "519bd3116aeeb42d5372c29d982d16d0170d3d4a5ed85fc7dd91642ffff3c67c"
 dependencies = [
- "darling 0.23.0",
+ "darling 0.20.11",
  "ident_case",
  "prettyplease",
  "proc-macro2",
@@ -3594,6 +3594,7 @@ dependencies = [
  "duckdb",
  "flatbuffers",
  "futures",
+ "globset",
  "hash-index",
  "im",
  "insta",
@@ -3602,7 +3603,6 @@ dependencies = [
  "object_store 0.13.2",
  "parking_lot",
  "paste",
- "regex",
  "roaring",
  "rstest 0.26.1",
  "runtime-datafusion",
@@ -4202,9 +4202,12 @@ checksum = "510ca239cf13b7f8d16a2b48f263de7b4f8c566f0af58d901031473c76afb1e3"
 name = "connector-abfs"
 version = "2.2.0-unstable"
 dependencies = [
+ "app",
  "linkme",
  "object_store 0.13.2",
  "runtime",
+ "runtime-parameters",
+ "runtime-secrets",
  "secrecy",
  "snafu",
  "tokio",
@@ -4229,6 +4232,7 @@ dependencies = [
  "linkme",
  "parking_lot",
  "runtime",
+ "runtime-parameters",
  "secrecy",
  "sha2 0.10.9",
  "snafu",
@@ -4255,6 +4259,8 @@ dependencies = [
  "ns_lookup",
  "paste",
  "runtime",
+ "runtime-parameters",
+ "runtime-udfs-api",
  "secrecy",
  "snafu",
  "url",
@@ -4277,6 +4283,7 @@ dependencies = [
  "runtime",
  "runtime-api-types",
  "runtime-metrics",
+ "runtime-parameters",
  "serde_json",
  "snafu",
  "tokio",
@@ -4290,6 +4297,7 @@ dependencies = [
  "app",
  "async-trait",
  "aws-sdk-credential-bridge",
+ "data-http-rate-control",
  "data_components",
  "datafusion",
  "futures",
@@ -4299,6 +4307,7 @@ dependencies = [
  "runtime",
  "runtime-api-types",
  "runtime-metrics",
+ "runtime-parameters",
  "runtime-rate-control",
  "runtime-secrets",
  "secrecy",
@@ -4321,6 +4330,8 @@ dependencies = [
  "linkme",
  "paste",
  "runtime",
+ "runtime-parameters",
+ "runtime-secrets",
  "secrecy",
  "snafu",
  "tokio",
@@ -4342,6 +4353,8 @@ dependencies = [
  "ns_lookup",
  "paste",
  "runtime",
+ "runtime-parameters",
+ "runtime-udfs-api",
  "snafu",
  "tracing",
 ]
@@ -4358,6 +4371,8 @@ dependencies = [
  "linkme",
  "paste",
  "runtime",
+ "runtime-datafusion",
+ "runtime-parameters",
  "snafu",
 ]
 
@@ -4372,6 +4387,8 @@ dependencies = [
  "duckdb",
  "linkme",
  "runtime",
+ "runtime-datafusion",
+ "runtime-parameters",
  "snafu",
  "tokio",
  "tracing",
@@ -4393,6 +4410,7 @@ dependencies = [
  "aws-smithy-types",
  "base64 0.22.1",
  "chrono",
+ "data-connector-api",
  "data_components",
  "datafusion",
  "dynamodb-streams",
@@ -4425,6 +4443,7 @@ dependencies = [
  "linkme",
  "paste",
  "runtime",
+ "runtime-parameters",
  "secrecy",
  "snafu",
  "tracing",
@@ -4443,6 +4462,8 @@ dependencies = [
  "linkme",
  "paste",
  "runtime",
+ "runtime-parameters",
+ "runtime-udfs-api",
  "snafu",
 ]
 
@@ -4453,6 +4474,7 @@ dependencies = [
  "linkme",
  "paste",
  "runtime",
+ "runtime-parameters",
  "snafu",
  "tokio",
  "url",
@@ -4462,9 +4484,13 @@ dependencies = [
 name = "connector-gcs"
 version = "2.2.0-unstable"
 dependencies = [
+ "app",
  "linkme",
  "object_store 0.13.2",
  "runtime",
+ "runtime-parameters",
+ "runtime-secrets",
+ "secrecy",
  "snafu",
  "tokio",
  "url",
@@ -4488,6 +4514,7 @@ dependencies = [
  "runtime",
  "runtime-api-types",
  "runtime-metrics",
+ "runtime-parameters",
  "secrecy",
  "snafu",
  "tempfile",
@@ -4517,6 +4544,8 @@ dependencies = [
  "linkme",
  "reqwest 0.13.4",
  "runtime",
+ "runtime-datafusion",
+ "runtime-parameters",
  "runtime-rate-control",
  "runtime-secrets",
  "secrecy",
@@ -4547,6 +4576,7 @@ dependencies = [
  "app",
  "arrow",
  "async-trait",
+ "data-http-rate-control",
  "data_components",
  "datafusion",
  "futures",
@@ -4558,7 +4588,9 @@ dependencies = [
  "reqwest 0.13.4",
  "runtime",
  "runtime-metrics",
+ "runtime-parameters",
  "runtime-rate-control",
+ "runtime-secrets",
  "secrecy",
  "serde",
  "serde_json",
@@ -4586,6 +4618,7 @@ dependencies = [
  "paste",
  "regex",
  "runtime",
+ "runtime-parameters",
  "secrecy",
  "snafu",
 ]
@@ -4606,7 +4639,9 @@ dependencies = [
  "opentelemetry",
  "runtime",
  "runtime-api-types",
+ "runtime-datafusion",
  "runtime-metrics",
+ "runtime-parameters",
  "secrecy",
  "serde",
  "serde_json",
@@ -4625,6 +4660,7 @@ dependencies = [
  "async-stream",
  "async-trait",
  "criterion 0.7.0",
+ "data-connector-api",
  "data_components",
  "datafusion",
  "datafusion-table-providers",
@@ -4634,6 +4670,7 @@ dependencies = [
  "mongodb",
  "paste",
  "runtime",
+ "runtime-parameters",
  "secrecy",
  "serde_json",
  "snafu",
@@ -4652,6 +4689,7 @@ dependencies = [
  "linkme",
  "paste",
  "runtime",
+ "runtime-parameters",
  "snafu",
  "tiberius",
 ]
@@ -4675,6 +4713,8 @@ dependencies = [
  "runtime",
  "runtime-api-types",
  "runtime-metrics",
+ "runtime-parameters",
+ "runtime-udfs-api",
  "secrecy",
  "snafu",
  "tokio",
@@ -4688,6 +4728,7 @@ dependencies = [
  "linkme",
  "paste",
  "runtime",
+ "runtime-parameters",
  "snafu",
  "tokio",
  "url",
@@ -4710,6 +4751,8 @@ dependencies = [
  "odbc-api",
  "paste",
  "runtime",
+ "runtime-parameters",
+ "runtime-udfs-api",
  "secrecy",
  "sha2 0.10.9",
  "snafu",
@@ -4750,8 +4793,12 @@ dependencies = [
  "opentelemetry",
  "runtime",
  "runtime-api-types",
+ "runtime-datafusion",
  "runtime-metrics",
+ "runtime-parameters",
  "secrecy",
+ "serde",
+ "serde_json",
  "snafu",
  "tokio",
  "tokio-postgres",
@@ -4796,6 +4843,7 @@ dependencies = [
  "linkme",
  "paste",
  "runtime",
+ "runtime-parameters",
  "snafu",
  "tokio",
  "url",
@@ -4823,7 +4871,9 @@ dependencies = [
  "percent-encoding",
  "reqwest 0.13.4",
  "runtime",
+ "runtime-datafusion",
  "runtime-object-store",
+ "runtime-parameters",
  "secrecy",
  "serde",
  "serde_json",
@@ -4840,6 +4890,7 @@ dependencies = [
  "linkme",
  "paste",
  "runtime",
+ "runtime-parameters",
  "snafu",
  "tokio",
  "url",
@@ -4858,6 +4909,8 @@ dependencies = [
  "linkme",
  "paste",
  "runtime",
+ "runtime-parameters",
+ "runtime-udfs-api",
  "snafu",
  "snowflake-api",
 ]
@@ -5620,17 +5673,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "424e0138278faeb2b401f174ad17e715c829512d74f3d1e81eb43365c2e0590e"
 dependencies = [
  "ctor-proc-macro",
- "dtor 0.1.1",
-]
-
-[[package]]
-name = "ctor"
-version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "352d39c2f7bef1d6ad73db6f5160efcaed66d94ef8c6c573a8410c00bf909a98"
-dependencies = [
- "ctor-proc-macro",
- "dtor 0.3.0",
+ "dtor",
 ]
 
 [[package]]
@@ -5955,8 +5998,10 @@ dependencies = [
 name = "data-connector-api"
 version = "2.2.0-unstable"
 dependencies = [
+ "data_components",
  "globset",
  "runtime-component",
+ "serde_json",
  "snafu",
 ]
 
@@ -5965,6 +6010,26 @@ name = "data-encoding"
 version = "2.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a4ae5f15dda3c708c0ade84bfee31ccab44a3da4f88015ed22f63732abe300c8"
+
+[[package]]
+name = "data-http-rate-control"
+version = "2.2.0-unstable"
+dependencies = [
+ "data-connector-api",
+ "data_components",
+ "fundu",
+ "governor",
+ "object_store 0.13.2",
+ "opentelemetry",
+ "runtime-api-types",
+ "runtime-metrics",
+ "runtime-parameters",
+ "runtime-rate-control",
+ "tokio",
+ "tracing",
+ "url",
+ "uuid 1.23.2",
+]
 
 [[package]]
 name = "data_components"
@@ -5996,7 +6061,6 @@ dependencies = [
  "chrono",
  "connector-postgres-common",
  "criterion 0.7.0",
- "ctor 0.8.0",
  "dashmap",
  "dataformat-json",
  "datafusion",
@@ -6052,6 +6116,7 @@ dependencies = [
  "snafu",
  "snowflake-api",
  "spark-connect-rs",
+ "spice-table",
  "telemetry",
  "tempfile",
  "tiberius",
@@ -6919,7 +6984,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/datafusion-table-providers.git?rev=99e33a11fac58b89edca3ee522e41d777e39cabb#99e33a11fac58b89edca3ee522e41d777e39cabb"
+source = "git+https://github.com/spiceai/datafusion-table-providers.git?rev=318492b8ae79162586ada08f7672563176bb0331#318492b8ae79162586ada08f7672563176bb0331"
 dependencies = [
  "adbc_core",
  "adbc_driver_manager",
@@ -7480,15 +7545,6 @@ name = "dtor"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "404d02eeb088a82cfd873006cb713fe411306c7d182c344905e101fb1167d301"
-dependencies = [
- "dtor-proc-macro",
-]
-
-[[package]]
-name = "dtor"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f1057d6c64987086ff8ed0fd3fbf377a6b7d205cc7715868cd401705f715cbe4"
 dependencies = [
  "dtor-proc-macro",
 ]
@@ -13716,7 +13772,7 @@ version = "0.56.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "97b31d3d8e99a85d83b73ec26647f5607b80578ed9375810b6e44ffa3590a236"
 dependencies = [
- "ctor 0.6.3",
+ "ctor",
  "opendal-core",
  "opendal-layer-concurrent-limit",
  "opendal-layer-logging",
@@ -16813,6 +16869,7 @@ dependencies = [
  "dashmap",
  "data-accelerator-api",
  "data-connector-api",
+ "data-http-rate-control",
  "data_components",
  "dataformat-json",
  "datafusion",
@@ -16919,6 +16976,7 @@ dependencies = [
  "runtime-search",
  "runtime-secrets",
  "runtime-status",
+ "runtime-table",
  "runtime-table-partition",
  "runtime-tools",
  "runtime-udfs-api",
@@ -16937,6 +16995,7 @@ dependencies = [
  "snowflake-api",
  "spice-cloud",
  "spice-cloud-client",
+ "spice-table",
  "spiceai",
  "spicepod",
  "sysinfo 0.38.4",
@@ -16947,6 +17006,7 @@ dependencies = [
  "test-framework",
  "tiberius",
  "token_provider",
+ "tokenizers 0.21.4",
  "tokio",
  "tokio-postgres",
  "tokio-rusqlite",
@@ -17233,6 +17293,7 @@ dependencies = [
  "futures",
  "insta",
  "itertools 0.14.0",
+ "linkme",
  "object_store 0.13.2",
  "opentelemetry",
  "parking_lot",
@@ -17241,9 +17302,11 @@ dependencies = [
  "runtime-object-store",
  "runtime-query-engine",
  "runtime-request-context",
+ "runtime-udfs-api",
  "search",
  "serde_json",
  "snafu",
+ "spice-table",
  "tokio",
  "tokio-stream",
  "tokio-util",
@@ -17264,6 +17327,7 @@ dependencies = [
  "futures",
  "itertools 0.14.0",
  "snafu",
+ "spice-table",
  "tokio",
  "tracing",
 ]
@@ -17518,6 +17582,7 @@ dependencies = [
  "serde",
  "serde_json",
  "snafu",
+ "spice-table",
  "spicepod",
  "telemetry",
  "tokio",
@@ -17573,6 +17638,65 @@ dependencies = [
  "runtime-metrics",
  "tokio",
  "tokio-util",
+]
+
+[[package]]
+name = "runtime-table"
+version = "2.2.0-unstable"
+dependencies = [
+ "arrow",
+ "arrow-schema",
+ "arrow_tools",
+ "async-stream",
+ "async-trait",
+ "cache",
+ "cayenne",
+ "chrono",
+ "data-accelerator-api",
+ "data-connector-api",
+ "data_components",
+ "datafusion",
+ "datafusion-datasource",
+ "datafusion-expr",
+ "datafusion-federation",
+ "datafusion-functions-json",
+ "datafusion-optimizer-rules",
+ "datafusion-table-providers",
+ "fundu",
+ "futures",
+ "insta",
+ "opentelemetry",
+ "opentelemetry-prometheus",
+ "opentelemetry_sdk",
+ "parking_lot",
+ "prometheus",
+ "rand 0.10.1",
+ "runtime-acceleration",
+ "runtime-async",
+ "runtime-component",
+ "runtime-datafusion",
+ "runtime-datafusion-index",
+ "runtime-metrics",
+ "runtime-object-store",
+ "runtime-request-context",
+ "runtime-resources",
+ "runtime-search",
+ "runtime-status",
+ "runtime-table-partition",
+ "runtime-udfs-api",
+ "search",
+ "serde",
+ "snafu",
+ "spice-table",
+ "spicepod",
+ "telemetry",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "tracing",
+ "twox-hash",
+ "util",
+ "utoipa",
 ]
 
 [[package]]
@@ -18319,6 +18443,7 @@ dependencies = [
  "serde",
  "serde_json",
  "snafu",
+ "spice-table",
  "tantivy",
  "tempfile",
  "tokio",
@@ -18636,9 +18761,9 @@ dependencies = [
 
 [[package]]
 name = "serde_with"
-version = "3.20.0"
+version = "3.21.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e72c1c2cb7b223fafb600a619537a871c2818583d619401b785e7c0b746ccde2"
+checksum = "76a5c54c7310e7b8b9577c286d7e399ddd876c3e12b3ed917a8aabc4b96e9e8c"
 dependencies = [
  "base64 0.22.1",
  "bs58",
@@ -18656,9 +18781,9 @@ dependencies = [
 
 [[package]]
 name = "serde_with_macros"
-version = "3.20.0"
+version = "3.21.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b90c488738ecb4fb0262f41f43bc40efc5868d9fb744319ddf5f5317f417bfac"
+checksum = "84d57bc0c8b9a17920c178daa6bb924850d54a9c97ab45194bb8c17ad66bb660"
 dependencies = [
  "darling 0.23.0",
  "proc-macro2",
@@ -19248,6 +19373,7 @@ dependencies = [
  "datafusion",
  "reqwest 0.13.4",
  "runtime",
+ "runtime-secrets",
  "serde",
  "serde_json",
  "snafu",
@@ -19263,7 +19389,19 @@ dependencies = [
  "serde",
  "serde_json",
  "snafu",
+ "tokio",
  "url",
+]
+
+[[package]]
+name = "spice-table"
+version = "2.2.0-unstable"
+dependencies = [
+ "async-trait",
+ "datafusion",
+ "datafusion-federation",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -19341,6 +19479,7 @@ dependencies = [
  "connector-spiceai",
  "cpu-budget",
  "crash-handler",
+ "datafusion",
  "event_stream",
  "futures",
  "libc",
@@ -19361,6 +19500,8 @@ dependencies = [
  "runtime-cloud-connect",
  "runtime-datafusion",
  "runtime-query-engine",
+ "runtime-request-context",
+ "runtime-secrets",
  "rustls",
  "serde_json",
  "snafu",
@@ -22718,6 +22859,10 @@ dependencies = [
  "moka",
  "object_store 0.13.2",
  "opentelemetry",
+ "opentelemetry-prometheus",
+ "opentelemetry_sdk",
+ "parking_lot",
+ "prometheus",
  "rstest 0.26.1",
  "tempfile",
  "tokio",
