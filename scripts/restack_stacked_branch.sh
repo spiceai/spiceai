@@ -199,12 +199,89 @@ merge_other_side() {
 # object together, because a revert can be entirely in the mode: parent adds +x,
 # child takes it away, and every blob involved is byte-identical while the
 # executable bit the child removed survives in the result.
+# Both capture git's output before parsing it, so a failed read is a failure
+# rather than an empty answer: through a pipe the status would be awk's, and an
+# unreadable index or object would look exactly like a path that is not there.
 tree_entry() {
-  git ls-tree "$1" -- ":(literal)$2" | awk '{ print $1 " " $3 }'
+  local out
+  out=$(git ls-tree "$1" -- ":(literal)$2") || return 1
+  printf '%s\n' "$out" | awk '{ print $1 " " $3 }'
 }
 
 index_entry() {
-  git ls-files --stage -- ":(literal)$1" | awk '$3 == 0 { print $1 " " $2 }'
+  local out
+  out=$(git ls-files --stage -- ":(literal)$1") || return 1
+  printf '%s\n' "$out" | awk '$3 == 0 { print $1 " " $2 }'
+}
+
+# Does the staged result for one path match what a merge based on the stack base
+# would have produced? Prints a finding and returns 1 if not.
+#
+# Comparing the staged entry against trunk's would only catch a change lost
+# whole. A child that reverts one of the parent's hunks and edits the same file
+# elsewhere keeps the second edit and loses the revert, leaving a result that
+# matches neither side -- so the comparison has to be against the correct merge,
+# not against either input.
+audit_modification() {
+  local path="$1" stack_base="$2" pre="$3" other="$4" tmp="$5"
+  local staged_entry mine_entry theirs_entry base_entry
+  staged_entry=$(index_entry "$path") || die "could not read the index entry for $path"
+  mine_entry=$(tree_entry "$pre" "$path") || die "could not read $pre:$path"
+  theirs_entry=$(tree_entry "$other" "$path") || die "could not read $other:$path"
+  base_entry=$(tree_entry "$stack_base" "$path") || die "could not read $stack_base:$path"
+
+  # An unmerged path has no stage 0 and is somebody's open conflict; a path
+  # missing on a side is an add or a delete, which the filters above cover.
+  [ -n "$staged_entry" ] && [ -n "$mine_entry" ] &&
+    [ -n "$theirs_entry" ] && [ -n "$base_entry" ] || return 0
+
+  local staged_mode staged_oid mine_mode mine_oid theirs_mode theirs_oid base_mode base_oid
+  read -r staged_mode staged_oid <<< "$staged_entry"
+  read -r mine_mode mine_oid <<< "$mine_entry"
+  read -r theirs_mode theirs_oid <<< "$theirs_entry"
+  read -r base_mode base_oid <<< "$base_entry"
+
+  git cat-file blob "$mine_oid" > "$tmp/m.ours" 2>/dev/null &&
+    git cat-file blob "$base_oid" > "$tmp/m.base" 2>/dev/null &&
+    git cat-file blob "$theirs_oid" > "$tmp/m.theirs" 2>/dev/null &&
+    git cat-file blob "$staged_oid" > "$tmp/m.staged" 2>/dev/null ||
+    die "could not read the blobs for $path"
+
+  local expected_status
+  git merge-file -p --diff3 -L ours -L base -L trunk \
+    "$tmp/m.ours" "$tmp/m.base" "$tmp/m.theirs" > "$tmp/m.expected" 2>/dev/null
+  expected_status=$?
+
+  if [ "$expected_status" -eq 0 ]; then
+    if ! cmp -s "$tmp/m.expected" "$tmp/m.staged"; then
+      echo "DISCARDED $path: the staged content is not what a merge from the stack base gives"
+      return 1
+    fi
+  elif [ "$expected_status" -ge 1 ] && [ "$expected_status" -le 127 ]; then
+    # git resolved this without a conflict only because it used the older base.
+    echo "REVIEW $path: a merge from the stack base conflicts here, so the staged result was never decided"
+    return 1
+  else
+    echo "REVIEW $path: the expected merge could not be computed (binary content?)"
+    return 1
+  fi
+
+  local expected_mode
+  if [ "$mine_mode" != "$base_mode" ] && [ "$theirs_mode" != "$base_mode" ] &&
+     [ "$mine_mode" != "$theirs_mode" ]; then
+    echo "REVIEW $path: both sides changed the file mode, to $mine_mode and $theirs_mode"
+    return 1
+  fi
+  if [ "$mine_mode" != "$base_mode" ]; then
+    expected_mode="$mine_mode"
+  else
+    expected_mode="$theirs_mode"
+  fi
+  if [ "$staged_mode" != "$expected_mode" ]; then
+    echo "DISCARDED $path: staged mode $staged_mode, expected $expected_mode"
+    return 1
+  fi
+  return 0
 }
 
 # Exit status: 0 if the merge did what the child intended, 1 otherwise.
@@ -279,10 +356,7 @@ cmd_audit() {
   # keeps trunk's version. Neither filter above lists such a path -- it is a
   # modification, and its content is simply gone.
   #
-  # The signature is that the staged entry is identical to trunk's while the
-  # child's differs: the child's edit is not represented in the result at all. An
-  # edit that merged normally leaves a result matching neither side exactly.
-  local other staged theirs mine
+  local other
   if ! other=$(merge_other_side "$pre"); then
     # Outside a merge there is no other side to compare against. Say so rather
     # than reporting on a narrower check than the caller asked for: a quiet
@@ -291,16 +365,8 @@ cmd_audit() {
     other=""
   fi
   while [ -n "$other" ] && IFS= read -r -d '' path; do
-    staged=$(index_entry "$path")
-    theirs=$(tree_entry "$other" "$path")
-    mine=$(tree_entry "$pre" "$path")
-    # An unmerged path has no stage 0 and is somebody's open conflict; a path
-    # missing from either side is an add or a delete, already covered above.
-    [ -n "$staged" ] && [ -n "$theirs" ] && [ -n "$mine" ] || continue
-    if [ "$staged" = "$theirs" ] && [ "$mine" != "$theirs" ]; then
-      echo "DISCARDED $path"
+    audit_modification "$path" "$stack_base" "$pre" "$other" "$tmp" ||
       findings=$((findings + 1))
-    fi
   done < "$tmp/modified"
 
   rm -rf "$tmp"

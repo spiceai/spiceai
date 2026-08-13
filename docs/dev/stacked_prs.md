@@ -211,8 +211,8 @@ scripts/restack_stacked_branch.sh audit "$STACKBASE" "$PRE"
 ```
 
 It compares what the child *intended* against what the merge actually staged, and exits
-non-zero on any `RESURRECTED`, `LOST`, or `DISCARDED` path. Run it again after every
-correction.
+non-zero on any `RESURRECTED`, `LOST`, `DISCARDED`, or `REVIEW` path. Run it again after
+every correction.
 
 `DISCARDED` is the same failure as `RESURRECTED`, in content or file mode rather than
 existence — a reverted executable bit counts, and every blob involved is identical: when
@@ -220,6 +220,13 @@ the child's edit *reverts* something the parent did, the child's side matches th
 point, so the merge sees nothing to preserve and keeps `trunk`'s version. No conflict is
 reported, and the path is a modification, so listing added and deleted paths alone would
 never surface it.
+
+The check is a comparison against the merge that *should* have happened — the staged
+content against a three-way merge from the stack base — rather than against either input,
+because a file can lose a revert and keep an unrelated edit in the same commit, leaving a
+result that matches neither side. `REVIEW` is the case where that correct merge conflicts:
+git resolved the path without asking only because it used the older base, so nobody has
+actually decided what belongs there.
 
 Two properties are worth knowing, because both were bugs that reported success:
 

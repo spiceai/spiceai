@@ -187,6 +187,36 @@ start_test "audit reports a child edit the merge discarded (a revert of the pare
   esac
 ) || failures=$((failures + 1))
 
+start_test "audit reports a partial loss, where the result matches neither side"
+(
+  new_stack "$work_root/partial"
+  printf 'l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\n' > f.txt && commit_all "fork point"
+  git checkout --quiet -b parent
+  printf 'l1\nPARENT\nl3\nl4\nl5\nl6\nl7\nl8\n' > f.txt && commit_all "parent edits line 2"
+  stack_base=$(git rev-parse HEAD)
+  git checkout --quiet -b child
+  # Two changes in one file: a revert of the parent's line 2, and an unrelated
+  # edit at line 8. The merge keeps the second and drops the first, so the staged
+  # blob equals neither the child's version nor trunk's, and comparing whole
+  # entries against either side sees nothing wrong.
+  printf 'l1\nl2\nl3\nl4\nl5\nl6\nl7\nCHILD\n' > f.txt && commit_all "child reverts line 2, edits line 8"
+  pre=$(git rev-parse HEAD)
+  squash_parent_onto_trunk
+  git checkout --quiet child
+  git merge --no-ff --no-commit trunk >/dev/null 2>&1
+
+  staged=$(git show :f.txt)
+  case "$staged" in
+    *PARENT*) ;;
+    *) fail_test "the fixture did not reproduce the partial loss" ;;
+  esac
+  output=$("$subject" audit "$stack_base" "$pre" 2>/dev/null)
+  case "$output" in
+    *"DISCARDED f.txt"*) ;;
+    *) fail_test "a partial loss was not reported: $output" ;;
+  esac
+) || failures=$((failures + 1))
+
 start_test "audit reports a discarded mode revert, where every blob is identical"
 (
   new_stack "$work_root/moderevert"
