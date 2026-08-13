@@ -302,19 +302,9 @@ impl Runtime {
             .await;
 
         if current_app.is_some_and(|current_app| *current_app == new_app) {
-            // No diffs to run, so nothing is ever in flight and the preflight's
-            // reservation settles immediately. Settling here as well as below keeps
-            // one rule — the standing reservation is what the applied app holds —
-            // rather than leaving this path on the preflight's transitional figure.
-            self.duckdb_budget_context.settle_cayenne_reservation();
             return false;
         }
 
-        // Whether the diffs actually reconciled every component the new app declares.
-        // A diff that bails or skips one leaves a provider the new app does not
-        // describe still running, which is what decides whether the reservation
-        // charged for the swap can be released below.
-        let mut fully_reconciled = true;
         if let Some(current_app) = current_app {
             tracing::debug!("Updated pods information: {new_app:?}");
             tracing::debug!("Previous pods information: {current_app:?}");
@@ -326,10 +316,10 @@ impl Runtime {
             Arc::clone(&self)
                 .apply_catalog_diff(current_app, &new_app)
                 .await;
-            fully_reconciled &= Arc::clone(&self)
+            Arc::clone(&self)
                 .apply_dataset_diff(current_app, &new_app)
                 .await;
-            fully_reconciled &= Arc::clone(&self)
+            Arc::clone(&self)
                 .apply_view_diff(current_app, &new_app)
                 .await;
             self.apply_model_diff(current_app, &new_app).await;
@@ -340,21 +330,6 @@ impl Runtime {
                     .apply_worker_diff(current_app, &new_app)
                     .await;
             }
-        }
-
-        // Release the overlap the preflight charged, but only when the diffs did what
-        // the settled figure assumes: it describes what the new app DECLARES, and a
-        // diff that bailed or skipped a component has left that component's provider
-        // — and its caches — live. Settling then would hand the in-memory tier bytes
-        // that are still held, and reapplying the same app is a no-op, so nothing
-        // would correct it. Keeping the overlap over-reserves until a later reload
-        // succeeds, which is the safe direction.
-        if fully_reconciled {
-            self.duckdb_budget_context.settle_cayenne_reservation();
-        } else {
-            tracing::warn!(
-                "Some components were not reconciled by this reload, so the accelerator memory reservation stays at the higher figure the swap was charged at until a later reload succeeds"
-            );
         }
 
         *self.app.write().await = Some(new_app);

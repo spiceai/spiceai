@@ -1772,10 +1772,9 @@ pub(crate) struct DuckDbBudgetContext {
     current_total_memory: Arc<AtomicU64>,
     /// Off-pool Cayenne cache reservation the current app holds, charged per
     /// component at the ceiling its provider was created with, and shared with the
-    /// live in-memory-tier sampler so reload-added caches remain enforced. Unlike
-    /// the `DuckDB` aggregate this is not a high-water: a reload republishes it, and
-    /// [`DuckDbBudgetContext::settle_cayenne_reservation`] lowers it to what the
-    /// applied app declares once the diffs have run.
+    /// live in-memory-tier sampler so reload-added caches remain enforced. A running
+    /// maximum, like the `DuckDB` aggregate: a reload raises it and nothing lowers it,
+    /// because the reload path cannot report which providers it actually dropped.
     current_cayenne_reservation_bytes: Arc<AtomicU64>,
     /// Whether the query pool came from an explicit `runtime.query.memory_limit`.
     /// Such a pool is honored verbatim and a restart reproduces it exactly, so the
@@ -1806,9 +1805,8 @@ impl DuckDbBudgetContext {
     /// Charging per identity is what keeps a single changed table from
     /// double-charging every unchanged table beside it.
     ///
-    /// Returns the figure the in-memory-tier sampler enforces while the apply runs.
-    /// [`Self::settle_cayenne_reservation`] republishes what the applied app declares
-    /// once the diffs have dropped the providers this overlap covered.
+    /// Returns the reservation the in-memory-tier sampler enforces: the largest this
+    /// runtime has charged, which this reload can raise but never lower.
     fn retained_cayenne_reservation_bytes(
         &self,
         current_app: Option<&Arc<App>>,
@@ -1873,29 +1871,22 @@ impl DuckDbBudgetContext {
         *last_reservations = next_reservations;
         drop(last_reservations);
 
-        // The overlap stands while the apply runs — both providers of a replaced
-        // component are resident until the diff drops the old one — and
-        // [`Self::settle_cayenne_reservation`] republishes the settled figure once
-        // that is done. Publishing the overlap and leaving it would throttle the
-        // in-memory tier against caches that no longer exist for as long as no
-        // further reload arrived, which may be the life of the process.
+        // Published as a running maximum, so a reload can raise the enforced
+        // reservation but never lower it.
+        //
+        // Lowering it correctly would mean knowing which replacements and removals
+        // the diffs actually performed, and the reload path cannot say:
+        // `update_dataset`, `remove_dataset` and `remove_view` all return `()`, and
+        // several failure paths log and continue. Releasing on the assumption that
+        // the new app describes what is resident would, whenever one of those failed,
+        // hand the in-memory tier bytes a live provider still holds — and because
+        // reapplying an identical app is a no-op, nothing would correct it. The cost
+        // of the maximum is over-reservation until the process restarts, which
+        // throttles rather than over-commits; releasing it needs the reload path to
+        // report what it applied, which is its own change.
         self.current_cayenne_reservation_bytes
-            .store(overlap_bytes, Ordering::Release);
-        overlap_bytes
-    }
-
-    /// Republishes the reservation the applied app actually holds, dropping the
-    /// replacement and removal overlap [`Self::retained_cayenne_reservation_bytes`]
-    /// charged for the duration of the apply.
-    ///
-    /// Call once the dataset and view diffs have run, so the providers the overlap
-    /// covered are gone before the memory they held is released to the in-memory
-    /// tier. Safe to call when nothing changed: the settled figure equals the
-    /// overlap for an app that replaced and removed nothing.
-    pub(crate) fn settle_cayenne_reservation(&self) {
-        let settled_bytes = self.settled_cayenne_reservation_bytes();
-        self.current_cayenne_reservation_bytes
-            .store(settled_bytes, Ordering::Release);
+            .fetch_max(overlap_bytes, Ordering::AcqRel)
+            .max(overlap_bytes)
     }
 
     /// Off-pool Cayenne bytes the app tracked by [`Self::last_app_cayenne_reservations`]
@@ -3024,9 +3015,10 @@ mod test {
         );
     }
 
-    /// The reservation tracked for the next reload is the ceiling each provider was
-    /// created with, so a table that outlives several reloads is never re-charged for
-    /// an overlap that has already completed.
+    /// The state tracked for the next reload is the ceiling each provider was created
+    /// with, so a table that outlives several reloads is never re-charged for an
+    /// overlap that has already completed — even though the figure the sampler
+    /// enforces is a maximum that no reload lowers.
     #[cfg(not(windows))]
     #[test]
     fn cayenne_reload_retires_the_overlap_after_it_completes() {
@@ -3066,8 +3058,8 @@ mod test {
         );
         assert_eq!(
             context.retained_cayenne_reservation_bytes(Some(&one_table), &one_table, total_memory),
-            per_table,
-            "once the removal has drained, the reservation falls back to what is held"
+            2 * per_table,
+            "the enforced reservation is a maximum, so the drained table stays covered"
         );
         assert_eq!(
             context
@@ -3081,13 +3073,12 @@ mod test {
         );
     }
 
-    /// The overlap a replacement charges covers providers that are resident only
-    /// while the apply runs. Settling republishes what the applied app holds, so the
-    /// in-memory-tier sampler stops reserving for caches the diffs have dropped
-    /// instead of waiting for a later reload that may never arrive.
+    /// A replacement charges both providers, and the enforced reservation is a running
+    /// maximum: a later, smaller figure never lowers it, because the reload path
+    /// cannot report which providers it actually dropped.
     #[cfg(not(windows))]
     #[test]
-    fn cayenne_settling_releases_the_replacement_overlap() {
+    fn cayenne_reservation_never_falls_below_what_was_charged() {
         let app_with_segment_cache =
             |mb: &str| {
                 let mut acceleration = cayenne_test_accel("cayenne", true);
@@ -3126,14 +3117,22 @@ mod test {
             "the sampler reserves for both while the apply runs"
         );
 
-        context.settle_cayenne_reservation();
-
+        // A later reload of the settled app computes the smaller figure. It must not
+        // lower what the sampler enforces: the reload path cannot report whether the
+        // provider this replaced was actually dropped.
+        let later =
+            context.retained_cayenne_reservation_bytes(Some(&new_app), &new_app, total_memory);
+        assert_eq!(
+            later,
+            current + new,
+            "a smaller later figure must not lower the enforced reservation"
+        );
         assert_eq!(
             context
                 .current_cayenne_reservation_bytes
                 .load(Ordering::Acquire),
-            new,
-            "settling releases the provider the apply dropped"
+            current + new,
+            "the sampler keeps reserving for a provider that may still be live"
         );
     }
 

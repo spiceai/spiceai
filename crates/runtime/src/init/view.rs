@@ -399,20 +399,12 @@ impl Runtime {
     /// Update views based on changed between the current and new app.
     /// This function will update views that have changed, and remove views that are no longer in the app.
     /// It will also update views that have dependencies that have changed.
-    /// Returns whether every view the new app declares was reconciled: `false` when a
-    /// view could not be built or removed, so a provider the new app does not describe
-    /// is still live. The accelerator memory budget uses this to decide whether the
-    /// reservation it charged for the swap can safely be released
-    /// ([`Runtime::apply_app_diff`]).
     pub(crate) async fn apply_view_diff(
         self: Arc<Self>,
         current_app: &Arc<App>,
         new_app: &Arc<App>,
-    ) -> bool {
+    ) {
         let validated_views = Arc::clone(&self).get_valid_views(new_app, LogErrors(true));
-        // A view dropped here is neither applied nor removed: it stays in `new_app`,
-        // so the removal loop below leaves its old provider running.
-        let mut fully_applied = validated_views.len() == new_app.views.len();
         let existing_validated_views =
             Arc::clone(&self).get_valid_views(current_app, LogErrors(false));
 
@@ -442,7 +434,6 @@ impl Runtime {
                     Ok(v) => v,
                     Err(e) => {
                         tracing::error!("Could not remove view {}: {e}", view.name);
-                        fully_applied = false;
                         continue;
                     }
                 };
@@ -505,7 +496,5 @@ impl Runtime {
                 }
             }
         }
-
-        fully_applied
     }
 }

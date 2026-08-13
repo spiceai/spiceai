@@ -1604,27 +1604,19 @@ impl Runtime {
         Ok(())
     }
 
-    /// Returns whether every dataset the new app declares was reconciled: `false`
-    /// when the diff bailed, skipped a dataset it could not build, or failed to
-    /// initialize one, so a provider the new app does not describe is still live.
-    /// The accelerator memory budget uses this to decide whether the reservation it
-    /// charged for the swap can safely be released ([`Runtime::apply_app_diff`]).
     pub(crate) async fn apply_dataset_diff(
         self: Arc<Self>,
         current_app: &Arc<App>,
         new_app: &Arc<App>,
-    ) -> bool {
+    ) {
         let valid_datasets = Arc::clone(&self).get_valid_datasets(new_app, LogErrors(true));
-        // A dataset dropped here is neither applied nor removed: it stays in
-        // `new_app`, so the removal loop below leaves its old provider running.
-        let mut fully_applied = valid_datasets.len() == new_app.datasets.len();
 
         // Validate Cayenne snapshot consistency before initializing accelerators.
         let acceleration_sources: Vec<Arc<dyn AccelerationSource>> =
             valid_datasets.iter().map(|ds| ds.clone_arc()).collect();
         if let Err(err) = validate_cayenne_snapshot_consistency(&acceleration_sources) {
             tracing::error!("{err}");
-            return false;
+            return;
         }
 
         let existing_datasets = Arc::clone(&self).get_valid_datasets(current_app, LogErrors(false));
@@ -1651,12 +1643,10 @@ impl Runtime {
                 Some(Ok(status)) => status.clone(),
                 Some(Err(_)) => {
                     // Error already logged in initialize_datasets_accelerators
-                    fully_applied = false;
                     continue;
                 }
                 None => {
                     tracing::error!("Dataset {} missing from initialization results", ds.name);
-                    fully_applied = false;
                     continue;
                 }
             };
@@ -1686,7 +1676,6 @@ impl Runtime {
                             "Unable to unload dataset {}: {err}\nReport a bug to request support: https://github.com/spiceai/spiceai/issues ",
                             ds.name
                         );
-                        fully_applied = false;
                         continue;
                     }
                 };
@@ -1701,7 +1690,6 @@ impl Runtime {
                         tracing::error!(
                             "Unable to unload dataset {ds_name}: {err}\nReport a bug to request support: https://github.com/spiceai/spiceai/issues"
                         );
-                        fully_applied = false;
                         continue;
                     }
                 };
@@ -1713,8 +1701,6 @@ impl Runtime {
                     .await;
             }
         }
-
-        fully_applied
     }
 
     /// Initialize datasets configured with accelerators before registering the datasets.
