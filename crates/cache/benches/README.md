@@ -64,6 +64,30 @@ Apple M-series, `--sample-size 10`. Lower is faster.
 its reads miss. A Pingora miss is one metadata lookup, while a hit removes the
 entry and re-admits it, so this measures the path where Pingora is cheapest.
 
+### Pure reads across hit rates
+
+`concurrent_get` is fixed at ~3% and `hot_read_write` refills on a miss, so
+neither isolates the read path across hit rates. `tests/hit_rate_experiment.rs`
+does: no writes, no eviction, resident set pinned. 16 threads, capacity 5,000,
+median of five:
+
+| hit rate | moka_lru | moka_tinylfu | pingora_lru | pingora vs moka_lru |
+| ---: | ---: | ---: | ---: | ---: |
+| 3% | 34.9 ms | 36.9 ms | 13.8 ms | 0.40x |
+| 50% | 33.9 ms | 34.9 ms | 22.5 ms | 0.66x |
+| 80% | 32.9 ms | 33.7 ms | 32.5 ms | 0.99x |
+| 95% | 34.7 ms | 34.7 ms | 39.0 ms | 1.12x |
+| 99% | 35.2 ms | 36.6 ms | 40.2 ms | 1.14x |
+
+Moka is flat: 33-35 ms across a 33x swing in hit rate. Pingora rises
+monotonically, 2.9x from end to end, because only a hit pays the remove and
+re-admit. They cross around 80%.
+
+Above the crossover the two are close — Pingora 12-14% behind, against Moka's
+own run-to-run spread — so on reads alone this is a parity result, not a Moka
+win. The larger gaps in `hot_read_write` at 95% and 99% therefore come from the
+refills, not from the read path.
+
 ### Read-through across hit rates (`hot_read_write`)
 
 | hit rate | threads | moka_lru | moka_tinylfu | pingora_lru | pingora vs moka_lru |
@@ -84,9 +108,9 @@ Pingora also scales worse with threads. Doubling threads doubles the work, so
 
 ### Does cache size matter?
 
-Largely no. A separate pure-read sweep over 1,000 / 5,000 / 30,000 entries put
-the crossover between 80% and 95% at every capacity, and Pingora's timings were
-within 3% of each other across the whole 30x range.
+Largely no. The same harness swept 1,000 / 5,000 / 30,000 entries and put the
+crossover between 80% and 95% at every capacity, with Pingora's timings within
+3% of each other across the whole 30x range.
 
 One exception, outside the range these benchmarks use: at 3% hits with 30,000
 entries — a 1,000,000-key working set — Moka's pure-read time jumps 2.4x while
