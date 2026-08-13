@@ -1459,6 +1459,21 @@ fn plan_cayenne_memory_budgets(
 ///
 /// A view has no `from:` and `ViewBuilder::try_from` rejects every refresh mode
 /// except `full`, so its unset default is the whole-table replace.
+/// Whether the pod hosts a Cayenne catalog.
+///
+/// A `from: cayenne` catalog creates Cayenne tables without any dataset-level
+/// acceleration block, so scanning `app.datasets`/`app.views` alone misses it.
+#[cfg(not(windows))]
+fn has_cayenne_catalog(app: &Arc<app::App>) -> bool {
+    app.catalogs.iter().any(|catalog| {
+        catalog
+            .from
+            .split(':')
+            .next()
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("cayenne"))
+    })
+}
+
 #[cfg(not(windows))]
 fn cayenne_accelerations(
     app: &Arc<app::App>,
@@ -1625,13 +1640,17 @@ fn estimate_cayenne_reservation_bytes(
     }
 
     // Scan-path cache: one process-wide cache shared by every table, so it is
-    // counted once rather than per acceleration — and only when a Cayenne table
-    // exists to use it. `install_segment_cache` is gated the same way, so an app
-    // with no Cayenne acceleration has no cache to reserve against, and reserving
-    // anyway would shrink the query pool for memory that is never allocated.
-    // Reading the installed capacity rather than recomputing the budget also
-    // reports zero when caching is switched off.
-    if has_cayenne_acceleration {
+    // counted once rather than per acceleration — and only when something exists
+    // to use it, since reserving against the query pool for a cache no table can
+    // read would shrink every other query's budget for nothing. Reading the
+    // installed capacity rather than recomputing the budget also reports zero
+    // when caching is switched off.
+    //
+    // Catalogs count as much as datasets here: a `from: cayenne` catalog builds
+    // its tables through `CayenneTableProviderBuilder` and `CayenneContext`, which
+    // read from the same shared cache. A catalog-only pod would otherwise keep the
+    // full query pool while the cache filled beside it.
+    if has_cayenne_acceleration || has_cayenne_catalog(app) {
         total = total
             .saturating_add(vortex_datafusion::process_segment_cache_capacity_bytes().unwrap_or(0));
     }
@@ -2079,6 +2098,26 @@ mod test {
         assert!(
             estimate_cayenne_reservation_bytes(Some(&app), &HashMap::new()) > 0,
             "a Cayenne table reserves against the query pool"
+        );
+    }
+
+    /// A catalog-only pod hosts Cayenne tables with no dataset acceleration block,
+    /// so the reservation has to see it or the shared cache grows beside a query
+    /// pool that never accounted for it.
+    #[cfg(not(windows))]
+    #[test]
+    fn a_cayenne_catalog_reserves_even_without_a_dataset_acceleration() {
+        let catalog =
+            spicepod::component::catalog::Catalog::new("cayenne".to_string(), "cat".to_string());
+        let app = Arc::new(app::AppBuilder::new("test").with_catalog(catalog).build());
+        assert!(
+            has_cayenne_catalog(&app),
+            "a `from: cayenne` catalog must be recognized"
+        );
+        assert!(
+            estimate_cayenne_reservation_bytes(Some(&app), &HashMap::new()) > 0
+                || vortex_datafusion::process_segment_cache_capacity_bytes().is_none(),
+            "a catalog-only pod reserves the shared cache when one is installed"
         );
     }
 
