@@ -1,3 +1,20 @@
+/*
+Copyright 2024-2026 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+#![expect(clippy::expect_used, reason = "integration-test helpers")]
+
 //! Pure-read performance against hit rate and cache size, for both engines.
 //!
 //! Complements `benches/cache_throughput.rs`. The benchmarks there either sit at
@@ -68,7 +85,10 @@ impl AsTableRefs for V {
 }
 
 fn random_value(rng: &mut StdRng) -> String {
-    rng.sample_iter(&Alphanumeric).take(32).map(char::from).collect()
+    rng.sample_iter(&Alphanumeric)
+        .take(32)
+        .map(char::from)
+        .collect()
 }
 
 type Cache = LruCache<V, HashBuilder, Box<dyn Hasher + Send + Sync>>;
@@ -132,9 +152,8 @@ fn run(
     // Bounded by THREADS * OPS, so u32 holds them and the widening to f64 is
     // lossless.
     let total = f64::from(u32::try_from(THREADS * OPS).expect("operation count fits in u32"));
-    let miss_count = f64::from(
-        u32::try_from(misses.load(Ordering::Relaxed)).expect("miss count fits in u32"),
-    );
+    let miss_count =
+        f64::from(u32::try_from(misses.load(Ordering::Relaxed)).expect("miss count fits in u32"));
     let hit_rate = 1.0 - miss_count / total;
     (elapsed, hit_rate, resident)
 }
