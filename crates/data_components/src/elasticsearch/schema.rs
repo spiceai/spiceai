@@ -72,20 +72,39 @@ fn collect_mapping_fields(
         let Some(field_type) = &mapping.field_type else {
             continue;
         };
-        let keyword_subfield = mapping.fields.as_ref().and_then(|subfields| {
-            subfields.iter().find_map(|(sub_name, sub_mapping)| {
+        let keyword_sibling = mapping.fields.as_ref().and_then(|subfields| {
+            subfields.iter().find(|(_, sub_mapping)| {
                 matches!(
                     sub_mapping.field_type.as_deref(),
                     Some("keyword" | "constant_keyword" | "wildcard")
                 )
-                .then(|| sub_name.clone())
             })
         });
+        let keyword_subfield = keyword_sibling.map(|(sub_name, _)| sub_name.clone());
+        // Whichever field the pushdown will actually query for an exact-value predicate — the
+        // `keyword` sibling for `text`, or the field itself for `keyword`/`wildcard`/
+        // `constant_keyword` — carries the `ignore_above` that truncates it.
+        let is_keyword_family = matches!(
+            field_type.as_str(),
+            "keyword" | "wildcard" | "constant_keyword"
+        );
+        let keyword_ignore_above = if is_keyword_family {
+            mapping.ignore_above
+        } else {
+            keyword_sibling.and_then(|(_, sub_mapping)| sub_mapping.ignore_above)
+        }
+        .map(|n| n as usize);
+        // A `null_value` on either the field itself or its keyword sibling makes an `exists`
+        // pre-filter unsafe for IS [NOT] NULL (see `EsFilterSchema::from_mapping`).
+        let has_null_value = mapping.null_value.is_some()
+            || keyword_sibling.is_some_and(|(_, sub_mapping)| sub_mapping.null_value.is_some());
         fields.insert(
             full_name,
             EsMappingField {
                 field_type: field_type.clone(),
                 keyword_subfield,
+                keyword_ignore_above,
+                has_null_value,
             },
         );
     }
@@ -173,30 +192,23 @@ mod tests {
             "title".to_string(),
             FieldMapping {
                 field_type: Some("text".to_string()),
-                properties: None,
-                fields: None,
-                dims: None,
-                similarity: None,
+                ..Default::default()
             },
         );
         properties.insert(
             "count".to_string(),
             FieldMapping {
                 field_type: Some("integer".to_string()),
-                properties: None,
-                fields: None,
-                dims: None,
-                similarity: None,
+                ..Default::default()
             },
         );
         properties.insert(
             "embedding".to_string(),
             FieldMapping {
                 field_type: Some("dense_vector".to_string()),
-                properties: None,
-                fields: None,
                 dims: Some(384),
                 similarity: Some("cosine".to_string()),
+                ..Default::default()
             },
         );
 
@@ -222,15 +234,70 @@ mod tests {
             "big".to_string(),
             FieldMapping {
                 field_type: Some("unsigned_long".to_string()),
-                properties: None,
-                fields: None,
-                dims: None,
-                similarity: None,
+                ..Default::default()
             },
         );
 
         let schema = mapping_to_schema(&properties);
         let big = schema.field_with_name("big").expect("big field");
         assert_eq!(big.data_type(), &DataType::UInt64);
+    }
+
+    #[test]
+    fn filter_schema_carries_keyword_ignore_above_and_null_value() {
+        use datafusion::logical_expr::TableProviderFilterPushDown;
+        use datafusion::prelude::{col, lit};
+        use elasticsearch_datafusion_filter::classify_filter;
+
+        let mut title_fields = HashMap::new();
+        title_fields.insert(
+            "keyword".to_string(),
+            FieldMapping {
+                field_type: Some("keyword".to_string()),
+                ignore_above: Some(64),
+                ..Default::default()
+            },
+        );
+        let mut properties = HashMap::new();
+        properties.insert(
+            "title".to_string(),
+            FieldMapping {
+                field_type: Some("text".to_string()),
+                fields: Some(title_fields),
+                ..Default::default()
+            },
+        );
+        properties.insert(
+            "code".to_string(),
+            FieldMapping {
+                field_type: Some("keyword".to_string()),
+                null_value: Some(serde_json::json!("UNKNOWN")),
+                ..Default::default()
+            },
+        );
+
+        let filter_schema = mapping_to_filter_schema(&properties);
+
+        // A literal past the real `ignore_above: 64` must not be pushed as a superset — the
+        // matching row could be entirely absent from the `.keyword` sub-field.
+        let long_literal = "x".repeat(65);
+        assert_eq!(
+            classify_filter(&filter_schema, &col("title").eq(lit(long_literal))),
+            TableProviderFilterPushDown::Unsupported
+        );
+        assert_eq!(
+            classify_filter(&filter_schema, &col("title").eq(lit("short"))),
+            TableProviderFilterPushDown::Inexact
+        );
+
+        // `null_value` makes `exists` untrustworthy for IS [NOT] NULL, but not for equality.
+        assert_eq!(
+            classify_filter(&filter_schema, &col("code").is_null()),
+            TableProviderFilterPushDown::Unsupported
+        );
+        assert_eq!(
+            classify_filter(&filter_schema, &col("code").eq(lit("open"))),
+            TableProviderFilterPushDown::Exact
+        );
     }
 }

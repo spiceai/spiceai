@@ -25,6 +25,7 @@ use arrow_schema::{DataType, Schema, SchemaRef};
 use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
 use elasticsearch::Elasticsearch;
+use elasticsearch_datafusion_filter::SPICE_MANAGED_KEYWORD_IGNORE_ABOVE;
 use search::generation::util::get_primary_keys;
 use search::index::chunking::{CHUNKED_INDEX_CHUNK_KEY, ChunkedSearchIndex};
 pub(crate) use search::index::elasticsearch::{
@@ -322,6 +323,20 @@ pub(crate) fn add_metadata_column_mappings(
                 if field_type != "text" {
                     obj.insert("doc_values".to_string(), serde_json::Value::Bool(false));
                 }
+                // A string column's mapping (see `arrow_type_to_es_mapping`) always attaches a
+                // `.keyword` multi-field. Disabling only the parent `text` field's `index`
+                // leaves that sub-field indexed (ES defaults multi-fields to `index: true`
+                // independently of their parent), so a "non-filterable" column would still be
+                // fully searchable via `col.keyword`. Disable indexing on every multi-field too.
+                if let Some(sub_fields) = obj.get_mut("fields").and_then(|f| f.as_object_mut()) {
+                    for sub_mapping in sub_fields.values_mut() {
+                        if let Some(sub_obj) = sub_mapping.as_object_mut() {
+                            sub_obj.insert("index".to_string(), serde_json::Value::Bool(false));
+                            sub_obj
+                                .insert("doc_values".to_string(), serde_json::Value::Bool(false));
+                        }
+                    }
+                }
             }
         }
         properties.insert(name, mapping);
@@ -389,7 +404,7 @@ async fn ensure_index_with_mapping(
             t.clone(),
             serde_json::json!({
                 "type": "text",
-                "fields": { "keyword": { "type": "keyword", "ignore_above": 256 } },
+                "fields": { "keyword": { "type": "keyword", "ignore_above": SPICE_MANAGED_KEYWORD_IGNORE_ABOVE } },
             }),
         );
     }
@@ -506,7 +521,7 @@ fn arrow_type_to_es_mapping(dt: &DataType) -> serde_json::Value {
         DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => {
             serde_json::json!({
                 "type": "text",
-                "fields": { "keyword": { "type": "keyword", "ignore_above": 256 } },
+                "fields": { "keyword": { "type": "keyword", "ignore_above": SPICE_MANAGED_KEYWORD_IGNORE_ABOVE } },
             })
         }
         _ => serde_json::json!({ "type": "keyword" }),
@@ -574,7 +589,7 @@ pub(crate) async fn ensure_index_with_text_mapping(
             field.clone(),
             serde_json::json!({
                 "type": "text",
-                "fields": { "keyword": { "type": "keyword", "ignore_above": 256 } }
+                "fields": { "keyword": { "type": "keyword", "ignore_above": SPICE_MANAGED_KEYWORD_IGNORE_ABOVE } }
             }),
         );
     }
@@ -686,5 +701,45 @@ fn derive_primary_keys(
         Ok(ChunkedSearchIndex::augment_primary_key(primary_key))
     } else {
         Ok(primary_key)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn non_filterable_text_column_disables_keyword_subfield() {
+        let field = Arc::new(arrow_schema::Field::new("note", DataType::Utf8, true));
+        let metadata_columns: MetadataColumns = vec![MetadataColumn::NonFilterable(field)].into();
+        let mut properties = serde_json::Map::new();
+
+        add_metadata_column_mappings(&mut properties, &metadata_columns, "");
+
+        let mapping = properties
+            .get("note")
+            .expect("note column should be mapped");
+        assert_eq!(mapping["index"], serde_json::Value::Bool(false));
+        let keyword = &mapping["fields"]["keyword"];
+        assert_eq!(
+            keyword["index"],
+            serde_json::Value::Bool(false),
+            "non-filterable text column must disable its keyword sub-field too, \
+             or it stays fully searchable via col.keyword despite index: false on the parent"
+        );
+        assert_eq!(keyword["doc_values"], serde_json::Value::Bool(false));
+    }
+
+    #[test]
+    fn filterable_text_column_keeps_keyword_subfield_indexed() {
+        let field = Arc::new(arrow_schema::Field::new("tag", DataType::Utf8, true));
+        let metadata_columns: MetadataColumns = vec![MetadataColumn::Filterable(field)].into();
+        let mut properties = serde_json::Map::new();
+
+        add_metadata_column_mappings(&mut properties, &metadata_columns, "");
+
+        let mapping = properties.get("tag").expect("tag column should be mapped");
+        assert_eq!(mapping["index"], serde_json::Value::Bool(true));
+        assert_eq!(mapping["fields"]["keyword"].get("index"), None);
     }
 }

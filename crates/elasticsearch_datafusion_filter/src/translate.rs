@@ -136,6 +136,12 @@ fn translate_comparison(
 }
 
 fn translate_eq(field_type: &EsFieldType, column: &str, value: &Value) -> Outcome {
+    // A literal longer than a `TextWithKeyword`'s `ignore_above` can never be indexed in the
+    // sub-field, so pushing `term` for it would silently exclude a row whose real value equals
+    // the literal — a subset, not a superset.
+    if !field_type.accepts_value_length(value) {
+        return Outcome::Unsupported;
+    }
     let field = field_type.value_field(column);
     Outcome::Pushable {
         exact: field_type.is_exact_for_value_match(),
@@ -144,9 +150,9 @@ fn translate_eq(field_type: &EsFieldType, column: &str, value: &Value) -> Outcom
 }
 
 fn translate_range(field_type: &EsFieldType, column: &str, es_op: &str, value: &Value) -> Outcome {
-    // A range on a boolean field is nonsensical; everything else that reached here has a
-    // value that matches the field type.
-    if matches!(field_type, EsFieldType::Boolean) {
+    // No safe superset for a range on a boolean field, or on a quantized float (see
+    // `EsFieldType::supports_range`).
+    if !field_type.supports_range() {
         return Outcome::Unsupported;
     }
     let field = field_type.value_field(column);
@@ -183,6 +189,12 @@ fn translate_in_list(
         if !value_matches_field(field_type, &value) {
             return Outcome::Unsupported;
         }
+        // A single over-length literal (see `translate_eq`) makes the *whole* IN-list
+        // unsafe to push: dropping just that literal from `terms` would still exclude a row
+        // matching it via that branch, which no re-check above the scan can recover.
+        if !field_type.accepts_value_length(&value) {
+            return Outcome::Unsupported;
+        }
         values.push(value);
     }
     if values.is_empty() {
@@ -216,7 +228,7 @@ fn translate_between(
     let Some(field_type) = schema.get(column) else {
         return Outcome::Unsupported;
     };
-    if matches!(field_type, EsFieldType::Boolean) {
+    if !field_type.supports_range() {
         return Outcome::Unsupported;
     }
     let (Some(low), Some(high)) = (scalar_to_json(low), scalar_to_json(high)) else {
@@ -246,6 +258,12 @@ fn translate_is_null(schema: &EsFilterSchema, inner: &Expr, is_null: bool) -> Ou
         return Outcome::Unsupported;
     };
     if schema.get(column).is_none() {
+        return Outcome::Unsupported;
+    }
+    // A `null_value` sentinel makes a source `null` still "exist" in the index — `exists` can't
+    // tell it apart from a real value, so `must_not exists` (IS NULL) would wrongly exclude that
+    // row from the pre-filtered candidates, which no above-scan recheck can restore.
+    if !schema.supports_null_check(column) {
         return Outcome::Unsupported;
     }
     let exists = json!({ "exists": { "field": column } });
@@ -417,8 +435,8 @@ fn value_matches_field(field_type: &EsFieldType, value: &Value) -> bool {
     match field_type {
         EsFieldType::Boolean => value.is_boolean(),
         EsFieldType::Integer => value.is_i64() || value.is_u64(),
-        EsFieldType::Float => value.is_number(),
-        EsFieldType::Keyword | EsFieldType::TextWithKeyword { .. } => value.is_string(),
+        EsFieldType::Float | EsFieldType::QuantizedFloat => value.is_number(),
+        EsFieldType::Keyword { .. } | EsFieldType::TextWithKeyword { .. } => value.is_string(),
     }
 }
 
@@ -454,12 +472,14 @@ mod tests {
         EsFilterSchema::new()
             .with_field("age", EsFieldType::Integer)
             .with_field("score", EsFieldType::Float)
+            .with_field("weight", EsFieldType::QuantizedFloat)
             .with_field("active", EsFieldType::Boolean)
-            .with_field("status", EsFieldType::Keyword)
+            .with_field("status", EsFieldType::Keyword { ignore_above: None })
             .with_field(
                 "title",
                 EsFieldType::TextWithKeyword {
                     keyword_subfield: "keyword".to_string(),
+                    ignore_above: Some(8),
                 },
             )
     }
@@ -610,6 +630,32 @@ mod tests {
     }
 
     #[test]
+    fn is_null_on_field_with_null_value_is_unsupported() {
+        // A `null_value` sentinel means a source `null` still "exists" in the index, so
+        // `exists`/`must_not exists` can't be trusted to mean IS [NOT] NULL.
+        let info = crate::schema::EsMappingField {
+            field_type: "keyword".to_string(),
+            keyword_subfield: None,
+            keyword_ignore_above: None,
+            has_null_value: true,
+        };
+        let schema = EsFilterSchema::from_mapping([("code", &info)]);
+        assert_eq!(
+            classify_filter(&schema, &col("code").is_null()),
+            TableProviderFilterPushDown::Unsupported
+        );
+        assert_eq!(
+            classify_filter(&schema, &col("code").is_not_null()),
+            TableProviderFilterPushDown::Unsupported
+        );
+        // Equality is unaffected — `null_value` doesn't change term-query correctness.
+        assert_eq!(
+            classify_filter(&schema, &col("code").eq(lit("open"))),
+            TableProviderFilterPushDown::Exact
+        );
+    }
+
+    #[test]
     fn prefix_like_on_keyword_is_inexact_prefix() {
         let expr = col("status").like(lit("open%"));
         assert_eq!(classify(&expr), TableProviderFilterPushDown::Inexact);
@@ -617,12 +663,59 @@ mod tests {
     }
 
     #[test]
-    fn prefix_like_on_text_targets_keyword_subfield() {
+    fn prefix_like_on_text_with_keyword_is_unsupported() {
+        // `ignore_above` means an arbitrarily long matching value could be entirely absent from
+        // the `.keyword` sub-field, so a prefix clause is never a safe superset here.
         let expr = col("title").like(lit("hel%"));
-        assert_eq!(
-            clause(&expr),
-            json!({ "prefix": { "title.keyword": "hel" } })
-        );
+        assert_eq!(classify(&expr), TableProviderFilterPushDown::Unsupported);
+        assert_eq!(translate_filter(&schema(), &expr), None);
+    }
+
+    #[test]
+    fn eq_literal_over_ignore_above_is_unsupported() {
+        // "title" has ignore_above: 8; a 9-character literal can never be indexed in the
+        // sub-field, so pushing `term` for it would silently drop a matching row.
+        let expr = col("title").eq(lit("123456789"));
+        assert_eq!(classify(&expr), TableProviderFilterPushDown::Unsupported);
+    }
+
+    #[test]
+    fn eq_literal_within_ignore_above_is_still_pushed() {
+        let expr = col("title").eq(lit("12345678"));
+        assert_eq!(classify(&expr), TableProviderFilterPushDown::Inexact);
+    }
+
+    #[test]
+    fn in_list_with_one_over_length_literal_is_unsupported() {
+        // Dropping just the over-length literal would still miss a row matching it.
+        let expr = col("title").in_list(vec![lit("short"), lit("123456789")], false);
+        assert_eq!(classify(&expr), TableProviderFilterPushDown::Unsupported);
+    }
+
+    #[test]
+    fn quantized_float_eq_is_inexact() {
+        // Equality applies the same quantization to the query literal on both sides.
+        let expr = col("weight").eq(lit(1.04_f64));
+        assert_eq!(classify(&expr), TableProviderFilterPushDown::Inexact);
+    }
+
+    #[test]
+    fn quantized_float_range_is_unsupported() {
+        // A range boundary compares against the quantized indexed value and can exclude a row
+        // that satisfies the SQL predicate on the unquantized source value.
+        let expr = col("weight").gt(lit(1.01_f64));
+        assert_eq!(classify(&expr), TableProviderFilterPushDown::Unsupported);
+    }
+
+    #[test]
+    fn quantized_float_between_is_unsupported() {
+        let expr = Expr::Between(datafusion::logical_expr::expr::Between::new(
+            Box::new(col("weight")),
+            false,
+            Box::new(lit(1.0_f64)),
+            Box::new(lit(2.0_f64)),
+        ));
+        assert_eq!(classify(&expr), TableProviderFilterPushDown::Unsupported);
     }
 
     #[test]

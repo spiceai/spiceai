@@ -83,7 +83,7 @@ pub struct Mappings {
     pub properties: HashMap<String, FieldMapping>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct FieldMapping {
     #[serde(rename = "type")]
     pub field_type: Option<String>,
@@ -94,9 +94,20 @@ pub struct FieldMapping {
     #[serde(default)]
     pub fields: Option<HashMap<String, FieldMapping>>,
     /// For `dense_vector` fields.
+    #[serde(default)]
     pub dims: Option<i64>,
     /// Similarity metric for `dense_vector` (e.g. `cosine`, `l2_norm`, `dot_product`).
+    #[serde(default)]
     pub similarity: Option<String>,
+    /// Elasticsearch truncates indexing of a `keyword`-family field above this length —
+    /// values longer than it are simply absent from the index.
+    #[serde(default)]
+    pub ignore_above: Option<u32>,
+    /// Present if the mapping substitutes an explicit value for a source JSON `null`. When set,
+    /// a document with a real `null` still has an indexed value, so `exists` cannot distinguish
+    /// it from a genuine value.
+    #[serde(default)]
+    pub null_value: Option<serde_json::Value>,
 }
 
 /// A search request body sent to `POST /<index>/_search`.

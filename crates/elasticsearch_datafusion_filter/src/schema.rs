@@ -21,6 +21,12 @@ use std::collections::HashMap;
 
 use arrow::datatypes::{DataType, Schema};
 
+/// The `ignore_above` Spice sets on the `.keyword` multi-field it attaches to every managed
+/// `text` column (see `runtime`'s Elasticsearch mapping builder): a source value longer than this
+/// (in characters) has no entry in the sub-field at all. Kept as one constant so the write path
+/// and this crate's pushdown safety checks cannot silently drift apart.
+pub const SPICE_MANAGED_KEYWORD_IGNORE_ABOVE: usize = 256;
+
 /// How a single column is represented in the Elasticsearch mapping. Determines both whether a
 /// SQL predicate can be pushed down and whether the pushdown is exact.
 ///
@@ -35,18 +41,41 @@ pub enum EsFieldType {
     /// ES `byte`/`short`/`integer`/`long` (any exactly-representable integer). `term`/`range`
     /// are exact.
     Integer,
-    /// ES `float`/`double`/`half_float`/`scaled_float`. Comparisons are pushed but marked
-    /// inexact: the JSON round-trip and the SQL literal may not share Elasticsearch's binary
-    /// representation, so `DataFusion` re-checks.
+    /// ES `float`/`double`. Comparisons are pushed but marked inexact: the JSON round-trip and
+    /// the SQL literal may not share Elasticsearch's binary representation, so `DataFusion`
+    /// re-checks. Unlike [`EsFieldType::QuantizedFloat`], the indexed value round-trips the
+    /// source value exactly (no scaling/rounding), so a range clause is always a superset.
     Float,
-    /// ES `keyword`: a whole-value, non-analyzed string. `term`/`range`/`prefix` match the
-    /// stored value exactly.
-    Keyword,
+    /// ES `half_float`/`scaled_float`. The indexed value is *quantized* (rounded, or scaled then
+    /// rounded to an integer) rather than round-tripped, so a `range`/`BETWEEN` boundary compares
+    /// the quantized value against a query threshold and can exclude a source row that actually
+    /// satisfies the SQL predicate — a false negative no `DataFusion` re-check can recover.
+    /// Equality still pushes: Elasticsearch applies the same quantization to the query literal,
+    /// so a `term` match is still a safe superset.
+    QuantizedFloat,
+    /// ES `keyword`/`wildcard`/`constant_keyword`: a whole-value, non-analyzed string.
+    /// `term`/`range`/`prefix` match the stored value exactly.
+    ///
+    /// `ignore_above` (`Some(n)`) means the field itself silently omits values longer than `n`
+    /// characters, same subset hazard as [`EsFieldType::TextWithKeyword`]'s — reject
+    /// over-length equality/`IN` literals and never push `prefix`. `None` means the mapping was
+    /// read directly and declares no `ignore_above` (verified unbounded), *except* when
+    /// constructed without real mapping data (e.g. in tests), where it just means "not modeled".
+    Keyword { ignore_above: Option<usize> },
     /// An analyzed `text` field carrying a non-analyzed `keyword` sub-field (the mapping Spice
     /// writes for string columns, e.g. `col.keyword`). Equality/prefix are pushed against the
-    /// sub-field but marked inexact: `ignore_above` drops long values from the sub-field and
-    /// analysis/collation can differ, so `DataFusion` re-checks.
-    TextWithKeyword { keyword_subfield: String },
+    /// sub-field but marked inexact: analysis/collation can differ, so `DataFusion` re-checks.
+    ///
+    /// `ignore_above` (`Some(n)`) means the sub-field silently omits values longer than `n`
+    /// characters — a source row can satisfy the SQL predicate while having no entry at all in
+    /// the sub-field, which is a *subset*, not a superset. Predicates against such a field must
+    /// reject literals over the threshold (equality/`IN`) and never push `prefix` at all (an
+    /// unseen longer matching value could always exist). `None` means the limit is not known —
+    /// callers must not use it as evidence the field is unbounded (see `from_mapping`).
+    TextWithKeyword {
+        keyword_subfield: String,
+        ignore_above: Option<usize>,
+    },
 }
 
 impl EsFieldType {
@@ -55,9 +84,9 @@ impl EsFieldType {
     #[must_use]
     pub fn value_field(&self, column: &str) -> String {
         match self {
-            EsFieldType::TextWithKeyword { keyword_subfield } => {
-                format!("{column}.{keyword_subfield}")
-            }
+            EsFieldType::TextWithKeyword {
+                keyword_subfield, ..
+            } => format!("{column}.{keyword_subfield}"),
             _ => column.to_string(),
         }
     }
@@ -67,19 +96,59 @@ impl EsFieldType {
     #[must_use]
     pub fn is_exact_for_value_match(&self) -> bool {
         match self {
-            EsFieldType::Boolean | EsFieldType::Integer | EsFieldType::Keyword => true,
-            EsFieldType::Float | EsFieldType::TextWithKeyword { .. } => false,
+            EsFieldType::Boolean | EsFieldType::Integer | EsFieldType::Keyword { .. } => true,
+            EsFieldType::Float
+            | EsFieldType::QuantizedFloat
+            | EsFieldType::TextWithKeyword { .. } => false,
         }
     }
 
-    /// Whether a prefix (`LIKE 'x%'`) predicate is expressible against this field type.
+    /// Whether a `range`/`BETWEEN` predicate is expressible against this field type at all.
+    /// `false` for [`EsFieldType::Boolean`] (nonsensical) and [`EsFieldType::QuantizedFloat`]
+    /// (quantization can make a boundary comparison exclude a true SQL match — see the variant's
+    /// docs — so there is no safe superset to push).
+    #[must_use]
+    pub fn supports_range(&self) -> bool {
+        !matches!(self, EsFieldType::Boolean | EsFieldType::QuantizedFloat)
+    }
+
+    /// Whether a prefix (`LIKE 'x%'`) predicate is expressible against this field type. `false`
+    /// whenever `ignore_above` is `Some`: an unseen value longer than the threshold could still
+    /// match the prefix while having no entry in the index at all, and no length check on the
+    /// prefix literal itself can rule that out.
     #[must_use]
     pub fn supports_prefix(&self) -> bool {
-        matches!(
-            self,
-            EsFieldType::Keyword | EsFieldType::TextWithKeyword { .. }
-        )
+        match self {
+            EsFieldType::Keyword { ignore_above }
+            | EsFieldType::TextWithKeyword { ignore_above, .. } => ignore_above.is_none(),
+            _ => false,
+        }
     }
+
+    /// Whether `value` (already confirmed type-compatible via `value_matches_field`) can actually
+    /// be found by this field's exact-value clause. `false` only when this field's `ignore_above`
+    /// the literal exceeds — Elasticsearch never indexed anything that could match it, so pushing
+    /// the clause would silently exclude a row whose real value equals the literal.
+    #[must_use]
+    pub fn accepts_value_length(&self, value: &serde_json::Value) -> bool {
+        let ignore_above = match self {
+            EsFieldType::TextWithKeyword { ignore_above, .. }
+            | EsFieldType::Keyword { ignore_above } => *ignore_above,
+            _ => None,
+        };
+        match ignore_above {
+            Some(limit) => value.as_str().is_none_or(|s| s.chars().count() <= limit),
+            None => true,
+        }
+    }
+}
+
+/// A registered column: its Elasticsearch representation, plus whether an `exists`-based
+/// `IS [NOT] NULL` pre-filter is safe to push for it.
+#[derive(Debug, Clone)]
+struct ColumnEntry {
+    field_type: EsFieldType,
+    supports_null_check: bool,
 }
 
 /// The set of columns that may be filtered in Elasticsearch, keyed by column name.
@@ -89,7 +158,7 @@ impl EsFieldType {
 /// references it.
 #[derive(Debug, Clone, Default)]
 pub struct EsFilterSchema {
-    fields: HashMap<String, EsFieldType>,
+    fields: HashMap<String, ColumnEntry>,
 }
 
 impl EsFilterSchema {
@@ -100,16 +169,36 @@ impl EsFilterSchema {
         }
     }
 
-    /// Register a single column with an explicit Elasticsearch field type.
+    /// Register a single column with an explicit Elasticsearch field type. `IS [NOT] NULL`
+    /// pushdown is assumed safe (no `null_value` sentinel) — use this for Spice-managed schemas
+    /// and tests; [`Self::from_mapping`] verifies it against the real mapping instead.
     #[must_use]
     pub fn with_field(mut self, name: impl Into<String>, field_type: EsFieldType) -> Self {
-        self.fields.insert(name.into(), field_type);
+        self.fields.insert(
+            name.into(),
+            ColumnEntry {
+                field_type,
+                supports_null_check: true,
+            },
+        );
         self
     }
 
     #[must_use]
     pub fn get(&self, column: &str) -> Option<&EsFieldType> {
-        self.fields.get(column)
+        self.fields.get(column).map(|entry| &entry.field_type)
+    }
+
+    /// Whether an `exists`/`must_not exists` pre-filter is safe to push for `column`'s
+    /// `IS [NOT] NULL`. `false` when the real mapping declares a `null_value` sentinel: a
+    /// document with an explicit source `null` still has an indexed value, so `exists` can't
+    /// tell it apart from a genuine one — `must_not exists` (`IS NULL`) would then wrongly
+    /// exclude that row from the pre-filtered candidates, which no above-scan recheck restores.
+    #[must_use]
+    pub fn supports_null_check(&self, column: &str) -> bool {
+        self.fields
+            .get(column)
+            .is_some_and(|entry| entry.supports_null_check)
     }
 
     #[must_use]
@@ -129,8 +218,14 @@ impl EsFilterSchema {
     pub fn from_connector_schema(schema: &Schema) -> Self {
         let mut fields = HashMap::new();
         for field in schema.fields() {
-            if let Some(ft) = arrow_type_to_es_numeric(field.data_type()) {
-                fields.insert(field.name().clone(), ft);
+            if let Some(field_type) = arrow_type_to_es_numeric(field.data_type()) {
+                fields.insert(
+                    field.name().clone(),
+                    ColumnEntry {
+                        field_type,
+                        supports_null_check: true,
+                    },
+                );
             }
         }
         Self { fields }
@@ -146,19 +241,27 @@ impl EsFilterSchema {
             let Ok(field) = schema.field_with_name(name) else {
                 continue;
             };
-            if let Some(ft) = arrow_type_to_es_numeric(field.data_type()) {
-                fields.insert(name.clone(), ft);
+            let field_type = if let Some(field_type) = arrow_type_to_es_numeric(field.data_type()) {
+                field_type
             } else if matches!(
                 field.data_type(),
                 DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
             ) {
-                fields.insert(
-                    name.clone(),
-                    EsFieldType::TextWithKeyword {
-                        keyword_subfield: "keyword".to_string(),
-                    },
-                );
-            }
+                EsFieldType::TextWithKeyword {
+                    keyword_subfield: "keyword".to_string(),
+                    ignore_above: Some(SPICE_MANAGED_KEYWORD_IGNORE_ABOVE),
+                }
+            } else {
+                continue;
+            };
+            // Spice's own write path never sets a `null_value` sentinel on managed mappings.
+            fields.insert(
+                name.clone(),
+                ColumnEntry {
+                    field_type,
+                    supports_null_check: true,
+                },
+            );
         }
         Self { fields }
     }
@@ -175,6 +278,14 @@ pub struct EsMappingField {
     /// `"keyword"` for `title.keyword`), if the mapping declares one. Only meaningful when
     /// `field_type` is an analyzed text type.
     pub keyword_subfield: Option<String>,
+    /// `ignore_above` on whichever field the pushdown will actually query for an exact-value
+    /// predicate: the keyword sibling for `text`, or the field itself for
+    /// `keyword`/`wildcard`/`constant_keyword`. `None` means the real mapping was read and
+    /// declares no `ignore_above` (verified unbounded).
+    pub keyword_ignore_above: Option<usize>,
+    /// Whether `null_value` is set on this field, or (for `text`) on its keyword sibling — see
+    /// [`EsFieldType`] docs on why that makes an `exists` pre-filter unsafe.
+    pub has_null_value: bool,
 }
 
 impl EsFilterSchema {
@@ -195,16 +306,31 @@ impl EsFilterSchema {
                 "byte" | "short" | "integer" | "long" | "unsigned_long" => {
                     Some(EsFieldType::Integer)
                 }
-                "float" | "half_float" | "double" | "scaled_float" => Some(EsFieldType::Float),
-                "keyword" | "wildcard" | "constant_keyword" => Some(EsFieldType::Keyword),
-                "text" | "match_only_text" => info
-                    .keyword_subfield
-                    .clone()
-                    .map(|keyword_subfield| EsFieldType::TextWithKeyword { keyword_subfield }),
+                "float" | "double" => Some(EsFieldType::Float),
+                // Quantizing types: a range/BETWEEN boundary can exclude a true SQL match (see
+                // `EsFieldType::QuantizedFloat`), so these must not be treated as plain `Float`.
+                "half_float" | "scaled_float" => Some(EsFieldType::QuantizedFloat),
+                "keyword" | "wildcard" | "constant_keyword" => Some(EsFieldType::Keyword {
+                    ignore_above: info.keyword_ignore_above,
+                }),
+                "text" | "match_only_text" => {
+                    info.keyword_subfield.clone().map(|keyword_subfield| {
+                        EsFieldType::TextWithKeyword {
+                            keyword_subfield,
+                            ignore_above: info.keyword_ignore_above,
+                        }
+                    })
+                }
                 _ => None,
             };
             if let Some(field_type) = field_type {
-                fields.insert(name.to_string(), field_type);
+                fields.insert(
+                    name.to_string(),
+                    ColumnEntry {
+                        field_type,
+                        supports_null_check: !info.has_null_value,
+                    },
+                );
             }
         }
         Self { fields }
