@@ -38,7 +38,8 @@ fn a_disabled_process_cache_is_not_replaced_by_private_per_table_caches() {
         ..Default::default()
     };
 
-    let format = VortexFormat::new_with_options(VortexSession::default(), opts.clone());
+    let format = VortexFormat::new_with_options(VortexSession::default(), opts.clone())
+        .with_process_segment_cache();
     assert_eq!(
         format.segment_cache_capacity_bytes(),
         None,
@@ -46,8 +47,19 @@ fn a_disabled_process_cache_is_not_replaced_by_private_per_table_caches() {
     );
 
     // Every table, not just the first.
-    let second = VortexFormat::new_with_options(VortexSession::default(), opts);
+    let second = VortexFormat::new_with_options(VortexSession::default(), opts.clone())
+        .with_process_segment_cache();
     assert_eq!(second.segment_cache_capacity_bytes(), None);
+
+    // A format that never opts in is not governed by the Cayenne setting: a
+    // listing table over external files keeps its own explicitly-sized cache,
+    // which is the behaviour it had before the shared cache existed.
+    let independent = VortexFormat::new_with_options(VortexSession::default(), opts);
+    assert_eq!(
+        independent.segment_cache_capacity_bytes(),
+        Some(512 * 1024 * 1024),
+        "an opt-out format keeps its own cache"
+    );
 
     // And the decision stands: a later install cannot turn caching back on.
     assert!(

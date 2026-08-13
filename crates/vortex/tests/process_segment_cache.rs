@@ -32,7 +32,7 @@ fn format() -> VortexFormat {
     // into per format.
     let opts = VortexTableOptions::default();
     assert_eq!(opts.segment_cache_size_bytes, None);
-    VortexFormat::new_with_options(VortexSession::default(), opts)
+    VortexFormat::new_with_options(VortexSession::default(), opts).with_process_segment_cache()
 }
 
 #[test]
@@ -54,7 +54,8 @@ fn the_installed_cache_is_shared_by_every_format_and_installed_once() {
             segment_cache_size_bytes: Some(4 * 1024 * 1024),
             ..Default::default()
         },
-    );
+    )
+    .with_process_segment_cache();
     assert_eq!(
         private.segment_cache_capacity_bytes(),
         Some(4 * 1024 * 1024),

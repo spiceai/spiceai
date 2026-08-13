@@ -323,6 +323,22 @@ impl SharedSegmentCache {
         })
     }
 
+    /// Retire every cached segment under `paths`.
+    ///
+    /// Matches on the path alone, so a path retired in one store also drops
+    /// matching entries in *every* store — deliberate over-invalidation. The two
+    /// errors are not symmetric: over-invalidating costs a re-read, while
+    /// under-invalidating leaves retired segments resident, which is the leak
+    /// this exists to prevent (#12936). Carrying the store through would mean
+    /// callers rebuilding the key the opener derives from
+    /// `FileScanConfig::object_store_url`, and any divergence between those two
+    /// derivations would silently match nothing.
+    ///
+    /// The over-approximation is close to free in practice. It only bites when
+    /// the same *relative* path exists in two stores, and the only caller whose
+    /// paths reach this cache is Cayenne, whose files are
+    /// `{uuid7}_p{shard}_{index}.vortex` beneath a uuid7 snapshot directory — so
+    /// two stores colliding on one requires the same uuid7 twice.
     pub(crate) async fn invalidate_paths(&self, paths: HashSet<Path>) {
         if paths.is_empty() {
             return;

@@ -1356,9 +1356,11 @@ impl CayenneAccelerator {
             // size. This memory-aware default only reaches a process with no
             // installed cache (an embedded host that skips the runtime builder).
             config.segment_cache_mb = hw.segment_cache_mb();
-            if let autotune::Knob::Set(requested_mb) =
-                autotune::read_knob(acceleration, &["cayenne_segment_cache_mb"])
-            {
+            // Report on the key being *present*, not on it parsing: `read_knob`
+            // folds `auto` and malformed values alike into `Knob::Auto`, so
+            // matching on `Set` would leave those operators unaware their setting
+            // no longer does anything.
+            if let Some(requested_mb) = acceleration.params.get("cayenne_segment_cache_mb") {
                 tracing::warn!(
                     "Dataset {table_name}: acceleration.params.cayenne_segment_cache_mb={requested_mb} is ignored. The Vortex segment cache is now a single budget shared by every table instead of one cache per table, so a per-table size has nothing to size. To control it, set runtime.params.cayenne_segment_cache_mb (in MB; 0 disables caching). See: https://spiceai.org/docs/components/data-accelerators/cayenne"
                 );

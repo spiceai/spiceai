@@ -398,27 +398,16 @@ impl VortexFormat {
 
     /// Creates a new instance with configured by a [`VortexTableOptions`].
     ///
-    /// Scans share the process-wide segment cache when one is installed (see
-    /// `install_process_segment_cache`), so its byte budget covers every table
-    /// rather than being reserved per format. `segment_cache_size_bytes` builds a
-    /// private cache instead, for a standalone format outside that budget.
+    /// Scans cache segments only when `segment_cache_size_bytes` asks for it. The
+    /// process-wide cache is opt-in through [`Self::with_process_segment_cache`],
+    /// because caching is only sound for a caller whose file paths are immutable.
     #[must_use]
     pub fn new_with_options(session: VortexSession, opts: VortexTableOptions) -> Self {
-        let segment_cache = segment_cache::process_segment_cache()
-            .map(Arc::clone)
-            .or_else(|| {
-                // Only when the process never decided. A process that switched
-                // caching off must not get a private cache per format — that is
-                // the per-table allocation the shared budget replaced, and it
-                // would be invisible to the runtime's memory accounting.
-                if segment_cache::segment_caching_disabled() {
-                    return None;
-                }
-                opts.segment_cache_size_bytes
-                    .and_then(|bytes| u64::try_from(bytes).ok())
-                    .filter(|bytes| *bytes > 0)
-                    .map(|bytes| Arc::new(SharedSegmentCache::new(bytes, true)))
-            });
+        let segment_cache = opts
+            .segment_cache_size_bytes
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .filter(|bytes| *bytes > 0)
+            .map(|bytes| Arc::new(SharedSegmentCache::new(bytes, true)));
 
         Self {
             session,
@@ -481,6 +470,30 @@ impl VortexFormat {
             segment_cache: self.segment_cache.clone(),
             write_shard: Some(config),
         }
+    }
+
+    /// Serve this format's scans from the process-wide segment cache.
+    ///
+    /// **Opt-in, and only sound when this format's file paths are immutable.** The
+    /// segment cache has no read-time validation: a file overwritten in place
+    /// keeps serving the segments cached under its path. Cayenne qualifies —
+    /// every data file is `{uuid7}_p{shard}_{index}.vortex` beneath a uuid7
+    /// snapshot directory, so a path is written once and never reused, and
+    /// retirement invalidates it explicitly. A listing table over externally
+    /// managed files does not: those can be replaced under the same name at any
+    /// time, which is why they keep the private, opt-in cache above.
+    ///
+    /// Falls back to whatever this format already had when the process made no
+    /// caching decision (an embedded host that skips the runtime builder), and
+    /// caches nothing when the decision was to disable it.
+    #[must_use]
+    pub fn with_process_segment_cache(mut self) -> Self {
+        if let Some(process) = segment_cache::process_segment_cache() {
+            self.segment_cache = Some(Arc::clone(process));
+        } else if segment_cache::segment_caching_disabled() {
+            self.segment_cache = None;
+        }
+        self
     }
 
     /// Byte capacity of the segment cache backing this format's scans, or `None`
