@@ -1105,6 +1105,10 @@ mod tests {
     /// applied. With `id = 47` pushed down, the matching document remains available even when
     /// `limit = 1`. Regression test for #12231.
     #[tokio::test]
+    #[allow(
+        clippy::float_cmp,
+        reason = "asserts the relevance score is bit-identical whether or not a pushed SQL filter is applied"
+    )]
     async fn filter_pushdown_finds_row_beyond_candidate_cap() {
         use crate::SEARCH_SCORE_COLUMN_NAME;
         use arrow::array::{Float64Array, Int32Array};
