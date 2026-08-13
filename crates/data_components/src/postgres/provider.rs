@@ -77,6 +77,8 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+const POSTGRES_CATALOG_DOCS: &str = "https://spiceai.org/docs/components/catalogs/postgres";
+
 pub use connector_postgres_common::{
     ReplicaIdentityOutcome, ReplicationSlotStatus, SkipReason, ViewRelation,
     check_cdc_prerequisites, classify_replica_identity, ensure_replication_slot_capacity,
@@ -115,6 +117,11 @@ pub struct PostgresCatalogProvider {
     table_creator: Arc<dyn Read>,
     schemas: RwLock<HashMap<String, Arc<PostgresSchemaProvider>>>,
     selector: TableSelector,
+    /// Tables registered by the previous refresh, or `None` before the first
+    /// one completes. Only [`empty_catalog_warning`] reads it: this provider is
+    /// polled every refresh interval, so an empty catalog is reported when it
+    /// *becomes* empty rather than once a minute for the life of the process.
+    last_table_count: RwLock<Option<usize>>,
 }
 
 impl std::fmt::Debug for PostgresCatalogProvider {
@@ -138,6 +145,7 @@ impl PostgresCatalogProvider {
             table_creator,
             schemas: RwLock::new(HashMap::new()),
             selector,
+            last_table_count: RwLock::new(None),
         }
     }
 
@@ -247,12 +255,33 @@ impl PostgresCatalogProvider {
             }
         }
 
+        let table_count: usize = schemas.values().map(|schema| schema.table_count()).sum();
+        let schemas_registered = schemas.len();
+
         {
             let mut guard = match self.schemas.write() {
                 Ok(guard) => guard,
                 Err(e) => e.into_inner(),
             };
             *guard = schemas;
+        }
+
+        let previous_count = {
+            let mut guard = match self.last_table_count.write() {
+                Ok(guard) => guard,
+                Err(e) => e.into_inner(),
+            };
+            guard.replace(table_count)
+        };
+
+        if let Some(warning) = empty_catalog_warning(
+            &self.catalog_name,
+            previous_count,
+            table_count,
+            schemas_registered,
+            &self.selector,
+        ) {
+            tracing::warn!("{warning}");
         }
 
         Ok(())
@@ -466,6 +495,16 @@ impl PostgresSchemaProvider {
         }
     }
 
+    /// How many tables this schema registered. Counts without cloning every
+    /// name, which `SchemaProvider::table_names` would.
+    fn table_count(&self) -> usize {
+        let guard = match self.tables.read() {
+            Ok(guard) => guard,
+            Err(e) => e.into_inner(),
+        };
+        guard.len()
+    }
+
     async fn refresh_tables(
         &self,
         foreign_keys: &ForeignKeyMap,
@@ -593,6 +632,46 @@ fn foreign_key_target(catalog: &str, schema: &str, table: &str) -> String {
         quote_identifier(schema),
         quote_identifier(table),
     )
+}
+
+/// The warning for a refresh that registered no tables, or `None` when there is
+/// nothing to report.
+///
+/// A catalog that selects nothing is the one outcome the federated path cannot
+/// distinguish from success on its own: it loads, reports ready, and answers
+/// every query with "table not found". The accelerated path fails loud here
+/// (#11983); the federated path warns instead, because a federated catalog can
+/// legitimately be configured before the tables it names exist -- so this must
+/// say enough for a user to tell "my patterns are wrong" from "my tables are not
+/// there yet".
+///
+/// Reported on the transition to empty rather than on every refresh: a repeated
+/// warning for a steady misconfiguration is how a log stops being read.
+fn empty_catalog_warning(
+    catalog_name: &str,
+    previous_count: Option<usize>,
+    current_count: usize,
+    schemas_registered: usize,
+    selector: &TableSelector,
+) -> Option<String> {
+    if current_count > 0 || previous_count == Some(0) {
+        return None;
+    }
+
+    let patterns = selector.describe();
+    let cause = if patterns.is_empty() {
+        format!(
+            "It selects every table it can see, so either the database has no tables in the {schemas_registered} schema(s) it discovered, or the connected role cannot see them -- check the role's SELECT and USAGE grants"
+        )
+    } else {
+        format!(
+            "None of the tables in the {schemas_registered} schema(s) it discovered matched {patterns}. Patterns match the qualified '<schema>.<table>' name, so an unqualified pattern such as 'orders' never matches -- write 'public.orders' (or 'public.*') instead"
+        )
+    };
+
+    Some(format!(
+        "PostgreSQL catalog {catalog_name} registered no tables, so queries against it will not resolve any table. {cause}. Docs: {POSTGRES_CATALOG_DOCS}"
+    ))
 }
 
 /// What `refresh_schemas` does with a single schema after attempting to refresh
@@ -783,9 +862,9 @@ impl SchemaProvider for PostgresSchemaProvider {
 #[cfg(test)]
 mod tests {
     use super::{
-        CommentMap, ForeignKeyConstraint, ForeignKeyMap, SchemaRefreshOutcome, TableComments,
-        build_table_providers_for_schema, foreign_key_target, schema_refresh_outcome,
-        select_relations,
+        CommentMap, ForeignKeyConstraint, ForeignKeyMap, POSTGRES_CATALOG_DOCS,
+        SchemaRefreshOutcome, TableComments, build_table_providers_for_schema,
+        empty_catalog_warning, foreign_key_target, schema_refresh_outcome, select_relations,
     };
     use crate::{
         DESCRIPTION_METADATA_KEY, FOREIGN_KEYS_METADATA_KEY, Read, SOURCE_TYPE_METADATA_KEY,
@@ -1020,6 +1099,67 @@ mod tests {
                 "table must round-trip (target = `{target}`)"
             );
         }
+    }
+
+    /// The empty-catalog warning has to fire when a catalog *becomes* empty and
+    /// stay quiet while it stays that way, or a steady misconfiguration prints
+    /// once a refresh interval forever and the log stops being worth reading.
+    #[test]
+    fn empty_catalog_warning_reports_the_transition_to_empty() {
+        let selector = TableSelector::select_all();
+        let warn = |previous, current| {
+            empty_catalog_warning("pg", previous, current, 1, &selector).is_some()
+        };
+
+        assert!(warn(None, 0), "the first refresh finding nothing warns");
+        assert!(warn(Some(3), 0), "losing every table warns");
+        assert!(
+            !warn(Some(0), 0),
+            "a catalog that was already empty must not warn again"
+        );
+        assert!(!warn(None, 3), "a catalog with tables never warns");
+        assert!(!warn(Some(0), 3), "recovering from empty does not warn");
+    }
+
+    /// The message exists to tell "my patterns are wrong" from "my tables are
+    /// not there yet", so it must name the patterns when there are any and say
+    /// something useful when there are none.
+    #[test]
+    fn empty_catalog_warning_names_the_configured_patterns() {
+        let filtered = TableSelector::new(Some(make_globset(&["public.orders"])), None)
+            .with_include_patterns(&["public.orders".to_string()])
+            .with_exclude_patterns(&["public.secret".to_string()]);
+
+        let message = empty_catalog_warning("pg", None, 0, 2, &filtered)
+            .expect("an empty filtered catalog should warn");
+        assert!(message.contains("pg"), "names the catalog: {message}");
+        assert!(
+            message.contains("include: ['public.orders']")
+                && message.contains("exclude: ['public.secret']"),
+            "names both halves of the configuration: {message}"
+        );
+        assert!(
+            message.contains("2 schema(s)"),
+            "says how much was searched: {message}"
+        );
+        assert!(
+            message.contains(POSTGRES_CATALOG_DOCS),
+            "links the docs: {message}"
+        );
+        assert!(!message.contains('\n'), "stays on one line: {message:?}");
+
+        // An unfiltered catalog cannot blame patterns, so it must point at the
+        // other two explanations instead of naming an empty pattern list.
+        let unfiltered = empty_catalog_warning("pg", None, 0, 1, &TableSelector::select_all())
+            .expect("an empty unfiltered catalog should warn");
+        assert!(
+            !unfiltered.contains("include:") && !unfiltered.contains("matched"),
+            "does not blame patterns that were never configured: {unfiltered}"
+        );
+        assert!(
+            unfiltered.contains("grants"),
+            "points at the likely cause instead: {unfiltered}"
+        );
     }
 
     /// Regression coverage for #11724: the per-schema failure decision must keep

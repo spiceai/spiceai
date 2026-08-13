@@ -43,6 +43,11 @@ pub struct TableSelector {
     /// Literal prefix of each `include` pattern, for [`TableSelector::may_select_within`].
     /// Empty when the patterns were not supplied, which disables that prune.
     include_literal_prefixes: Arc<Vec<String>>,
+    /// The patterns verbatim, for [`TableSelector::describe`]. A [`GlobSet`]
+    /// cannot be printed, and a catalog that selected nothing is diagnosable
+    /// only by the patterns the user actually wrote.
+    include_patterns: Arc<Vec<String>>,
+    exclude_patterns: Arc<Vec<String>>,
 }
 
 impl TableSelector {
@@ -54,6 +59,8 @@ impl TableSelector {
             include: include.map(Arc::new),
             exclude: exclude.map(Arc::new),
             include_literal_prefixes: Arc::default(),
+            include_patterns: Arc::default(),
+            exclude_patterns: Arc::default(),
         }
     }
 
@@ -78,7 +85,44 @@ impl TableSelector {
                 .map(|pattern| glob_literal_prefix(pattern))
                 .collect(),
         );
+        self.include_patterns = Arc::new(patterns.to_vec());
         self
+    }
+
+    /// Records the raw `exclude` patterns for [`TableSelector::describe`].
+    ///
+    /// Diagnostics only -- `exclude` is already applied from the compiled set
+    /// passed to [`TableSelector::new`], so omitting this costs a less specific
+    /// message and nothing else.
+    #[must_use]
+    pub fn with_exclude_patterns(mut self, patterns: &[String]) -> Self {
+        self.exclude_patterns = Arc::new(patterns.to_vec());
+        self
+    }
+
+    /// The configuration as the user wrote it, for a message about what it
+    /// selected. Empty when the catalog filters nothing.
+    ///
+    /// Renders as `include: ['a.*'], exclude: ['a.b']`, omitting whichever half
+    /// is absent, so a caller can drop it into a sentence.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        let quoted = |patterns: &[String]| {
+            patterns
+                .iter()
+                .map(|p| format!("'{p}'"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+
+        let mut parts = Vec::new();
+        if !self.include_patterns.is_empty() {
+            parts.push(format!("include: [{}]", quoted(&self.include_patterns)));
+        }
+        if !self.exclude_patterns.is_empty() {
+            parts.push(format!("exclude: [{}]", quoted(&self.exclude_patterns)));
+        }
+        parts.join(", ")
     }
 
     /// Whether any `include` pattern could match a name beginning with

@@ -118,6 +118,7 @@ impl Catalog {
 pub fn table_selector(catalog: &CatalogSpec) -> TableSelector {
     TableSelector::new(catalog.include.clone(), catalog.exclude.clone())
         .with_include_patterns(&catalog.orig_include)
+        .with_exclude_patterns(&catalog.orig_exclude)
 }
 
 pub struct CatalogBuilder {
