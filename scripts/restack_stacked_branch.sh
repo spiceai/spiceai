@@ -9,8 +9,9 @@
 # base. Files only the parent touched merge silently and correctly; files both
 # branches edited conflict spuriously; and files the parent added that the child
 # deleted are restored with no conflict reported at all. That last one is what
-# this exists for: it removed half of the registry #12661 was written to delete,
-# and the conflict list never mentioned it.
+# this exists for: restacking #12891 after its parent #12661 landed put
+# crates/runtime-table/src/table_layers.rs back -- half of the registry #12891
+# was written to delete -- and the conflict list never mentioned it.
 #
 # Two subcommands do the mechanical parts, both of which have failed in ways that
 # print nothing:
@@ -117,9 +118,13 @@ resolve_with_tmp() {
     return 2
   fi
 
-  if git merge-file -p --diff3 \
-       -L ours -L "base ($stack_base)" -L trunk \
-       "$tmp/ours" "$tmp/base" "$tmp/theirs" > "$tmp/merged" 2>/dev/null; then
+  local merge_status
+  git merge-file -p --diff3 \
+    -L ours -L "base ($stack_base)" -L trunk \
+    "$tmp/ours" "$tmp/base" "$tmp/theirs" > "$tmp/merged" 2>/dev/null
+  merge_status=$?
+
+  if [ "$merge_status" -eq 0 ]; then
     # `:(literal)` because git add takes a pathspec, not a filename: a conflicted
     # path containing *, ? or [] would otherwise stage every other path it matches.
     cp -- "$tmp/merged" "$path" && git add -- ":(literal)$path" || die "could not stage $path"
@@ -127,18 +132,20 @@ resolve_with_tmp() {
     return 0
   fi
 
-  # merge-file exits non-zero for conflicts and for fatal errors alike, but only
-  # writes output in the first case. That output is the correctly based conflict
-  # this step exists to produce, so keep it -- unstaged, so the path stays
-  # unmerged until a human agrees. Discarding it would send the reader back to
-  # git's spurious-base conflict.
-  if [ -s "$tmp/merged" ]; then
+  # merge-file reports conflicts as a count in 1..127 and fatal errors above that.
+  # Only the first range means the output is a conflict worth keeping: it is the
+  # correctly based conflict this step exists to produce, so it goes to the
+  # worktree unstaged, leaving the path unmerged until a human agrees. Discarding
+  # it would send the reader back to git's spurious-base conflict. Deciding by
+  # "did it write anything" instead would copy the partial output of an
+  # interrupted or failed run over the file.
+  if [ "$merge_status" -ge 1 ] && [ "$merge_status" -le 127 ]; then
     cp -- "$tmp/merged" "$path" || die "could not write $path"
     echo "CONFLICT $path: correctly based markers written, left unstaged"
     return 1
   fi
 
-  echo "MANUAL $path: merge-file failed; worktree left untouched"
+  echo "MANUAL $path: merge-file failed (status $merge_status); worktree left untouched"
   return 2
 }
 

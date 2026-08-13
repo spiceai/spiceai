@@ -110,10 +110,10 @@ on *both* sides of the comparison, and git handles the three cases differently:
 | A file the parent **and** child both edited | Frequently a **spurious conflict**: git cannot align the duplicated parent hunks against a base that predates them. |
 | A file the parent **added** and the child **deleted** | **Silently restored, with no conflict reported.** At the fork point the file does not exist, and it does not exist in your tree either, so git sees no change on your side and applies trunk's add unopposed. |
 
-The third row is the dangerous one. It hit `ben/issue-12614-spice-layer` (stacked on
-the branch that landed as #12661): 13 reported conflicts, plus
-`crates/runtime-table/src/table_layers.rs` — half of the registry that PR existed to
-delete — restored with no mention in the conflict list.
+The third row is the dangerous one. It hit #12891, stacked on the branch that landed as
+#12661: restacking it after the parent squash-merged produced 13 reported conflicts,
+plus `crates/runtime-table/src/table_layers.rs` — half of the registry #12891 was
+written to delete — put back with no mention in the conflict list.
 
 ---
 
@@ -252,16 +252,16 @@ from a clean checkout (`docs/dev/ci_signoff.md`), and the merge is a new commit,
 previous attestation no longer covers it:
 
 ```bash
-git rev-list --parents -n1 HEAD | wc -w   # after the commit below: 3 = a real merge
 git commit                                # completes the --no-commit merge
+git rev-list --parents -n1 HEAD | wc -w   # 3 = a real merge, 2 = no merge happened
 git status --short                        # must be clean before signing off
 git push
 make signoff
 ```
 
-Count the parents rather than trusting the commit to have merged anything: two words
-means an ordinary commit, and the `--no-commit` merge never happened. `git status`
-cannot tell you that — it is clean either way.
+Count the parents *of the commit you just made*, rather than trusting it to have merged
+anything: two words means an ordinary commit and the `--no-commit` merge never
+happened. `git status` cannot tell you that — it is clean either way.
 
 ---
 

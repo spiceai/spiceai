@@ -343,6 +343,44 @@ start_test "resolve stages a clean three-way merge against the stack base"
   [ -z "$(git ls-files -u -- f.txt)" ] || fail_test "the path was left unmerged"
 ) || failures=$((failures + 1))
 
+start_test "resolve refuses a fatal merge-file even when it wrote partial output"
+(
+  new_stack "$work_root/fatal"
+  printf 'l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\n' > f.txt && commit_all "fork point"
+  git checkout --quiet -b parent
+  printf 'l1\nPARENT\nl3\nl4\nl5\nl6\nl7\nl8\n' > f.txt && commit_all "parent edits"
+  stack_base=$(git rev-parse HEAD)
+  git checkout --quiet -b child
+  printf 'l1\nPARENT\nl3\nl4\nl5\nl6\nl7\nCHILD\n' > f.txt && commit_all "child edits"
+  squash_parent_onto_trunk
+  printf 'l1\nPARENT\nTRUNK\nl4\nl5\nl6\nl7\nl8\n' > f.txt && commit_all "trunk edits"
+  git checkout --quiet child
+  git merge --no-ff --no-commit trunk >/dev/null 2>&1
+  before=$(cat f.txt)
+
+  # A `git` that fails `merge-file` the way an interrupted or failed run does:
+  # some output on stdout, then a fatal status. Deciding by "did it write
+  # anything" would copy that fragment over the conflicted file.
+  stub_dir="$work_root/fatal_stub"
+  mkdir -p "$stub_dir"
+  real_git=$(command -v git)
+  cat >"$stub_dir/git" <<STUB
+#!/usr/bin/env bash
+if [ "\$1" = "merge-file" ]; then
+  printf 'PARTIAL OUTPUT FROM A FAILED RUN\n'
+  exit 255
+fi
+exec "$real_git" "\$@"
+STUB
+  chmod +x "$stub_dir/git"
+
+  output=$(PATH="$stub_dir:$PATH" "$subject" resolve "$stack_base" f.txt 2>/dev/null)
+  status=$?
+  [ "$status" -eq 2 ] || fail_test "expected exit 2 for a fatal merge-file, got $status ($output)"
+  [ "$(cat f.txt)" = "$before" ] ||
+    fail_test "the partial output of a failed run was written over the conflicted file"
+) || failures=$((failures + 1))
+
 start_test "resolve stages only the named path when the name contains glob characters"
 (
   new_stack "$work_root/globby"
