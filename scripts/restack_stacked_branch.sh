@@ -318,6 +318,31 @@ renamed_to() {
   return 1
 }
 
+# The nearest ancestor of this path that exists on <rev> as something other than
+# a directory, in BLOCKING_ANCESTOR. A child that adds dir/file while trunk puts a
+# file or a link at dir cannot have both, and from the stack base that is a
+# collision somebody has to settle -- while the addition itself, looked up by its
+# exact name, simply looks absent from trunk.
+blocking_ancestor() {
+  local rev="$1" target="$2" dir="${2%/*}" entry mode
+  BLOCKING_ANCESTOR=""
+  while [ -n "$dir" ] && [ "$dir" != "$target" ]; do
+    entry=$(tree_entry "$rev" "$dir") || return 1
+    if [ -n "$entry" ]; then
+      mode=${entry%% *}
+      if [ "$mode" != 040000 ]; then
+        BLOCKING_ANCESTOR="$dir"
+        return 0
+      fi
+    fi
+    case "$dir" in
+      */*) dir="${dir%/*}" ;;
+      *) dir="" ;;
+    esac
+  done
+  return 1
+}
+
 # Anything above the final component that git cannot see: a symlinked ancestor
 # means a write to this path lands outside the worktree entirely, and a hard link
 # means truncating an inode somebody else's file also points at.
@@ -733,6 +758,11 @@ cmd_audit() {
       fi
       if [ -n "$theirs_add" ] && [ "$theirs_add" != "$mine_add" ]; then
         accept_or_review "$path" "you and trunk each added this path differently, and the result has neither" ||
+          findings=$((findings + 1))
+        continue
+      fi
+      if [ -n "$other" ] && blocking_ancestor "$other" "$path"; then
+        accept_or_review "$path" "trunk put something other than a directory at $BLOCKING_ANCESTOR, so this addition and trunk cannot both exist" ||
           findings=$((findings + 1))
         continue
       fi

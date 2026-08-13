@@ -634,6 +634,41 @@ start_test "audit lets an add/add settled by removing the path be accepted"
   [ "$status" -eq 0 ] || fail_test "the resolution could not be accepted: $output"
 ) || failures=$((failures + 1))
 
+start_test "audit treats a file-versus-directory collision as a decision"
+(
+  new_stack "$work_root/dircollision"
+  printf 'seed\n' > seed.txt && commit_all "fork point"
+  git checkout --quiet -b parent
+  printf 'p\n' > p.txt && commit_all "parent work"
+  stack_base=$(git rev-parse HEAD)
+  git checkout --quiet -b child
+  mkdir -p dir && printf 'child\n' > dir/file && commit_all "child adds dir/file"
+  pre=$(git rev-parse HEAD)
+  squash_parent_onto_trunk
+  printf 'trunk put a file here\n' > dir && commit_all "trunk adds a file called dir"
+  git checkout --quiet child
+  git merge --no-ff --no-commit trunk >/dev/null 2>&1
+  # Settle it by keeping trunk's file at dir, so the child's addition is gone.
+  # git parks trunk's version at dir~trunk to avoid the collision, so that has to
+  # be cleaned up as part of the resolution too.
+  git rm --quiet -r --cached dir >/dev/null 2>&1 || true
+  rm -rf dir && printf 'trunk put a file here\n' > dir && git add dir
+  git rm --quiet --cached -- 'dir~trunk' >/dev/null 2>&1 || true
+  rm -f -- 'dir~trunk'
+  [ -z "$(git ls-files -u)" ] || fail_test "the fixture left something unmerged: $(git ls-files -u)"
+
+  # Looked up by its exact name, dir/file is simply absent from trunk, so this
+  # reads as a plain loss unless the collision above it is noticed.
+  output=$("$subject" audit "$stack_base" "$pre" --trunk trunk 2>/dev/null)
+  case "$output" in
+    *"REVIEW dir/file"*) ;;
+    *) fail_test "a file-versus-directory collision was not treated as a decision: $output" ;;
+  esac
+  output=$("$subject" audit "$stack_base" "$pre" --trunk trunk --accept dir/file 2>/dev/null)
+  status=$?
+  [ "$status" -eq 0 ] || fail_test "the resolution could not be accepted: $output"
+) || failures=$((failures + 1))
+
 start_test "audit still reports a child-only addition the merge dropped"
 (
   new_stack "$work_root/addadd_lost"
