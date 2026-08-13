@@ -1038,6 +1038,33 @@ start_test "audit will not let --accept silence a plain resurrection"
   esac
 ) || failures=$((failures + 1))
 
+start_test "audit will not let --accept carry a dropped mode change"
+(
+  new_stack "$work_root/accept_mode"
+  printf 'a\nb\nc\n' > run.sh && commit_all "fork point"
+  git checkout --quiet -b parent
+  printf 'a\nPARENT\nc\n' > run.sh && commit_all "parent edits line 2"
+  stack_base=$(git rev-parse HEAD)
+  git checkout --quiet -b child
+  printf 'a\nCHILD\nc\n' > run.sh && commit_all "child edits line 2"
+  pre=$(git rev-parse HEAD)
+  squash_parent_onto_trunk
+  printf 'a\nTRUNK\nc\n' > run.sh && chmod +x run.sh && commit_all "trunk edits line 2 and marks it executable"
+  git checkout --quiet child
+  git merge --no-ff --no-commit trunk >/dev/null 2>&1
+  # Resolve the content by hand but leave the mode alone. The content is genuinely
+  # ambiguous; the executable bit is not — only trunk touched it.
+  printf 'a\nDECIDED\nc\n' > run.sh && chmod -x run.sh && git add run.sh
+
+  output=$("$subject" audit "$stack_base" "$pre" --trunk trunk --accept run.sh 2>/dev/null)
+  status=$?
+  [ "$status" -ne 0 ] || fail_test "--accept carried a dropped executable bit: $output"
+  case "$output" in
+    *"DISCARDED run.sh"*) ;;
+    *) fail_test "expected the mode to be reported, got: $output" ;;
+  esac
+) || failures=$((failures + 1))
+
 start_test "audit will not let --accept silence a discarded edit"
 (
   new_stack "$work_root/acceptdiscard"

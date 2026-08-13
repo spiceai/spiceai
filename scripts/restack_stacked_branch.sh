@@ -577,6 +577,26 @@ audit_modification() {
     return 0
   fi
 
+  # The mode is decided before the content, because the two are independent: a
+  # merge nobody can settle textually may still have exactly one answer for the
+  # executable bit, and accepting the content decision must not carry a dropped
+  # mode change with it.
+  local expected_mode
+  if [ "$mine_mode" != "$base_mode" ] && [ "$theirs_mode" != "$base_mode" ] &&
+     [ "$mine_mode" != "$theirs_mode" ]; then
+    accept_or_review "$path" "both sides changed the file mode, to $mine_mode and $theirs_mode"
+    return $?
+  fi
+  if [ "$mine_mode" != "$base_mode" ]; then
+    expected_mode="$mine_mode"
+  else
+    expected_mode="$theirs_mode"
+  fi
+  if [ "$staged_mode" != "$expected_mode" ]; then
+    echo "DISCARDED $path: staged mode $staged_mode, expected $expected_mode"
+    return 1
+  fi
+
   git cat-file blob "$mine_oid" > "$tmp/m.ours" 2>/dev/null &&
     git cat-file blob "$base_oid" > "$tmp/m.base" 2>/dev/null &&
     git cat-file blob "$theirs_oid" > "$tmp/m.theirs" 2>/dev/null &&
@@ -602,21 +622,6 @@ audit_modification() {
     return $?
   fi
 
-  local expected_mode
-  if [ "$mine_mode" != "$base_mode" ] && [ "$theirs_mode" != "$base_mode" ] &&
-     [ "$mine_mode" != "$theirs_mode" ]; then
-    accept_or_review "$path" "both sides changed the file mode, to $mine_mode and $theirs_mode"
-    return $?
-  fi
-  if [ "$mine_mode" != "$base_mode" ]; then
-    expected_mode="$mine_mode"
-  else
-    expected_mode="$theirs_mode"
-  fi
-  if [ "$staged_mode" != "$expected_mode" ]; then
-    echo "DISCARDED $path: staged mode $staged_mode, expected $expected_mode"
-    return 1
-  fi
   return 0
 }
 
