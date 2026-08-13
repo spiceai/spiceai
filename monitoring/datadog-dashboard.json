@@ -497,12 +497,24 @@
                 {
                   "formulas": [
                     {
-                      "alias": "Processed",
-                      "formula": "per_second(query1)"
+                      "alias": "Processed B/s",
+                      "formula": "per_second(query1)",
+                      "number_format": {
+                        "unit": {
+                          "type": "canonical_unit",
+                          "unit_name": "byte"
+                        }
+                      }
                     },
                     {
-                      "alias": "Returned",
-                      "formula": "per_second(query2)"
+                      "alias": "Returned B/s",
+                      "formula": "per_second(query2)",
+                      "number_format": {
+                        "unit": {
+                          "type": "canonical_unit",
+                          "unit_name": "byte"
+                        }
+                      }
                     }
                   ],
                   "queries": [
@@ -556,8 +568,14 @@
                 {
                   "formulas": [
                     {
-                      "alias": "Spilled Bytes",
-                      "formula": "per_second(query1)"
+                      "alias": "Spilled B/s",
+                      "formula": "per_second(query1)",
+                      "number_format": {
+                        "unit": {
+                          "type": "canonical_unit",
+                          "unit_name": "byte"
+                        }
+                      }
                     }
                   ],
                   "queries": [
@@ -2226,15 +2244,33 @@
                   "formulas": [
                     {
                       "formula": "query1",
-                      "alias": "budget"
+                      "alias": "budget",
+                      "number_format": {
+                        "unit": {
+                          "type": "canonical_unit",
+                          "unit_name": "millicore"
+                        }
+                      }
                     },
                     {
                       "formula": "query2",
-                      "alias": "limit"
+                      "alias": "limit",
+                      "number_format": {
+                        "unit": {
+                          "type": "canonical_unit",
+                          "unit_name": "millicore"
+                        }
+                      }
                     },
                     {
                       "formula": "query3",
-                      "alias": "request"
+                      "alias": "request",
+                      "number_format": {
+                        "unit": {
+                          "type": "canonical_unit",
+                          "unit_name": "millicore"
+                        }
+                      }
                     }
                   ],
                   "queries": [
