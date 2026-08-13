@@ -1119,6 +1119,39 @@ impl GraphQLClient {
             .map(|p| p(&response_headers, &response))
             .transpose()?;
 
+        self.process_response(query, schema.as_ref(), limit, cursor.as_deref(), &response)
+    }
+
+    /// The result for a page that yielded no rows, keeping whichever schema the table is
+    /// configured with so an empty page cannot narrow it.
+    ///
+    /// Every early exit out of [`Self::process_response`] goes through here: the schema a rowless
+    /// page reports is the one rule they must agree on, so it lives in one place.
+    fn empty_page(
+        &self,
+        schema: Option<&SchemaRef>,
+        cursor: Option<String>,
+    ) -> Result<GraphQLQueryResult> {
+        Ok(GraphQLQueryResult {
+            records: vec![],
+            limit_reached: false,
+            // No rows to infer from, so this resolves to the override or the configured schema.
+            schema: get_json_schema(self.schema.as_ref(), schema, &[])?,
+            cursor,
+        })
+    }
+
+    /// Turn a decoded GraphQL response body into record batches, resolving the schema each page is
+    /// parsed with. Split out from `execute_inner` so the page-shape handling — null payload, empty
+    /// page, repeated cursor — is reachable without an HTTP round trip.
+    fn process_response(
+        &self,
+        query: &GraphQLQuery,
+        schema: Option<&SchemaRef>,
+        limit: Option<usize>,
+        cursor: Option<&str>,
+        response: &serde_json::Value,
+    ) -> Result<GraphQLQueryResult> {
         let json_pointer = query
             .json_pointer
             .as_ref()
@@ -1141,7 +1174,7 @@ impl GraphQLClient {
                 } else {
                     format!("Invalid JSON pointer: '{json_pointer}'. The expected data path was not found in the response.")
                 };
-                tracing::error!("Failed to extract data from response. Full response: {}", serde_json::to_string_pretty(&response).unwrap_or_else(|_| format!("{response:?}")));
+                tracing::error!("Failed to extract data from response. Full response: {}", serde_json::to_string_pretty(response).unwrap_or_else(|_| format!("{response:?}")));
                 Error::InvalidJsonPointer {
                     pointer: error_msg,
                 }
@@ -1151,18 +1184,13 @@ impl GraphQLClient {
         // Handle null data explicitly
         if extracted_data.is_null() {
             tracing::debug!("Extracted data at pointer '{json_pointer}' is null");
-            return Ok(GraphQLQueryResult {
-                records: vec![],
-                limit_reached: false,
-                schema: schema.unwrap_or_else(|| Arc::new(arrow::datatypes::Schema::empty())),
-                cursor: None,
-            });
+            return self.empty_page(schema, None);
         }
 
         let next_cursor = query
             .pagination_parameters
             .as_ref()
-            .and_then(|x| x.get_next_cursor_from_response(&response));
+            .and_then(|x| x.get_next_cursor_from_response(response));
 
         // Validate next cursor if present
         if let Some(ref next_cursor_val) = next_cursor {
@@ -1170,17 +1198,12 @@ impl GraphQLClient {
                 tracing::warn!("Empty cursor returned from pagination, stopping pagination");
             }
             // Detect potential infinite loop - same cursor returned
-            if cursor.as_ref() == Some(next_cursor_val) {
+            if cursor == Some(next_cursor_val.as_str()) {
                 tracing::warn!(
                     "Same cursor returned from pagination, stopping to prevent infinite loop"
                 );
                 // Use limit_reached: false for loop protection exits, not data limit exhaustion
-                return Ok(GraphQLQueryResult {
-                    records: vec![],
-                    limit_reached: false,
-                    schema: schema.unwrap_or_else(|| Arc::new(arrow::datatypes::Schema::empty())),
-                    cursor: None,
-                });
+                return self.empty_page(schema, None);
             }
         }
 
@@ -1195,12 +1218,7 @@ impl GraphQLClient {
         // Validate we have data to process
         if unwrapped.is_empty() {
             tracing::debug!("No data to process after extraction");
-            return Ok(GraphQLQueryResult {
-                records: vec![],
-                limit_reached: false,
-                schema: schema.unwrap_or_else(|| Arc::new(arrow::datatypes::Schema::empty())),
-                cursor: next_cursor,
-            });
+            return self.empty_page(schema, next_cursor);
         }
 
         unwrapped = match self.unnest_parameters.behavior {
@@ -1210,7 +1228,7 @@ impl GraphQLClient {
             }
         };
 
-        let schema = get_json_schema(self.schema.as_ref(), schema.as_ref(), &unwrapped)?;
+        let schema = get_json_schema(self.schema.as_ref(), schema, &unwrapped)?;
 
         let mut res = vec![];
         for v in unwrapped {
@@ -1470,6 +1488,11 @@ impl GraphQLClient {
     }
 }
 
+/// Resolve the schema a page's rows are parsed with: per-query override, then the schema
+/// configured on the client, then inference from the rows themselves.
+///
+/// An empty `json_iter` means there are no rows to infer from, so the last step yields an empty
+/// schema rather than guessing one.
 fn get_json_schema(
     client_schema: Option<&SchemaRef>,
     schema_override: Option<&SchemaRef>,
@@ -1718,6 +1741,191 @@ mod tests {
     use crate::graphql::client::GraphQLQuery;
 
     use super::{DuplicateBehavior, PaginationParameters, UnnestBehavior, handle_http_error};
+
+    mod empty_page_schema {
+        use std::sync::Arc;
+
+        use arrow::array::RecordBatch;
+        use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+        use serde_json::json;
+        use url::Url;
+
+        use crate::graphql::builder::GraphQLClientBuilder;
+        use crate::graphql::client::{
+            GraphQLClient, GraphQLQuery, GraphQLQueryResult, UnnestBehavior,
+        };
+
+        const UNPAGINATED_QUERY: &str = "query { view { nodes { id } } }";
+        const PAGINATED_QUERY: &str =
+            "query { view(first: 10) { nodes { id } pageInfo { hasNextPage endCursor } } }";
+
+        fn configured_schema() -> SchemaRef {
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Utf8, true),
+                Field::new("title", DataType::Utf8, true),
+            ]))
+        }
+
+        fn client_with_schema(schema: Option<SchemaRef>) -> GraphQLClient {
+            GraphQLClientBuilder::new(
+                Url::parse("https://example.com/graphql").expect("valid URL"),
+                UnnestBehavior::Depth(0),
+            )
+            .with_json_pointer(Some("/data/view/nodes"))
+            .with_schema(schema)
+            .build(reqwest::Client::new())
+            .expect("client to build")
+        }
+
+        fn process(
+            client: &GraphQLClient,
+            query_str: &str,
+            schema_override: Option<&SchemaRef>,
+            cursor: Option<&str>,
+            response: &serde_json::Value,
+        ) -> GraphQLQueryResult {
+            let query =
+                GraphQLQuery::try_from(Arc::<str>::from(query_str)).expect("query to parse");
+
+            client
+                .process_response(&query, schema_override, None, cursor, response)
+                .expect("an empty page is a valid response, not an error")
+        }
+
+        /// Regression test for #13004: a first page with no rows must not discard the configured
+        /// schema, or preflight builds the table from `Schema::empty()` and the dataset fails to
+        /// connect.
+        #[test]
+        fn empty_page_keeps_the_configured_schema() {
+            let schema = configured_schema();
+            let client = client_with_schema(Some(Arc::clone(&schema)));
+
+            let result = process(
+                &client,
+                UNPAGINATED_QUERY,
+                None,
+                None,
+                &json!({"data": {"view": {"nodes": []}}}),
+            );
+
+            assert!(result.records.is_empty(), "an empty page yields no rows");
+            assert_eq!(result.schema, schema);
+        }
+
+        /// A null payload is the same shape as an empty page: GitHub returns `nodes: null` rather
+        /// than `[]` for some resources.
+        #[test]
+        fn null_payload_keeps_the_configured_schema() {
+            let schema = configured_schema();
+            let client = client_with_schema(Some(Arc::clone(&schema)));
+
+            let result = process(
+                &client,
+                UNPAGINATED_QUERY,
+                None,
+                None,
+                &json!({"data": {"view": {"nodes": null}}}),
+            );
+
+            assert!(result.records.is_empty());
+            assert_eq!(result.schema, schema);
+        }
+
+        /// The pagination loop-guard exit is the third early return out of the page handler, and it
+        /// dropped the configured schema the same way the other two did.
+        #[test]
+        fn repeated_cursor_keeps_the_configured_schema() {
+            let schema = configured_schema();
+            let client = client_with_schema(Some(Arc::clone(&schema)));
+
+            let result = process(
+                &client,
+                PAGINATED_QUERY,
+                None,
+                Some("cursor-1"),
+                &json!({
+                    "data": {
+                        "view": {
+                            "nodes": [{"id": "1", "title": "a"}],
+                            "pageInfo": {"hasNextPage": true, "endCursor": "cursor-1"}
+                        }
+                    }
+                }),
+            );
+
+            assert!(
+                result.records.is_empty(),
+                "the loop guard stops before parsing rows"
+            );
+            assert!(result.cursor.is_none(), "the loop guard clears the cursor");
+            assert_eq!(result.schema, schema);
+        }
+
+        /// A per-query schema override outranks the client's configured schema on an empty page,
+        /// matching the precedence a non-empty page already used.
+        #[test]
+        fn schema_override_outranks_the_configured_schema_on_an_empty_page() {
+            let override_schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
+                "only_field",
+                DataType::Int64,
+                true,
+            )]));
+            let client = client_with_schema(Some(configured_schema()));
+
+            let result = process(
+                &client,
+                UNPAGINATED_QUERY,
+                Some(&override_schema),
+                None,
+                &json!({"data": {"view": {"nodes": []}}}),
+            );
+
+            assert_eq!(result.schema, override_schema);
+        }
+
+        /// With nothing configured there is still nothing to infer from, so an empty page keeps
+        /// reporting an empty schema.
+        #[test]
+        fn empty_page_without_a_configured_schema_stays_empty() {
+            let client = client_with_schema(None);
+
+            let result = process(
+                &client,
+                UNPAGINATED_QUERY,
+                None,
+                None,
+                &json!({"data": {"view": {"nodes": []}}}),
+            );
+
+            assert_eq!(result.schema.fields().len(), 0);
+        }
+
+        /// A page that does have rows is unaffected: the configured schema is what its batches are
+        /// parsed with.
+        #[test]
+        fn non_empty_page_still_parses_with_the_configured_schema() {
+            let schema = configured_schema();
+            let client = client_with_schema(Some(Arc::clone(&schema)));
+
+            let result = process(
+                &client,
+                UNPAGINATED_QUERY,
+                None,
+                None,
+                &json!({"data": {"view": {"nodes": [{"id": "1", "title": "a"}]}}}),
+            );
+
+            assert_eq!(result.schema, schema);
+            assert_eq!(
+                result
+                    .records
+                    .iter()
+                    .map(RecordBatch::num_rows)
+                    .sum::<usize>(),
+                1
+            );
+        }
+    }
 
     struct TestPaginationParseCase {
         name: &'static str,
