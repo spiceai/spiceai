@@ -396,6 +396,54 @@ pub(crate) fn is_delete_all(filters: &[Expr]) -> bool {
     })
 }
 
+/// Taints the maintained live row count's exactness once the wrapped delete has
+/// removed rows.
+///
+/// A delete tombstones rows the persisted `num_rows` still counts, and nothing
+/// re-derives that count — `cached_table_statistics_for_optimizer` only *masks*
+/// the drift while `has_pending_deletions()` holds. Any path that folds the
+/// tombstone (compaction, overwrite, datalake promotion, the seq-prefix bake)
+/// drops that mask, and one that does not also re-baseline the count with
+/// [`RowCountUpdate::Set`] leaves it served `Exact` over a stale value — which a
+/// distributed `COUNT(*)` can substitute into its result. Tainting exactness at
+/// delete time makes the mask no longer the only thing standing between a stale
+/// count and an `Exact` answer, for every fold path at once.
+///
+/// The count itself is deliberately left alone rather than decremented: the
+/// deleted total spans tiers the persisted count does not uniformly include (a
+/// delete-all also purges the mem tier), so subtracting it can under-count. An
+/// over-count served `Inexact` is a planner estimate; an under-count that a later
+/// `Set` has not yet corrected would be a wrong answer.
+///
+/// [`RowCountUpdate::Set`]: super::column_stats::RowCountUpdate::Set
+pub(crate) struct RowCountExactnessTaintingDeletionSink {
+    pub(crate) table: CayenneTableProvider,
+    pub(crate) inner: Arc<dyn DeletionSink>,
+}
+
+#[async_trait]
+impl DeletionSink for RowCountExactnessTaintingDeletionSink {
+    async fn delete_from(
+        &self,
+        context: Arc<TaskContext>,
+    ) -> std::result::Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+        let deleted = self.inner.delete_from(context).await?;
+        if deleted > 0 {
+            // Ordering is safe after the inner publish: for the whole window
+            // between the tombstone becoming visible and this taint landing,
+            // `has_pending_deletions()` is true, so the count is already served
+            // `Inexact`.
+            self.table
+                .amend_persisted_row_count(super::column_stats::RowCountUpdate::Delta {
+                    delta: 0,
+                    exact: false,
+                })
+                .await;
+        }
+        Ok(deleted)
+    }
+}
+
 pub(crate) struct PkKeysetInvalidatingDeletionSink {
     pub(crate) table: CayenneTableProvider,
     pub(crate) inner: Arc<dyn DeletionSink>,

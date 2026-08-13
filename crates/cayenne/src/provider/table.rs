@@ -53,7 +53,8 @@ use super::on_conflict::{
     PkDeletionSnapshot, PkKeysetInvalidatingDeletionSink, PreparedInsertStream,
     PreparedOnConflictDeletionPublish, PreparedOnConflictDurablePayload,
     PreparedProtectedSnapshotUpdate, PreparedShardedInsertStream, ProtectedSnapshotScan,
-    RowKeyDeletionDelta, ShardedApplyResult, pk_deletion_snapshot_for_strategy,
+    RowCountExactnessTaintingDeletionSink, RowKeyDeletionDelta, ShardedApplyResult,
+    pk_deletion_snapshot_for_strategy,
 };
 use super::pk_index::{
     BoundedShardedPkIndexBuilder, COLD_PK_BLOOM_PER_FILE_MAX_BYTES, CachedPkIndex, CachedPkKeyset,
@@ -1197,6 +1198,23 @@ struct ColdManifestForSnapshot {
     snapshot_id: String,
     /// Every live cold file for the table at that snapshot.
     files: Arc<Vec<crate::metadata::ColdTierFile>>,
+}
+
+/// What [`CayenneTableProvider::write_stream_to_cold`] produced for one datalake
+/// promotion.
+struct ColdWriteOutcome {
+    /// Manifest rows for the files this promotion wrote.
+    cold_files: Vec<crate::metadata::ColdTierFile>,
+    /// Rows written across those files.
+    total_rows: u64,
+    /// Whether every written file's row count was read from its footer.
+    ///
+    /// A file whose count could not be inferred is still committed (dropping it
+    /// would lose rows) but carries a placeholder `row_count` of 0, so the
+    /// manifest's row-count sum is a lower bound rather than the live count.
+    /// Promotion re-baselines the maintained count from that sum, so it may only
+    /// claim the result exact when this is `true`.
+    row_counts_complete: bool,
 }
 
 /// Inputs for [`CayenneTableProvider::build_cold_tier_scan_plan`], grouped the way
@@ -16541,7 +16559,9 @@ impl CayenneTableProvider {
 
     /// Write a (Z-ordered, deletes-applied) stream to the cold object store as
     /// read-optimized Vortex files, returning one [`ColdTierFile`] per written
-    /// file with accurate per-file footer statistics (for listing-time pruning).
+    /// file with accurate per-file footer statistics (for listing-time pruning),
+    /// plus whether every file's row count could be read (see
+    /// [`ColdWriteOutcome::row_counts_complete`]).
     ///
     /// Single ordered run (`target_partitions = 1`) so the Z-order survives across
     /// cold files — each file is a contiguous slice of the sorted order, giving
@@ -16554,7 +16574,7 @@ impl CayenneTableProvider {
         cold_config: Option<&crate::metadata::ObjectStoreConfig>,
         stream: SendableRecordBatchStream,
         max_sequence: i64,
-    ) -> Result<(Vec<crate::metadata::ColdTierFile>, u64)> {
+    ) -> Result<ColdWriteOutcome> {
         let promotion_id = uuid::Uuid::now_v7().to_string();
         let cold_base = cold_location.trim_end_matches('/');
         let cold_dir_url = format!(
@@ -16678,6 +16698,7 @@ impl CayenneTableProvider {
         let mut listing = store.list(Some(&prefix));
         let mut cold_files = Vec::new();
         let mut total_rows = 0u64;
+        let mut row_counts_complete = true;
         while let Some(meta) = listing.next().await {
             let meta = meta.map_err(|e| Error::Internal {
                 table: self.table_metadata.table_name.clone(),
@@ -16689,12 +16710,24 @@ impl CayenneTableProvider {
             let stats = format
                 .infer_stats(session_state.as_ref(), &store, self.table_schema(), &meta)
                 .await?;
-            let row_count = stats
+            let inferred_row_count = stats
                 .num_rows
                 .get_value()
                 .copied()
-                .and_then(|v| i64::try_from(v).ok())
-                .unwrap_or(0);
+                .and_then(|v| i64::try_from(v).ok());
+            if inferred_row_count.is_none() {
+                // The manifest still records this file (dropping it would lose
+                // rows), but its row count is a placeholder, so the manifest sum
+                // is no longer a provable live count — see `ColdWriteOutcome`.
+                row_counts_complete = false;
+                tracing::warn!(
+                    target: "cayenne::compaction",
+                    table = self.table_metadata.table_name.as_str(),
+                    file = %meta.location,
+                    "Datalake file row count could not be read from its footer; the maintained row count stays inexact until the next full rewrite"
+                );
+            }
+            let row_count = inferred_row_count.unwrap_or(0);
             total_rows += u64::try_from(row_count.max(0)).unwrap_or(0);
             let statistics_blob =
                 crate::stats::statistics_to_persisted_blob(&stats, &self.table_metadata.schema)
@@ -16736,7 +16769,11 @@ impl CayenneTableProvider {
             });
         }
 
-        Ok((cold_files, total_rows))
+        Ok(ColdWriteOutcome {
+            cold_files,
+            total_rows,
+            row_counts_complete,
+        })
     }
 
     /// Build the per-file primary-key existence bloom for a just-written cold
@@ -17181,7 +17218,11 @@ impl CayenneTableProvider {
         let stream = self.zorder_sort_stream(stream, clustering, &task_ctx);
 
         // Write the clustered, deletes-applied rows to the cold object store.
-        let (cold_files, total_rows) = self
+        let ColdWriteOutcome {
+            cold_files,
+            total_rows,
+            row_counts_complete,
+        } = self
             .write_stream_to_cold(
                 &cold_location,
                 self.cold_object_store_config.as_ref(),
@@ -17268,6 +17309,34 @@ impl CayenneTableProvider {
             // metastore read, and no capture can observe one half without the other.
             self.store_cold_manifest(&new_snapshot_id, &cold_files);
         }
+
+        // Re-baseline the maintained live row count from the manifest this commit
+        // just registered. Promotion is a full-rewrite fold: it applies every
+        // tombstone physically and clears the deletion index, which drops
+        // `has_pending_deletions()` — the only thing masking a count a standalone
+        // delete left stale. Compaction and overwrite `Set` their count for the
+        // same reason; without this, promotion instead restores `Exact` over the
+        // stale value, and an exact statistic may be substituted into a result
+        // (a distributed `COUNT(*)` then over-counts by the deleted rows).
+        //
+        // The committed manifest IS the whole live set: warm and the prior cold
+        // manifest were overwrite-cleared, and the mem/inline tiers were
+        // checkpointed into the rewrite above. Claim exactness only when every
+        // written file's count was readable — otherwise the sum is a lower bound,
+        // so taint instead, leaving a real scan to answer `COUNT(*)`.
+        let live_rows = cold_files
+            .iter()
+            .fold(0i64, |acc, f| acc.saturating_add(f.row_count.max(0)));
+        self.amend_persisted_row_count(if row_counts_complete {
+            RowCountUpdate::Set(live_rows)
+        } else {
+            RowCountUpdate::Delta {
+                delta: 0,
+                exact: false,
+            }
+        })
+        .await;
+
         if let Err(error) = self.prune_snapshot_manifest_to(&new_snapshot_id).await {
             tracing::warn!(
                 target: "cayenne::compaction",
@@ -20476,6 +20545,94 @@ impl CayenneTableProvider {
         let new_rows = accumulator.row_count();
         self.persist_table_stats_locked(accumulator, RowCountUpdate::Set(new_rows), true)
             .await;
+    }
+
+    /// Apply a [`RowCountUpdate`] to the persisted statistics **without** a
+    /// write accumulator to merge, for the callers that change how many rows are
+    /// live without producing one.
+    ///
+    /// The row-count arms are exactly [`Self::persist_table_stats_locked`]'s; the
+    /// min/max + NDV blob is carried forward verbatim. That is sound for both
+    /// kinds of caller: a delete can only narrow the live aggregate, so the
+    /// existing one stays a valid superset, and a datalake promotion writes
+    /// through the cold Vortex sink, which accumulates no column stats to merge.
+    ///
+    /// Two uses, both about the `num_rows_exact` invariant "an `Exact` count is
+    /// the live count":
+    /// - `Delta { delta: 0, exact: false }` taints exactness when rows were
+    ///   tombstoned but the count could not be re-derived, so no later fold of
+    ///   that tombstone can serve the stale count `Exact`. Persisting (not just
+    ///   caching) the taint is what makes it survive a restart.
+    /// - `Set(n)` re-establishes exactness from an authoritative live count, the
+    ///   way compaction and overwrite do from their accumulators.
+    ///
+    /// Best-effort like [`Self::persist_table_stats`]: a failure is logged and
+    /// the maintained count is left as it was. A table with no persisted stats
+    /// row yet serves no count at all, so there is nothing to amend.
+    pub(crate) async fn amend_persisted_row_count(&self, num_rows_update: RowCountUpdate) {
+        let _stats_persistence_guard = self.table_statistics_persistence_lock.lock().await;
+
+        let cached_raw = {
+            let guard = self.table_statistics.read();
+            guard.raw.clone()
+        };
+        let existing = match cached_raw {
+            Some(raw) => Some(raw),
+            None => match self
+                .catalog
+                .get_table_statistics(&self.table_metadata.table_id)
+                .await
+            {
+                Ok(stats) => stats,
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to load existing table stats for {} before amending the maintained row count: {e}",
+                        self.table_metadata.table_name
+                    );
+                    return;
+                }
+            },
+        };
+        let Some(existing) = existing else {
+            return;
+        };
+
+        let (num_rows, num_rows_exact) = match num_rows_update {
+            RowCountUpdate::Delta { delta, exact } => (
+                existing.num_rows.saturating_add(delta).max(0),
+                exact && existing.num_rows_exact,
+            ),
+            RowCountUpdate::Set(n) => (n.max(0), true),
+            RowCountUpdate::Unchanged => (existing.num_rows, existing.num_rows_exact),
+        };
+        if num_rows == existing.num_rows && num_rows_exact == existing.num_rows_exact {
+            return;
+        }
+
+        let stats = TableStatistics {
+            num_rows,
+            num_rows_exact,
+            ..existing
+        };
+        if let Err(e) = self.catalog.upsert_table_statistics(&stats).await {
+            tracing::warn!(
+                "Failed to persist the amended maintained row count for {}: {e}",
+                self.table_metadata.table_name
+            );
+            return;
+        }
+
+        // `num_rows` feeds the derived `Statistics`, so both cached views are
+        // rebuilt rather than only flipping `count_exact`.
+        let df_stats = Self::table_statistics_to_df(&self.table_schema(), &stats);
+        let df_stats_inexact = df_stats
+            .as_ref()
+            .map(|s| Self::statistics_to_inexact(s.clone()));
+        let mut cache = self.table_statistics.write();
+        cache.optimizer = df_stats;
+        cache.optimizer_inexact = df_stats_inexact;
+        cache.count_exact = stats.num_rows_exact;
+        cache.raw = Some(stats);
     }
 
     /// Persist merged/replaced stats.
@@ -28459,12 +28616,12 @@ impl TableProvider for CayenneTableProvider {
         let file_sink = self
             .build_deletion_vector_sink(&filters, None, DeletionRequestSource::User)
             .await?;
-        Ok(Arc::new(DeletionExec::new(Arc::new(
-            InlineAwareDeletionSink {
+        Ok(Arc::new(DeletionExec::new(self.taint_row_count_exactness(
+            Arc::new(InlineAwareDeletionSink {
                 table: self.clone_for_write(),
                 file_sink,
                 filters,
-            },
+            }),
         ))))
     }
 
@@ -28645,13 +28802,23 @@ impl CayenneTableProvider {
             Arc::clone(&self.write_lock),
             Arc::clone(&self.listing_fence),
         ));
-        Ok(Arc::new(DeletionExec::new(Arc::new(
-            PkKeysetInvalidatingDeletionSink {
+        Ok(Arc::new(DeletionExec::new(self.taint_row_count_exactness(
+            Arc::new(PkKeysetInvalidatingDeletionSink {
                 table: self.clone_for_write(),
                 inner: sink,
                 filters: filters.to_vec(),
-            },
+            }),
         ))))
+    }
+
+    /// Wrap a user-`DELETE` sink so a delete that removed rows taints the
+    /// maintained row count's exactness — see
+    /// [`RowCountExactnessTaintingDeletionSink`].
+    fn taint_row_count_exactness(&self, inner: Arc<dyn DeletionSink>) -> Arc<dyn DeletionSink> {
+        Arc::new(RowCountExactnessTaintingDeletionSink {
+            table: self.clone_for_write(),
+            inner,
+        })
     }
 
     /// Main deletion-vector path via [`CayenneDeletionSink`].
@@ -28667,12 +28834,12 @@ impl CayenneTableProvider {
             )
             .await?,
         );
-        Ok(Arc::new(DeletionExec::new(Arc::new(
-            PkKeysetInvalidatingDeletionSink {
+        Ok(Arc::new(DeletionExec::new(self.taint_row_count_exactness(
+            Arc::new(PkKeysetInvalidatingDeletionSink {
                 table: self.clone_for_write(),
                 inner: sink,
                 filters: filters.to_vec(),
-            },
+            }),
         ))))
     }
 
