@@ -293,6 +293,64 @@ start_test "audit refuses to call a merge clean while an added path is unmerged"
   [ "$status" -ne 0 ] || fail_test "an unresolved addition was reported clean: $output"
 ) || failures=$((failures + 1))
 
+start_test "audit checks a resolved path the child never touched"
+(
+  new_stack "$work_root/resolveduntouched"
+  printf 'a\nb\nc\n' > shared.txt && commit_all "fork point"
+  git checkout --quiet -b parent
+  printf 'a\nPARENT\nc\n' > shared.txt && commit_all "parent edits it before the split"
+  stack_base=$(git rev-parse HEAD)
+  git checkout --quiet -b child
+  printf 'child\n' > c.txt && commit_all "child works elsewhere entirely"
+  pre=$(git rev-parse HEAD)
+  squash_parent_onto_trunk
+  printf 'a\nTRUNK\nc\n' > shared.txt && commit_all "trunk edits the same line after"
+  git checkout --quiet child
+  git merge --no-ff --no-commit trunk >/dev/null 2>&1
+  # Resolve it the wrong way: keep the parent's line. From the stack base this
+  # merge is not ambiguous — our side equals the base, so trunk's version wins.
+  printf 'a\nPARENT\nc\n' > shared.txt && git add shared.txt
+
+  # The path is in none of the intent lists, since stack_base..pre never touched
+  # it, so nothing else in the audit would look at this resolution.
+  output=$("$subject" audit "$stack_base" "$pre" --trunk trunk 2>/dev/null)
+  status=$?
+  [ "$status" -ne 0 ] || fail_test "a wrongly resolved untouched path was reported clean: $output"
+  case "$output" in
+    *"DISCARDED shared.txt"*) ;;
+    *) fail_test "the untouched path was not reported: $output" ;;
+  esac
+) || failures=$((failures + 1))
+
+start_test "stack-base refuses to answer from the wrong branch"
+(
+  origin="$work_root/origin3.git"
+  git init --quiet --bare --initial-branch=trunk "$origin"
+
+  new_stack "$work_root/stackbase_wrongbranch"
+  git remote add origin "$origin"
+  printf 'old\n' > keep.txt && commit_all "fork point"
+  git push --quiet origin trunk
+  git checkout --quiet -b parent
+  printf 'p\n' > p.rs && commit_all "parent work"
+  parent_head=$(git rev-parse HEAD)
+  git push --quiet origin parent
+  git --git-dir="$origin" update-ref refs/pull/1/head "$parent_head"
+  git checkout --quiet -b child && printf 'c\n' > c.rs && commit_all "child work"
+
+  # Standing on trunk, HEAD shares only the fork point with the parent, and the
+  # document derives the stack base before checking the child out.
+  git checkout --quiet trunk
+  output=$("$subject" stack-base 1 2>&1)
+  status=$?
+  [ "$status" -ne 0 ] || fail_test "the fork point was returned as a stack base: $output"
+
+  # Naming the child gives the right answer from anywhere.
+  output=$("$subject" stack-base 1 --child child 2>/dev/null)
+  [ "$output" = "$parent_head" ] ||
+    fail_test "expected ${parent_head:0:8} with --child, got ${output:0:8}"
+) || failures=$((failures + 1))
+
 start_test "audit reports a conflict on a path the child never touched"
 (
   new_stack "$work_root/untouched"

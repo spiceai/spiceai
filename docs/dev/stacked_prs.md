@@ -40,12 +40,15 @@ Derive them rather than assuming they are the same commit — the parent branch 
 gains review-fix commits after the child splits off:
 
 ```bash
-STACKBASE=$(scripts/restack_stacked_branch.sh stack-base <parent-pr>)
+STACKBASE=$(scripts/restack_stacked_branch.sh stack-base <parent-pr> --child <child>)
 PARENT_HEAD=$(gh pr view <parent-pr> --json headRefOid -q .headRefOid)   # step 1 only
 ```
 
 The script fetches the tracking refs and the PR ref (the parent branch is deleted, but
-`refs/pull/<n>/head` survives) and derives the stack base with `merge-base`.
+`refs/pull/<n>/head` survives) and derives the stack base with `merge-base`. Name the
+child, or check it out first: derived from `trunk` the answer is the fork point, which
+is the wrong boundary everywhere it is used. The script refuses to return a commit
+`trunk` already contains rather than let that pass.
 
 > **Fetch the tracking refs, not just the PR ref.** `git fetch origin <refspec>` leaves
 > its result in `FETCH_HEAD` and does **not** update `origin/trunk`. Every comparison,

@@ -28,7 +28,7 @@
 # thing, so nothing else would catch them.
 #
 # Usage:
-#   scripts/restack_stacked_branch.sh stack-base <parent-pr>
+#   scripts/restack_stacked_branch.sh stack-base <parent-pr> [--child <ref>]
 #   scripts/restack_stacked_branch.sh resolve <stack-base> <path>
 #   scripts/restack_stacked_branch.sh audit <stack-base> <pre-merge-tip>
 #            [--trunk <rev>] [--accept <path>]...
@@ -54,8 +54,20 @@ die() {
 # never merged. Using the head instead would read that parent work as child
 # deletions and let the three-way merge drop it.
 cmd_stack_base() {
-  local parent_pr="${1:-}"
-  [ -n "$parent_pr" ] || die "usage: stack-base <parent-pr>"
+  local parent_pr="${1:-}" child="HEAD"
+  [ -n "$parent_pr" ] || die "usage: stack-base <parent-pr> [--child <ref>]"
+  shift
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --child)
+        shift
+        [ -n "${1:-}" ] || die "--child needs a ref"
+        child="$1"
+        shift
+        ;;
+      *) die "unknown option for stack-base: $1" ;;
+    esac
+  done
 
   # An explicit refspec rather than a bare `git fetch origin`, which obeys
   # `remote.origin.fetch`: a --single-branch clone narrows that to the checked-out
@@ -66,10 +78,23 @@ cmd_stack_base() {
   git fetch --quiet origin "refs/pull/${parent_pr}/head" ||
     die "could not fetch refs/pull/${parent_pr}/head"
 
-  local parent_head
+  local parent_head base ancestry
   parent_head=$(git rev-parse FETCH_HEAD) || die "could not resolve FETCH_HEAD"
-  git merge-base HEAD "$parent_head" ||
-    die "no common commit between HEAD and PR #${parent_pr}"
+  base=$(git merge-base "$child" "$parent_head") ||
+    die "no common commit between $child and PR #${parent_pr}"
+
+  # Run from trunk rather than from the child and this returns the fork point,
+  # which is the wrong boundary everywhere it is used -- a rebase from it replays
+  # the parent's commits as the child's. A commit trunk already contains cannot
+  # be a stack base, so say so here instead of leaving it to be discovered later.
+  git merge-base --is-ancestor "$base" "refs/remotes/origin/trunk"
+  ancestry=$?
+  case "$ancestry" in
+    1) ;;
+    0) die "$child shares only ${base} with PR #${parent_pr}, and trunk already contains it: check out the child branch, or pass --child <ref>" ;;
+    *) die "could not tell whether ${base} is contained in origin/trunk (status $ancestry)" ;;
+  esac
+  printf '%s\n' "$base"
 }
 
 # Exit status:
@@ -545,7 +570,7 @@ cmd_audit() {
     rm -rf "$tmp"
     die "could not read unmerged entries from the index"
   fi
-  local record last_unmerged="" theirs_now base_now theirs_add mine_add renamed_to
+  local record last_unmerged="" theirs_now base_now theirs_add mine_add renamed_to theirs_here
   while IFS= read -r -d '' record; do
     path=${record#*$'\t'}
     [ "$path" = "$last_unmerged" ] && continue
@@ -642,6 +667,30 @@ cmd_audit() {
     audit_modification "$path" "$stack_base" "$pre" "$other" "$tmp" ||
       findings=$((findings + 1))
   done < "$tmp/modified"
+
+  # Paths where the staged result differs from trunk. The child's own work is
+  # supposed to differ; a path it never touched is not, and after a conflict on
+  # such a path is resolved it appears in none of the intent lists, so nothing
+  # above would look at the resolution. From the stack base those merges are not
+  # ambiguous at all -- our side equals the base, so trunk's version wins.
+  if [ -n "$other" ]; then
+    local mine_here base_here staged_here
+    if ! git diff --cached --name-only -z --no-renames "$other" -- > "$tmp/vs_trunk"; then
+      rm -rf "$tmp"
+      die "could not compare the index against $other"
+    fi
+    while IFS= read -r -d '' path; do
+      [ -z "$(git ls-files -u -- ":(literal)$path")" ] || continue
+      mine_here=$(tree_entry "$pre" "$path") || die "could not read $pre:$path"
+      base_here=$(tree_entry "$stack_base" "$path") || die "could not read $stack_base:$path"
+      [ "$mine_here" = "$base_here" ] || continue        # the child changed it
+      staged_here=$(index_entry "$path") || die "could not read the index entry for $path"
+      theirs_here=$(tree_entry "$other" "$path") || die "could not read $other:$path"
+      [ "$staged_here" = "$theirs_here" ] && continue
+      echo "DISCARDED $path: you never touched it, so the result should be trunk's version"
+      findings=$((findings + 1))
+    done < "$tmp/vs_trunk"
+  fi
 
   rm -rf "$tmp"
 
