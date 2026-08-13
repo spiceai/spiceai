@@ -126,7 +126,7 @@ limitations under the License.
 //!   dataset that joins later is not seated at a position a slot-mate was
 //!   credited to — above changes it never consumed (#12609). Its member takes
 //!   the hold over on registration. A hold nothing claims within
-//!   [`UNCLAIMED_RESERVATION_GRACE`] (a table left in the publication by a
+//!   the configured unclaimed-reservation grace (a table left in the publication by a
 //!   removed dataset) would pin WAL forever, so the table is dropped from the
 //!   publication — which is what makes releasing its floor safe — and logged at
 //!   ERROR.
@@ -386,7 +386,8 @@ const RECV_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1
 /// hold. Sized to comfortably cover a runtime loading many datasets — and a
 /// catalog that discovers and attaches its members over several refreshes —
 /// since expiring a hold early costs that dataset a full re-snapshot.
-const UNCLAIMED_RESERVATION_GRACE: std::time::Duration = std::time::Duration::from_mins(5);
+pub const DEFAULT_UNCLAIMED_RESERVATION_GRACE: std::time::Duration =
+    std::time::Duration::from_mins(5);
 
 /// Yield to the Tokio scheduler after draining this many buffered events via the
 /// non-blocking `try_recv` fast path. Most `handle_decoded` branches (Insert /
@@ -2588,7 +2589,7 @@ async fn run_pump(source: Arc<SharedSource>) {
                 );
                 return;
             }
-            source.release_unclaimed_reservations(UNCLAIMED_RESERVATION_GRACE);
+            source.release_unclaimed_reservations(params.unclaimed_reservation_grace);
             // Busy streams may never enter the blocking receive path, so check
             // eager deadlines once per decoded event as well as through the
             // receive timeout below. `EagerHold` caches the earliest deadline, so
@@ -3658,6 +3659,7 @@ mod tests {
             ephemeral_accelerator: false,
             status_interval: std::time::Duration::from_secs(5),
             bootstrap_batch_size: 8192,
+            unclaimed_reservation_grace: DEFAULT_UNCLAIMED_RESERVATION_GRACE,
             shared: true,
             member_channel_capacity: DEFAULT_MEMBER_CHANNEL_CAPACITY,
             pg_output_format: crate::postgres_replication::PgOutputFormat::Binary,

@@ -130,6 +130,17 @@ pub struct ReplicationParams {
     /// still emits text for types lacking a binary send function, so the text
     /// decode path stays live regardless of this setting.
     pub pg_output_format: PgOutputFormat,
+
+    /// How long the shared slot keeps holding its ack floor for a table that is
+    /// in the publication but has no attached member — see
+    /// `shared::DEFAULT_UNCLAIMED_RESERVATION_GRACE` for what the hold is for and
+    /// what letting it lapse costs.
+    ///
+    /// Internal, not a spicepod parameter: the connector always supplies the
+    /// default. It is a field only so a test can shorten it, since the behavior
+    /// that depends on the hold lapsing is otherwise unreachable in under five
+    /// minutes. Read from the params of whichever member opened the slot.
+    pub unclaimed_reservation_grace: Duration,
 }
 
 impl ReplicationParams {
@@ -837,6 +848,8 @@ TXTE85+Or9IUwDI9543jsyCvuQ8=
             shared: false,
             member_channel_capacity: 16,
             pg_output_format: PgOutputFormat::Binary,
+            unclaimed_reservation_grace:
+                crate::postgres_replication::shared::DEFAULT_UNCLAIMED_RESERVATION_GRACE,
         }
     }
 
