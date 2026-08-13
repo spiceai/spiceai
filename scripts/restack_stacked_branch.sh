@@ -126,6 +126,8 @@ cmd_resolve() {
     worktree_oddity="a symlink"
   elif [ -e "$path" ] && [ ! -f "$path" ]; then
     worktree_oddity="not a regular file"
+  else
+    worktree_oddity=$(unsafe_worktree_path "$path") || worktree_oddity=""
   fi
   if [ -n "$worktree_oddity" ] ||
      [ "${ours_mode:-none}" != "${theirs_mode:-none}" ] || [ "$ours_mode" = 120000 ]; then
@@ -295,17 +297,47 @@ index_entry() {
 # it keeps the content under another name, and from the older base -- where the
 # path never existed -- that lands as a clean addition while the child's deletion
 # looks honoured.
+# Sets RENAMED_DEST rather than printing it: command substitution strips trailing
+# newlines, and a path may end in one, so `g` and `g\n` would compare equal and a
+# rename/rename conflict would look like both sides agreeing.
 renamed_to() {
   local map="$1" want="$2" status old new
+  RENAMED_DEST=""
   [ -n "$map" ] && [ -s "$map" ] || return 1
   while IFS= read -r -d '' status; do
     IFS= read -r -d '' old || return 1
     IFS= read -r -d '' new || return 1
     case "$status" in
-      R*) [ "$old" = "$want" ] && { printf '%s' "$new"; return 0; } ;;
+      R*) [ "$old" = "$want" ] && { RENAMED_DEST="$new"; return 0; } ;;
       *) ;;
     esac
   done < "$map"
+  return 1
+}
+
+# Anything above the final component that git cannot see: a symlinked ancestor
+# means a write to this path lands outside the worktree entirely, and a hard link
+# means truncating an inode somebody else's file also points at.
+unsafe_worktree_path() {
+  local target="$1" dir="${1%/*}" links=""
+  while [ -n "$dir" ] && [ "$dir" != "$target" ]; do
+    if [ -L "$dir" ]; then
+      printf 'under %s, which is a symlink' "$dir"
+      return 0
+    fi
+    case "$dir" in
+      */*) dir="${dir%/*}" ;;
+      *) dir="" ;;
+    esac
+  done
+  if [ -f "$target" ] && [ ! -L "$target" ]; then
+    links=$(stat -f %l -- "$target" 2>/dev/null) ||
+      links=$(stat -c %h -- "$target" 2>/dev/null) || links=""
+    case "$links" in
+      "" | 1) ;;
+      *) printf 'a hard link with %s names' "$links"; return 0 ;;
+    esac
+  fi
   return 1
 }
 
@@ -604,7 +636,7 @@ cmd_audit() {
     rm -rf "$tmp"
     die "could not read unmerged entries from the index"
   fi
-  local record last_unmerged="" theirs_now base_now theirs_add mine_add renamed_to child_moved_to theirs_here
+  local record last_unmerged="" theirs_now base_now theirs_add mine_add renamed_to_trunk theirs_here
   while IFS= read -r -d '' record; do
     path=${record#*$'\t'}
     [ "$path" = "$last_unmerged" ] && continue
@@ -623,22 +655,23 @@ cmd_audit() {
       theirs_now=$(tree_entry "$other" "$path") || die "could not read $other:$path"
       base_now=$(tree_entry "$stack_base" "$path") || die "could not read $stack_base:$path"
       if [ -z "$theirs_now" ]; then
-        if renamed_to=$(renamed_to "$RESTACK_RENAMES" "$path"); then
+        if renamed_to "$RESTACK_RENAMES" "$path"; then
+          renamed_to_trunk="$RENAMED_DEST"
           # Unless we moved it to the same place, in which case both sides agree
           # and the addition audit checks what landed there.
-          child_moved_to=$(renamed_to "$RESTACK_CHILD_RENAMES" "$path") || child_moved_to=""
-          if [ "$child_moved_to" = "$renamed_to" ]; then
+          if renamed_to "$RESTACK_CHILD_RENAMES" "$path" &&
+             [ "$RENAMED_DEST" = "$renamed_to_trunk" ]; then
             continue
           fi
-          accept_or_review "$path" "you deleted it and trunk renamed it to $renamed_to, which nothing has decided" ||
+          accept_or_review "$path" "you deleted it and trunk renamed it to $renamed_to_trunk, which nothing has decided" ||
             findings=$((findings + 1))
           continue
         fi
         # Trunk deleted it, and so did we -- unless what looks like our deletion
         # is really a move, in which case the stack base sees a rename against a
         # deletion and nothing has settled which wins.
-        if renamed_to=$(renamed_to "$RESTACK_CHILD_RENAMES" "$path"); then
-          accept_or_review "$path" "you renamed it to $renamed_to and trunk deleted it, which nothing has decided" ||
+        if renamed_to "$RESTACK_CHILD_RENAMES" "$path"; then
+          accept_or_review "$path" "you renamed it to $RENAMED_DEST and trunk deleted it, which nothing has decided" ||
             findings=$((findings + 1))
         fi
         continue

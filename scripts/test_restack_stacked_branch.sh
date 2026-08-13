@@ -1159,6 +1159,60 @@ start_test "resolve keeps the executable bit both sides agreed on"
     fail_test "an unstaged mode change was left behind: $(git diff -- run.sh | head -3)"
 ) || failures=$((failures + 1))
 
+start_test "resolve refuses a path whose directory is a symlink"
+(
+  new_stack "$work_root/symlinked_dir"
+  mkdir -p real
+  printf 'l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\n' > real/f.txt && commit_all "fork point"
+  git checkout --quiet -b parent
+  printf 'l1\nPARENT\nl3\nl4\nl5\nl6\nl7\nl8\n' > real/f.txt && commit_all "parent edits"
+  stack_base=$(git rev-parse HEAD)
+  git checkout --quiet -b child
+  printf 'l1\nPARENT\nl3\nl4\nl5\nl6\nl7\nCHILD\n' > real/f.txt && commit_all "child edits"
+  squash_parent_onto_trunk
+  printf 'l1\nPARENT\nTRUNK\nl4\nl5\nl6\nl7\nl8\n' > real/f.txt && commit_all "trunk edits"
+  git checkout --quiet child
+  git merge --no-ff --no-commit trunk >/dev/null 2>&1
+
+  # Replace the directory with a link to somewhere else entirely. The final
+  # component is still a regular file, so a check that only looks at it passes
+  # and the write lands outside the worktree.
+  mkdir -p "$work_root/symlinked_dir_elsewhere"
+  printf 'OUTSIDE\n' > "$work_root/symlinked_dir_elsewhere/f.txt"
+  rm -rf real && ln -s "$work_root/symlinked_dir_elsewhere" real
+
+  output=$("$subject" resolve "$stack_base" real/f.txt 2>/dev/null)
+  status=$?
+  [ "$status" -eq 2 ] || fail_test "expected exit 2 for a symlinked directory, got $status ($output)"
+  [ "$(cat "$work_root/symlinked_dir_elsewhere/f.txt")" = "OUTSIDE" ] ||
+    fail_test "a file outside the worktree was overwritten"
+) || failures=$((failures + 1))
+
+start_test "resolve refuses a conflicted path that is a hard link"
+(
+  new_stack "$work_root/hardlink"
+  printf 'l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\n' > f.txt && commit_all "fork point"
+  git checkout --quiet -b parent
+  printf 'l1\nPARENT\nl3\nl4\nl5\nl6\nl7\nl8\n' > f.txt && commit_all "parent edits"
+  stack_base=$(git rev-parse HEAD)
+  git checkout --quiet -b child
+  printf 'l1\nPARENT\nl3\nl4\nl5\nl6\nl7\nCHILD\n' > f.txt && commit_all "child edits"
+  squash_parent_onto_trunk
+  printf 'l1\nPARENT\nTRUNK\nl4\nl5\nl6\nl7\nl8\n' > f.txt && commit_all "trunk edits"
+  git checkout --quiet child
+  git merge --no-ff --no-commit trunk >/dev/null 2>&1
+
+  # Another name for the same inode: copying over one truncates the other.
+  ln f.txt "$work_root/hardlink_other" 2>/dev/null || exit 0   # no hard links here
+  before=$(cat "$work_root/hardlink_other")
+
+  output=$("$subject" resolve "$stack_base" f.txt 2>/dev/null)
+  status=$?
+  [ "$status" -eq 2 ] || fail_test "expected exit 2 for a hard link, got $status ($output)"
+  [ "$(cat "$work_root/hardlink_other")" = "$before" ] ||
+    fail_test "the other name for the inode was rewritten"
+) || failures=$((failures + 1))
+
 start_test "resolve refuses a conflicted path replaced by a directory"
 (
   new_stack "$work_root/worktree_dir"
