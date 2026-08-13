@@ -71,6 +71,32 @@ squash_parent_onto_trunk() {
 }
 
 # ---------------------------------------------------------------------------
+# usage
+# ---------------------------------------------------------------------------
+
+start_test "usage lists every subcommand, and an unknown one is rejected"
+(
+  # Nothing else runs the help path, so a broken one would only be found by
+  # someone reaching for it -- which is the worst moment.
+  output=$(bash "$subject" --help 2>&1)
+  status=$?
+  [ "$status" -eq 0 ] || fail_test "--help exited $status"
+  case "$output" in
+    *sed*|*error*|*"command not found"*) fail_test "--help printed an error: $output" ;;
+  esac
+  for word in stack-base resolve audit; do
+    case "$output" in
+      *"$word"*) ;;
+      *) fail_test "--help does not mention $word: $output" ;;
+    esac
+  done
+
+  output=$(bash "$subject" not-a-subcommand 2>&1)
+  status=$?
+  [ "$status" -ne 0 ] || fail_test "an unknown subcommand exited 0"
+) || failures=$((failures + 1))
+
+# ---------------------------------------------------------------------------
 # audit
 # ---------------------------------------------------------------------------
 

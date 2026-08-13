@@ -39,10 +39,7 @@
 set -uo pipefail
 
 usage() {
-  sed -n '/^# Paths are repository-relative, as git's own diffs report them; the commands move
-# to the worktree root before doing anything.
-#
-# Usage:/,/^$/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '/^# Usage:/,/^$/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 die() {
