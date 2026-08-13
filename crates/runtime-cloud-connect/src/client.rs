@@ -31,9 +31,9 @@ limitations under the License.
 //! The identity is renewed on a ~12h cadence (see
 //! [`crate::config::DEFAULT_RENEWAL_LEAD`]) against the cloud `/renew`
 //! endpoint, both from the live stream loop and before reconnect attempts;
-//! every renewal rotates the keypair. An expired leaf can still renew
-//! within the 30-day grace window ([`crate::enroll::RENEWAL_GRACE`]);
-//! past it a fresh enrollment key is required.
+//! every renewal rotates the keypair. The control plane decides whether an
+//! expired leaf can still renew; the client does not impose its own grace
+//! deadline on a credential the cloud may still accept.
 //!
 //! `Adopt` over the stream is a trust/marker message (the portal admin
 //! confirmed the instance) — the cert was already issued at enroll, so the

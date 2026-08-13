@@ -34,8 +34,8 @@ limitations under the License.
 //!   lost response safe to retry, and what lets a **new** key recover the
 //!   same operation after the first key expires.
 //! - `POST /v1/cloud-connect/renew` — ~12h cadence. Authenticated by dual
-//!   proof-of-possession rather than mTLS (the presented cert may already
-//!   be expired within the 30-day grace window): the CURRENT key signs the
+//!   proof-of-possession rather than mTLS (the control plane may still accept
+//!   an expired presented cert): the CURRENT key signs the
 //!   fresh CSR's DER bytes (`pop_sig`), and the NEW key proves itself via
 //!   the CSR's self-signature. **Every renewal rotates the keypair.**
 //!
@@ -63,11 +63,6 @@ use crate::identity::{EnrollmentMaterial, Identity, IdentityStore};
 pub const ENROLL_PATH: &str = "/v1/cloud-connect/enroll";
 /// Path of the cloud renew endpoint, relative to the enroll base URL.
 pub const RENEW_PATH: &str = "/v1/cloud-connect/renew";
-
-/// How long past the leaf's `not_after` a renewal is still accepted by the
-/// cloud (mirrors the server-side grace). Past this the identity is dead
-/// and a fresh enrollment key is required.
-pub const RENEWAL_GRACE: Duration = Duration::from_hours(30 * 24);
 
 /// The retry deadline for direct `spiced --token` (and service-install)
 /// bootstrap: headless flows tolerate a long transient outage because
@@ -616,8 +611,8 @@ impl EnrollClient {
 
     /// Renew the identity with a fresh keypair (`material`), presenting the
     /// current leaf and the current-key proof-of-possession signature over
-    /// the new CSR. Works within the grace window even when the presented
-    /// leaf is already expired.
+    /// the new CSR. The control plane decides whether an expired presented
+    /// leaf remains renewable.
     ///
     /// `material` also carries the freshly-generated X25519 encryption key: its
     /// public half rides this request so the cloud re-pins both keys in one
@@ -948,10 +943,10 @@ pub enum EnrollNowError {
     },
 
     #[snafu(display(
-        "The existing Cloud Connect identity at {} could not be activated because the local gateway environment is unavailable: {source}. The supplied enrollment authority was not redeemed. Fix the host trust or transport configuration and retry. See: https://spiceai.org/docs",
+        "The existing Cloud Connect identity at {} could not be validated because the validation task failed: {source}. The supplied enrollment authority was not redeemed. Retry; if the failure persists, report it with this error. See: https://spiceai.org/docs",
         path.display()
     ))]
-    IdentityEnvironment {
+    IdentityValidation {
         path: std::path::PathBuf,
         source: crate::Error,
     },
@@ -1047,7 +1042,7 @@ pub enum EnrollNowOutcome {
 /// - [`EnrollNowError::InvalidRegion`] — the declared region label is
 ///   malformed (checked before any request).
 /// - [`EnrollNowError::IdentityUnreadable`] / [`EnrollNowError::IdentityUnusable`]
-///   / [`EnrollNowError::IdentityEnvironment`] — an identity file exists but
+///   / [`EnrollNowError::IdentityValidation`] — an identity file exists but
 ///   cannot be safely reused; refusing to guess beats silently re-enrolling
 ///   over a live instance.
 /// - [`EnrollNowError::Draft`] / [`EnrollNowError::Client`] /
@@ -1107,7 +1102,7 @@ pub async fn enroll_now(
                             reason: reason.to_string(),
                         }
                     }
-                    source => EnrollNowError::IdentityEnvironment {
+                    source => EnrollNowError::IdentityValidation {
                         path: identity_path.clone(),
                         source,
                     },
@@ -1206,16 +1201,17 @@ pub async fn enroll_now(
         })?;
     let to_store = identity.clone();
     let store_path = config.identity_path.clone();
-    let stored = tokio::task::spawn_blocking(move || IdentityStore::store(&store_path, &to_store))
-        .await
-        .unwrap_or_else(|join| {
-            Err(crate::identity::Error::Io {
-                path: config.identity_path.clone(),
-                source: std::io::Error::other(format!(
-                    "identity persistence task panicked: {join}"
-                )),
-            })
-        });
+    let store_transaction = Arc::clone(&enrollment_transaction);
+    let stored = tokio::task::spawn_blocking(move || {
+        IdentityStore::store_with_transaction(&store_path, &to_store, &store_transaction)
+    })
+    .await
+    .unwrap_or_else(|join| {
+        Err(crate::identity::Error::Io {
+            path: config.identity_path.clone(),
+            source: std::io::Error::other(format!("identity persistence task panicked: {join}")),
+        })
+    });
     stored.context(PersistSnafu {
         path: config.identity_path.clone(),
     })?;
@@ -1791,8 +1787,8 @@ mod tests {
         .expect("serialize request without a region");
 
         // Absence means "leave the stored region alone". Sending `null` would
-        // make every re-enroll — the recovery path past the renewal grace
-        // window — silently erase a region set in the portal.
+        // make every re-enroll after the control plane rejects the old
+        // credential silently erase a region set in the portal.
         assert!(
             omitted.get("region").is_none(),
             "an omitted --region must not appear on the wire at all"

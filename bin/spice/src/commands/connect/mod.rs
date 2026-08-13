@@ -757,11 +757,10 @@ fn resolved_endpoint(config_dir: &Path, explicit: Option<&str>) -> String {
     {
         return env;
     }
-    if let Ok(s) = std::fs::read_to_string(config_dir.join(CLOUD_ENDPOINT_FILE)) {
-        let trimmed = s.trim();
-        if !trimmed.is_empty() {
-            return trimmed.to_string();
-        }
+    if let Ok(Some(endpoint)) =
+        runtime_cloud_connect::CloudConnectConfig::read_enroll_endpoint_override(config_dir)
+    {
+        return endpoint;
     }
     runtime_cloud_connect::config::DEFAULT_ENDPOINT.to_string()
 }

@@ -302,13 +302,10 @@ impl Identity {
     /// Why this identity cannot establish a control stream, if any.
     ///
     /// Enrollment uses this as a fail-closed gate before honoring the
-    /// existing-identity precedence rule. An explicit gateway override makes
-    /// a legacy identity with no stored gateway usable, but credentials and
-    /// the cloud identifier are always required.
-    pub(crate) fn reconnect_validation_error(
-        &self,
-        gateway_override: Option<&str>,
-    ) -> Option<&'static str> {
+    /// existing-identity precedence rule. Credentials, the cloud identifier,
+    /// and a durable gateway address are always required; a process-local
+    /// override may redirect a running client but cannot activate an identity.
+    pub(crate) fn reconnect_validation_error(&self) -> Option<&'static str> {
         if self.identifier.trim().is_empty() {
             return Some("the cloud-assigned instance identifier is empty");
         }
@@ -347,9 +344,7 @@ impl Identity {
         if public_key_pem.contents() != private_key.subject_public_key_info().as_slice() {
             return Some("the client identity public and private keys do not match");
         }
-        if self.gateway_addr.trim().is_empty()
-            && gateway_override.is_none_or(|endpoint| endpoint.trim().is_empty())
-        {
+        if self.gateway_addr.trim().is_empty() {
             return Some("the gateway address is empty");
         }
         match (
@@ -615,7 +610,7 @@ fn write_lock() -> std::sync::MutexGuard<'static, ()> {
 
 fn acquire_update_transaction(path: &Path) -> Result<crate::draft::EnrollmentTransactionLock> {
     let config_dir = path.parent().unwrap_or_else(|| Path::new("."));
-    crate::draft::EnrollmentTransactionLock::try_acquire(config_dir).map_err(|source| {
+    crate::draft::EnrollmentTransactionLock::acquire(config_dir).map_err(|source| {
         Error::UpdateTransaction {
             path: path.to_path_buf(),
             reason: source.to_string(),
@@ -749,11 +744,25 @@ impl IdentityStore {
 
     /// Persist an identity to disk atomically with `0600` perms on Unix.
     ///
+    /// This acquires the config directory's enrollment/removal transaction so
+    /// every creating writer participates in the same resurrection boundary.
+    /// Enrollment, which already owns that transaction, uses the internal
+    /// `store_with_transaction` path instead of acquiring it recursively.
+    ///
     /// # Errors
     ///
     /// Returns an error if the parent directory cannot be created, the
     /// identity cannot be serialized, or the file cannot be written.
     pub fn store(path: &Path, identity: &Identity) -> Result<()> {
+        let transaction = acquire_update_transaction(path)?;
+        Self::store_with_transaction(path, identity, &transaction)
+    }
+
+    pub(crate) fn store_with_transaction(
+        path: &Path,
+        identity: &Identity,
+        _transaction: &crate::draft::EnrollmentTransactionLock,
+    ) -> Result<()> {
         let _guard = write_lock();
         Self::store_locked(path, identity)
     }
@@ -1521,7 +1530,7 @@ mod tests {
 
     #[test]
     fn reconnect_validation_accepts_a_matching_certificate_and_private_key() {
-        assert_eq!(sample_identity().reconnect_validation_error(None), None);
+        assert_eq!(sample_identity().reconnect_validation_error(), None);
     }
 
     #[test]
@@ -1531,7 +1540,7 @@ mod tests {
             "-----BEGIN CERTIFICATE-----\nnot-a-certificate\n-----END CERTIFICATE-----\n"
                 .to_string();
         assert_eq!(
-            identity.reconnect_validation_error(None),
+            identity.reconnect_validation_error(),
             Some("the client identity certificate is not valid PEM")
         );
 
@@ -1540,7 +1549,7 @@ mod tests {
             "-----BEGIN PRIVATE KEY-----\nnot-a-private-key\n-----END PRIVATE KEY-----\n"
                 .to_string();
         assert_eq!(
-            identity.reconnect_validation_error(None),
+            identity.reconnect_validation_error(),
             Some("the client identity private key is not valid PKCS key material")
         );
     }
@@ -1552,7 +1561,7 @@ mod tests {
             .expect("generate mismatched private key")
             .serialize_pem();
         assert_eq!(
-            identity.reconnect_validation_error(None),
+            identity.reconnect_validation_error(),
             Some("the client identity certificate and private key do not match")
         );
     }
@@ -1563,14 +1572,14 @@ mod tests {
         identity.public_key_pem =
             "-----BEGIN PUBLIC KEY-----\nnot-a-public-key\n-----END PUBLIC KEY-----\n".to_string();
         assert_eq!(
-            identity.reconnect_validation_error(None),
+            identity.reconnect_validation_error(),
             Some("the client identity public key is not valid PEM")
         );
 
         let mut identity = sample_identity();
         identity.public_key_pem = identity.private_key_pem.clone();
         assert_eq!(
-            identity.reconnect_validation_error(None),
+            identity.reconnect_validation_error(),
             Some("the client identity public key has an invalid PEM label")
         );
 
@@ -1579,7 +1588,7 @@ mod tests {
             .expect("generate mismatched public key")
             .public_key_pem();
         assert_eq!(
-            identity.reconnect_validation_error(None),
+            identity.reconnect_validation_error(),
             Some("the client identity public and private keys do not match")
         );
     }
@@ -1592,7 +1601,7 @@ mod tests {
             .public_key_spki_pem();
 
         assert_eq!(
-            identity.reconnect_validation_error(None),
+            identity.reconnect_validation_error(),
             Some("the secret-delivery public and private keys do not match")
         );
     }

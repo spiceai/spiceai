@@ -184,9 +184,24 @@ pub struct ReconnectableIdentity {
 }
 
 impl ReconnectableIdentity {
+    /// The stable cloud identifier, for diagnostics that do not need access to
+    /// credential material.
     #[must_use]
-    pub fn as_identity(&self) -> &Identity {
-        &self.identity
+    pub fn identifier(&self) -> &str {
+        &self.identity.identifier
+    }
+
+    /// The application currently receiving this instance's metrics.
+    #[must_use]
+    pub fn app_id(&self) -> Option<&str> {
+        self.identity.app_id.as_deref()
+    }
+
+    /// Decode the local delivered-secrets cache key without exposing the
+    /// identity's mTLS or encryption private keys.
+    #[must_use]
+    pub fn cache_key(&self) -> Option<identity::CacheKey> {
+        self.identity.cache_key()
     }
 
     /// The exact configuration used to validate this startup snapshot.
@@ -196,20 +211,12 @@ impl ReconnectableIdentity {
     }
 }
 
-impl std::ops::Deref for ReconnectableIdentity {
-    type Target = Identity;
-
-    fn deref(&self) -> &Self::Target {
-        &self.identity
-    }
-}
-
 /// Load the durable identity that may activate Cloud Connect.
 ///
 /// This is the shared activation boundary for the runtime, early bootstrap
 /// facilities, and service installation. A file being present or parseable is
-/// insufficient: the credential, key relationships, renewal window, and exact
-/// endpoint shape used by the control client must all be usable.
+/// insufficient: the credential, key relationships, signed validity interval,
+/// and persisted endpoint shape must all be usable.
 ///
 /// # Errors
 ///
@@ -266,7 +273,7 @@ pub(crate) fn validate_reconnectable_credential(
 ) -> Result<(Identity, String)> {
     let identity_path = config.identity_path.clone();
 
-    if let Some(reason) = identity.reconnect_validation_error(config.gateway_endpoint.as_deref()) {
+    if let Some(reason) = identity.reconnect_validation_error() {
         return Err(Error::IdentityUnusable {
             path: identity_path,
             reason,
@@ -293,7 +300,7 @@ pub(crate) fn validate_reconnectable_credential(
     // field before the driver uses it to schedule renewal.
     identity.not_after_unix = Some(signed_not_after);
     let endpoint = config
-        .validated_stream_endpoint(&identity)
+        .validated_persisted_gateway_endpoint(&identity)
         .map_err(|reason| Error::IdentityUnusable {
             path: identity_path,
             reason,
@@ -565,7 +572,7 @@ mod tests {
         let loaded = load_reconnectable_identity(&config)
             .expect("validate identity")
             .expect("identity is present");
-        assert_eq!(loaded.identifier, identity.identifier);
+        assert_eq!(loaded.identifier(), identity.identifier);
     }
 
     #[test]
@@ -579,7 +586,7 @@ mod tests {
         let expired = load_reconnectable_identity(&config)
             .expect("the control plane decides whether the identity remains renewable")
             .expect("identity is present");
-        assert_eq!(expired.not_after_unix, Some(1_577_836_800));
+        assert_eq!(expired.identity.not_after_unix, Some(1_577_836_800));
 
         set_certificate_validity(&mut identity, (2025, 1, 1), (2099, 1, 1));
         identity.gateway_addr = "not a valid gateway".to_string();
@@ -615,10 +622,16 @@ mod tests {
             "https://gateway.example:443/path",
         ] {
             config.gateway_endpoint = Some(override_endpoint.to_string());
-            let error = validate_reconnectable_identity(&config, identity.clone())
-                .expect_err("gateway override must match the channel transport shape");
-            assert!(error.to_string().contains("gateway endpoint"), "{error}");
+            validate_reconnectable_identity(&config, identity.clone()).expect(
+                "a process-local gateway override must not decide durable identity activation",
+            );
         }
+
+        identity.gateway_addr.clear();
+        config.gateway_endpoint = Some("https://gateway.example:443".to_string());
+        let error = validate_reconnectable_identity(&config, identity)
+            .expect_err("an override must not replace missing durable gateway state");
+        assert!(error.to_string().contains("gateway address is empty"));
     }
 
     #[test]
@@ -651,8 +664,8 @@ mod tests {
         IdentityStore::store(&config.identity_path, &replacement).expect("replace identity");
         config.gateway_endpoint = Some("https://other.example:443".to_string());
 
-        assert_eq!(snapshot.identifier, "inst_test");
-        assert_ne!(snapshot.identifier, replacement.identifier);
+        assert_eq!(snapshot.identifier(), "inst_test");
+        assert_ne!(snapshot.identifier(), replacement.identifier);
         assert!(snapshot.config().gateway_endpoint.is_none());
         assert_ne!(snapshot.config().gateway_endpoint, config.gateway_endpoint);
     }
