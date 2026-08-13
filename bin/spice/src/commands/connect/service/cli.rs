@@ -218,6 +218,8 @@ async fn install(
     config_dir: &Path,
     endpoint: &str,
 ) -> Result<()> {
+    validate_service_identity(config_dir).await?;
+
     // Resolved, not derived from `$HOME`: `sudo` rewrites `HOME` to `/root`, and
     // the runtime the operator installed is normally under their own home.
     let spiced_path = ctx.resolve_spiced_path().ok_or_else(|| Error::InvalidArgument {
@@ -268,6 +270,37 @@ async fn install(
     println!("  spice connect service logs -f");
     println!("  spice connect service uninstall");
     Ok(())
+}
+
+/// Require the exact durable identity the installed service can use.
+///
+/// The unit persists only `SPICE_CONFIG_DIR`, so an override inherited from
+/// the installing shell cannot make an otherwise unusable identity safe to
+/// install. The runtime will make the same decision after the first restart.
+async fn validate_service_identity(config_dir: &Path) -> Result<()> {
+    let mut config = runtime_cloud_connect::CloudConnectConfig::from_env_at(
+        env!("CARGO_PKG_VERSION"),
+        config_dir.to_path_buf(),
+    );
+    config.gateway_endpoint = None;
+
+    match runtime_cloud_connect::load_reconnectable_identity_async(&config).await {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => Err(Error::InvalidArgument {
+            message: format!(
+                "Failed to install the Spice Cloud Connect service: {} has no enrolled identity. \
+                 Mint an enrollment key in the Spice Cloud portal and start the runtime with \
+                 `spiced --token <enrollment-key>` before installing the service. \
+                 See: https://spiceai.org/docs",
+                config.identity_path.display()
+            ),
+        }),
+        Err(error) => Err(Error::CloudConnectIo {
+            message: format!(
+                "validate the durable Cloud Connect identity before installing the service: {error}"
+            ),
+        }),
+    }
 }
 
 /// Uninstall and say exactly what was and was not removed.
@@ -368,7 +401,7 @@ fn with_recovery_detail(
 /// The report is already on stdout by the time this runs: the diagnosis travels
 /// as the process's error on stderr, so a `--output json` run stays parseable.
 fn degraded_error(status: &ConnectStatus) -> Result<()> {
-    match status.degradation() {
+    match status.service_degradation() {
         Some(message) => Err(Error::ServiceUnavailable { message }),
         None => Ok(()),
     }

@@ -59,7 +59,7 @@ limitations under the License.
 use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -190,9 +190,25 @@ impl TestCa {
     /// requester's P-256 public key point (for later PoP verification).
     /// `from_pem` verifies the CSR's self-signature, so this only succeeds
     /// if the client genuinely holds the private key it enrolled with.
-    fn sign_csr(&self, csr_pem: &str) -> Result<(String, Vec<u8>), rcgen::Error> {
-        let csr = CertificateSigningRequestParams::from_pem(csr_pem)?;
+    fn sign_csr(
+        &self,
+        csr_pem: &str,
+        validity: Duration,
+        not_before_offset_secs: i64,
+    ) -> Result<(String, Vec<u8>), rcgen::Error> {
+        let mut csr = CertificateSigningRequestParams::from_pem(csr_pem)?;
         let point = p256_point(csr.public_key.der_bytes());
+        // The signed interval is the credential's authority. Keep it aligned
+        // with the response timestamp so renewal tests exercise real mTLS
+        // validity rather than an unsigned scheduling hint.
+        let now = std::time::SystemTime::now();
+        csr.params.not_before = if not_before_offset_secs < 0 {
+            now - Duration::from_secs(not_before_offset_secs.unsigned_abs())
+        } else {
+            now + Duration::from_secs(not_before_offset_secs.unsigned_abs())
+        }
+        .into();
+        csr.params.not_after = (now + validity).into();
         let leaf = csr.signed_by(&self.issuer)?;
         Ok((leaf.pem(), point))
     }
@@ -262,6 +278,9 @@ struct CloudMock {
     /// When set, enrollment returns a valid X.509 leaf for a different key
     /// than the submitted CSR, modeling an unusable committed response.
     issue_mismatched_enroll_certificate: Arc<AtomicBool>,
+    /// Offset from the mock host's current time for a renewed leaf's
+    /// `not_before`. A positive value models the client clock trailing the CA.
+    renew_not_before_offset_secs: Arc<AtomicI64>,
     /// The public key pinned at the last enroll/renew — the only key whose
     /// PoP signature authorizes a rotation (mirrors the cloud's pinning).
     pinned_point: Arc<Mutex<Option<Vec<u8>>>>,
@@ -308,6 +327,7 @@ impl CloudMock {
             enroll_paused: Arc::new(Notify::new()),
             resume_enroll: Arc::new(Notify::new()),
             issue_mismatched_enroll_certificate: Arc::new(AtomicBool::new(false)),
+            renew_not_before_offset_secs: Arc::new(AtomicI64::new(-60)),
             pinned_point: Arc::new(Mutex::new(None)),
             stored_region: Arc::new(Mutex::new(None)),
             enroll_requests: Arc::new(Mutex::new(Vec::new())),
@@ -531,7 +551,11 @@ async fn mock_enroll(
         };
         org
     };
-    let Ok((mut leaf_pem, point)) = mock.ca.sign_csr(csr_pem) else {
+    let Ok((mut leaf_pem, point)) = mock.ca.sign_csr(
+        csr_pem,
+        Duration::from_secs(u64::try_from(mock.leaf_validity_secs).unwrap_or_default()),
+        -60,
+    ) else {
         return error_json(StatusCode::BAD_REQUEST, "invalid_request", "Malformed CSR");
     };
     if mock
@@ -669,7 +693,11 @@ async fn mock_renew(
     }
 
     // Re-issue over the CSR's NEW key and pin it (the rotation).
-    let Ok((leaf_pem, point)) = mock.ca.sign_csr(csr_pem) else {
+    let Ok((leaf_pem, point)) = mock.ca.sign_csr(
+        csr_pem,
+        Duration::from_hours(24),
+        mock.renew_not_before_offset_secs.load(Ordering::SeqCst),
+    ) else {
         return error_json(StatusCode::BAD_REQUEST, "invalid_request", "Malformed CSR");
     };
     *mock.pinned_point.lock().await = Some(point);
@@ -3300,10 +3328,9 @@ async fn reconnects_over_mtls_after_disconnect() {
 
 #[tokio::test]
 async fn renewal_rotates_keypair_and_persists() {
-    // Issue a leaf that "expires" in 5s with a 2s renewal lead: renewal
+    // Issue a leaf that expires in 5s with a 2s renewal lead: renewal
     // becomes due ~3s after enrollment, exercising the ~12h loop at test
-    // speed. (The rcgen-signed cert itself is valid longer — the client
-    // schedules from the reported not_after, which is what's under test.)
+    // speed. The signed certificate and response report the same interval.
     let harness = Harness::new(5).await;
     let dir = tempfile::tempdir().unwrap();
     let identity_path = dir.path().join("identity.json");
@@ -3323,6 +3350,13 @@ async fn renewal_rotates_keypair_and_persists() {
         .expect("load identity")
         .expect("identity present");
     assert_eq!(enrolled_identity.identifier, ASSIGNED_ID);
+    // Model a CA whose clock is one hour ahead of this host. The cloud commits
+    // the new public key before returning the renewed leaf, so local clock
+    // validation must not discard the only matching private key.
+    harness
+        .cloud
+        .renew_not_before_offset_secs
+        .store(60 * 60, Ordering::SeqCst);
     let handle = runtime_cloud_connect::CloudConnect::start(config, runtime)
         .await
         .expect("start")

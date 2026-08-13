@@ -92,6 +92,7 @@ const NAME_DIGEST_HEX: usize = 16;
 
 /// Marks a booted systemd system. Present only when systemd is PID 1 and
 /// running, which is exactly the condition `systemctl` needs.
+#[cfg(target_os = "linux")]
 const SYSTEMD_RUNTIME_MARKER: &str = "/run/systemd/system";
 
 /// Root-owned directory the installed service's `spiced` is staged into.

@@ -790,7 +790,8 @@ mod connect {
             .stdout(predicate::str::contains("spiced --token <enrollment-key>"))
             .stdout(predicate::str::contains("status"))
             .stdout(predicate::str::contains("remove"))
-            .stdout(predicate::str::contains("--install"))
+            .stdout(predicate::str::contains("service install"))
+            .stdout(predicate::str::contains("--install").not())
             .stdout(predicate::str::contains("SPICE-ADOPT").not())
             .stdout(predicate::str::contains("pending-adopt-code").not())
             .stdout(predicate::str::contains("--app-name").not())
@@ -843,12 +844,125 @@ mod connect {
 
         spice_cmd()
             .env("SPICE_CONFIG_DIR", config_dir.path())
-            .arg("connect")
-            .arg("--install")
+            .args(["connect", "service", "install"])
             .assert()
             .failure()
-            .stdout(predicate::str::contains("load identity"))
+            .stdout(predicate::str::contains("validate the durable"))
             .stdout(predicate::str::contains("not valid JSON").not());
+    }
+
+    #[test]
+    fn install_rejects_a_missing_identity_before_service_setup() {
+        let config_dir = TempDir::new().expect("create config directory");
+
+        spice_cmd()
+            .env("SPICE_CONFIG_DIR", config_dir.path())
+            .args(["connect", "service", "install"])
+            .assert()
+            .failure()
+            .stdout(predicate::str::contains("has no enrolled identity"))
+            .stdout(predicate::str::contains("spiced --token"));
+    }
+
+    #[test]
+    fn install_rejects_a_parseable_but_unusable_identity_before_service_setup() {
+        let config_dir = TempDir::new().expect("create config directory");
+        fs::write(
+            config_dir.path().join("identity.json"),
+            serde_json::json!({
+                "identifier": "",
+                "identity_cert_pem": "credential-that-must-not-be-printed",
+                "private_key_pem": "private-key-that-must-not-be-printed",
+                "public_key_pem": "public-key",
+                "gateway_addr": "gateway.example:443"
+            })
+            .to_string(),
+        )
+        .expect("write unusable identity");
+
+        spice_cmd()
+            .env("SPICE_CONFIG_DIR", config_dir.path())
+            .args(["connect", "service", "install"])
+            .assert()
+            .failure()
+            .stdout(predicate::str::contains("cannot be used"))
+            .stdout(predicate::str::contains("identifier is empty"))
+            .stdout(predicate::str::contains("credential-that-must-not-be-printed").not())
+            .stdout(predicate::str::contains("private-key-that-must-not-be-printed").not());
+    }
+
+    #[test]
+    fn status_uses_signed_expiry_without_treating_the_host_clock_as_credential_authority() {
+        use rcgen::{CertificateParams, KeyPair};
+
+        let config_dir = TempDir::new().expect("create config directory");
+        let material = runtime_cloud_connect::identity::IdentityStore::generate_enrollment()
+            .expect("generate identity material");
+        let keypair = KeyPair::from_pem(&material.private_key_pem).expect("parse identity key");
+        let mut params =
+            CertificateParams::new(Vec::<String>::new()).expect("certificate parameters");
+        params.not_before = rcgen::date_time_ymd(2019, 1, 1);
+        params.not_after = rcgen::date_time_ymd(2020, 1, 1);
+        let certificate = params.self_signed(&keypair).expect("sign certificate");
+        let identity = runtime_cloud_connect::Identity {
+            identifier: "inst_expired".to_string(),
+            identity_cert_pem: certificate.pem(),
+            private_key_pem: material.private_key_pem,
+            public_key_pem: material.public_key_pem,
+            ca_bundle_pem: String::new(),
+            gateway_addr: "gateway.example:443".to_string(),
+            // Deliberately inconsistent: status and activation must trust the
+            // signed certificate rather than this unsigned cache field.
+            not_after_unix: Some(4_102_444_800),
+            enc_private_key_pem: material.enc_private_key_pem,
+            enc_public_key_pem: material.enc_public_key_pem,
+            enc_previous_private_key_pem: String::new(),
+            cache_key_b64: String::new(),
+            app_id: None,
+            org_name: None,
+            app_name: None,
+            monitor_url: None,
+        };
+        runtime_cloud_connect::identity::IdentityStore::store(
+            &config_dir.path().join("identity.json"),
+            &identity,
+        )
+        .expect("store expired identity");
+
+        spice_cmd()
+            .env("SPICE_CONFIG_DIR", config_dir.path())
+            .args(["connect", "--endpoint", "http://127.0.0.1:9", "status"])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("Spice Cloud Connect: connected"))
+            .stdout(predicate::str::contains(
+                "expiry:      unix=1577836800 (expired=true)",
+            ))
+            .stdout(predicate::str::contains("4102444800").not())
+            .stdout(predicate::str::contains("identity unusable").not());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn status_fails_closed_when_the_persisted_endpoint_is_a_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let config_dir = TempDir::new().expect("create config directory");
+        let target = config_dir.path().join("redirected-endpoint");
+        fs::write(&target, "https://wrong-control-plane.example").expect("write target endpoint");
+        symlink(&target, config_dir.path().join("cloud-endpoint"))
+            .expect("create endpoint symlink");
+
+        spice_cmd()
+            .env("SPICE_CONFIG_DIR", config_dir.path())
+            .env_remove("SPICE_CLOUD_ENDPOINT")
+            .args(["connect", "status"])
+            .assert()
+            .failure()
+            .stdout(predicate::str::contains(
+                "read the Cloud Connect endpoint override",
+            ))
+            .stdout(predicate::str::contains("wrong-control-plane").not());
     }
 }
 

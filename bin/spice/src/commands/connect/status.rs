@@ -30,7 +30,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
-use runtime_cloud_connect::config::IDENTITY_FILE;
+use runtime_cloud_connect::config::{CloudConnectConfig, IDENTITY_FILE};
 
 use super::service::{self, ServiceBackend, ServiceStatus};
 use crate::error::Result;
@@ -41,7 +41,7 @@ use crate::output::{OutputFormat, write_json};
 /// This is a public automation surface. Bump it when a field is renamed or
 /// removed, or when an enum grows a variant consumers must branch on, and
 /// update the golden fixtures in the same change.
-pub(crate) const STATUS_SCHEMA_VERSION: u32 = 1;
+pub(crate) const STATUS_SCHEMA_VERSION: u32 = 2;
 
 /// Whether this directory is connected to Spice Cloud.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -54,6 +54,9 @@ pub(crate) enum ConnectionState {
     EnrollmentIncomplete,
     /// An enrolled identity is present.
     Enrolled,
+    /// An identity is readable but its durable credential or endpoint state
+    /// cannot activate Cloud Connect.
+    Unusable,
     /// An identity file is present and could not be read. Reported rather than
     /// folded into `not_connected`: every `spiced` start in this directory will
     /// reject the same file and run unmanaged, which is a failure to fix, not
@@ -116,7 +119,8 @@ pub(crate) struct ConnectionStatus {
     /// states a wrong clock explains. `null` when it was not measured or was
     /// insignificant.
     pub(crate) clock: Option<String>,
-    /// Why the state is `unreadable`, when it is. `null` otherwise.
+    /// Why the state is `unreadable` or `unusable`, when it is. `null`
+    /// otherwise.
     pub(crate) diagnostic: Option<String>,
 }
 
@@ -174,8 +178,10 @@ impl ConnectStatus {
         // An identity that is present but unreadable is its own state. Reading
         // the error as "nothing here" would report a directory as unconnected
         // while every `spiced` start in it keeps rejecting the same file.
-        let identity =
-            runtime_cloud_connect::identity::IdentityStore::load_optional(&identity_path);
+        let identity = runtime_cloud_connect::identity::IdentityStore::load_optional_async(
+            identity_path.clone(),
+        )
+        .await;
 
         let mut connection = ConnectionStatus {
             state: ConnectionState::NotConnected,
@@ -208,16 +214,29 @@ impl ConnectStatus {
             }
         };
 
+        let mut clock_relevant = false;
         if let Some(id) = identity {
-            connection.state = ConnectionState::Enrolled;
             connection.expired = id.is_expired();
-            connection.expires_at_unix = id.not_after_unix;
+            clock_relevant = connection.expired || id.is_not_yet_valid();
+            connection.expires_at_unix = id.effective_not_after_unix();
             connection.gateway_addr =
                 (!id.gateway_addr.is_empty()).then(|| id.gateway_addr.clone());
-            connection.identifier = Some(id.identifier);
-            connection.org_name = id.org_name;
-            connection.app_name = id.app_name;
-            connection.monitor_url = id.monitor_url;
+            connection.identifier = Some(id.identifier.clone());
+            connection.org_name.clone_from(&id.org_name);
+            connection.app_name.clone_from(&id.app_name);
+            connection.monitor_url.clone_from(&id.monitor_url);
+
+            let config = CloudConnectConfig::from_env_at(
+                env!("CARGO_PKG_VERSION"),
+                config_dir.to_path_buf(),
+            );
+            match runtime_cloud_connect::validate_reconnectable_identity_async(&config, id).await {
+                Ok(_) => connection.state = ConnectionState::Enrolled,
+                Err(error) => {
+                    connection.state = ConnectionState::Unusable;
+                    connection.diagnostic = Some(error.to_string());
+                }
+            }
         } else if connection.draft_path.is_some() {
             connection.state = ConnectionState::EnrollmentIncomplete;
         }
@@ -226,7 +245,7 @@ impl ConnectStatus {
         // not actually expired, and a stuck enrollment is a state a wrong clock
         // explains — the enroll keeps failing on certificate validity. Measure
         // only there, so the common `status` stays offline and instant.
-        if connection.expired || connection.state == ConnectionState::EnrollmentIncomplete {
+        if clock_relevant || connection.state == ConnectionState::EnrollmentIncomplete {
             connection.clock = clock_advice(endpoint).await;
         }
 
@@ -259,16 +278,27 @@ impl ConnectStatus {
     /// what travels as the command's error — which keeps a `--output json` run
     /// parseable and still exits non-zero.
     pub(crate) fn degradation(&self) -> Option<String> {
-        if self.connection.state == ConnectionState::Unreadable {
+        if matches!(
+            self.connection.state,
+            ConnectionState::Unreadable | ConnectionState::Unusable
+        ) {
             return Some(self.connection.diagnostic.clone().unwrap_or_else(|| {
                 format!(
-                    "The Spice Cloud Connect identity at {} could not be read.",
+                    "The Spice Cloud Connect identity at {} cannot activate Cloud Connect.",
                     self.connection.identity_path.display()
                 )
             }));
         }
+        self.service_degradation()
+    }
+
+    /// The service-only diagnosis used by the filtered status command.
+    ///
+    /// Its JSON document contains only the service object, so its exit status
+    /// must never depend on a connection condition the document cannot explain.
+    pub(crate) fn service_degradation(&self) -> Option<String> {
         if self.service.state.is_degraded() {
-            return Some(format!(
+            Some(format!(
                 "The Spice Cloud Connect service for {} is {}{}",
                 self.connection.directory.display(),
                 self.service.state,
@@ -276,9 +306,10 @@ impl ConnectStatus {
                     Some(diagnostic) => format!(": {diagnostic}"),
                     None => ".".to_string(),
                 }
-            ));
+            ))
+        } else {
+            None
         }
-        None
     }
 }
 
@@ -413,6 +444,17 @@ fn render_connection(connection: &ConnectionStatus) {
         ConnectionState::Unreadable => {
             println!("Spice Cloud Connect: identity unreadable");
             println!("  identity:    {}", connection.identity_path.display());
+        }
+        ConnectionState::Unusable => {
+            println!("Spice Cloud Connect: identity unusable");
+            println!("  identity:    {}", connection.identity_path.display());
+            println!(
+                "  expiry:      {}",
+                match connection.expires_at_unix {
+                    Some(secs) => format!("unix={secs} (expired={})", connection.expired),
+                    None => "unbounded".to_string(),
+                }
+            );
         }
     }
     if let Some(diagnostic) = &connection.diagnostic {
@@ -625,6 +667,52 @@ mod tests {
             .degradation()
             .expect("an unreadable identity must not exit zero");
         assert!(degradation.contains("identity"), "{degradation}");
+    }
+
+    #[tokio::test]
+    async fn a_parseable_but_unusable_identity_is_not_reported_as_connected() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let instance_dir = dir.path().join("edge-1");
+        let config_dir = instance_dir.join(".spice");
+        std::fs::create_dir_all(&config_dir).expect("create config dir");
+        std::fs::write(
+            config_dir.join(IDENTITY_FILE),
+            serde_json::json!({
+                "identifier": "",
+                "identity_cert_pem": "credential-that-must-not-be-printed",
+                "private_key_pem": "private-key-that-must-not-be-printed",
+                "public_key_pem": "public-key",
+                "gateway_addr": "gateway.example:443"
+            })
+            .to_string(),
+        )
+        .expect("write unusable identity");
+
+        let status = snapshot(dir.path(), &instance_dir, &config_dir).await;
+        assert_eq!(status.connection.state, ConnectionState::Unusable);
+        let diagnostic = status
+            .connection
+            .diagnostic
+            .as_deref()
+            .expect("an unusable identity must say why");
+        assert!(diagnostic.contains("identifier is empty"), "{diagnostic}");
+        assert!(!diagnostic.contains("credential-that-must-not-be-printed"));
+        assert!(!diagnostic.contains("private-key-that-must-not-be-printed"));
+        assert!(status.degradation().is_some());
+    }
+
+    #[test]
+    fn the_filtered_service_status_is_not_degraded_by_hidden_connection_state() {
+        let mut status = golden_status();
+        status.connection.state = ConnectionState::Unusable;
+        status.connection.diagnostic = Some("identity needs repair".to_string());
+
+        assert!(status.degradation().is_some());
+        assert_eq!(
+            status.service_degradation(),
+            None,
+            "the service-only document reports a healthy running service"
+        );
     }
 
     #[tokio::test]

@@ -16,7 +16,7 @@ limitations under the License.
 
 //! Configuration for the Cloud Connect client.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// Default enroll endpoint for the Spice Cloud control plane (state
@@ -105,9 +105,9 @@ pub struct CloudConnectConfig {
     /// the host facts rather than as one of them. The cloud records it on
     /// the registry row and resolves the instance's gateway stamp from it.
     ///
-    /// `None` means "leave the stored value alone": a re-enroll (the recovery
-    /// path once the renewal grace window has passed) must not erase a region
-    /// set in the portal.
+    /// `None` means "leave the stored value alone": a re-enroll after the
+    /// control plane rejects the old credential must not erase a region set in
+    /// the portal.
     pub instance_region: Option<String>,
 
     /// Runtime semver-like string (`v2.0.0-build.deadbeef`). Sent in
@@ -140,6 +140,76 @@ pub struct CloudConnectConfig {
 }
 
 impl CloudConnectConfig {
+    /// Resolve the control-stream endpoint for a persisted identity.
+    ///
+    /// A configured override is already a complete URL. Otherwise the enroll
+    /// response supplies `host:port`, and transport mode supplies the scheme.
+    #[must_use]
+    pub fn stream_endpoint(&self, identity: &crate::identity::Identity) -> Option<String> {
+        if let Some(ref endpoint) = self.gateway_endpoint {
+            return Some(endpoint.clone());
+        }
+        if identity.gateway_addr.trim().is_empty() {
+            return None;
+        }
+        let scheme = if self.insecure { "http" } else { "https" };
+        Some(format!("{scheme}://{}", identity.gateway_addr))
+    }
+
+    /// Resolve and validate the persisted control-stream endpoint shape.
+    ///
+    /// Durable activation deliberately ignores the process-local gateway
+    /// override. The override may redirect the running client's reconnect
+    /// attempts, but a typo or a service environment difference must not make
+    /// consumers disagree about whether the persisted identity is usable.
+    pub(crate) fn validated_persisted_gateway_endpoint(
+        &self,
+        identity: &crate::identity::Identity,
+    ) -> Result<String, &'static str> {
+        if identity.gateway_addr.trim().is_empty() {
+            return Err("the gateway address is empty");
+        }
+        let expected_scheme = if self.insecure { "http" } else { "https" };
+        let endpoint = format!("{expected_scheme}://{}", identity.gateway_addr);
+        let uri = endpoint
+            .parse::<http::Uri>()
+            .map_err(|_| "the gateway endpoint is invalid")?;
+        if uri.scheme_str() != Some(expected_scheme) {
+            return Err("the gateway endpoint uses the wrong transport scheme");
+        }
+        if uri.host().is_none() {
+            return Err("the gateway endpoint has no host");
+        }
+        match uri.port_u16() {
+            None => return Err("the gateway endpoint has no explicit port"),
+            Some(0) => return Err("the gateway endpoint port must be greater than zero"),
+            Some(_) => {}
+        }
+        if uri
+            .path_and_query()
+            .is_some_and(|path_and_query| path_and_query.as_str() != "/")
+        {
+            return Err("the gateway endpoint must not contain a path or query");
+        }
+        Ok(endpoint)
+    }
+
+    /// Read the optional instance-local enrollment endpoint override without
+    /// following symlinks or opening special files in blocking mode.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the path exists but is unreadable or is not a
+    /// regular file.
+    pub fn read_enroll_endpoint_override(config_dir: &Path) -> std::io::Result<Option<String>> {
+        let path = config_dir.join("cloud-endpoint");
+        crate::identity::read_regular_file_optional(&path).map(|contents| {
+            contents
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        })
+    }
+
     /// Resolve the Cloud Connect config directory to its canonical location.
     ///
     /// Precedence:
@@ -378,5 +448,72 @@ mod tests {
             config.instance_region.is_none(),
             "the region is an explicit argument, never read from the environment"
         );
+    }
+
+    #[test]
+    fn persisted_gateway_rejects_port_zero() {
+        let _guard = ENV_LOCK.lock().expect("env lock poisoned");
+        unsafe {
+            std::env::remove_var("SPICE_CLOUD_ENDPOINT");
+            std::env::remove_var("SPICE_CLOUD_GATEWAY_ENDPOINT");
+        }
+        let config = CloudConnectConfig::from_env("v0.0.0-test");
+        let identity = crate::identity::Identity {
+            identifier: "inst_test".to_string(),
+            identity_cert_pem: String::new(),
+            private_key_pem: String::new(),
+            public_key_pem: String::new(),
+            ca_bundle_pem: String::new(),
+            gateway_addr: "gateway.example.test:0".to_string(),
+            not_after_unix: None,
+            app_id: None,
+            org_name: None,
+            app_name: None,
+            monitor_url: None,
+            enc_private_key_pem: String::new(),
+            enc_public_key_pem: String::new(),
+            enc_previous_private_key_pem: String::new(),
+            cache_key_b64: String::new(),
+        };
+
+        assert_eq!(
+            config.validated_persisted_gateway_endpoint(&identity),
+            Err("the gateway endpoint port must be greater than zero")
+        );
+    }
+
+    #[test]
+    fn enrollment_endpoint_override_is_trimmed_and_optional() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert!(
+            CloudConnectConfig::read_enroll_endpoint_override(dir.path())
+                .expect("missing override is ordinary absence")
+                .is_none()
+        );
+        std::fs::write(
+            dir.path().join("cloud-endpoint"),
+            "  https://cloud.example.test  \n",
+        )
+        .expect("write override");
+        assert_eq!(
+            CloudConnectConfig::read_enroll_endpoint_override(dir.path())
+                .expect("read override")
+                .as_deref(),
+            Some("https://cloud.example.test")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn enrollment_endpoint_override_does_not_follow_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("target");
+        std::fs::write(&target, "https://redirected.example.test").expect("write symlink target");
+        symlink(&target, dir.path().join("cloud-endpoint")).expect("create symlink");
+
+        CloudConnectConfig::read_enroll_endpoint_override(dir.path())
+            .expect_err("a state-file symlink must be rejected");
     }
 }

@@ -34,10 +34,16 @@ limitations under the License.
 //! between the runtime and the local filesystem. Other Spice tooling
 //! should treat it as opaque.
 
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use base64::Engine as _;
-use rcgen::{CertificateParams, DnType, ExtendedKeyUsagePurpose, KeyPair, PublicKeyData};
+use rcgen::{
+    CertificateParams, CertificateSigningRequestParams, DnType, ExtendedKeyUsagePurpose, KeyPair,
+    PublicKeyData,
+};
 use serde::{Deserialize, Serialize};
 use snafu::{ResultExt, Snafu};
 use zeroize::Zeroizing;
@@ -52,7 +58,12 @@ pub enum Error {
         source: std::io::Error,
     },
 
-    #[snafu(display("Failed to parse identity JSON at {}: {source}", path.display()))]
+    #[snafu(display(
+        "Failed to parse identity JSON at {} (line {}, column {})",
+        path.display(),
+        source.line(),
+        source.column()
+    ))]
     Parse {
         path: PathBuf,
         source: serde_json::Error,
@@ -78,6 +89,18 @@ pub enum Error {
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+/// Result of a credential read-modify-write under the enrollment transaction.
+#[derive(Debug)]
+pub enum CredentialUpdateOutcome {
+    /// The update matched the durable generation and was stored.
+    Stored(Identity),
+    /// A newer enrollment or renewal was already durable, so the stale update
+    /// was rejected and the durable winner is returned to the caller.
+    Superseded(Identity),
+    /// Removal won the transaction and no identity remains.
+    Missing,
+}
 
 /// Persisted runtime identity. Treat as opaque outside this crate.
 #[derive(Clone, Serialize, Deserialize)]
@@ -270,16 +293,31 @@ where
 }
 
 impl Identity {
+    pub(crate) fn certificate_validity_unix(&self) -> Result<(i64, i64), &'static str> {
+        let certificate_pem = pem::parse(&self.identity_cert_pem)
+            .map_err(|_| "the client identity certificate is not valid PEM")?;
+        if certificate_pem.tag() != "CERTIFICATE" {
+            return Err("the client identity certificate has an invalid PEM label");
+        }
+        let (remaining, certificate) =
+            x509_parser::prelude::parse_x509_certificate(certificate_pem.contents())
+                .map_err(|_| "the client identity certificate is not valid X.509")?;
+        if !remaining.is_empty() {
+            return Err("the client identity certificate has trailing DER data");
+        }
+        Ok((
+            certificate.validity().not_before.timestamp(),
+            certificate.validity().not_after.timestamp(),
+        ))
+    }
+
     /// Why this identity cannot establish a control stream, if any.
     ///
     /// Enrollment uses this as a fail-closed gate before honoring the
-    /// existing-identity precedence rule. An explicit gateway override makes
-    /// a legacy identity with no stored gateway usable, but credentials and
-    /// the cloud identifier are always required.
-    pub(crate) fn reconnect_validation_error(
-        &self,
-        gateway_override: Option<&str>,
-    ) -> Option<&'static str> {
+    /// existing-identity precedence rule. Credentials, the cloud identifier,
+    /// and a durable gateway address are always required; a process-local
+    /// override may redirect a running client but cannot activate an identity.
+    pub(crate) fn reconnect_validation_error(&self) -> Option<&'static str> {
         if self.identifier.trim().is_empty() {
             return Some("the cloud-assigned instance identifier is empty");
         }
@@ -318,29 +356,79 @@ impl Identity {
         if public_key_pem.contents() != private_key.subject_public_key_info().as_slice() {
             return Some("the client identity public and private keys do not match");
         }
-        if self.gateway_addr.trim().is_empty()
-            && gateway_override.is_none_or(|endpoint| endpoint.trim().is_empty())
-        {
+        if self.gateway_addr.trim().is_empty() {
             return Some("the gateway address is empty");
         }
+        match (
+            self.enc_private_key_pem.trim().is_empty(),
+            self.enc_public_key_pem.trim().is_empty(),
+        ) {
+            // Identities written before encrypted secret delivery carry
+            // neither field. They remain reconnectable and gain a keypair on
+            // their next scheduled renewal.
+            (true, true) => {}
+            (false, false) => {
+                let Ok(keypair) = cloud_connect_crypto::EncryptionKeypair::from_pkcs8_pem(
+                    &self.enc_private_key_pem,
+                ) else {
+                    return Some(
+                        "the secret-delivery private key is not valid X25519 key material",
+                    );
+                };
+                let Ok(public_key) = pem::parse(&self.enc_public_key_pem) else {
+                    return Some("the secret-delivery public key is not valid PEM");
+                };
+                if public_key.tag() != "PUBLIC KEY" {
+                    return Some("the secret-delivery public key has an invalid PEM label");
+                }
+                let Ok(expected_public_key) = pem::parse(keypair.public_key_spki_pem()) else {
+                    return Some("the secret-delivery public key could not be derived");
+                };
+                if public_key.contents() != expected_public_key.contents() {
+                    return Some("the secret-delivery public and private keys do not match");
+                }
+            }
+            _ => return Some("the secret-delivery keypair is incomplete"),
+        }
         None
+    }
+
+    /// The signed certificate expiry, falling back to the cached response value
+    /// only when a legacy certificate cannot be parsed.
+    #[must_use]
+    pub fn effective_not_after_unix(&self) -> Option<u64> {
+        self.certificate_validity_unix()
+            .ok()
+            .and_then(|(_, not_after)| u64::try_from(not_after).ok())
+            .or(self.not_after_unix)
     }
 
     /// Returns `true` if the identity has an expiry that is in the past
     /// relative to the system clock. An identity with no expiry never expires.
     #[must_use]
     pub fn is_expired(&self) -> bool {
-        let Some(not_after) = self.not_after_unix else {
-            return false;
-        };
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs());
+        let not_after = self.effective_not_after_unix().map(i128::from);
+        let Some(not_after) = not_after else {
+            return false;
+        };
         // Treat the cert as expired *at* `not_after`, not only strictly after
         // it: the field is defined as the timestamp after which the server no
         // longer accepts the credential, so the boundary second should
         // already be considered past the NotAfter limit.
-        now >= not_after
+        i128::from(now) >= not_after
+    }
+
+    /// Returns `true` when the signed certificate validity interval starts in
+    /// the future relative to the system clock.
+    #[must_use]
+    pub fn is_not_yet_valid(&self) -> bool {
+        self.certificate_validity_unix()
+            .is_ok_and(|(not_before, _)| {
+                i128::from(crate::heartbeat::now_unix()) < i128::from(not_before)
+            })
     }
 
     /// The encryption keys a sealed payload may be addressed to: the current
@@ -534,12 +622,298 @@ fn write_lock() -> std::sync::MutexGuard<'static, ()> {
 
 fn acquire_update_transaction(path: &Path) -> Result<crate::draft::EnrollmentTransactionLock> {
     let config_dir = path.parent().unwrap_or_else(|| Path::new("."));
-    crate::draft::EnrollmentTransactionLock::try_acquire(config_dir).map_err(|source| {
+    crate::draft::EnrollmentTransactionLock::acquire(config_dir).map_err(|source| {
         Error::UpdateTransaction {
             path: path.to_path_buf(),
             reason: source.to_string(),
         }
     })
+}
+
+fn acquire_removal_transaction(path: &Path) -> Result<crate::draft::EnrollmentTransactionLock> {
+    let config_dir = path.parent().unwrap_or_else(|| Path::new("."));
+    crate::draft::EnrollmentTransactionLock::acquire_for_removal(config_dir).map_err(|source| {
+        Error::UpdateTransaction {
+            path: path.to_path_buf(),
+            reason: source.to_string(),
+        }
+    })
+}
+
+/// Read a security-sensitive state file without following symlinks or opening
+/// a FIFO/device in blocking mode.
+///
+/// A missing path is the only absence case. Every other file-system object is
+/// rejected so a privileged bootstrap cannot be redirected outside its config
+/// directory or held indefinitely by a special file.
+pub(crate) fn read_regular_file_optional(path: &Path) -> std::io::Result<Option<String>> {
+    use std::io::Read as _;
+
+    #[cfg(unix)]
+    let Some(mut file) = open_regular_file_optional_unix(path)? else {
+        return Ok(None);
+    };
+
+    #[cfg(windows)]
+    let mut file = {
+        use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
+
+        match validate_state_path_ancestors(path) {
+            Ok(()) => {}
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(source) => return Err(source),
+        }
+
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        let file = match std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)
+        {
+            Ok(file) => file,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(source) => return Err(source),
+        };
+        let metadata = file.metadata()?;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 || !metadata.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "the state path must be a regular file",
+            ));
+        }
+        file
+    };
+
+    #[cfg(not(any(unix, windows)))]
+    let mut file = {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "secure state-file reads are unsupported on this platform",
+        ));
+    };
+
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "the state path must be a regular file",
+        ));
+    }
+
+    let mut contents = String::new();
+    file.read_to_string(&mut contents)?;
+    Ok(Some(contents))
+}
+
+/// Open a state file relative to verified directory descriptors, refusing a
+/// symlink or non-directory at every component.
+///
+/// Unix has a small set of root-owned compatibility links in otherwise
+/// immutable directories (`/var` and `/tmp` on macOS are common examples).
+/// Those links cannot be replaced by the process running Spice and are safe to
+/// resolve before descriptor traversal. Every other symlink is rejected,
+/// including a root-owned link in a user-writable directory. `openat` with
+/// `O_NOFOLLOW` then closes the rename race between inspecting and opening
+/// every ordinary component.
+#[cfg(unix)]
+fn open_regular_file_optional_unix(path: &Path) -> std::io::Result<Option<std::fs::File>> {
+    open_regular_file_optional_unix_with(path, || {})
+}
+
+#[cfg(unix)]
+fn open_regular_file_optional_unix_with(
+    path: &Path,
+    before_descriptor_traversal: impl FnOnce(),
+) -> std::io::Result<Option<std::fs::File>> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let absolute = normalize_absolute_state_path(path)?;
+    let file_name = absolute.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "the state path has no file name",
+        )
+    })?;
+    let parent = absolute.parent().unwrap_or_else(|| Path::new("/"));
+    let parent = resolve_trusted_system_links(parent)?;
+    before_descriptor_traversal();
+    let mut directory = std::fs::File::open("/")?;
+
+    for component in parent.components() {
+        let std::path::Component::Normal(component) = component else {
+            continue;
+        };
+        let component = CString::new(component.as_bytes()).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "the state path contains a NUL byte",
+            )
+        })?;
+        // SAFETY: `component` is NUL-terminated, the directory descriptor is
+        // live for this call, and no pointer is retained. `O_NOFOLLOW` and
+        // `O_DIRECTORY` make a raced symlink/non-directory fail this step.
+        let descriptor = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                component.as_ptr(),
+                libc::O_RDONLY
+                    | libc::O_DIRECTORY
+                    | libc::O_NOFOLLOW
+                    | libc::O_NONBLOCK
+                    | libc::O_CLOEXEC,
+            )
+        };
+        if descriptor < 0 {
+            let source = std::io::Error::last_os_error();
+            if source.kind() == std::io::ErrorKind::NotFound {
+                return Ok(None);
+            }
+            return Err(source);
+        }
+        // SAFETY: `openat` returned a new owned descriptor on success.
+        directory = unsafe { std::fs::File::from_raw_fd(descriptor) };
+    }
+
+    let file_name = CString::new(file_name.as_bytes()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "the state path contains a NUL byte",
+        )
+    })?;
+    // SAFETY: `file_name` is NUL-terminated, the directory descriptor is live
+    // for this call, and no pointer is retained. The leaf cannot be followed.
+    let descriptor = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            file_name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        )
+    };
+    if descriptor < 0 {
+        let source = std::io::Error::last_os_error();
+        if source.kind() == std::io::ErrorKind::NotFound {
+            return Ok(None);
+        }
+        return Err(source);
+    }
+    // SAFETY: `openat` returned a new owned descriptor on success.
+    Ok(Some(unsafe { std::fs::File::from_raw_fd(descriptor) }))
+}
+
+#[cfg(unix)]
+fn normalize_absolute_state_path(path: &Path) -> std::io::Result<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let mut normalized = PathBuf::from("/");
+    for component in absolute.components() {
+        match component {
+            std::path::Component::RootDir | std::path::Component::CurDir => {}
+            std::path::Component::Normal(component) => normalized.push(component),
+            std::path::Component::ParentDir => {
+                if !normalized.pop() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "the state path escapes the filesystem root",
+                    ));
+                }
+            }
+            std::path::Component::Prefix(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "the state path has a non-Unix prefix",
+                ));
+            }
+        }
+    }
+    Ok(normalized)
+}
+
+#[cfg(unix)]
+fn resolve_trusted_system_links(path: &Path) -> std::io::Result<PathBuf> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    let mut resolved = PathBuf::from("/");
+    let mut components = path.components().filter_map(|component| match component {
+        std::path::Component::Normal(component) => Some(component),
+        _ => None,
+    });
+    while let Some(component) = components.next() {
+        let candidate = resolved.join(component);
+        let metadata = match std::fs::symlink_metadata(&candidate) {
+            Ok(metadata) => metadata,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                resolved.push(component);
+                for remaining in components {
+                    resolved.push(remaining);
+                }
+                return Ok(resolved);
+            }
+            Err(source) => return Err(source),
+        };
+        if !metadata.file_type().is_symlink() {
+            resolved.push(component);
+            continue;
+        }
+        let containing = candidate.parent().unwrap_or_else(|| Path::new("/"));
+        let containing_metadata = std::fs::metadata(containing)?;
+        let trusted_system_link = metadata.uid() == 0
+            && containing_metadata.uid() == 0
+            && containing_metadata.permissions().mode() & 0o022 == 0;
+        if !trusted_system_link {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "the state path has an untrusted symlink ancestor: {}",
+                    candidate.display()
+                ),
+            ));
+        }
+        resolved = std::fs::canonicalize(candidate)?;
+    }
+    Ok(resolved)
+}
+
+#[cfg(windows)]
+fn validate_state_path_ancestors(path: &Path) -> std::io::Result<()> {
+    use std::os::windows::fs::MetadataExt as _;
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let Some(parent) = absolute.parent() else {
+        return Ok(());
+    };
+    let mut current = PathBuf::new();
+    for component in parent.components() {
+        current.push(component.as_os_str());
+        let metadata = std::fs::symlink_metadata(&current)?;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "the state path has a reparse-point ancestor: {}",
+                    current.display()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn validate_state_path_ancestors(_path: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "secure state-file reads are unsupported on this platform",
+    ))
 }
 
 impl IdentityStore {
@@ -554,14 +928,14 @@ impl IdentityStore {
         cleanup_stale_identity_backups(path).context(IoSnafu {
             path: path.to_path_buf(),
         })?;
-        match std::fs::read_to_string(path) {
-            Ok(s) => {
+        match read_regular_file_optional(path) {
+            Ok(Some(s)) => {
                 let identity: Identity = serde_json::from_str(&s).context(ParseSnafu {
                     path: path.to_path_buf(),
                 })?;
                 Ok(Some(identity))
             }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Ok(None) => Ok(None),
             Err(err) => Err(Error::Io {
                 path: path.to_path_buf(),
                 source: err,
@@ -569,13 +943,45 @@ impl IdentityStore {
         }
     }
 
+    /// Async wrapper around [`Self::load_optional`] for Tokio call sites.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::load_optional`]. A failed blocking
+    /// task is reported as an I/O error without exposing identity contents.
+    pub async fn load_optional_async(path: PathBuf) -> Result<Option<Identity>> {
+        let task_path = path.clone();
+        tokio::task::spawn_blocking(move || Self::load_optional(&task_path))
+            .await
+            .unwrap_or_else(|join| {
+                Err(Error::Io {
+                    path,
+                    source: std::io::Error::other(format!("identity load task panicked: {join}")),
+                })
+            })
+    }
+
     /// Persist an identity to disk atomically with `0600` perms on Unix.
+    ///
+    /// This acquires the config directory's enrollment/removal transaction so
+    /// every creating writer participates in the same resurrection boundary.
+    /// Enrollment, which already owns that transaction, uses the internal
+    /// `store_with_transaction` path instead of acquiring it recursively.
     ///
     /// # Errors
     ///
     /// Returns an error if the parent directory cannot be created, the
     /// identity cannot be serialized, or the file cannot be written.
     pub fn store(path: &Path, identity: &Identity) -> Result<()> {
+        let transaction = acquire_update_transaction(path)?;
+        Self::store_with_transaction(path, identity, &transaction)
+    }
+
+    pub(crate) fn store_with_transaction(
+        path: &Path,
+        identity: &Identity,
+        _transaction: &crate::draft::EnrollmentTransactionLock,
+    ) -> Result<()> {
         let _guard = write_lock();
         Self::store_locked(path, identity)
     }
@@ -735,8 +1141,11 @@ impl IdentityStore {
     /// is owned by control commands and can be newer on disk, so every such
     /// full identity update must merge it while holding [`write_lock`].
     ///
-    /// Returns `Ok(None)` when the identity was removed before the write and
-    /// does not recreate it.
+    /// `expected_identifier` and `expected_public_key_pem` fence the durable
+    /// credential generation the caller cloned before a long-running request.
+    /// A removal followed by re-enrollment can therefore win the transaction
+    /// without a queued stale update overwriting the replacement. Missing and
+    /// superseded generations are reported without writing.
     ///
     /// # Errors
     ///
@@ -744,13 +1153,20 @@ impl IdentityStore {
     /// merged identity cannot be written.
     pub fn store_credential_update(
         path: &Path,
+        expected_identifier: &str,
+        expected_public_key_pem: &str,
         credential_update: &Identity,
-    ) -> Result<Option<Identity>> {
+    ) -> Result<CredentialUpdateOutcome> {
         let _transaction = acquire_update_transaction(path)?;
         let _guard = write_lock();
         let Some(current) = Self::load_optional(path)? else {
-            return Ok(None);
+            return Ok(CredentialUpdateOutcome::Missing);
         };
+        if current.identifier != expected_identifier
+            || current.public_key_pem != expected_public_key_pem
+        {
+            return Ok(CredentialUpdateOutcome::Superseded(current));
+        }
         let mut merged = credential_update.clone();
         // The whole attachment tuple, not just the app id: a command handler
         // may have written any of these after the caller cloned its identity,
@@ -760,7 +1176,7 @@ impl IdentityStore {
         merged.app_name = current.app_name;
         merged.monitor_url = current.monitor_url;
         Self::store_locked(path, &merged)?;
-        Ok(Some(merged))
+        Ok(CredentialUpdateOutcome::Stored(merged))
     }
 
     /// The write itself, with the caller already holding [`write_lock`].
@@ -776,17 +1192,60 @@ impl IdentityStore {
 
     /// Remove the identity file. No-op if it doesn't exist.
     ///
-    /// Takes [`write_lock`] to serialize with updates in this process. The
-    /// caller performing `spice connect remove` owns the config directory's
-    /// enrollment transaction before calling this method, which serializes the
-    /// removal with updates from another process.
+    /// Acquires the config directory's persistent enrollment transaction before
+    /// [`write_lock`], the same order used by every read-modify-write. This
+    /// serializes runtime revocation and remote removal with writers in another
+    /// process, preventing a stale writer from resurrecting the identity.
     ///
     /// # Errors
     ///
     /// Returns an error if the file exists but cannot be removed.
     pub fn clear(path: &Path) -> Result<()> {
+        let transaction = acquire_removal_transaction(path)?;
+        Self::clear_with_transaction(path, &transaction)
+    }
+
+    /// Remove the identity while the caller retains ownership of the config
+    /// directory's enrollment transaction.
+    ///
+    /// This is the non-recursive removal path for `spice connect remove`, which
+    /// owns one transaction across the identity, draft, endpoint, cached
+    /// secrets, and installed service. The transaction must protect the same
+    /// config directory as `path`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the transaction belongs to another directory or
+    /// when the identity file exists but cannot be removed.
+    pub fn clear_with_transaction(
+        path: &Path,
+        transaction: &crate::draft::EnrollmentTransactionLock,
+    ) -> Result<()> {
+        if !transaction.protects(path) {
+            return Err(Error::UpdateTransaction {
+                path: path.to_path_buf(),
+                reason: "the held enrollment transaction belongs to another config directory"
+                    .to_string(),
+            });
+        }
         let _guard = write_lock();
         Self::clear_locked(path)
+    }
+
+    /// Async variant of [`Self::clear_with_transaction`] for a caller that
+    /// already owns the config directory's enrollment transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::clear_with_transaction`], or an error
+    /// when the blocking task carrying the removal panics.
+    pub async fn clear_with_transaction_async(
+        path: PathBuf,
+        transaction: Arc<crate::draft::EnrollmentTransactionLock>,
+    ) -> Result<()> {
+        tokio::task::spawn_blocking(move || Self::clear_with_transaction(&path, &transaction))
+            .await
+            .map_err(|source| Error::ClearTaskPanicked { source })?
     }
 
     /// Async variant of [`IdentityStore::clear`] for use on the Tokio driver
@@ -811,7 +1270,9 @@ impl IdentityStore {
     /// The removal itself, with the caller already holding [`write_lock`].
     fn clear_locked(path: &Path) -> Result<()> {
         match std::fs::remove_file(path) {
-            Ok(()) => Ok(()),
+            Ok(()) => sync_parent_directory(path).context(IoSnafu {
+                path: path.to_path_buf(),
+            }),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(err) => Err(Error::Io {
                 path: path.to_path_buf(),
@@ -905,6 +1366,53 @@ pub struct EnrollmentMaterial {
     /// X25519 encryption public key (RFC 8410 SPKI PEM); sent as the
     /// enroll request's `enc_pubkey_pem`.
     pub enc_public_key_pem: String,
+}
+
+impl EnrollmentMaterial {
+    /// Why persisted enrollment material is not safe to replay, if any.
+    ///
+    /// Every reason is deliberately independent of the key bytes so a corrupt
+    /// draft can be diagnosed without reproducing credential material.
+    pub(crate) fn validation_error(&self) -> Option<&'static str> {
+        let Ok(private_key) = KeyPair::from_pem(&self.private_key_pem) else {
+            return Some("the identity private key is not valid PKCS key material");
+        };
+        let Ok(public_key) = pem::parse(&self.public_key_pem) else {
+            return Some("the identity public key is not valid PEM");
+        };
+        if public_key.tag() != "PUBLIC KEY" {
+            return Some("the identity public key has an invalid PEM label");
+        }
+        if public_key.contents() != private_key.subject_public_key_info().as_slice() {
+            return Some("the identity public and private keys do not match");
+        }
+
+        let Ok(csr) = CertificateSigningRequestParams::from_pem(&self.csr_pem) else {
+            return Some("the certificate request is invalid or has a bad self-signature");
+        };
+        if csr.public_key.der_bytes() != private_key.der_bytes() {
+            return Some("the certificate request and identity private key do not match");
+        }
+
+        let Ok(enc_keypair) =
+            cloud_connect_crypto::EncryptionKeypair::from_pkcs8_pem(&self.enc_private_key_pem)
+        else {
+            return Some("the secret-delivery private key is not valid X25519 key material");
+        };
+        let Ok(enc_public_key) = pem::parse(&self.enc_public_key_pem) else {
+            return Some("the secret-delivery public key is not valid PEM");
+        };
+        if enc_public_key.tag() != "PUBLIC KEY" {
+            return Some("the secret-delivery public key has an invalid PEM label");
+        }
+        let Ok(expected_enc_public_key) = pem::parse(enc_keypair.public_key_spki_pem()) else {
+            return Some("the secret-delivery public key could not be derived");
+        };
+        if enc_public_key.contents() != expected_enc_public_key.contents() {
+            return Some("the secret-delivery public and private keys do not match");
+        }
+        None
+    }
 }
 
 impl std::fmt::Debug for EnrollmentMaterial {
@@ -1213,6 +1721,8 @@ mod tests {
             .expect("build sample identity certificate parameters")
             .self_signed(&key_pair)
             .expect("sign sample identity certificate");
+        let encryption_keypair = cloud_connect_crypto::EncryptionKeypair::generate()
+            .expect("generate sample encryption key");
         Identity {
             identifier: "inst_test".to_string(),
             identity_cert_pem: certificate.pem(),
@@ -1226,18 +1736,32 @@ mod tests {
             org_name: None,
             app_name: None,
             monitor_url: None,
-            enc_private_key_pem:
-                "-----BEGIN PRIVATE KEY-----\nMOCKENC\n-----END PRIVATE KEY-----\n".to_string(),
-            enc_public_key_pem: "-----BEGIN PUBLIC KEY-----\nMOCKENC\n-----END PUBLIC KEY-----\n"
-                .to_string(),
+            enc_private_key_pem: encryption_keypair.to_pkcs8_pem().to_string(),
+            enc_public_key_pem: encryption_keypair.public_key_spki_pem(),
             enc_previous_private_key_pem: String::new(),
             cache_key_b64: String::new(),
         }
     }
 
+    fn set_sample_certificate_validity(
+        identity: &mut Identity,
+        not_before: (i32, u8, u8),
+        not_after: (i32, u8, u8),
+    ) {
+        let key_pair = KeyPair::from_pem(&identity.private_key_pem).expect("parse identity key");
+        let mut params = CertificateParams::new(Vec::<String>::new())
+            .expect("build sample identity certificate parameters");
+        params.not_before = rcgen::date_time_ymd(not_before.0, not_before.1, not_before.2);
+        params.not_after = rcgen::date_time_ymd(not_after.0, not_after.1, not_after.2);
+        identity.identity_cert_pem = params
+            .self_signed(&key_pair)
+            .expect("sign sample identity certificate")
+            .pem();
+    }
+
     #[test]
     fn reconnect_validation_accepts_a_matching_certificate_and_private_key() {
-        assert_eq!(sample_identity().reconnect_validation_error(None), None);
+        assert_eq!(sample_identity().reconnect_validation_error(), None);
     }
 
     #[test]
@@ -1247,7 +1771,7 @@ mod tests {
             "-----BEGIN CERTIFICATE-----\nnot-a-certificate\n-----END CERTIFICATE-----\n"
                 .to_string();
         assert_eq!(
-            identity.reconnect_validation_error(None),
+            identity.reconnect_validation_error(),
             Some("the client identity certificate is not valid PEM")
         );
 
@@ -1256,7 +1780,7 @@ mod tests {
             "-----BEGIN PRIVATE KEY-----\nnot-a-private-key\n-----END PRIVATE KEY-----\n"
                 .to_string();
         assert_eq!(
-            identity.reconnect_validation_error(None),
+            identity.reconnect_validation_error(),
             Some("the client identity private key is not valid PKCS key material")
         );
     }
@@ -1268,7 +1792,7 @@ mod tests {
             .expect("generate mismatched private key")
             .serialize_pem();
         assert_eq!(
-            identity.reconnect_validation_error(None),
+            identity.reconnect_validation_error(),
             Some("the client identity certificate and private key do not match")
         );
     }
@@ -1279,14 +1803,14 @@ mod tests {
         identity.public_key_pem =
             "-----BEGIN PUBLIC KEY-----\nnot-a-public-key\n-----END PUBLIC KEY-----\n".to_string();
         assert_eq!(
-            identity.reconnect_validation_error(None),
+            identity.reconnect_validation_error(),
             Some("the client identity public key is not valid PEM")
         );
 
         let mut identity = sample_identity();
         identity.public_key_pem = identity.private_key_pem.clone();
         assert_eq!(
-            identity.reconnect_validation_error(None),
+            identity.reconnect_validation_error(),
             Some("the client identity public key has an invalid PEM label")
         );
 
@@ -1295,8 +1819,45 @@ mod tests {
             .expect("generate mismatched public key")
             .public_key_pem();
         assert_eq!(
-            identity.reconnect_validation_error(None),
+            identity.reconnect_validation_error(),
             Some("the client identity public and private keys do not match")
+        );
+    }
+
+    #[test]
+    fn reconnect_validation_rejects_a_mismatched_encryption_keypair() {
+        let mut identity = sample_identity();
+        identity.enc_public_key_pem = cloud_connect_crypto::EncryptionKeypair::generate()
+            .expect("generate mismatched encryption key")
+            .public_key_spki_pem();
+
+        assert_eq!(
+            identity.reconnect_validation_error(),
+            Some("the secret-delivery public and private keys do not match")
+        );
+    }
+
+    #[test]
+    fn enrollment_material_validation_binds_both_keypairs_and_the_csr() {
+        let material = IdentityStore::generate_enrollment().expect("generate material");
+        assert_eq!(material.validation_error(), None);
+
+        let mut mismatched_csr = material.clone();
+        mismatched_csr.csr_pem = IdentityStore::generate_enrollment()
+            .expect("generate mismatched CSR")
+            .csr_pem;
+        assert_eq!(
+            mismatched_csr.validation_error(),
+            Some("the certificate request and identity private key do not match")
+        );
+
+        let mut mismatched_encryption_key = material;
+        mismatched_encryption_key.enc_public_key_pem = IdentityStore::generate_enrollment()
+            .expect("generate mismatched encryption key")
+            .enc_public_key_pem;
+        assert_eq!(
+            mismatched_encryption_key.validation_error(),
+            Some("the secret-delivery public and private keys do not match")
         );
     }
 
@@ -1809,9 +2370,9 @@ mod tests {
     }
 
     /// A release racing attachment updates must win, exactly as it does for
-    /// app-id updates: both writers take the same lock, so the file is either
-    /// removed before the read (nothing to update) or after the write (removed
-    /// again).
+    /// app-id updates: both mutations take the same persistent transaction, so
+    /// an update either lands before removal, observes the removed file after
+    /// it, or is explicitly rejected while removal owns the directory.
     #[test]
     fn a_release_wins_over_concurrent_attachment_updates() {
         let dir = tempfile::tempdir().expect("create tempdir");
@@ -1825,7 +2386,13 @@ mod tests {
                         app_id: format!("400{i}"),
                         ..sample_attachment()
                     };
-                    IdentityStore::set_attachment(&path, Some(&attachment)).expect("attach");
+                    if let Err(error) = IdentityStore::set_attachment(&path, Some(&attachment)) {
+                        assert!(
+                            error.to_string().contains("Another live process"),
+                            "{error}"
+                        );
+                        break;
+                    }
                 }
             });
             IdentityStore::clear(&path).expect("clear");
@@ -1922,8 +2489,8 @@ mod tests {
     /// A release racing app-id updates must win: `store_app_id` reads the file
     /// and writes it back, so a removal landing between the two would be undone
     /// and the instance would keep talking to a control plane that released it.
-    /// Both sides take the same writer lock, which leaves only the two orderings
-    /// where the file ends up gone.
+    /// Both sides take the same persistent transaction, so a racing update may
+    /// be rejected, but no ordering can recreate the file after removal.
     #[test]
     fn a_release_wins_over_concurrent_app_id_updates() {
         let dir = tempfile::tempdir().expect("create tempdir");
@@ -1933,7 +2500,13 @@ mod tests {
         std::thread::scope(|scope| {
             let updater = scope.spawn(|| {
                 for i in 0..200 {
-                    IdentityStore::store_app_id(&path, &format!("400{i}")).expect("store app id");
+                    if let Err(error) = IdentityStore::store_app_id(&path, &format!("400{i}")) {
+                        assert!(
+                            error.to_string().contains("Another live process"),
+                            "{error}"
+                        );
+                        break;
+                    }
                 }
             });
             IdentityStore::clear(&path).expect("clear");
@@ -1967,9 +2540,15 @@ mod tests {
             rotated.app_id, None,
             "the renewal clone is stale by construction"
         );
-        let merged = IdentityStore::store_credential_update(&path, &rotated)
-            .expect("store rotated")
-            .expect("identity still present");
+        let CredentialUpdateOutcome::Stored(merged) = IdentityStore::store_credential_update(
+            &path,
+            &identity.identifier,
+            &identity.public_key_pem,
+            &rotated,
+        )
+        .expect("store rotated") else {
+            panic!("the expected credential generation must still be present");
+        };
 
         let loaded = IdentityStore::load_optional(&path)
             .expect("load")
@@ -1993,11 +2572,17 @@ mod tests {
             .expect("present");
         IdentityStore::set_attachment(&path, Some(&sample_attachment())).expect("attach");
 
-        let mut rotated = stale;
+        let mut rotated = stale.clone();
         rotated.private_key_pem = "ROTATED-KEY".to_string();
-        let merged = IdentityStore::store_credential_update(&path, &rotated)
-            .expect("store rotated")
-            .expect("identity still present");
+        let CredentialUpdateOutcome::Stored(merged) = IdentityStore::store_credential_update(
+            &path,
+            &stale.identifier,
+            &stale.public_key_pem,
+            &rotated,
+        )
+        .expect("store rotated") else {
+            panic!("the expected credential generation must still be present");
+        };
 
         let loaded = IdentityStore::load_optional(&path)
             .expect("load")
@@ -2021,11 +2606,47 @@ mod tests {
         IdentityStore::store(&path, &identity).expect("store");
         IdentityStore::clear(&path).expect("remove");
 
-        let stored = IdentityStore::store_credential_update(&path, &identity)
-            .expect("credential update is a no-op");
+        let stored = IdentityStore::store_credential_update(
+            &path,
+            &identity.identifier,
+            &identity.public_key_pem,
+            &identity,
+        )
+        .expect("credential update is a no-op");
 
-        assert!(stored.is_none());
+        assert!(matches!(stored, CredentialUpdateOutcome::Missing));
         assert!(IdentityStore::load_optional(&path).expect("load").is_none());
+    }
+
+    #[test]
+    fn credential_update_cannot_overwrite_a_replacement_identity() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join("identity.json");
+        let stale = sample_identity();
+        IdentityStore::store(&path, &stale).expect("store original identity");
+
+        let mut stale_update = stale.clone();
+        stale_update.private_key_pem = "STALE-ROTATED-KEY".to_string();
+        let replacement = sample_identity();
+        IdentityStore::store(&path, &replacement).expect("publish replacement identity");
+
+        let outcome = IdentityStore::store_credential_update(
+            &path,
+            &stale.identifier,
+            &stale.public_key_pem,
+            &stale_update,
+        )
+        .expect("reject stale update without losing the replacement");
+        let CredentialUpdateOutcome::Superseded(winner) = outcome else {
+            panic!("a new credential generation must supersede the stale update");
+        };
+
+        assert_eq!(winner.public_key_pem, replacement.public_key_pem);
+        let durable = IdentityStore::load_optional(&path)
+            .expect("load replacement")
+            .expect("replacement remains present");
+        assert_eq!(durable.public_key_pem, replacement.public_key_pem);
+        assert_eq!(durable.private_key_pem, replacement.private_key_pem);
     }
 
     #[test]
@@ -2040,8 +2661,13 @@ mod tests {
 
         let mut rotated = identity.clone();
         rotated.private_key_pem = "ROTATED-KEY".to_string();
-        let credential_error = IdentityStore::store_credential_update(&path, &rotated)
-            .expect_err("credential update must not overlap removal");
+        let credential_error = IdentityStore::store_credential_update(
+            &path,
+            &identity.identifier,
+            &identity.public_key_pem,
+            &rotated,
+        )
+        .expect_err("credential update must not overlap removal");
         let app_id_error = IdentityStore::set_app_id(&path, Some("4002"))
             .expect_err("app id update must not overlap removal");
         let attachment = AppAttachment {
@@ -2076,10 +2702,18 @@ mod tests {
         assert_eq!(stored.app_id, None);
 
         drop(removal);
-        let merged = IdentityStore::store_credential_update(&path, &rotated)
-            .expect("store after removal transaction")
-            .expect("identity remains");
+        let CredentialUpdateOutcome::Stored(merged) = IdentityStore::store_credential_update(
+            &path,
+            &identity.identifier,
+            &identity.public_key_pem,
+            &rotated,
+        )
+        .expect("store after removal transaction") else {
+            panic!("the original credential generation remains");
+        };
         assert_eq!(merged.private_key_pem, "ROTATED-KEY");
+        IdentityStore::clear(&path).expect("clear after transaction ownership is released");
+        assert!(IdentityStore::load_optional(&path).expect("load").is_none());
     }
 
     #[test]
@@ -2133,6 +2767,128 @@ mod tests {
         let path = dir.path().join("does-not-exist.json");
         let loaded = IdentityStore::load_optional(&path).expect("load");
         assert!(loaded.is_none());
+    }
+
+    #[test]
+    fn identity_parse_errors_never_echo_persisted_values() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join("identity.json");
+        let secret = "credential-value-that-must-stay-redacted";
+        std::fs::write(
+            &path,
+            format!(r#"{{"identifier":["{secret}"],"identity_cert_pem":"CERT","private_key_pem":"KEY","public_key_pem":"PUB"}}"#),
+        )
+        .expect("write malformed identity");
+
+        let error = IdentityStore::load_optional(&path)
+            .expect_err("the wrong identifier type must fail parsing");
+        let rendered = error.to_string();
+        assert!(rendered.contains("Failed to parse identity JSON"));
+        assert!(
+            !rendered.contains(secret),
+            "parse error leaked persisted data"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn identity_reads_reject_symlinks_without_reading_the_target() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let target = dir.path().join("outside.json");
+        let path = dir.path().join("identity.json");
+        std::fs::write(&target, "sensitive target").expect("write target");
+        symlink(&target, &path).expect("create identity symlink");
+
+        let error = IdentityStore::load_optional(&path).expect_err("symlink must be rejected");
+        assert!(matches!(error, Error::Io { .. }), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(target).expect("target remains readable"),
+            "sensitive target"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn identity_reads_reject_an_untrusted_symlink_ancestor() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir(&outside).expect("create target directory");
+        let target = outside.join("identity.json");
+        std::fs::write(&target, "sensitive target").expect("write target");
+        let redirected_parent = dir.path().join("redirected-config");
+        symlink(&outside, &redirected_parent).expect("create parent symlink");
+
+        let error = IdentityStore::load_optional(&redirected_parent.join("identity.json"))
+            .expect_err("a state path with an untrusted symlink ancestor must be rejected");
+
+        assert!(matches!(error, Error::Io { .. }), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(target).expect("target remains readable"),
+            "sensitive target"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn descriptor_traversal_rejects_a_parent_swapped_to_a_symlink_after_validation() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let config = dir.path().join("config");
+        std::fs::create_dir(&config).expect("create config directory");
+        std::fs::write(config.join("identity.json"), "safe identity").expect("write safe file");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir(&outside).expect("create target directory");
+        std::fs::write(outside.join("identity.json"), "redirected identity")
+            .expect("write redirected file");
+        let checked_config = dir.path().join("checked-config");
+        let identity_path = config.join("identity.json");
+
+        open_regular_file_optional_unix_with(&identity_path, || {
+            std::fs::rename(&config, &checked_config).expect("move checked directory");
+            symlink(&outside, &config).expect("replace parent with symlink");
+        })
+        .expect_err("descriptor-relative traversal must reject the raced parent symlink");
+
+        assert_eq!(
+            std::fs::read_to_string(outside.join("identity.json"))
+                .expect("redirected target remains readable"),
+            "redirected identity"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn identity_reads_reject_fifos_without_blocking() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt as _;
+        use std::os::unix::fs::FileTypeExt as _;
+
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join("identity.json");
+        let path_c = CString::new(path.as_os_str().as_bytes()).expect("FIFO path has no NUL");
+        // SAFETY: `path_c` is a valid NUL-terminated path and `0o600` is a
+        // valid mode. `mkfifo` retains neither argument.
+        let result = unsafe { libc::mkfifo(path_c.as_ptr(), 0o600) };
+        assert_eq!(
+            result,
+            0,
+            "create FIFO: {}",
+            std::io::Error::last_os_error()
+        );
+
+        let error = IdentityStore::load_optional(&path).expect_err("FIFO must be rejected");
+        assert!(matches!(error, Error::Io { .. }), "{error}");
+        assert!(
+            std::fs::metadata(path)
+                .expect("FIFO metadata")
+                .file_type()
+                .is_fifo()
+        );
     }
 
     /// An identity file written before the encryption keyring and cache key
@@ -2379,33 +3135,30 @@ mod tests {
     }
 
     #[test]
-    fn is_expired_detects_past_timestamp() {
+    fn is_expired_uses_the_signed_certificate_over_a_future_cached_timestamp() {
         let mut identity = sample_identity();
-        identity.not_after_unix = Some(1);
+        set_sample_certificate_validity(&mut identity, (2019, 1, 1), (2020, 1, 1));
+        identity.not_after_unix = Some(4_102_444_800);
         assert!(identity.is_expired());
     }
 
     #[test]
-    fn is_expired_treats_boundary_second_as_expired() {
-        // A cert whose `not_after_unix` equals the current second is past the
-        // NotAfter boundary and must be considered expired.
+    fn is_expired_falls_back_to_the_cached_timestamp_for_an_unparseable_certificate() {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .expect("system clock after unix epoch");
         let mut identity = sample_identity();
+        identity.identity_cert_pem = "not a certificate".to_string();
         identity.not_after_unix = Some(now);
         assert!(identity.is_expired());
     }
 
     #[test]
-    fn is_expired_accepts_future_timestamp() {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .expect("system clock after unix epoch");
+    fn is_expired_uses_the_signed_certificate_over_a_past_cached_timestamp() {
         let mut identity = sample_identity();
-        identity.not_after_unix = Some(now + 3600);
+        set_sample_certificate_validity(&mut identity, (2025, 1, 1), (2099, 1, 1));
+        identity.not_after_unix = Some(1);
         assert!(!identity.is_expired());
     }
 }

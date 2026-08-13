@@ -29,8 +29,8 @@ limitations under the License.
 //!    then enrolls this instance *before the runtime is built or any
 //!    listener binds*, so the durable identity exists by the time anything
 //!    else here runs.
-//! 2. `$SPICE_CONFIG_DIR/identity.json` exists (a previously enrolled
-//!    instance) — reconnection is automatic, with no flag.
+//! 2. `$SPICE_CONFIG_DIR/identity.json` contains a usable previously-enrolled
+//!    identity — reconnection is automatic, with no flag.
 //!
 //! If neither is true, this module never opens a connection. An existing
 //! identity always wins over a supplied `--token`: the key is not redeemed
@@ -80,9 +80,9 @@ use runtime::Runtime;
 use runtime::datafusion::query::Error as QueryError;
 use runtime::metrics_reader::MetricsReader;
 use runtime::status::ComponentStatus;
-use runtime_cloud_connect::config::{
-    CLOUD_MANAGED_SPICEPOD_FILE, CloudConnectConfig, IDENTITY_FILE,
-};
+#[cfg(test)]
+use runtime_cloud_connect::config::IDENTITY_FILE;
+use runtime_cloud_connect::config::{CLOUD_MANAGED_SPICEPOD_FILE, CloudConnectConfig};
 use runtime_cloud_connect::handlers::{
     Capability, CommandError, MAX_QUERY_RESULT_BYTES, QueryOutcome, RuntimeHandle, RuntimePhase,
     SpicepodDeployment, StatusReport, effective_max_rows,
@@ -126,44 +126,105 @@ const DEFAULT_LOG_TAIL_LINES: usize = 500;
 /// itself is bounded, this wait always settles.
 const INITIAL_LOAD_BUDGET: Duration = Duration::from_mins(2);
 
-/// Cheap probe for whether Spice Cloud Connect is configured for this
-/// instance, using the same signals as [`maybe_start`]: a `--token`
-/// enrollment bootstrap in progress, or an on-disk identity.
+/// The one durable-state decision made before the runtime is built.
 ///
-/// Called from `init_tracing` (before [`maybe_start`]) to decide whether to
-/// install the log-capture layer. It runs in the same process — hence the
-/// same working directory — as [`maybe_start`], so both resolve the config
-/// directory identically. This is a lightweight existence check; it does not
-/// read or validate the file (that happens in `maybe_start`).
-pub(crate) fn is_configured(token_supplied: bool) -> bool {
-    if token_supplied {
-        return true;
+/// The one-time `--token` is consumed before this runs, so it is never an
+/// activation signal. A usable identity exclusively activates credentialed
+/// facilities; observing an unusable identity only preserves the instance's
+/// cloud-managed configuration provenance.
+pub(crate) struct StartupState {
+    config_dir: PathBuf,
+    identity_observed: bool,
+    reconnectable_identity: Option<runtime_cloud_connect::ReconnectableIdentity>,
+}
+
+impl StartupState {
+    #[must_use]
+    pub(crate) fn config_dir(&self) -> &Path {
+        &self.config_dir
     }
-    CloudConnectConfig::default_config_dir()
-        .join(IDENTITY_FILE)
-        .exists()
+
+    #[must_use]
+    pub(crate) fn identity_observed(&self) -> bool {
+        self.identity_observed
+    }
+
+    #[must_use]
+    pub(crate) fn into_identity(self) -> Option<runtime_cloud_connect::ReconnectableIdentity> {
+        self.reconnectable_identity
+    }
 }
 
-/// Read the optional instance-local `cloud-endpoint` override file. This
-/// overrides the cloud **enroll** endpoint (state plane); the gateway (stream)
-/// address comes from the enroll response.
-fn read_endpoint_override(config_dir: &Path) -> Option<String> {
-    let path = config_dir.join("cloud-endpoint");
-    std::fs::read_to_string(path)
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-}
-
-/// Build a [`CloudConnectConfig`] from env + on-disk state.
-fn build_config(runtime_version: &str) -> CloudConnectConfig {
-    let mut config = CloudConnectConfig::from_env(runtime_version);
+pub(crate) async fn load_startup_state() -> StartupState {
+    let mut config = CloudConnectConfig::from_env(env!("CARGO_PKG_VERSION"));
     if std::env::var_os("SPICE_CLOUD_ENDPOINT").is_none()
-        && let Some(override_endpoint) = read_endpoint_override(&config.config_dir)
+        && let Err(error) = apply_endpoint_override(&mut config)
+    {
+        tracing::error!(
+            "Spice Cloud Connect is disabled for this start because the enrollment endpoint override at {} could not be read safely: {error}",
+            config.config_dir.join("cloud-endpoint").display()
+        );
+        let mut state = load_startup_state_from_config(&config).await;
+        state.reconnectable_identity = None;
+        return state;
+    }
+    load_startup_state_from_config(&config).await
+}
+
+/// Load the durable activation snapshot without making an optional Cloud
+/// Connect configuration failure fatal to the rest of the runtime.
+///
+/// The error is still surfaced at ERROR through the temporary startup
+/// subscriber installed by `main`; the absent activation token makes every
+/// credentialed Cloud Connect facility fail closed while configuration
+/// provenance remains available so the runtime can keep serving.
+async fn load_startup_state_from_config(config: &CloudConnectConfig) -> StartupState {
+    match runtime_cloud_connect::load_reconnectable_identity_async(config).await {
+        Ok(reconnectable_identity) => StartupState {
+            config_dir: config.config_dir.clone(),
+            identity_observed: reconnectable_identity.is_some(),
+            reconnectable_identity,
+        },
+        Err(error) => {
+            tracing::error!(
+                "Spice Cloud Connect is disabled for this start because its durable identity could not be activated: {error}"
+            );
+            StartupState {
+                config_dir: config.config_dir.clone(),
+                // Preserve deployment provenance only when identity contents
+                // were actually observed. An I/O failure can instead mean the
+                // whole config directory is unavailable; treating that as
+                // cloud-managed would make a second read failure abort startup.
+                identity_observed: identity_contents_were_observed(&error),
+                reconnectable_identity: None,
+            }
+        }
+    }
+}
+
+fn identity_contents_were_observed(error: &runtime_cloud_connect::Error) -> bool {
+    matches!(
+        error,
+        runtime_cloud_connect::Error::IdentityUnusable { .. }
+            | runtime_cloud_connect::Error::IdentityValidationTaskPanicked { .. }
+            | runtime_cloud_connect::Error::IdentityLoad {
+                source: runtime_cloud_connect::identity::Error::Parse { .. },
+                ..
+            }
+    )
+}
+
+/// Apply the optional instance-local `cloud-endpoint` override. This overrides
+/// the cloud **enroll** endpoint (state plane); the gateway (stream) address
+/// comes from the enroll response. An unsafe or unreadable file is an error so
+/// the caller cannot silently renew against another control plane.
+fn apply_endpoint_override(config: &mut CloudConnectConfig) -> std::io::Result<()> {
+    if let Some(override_endpoint) =
+        CloudConnectConfig::read_enroll_endpoint_override(&config.config_dir)?
     {
         config.enroll_endpoint = override_endpoint;
     }
-    config
+    Ok(())
 }
 
 /// Why a `--token` bootstrap could not produce a durable identity. Every
@@ -184,6 +245,15 @@ pub enum BootstrapEnrollmentError {
          'us-west-2' or 'on-prem-syd'). See: https://spiceai.org/docs"
     ))]
     InvalidRegion { region: String },
+
+    #[snafu(display(
+        "Failed to enroll this instance with Spice Cloud: the enrollment endpoint override at {} could not be read safely: {source}",
+        path.display()
+    ))]
+    EndpointOverride {
+        path: PathBuf,
+        source: std::io::Error,
+    },
 
     #[snafu(display("Failed to enroll this instance with Spice Cloud ({endpoint}): {source}"))]
     Enroll {
@@ -209,8 +279,8 @@ pub enum BootstrapEnrollmentError {
 /// # Errors
 ///
 /// Returns [`BootstrapEnrollmentError`] when the key or region is malformed
-/// (checked locally, never echoed) or when [`enroll_now`] fails terminally
-/// or exhausts its retry budget.
+/// (checked locally, never echoed), the endpoint override cannot be read
+/// safely, or [`enroll_now`] fails terminally or exhausts its retry budget.
 pub async fn bootstrap_enrollment(args: &mut crate::Args) -> Result<(), BootstrapEnrollmentError> {
     use runtime_cloud_connect::{
         EnrollNowOutcome, EnrollmentAuthority, EnrollmentKey, RetryPolicy,
@@ -237,7 +307,12 @@ pub async fn bootstrap_enrollment(args: &mut crate::Args) -> Result<(), Bootstra
         });
     }
 
-    let mut config = build_config(env!("CARGO_PKG_VERSION"));
+    let mut config = CloudConnectConfig::from_env(env!("CARGO_PKG_VERSION"));
+    if std::env::var_os("SPICE_CLOUD_ENDPOINT").is_none() {
+        let path = config.config_dir.join("cloud-endpoint");
+        apply_endpoint_override(&mut config)
+            .map_err(|source| BootstrapEnrollmentError::EndpointOverride { path, source })?;
+    }
     config.instance_region = args.region.clone();
 
     let authority = EnrollmentAuthority::Token {
@@ -301,18 +376,19 @@ pub struct CloudManagedSpicepodReadError {
     pub source: std::io::Error,
 }
 
-/// The cloud-managed spicepod this instance starts on, or `None` when Cloud
-/// Connect is not configured or no deployment has ever landed here.
+/// The cloud-managed spicepod this instance starts on, or `None` when no
+/// durable identity state was observed or no deployment has ever landed here.
 ///
 /// Reads files only — no control-plane round trip — so an instance whose
-/// gateway is unreachable still comes up on its deployed configuration.
+/// credentials are expired, corrupt, or otherwise unusable still comes up on
+/// its deployed configuration without activating Cloud Connect.
 pub async fn cloud_managed_spicepod(
-    token_supplied: bool,
+    config_dir: &Path,
+    identity_observed: bool,
 ) -> std::result::Result<Option<CloudManagedSpicepod>, CloudManagedSpicepodReadError> {
-    if !is_configured(token_supplied) {
+    if !identity_observed {
         return Ok(None);
     }
-    let config_dir = CloudConnectConfig::default_config_dir();
     let path = config_dir.join(CLOUD_MANAGED_SPICEPOD_FILE);
     read_cloud_managed_spicepod(path).await
 }
@@ -352,14 +428,11 @@ pub struct DeliveredSecretsState {
 /// the config dir, so a restart restores its secrets with the gateway
 /// unreachable. That is the property the local cache key buys.
 pub async fn restore_delivered_secrets(
-    runtime_version: &str,
     runtime: &Arc<Runtime>,
-    token_supplied: bool,
+    identity: Option<&runtime_cloud_connect::ReconnectableIdentity>,
 ) -> Option<DeliveredSecretsState> {
-    if !is_configured(token_supplied) {
-        return None;
-    }
-    let config = build_config(runtime_version);
+    let identity = identity?;
+    let config = identity.config();
 
     // Registered as a built-in so `${ secrets:NAME }` reaches it with nothing
     // declared in the spicepod, it sits below every user-declared store, and a
@@ -370,7 +443,7 @@ pub async fn restore_delivered_secrets(
         Arc::clone(&store) as Arc<dyn runtime::secrets::SecretStore>,
     );
 
-    load_cached_secrets(&config, &store);
+    load_cached_secrets(config, &store, identity);
     Some(DeliveredSecretsState { store })
 }
 
@@ -393,43 +466,21 @@ pub async fn restore_delivered_secrets(
 /// `runtime_overrides` are the process's `--set-runtime` values, which a
 /// deployment has to carry the same way a start onto the same file would.
 pub async fn maybe_start(
-    runtime_version: &str,
     runtime: Arc<Runtime>,
+    identity: Option<runtime_cloud_connect::ReconnectableIdentity>,
     delivered_secrets: Option<DeliveredSecretsState>,
     running_deployment: Option<CloudManagedSpicepod>,
     metrics: Option<MetricsReader>,
     runtime_overrides: Vec<(String, String)>,
 ) -> Option<CloudConnect> {
-    let config = build_config(runtime_version);
-
-    // Quick sanity probe — no identity means disabled. Surface a load/parse
-    // error (corrupt or unreadable identity.json) rather than silently
-    // treating it as "not enrolled", so a broken identity file is visible
-    // to the operator instead of quietly disabling Cloud Connect.
-    let mut persisted_app_id = None;
-    let has_identity = match IdentityStore::load_optional(&config.identity_path) {
-        Ok(opt) => {
-            // Restores the metrics attribution across a restart. Without it the
-            // instance exports nothing until its next deploy, which may be days.
-            persisted_app_id = opt.as_ref().and_then(|i| i.app_id.clone());
-            opt.is_some()
-        }
-        Err(err) => {
-            tracing::warn!(
-                "Spice Cloud Connect: could not read identity at {}: {err}; \
-                 treating as not-enrolled — fix or remove the file to re-enroll",
-                config.identity_path.display()
-            );
-            false
-        }
-    };
-    if !has_identity {
-        tracing::debug!(
-            "Spice Cloud Connect: disabled (no identity at {})",
-            config.identity_path.display()
-        );
+    let Some(identity) = identity else {
+        tracing::debug!("Spice Cloud Connect: disabled (no usable persisted identity)");
         return None;
-    }
+    };
+    let config = identity.config();
+    // Restores metrics attribution across a restart. Without it the instance
+    // exports nothing until its next deploy, which may be days.
+    let persisted_app_id = identity.app_id().map(str::to_string);
 
     tracing::info!(
         "Spice Cloud Connect: enabled, enroll_endpoint={}",
@@ -469,7 +520,7 @@ pub async fn maybe_start(
             CLOUD_DELIVERED_STORE,
             Arc::clone(&store) as Arc<dyn runtime::secrets::SecretStore>,
         );
-        load_cached_secrets(&config, &store);
+        load_cached_secrets(config, &store, &identity);
         store
     };
 
@@ -489,16 +540,7 @@ pub async fn maybe_start(
             initial_load_budget: INITIAL_LOAD_BUDGET,
         }));
 
-    match CloudConnect::start(config, handle).await {
-        Ok(Some(client)) => Some(client),
-        Ok(None) => None,
-        Err(err) => {
-            tracing::warn!(
-                "Spice Cloud Connect: failed to start (continuing without cloud management): {err}"
-            );
-            None
-        }
-    }
+    Some(CloudConnect::start_reconnectable(handle, identity))
 }
 
 /// Load the delivered-secrets cache into `store`.
@@ -511,12 +553,12 @@ pub async fn maybe_start(
 /// wrong-key, or unknown-version cache is discarded with an actionable warning
 /// and the instance comes up with no delivered secrets, which one deployment
 /// restores. Crashing here would make a corrupt file unbootable.
-fn load_cached_secrets(config: &CloudConnectConfig, store: &CloudDeliveredSecretStore) {
-    let Some(key) = IdentityStore::load_optional(&config.identity_path)
-        .ok()
-        .flatten()
-        .and_then(|identity| identity.cache_key())
-    else {
+fn load_cached_secrets(
+    config: &CloudConnectConfig,
+    store: &CloudDeliveredSecretStore,
+    identity: &runtime_cloud_connect::ReconnectableIdentity,
+) {
+    let Some(key) = identity.cache_key() else {
         // No identity yet (a first boot that will enroll below), or one that
         // predates the cache key. Either way there is nothing to restore.
         return;
@@ -1908,6 +1950,119 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_unusable_identity_disables_cloud_connect_without_aborting_startup() {
+        let dir = scratch_dir("unusable-startup-identity");
+        let identity_path = dir.join(IDENTITY_FILE);
+        std::fs::write(&identity_path, "not valid identity JSON")
+            .expect("write malformed identity");
+        let mut config = CloudConnectConfig::from_env("test-runtime");
+        config.config_dir.clone_from(&dir);
+        config.identity_path = identity_path;
+
+        let state = load_startup_state_from_config(&config).await;
+        assert!(
+            state.reconnectable_identity.is_none(),
+            "an optional integration's unusable identity must fail Cloud Connect closed without failing spiced"
+        );
+        assert!(
+            state.identity_observed,
+            "invalid credentials must not erase cloud-managed configuration provenance"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unsafe_endpoint_override_is_a_configuration_error() {
+        use std::os::unix::fs::symlink;
+
+        let dir = scratch_dir("unsafe-endpoint-override");
+        let target = dir.join("redirected-endpoint");
+        std::fs::write(&target, "https://wrong-control-plane.example")
+            .expect("write target endpoint");
+        symlink(&target, dir.join("cloud-endpoint")).expect("create endpoint symlink");
+        let mut config = CloudConnectConfig::from_env("test-runtime");
+        config.config_dir.clone_from(&dir);
+
+        apply_endpoint_override(&mut config)
+            .expect_err("an unsafe override must disable enrollment and renewal");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn an_unusable_identity_still_restores_its_managed_spicepod() {
+        let dir = scratch_dir("unusable-identity-managed-spicepod");
+        let identity_path = dir.join(IDENTITY_FILE);
+        std::fs::write(&identity_path, "not valid identity JSON")
+            .expect("write malformed identity");
+        std::fs::write(dir.join(CLOUD_MANAGED_SPICEPOD_FILE), VALID_SPICEPOD)
+            .expect("write managed spicepod");
+        let mut config = CloudConnectConfig::from_env("test-runtime");
+        config.config_dir.clone_from(&dir);
+        config.identity_path = identity_path;
+
+        let state = load_startup_state_from_config(&config).await;
+        let deployed = cloud_managed_spicepod(state.config_dir(), state.identity_observed())
+            .await
+            .expect("read managed spicepod")
+            .expect("managed spicepod remains selected");
+        assert_eq!(deployed.spicepod_yaml, VALID_SPICEPOD);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_identity_does_not_force_a_second_config_directory_read() {
+        let dir = scratch_dir("unreadable-identity-does-not-force-managed-read");
+        let identity_path = dir.join(IDENTITY_FILE);
+        std::fs::create_dir(&identity_path).expect("make the identity path unreadable as a file");
+        std::fs::write(dir.join(CLOUD_MANAGED_SPICEPOD_FILE), VALID_SPICEPOD)
+            .expect("write managed spicepod");
+        let mut config = CloudConnectConfig::from_env("test-runtime");
+        config.config_dir.clone_from(&dir);
+        config.identity_path = identity_path;
+
+        let state = load_startup_state_from_config(&config).await;
+        assert!(state.reconnectable_identity.is_none());
+        assert!(
+            !state.identity_observed,
+            "an identity I/O error does not prove durable cloud-managed provenance"
+        );
+        assert!(
+            cloud_managed_spicepod(state.config_dir(), state.identity_observed())
+                .await
+                .expect("the managed spicepod read is skipped")
+                .is_none()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_removed_identity_does_not_restore_a_stale_managed_spicepod() {
+        let dir = scratch_dir("removed-identity-stale-managed-spicepod");
+        std::fs::write(dir.join(CLOUD_MANAGED_SPICEPOD_FILE), VALID_SPICEPOD)
+            .expect("write stale managed spicepod");
+        let mut config = CloudConnectConfig::from_env("test-runtime");
+        config.config_dir.clone_from(&dir);
+        config.identity_path = dir.join(IDENTITY_FILE);
+
+        let state = load_startup_state_from_config(&config).await;
+        assert!(!state.identity_observed());
+        assert!(
+            cloud_managed_spicepod(state.config_dir(), state.identity_observed())
+                .await
+                .expect("check managed spicepod")
+                .is_none(),
+            "release removes the identity marker, so stale deployment state must stay inactive"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn a_missing_managed_deployment_is_an_ordinary_absence() {
         let dir = scratch_dir("managed-missing");
         let path = dir.join(CLOUD_MANAGED_SPICEPOD_FILE);
@@ -2306,7 +2461,7 @@ datasets:
             "views:\n  - name: v\n    sql: SELECT 1\n",
             "catalogs:\n  - from: spice.ai\n    name: c\n",
             "models:\n  - from: openai\n    name: m\n",
-            "functions:\n  - name: f\n    from: https://example.com\n",
+            "functions:\n  - name: f\n    from: https://example.com\n    signature:\n      args: []\n      returns: int64\n",
         ];
         for change in changes {
             // Appending to `ACTIVE` would leave two `datasets:` keys, so the
@@ -2341,13 +2496,19 @@ datasets:
                 "extensions",
                 "extensions:\n  spice_cloud:\n    enabled: true\n",
             ),
-            ("management", "management:\n  enabled: true\n"),
+            (
+                "management",
+                "management:\n  enabled: true\n  api_key: test-api-key\n",
+            ),
             ("rerankers", "rerankers:\n  - name: r\n    from: openai\n"),
             ("runtime", "runtime:\n  dataset_load_parallelism: 2\n"),
             ("secrets", "secrets:\n  - from: env\n    name: env\n"),
             ("snapshots", "snapshots:\n  enabled: true\n"),
-            ("tools", "tools:\n  - name: t\n    from: builtin\n"),
-            ("workers", "workers:\n  - name: w\n    from: builtin\n"),
+            (
+                "tools",
+                "tools:\n  - name: t\n    from: builtin:list_datasets\n",
+            ),
+            ("workers", "workers:\n  - name: w\n    sql: SELECT 1\n"),
         ];
         for (section, change) in changes {
             let deployed = with_sections(change);
@@ -2410,7 +2571,7 @@ datasets:
     async fn a_mixed_deployment_serves_its_components_and_names_the_rest() {
         let dir = scratch_dir("split-mixed");
         let deployed = with_sections(
-            "runtime:\n  dataset_load_parallelism: 2\ntools:\n  - name: t\n    from: builtin\nviews:\n  - name: v\n    sql: SELECT 1\n",
+            "runtime:\n  dataset_load_parallelism: 2\ntools:\n  - name: t\n    from: builtin:list_datasets\nviews:\n  - name: v\n    sql: SELECT 1\n",
         );
         let split = split(&dir, ACTIVE, &deployed).await;
 
@@ -2815,7 +2976,7 @@ views:
     sql: SELECT 1 AS n
 tools:
   - name: local_tool
-    from: builtin
+    from: builtin:list_datasets
 ";
         let handle = handle_serving_locally(&dir, local).await;
 
@@ -2830,7 +2991,7 @@ views:
     sql: SELECT 2 AS n
 tools:
   - name: local_tool
-    from: builtin
+    from: builtin:list_datasets
 ";
         let document = handle
             .apply_spicepod(deployment(&dir, deployed))
@@ -2852,7 +3013,8 @@ tools:
 
         // And a start-time section it does change is reported against that same
         // baseline rather than being lost with it.
-        let changes_tools = deployed.replace("from: builtin", "from: https://example.com");
+        let changes_tools =
+            deployed.replace("from: builtin:list_datasets", "from: https://example.com");
         let document = handle
             .apply_spicepod(deployment(&dir, &changes_tools))
             .await
@@ -2860,7 +3022,7 @@ tools:
         assert_eq!(document["restart_required"], serde_json::json!(["tools"]));
         assert_eq!(
             active_app(&handle).await.tools[0].from,
-            "builtin",
+            "builtin:list_datasets",
             "the tool this instance started with is the one it keeps"
         );
 
