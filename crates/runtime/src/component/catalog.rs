@@ -450,25 +450,25 @@ mod tests {
         assert!(mapped.is_durable());
     }
 
-    /// The per-table acceleration a catalog expands into. Two consumers depend on
+    /// The dataset acceleration a catalog converts into. Two consumers depend on
     /// this being exactly what the accelerated tables are configured with: the
     /// catalog connector, which adds only the per-table key on top of it, and the
     /// runtime builder's Cayenne memory budgets, which classify it (#13013).
     #[test]
-    fn test_catalog_acceleration_expands_to_the_per_table_acceleration() {
+    fn test_catalog_acceleration_converts_to_the_dataset_acceleration() {
         let acceleration = CatalogAcceleration::from(cayenne_file_acceleration());
 
-        let expanded = acceleration.to_dataset_acceleration();
+        let converted = acceleration.to_dataset_acceleration();
 
-        assert!(expanded.enabled);
-        assert_eq!(expanded.engine.as_deref(), Some("cayenne"));
+        assert!(converted.enabled);
+        assert_eq!(converted.engine.as_deref(), Some("cayenne"));
         assert_eq!(
-            expanded.refresh_mode,
+            converted.refresh_mode,
             Some(spicepod::acceleration::RefreshMode::Changes)
         );
-        assert_eq!(expanded.mode, spicepod::acceleration::Mode::File);
+        assert_eq!(converted.mode, spicepod::acceleration::Mode::File);
         assert_eq!(
-            expanded
+            converted
                 .params
                 .as_ref()
                 .map(spicepod::param::Params::as_string_map)
@@ -480,11 +480,11 @@ mod tests {
         // The per-table key is the connector's to fill in; the catalog schema has no
         // place to declare one, so leaving a stale value here would key every table
         // on the same columns.
-        assert_eq!(expanded.primary_key, None);
-        assert!(expanded.on_conflict.is_empty());
+        assert_eq!(converted.primary_key, None);
+        assert!(converted.on_conflict.is_empty());
 
         // Params are omitted entirely rather than serialized as an empty block, so an
-        // expanded acceleration matches a hand-written one with no `params`.
+        // converted acceleration matches a hand-written one with no `params`.
         let no_params = CatalogAcceleration::from(spicepod_catalog::CatalogAcceleration {
             params: None,
             ..cayenne_file_acceleration()

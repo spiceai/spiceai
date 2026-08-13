@@ -1241,8 +1241,9 @@ pub fn streams_cdc_changes(app: Option<&Arc<app::App>>) -> bool {
 /// own `acceleration` block and is initialized through the same
 /// `DataAccelerator::init` path as a dataset
 /// (`init::view::initialize_views_accelerators`, which resolves any engine in the
-/// registry); a catalog carries `CatalogAcceleration`, which expands into one
-/// dataset acceleration per discovered table (see [`cayenne_accelerations`]).
+/// registry); a catalog carries `CatalogAcceleration`, which is converted into the
+/// dataset acceleration its tables are configured with (see
+/// [`cayenne_accelerations`]).
 ///
 /// Each acceleration is classified by `RefreshWriteProfile::from_spicepod` — the
 /// same mapping `dataaccelerator::cayenne` uses to configure the table — so the
@@ -1393,12 +1394,20 @@ fn plan_cayenne_memory_budgets(
 /// except `full`, so its unset default is the whole-table replace.
 ///
 /// A catalog carries `CatalogAcceleration` rather than a dataset's `Acceleration`,
-/// so it is expanded through
-/// [`runtime_component::catalog::CatalogAcceleration::to_dataset_acceleration`] —
-/// the same mapping the catalog connector applies to every table it accelerates,
-/// so the budget classifies exactly what the tables are configured with. The
-/// yielded acceleration is therefore owned for a catalog and borrowed for the two
-/// component kinds that declare one directly.
+/// so it is CONVERTED into one — through
+/// [`runtime_component::catalog::CatalogAcceleration::to_dataset_acceleration`],
+/// the same conversion the catalog connector configures every table it accelerates
+/// from — and then classified like any other. That is a config-shape conversion
+/// only: it reads the Spicepod, discovers nothing, and yields one item per catalog
+/// rather than one per table (see `count_compaction_eligible_accelerations` and
+/// `estimate_cayenne_reservation_bytes` for what that means for each consumer).
+/// Converting rather than classifying `CatalogAcceleration` in place is what keeps
+/// `RefreshWriteProfile` the single classifier; the eventual home for this is a
+/// trait both acceleration types implement, the pre-init counterpart of
+/// `AccelerationSource`.
+///
+/// The yielded acceleration is therefore owned for a catalog and borrowed for the
+/// two component kinds that declare one directly.
 #[cfg(not(windows))]
 fn cayenne_accelerations(
     app: &Arc<app::App>,
@@ -1426,7 +1435,7 @@ fn cayenne_accelerations(
             )
         }))
         .chain(app.catalogs.iter().map(|catalog| {
-            let expanded = catalog.acceleration.clone().map(|acceleration| {
+            let converted = catalog.acceleration.clone().map(|acceleration| {
                 Cow::Owned(
                     runtime_component::catalog::CatalogAcceleration::from(acceleration)
                         .to_dataset_acceleration(),
@@ -1434,7 +1443,7 @@ fn cayenne_accelerations(
             });
             // The expansion always names a `refresh_mode` (catalog acceleration
             // requires one), so this fallback is never consulted.
-            (expanded, RefreshMode::Changes)
+            (converted, RefreshMode::Changes)
         }))
         .filter_map(|(accel, unset)| accel.map(|accel| (accel, unset)))
         .filter(|(accel, _)| {
@@ -2816,11 +2825,11 @@ mod test {
     }
 
     /// Regression for #13013: a pod whose only Cayenne acceleration is a catalog must
-    /// be budgeted on the same terms as the equivalent set of datasets. A catalog
-    /// expands into one CDC-accelerated Cayenne table per discovered table, so it
-    /// reaches the in-memory CDC tier (the query-pool reduction that leaves room for
-    /// that tier is gated on it) and takes the compaction carve whenever its storage
-    /// mode accumulates Vortex files.
+    /// be budgeted on the same terms as the equivalent set of datasets. Every table a
+    /// catalog accelerates is a CDC-accelerated Cayenne table, so the catalog reaches
+    /// the in-memory CDC tier (the query-pool reduction that leaves room for that
+    /// tier is gated on it) and takes the compaction carve whenever its storage mode
+    /// accumulates Vortex files.
     ///
     /// Asserted against an equivalent dataset rather than against literals, so the
     /// two component kinds cannot drift apart as the classification evolves.

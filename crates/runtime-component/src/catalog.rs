@@ -47,16 +47,29 @@ impl CatalogAcceleration {
         matches!(self.mode, Mode::File | Mode::FileUpdate)
     }
 
-    /// The dataset-level acceleration every table this catalog accelerates is
-    /// configured with: the catalog's engine, storage mode and accelerator params,
-    /// on the one refresh mode catalog acceleration supports.
+    /// Convert this catalog acceleration into the dataset-level acceleration every
+    /// table it accelerates is configured with: the catalog's engine, storage mode
+    /// and accelerator params, on the one refresh mode catalog acceleration
+    /// supports.
     ///
-    /// This is the single mapping from a catalog's acceleration onto the per-table
-    /// shape it expands into, so the two consumers cannot drift: the catalog
-    /// connector fills in the per-table `primary_key`/`on_conflict` on top of it
-    /// before building each dataset, and the runtime builder classifies it for the
-    /// Cayenne memory budgets — which therefore budget for exactly the tables the
-    /// catalog creates.
+    /// This is a config-shape conversion, not a table enumeration — it names no
+    /// table, connects to nothing, and yields one value per catalog however many
+    /// tables that catalog goes on to accelerate.
+    ///
+    /// It is the single conversion both consumers go through, so the two cannot
+    /// drift: the catalog connector fills in the per-table
+    /// `primary_key`/`on_conflict` on top of it before building each dataset, and
+    /// the runtime builder classifies it for the Cayenne memory budgets — which
+    /// therefore budget for exactly what the catalog's tables are configured with.
+    ///
+    /// Converting is what keeps a single classifier. Answering "does this reach the
+    /// CDC tier / accumulate files?" from `CatalogAcceleration` directly would state
+    /// in a second place what `RefreshWriteProfile` already decides for a dataset,
+    /// and the two would drift the first time that mapping changed. If a third
+    /// component kind ever needs the same analysis, this conversion is the seam to
+    /// replace with a trait both acceleration types implement — the pre-init
+    /// counterpart of `AccelerationSource`, which serves that role after
+    /// initialization.
     #[must_use]
     pub fn to_dataset_acceleration(&self) -> spicepod::acceleration::Acceleration {
         spicepod::acceleration::Acceleration {
