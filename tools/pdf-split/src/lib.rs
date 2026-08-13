@@ -26,10 +26,11 @@ limitations under the License.
 //! Output file names are zero-indexed (`p0000.pdf`, `p0001.pdf`, …) to match
 //! `FinanceBench`'s zero-indexed `evidence_page_num`.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use lopdf::Document;
-use snafu::{ResultExt, Snafu};
+use lopdf::{Document, Object, ObjectId};
+use snafu::{OptionExt, ResultExt, Snafu};
 
 #[derive(Snafu, Debug)]
 pub enum Error {
@@ -60,16 +61,26 @@ pub enum Error {
         page: usize,
         source: std::io::Error,
     },
+
+    #[snafu(display("Page {page} missing from page tree of {path}", path = path.display()))]
+    PageMissing { path: PathBuf, page: usize },
+
+    #[snafu(display("Failed to trim page {page} of {path}: {source}", path = path.display()))]
+    TrimPage {
+        path: PathBuf,
+        page: usize,
+        source: lopdf::Error,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// Split a single PDF into one single-page PDF per page, written to `out_dir`.
 ///
-/// For each page the source document is cloned and every other page deleted,
-/// leaving a one-page document that is saved as `<out_dir>/pNNNN.pdf` with a
-/// zero-indexed, zero-padded page number. Returns the written paths in page
-/// order.
+/// For each page the source document is cloned and its page tree trimmed to
+/// that single page, leaving a one-page document that is saved as
+/// `<out_dir>/pNNNN.pdf` with a zero-indexed, zero-padded page number. Returns
+/// the written paths in page order.
 ///
 /// The split is idempotent: if `out_dir` already holds exactly one `pNNNN.pdf`
 /// per source page, the existing files are returned without re-writing them.
@@ -95,18 +106,28 @@ pub fn split_pdf(input: &Path, out_dir: &Path) -> Result<Vec<PathBuf>> {
         return Ok(expected);
     }
 
+    // `keep_page_id` is the leaf `Page` object for each 1-indexed page number.
+    let pages: BTreeMap<u32, ObjectId> = doc.get_pages();
+
     let mut written = Vec::with_capacity(page_numbers.len());
-    for (idx, keep) in page_numbers.iter().enumerate() {
+    for (idx, page_number) in page_numbers.iter().enumerate() {
+        let keep_page_id = *pages.get(page_number).context(PageMissingSnafu {
+            path: input,
+            page: idx,
+        })?;
+
+        // Clone the whole document — this preserves every inherited page-tree
+        // attribute (Resources, MediaBox, Rotate, …) for the kept page. Then,
+        // instead of deleting the other N-1 pages (each deletion traverses the
+        // whole object graph, making a full split O(pages^2 * objects)), trim
+        // the page tree to just the kept page's ancestor chain and prune the
+        // now-unreferenced objects in a single pass.
         let mut page_doc = doc.clone();
-        let to_delete: Vec<u32> = page_numbers
-            .iter()
-            .filter(|n| *n != keep)
-            .copied()
-            .collect();
-        page_doc.delete_pages(&to_delete);
+        retain_single_page(&mut page_doc, keep_page_id).context(TrimPageSnafu {
+            path: input,
+            page: idx,
+        })?;
         page_doc.prune_objects();
-        page_doc.renumber_objects();
-        page_doc.compress();
 
         let out_path = out_dir.join(page_file_name(idx));
         page_doc.save(&out_path).context(SavePageSnafu {
@@ -117,6 +138,69 @@ pub fn split_pdf(input: &Path, out_dir: &Path) -> Result<Vec<PathBuf>> {
     }
 
     Ok(written)
+}
+
+/// Trim `doc`'s page tree so `keep_page_id` is the only reachable page.
+///
+/// Walks the kept page's `Parent` chain to the page-tree root and, at every
+/// intermediate `Pages` node, replaces `Kids` with just the child on that chain
+/// and sets `Count` to 1. The ancestor chain itself is left intact, so every
+/// attribute the kept page inherits (`Resources`, `MediaBox`, `Rotate`, …) is
+/// preserved. Callers should follow with `prune_objects` to drop the sibling
+/// pages and subtrees this leaves unreferenced.
+fn retain_single_page(doc: &mut Document, keep_page_id: ObjectId) -> Result<(), lopdf::Error> {
+    strip_cross_page_catalog_refs(doc);
+
+    let mut child = keep_page_id;
+    // Bound the walk by the object count so a malformed `Parent` cycle cannot
+    // loop forever.
+    let max_depth = doc.objects.len() + 1;
+    for _ in 0..max_depth {
+        let parent = doc
+            .get_object(child)
+            .and_then(Object::as_dict)?
+            .get(b"Parent")
+            .and_then(Object::as_reference);
+        let Ok(parent_id) = parent else {
+            // Reached the page-tree root (a `Pages` node has no `Parent`).
+            return Ok(());
+        };
+        let parent_dict = doc
+            .get_object_mut(parent_id)
+            .and_then(Object::as_dict_mut)?;
+        parent_dict.set("Kids", vec![Object::Reference(child)]);
+        parent_dict.set("Count", 1);
+        child = parent_id;
+    }
+    Err(lopdf::Error::ReferenceCycle(child))
+}
+
+/// Remove document-catalog entries that reference pages other than the one being
+/// kept, so `prune_objects` can drop the other pages' content.
+///
+/// Tagged PDFs (SEC filings are tagged) carry a `/StructTreeRoot` accessibility
+/// tree that reaches every page's marked content; named destinations, outlines,
+/// and forms do the same. Left in place, these keep every content stream
+/// reachable and defeat pruning — one split page then re-serializes the whole
+/// document. None of them are needed to extract a page's text, so they are
+/// dropped. The kept page's own `/Contents` and `/Resources` are referenced by
+/// the page itself and are unaffected.
+fn strip_cross_page_catalog_refs(doc: &mut Document) {
+    let Ok(catalog_id) = doc.trailer.get(b"Root").and_then(Object::as_reference) else {
+        return;
+    };
+    if let Ok(catalog) = doc.get_object_mut(catalog_id).and_then(Object::as_dict_mut) {
+        for key in [
+            b"StructTreeRoot".as_slice(),
+            b"Outlines",
+            b"Names",
+            b"Dests",
+            b"AcroForm",
+            b"MarkInfo",
+        ] {
+            catalog.remove(key);
+        }
+    }
 }
 
 /// Split every `*.pdf` in `input_dir` (non-recursively) into `<out_dir>/<stem>/pNNNN.pdf`.
