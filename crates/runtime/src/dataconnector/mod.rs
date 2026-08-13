@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::accelerated::{self, AcceleratedTable};
 use crate::component::ComponentInitialization;
 use crate::component::catalog::Catalog;
 use crate::component::dataset::Dataset;
@@ -28,6 +27,7 @@ pub(crate) use crate::parameters::Parameters;
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use data_components::cdc::ChangesStream;
+use data_connector_api::accelerated::{AcceleratorSetup, RegisteredAcceleratedTable};
 use datafusion::datasource::TableProvider;
 use linkme::distributed_slice;
 pub use parameters::ConnectorParams;
@@ -453,18 +453,17 @@ pub trait DataConnector: Debug + Send + Sync + 'static {
     }
 
     /// A hook called **before** the accelerated table is built, giving the
-    /// connector a chance to wrap or replace the accelerator provider on the
-    /// [`Builder`](crate::accelerated::Builder).
+    /// connector a chance to wrap or replace the accelerator's provider.
     ///
-    /// Any provider set here will be shared with the [`Refresher`] that is
-    /// created during [`Builder::build`]. Use this hook instead of
+    /// Any provider set here will be shared with the [`Refresher`] created when
+    /// the table is built. Use this hook instead of
     /// [`on_accelerated_table_registration`](Self::on_accelerated_table_registration)
     /// when the wrapped provider must be visible to the refresh pipeline
     /// (e.g. to recreate indexes after a data refresh).
     async fn on_accelerator_setup(
         &self,
         _dataset: &Dataset,
-        _builder: &mut accelerated::Builder,
+        _accelerator: &mut dyn AcceleratorSetup,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Ok(())
     }
@@ -478,7 +477,7 @@ pub trait DataConnector: Debug + Send + Sync + 'static {
     async fn on_accelerated_table_registration(
         &self,
         _dataset: &Dataset,
-        _accelerated_table: &mut AcceleratedTable,
+        _accelerated_table: &mut dyn RegisteredAcceleratedTable,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Ok(())
     }

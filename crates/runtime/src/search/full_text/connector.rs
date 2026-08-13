@@ -22,7 +22,6 @@ use search::index::compound::CompoundSearchIndex;
 use std::any::Any;
 use std::sync::Arc;
 
-use crate::accelerated::{self, AcceleratedTable};
 use crate::changes::{Indexes, index_change_envelope};
 use crate::component::{
     ComponentInitialization,
@@ -31,6 +30,7 @@ use crate::component::{
 use crate::dataconnector::{DataConnector, DataConnectorError, DataConnectorResult};
 use crate::federated::FederatedTable;
 use crate::search::full_text::table::add_full_text_search_to_table;
+use data_connector_api::accelerated::{AcceleratorSetup, RegisteredAcceleratedTable};
 use futures::StreamExt;
 use runtime_metrics::component::MetricsProvider;
 use spice_table::LayerWalk;
@@ -176,17 +176,17 @@ impl DataConnector for FullTextConnector {
     async fn on_accelerator_setup(
         &self,
         dataset: &Dataset,
-        builder: &mut accelerated::Builder,
+        accelerator: &mut dyn AcceleratorSetup,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.inner_connector
-            .on_accelerator_setup(dataset, builder)
+            .on_accelerator_setup(dataset, accelerator)
             .await
     }
 
     async fn on_accelerated_table_registration(
         &self,
         dataset: &Dataset,
-        accelerated_table: &mut AcceleratedTable,
+        accelerated_table: &mut dyn RegisteredAcceleratedTable,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.inner_connector
             .on_accelerated_table_registration(dataset, accelerated_table)

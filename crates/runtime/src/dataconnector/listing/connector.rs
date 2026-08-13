@@ -54,7 +54,6 @@ use {
 };
 
 use crate::Runtime;
-use crate::accelerated::AcceleratedTable;
 use crate::component::dataset::Dataset;
 use crate::dataconnector::{
     ConnectorComponent, DataConnector, DataConnectorError, DataConnectorResult,
@@ -65,6 +64,7 @@ use data_components::object::{
     metadata::{MetadataColumn, ObjectStoreMetadataTable},
     text::ObjectStoreTextTable,
 };
+use data_connector_api::accelerated::RegisteredAcceleratedTable;
 
 use super::{
     DelimitedFormat, ParsedFileExtension, detect_file_extension_from_path,
@@ -1018,7 +1018,7 @@ pub trait ListingTableConnector: DataConnector {
     async fn on_accelerated_table_registration(
         &self,
         _dataset: &Dataset,
-        _accelerated_table: &mut AcceleratedTable,
+        _accelerated_table: &mut dyn RegisteredAcceleratedTable,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Ok(())
     }
@@ -1436,7 +1436,7 @@ impl<T: ListingTableConnector + Display> DataConnector for T {
     async fn on_accelerated_table_registration(
         &self,
         dataset: &Dataset,
-        accelerated_table: &mut AcceleratedTable,
+        accelerated_table: &mut dyn RegisteredAcceleratedTable,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         ListingTableConnector::on_accelerated_table_registration(self, dataset, accelerated_table)
             .await

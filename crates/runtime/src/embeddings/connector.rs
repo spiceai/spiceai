@@ -13,7 +13,6 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use crate::accelerated::{self, AcceleratedTable};
 use crate::changes::Indexes;
 use crate::changes::index_change_envelope;
 use crate::component::ComponentInitialization;
@@ -33,6 +32,7 @@ use crate::model::EmbeddingModelStore;
 use crate::secrets::Secrets;
 use async_trait::async_trait;
 use data_components::cdc::{ChangeEnvelope, ChangesStream, StreamError, replace_change_batch_data};
+use data_connector_api::accelerated::{AcceleratorSetup, RegisteredAcceleratedTable};
 use datafusion::datasource::TableProvider;
 use futures::StreamExt;
 use itertools::Itertools;
@@ -289,10 +289,10 @@ impl DataConnector for EmbeddingConnector {
     async fn on_accelerator_setup(
         &self,
         dataset: &Dataset,
-        builder: &mut accelerated::Builder,
+        accelerator: &mut dyn AcceleratorSetup,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.inner_connector
-            .on_accelerator_setup(dataset, builder)
+            .on_accelerator_setup(dataset, accelerator)
             .await?;
 
         #[cfg(feature = "duckdb")]
@@ -308,18 +308,17 @@ impl DataConnector for EmbeddingConnector {
                 "Wrapping accelerator with DuckDB HNSW vector indexes"
             );
 
-            let accelerator = builder.get_accelerator();
             let indexed_accelerator =
                 crate::embeddings::index::duckdb::wrap_accelerator_with_duckdb_vector_indexes(
                     &dataset.name,
                     embedding_columns,
                     &vector_engine,
-                    accelerator,
+                    accelerator.accelerator(),
                     Arc::clone(&self.embedding_models),
                     Arc::clone(&self.secrets),
                 )
                 .await?;
-            builder.set_accelerator(indexed_accelerator);
+            accelerator.set_accelerator(indexed_accelerator);
             return Ok(());
         }
 
@@ -329,7 +328,7 @@ impl DataConnector for EmbeddingConnector {
     async fn on_accelerated_table_registration(
         &self,
         dataset: &Dataset,
-        accelerated_table: &mut AcceleratedTable,
+        accelerated_table: &mut dyn RegisteredAcceleratedTable,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.inner_connector
             .on_accelerated_table_registration(dataset, accelerated_table)

@@ -14,11 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::accelerated::AcceleratedTable;
 use crate::component::dataset::Dataset;
 use crate::dataconnector::ConnectorComponent;
 use crate::dataconnector::listing::LISTING_TABLE_PARAMETERS;
 use async_trait::async_trait;
+use data_connector_api::accelerated::RegisteredAcceleratedTable;
 
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use snafu::prelude::*;
@@ -150,13 +150,12 @@ impl ListingTableConnector for File {
 
     /// Set up a file watcher to refresh the accelerated table when the file is updated.
     ///
-    /// Spawns an async top-level Tokio task to watch the file(s) and adds it to the join
-    /// handles of the `AcceleratedTable`. When the `AcceleratedTable` is dropped, the file
-    /// watcher is aborted.
+    /// Spawns an async top-level Tokio task to watch the file(s) and attaches it to the
+    /// accelerated table, so the watcher is aborted when that table is dropped.
     async fn on_accelerated_table_registration(
         &self,
         dataset: &Dataset,
-        accelerated_table: &mut AcceleratedTable,
+        accelerated_table: &mut dyn RegisteredAcceleratedTable,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // Only enable the file watcher if the acceleration has the file_watcher parameter set to "enabled"
         let enabled = dataset.acceleration.as_ref().is_some_and(|acceleration| {
@@ -173,7 +172,7 @@ impl ListingTableConnector for File {
 
         let path = get_path(dataset);
         let (tx, mut rx) = mpsc::channel(100);
-        let Some(refresh_trigger) = accelerated_table.refresh_trigger().cloned() else {
+        let Some(refresh_requester) = accelerated_table.refresh_requester() else {
             return Ok(());
         };
 
@@ -219,7 +218,7 @@ impl ListingTableConnector for File {
                             continue;
                         }
                         tracing::debug!("Triggering refresh for file {}", path.display());
-                        if let Err(e) = refresh_trigger.send(None).await {
+                        if let Err(e) = refresh_requester.request_refresh().await {
                             tracing::error!("Failed to trigger refresh: {e}");
                         }
                         last_refresh = Instant::now();
@@ -229,7 +228,7 @@ impl ListingTableConnector for File {
             }
         });
 
-        accelerated_table.handlers.push(watcher_task);
+        accelerated_table.attach_task(watcher_task);
 
         Ok(())
     }
