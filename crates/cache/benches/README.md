@@ -93,10 +93,24 @@ TinyLFU earns its keep where admission control matters: 13% ahead of LRU at 50%,
 7% at 95%, and level at 99%, where almost nothing is evicted.
 
 Numbers are from a laptop at reduced sample size, where 32 threads oversubscribes
-the cores. Intervals run to roughly +/-8%, so the 50% and 95% gaps are solid and
-the 14% figure at 99% and 16 threads is near the noise floor. Moka reading
-slower at 99% than at 95% is within that margin and should not be read as a
-trend.
+the cores.
+
+Moka is far noisier than Pingora. A separate run measuring run-to-run spread
+over five repetitions found Moka varying up to 30% between repetitions while
+Pingora stayed within 1-3%, most likely Moka's background maintenance landing
+differently. Treat differences under roughly 15% against Moka as unresolved at
+this sample size: the 50% gaps are real, the 99% ones are directional. Pingora's
+reproducibility is itself a result, and arguably matters more for tail latency
+than the median either way.
+
+The `C/W` sizing was checked separately against measured hit rates. Achieved
+rates land within half a point of target (3.0 / 50.3 / 80.0 / 95.0 / 99.0) and
+the resident set matches capacity exactly, for both engines. The crossover also
+holds across a 30x capacity range - 1,000, 5,000 and 30,000 entries all put it
+between 80% and 95% - so the single capacity used here does not bias it.
+
+This benchmark asserts its hit rates through sizing rather than measuring them.
+That was verified once by hand, as above, but it is an assumption in the code.
 
 ## Thread Counts
 
