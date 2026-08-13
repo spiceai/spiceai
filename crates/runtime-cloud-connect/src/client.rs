@@ -235,6 +235,12 @@ impl ClientDriver {
             .is_some_and(|id| renewal_due(id, self.config.renewal_lead))
         {
             match self.renew_once(enroll_client).await {
+                Ok(()) if self.identity.is_none() => {
+                    tracing::info!(
+                        "Cloud Connect: the durable identity was removed while renewal was in flight; exiting cloud-connect without replaying the stale credential"
+                    );
+                    return CredentialStep::Exit;
+                }
                 Ok(()) => {}
                 Err(err) if renewal_rejection_revokes_identity(&err) => {
                     // A 401 is the cloud's credential revocation signal. It
@@ -307,6 +313,8 @@ impl ClientDriver {
                 reason: format!("failed to generate renewal key material: {source}"),
             }
         })?;
+        let expected_identifier = current.identifier.clone();
+        let expected_public_key_pem = current.public_key_pem.clone();
         let outcome = client.renew(&current, &material).await?;
 
         let mut rotated = Identity {
@@ -317,7 +325,10 @@ impl ClientDriver {
             // The CA bundle and gateway address are not re-sent on renewal.
             ca_bundle_pem: current.ca_bundle_pem,
             gateway_addr: current.gateway_addr,
-            not_after_unix: Some(outcome.not_after_unix),
+            // The response's unsigned `not_after` hint is deliberately
+            // ignored. Validation below derives this cache exclusively from
+            // the signed leaf the cloud has already committed.
+            not_after_unix: None,
             // The attachment tuple is not part of the credential and /renew
             // does not re-send it, so it rides across the rotation unchanged
             // (and is re-merged from disk by the persist below, in case a
@@ -362,9 +373,18 @@ impl ClientDriver {
         // persistence fails, the rotated identity must be used in memory
         // (the old key can no longer renew). Persistence logs the failure;
         // the next successful renewal re-attempts the write.
-        rotated = self
-            .persist_identity_preserving_attachment(rotated, "renewed identity")
-            .await;
+        let Some(rotated) = self
+            .persist_identity_preserving_attachment(
+                &expected_identifier,
+                &expected_public_key_pem,
+                rotated,
+                "renewed identity",
+            )
+            .await
+        else {
+            self.identity = None;
+            return Ok(());
+        };
         tracing::info!(
             "Cloud Connect: identity renewed for {} (identity and encryption keypairs rotated, valid until {})",
             rotated.identifier,
@@ -386,37 +406,53 @@ impl ClientDriver {
     /// recently written by a command handler.
     async fn persist_identity_preserving_attachment(
         &self,
+        expected_identifier: &str,
+        expected_public_key_pem: &str,
         identity: Identity,
         update: &'static str,
-    ) -> Identity {
+    ) -> Option<Identity> {
         let path = self.config.identity_path.clone();
         let fallback = identity.clone();
+        let expected_identifier = expected_identifier.to_string();
+        let expected_public_key_pem = expected_public_key_pem.to_string();
         let result = tokio::task::spawn_blocking(move || {
-            IdentityStore::store_credential_update(&path, &identity)
+            IdentityStore::store_credential_update(
+                &path,
+                &expected_identifier,
+                &expected_public_key_pem,
+                &identity,
+            )
         })
         .await;
         match result {
-            Ok(Ok(Some(merged))) => merged,
-            Ok(Ok(None)) => {
-                tracing::error!(
-                    "Cloud Connect: identity disappeared while the {update} was being persisted at {}; continuing with the updated in-memory identity",
+            Ok(Ok(crate::identity::CredentialUpdateOutcome::Stored(merged))) => Some(merged),
+            Ok(Ok(crate::identity::CredentialUpdateOutcome::Superseded(current))) => {
+                tracing::warn!(
+                    "Cloud Connect: skipped the stale {update} at {} because another enrollment or renewal published a newer credential generation; continuing with that durable identity",
                     self.config.identity_path.display()
                 );
-                fallback
+                Some(current)
+            }
+            Ok(Ok(crate::identity::CredentialUpdateOutcome::Missing)) => {
+                tracing::error!(
+                    "Cloud Connect: identity disappeared while the {update} was being persisted at {}; dropping the stale in-memory identity",
+                    self.config.identity_path.display()
+                );
+                None
             }
             Ok(Err(error)) => {
                 tracing::error!(
                     "Cloud Connect: failed to persist the {update} at {}: {error}; continuing with the updated in-memory identity (it will be lost on restart)",
                     self.config.identity_path.display()
                 );
-                fallback
+                Some(fallback)
             }
             Err(error) => {
                 tracing::error!(
                     "Cloud Connect: {update} persistence task failed at {}: {error}; continuing with the updated in-memory identity (it will be lost on restart)",
                     self.config.identity_path.display()
                 );
-                fallback
+                Some(fallback)
             }
         }
     }
@@ -1165,13 +1201,16 @@ impl ClientDriver {
         if crate::sealed_secrets::opened_with_current(&opened.inner_key_id, &keyring) {
             let mut updated = identity;
             if updated.retire_previous_enc_key() {
-                self.identity = Some(
-                    self.persist_identity_preserving_attachment(
+                let expected_identifier = updated.identifier.clone();
+                let expected_public_key_pem = updated.public_key_pem.clone();
+                self.identity = self
+                    .persist_identity_preserving_attachment(
+                        &expected_identifier,
+                        &expected_public_key_pem,
                         updated,
                         "previous encryption-key retirement",
                     )
-                    .await,
-                );
+                    .await;
             }
         }
 

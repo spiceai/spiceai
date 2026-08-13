@@ -156,7 +156,19 @@ impl StartupState {
 }
 
 pub(crate) async fn load_startup_state() -> StartupState {
-    load_startup_state_from_config(&build_config(env!("CARGO_PKG_VERSION"))).await
+    let mut config = CloudConnectConfig::from_env(env!("CARGO_PKG_VERSION"));
+    if std::env::var_os("SPICE_CLOUD_ENDPOINT").is_none()
+        && let Err(error) = apply_endpoint_override(&mut config)
+    {
+        tracing::error!(
+            "Spice Cloud Connect is disabled for this start because the enrollment endpoint override at {} could not be read safely: {error}",
+            config.config_dir.join("cloud-endpoint").display()
+        );
+        let mut state = load_startup_state_from_config(&config).await;
+        state.reconnectable_identity = None;
+        return state;
+    }
+    load_startup_state_from_config(&config).await
 }
 
 /// Load the durable activation snapshot without making an optional Cloud
@@ -202,31 +214,17 @@ fn identity_contents_were_observed(error: &runtime_cloud_connect::Error) -> bool
     )
 }
 
-/// Read the optional instance-local `cloud-endpoint` override file. This
-/// overrides the cloud **enroll** endpoint (state plane); the gateway (stream)
-/// address comes from the enroll response.
-fn read_endpoint_override(config_dir: &Path) -> Option<String> {
-    match CloudConnectConfig::read_enroll_endpoint_override(config_dir) {
-        Ok(endpoint) => endpoint,
-        Err(error) => {
-            tracing::warn!(
-                "Spice Cloud Connect ignored the enrollment endpoint override in {}: {error}",
-                config_dir.display()
-            );
-            None
-        }
-    }
-}
-
-/// Build a [`CloudConnectConfig`] from env + on-disk state.
-fn build_config(runtime_version: &str) -> CloudConnectConfig {
-    let mut config = CloudConnectConfig::from_env(runtime_version);
-    if std::env::var_os("SPICE_CLOUD_ENDPOINT").is_none()
-        && let Some(override_endpoint) = read_endpoint_override(&config.config_dir)
+/// Apply the optional instance-local `cloud-endpoint` override. This overrides
+/// the cloud **enroll** endpoint (state plane); the gateway (stream) address
+/// comes from the enroll response. An unsafe or unreadable file is an error so
+/// the caller cannot silently renew against another control plane.
+fn apply_endpoint_override(config: &mut CloudConnectConfig) -> std::io::Result<()> {
+    if let Some(override_endpoint) =
+        CloudConnectConfig::read_enroll_endpoint_override(&config.config_dir)?
     {
         config.enroll_endpoint = override_endpoint;
     }
-    config
+    Ok(())
 }
 
 /// Why a `--token` bootstrap could not produce a durable identity. Every
@@ -247,6 +245,15 @@ pub enum BootstrapEnrollmentError {
          'us-west-2' or 'on-prem-syd'). See: https://spiceai.org/docs"
     ))]
     InvalidRegion { region: String },
+
+    #[snafu(display(
+        "Failed to enroll this instance with Spice Cloud: the enrollment endpoint override at {} could not be read safely: {source}",
+        path.display()
+    ))]
+    EndpointOverride {
+        path: PathBuf,
+        source: std::io::Error,
+    },
 
     #[snafu(display("Failed to enroll this instance with Spice Cloud ({endpoint}): {source}"))]
     Enroll {
@@ -272,8 +279,8 @@ pub enum BootstrapEnrollmentError {
 /// # Errors
 ///
 /// Returns [`BootstrapEnrollmentError`] when the key or region is malformed
-/// (checked locally, never echoed) or when [`enroll_now`] fails terminally
-/// or exhausts its retry budget.
+/// (checked locally, never echoed), the endpoint override cannot be read
+/// safely, or [`enroll_now`] fails terminally or exhausts its retry budget.
 pub async fn bootstrap_enrollment(args: &mut crate::Args) -> Result<(), BootstrapEnrollmentError> {
     use runtime_cloud_connect::{
         EnrollNowOutcome, EnrollmentAuthority, EnrollmentKey, RetryPolicy,
@@ -300,7 +307,12 @@ pub async fn bootstrap_enrollment(args: &mut crate::Args) -> Result<(), Bootstra
         });
     }
 
-    let mut config = build_config(env!("CARGO_PKG_VERSION"));
+    let mut config = CloudConnectConfig::from_env(env!("CARGO_PKG_VERSION"));
+    if std::env::var_os("SPICE_CLOUD_ENDPOINT").is_none() {
+        let path = config.config_dir.join("cloud-endpoint");
+        apply_endpoint_override(&mut config)
+            .map_err(|source| BootstrapEnrollmentError::EndpointOverride { path, source })?;
+    }
     config.instance_region = args.region.clone();
 
     let authority = EnrollmentAuthority::Token {
@@ -1956,6 +1968,25 @@ mod tests {
             state.identity_observed,
             "invalid credentials must not erase cloud-managed configuration provenance"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unsafe_endpoint_override_is_a_configuration_error() {
+        use std::os::unix::fs::symlink;
+
+        let dir = scratch_dir("unsafe-endpoint-override");
+        let target = dir.join("redirected-endpoint");
+        std::fs::write(&target, "https://wrong-control-plane.example")
+            .expect("write target endpoint");
+        symlink(&target, dir.join("cloud-endpoint")).expect("create endpoint symlink");
+        let mut config = CloudConnectConfig::from_env("test-runtime");
+        config.config_dir.clone_from(&dir);
+
+        apply_endpoint_override(&mut config)
+            .expect_err("an unsafe override must disable enrollment and renewal");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

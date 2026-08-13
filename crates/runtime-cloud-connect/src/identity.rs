@@ -90,6 +90,18 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+/// Result of a credential read-modify-write under the enrollment transaction.
+#[derive(Debug)]
+pub enum CredentialUpdateOutcome {
+    /// The update matched the durable generation and was stored.
+    Stored(Identity),
+    /// A newer enrollment or renewal was already durable, so the stale update
+    /// was rejected and the durable winner is returned to the caller.
+    Superseded(Identity),
+    /// Removal won the transaction and no identity remains.
+    Missing,
+}
+
 /// Persisted runtime identity. Treat as opaque outside this crate.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Identity {
@@ -637,6 +649,12 @@ fn acquire_removal_transaction(path: &Path) -> Result<crate::draft::EnrollmentTr
 pub(crate) fn read_regular_file_optional(path: &Path) -> std::io::Result<Option<String>> {
     use std::io::Read as _;
 
+    match validate_state_path_ancestors(path) {
+        Ok(()) => {}
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => return Err(source),
+    }
+
     #[cfg(unix)]
     let mut file = {
         use std::os::unix::fs::OpenOptionsExt as _;
@@ -695,6 +713,90 @@ pub(crate) fn read_regular_file_optional(path: &Path) -> std::io::Result<Option<
     let mut contents = String::new();
     file.read_to_string(&mut contents)?;
     Ok(Some(contents))
+}
+
+/// Reject a state path whose parent traversal can be redirected by an
+/// untrusted symlink or reparse point.
+///
+/// Unix has a small set of root-owned compatibility links in otherwise
+/// immutable directories (`/var` and `/tmp` on macOS are common examples).
+/// Those links cannot be replaced by the process running Spice and are safe to
+/// traverse. Every other symlink is rejected, including a root-owned link in a
+/// user-writable directory. The final component is still opened with
+/// `O_NOFOLLOW`, closing the leaf race after this full-path validation.
+#[cfg(unix)]
+fn validate_state_path_ancestors(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let Some(parent) = absolute.parent() else {
+        return Ok(());
+    };
+    let mut current = PathBuf::new();
+    for component in parent.components() {
+        current.push(component.as_os_str());
+        let metadata = std::fs::symlink_metadata(&current)?;
+        if !metadata.file_type().is_symlink() {
+            continue;
+        }
+        let containing = current.parent().unwrap_or_else(|| Path::new("/"));
+        let containing_metadata = std::fs::metadata(containing)?;
+        let trusted_system_link = metadata.uid() == 0
+            && containing_metadata.uid() == 0
+            && containing_metadata.permissions().mode() & 0o022 == 0;
+        if !trusted_system_link {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "the state path has an untrusted symlink ancestor: {}",
+                    current.display()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn validate_state_path_ancestors(path: &Path) -> std::io::Result<()> {
+    use std::os::windows::fs::MetadataExt as _;
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let Some(parent) = absolute.parent() else {
+        return Ok(());
+    };
+    let mut current = PathBuf::new();
+    for component in parent.components() {
+        current.push(component.as_os_str());
+        let metadata = std::fs::symlink_metadata(&current)?;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "the state path has a reparse-point ancestor: {}",
+                    current.display()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn validate_state_path_ancestors(_path: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "secure state-file reads are unsupported on this platform",
+    ))
 }
 
 impl IdentityStore {
@@ -922,8 +1024,11 @@ impl IdentityStore {
     /// is owned by control commands and can be newer on disk, so every such
     /// full identity update must merge it while holding [`write_lock`].
     ///
-    /// Returns `Ok(None)` when the identity was removed before the write and
-    /// does not recreate it.
+    /// `expected_identifier` and `expected_public_key_pem` fence the durable
+    /// credential generation the caller cloned before a long-running request.
+    /// A removal followed by re-enrollment can therefore win the transaction
+    /// without a queued stale update overwriting the replacement. Missing and
+    /// superseded generations are reported without writing.
     ///
     /// # Errors
     ///
@@ -931,13 +1036,20 @@ impl IdentityStore {
     /// merged identity cannot be written.
     pub fn store_credential_update(
         path: &Path,
+        expected_identifier: &str,
+        expected_public_key_pem: &str,
         credential_update: &Identity,
-    ) -> Result<Option<Identity>> {
+    ) -> Result<CredentialUpdateOutcome> {
         let _transaction = acquire_update_transaction(path)?;
         let _guard = write_lock();
         let Some(current) = Self::load_optional(path)? else {
-            return Ok(None);
+            return Ok(CredentialUpdateOutcome::Missing);
         };
+        if current.identifier != expected_identifier
+            || current.public_key_pem != expected_public_key_pem
+        {
+            return Ok(CredentialUpdateOutcome::Superseded(current));
+        }
         let mut merged = credential_update.clone();
         // The whole attachment tuple, not just the app id: a command handler
         // may have written any of these after the caller cloned its identity,
@@ -947,7 +1059,7 @@ impl IdentityStore {
         merged.app_name = current.app_name;
         merged.monitor_url = current.monitor_url;
         Self::store_locked(path, &merged)?;
-        Ok(Some(merged))
+        Ok(CredentialUpdateOutcome::Stored(merged))
     }
 
     /// The write itself, with the caller already holding [`write_lock`].
@@ -1041,7 +1153,9 @@ impl IdentityStore {
     /// The removal itself, with the caller already holding [`write_lock`].
     fn clear_locked(path: &Path) -> Result<()> {
         match std::fs::remove_file(path) {
-            Ok(()) => Ok(()),
+            Ok(()) => sync_parent_directory(path).context(IoSnafu {
+                path: path.to_path_buf(),
+            }),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(err) => Err(Error::Io {
                 path: path.to_path_buf(),
@@ -2309,9 +2423,15 @@ mod tests {
             rotated.app_id, None,
             "the renewal clone is stale by construction"
         );
-        let merged = IdentityStore::store_credential_update(&path, &rotated)
-            .expect("store rotated")
-            .expect("identity still present");
+        let CredentialUpdateOutcome::Stored(merged) = IdentityStore::store_credential_update(
+            &path,
+            &identity.identifier,
+            &identity.public_key_pem,
+            &rotated,
+        )
+        .expect("store rotated") else {
+            panic!("the expected credential generation must still be present");
+        };
 
         let loaded = IdentityStore::load_optional(&path)
             .expect("load")
@@ -2335,11 +2455,17 @@ mod tests {
             .expect("present");
         IdentityStore::set_attachment(&path, Some(&sample_attachment())).expect("attach");
 
-        let mut rotated = stale;
+        let mut rotated = stale.clone();
         rotated.private_key_pem = "ROTATED-KEY".to_string();
-        let merged = IdentityStore::store_credential_update(&path, &rotated)
-            .expect("store rotated")
-            .expect("identity still present");
+        let CredentialUpdateOutcome::Stored(merged) = IdentityStore::store_credential_update(
+            &path,
+            &stale.identifier,
+            &stale.public_key_pem,
+            &rotated,
+        )
+        .expect("store rotated") else {
+            panic!("the expected credential generation must still be present");
+        };
 
         let loaded = IdentityStore::load_optional(&path)
             .expect("load")
@@ -2363,11 +2489,47 @@ mod tests {
         IdentityStore::store(&path, &identity).expect("store");
         IdentityStore::clear(&path).expect("remove");
 
-        let stored = IdentityStore::store_credential_update(&path, &identity)
-            .expect("credential update is a no-op");
+        let stored = IdentityStore::store_credential_update(
+            &path,
+            &identity.identifier,
+            &identity.public_key_pem,
+            &identity,
+        )
+        .expect("credential update is a no-op");
 
-        assert!(stored.is_none());
+        assert!(matches!(stored, CredentialUpdateOutcome::Missing));
         assert!(IdentityStore::load_optional(&path).expect("load").is_none());
+    }
+
+    #[test]
+    fn credential_update_cannot_overwrite_a_replacement_identity() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join("identity.json");
+        let stale = sample_identity();
+        IdentityStore::store(&path, &stale).expect("store original identity");
+
+        let mut stale_update = stale.clone();
+        stale_update.private_key_pem = "STALE-ROTATED-KEY".to_string();
+        let replacement = sample_identity();
+        IdentityStore::store(&path, &replacement).expect("publish replacement identity");
+
+        let outcome = IdentityStore::store_credential_update(
+            &path,
+            &stale.identifier,
+            &stale.public_key_pem,
+            &stale_update,
+        )
+        .expect("reject stale update without losing the replacement");
+        let CredentialUpdateOutcome::Superseded(winner) = outcome else {
+            panic!("a new credential generation must supersede the stale update");
+        };
+
+        assert_eq!(winner.public_key_pem, replacement.public_key_pem);
+        let durable = IdentityStore::load_optional(&path)
+            .expect("load replacement")
+            .expect("replacement remains present");
+        assert_eq!(durable.public_key_pem, replacement.public_key_pem);
+        assert_eq!(durable.private_key_pem, replacement.private_key_pem);
     }
 
     #[test]
@@ -2382,8 +2544,13 @@ mod tests {
 
         let mut rotated = identity.clone();
         rotated.private_key_pem = "ROTATED-KEY".to_string();
-        let credential_error = IdentityStore::store_credential_update(&path, &rotated)
-            .expect_err("credential update must not overlap removal");
+        let credential_error = IdentityStore::store_credential_update(
+            &path,
+            &identity.identifier,
+            &identity.public_key_pem,
+            &rotated,
+        )
+        .expect_err("credential update must not overlap removal");
         let app_id_error = IdentityStore::set_app_id(&path, Some("4002"))
             .expect_err("app id update must not overlap removal");
         let attachment = AppAttachment {
@@ -2418,9 +2585,15 @@ mod tests {
         assert_eq!(stored.app_id, None);
 
         drop(removal);
-        let merged = IdentityStore::store_credential_update(&path, &rotated)
-            .expect("store after removal transaction")
-            .expect("identity remains");
+        let CredentialUpdateOutcome::Stored(merged) = IdentityStore::store_credential_update(
+            &path,
+            &identity.identifier,
+            &identity.public_key_pem,
+            &rotated,
+        )
+        .expect("store after removal transaction") else {
+            panic!("the original credential generation remains");
+        };
         assert_eq!(merged.private_key_pem, "ROTATED-KEY");
         IdentityStore::clear(&path).expect("clear after transaction ownership is released");
         assert!(IdentityStore::load_optional(&path).expect("load").is_none());
@@ -2512,6 +2685,29 @@ mod tests {
         symlink(&target, &path).expect("create identity symlink");
 
         let error = IdentityStore::load_optional(&path).expect_err("symlink must be rejected");
+        assert!(matches!(error, Error::Io { .. }), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(target).expect("target remains readable"),
+            "sensitive target"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn identity_reads_reject_an_untrusted_symlink_ancestor() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir(&outside).expect("create target directory");
+        let target = outside.join("identity.json");
+        std::fs::write(&target, "sensitive target").expect("write target");
+        let redirected_parent = dir.path().join("redirected-config");
+        symlink(&outside, &redirected_parent).expect("create parent symlink");
+
+        let error = IdentityStore::load_optional(&redirected_parent.join("identity.json"))
+            .expect_err("a state path with an untrusted symlink ancestor must be rejected");
+
         assert!(matches!(error, Error::Io { .. }), "{error}");
         assert_eq!(
             std::fs::read_to_string(target).expect("target remains readable"),

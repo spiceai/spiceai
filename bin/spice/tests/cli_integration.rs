@@ -941,6 +941,29 @@ mod connect {
             .stdout(predicate::str::contains("4102444800").not())
             .stdout(predicate::str::contains("identity unusable").not());
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn status_fails_closed_when_the_persisted_endpoint_is_a_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let config_dir = TempDir::new().expect("create config directory");
+        let target = config_dir.path().join("redirected-endpoint");
+        fs::write(&target, "https://wrong-control-plane.example").expect("write target endpoint");
+        symlink(&target, config_dir.path().join("cloud-endpoint"))
+            .expect("create endpoint symlink");
+
+        spice_cmd()
+            .env("SPICE_CONFIG_DIR", config_dir.path())
+            .env_remove("SPICE_CLOUD_ENDPOINT")
+            .args(["connect", "status"])
+            .assert()
+            .failure()
+            .stdout(predicate::str::contains(
+                "read the Cloud Connect endpoint override",
+            ))
+            .stdout(predicate::str::contains("wrong-control-plane").not());
+    }
 }
 
 // ============================================================================

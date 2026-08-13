@@ -180,8 +180,10 @@ impl CloudConnectConfig {
         if uri.host().is_none() {
             return Err("the gateway endpoint has no host");
         }
-        if uri.port_u16().is_none() {
-            return Err("the gateway endpoint has no explicit port");
+        match uri.port_u16() {
+            None => return Err("the gateway endpoint has no explicit port"),
+            Some(0) => return Err("the gateway endpoint port must be greater than zero"),
+            Some(_) => {}
         }
         if uri
             .path_and_query()
@@ -445,6 +447,38 @@ mod tests {
         assert!(
             config.instance_region.is_none(),
             "the region is an explicit argument, never read from the environment"
+        );
+    }
+
+    #[test]
+    fn persisted_gateway_rejects_port_zero() {
+        let _guard = ENV_LOCK.lock().expect("env lock poisoned");
+        unsafe {
+            std::env::remove_var("SPICE_CLOUD_ENDPOINT");
+            std::env::remove_var("SPICE_CLOUD_GATEWAY_ENDPOINT");
+        }
+        let config = CloudConnectConfig::from_env("v0.0.0-test");
+        let identity = crate::identity::Identity {
+            identifier: "inst_test".to_string(),
+            identity_cert_pem: String::new(),
+            private_key_pem: String::new(),
+            public_key_pem: String::new(),
+            ca_bundle_pem: String::new(),
+            gateway_addr: "gateway.example.test:0".to_string(),
+            not_after_unix: None,
+            app_id: None,
+            org_name: None,
+            app_name: None,
+            monitor_url: None,
+            enc_private_key_pem: String::new(),
+            enc_public_key_pem: String::new(),
+            enc_previous_private_key_pem: String::new(),
+            cache_key_b64: String::new(),
+        };
+
+        assert_eq!(
+            config.validated_persisted_gateway_endpoint(&identity),
+            Err("the gateway endpoint port must be greater than zero")
         );
     }
 

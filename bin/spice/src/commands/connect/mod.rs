@@ -245,12 +245,13 @@ pub async fn execute(ctx: &RuntimeContext, args: ConnectArgs) -> Result<()> {
                 remove_identity(&config_dir, args.endpoint.as_deref(), args.yes, args.force).await
             }
             ConnectCommand::Service(service_args) => {
+                let endpoint = resolved_endpoint(&config_dir, args.endpoint.as_deref())?;
                 service::cli::execute(
                     ctx,
                     service_args,
                     &instance_dir_for(&config_dir),
                     &config_dir,
-                    &resolved_endpoint(&config_dir, args.endpoint.as_deref()),
+                    &endpoint,
                 )
                 .await
             }
@@ -330,7 +331,7 @@ fn reject_cloud_region(cloud_region: Option<&str>) -> Result<()> {
 /// enrollment belongs to the runtime — so it errors with the exact command that
 /// does enroll.
 async fn connect_existing(config_dir: &Path, endpoint: Option<&str>) -> Result<()> {
-    let status = collect_status(config_dir, endpoint).await;
+    let status = collect_status(config_dir, endpoint).await?;
     if status.connection.state != ConnectionState::NotConnected {
         if status.connection.state == ConnectionState::Enrolled {
             println!("This host is already enrolled with Spice Cloud.");
@@ -351,14 +352,15 @@ async fn connect_existing(config_dir: &Path, endpoint: Option<&str>) -> Result<(
 }
 
 /// Collect the one status snapshot used by the bare and explicit status forms.
-async fn collect_status(config_dir: &Path, endpoint: Option<&str>) -> ConnectStatus {
-    ConnectStatus::collect(
+async fn collect_status(config_dir: &Path, endpoint: Option<&str>) -> Result<ConnectStatus> {
+    let endpoint = resolved_endpoint(config_dir, endpoint)?;
+    Ok(ConnectStatus::collect(
         service::backend(),
         &instance_dir_for(config_dir),
         config_dir,
-        &resolved_endpoint(config_dir, endpoint),
+        &endpoint,
     )
-    .await
+    .await)
 }
 
 /// Render an already-collected snapshot and preserve its degraded exit status.
@@ -431,7 +433,7 @@ async fn print_status(
     endpoint: Option<&str>,
     output: OutputFormat,
 ) -> Result<()> {
-    let status = collect_status(config_dir, endpoint).await;
+    let status = collect_status(config_dir, endpoint).await?;
     render_status(&status, output)
 }
 
@@ -474,14 +476,14 @@ async fn release_instance(
     config_dir: &Path,
     endpoint: Option<&str>,
     identity: &runtime_cloud_connect::Identity,
-) -> ReleaseVerdict {
-    let endpoint = resolved_endpoint(config_dir, endpoint);
+) -> Result<ReleaseVerdict> {
+    let endpoint = resolved_endpoint(config_dir, endpoint)?;
     let ca = (!identity.ca_bundle_pem.is_empty()).then_some(identity.ca_bundle_pem.as_str());
 
-    classify_release(
+    Ok(classify_release(
         runtime_cloud_connect::release::release(&endpoint, identity, ca).await,
         &endpoint,
-    )
+    ))
 }
 
 /// [`release_instance`] without the request: the classification of what the
@@ -599,7 +601,7 @@ async fn remove_identity(
     // Reported before anything is cleared: the identity leaf is the credential
     // that authorises the release, so it has to still exist.
     if let Some(ref identity) = identity {
-        match release_instance(config_dir, endpoint, identity).await {
+        match release_instance(config_dir, endpoint, identity).await? {
             ReleaseVerdict::Confirmed { outcome } => {
                 println!("Released this instance in Spice Cloud.");
                 if !outcome.status.is_empty() {
@@ -748,21 +750,25 @@ fn confirm(prompt: &str) -> Result<bool> {
 /// precedence used at runtime: an explicit `--endpoint` first, then the
 /// `SPICE_CLOUD_ENDPOINT` env var, then the on-disk `cloud-endpoint` override
 /// in the config dir, then the built-in default.
-fn resolved_endpoint(config_dir: &Path, explicit: Option<&str>) -> String {
+fn resolved_endpoint(config_dir: &Path, explicit: Option<&str>) -> Result<String> {
     if let Some(endpoint) = explicit.filter(|e| !e.is_empty()) {
-        return endpoint.to_string();
+        return Ok(endpoint.to_string());
     }
     if let Ok(env) = std::env::var("SPICE_CLOUD_ENDPOINT")
         && !env.is_empty()
     {
-        return env;
+        return Ok(env);
     }
-    if let Ok(Some(endpoint)) =
-        runtime_cloud_connect::CloudConnectConfig::read_enroll_endpoint_override(config_dir)
-    {
-        return endpoint;
+    match runtime_cloud_connect::CloudConnectConfig::read_enroll_endpoint_override(config_dir) {
+        Ok(Some(endpoint)) => Ok(endpoint),
+        Ok(None) => Ok(runtime_cloud_connect::config::DEFAULT_ENDPOINT.to_string()),
+        Err(source) => Err(Error::CloudConnectIo {
+            message: format!(
+                "read the Cloud Connect endpoint override at {}: {source}",
+                config_dir.join(CLOUD_ENDPOINT_FILE).display()
+            ),
+        }),
     }
-    runtime_cloud_connect::config::DEFAULT_ENDPOINT.to_string()
 }
 
 #[cfg(test)]
@@ -1071,7 +1077,8 @@ mod tests {
     fn resolved_endpoint_prefers_the_explicit_flag() {
         let dir = tempfile::tempdir().expect("create tempdir");
         assert_eq!(
-            resolved_endpoint(dir.path(), Some("https://explicit.example")),
+            resolved_endpoint(dir.path(), Some("https://explicit.example"))
+                .expect("explicit endpoint"),
             "https://explicit.example"
         );
     }
@@ -1082,7 +1089,7 @@ mod tests {
 
         // Nothing on disk: the built-in default.
         assert_eq!(
-            resolved_endpoint(dir.path(), None),
+            resolved_endpoint(dir.path(), None).expect("default endpoint"),
             runtime_cloud_connect::config::DEFAULT_ENDPOINT
         );
 
@@ -1093,16 +1100,40 @@ mod tests {
         )
         .expect("write override");
         assert_eq!(
-            resolved_endpoint(dir.path(), None),
+            resolved_endpoint(dir.path(), None).expect("persisted endpoint"),
             "https://override.example"
         );
 
         // A blank override is not an endpoint.
         std::fs::write(dir.path().join(CLOUD_ENDPOINT_FILE), "  \n").expect("write blank override");
         assert_eq!(
-            resolved_endpoint(dir.path(), None),
+            resolved_endpoint(dir.path(), None).expect("blank override uses the default"),
             runtime_cloud_connect::config::DEFAULT_ENDPOINT
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolved_endpoint_fails_closed_on_an_unreadable_override() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let target = dir.path().join("redirected-endpoint");
+        std::fs::write(&target, "https://wrong-control-plane.example")
+            .expect("write target endpoint");
+        symlink(&target, dir.path().join(CLOUD_ENDPOINT_FILE)).expect("create endpoint symlink");
+
+        let error = resolved_endpoint(dir.path(), None)
+            .expect_err("an unsafe override must not fall back to the production endpoint");
+
+        assert!(
+            error.to_string().contains("could not be read safely")
+                || error
+                    .to_string()
+                    .contains("read the Cloud Connect endpoint override"),
+            "{error}"
+        );
+        assert!(!error.to_string().contains("wrong-control-plane"));
     }
 
     #[tokio::test]

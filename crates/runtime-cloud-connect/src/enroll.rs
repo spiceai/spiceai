@@ -446,7 +446,6 @@ struct RenewRequest<'a> {
 #[derive(Deserialize)]
 struct RenewResponseWire {
     identity_cert_pem: String,
-    not_after: String,
 }
 
 /// Parsed result of a successful renewal (the CA bundle and gateway address
@@ -454,8 +453,6 @@ struct RenewResponseWire {
 #[derive(Debug)]
 pub struct RenewOutcome {
     pub identity_cert_pem: String,
-    /// New leaf expiry, Unix seconds.
-    pub not_after_unix: u64,
 }
 
 /// Error body shape the cloud endpoints return:
@@ -632,7 +629,6 @@ impl EnrollClient {
         };
         let builder = self.http.post(&self.renew_url).json(&request);
         let wire: RenewResponseWire = self.send(&self.renew_url, builder, None).await?;
-        let not_after_unix = parse_not_after(&self.renew_url, &wire.not_after)?;
         ensure_response_field(
             &self.renew_url,
             "identity_cert_pem",
@@ -640,7 +636,6 @@ impl EnrollClient {
         )?;
         Ok(RenewOutcome {
             identity_cert_pem: wire.identity_cert_pem,
-            not_after_unix,
         })
     }
 
@@ -1284,8 +1279,8 @@ pub(crate) fn sign_pop_payload(
     Ok(base64::engine::general_purpose::STANDARD.encode(signature.as_ref()))
 }
 
-/// Parse an RFC 3339 `not_after` timestamp from an enroll/renew response
-/// into Unix seconds.
+/// Parse an RFC 3339 `not_after` timestamp from an enroll response into Unix
+/// seconds. Renewal derives this value from the signed leaf instead.
 pub(crate) fn parse_not_after(url: &str, value: &str) -> Result<u64> {
     let parsed =
         chrono::DateTime::parse_from_rfc3339(value).map_err(|source| Error::InvalidResponse {
@@ -1402,6 +1397,17 @@ mod tests {
     fn parse_not_after_rejects_pre_epoch() {
         parse_not_after("http://test", "1899-01-01T00:00:00Z")
             .expect_err("pre-epoch timestamps cannot be a cert expiry");
+    }
+
+    #[test]
+    fn renewal_response_does_not_trust_the_unsigned_expiry_hint() {
+        let response: RenewResponseWire = serde_json::from_value(serde_json::json!({
+            "identity_cert_pem": "signed-leaf",
+            "not_after": "not-a-timestamp"
+        }))
+        .expect("the unsigned hint cannot reject a committed renewal");
+
+        assert_eq!(response.identity_cert_pem, "signed-leaf");
     }
 
     #[test]
