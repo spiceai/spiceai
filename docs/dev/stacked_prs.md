@@ -128,7 +128,7 @@ published yet:
 
 ```bash
 git checkout <child>
-git rebase --onto origin/trunk "$STACKBASE"   # stack base = parent's tip at the split
+git rebase --onto origin/trunk "$STACKBASE"   # the derived stack base, not the split tip
 git push -u origin <child>                    # first push, not a force push
 ```
 

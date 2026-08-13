@@ -528,7 +528,10 @@ cmd_audit() {
       theirs_now=""
       base_now=""
     fi
-    if [ -n "$other" ] && [ "$theirs_now" != "$base_now" ]; then
+    # Only a trunk that still *has* the path makes this a delete/modify. If trunk
+    # deleted it too, both sides agreed and a staged path is an unambiguous
+    # restoration, which no decision can explain away.
+    if [ -n "$other" ] && [ -n "$theirs_now" ] && [ "$theirs_now" != "$base_now" ]; then
       accept_or_review "$path" "you deleted it and trunk changed it, which nothing has decided" ||
         findings=$((findings + 1))
     else

@@ -547,6 +547,32 @@ start_test "audit still reports a child-only addition the merge dropped"
   esac
 ) || failures=$((failures + 1))
 
+start_test "audit calls a restoration a restoration when both sides deleted the path"
+(
+  new_stack "$work_root/bothdeleted"
+  printf 'old\n' > keep.txt && commit_all "fork point"
+  git checkout --quiet -b parent
+  printf 'registry\n' > registry.rs && commit_all "parent adds registry.rs"
+  stack_base=$(git rev-parse HEAD)
+  git checkout --quiet -b child
+  git rm --quiet registry.rs && commit_all "child deletes registry.rs"
+  pre=$(git rev-parse HEAD)
+  squash_parent_onto_trunk
+  git rm --quiet registry.rs && commit_all "trunk deletes it as well"
+  git checkout --quiet child
+  git merge --no-ff --no-commit trunk >/dev/null 2>&1
+  # However it got back in, both sides had agreed it should go.
+  git checkout --quiet "$stack_base" -- registry.rs && git add registry.rs
+
+  output=$("$subject" audit "$stack_base" "$pre" --trunk trunk --accept registry.rs 2>/dev/null)
+  status=$?
+  [ "$status" -ne 0 ] || fail_test "a path both sides deleted was accepted back: $output"
+  case "$output" in
+    *"RESURRECTED registry.rs"*) ;;
+    *) fail_test "expected an unambiguous restoration, got: $output" ;;
+  esac
+) || failures=$((failures + 1))
+
 start_test "audit will not let --accept silence a plain resurrection"
 (
   new_stack "$work_root/acceptresurrect"
