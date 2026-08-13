@@ -145,13 +145,25 @@ one where you most need the worktree held open for the audit:
 
 ```bash
 git checkout <child>
+git status --porcelain             # must be empty before you start — see below
 PRE=$(git rev-parse HEAD)          # the child's pre-merge tip; needed by the audit
                                    # $PARENT_HEAD / $STACKBASE derived as above
 git merge --no-ff --no-commit origin/trunk
+test -f "$(git rev-parse --git-dir)/MERGE_HEAD" || echo "the merge did not start — stop"
 ```
 
 `HEAD` stays at `$PRE` for every step below; the merge result lives in the index and
 worktree until you commit it in step 5.
+
+**Start from a clean index, and confirm the merge actually began.** A staged change
+makes `git merge` refuse outright — even one to a file the merge does not touch — and
+it refuses *quietly* enough to be missed: exit 2, no `MERGE_HEAD`, and the steps below
+carry on regardless. Step 5's `git commit` then turns that staged change into an
+ordinary commit, so you push a branch that never took `trunk` plus a commit nobody
+reviewed, and the audit reports nothing because nothing was resurrected. Checking
+`git status` afterwards cannot see it either: by then the tree is clean. An *unstaged*
+change is harmless — the merge proceeds and a worktree-only edit stays out of the
+commit — but it is simpler to begin clean than to remember which kind you have.
 
 **1. Confirm trunk's squash really matches the parent head** — `$PARENT_HEAD` here, not
 `$STACKBASE`, since the squash reflects the parent's final state. Restrict the
@@ -240,11 +252,16 @@ from a clean checkout (`docs/dev/ci_signoff.md`), and the merge is a new commit,
 previous attestation no longer covers it:
 
 ```bash
-git commit                    # completes the --no-commit merge
-git status --short            # must be clean before signing off
+git rev-list --parents -n1 HEAD | wc -w   # after the commit below: 3 = a real merge
+git commit                                # completes the --no-commit merge
+git status --short                        # must be clean before signing off
 git push
 make signoff
 ```
+
+Count the parents rather than trusting the commit to have merged anything: two words
+means an ordinary commit, and the `--no-commit` merge never happened. `git status`
+cannot tell you that — it is clean either way.
 
 ---
 
