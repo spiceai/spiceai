@@ -194,6 +194,12 @@ merge_other_side() {
   local pre_tip="$1" git_dir first
   git_dir=$(git rev-parse --git-dir) || return 1
   if [ -f "$git_dir/MERGE_HEAD" ]; then
+    # During a --no-commit merge HEAD is the pre-merge tip by definition, so if
+    # it is not, the caller named the wrong commit. That matters more than it
+    # looks: a wrong pre-merge tip empties the intent diffs, and empty lists are
+    # indistinguishable from nothing to report.
+    [ "$(git rev-parse --verify --quiet HEAD)" = \
+      "$(git rev-parse --verify --quiet "$pre_tip")" ] || return 1
     git rev-parse --verify --quiet MERGE_HEAD
     return $?
   fi

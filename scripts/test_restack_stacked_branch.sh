@@ -345,6 +345,27 @@ start_test "audit separates a delete/modify from a silent restoration, and can a
   [ "$status" -eq 0 ] || fail_test "the decision could not be accepted: $output"
 ) || failures=$((failures + 1))
 
+start_test "audit will not report clean when handed the wrong pre-merge tip"
+(
+  new_stack "$work_root/wrongpre"
+  printf 'old\n' > keep.txt && commit_all "fork point"
+  git checkout --quiet -b parent
+  printf 'registry\n' > registry.rs && commit_all "parent adds registry.rs"
+  stack_base=$(git rev-parse HEAD)
+  git checkout --quiet -b child
+  git rm --quiet registry.rs && commit_all "child deletes registry.rs"
+  squash_parent_onto_trunk
+  git checkout --quiet child
+  git merge --no-ff --no-commit trunk >/dev/null 2>&1
+  [ -e registry.rs ] || fail_test "the fixture did not restore the deleted file"
+
+  # The stack base passed as both arguments: every intent diff is empty, and an
+  # empty list looks exactly like nothing to report.
+  output=$("$subject" audit "$stack_base" "$stack_base" --trunk trunk 2>&1)
+  status=$?
+  [ "$status" -ne 0 ] || fail_test "a wrong pre-merge tip reported clean over a resurrection: $output"
+) || failures=$((failures + 1))
+
 start_test "audit will not audit a merge of something other than trunk"
 (
   new_stack "$work_root/othermerge"
