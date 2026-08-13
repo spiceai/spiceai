@@ -21,7 +21,9 @@ limitations under the License.
 
 use super::{CatalogConnector, ConnectorComponent, ParameterSpec};
 use crate::{
-    Runtime, component::catalog::Catalog, dataconnector::parameters::ConnectorParams,
+    Runtime,
+    component::catalog::{Catalog, table_selector},
+    dataconnector::parameters::ConnectorParams,
     parameters::Parameters,
 };
 use async_trait::async_trait;
@@ -231,21 +233,16 @@ impl CayenneCatalogConnector {
         // path, the catalog path has no schema inference, so `adaptive` is seeded
         // purely from the detected `HardwareProfile` — the controller's bounds
         // anchor to `[floor, 4×seed]`, so a host-appropriate seed is essential.
-        let tuning_mode = self
-            .params
-            .get("tuning")
-            .expose()
-            .ok()
-            .map(|v| v.trim().to_ascii_lowercase());
-        if let Some(mode) = &tuning_mode
-            && mode != "auto"
-            && mode != "adaptive"
-        {
+        let raw_tuning = self.params.get("tuning").expose().ok();
+        let (tuning_mode, tuning_was_invalid) =
+            crate::dataaccelerator::cayenne::autotune::TuningMode::parse(raw_tuning);
+        if tuning_was_invalid {
             tracing::warn!(
-                "Invalid Cayenne catalog parameter `tuning` value `{mode}`; expected `auto` or `adaptive`, defaulting to `auto`."
+                "Invalid Cayenne catalog parameter `tuning` value `{}`; expected `auto` or `adaptive`, defaulting to `auto`.",
+                raw_tuning.unwrap_or_default().trim()
             );
         }
-        let dynamic_tuning = tuning_mode.as_deref() == Some("adaptive");
+        let dynamic_tuning = tuning_mode.is_adaptive();
 
         // Seed the adaptive-tunable knobs from the host hardware profile (only
         // when adaptive is requested — `auto` keeps the engine defaults so the
@@ -353,7 +350,7 @@ impl CatalogConnector for CayenneCatalogConnector {
         let runtime_env = runtime.datafusion().ctx.runtime_env();
         let provider_config = self.parse_provider_config().await;
         let refreshable_provider = Arc::new(
-            CayenneCatalogProvider::try_new(provider_config, runtime_env)
+            CayenneCatalogProvider::try_new(provider_config, runtime_env, table_selector(catalog))
                 .await
                 .map_err(|e| super::Error::UnableToGetCatalogProvider {
                     connector: PREFIX.to_string(),

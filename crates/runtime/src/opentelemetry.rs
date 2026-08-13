@@ -52,8 +52,10 @@ use tonic::Status;
 use tonic::async_trait;
 use tonic::codec::CompressionEncoding;
 
-use crate::{Runtime, tracers::OnceTracer, warn_once};
+use crate::Runtime;
 use runtime_query_engine::query_engine::{QueryEngine, UpdateType};
+use util::tracers::OnceTracer;
+use util::warn_once;
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -166,11 +168,27 @@ impl MetricsService for Service {
                         );
                         continue;
                     };
-                    let existing_schema = (self
+                    let existing_schema = match self
                         .datafusion
                         .get_arrow_schema(TableReference::bare(metric.name.clone()))
-                        .await)
-                        .ok();
+                        .await
+                    {
+                        Ok(schema) => Some(schema),
+                        // The dataset is not yet registered (e.g. a `sink` dataset parked
+                        // until its first write after a restart). Fall back to the
+                        // acceleration checkpoint so a data point that omits a NULL dimension
+                        // is still built against the stored (wide) schema, rather than a
+                        // narrower batch the write rejects as a removed column.
+                        Err(_) => match self.runtime.as_ref().and_then(Weak::upgrade) {
+                            Some(runtime) => runtime
+                                .accelerated_checkpoint_schema(&TableReference::bare(
+                                    metric.name.clone(),
+                                ))
+                                .await
+                                .map(|schema| schema.as_ref().clone()),
+                            None => None,
+                        },
+                    };
                     let (record_batch_result, data_points_count) = metric_data_to_record_batch(
                         metric.name.as_str(),
                         &data,
@@ -670,7 +688,13 @@ fn attributes_to_fields_and_columns(
     let mut columns: IndexMap<String, Box<dyn ArrayBuilder>> = IndexMap::new();
     let mut warned_collisions: HashSet<&str> = HashSet::new();
 
-    initialize_attribute_schema(&mut fields, &mut columns, existing_schema, value_columns);
+    initialize_attribute_schema(
+        metric,
+        &mut fields,
+        &mut columns,
+        existing_schema,
+        value_columns,
+    );
 
     for (i, inner_attributes) in attributes.iter().enumerate() {
         for attribute in *inner_attributes {
@@ -786,7 +810,46 @@ fn attributes_to_fields_and_columns(
     (fields, columns)
 }
 
+/// Builder plus the canonical Arrow type it produces for a stored dimension column, or `None`
+/// when this module has no builder for the column's type.
+///
+/// The string/binary *families* collapse onto the canonical `Utf8`/`Binary` builders:
+/// accelerators store them in view/large layouts (e.g. Cayenne stores `Utf8View`) but
+/// `append_attribute!` always builds `Utf8`/`Binary` and `verify_schema` treats the families
+/// as equivalent, so seeding the canonical type writes back cleanly. `UInt64` and the two list
+/// types cover the columns the histogram path (#11992) writes — `count` and the
+/// `bucket_counts`/`explicit_bounds` arrays — which are value columns on a histogram but
+/// ordinary stored dimensions for a data point of another shape (#12117); the list element
+/// field is taken from the stored schema so the built array's type matches the field exactly.
+fn dimension_builder_for(field: &Field) -> Option<(Box<dyn ArrayBuilder>, DataType)> {
+    match field.data_type() {
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => {
+            Some((Box::new(StringBuilder::new()), DataType::Utf8))
+        }
+        DataType::Boolean => Some((Box::new(BooleanBuilder::new()), DataType::Boolean)),
+        DataType::Int64 => Some((Box::new(Int64Builder::new()), DataType::Int64)),
+        DataType::UInt64 => Some((Box::new(UInt64Builder::new()), DataType::UInt64)),
+        DataType::Float64 => Some((Box::new(Float64Builder::new()), DataType::Float64)),
+        DataType::Binary | DataType::LargeBinary | DataType::BinaryView => {
+            Some((Box::new(BinaryBuilder::new()), DataType::Binary))
+        }
+        DataType::List(item) => match item.data_type() {
+            DataType::UInt64 => Some((
+                Box::new(ListBuilder::new(UInt64Builder::new()).with_field(Arc::clone(item))),
+                field.data_type().clone(),
+            )),
+            DataType::Float64 => Some((
+                Box::new(ListBuilder::new(Float64Builder::new()).with_field(Arc::clone(item))),
+                field.data_type().clone(),
+            )),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 fn initialize_attribute_schema(
+    metric: &str,
     fields: &mut IndexMap<String, Arc<Field>>,
     columns: &mut IndexMap<String, Box<dyn ArrayBuilder>>,
     existing_schema: Option<&Schema>,
@@ -803,25 +866,35 @@ fn initialize_attribute_schema(
                 continue;
             }
 
-            fields.insert(field.name().clone(), Arc::clone(field));
-            match field.data_type() {
-                DataType::Utf8 => {
-                    columns.insert(field.name().clone(), Box::new(StringBuilder::new()));
-                }
-                DataType::Boolean => {
-                    columns.insert(field.name().clone(), Box::new(BooleanBuilder::new()));
-                }
-                DataType::Int64 => {
-                    columns.insert(field.name().clone(), Box::new(Int64Builder::new()));
-                }
-                DataType::Float64 => {
-                    columns.insert(field.name().clone(), Box::new(Float64Builder::new()));
-                }
-                DataType::Binary => {
-                    columns.insert(field.name().clone(), Box::new(BinaryBuilder::new()));
-                }
-                _ => {}
-            }
+            // `fields` and `columns` are zipped positionally into the batch, so a field seeded
+            // without a builder makes the two lists disagree and `RecordBatch::try_new` rejects
+            // the whole export. Seed the pair together, or drop the column (naming it) and let
+            // the write path report the schema mismatch it can describe.
+            let Some((builder, builder_type)) = dimension_builder_for(field) else {
+                tracing::warn!(
+                    "Metric {metric} has stored column {name} of unsupported type {data_type}, dropping it from this export",
+                    name = field.name(),
+                    data_type = field.data_type(),
+                );
+                continue;
+            };
+
+            // Force the seeded dimension column nullable: a data point that omits this
+            // attribute is backfilled with NULL, so a non-nullable field (e.g. a source
+            // column the accelerator stored as `NOT NULL`) would make `RecordBatch::try_new`
+            // reject the whole batch and drop the export. Adjust the stored field's data type
+            // to the builder's output (matching the view/large-family collapse) and force it
+            // nullable, preserving its metadata rather than rebuilding it from scratch.
+            let name = field.name().clone();
+            let nullable_field = Arc::new(
+                field
+                    .as_ref()
+                    .clone()
+                    .with_data_type(builder_type)
+                    .with_nullable(true),
+            );
+            fields.insert(name.clone(), nullable_field);
+            columns.insert(name, builder);
         }
     }
 }
@@ -842,14 +915,38 @@ fn append_null(
     key: &str,
 ) {
     if let Some(field) = fields.get(key) {
+        // Keep in step with `dimension_builder_for`: a column it can seed but this cannot null
+        // stays short of the other columns, and `RecordBatch::try_new` rejects the export.
         match field.data_type() {
             DataType::Utf8 => append_null!(columns, key, StringBuilder),
             DataType::Boolean => append_null!(columns, key, BooleanBuilder),
             DataType::Int64 => append_null!(columns, key, Int64Builder),
+            DataType::UInt64 => append_null!(columns, key, UInt64Builder),
             DataType::Float64 => append_null!(columns, key, Float64Builder),
             DataType::Binary => append_null!(columns, key, BinaryBuilder),
+            DataType::List(item) => match item.data_type() {
+                DataType::UInt64 => append_null!(columns, key, ListBuilder<UInt64Builder>),
+                DataType::Float64 => append_null!(columns, key, ListBuilder<Float64Builder>),
+                _ => {}
+            },
             _ => {}
         }
+    }
+}
+
+/// Builds the OpenTelemetry metrics ingest [`Service`] (the `MetricsService::export` handler).
+///
+/// Exposed so the ingest handler can be driven directly (e.g. in tests) without standing up a
+/// gRPC transport; production wiring goes through [`create_metrics_service`].
+#[must_use]
+pub fn build_metrics_service(
+    datafusion: Arc<dyn QueryEngine>,
+    runtime: Option<Weak<Runtime>>,
+) -> Service {
+    Service {
+        datafusion,
+        runtime,
+        once_tracer: OnceTracer::new(),
     }
 }
 
@@ -861,12 +958,8 @@ pub fn create_metrics_service(
     datafusion: Arc<dyn QueryEngine>,
     runtime: Option<Weak<Runtime>>,
 ) -> MetricsServiceServer<Service> {
-    let service = Service {
-        datafusion,
-        runtime,
-        once_tracer: OnceTracer::new(),
-    };
-    MetricsServiceServer::new(service).accept_compressed(CompressionEncoding::Gzip)
+    MetricsServiceServer::new(build_metrics_service(datafusion, runtime))
+        .accept_compressed(CompressionEncoding::Gzip)
 }
 
 #[cfg(test)]
@@ -1252,6 +1345,130 @@ mod tests {
         assert_eq!(widened_names, rebuilt_names);
     }
 
+    #[test]
+    fn seeded_non_nullable_dimension_is_null_filled_not_dropped() {
+        // Regression: a metric whose stored schema declares a dimension column as
+        // non-nullable (e.g. a source column the accelerator persisted as `NOT NULL`).
+        // A data point that omits that dimension must produce the column present-but-NULL,
+        // not fail the batch build (which would silently drop the whole export).
+        let existing = Schema::new(vec![
+            Field::new(VALUE_COLUMN_NAME, DataType::Float64, true),
+            Field::new(TIME_UNIX_NANO_COLUMN_NAME, DataType::UInt64, true),
+            Field::new(START_TIME_UNIX_NANO_COLUMN_NAME, DataType::UInt64, true),
+            Field::new("region", DataType::Utf8, false),
+        ]);
+
+        let data = Data::Gauge(opentelemetry_proto::tonic::metrics::v1::Gauge {
+            data_points: vec![number_data_point(1.0, vec![])],
+        });
+
+        let (result, _) = metric_data_to_record_batch("svc_requests", &data, Some(&existing));
+        let batch = result.expect("batch must build despite the non-nullable stored dimension");
+
+        let region_field = batch
+            .schema()
+            .field_with_name("region")
+            .expect("region column carried over from the existing schema")
+            .clone();
+        assert!(
+            region_field.is_nullable(),
+            "seeded dimension column must be emitted nullable so NULL backfill is valid"
+        );
+
+        let region = column(&batch, "region").as_string::<i32>();
+        assert!(
+            region.is_null(0),
+            "omitted dimension must be NULL, not dropped"
+        );
+    }
+
+    #[test]
+    fn seeded_unsupported_type_dimension_is_skipped_without_desync() {
+        // An existing-schema column with a type the attribute builders don't support must be
+        // skipped entirely (field AND column), never inserted as a field with no column —
+        // which would desync `fields`/`columns` and fail `RecordBatch::try_new`.
+        let existing = Schema::new(vec![
+            Field::new(VALUE_COLUMN_NAME, DataType::Float64, true),
+            Field::new(TIME_UNIX_NANO_COLUMN_NAME, DataType::UInt64, true),
+            Field::new(START_TIME_UNIX_NANO_COLUMN_NAME, DataType::UInt64, true),
+            Field::new("region", DataType::Utf8, true),
+            // Not one of the supported attribute builder types.
+            Field::new("weird", DataType::Int32, true),
+        ]);
+
+        let data = Data::Gauge(opentelemetry_proto::tonic::metrics::v1::Gauge {
+            data_points: vec![number_data_point(
+                1.0,
+                vec![string_attribute("region", "us")],
+            )],
+        });
+
+        let (result, _) = metric_data_to_record_batch("svc_requests", &data, Some(&existing));
+        let batch = result.expect("batch must build even with an unsupported existing column");
+
+        assert!(
+            batch.schema().field_with_name("region").is_ok(),
+            "supported dimension is still carried over"
+        );
+        assert!(
+            batch.schema().field_with_name("weird").is_err(),
+            "unsupported-type column must be skipped, not partially seeded"
+        );
+    }
+
+    #[test]
+    fn seeded_view_type_dimensions_are_materialized_not_dropped() {
+        // Regression for the Cayenne field-count mismatch: accelerators store string/binary
+        // dimensions in view/large layouts (Cayenne uses `Utf8View`). Matching only the exact
+        // `Utf8`/`Binary` type skipped those columns, so a data point missing them produced a
+        // narrower batch than the stored table (e.g. 17 expected vs 14 received) and the write
+        // failed. Every stored dimension must be materialized, present-but-NULL when absent.
+        let existing = Schema::new(vec![
+            Field::new(VALUE_COLUMN_NAME, DataType::Float64, true),
+            Field::new(TIME_UNIX_NANO_COLUMN_NAME, DataType::UInt64, true),
+            Field::new(START_TIME_UNIX_NANO_COLUMN_NAME, DataType::UInt64, true),
+            Field::new("region", DataType::Utf8View, true),
+            Field::new("team", DataType::LargeUtf8, true),
+            Field::new("payload", DataType::BinaryView, true),
+        ]);
+
+        // Data point carries none of the view-typed dimensions.
+        let data = Data::Gauge(opentelemetry_proto::tonic::metrics::v1::Gauge {
+            data_points: vec![number_data_point(1.0, vec![])],
+        });
+
+        let (result, _) = metric_data_to_record_batch("query_active_count", &data, Some(&existing));
+        let batch = result.expect("batch must build with the view-typed dimensions materialized");
+
+        assert_eq!(
+            batch.num_columns(),
+            existing.fields().len(),
+            "every stored column must be present so the write matches the table width"
+        );
+
+        // View/large string columns are materialized as canonical `Utf8` (matching how present
+        // attributes are appended); `verify_schema` treats the utf8 family as equivalent.
+        for name in ["region", "team"] {
+            let field = batch
+                .schema()
+                .field_with_name(name)
+                .unwrap_or_else(|_| panic!("{name} must be carried over"))
+                .clone();
+            assert_eq!(field.data_type(), &DataType::Utf8, "{name} seeded as Utf8");
+            assert!(
+                column(&batch, name).as_string::<i32>().is_null(0),
+                "{name} omitted on the data point must be NULL"
+            );
+        }
+
+        let payload_field = batch
+            .schema()
+            .field_with_name("payload")
+            .expect("payload must be carried over")
+            .clone();
+        assert_eq!(payload_field.data_type(), &DataType::Binary);
+    }
+
     fn field_names(schema: &Schema) -> Vec<&str> {
         schema.fields().iter().map(|f| f.name().as_str()).collect()
     }
@@ -1380,5 +1597,65 @@ mod tests {
             .downcast_ref::<Float64Array>()
             .expect("value keeps the metric's own type");
         assert!((values.value(0) - 1.5).abs() < f64::EPSILON);
+    }
+
+    /// A stored column is seeded so it keeps its position and gets a null backfill, which needs
+    /// both a builder to seed and a null to append. The histogram path writes `count` as
+    /// `UInt64` and the two bucket arrays as lists, and those are dimensions — not value
+    /// columns — for a data point of another shape, so seeding must cover them (fixes #12117).
+    #[test]
+    fn histogram_columns_seed_as_dimensions_on_a_later_gauge_export() {
+        let histogram = Data::Histogram(Histogram {
+            data_points: vec![histogram_data_point(
+                5,
+                Some(12.5),
+                Some(0.5),
+                Some(9.0),
+                vec![1, 2, 2],
+                vec![1.0, 5.0],
+                vec![string_attribute("host", "a")],
+            )],
+            aggregation_temporality: 0,
+        });
+        let stored = metric_data_to_record_batch("latency", &histogram, None)
+            .0
+            .expect("histogram batch builds")
+            .schema();
+
+        let gauge = Data::Gauge(opentelemetry_proto::tonic::metrics::v1::Gauge {
+            data_points: vec![number_data_point(1.0, vec![string_attribute("host", "b")])],
+        });
+        let (result, _) = metric_data_to_record_batch("latency", &gauge, Some(&stored));
+        let batch = result.expect("gauge batch builds against the stored histogram schema");
+
+        assert_eq!(
+            field_names(&batch.schema()),
+            vec![
+                VALUE_COLUMN_NAME,
+                TIME_UNIX_NANO_COLUMN_NAME,
+                START_TIME_UNIX_NANO_COLUMN_NAME,
+                COUNT_COLUMN_NAME,
+                SUM_COLUMN_NAME,
+                MIN_COLUMN_NAME,
+                MAX_COLUMN_NAME,
+                BUCKET_COUNTS_COLUMN_NAME,
+                EXPLICIT_BOUNDS_COLUMN_NAME,
+                "host",
+            ],
+            "every stored dimension must keep its position"
+        );
+        assert_eq!(batch.num_rows(), 1);
+        for name in [
+            COUNT_COLUMN_NAME,
+            SUM_COLUMN_NAME,
+            BUCKET_COUNTS_COLUMN_NAME,
+            EXPLICIT_BOUNDS_COLUMN_NAME,
+        ] {
+            assert!(
+                column(&batch, name).is_null(0),
+                "{name} is not carried by this data point shape, so it must be null"
+            );
+        }
+        assert_eq!(column(&batch, "host").as_string::<i32>().value(0), "b");
     }
 }

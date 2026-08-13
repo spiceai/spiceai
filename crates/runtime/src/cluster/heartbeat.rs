@@ -31,6 +31,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::StreamExt;
+use object_store::UpdateVersion;
 use object_store::path::Path;
 use object_store::{Error as ObjectStoreError, ObjectStore, ObjectStoreExt, PutMode, PutOptions};
 use serde::{Deserialize, Serialize};
@@ -73,6 +74,11 @@ pub enum Error {
     },
     #[snafu(display("Failed to (de)serialize heartbeat: {source}"))]
     Serde { source: serde_json::Error },
+    #[snafu(display(
+        "Heartbeat for {scheduler_id} was written by another incarnation during this write"
+    ))]
+    HeartbeatSupersededDuringWrite { scheduler_id: String },
+
     #[snafu(display("Heartbeat write for {scheduler_id} exhausted retries: {source}"))]
     RetryExhausted {
         scheduler_id: String,
@@ -135,14 +141,16 @@ impl SchedulerHeartbeatStore {
         Path::from(format!("{}{}.json", self.prefix, scheduler_id))
     }
 
-    /// Writes (or overwrites) the heartbeat for a scheduler.
+    /// Writes (or overwrites) the heartbeat for a scheduler, returning the
+    /// version written where the store reports one. Callers keep that version so
+    /// a later write can stay conditional even if the object cannot be read.
     pub async fn heartbeat(
         &self,
         scheduler_id: &str,
         instance_id: Uuid,
         now_ms: u64,
         ttl_ms: u64,
-    ) -> Result<()> {
+    ) -> Result<Option<UpdateVersion>> {
         let beat = SchedulerHeartbeat {
             scheduler_id: scheduler_id.to_string(),
             instance_id,
@@ -167,7 +175,9 @@ impl SchedulerHeartbeatStore {
                 )
                 .await
             {
-                Ok(_) => return Ok(()),
+                Ok(result) => {
+                    return Ok(Self::usable_version_of(result.e_tag, result.version));
+                }
                 Err(source) => {
                     let Some(delay) = backoff.next_duration() else {
                         return Err(Error::RetryExhausted {
@@ -186,6 +196,131 @@ impl SchedulerHeartbeatStore {
                     tokio::time::sleep(delay).await;
                 }
             }
+        }
+    }
+
+    /// Reads the heartbeat together with the object version needed to write it
+    /// back conditionally. `None` means the object does not exist yet.
+    /// The version is what a conditional write needs; the payload is only used
+    /// to see *whose* beat it is. An unparsable payload therefore yields
+    /// `Some((None, version))` rather than an error: failing here would stop a
+    /// healthy scheduler from ever repairing its own key, where the previous
+    /// unconditional write self-healed.
+    pub async fn read_versioned(
+        &self,
+        scheduler_id: &str,
+    ) -> Result<Option<(Option<SchedulerHeartbeat>, UpdateVersion)>> {
+        let path = self.path_for(scheduler_id);
+        match self.store.get(&path).await {
+            Ok(result) => {
+                let version = UpdateVersion {
+                    e_tag: result.meta.e_tag.clone(),
+                    version: result.meta.version.clone(),
+                };
+                let bytes = result.bytes().await.map_err(|source| Error::Read {
+                    path: path.to_string(),
+                    source,
+                })?;
+                let beat = match serde_json::from_slice::<SchedulerHeartbeat>(&bytes) {
+                    Ok(beat) => Some(beat),
+                    Err(err) => {
+                        tracing::warn!(
+                            path = %path,
+                            error = %err,
+                            "Unparsable heartbeat payload; treating the holder as unknown"
+                        );
+                        None
+                    }
+                };
+                Ok(Some((beat, version)))
+            }
+            Err(ObjectStoreError::NotFound { .. }) => Ok(None),
+            Err(source) => Err(Error::Read {
+                path: path.to_string(),
+                source,
+            }),
+        }
+    }
+
+    /// A version is only usable as a write predicate when it actually carries an
+    /// identifier. Some stores return neither an `ETag` nor a version, and passing
+    /// an empty predicate would assert a condition the store cannot check.
+    fn usable_version_of(e_tag: Option<String>, version: Option<String>) -> Option<UpdateVersion> {
+        if e_tag.is_none() && version.is_none() {
+            return None;
+        }
+        Some(UpdateVersion { e_tag, version })
+    }
+
+    /// Writes the heartbeat only if the stored object is still the one the
+    /// caller observed (`expected`), or is still absent when `expected` is
+    /// `None`.
+    ///
+    /// The key is shared by every incarnation of a `scheduler_id`, so an
+    /// unconditional write lets a superseded process clobber the incarnation
+    /// that replaced it. A conditional write means that if anyone else wrote in
+    /// between, this fails with [`Error::HeartbeatSupersededDuringWrite`]
+    /// instead of overwriting them.
+    ///
+    /// This is **not** an ownership fence. It proves only that the object has
+    /// not changed since `expected` was observed; it says nothing about whether
+    /// the caller is still the registered incarnation. Callers that need
+    /// ownership must check membership separately, as `write_heartbeat` does.
+    ///
+    /// Returns the version of the object just written, so a caller can keep
+    /// writing conditionally even while reads are failing.
+    pub async fn heartbeat_if_unchanged(
+        &self,
+        scheduler_id: &str,
+        instance_id: Uuid,
+        now_ms: u64,
+        ttl_ms: u64,
+        expected: Option<&UpdateVersion>,
+    ) -> Result<Option<UpdateVersion>> {
+        let beat = SchedulerHeartbeat {
+            scheduler_id: scheduler_id.to_string(),
+            instance_id,
+            last_heartbeat_ms: now_ms,
+            ttl_ms,
+        };
+        let payload = serde_json::to_vec(&beat).context(SerdeSnafu)?;
+        let path = self.path_for(scheduler_id);
+        let mode = match expected {
+            Some(version) => PutMode::Update(version.clone()),
+            None => PutMode::Create,
+        };
+
+        // Deliberately a single attempt. Retrying a *conditional* write after an
+        // ambiguous failure is what makes a lost acknowledgement dangerous: the
+        // retry's precondition fails against a write that may have been our own,
+        // which cannot be distinguished from a successor's. The caller treats an
+        // unknown outcome as "the retained version can no longer be trusted"
+        // instead, and the store's own retry policy still covers transport
+        // errors.
+        match self
+            .store
+            .put_opts(&path, payload.into(), PutOptions::from(mode))
+            .await
+        {
+            Ok(result) => Ok(Self::usable_version_of(result.e_tag, result.version)),
+            // `NotFound` belongs with the conflict cases: a conditional update
+            // whose target has been deleted since it was read has lost the same
+            // race, and some stores report it that way rather than as a
+            // precondition failure. Treating it as a hard error would abort
+            // registration *after* membership was committed, leaving a registered
+            // entry with no running registry, where the caller can simply re-read
+            // and create the key instead.
+            Err(
+                ObjectStoreError::Precondition { .. }
+                | ObjectStoreError::AlreadyExists { .. }
+                | ObjectStoreError::NotFound { .. },
+            ) => Err(Error::HeartbeatSupersededDuringWrite {
+                scheduler_id: scheduler_id.to_string(),
+            }),
+            Err(source) => Err(Error::Write {
+                path: path.to_string(),
+                source,
+            }),
         }
     }
 

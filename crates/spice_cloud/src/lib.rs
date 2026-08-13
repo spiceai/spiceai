@@ -24,9 +24,7 @@ use snafu::{ResultExt, prelude::*};
 
 use runtime::{
     Runtime,
-    accelerated_table::{
-        AcceleratedTable, AcceleratedTableBuilderError, Retention, refresh::Refresh,
-    },
+    accelerated::{AcceleratedTable, AcceleratedTableBuilderError, Retention, refresh::Refresh},
     component::{
         access::AccessMode,
         dataset::{
@@ -39,7 +37,7 @@ use runtime::{
     dataaccelerator::{self, AcceleratorEngineRegistry},
     dataconnector::{DataConnectorError, create_new_connector, parameters::ConnectorParamsBuilder},
     extension::{Error as ExtensionError, Extension, ExtensionFactory, ExtensionManifest, Result},
-    federated_table::FederatedTable,
+    federated::FederatedTable,
     secrets::{ExposeSecret, Secrets},
     spice_metrics::get_metrics_table_reference,
     status,
@@ -207,7 +205,7 @@ impl SpiceExtension {
 
         runtime
             .datafusion()
-            .register_table_as_writable_and_with_schema(metrics_table_reference, table)
+            .register_table_as_writable_and_with_schema(metrics_table_reference, table.into_table())
             .boxed()
             .map_err(|e| runtime::extension::Error::UnableToStartExtension { source: e })?;
 

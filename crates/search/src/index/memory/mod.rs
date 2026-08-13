@@ -42,6 +42,7 @@ use llms::embeddings::Embed;
 use parking_lot::RwLock;
 use runtime_datafusion_index::{Index, WriteWindow};
 use snafu::{ResultExt, Snafu, ensure};
+use spice_table::Index;
 
 use crate::index::{
     SearchIndex, VectorIndex, embedding_col,

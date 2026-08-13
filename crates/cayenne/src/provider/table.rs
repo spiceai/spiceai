@@ -170,12 +170,91 @@ const STAGED_WRITE_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 /// parallelism. See `snapshot_write_concurrency`.
 pub(crate) const DEFAULT_WRITE_CONCURRENCY: usize = 4;
 const TABLE_STATISTICS_FULL_COLUMN_SYNC_LIMIT: usize = 256;
-/// Upper bound on maintained-aggregate retained index entries (per-PK
-/// contributions plus distinct `MIN`/`MAX` multiset nodes); exceeding it fails
-/// the registry safe to a base-table rebuild so memory stays bounded.
-/// TODO: derive from `runtime.query.memory_limit` once the budget is threaded to
-/// the provider (Pattern 9 — budget-derived caps).
-const MAINTAINED_AGGREGATE_MAX_INDEX_ENTRIES: usize = 5_000_000;
+/// Fraction of the query memory pool the maintained-aggregate retained indexes
+/// (per-PK contributions plus distinct `MIN`/`MAX` multiset nodes) may occupy.
+///
+/// The indexes are plain allocations rather than pool reservations — they live on
+/// the CDC write path, where a reservation failure would have to fail the write
+/// rather than the aggregate — so this fraction is what keeps them inside the
+/// operator's `runtime.query.memory_limit` contract. Deliberately a minority
+/// share: the pool's primary job is serving queries, and an over-cap index fails
+/// safe to a base-table scan, which is slower but always correct.
+const MAINTAINED_AGGREGATE_INDEX_POOL_FRACTION: f64 = 0.10;
+
+/// Retained-index budget used when the query memory pool is unbounded, and the
+/// ceiling applied to the derived fraction on a very large pool. An unbounded
+/// pool still needs *some* bound, or an index on a large table grows until the
+/// host OOMs.
+const MAINTAINED_AGGREGATE_MAX_INDEX_BYTES_DEFAULT: usize = 512 * 1024 * 1024;
+
+/// How many mem-tier checkpoints pass between attempts to rebuild a stale
+/// maintained-aggregate registry. A rebuild is a full visible-state scan, and on
+/// a table that genuinely exceeds its retained-index budget it will re-stale, so
+/// the retry must be a trickle rather than a loop. The first stale checkpoint
+/// attempts immediately, so a transient failure recovers at once.
+const MAINTAINED_AGGREGATE_REARM_TICK_INTERVAL: u64 = 32;
+
+/// How many times a rebuild may fail before the table stops attempting it.
+///
+/// Distinct from re-staling, which is the byte budget working as designed and is
+/// always worth retrying. A rebuild that *errors* is a fault, and the faults that
+/// reach it are usually permanent — a filter that does not type-check against the
+/// table fails the same way on every batch. Since each attempt rescans the whole
+/// visible state, retrying such a failure forever costs a full table scan per
+/// interval and recovers nothing. A few attempts still absorb a transient I/O
+/// error.
+const MAINTAINED_AGGREGATE_REBUILD_MAX_FAILURES: u64 = 3;
+
+/// Floor for the derived retained-index budget, applied only where the pool can
+/// afford it. Below this an index is too small to serve any useful table, so a
+/// modest pool is lifted to the floor rather than left with a share no index can
+/// fit. The lift is still capped by the pool limit itself — see
+/// [`maintained_aggregate_max_index_bytes`] — because a floor that exceeded the
+/// pool would breach the very budget it exists to enforce.
+const MAINTAINED_AGGREGATE_MIN_INDEX_BYTES: usize = 8 * 1024 * 1024;
+
+/// Resolve the maintained-aggregate retained-index byte budget from the query
+/// memory pool, so the index cannot grow past the operator's
+/// `runtime.query.memory_limit`. An unbounded/unknown pool falls back to
+/// [`MAINTAINED_AGGREGATE_MAX_INDEX_BYTES_DEFAULT`].
+fn maintained_aggregate_max_index_bytes(
+    runtime_env: &datafusion::execution::runtime_env::RuntimeEnv,
+) -> usize {
+    use datafusion::execution::memory_pool::MemoryPool;
+    match MemoryPool::memory_limit(&*runtime_env.memory_pool) {
+        datafusion::execution::memory_pool::MemoryLimit::Finite(limit) => {
+            // `f64` round-trip is exact enough for a budget fraction; the
+            // saturating cast floors a non-finite product at 0, which the
+            // clamp below lifts to the floor.
+            #[expect(
+                clippy::cast_precision_loss,
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "budget fraction; result is clamped to [MIN, DEFAULT] and capped at the pool limit"
+            )]
+            let scaled = (limit as f64 * MAINTAINED_AGGREGATE_INDEX_POOL_FRACTION) as usize;
+            // The floor lifts a modest pool's share to something an index can
+            // fit, but never past the pool itself: on a pool smaller than the
+            // floor the lift would hand the index more memory than
+            // `runtime.query.memory_limit` allows (a 4MiB pool would get an 8MiB
+            // budget). Capping at `limit` leaves such a pool a budget any real
+            // index overruns, so maintained aggregates fail safe to base-table
+            // scans — the intended outcome for a pool that cannot afford them.
+            scaled
+                .clamp(
+                    MAINTAINED_AGGREGATE_MIN_INDEX_BYTES,
+                    MAINTAINED_AGGREGATE_MAX_INDEX_BYTES_DEFAULT,
+                )
+                .min(limit)
+        }
+        // No knowable ceiling to derive from — fall back to the standalone
+        // default rather than leaving the index unbounded.
+        datafusion::execution::memory_pool::MemoryLimit::Infinite
+        | datafusion::execution::memory_pool::MemoryLimit::Unknown => {
+            MAINTAINED_AGGREGATE_MAX_INDEX_BYTES_DEFAULT
+        }
+    }
+}
 /// Bounded depth of the per-table maintained-aggregate apply queue. The CDC
 /// write path enqueues maintenance here and continues, so registry maintenance
 /// runs off the replication critical path while the background applier drains it
@@ -637,7 +716,7 @@ struct SnapshotFilesForScan {
 }
 
 /// Serialize one or more `RecordBatch`es to Arrow IPC stream bytes.
-fn serialize_batches_to_ipc(
+pub(super) fn serialize_batches_to_ipc(
     batches: &[RecordBatch],
 ) -> std::result::Result<Vec<u8>, arrow::error::ArrowError> {
     let mut buf = Vec::new();
@@ -1585,6 +1664,13 @@ pub struct CayenneTableProvider {
     /// when both hold exact keysets). Shared across clones like the caches.
     pk_keyset_bytes_single: Arc<AtomicUsize>,
     pk_keyset_bytes_sharded: Arc<AtomicUsize>,
+    /// Serializes read-both-components-then-publish. The two components are
+    /// written under different locks (the single keyset's and the sharded
+    /// index's), so without this a publisher can read the sum, be overtaken by a
+    /// publisher that reads a newer sum and writes it, and then land its own
+    /// stale total last — leaving both the pool reservation and this table's
+    /// share of the fleet budget under-reporting residency that exists.
+    pk_keyset_publish_lock: Arc<ParkingMutex<()>>,
     /// Per-key transaction OCC (`transaction_has_conflict`) trusts the Exact
     /// keyset's per-key `sequence` stamps ONLY when this is `false`. Set `true`
     /// whenever an event leaves the shared Exact keyset with a stale or missing
@@ -2069,6 +2155,15 @@ pub struct CayenneTableProvider {
     /// aggregates are configured. Cloned (never re-spawned) onto provider
     /// clones so every clone feeds the one ordered applier.
     maintained_aggregate_tx: Option<tokio::sync::mpsc::Sender<MaintainedAggregateApply>>,
+    /// Counts checkpoints observed while the maintained-aggregate registry is
+    /// stale, so the rebuild that recovers it runs on a bounded trickle rather
+    /// than on every checkpoint. Shared across clones — one table, one attempt
+    /// cadence. See [`Self::try_rearm_maintained_aggregates`].
+    maintained_aggregate_rearm_ticks: Arc<AtomicU64>,
+    /// Consecutive rebuild *faults*, latching the rearm off at
+    /// [`MAINTAINED_AGGREGATE_REBUILD_MAX_FAILURES`]. Separate from the tick
+    /// counter because re-staling is not a fault and must keep retrying.
+    maintained_aggregate_rebuild_failures: Arc<AtomicU64>,
     /// Per-table background compaction task, populated by
     /// [`Self::spawn_background_compaction`]. Held by `Arc<OnceLock<…>>` so it
     /// survives [`Self::clone_for_write`] and shares its drop signal across
@@ -2105,6 +2200,22 @@ pub struct CayenneTableProvider {
     /// append-mode refresh's primary-key dedup path — can see it. `None` when
     /// the table has no primary key.
     pk_constraints: Option<Constraints>,
+}
+
+/// The inline corpus an overwrite commits alongside its snapshot flip, as the
+/// in-memory visibility state needs to describe it. Both values come from the
+/// single `cayenne_inlined_data` row [`CayenneCatalog::commit_overwrite_in_txn`]
+/// inserts, so the in-memory counters end up describing exactly what the catalog
+/// holds.
+///
+/// [`CayenneCatalog`]: crate::CayenneCatalog
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct InlinedOverwritePublish {
+    /// Rows in the inline entry — the whole table's contents on this path.
+    pub(crate) row_count: i64,
+    /// Sequence assigned to the entry; the inline visibility watermark must
+    /// reach it before a scan will materialize the entry.
+    pub(crate) sequence_number: i64,
 }
 
 /// Prebuilt in-memory state for publishing a cloned append snapshot. Building
@@ -2890,6 +3001,14 @@ impl CayenneTableProvider {
     pub(crate) fn metadata_catalog(&self) -> &Arc<dyn MetadataCatalog> {
         &self.catalog
     }
+
+    /// The shared per-table context (Vortex format + caches + resolved config).
+    /// Exposed for sibling `provider::*` modules that drive a write path from
+    /// outside this one.
+    pub(super) fn context(&self) -> &Arc<CayenneContext> {
+        &self.context
+    }
+
     /// Returns the name of this table.
     #[must_use]
     pub fn table_name(&self) -> &str {
@@ -3360,13 +3479,149 @@ impl CayenneTableProvider {
     /// the table *before* the fence and performs no I/O), so the fence guards only
     /// the in-memory pointer swaps — never an `.await` that touches disk or the
     /// metastore.
-    pub(crate) async fn publish_overwrite_snapshot(&self, new_snapshot_id: &str) -> Result<()> {
+    ///
+    /// `inlined_rows` is `Some(..)` when the overwrite's contents were committed
+    /// to the metastore inline tier rather than to Vortex files under
+    /// `new_snapshot_id` (whose directory is then empty). It re-seeds the inline
+    /// counters that [`Self::invalidate_inlined_cache`] zeroes, so the flip lands
+    /// on the exact corpus the catalog holds.
+    pub(crate) async fn publish_overwrite_snapshot(
+        &self,
+        new_snapshot_id: &str,
+        inlined_rows: Option<InlinedOverwritePublish>,
+    ) -> Result<()> {
         // Build the new listing table BEFORE acquiring the fence (synchronous, no
         // I/O), then flip every visibility-affecting pointer atomically below.
         let new_listing_table = self.build_overwrite_listing_table(new_snapshot_id)?;
         let _fence = self.listing_fence.write().await;
-        self.publish_overwrite_snapshot_fenced(new_snapshot_id, new_listing_table);
+        self.publish_overwrite_snapshot_fenced(new_snapshot_id, new_listing_table, inlined_rows);
         Ok(())
+    }
+
+    /// Make an inlined overwrite's replacement rows readable BEFORE its catalog
+    /// transaction runs. Called from [`Self::begin_overwrite`], under the
+    /// per-table write lock, once the payload is built and its sequence reserved.
+    ///
+    /// # Why this cannot wait for the publish
+    ///
+    /// The overwrite's catalog transaction and its in-memory publish are two
+    /// separate atomic units: the transaction clears the old inline corpus,
+    /// inserts the replacement row and flips the durable snapshot pointer, and
+    /// only later does [`Self::publish_overwrite_snapshot`] move the in-memory
+    /// pointers under the listing fence. A scan (which holds
+    /// `listing_fence.read()`) can land between them. Left alone it would pair
+    /// the PRE-overwrite in-memory state — whose inline visibility watermark
+    /// still sits below the new row's sequence — with a catalog that now holds
+    /// only that new row: the row is skipped as unpublished, the inline view
+    /// comes back empty, and if the pre-overwrite snapshot was itself inlined its
+    /// directory is empty too. The scan then reports an EMPTY TABLE.
+    ///
+    /// # Why publishing early is safe
+    ///
+    /// * The watermark only ever admits rows. Every pre-overwrite entry carries a
+    ///   sequence strictly below the old watermark, so raising it hides nothing;
+    ///   before the transaction commits a scan still sees the whole old corpus.
+    /// * `durable_inlined_row_count` gates a fast path that returns an empty view
+    ///   without reading the catalog. Raising it (a saturating max — never a
+    ///   store, which could shrink a larger pre-overwrite corpus to the
+    ///   replacement's size) can only force a full read, which is always correct.
+    /// * The structural-epoch bump invalidates any materialized view, so every
+    ///   read in the window goes to the catalog — and the catalog is only ever in
+    ///   one of two states, because the clear, the insert and the pointer flip
+    ///   are one transaction. Before it: the old rows. After it: the replacement.
+    ///
+    /// `inlined_row_count` is deliberately NOT raised. It gates whether a scan
+    /// consults the inline tier at all, and leaving it at the pre-overwrite value
+    /// is what keeps a file-backed predecessor correct: such a table has no
+    /// inline rows, so the window skips the tier entirely and reads its (still
+    /// current) file directory rather than mixing those files with the
+    /// replacement rows. [`Self::publish_overwrite_snapshot`] sets it, together
+    /// with the directory swap, under the fence.
+    ///
+    /// If the transaction fails or is rolled back all three are harmless
+    /// over-approximations: a raised watermark has nothing to admit, an inflated
+    /// count forces a full read, a bumped epoch forces one rebuild.
+    pub(super) fn prepublish_inlined_overwrite(&self, inlined_rows: InlinedOverwritePublish) {
+        self.durable_inlined_row_count
+            .fetch_max(inlined_rows.row_count, Ordering::Relaxed);
+        self.published_inlined_seq
+            .fetch_max(inlined_rows.sequence_number, Ordering::Release);
+        self.bump_inlined_structural_epoch();
+    }
+
+    /// Whether an overwrite of this table may be inlined at all.
+    ///
+    /// Four shapes are refused, and each keeps the Vortex path every overwrite
+    /// used before inlining existed:
+    ///
+    /// * **A mem-tier seal shadow.** Inlining an overwrite advances the inline
+    ///   watermark ahead of the commit (see
+    ///   [`Self::prepublish_inlined_overwrite`]), which exposes EVERY durable
+    ///   `cayenne_inlined_data` row at or below the new sequence. That is exactly
+    ///   the overwrite's own row — unless a seal has written the RAM tier's
+    ///   contents to the inline tier at a sequence deliberately kept ABOVE the
+    ///   watermark while the very same rows stay live in the tier
+    ///   (`seal_mem_tier_durable`), in which case exposing it would serve them
+    ///   twice. The tier is reachable only under `cdc_durability: memory`, which
+    ///   the whole-table-replace refresh profile never selects, so this bites only
+    ///   on a hand-issued overwrite against a CDC table.
+    /// * **A partition column**, and
+    /// * **retention delete filters** — the same two conditions
+    ///   `InlineMutationPolicy::from_blocking_conditions` bars the CDC write path
+    ///   on, for the same reasons: an inline entry carries no partition key, and
+    ///   retention filters do not reach into the inline corpus. This is the
+    ///   single-provider partition-aware shape.
+    /// * **A coupled writer** — the child table of a partitioned *dataset*. Each
+    ///   child carries `partition_column: None`, so the check above does not
+    ///   reach it, and every child shares one context and therefore the one
+    ///   `try_acquire`-only inline-admission slot
+    ///   ([`CayenneContext::try_acquire_overwrite_inline_admission`]). The
+    ///   children write concurrently under a single routing demux, so exactly one
+    ///   of them would take the slot and inline while its siblings fell back to
+    ///   Vortex — leaving a whole-table replace split across both tiers, with the
+    ///   inlined partition picked by whichever child happened to reach admission
+    ///   first. Widening the slot to admit them all is not the alternative:
+    ///   awaiting it reintroduces the demux hold-and-wait deadlock of
+    ///   spiceai/spiceai#11818, and one permit per child would multiply the
+    ///   buffered-admission memory reservation by a partition count that is not
+    ///   statically bounded (time-based partitions grow indefinitely). Little is
+    ///   given up: a child is already clamped to `write_concurrency = 1`, so a
+    ///   refresh leaves one file per partition and the next overwrite replaces
+    ///   it — not the growing pile of tiny files inlining exists to prevent.
+    pub(super) fn inline_overwrite_admissible(&self) -> bool {
+        self.mem_tier.is_empty()
+            && !self.mem_tier_shadow_present.load(Ordering::Acquire)
+            && self.table_metadata.partition_column.is_none()
+            && !self.context().is_coupled_writer()
+            && !self.has_retention_delete_filters()
+    }
+
+    /// Materialize the pre-overwrite inline view into the cache so a scan that
+    /// lands between an overwrite's commit and its publish is served from memory
+    /// rather than from the just-cleared catalog.
+    ///
+    /// The mirror of [`Self::prepublish_inlined_overwrite`] for an overwrite that
+    /// does NOT inline: its transaction clears the inline corpus and puts nothing
+    /// back, so a rebuild inside the window returns an empty view. Paired with a
+    /// pre-overwrite snapshot that was itself inlined — an empty directory — that
+    /// is again an empty table. A cache entry stamped with the current generation
+    /// keeps the window on the complete pre-overwrite corpus instead; the caller
+    /// holds the per-table write lock, so nothing can invalidate it before
+    /// [`Self::publish_overwrite_snapshot`] swaps corpus and directory together.
+    ///
+    /// Best-effort: a failure to read leaves the window on the (pre-existing)
+    /// rebuild path rather than failing the overwrite.
+    pub(super) async fn warm_inlined_cache_for_overwrite(&self) {
+        if self.cached_inlined_row_count() <= 0 {
+            return;
+        }
+        if let Err(error) = self.read_inlined_batches().await {
+            tracing::warn!(
+                table = self.table_metadata.table_name.as_str(),
+                %error,
+                "Failed to materialize the inline view before an overwrite commit; a scan between the commit and the publish may miss inline rows"
+            );
+        }
     }
 
     /// Build the new snapshot's listing table for an overwrite publish
@@ -3395,6 +3650,7 @@ impl CayenneTableProvider {
         &self,
         new_snapshot_id: &str,
         new_listing_table: Arc<ListingTable>,
+        inlined_rows: Option<InlinedOverwritePublish>,
     ) {
         // No scan-view seqlock bracket needed: the caller holds `listing_fence.write()`
         // and every step here is synchronous, while a scan-view capture holds
@@ -3410,6 +3666,23 @@ impl CayenneTableProvider {
         // `inlined_generation`; bump it here, under the fence, so a scan never pairs
         // the new snapshot with stale pre-overwrite inline batches.
         self.invalidate_inlined_cache();
+        // An inlined overwrite committed replacement rows in that same transaction,
+        // so re-seed the counters the clear just zeroed to describe them. Ordering
+        // mirrors `publish_inlined_mutation`: counts and watermark first, then a
+        // `Release` structural bump publishes them, so a reader that observes the
+        // new epoch also observes the new corpus (and full-rebuilds against it — the
+        // corpus was replaced, so the append-only delta path must not be taken).
+        // The watermark was already advanced by `prepublish_inlined_overwrite`; the
+        // `fetch_max` here is what makes the two orderings agree on the same value.
+        if let Some(inlined) = inlined_rows {
+            self.inlined_row_count
+                .store(inlined.row_count, Ordering::Relaxed);
+            self.durable_inlined_row_count
+                .store(inlined.row_count, Ordering::Relaxed);
+            self.published_inlined_seq
+                .fetch_max(inlined.sequence_number, Ordering::Release);
+            self.bump_inlined_structural_epoch();
+        }
         self.mark_maintained_aggregates_stale();
         // `update_current_snapshot_id` above already cleared the sorted-output
         // attestation; the overwrite rebinds to a non-sorted snapshot, so it stays cleared.
@@ -5678,7 +5951,7 @@ impl CayenneTableProvider {
                 &maintained_aggregate_specs,
                 &table_metadata.schema,
                 &pk_column_indices,
-                MAINTAINED_AGGREGATE_MAX_INDEX_ENTRIES,
+                maintained_aggregate_max_index_bytes(context.runtime_env()),
             )
             .map_err(|source| CatalogError::InvalidOperation {
                 message: format!(
@@ -5818,6 +6091,7 @@ impl CayenneTableProvider {
             pk_warm_probe_done: Arc::new(AtomicBool::new(false)),
             pk_keyset_bytes_single: Arc::new(AtomicUsize::new(0)),
             pk_keyset_bytes_sharded: Arc::new(AtomicUsize::new(0)),
+            pk_keyset_publish_lock: Arc::new(ParkingMutex::new(())),
             pk_keyset_occ_degraded: Arc::new(AtomicBool::new(false)),
             cold_pk_existence: Arc::new(ParkingMutex::new(None)),
             table_memory,
@@ -5906,6 +6180,8 @@ impl CayenneTableProvider {
             maintained_aggregate_epoch: Arc::new(AtomicU64::new(0)),
             maintained_aggregate_visibility_sequence: Arc::new(AtomicU64::new(0)),
             maintained_aggregate_tx,
+            maintained_aggregate_rearm_ticks: Arc::new(AtomicU64::new(0)),
+            maintained_aggregate_rebuild_failures: Arc::new(AtomicU64::new(0)),
             background_compactor: Arc::new(std::sync::OnceLock::new()),
             background_mem_tier_checkpointer: Arc::new(std::sync::OnceLock::new()),
             background_cold_tier_promoter: Arc::new(std::sync::OnceLock::new()),
@@ -7009,6 +7285,7 @@ impl CayenneTableProvider {
             pk_warm_probe_done: Arc::clone(&self.pk_warm_probe_done),
             pk_keyset_bytes_single: Arc::clone(&self.pk_keyset_bytes_single),
             pk_keyset_bytes_sharded: Arc::clone(&self.pk_keyset_bytes_sharded),
+            pk_keyset_publish_lock: Arc::clone(&self.pk_keyset_publish_lock),
             pk_keyset_occ_degraded: Arc::clone(&self.pk_keyset_occ_degraded),
             cold_pk_existence: Arc::clone(&self.cold_pk_existence),
             table_memory: Arc::clone(&self.table_memory),
@@ -7078,6 +7355,10 @@ impl CayenneTableProvider {
             // Clone the sender (never re-spawn): all provider clones feed the one
             // ordered background applier spawned by the original constructor.
             maintained_aggregate_tx: self.maintained_aggregate_tx.clone(),
+            maintained_aggregate_rearm_ticks: Arc::clone(&self.maintained_aggregate_rearm_ticks),
+            maintained_aggregate_rebuild_failures: Arc::clone(
+                &self.maintained_aggregate_rebuild_failures,
+            ),
             background_compactor: Arc::clone(&self.background_compactor),
             // Shared so the single periodic checkpoint task (spawned on the
             // original `Arc`) survives writer clones and its drop signal is shared.
@@ -7409,17 +7690,44 @@ impl CayenneTableProvider {
         matches!(self.table_metadata.on_conflict, Some(OnConflict::Upsert(_)))
     }
 
+    /// Effective byte budget for the table-wide PK keyset cache
+    /// (`pk_keyset_cache`).
+    fn effective_single_keyset_budget(&self) -> usize {
+        self.effective_pk_keyset_budget(self.pk_keyset_bytes_single.load(Ordering::Relaxed))
+    }
+
+    /// Effective byte budget for the per-shard PK index (`sharded_pk_keyset_cache`).
+    fn effective_sharded_keyset_budget(&self) -> usize {
+        self.effective_pk_keyset_budget(self.pk_keyset_bytes_sharded.load(Ordering::Relaxed))
+    }
+
     /// Effective byte budget for ONE PK cache. Sharded (N>1) tables maintain
     /// two live caches — the table-wide keyset and the per-shard index — so
     /// each gets half the configured budget, keeping their combined resident
     /// size within it.
-    fn effective_pk_keyset_budget(&self) -> usize {
+    ///
+    /// `own` is the residency of the cache being bounded, NOT the table's total
+    /// across both. Every caller compares this ceiling against one cache's
+    /// `approx_bytes`, so feeding it the sum would hand each cache the other's
+    /// bytes as extra allowance: with the fleet full and the table-wide keyset
+    /// holding 1 GiB, the per-shard index would be told it may reach 1 GiB too,
+    /// and the pair would grow to twice what the fleet had left.
+    fn effective_pk_keyset_budget(&self, own: usize) -> usize {
         let max_bytes = self.context.pk_keyset_cache_max_bytes();
-        if self.mem_tier_shard_count() > 1 {
+        let per_cache = if self.mem_tier_shard_count() > 1 {
             max_bytes / 2
         } else {
             max_bytes
-        }
+        };
+        // Clamp to what the FLEET has left. `pk_keyset_cache_mb` derives each
+        // table's figure from total memory (~1/32, clamped 256 MiB–8 GiB) with
+        // no view of its siblings, so seven CDC tables on a 96 GiB host each
+        // believe they may hold 3 GiB — 21 GiB in aggregate, which no single
+        // table can ever exceed. A SF-1000 profile measured ~14.5 GiB resident
+        // in keysets with zero over-budget events for exactly that reason.
+        //
+        // Unset (embedders, tests) leaves the per-table figure untouched.
+        super::pk_keyset_budget::clamp_pk_keyset_budget(per_cache, own)
     }
 
     /// Publish the table-wide PK cache's resident bytes and refresh the sum.
@@ -7435,10 +7743,17 @@ impl CayenneTableProvider {
     }
 
     fn publish_keyset_bytes_total(&self) {
+        // Read both components AND publish under one lock. The components are
+        // stored before this point, so whichever publisher holds the lock last
+        // reads every completed store and publishes the true sum; splitting the
+        // read from the publish lets a stale total land last and under-report.
+        let _guard = self.pk_keyset_publish_lock.lock();
         let total = self
             .pk_keyset_bytes_single
             .load(Ordering::Relaxed)
             .saturating_add(self.pk_keyset_bytes_sharded.load(Ordering::Relaxed));
+        // `set_keyset_bytes` also restates this table's share of the fleet
+        // ceiling, and releases it on drop.
         self.table_memory.set_keyset_bytes(total);
     }
 
@@ -7464,7 +7779,7 @@ impl CayenneTableProvider {
     }
 
     pub(crate) fn store_cached_pk_index(&self, index: CachedPkIndex) {
-        let max_bytes = self.effective_pk_keyset_budget();
+        let max_bytes = self.effective_single_keyset_budget();
         let to_store = match index {
             CachedPkIndex::Exact(keyset) if keyset.approx_bytes > max_bytes => {
                 if self.upsert_bloom_eligible() {
@@ -7691,15 +8006,28 @@ impl CayenneTableProvider {
             let mut sharded = self.sharded_pk_keyset_cache.lock();
             let mut drop_index = false;
             if let Some(index) = sharded.as_mut() {
-                index.record_keys(keys, location);
-                // Byte budget: upsert degrades to per-shard blooms (a false
+                // Budget enforced DURING the insert, not after it. Recording the
+                // whole batch first and reconciling afterwards made the budget a
+                // trim rather than an admission control: the peak was
+                // `batch_keys x entry_bytes` with no ceiling, which at SF-1000
+                // reached ~14.5 GiB against a 256 MiB default.
+                let max_bytes = self.effective_sharded_keyset_budget();
+                let within_budget = index.record_keys_bounded(keys, location, max_bytes);
+                // Over budget: upsert degrades to per-shard blooms (a false
                 // positive is only a redundant delete); `DoNothing` needs
                 // exactness, so drop and let the next validation lazy-rebuild.
-                let max_bytes = self.effective_pk_keyset_budget();
-                if index.approx_bytes() > max_bytes {
+                if !within_budget {
                     if self.upsert_bloom_eligible() {
                         let per_shard = max_bytes / index.shard_count().max(1);
                         index.degrade_to_blooms(per_shard);
+                        // The bounded insert stopped at the budget and the
+                        // degrade only converted what was already held, so the
+                        // rest of this batch is missing from the bloom. An
+                        // absent key is a false negative, which under upsert
+                        // reads as a new PK and writes a duplicate live row —
+                        // backfill the whole batch, as the single-keyset path
+                        // below has always done.
+                        index.record_keys_after_degrade(keys);
                     } else {
                         drop_index = true;
                     }
@@ -7713,7 +8041,7 @@ impl CayenneTableProvider {
             }
         }
 
-        let max_bytes = self.effective_pk_keyset_budget();
+        let max_bytes = self.effective_single_keyset_budget();
         let mut guard = self.pk_keyset_cache.lock();
         // Take ownership so an over-budget Exact keyset can be replaced by a
         // bloom without a borrow conflict; the index is restored before return.
@@ -8458,7 +8786,7 @@ impl CayenneTableProvider {
         // would wrongly drop a genuinely new row) and keeps the exact build.
         let budget = self
             .upsert_bloom_eligible()
-            .then(|| self.effective_pk_keyset_budget());
+            .then(|| self.effective_sharded_keyset_budget());
         let mut keyset = BoundedShardedPkIndexBuilder::new(shards, budget);
         let mut row_id_base: i64 = 0;
 
@@ -10499,7 +10827,7 @@ impl CayenneTableProvider {
             // already-bloomed index whose blooms sit above a very small budget.
             let mut bytes = None;
             if let Some(index @ ShardedPkIndex::Exact(_)) = sharded.as_mut() {
-                let max_bytes = self.effective_pk_keyset_budget();
+                let max_bytes = self.effective_sharded_keyset_budget();
                 let resident = index.approx_bytes();
                 if resident > max_bytes && self.upsert_bloom_eligible() {
                     tracing::warn!(
@@ -14013,6 +14341,26 @@ impl CayenneTableProvider {
         });
     }
 
+    /// Ask the debounced maintenance loop to drain the metastore WAL, without
+    /// queueing any other work.
+    ///
+    /// Every maintenance pass ends in `catalog.checkpoint_wal()`, but a write
+    /// that contributes no stats, no listing refresh and no retention never
+    /// schedules a pass at all. An inlined overwrite is exactly that shape: it
+    /// writes an Arrow IPC blob straight into the metastore and touches no
+    /// files. With the inline auto-checkpoint disabled by default the background
+    /// tick is the ONLY WAL drain, so a table refreshed on a schedule would grow
+    /// its WAL by one blob per refresh, unboundedly. Scheduled AFTER the commit,
+    /// never inside the transaction — a checkpoint there would land an fsync in
+    /// the commit's WAL-write-locked window.
+    pub(crate) fn schedule_wal_checkpoint(&self) {
+        self.post_write_maintenance
+            .state
+            .lock()
+            .wal_checkpoint_requested = true;
+        self.spawn_post_write_maintenance_loop();
+    }
+
     pub(crate) fn schedule_post_write_maintenance(
         &self,
         stats: Option<Arc<ColumnStatsAccumulator>>,
@@ -14040,6 +14388,13 @@ impl CayenneTableProvider {
                 .saturating_add(live_rows_delta);
         }
 
+        self.spawn_post_write_maintenance_loop();
+    }
+
+    /// Start the debounced maintenance loop unless one is already running.
+    /// Callers queue their work into `post_write_maintenance.state` first, so a
+    /// loop that is already scheduled picks it up on its next pass.
+    fn spawn_post_write_maintenance_loop(&self) {
         if self
             .post_write_maintenance
             .scheduled
@@ -16482,7 +16837,7 @@ impl CayenneTableProvider {
     /// ([`Self::partition_cold_manifest_for_promotion`]), read the canonical
     /// visible stream restricted to warm + dirty cold files (all deletes
     /// applied, single-version per key — the proven rewrite read with a
-    /// [`super::cold_partition::ColdScanFileSubset`] session extension),
+    /// [`super::cold_partition::ColdScanFiles`] session extension),
     /// Z-order cluster it, write read-optimized Vortex to the cold store, then
     /// atomically register the new files PLUS the carried-forward clean
     /// manifest rows + overwrite-clear the warm tier + flip to a fresh empty
@@ -16794,18 +17149,23 @@ impl CayenneTableProvider {
         // files' across promotions. Watch `datalake_rewrite_selectivity`; if it
         // ratchets up, the counter-measure is a recluster policy (full rewrite
         // past a dirty-fraction threshold).
-        let (dirty_cold, clean_cold) = (partition.dirty, partition.clean);
+        let (dirty_cold, clean_cold) = (Arc::new(partition.dirty), partition.clean);
 
         // Canonical visible read (all tiers, all deletes applied, single-version
         // per key) — reuses the proven rewrite read so cold is correct by
-        // construction. The session's `ColdScanFileSubset` extension restricts
-        // its cold branch to the dirty files: clean files stay out of the
-        // stream entirely.
-        let dirty_urls: std::collections::HashSet<String> =
-            dirty_cold.iter().map(|f| f.file_url.clone()).collect();
+        // construction. The session's `ColdScanFiles` extension SUPPLIES its
+        // cold branch the dirty files: clean files stay out of the stream
+        // entirely.
+        //
+        // The extension carries the classified rows themselves, so the rewrite
+        // reads exactly the listing this promotion classified. Handing down
+        // their URLs instead would leave the scan to select them out of its own
+        // later manifest capture, and a dirty file absent from that capture
+        // would be dropped from the rewrite while the commit below still
+        // retires it — silent row loss (#12708).
         let ctx = self.create_compaction_session_context_with_config(
             SessionConfig::default().with_extension(Arc::new(
-                super::cold_partition::ColdScanFileSubset(dirty_urls),
+                super::cold_partition::ColdScanFiles(Arc::clone(&dirty_cold)),
             )),
         );
         let (stream, _generation_before) = self.visible_file_stream_for_rewrite(&ctx).await?;
@@ -16898,7 +17258,10 @@ impl CayenneTableProvider {
                     &cold_files,
                 )
                 .await?;
-            self.publish_overwrite_snapshot_fenced(&new_snapshot_id, new_listing_table);
+            // Cold graduation's content is the registered cold files; the overwrite
+            // clear drops the warm tier's inline corpus with nothing to replace it,
+            // so there are no inline rows to republish.
+            self.publish_overwrite_snapshot_fenced(&new_snapshot_id, new_listing_table, None);
             // The third publication step, under the same fence: hand the manifest
             // this commit just wrote to the scan path as the cold half of the new
             // snapshot. Every subsequent capture then resolves both halves with no
@@ -18712,6 +19075,12 @@ impl CayenneTableProvider {
 
         let ctx = self.create_session_context();
         let session_state = Arc::new(ctx.state());
+        // NOTE: the scan is deliberately unprojected. The views resolve their
+        // group-by, aggregate-input, and PK columns as indices into the TABLE
+        // schema (`ResolvedAggregateSpec`), so a projected scan would renumber
+        // the columns out from under them. Projecting requires re-resolving every
+        // view against the projected schema; until that lands, correctness wins
+        // over the wasted materialization.
         let plan =
             <Self as TableProvider>::scan(self, session_state.as_ref(), None, &[], None).await?;
         let batches = collect(plan, session_state.task_ctx()).await?;
@@ -18740,6 +19109,106 @@ impl CayenneTableProvider {
         Ok(())
     }
 
+    /// Rebuild a stale maintained-aggregate registry, rate-limited.
+    ///
+    /// Every maintained-aggregate fail-safe (retained-index cap exceeded,
+    /// apply-queue overflow, accumulator overflow, epoch gap) lands in `Stale`,
+    /// and only a rebuild clears it. Without this, the first such failure would
+    /// disable maintained aggregates for the rest of the provider's life —
+    /// silently, since a stale registry simply serves base-table scans. A CDC
+    /// provider is long-lived, so "recovers at next open" means "never".
+    ///
+    /// Rate-limited because a rebuild is a full visible-state scan: on a table
+    /// that is over its retained-index budget the rebuild will trip the cap and
+    /// re-stale, so retrying it in a tight loop would burn the pool on a failure
+    /// that repeats. One attempt per interval bounds that to a background trickle
+    /// while still recovering promptly from a transient failure.
+    async fn try_rearm_maintained_aggregates(&self) {
+        if self.maintained_aggregates.is_empty() || !self.maintained_aggregates.is_stale() {
+            // Rearm the counter while the registry is healthy so the interval is
+            // measured per staleness episode. A lifetime counter would leave the
+            // next episode starting mid-interval and delay its first attempt by
+            // up to `MAINTAINED_AGGREGATE_REARM_TICK_INTERVAL - 1` checkpoints.
+            self.maintained_aggregate_rearm_ticks
+                .store(0, Ordering::Release);
+            return;
+        }
+
+        // A rebuild that has already failed its budget of attempts stays failed:
+        // the cause does not heal on its own, and each retry rescans the whole
+        // visible state. Stop rather than burn a scan per interval forever.
+        if self
+            .maintained_aggregate_rebuild_failures
+            .load(Ordering::Acquire)
+            >= MAINTAINED_AGGREGATE_REBUILD_MAX_FAILURES
+        {
+            return;
+        }
+
+        // Tick-counted rather than clock-based: checkpoints are already periodic,
+        // so counting them gives a bounded cadence with no wall-clock dependency
+        // (and no way for a clock jump to stall recovery). The first stale tick
+        // attempts immediately; the rest trickle.
+        let tick = self
+            .maintained_aggregate_rearm_ticks
+            .fetch_add(1, Ordering::AcqRel);
+        if !tick.is_multiple_of(MAINTAINED_AGGREGATE_REARM_TICK_INTERVAL) {
+            return;
+        }
+
+        let (retained, budget) = self.maintained_aggregates.retained_bytes_and_budget();
+        match self
+            .rebuild_maintained_aggregates_from_visible_state()
+            .await
+        {
+            Ok(()) if !self.maintained_aggregates.is_stale() => {
+                tracing::info!(
+                    table = %self.table_metadata.table_name,
+                    "Maintained aggregate state rebuilt after staleness; queries are served from maintained state again"
+                );
+            }
+            Ok(()) => {
+                tracing::warn!(
+                    table = %self.table_metadata.table_name,
+                    retained_bytes = retained,
+                    budget_bytes = budget,
+                    "Maintained aggregate rebuild re-staled: the table's retained index does not fit its memory budget. Queries continue on base table scans. Raise 'runtime.query.memory_limit' or narrow the maintained aggregate's filter."
+                );
+            }
+            Err(error) => {
+                // A rebuild that errors is not the budget doing its job — that is
+                // the `Ok` arm above, and it is worth retrying because the table's
+                // size moves. This is a fault, and the ones that reach here are
+                // overwhelmingly permanent: a filter whose types do not line up
+                // fails identically on every batch, forever. Each attempt is a
+                // full visible-state scan, so retrying one of those buys nothing
+                // and costs a scan of the whole table every interval.
+                //
+                // Give it a few tries — an I/O blip deserves them — then stop and
+                // say so once, with what an operator would need to act.
+                let failures = self
+                    .maintained_aggregate_rebuild_failures
+                    .fetch_add(1, Ordering::AcqRel)
+                    .saturating_add(1);
+                if failures >= MAINTAINED_AGGREGATE_REBUILD_MAX_FAILURES {
+                    tracing::error!(
+                        table = %self.table_metadata.table_name,
+                        error = %error,
+                        failures,
+                        "Maintained aggregate rebuild failed {failures} times and will not be retried; queries continue on base table scans for the life of this table. This is usually a maintained aggregate whose filter or aggregate columns do not type-check against the table — check 'maintained_aggregates' in the spicepod, then restart to re-arm."
+                    );
+                } else {
+                    tracing::warn!(
+                        table = %self.table_metadata.table_name,
+                        error = %error,
+                        failures,
+                        "Maintained aggregate rebuild failed; queries continue on base table scans and the rebuild will be retried"
+                    );
+                }
+            }
+        }
+    }
+
     fn wrap_scan_plan_with_cayenne_metadata(
         &self,
         plan: Arc<dyn ExecutionPlan>,
@@ -18747,6 +19216,7 @@ impl CayenneTableProvider {
         maintained_aggregate_epoch: Option<u64>,
     ) -> Arc<dyn ExecutionPlan> {
         let overlay = self.optimizer_stats_overlay_for_schema(&plan.schema());
+        let table_name = self.table_metadata.table_name.as_str();
         if let Some(epoch) = maintained_aggregate_epoch {
             Arc::new(
                 CayenneAccelerationExec::with_guard_and_maintained_aggregates(
@@ -18755,12 +19225,14 @@ impl CayenneTableProvider {
                     Arc::clone(&self.maintained_aggregates),
                     epoch,
                 )
-                .with_optimizer_column_overlay(overlay),
+                .with_optimizer_column_overlay(overlay)
+                .with_table_name(table_name),
             )
         } else {
             Arc::new(
                 CayenneAccelerationExec::with_guard(plan, scan_guard)
-                    .with_optimizer_column_overlay(overlay),
+                    .with_optimizer_column_overlay(overlay)
+                    .with_table_name(table_name),
             )
         }
     }
@@ -18778,9 +19250,9 @@ impl CayenneTableProvider {
     }
 
     /// [`Self::create_compaction_session_context`] with an explicit config —
-    /// the carry-forward promotion attaches its [`ColdScanFileSubset`]
-    /// extension here so its private session's cold branch reads only the
-    /// dirty files being rewritten.
+    /// the carry-forward promotion attaches its
+    /// [`super::cold_partition::ColdScanFiles`] extension here so its private
+    /// session's cold branch reads only the dirty files being rewritten.
     fn create_compaction_session_context_with_config(
         &self,
         config: SessionConfig,
@@ -19377,6 +19849,26 @@ impl CayenneTableProvider {
         // racing delta that already snapshotted the queue cannot mis-store.
         self.pending_tombstone_deltas.lock().drain_through(u64::MAX);
         self.bump_inlined_structural_epoch();
+    }
+
+    /// Discard the materialized inline view WITHOUT touching the generation, the
+    /// structural epoch, the watermark or any row count — the state a freshly
+    /// opened provider starts in, reproduced on a running one.
+    ///
+    /// Tests use it to force the next inline read down the metastore rebuild path,
+    /// which is where an overwrite's commit/publish window is observable: while the
+    /// cache holds a view stamped with the current generation, every read is served
+    /// from memory and the window is invisible.
+    #[cfg(test)]
+    pub(crate) fn drop_inlined_cache_for_test(&self) {
+        self.inlined_cache.store(Arc::new(InlinedCache {
+            generation: u64::MAX,
+            structural_epoch: u64::MAX,
+            materialized_through_sequence: i64::MIN,
+            tombstone_delta_seq: 0,
+            batches: Arc::new(Vec::new()),
+            view: Arc::new(Vec::new()),
+        }));
     }
 
     /// Get the current snapshot ID.
@@ -20733,6 +21225,54 @@ impl CayenneTableProvider {
         })
     }
 
+    /// Adapt inline batches decoded from the corpus to the live table schema.
+    ///
+    /// An inline entry is Arrow IPC frozen at the schema that was live when it was
+    /// written, so a widening schema evolution leaves the corpus a width behind.
+    /// [`Self::evolve_schema_live`] keeps its own swap safe by flushing the corpus
+    /// first, but the open-time evolution in `try_widening_schema_evolution`
+    /// commits the evolved schema straight to the metastore, so a provider can open
+    /// onto a corpus written under a narrower one. Reading it unadapted resolves
+    /// live-schema column indices against that narrower batch.
+    ///
+    /// Adapting here — the decode both cache paths share — gives the corpus the
+    /// treatment old Vortex files already get in the opener: missing nullable
+    /// columns null-filled, widened columns cast. Both are the truth for a row
+    /// written before the widening, which is why `classify` admits only added
+    /// *nullable* columns and lossless casts into a widening plan.
+    ///
+    /// A corpus already at the live width (the overwhelmingly common case) short-
+    /// circuits on a field comparison and is returned untouched.
+    fn adapt_inlined_batches_to_live_schema(
+        &self,
+        batches: Vec<RecordBatch>,
+    ) -> Result<Vec<RecordBatch>> {
+        let live_schema = self.table_schema();
+        if batches
+            .iter()
+            .all(|batch| batch.schema_ref().fields() == live_schema.fields())
+        {
+            return Ok(batches);
+        }
+
+        batches
+            .into_iter()
+            .map(|batch| {
+                arrow_tools::record_batch::try_cast_to(batch, Arc::clone(&live_schema)).map_err(
+                    |e| super::Error::DataValidation {
+                        table: self.table_metadata.table_name.clone(),
+                        message: format!(
+                            "Inlined rows were written under an earlier schema that cannot be \
+                             read under the current one: {e}. Set 'on_schema_change: \
+                             drop_and_recreate' to rebuild the acceleration on an incompatible \
+                             schema change. See: https://spiceai.org/docs/components/data-accelerators"
+                        ),
+                    },
+                )
+            })
+            .collect()
+    }
+
     /// Decode one inline-data entry's IPC blob and apply the deletion-map filter,
     /// returning its per-entry view. Shared by the full-rebuild and delta paths so
     /// the two never diverge in how an entry is materialized.
@@ -20743,6 +21283,7 @@ impl CayenneTableProvider {
     ) -> Result<InlinedViewEntry> {
         let entry_batches = deserialize_ipc_to_batch(&entry.data_ipc)
             .map_err(|e| super::Error::Arrow { source: e })?;
+        let entry_batches = self.adapt_inlined_batches_to_live_schema(entry_batches)?;
         // Pre-filter stats are a conservative superset: tombstone removal can only
         // shrink row ranges, never widen min/max.
         let statistics = Arc::new(super::file_pruning::statistics_from_record_batches(
@@ -23015,11 +23556,18 @@ impl CayenneTableProvider {
     /// or tier clearing fails. The source slot is not advanced on failure.
     #[doc(hidden)]
     pub async fn checkpoint_mem_tier(&self) -> Result<u64> {
-        let mut guards = self.acquire_capture_locks_blocking().await;
-        // Keep `guards` alive so `mem_checkpoint_lock` spans the whole lifecycle;
-        // pass only the capture-scoped `write` guard to `inner`.
-        let write = guards.write.take();
-        self.checkpoint_mem_tier_inner(write).await
+        let rows = {
+            let mut guards = self.acquire_capture_locks_blocking().await;
+            // Keep `guards` alive so `mem_checkpoint_lock` spans the whole
+            // lifecycle; pass only the capture-scoped `write` guard to `inner`.
+            let write = guards.write.take();
+            self.checkpoint_mem_tier_inner(write).await?
+        };
+        // Recover a stale maintained-aggregate registry, rate-limited. Deliberately
+        // OUTSIDE the capture locks: the rebuild scans visible state and must not
+        // hold the checkpoint fence while it does.
+        self.try_rearm_maintained_aggregates().await;
+        Ok(rows)
     }
 
     /// BEST-EFFORT counterpart to [`Self::checkpoint_mem_tier`]: returns
@@ -24862,6 +25410,10 @@ impl CayenneTableProvider {
 
         for entry in inlined_data {
             let batches = deserialize_ipc_to_batch(&entry.data_ipc)?;
+            // Same widening-evolution adaptation the cached read path applies: a
+            // DELETE predicate naming an added column must resolve against rows
+            // written before it existed.
+            let batches = self.adapt_inlined_batches_to_live_schema(batches)?;
             let mut rewritten_batches = Vec::with_capacity(batches.len());
             let mut original_rows = 0_usize;
             let mut remaining_rows = 0_usize;
@@ -25947,7 +26499,11 @@ impl CayenneTableProvider {
     /// a manifest read after the caller's capture can belong to a later promotion,
     /// and pairing it with the captured warm snapshot double-counts every promoted
     /// row. Each row carries its serialized Vortex `FileStatistics` blob, so
-    /// listing-time pruning runs with NO object-store round-trip. The returned plan
+    /// listing-time pruning runs with NO object-store round-trip.
+    ///
+    /// A promotion's private session overrides `cold_files` entirely with its
+    /// [`super::cold_partition::ColdScanFiles`] extension — see the override
+    /// below for why that is a replacement and not a filter. The returned plan
     /// is a Vortex `DataSourceExec`; the caller wraps it with the key-based
     /// (`Ignore`) deletion filter and unions it into the scan tree.
     async fn build_cold_tier_scan_plan(
@@ -25979,18 +26535,12 @@ impl CayenneTableProvider {
         }
 
         // Carry-forward promotion: the promotion's PRIVATE session carries a
-        // `ColdScanFileSubset` config extension restricting this branch to the
-        // dirty files being rewritten (clean files are carried forward by
-        // manifest reference, never re-read). User-query sessions never carry
-        // the extension, so queries always see the full captured manifest.
-        let cold_files: Vec<&crate::metadata::ColdTierFile> =
-            match scan_config.get_extension::<super::cold_partition::ColdScanFileSubset>() {
-                Some(subset) => cold_files
-                    .iter()
-                    .filter(|f| subset.0.contains(&f.file_url))
-                    .collect(),
-                None => cold_files.iter().collect(),
-            };
+        // `ColdScanFiles` config extension supplying the dirty files being
+        // rewritten. User-query sessions never carry it, so queries always see
+        // the full captured manifest.
+        let promotion_files = scan_config.get_extension::<super::cold_partition::ColdScanFiles>();
+        let cold_files =
+            super::cold_partition::cold_files_for_scan(cold_files, promotion_files.as_deref());
         // No early all-empty guard needed: the per-file loop skips zero-size
         // files and the `object_store_url is None` / `kept.is_empty()` checks
         // below both return `Ok(None)` when nothing survives.
@@ -29064,6 +29614,67 @@ mod tests {
         );
     }
 
+    /// The retained index is a plain allocation, not a pool reservation, so its
+    /// budget is the only thing keeping it inside `runtime.query.memory_limit`.
+    /// A budget above the pool would breach the contract the derivation exists to
+    /// enforce — the floor must never lift past what the pool can afford.
+    #[test]
+    fn maintained_aggregate_index_budget_never_exceeds_the_query_pool() {
+        use datafusion::execution::memory_pool::GreedyMemoryPool;
+        use datafusion_execution::runtime_env::RuntimeEnvBuilder;
+
+        // A pool below the floor: lifting to the floor would hand the index twice
+        // the entire pool.
+        const TINY_POOL: usize = 4 * 1024 * 1024;
+
+        let budget_for = |pool_bytes: usize| {
+            let runtime_env = RuntimeEnvBuilder::new()
+                .with_memory_pool(Arc::new(GreedyMemoryPool::new(pool_bytes)))
+                .build()
+                .expect("finite-pool runtime env");
+            maintained_aggregate_max_index_bytes(&runtime_env)
+        };
+
+        // Such a pool keeps a budget any real index overruns, so maintained
+        // aggregates fail safe to base-table scans.
+        assert!(
+            budget_for(TINY_POOL) <= TINY_POOL,
+            "a pool below the floor must not yield a budget larger than the pool"
+        );
+
+        // A pool whose derived share lands under the floor but that can afford the
+        // floor: the lift applies, because 8MiB of a 32MiB pool is still a
+        // minority share.
+        assert_eq!(
+            budget_for(32 * 1024 * 1024),
+            MAINTAINED_AGGREGATE_MIN_INDEX_BYTES,
+            "a pool that can afford the floor is lifted to it"
+        );
+
+        // A large pool takes the fraction, capped by the standalone default.
+        assert_eq!(
+            budget_for(8 * 1024 * 1024 * 1024),
+            MAINTAINED_AGGREGATE_MAX_INDEX_BYTES_DEFAULT,
+            "a large pool is capped at the standalone default"
+        );
+
+        // The invariant across the range, including degenerate pools.
+        for pool_bytes in [
+            1,
+            1024,
+            TINY_POOL,
+            32 * 1024 * 1024,
+            256 * 1024 * 1024,
+            8 * 1024 * 1024 * 1024,
+        ] {
+            let budget = budget_for(pool_bytes);
+            assert!(
+                budget <= pool_bytes,
+                "budget {budget} for a {pool_bytes}B pool must stay within the pool"
+            );
+        }
+    }
+
     /// Mark-and-sweep core: an orphan (on store, not in manifest) is marked on
     /// first sight and deleted only once observed for >= grace; a manifest-
     /// referenced file is never touched.
@@ -30797,7 +31408,7 @@ mod tests {
             *provider.test_pre_publish_hook.lock() = Some(Box::new(move || {
                 Box::pin(async move {
                     provider_in_hook
-                        .publish_overwrite_snapshot(&overwrite_id)
+                        .publish_overwrite_snapshot(&overwrite_id, None)
                         .await
                         .expect("mid-pass overwrite publish");
                     fired.store(true, Ordering::SeqCst);
@@ -32523,7 +33134,7 @@ mod tests {
             None => panic!("a DoNothing table must keep its exact cache, not drop it"),
         };
         assert!(
-            resident > provider.effective_pk_keyset_budget(),
+            resident > provider.effective_sharded_keyset_budget(),
             "the index the resync left alone must be the over-budget one"
         );
         assert!(
@@ -38251,7 +38862,7 @@ mod tests {
             *provider.test_pre_publish_hook.lock() = Some(Box::new(move || {
                 Box::pin(async move {
                     provider_in_hook
-                        .publish_overwrite_snapshot(&overwrite_id)
+                        .publish_overwrite_snapshot(&overwrite_id, None)
                         .await
                         .expect("mid-pass overwrite publish");
                     fired.store(true, Ordering::SeqCst);

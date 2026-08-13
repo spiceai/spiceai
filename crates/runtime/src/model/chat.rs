@@ -34,7 +34,9 @@ use spicepod::component::model::ModelFileType;
 use spicepod::component::model::{Model, ModelSource};
 #[cfg(feature = "models")]
 use std::path::PathBuf;
-use std::{collections::HashMap, str::FromStr, sync::Arc};
+#[cfg(feature = "models")]
+use std::str::FromStr;
+use std::{collections::HashMap, sync::Arc};
 use token_provider::registry::TokenProviderRegistry;
 use tokio::sync::RwLock;
 

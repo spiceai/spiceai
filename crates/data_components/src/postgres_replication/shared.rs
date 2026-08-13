@@ -120,6 +120,16 @@ limitations under the License.
 //! - Fatal errors (auth, decode, slot dropped) are broadcast to all members.
 //! - The pump exits and deregisters once every member has detached; a later
 //!   subscriber starts a fresh pump that resumes from the slot.
+//! - *Not yet attached* is the same situation as detached and gets the same
+//!   hold. On a resuming slot the first member to attach reserves a floor at
+//!   the slot's resume LSN for every published table with no member, so a
+//!   dataset that joins later is not seated at a position a slot-mate was
+//!   credited to — above changes it never consumed (#12609). Its member takes
+//!   the hold over on registration. A hold nothing claims within
+//!   [`UNCLAIMED_RESERVATION_GRACE`] (a table left in the publication by a
+//!   removed dataset) would pin WAL forever, so the table is dropped from the
+//!   publication — which is what makes releasing its floor safe — and logged at
+//!   ERROR.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
@@ -135,9 +145,9 @@ use tokio::sync::Notify;
 use bytes::Bytes;
 
 use super::{
-    Error, ReplicationMetricsCollector, ReplicationStreamInput, Result, SchemaEvolutionPolicy,
-    bootstrap, changes::PgChangeRows, client, config::ReplicationParams, pgoutput, resilience,
-    schema_evolution::RelationSchemaTracker, slot,
+    AppliedLsn, AppliedLsnStore, Error, ReplicationMetricsCollector, ReplicationStreamInput,
+    Result, SchemaEvolutionPolicy, bootstrap, changes::PgChangeRows, client,
+    config::ReplicationParams, pgoutput, resilience, schema_evolution::RelationSchemaTracker, slot,
 };
 use rustc_hash::FxHashMap;
 
@@ -370,6 +380,14 @@ fn env_usize_in_range(name: &'static str, default: usize, max: usize) -> usize {
 /// of seconds between messages; this keeps membership changes responsive.
 const RECV_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// How long the shared slot holds its ack floor for a published table whose
+/// dataset has not joined (see `SharedSource::install_reservations`) before
+/// giving up on it: dropping the table from the publication and releasing the
+/// hold. Sized to comfortably cover a runtime loading many datasets — and a
+/// catalog that discovers and attaches its members over several refreshes —
+/// since expiring a hold early costs that dataset a full re-snapshot.
+const UNCLAIMED_RESERVATION_GRACE: std::time::Duration = std::time::Duration::from_mins(5);
+
 /// Yield to the Tokio scheduler after draining this many buffered events via the
 /// non-blocking `try_recv` fast path. Most `handle_decoded` branches (Insert /
 /// Update / Delete during a transaction) never reach a real `.await`, so a large
@@ -459,6 +477,9 @@ struct MemberHandle {
     /// source-commit time is within this of now, so the dataset becomes Ready
     /// only once it has caught up to the source head.
     ready_lag: std::time::Duration,
+    /// Where this member's applied-LSN watermark is recorded; cloned into each
+    /// envelope's committer. See `SharedLsnCommitter::applied_lsn_store`.
+    applied_lsn_store: Arc<dyn AppliedLsnStore>,
 }
 
 /// `LIVE`: the member is attached and routing to it is allowed. Cleared on
@@ -511,6 +532,18 @@ impl AckSlot {
             committed: AtomicU64::new(at),
             delivered: AtomicU64::new(at),
             state: AtomicU8::new(LIVE | if snapshotting { SNAPSHOTTING } else { 0 }),
+        }
+    }
+
+    /// A floor held for a published table that has no member yet — the same
+    /// state a detached member is left in (no [`LIVE`], no [`STREAMING`]), so
+    /// it is never routed to and never credited, but its `committed` counts
+    /// toward the slot-level floor. See [`AckTable::reserve`].
+    fn reserved(at: u64) -> Self {
+        Self {
+            committed: AtomicU64::new(at),
+            delivered: AtomicU64::new(at),
+            state: AtomicU8::new(0),
         }
     }
 
@@ -586,6 +619,35 @@ impl AckTable {
                 members.insert(key.clone(), Arc::new(AckSlot::new(at, snapshotting)));
             }
         }
+    }
+
+    /// Hold the floor at `at` for a published table that has no member on this
+    /// source yet, so the slot cannot ack past changes nobody has consumed.
+    /// Returns whether a new hold was installed (an existing entry — a member
+    /// that already joined — is never disturbed).
+    ///
+    /// This is the *not yet attached* case of the same situation as a detached
+    /// member, and gets the same treatment: the entry is inert for routing and
+    /// crediting, and pins [`Self::flush_lsn`] until the real member arrives
+    /// and [`Self::register`] takes it over through the rejoin branch. Without
+    /// it, the first member to join a resuming slot is credited to the WAL head
+    /// by the next keepalive, and a member joining after that is seated above
+    /// its own unconsumed changes — which are then acked away (#12609).
+    fn reserve(&self, key: &MemberKey, at: u64) -> bool {
+        let mut members = write_lock(&self.members);
+        if members.contains_key(key) {
+            return false;
+        }
+        members.insert(key.clone(), Arc::new(AckSlot::reserved(at)));
+        true
+    }
+
+    /// Drop a hold installed by [`Self::reserve`] that no member ever claimed,
+    /// releasing the slot-level floor it pins. Only ever called for a table
+    /// that has also been dropped from the publication, so nothing can arrive
+    /// for it after this.
+    fn release(&self, key: &MemberKey) {
+        write_lock(&self.members).remove(key);
     }
 
     /// The member's initial snapshot finished cleanly. It stays *held* until
@@ -665,8 +727,11 @@ impl AckTable {
     /// monotonically into `shared_flush`. Recomputed on read, so nobody should
     /// cache the result expecting eager freshness. The monotonic CAS preserves
     /// the never-regress guarantee even if a `register` seeds a slot below the
-    /// last reported floor mid-sweep. The sweep is ≤ 8 atomic loads under an
-    /// uncontended read lock — it replaces the old per-commit `recompute`.
+    /// last reported floor mid-sweep. The sweep is one atomic load per entry
+    /// under an uncontended read lock — typically ≤ 8 members, transiently more
+    /// on a resuming slot that is still holding floors for tables whose
+    /// datasets have not joined ([`Self::reserve`]) — and it replaces the old
+    /// per-commit `recompute`.
     fn flush_lsn(&self) -> u64 {
         let floor = read_lock(&self.members)
             .values()
@@ -738,12 +803,40 @@ struct SharedLsnCommitter {
     /// Source-commit timestamp (ms since the Unix epoch) of the batch this
     /// commit acks; `None` when the transaction carried no commit time.
     source_commit_ts_ms: Option<i64>,
+    /// Where this member's applied-LSN watermark is recorded.
+    ///
+    /// Written from [`CommitChange::commit`] specifically, which is the only
+    /// point at which the acked changes are known durable: this committer
+    /// supports deferral, so under an in-memory CDC durability tier the runtime
+    /// holds it until the covering checkpoint is durable
+    /// (`SlotAdvancer::on_checkpoint_durable`). Recording the watermark anywhere
+    /// earlier — when a batch reaches the memory tier — would claim rows a
+    /// restart loses, and the next start would then resume *past* changes the
+    /// acceleration never durably received.
+    applied_lsn_store: Arc<dyn AppliedLsnStore>,
 }
 
 #[async_trait]
 impl CommitChange for SharedLsnCommitter {
     async fn commit(&self) -> std::result::Result<(), CommitError> {
         self.slot.commit(self.flush_to);
+        // Record the watermark alongside the slot ack, never ahead of it. A
+        // failure here is logged rather than surfaced: the ack already happened,
+        // so failing the commit would stall CDC over bookkeeping, and a stale
+        // watermark only ever costs a redundant rebuild on the next start —
+        // whereas a watermark ahead of durable data would resume past changes
+        // the acceleration does not hold.
+        if let Err(e) = self
+            .applied_lsn_store
+            .save(AppliedLsn { lsn: self.flush_to })
+            .await
+        {
+            tracing::warn!(
+                dataset = %self.dataset,
+                "could not record how far this acceleration has been advanced (lsn={}); if the process restarts before this succeeds, the acceleration is rebuilt from the source rather than resumed: {e}",
+                self.flush_to,
+            );
+        }
         crate::cdc::log_committer_progress(
             "postgres",
             &self.dataset,
@@ -787,11 +880,88 @@ impl CommitChange for SharedLsnCommitter {
 /// A shared-slot `PostgreSQL` envelope before it crosses the member stream
 /// boundary. It keeps pgoutput messages raw so adjacent source transactions can
 /// be folded without tuple decoding or Arrow construction on the pump.
+/// The zero-row boundary envelope that carries a
+/// [`SnapshotWatermarkCommitter`], or the stream error if its (empty) batch
+/// cannot be built.
+fn snapshot_watermark_envelope(
+    schema: &SchemaRef,
+    applied_lsn_store: Arc<dyn AppliedLsnStore>,
+    lsn: u64,
+    dataset: String,
+    history_unavailable: bool,
+) -> std::result::Result<ChangeEnvelope, StreamError> {
+    let (_, batch, _, _) = crate::cdc::build_heartbeat_envelope(schema, None, false)
+        .map_err(|e| StreamError::External(e.to_string()))?
+        .into_parts()
+        .map_err(|e| StreamError::External(e.to_string()))?;
+    Ok(ChangeEnvelope::from_parts(
+        Box::new(SnapshotWatermarkCommitter {
+            applied_lsn_store,
+            lsn,
+            dataset,
+        }),
+        batch,
+        // Readiness stays lag-based: an acceleration being loaded is not ready.
+        false,
+        history_unavailable,
+    ))
+}
+
+/// Records the watermark for a just-completed snapshot, as its own zero-row
+/// boundary envelope.
+///
+/// Without this the watermark is first written by the acknowledgement of a *WAL*
+/// change, so a restart in the window between "snapshot applied" and "first
+/// change acked" reads no watermark at all and treats a fully populated
+/// acceleration as a first load — appending a fresh snapshot over surviving rows,
+/// which is the silent divergence the watermark exists to prevent.
+///
+/// Deliberately does **not** override `supports_deferral`, so it inherits the
+/// conservative `false`: the consumer cannot hold this commit behind a later
+/// in-memory durability fence, which is what guarantees the snapshot's rows are
+/// durable before their watermark claims them. Same contract as
+/// `mysql_replication`'s snapshot-boundary committer.
+struct SnapshotWatermarkCommitter {
+    applied_lsn_store: Arc<dyn AppliedLsnStore>,
+    /// The LSN the snapshot's contents are complete as of: the slot's consistent
+    /// point, which is at or before the snapshot's visibility. Undershooting is
+    /// safe — replay from it re-delivers changes the snapshot already reflects —
+    /// whereas a later LSN could skip a change the snapshot did not see.
+    lsn: u64,
+    dataset: String,
+}
+
+#[async_trait]
+impl CommitChange for SnapshotWatermarkCommitter {
+    async fn commit(&self) -> std::result::Result<(), CommitError> {
+        if let Err(e) = self
+            .applied_lsn_store
+            .save(AppliedLsn { lsn: self.lsn })
+            .await
+        {
+            tracing::warn!(
+                dataset = %self.dataset,
+                "could not record the snapshot's applied position (lsn={}); the acceleration is correct, but a restart before the next acknowledgement will rebuild it from the source rather than resume: {e}",
+                self.lsn,
+            );
+        }
+        crate::cdc::log_committer_progress(
+            "postgres",
+            &self.dataset,
+            &format!("snapshot-complete lsn={}", self.lsn),
+            None,
+        );
+        Ok(())
+    }
+}
+
 struct PendingPgEnvelope {
     rows: PgChangeRows,
     slot: Arc<AckSlot>,
     flush_to: u64,
     dataset: String,
+    /// Cloned from the member; see `SharedLsnCommitter::applied_lsn_store`.
+    applied_lsn_store: Arc<dyn AppliedLsnStore>,
     is_dataset_ready: bool,
     first_received_at: std::time::Instant,
 }
@@ -824,6 +994,9 @@ impl PendingPgEnvelope {
             slot,
             flush_to,
             dataset,
+            // Same member (the `slot` pointer check above proves it), so both
+            // sides carry the same store; either may be kept.
+            applied_lsn_store,
             is_dataset_ready,
             first_received_at,
         } = other;
@@ -835,6 +1008,7 @@ impl PendingPgEnvelope {
                 slot,
                 flush_to,
                 dataset,
+                applied_lsn_store,
                 is_dataset_ready,
                 first_received_at,
             });
@@ -858,6 +1032,7 @@ impl PendingPgEnvelope {
                 flush_to: self.flush_to,
                 dataset: self.dataset,
                 source_commit_ts_ms,
+                applied_lsn_store: self.applied_lsn_store,
             }),
             Box::new(self.rows),
             self.is_dataset_ready,
@@ -1307,6 +1482,19 @@ struct SharedSource {
     /// Tables whose member detached during this pump's lifetime; a rejoin is
     /// resumed via held-floor replay instead of a snapshot.
     detached: Mutex<HashSet<MemberKey>>,
+    /// Published tables this source is holding the ack floor for until their
+    /// dataset joins, with the instant each hold was installed (see
+    /// [`AckTable::reserve`] and [`Self::release_unclaimed_reservations`]).
+    /// Installed once, on the first member to attach to a resuming slot.
+    reservations: Mutex<HashMap<MemberKey, std::time::Instant>>,
+    /// Whether [`Self::reservations`] has been populated — the decision is
+    /// made once per source, by whichever member attaches first.
+    reservations_installed: AtomicBool,
+    /// `reservations.len()`, maintained under that mutex so the pump's
+    /// per-event expiry sweep is one relaxed load in the steady state (holds
+    /// exist only between a resume and the last member joining) instead of a
+    /// lock acquisition.
+    outstanding_reservations: AtomicUsize,
 }
 
 impl SharedSource {
@@ -1322,6 +1510,9 @@ impl SharedSource {
             dead: AtomicBool::new(false),
             slot_created_fresh: AtomicBool::new(false),
             detached: Mutex::new(HashSet::new()),
+            reservations: Mutex::new(HashMap::new()),
+            reservations_installed: AtomicBool::new(false),
+            outstanding_reservations: AtomicUsize::new(0),
         }
     }
 
@@ -1447,6 +1638,156 @@ impl SharedSource {
         }
     }
 
+    /// Hold the ack floor at the slot's resume LSN for every published table
+    /// that has no member yet, so the slot cannot acknowledge changes belonging
+    /// to a dataset that has not joined this source yet (#12609).
+    ///
+    /// Decided once per source, by the first member to attach, under the setup
+    /// lock and before the pump starts — so the floor is pinned before the
+    /// first connect can credit anyone.
+    fn install_reservations(&self, setup: &slot::SharedMemberSetup) {
+        if self.reservations_installed.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        // Only a *resuming* slot is owed anything below a join point.
+        // `created_fresh` covers both cases where nothing is: a slot this
+        // process created, and one fast-forwarded past its history for a
+        // re-bootstrap — that one only happens when every member re-snapshots
+        // (`slot_is_disposable`), which is what makes discarding the history
+        // safe there and holding a floor pointless. A slot whose
+        // `confirmed_flush_lsn` the catalog has not published yet offers no
+        // floor worth holding (0 would pin the ack forever).
+        if setup.slot.created_fresh || setup.slot.consistent_lsn == 0 {
+            return;
+        }
+        let resume_lsn = setup.slot.consistent_lsn;
+        let held: Vec<MemberKey> = setup
+            .publication_tables
+            .iter()
+            .filter(|key| self.ack.reserve(key, resume_lsn))
+            .cloned()
+            .collect();
+        if held.is_empty() {
+            return;
+        }
+        tracing::info!(
+            slot = %self.key.slot_name,
+            tables = held.len(),
+            resume_lsn = %slot::format_lsn(resume_lsn),
+            "holding the shared slot's ack floor for published tables whose dataset has not \
+             joined yet"
+        );
+        let now = std::time::Instant::now();
+        let mut reservations = lock(&self.reservations);
+        for key in held {
+            reservations.insert(key, now);
+        }
+        self.outstanding_reservations
+            .store(reservations.len(), Ordering::Relaxed);
+    }
+
+    /// A member has taken over its reservation (or joined a table that never
+    /// had one) — stop tracking it as unclaimed. The ack entry itself is kept:
+    /// [`AckTable::register`] hands the held floor to the member.
+    fn claim_reservation(&self, key: &MemberKey) {
+        let mut reservations = lock(&self.reservations);
+        reservations.remove(key);
+        self.outstanding_reservations
+            .store(reservations.len(), Ordering::Relaxed);
+    }
+
+    /// Holds no dataset has claimed within `grace`, removed from tracking as
+    /// they are returned: the caller releases each one exactly once, rather
+    /// than a per-second sweep re-spawning a release that is already in flight.
+    fn take_expired_reservations(&self, grace: std::time::Duration) -> Vec<MemberKey> {
+        // The pump sweeps per decoded event; nothing held is the steady state.
+        if self.outstanding_reservations.load(Ordering::Relaxed) == 0 {
+            return Vec::new();
+        }
+        let mut reservations = lock(&self.reservations);
+        let expired: Vec<MemberKey> = reservations
+            .iter()
+            .filter(|(_, held_since)| held_since.elapsed() >= grace)
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in &expired {
+            reservations.remove(key);
+        }
+        self.outstanding_reservations
+            .store(reservations.len(), Ordering::Relaxed);
+        expired
+    }
+
+    /// Release holds no dataset claimed within `grace`.
+    ///
+    /// A table can sit in the publication with no dataset behind it — one
+    /// removed from the spicepod, or renamed — and its hold would otherwise pin
+    /// WAL retention for the whole slot forever. Dropping the table from the
+    /// publication first is what makes releasing the floor safe rather than a
+    /// second silent-loss path: an unpublished table produces no more changes,
+    /// and if the dataset ever comes back, `table_added` sends it through the
+    /// initial-snapshot path instead of a resume.
+    fn release_unclaimed_reservations(self: &Arc<Self>, grace: std::time::Duration) {
+        for key in self.take_expired_reservations(grace) {
+            let params = self.params.clone();
+            let slot_name = self.key.slot_name.clone();
+            let publication = self.params.publication_name.clone();
+            let grace_secs = grace.as_secs();
+            let source = Arc::clone(self);
+            tokio::spawn(async move {
+                // The setup lock is what `attach_member` holds while it adds a
+                // table to the publication and registers, so taking it here
+                // makes "is this table still unsubscribed?" a decision the
+                // attach path cannot land inside. A dataset that arrives first
+                // wins and keeps its table published; one that arrives after
+                // finds the table gone from the publication and takes a fresh
+                // snapshot, which is correct either way.
+                let _guard = source.setup_lock.lock().await;
+                if source.member(&key).is_some() {
+                    return;
+                }
+                tracing::error!(
+                    table = %format_member(&key),
+                    slot = %slot_name,
+                    publication = %publication,
+                    grace_secs,
+                    "no dataset subscribed to a published table on this shared slot within the \
+                     grace period; it was pinning WAL retention for every dataset on the slot, \
+                     so it is being dropped from the publication and the slot's acknowledgement \
+                     released. Re-adding a dataset for this table will take a fresh initial \
+                     snapshot"
+                );
+                let (schema_name, table_name) = key.clone();
+                match slot::remove_table_from_publication(&params, &schema_name, &table_name).await
+                {
+                    // Only release the floor once the table is provably out of
+                    // the publication: while it is still published its changes
+                    // keep arriving with no member to route them to, and acking
+                    // past them would be the very loss this hold exists to
+                    // prevent.
+                    Ok(()) => source.ack.release(&key),
+                    Err(e) => {
+                        // Keep the hold and re-arm the grace period so the next
+                        // sweep tries again, rather than leaving a table pinning
+                        // WAL with nothing watching it.
+                        let mut reservations = lock(&source.reservations);
+                        reservations.insert(key, std::time::Instant::now());
+                        source
+                            .outstanding_reservations
+                            .store(reservations.len(), Ordering::Relaxed);
+                        tracing::warn!(
+                            table = %format!("{schema_name}.{table_name}"),
+                            slot = %slot_name,
+                            "failed to drop an unsubscribed table from the shared publication; \
+                             the shared slot keeps holding WAL for it and will retry. Drop it \
+                             manually to release retention now: {e}"
+                        );
+                    }
+                }
+            });
+        }
+    }
+
     /// Lazily detach members whose receiving stream has been dropped.
     fn reap_closed_members(&self) {
         let closed: Vec<MemberKey> = lock(&self.members)
@@ -1526,6 +1867,7 @@ async fn attach_member(
         table_name,
         metrics,
         policy,
+        applied_lsn_store,
     } = input;
     let member_key: MemberKey = (schema_name.clone(), table_name.clone());
 
@@ -1592,7 +1934,7 @@ async fn attach_member(
     }
 
     // Slot + publication DDL (idempotent, retried on transient errors).
-    let setup = slot::setup_shared_member(&source.params, &schema_name, &table_name).await?;
+    let mut setup = slot::setup_shared_member(&source.params, &schema_name, &table_name).await?;
     if setup.slot.created_fresh {
         source.slot_created_fresh.store(true, Ordering::Release);
     }
@@ -1600,6 +1942,11 @@ async fn attach_member(
         source.ack.seed(setup.slot.consistent_lsn);
         metrics.set_confirmed_flush_lsn(setup.slot.consistent_lsn);
     }
+    // Before anything can be credited on this source, pin the floor for the
+    // published tables whose datasets have not joined yet — including, when
+    // this member is the first to arrive on a resuming slot, the ones that will
+    // join after it.
+    source.install_reservations(&setup);
 
     let rejoining = lock(&source.detached).remove(&member_key);
     // Snapshot when this slot epoch has no usable history for the table:
@@ -1617,11 +1964,95 @@ async fn attach_member(
         || (!rejoining && source.slot_created_fresh.load(Ordering::Acquire));
 
     let snapshotting = need_snapshot && params.initial_snapshot;
+
+    // Is there a gap this slot cannot supply?
+    //
+    // Computed, not inferred. The watermark records the LSN the acceleration's
+    // contents are complete as of; `restart_lsn` is the earliest LSN the slot can
+    // still stream from. A watermark older than that is a gap no stream can fill:
+    // a row deleted at the source in that window has no change event left to
+    // replay, so appending snapshot rows over the survivors would leave the
+    // deletion applied at the source and never here, in every later query.
+    //
+    // The three outcomes:
+    //
+    //   * no watermark -> this acceleration has never been loaded. A first
+    //     bootstrap, not a gap: snapshot-and-append is exactly right, and this is
+    //     also every ephemeral accelerator (their store records nothing, since
+    //     they boot empty and re-snapshot every start).
+    //   * watermark, and the slot still reaches it -> resume; the WAL between the
+    //     two is still there to replay.
+    //   * watermark the slot cannot reach (or no slot at all) -> hand the reload
+    //     to the consumer, which owns the accelerator and can replace its
+    //     contents atomically (see `cdc::ChangeEnvelope::history_unavailable`).
+    let watermark = match applied_lsn_store.load().await {
+        Ok(watermark) => watermark,
+        Err(e) => {
+            // Reading it failed, so we cannot prove the gap is fillable. Treat it
+            // the same as a position belonging to another source — unusable — so
+            // the acceleration is rebuilt: a needless rebuild costs a re-read,
+            // while a wrong resume silently keeps rows the source has deleted.
+            tracing::warn!(
+                dataset = %dataset_name,
+                "could not read how far this acceleration has been advanced, so it will be rebuilt from the source rather than resumed on an unproven position: {e}"
+            );
+            super::RecordedPosition::ForeignSource
+        }
+    };
+    // Absence of a watermark is evidence of a gap only when the acceleration
+    // could be holding rows this process did not load AND a position could have
+    // been recorded. An ephemeral acceleration boots empty, so absence means
+    // nothing is there; a store that cannot record (no durable sidecar) makes
+    // absence permanent, and rebuilding on it would re-read the whole table on
+    // every restart rather than once.
+    let tracks_positions = applied_lsn_store.records_positions();
+    if !params.ephemeral_accelerator && !tracks_positions {
+        tracing::warn!(
+            dataset = %dataset_name,
+            "this acceleration persists across restarts but has nowhere to record how far it has been advanced, so a replication slot that is dropped or invalidated cannot be detected and rows deleted at the source while it was gone would survive here"
+        );
+    }
+    let rebuild_via_consumer = super::needs_rebuild(
+        &watermark,
+        setup.slot_restart_lsn,
+        !params.ephemeral_accelerator && tracks_positions,
+    );
+
+    // Resume from the watermark, not from the server's acknowledged position,
+    // whenever the watermark is behind it.
+    //
+    // The two can disagree: the slot ack is advanced by the same commit that
+    // records the watermark, but the ack reaches the server through the pump's
+    // status updates while the watermark is a local write that can fail or be
+    // interrupted. The server's `confirmed_flush_lsn` is what streaming would
+    // otherwise resume from, so a watermark behind it means the interval between
+    // them was acknowledged but never recorded as applied — and resuming at the
+    // server's position would skip it silently. The WAL for that interval is
+    // still retained (`restart_lsn` is at or before the watermark, or this would
+    // have been a rebuild), so replaying it is both possible and idempotent
+    // through the primary-key upsert.
+    if let super::RecordedPosition::At(watermark) = &watermark
+        && !rebuild_via_consumer
+        && setup.slot.consistent_lsn > watermark.lsn
+    {
+        tracing::warn!(
+            dataset = %dataset_name,
+            server_position = %slot::format_lsn(setup.slot.consistent_lsn),
+            recorded_position = %slot::format_lsn(watermark.lsn),
+            "this slot was acknowledged past what the acceleration recorded as applied, so streaming resumes from the recorded position and replays the difference rather than skipping it"
+        );
+        setup.slot.consistent_lsn = watermark.lsn;
+    }
+
     let (sender, receiver) = member_mailbox(params.member_channel_capacity);
     // Grouping signal for the analysis: record which shared slot this dataset joined.
     // (Membership liveness is marked by `mark_member_attached` just below.)
     metrics.set_slot_name(source.key.slot_name.clone());
+    // `register` takes over any hold installed for this table through its
+    // rejoin branch, keeping the held floor — so the replay this member is
+    // owed starts where the slot resumed, not where a slot-mate was credited.
     source.ack.register(&member_key, snapshotting);
+    source.claim_reservation(&member_key);
     lock(&source.members).insert(
         member_key.clone(),
         Arc::new(MemberHandle {
@@ -1633,6 +2064,7 @@ async fn attach_member(
             sender,
             metrics: Arc::clone(&metrics),
             ready_lag: params.ready_lag,
+            applied_lsn_store: Arc::clone(&applied_lsn_store),
         }),
     );
     // Membership liveness is now observable (`dataset_postgres_replication_member_attached`):
@@ -1687,7 +2119,67 @@ async fn attach_member(
     // `bootstrap_finished` hook flips the member live and asks the pump to
     // reconnect — Postgres resumes from the held floor and replays the
     // member's gap (idempotent for everyone).
-    let head: ChangesStream = if snapshotting {
+    // Flips the member live and asks the pump to reconnect, so Postgres replays
+    // from the held floor. Shared by the two held-at-join arms below: after a
+    // clean snapshot, and after the consumer has been told to reload.
+    let live_flip_hook = |source: &Arc<SharedSource>, key: &MemberKey| {
+        let hook_source = Arc::clone(source);
+        let hook_key = key.clone();
+        let mut hook_fired = false;
+        stream::poll_fn(move |_| {
+            if !hook_fired {
+                hook_fired = true;
+                hook_source.ack.snapshot_finished(&hook_key);
+                hook_source.restart_requested.store(true, Ordering::Release);
+            }
+            std::task::Poll::Ready(None)
+        })
+    };
+
+    let head: ChangesStream = if rebuild_via_consumer {
+        // One zero-row envelope asking the consumer to replace the accelerator's
+        // contents from the source, then the same live-flip as a finished
+        // snapshot. The consumer applies nothing further until the reload
+        // completes, so the WAL that follows lands on top of it — back-pressure
+        // in the member mailbox is what orders the two.
+        // The signal carries the watermark committer, not a no-op one, so the
+        // position is recorded when the consumer finishes the rebuild and commits
+        // it. Without that, a rebuild would leave no watermark behind and the
+        // very next start would rebuild again — re-reading the whole table on
+        // every restart of a dataset whose source happens to be quiet.
+        //
+        // A real committer also keeps this envelope out of the consumer's
+        // heartbeat stripping (which requires a no-op committer), so it reaches
+        // the write path and is committed with the usual durability-then-commit
+        // ordering.
+        let signal_item = snapshot_watermark_envelope(
+            &schema,
+            Arc::clone(&applied_lsn_store),
+            setup.slot.consistent_lsn,
+            dataset_name.clone(),
+            true,
+        );
+        let signal = stream::once(async move { signal_item });
+        tracing::warn!(
+            dataset = %dataset_name,
+            table = %format_member(&member_key),
+            slot = %source.key.slot_name,
+            "this replication slot has no history for the table, and the acceleration persists across restarts, so it will be rebuilt from the source before changes are applied"
+        );
+        // No snapshot runs on this path — the consumer's reload replaces it — so
+        // the gauge's documented "finished, or skipped" state is reached here.
+        // Leaving it at 0 would strand every readiness probe reading it.
+        metrics.mark_bootstrap_complete();
+        Box::pin(signal.chain(live_flip_hook(source, &member_key)))
+    } else if snapshotting {
+        // Built before `dataset_name` is moved into the snapshot input below.
+        let watermark_boundary = snapshot_watermark_envelope(
+            &schema,
+            Arc::clone(&applied_lsn_store),
+            setup.slot.consistent_lsn,
+            dataset_name.clone(),
+            false,
+        );
         let snapshot = bootstrap::snapshot_stream(bootstrap::SnapshotInput {
             params: params.clone(),
             schema_name,
@@ -1712,17 +2204,39 @@ async fn attach_member(
         let hook_source = Arc::clone(source);
         let hook_key = member_key.clone();
         let mut hook_fired = false;
+        let flip_error_flag = Arc::clone(&saw_error);
         let bootstrap_finished = stream::poll_fn(move |_| {
             if !hook_fired {
                 hook_fired = true;
-                if !saw_error.load(Ordering::Acquire) {
+                if !flip_error_flag.load(Ordering::Acquire) {
                     hook_source.ack.snapshot_finished(&hook_key);
                     hook_source.restart_requested.store(true, Ordering::Release);
                 }
             }
             std::task::Poll::Ready(None)
         });
-        Box::pin(snapshot.chain(bootstrap_finished))
+        // Record the snapshot's position, but ONLY for a snapshot that completed
+        // cleanly — gated on the same flag as the live flip above.
+        //
+        // A failed snapshot ends its stream after yielding the error, so without
+        // this gate the boundary would still be reached and could record a
+        // watermark for an acceleration that is missing base rows. The next start
+        // would then find that watermark reachable, resume, and never load the
+        // rows the snapshot never delivered.
+        //
+        // The committer itself cannot be deferred, so when it does run, the
+        // snapshot's rows are already durable.
+        let mut boundary_item = Some(watermark_boundary);
+        let boundary = stream::poll_fn(move |_| {
+            let Some(item) = boundary_item.take() else {
+                return std::task::Poll::Ready(None);
+            };
+            if saw_error.load(Ordering::Acquire) {
+                return std::task::Poll::Ready(None);
+            }
+            std::task::Poll::Ready(Some(item))
+        });
+        Box::pin(snapshot.chain(boundary).chain(bootstrap_finished))
     } else {
         metrics.mark_bootstrap_complete();
         // Readiness is lag-based: a resuming member becomes Ready via lag-gated
@@ -2074,6 +2588,7 @@ async fn run_pump(source: Arc<SharedSource>) {
                 );
                 return;
             }
+            source.release_unclaimed_reservations(UNCLAIMED_RESERVATION_GRACE);
             // Busy streams may never enter the blocking receive path, so check
             // eager deadlines once per decoded event as well as through the
             // receive timeout below. `EagerHold` caches the earliest deadline, so
@@ -3019,6 +3534,7 @@ async fn deliver_commit(
             slot: Arc::clone(slot),
             flush_to: boundary.end_lsn,
             dataset: member.dataset_name.clone(),
+            applied_lsn_store: Arc::clone(&member.applied_lsn_store),
             is_dataset_ready: is_ready,
             first_received_at: std::time::Instant::now(),
         };
@@ -3116,6 +3632,7 @@ mod tests {
                 Some(source_commit_ts_ms),
             ),
             slot: Arc::clone(slot),
+            applied_lsn_store: Arc::new(crate::postgres_replication::NoopAppliedLsnStore),
             flush_to,
             dataset: "ds".to_string(),
             is_dataset_ready: ready,
@@ -3145,6 +3662,29 @@ mod tests {
             member_channel_capacity: DEFAULT_MEMBER_CHANNEL_CAPACITY,
             pg_output_format: crate::postgres_replication::PgOutputFormat::Binary,
             ready_lag: crate::cdc::DEFAULT_READY_LAG,
+        }
+    }
+
+    /// A `setup_shared_member` outcome for a slot holding `tables` in its
+    /// publication.
+    fn shared_setup(
+        consistent_lsn: u64,
+        created_fresh: bool,
+        tables: &[&str],
+    ) -> slot::SharedMemberSetup {
+        slot::SharedMemberSetup {
+            slot_restart_lsn: Some(0),
+            slot: slot::SlotInfo {
+                slot_name: "slot".to_string(),
+                publication_name: "pub".to_string(),
+                consistent_lsn,
+                snapshot_name: None,
+                created_fresh,
+                generated_columns: vec![],
+            },
+            table_added: false,
+            generated_columns: vec![],
+            publication_tables: tables.iter().map(|t| key(t)).collect(),
         }
     }
 
@@ -3261,6 +3801,7 @@ mod tests {
             lock(&source.members).insert(
                 member_key.clone(),
                 Arc::new(MemberHandle {
+                    applied_lsn_store: Arc::new(crate::postgres_replication::NoopAppliedLsnStore),
                     dataset_name: format!("ds{i}"),
                     schema: Arc::clone(&schema),
                     primary_keys: vec![],
@@ -3298,6 +3839,7 @@ mod tests {
         lock(&source.members).insert(
             member_key.clone(),
             Arc::new(MemberHandle {
+                applied_lsn_store: Arc::new(crate::postgres_replication::NoopAppliedLsnStore),
                 dataset_name: "users".into(),
                 schema,
                 primary_keys: vec!["id".into()],
@@ -3416,6 +3958,7 @@ mod tests {
             lock(&source.members).insert(
                 member_key.clone(),
                 Arc::new(MemberHandle {
+                    applied_lsn_store: Arc::new(crate::postgres_replication::NoopAppliedLsnStore),
                     dataset_name: "users".into(),
                     schema,
                     primary_keys: vec!["id".into()],
@@ -4474,6 +5017,129 @@ mod tests {
         assert_eq!(ack.flush_lsn(), 900);
     }
 
+    /// Regression for #12609. On a resuming slot the first member to join is
+    /// credited to the WAL head by the next keepalive, and the floor only ever
+    /// rises — so a member joining after that would be seated above changes to
+    /// its own table that nobody consumed, and they would be acked away. A hold
+    /// for the published-but-unattached table keeps the floor at the resume LSN
+    /// until its member arrives to take it over.
+    #[test]
+    fn reserved_hold_pins_the_floor_until_its_member_joins() {
+        let ack = AckTable::default();
+        // Resume: the slot's confirmed_flush_lsn from before the restart.
+        ack.seed(100);
+        assert!(ack.reserve(&key("a"), 100), "a is published, no member yet");
+        assert!(ack.reserve(&key("b"), 100), "b is published, no member yet");
+
+        // b's dataset joins first, streams, and goes idle at the WAL head.
+        ack.register(&key("b"), false);
+        assert!(!ack.reserve(&key("b"), 100), "a member is never disturbed");
+        ack.promote_ready_members();
+        ack.deliver(&key("b"), 500);
+        ack.commit(&key("b"), 500);
+        ack.credit_idle(500);
+        assert_eq!(
+            ack.flush_lsn(),
+            100,
+            "a's hold pins the slot at the resume LSN while b races ahead"
+        );
+
+        // a's dataset joins second and inherits the hold, not b's position.
+        ack.register(&key("a"), false);
+        assert_eq!(
+            ack.committed(&key("a")),
+            100,
+            "the second joiner must resume from the slot's resume LSN"
+        );
+        assert_eq!(ack.delivered(&key("a")), 100, "nothing delivered to a yet");
+
+        // The reconnect starts at 100, replays a's gap, and only once a has
+        // applied it does the slot acknowledge past it.
+        ack.promote_ready_members();
+        ack.deliver(&key("a"), 500);
+        assert_eq!(
+            ack.flush_lsn(),
+            100,
+            "in-flight replay still holds the floor"
+        );
+        ack.commit(&key("a"), 500);
+        assert_eq!(ack.flush_lsn(), 500);
+    }
+
+    /// The first member to attach a resuming slot holds a floor for every
+    /// published table; each member's own hold is handed over when it
+    /// registers, and only the ones nothing ever claims expire.
+    #[test]
+    fn reservations_cover_published_tables_until_their_members_join() {
+        let (source, _) = test_source_with_members(0);
+        source.install_reservations(&shared_setup(100, false, &["t0", "t1", "orphan"]));
+        assert_eq!(
+            source.ack.flush_lsn(),
+            100,
+            "the slot cannot ack past the resume LSN while tables are unattached"
+        );
+
+        // The decision belongs to the first member to attach: a later attach
+        // does not re-open it (its table is already published and held, and a
+        // table that appears afterwards was added by that attach itself, so it
+        // snapshots).
+        source.install_reservations(&shared_setup(900, false, &["late"]));
+        assert!(
+            source.ack.slot(&key("late")).is_none(),
+            "reservations are installed once per source"
+        );
+
+        // t0's dataset joins and takes over its hold; the rest stay held.
+        source.ack.register(&key("t0"), false);
+        source.claim_reservation(&key("t0"));
+        let mut expired = source.take_expired_reservations(std::time::Duration::ZERO);
+        expired.sort();
+        assert_eq!(
+            expired,
+            vec![key("orphan"), key("t1")],
+            "only holds no member claimed expire"
+        );
+        assert!(
+            source
+                .take_expired_reservations(std::time::Duration::ZERO)
+                .is_empty(),
+            "an expired hold is handed out once, so one release is spawned per table"
+        );
+    }
+
+    /// A slot this process created owes nobody WAL below their join point —
+    /// every member of it snapshots — so nothing is held.
+    #[test]
+    fn a_freshly_created_slot_reserves_nothing() {
+        let (source, _) = test_source_with_members(0);
+        source.install_reservations(&shared_setup(100, true, &["t0"]));
+        assert!(source.ack.slot(&key("t0")).is_none());
+        assert!(
+            source
+                .take_expired_reservations(std::time::Duration::ZERO)
+                .is_empty()
+        );
+    }
+
+    /// A published table no dataset ever subscribes to would pin WAL for the
+    /// whole slot forever. Releasing its hold (done only once the table is out
+    /// of the publication) lets the floor advance again.
+    #[test]
+    fn releasing_an_unclaimed_hold_unpins_the_floor() {
+        let ack = AckTable::default();
+        ack.seed(100);
+        ack.reserve(&key("gone"), 100);
+        ack.register(&key("a"), false);
+        ack.promote_ready_members();
+        ack.deliver(&key("a"), 400);
+        ack.commit(&key("a"), 400);
+        ack.credit_idle(400);
+        assert_eq!(ack.flush_lsn(), 100, "the unclaimed hold pins the slot");
+
+        ack.release(&key("gone"));
+        assert_eq!(ack.flush_lsn(), 400);
+    }
+
     #[test]
     fn replayed_older_commits_never_regress() {
         let ack = AckTable::default();
@@ -4499,6 +5165,7 @@ mod tests {
         ack.seed(10);
         ack.register(&key("a"), false);
         let committer = SharedLsnCommitter {
+            applied_lsn_store: Arc::new(crate::postgres_replication::NoopAppliedLsnStore),
             slot: ack.slot(&key("a")).expect("slot registered"),
             flush_to: 42,
             dataset: "test".to_string(),

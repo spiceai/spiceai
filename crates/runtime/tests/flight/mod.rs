@@ -31,7 +31,7 @@ use datafusion::sql::TableReference;
 use futures::{Stream, TryStreamExt as _};
 use rand::RngExt as _;
 use runtime::{
-    Runtime, accelerated_table::refresh::Refresh, auth::EndpointAuth,
+    Runtime, accelerated::refresh::Refresh, auth::EndpointAuth,
     component::dataset::acceleration::Acceleration, config::Config, datafusion::DataFusion,
     flight::RateLimits, internal_table::create_internal_accelerated_table, secrets::Secrets,
 };
@@ -52,6 +52,7 @@ mod do_put;
 mod prepared_statements;
 mod statement_substrait_plan;
 mod statement_update;
+mod trace_id;
 
 async fn start_spice_test_app(
     flight_auth: Option<Arc<dyn FlightBasicAuth + Send + Sync>>,
@@ -243,7 +244,7 @@ async fn register_test_table(
     .map_err(anyhow::Error::from)?;
 
     datafusion
-        .register_table_as_writable_and_with_schema(table_name, table)
+        .register_table_as_writable_and_with_schema(table_name, table.into_table())
         .map_err(anyhow::Error::from)?;
 
     Ok(())

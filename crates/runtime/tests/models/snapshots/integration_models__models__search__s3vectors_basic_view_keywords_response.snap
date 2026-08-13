@@ -6,7 +6,7 @@ expression: "normalize_search_response(resp, round_scores)"
   "duration_ms": "duration_ms_val",
   "results": [
     {
-      "_score": "0.54",
+      "_score": "0.77",
       "dataset": "qs_view",
       "matches": {
         "answer": [
@@ -18,7 +18,7 @@ expression: "normalize_search_response(resp, round_scores)"
       }
     },
     {
-      "_score": "0.51",
+      "_score": "0.75",
       "dataset": "qs_view",
       "matches": {
         "answer": [
@@ -30,7 +30,7 @@ expression: "normalize_search_response(resp, round_scores)"
       }
     },
     {
-      "_score": "0.51",
+      "_score": "0.75",
       "dataset": "qs_view",
       "matches": {
         "answer": [
@@ -42,7 +42,7 @@ expression: "normalize_search_response(resp, round_scores)"
       }
     },
     {
-      "_score": "0.49",
+      "_score": "0.74",
       "dataset": "qs_view",
       "matches": {
         "answer": [

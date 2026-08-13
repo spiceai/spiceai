@@ -21,8 +21,8 @@ use reqwest::Client;
 use spice_cloud_client::{
     CloudClient,
     types::{
-        AppExecutor, AppResourceLimits, AppResourceRequests, AppResources, CreateAppRequest,
-        CreateDeploymentRequest, UpdateAppRequest, UpdateChannel,
+        CreateDeploymentRequest, CreateProjectRequest, ProjectExecutor, ProjectResourceLimits,
+        ProjectResourceRequests, ProjectResources, UpdateChannel, UpdateProjectRequest,
     },
 };
 
@@ -136,33 +136,33 @@ async fn resolve_cloud_token(
 }
 
 /// Default resource allocation shared by scheduler and executor when no overrides are provided.
-fn default_resources() -> AppResources {
-    AppResources {
-        limits: AppResourceLimits {
+fn default_resources() -> ProjectResources {
+    ProjectResources {
+        limits: ProjectResourceLimits {
             cpu: None,
             memory: Some("16Gi".to_string()),
             ephemeral_storage: None,
         },
-        requests: Some(AppResourceRequests {
+        requests: Some(ProjectResourceRequests {
             cpu: Some("0.1".to_string()),
             memory: Some("256Mi".to_string()),
         }),
     }
 }
 
-/// Build an [`AppResources`] by merging explicit overrides on top of a set of
+/// Build an [`ProjectResources`] by merging explicit overrides on top of a set of
 /// base (default) resources.
 ///
 /// Each field is overridden independently: only the values that are `Some`
 /// replace the corresponding field in `base`.
 fn resources_over(
-    base: AppResources,
+    base: ProjectResources,
     memory_limit: Option<&str>,
     cpu_limit: Option<&str>,
     cpu_request: Option<&str>,
     memory_request: Option<&str>,
     ephemeral_storage_limit: Option<&str>,
-) -> AppResources {
+) -> ProjectResources {
     let memory_limit_val = memory_limit.map(ToString::to_string).or(base.limits.memory);
     let cpu_limit_val = cpu_limit.map(ToString::to_string).or(base.limits.cpu);
     let cpu_request_val = cpu_request
@@ -172,14 +172,14 @@ fn resources_over(
         .map(ToString::to_string)
         .or(base.requests.as_ref().and_then(|r| r.memory.clone()));
 
-    AppResources {
-        limits: AppResourceLimits {
+    ProjectResources {
+        limits: ProjectResourceLimits {
             cpu: cpu_limit_val,
             memory: memory_limit_val,
             ephemeral_storage: ephemeral_storage_limit.map(ToString::to_string),
         },
         requests: if cpu_request_val.is_some() || memory_request_val.is_some() {
-            Some(AppResourceRequests {
+            Some(ProjectResourceRequests {
                 cpu: cpu_request_val,
                 memory: memory_request_val,
             })
@@ -195,7 +195,7 @@ pub(crate) async fn ensure_spice_cloud_app(
     config: &AppCreateConfig,
     deployment_mode: &DeploymentMode,
 ) -> anyhow::Result<i64> {
-    let apps = cloud.list_apps().await?;
+    let apps = cloud.list_projects().await?;
     if let Some(app) = apps.into_iter().find(|a| a.name == app_name) {
         return Ok(app.id);
     }
@@ -226,7 +226,7 @@ pub(crate) async fn ensure_spice_cloud_app(
 
     // Executor — same resource defaults as scheduler; each field overridable independently.
     let executor = if matches!(deployment_mode, DeploymentMode::Cluster) {
-        Some(AppExecutor {
+        Some(ProjectExecutor {
             replicas: Some(config.executor_replicas),
             resources: Some(resources_over(
                 default_resources(),
@@ -242,7 +242,7 @@ pub(crate) async fn ensure_spice_cloud_app(
         None
     };
 
-    let create_app_request = CreateAppRequest {
+    let create_project_request = CreateProjectRequest {
         name: app_name.to_string(),
         description: None,
         visibility: "private".to_string(),
@@ -274,9 +274,9 @@ pub(crate) async fn ensure_spice_cloud_app(
         storage_size_gb: None,
     };
 
-    eprintln!("[stdio] CreateAppRequest: {create_app_request:?}");
+    eprintln!("[stdio] CreateProjectRequest: {create_project_request:?}");
 
-    let create_result = cloud.create_app(&create_app_request).await;
+    let create_result = cloud.create_project(&create_project_request).await;
     eprintln!("[stdio] create_result: {create_result:?}");
     match create_result {
         Ok(app) => {
@@ -290,7 +290,7 @@ pub(crate) async fn ensure_spice_cloud_app(
         }
         Err(spice_cloud_client::error::Error::Conflict { .. }) => {
             // Race condition — another caller created it; re-fetch
-            let apps = cloud.list_apps().await?;
+            let apps = cloud.list_projects().await?;
             if let Some(app) = apps.into_iter().find(|a| a.name == app_name) {
                 apply_storage_config(cloud, app.id, config).await?;
                 return Ok(app.id);
@@ -319,19 +319,19 @@ async fn apply_storage_config(
         return Ok(());
     }
 
-    let executor = config.executor_storage_size_gb.map(|size| AppExecutor {
+    let executor = config.executor_storage_size_gb.map(|size| ProjectExecutor {
         replicas: None,
         resources: None,
         storage_size_gb: Some(size),
     });
 
     cloud
-        .update_app(
+        .update_project(
             app_id,
-            &UpdateAppRequest {
+            &UpdateProjectRequest {
                 executor,
                 storage_size_gb: config.app_storage_size_gb,
-                ..UpdateAppRequest::default()
+                ..UpdateProjectRequest::default()
             },
         )
         .await?;
@@ -384,11 +384,11 @@ pub(crate) async fn apply_spicepod_to_app(
     spicepod_yaml: &str,
 ) -> anyhow::Result<()> {
     cloud
-        .update_app(
+        .update_project(
             app_id,
-            &UpdateAppRequest {
+            &UpdateProjectRequest {
                 spicepod: Some(spicepod_yaml.to_string()),
-                ..UpdateAppRequest::default()
+                ..UpdateProjectRequest::default()
             },
         )
         .await?;
@@ -418,8 +418,8 @@ pub(crate) async fn create_deployment(
 }
 
 /// Delete (soft-delete) a Spice Cloud app.
-pub(crate) async fn delete_app(cloud: &CloudClient, app_id: i64) -> anyhow::Result<()> {
-    cloud.delete_app(app_id).await?;
+pub(crate) async fn delete_project(cloud: &CloudClient, app_id: i64) -> anyhow::Result<()> {
+    cloud.delete_project(app_id).await?;
     Ok(())
 }
 
@@ -460,7 +460,7 @@ impl Drop for ScpAppGuard {
                 eprintln!("[stdio] ScpAppGuard: failed to build tokio runtime for cleanup");
                 return;
             };
-            match rt.block_on(delete_app(&cloud, app_id)) {
+            match rt.block_on(delete_project(&cloud, app_id)) {
                 Ok(()) => eprintln!("[stdio] ScpAppGuard: deleted app {app_id}"),
                 Err(e) => eprintln!("[stdio] ScpAppGuard: failed to delete app {app_id}: {e}"),
             }

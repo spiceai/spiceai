@@ -28,6 +28,7 @@ pub mod stream;
 
 use async_trait::async_trait;
 use data_components::inferred_schema::{InferredIndex, InferredSchema, InferredSortColumn};
+use data_connector_api::schema_projection::{ProjectionPolicy, parse_schema_projection};
 use datafusion::datasource::TableProvider;
 use datafusion_table_providers::mongodb::{
     Error as MongoDBError, MongoDBTableFactory, connection_pool::MongoDBConnectionPool,
@@ -35,13 +36,12 @@ use datafusion_table_providers::mongodb::{
 use mongodb::bson::{Bson, Document, doc};
 use runtime::component::dataset::Dataset;
 use runtime::component::dataset::acceleration::RefreshMode;
-use runtime::dataconnector::schema_projection::{ProjectionPolicy, parse_schema_projection};
 use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult,
 };
-use runtime::federated_table::FederatedTable;
-use runtime::parameters::{ParameterSpec, Parameters};
+use runtime::federated::FederatedTable;
+use runtime_parameters::{ParameterSpec, Parameters};
 use secrecy::ExposeSecret;
 use snafu::prelude::*;
 use std::any::Any;

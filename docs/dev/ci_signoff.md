@@ -312,6 +312,18 @@ and leaves an existing success alone. The correction handlers cannot cover this 
 after the fact: both are gated on `cancelled()`, and a budget expiry is a *failed*
 step by the design above.
 
+A status of 128+N is how that reads only when `make` dies *of* the signal. A
+cancellation signals the whole process group, and a recipe line that handles it
+can return an ordinary small status instead — indistinguishable, by status alone,
+from a recipe that genuinely failed, which is how a cancelled run came to publish
+"Sign-off checks failed" about a branch nothing judged
+([#12710](https://github.com/spiceai/spiceai/issues/12710)). So a remote run also
+traps `INT`/`TERM`/`HUP` for the duration of the checks and records that it was
+signalled; classification reads the recorded signal *or* the 128+N status, and
+either one means no verdict. The trap is armed on remote runs only, and only once
+there is a `pending` on the commit to explain — a local `make signoff` keeps the
+Ctrl-C that stops it.
+
 Only one sign-off runs per commit. Both dispatch forms — `-f branch=<branch>` and
 `-f pr_number=<N>` — resolve to the same commit before the sign-off job starts,
 and its concurrency group is keyed on that commit, so a second dispatch for a
@@ -354,20 +366,37 @@ SSH key access to the host and `gh` auth on that machine.
 
 `signoff.yml` sets `concurrency: signoff-<pr|branch>` with `cancel-in-progress`, so
 re-dispatching sign-off for a branch cancels the run before it. A cancelled job is
-killed by signal, which makes the in-flight `run_checks` return non-zero — and the
-dying script posts `signoff=failure`, "Sign-off checks failed after Ns", about a
-branch nothing actually judged.
+killed by signal, and a run that was signalled judged nothing — so it must publish
+no verdict at all, in either direction: not the `failure` that says the branch's
+checks failed, and not the `success` that would clear a branch whose checks were
+cut short.
 
-So the workflow corrects the record on its way out. When the job ends cancelled it
-runs:
+**The run declines the verdict itself.** That is the first and load-bearing layer:
+the script traps `INT`/`TERM`/`HUP` for the duration of the checks, and a recorded
+signal — or a 128+N status from a `make` that died of one — classifies the run as
+`signalled`, which publishes no status and leaves the `pending` it posted on its
+way in. Deciding in-process is what makes the decision reliable, because the script
+is the one party that observes the signal unambiguously: by exit status alone, a
+`make` that trapped the cancellation and returned a small status is
+indistinguishable from a recipe that genuinely failed, and reading it as one is how
+a cancelled run published "Sign-off checks failed" about a branch nothing judged
+([#12710](https://github.com/spiceai/spiceai/issues/12710)).
+
+**The correction step is the backstop.** A run cannot always decline for itself: a
+`SIGKILL` runs no handler, and the script can be killed in the window between
+`run_checks` returning and the decline being reached — as can an older run, or a
+racing one in the other concurrency group. So when the job ends cancelled the
+workflow still runs:
 
 ```bash
 scripts/signoff correct-cancelled [<sha>] [<owner/repo>]
 ```
 
-which rewrites the status to `pending` — not `success`, because HEAD really is not
-signed off, and not `error`, because `pending` is the state Attestation already
-describes as "re-dispatch sign-off" rather than as a defect in the diff.
+which rewrites a `failure`/`error` left by any of those to `pending` — not
+`success`, because HEAD really is not signed off, and not `error`, because
+`pending` is the state Attestation already describes as "re-dispatch sign-off"
+rather than as a defect in the diff. On a run that declined for itself there is
+nothing to rewrite, and the step says so and exits.
 
 **It rewrites only `failure` and `error`.** A cancelled run can find a legitimate
 `success` on the commit two ways, and overwriting either would throw away checks
@@ -379,6 +408,19 @@ that passed and cost another 1-4 hour run:
   dispatch *input*, so `-f branch=my-branch` and `-f pr_number=123` for that same
   branch are different groups: they do not cancel each other, and either can be
   cancelled after the other has succeeded.
+
+**It reads until the commit stops changing.** The `if: cancelled()` step starts
+when the `Sign off` step is *marked* cancelled, which is before that step's
+process has finished writing: on one run the handler read `pending`, correctly
+declined, and the `failure` it existed to withdraw was posted four seconds later,
+leaving nothing that could take it back
+([#12710](https://github.com/spiceai/spiceai/issues/12710)). So a `pending` — the
+state a run posts on its way in, and so the one a late verdict overwrites — is
+re-read for ~15s before the commit is treated as settled. The other states return
+at once: a `failure`/`error` is already the verdict being withdrawn, a `success`
+is settled and must not be second-guessed, and an unset context means no run got
+as far as posting anything. Waiting is not licence to write — a `success` that
+appears late is still left alone.
 
 A read failure is likewise not treated as "no status" — that would license the
 overwrite the guard exists to prevent. Every path exits 0, so the correction can
