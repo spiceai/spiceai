@@ -265,19 +265,21 @@ pub(crate) struct SharedSegmentCache {
 impl SharedSegmentCache {
     /// A cache with a budget of its own. Callers outside the process cache use
     /// this — a standalone `VortexFormat` configured with
-    /// `segment_cache_size_bytes`, and tests that need an isolated budget.
     /// A cache with a budget of its own, registered so its metrics report under
     /// `name`. Returns an `Arc` because the metrics registry holds a weak
     /// reference to it.
+    ///
+    /// Used for the process-wide cache, for a format that sizes its own through
+    /// `segment_cache_size_bytes`, and by tests that need an isolated budget.
     pub(crate) fn new(
         max_capacity_bytes: u64,
         track_retirement: bool,
-        name: impl Into<Arc<str>>,
+        name: impl AsRef<str>,
     ) -> Arc<Self> {
         let cache = Arc::new(Self::build(
             max_capacity_bytes,
             track_retirement,
-            name.into(),
+            name.as_ref(),
         ));
         REGISTERED_CACHES.lock().push(Arc::downgrade(&cache));
         cache
@@ -295,9 +297,9 @@ impl SharedSegmentCache {
         Self::new(max_capacity_bytes, true, name)
     }
 
-    fn build(max_capacity_bytes: u64, track_retirement: bool, name: Arc<str>) -> Self {
+    fn build(max_capacity_bytes: u64, track_retirement: bool, name: &str) -> Self {
         Self {
-            label: [KeyValue::new("cache", name.to_string())],
+            label: [KeyValue::new("cache", name.to_owned())],
             cache: Cache::builder()
                 .name("vortex-datafusion-segment-cache")
                 .max_capacity(max_capacity_bytes)
@@ -659,7 +661,7 @@ mod tests {
             name: &str,
             capacity_bytes: u64,
         ) -> (Arc<SharedSegmentCache>, SegmentCacheMetrics) {
-            let cache = SharedSegmentCache::new(capacity_bytes, false, name.to_string());
+            let cache = SharedSegmentCache::new(capacity_bytes, false, name);
             let metrics =
                 SegmentCacheMetrics::register(&self.provider.meter("cayenne_segment_cache_test"));
             (cache, metrics)
@@ -734,7 +736,7 @@ mod tests {
             name: &str,
             capacity_bytes: u64,
         ) -> (Arc<SharedSegmentCache>, SegmentCacheMetrics) {
-            let cache = SharedSegmentCache::new(capacity_bytes, false, name.to_string());
+            let cache = SharedSegmentCache::new(capacity_bytes, false, name);
             let metrics =
                 SegmentCacheMetrics::register(&self.provider.meter("segment_cache_delta_test"));
             (cache, metrics)
