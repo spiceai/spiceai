@@ -341,7 +341,7 @@ blocking_ancestor() {
   local rev="$1" target="$2" dir="${2%/*}" entry mode
   BLOCKING_ANCESTOR=""
   while [ -n "$dir" ] && [ "$dir" != "$target" ]; do
-    entry=$(tree_entry "$rev" "$dir") || return 1
+    entry=$(tree_entry "$rev" "$dir") || die "could not read $rev:$dir"
     if [ -n "$entry" ]; then
       mode=${entry%% *}
       if [ "$mode" != 040000 ]; then
@@ -763,7 +763,7 @@ cmd_audit() {
     rm -rf "$tmp"
     die "could not read unmerged entries from the index"
   fi
-  local record last_unmerged="" theirs_now base_now theirs_add mine_add theirs_here
+  local record last_unmerged="" theirs_now base_now theirs_add mine_add theirs_here collision_ancestor trunk_blocker base_blocker
   while IFS= read -r -d '' record; do
     path=${record#*$'\t'}
     [ "$path" = "$last_unmerged" ] && continue
@@ -846,9 +846,20 @@ cmd_audit() {
         continue
       fi
       if [ -n "$other" ] && blocking_ancestor "$other" "$path"; then
-        accept_or_review "$path" "trunk put something other than a directory at $BLOCKING_ANCESTOR, so this addition and trunk cannot both exist" ||
-          findings=$((findings + 1))
-        continue
+        # Only if trunk introduced or changed that blocker. One the stack base
+        # already had is not ambiguous: from the stack base the child's
+        # replacement simply wins, so losing it is a plain loss and no decision
+        # can explain it away.
+        collision_ancestor="$BLOCKING_ANCESTOR"
+        trunk_blocker=$(tree_entry "$other" "$collision_ancestor") ||
+          die "could not read $other:$collision_ancestor"
+        base_blocker=$(tree_entry "$stack_base" "$collision_ancestor") ||
+          die "could not read $stack_base:$collision_ancestor"
+        if [ "$trunk_blocker" != "$base_blocker" ]; then
+          accept_or_review "$path" "trunk put something other than a directory at $collision_ancestor, so this addition and trunk cannot both exist" ||
+            findings=$((findings + 1))
+          continue
+        fi
       fi
       echo "LOST $path"
       findings=$((findings + 1))

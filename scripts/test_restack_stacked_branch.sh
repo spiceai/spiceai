@@ -730,6 +730,41 @@ start_test "audit reports a collision when the merge kept your addition instead"
   esac
 ) || failures=$((failures + 1))
 
+start_test "audit will not let a pre-existing blocker excuse a lost replacement"
+(
+  new_stack "$work_root/blocker_unchanged"
+  printf 'seed\n' > seed.txt && commit_all "fork point"
+  git checkout --quiet -b parent
+  printf 'parent version\n' > dir && commit_all "parent adds a file called dir"
+  stack_base=$(git rev-parse HEAD)
+  git checkout --quiet -b child
+  git rm --quiet dir && mkdir -p dir && printf 'child\n' > dir/file &&
+    commit_all "child replaces it with a directory"
+  pre=$(git rev-parse HEAD)
+  squash_parent_onto_trunk
+  git checkout --quiet child
+  git merge --no-ff --no-commit trunk >/dev/null 2>&1
+  # A wrong resolution that puts trunk's file back and drops the child's
+  # directory. Trunk never touched dir, so from the stack base the child's
+  # replacement simply wins: this is a loss, not a judgement call.
+  rm -rf dir && printf 'parent version\n' > dir
+  git rm --quiet -r --cached dir >/dev/null 2>&1 || true
+  git add dir
+  # git parks trunk's copy at dir~trunk during the collision; clear it so the loss
+  # below is the only thing left to report.
+  git rm --quiet --cached -- 'dir~trunk' >/dev/null 2>&1 || true
+  rm -f -- 'dir~trunk'
+  [ -z "$(git ls-files -u)" ] || fail_test "the fixture left something unmerged: $(git ls-files -u)"
+
+  output=$("$subject" audit "$stack_base" "$pre" --trunk trunk --accept dir/file 2>/dev/null)
+  status=$?
+  [ "$status" -ne 0 ] || fail_test "--accept excused a lost replacement: $output"
+  case "$output" in
+    *"LOST dir/file"*) ;;
+    *) fail_test "expected a plain loss, got: $output" ;;
+  esac
+) || failures=$((failures + 1))
+
 start_test "audit treats a file-versus-directory collision as a decision"
 (
   new_stack "$work_root/dircollision"
