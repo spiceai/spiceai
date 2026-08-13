@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
+use std::collections::HashSet;
 use std::fmt::Debug;
 use std::fmt::Display;
 use std::fmt::Formatter;
@@ -48,6 +49,7 @@ use futures::TryStreamExt as _;
 use futures::stream;
 use object_store::ObjectMeta;
 use object_store::ObjectStore;
+use object_store::path::Path;
 use vortex::VortexSessionDefault;
 use vortex::arrow::ArrowSessionExt;
 use vortex::arrow::FromArrowType;
@@ -396,7 +398,7 @@ impl VortexFormat {
     /// Creates a new instance with configured by a [`VortexTableOptions`].
     #[must_use]
     pub fn new_with_options(session: VortexSession, opts: VortexTableOptions) -> Self {
-        Self::new_with_options_and_optional_dataset(session, opts, None)
+        Self::new_with_options_and_optional_dataset(session, opts, None, false)
     }
 
     /// Creates a configured format whose segment-cache metrics use `dataset`.
@@ -410,19 +412,32 @@ impl VortexFormat {
         opts: VortexTableOptions,
         dataset: impl Into<Arc<str>>,
     ) -> Self {
-        Self::new_with_options_and_optional_dataset(session, opts, Some(dataset.into()))
+        Self::new_with_options_and_optional_dataset(session, opts, Some(dataset.into()), false)
+    }
+
+    /// Like [`Self::new_with_options_and_dataset_label`], but the segment cache
+    /// also prevents an already-open file from inserting segments after its path
+    /// is retired. Mutable Cayenne tables use this.
+    #[must_use]
+    pub fn new_with_options_and_dataset_label_tracking_retirement(
+        session: VortexSession,
+        opts: VortexTableOptions,
+        dataset: impl Into<Arc<str>>,
+    ) -> Self {
+        Self::new_with_options_and_optional_dataset(session, opts, Some(dataset.into()), true)
     }
 
     fn new_with_options_and_optional_dataset(
         session: VortexSession,
         opts: VortexTableOptions,
         dataset: Option<Arc<str>>,
+        track_retirement: bool,
     ) -> Self {
         let segment_cache = opts
             .segment_cache_size_bytes
             .and_then(|bytes| u64::try_from(bytes).ok())
             .filter(|bytes| *bytes > 0)
-            .map(|bytes| Arc::new(SharedSegmentCache::new(bytes, dataset)));
+            .map(|bytes| Arc::new(SharedSegmentCache::new(bytes, dataset, track_retirement)));
 
         Self {
             session,
@@ -437,6 +452,23 @@ impl VortexFormat {
     #[must_use]
     pub fn options(&self) -> &VortexTableOptions {
         &self.opts
+    }
+
+    /// Invalidates cached Vortex segments for the exact object-store paths and
+    /// physically evicts them before returning.
+    pub async fn invalidate_segment_cache_paths(&self, paths: HashSet<Path>) {
+        if let Some(cache) = self.segment_cache.as_ref() {
+            cache.invalidate_paths(paths).await;
+        }
+    }
+
+    /// Returns the current number of cached Vortex segments, or `None` when the
+    /// segment cache is disabled.
+    pub async fn segment_cache_entry_count(&self) -> Option<u64> {
+        match self.segment_cache.as_ref() {
+            Some(cache) => Some(cache.entry_count().await),
+            None => None,
+        }
     }
 
     /// Creates a format that attaches access plans and adjusts footer-derived
@@ -477,6 +509,24 @@ impl VortexFormat {
     #[must_use]
     pub fn with_dataset_label(&self, dataset: impl Into<Arc<str>>) -> Self {
         let mut format = Self::new_with_options_and_dataset_label(
+            self.session.clone(),
+            self.opts.clone(),
+            dataset,
+        );
+        format
+            .access_plan_provider
+            .clone_from(&self.access_plan_provider);
+        format.write_shard.clone_from(&self.write_shard);
+        format
+    }
+
+    /// Returns a dataset-labelled format whose segment cache also prevents an
+    /// already-open file from inserting segments after its path is retired.
+    /// Mutable Cayenne tables use this; read-only formats keep the original
+    /// cache-miss path without retirement bookkeeping.
+    #[must_use]
+    pub fn with_dataset_label_and_retirement_tracking(&self, dataset: impl Into<Arc<str>>) -> Self {
+        let mut format = Self::new_with_options_and_dataset_label_tracking_retirement(
             self.session.clone(),
             self.opts.clone(),
             dataset,

@@ -1084,11 +1084,13 @@ impl CayenneContext {
             vortex_session = vortex_session.set(full_strategy);
         }
 
-        Arc::new(VortexFormat::new_with_options_and_dataset_label(
-            vortex_session,
-            Self::vortex_table_options(config),
-            dataset,
-        ))
+        Arc::new(
+            VortexFormat::new_with_options_and_dataset_label_tracking_retirement(
+                vortex_session,
+                Self::vortex_table_options(config),
+                dataset,
+            ),
+        )
     }
 
     /// Table options shared by the base format and any per-write format

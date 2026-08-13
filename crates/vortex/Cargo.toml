@@ -30,7 +30,7 @@ moka = { workspace = true, features = ["future"] }
 object_store = { workspace = true }
 opentelemetry = { workspace = true }
 parking_lot = { workspace = true }
-tokio = { workspace = true, features = ["rt-multi-thread", "fs"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "fs", "time"] }
 tokio-stream = { workspace = true }
 tracing = { workspace = true, features = ["std", "attributes"] }
 twox-hash = { workspace = true }
