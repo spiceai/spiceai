@@ -552,6 +552,31 @@ audit_modification() {
   read -r theirs_mode theirs_oid <<< "$theirs_entry"
   read -r base_mode base_oid <<< "$base_entry"
 
+  # A symlink is never text-merged: git leaves two different link changes for a
+  # person, and one change wins outright. Merging the target as text can quietly
+  # agree with whatever the older base produced -- a multiline target where our
+  # change is a subset of trunk's merges to exactly trunk's bytes -- and call a
+  # link nobody chose correct.
+  if [ "$mine_mode" = 120000 ] || [ "$theirs_mode" = 120000 ] ||
+     [ "$base_mode" = 120000 ]; then
+    if [ "$mine_entry" != "$base_entry" ] && [ "$theirs_entry" != "$base_entry" ] &&
+       [ "$mine_entry" != "$theirs_entry" ]; then
+      accept_or_review "$path" "both sides changed this symlink, and git does not merge links"
+      return $?
+    fi
+    local expected_link
+    if [ "$mine_entry" != "$base_entry" ]; then
+      expected_link="$mine_entry"
+    else
+      expected_link="$theirs_entry"
+    fi
+    if [ "$staged_entry" != "$expected_link" ]; then
+      echo "DISCARDED $path: the staged link is not the one a merge from the stack base gives"
+      return 1
+    fi
+    return 0
+  fi
+
   git cat-file blob "$mine_oid" > "$tmp/m.ours" 2>/dev/null &&
     git cat-file blob "$base_oid" > "$tmp/m.base" 2>/dev/null &&
     git cat-file blob "$theirs_oid" > "$tmp/m.theirs" 2>/dev/null &&
