@@ -103,10 +103,13 @@ pub fn register_process_segment_cache_metrics() {
     let Some(Some(cache)) = PROCESS_CACHE.get() else {
         return;
     };
-    let _ = PROCESS_METRICS.set(SegmentCacheMetrics::register(
-        &global::meter("cayenne_segment_cache"),
-        cache,
-    ));
+    // `get_or_init`, not `set`: the instruments must be *built* once. Building
+    // them registers OpenTelemetry callbacks that outlive the returned handles,
+    // so constructing a second set and then discarding it would leave duplicate
+    // callbacks emitting the same series.
+    PROCESS_METRICS.get_or_init(|| {
+        SegmentCacheMetrics::register(&global::meter("cayenne_segment_cache"), cache)
+    });
 }
 
 /// The installed process-wide cache, if one is installed.

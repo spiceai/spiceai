@@ -402,7 +402,7 @@ impl RuntimeBuilder {
         let cayenne_segment_cache_mb =
             parse_usize_runtime_param(&spicepod_rt.params, CAYENNE_SEGMENT_CACHE_MB_PARAM);
         log_applied_cayenne_param(CAYENNE_SEGMENT_CACHE_MB_PARAM, cayenne_segment_cache_mb);
-        install_segment_cache(self.app.as_ref(), cayenne_segment_cache_mb);
+        install_segment_cache(cayenne_segment_cache_mb);
         let cayenne_filter_propagation = parse_cayenne_filter_propagation(&spicepod_rt.params);
 
         // Process-global SQLite metastore pragma tuning (cache, mmap, busy
@@ -1065,45 +1065,33 @@ fn segment_cache_budget_bytes(configured_mb: Option<usize>) -> u64 {
 
     match configured_mb {
         Some(mb) => u64::try_from(mb).unwrap_or(u64::MAX).saturating_mul(MIB),
-        None => (crate::resource_monitor::get_total_memory() / HOST_FRACTION)
-            .clamp(FLOOR_BYTES, CEIL_BYTES),
+        // Derive in whole MiB: `get_total_memory()` is not page-aligned on every
+        // host, so dividing the byte count would give a budget whose value
+        // depends on the machine.
+        None => (crate::resource_monitor::get_total_memory() / HOST_FRACTION / MIB)
+            .clamp(FLOOR_BYTES / MIB, CEIL_BYTES / MIB)
+            .saturating_mul(MIB),
     }
 }
 
-/// Install the process-wide Vortex segment cache before any Cayenne table is
-/// Install the process-wide Vortex segment cache, if this app has a Cayenne table
-/// to use it.
+/// Install the process-wide Vortex segment cache, before any Cayenne table is
+/// registered so every format shares one budget.
 ///
-/// Gated on an actual Cayenne acceleration because the reservation planner counts
-/// the cache against the query memory pool: installing one for an app that can
-/// never read from it would shrink every other query's budget for nothing.
-fn install_segment_cache(app: Option<&Arc<app::App>>, configured_mb: Option<usize>) {
-    let Some(app) = app else {
-        return;
-    };
-    #[cfg(not(windows))]
-    if cayenne_accelerations(app).next().is_none() {
-        tracing::debug!(
-            "No Cayenne acceleration configured; skipping the Vortex segment cache install"
-        );
-        return;
-    }
-    #[cfg(windows)]
-    {
-        // Cayenne is not compiled on Windows, so nothing can read the cache.
-        let _ = app;
-        return;
-    }
-
+/// Always installs a decision, even for a pod with no Cayenne table today.
+/// Datasets can be added after startup through `apply_app`/`apply_dataset_diff`,
+/// and a format that finds no decision falls back to a cache of its own — which
+/// would rebuild the per-table allocation this replaced, and would ignore a
+/// configured `0`. What *is* gated on a Cayenne table is the memory reservation
+/// (see `estimate_cayenne_reservation_bytes`): an empty Moka cache allocates
+/// nothing until something inserts into it, so installing costs nothing, while
+/// reserving against the query pool for a cache no table can read would shrink
+/// every other query's budget for nothing.
+fn install_segment_cache(configured_mb: Option<usize>) {
     // `runtime.params.cayenne_segment_cache_mb` is the only input. Per-table values
     // sized a per-table cache; there is no conversion from them to a shared budget
     // that is not invented, and a single dataset's setting must not decide the
     // budget every other table reads from. They are reported as ignored where they
     // are read, against the dataset that set them.
-    #[cfg_attr(
-        windows,
-        expect(unreachable_code, reason = "Cayenne is not built on Windows")
-    )]
     let bytes = segment_cache_budget_bytes(configured_mb);
 
     if bytes == 0 {

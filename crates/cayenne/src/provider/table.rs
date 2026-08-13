@@ -3905,7 +3905,8 @@ impl CayenneTableProvider {
         }
         // Cold scans use the same shared Vortex format as warm scans. Evict
         // exactly the successfully absent objects after the physical sweep so
-        // superseded generations cannot occupy the bounded per-table cache.
+        // superseded generations cannot occupy the bounded segment cache, which
+        // is process-wide: what they hold is taken from every other table too.
         self.invalidate_segment_cache_paths(retired_cache_paths)
             .await;
         // Key-delete scans build one `ListingTable` per live cold directory.
