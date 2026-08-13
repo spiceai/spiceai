@@ -156,7 +156,19 @@ impl CloudClient {
     /// Create a new authenticated cloud client with an explicit bearer token,
     /// acting on `org`.
     pub fn with_token_for_org(token: impl Into<String>, org: Option<&str>) -> Result<Self> {
-        let mut inner = InnerCloudClient::new(&get_base_url())
+        Self::with_token_for_org_at(token, org, &get_base_url())
+    }
+
+    /// Create an authenticated client against an explicit Cloud API base URL.
+    ///
+    /// Cloud Connect uses this for `--endpoint` and local HTTP fixtures; every
+    /// other Cloud command continues to use [`Self::with_token_for_org`].
+    pub fn with_token_for_org_at(
+        token: impl Into<String>,
+        org: Option<&str>,
+        base_url: &str,
+    ) -> Result<Self> {
+        let mut inner = InnerCloudClient::new(base_url)
             .map_err(map_cloud_error(None))?
             .with_token(token);
         if let Some(org) = org {
@@ -849,6 +861,9 @@ fn map_cloud_error(org: Option<&str>) -> impl Fn(spice_cloud_client::error::Erro
                 format!("Spice Cloud request failed with status {status}: {message}"),
             ),
             CloudError::HttpRequest { source } => Error::HttpRequestFailed { source },
+            CloudError::ResponseTooLarge => Error::InvalidResponse {
+                message: "Spice Cloud response exceeded the 64 KiB limit".to_string(),
+            },
             CloudError::JsonParse { source } => Error::InvalidResponse {
                 message: format!("Failed to parse response: {source}"),
             },

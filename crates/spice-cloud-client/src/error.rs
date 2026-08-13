@@ -29,6 +29,10 @@ pub enum Error {
     #[snafu(display("HTTP request failed: {source}"))]
     HttpRequest { source: reqwest::Error },
 
+    /// The server returned a body larger than the client accepts.
+    #[snafu(display("Response body exceeded the 64 KiB limit"))]
+    ResponseTooLarge,
+
     /// The server returned 401 Unauthorized.
     #[snafu(display("Unauthorized: {message}"))]
     Unauthorized { message: String },

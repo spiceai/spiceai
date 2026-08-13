@@ -2430,6 +2430,12 @@ async fn an_existing_identity_wins_without_redeeming_the_key() {
         dir.path(),
         &runtime_cloud_connect::enroll::InstanceFacts::gather(&config.runtime_version),
         config.instance_region.as_deref(),
+        &runtime_cloud_connect::EnrollmentRequestBinding {
+            endpoint: config.enroll_endpoint.trim_end_matches('/').to_string(),
+            authority: runtime_cloud_connect::EnrollmentAuthorityBinding::Token {
+                expected_org: None,
+            },
+        },
     )
     .expect("create a stale enrollment draft");
     assert!(

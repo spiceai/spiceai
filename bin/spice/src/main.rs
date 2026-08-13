@@ -813,7 +813,9 @@ fn machine_error_code(error: &spice::error::Error) -> &'static str {
         spice::error::Error::RuntimeExecution { .. } => "runtime_execution",
         spice::error::Error::RuntimeVersion { .. } => "runtime_version",
         spice::error::Error::Environment { .. } => "environment",
-        spice::error::Error::InvalidArgument { .. } => "invalid_argument",
+        spice::error::Error::InvalidArgument { .. } | spice::error::Error::InvalidUsage { .. } => {
+            "invalid_argument"
+        }
         spice::error::Error::Cloud { code, .. } => code.as_str(),
         spice::error::Error::DeviceAuthorizationDenied => "device_authorization_denied",
         spice::error::Error::HomeDirectoryNotFound => "home_directory_not_found",
@@ -824,6 +826,7 @@ fn machine_error_code(error: &spice::error::Error) -> &'static str {
         spice::error::Error::NoModelsConfigured => "no_models_configured",
         spice::error::Error::CloudConnectIo { .. } => "cloud_connect_io",
         spice::error::Error::CloudConnectEnroll { .. } => "cloud_connect_enroll",
+        spice::error::Error::CloudConnectProject { .. } => "cloud_connect_project",
         spice::error::Error::ServiceNotInstalled { .. } => "service_not_installed",
         spice::error::Error::ServiceUnavailable { .. } => "service_unavailable",
         spice::error::Error::Interrupted => "interrupted",

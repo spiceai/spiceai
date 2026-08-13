@@ -17182,6 +17182,7 @@ dependencies = [
  "cloud-connect-crypto",
  "dirs",
  "fs4",
+ "futures",
  "gethostname",
  "getrandom 0.3.4",
  "http 1.4.1",
@@ -17206,6 +17207,7 @@ dependencies = [
  "tonic-prost-build",
  "tracing",
  "uuid 1.23.2",
+ "windows-sys 0.61.2",
  "x509-parser 0.18.1",
  "zeroize",
 ]
@@ -19365,8 +19367,10 @@ dependencies = [
  "tracing-subscriber",
  "urlencoding",
  "uuid 1.23.2",
+ "windows-sys 0.61.2",
  "wiremock",
  "yaml",
+ "zeroize",
  "zip 7.2.0",
 ]
 
@@ -19389,6 +19393,7 @@ dependencies = [
 name = "spice-cloud-client"
 version = "2.2.0-unstable"
 dependencies = [
+ "futures",
  "reqwest 0.13.4",
  "serde",
  "serde_json",
