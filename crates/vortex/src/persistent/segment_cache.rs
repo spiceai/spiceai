@@ -39,6 +39,13 @@ type PathStates = Arc<DashMap<Path, Weak<PathCacheState>>>;
 /// on its own. A per-table cache never noticed, because every path it saw came
 /// from that table's store; one cache serving every table does, and two stores
 /// holding the same relative path would otherwise return each other's bytes.
+///
+/// This is a registry URL, not an `ObjectStore` instance, so it assumes one
+/// object-store registry per process — true of `spiced`. A second `Runtime` in
+/// the same process shares the first one's cache anyway (see
+/// [`install_process_segment_cache`]), and could in principle register a
+/// different store under the same URL; supporting that properly means scoping
+/// the cache to a `RuntimeEnv` rather than the process.
 type StoreKey = Arc<str>;
 
 /// Largest segment copied inline on the async put path.
@@ -101,7 +108,7 @@ static PROCESS_METRICS: OnceLock<SegmentCacheMetrics> = OnceLock::new();
 /// Returns `false` when a decision was already made; the first one stands, so a
 /// second runtime in the same process cannot resize or re-enable the cache.
 ///
-/// Metrics are registered separately by [`register_process_segment_cache_metrics`]:
+/// Metrics are registered separately by [`register_segment_cache_metrics`]:
 /// the cache has to exist before any table is registered, which is earlier than
 /// the point where the real meter provider is in place.
 pub fn install_process_segment_cache(max_capacity_bytes: u64) -> bool {

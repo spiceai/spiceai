@@ -420,7 +420,7 @@ impl VortexFormat {
     /// Creates a new instance with configured by a [`VortexTableOptions`].
     ///
     /// Scans cache segments only when `segment_cache_size_bytes` asks for it. The
-    /// process-wide cache is opt-in through [`Self::with_process_segment_cache`],
+    /// process-wide cache is opt-in through [`Self::new_with_process_segment_cache`],
     /// because caching is only sound for a caller whose file paths are immutable.
     #[must_use]
     pub fn new_with_options(session: VortexSession, opts: VortexTableOptions) -> Self {
