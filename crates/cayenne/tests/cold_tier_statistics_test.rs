@@ -289,11 +289,6 @@ async fn test_a_delete_taints_the_maintained_count_exactness_impl(
     settle(&table).await?;
     assert_count_agrees(&table, &ctx, 200, "before the delete").await?;
 
-    // A delete that matches nothing removes no rows, so the count still
-    // describes the live set and stays exact.
-    delete_id(&table, 12_846).await?;
-    assert_count_agrees(&table, &ctx, 200, "after a delete matching no row").await?;
-
     delete_id(&table, 42).await?;
     settle(&table).await?;
     assert_eq!(
@@ -304,7 +299,7 @@ async fn test_a_delete_taints_the_maintained_count_exactness_impl(
     assert!(
         !table
             .statistics()
-            .expect("maintained statistics must be populated after a delete")
+            .unwrap_or_else(|| panic!("maintained statistics must be populated after a delete"))
             .num_rows
             .is_exact()
             .unwrap_or(false),
@@ -317,12 +312,23 @@ async fn test_a_delete_taints_the_maintained_count_exactness_impl(
         .catalog
         .get_table_statistics(table.table_id())
         .await?
-        .expect("statistics row must be persisted");
+        .unwrap_or_else(|| panic!("statistics row must be persisted"));
     assert!(
         !persisted.num_rows_exact,
         "the persisted exactness flag must be tainted, got num_rows={} num_rows_exact=true",
         persisted.num_rows
     );
+
+    // A full rewrite still re-establishes exactness from its own authoritative
+    // count, so the taint is a hold on the fast path, not a permanent loss of it.
+    insert_range(&table, 200..210).await?;
+    settle(&table).await?;
+    assert!(
+        table.promote_warm_to_cold().await?,
+        "the promotion folding the tombstone should fire"
+    );
+    table.flush_pending_maintenance().await?;
+    assert_count_agrees(&table, &ctx, 209, "after a full rewrite re-baselined it").await?;
 
     Ok(())
 }

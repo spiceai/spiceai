@@ -396,8 +396,7 @@ pub(crate) fn is_delete_all(filters: &[Expr]) -> bool {
     })
 }
 
-/// Taints the maintained live row count's exactness once the wrapped delete has
-/// removed rows.
+/// Taints the maintained live row count's exactness around a user `DELETE`.
 ///
 /// A delete tombstones rows the persisted `num_rows` still counts, and nothing
 /// re-derives that count — `cached_table_statistics_for_optimizer` only *masks*
@@ -427,20 +426,24 @@ impl DeletionSink for RowCountExactnessTaintingDeletionSink {
         &self,
         context: Arc<TaskContext>,
     ) -> std::result::Result<u64, Box<dyn std::error::Error + Send + Sync>> {
-        let deleted = self.inner.delete_from(context).await?;
-        if deleted > 0 {
-            // Ordering is safe after the inner publish: for the whole window
-            // between the tombstone becoming visible and this taint landing,
-            // `has_pending_deletions()` is true, so the count is already served
-            // `Inexact`.
-            self.table
-                .amend_persisted_row_count(super::column_stats::RowCountUpdate::Delta {
-                    delta: 0,
-                    exact: false,
-                })
-                .await;
-        }
-        Ok(deleted)
+        // Taint BEFORE the inner delete, which publishes durably and cannot be
+        // undone. Taint-then-delete can only leave the count conservative (a
+        // delete that removes nothing, errors, or is cancelled costs the metadata
+        // `COUNT(*)` fast path until the next full rewrite); delete-then-taint
+        // leaves the *unsafe* residue — a cancellation, crash, or failed
+        // statistics write between the two, after which the tombstone is durable
+        // while `num_rows_exact` still claims the stale count is the live one, and
+        // a later fold un-masks it as `Exact`. This mirrors
+        // `PkKeysetInvalidatingDeletionSink`'s unconditional pre-delete
+        // `mark_pk_keyset_occ_degraded`, and for the same reason: on this path the
+        // conservative direction is free and the optimistic one is a wrong answer.
+        self.table
+            .amend_persisted_row_count(super::column_stats::RowCountUpdate::Delta {
+                delta: 0,
+                exact: false,
+            })
+            .await;
+        self.inner.delete_from(context).await
     }
 }
 
