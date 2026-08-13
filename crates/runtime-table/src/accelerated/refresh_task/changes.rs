@@ -1959,32 +1959,10 @@ impl RefreshTask {
         let any_ready = envelopes.iter().any(cdc::ChangeEnvelope::is_dataset_ready);
 
         // Read before the heartbeat retain below, for the same reason `any_ready`
-        // is: the signal rides a zero-row, no-op-committer envelope (see
-        // `cdc::build_history_unavailable_envelope`), so the retain would
-        // otherwise strip it and the rebuild would never happen.
-        let history_unavailable = envelopes
-            .iter()
-            .any(cdc::ChangeEnvelope::history_unavailable);
-
-        // Runs BEFORE the heartbeat retain, so the signal is still findable
-        // whichever committer it rides: a source that raises it on a no-op
-        // envelope (`cdc::build_history_unavailable_envelope`) would otherwise
-        // have it stripped here and the prefix below would survive.
-        //
-        // The rebuild runs before the whole run, so anything the run carries
-        // AHEAD of the signal would be applied on top of a table that was
-        // re-read after it — writing a value the source has already moved past.
-        // Streaming resumes at the position the source captured when it raised
-        // the signal, which is at or after those envelopes, so nothing replays
-        // over the regression and it is durable.
-        //
-        // Discarding them is exact rather than lossy: the signal means the
-        // source can no longer explain what changed, and the re-read observes
-        // the source at a point at or after every envelope that preceded the
-        // signal, so the re-read already reflects them. Their committers are
-        // dropped unacked, which only holds a source position back — the
-        // rebuild's own boundary commit carries the new one.
-        discard_pre_rebuild_envelopes(&mut envelopes);
+        // is: a signal may ride a zero-row envelope, which the retain would
+        // otherwise strip — and the rebuild would never happen. See
+        // `trim_to_rebuild_signal` for why the prefix goes with it.
+        let history_unavailable = trim_to_rebuild_signal(&mut envelopes);
 
         // Strip zero-row readiness heartbeats from the write/durability path
         // (#12007). Lag-based readiness (#11777) makes CDC connectors emit a
@@ -3892,19 +3870,37 @@ fn encode_array_value(array: &dyn Array, row_id: usize, key: &mut Vec<u8>) {
     }
 }
 
-/// Drop everything a run carries ahead of a [`cdc::ChangeEnvelope::history_unavailable`]
-/// signal, so the rebuild is an ordering barrier rather than a jump ahead of the
-/// changes it was queued behind.
+/// Trim a run to start at its [`cdc::ChangeEnvelope::history_unavailable`]
+/// signal, reporting whether it had one.
 ///
-/// A no-op when the run carries no signal, which is every ordinary run.
-fn discard_pre_rebuild_envelopes(envelopes: &mut Vec<cdc::ChangeEnvelope>) {
-    if let Some(signal) = envelopes
+/// The rebuild runs before the whole run, so anything the run carries AHEAD of
+/// the signal would be applied on top of a table that was re-read past it —
+/// writing a value the source has already moved on from. Streaming resumes at
+/// the position the source captured when it raised the signal, which is at or
+/// after those envelopes, so nothing replays over the regression and it is
+/// durable.
+///
+/// Discarding them is exact rather than lossy: the signal means the source can
+/// no longer explain what changed, and the re-read observes the source at a
+/// point at or after every envelope that preceded the signal, so the re-read
+/// already reflects them. Their committers are dropped unacked, which only holds
+/// a source position back — the rebuild's own boundary commit carries the new
+/// one.
+///
+/// The LAST signal is the barrier, not the first: one rebuild answers every
+/// signal in the run (the caller performs exactly one), so envelopes between two
+/// signals are subsumed by it just as the leading ones are.
+///
+/// A no-op on every ordinary run, which carries no signal at all.
+fn trim_to_rebuild_signal(envelopes: &mut Vec<cdc::ChangeEnvelope>) -> bool {
+    let Some(signal) = envelopes
         .iter()
-        .position(cdc::ChangeEnvelope::history_unavailable)
-        && signal > 0
-    {
-        envelopes.drain(..signal);
-    }
+        .rposition(cdc::ChangeEnvelope::history_unavailable)
+    else {
+        return false;
+    };
+    envelopes.drain(..signal);
+    true
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -6839,14 +6835,17 @@ mod tests {
     /// Build a zero-row readiness heartbeat envelope over the unit-test data
     /// schema, as CDC connectors emit (#11777) roughly once a second on a
     /// caught-up source.
+    fn make_heartbeat_envelope(is_ready: bool) -> ChangeEnvelope {
+        let schema = Arc::new(create_test_data_schema());
+        cdc::build_heartbeat_envelope(&schema, cdc::now_unix_ms(), is_ready)
+            .expect("heartbeat envelope builds")
+    }
+
     /// A rebuild signal is an ordering barrier, not a jump to the front of the
-    /// run. Anything the run carries ahead of the signal is subsumed by the
-    /// re-read that follows and must be discarded: applying it afterwards writes
-    /// a value the source has already moved past, and because streaming resumes
-    /// at the position captured when the signal was raised, nothing replays over
-    /// the regression.
+    /// run: what the run carries ahead of it is subsumed by the re-read and must
+    /// go with it. See `trim_to_rebuild_signal`.
     #[test]
-    fn a_rebuild_signal_discards_only_what_precedes_it() {
+    fn a_run_is_trimmed_to_its_last_rebuild_signal() {
         let log = Arc::new(CommitLog::default());
         let schema = Arc::new(create_test_data_schema());
         let signal =
@@ -6860,30 +6859,37 @@ mod tests {
             signal(),
             make_tracked_envelope(3, Arc::clone(&log), false),
         ];
-        discard_pre_rebuild_envelopes(&mut run);
+        assert!(trim_to_rebuild_signal(&mut run));
         assert_eq!(run.len(), 2, "only the signal and its suffix survive");
         assert!(run[0].history_unavailable(), "the signal leads the run");
         assert!(!run[1].history_unavailable());
 
-        // A signal already at the front loses nothing — the stream-head case
-        // every source takes when it raises the signal at subscribe time.
-        let mut run = vec![signal(), make_tracked_envelope(4, Arc::clone(&log), false)];
-        discard_pre_rebuild_envelopes(&mut run);
-        assert_eq!(run.len(), 2);
-
-        // An ordinary run is untouched.
+        // Two signals in one coalesced run still get exactly one rebuild, so the
+        // envelopes BETWEEN them are subsumed by it too and must not survive.
         let mut run = vec![
+            make_tracked_envelope(4, Arc::clone(&log), false),
+            signal(),
             make_tracked_envelope(5, Arc::clone(&log), false),
+            signal(),
             make_tracked_envelope(6, Arc::clone(&log), false),
         ];
-        discard_pre_rebuild_envelopes(&mut run);
-        assert_eq!(run.len(), 2);
-    }
+        assert!(trim_to_rebuild_signal(&mut run));
+        assert_eq!(run.len(), 2, "the run is trimmed to the LAST signal");
+        assert!(run[0].history_unavailable());
 
-    fn make_heartbeat_envelope(is_ready: bool) -> ChangeEnvelope {
-        let schema = Arc::new(create_test_data_schema());
-        cdc::build_heartbeat_envelope(&schema, cdc::now_unix_ms(), is_ready)
-            .expect("heartbeat envelope builds")
+        // A signal already at the front loses nothing — the stream-head case
+        // every source takes when it raises the signal at subscribe time.
+        let mut run = vec![signal(), make_tracked_envelope(7, Arc::clone(&log), false)];
+        assert!(trim_to_rebuild_signal(&mut run));
+        assert_eq!(run.len(), 2);
+
+        // An ordinary run is untouched, and reports no rebuild.
+        let mut run = vec![
+            make_tracked_envelope(8, Arc::clone(&log), false),
+            make_tracked_envelope(9, Arc::clone(&log), false),
+        ];
+        assert!(!trim_to_rebuild_signal(&mut run));
+        assert_eq!(run.len(), 2);
     }
 
     /// A run of pure readiness heartbeats must flip the dataset Ready without

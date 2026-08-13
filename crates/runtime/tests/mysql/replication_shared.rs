@@ -298,12 +298,13 @@ async fn drain_bootstrap(
 /// re-read moves to the consumer's atomic overwrite
 /// (`ChangeEnvelope::history_unavailable`), so the resulting contents are
 /// asserted where that path is covered, not here.
+///
 /// The idle heartbeats a caught-up GTID stream interleaves are zero-row too, so
 /// the signal is found by its flag rather than by position. Any envelope
 /// carrying rows before it is the failure this guards: that is a truncate or a
 /// snapshot batch, i.e. the acceleration being emptied and refilled.
 async fn drain_rebuild(stream: &mut ChangesStream, what: &str) -> Result<(), anyhow::Error> {
-    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let deadline = std::time::Instant::now() + Duration::from_mins(1);
     loop {
         let env = next_envelope(stream, &format!("{what} rebuild signal")).await?;
         anyhow::ensure!(
@@ -312,15 +313,17 @@ async fn drain_rebuild(stream: &mut ChangesStream, what: &str) -> Result<(), any
              member's channel before any rebuild signal (ops: {:?})",
             ops_of(&env)
         );
-        if env.history_unavailable() {
+        let is_signal = env.history_unavailable();
+        if is_signal {
             assert!(
                 !env.is_dataset_ready(),
                 "{what}: the rebuild signal is not ready; readiness is lag-based"
             );
-            env.commit().await?;
-            return Ok(());
         }
         env.commit().await?;
+        if is_signal {
+            return Ok(());
+        }
         anyhow::ensure!(
             std::time::Instant::now() < deadline,
             "{what}: never received a rebuild signal"

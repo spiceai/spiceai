@@ -940,11 +940,6 @@ async fn attach_member(
             // contents until it swaps. Clearing the table here and letting the
             // snapshot refill it — what a `truncate` prelude does — is
             // observable to queries as an empty, then partially filled, table.
-            //
-            // The boundary committer rides this envelope rather than following
-            // it: it must persist the head only once the replacement is durably
-            // applied, and being a real committer it also keeps the envelope out
-            // of the consumer's zero-row heartbeat stripping.
             let signal = snapshot_boundary_envelope(
                 source,
                 &member_key,
@@ -964,24 +959,14 @@ async fn attach_member(
             Box::pin(stream::once(async move { Ok(signal) }))
         }
         MemberStart::Snapshot => {
-            let dataset_for_boundary = dataset_name.clone();
             // Clear whatever a crashed earlier load left behind, so the snapshot
             // is a full replace rather than an upsert over rows the source no
             // longer has. Reached only when nothing was ever persisted for this
             // member, so there is no completed load to preserve; an acceleration
             // that has one takes the `Rebuild` arm above.
             let truncate = super::truncate_envelope(&schema, &primary_keys, &column_map)?;
-            let snapshot = super::bootstrap::snapshot_stream(super::bootstrap::SnapshotInput {
-                params: params.clone(),
-                layout,
-                schema: Arc::clone(&schema),
-                primary_keys,
-                column_map,
-                database,
-                table,
-                dataset_name,
-                metrics: Arc::clone(&metrics),
-            });
+            // Built before the snapshot input takes ownership of `dataset_name`.
+            //
             // Snapshot completion is signalled by a real boundary committer, NOT
             // a stream-drain hook: the committer's `commit()` runs on the apply
             // loop only after every prior (snapshot) envelope is durably applied,
@@ -996,9 +981,20 @@ async fn attach_member(
                 source,
                 &member_key,
                 &schema,
-                dataset_for_boundary,
+                dataset_name.clone(),
                 false,
             )?;
+            let snapshot = super::bootstrap::snapshot_stream(super::bootstrap::SnapshotInput {
+                params: params.clone(),
+                layout,
+                schema: Arc::clone(&schema),
+                primary_keys,
+                column_map,
+                database,
+                table,
+                dataset_name,
+                metrics: Arc::clone(&metrics),
+            });
             Box::pin(
                 stream::once(async move { Ok(truncate) })
                     .chain(snapshot)
@@ -1115,12 +1111,18 @@ async fn resolve_start_position(
             message: e.to_string(),
         })?;
 
-    // A recorded position proves two things the emptiness question turns on:
-    // the store is durable (an accelerator that does not survive restarts is
-    // wired to `NoopPositionStore`, which records nothing), and a load once ran
-    // far enough to record progress. So an acceleration that reaches the
-    // loading path with one behind it is holding rows, and must be replaced
-    // rather than emptied and refilled.
+    // A recorded position proves the acceleration is holding rows: the store is
+    // durable (an accelerator that does not survive restarts is wired to
+    // `NoopPositionStore`, which records nothing) and a load once ran far enough
+    // to record progress. Such an acceleration must be replaced, not emptied and
+    // refilled.
+    //
+    // The converse does not hold, and this deliberately under-claims rather than
+    // guessing: a durable acceleration whose sidecar failed to open also records
+    // nothing, and reads here as a first load. Closing that needs the store to
+    // say whether it can record at all, and the params to say whether the
+    // acceleration survives restarts — the shape `postgres_replication` uses.
+    // Tracked in #13021.
     let has_recorded_position = persisted.is_some();
 
     // `Some((position, gtid_seed))` to resume, `None` to (re)snapshot.
@@ -1134,13 +1136,7 @@ async fn resolve_start_position(
             )
             .is_err()
             {
-                apply_invalid_checkpoint(
-                    params,
-                    position_store,
-                    dataset_name,
-                    "layout/schema drift",
-                )
-                .await?;
+                apply_invalid_checkpoint(params, dataset_name, "layout/schema drift")?;
                 None
             } else {
                 match persisted.cursor_type {
@@ -1181,25 +1177,13 @@ async fn resolve_start_position(
                                 match gtid_checkpoint_verdict(&set, &source_executed) {
                                     CheckpointVerdict::Resume => Some((persisted.position, set)),
                                     CheckpointVerdict::Unresumable(reason) => {
-                                        apply_invalid_checkpoint(
-                                            params,
-                                            position_store,
-                                            dataset_name,
-                                            reason,
-                                        )
-                                        .await?;
+                                        apply_invalid_checkpoint(params, dataset_name, reason)?;
                                         None
                                     }
                                 }
                             }
                             Err(reason) => {
-                                apply_invalid_checkpoint(
-                                    params,
-                                    position_store,
-                                    dataset_name,
-                                    reason,
-                                )
-                                .await?;
+                                apply_invalid_checkpoint(params, dataset_name, reason)?;
                                 None
                             }
                         }
@@ -1211,13 +1195,7 @@ async fn resolve_start_position(
                         match file_checkpoint_verdict(present) {
                             CheckpointVerdict::Resume => Some((persisted.position, GtidSet::new())),
                             CheckpointVerdict::Unresumable(reason) => {
-                                apply_invalid_checkpoint(
-                                    params,
-                                    position_store,
-                                    dataset_name,
-                                    reason,
-                                )
-                                .await?;
+                                apply_invalid_checkpoint(params, dataset_name, reason)?;
                                 None
                             }
                         }
@@ -1278,9 +1256,8 @@ async fn resolve_start_position(
 
 /// Apply `invalid_checkpoint_behavior` for one member: `Error` fails the
 /// member's stream; `Restart` clears its saved position so it re-snapshots.
-async fn apply_invalid_checkpoint(
+fn apply_invalid_checkpoint(
     params: &ReplicationParams,
-    position_store: &Arc<dyn PositionStore>,
     dataset_name: &str,
     reason: &str,
 ) -> Result<()> {
@@ -1298,10 +1275,10 @@ async fn apply_invalid_checkpoint(
         }
         .fail(),
         InvalidCheckpointBehavior::Restart => {
-            tracing::warn!(dataset = %dataset_name, reason, "persisted mysql binlog checkpoint unusable; rebootstrapping");
-            if let Err(e) = position_store.clear().await {
-                tracing::warn!(dataset = %dataset_name, error = %e, "failed to clear unusable binlog position");
-            }
+            tracing::warn!(dataset = %dataset_name, reason, "persisted mysql binlog checkpoint unusable; rebuilding");
+            // Deliberately left in place until the rebuild's boundary committer
+            // replaces it with the new head — same invariant, and same reasoning,
+            // as `rebootstrap_member`.
             Ok(())
         }
     }
@@ -2445,7 +2422,6 @@ async fn poll_head_and_heartbeat(
 mod tests {
     use crate::mysql_replication::metrics::Metrics;
 
-    use arrow::array::Array;
     use arrow::datatypes::{DataType, Field, Schema};
 
     use super::*;
@@ -2513,14 +2489,15 @@ mod tests {
 
     /// A source with one live member whose channel the test owns, built without
     /// touching `MySQL`: everything `rebootstrap_member` reads is local state.
-    fn source_with_member(
-        member_key: &MemberKey,
-    ) -> (
-        Arc<SharedSource>,
-        Arc<MemberHandle>,
-        Arc<MemoryPositionStore>,
-        mpsc::Receiver<std::result::Result<ChangeEnvelope, StreamError>>,
-    ) {
+    /// One live member and everything a test needs to observe what it emitted.
+    struct TestMember {
+        source: Arc<SharedSource>,
+        member: Arc<MemberHandle>,
+        position_store: Arc<MemoryPositionStore>,
+        receiver: mpsc::Receiver<std::result::Result<ChangeEnvelope, StreamError>>,
+    }
+
+    fn source_with_member(member_key: &MemberKey) -> TestMember {
         let params = test_params();
         let source = Arc::new(SharedSource {
             key: SourceKey {
@@ -2585,22 +2562,12 @@ mod tests {
             .ack
             .register(member_key, pos("binlog.000001", 100), false);
         source.ack.promote_ready_members();
-        (source, member, position_store, receiver)
-    }
-
-    /// Every row's `op` in an envelope's built batch. `"t"` is the truncate that
-    /// empties the acceleration.
-    fn envelope_ops(envelope: ChangeEnvelope) -> Vec<String> {
-        let (_, batch, _, _) = envelope.into_parts().expect("build change batch");
-        let ops = batch
-            .record
-            .column_by_name("op")
-            .expect("op column")
-            .as_any()
-            .downcast_ref::<arrow::array::StringArray>()
-            .expect("op is a string column")
-            .clone();
-        (0..ops.len()).map(|i| ops.value(i).to_string()).collect()
+        TestMember {
+            source,
+            member,
+            position_store,
+            receiver,
+        }
     }
 
     #[tokio::test]
@@ -2612,7 +2579,12 @@ mod tests {
         // the contents atomically instead, so a query issued mid-rebuild returns
         // either the pre-rebuild rows or the completed ones.
         let member_key = key("db", "orders");
-        let (source, member, position_store, mut receiver) = source_with_member(&member_key);
+        let TestMember {
+            source,
+            member,
+            position_store,
+            mut receiver,
+        } = source_with_member(&member_key);
         // The purged checkpoint this member is recovering from.
         let purged = PersistedPosition {
             position: pos("binlog.000001", 100),
@@ -2648,9 +2620,8 @@ mod tests {
             "the signal carries the boundary committer, so the consumer's heartbeat \
              stripping cannot drop it and leave the new head unpersisted"
         );
-        assert_eq!(
-            envelope_ops(envelope),
-            Vec::<String>::new(),
+        assert!(
+            envelope.is_empty(),
             "the rebuild is a zero-row signal: no truncate, and no snapshot rows \
              for the consumer to apply on top of a table it is about to replace"
         );
@@ -2667,11 +2638,7 @@ mod tests {
         assert_eq!(slot.committed(), pos("binlog.000004", 4));
 
         // The unusable checkpoint stays until the signal's committer replaces it
-        // with the new head. It is the only durable evidence that this
-        // acceleration holds rows no position explains — clearing it up front and
-        // then crashing mid-rebuild would leave the next start reading a
-        // populated acceleration as a first load, and a first load empties it and
-        // refills it from a snapshot: the window this whole change closes.
+        // with the new head — see `rebootstrap_member` for why.
         let still_there = position_store
             .load()
             .await
@@ -2686,7 +2653,7 @@ mod tests {
         // to preserve and must NOT trigger a rebuild — that would re-read the
         // source table on every cold start.
         let member_key = key("db", "orders");
-        let (source, member, _position_store, _receiver) = source_with_member(&member_key);
+        let TestMember { source, member, .. } = source_with_member(&member_key);
 
         for (history_unavailable, expected) in [(false, false), (true, true)] {
             let envelope = snapshot_boundary_envelope(

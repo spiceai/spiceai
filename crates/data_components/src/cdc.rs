@@ -617,6 +617,16 @@ impl ChangeEnvelope {
     /// Carried as its own zero-row envelope (see
     /// [`build_history_unavailable_envelope`]) so it is ordered in the stream
     /// rather than racing it.
+    ///
+    /// A source may raise it mid-stream, not only at the head. The consumer
+    /// treats it as a **barrier**: it coalesces envelopes into runs and performs
+    /// one rebuild per run, so everything the run carried ahead of the signal is
+    /// discarded rather than applied on top of the replacement — applying it
+    /// would write values the re-read has already moved past. Two obligations
+    /// follow for a source that raises this: the committers it emitted before
+    /// the signal must be safely droppable (they are dropped unacked), and the
+    /// position it resumes from afterwards must be at or after them, so the
+    /// re-read genuinely subsumes what was discarded.
     #[must_use]
     pub fn history_unavailable(&self) -> bool {
         self.history_unavailable
@@ -847,6 +857,15 @@ pub fn build_ready_signal_envelope(schema: &SchemaRef) -> Result<ChangeEnvelope,
 /// *before* the changes it precedes, so the rebuild is ordered ahead of them
 /// rather than racing them, and `is_dataset_ready` is false because a dataset
 /// whose accelerator is about to be replaced is not ready to serve.
+///
+/// **The no-op committer is the catch**, and why neither shipped source uses
+/// this: a rebuild that acknowledges no position leaves nothing behind saying it
+/// happened, so the next start finds the same unusable position and re-reads the
+/// whole table again — on every restart of a dataset whose source is quiet. A
+/// source with a position to record should build the envelope itself around its
+/// own committer (`ChangeEnvelope::from_parts(committer, batch, false, true)`),
+/// which also keeps it out of the consumer's zero-row heartbeat stripping. Use
+/// this only when there is genuinely no position to persist.
 pub fn build_history_unavailable_envelope(
     schema: &SchemaRef,
 ) -> Result<ChangeEnvelope, ChangeBatchError> {
