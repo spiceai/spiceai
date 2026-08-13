@@ -36,11 +36,19 @@ concurrency:
 
 jobs:
   test-restack-script:
-    name: Unit tests for the restack helper
+    name: Unit tests for the restack helper (${{ matrix.os }})
+    # Both platforms, because the helper has to tell GNU tools from BSD ones:
+    # stat's format flag differs, BSD chmod has no --, and a check that reads the
+    # wrong one silently mis-classifies every path. A Linux-only job would let a
+    # macOS regression through, and macOS is a development platform here.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-latest]
     # GitHub-hosted on purpose: a handful of throwaway git repositories in a
     # tmpdir, no network and no build, so it must not queue behind the
     # self-hosted pool.
-    runs-on: ubuntu-24.04
+    runs-on: ${{ matrix.os }}
     # Reads the repository and nothing else.
     permissions:
       contents: read

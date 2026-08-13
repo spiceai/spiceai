@@ -254,8 +254,13 @@ commits either way, and a considered decision looks exactly like git's silent on
 index. Say so explicitly once you have made the call, so the re-run can finish:
 
 ```bash
-scripts/restack_stacked_branch.sh audit "$STACKBASE" "$PRE" --accept <path>
+scripts/restack_stacked_branch.sh audit "$STACKBASE" "$PRE" \
+  --parent-head "$PARENT_HEAD" --accept <path> [--accept <path>]...
 ```
+
+Each run starts from nothing, so pass every path you have accepted so far, and keep
+`--parent-head` on: dropping either turns the next run into a weaker check than the one
+before it.
 
 `--accept` applies only to `REVIEW`. A `RESURRECTED`, `LOST`, or `DISCARDED` path is not
 ambiguous — nothing was decided there, something was lost — so it stays a finding until
