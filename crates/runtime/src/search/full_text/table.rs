@@ -17,7 +17,7 @@ use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
 use snafu::ResultExt;
 use spice_table::{Index, IndexLayer, SpiceTable};
-use spicepod::semantic::{Column, IndexStore, MetadataType};
+use spicepod::semantic::{Column, IndexStore};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -25,6 +25,9 @@ use std::sync::Arc;
 use crate::component::column::full_text_search_config;
 use crate::component::dataset::FullTextSearchDatasetConfig;
 use crate::make_spice_data_sub_directory;
+
+#[cfg(feature = "elasticsearch")]
+use spicepod::semantic::MetadataType;
 
 use search::generation::text_search::index::FullTextDatabaseIndex;
 
