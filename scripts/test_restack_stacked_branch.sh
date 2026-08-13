@@ -547,6 +547,34 @@ start_test "audit still reports a child-only addition the merge dropped"
   esac
 ) || failures=$((failures + 1))
 
+start_test "audit reports a deletion trunk carried away under a new name"
+(
+  new_stack "$work_root/renamed"
+  printf 'keep\n' > keep.txt && commit_all "fork point"
+  git checkout --quiet -b parent
+  printf 'registry contents\n' > registry.rs && commit_all "parent adds registry.rs"
+  stack_base=$(git rev-parse HEAD)
+  git checkout --quiet -b child
+  git rm --quiet registry.rs && commit_all "child deletes registry.rs"
+  pre=$(git rev-parse HEAD)
+  squash_parent_onto_trunk
+  git mv registry.rs registry_moved.rs && commit_all "trunk renames it instead"
+  git checkout --quiet child
+  git merge --no-ff --no-commit trunk >/dev/null 2>&1
+
+  # The old path is gone, so the deletion looks honoured, while the content the
+  # child deleted is back under another name.
+  [ -e registry.rs ] && fail_test "the fixture kept the old path"
+  [ -e registry_moved.rs ] || fail_test "the fixture did not restore the content elsewhere"
+  output=$("$subject" audit "$stack_base" "$pre" --trunk trunk 2>/dev/null)
+  status=$?
+  [ "$status" -ne 0 ] || fail_test "a rename of a deleted path was reported clean: $output"
+  case "$output" in
+    *"REVIEW registry.rs"*) ;;
+    *) fail_test "the renamed-away deletion was not reported: $output" ;;
+  esac
+) || failures=$((failures + 1))
+
 start_test "audit calls a restoration a restoration when both sides deleted the path"
 (
   new_stack "$work_root/bothdeleted"

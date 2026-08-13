@@ -231,6 +231,25 @@ index_entry() {
   printf '%s\n' "$out" | awk '$3 == 0 { print $1 " " $2 }'
 }
 
+# Did trunk rename this path away rather than delete it? Prints the new name.
+# A path missing from trunk is not proof that trunk agreed it should go: renaming
+# it keeps the content under another name, and from the older base -- where the
+# path never existed -- that lands as a clean addition while the child's deletion
+# looks honoured.
+trunk_renamed_to() {
+  local want="$1" status old new
+  [ -n "${RESTACK_RENAMES:-}" ] && [ -s "$RESTACK_RENAMES" ] || return 1
+  while IFS= read -r -d '' status; do
+    IFS= read -r -d '' old || return 1
+    IFS= read -r -d '' new || return 1
+    case "$status" in
+      R*) [ "$old" = "$want" ] && { printf '%s' "$new"; return 0; } ;;
+      *) ;;
+    esac
+  done < "$RESTACK_RENAMES"
+  return 1
+}
+
 # Report an ambiguous path, unless a person has said they decided it. Only cases
 # a correctly based merge could not settle by itself come through here: a
 # deterministic loss is never something --accept may silence.
@@ -482,6 +501,17 @@ cmd_audit() {
     other=""
   fi
 
+  # Renames trunk made since the stack base, so a deleted path that is missing
+  # from trunk can be told apart from one trunk carried elsewhere.
+  RESTACK_RENAMES="$tmp/renames"
+  : > "$RESTACK_RENAMES"
+  if [ -n "$other" ] &&
+     ! git diff -z --name-status --find-renames --diff-filter=R \
+         "$stack_base" "$other" -- > "$RESTACK_RENAMES"; then
+    rm -rf "$tmp"
+    die "could not list renames between $stack_base and $other"
+  fi
+
   local findings=0 path
 
   # Any unmerged path means the merge is undecided, and the three intent lists
@@ -492,7 +522,7 @@ cmd_audit() {
     rm -rf "$tmp"
     die "could not read unmerged entries from the index"
   fi
-  local record last_unmerged="" theirs_now base_now theirs_add mine_add
+  local record last_unmerged="" theirs_now base_now theirs_add mine_add renamed_to
   while IFS= read -r -d '' record; do
     path=${record#*$'\t'}
     [ "$path" = "$last_unmerged" ] && continue
@@ -510,7 +540,12 @@ cmd_audit() {
       [ -n "$other" ] || continue
       theirs_now=$(tree_entry "$other" "$path") || die "could not read $other:$path"
       base_now=$(tree_entry "$stack_base" "$path") || die "could not read $stack_base:$path"
-      [ -n "$theirs_now" ] || continue                 # trunk deleted it too
+      if [ -z "$theirs_now" ]; then
+        renamed_to=$(trunk_renamed_to "$path") || continue   # trunk deleted it too
+        accept_or_review "$path" "you deleted it and trunk renamed it to $renamed_to, which nothing has decided" ||
+          findings=$((findings + 1))
+        continue
+      fi
       [ "$theirs_now" = "$base_now" ] && continue      # trunk left it alone
       accept_or_review "$path" "you deleted it and trunk changed it, which nothing has decided" ||
         findings=$((findings + 1))
