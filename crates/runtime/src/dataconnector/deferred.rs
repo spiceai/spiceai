@@ -105,7 +105,7 @@ impl DataConnector for DeferredConnector {
 
     fn changes_stream(
         &self,
-        _federated_table: Arc<crate::federated::FederatedTable>,
+        _federated_table: Arc<dyn data_connector_api::federated::FederatedTableProvider>,
         _dataset: &Dataset,
     ) -> Option<data_components::cdc::ChangesStream> {
         None
@@ -117,7 +117,7 @@ impl DataConnector for DeferredConnector {
 
     fn append_stream(
         &self,
-        _federated_table: Arc<crate::federated::FederatedTable>,
+        _federated_table: Arc<dyn data_connector_api::federated::FederatedTableProvider>,
     ) -> Option<data_components::cdc::ChangesStream> {
         None
     }

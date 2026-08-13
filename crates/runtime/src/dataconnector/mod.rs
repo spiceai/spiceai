@@ -18,7 +18,6 @@ use crate::component::ComponentInitialization;
 use crate::component::catalog::Catalog;
 use crate::component::dataset::Dataset;
 use crate::component::dataset::acceleration::RefreshMode;
-use crate::federated::FederatedTable;
 // A second alias for the `runtime-parameters` types, kept crate-visible for the
 // same reason as the `parameters` alias itself: it would otherwise be a way for
 // a connector to name them without depending on the crate that owns them.
@@ -28,6 +27,7 @@ use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use data_components::cdc::ChangesStream;
 use data_connector_api::accelerated::{AcceleratorSetup, RegisteredAcceleratedTable};
+use data_connector_api::federated::FederatedTableProvider;
 use datafusion::datasource::TableProvider;
 use linkme::distributed_slice;
 pub use parameters::ConnectorParams;
@@ -383,7 +383,7 @@ pub trait DataConnector: Debug + Send + Sync + 'static {
 
     fn changes_stream(
         &self,
-        _federated_table: Arc<FederatedTable>,
+        _federated_table: Arc<dyn FederatedTableProvider>,
         _dataset: &Dataset,
     ) -> Option<ChangesStream> {
         None
@@ -393,7 +393,10 @@ pub trait DataConnector: Debug + Send + Sync + 'static {
         false
     }
 
-    fn append_stream(&self, _federated_table: Arc<FederatedTable>) -> Option<ChangesStream> {
+    fn append_stream(
+        &self,
+        _federated_table: Arc<dyn FederatedTableProvider>,
+    ) -> Option<ChangesStream> {
         None
     }
 

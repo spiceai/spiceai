@@ -33,6 +33,7 @@ use crate::secrets::Secrets;
 use async_trait::async_trait;
 use data_components::cdc::{ChangeEnvelope, ChangesStream, StreamError, replace_change_batch_data};
 use data_connector_api::accelerated::{AcceleratorSetup, RegisteredAcceleratedTable};
+use data_connector_api::federated::FederatedTableProvider;
 use datafusion::datasource::TableProvider;
 use futures::StreamExt;
 use itertools::Itertools;
@@ -345,7 +346,7 @@ impl DataConnector for EmbeddingConnector {
 
     fn changes_stream(
         &self,
-        federated_table: Arc<FederatedTable>,
+        federated_table: Arc<dyn FederatedTableProvider>,
         dataset: &Dataset,
     ) -> Option<ChangesStream> {
         let table_provider = federated_table.try_table_provider_sync()?;
@@ -422,7 +423,10 @@ impl DataConnector for EmbeddingConnector {
         self.inner_connector.supports_append_stream()
     }
 
-    fn append_stream(&self, federated_table: Arc<FederatedTable>) -> Option<ChangesStream> {
+    fn append_stream(
+        &self,
+        federated_table: Arc<dyn FederatedTableProvider>,
+    ) -> Option<ChangesStream> {
         let table_provider = federated_table.try_table_provider_sync()?;
 
         if let Some(indexed_table) =
@@ -727,7 +731,7 @@ pub(crate) async fn try_wrap_view_accelerator_with_hnsw(
 /// drop the changes stream and leave the index stale.
 fn underlying_federated_table_for_indexed_table(
     src_table_provider: &Arc<dyn TableProvider>,
-) -> Arc<FederatedTable> {
+) -> Arc<dyn FederatedTableProvider> {
     let source = peel_to(src_table_provider, LayerWalk::Source);
     Arc::new(FederatedTable::Immediate(Arc::clone(source)))
 }
@@ -763,7 +767,7 @@ mod tests {
 
         fn changes_stream(
             &self,
-            _federated_table: Arc<FederatedTable>,
+            _federated_table: Arc<dyn FederatedTableProvider>,
             _dataset: &Dataset,
         ) -> Option<ChangesStream> {
             Some(futures::stream::empty().boxed())
@@ -773,7 +777,10 @@ mod tests {
             true
         }
 
-        fn append_stream(&self, _federated_table: Arc<FederatedTable>) -> Option<ChangesStream> {
+        fn append_stream(
+            &self,
+            _federated_table: Arc<dyn FederatedTableProvider>,
+        ) -> Option<ChangesStream> {
             Some(futures::stream::empty().boxed())
         }
     }
@@ -790,7 +797,7 @@ mod tests {
     /// The provider stack an `EmbeddingConnector` is handed when the dataset also has
     /// full-text search: the outer `FullTextConnector` peels its own `IndexLayer`
     /// off before delegating, leaving the vector scan on top.
-    fn vector_scan_over_memtable() -> Arc<FederatedTable> {
+    fn vector_scan_over_memtable() -> Arc<dyn FederatedTableProvider> {
         let vector_scan = VectorScanTableProvider {
             table_provider: memtable(),
             vector_index_list: Arc::new(LogicalPlan::EmptyRelation(EmptyRelation {

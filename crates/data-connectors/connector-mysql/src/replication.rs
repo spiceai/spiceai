@@ -36,6 +36,7 @@ use data_components::mysql_replication::{
     ReplicationMetrics, ReplicationMetricsCollector, ReplicationParams, ReplicationStreamInput,
     StoreError, derive_server_id, process_nonce, start_replication_stream,
 };
+use data_connector_api::federated::FederatedTableProvider;
 use datafusion::sql::TableReference;
 use futures::StreamExt;
 use mysql_async::{Opts, OptsBuilder, SslOpts};
@@ -45,7 +46,6 @@ use runtime::dataaccelerator::spice_sys::{
     OpenOption,
     mysql_binlog::{MySqlBinlogCheckpoint, MySqlBinlogSys},
 };
-use runtime::federated::FederatedTable;
 use runtime_metrics::component::{MetricSpec, MetricType, ObserveMetricCallback};
 use runtime_parameters::Parameters;
 use std::collections::hash_map::DefaultHasher;
@@ -58,7 +58,7 @@ const MAX_BOOTSTRAP_BATCH_SIZE: usize = 1_048_576;
 pub fn build_changes_stream(
     params: &Parameters,
     dataset: &Dataset,
-    federated_table: Arc<FederatedTable>,
+    federated_table: Arc<dyn FederatedTableProvider>,
     metrics: Arc<ReplicationMetricsCollector>,
 ) -> ChangesStream {
     let dataset_name = dataset.name.to_string();

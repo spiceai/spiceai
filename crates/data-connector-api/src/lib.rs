@@ -23,6 +23,7 @@ limitations under the License.
 //! depending on the runtime that orchestrates it.
 
 pub mod accelerated;
+pub mod federated;
 pub mod schema_projection;
 
 use std::sync::Arc;

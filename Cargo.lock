@@ -4630,6 +4630,7 @@ dependencies = [
  "arrow-schema",
  "async-stream",
  "async-trait",
+ "data-connector-api",
  "data_components",
  "dataformat-json",
  "datafusion",
@@ -4701,6 +4702,7 @@ dependencies = [
  "async-stream",
  "async-trait",
  "chrono",
+ "data-connector-api",
  "data_components",
  "datafusion",
  "datafusion-table-providers",
@@ -4784,6 +4786,7 @@ version = "2.2.0-unstable"
 dependencies = [
  "async-stream",
  "async-trait",
+ "data-connector-api",
  "data_components",
  "datafusion",
  "datafusion-table-providers",

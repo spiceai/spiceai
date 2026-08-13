@@ -39,6 +39,7 @@ use crate::dataconnector::{DataConnector, DataConnectorError, DataConnectorResul
 use crate::federated::FederatedTable;
 use crate::search::full_text::table::add_compound_fts_to_table;
 use data_connector_api::accelerated::{AcceleratorSetup, RegisteredAcceleratedTable};
+use data_connector_api::federated::FederatedTableProvider;
 use runtime_metrics::component::MetricsProvider;
 use runtime_parameters_typed::TypedParams as _;
 use runtime_search::store_params::elasticsearch::{
@@ -121,11 +122,11 @@ impl ElasticsearchFullTextConnector {
     #[expect(clippy::needless_pass_by_value)]
     fn with_indexed_stream<F>(
         &self,
-        federated_table: Arc<FederatedTable>,
+        federated_table: Arc<dyn FederatedTableProvider>,
         f: F,
     ) -> Option<ChangesStream>
     where
-        F: Fn(&Arc<dyn DataConnector>, Arc<FederatedTable>) -> Option<ChangesStream>,
+        F: Fn(&Arc<dyn DataConnector>, Arc<dyn FederatedTableProvider>) -> Option<ChangesStream>,
     {
         let table_provider = federated_table.try_table_provider_sync()?;
         let indexed_table =
@@ -263,7 +264,7 @@ impl DataConnector for ElasticsearchFullTextConnector {
 
     fn changes_stream(
         &self,
-        federated_table: Arc<FederatedTable>,
+        federated_table: Arc<dyn FederatedTableProvider>,
         dataset: &Dataset,
     ) -> Option<ChangesStream> {
         self.with_indexed_stream(federated_table, |inner, table| {
@@ -275,7 +276,10 @@ impl DataConnector for ElasticsearchFullTextConnector {
         self.inner_connector.supports_append_stream()
     }
 
-    fn append_stream(&self, federated_table: Arc<FederatedTable>) -> Option<ChangesStream> {
+    fn append_stream(
+        &self,
+        federated_table: Arc<dyn FederatedTableProvider>,
+    ) -> Option<ChangesStream> {
         self.with_indexed_stream(federated_table, |inner, table| inner.append_stream(table))
     }
 

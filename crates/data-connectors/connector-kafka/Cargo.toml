@@ -11,6 +11,7 @@ linkme.workspace = true
 arrow-schema.workspace = true
 async-stream.workspace = true
 async-trait.workspace = true
+data-connector-api = { path = "../../data-connector-api" }
 data_components = { path = "../../data_components", features = ["kafka"] }
 dataformat-json = { path = "../../dataformat-json" }
 datafusion.workspace = true
