@@ -123,8 +123,11 @@ start_test "audit handles paths git C-quotes (newline, non-ASCII)"
 (
   new_stack "$work_root/quoting"
   awkward=$(printf 'na\303\257ve\nname.rs')
-  printf 'x\n' > "$awkward" && commit_all "fork point"
+  printf 'x\n' > keep.txt && commit_all "fork point"
   git checkout --quiet -b parent
+  # The parent has to have a commit of its own: a stack base that trunk already
+  # contains is the fork point, which the audit refuses as a mis-derived base.
+  printf 'x\n' > "$awkward" && commit_all "parent adds the awkward path"
   stack_base=$(git rev-parse HEAD)
   git checkout --quiet -b child
   git rm --quiet -- "$awkward" && commit_all "child deletes the awkward path"
@@ -414,6 +417,32 @@ start_test "audit reports a surviving deletion that trunk had changed"
   output=$("$subject" audit "$stack_base" "$pre" --trunk trunk --accept f.txt 2>/dev/null)
   status=$?
   [ "$status" -eq 0 ] || fail_test "the decision could not be accepted: $output"
+) || failures=$((failures + 1))
+
+start_test "audit refuses the fork point in place of the stack base"
+(
+  new_stack "$work_root/forkpointarg"
+  printf 'old\n' > keep.txt && commit_all "fork point"
+  fork_point=$(git rev-parse HEAD)
+  git checkout --quiet -b parent
+  printf 'registry\n' > registry.rs && commit_all "parent adds registry.rs"
+  git checkout --quiet -b child
+  git rm --quiet registry.rs && commit_all "child deletes registry.rs"
+  pre=$(git rev-parse HEAD)
+  squash_parent_onto_trunk
+  git checkout --quiet child
+  git merge --no-ff --no-commit trunk >/dev/null 2>&1
+  [ -e registry.rs ] || fail_test "the fixture did not restore the deleted file"
+
+  # registry.rs exists at neither the fork point nor the child's tip, so with the
+  # fork point as the base every intent list is empty and the restoration is
+  # invisible. It is also the confusion the document is largely about.
+  output=$("$subject" audit "$fork_point" "$pre" --trunk trunk 2>&1)
+  status=$?
+  [ "$status" -ne 0 ] || fail_test "the fork point was accepted as a stack base: $output"
+  case "$output" in
+    *"audit clean"*) fail_test "a resurrection went unreported with the wrong base: $output" ;;
+  esac
 ) || failures=$((failures + 1))
 
 start_test "audit will not report clean when handed the wrong pre-merge tip"

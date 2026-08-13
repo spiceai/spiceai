@@ -444,6 +444,19 @@ cmd_audit() {
   trunk_rev=$(git rev-parse --verify --quiet "$trunk_ref^{commit}") ||
     die "cannot resolve $trunk_ref; pass --trunk <rev> to say what this merge brings in"
 
+  # Naming commits is not enough. The stack base must be somewhere on the child's
+  # history, and it must not already be part of trunk: a commit trunk contains is
+  # the fork point (or older), not the parent's tip, and passing that is the very
+  # confusion this tooling exists to prevent. It also hides the failure it was
+  # written for -- a path the parent added and the child deleted exists at
+  # neither the fork point nor the child's tip, so no intent diff mentions it and
+  # the merge can restore it in silence.
+  git merge-base --is-ancestor "$stack_base" "$pre" ||
+    die "$stack_base is not an ancestor of $pre, so it cannot be this branch's stack base"
+  if git merge-base --is-ancestor "$stack_base" "$trunk_rev"; then
+    die "$stack_base is already contained in $trunk_ref, so it is the fork point rather than the parent's tip; derive it with: $(basename "${BASH_SOURCE[0]}") stack-base <parent-pr>"
+  fi
+
   local other incomplete=0
   if other=$(merge_other_side "$pre"); then
     # An active merge is not necessarily *this* merge. Merging anything else and
