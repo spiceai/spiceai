@@ -751,6 +751,36 @@ start_test "audit reports a deletion trunk carried away under a new name"
   esac
 ) || failures=$((failures + 1))
 
+start_test "audit treats a restored old path as a decision when trunk renamed it"
+(
+  new_stack "$work_root/restored_rename"
+  printf 'keep\n' > keep.txt && commit_all "fork point"
+  git checkout --quiet -b parent
+  printf 'line one\nline two\nline three\nline four\n' > f.txt && commit_all "parent adds f.txt"
+  stack_base=$(git rev-parse HEAD)
+  git checkout --quiet -b child
+  git rm --quiet f.txt && commit_all "child deletes f.txt"
+  pre=$(git rev-parse HEAD)
+  squash_parent_onto_trunk
+  git mv f.txt g.txt && commit_all "trunk renames it to g.txt"
+  git checkout --quiet child
+  git merge --no-ff --no-commit trunk >/dev/null 2>&1
+  # Somebody settles the delete-versus-rename by putting the old path back.
+  git checkout --quiet "$stack_base" -- f.txt && git add f.txt
+
+  # Trunk has no f.txt, so this looks like both sides agreeing it should go and
+  # the old path coming back for no reason — but trunk moved it rather than
+  # deleting it, so keeping f.txt is a decision somebody can make.
+  output=$("$subject" audit "$stack_base" "$pre" --trunk trunk 2>/dev/null)
+  case "$output" in
+    *"REVIEW f.txt"*) ;;
+    *) fail_test "a restored path against a trunk rename was not a decision: $output" ;;
+  esac
+  output=$("$subject" audit "$stack_base" "$pre" --trunk trunk --accept f.txt 2>/dev/null)
+  status=$?
+  [ "$status" -eq 0 ] || fail_test "the decision could not be accepted: $output"
+) || failures=$((failures + 1))
+
 start_test "audit calls a restoration a restoration when both sides deleted the path"
 (
   new_stack "$work_root/bothdeleted"

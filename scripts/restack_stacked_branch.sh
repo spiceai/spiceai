@@ -388,6 +388,28 @@ unsafe_worktree_path() {
   return 1
 }
 
+# Sets RENAME_AMBIGUITY when a path missing from trunk is missing because it moved
+# rather than because trunk agreed it should go -- on either side. Both sides
+# moving it to the same place is not ambiguous, and neither is neither.
+rename_ambiguity() {
+  local path="$1" trunk_dest=""
+  RENAME_AMBIGUITY=""
+  if renamed_to "$RESTACK_RENAMES" "$path"; then
+    trunk_dest="$RENAMED_DEST"
+    if renamed_to "$RESTACK_CHILD_RENAMES" "$path" &&
+       [ "$RENAMED_DEST" = "$trunk_dest" ]; then
+      return 1
+    fi
+    RENAME_AMBIGUITY="trunk renamed it to $trunk_dest"
+    return 0
+  fi
+  if renamed_to "$RESTACK_CHILD_RENAMES" "$path"; then
+    RENAME_AMBIGUITY="you renamed it to $RENAMED_DEST and trunk deleted it"
+    return 0
+  fi
+  return 1
+}
+
 # Report an ambiguous path, unless a person has said they decided it. Only cases
 # a correctly based merge could not settle by itself come through here: a
 # deterministic loss is never something --accept may silence.
@@ -683,7 +705,7 @@ cmd_audit() {
     rm -rf "$tmp"
     die "could not read unmerged entries from the index"
   fi
-  local record last_unmerged="" theirs_now base_now theirs_add mine_add renamed_to_trunk theirs_here
+  local record last_unmerged="" theirs_now base_now theirs_add mine_add theirs_here
   while IFS= read -r -d '' record; do
     path=${record#*$'\t'}
     [ "$path" = "$last_unmerged" ] && continue
@@ -702,23 +724,11 @@ cmd_audit() {
       theirs_now=$(tree_entry "$other" "$path") || die "could not read $other:$path"
       base_now=$(tree_entry "$stack_base" "$path") || die "could not read $stack_base:$path"
       if [ -z "$theirs_now" ]; then
-        if renamed_to "$RESTACK_RENAMES" "$path"; then
-          renamed_to_trunk="$RENAMED_DEST"
-          # Unless we moved it to the same place, in which case both sides agree
-          # and the addition audit checks what landed there.
-          if renamed_to "$RESTACK_CHILD_RENAMES" "$path" &&
-             [ "$RENAMED_DEST" = "$renamed_to_trunk" ]; then
-            continue
-          fi
-          accept_or_review "$path" "you deleted it and trunk renamed it to $renamed_to_trunk, which nothing has decided" ||
-            findings=$((findings + 1))
-          continue
-        fi
-        # Trunk deleted it, and so did we -- unless what looks like our deletion
-        # is really a move, in which case the stack base sees a rename against a
+        # Trunk deleted it, and so did we -- unless either side's missing entry is
+        # really a move, in which case the stack base sees a rename against a
         # deletion and nothing has settled which wins.
-        if renamed_to "$RESTACK_CHILD_RENAMES" "$path"; then
-          accept_or_review "$path" "you renamed it to $RENAMED_DEST and trunk deleted it, which nothing has decided" ||
+        if rename_ambiguity "$path"; then
+          accept_or_review "$path" "$RENAME_AMBIGUITY, which nothing has decided" ||
             findings=$((findings + 1))
         fi
         continue
@@ -745,6 +755,11 @@ cmd_audit() {
     # restoration, which no decision can explain away.
     if [ -n "$other" ] && [ -n "$theirs_now" ] && [ "$theirs_now" != "$base_now" ]; then
       accept_or_review "$path" "you deleted it and trunk changed it, which nothing has decided" ||
+        findings=$((findings + 1))
+    elif [ -n "$other" ] && [ -z "$theirs_now" ] && rename_ambiguity "$path"; then
+      # Missing from trunk because it moved, not because trunk agreed it should
+      # go, so keeping the old path can be somebody's decision.
+      accept_or_review "$path" "$RENAME_AMBIGUITY, and the old path is back, which nothing has decided" ||
         findings=$((findings + 1))
     else
       # Unambiguous: trunk did not touch it, so nothing was decided here and the
