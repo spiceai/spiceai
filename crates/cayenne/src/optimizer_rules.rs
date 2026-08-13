@@ -119,6 +119,7 @@ use datafusion::common::{JoinType, NullEquality, extensions_options};
 use datafusion::config::{ConfigExtension, ConfigOptions};
 use datafusion::error::{DataFusionError, Result};
 use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
+use datafusion::physical_expr_common::physical_expr::is_volatile;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode};
@@ -1646,10 +1647,18 @@ impl PhysicalOptimizerRule for CayenneDedupFilterConjuncts {
     }
 }
 
-/// Splits `predicate` into its top-level `AND` conjuncts and, if any conjunct
-/// repeats (by expression equality, not just pointer identity), rebuilds the
-/// conjunction with only the first occurrence of each kept. Returns `None`
-/// when there is nothing to dedup, so callers can skip rebuilding the node.
+/// Splits `predicate` into its top-level `AND` conjuncts and, if any
+/// *deterministic* conjunct repeats (by expression equality, not just pointer
+/// identity), rebuilds the conjunction with only the first occurrence of each
+/// kept. Returns `None` when there is nothing to dedup, so callers can skip
+/// rebuilding the node.
+///
+/// A volatile conjunct (e.g. a call to a `Volatility::Volatile` UDF) is never
+/// treated as a removable duplicate, even against an structurally-identical
+/// sibling: two calls can return different values or carry side effects, so
+/// collapsing them into one evaluation would change the predicate's meaning,
+/// not just its cost. `DataFusion`'s own optimizer passes guard constant
+/// folding and CSE the same way; `is_volatile` is the same check they use.
 fn dedup_conjunction(predicate: &Arc<dyn PhysicalExpr>) -> Option<Arc<dyn PhysicalExpr>> {
     let conjuncts = split_conjunction(predicate);
     if conjuncts.len() < 2 {
@@ -1658,7 +1667,11 @@ fn dedup_conjunction(predicate: &Arc<dyn PhysicalExpr>) -> Option<Arc<dyn Physic
 
     let mut deduped: Vec<Arc<dyn PhysicalExpr>> = Vec::with_capacity(conjuncts.len());
     for expr in &conjuncts {
-        if !deduped.iter().any(|kept| kept.as_ref() == expr.as_ref()) {
+        let is_removable_duplicate = !is_volatile(expr)
+            && deduped
+                .iter()
+                .any(|kept| !is_volatile(kept) && kept.as_ref() == expr.as_ref());
+        if !is_removable_duplicate {
             deduped.push(Arc::clone(expr));
         }
     }
@@ -1674,10 +1687,10 @@ fn dedup_conjunction(predicate: &Arc<dyn PhysicalExpr>) -> Option<Arc<dyn Physic
 mod tests {
     use super::{
         ANTI_JOIN_SORT_MERGE_MIN_EXACT_ROWS, CayenneAntiJoinSortMergeRewriter,
-        CayenneDynamicFilterSharing, CayenneMaintainedAggregateRewriter, CayenneOptimizerConfig,
-        CayenneStatsAggregateRewriter, FilterAddition, HASH_JOIN_BUILD_SIDE_OVERHEAD_DEN,
-        HASH_JOIN_BUILD_SIDE_OVERHEAD_NUM, apply_filter_additions, build_side_memory_estimate,
-        plan_schema_fields,
+        CayenneDedupFilterConjuncts, CayenneDynamicFilterSharing,
+        CayenneMaintainedAggregateRewriter, CayenneOptimizerConfig, CayenneStatsAggregateRewriter,
+        FilterAddition, HASH_JOIN_BUILD_SIDE_OVERHEAD_DEN, HASH_JOIN_BUILD_SIDE_OVERHEAD_NUM,
+        apply_filter_additions, build_side_memory_estimate, plan_schema_fields,
     };
     use crate::maintained_aggregate::{
         MaintainedAggregateExec, MaintainedAggregateExpr, MaintainedAggregateFunction,
@@ -1696,6 +1709,7 @@ mod tests {
     use datafusion::physical_optimizer::PhysicalOptimizerRule;
     use datafusion::physical_plan::Partitioning;
     use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode, PhysicalGroupBy};
+    use datafusion::physical_plan::filter::FilterExec;
     use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode, SortMergeJoinExec};
     use datafusion::physical_plan::repartition::RepartitionExec;
     use datafusion::physical_plan::sorts::sort::SortExec;
@@ -3684,5 +3698,98 @@ mod tests {
                 "each concurrent inner join should be rewritten to sort-merge under fair-share"
             );
         }
+    }
+
+    fn int32_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]))
+    }
+
+    fn empty_memory_exec(schema: &Arc<Schema>) -> Arc<dyn ExecutionPlan> {
+        MemorySourceConfig::try_new_exec(&[vec![]], Arc::clone(schema), None)
+            .expect("empty memory exec should build")
+    }
+
+    #[test]
+    fn dedups_a_repeated_deterministic_conjunct() {
+        let schema = int32_schema();
+        let equals_five = datafusion_physical_expr::expressions::binary(
+            col("a", &schema).expect("column a should exist"),
+            datafusion::logical_expr::Operator::Eq,
+            lit(5),
+            &schema,
+        )
+        .expect("building `a = 5` should succeed");
+        let predicate = conjunction(vec![Arc::clone(&equals_five), equals_five]);
+        let filter = Arc::new(
+            FilterExec::try_new(predicate, empty_memory_exec(&schema))
+                .expect("filter should build"),
+        );
+
+        let optimized = CayenneDedupFilterConjuncts
+            .optimize(filter, &ConfigOptions::new())
+            .expect("optimize should succeed");
+
+        let rewritten = optimized
+            .downcast_ref::<FilterExec>()
+            .expect("plan should remain a FilterExec");
+        assert_eq!(
+            datafusion_physical_expr::utils::split_conjunction(rewritten.predicate()).len(),
+            1,
+            "a repeated deterministic conjunct should collapse to one occurrence"
+        );
+    }
+
+    /// Regression for a review finding on the Cayenne benchmark-snapshot dup-filter
+    /// fix: `dedup_conjunction` must never treat two structurally-identical calls
+    /// to a volatile function as a removable duplicate. Two evaluations of a
+    /// volatile expression can return different values or carry side effects, so
+    /// collapsing them into one changes the predicate's meaning, not just its
+    /// cost — the same hazard `DataFusion`'s own constant-folding/CSE passes guard
+    /// against with the same `is_volatile` check.
+    #[test]
+    fn does_not_dedup_a_repeated_volatile_conjunct() {
+        let schema = int32_schema();
+        let random_udf = datafusion_functions::math::random();
+        let config_options = Arc::new(ConfigOptions::new());
+        let random_call = |fun: Arc<datafusion_expr::ScalarUDF>| -> Arc<dyn PhysicalExpr> {
+            let call: Arc<dyn PhysicalExpr> = Arc::new(
+                datafusion_physical_expr::ScalarFunctionExpr::try_new(
+                    fun,
+                    vec![],
+                    &schema,
+                    Arc::clone(&config_options),
+                )
+                .expect("building a random() call should succeed"),
+            );
+            datafusion_physical_expr::expressions::binary(
+                call,
+                datafusion::logical_expr::Operator::Gt,
+                lit(0.5_f64),
+                &schema,
+            )
+            .expect("building `random() > 0.5` should succeed")
+        };
+        // Two independently-built calls to the same volatile function — same
+        // structure, but each is its own evaluation.
+        let first_call = random_call(Arc::clone(&random_udf));
+        let second_call = random_call(random_udf);
+        let predicate = conjunction(vec![first_call, second_call]);
+        let filter = Arc::new(
+            FilterExec::try_new(predicate, empty_memory_exec(&schema))
+                .expect("filter should build"),
+        );
+
+        let optimized = CayenneDedupFilterConjuncts
+            .optimize(filter, &ConfigOptions::new())
+            .expect("optimize should succeed");
+
+        let rewritten = optimized
+            .downcast_ref::<FilterExec>()
+            .expect("plan should remain a FilterExec");
+        assert_eq!(
+            datafusion_physical_expr::utils::split_conjunction(rewritten.predicate()).len(),
+            2,
+            "two structurally-identical calls to a volatile function must both survive"
+        );
     }
 }
