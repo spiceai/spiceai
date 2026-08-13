@@ -491,8 +491,8 @@ cmd_audit() {
       # base only made it look settled -- trunk's change is invisible from there
       # if it happens to restore the fork-point content.
       [ -n "$other" ] || continue
-      theirs_now=$(tree_entry "$other" "$path")
-      base_now=$(tree_entry "$stack_base" "$path")
+      theirs_now=$(tree_entry "$other" "$path") || die "could not read $other:$path"
+      base_now=$(tree_entry "$stack_base" "$path") || die "could not read $stack_base:$path"
       [ -n "$theirs_now" ] || continue                 # trunk deleted it too
       [ "$theirs_now" = "$base_now" ] && continue      # trunk left it alone
       if path_accepted "$path"; then
@@ -512,8 +512,14 @@ cmd_audit() {
     # If trunk changed the file after the stack base, a correctly based merge is
     # a delete/modify conflict rather than a silent restoration, and keeping
     # trunk's version is a decision somebody may legitimately have made.
-    if [ -n "$other" ] &&
-       [ "$(tree_entry "$other" "$path")" != "$(tree_entry "$stack_base" "$path")" ]; then
+    if [ -n "$other" ]; then
+      theirs_now=$(tree_entry "$other" "$path") || die "could not read $other:$path"
+      base_now=$(tree_entry "$stack_base" "$path") || die "could not read $stack_base:$path"
+    else
+      theirs_now=""
+      base_now=""
+    fi
+    if [ -n "$other" ] && [ "$theirs_now" != "$base_now" ]; then
       echo "REVIEW $path: you deleted it and trunk changed it, which nothing has decided"
     else
       echo "RESURRECTED $path"

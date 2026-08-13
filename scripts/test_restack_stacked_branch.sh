@@ -345,6 +345,44 @@ start_test "audit separates a delete/modify from a silent restoration, and can a
   [ "$status" -eq 0 ] || fail_test "the decision could not be accepted: $output"
 ) || failures=$((failures + 1))
 
+start_test "audit fails loudly when a tree cannot be read, rather than assuming absence"
+(
+  new_stack "$work_root/badtree"
+  printf 'fork\n' > f.txt && commit_all "fork point"
+  git checkout --quiet -b parent
+  printf 'parent\n' > f.txt && commit_all "parent changes it"
+  stack_base=$(git rev-parse HEAD)
+  git checkout --quiet -b child
+  git rm --quiet f.txt && commit_all "child deletes it"
+  pre=$(git rev-parse HEAD)
+  squash_parent_onto_trunk
+  printf 'fork\n' > f.txt && commit_all "trunk restores the fork-point content"
+  git checkout --quiet child
+  git merge --no-ff --no-commit trunk >/dev/null 2>&1
+
+  # An unreadable tree returns nothing, which reads as "trunk deleted it too" and
+  # would let a surviving deletion pass as agreed.
+  stub_dir="$work_root/badtree_stub"
+  mkdir -p "$stub_dir"
+  real_git=$(command -v git)
+  cat >"$stub_dir/git" <<STUB
+#!/usr/bin/env bash
+if [ "\$1" = "ls-tree" ]; then
+  echo "fatal: bad object" >&2
+  exit 128
+fi
+exec "$real_git" "\$@"
+STUB
+  chmod +x "$stub_dir/git"
+
+  output=$(PATH="$stub_dir:$PATH" "$subject" audit "$stack_base" "$pre" --trunk trunk 2>&1)
+  status=$?
+  [ "$status" -ne 0 ] || fail_test "an unreadable tree exited 0: $output"
+  case "$output" in
+    *"audit clean"*) fail_test "an unreadable tree reported clean: $output" ;;
+  esac
+) || failures=$((failures + 1))
+
 start_test "audit reports a surviving deletion that trunk had changed"
 (
   new_stack "$work_root/deletionkept"
