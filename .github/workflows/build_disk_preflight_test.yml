@@ -1,0 +1,58 @@
+---
+name: Build Disk Preflight Tests
+
+# `scripts/preflight_build_disk.sh` decides whether a build job gets blamed on
+# the runner or left to fail as a broken branch, and both directions cost
+# something real. Under-reporting is the condition #12794 describes: an
+# out-of-disk host fails minutes in with `os error 28` on a crate the branch
+# never touched, and the merge queue freezes while the failure is triaged as a
+# compiler-cache fault. Over-reporting would refuse builds that pass today —
+# every GitHub-hosted image sits below any floor useful for the self-hosted
+# pool — so the "report but build anyway" paths are tested as carefully as the
+# refusal.
+on:
+  pull_request:
+    branches:
+      - trunk
+      - release-*
+      - release/*
+      - feature-*
+    paths:
+      - 'scripts/preflight_build_disk.sh'
+      - 'scripts/test_preflight_build_disk.sh'
+      - '.github/actions/build-spiced/action.yml'
+      - '.github/workflows/build_disk_preflight_test.yml'
+  push:
+    branches:
+      - trunk
+    paths:
+      - 'scripts/preflight_build_disk.sh'
+      - 'scripts/test_preflight_build_disk.sh'
+      - '.github/actions/build-spiced/action.yml'
+      - '.github/workflows/build_disk_preflight_test.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  test-build-disk-preflight:
+    name: Unit tests for the build disk preflight
+    # GitHub-hosted on purpose: this is a sub-second check and must not queue
+    # behind the self-hosted pool whose full disks it exists to report.
+    runs-on: ubuntu-24.04
+    # A checkout plus a local bash script against a stub `df` — the job reads
+    # the repository and nothing else, so it needs no write scope.
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Run tests
+        # Invoked through `bash` rather than as `./…` so the job does not depend
+        # on the script's executable bit surviving a checkout on every platform.
+        run: bash scripts/test_preflight_build_disk.sh

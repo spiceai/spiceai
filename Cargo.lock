@@ -3594,6 +3594,7 @@ dependencies = [
  "duckdb",
  "flatbuffers",
  "futures",
+ "globset",
  "hash-index",
  "im",
  "insta",
@@ -3602,7 +3603,6 @@ dependencies = [
  "object_store 0.13.2",
  "parking_lot",
  "paste",
- "regex",
  "roaring",
  "rstest 0.26.1",
  "runtime-datafusion",
@@ -4202,9 +4202,12 @@ checksum = "510ca239cf13b7f8d16a2b48f263de7b4f8c566f0af58d901031473c76afb1e3"
 name = "connector-abfs"
 version = "2.2.0-unstable"
 dependencies = [
+ "app",
  "linkme",
  "object_store 0.13.2",
  "runtime",
+ "runtime-parameters",
+ "runtime-secrets",
  "secrecy",
  "snafu",
  "tokio",
@@ -4229,6 +4232,7 @@ dependencies = [
  "linkme",
  "parking_lot",
  "runtime",
+ "runtime-parameters",
  "secrecy",
  "sha2 0.10.9",
  "snafu",
@@ -4255,6 +4259,8 @@ dependencies = [
  "ns_lookup",
  "paste",
  "runtime",
+ "runtime-parameters",
+ "runtime-udfs-api",
  "secrecy",
  "snafu",
  "url",
@@ -4277,6 +4283,7 @@ dependencies = [
  "runtime",
  "runtime-api-types",
  "runtime-metrics",
+ "runtime-parameters",
  "serde_json",
  "snafu",
  "tokio",
@@ -4290,6 +4297,7 @@ dependencies = [
  "app",
  "async-trait",
  "aws-sdk-credential-bridge",
+ "data-http-rate-control",
  "data_components",
  "datafusion",
  "futures",
@@ -4299,6 +4307,7 @@ dependencies = [
  "runtime",
  "runtime-api-types",
  "runtime-metrics",
+ "runtime-parameters",
  "runtime-rate-control",
  "runtime-secrets",
  "secrecy",
@@ -4321,6 +4330,8 @@ dependencies = [
  "linkme",
  "paste",
  "runtime",
+ "runtime-parameters",
+ "runtime-secrets",
  "secrecy",
  "snafu",
  "tokio",
@@ -4342,6 +4353,8 @@ dependencies = [
  "ns_lookup",
  "paste",
  "runtime",
+ "runtime-parameters",
+ "runtime-udfs-api",
  "snafu",
  "tracing",
 ]
@@ -4358,6 +4371,8 @@ dependencies = [
  "linkme",
  "paste",
  "runtime",
+ "runtime-datafusion",
+ "runtime-parameters",
  "snafu",
 ]
 
@@ -4372,6 +4387,8 @@ dependencies = [
  "duckdb",
  "linkme",
  "runtime",
+ "runtime-datafusion",
+ "runtime-parameters",
  "snafu",
  "tokio",
  "tracing",
@@ -4393,6 +4410,7 @@ dependencies = [
  "aws-smithy-types",
  "base64 0.22.1",
  "chrono",
+ "data-connector-api",
  "data_components",
  "datafusion",
  "dynamodb-streams",
@@ -4425,6 +4443,7 @@ dependencies = [
  "linkme",
  "paste",
  "runtime",
+ "runtime-parameters",
  "secrecy",
  "snafu",
  "tracing",
@@ -4443,6 +4462,8 @@ dependencies = [
  "linkme",
  "paste",
  "runtime",
+ "runtime-parameters",
+ "runtime-udfs-api",
  "snafu",
 ]
 
@@ -4453,6 +4474,7 @@ dependencies = [
  "linkme",
  "paste",
  "runtime",
+ "runtime-parameters",
  "snafu",
  "tokio",
  "url",
@@ -4462,9 +4484,13 @@ dependencies = [
 name = "connector-gcs"
 version = "2.2.0-unstable"
 dependencies = [
+ "app",
  "linkme",
  "object_store 0.13.2",
  "runtime",
+ "runtime-parameters",
+ "runtime-secrets",
+ "secrecy",
  "snafu",
  "tokio",
  "url",
@@ -4488,6 +4514,7 @@ dependencies = [
  "runtime",
  "runtime-api-types",
  "runtime-metrics",
+ "runtime-parameters",
  "secrecy",
  "snafu",
  "tempfile",
@@ -4517,6 +4544,8 @@ dependencies = [
  "linkme",
  "reqwest 0.13.4",
  "runtime",
+ "runtime-datafusion",
+ "runtime-parameters",
  "runtime-rate-control",
  "runtime-secrets",
  "secrecy",
@@ -4547,6 +4576,7 @@ dependencies = [
  "app",
  "arrow",
  "async-trait",
+ "data-http-rate-control",
  "data_components",
  "datafusion",
  "futures",
@@ -4558,7 +4588,9 @@ dependencies = [
  "reqwest 0.13.4",
  "runtime",
  "runtime-metrics",
+ "runtime-parameters",
  "runtime-rate-control",
+ "runtime-secrets",
  "secrecy",
  "serde",
  "serde_json",
@@ -4586,6 +4618,7 @@ dependencies = [
  "paste",
  "regex",
  "runtime",
+ "runtime-parameters",
  "secrecy",
  "snafu",
 ]
@@ -4606,7 +4639,9 @@ dependencies = [
  "opentelemetry",
  "runtime",
  "runtime-api-types",
+ "runtime-datafusion",
  "runtime-metrics",
+ "runtime-parameters",
  "secrecy",
  "serde",
  "serde_json",
@@ -4625,6 +4660,7 @@ dependencies = [
  "async-stream",
  "async-trait",
  "criterion 0.7.0",
+ "data-connector-api",
  "data_components",
  "datafusion",
  "datafusion-table-providers",
@@ -4634,6 +4670,7 @@ dependencies = [
  "mongodb",
  "paste",
  "runtime",
+ "runtime-parameters",
  "secrecy",
  "serde_json",
  "snafu",
@@ -4652,6 +4689,7 @@ dependencies = [
  "linkme",
  "paste",
  "runtime",
+ "runtime-parameters",
  "snafu",
  "tiberius",
 ]
@@ -4675,6 +4713,8 @@ dependencies = [
  "runtime",
  "runtime-api-types",
  "runtime-metrics",
+ "runtime-parameters",
+ "runtime-udfs-api",
  "secrecy",
  "snafu",
  "tokio",
@@ -4688,6 +4728,7 @@ dependencies = [
  "linkme",
  "paste",
  "runtime",
+ "runtime-parameters",
  "snafu",
  "tokio",
  "url",
@@ -4710,6 +4751,8 @@ dependencies = [
  "odbc-api",
  "paste",
  "runtime",
+ "runtime-parameters",
+ "runtime-udfs-api",
  "secrecy",
  "sha2 0.10.9",
  "snafu",
@@ -4750,8 +4793,12 @@ dependencies = [
  "opentelemetry",
  "runtime",
  "runtime-api-types",
+ "runtime-datafusion",
  "runtime-metrics",
+ "runtime-parameters",
  "secrecy",
+ "serde",
+ "serde_json",
  "snafu",
  "tokio",
  "tokio-postgres",
@@ -4796,6 +4843,7 @@ dependencies = [
  "linkme",
  "paste",
  "runtime",
+ "runtime-parameters",
  "snafu",
  "tokio",
  "url",
@@ -4823,7 +4871,9 @@ dependencies = [
  "percent-encoding",
  "reqwest 0.13.4",
  "runtime",
+ "runtime-datafusion",
  "runtime-object-store",
+ "runtime-parameters",
  "secrecy",
  "serde",
  "serde_json",
@@ -4840,6 +4890,7 @@ dependencies = [
  "linkme",
  "paste",
  "runtime",
+ "runtime-parameters",
  "snafu",
  "tokio",
  "url",
@@ -4858,6 +4909,8 @@ dependencies = [
  "linkme",
  "paste",
  "runtime",
+ "runtime-parameters",
+ "runtime-udfs-api",
  "snafu",
  "snowflake-api",
 ]
@@ -5620,17 +5673,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "424e0138278faeb2b401f174ad17e715c829512d74f3d1e81eb43365c2e0590e"
 dependencies = [
  "ctor-proc-macro",
- "dtor 0.1.1",
-]
-
-[[package]]
-name = "ctor"
-version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "352d39c2f7bef1d6ad73db6f5160efcaed66d94ef8c6c573a8410c00bf909a98"
-dependencies = [
- "ctor-proc-macro",
- "dtor 0.3.0",
+ "dtor",
 ]
 
 [[package]]
@@ -5955,8 +5998,10 @@ dependencies = [
 name = "data-connector-api"
 version = "2.2.0-unstable"
 dependencies = [
+ "data_components",
  "globset",
  "runtime-component",
+ "serde_json",
  "snafu",
 ]
 
@@ -5965,6 +6010,26 @@ name = "data-encoding"
 version = "2.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a4ae5f15dda3c708c0ade84bfee31ccab44a3da4f88015ed22f63732abe300c8"
+
+[[package]]
+name = "data-http-rate-control"
+version = "2.2.0-unstable"
+dependencies = [
+ "data-connector-api",
+ "data_components",
+ "fundu",
+ "governor",
+ "object_store 0.13.2",
+ "opentelemetry",
+ "runtime-api-types",
+ "runtime-metrics",
+ "runtime-parameters",
+ "runtime-rate-control",
+ "tokio",
+ "tracing",
+ "url",
+ "uuid 1.23.2",
+]
 
 [[package]]
 name = "data_components"
@@ -5996,7 +6061,6 @@ dependencies = [
  "chrono",
  "connector-postgres-common",
  "criterion 0.7.0",
- "ctor 0.8.0",
  "dashmap",
  "dataformat-json",
  "datafusion",
@@ -6053,6 +6117,7 @@ dependencies = [
  "snafu",
  "snowflake-api",
  "spark-connect-rs",
+ "spice-table",
  "telemetry",
  "tempfile",
  "tiberius",
@@ -6095,7 +6160,7 @@ dependencies = [
 [[package]]
 name = "datafusion"
 version = "54.1.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=fed13d9b9817aac30891bd96bb88c9b0afedc4c9#fed13d9b9817aac30891bd96bb88c9b0afedc4c9"
+source = "git+https://github.com/spiceai/datafusion.git?rev=edd8861e69c2eb268d4e8e4e6c45485b714eb9ce#edd8861e69c2eb268d4e8e4e6c45485b714eb9ce"
 dependencies = [
  "arrow",
  "arrow-schema",
@@ -6147,7 +6212,7 @@ dependencies = [
 [[package]]
 name = "datafusion-catalog"
 version = "54.1.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=fed13d9b9817aac30891bd96bb88c9b0afedc4c9#fed13d9b9817aac30891bd96bb88c9b0afedc4c9"
+source = "git+https://github.com/spiceai/datafusion.git?rev=edd8861e69c2eb268d4e8e4e6c45485b714eb9ce#edd8861e69c2eb268d4e8e4e6c45485b714eb9ce"
 dependencies = [
  "arrow",
  "async-trait",
@@ -6171,7 +6236,7 @@ dependencies = [
 [[package]]
 name = "datafusion-catalog-listing"
 version = "54.1.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=fed13d9b9817aac30891bd96bb88c9b0afedc4c9#fed13d9b9817aac30891bd96bb88c9b0afedc4c9"
+source = "git+https://github.com/spiceai/datafusion.git?rev=edd8861e69c2eb268d4e8e4e6c45485b714eb9ce#edd8861e69c2eb268d4e8e4e6c45485b714eb9ce"
 dependencies = [
  "arrow",
  "async-trait",
@@ -6195,7 +6260,7 @@ dependencies = [
 [[package]]
 name = "datafusion-common"
 version = "54.1.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=fed13d9b9817aac30891bd96bb88c9b0afedc4c9#fed13d9b9817aac30891bd96bb88c9b0afedc4c9"
+source = "git+https://github.com/spiceai/datafusion.git?rev=edd8861e69c2eb268d4e8e4e6c45485b714eb9ce#edd8861e69c2eb268d4e8e4e6c45485b714eb9ce"
 dependencies = [
  "arrow",
  "arrow-ipc",
@@ -6220,7 +6285,7 @@ dependencies = [
 [[package]]
 name = "datafusion-common-runtime"
 version = "54.1.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=fed13d9b9817aac30891bd96bb88c9b0afedc4c9#fed13d9b9817aac30891bd96bb88c9b0afedc4c9"
+source = "git+https://github.com/spiceai/datafusion.git?rev=edd8861e69c2eb268d4e8e4e6c45485b714eb9ce#edd8861e69c2eb268d4e8e4e6c45485b714eb9ce"
 dependencies = [
  "futures",
  "log",
@@ -6230,7 +6295,7 @@ dependencies = [
 [[package]]
 name = "datafusion-datasource"
 version = "54.1.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=fed13d9b9817aac30891bd96bb88c9b0afedc4c9#fed13d9b9817aac30891bd96bb88c9b0afedc4c9"
+source = "git+https://github.com/spiceai/datafusion.git?rev=edd8861e69c2eb268d4e8e4e6c45485b714eb9ce#edd8861e69c2eb268d4e8e4e6c45485b714eb9ce"
 dependencies = [
  "arrow",
  "async-compression",
@@ -6267,7 +6332,7 @@ dependencies = [
 [[package]]
 name = "datafusion-datasource-arrow"
 version = "54.1.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=fed13d9b9817aac30891bd96bb88c9b0afedc4c9#fed13d9b9817aac30891bd96bb88c9b0afedc4c9"
+source = "git+https://github.com/spiceai/datafusion.git?rev=edd8861e69c2eb268d4e8e4e6c45485b714eb9ce#edd8861e69c2eb268d4e8e4e6c45485b714eb9ce"
 dependencies = [
  "arrow",
  "arrow-ipc",
@@ -6290,7 +6355,7 @@ dependencies = [
 [[package]]
 name = "datafusion-datasource-csv"
 version = "54.1.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=fed13d9b9817aac30891bd96bb88c9b0afedc4c9#fed13d9b9817aac30891bd96bb88c9b0afedc4c9"
+source = "git+https://github.com/spiceai/datafusion.git?rev=edd8861e69c2eb268d4e8e4e6c45485b714eb9ce#edd8861e69c2eb268d4e8e4e6c45485b714eb9ce"
 dependencies = [
  "arrow",
  "async-trait",
@@ -6312,7 +6377,7 @@ dependencies = [
 [[package]]
 name = "datafusion-datasource-json"
 version = "54.1.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=fed13d9b9817aac30891bd96bb88c9b0afedc4c9#fed13d9b9817aac30891bd96bb88c9b0afedc4c9"
+source = "git+https://github.com/spiceai/datafusion.git?rev=edd8861e69c2eb268d4e8e4e6c45485b714eb9ce#edd8861e69c2eb268d4e8e4e6c45485b714eb9ce"
 dependencies = [
  "arrow",
  "async-trait",
@@ -6334,7 +6399,7 @@ dependencies = [
 [[package]]
 name = "datafusion-datasource-parquet"
 version = "54.1.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=fed13d9b9817aac30891bd96bb88c9b0afedc4c9#fed13d9b9817aac30891bd96bb88c9b0afedc4c9"
+source = "git+https://github.com/spiceai/datafusion.git?rev=edd8861e69c2eb268d4e8e4e6c45485b714eb9ce#edd8861e69c2eb268d4e8e4e6c45485b714eb9ce"
 dependencies = [
  "arrow",
  "async-trait",
@@ -6383,12 +6448,12 @@ dependencies = [
 [[package]]
 name = "datafusion-doc"
 version = "54.1.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=fed13d9b9817aac30891bd96bb88c9b0afedc4c9#fed13d9b9817aac30891bd96bb88c9b0afedc4c9"
+source = "git+https://github.com/spiceai/datafusion.git?rev=edd8861e69c2eb268d4e8e4e6c45485b714eb9ce#edd8861e69c2eb268d4e8e4e6c45485b714eb9ce"
 
 [[package]]
 name = "datafusion-execution"
 version = "54.1.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=fed13d9b9817aac30891bd96bb88c9b0afedc4c9#fed13d9b9817aac30891bd96bb88c9b0afedc4c9"
+source = "git+https://github.com/spiceai/datafusion.git?rev=edd8861e69c2eb268d4e8e4e6c45485b714eb9ce#edd8861e69c2eb268d4e8e4e6c45485b714eb9ce"
 dependencies = [
  "arrow",
  "arrow-buffer",
@@ -6409,7 +6474,7 @@ dependencies = [
 [[package]]
 name = "datafusion-expr"
 version = "54.1.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=fed13d9b9817aac30891bd96bb88c9b0afedc4c9#fed13d9b9817aac30891bd96bb88c9b0afedc4c9"
+source = "git+https://github.com/spiceai/datafusion.git?rev=edd8861e69c2eb268d4e8e4e6c45485b714eb9ce#edd8861e69c2eb268d4e8e4e6c45485b714eb9ce"
 dependencies = [
  "arrow",
  "arrow-schema",
@@ -6431,7 +6496,7 @@ dependencies = [
 [[package]]
 name = "datafusion-expr-common"
 version = "54.1.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=fed13d9b9817aac30891bd96bb88c9b0afedc4c9#fed13d9b9817aac30891bd96bb88c9b0afedc4c9"
+source = "git+https://github.com/spiceai/datafusion.git?rev=edd8861e69c2eb268d4e8e4e6c45485b714eb9ce#edd8861e69c2eb268d4e8e4e6c45485b714eb9ce"
 dependencies = [
  "arrow",
  "datafusion-common",
@@ -6483,7 +6548,7 @@ dependencies = [
 [[package]]
 name = "datafusion-functions"
 version = "54.1.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=fed13d9b9817aac30891bd96bb88c9b0afedc4c9#fed13d9b9817aac30891bd96bb88c9b0afedc4c9"
+source = "git+https://github.com/spiceai/datafusion.git?rev=edd8861e69c2eb268d4e8e4e6c45485b714eb9ce#edd8861e69c2eb268d4e8e4e6c45485b714eb9ce"
 dependencies = [
  "arrow",
  "arrow-buffer",
@@ -6514,7 +6579,7 @@ dependencies = [
 [[package]]
 name = "datafusion-functions-aggregate"
 version = "54.1.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=fed13d9b9817aac30891bd96bb88c9b0afedc4c9#fed13d9b9817aac30891bd96bb88c9b0afedc4c9"
+source = "git+https://github.com/spiceai/datafusion.git?rev=edd8861e69c2eb268d4e8e4e6c45485b714eb9ce#edd8861e69c2eb268d4e8e4e6c45485b714eb9ce"
 dependencies = [
  "arrow",
  "datafusion-common",
@@ -6534,7 +6599,7 @@ dependencies = [
 [[package]]
 name = "datafusion-functions-aggregate-common"
 version = "54.1.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=fed13d9b9817aac30891bd96bb88c9b0afedc4c9#fed13d9b9817aac30891bd96bb88c9b0afedc4c9"
+source = "git+https://github.com/spiceai/datafusion.git?rev=edd8861e69c2eb268d4e8e4e6c45485b714eb9ce#edd8861e69c2eb268d4e8e4e6c45485b714eb9ce"
 dependencies = [
  "arrow",
  "datafusion-common",
@@ -6558,7 +6623,7 @@ dependencies = [
 [[package]]
 name = "datafusion-functions-nested"
 version = "54.1.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=fed13d9b9817aac30891bd96bb88c9b0afedc4c9#fed13d9b9817aac30891bd96bb88c9b0afedc4c9"
+source = "git+https://github.com/spiceai/datafusion.git?rev=edd8861e69c2eb268d4e8e4e6c45485b714eb9ce#edd8861e69c2eb268d4e8e4e6c45485b714eb9ce"
 dependencies = [
  "arrow",
  "arrow-ord",
@@ -6582,7 +6647,7 @@ dependencies = [
 [[package]]
 name = "datafusion-functions-table"
 version = "54.1.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=fed13d9b9817aac30891bd96bb88c9b0afedc4c9#fed13d9b9817aac30891bd96bb88c9b0afedc4c9"
+source = "git+https://github.com/spiceai/datafusion.git?rev=edd8861e69c2eb268d4e8e4e6c45485b714eb9ce#edd8861e69c2eb268d4e8e4e6c45485b714eb9ce"
 dependencies = [
  "arrow",
  "async-trait",
@@ -6597,7 +6662,7 @@ dependencies = [
 [[package]]
 name = "datafusion-functions-window"
 version = "54.1.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=fed13d9b9817aac30891bd96bb88c9b0afedc4c9#fed13d9b9817aac30891bd96bb88c9b0afedc4c9"
+source = "git+https://github.com/spiceai/datafusion.git?rev=edd8861e69c2eb268d4e8e4e6c45485b714eb9ce#edd8861e69c2eb268d4e8e4e6c45485b714eb9ce"
 dependencies = [
  "arrow",
  "datafusion-common",
@@ -6613,7 +6678,7 @@ dependencies = [
 [[package]]
 name = "datafusion-functions-window-common"
 version = "54.1.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=fed13d9b9817aac30891bd96bb88c9b0afedc4c9#fed13d9b9817aac30891bd96bb88c9b0afedc4c9"
+source = "git+https://github.com/spiceai/datafusion.git?rev=edd8861e69c2eb268d4e8e4e6c45485b714eb9ce#edd8861e69c2eb268d4e8e4e6c45485b714eb9ce"
 dependencies = [
  "datafusion-common",
  "datafusion-physical-expr-common",
@@ -6622,7 +6687,7 @@ dependencies = [
 [[package]]
 name = "datafusion-macros"
 version = "54.1.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=fed13d9b9817aac30891bd96bb88c9b0afedc4c9#fed13d9b9817aac30891bd96bb88c9b0afedc4c9"
+source = "git+https://github.com/spiceai/datafusion.git?rev=edd8861e69c2eb268d4e8e4e6c45485b714eb9ce#edd8861e69c2eb268d4e8e4e6c45485b714eb9ce"
 dependencies = [
  "datafusion-doc",
  "quote",
@@ -6632,7 +6697,7 @@ dependencies = [
 [[package]]
 name = "datafusion-optimizer"
 version = "54.1.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=fed13d9b9817aac30891bd96bb88c9b0afedc4c9#fed13d9b9817aac30891bd96bb88c9b0afedc4c9"
+source = "git+https://github.com/spiceai/datafusion.git?rev=edd8861e69c2eb268d4e8e4e6c45485b714eb9ce#edd8861e69c2eb268d4e8e4e6c45485b714eb9ce"
 dependencies = [
  "arrow",
  "chrono",
@@ -6683,7 +6748,7 @@ dependencies = [
 [[package]]
 name = "datafusion-physical-expr"
 version = "54.1.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=fed13d9b9817aac30891bd96bb88c9b0afedc4c9#fed13d9b9817aac30891bd96bb88c9b0afedc4c9"
+source = "git+https://github.com/spiceai/datafusion.git?rev=edd8861e69c2eb268d4e8e4e6c45485b714eb9ce#edd8861e69c2eb268d4e8e4e6c45485b714eb9ce"
 dependencies = [
  "arrow",
  "datafusion-common",
@@ -6704,7 +6769,7 @@ dependencies = [
 [[package]]
 name = "datafusion-physical-expr-adapter"
 version = "54.1.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=fed13d9b9817aac30891bd96bb88c9b0afedc4c9#fed13d9b9817aac30891bd96bb88c9b0afedc4c9"
+source = "git+https://github.com/spiceai/datafusion.git?rev=edd8861e69c2eb268d4e8e4e6c45485b714eb9ce#edd8861e69c2eb268d4e8e4e6c45485b714eb9ce"
 dependencies = [
  "arrow",
  "datafusion-common",
@@ -6718,7 +6783,7 @@ dependencies = [
 [[package]]
 name = "datafusion-physical-expr-common"
 version = "54.1.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=fed13d9b9817aac30891bd96bb88c9b0afedc4c9#fed13d9b9817aac30891bd96bb88c9b0afedc4c9"
+source = "git+https://github.com/spiceai/datafusion.git?rev=edd8861e69c2eb268d4e8e4e6c45485b714eb9ce#edd8861e69c2eb268d4e8e4e6c45485b714eb9ce"
 dependencies = [
  "arrow",
  "chrono",
@@ -6734,7 +6799,7 @@ dependencies = [
 [[package]]
 name = "datafusion-physical-optimizer"
 version = "54.1.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=fed13d9b9817aac30891bd96bb88c9b0afedc4c9#fed13d9b9817aac30891bd96bb88c9b0afedc4c9"
+source = "git+https://github.com/spiceai/datafusion.git?rev=edd8861e69c2eb268d4e8e4e6c45485b714eb9ce#edd8861e69c2eb268d4e8e4e6c45485b714eb9ce"
 dependencies = [
  "arrow",
  "datafusion-common",
@@ -6754,7 +6819,7 @@ dependencies = [
 [[package]]
 name = "datafusion-physical-plan"
 version = "54.1.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=fed13d9b9817aac30891bd96bb88c9b0afedc4c9#fed13d9b9817aac30891bd96bb88c9b0afedc4c9"
+source = "git+https://github.com/spiceai/datafusion.git?rev=edd8861e69c2eb268d4e8e4e6c45485b714eb9ce#edd8861e69c2eb268d4e8e4e6c45485b714eb9ce"
 dependencies = [
  "arrow",
  "arrow-data",
@@ -6786,7 +6851,7 @@ dependencies = [
 [[package]]
 name = "datafusion-proto"
 version = "54.1.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=fed13d9b9817aac30891bd96bb88c9b0afedc4c9#fed13d9b9817aac30891bd96bb88c9b0afedc4c9"
+source = "git+https://github.com/spiceai/datafusion.git?rev=edd8861e69c2eb268d4e8e4e6c45485b714eb9ce#edd8861e69c2eb268d4e8e4e6c45485b714eb9ce"
 dependencies = [
  "arrow",
  "chrono",
@@ -6815,7 +6880,7 @@ dependencies = [
 [[package]]
 name = "datafusion-proto-common"
 version = "54.1.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=fed13d9b9817aac30891bd96bb88c9b0afedc4c9#fed13d9b9817aac30891bd96bb88c9b0afedc4c9"
+source = "git+https://github.com/spiceai/datafusion.git?rev=edd8861e69c2eb268d4e8e4e6c45485b714eb9ce#edd8861e69c2eb268d4e8e4e6c45485b714eb9ce"
 dependencies = [
  "arrow",
  "datafusion-common",
@@ -6827,7 +6892,7 @@ dependencies = [
 [[package]]
 name = "datafusion-pruning"
 version = "54.1.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=fed13d9b9817aac30891bd96bb88c9b0afedc4c9#fed13d9b9817aac30891bd96bb88c9b0afedc4c9"
+source = "git+https://github.com/spiceai/datafusion.git?rev=edd8861e69c2eb268d4e8e4e6c45485b714eb9ce#edd8861e69c2eb268d4e8e4e6c45485b714eb9ce"
 dependencies = [
  "arrow",
  "datafusion-common",
@@ -6842,7 +6907,7 @@ dependencies = [
 [[package]]
 name = "datafusion-session"
 version = "54.1.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=fed13d9b9817aac30891bd96bb88c9b0afedc4c9#fed13d9b9817aac30891bd96bb88c9b0afedc4c9"
+source = "git+https://github.com/spiceai/datafusion.git?rev=edd8861e69c2eb268d4e8e4e6c45485b714eb9ce#edd8861e69c2eb268d4e8e4e6c45485b714eb9ce"
 dependencies = [
  "async-trait",
  "datafusion-common",
@@ -6855,7 +6920,7 @@ dependencies = [
 [[package]]
 name = "datafusion-spark"
 version = "54.1.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=fed13d9b9817aac30891bd96bb88c9b0afedc4c9#fed13d9b9817aac30891bd96bb88c9b0afedc4c9"
+source = "git+https://github.com/spiceai/datafusion.git?rev=edd8861e69c2eb268d4e8e4e6c45485b714eb9ce#edd8861e69c2eb268d4e8e4e6c45485b714eb9ce"
 dependencies = [
  "arrow",
  "bigdecimal",
@@ -6883,7 +6948,7 @@ dependencies = [
 [[package]]
 name = "datafusion-sql"
 version = "54.1.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=fed13d9b9817aac30891bd96bb88c9b0afedc4c9#fed13d9b9817aac30891bd96bb88c9b0afedc4c9"
+source = "git+https://github.com/spiceai/datafusion.git?rev=edd8861e69c2eb268d4e8e4e6c45485b714eb9ce#edd8861e69c2eb268d4e8e4e6c45485b714eb9ce"
 dependencies = [
  "arrow",
  "bigdecimal",
@@ -6901,7 +6966,7 @@ dependencies = [
 [[package]]
 name = "datafusion-substrait"
 version = "54.1.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=fed13d9b9817aac30891bd96bb88c9b0afedc4c9#fed13d9b9817aac30891bd96bb88c9b0afedc4c9"
+source = "git+https://github.com/spiceai/datafusion.git?rev=edd8861e69c2eb268d4e8e4e6c45485b714eb9ce#edd8861e69c2eb268d4e8e4e6c45485b714eb9ce"
 dependencies = [
  "async-recursion",
  "async-trait",
@@ -6920,7 +6985,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/datafusion-table-providers.git?rev=99e33a11fac58b89edca3ee522e41d777e39cabb#99e33a11fac58b89edca3ee522e41d777e39cabb"
+source = "git+https://github.com/spiceai/datafusion-table-providers.git?rev=318492b8ae79162586ada08f7672563176bb0331#318492b8ae79162586ada08f7672563176bb0331"
 dependencies = [
  "adbc_core",
  "adbc_driver_manager",
@@ -7481,15 +7546,6 @@ name = "dtor"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "404d02eeb088a82cfd873006cb713fe411306c7d182c344905e101fb1167d301"
-dependencies = [
- "dtor-proc-macro",
-]
-
-[[package]]
-name = "dtor"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f1057d6c64987086ff8ed0fd3fbf377a6b7d205cc7715868cd401705f715cbe4"
 dependencies = [
  "dtor-proc-macro",
 ]
@@ -10019,7 +10075,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.62.2",
+ "windows-core 0.61.2",
 ]
 
 [[package]]
@@ -13727,7 +13783,7 @@ version = "0.56.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "97b31d3d8e99a85d83b73ec26647f5607b80578ed9375810b6e44ffa3590a236"
 dependencies = [
- "ctor 0.6.3",
+ "ctor",
  "opendal-core",
  "opendal-layer-concurrent-limit",
  "opendal-layer-logging",
@@ -15189,8 +15245,8 @@ version = "0.14.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "343d3bd7056eda839b03204e68deff7d1b13aba7af2b2fd16890697274262ee7"
 dependencies = [
- "heck 0.4.1",
- "itertools 0.10.5",
+ "heck 0.5.0",
+ "itertools 0.12.1",
  "log",
  "multimap",
  "petgraph",
@@ -15211,7 +15267,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "27c6023962132f4b30eb4c172c91ce92d933da334c59c23cddee82358ddafb0b"
 dependencies = [
  "anyhow",
- "itertools 0.10.5",
+ "itertools 0.12.1",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
@@ -16824,6 +16880,7 @@ dependencies = [
  "dashmap",
  "data-accelerator-api",
  "data-connector-api",
+ "data-http-rate-control",
  "data_components",
  "dataformat-json",
  "datafusion",
@@ -16930,6 +16987,7 @@ dependencies = [
  "runtime-search",
  "runtime-secrets",
  "runtime-status",
+ "runtime-table",
  "runtime-table-partition",
  "runtime-tools",
  "runtime-udfs-api",
@@ -16948,6 +17006,7 @@ dependencies = [
  "snowflake-api",
  "spice-cloud",
  "spice-cloud-client",
+ "spice-table",
  "spiceai",
  "spicepod",
  "sysinfo 0.38.4",
@@ -16958,6 +17017,7 @@ dependencies = [
  "test-framework",
  "tiberius",
  "token_provider",
+ "tokenizers 0.21.4",
  "tokio",
  "tokio-postgres",
  "tokio-rusqlite",
@@ -17244,6 +17304,7 @@ dependencies = [
  "futures",
  "insta",
  "itertools 0.14.0",
+ "linkme",
  "object_store 0.13.2",
  "opentelemetry",
  "parking_lot",
@@ -17252,9 +17313,11 @@ dependencies = [
  "runtime-object-store",
  "runtime-query-engine",
  "runtime-request-context",
+ "runtime-udfs-api",
  "search",
  "serde_json",
  "snafu",
+ "spice-table",
  "tokio",
  "tokio-stream",
  "tokio-util",
@@ -17275,6 +17338,7 @@ dependencies = [
  "futures",
  "itertools 0.14.0",
  "snafu",
+ "spice-table",
  "tokio",
  "tracing",
 ]
@@ -17529,6 +17593,7 @@ dependencies = [
  "serde",
  "serde_json",
  "snafu",
+ "spice-table",
  "spicepod",
  "telemetry",
  "tokio",
@@ -17584,6 +17649,65 @@ dependencies = [
  "runtime-metrics",
  "tokio",
  "tokio-util",
+]
+
+[[package]]
+name = "runtime-table"
+version = "2.2.0-unstable"
+dependencies = [
+ "arrow",
+ "arrow-schema",
+ "arrow_tools",
+ "async-stream",
+ "async-trait",
+ "cache",
+ "cayenne",
+ "chrono",
+ "data-accelerator-api",
+ "data-connector-api",
+ "data_components",
+ "datafusion",
+ "datafusion-datasource",
+ "datafusion-expr",
+ "datafusion-federation",
+ "datafusion-functions-json",
+ "datafusion-optimizer-rules",
+ "datafusion-table-providers",
+ "fundu",
+ "futures",
+ "insta",
+ "opentelemetry",
+ "opentelemetry-prometheus",
+ "opentelemetry_sdk",
+ "parking_lot",
+ "prometheus",
+ "rand 0.10.1",
+ "runtime-acceleration",
+ "runtime-async",
+ "runtime-component",
+ "runtime-datafusion",
+ "runtime-datafusion-index",
+ "runtime-metrics",
+ "runtime-object-store",
+ "runtime-request-context",
+ "runtime-resources",
+ "runtime-search",
+ "runtime-status",
+ "runtime-table-partition",
+ "runtime-udfs-api",
+ "search",
+ "serde",
+ "snafu",
+ "spice-table",
+ "spicepod",
+ "telemetry",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "tracing",
+ "twox-hash",
+ "util",
+ "utoipa",
 ]
 
 [[package]]
@@ -18331,6 +18455,7 @@ dependencies = [
  "serde",
  "serde_json",
  "snafu",
+ "spice-table",
  "tantivy",
  "tempfile",
  "tokio",
@@ -19042,7 +19167,7 @@ version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c1c97747dbf44bb1ca44a561ece23508e99cb592e862f22222dcf42f51d1e451"
 dependencies = [
- "heck 0.4.1",
+ "heck 0.5.0",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
@@ -19213,6 +19338,7 @@ dependencies = [
  "fundu",
  "futures",
  "gethostname",
+ "http 1.4.1",
  "humantime",
  "insta",
  "keyring",
@@ -19274,7 +19400,19 @@ dependencies = [
  "serde",
  "serde_json",
  "snafu",
+ "tokio",
  "url",
+]
+
+[[package]]
+name = "spice-table"
+version = "2.2.0-unstable"
+dependencies = [
+ "async-trait",
+ "datafusion",
+ "datafusion-federation",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -19352,6 +19490,7 @@ dependencies = [
  "connector-spiceai",
  "cpu-budget",
  "crash-handler",
+ "datafusion",
  "event_stream",
  "futures",
  "libc",
@@ -19372,6 +19511,7 @@ dependencies = [
  "runtime-cloud-connect",
  "runtime-datafusion",
  "runtime-query-engine",
+ "runtime-request-context",
  "rustls",
  "serde_json",
  "snafu",
@@ -20546,6 +20686,7 @@ dependencies = [
  "insta",
  "itertools 0.14.0",
  "parking_lot",
+ "parquet",
  "rand 0.10.1",
  "reqwest 0.13.4",
  "serde",
@@ -22349,6 +22490,7 @@ dependencies = [
  "ctrlc",
  "datafusion",
  "futures",
+ "globset",
  "http-body 1.0.1",
  "humantime",
  "parking_lot",
@@ -22727,6 +22869,10 @@ dependencies = [
  "moka",
  "object_store 0.13.2",
  "opentelemetry",
+ "opentelemetry-prometheus",
+ "opentelemetry_sdk",
+ "parking_lot",
+ "prometheus",
  "rstest 0.26.1",
  "tempfile",
  "tokio",

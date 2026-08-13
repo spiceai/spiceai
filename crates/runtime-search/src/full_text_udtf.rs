@@ -657,7 +657,7 @@ mod tests {
     use datafusion::prelude::Expr;
     use datafusion::scalar::ScalarValue;
     use datafusion::sql::TableReference;
-    use runtime_datafusion_index::Index;
+    use spice_table::Index;
     use std::collections::BTreeMap;
     use std::sync::Arc;
 

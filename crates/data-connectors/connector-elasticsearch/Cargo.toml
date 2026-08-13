@@ -30,6 +30,7 @@ elasticsearch = { path = "../../elasticsearch" }
 linkme.workspace = true
 paste.workspace = true
 runtime = { path = "../../runtime" }
+runtime-parameters = { path = "../../runtime-parameters" }
 secrecy.workspace = true
 snafu.workspace = true
 tracing.workspace = true

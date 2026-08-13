@@ -14,11 +14,17 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::time::Duration;
+
 use async_trait::async_trait;
 use bb8::{ErrorSink, Pool};
 use snafu::ResultExt;
-use tiberius::{Client, Config, error::Error as TiberiusError};
+use tiberius::{
+    Client, Config,
+    error::{Error as TiberiusError, IoErrorKind},
+};
 use tokio::net::TcpStream;
+use tokio::time::{Instant, timeout_at};
 
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
 
@@ -35,6 +41,22 @@ pub type SqlServerConnectionPool = Pool<SqlServerConnectionManager>;
 /// well-formed routing list needs, and bounding the chain keeps a list that routes
 /// back to the listener from redirecting for as long as the pool will wait.
 const MAX_ROUTING_REDIRECTS: usize = 3;
+
+/// How long one `connect` may take, whatever the peer does.
+///
+/// `bb8` consults its own `connection_timeout` only after
+/// [`bb8::ManageConnection::connect`] returns, so an attempt that never returns is
+/// never abandoned: the pending pool slot stays taken, later `Pool::get` calls are
+/// suppressed even once the server recovers, and timing out `Pool::get` does not
+/// cancel the replenishment task that is stuck. A peer that completes the TCP
+/// handshake and then stops answering is enough to reach that state — the OS-level
+/// connect timeout no longer applies once the connection has been accepted.
+///
+/// The bound covers the whole sequence — DNS, TCP, TLS, login, and every routing
+/// redirect — so a redirect chain cannot multiply it, and it sits inside `bb8`'s 30s
+/// default `connection_timeout` so an attempt fails within the window the pool is
+/// already willing to wait.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// How much of a server-supplied diagnostic to keep when reporting it.
 ///
@@ -69,14 +91,42 @@ fn as_one_line(text: &str) -> String {
     reported
 }
 
+/// Reports a connection attempt abandoned because it passed its deadline.
+///
+/// [`IoErrorKind::TimedOut`] rather than a protocol error: nothing about the exchange
+/// was malformed, the peer simply never finished it. The address is named because a
+/// routing redirect means the attempt that stalled need not be the one the dataset
+/// configured, and it is bounded because that address can be server-supplied.
+///
+/// `bound` is the deadline for the attempt as a whole, not a budget the named address
+/// received on its own: one deadline is shared by every dial in a routing chain, so a
+/// redirected replica can expire it having been given only what earlier dials left. The
+/// report says so, because naming an address next to a duration it never had would
+/// implicate a replica that was answering as fast as it was allowed to.
+fn stalled(addr: &str, bound: Duration) -> TiberiusError {
+    TiberiusError::Io {
+        kind: IoErrorKind::TimedOut,
+        message: format!(
+            "connecting to SQL Server did not complete within {}s, so the attempt was abandoned rather than left holding a connection pool slot. That deadline covers the attempt as a whole, including any routing redirects, and it expired while dialling {}. A peer that accepts the connection and then stops answering the TDS login reaches this; check that the address is a reachable SQL Server instance. For details, visit: https://spiceai.org/docs/components/data-connectors/mssql",
+            bound.as_secs(),
+            as_one_line(addr)
+        ),
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct SqlServerConnectionManager {
     config: Config,
+    /// The wall-clock bound on one connection attempt; [`CONNECT_TIMEOUT`] in production.
+    connect_timeout: Duration,
 }
 
 impl SqlServerConnectionManager {
     fn new(config: Config) -> SqlServerConnectionManager {
-        Self { config }
+        Self {
+            config,
+            connect_timeout: CONNECT_TIMEOUT,
+        }
     }
 
     pub async fn create(config: Config) -> super::Result<SqlServerConnectionPool> {
@@ -95,16 +145,24 @@ impl SqlServerConnectionManager {
     /// Each redirect re-dials a *clone* of the configured settings with only the host
     /// and port replaced, so the credentials, database, encryption and application name
     /// the routed replica needs are the ones the dataset supplied.
+    ///
+    /// The deadline is taken once and shared by every attempt, so following a chain of
+    /// redirects costs the caller no more wall-clock time than dialling one address
+    /// that never answers.
     async fn connect_with<C, F, Fut>(&self, connect: F) -> Result<C, TiberiusError>
     where
         F: Fn(Config) -> Fut,
         Fut: Future<Output = Result<C, TiberiusError>>,
     {
+        let deadline = Instant::now() + self.connect_timeout;
         let mut config = self.config.clone();
         let mut redirects = 0;
         loop {
-            match connect(config.clone()).await {
-                Err(TiberiusError::Routing { host, port }) => {
+            match timeout_at(deadline, connect(config.clone())).await {
+                // `config` still names the address this attempt was dialled at: only the
+                // routing arm below rewrites it, and only after an attempt has returned.
+                Err(_elapsed) => return Err(stalled(&config.get_addr(), self.connect_timeout)),
+                Ok(Err(TiberiusError::Routing { host, port })) => {
                     if redirects == MAX_ROUTING_REDIRECTS {
                         return Err(TiberiusError::Protocol(
                             format!(
@@ -122,8 +180,18 @@ impl SqlServerConnectionManager {
                     config.host(host);
                     config.port(port);
                 }
-                result => return result,
+                Ok(result) => return result,
             }
+        }
+    }
+
+    /// Builds a manager whose attempts are bounded by `connect_timeout` rather than by
+    /// [`CONNECT_TIMEOUT`], so a test can drive the deadline on the real clock.
+    #[cfg(test)]
+    fn with_connect_timeout(config: Config, connect_timeout: Duration) -> Self {
+        Self {
+            config,
+            connect_timeout,
         }
     }
 }
@@ -187,16 +255,22 @@ impl bb8::ManageConnection for SqlServerConnectionManager {
 mod tests {
     use std::{
         collections::VecDeque,
-        future::{Ready, ready},
+        future::{Ready, pending, ready},
         io::Write,
         sync::Arc,
+        time::Duration,
     };
 
+    use bb8::ManageConnection;
     use parking_lot::Mutex;
+    use tokio::{
+        net::TcpListener,
+        time::{Instant, sleep},
+    };
 
     use super::{
-        Config, ErrorSink, LogConnectionErrors, MAX_REPORTED_CHARS, MAX_ROUTING_REDIRECTS,
-        SqlServerConnectionManager, TiberiusError,
+        CONNECT_TIMEOUT, Config, ErrorSink, IoErrorKind, LogConnectionErrors, MAX_REPORTED_CHARS,
+        MAX_ROUTING_REDIRECTS, SqlServerConnectionManager, TiberiusError,
     };
 
     const LISTENER: &str = "ag-listener";
@@ -325,6 +399,105 @@ mod tests {
         assert!(
             dialled <= 8,
             "a routing chain must terminate within a few dials, not {dialled}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_connect_that_is_never_answered_ends_at_its_deadline() {
+        let started = Instant::now();
+
+        let Err(error) = SqlServerConnectionManager::new(listener_config())
+            .connect_with(|_config| pending::<Result<String, TiberiusError>>())
+            .await
+        else {
+            panic!("expected a peer that never answers to fail");
+        };
+
+        let TiberiusError::Io { kind, message } = &error else {
+            panic!("expected the abandoned attempt to be reported as an I/O timeout, got {error}");
+        };
+        assert_eq!(*kind, IoErrorKind::TimedOut);
+        assert!(
+            message.contains("ag-listener:1433"),
+            "the report should name the address that stalled: {message}"
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= CONNECT_TIMEOUT && elapsed < 2 * CONNECT_TIMEOUT,
+            "the attempt should end at its deadline, not after {elapsed:?}"
+        );
+    }
+
+    /// Every replica in the chain stalls for most of the bound before redirecting again.
+    /// A deadline taken per attempt rather than once would let a routing list multiply
+    /// the wait by `MAX_ROUTING_REDIRECTS + 1`, which is the whole window the pool has.
+    #[tokio::test(start_paused = true)]
+    async fn a_chain_of_stalling_redirects_shares_one_deadline() {
+        let stall = CONNECT_TIMEOUT * 2 / 3;
+        let started = Instant::now();
+
+        let Err(error) = SqlServerConnectionManager::new(listener_config())
+            .connect_with(|_config| async move {
+                sleep(stall).await;
+                Err::<String, _>(routing_to("read-replica", 1444))
+            })
+            .await
+        else {
+            panic!("expected a chain of stalling replicas to fail");
+        };
+
+        let TiberiusError::Io { kind, message } = &error else {
+            panic!("expected the abandoned attempt to be reported as an I/O timeout, got {error}");
+        };
+        assert_eq!(*kind, IoErrorKind::TimedOut);
+        assert!(
+            message.contains("read-replica:1444"),
+            "the report should name the redirected address that stalled: {message}"
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed <= CONNECT_TIMEOUT,
+            "following a redirect must not extend the bound: {elapsed:?}"
+        );
+    }
+
+    /// Drives the manager's own `connect` — DNS, TCP, and the TDS login — against a peer
+    /// that completes the TCP handshake and then answers nothing. The OS-level connect
+    /// timeout never applies to that shape, because the connection was accepted.
+    #[tokio::test]
+    async fn a_peer_that_accepts_tcp_and_then_stalls_fails_within_the_bound() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a loopback listener");
+        let addr = listener.local_addr().expect("the bound address");
+        let peer = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("the client to connect");
+            // Hold the accepted socket open without answering the pre-login: a peer that
+            // closed it would fail the attempt on its own, before any deadline.
+            sleep(Duration::from_mins(1)).await;
+            drop(stream);
+        });
+
+        let mut config = Config::new();
+        config.host(addr.ip().to_string());
+        config.port(addr.port());
+        let manager =
+            SqlServerConnectionManager::with_connect_timeout(config, Duration::from_millis(500));
+        let started = Instant::now();
+
+        let Err(error) = manager.connect().await else {
+            panic!("expected a peer that never answers the login to fail");
+        };
+        peer.abort();
+
+        let TiberiusError::Io { kind, .. } = &error else {
+            panic!("expected the stalled login to be reported as an I/O timeout, got {error}");
+        };
+        assert_eq!(*kind, IoErrorKind::TimedOut);
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "the attempt should end at its own bound, not the peer's: {elapsed:?}"
         );
     }
 

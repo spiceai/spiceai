@@ -34,6 +34,7 @@ aws-smithy-async.workspace = true
 aws-smithy-types.workspace = true
 base64.workspace = true
 chrono.workspace = true
+data-connector-api = { path = "../../data-connector-api" }
 data_components = { path = "../../data_components", features = ["federation"] }
 datafusion.workspace = true
 dynamodb-streams = { path = "../../dynamodb-streams" }

@@ -19,7 +19,7 @@ use super::ConnectorComponent;
 use super::ParameterSpec;
 use super::Parameters;
 use crate::Runtime;
-use crate::component::catalog::Catalog;
+use crate::component::catalog::{Catalog, table_selector};
 use crate::dataconnector::parameters::ConnectorParams;
 use async_trait::async_trait;
 use data_components::Read;
@@ -211,7 +211,7 @@ impl CatalogConnector for UnityCatalog {
             client,
             catalog_id,
             table_creator,
-            catalog.include.clone(),
+            table_selector(catalog),
         )
         .await
         {

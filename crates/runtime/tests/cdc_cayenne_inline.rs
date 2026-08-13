@@ -25,6 +25,7 @@ limitations under the License.
 //! Cayenne metastore (i.e. the data-inlining path was hit, not the file path).
 
 #![cfg(not(windows))]
+#![recursion_limit = "256"]
 #![allow(clippy::expect_used)]
 
 use std::sync::Arc;
@@ -46,9 +47,9 @@ use datafusion::prelude::SessionContext;
 use datafusion::sql::TableReference;
 use futures::StreamExt;
 use futures::stream as fstream;
-use runtime::accelerated_table::refresh::Refresh;
-use runtime::accelerated_table::refresh_task::RefreshTaskBuilder;
-use runtime::federated_table::FederatedTable;
+use runtime::accelerated::refresh::Refresh;
+use runtime::accelerated::refresh_task::RefreshTaskBuilder;
+use runtime::federated::FederatedTable;
 use runtime::status::RuntimeStatus;
 use tempfile::TempDir;
 use tokio::runtime::Handle;
@@ -178,7 +179,7 @@ async fn setup_cayenne(
 fn make_refresh_task(
     accelerator: Arc<dyn TableProvider>,
     table_name: &str,
-) -> runtime::accelerated_table::refresh_task::RefreshTask {
+) -> runtime::accelerated::refresh_task::RefreshTask {
     let federated = Arc::new(FederatedTable::new_unchecked(Arc::clone(&accelerator)));
     RefreshTaskBuilder::new(
         RuntimeStatus::new(),

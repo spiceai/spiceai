@@ -125,6 +125,22 @@ runtime = "runtime"
 # interface crates a connector needs (data-connector-api) name a component's
 # configuration without pulling in the orchestrator.
 runtime-component = "shared-utility"
+# Connector HTTP rate control carved out of the `runtime` crate body: the
+# per-dataset parameters, the process-wide per-origin registry, and its metrics.
+# `shared-utility`, NOT `extension-utility`, even though it is a connector-facing
+# building block: `runtime`'s own in-body https connector uses it, and
+# extension-utility may not be depended on by `runtime`. It becomes eligible to
+# move up once that connector is evacuated (see docs/dev/crate_layering.md).
+data-http-rate-control = "shared-utility"
+# The table-provider layers carved out of the `runtime` crate body: the
+# `AcceleratedTable` machinery (refresh/retention/CDC-apply/caching) and the
+# `FederatedTable` it wraps. An *implementation* sibling of `runtime`, not a
+# contract, so it stays in the `runtime` tier rather than shared-utility — that is
+# what keeps extensions from building on it (see the extension -> runtime-impl
+# rule in docs/dev/crate_layering.md). It reaches `runtime` types only through
+# the narrow `RefreshSource` trait it defines itself, so nothing pulls the
+# orchestrator back in.
+runtime-table = "runtime"
 # Extensions that sit above the runtime crate (depend on `runtime`).
 spice-cloud = "extension"
 tpc-extension = "extension"
@@ -181,6 +197,7 @@ runtime-async = "foundation"
 runtime-checkpoint-api = "foundation"
 runtime-cloud-connect = "foundation"
 runtime-datafusion-index = "foundation"
+spice-table = "foundation"
 runtime-metrics = "foundation"
 runtime-object-store = "foundation"
 runtime-parameter-spec = "foundation"

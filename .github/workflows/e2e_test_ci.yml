@@ -61,6 +61,11 @@ jobs:
   check_changes:
     if: ${{ github.event_name != 'pull_request' }}
     runs-on: spiceai-dev-runners
+    # Every job here is bounded, because on a `merge_group` run an unbounded one does not
+    # just waste a job: the queue candidate stays `AWAITING_CHECKS` for GitHub's 6-hour
+    # default and every entry behind it waits (#12717). A full-history checkout is the
+    # slow part of this one.
+    timeout-minutes: 10
     outputs:
       relevant_changes: ${{ steps.check.outputs.relevant_changes == 'true' || github.event_name == 'workflow_dispatch' }}
     steps:
@@ -76,6 +81,9 @@ jobs:
     name: Setup strategy matrix
     if: ${{ github.event_name != 'pull_request' }}
     runs-on: spiceai-dev-runners
+    # One `github-script` step returning a literal, so anything past a minute is a stuck
+    # runner rather than slow work.
+    timeout-minutes: 5
     outputs:
       matrix: ${{ steps.setup-matrix.outputs.result }}
 
@@ -109,6 +117,11 @@ jobs:
     runs-on: ${{ matrix.target.builder }}
     needs: [setup-matrix, check_changes]
     if: ${{ needs.check_changes.outputs.relevant_changes == 'true' }}
+    # A backstop above the longest step bound below, leaving room for the artifact upload
+    # and the post steps. The compile steps carry their own tighter bounds so that a
+    # wedged one is cut while the `always()` diagnostics after it can still run — a hung
+    # compile is exactly when the sccache stats are worth having.
+    timeout-minutes: 200
     env:
       HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
 
@@ -136,7 +149,7 @@ jobs:
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
 
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           save-if: ${{ github.ref == 'refs/heads/trunk' }}
 
@@ -154,7 +167,7 @@ jobs:
       - name: Set up spiceio
         if: matrix.target.builder == 'spiceai-macos' && env.HAS_SPICEIO_SECRET == 'true'
         id: setup-spiceio
-        uses: spiceai/spiceio/.github/actions/setup@97c3578dcf337786923da33cecd350e7335386b6 # v0.7.0
+        uses: spiceai/spiceio/.github/actions/setup@2ad4a874ff4813f8190117bc645af0dbb90b708c # v0.8.0
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
           smb-pass: ${{ secrets.UNAS_SMB_PASS }}
@@ -165,6 +178,11 @@ jobs:
 
       - name: Build spiced and spice CLI
         if: matrix.target.target_os != 'darwin'
+        # 65 minutes is the slowest this leg has taken across the last ten successful
+        # `merge_group` runs (44-65), so this is that worst case with room to spare. The
+        # spread is wide on a contended pool, and a bound tight enough to fail a
+        # legitimate build would be worse than the slow build it replaced.
+        timeout-minutes: 90
         uses: ./.github/actions/build-spiced
         with:
           features: 'tpc-extension,models,postgres-accel'
@@ -174,6 +192,12 @@ jobs:
 
       - name: Build spiced and spice CLI (macOS)
         if: matrix.target.target_os == 'darwin'
+        # This is the step that wedged for over 4.5 hours and held four queue candidates
+        # behind it (#12717). 138 minutes is its slowest successful `merge_group` run of
+        # the last ten (74-138); the self-hosted macOS pool puts several runner instances
+        # on one host, which is where that factor-of-two spread comes from, so the bound
+        # sits well clear of it rather than close to the median.
+        timeout-minutes: 180
         uses: ./.github/actions/build-spiced
         with:
           features: 'tpc-extension,models,postgres-accel,metal'
@@ -207,6 +231,7 @@ jobs:
     name: Setup model strategy matrix
     if: ${{ github.event_name != 'pull_request' }}
     runs-on: ubuntu-24.04
+    timeout-minutes: 5
     outputs:
       matrix: ${{ steps.setup-matrix.outputs.result }}
     steps:
@@ -2372,6 +2397,10 @@ jobs:
     name: E2E Test CI
     runs-on: ubuntu-latest
     if: ${{ !cancelled() }}
+    # The gate only reads the results it already has. Bounding it matters because it is
+    # the required check: a stuck gate blocks the queue even when every job it summarises
+    # has finished.
+    timeout-minutes: 5
     needs:
       - check_changes
       - setup-matrix

@@ -23,6 +23,7 @@ use data_components::cdc::{
     ChangeEnvelope, ChangesStream, CommitChange, CommitError, NoOpCommitter, StreamError,
     build_ready_signal_envelope, wrap_data_as_change_batch,
 };
+use data_connector_api::schema_projection::{ProjectionPolicy, parse_schema_projection};
 use datafusion::{
     arrow::datatypes::SchemaRef, datasource::TableProvider,
     physical_plan::SendableRecordBatchStream, prelude::SessionContext,
@@ -44,10 +45,9 @@ use runtime::{
         OpenOption,
         mongodb::{MongoCheckpointMetadata, MongoSys},
     },
-    dataconnector::schema_projection::{ProjectionPolicy, parse_schema_projection},
-    federated_table::FederatedTable,
-    parameters::{ExposedParamLookup, Parameters},
+    federated::FederatedTable,
 };
+use runtime_parameters::{ExposedParamLookup, Parameters};
 use std::{sync::Arc, time::Duration};
 use tokio_stream::StreamExt as TokioStreamExt;
 
@@ -215,7 +215,7 @@ pub fn build_changes_stream(
                 )))?;
             let ready = build_ready_signal_envelope(&schema)
                 .map_err(|error| StreamError::Arrow(error.to_string()))?;
-            let (_, batch, is_ready) = ready.into_parts()
+            let (_, batch, is_ready, _) = ready.into_parts()
                 .map_err(|error| StreamError::Arrow(error.to_string()))?;
             let committer: Box<dyn CommitChange + Send + Sync> = match mongo_sys.as_ref() {
                 Some(sys) => Box::new(MongoResumeTokenCommitter::new(
@@ -226,7 +226,9 @@ pub fn build_changes_stream(
                 )),
                 None => Box::new(NoOpCommitter),
             };
-            yield ChangeEnvelope::from_parts(committer, batch, is_ready);
+            // Not a history-unavailable signal: this is the readiness envelope
+            // re-wrapped with the resume-token committer.
+            yield ChangeEnvelope::from_parts(committer, batch, is_ready, false);
 
             tracing::info!(
                 dataset = %dataset.name,

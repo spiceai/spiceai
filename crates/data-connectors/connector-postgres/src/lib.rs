@@ -42,9 +42,9 @@ use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult, NewDataConnectorResult,
 };
-use runtime::datafusion::udf::deny_spice_functions_for_postgres_table_providers;
-use runtime::parameters::ParameterSpec;
+use runtime_datafusion::function_support::deny_spice_functions_for_postgres_table_providers;
 use runtime_metrics::component::MetricsProvider;
+use runtime_parameters::{ParameterSpec, Parameters};
 use secrecy::SecretBox;
 use snafu::prelude::*;
 use std::any::Any;
@@ -66,7 +66,7 @@ pub enum Error {
 pub struct Postgres {
     factory: PostgresTableFactory,
     pool: Arc<PostgresConnectionPool>,
-    params: runtime::parameters::Parameters,
+    params: Parameters,
     replication_metrics:
         std::sync::Arc<data_components::postgres_replication::ReplicationMetricsCollector>,
 }
@@ -1078,7 +1078,7 @@ impl DataConnector for Postgres {
 
     fn changes_stream(
         &self,
-        federated_table: Arc<runtime::federated_table::FederatedTable>,
+        federated_table: Arc<runtime::federated::FederatedTable>,
         dataset: &Dataset,
     ) -> Option<data_components::cdc::ChangesStream> {
         Some(replication::build_changes_stream(

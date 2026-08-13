@@ -271,13 +271,35 @@ The Actions workflow:
 The checks run under a 353-minute budget, inside a 358-minute job budget, so a
 run that overruns fails as a failed step rather than being terminated at the
 runner pool's ~360-minute wall (which reports as `cancelled`, with no failed
-step and no chance to clean up). A run that ends without a verdict — budget
-expired, evicted by a re-dispatch, cancelled — replaces its own `pending` status
-with a failure; otherwise `scripts/signoff status` and `scripts/signoff mine`
-would keep showing a sign-off in progress for a run that is long gone.
-Re-dispatch against the same HEAD to try again.
+step and no chance to clean up). A run that ends without a verdict leaves the
+commit at `pending` either way, and never at a failure. Where the two endings
+differ is only which status the handler finds:
 
-That replacement is the workflow's job, not the dying script's. Being signalled is
+| Ending | Handler | Effect |
+| --- | --- | --- |
+| Budget expired, runner died | `Resolve an incomplete sign-off` → `clear-pending` | Restates the `pending`, replacing the "in progress" wording with why the run ended |
+| Externally cancelled, evicted by a re-dispatch | `Correct the sign-off status…` → `correct-cancelled` | Repairs a `failure`/`error` into `pending`; leaves an already-`pending` status as it is |
+
+Either way, re-dispatch against the same HEAD to try again.
+
+The state stays `pending` because nothing judged the diff. `failure` is the one
+state that reads as a code failure: `pr.yml` rejects it, **Attestation** rejects it
+on the head commit ([#12362](https://github.com/spiceai/spiceai/issues/12362)), and
+a red `signoff` never self-clears, so the commit stays disqualified until someone
+re-dispatches by hand ([#12741](https://github.com/spiceai/spiceai/issues/12741)).
+
+`pr.yml` does not reject a `pending` — it is not a verdict — so Attestation decides
+on its own terms rather than being forced red by a dead run. For an ordinary head
+that means red, because HEAD really is not signed off, pointing at re-running
+sign-off instead of at a defect in the diff. A head that `pr.yml` already clears —
+a fast-tracked one, or one whose inheritance chain of verified base merges reaches
+a `success` — stays green, which is the same latitude a cancelled run has always had.
+
+A dormant `pending` is still distinguishable from a live one: `scripts/signoff
+status` reports any non-success as not signed off, and `scripts/signoff mine` takes
+its ⟳ from the in-flight run list, not from the status.
+
+That restatement is the workflow's job, not the dying script's. Being signalled is
 how a run learns its budget expired: `run_checks` returns `make`'s status and bash
 reports a killed child as 128+N, so the script classifies that as reaching **no
 verdict** and publishes nothing at all, saying why in its step summary. Treating it
@@ -289,6 +311,18 @@ what leaves the `pending` for `Resolve an incomplete sign-off` to describe hones
 and leaves an existing success alone. The correction handlers cannot cover this case
 after the fact: both are gated on `cancelled()`, and a budget expiry is a *failed*
 step by the design above.
+
+A status of 128+N is how that reads only when `make` dies *of* the signal. A
+cancellation signals the whole process group, and a recipe line that handles it
+can return an ordinary small status instead — indistinguishable, by status alone,
+from a recipe that genuinely failed, which is how a cancelled run came to publish
+"Sign-off checks failed" about a branch nothing judged
+([#12710](https://github.com/spiceai/spiceai/issues/12710)). So a remote run also
+traps `INT`/`TERM`/`HUP` for the duration of the checks and records that it was
+signalled; classification reads the recorded signal *or* the 128+N status, and
+either one means no verdict. The trap is armed on remote runs only, and only once
+there is a `pending` on the commit to explain — a local `make signoff` keeps the
+Ctrl-C that stops it.
 
 Only one sign-off runs per commit. Both dispatch forms — `-f branch=<branch>` and
 `-f pr_number=<N>` — resolve to the same commit before the sign-off job starts,
@@ -332,20 +366,37 @@ SSH key access to the host and `gh` auth on that machine.
 
 `signoff.yml` sets `concurrency: signoff-<pr|branch>` with `cancel-in-progress`, so
 re-dispatching sign-off for a branch cancels the run before it. A cancelled job is
-killed by signal, which makes the in-flight `run_checks` return non-zero — and the
-dying script posts `signoff=failure`, "Sign-off checks failed after Ns", about a
-branch nothing actually judged.
+killed by signal, and a run that was signalled judged nothing — so it must publish
+no verdict at all, in either direction: not the `failure` that says the branch's
+checks failed, and not the `success` that would clear a branch whose checks were
+cut short.
 
-So the workflow corrects the record on its way out. When the job ends cancelled it
-runs:
+**The run declines the verdict itself.** That is the first and load-bearing layer:
+the script traps `INT`/`TERM`/`HUP` for the duration of the checks, and a recorded
+signal — or a 128+N status from a `make` that died of one — classifies the run as
+`signalled`, which publishes no status and leaves the `pending` it posted on its
+way in. Deciding in-process is what makes the decision reliable, because the script
+is the one party that observes the signal unambiguously: by exit status alone, a
+`make` that trapped the cancellation and returned a small status is
+indistinguishable from a recipe that genuinely failed, and reading it as one is how
+a cancelled run published "Sign-off checks failed" about a branch nothing judged
+([#12710](https://github.com/spiceai/spiceai/issues/12710)).
+
+**The correction step is the backstop.** A run cannot always decline for itself: a
+`SIGKILL` runs no handler, and the script can be killed in the window between
+`run_checks` returning and the decline being reached — as can an older run, or a
+racing one in the other concurrency group. So when the job ends cancelled the
+workflow still runs:
 
 ```bash
 scripts/signoff correct-cancelled [<sha>] [<owner/repo>]
 ```
 
-which rewrites the status to `pending` — not `success`, because HEAD really is not
-signed off, and not `error`, because `pending` is the state Attestation already
-describes as "re-dispatch sign-off" rather than as a defect in the diff.
+which rewrites a `failure`/`error` left by any of those to `pending` — not
+`success`, because HEAD really is not signed off, and not `error`, because
+`pending` is the state Attestation already describes as "re-dispatch sign-off"
+rather than as a defect in the diff. On a run that declined for itself there is
+nothing to rewrite, and the step says so and exits.
 
 **It rewrites only `failure` and `error`.** A cancelled run can find a legitimate
 `success` on the commit two ways, and overwriting either would throw away checks
@@ -357,6 +408,19 @@ that passed and cost another 1-4 hour run:
   dispatch *input*, so `-f branch=my-branch` and `-f pr_number=123` for that same
   branch are different groups: they do not cancel each other, and either can be
   cancelled after the other has succeeded.
+
+**It reads until the commit stops changing.** The `if: cancelled()` step starts
+when the `Sign off` step is *marked* cancelled, which is before that step's
+process has finished writing: on one run the handler read `pending`, correctly
+declined, and the `failure` it existed to withdraw was posted four seconds later,
+leaving nothing that could take it back
+([#12710](https://github.com/spiceai/spiceai/issues/12710)). So a `pending` — the
+state a run posts on its way in, and so the one a late verdict overwrites — is
+re-read for ~15s before the commit is treated as settled. The other states return
+at once: a `failure`/`error` is already the verdict being withdrawn, a `success`
+is settled and must not be second-guessed, and an unset context means no run got
+as far as posting anything. Waiting is not licence to write — a `success` that
+appears late is still left alone.
 
 A read failure is likewise not treated as "no status" — that would license the
 overwrite the guard exists to prevent. Every path exits 0, so the correction can

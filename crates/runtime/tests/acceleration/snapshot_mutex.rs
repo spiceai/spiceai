@@ -29,10 +29,10 @@ use data_components::arrow::write::MemTable;
 use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
 use runtime::Runtime;
-use runtime::accelerated_table::refresh::{AccelerationRefreshMode, Refresh, Refresher};
-use runtime::accelerated_table::{SnapshotCreateTrigger, SnapshotCreationConfig};
+use runtime::accelerated::refresh::{AccelerationRefreshMode, Refresh, Refresher};
+use runtime::accelerated::{SnapshotCreateTrigger, SnapshotCreationConfig};
 use runtime::component::dataset::acceleration::RefreshMode;
-use runtime::federated_table::FederatedTable;
+use runtime::federated::FederatedTable;
 use runtime::status;
 use runtime_acceleration::dataset_checkpoint::DatasetCheckpointer;
 use runtime_acceleration::snapshot::{
