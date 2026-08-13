@@ -107,10 +107,13 @@ impl TableSelector {
     /// is absent, so a caller can drop it into a sentence.
     #[must_use]
     pub fn describe(&self) -> String {
+        // Escaped, not interpolated raw: a pattern is user-supplied text that
+        // may legally contain a newline or a control character, and every log
+        // line this lands in has to stay one line.
         let quoted = |patterns: &[String]| {
             patterns
                 .iter()
-                .map(|p| format!("'{p}'"))
+                .map(|p| format!("'{}'", p.escape_debug()))
                 .collect::<Vec<_>>()
                 .join(", ")
         };

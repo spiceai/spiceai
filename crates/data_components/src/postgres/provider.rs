@@ -256,6 +256,7 @@ impl PostgresCatalogProvider {
         }
 
         let table_count: usize = schemas.values().map(|schema| schema.table_count()).sum();
+        let selected_count: usize = schemas.values().map(|schema| schema.selected_count()).sum();
         let schemas_registered = schemas.len();
 
         {
@@ -278,6 +279,7 @@ impl PostgresCatalogProvider {
             &self.catalog_name,
             previous_count,
             table_count,
+            selected_count,
             schemas_registered,
             &self.selector,
         ) {
@@ -468,6 +470,11 @@ pub struct PostgresSchemaProvider {
     table_creator: Arc<dyn Read>,
     tables: RwLock<HashMap<String, Arc<dyn TableProvider>>>,
     selector: TableSelector,
+    /// Relations the last refresh selected, which is not the same as the number
+    /// it registered: a selected table whose provider cannot be built is logged
+    /// and skipped. Keeping both apart is what lets an empty catalog say
+    /// whether the patterns matched nothing or the matches failed to load.
+    selected_count: RwLock<usize>,
 }
 
 impl std::fmt::Debug for PostgresSchemaProvider {
@@ -492,7 +499,17 @@ impl PostgresSchemaProvider {
             table_creator,
             tables: RwLock::new(HashMap::new()),
             selector,
+            selected_count: RwLock::new(0),
         }
+    }
+
+    /// How many relations this schema's last refresh selected.
+    fn selected_count(&self) -> usize {
+        let guard = match self.selected_count.read() {
+            Ok(guard) => guard,
+            Err(e) => e.into_inner(),
+        };
+        *guard
     }
 
     /// How many tables this schema registered. Counts without cloning every
@@ -513,6 +530,13 @@ impl PostgresSchemaProvider {
         let table_names = self.list_tables().await?;
 
         let selected = select_relations(&self.selector, &self.schema_name, &table_names);
+        {
+            let mut guard = match self.selected_count.write() {
+                Ok(guard) => guard,
+                Err(e) => e.into_inner(),
+            };
+            *guard = selected.len();
+        }
 
         // Advisory: an entry lets a table skip its own schema query, and its
         // absence means that table resolves individually. A failure here is
@@ -647,10 +671,17 @@ fn foreign_key_target(catalog: &str, schema: &str, table: &str) -> String {
 ///
 /// Reported on the transition to empty rather than on every refresh: a repeated
 /// warning for a steady misconfiguration is how a log stops being read.
+///
+/// `selected_count` is deliberately separate from `current_count`: a selected
+/// table whose provider cannot be built is logged and skipped, so a catalog can
+/// register nothing while the patterns matched perfectly well. Blaming the
+/// patterns there would contradict the failure logged moments earlier and send
+/// the user to fix configuration that is already correct.
 fn empty_catalog_warning(
     catalog_name: &str,
     previous_count: Option<usize>,
     current_count: usize,
+    selected_count: usize,
     schemas_registered: usize,
     selector: &TableSelector,
 ) -> Option<String> {
@@ -659,7 +690,11 @@ fn empty_catalog_warning(
     }
 
     let patterns = selector.describe();
-    let cause = if patterns.is_empty() {
+    let cause = if selected_count > 0 {
+        format!(
+            "{selected_count} table(s) matched, but none could be registered -- the errors logged above this name the tables that failed and why"
+        )
+    } else if patterns.is_empty() {
         format!(
             "It selects every table it can see, so either the database has no tables in the {schemas_registered} schema(s) it discovered, or the connected role cannot see them -- check the role's SELECT and USAGE grants"
         )
@@ -1108,7 +1143,7 @@ mod tests {
     fn empty_catalog_warning_reports_the_transition_to_empty() {
         let selector = TableSelector::select_all();
         let warn = |previous, current| {
-            empty_catalog_warning("pg", previous, current, 1, &selector).is_some()
+            empty_catalog_warning("pg", previous, current, 0, 1, &selector).is_some()
         };
 
         assert!(warn(None, 0), "the first refresh finding nothing warns");
@@ -1130,7 +1165,7 @@ mod tests {
             .with_include_patterns(&["public.orders".to_string()])
             .with_exclude_patterns(&["public.secret".to_string()]);
 
-        let message = empty_catalog_warning("pg", None, 0, 2, &filtered)
+        let message = empty_catalog_warning("pg", None, 0, 0, 2, &filtered)
             .expect("an empty filtered catalog should warn");
         assert!(message.contains("pg"), "names the catalog: {message}");
         assert!(
@@ -1150,7 +1185,7 @@ mod tests {
 
         // An unfiltered catalog cannot blame patterns, so it must point at the
         // other two explanations instead of naming an empty pattern list.
-        let unfiltered = empty_catalog_warning("pg", None, 0, 1, &TableSelector::select_all())
+        let unfiltered = empty_catalog_warning("pg", None, 0, 0, 1, &TableSelector::select_all())
             .expect("an empty unfiltered catalog should warn");
         assert!(
             !unfiltered.contains("include:") && !unfiltered.contains("matched"),
@@ -1159,6 +1194,53 @@ mod tests {
         assert!(
             unfiltered.contains("grants"),
             "points at the likely cause instead: {unfiltered}"
+        );
+    }
+
+    /// A catalog can register nothing while the patterns matched perfectly well:
+    /// a selected table whose provider cannot be built is logged and skipped.
+    ///
+    /// Blaming the patterns there would contradict the failure logged moments
+    /// earlier and send the user to fix configuration that is already correct.
+    #[test]
+    fn empty_catalog_warning_does_not_blame_patterns_for_tables_that_failed_to_build() {
+        let filtered = TableSelector::new(Some(make_globset(&["public.orders"])), None)
+            .with_include_patterns(&["public.orders".to_string()]);
+
+        let message = empty_catalog_warning("pg", None, 0, 3, 1, &filtered)
+            .expect("a catalog that registered nothing should warn");
+
+        assert!(
+            message.contains("3 table(s) matched, but none could be registered"),
+            "it should report that the matches failed rather than that nothing matched: {message}"
+        );
+        assert!(
+            !message.contains("never matches"),
+            "it must not offer the unqualified-pattern advice when the patterns did match: {message}"
+        );
+        assert!(
+            !message.contains("grants"),
+            "it must not blame grants either: {message}"
+        );
+    }
+
+    /// A pattern is user-supplied text and can legally contain a newline, which
+    /// would split one warning into what reads as two log records.
+    #[test]
+    fn empty_catalog_warning_stays_on_one_line_for_a_pattern_containing_a_newline() {
+        let hostile = TableSelector::new(None, None)
+            .with_include_patterns(&["public.a\nWARN forged line".to_string()]);
+
+        let message = empty_catalog_warning("pg", None, 0, 0, 1, &hostile)
+            .expect("an empty filtered catalog should warn");
+
+        assert!(
+            !message.contains('\n'),
+            "the warning must stay on one line: {message:?}"
+        );
+        assert!(
+            message.contains("\\n"),
+            "the newline should survive as an escape so the pattern is still legible: {message}"
         );
     }
 
