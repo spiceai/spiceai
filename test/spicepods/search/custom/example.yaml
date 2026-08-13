@@ -12,8 +12,8 @@ name: custom-search-example
 # See https://github.com/spiceai/spiceai/issues/12935 for the required schema.
 
 datasets:
-  # The searchable corpus. `corpus` must be a dataset (it carries the search configuration).
-  # Declare `row_id:` explicitly — a primary key from the source system is not discovered
+  # The searchable corpus. `corpus`, `test_queries`, and `relevance_data` may each be a dataset or
+  # a view. Declare `row_id:` explicitly — a primary key from the source system is not discovered
   # automatically. The `row_id` column is what `relevance_data."corpus-id"` must match.
   - from: <your corpus source>          # e.g. postgres:documents, file:./corpus.parquet
     name: corpus

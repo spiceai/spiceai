@@ -236,35 +236,32 @@ fn print_retrieval_metrics_table(metrics_by_k: &BTreeMap<usize, RetrievalMetrics
 }
 
 /// Fails fast with an actionable message when a custom run's spicepod is missing one of the fixed
-/// tables the harness queries. `corpus` must be a dataset (it carries the search configuration),
-/// while `test_queries` and `relevance_data` may be datasets or views. Without this check the run
-/// would fail later with a raw `table not found` from the harness SQL.
+/// tables the harness queries. Each of `corpus`, `test_queries`, and `relevance_data` may be a
+/// dataset or a view. Without this check the run would fail later with a raw `table not found` from
+/// the harness SQL.
 fn validate_custom_spicepod(app: &App) -> anyhow::Result<()> {
-    let has_dataset = |name: &str| app.datasets.iter().any(|ds| ds.name == name);
-    let has_table = |name: &str| has_dataset(name) || app.views.iter().any(|v| v.name == name);
-
-    let mut missing = Vec::new();
-    if !has_dataset("corpus") {
-        missing.push("corpus (dataset)");
-    }
-    if !has_table("test_queries") {
-        missing.push("test_queries (dataset or view)");
-    }
-    if !has_table("relevance_data") {
-        missing.push("relevance_data (dataset or view)");
-    }
+    let missing: Vec<&str> = ["corpus", "test_queries", "relevance_data"]
+        .into_iter()
+        .filter(|name| !spicepod_has_table(app, name))
+        .collect();
 
     if !missing.is_empty() {
         return Err(anyhow::anyhow!(
             "Failed to run custom search test ({}): spicepod is missing required table(s): {}. \
             A custom search run (no --benchmark-dataset) must define `corpus`, `test_queries`, and \
-            `relevance_data`. See: https://github.com/spiceai/spiceai/issues/12935",
+            `relevance_data` (each may be a dataset or a view). \
+            See: https://github.com/spiceai/spiceai/issues/12935",
             app.name,
             missing.join(", ")
         ));
     }
 
     Ok(())
+}
+
+/// Whether the spicepod defines a table with `name` as either a dataset or a view.
+fn spicepod_has_table(app: &App, name: &str) -> bool {
+    app.datasets.iter().any(|ds| ds.name == name) || app.views.iter().any(|v| v.name == name)
 }
 
 fn search_dataset_attributes(app: &App) -> Vec<KeyValue> {

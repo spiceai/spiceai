@@ -47,7 +47,8 @@ const TOUCHE2020_RETRIEVAL_REPOSITORY: MtebRepo = MtebRepo::standard_sharded(
 /// The search dataset to run against. Each built-in variant owns its own MTEB data preparation,
 /// while `Custom` tests a customer-supplied spicepod as-is. Search-config construction,
 /// relevance-judgment loading, and result mapping are shared by [`harness`], since every run
-/// exposes the same fixed `corpus`/`test_queries`/`relevance_data` schema.
+/// exposes the same fixed `corpus`/`test_queries`/`relevance_data` schema (each of which may be a
+/// dataset or a view in a custom spicepod).
 pub(crate) enum SearchDataset {
     Builtin(BuiltinDataset),
     /// A customer-supplied spicepod. No MTEB data is downloaded: the harness tests whatever the

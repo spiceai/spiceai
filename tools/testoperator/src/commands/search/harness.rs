@@ -16,9 +16,10 @@ limitations under the License.
 
 //! Dataset-agnostic search harness: the SQL and result-mapping logic shared by every
 //! `testoperator run search` run, whether it targets a built-in MTEB dataset or a
-//! customer-supplied spicepod. Every run exposes the same fixed schema — a `corpus` dataset,
+//! customer-supplied spicepod. Every run exposes the same fixed schema — a `corpus` table,
 //! a `test_queries` table with `_id`/`text`, and a `relevance_data` table with `query-id`,
-//! `corpus-id`, and `score` — so the query, qrel, and transform steps here serve both.
+//! `corpus-id`, and `score` (each may be a dataset or a view) — so the query, qrel, and transform
+//! steps here serve both.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -48,7 +49,10 @@ fn read_text_column(batch: &RecordBatch, name: &str) -> anyhow::Result<Vec<Strin
     // A no-op when the column is already `Utf8`; otherwise this normalizes `LargeUtf8`/`Utf8View`
     // and casts integer ids to their text form so downstream matching against qrels is uniform.
     let utf8 = arrow::compute::cast(column, &DataType::Utf8).map_err(|e| {
-        anyhow::anyhow!("Failed to read '{name}' column as text (unsupported type {:?}): {e}", column.data_type())
+        anyhow::anyhow!(
+            "Failed to read '{name}' column as text (unsupported type {:?}): {e}",
+            column.data_type()
+        )
     })?;
 
     let string_array: &StringArray = utf8.as_string::<i32>();

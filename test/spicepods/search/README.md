@@ -37,9 +37,11 @@ testoperator run search --spicepod-path ./my-spicepod.yaml
 
 A custom spicepod must define three tables with a fixed schema:
 
+Each table may be a dataset or a view.
+
 | Name | Kind | Required columns | Notes |
 |---|---|---|---|
-| `corpus` | dataset | the column(s) set up for `embeddings:` and/or `full_text_search:` | Must declare `row_id:` (a source-system primary key is not discovered automatically). |
+| `corpus` | dataset or view | the column(s) set up for `embeddings:` and/or `full_text_search:` | Must declare `row_id:` (a source-system primary key is not discovered automatically). |
 | `test_queries` | dataset or view | `_id` (query id), `text` (query text) | Read as `SELECT _id as id, text FROM test_queries`. |
 | `relevance_data` | dataset or view | `"query-id"`, `"corpus-id"`, `score` | Read as `SELECT "query-id", "corpus-id", CAST(score AS BIGINT) AS score FROM relevance_data`. `score` must be a whole-number grade (0, 1, 2, ...); NDCG uses it as a weight. |
 
