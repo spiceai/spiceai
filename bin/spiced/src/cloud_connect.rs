@@ -110,8 +110,18 @@ const DEFAULT_LOG_TAIL_LINES: usize = 500;
 /// replaced. The load has no deadline of its own — an unreachable source is
 /// retried for as long as the instance is up — so the wait needs one, or a
 /// spicepod the runtime cannot satisfy would hold the command stream instead of
-/// answering. A deployment that runs out is answered as failed, having changed
-/// nothing, and can be deployed again.
+/// answering.
+///
+/// A deployment that outlasts the wait is still validated, persisted and
+/// cached; only the reconcile is skipped, so the deployment that fixes an
+/// instance whose load cannot finish is on disk for the next start rather than
+/// lost. The reconcile cannot simply proceed instead: abandoning the load would
+/// strand every component it had not reached (a diff skips what the two apps
+/// agree on, so nothing would ever register them), and loading them here
+/// inherits the load's own unbounded per-dataset retry, which would hold the
+/// apply — and with it every later command — indefinitely. Bounding that retry
+/// is [#12862](https://github.com/spiceai/spiceai/issues/12862); once the load
+/// itself is bounded, this wait always settles.
 const INITIAL_LOAD_BUDGET: Duration = Duration::from_mins(2);
 
 /// Cheap probe for whether Spice Cloud Connect is configured for this
@@ -375,6 +385,7 @@ pub async fn maybe_start(
             metrics,
             app_id: persisted_app_id,
             runtime_overrides,
+            initial_load_budget: INITIAL_LOAD_BUDGET,
         }));
 
     match CloudConnect::start(config, handle).await {
@@ -563,7 +574,11 @@ fn reconcile(active: &App, deployed: App) -> Reconciled {
 struct Pending {
     /// Sections of the document, from [`Reconciled::restart_required`].
     sections: Vec<String>,
-    /// Whether the delivered values on disk are not the ones in effect.
+    /// Whether the delivered values are not the ones the app runs on — either
+    /// because this process could not install them over values its components
+    /// have already resolved, or because they could not be written to the cache
+    /// the next start reads. Both mean a start would not serve what was
+    /// deployed, which is what the caller has to know.
     secrets: bool,
 }
 
@@ -643,10 +658,15 @@ struct SpicedRuntimeHandle {
     /// unwritable on a first boot, which is precisely the case the cache exists
     /// for.
     identity_path: std::path::PathBuf,
-    /// The spicepod on disk: the deployment this instance would come up on if
-    /// it started now, which is not necessarily all of what it is serving.
-    /// `None` until a deployment lands on an instance that booted on something
-    /// else, which matches no incoming deployment.
+    /// The deployment this process has adopted: the spicepod it applied as far
+    /// as it could, and against which [`SpicedRuntimeHandle::pending`] is
+    /// measured. `None` until a deployment lands on an instance that booted on
+    /// something else, which matches no incoming deployment.
+    ///
+    /// Usually also the spicepod on disk, but not always: a deployment
+    /// persisted while the initial load was unfinished is on disk without
+    /// having been adopted, so redelivering it re-applies it rather than being
+    /// answered from state that never described it.
     ///
     /// The other half of the pair — the configuration in effect — is the app
     /// the runtime holds, so there is nothing here to keep in step with it.
@@ -655,8 +675,8 @@ struct SpicedRuntimeHandle {
     /// across an `.await`.
     desired: RwLock<Option<String>>,
     /// What [`SpicedRuntimeHandle::desired`] changes that this process is not
-    /// serving, as the last apply classified it. Empty when the deployment on
-    /// disk is the one being served.
+    /// serving, as the last apply classified it. Empty when the deployment it
+    /// adopted is the one being served.
     ///
     /// Reported by `GetStatus` as well as by the apply that produced it, so the
     /// control plane sees the same set whether it watched the deploy or asked
@@ -671,6 +691,11 @@ struct SpicedRuntimeHandle {
     /// commits to, and the state update that follows — so two dispatches cannot
     /// interleave one's decision with the other's state change.
     applying: tokio::sync::Mutex<()>,
+    /// How long an apply waits for the initial component load before persisting
+    /// the deployment without reconciling it ([`INITIAL_LOAD_BUDGET`]). Held
+    /// rather than read from the constant so a test can exercise the bound
+    /// without waiting it out.
+    initial_load_budget: Duration,
     /// Reader for the metrics pushed to the control plane. `None` when no
     /// reader was attached to the meter provider, in which case this instance
     /// reports nothing rather than an empty payload.
@@ -698,6 +723,7 @@ struct SpicedRuntimeHandleParts {
     metrics: Option<MetricsReader>,
     app_id: Option<String>,
     runtime_overrides: Vec<(String, String)>,
+    initial_load_budget: Duration,
 }
 
 impl SpicedRuntimeHandle {
@@ -711,6 +737,7 @@ impl SpicedRuntimeHandle {
             metrics,
             app_id,
             runtime_overrides,
+            initial_load_budget,
         } = parts;
         // The deployment this process started on is both what is on disk and
         // what is in effect, so nothing is pending against it.
@@ -724,6 +751,7 @@ impl SpicedRuntimeHandle {
             pending: RwLock::new(Pending::default()),
             runtime_overrides,
             applying: tokio::sync::Mutex::new(()),
+            initial_load_budget,
             metrics,
             app_id: RwLock::new(app_id),
         }
@@ -877,14 +905,17 @@ impl SpicedRuntimeHandle {
     ///    all. Building the [`App`] parses the document rather than resolving
     ///    `${ secrets:… }` — a component does that as it loads — so a deployment
     ///    that does not build changes nothing.
-    /// 2. The secrets are cached before the spicepod is promoted: the start that
-    ///    eventually reads the cache is the one that reads the spicepod, so an
-    ///    instance interrupted in between comes back on the previous spicepod
-    ///    with the current credentials cached for it, rather than on a spicepod
-    ///    whose secrets it cannot resolve.
-    /// 3. What this process resolves and serves changes last, so a promotion
-    ///    that fails leaves the instance serving the configuration and resolving
-    ///    the credentials it already had.
+    /// 2. The secrets are cached and installed before the initial load is waited
+    ///    on. The cache is what the next start reads, and the start that reads it
+    ///    is the one that reads the spicepod, so an instance interrupted before
+    ///    the promotion comes back on the previous spicepod with the current
+    ///    credentials cached for it rather than on a spicepod whose secrets it
+    ///    cannot resolve. Installing them this early is what lets a deployment
+    ///    carrying a credential the running instance is missing unblock the very
+    ///    load it then waits on: only values nothing has resolved yet are
+    ///    installed, so nothing already loaded changes underneath.
+    /// 3. What this process serves changes last, so a promotion that fails
+    ///    leaves the instance serving the configuration it already had.
     ///
     /// Components converge one at a time: one that fails to build lands in an
     /// error state, stays visible through `GetStatus`, and is retried by the
@@ -905,8 +936,6 @@ impl SpicedRuntimeHandle {
             cache_error = self.cache_delivered_secrets(config_dir, secrets);
         }
 
-        let (deployed_app, path) = staged.promote().await?;
-
         // `None` when the deployment carried no payload at all, which says
         // nothing about the values in effect — a rotation pending from an
         // earlier deployment stays pending.
@@ -915,6 +944,33 @@ impl SpicedRuntimeHandle {
             secrets_pending = Some(self.install_delivered_secrets(&secrets));
             secrets.keys().cloned().collect::<Vec<String>>()
         });
+
+        // The load installs the components this deployment is diffed against, so
+        // it has to be over before anything is reconciled: a component it has
+        // not reached is not registered, and a diff would treat it as though it
+        // were. The wait is bounded, and a deployment that outlasts it is still
+        // persisted — the instance keeps serving what it was serving, and a
+        // start (an operator's, or one it takes for its own reasons) comes up on
+        // the deployment rather than on the configuration it was sent to
+        // replace.
+        if !self
+            .runtime
+            .wait_for_initial_load(self.initial_load_budget)
+            .await
+        {
+            let (_, path) = staged.promote().await?;
+            tracing::warn!(
+                "Spice Cloud Connect: the deployed spicepod was validated and persisted to {}, but this instance is still loading the components of the spicepod it is serving, so the deployment was not applied to the running process. Restart the instance to serve it. See: https://spiceai.org/docs",
+                path.display(),
+            );
+            return Err(unfinished_load_error(
+                &path,
+                self.initial_load_budget,
+                cache_error.as_deref(),
+            ));
+        }
+
+        let (deployed_app, path) = staged.promote().await?;
 
         // The app the runtime holds is the configuration in effect here: every
         // deployment installs what this process serves, so reading it back is
@@ -934,7 +990,10 @@ impl SpicedRuntimeHandle {
             let mut pending = self.pending.write();
             pending.sections = sections;
             if let Some(secrets) = secrets_pending {
-                pending.secrets = secrets;
+                // A delivered set the next start would not resolve is pending
+                // just as much as one this process cannot install: either way
+                // what is on disk is not what the app runs on.
+                pending.secrets = secrets || cache_error.is_some();
             }
             pending.restart_required()
         };
@@ -970,6 +1029,27 @@ impl SpicedRuntimeHandle {
             "secrets_cache_error": cache_error,
         }))
     }
+}
+
+/// What the control plane is told about a deployment the instance persisted but
+/// could not reconcile, because the components it would be diffed against are
+/// still being loaded.
+///
+/// Precise about what did happen: the app attribution was recorded, the
+/// spicepod is on disk, and the delivered secrets are installed and cached — it
+/// is the running process that is unchanged, and a start is what makes the
+/// deployment live.
+fn unfinished_load_error(path: &Path, budget: Duration, cache_error: Option<&str>) -> CommandError {
+    let cache = cache_error.map_or_else(String::new, |error| {
+        format!(
+            " Its secrets could not be cached for that start ({error}), so deploy them again once this instance is loaded."
+        )
+    });
+    CommandError::failed(format!(
+        "Failed to apply the deployed Spicepod to the running instance: it is still loading the components of the Spicepod it is serving and did not finish within {}s, so nothing was reconciled and the instance keeps serving its current configuration. The deployed Spicepod was validated and persisted to {}, and any secrets it delivered were installed, so restarting the instance serves it; GetStatus names the components the load is waiting on.{cache} See: https://spiceai.org/docs",
+        budget.as_secs(),
+        path.display(),
+    ))
 }
 
 /// What the control plane is told about a deployment that has been applied.
@@ -1057,22 +1137,19 @@ impl RuntimeHandle for SpicedRuntimeHandle {
 
     /// Apply a cloud-managed spicepod to this running instance.
     ///
-    /// 1. The apply waits for the initial component load
-    ///    ([`INITIAL_LOAD_BUDGET`]): the load is still registering the
-    ///    components of the app being replaced, so reconciling against it would
-    ///    treat a component the load has not reached as already registered.
-    /// 2. A redelivery of the spicepod on disk — the same YAML, byte for byte,
-    ///    delivering the secret values this instance already holds — is answered
-    ///    from the state the last apply left, without rebuilding or reconciling
-    ///    anything. It does write the delivered secrets to the cache the next
-    ///    start reads ([`SpicedRuntimeHandle::refresh_secret_cache`]), which is
-    ///    the one thing a redelivery can still repair.
-    /// 3. Anything else is validated by building an [`App`] from it on a sibling
+    /// 1. A redelivery of the deployment this process has adopted — the same
+    ///    YAML, byte for byte, delivering the secret values this instance
+    ///    already holds — is answered from the state the last apply left,
+    ///    without rebuilding or reconciling anything. It does write the
+    ///    delivered secrets to the cache the next start reads
+    ///    ([`SpicedRuntimeHandle::refresh_secret_cache`]), which is the one
+    ///    thing a redelivery can still repair.
+    /// 2. Anything else is validated by building an [`App`] from it on a sibling
     ///    temp file, so a malformed push is rejected with a clear error and the
     ///    previous good `spicepod-cloud-managed.yml` is left untouched and still
     ///    running; the validated file is then promoted to the canonical path so
     ///    the next start comes up on this configuration.
-    /// 4. [`SpicedRuntimeHandle::apply`] then puts into effect everything this
+    /// 3. [`SpicedRuntimeHandle::apply`] then puts into effect everything this
     ///    process can ([`reconcile`]) and reports the rest as
     ///    `restart_required`. Nothing here exits, signals, or drains the
     ///    process.
@@ -1135,22 +1212,6 @@ impl RuntimeHandle for SpicedRuntimeHandle {
             }
         }
 
-        // The load installs the components of the app this deployment is diffed
-        // against, so it has to be over before anything is reconciled. Waiting
-        // here rather than earlier keeps the wait serialized with every other
-        // apply, and bounded so a spicepod the runtime cannot satisfy answers
-        // the deployment instead of holding it.
-        if !self
-            .runtime
-            .wait_for_initial_load(INITIAL_LOAD_BUDGET)
-            .await
-        {
-            return Err(CommandError::failed(format!(
-                "Failed to apply the deployed Spicepod: this instance is still loading the components of the Spicepod it is serving, and did not finish within {}s. Nothing was changed and nothing was persisted. Check GetStatus for the components it is waiting on, then deploy again.",
-                INITIAL_LOAD_BUDGET.as_secs()
-            )));
-        }
-
         // A delivered set this instance already holds in full changes nothing,
         // so it does not make a redelivery into an apply. Anything else — a new
         // name, a rotated value, a withdrawn one — is a change the spicepod text
@@ -1163,13 +1224,14 @@ impl RuntimeHandle for SpicedRuntimeHandle {
         // not be held across the awaits below.
         let desired = self.desired.read().clone();
         if secrets_settled && desired.as_deref() == Some(spicepod_yaml) {
+            let cache_error = self.refresh_secret_cache(config_dir, delivered_secrets.as_ref());
             let restart_required = {
                 let mut pending = self.pending.write();
                 // A delivery this instance holds in full settles a rotation an
-                // earlier one left pending: the values on disk are the values
-                // in effect again.
+                // earlier one left pending — but only once the cache holds it
+                // too, because that is what the next start resolves.
                 if delivered_secrets.is_some() {
-                    pending.secrets = false;
+                    pending.secrets = cache_error.is_some();
                 }
                 pending.restart_required()
             };
@@ -1182,7 +1244,7 @@ impl RuntimeHandle for SpicedRuntimeHandle {
                 "live": restart_required.is_empty(),
                 "restart_required": restart_required,
                 "message": apply_message(&restart_required),
-                "secrets_cache_error": self.refresh_secret_cache(config_dir, delivered_secrets.as_ref()),
+                "secrets_cache_error": cache_error,
             }));
         }
 
@@ -2334,14 +2396,26 @@ views:
             path,
             spicepod_yaml: active.to_string(),
         };
-        handle_over(dir, active, Some(deployment)).await
+        handle_over(dir, active, Some(deployment), INITIAL_LOAD_BUDGET).await
+    }
+
+    /// A handle whose wait for the initial load runs out at once, which is what
+    /// an instance whose load can never finish looks like to a deployment.
+    async fn handle_load_never_finishing(dir: &Path, active: &str) -> Arc<SpicedRuntimeHandle> {
+        let path = dir.join(CLOUD_MANAGED_SPICEPOD_FILE);
+        std::fs::write(&path, active).expect("write the deployment being served");
+        let deployment = CloudManagedSpicepod {
+            path,
+            spicepod_yaml: active.to_string(),
+        };
+        handle_over(dir, active, Some(deployment), Duration::from_millis(200)).await
     }
 
     /// A handle over a runtime serving a spicepod that did not come from a
     /// deployment — a locally-configured instance, which is what the first
     /// Cloud deployment arrives at.
     async fn handle_serving_locally(dir: &Path, local: &str) -> Arc<SpicedRuntimeHandle> {
-        let handle = handle_over(dir, local, None).await;
+        let handle = handle_over(dir, local, None, INITIAL_LOAD_BUDGET).await;
         finish_loading(&handle).await;
         handle
     }
@@ -2350,6 +2424,7 @@ views:
         dir: &Path,
         app: &str,
         running_deployment: Option<CloudManagedSpicepod>,
+        initial_load_budget: Duration,
     ) -> Arc<SpicedRuntimeHandle> {
         let path = dir.join("startup.yml");
         std::fs::write(&path, app).expect("write the app this instance starts on");
@@ -2368,6 +2443,7 @@ views:
             metrics: None,
             app_id: None,
             runtime_overrides: Vec::new(),
+            initial_load_budget,
         }))
     }
 
@@ -2786,6 +2862,60 @@ tools:
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// An instance whose load cannot finish must not be a dead end. The
+    /// deployment that would fix it is the one that keeps timing out, so it is
+    /// persisted even though it is not reconciled: a start serves it, and the
+    /// failure says exactly that instead of claiming nothing happened. The
+    /// running process is untouched, and the deployment is not recorded as
+    /// applied, so it is applied in full the moment the load is over.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_deployment_that_outlasts_the_load_is_persisted_for_the_next_start() {
+        let dir = scratch_dir("apply-load-timeout");
+        let handle = handle_load_never_finishing(&dir, SERVING).await;
+
+        let err = handle
+            .apply_spicepod(deployment(&dir, SERVING_PLUS_VIEW))
+            .await
+            .expect_err("a deployment that outlasts the load is not applied");
+        assert!(
+            matches!(err, CommandError::Failed { .. }),
+            "an instance that is still loading may be able to apply the next attempt: {err}"
+        );
+        let message = err.to_string();
+        assert!(
+            message.contains("persisted") && message.contains("restarting"),
+            "the failure must say what did happen and how to serve it: {message}"
+        );
+
+        assert_eq!(
+            persisted_spicepod(&dir),
+            SERVING_PLUS_VIEW,
+            "the deployment must be on disk for the start that serves it"
+        );
+        assert_eq!(
+            handle.desired.read().as_deref(),
+            Some(SERVING),
+            "and must not be recorded as applied: this process never reconciled it"
+        );
+        assert_eq!(live_view_names(&handle).await, vec!["served_view"]);
+        assert!(!handle.runtime.status().is_shutdown());
+
+        // Once the load is over the same deployment applies in full, rather
+        // than being answered from state that never described it.
+        finish_loading(&handle).await;
+        let document = handle
+            .apply_spicepod(deployment(&dir, SERVING_PLUS_VIEW))
+            .await
+            .expect("the deployment applies once the load is over");
+        assert_eq!(document["live"], serde_json::json!(true));
+        assert_eq!(
+            query_rows(&handle.runtime, "SELECT n FROM deployed_view").await,
+            1
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A deployment that does not build changes nothing: not the file this
     /// instance starts on, not what it is serving, not what it reports.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3011,6 +3141,73 @@ tools:
             .expect("reverting the rotation applies");
         assert_eq!(reverted["restart_required"], serde_json::json!([]));
         assert_eq!(reverted["live"], serde_json::json!(true));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A delivered set the cache could not take is not settled either: the next
+    /// start would resolve something other than what was deployed, so the
+    /// deployment is not live until a later one writes it. Reporting it as live
+    /// off the in-memory values alone would hide the divergence until a start
+    /// exposed it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_secret_the_cache_refused_stays_pending_until_it_is_written() {
+        let dir = scratch_dir("secret-cache-pending");
+        let handle = handle_serving(&dir, SERVING).await;
+        enrol_with_a_cache_key(&dir.join(IDENTITY_FILE));
+        // A directory where the cache file belongs: the write fails for a
+        // reason that has nothing to do with the values themselves.
+        let cache_path = dir.join(runtime_cloud_connect::secret_cache::SECRET_CACHE_FILE);
+        std::fs::create_dir_all(&cache_path).expect("block the cache path");
+
+        let refused = handle
+            .apply_spicepod(SpicepodDeployment {
+                config_dir: &dir,
+                spicepod_yaml: SERVING_PLUS_VIEW,
+                delivered_secrets: Some(delivered("api_key", b"value-one")),
+                app_id: None,
+            })
+            .await
+            .expect("a deployment whose cache write fails still applies");
+        assert!(
+            refused["secrets_cache_error"].is_string(),
+            "the write failure must be reported: {refused}"
+        );
+        assert_eq!(refused["restart_required"], serde_json::json!(["secrets"]));
+        assert_eq!(refused["live"], serde_json::json!(false));
+        assert!(
+            handle
+                .delivered_secrets
+                .holds(&delivered("api_key", b"value-one")),
+            "the values are still installed here — it is the next start that would miss them"
+        );
+        let status = handle.status().await.expect("status is reported");
+        assert_eq!(
+            status.detail["restart_required"],
+            serde_json::json!(["secrets"]),
+            "status must report what the apply reported"
+        );
+
+        // Redelivering the same values once the cache can be written settles
+        // it: what is on disk is what this instance resolves again.
+        std::fs::remove_dir_all(&cache_path).expect("unblock the cache path");
+        let repaired = handle
+            .apply_spicepod(SpicepodDeployment {
+                config_dir: &dir,
+                spicepod_yaml: SERVING_PLUS_VIEW,
+                delivered_secrets: Some(delivered("api_key", b"value-one")),
+                app_id: None,
+            })
+            .await
+            .expect("the redelivery is answered");
+        assert_eq!(repaired["secrets_cache_error"], serde_json::Value::Null);
+        assert_eq!(repaired["restart_required"], serde_json::json!([]));
+        assert_eq!(repaired["live"], serde_json::json!(true));
+        assert!(
+            cached_secrets(&dir)
+                .expect("the redelivery wrote the cache")
+                .holds(&delivered("api_key", b"value-one"))
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
