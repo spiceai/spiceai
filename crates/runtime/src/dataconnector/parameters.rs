@@ -58,8 +58,8 @@ pub trait Validator {
 /// [`ConnectorComponent`] spec.
 ///
 /// Each method is a single capability rather than a handle to the orchestrator,
-/// so the contract names only types that live below `runtime`. A connector that
-/// needed `Arc<Runtime>` was really after one of these.
+/// so the contract names only types that live below `runtime`: a registry, a
+/// session, the loaded app, or an already-resolved answer.
 #[async_trait]
 pub trait ConnectorContext: Send + Sync {
     /// The loaded app, for the runtime-level configuration a connector consults

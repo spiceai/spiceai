@@ -48,7 +48,6 @@ use crate::component::dataset::{
     Dataset,
     acceleration::{Engine, RefreshMode},
 };
-use crate::federated::FederatedTable;
 use data_connector_api::federated::FederatedTableProvider;
 
 use super::{

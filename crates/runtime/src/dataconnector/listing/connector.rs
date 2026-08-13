@@ -3025,33 +3025,27 @@ mod tests {
         assert_eq!(get_url_prefix(&url), "file:///");
     }
 
-    #[tokio::test]
-    async fn test_parquet_page_index_options_default() {
-        let app = app::AppBuilder::new("test").build();
-        let runtime = crate::Runtime::builder()
-            .with_app_opt(Some(Arc::new(app)))
-            .build()
-            .await;
+    #[test]
+    fn test_parquet_page_index_options_default() {
+        let app = Arc::new(app::AppBuilder::new("test").build());
 
-        let options = parquet_page_index_options(&runtime).await;
+        let options = parquet_page_index_options(&app);
         assert!(options.enable_page_index);
     }
 
-    #[tokio::test]
-    async fn test_parquet_page_index_options_auto() {
+    #[test]
+    fn test_parquet_page_index_options_auto() {
         let mut params = std::collections::HashMap::new();
         params.insert("parquet_page_index".to_string(), "auto".to_string());
-        let app = app::AppBuilder::new("test")
-            .with_runtime_params(params)
-            .build();
-        let runtime = crate::Runtime::builder()
-            .with_app_opt(Some(Arc::new(app)))
-            .build()
-            .await;
+        let app = Arc::new(
+            app::AppBuilder::new("test")
+                .with_runtime_params(params)
+                .build(),
+        );
 
         // "auto" and "required" now behave the same since tolerate_missing_page_index
         // was removed in DataFusion v51. Page index reading handles missing indexes gracefully.
-        let options = parquet_page_index_options(&runtime).await;
+        let options = parquet_page_index_options(&app);
         assert!(options.enable_page_index);
     }
 
@@ -3157,52 +3151,48 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_parquet_page_index_options_skip() {
+    #[test]
+    fn test_parquet_page_index_options_skip() {
         let mut params = std::collections::HashMap::new();
         params.insert("parquet_page_index".to_string(), "skip".to_string());
-        let app = app::AppBuilder::new("test")
-            .with_runtime_params(params)
-            .build();
-        let runtime = crate::Runtime::builder()
-            .with_app_opt(Some(Arc::new(app)))
-            .build()
-            .await;
+        let app = Arc::new(
+            app::AppBuilder::new("test")
+                .with_runtime_params(params)
+                .build(),
+        );
 
-        let options = parquet_page_index_options(&runtime).await;
+        let options = parquet_page_index_options(&app);
         assert!(!options.enable_page_index);
     }
 
-    #[tokio::test]
-    async fn test_parquet_page_index_options_required() {
+    #[test]
+    fn test_parquet_page_index_options_required() {
         let mut params = std::collections::HashMap::new();
         params.insert("parquet_page_index".to_string(), "required".to_string());
-        let app = app::AppBuilder::new("test")
-            .with_runtime_params(params)
-            .build();
-        let runtime = crate::Runtime::builder()
-            .with_app_opt(Some(Arc::new(app)))
-            .build()
-            .await;
+        let app = Arc::new(
+            app::AppBuilder::new("test")
+                .with_runtime_params(params)
+                .build(),
+        );
 
-        let options = parquet_page_index_options(&runtime).await;
+        let options = parquet_page_index_options(&app);
         assert!(options.enable_page_index);
     }
 
-    #[tokio::test]
-    async fn test_parquet_page_index_options_invalid() {
+    #[test]
+    fn test_parquet_page_index_options_invalid() {
         let mut params = std::collections::HashMap::new();
         params.insert("parquet_page_index".to_string(), "invalid".to_string());
-        let app = app::AppBuilder::new("test")
-            .with_runtime_params(params)
-            .build();
-        let runtime = crate::Runtime::builder()
-            .with_app_opt(Some(Arc::new(app)))
-            .build()
-            .await;
+        let app = Arc::new(
+            app::AppBuilder::new("test")
+                .with_runtime_params(params)
+                .build(),
+        );
 
-        let options = parquet_page_index_options(&runtime).await;
-        // Should fall back to default
-        assert!(options.enable_page_index);
+        let options = parquet_page_index_options(&app);
+        assert!(
+            options.enable_page_index,
+            "an invalid value falls back to the default"
+        );
     }
 }

@@ -25,7 +25,6 @@ use crate::dataconnector::{
     kafka::{SidecarOffsetCommitHook, SidecarOffsetStore},
 };
 use crate::datafusion::refresh_sql;
-use crate::federated::FederatedTable;
 use crate::schema_evolution::{
     SCHEMA_EVOLUTION_APPLIED, SCHEMA_EVOLUTION_DETECTED, SCHEMA_EVOLUTION_FAILED,
     evolution_allowed, schema_evolution_labels, widening_plan_kind,

@@ -21,12 +21,12 @@ limitations under the License.
 //! write to ([`AcceleratorSetup`]), and once after it is registered, to attach
 //! background work to it ([`RegisteredAcceleratedTable`]).
 //!
-//! Both hooks used to take the accelerated-table types themselves — the builder
-//! and the table. Those live beside the runtime that orchestrates them, so a
-//! connector naming either would depend on the orchestrator for the sake of two
-//! getters and a `Vec::push`. Each trait here is the slice of one of those types
-//! that connectors actually reach for, so the contract names only Arrow,
-//! `DataFusion` and Tokio types. The runtime side satisfies them by forwarding.
+//! Each hook takes one of these traits rather than the accelerated-table type it
+//! acts on. The builder and the table live beside the runtime that orchestrates
+//! them, and a connector naming either would depend on the orchestrator to reach
+//! two getters and a `Vec::push`. Naming only the capability keeps the contract
+//! to Arrow, `DataFusion` and Tokio types; the runtime side satisfies it by
+//! forwarding.
 
 use std::fmt::Debug;
 use std::sync::Arc;
