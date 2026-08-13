@@ -29,6 +29,8 @@ limitations under the License.
 //! before any instrument exists — see its comment for what that means for
 //! assertions.
 
+#![recursion_limit = "256"]
+
 use std::{
     collections::{HashMap, HashSet},
     sync::LazyLock,

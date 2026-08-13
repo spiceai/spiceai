@@ -13,6 +13,12 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+
+// The runtime's async call graph nests deeply enough that computing the layout of a test's
+// top-level future exceeds rustc's default 128-deep query limit. Matches the `recursion_limit`
+// the `runtime` crate itself and the sibling integration test crates set.
+#![recursion_limit = "256"]
+
 use arrow::{array::RecordBatch, util::display::FormatOptions};
 #[cfg(feature = "mysql")]
 use datafusion::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -106,6 +112,8 @@ mod mysql;
 mod odbc;
 #[cfg(feature = "oracle")]
 mod oracle;
+#[cfg(not(windows))]
+mod otel_restart;
 mod plan_capture;
 #[cfg(feature = "postgres")]
 mod postgres;

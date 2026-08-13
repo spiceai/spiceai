@@ -575,9 +575,7 @@ pub(crate) async fn handle_nsql_query(
 
     let span = tracing::span!(target: "task_history", tracing::Level::INFO, "nsql", input = %query, model = %model, "labels");
 
-    if let Some(traceparent) = context.trace_parent() {
-        crate::http::traceparent::override_task_history_with_trace_parent(&span, traceparent);
-    }
+    crate::task_history::correlation::record_task_history_trace_id(&span, &context);
 
     let nsql_context = match build_nsql_context(
         Arc::clone(&rt),

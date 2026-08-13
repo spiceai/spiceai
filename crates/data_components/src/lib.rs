@@ -15,21 +15,18 @@ limitations under the License.
 */
 
 #![allow(clippy::missing_errors_doc)]
-use std::{borrow::Cow, collections::HashMap, error::Error, hash::BuildHasher, sync::Arc};
+use std::{collections::HashMap, error::Error, hash::BuildHasher, sync::Arc};
 
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::{Schema, SchemaRef};
 use datafusion::{
-    catalog::{CatalogProvider, Session},
-    common::{Constraints, Statistics, stats::Precision},
-    datasource::{TableProvider, TableType},
-    error::Result as DataFusionResult,
-    logical_expr::{LogicalPlan, TableProviderFilterPushDown, dml::InsertOp},
-    physical_plan::ExecutionPlan,
-    prelude::Expr,
+    catalog::CatalogProvider,
+    common::{Statistics, stats::Precision},
+    datasource::TableProvider,
     sql::TableReference,
 };
 use datafusion_federation::FederatedTableProviderAdaptor;
+use spice_table::{LayerWalk, SpiceTable, TableLayer};
 
 /// Canonical Arrow metadata keys, re-exported from `arrow_tools` where they are
 /// defined, so connectors keep reaching them through this crate.
@@ -119,12 +116,12 @@ pub mod object;
 pub mod poly;
 pub mod update;
 
-/// A [`TableProvider`] wrapper that merges additional metadata into the Arrow schema.
+/// A layer that merges additional metadata into the Arrow schema.
 ///
-/// All trait methods delegate to the inner provider except [`schema()`](TableProvider::schema),
-/// which returns the original schema with `extra_metadata` merged in.
+/// Declares only what it changes — the schema, which is the original with
+/// `extra_metadata` merged in, and the statistics it can infer from that
+/// metadata. Everything else is the table beneath it.
 pub struct MetadataEnrichedTableProvider {
-    inner: Arc<dyn TableProvider>,
     schema: SchemaRef,
 }
 
@@ -133,7 +130,10 @@ impl MetadataEnrichedTableProvider {
     ///
     /// Keys in `extra_metadata` will overwrite any pre-existing schema metadata with the same key.
     #[must_use]
-    pub fn new<S>(inner: Arc<dyn TableProvider>, extra_metadata: HashMap<String, String, S>) -> Self
+    pub fn new<S>(
+        inner: &Arc<dyn TableProvider>,
+        extra_metadata: HashMap<String, String, S>,
+    ) -> Self
     where
         S: BuildHasher,
     {
@@ -146,7 +146,7 @@ impl MetadataEnrichedTableProvider {
     /// `field_metadata` overwrite pre-existing field metadata for matching field names.
     #[must_use]
     pub fn new_with_field_metadata<S>(
-        inner: Arc<dyn TableProvider>,
+        inner: &Arc<dyn TableProvider>,
         extra_metadata: HashMap<String, String, S>,
         field_metadata: &FieldMetadata,
     ) -> Self
@@ -176,12 +176,7 @@ impl MetadataEnrichedTableProvider {
             .collect::<Vec<_>>();
 
         let schema = Arc::new(Schema::new_with_metadata(fields, metadata));
-        Self { inner, schema }
-    }
-
-    #[must_use]
-    pub fn get_inner_ref(&self) -> &Arc<dyn TableProvider> {
-        &self.inner
+        Self { schema }
     }
 }
 
@@ -222,11 +217,14 @@ where
         ));
     }
 
-    Arc::new(MetadataEnrichedTableProvider::new_with_field_metadata(
+    SpiceTable::over(
+        Arc::new(MetadataEnrichedTableProvider::new_with_field_metadata(
+            &provider,
+            extra_metadata,
+            &field_metadata,
+        )),
         provider,
-        extra_metadata,
-        &field_metadata,
-    ))
+    ) as Arc<dyn TableProvider>
 }
 
 impl std::fmt::Debug for MetadataEnrichedTableProvider {
@@ -237,81 +235,38 @@ impl std::fmt::Debug for MetadataEnrichedTableProvider {
 }
 
 #[async_trait]
-impl TableProvider for MetadataEnrichedTableProvider {
-    fn schema(&self) -> SchemaRef {
+impl TableLayer for MetadataEnrichedTableProvider {
+    /// Injects spicepod table/column metadata into the schema and carries no
+    /// read, CDC, source or index semantics of its own — so every walk but the
+    /// write walk sees past it, matching the write pass-through it does not have.
+    fn route<'a>(
+        &'a self,
+        walk: LayerWalk,
+        below: &'a Arc<dyn TableProvider>,
+    ) -> Option<&'a Arc<dyn TableProvider>> {
+        // Exhaustive on purpose: a wildcard would answer a future walk kind
+        // for this layer without anyone deciding what it should say.
+        match walk {
+            LayerWalk::Read
+            | LayerWalk::CdcDetection
+            | LayerWalk::Source
+            | LayerWalk::RetentionDelete
+            | LayerWalk::Index => Some(below),
+            LayerWalk::Write => None,
+        }
+    }
+
+    fn schema(&self, _below: &Arc<dyn TableProvider>) -> SchemaRef {
         Arc::clone(&self.schema)
     }
 
-    fn constraints(&self) -> Option<&Constraints> {
-        self.inner.constraints()
-    }
-
-    fn table_type(&self) -> TableType {
-        self.inner.table_type()
-    }
-
-    fn get_logical_plan(&self) -> Option<Cow<'_, LogicalPlan>> {
-        self.inner.get_logical_plan()
-    }
-
-    fn get_column_default(&self, column: &str) -> Option<&Expr> {
-        self.inner.get_column_default(column)
-    }
-
-    fn supports_filters_pushdown(
-        &self,
-        filters: &[&Expr],
-    ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
-        self.inner.supports_filters_pushdown(filters)
-    }
-
-    async fn scan(
-        &self,
-        state: &dyn Session,
-        projection: Option<&Vec<usize>>,
-        filters: &[Expr],
-        limit: Option<usize>,
-    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        self.inner.scan(state, projection, filters, limit).await
-    }
-
-    async fn insert_into(
-        &self,
-        state: &dyn Session,
-        input: Arc<dyn ExecutionPlan>,
-        overwrite: InsertOp,
-    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        self.inner.insert_into(state, input, overwrite).await
-    }
-
-    async fn delete_from(
-        &self,
-        state: &dyn Session,
-        filters: Vec<Expr>,
-    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        self.inner.delete_from(state, filters).await
-    }
-
-    async fn update(
-        &self,
-        state: &dyn Session,
-        assignments: Vec<(String, Expr)>,
-        filters: Vec<Expr>,
-    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        self.inner.update(state, assignments, filters).await
-    }
-
-    async fn truncate(&self, state: &dyn Session) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        self.inner.truncate(state).await
-    }
-
-    fn statistics(&self) -> Option<Statistics> {
+    fn statistics(&self, below: &Arc<dyn TableProvider>) -> Option<Statistics> {
         // Surface the inferred rough table size as table statistics so the query
         // optimizer, acceleration sizing, and observability can use it. Prefer the
-        // inner provider's statistics where it has them (they may be exact or
-        // cheaper), filling only the row-count / byte-size fields it leaves `Absent`
-        // with the inferred estimate.
-        match (inferred_statistics(&self.schema), self.inner.statistics()) {
+        // provider beneath where it has them (they may be exact or cheaper),
+        // filling only the row-count / byte-size fields it leaves `Absent` with
+        // the inferred estimate.
+        match (inferred_statistics(&self.schema), below.statistics()) {
             (Some(inferred), Some(mut inner)) => {
                 if matches!(inner.num_rows, Precision::Absent) {
                     inner.num_rows = inferred.num_rows;
@@ -353,6 +308,26 @@ pub trait Read: Send + Sync {
         &self,
         table_reference: TableReference,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn Error + Send + Sync>>;
+
+    /// A provider for a table whose schema the caller has already resolved.
+    ///
+    /// Lets a caller holding many schemas at once -- a catalog that resolved a
+    /// whole namespace in one query, say -- build providers without a round trip
+    /// per table.
+    ///
+    /// The default delegates to [`Read::table_provider`], discarding `schema`
+    /// and resolving it from the source instead: correct, and as costly as not
+    /// having asked. An implementation that overrides this must return a
+    /// provider indistinguishable from [`Read::table_provider`]'s -- same
+    /// wrappers, same pushdown -- since a table that plans differently depending
+    /// on how it was discovered is a bug the caller cannot see.
+    async fn table_provider_with_schema(
+        &self,
+        table_reference: TableReference,
+        _schema: SchemaRef,
+    ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn Error + Send + Sync>> {
+        self.table_provider(table_reference).await
+    }
 }
 
 #[async_trait]
@@ -462,8 +437,13 @@ impl Drop for RefreshingCatalogProvider {
 mod tests {
     use super::*;
     use datafusion::arrow::datatypes::{DataType, Field};
+    use datafusion::catalog::Session;
+    use datafusion::datasource::TableType;
     use datafusion::error::DataFusionError;
+    use datafusion::error::Result as DataFusionResult;
     use datafusion::logical_expr::{LogicalPlan, TableSource};
+    use datafusion::physical_plan::ExecutionPlan;
+    use datafusion::prelude::Expr;
     use datafusion_federation::{
         FederatedTableProviderAdaptor, FederatedTableSource, FederationAnalyzerForLogicalPlan,
         FederationProvider,

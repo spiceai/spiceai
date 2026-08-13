@@ -338,6 +338,14 @@ impl RefreshTaskRunner {
             .await;
     }
 
+    /// The [`RefreshTask`] this runner drives. Used by the refresher loop to
+    /// resolve the live set of dataset names (self + synchronized children) at
+    /// refresh completion — children attach after their own initial load, so
+    /// the set cannot be captured up front.
+    pub(crate) fn refresh_task(&self) -> &Arc<RefreshTask> {
+        &self.refresh_task
+    }
+
     /// Create a new [`Refresh`] based on defaults and overrides.
     async fn create_refresh_from_overrides(
         defaults: Arc<RwLock<Refresh>>,

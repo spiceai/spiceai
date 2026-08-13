@@ -49,10 +49,6 @@ pub(crate) async fn build_heartbeat(
         active_models,
         active_spicepods: 0,
         runtime_versions: std::collections::HashMap::new(),
-        // Absent, not empty: this runtime does not report deployment restart
-        // state yet, and on the wire "no detail reported" and "nothing needs a
-        // restart" are different states. Populate it only from a real
-        // restart-required source of truth, never with a placeholder.
         standalone_runtime: None,
     }
 }

@@ -16,6 +16,8 @@ flight_client = { path = "../../flight_client" }
 linkme.workspace = true
 paste.workspace = true
 runtime = { path = "../../runtime" }
+runtime-parameters = { path = "../../runtime-parameters" }
+runtime-udfs-api = { path = "../../runtime-udfs-api" }
 snafu.workspace = true
 
 [lints]

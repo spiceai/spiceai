@@ -21,7 +21,6 @@ use crate::accelerated::{
 };
 use crate::federated::FederatedTable;
 use crate::filter_converter::{TimestampFilterConvert, create_timestamp_filter_convert};
-use crate::table_layers::{EMBEDDING_INNER, METADATA_ENRICHED_INNER};
 use arrow::array::{RecordBatch, UInt64Array};
 use cache::Caching;
 use datafusion::{
@@ -33,37 +32,23 @@ use datafusion::{
 };
 use runtime_component::dataset::TimeFormat;
 use runtime_datafusion::{is_spice_internal_dataset, session_config::get_df_default_config};
-use runtime_datafusion_index::{
-    INDEXED_INNER, Index, InnerProviderFn, resolve_keys_matching_predicate,
-};
 use runtime_object_store::registry::default_runtime_env;
 use search::index::compound::{CompoundSearchIndex, CompoundVectorIndex};
+use spice_table::{Index, LayerWalk, peel_to, resolve_keys_matching_predicate};
 use tokio::runtime::Handle;
 use tokio::sync::Mutex;
 
-/// The wrapper layers stripped by [`strip_index_wrapper_layers`] below. Deliberately narrower
-/// than [`crate::table_layers::TABLE_PROVIDER_LAYERS`]: it excludes `ACCELERATED_INNER` (which resolves to the
-/// *federated/source* table, not the accelerator — peeling it here would redirect a delete to the
-/// wrong table entirely) and the Iceberg/federated-adaptor accessors (source-side wrappers that
-/// never wrap an accelerator's raw provider; `IcebergDeletionProvider` in particular has real
-/// delete semantics of its own, not a passthrough, so it must never be silently skipped).
-const INDEX_WRAPPER_INNER_FNS: &[InnerProviderFn] =
-    &[INDEXED_INNER, EMBEDDING_INNER, METADATA_ENRICHED_INNER];
-
-/// Strips `IndexedTableProvider`/`EmbeddingTable`/`MetadataEnrichedTableProvider` wrapper layers
-/// so the actual accelerator delete below bypasses `IndexedTableProvider::delete_from`'s
-/// index-aware handling — retention needs the *warm-only* index scope (see
-/// [`warm_delete_target`]), which is a different policy than that generic path's full/both-scope
-/// delete.
+/// Peels to the provider a retention delete must execute against, bypassing
+/// `IndexLayer::delete_from`'s index-aware handling — retention needs the
+/// *warm-only* index scope (see [`warm_delete_target`]), a different policy from
+/// that generic path's full/both-scope delete.
+///
+/// Each layer decides for itself whether [`LayerWalk::RetentionDelete`] may see
+/// past it, so a layer with delete semantics of its own — or one redirecting to
+/// the source side, which would send the delete to the wrong table entirely —
+/// stops the peel rather than being silently skipped here.
 fn strip_index_wrapper_layers(tbl: &Arc<dyn TableProvider>) -> Arc<dyn TableProvider> {
-    let mut current = Arc::clone(tbl);
-    while let Some(inner) = INDEX_WRAPPER_INNER_FNS
-        .iter()
-        .find_map(|f| f(current.as_ref()))
-    {
-        current = Arc::clone(inner);
-    }
-    current
+    Arc::clone(peel_to(tbl, LayerWalk::RetentionDelete))
 }
 
 /// Resolves the index a retention delete should actually hit: for a compound (fallback-composed)
@@ -287,7 +272,9 @@ impl super::AcceleratedTable {
             .await
                 && num_records > 0
                 && let Some(cache_provider) = caching.as_ref()
-                && let Err(e) = cache_provider.invalidate_for_table(dataset_name.clone())
+                && let Err(e) = cache_provider
+                    .invalidate_for_table(dataset_name.clone())
+                    .await
             {
                 tracing::error!(
                     "Failed to invalidate cached results for dataset {}: {e}",
@@ -567,36 +554,38 @@ mod tests {
     #[test]
     fn test_strip_index_wrapper_layers_unwraps_all_known_layers() {
         use data_components::MetadataEnrichedTableProvider;
-        use runtime_datafusion_index::IndexedTableProvider;
+        use spice_table::{IndexLayer, SpiceTable};
 
         let mem_table: Arc<dyn TableProvider> = Arc::new(
             MemTable::try_new(create_test_schema(), vec![]).expect("mem table should be created"),
         );
 
-        // IndexedTableProvider alone.
+        // An index layer alone.
         let wrapped: Arc<dyn TableProvider> =
-            Arc::new(IndexedTableProvider::new(Arc::clone(&mem_table)));
+            SpiceTable::over(Arc::new(IndexLayer::new()), Arc::clone(&mem_table));
         assert!(
             strip_index_wrapper_layers(&wrapped)
                 .downcast_ref::<MemTable>()
                 .is_some(),
-            "stripping an IndexedTableProvider must yield the underlying MemTable"
+            "stripping an IndexLayer must yield the underlying MemTable"
         );
 
-        // MetadataEnrichedTableProvider nested inside an IndexedTableProvider (the shape
+        // A metadata layer nested inside an index layer (the shape
         // `table_provider_with_spicepod_metadata` produces).
-        let metadata_enriched: Arc<dyn TableProvider> =
+        let metadata_enriched: Arc<dyn TableProvider> = SpiceTable::over(
             Arc::new(MetadataEnrichedTableProvider::new(
-                Arc::clone(&mem_table),
+                &mem_table,
                 std::collections::HashMap::from([("key".to_string(), "value".to_string())]),
-            ));
+            )),
+            Arc::clone(&mem_table),
+        );
         let wrapped_with_metadata: Arc<dyn TableProvider> =
-            Arc::new(IndexedTableProvider::new(metadata_enriched));
+            SpiceTable::over(Arc::new(IndexLayer::new()), metadata_enriched);
         assert!(
             strip_index_wrapper_layers(&wrapped_with_metadata)
                 .downcast_ref::<MemTable>()
                 .is_some(),
-            "stripping must peel through a nested MetadataEnrichedTableProvider layer"
+            "stripping must peel through a nested metadata layer"
         );
 
         // A provider with no wrapper layers is returned unchanged.

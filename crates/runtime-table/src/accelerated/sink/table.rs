@@ -25,8 +25,8 @@ use datafusion::{
 };
 use opentelemetry::KeyValue;
 use runtime_datafusion::execution_plan::schema_cast::SchemaCastScanExec;
-use runtime_datafusion_index::{Index, IndexedTableProvider, WriteWindow};
 use runtime_table_partition::provider::PartitionTableProvider;
+use spice_table::{Index, SpiceTable, WriteWindow};
 use util::RetryError;
 
 use crate::accelerated::{
@@ -113,7 +113,7 @@ pub(crate) struct TableSink {
     pub(super) table_provider: Arc<dyn TableProvider>,
     /// Additional indexes that receive write lifecycle hooks (`on_write_start`,
     /// `on_write_failed`, `on_write_complete`) but are **not** stored in the
-    /// accelerator-side [`IndexedTableProvider`].
+    /// accelerator-side [`IndexLayer`].
     ///
     /// Used for external indexes (e.g. Elasticsearch) that must be maintained on
     /// the accelerator write path but must never be visible to the query optimizer.
@@ -192,12 +192,13 @@ impl TableSink {
         let providers_before_write = self.providers_for_write_hooks().await;
 
         // Collect all indexes that need write-lifecycle hooks: those embedded in
-        // IndexedTableProvider on the accelerator and any extra sink_indexes (e.g.
+        // an index layer on the accelerator and any extra sink_indexes (e.g.
         // Elasticsearch indexes maintained externally to the accelerator storage).
         let provider_indexes_before: Vec<Arc<dyn Index + Send + Sync>> = providers_before_write
             .iter()
-            .filter_map(|p| p.downcast_ref::<IndexedTableProvider>())
-            .flat_map(IndexedTableProvider::get_all_indexes)
+            .filter_map(|p| p.downcast_ref::<SpiceTable>())
+            .flat_map(SpiceTable::indexes)
+            .map(Arc::clone)
             .collect();
 
         // A replacing write drops source rows by not re-sending them, so an index backed by its
@@ -248,8 +249,9 @@ impl TableSink {
         // no-op after append (index already exists). CDC skips this path entirely.
         let provider_indexes_after: Vec<Arc<dyn Index + Send + Sync>> = providers_after_write
             .iter()
-            .filter_map(|p| p.downcast_ref::<IndexedTableProvider>())
-            .flat_map(IndexedTableProvider::get_all_indexes)
+            .filter_map(|p| p.downcast_ref::<SpiceTable>())
+            .flat_map(SpiceTable::indexes)
+            .map(Arc::clone)
             .collect();
 
         finalize_indexes(
@@ -276,8 +278,9 @@ async fn run_on_write_failed(
 ) {
     let provider_indexes: Vec<Arc<dyn Index + Send + Sync>> = providers
         .iter()
-        .filter_map(|p| p.downcast_ref::<IndexedTableProvider>())
-        .flat_map(IndexedTableProvider::get_all_indexes)
+        .filter_map(|p| p.downcast_ref::<SpiceTable>())
+        .flat_map(SpiceTable::indexes)
+        .map(Arc::clone)
         .collect();
 
     rollback_indexes(

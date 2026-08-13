@@ -518,7 +518,10 @@ pub fn extract_cayenne_write_target(
         return Some(CayenneWriteTarget::Partitioned(Arc::clone(table_provider)));
     }
 
-    if let Some(poly) = table_provider.downcast_ref::<PolyTableProvider>() {
+    if let Some(poly) = spice_table::find_layer::<PolyTableProvider>(
+        table_provider.as_ref(),
+        spice_table::LayerWalk::Write,
+    ) {
         let writer = poly.writer();
         return extract_cayenne_write_target(&writer);
     }
