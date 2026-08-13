@@ -25,7 +25,6 @@ use crate::dataconnector::{
     kafka::{SidecarOffsetCommitHook, SidecarOffsetStore},
 };
 use crate::datafusion::refresh_sql;
-use crate::federated::FederatedTable;
 use crate::schema_evolution::{
     SCHEMA_EVOLUTION_APPLIED, SCHEMA_EVOLUTION_DETECTED, SCHEMA_EVOLUTION_FAILED,
     evolution_allowed, schema_evolution_labels, widening_plan_kind,
@@ -40,6 +39,7 @@ use data_components::debezium::{self, change_event};
 use data_components::debezium_kafka::DebeziumKafka;
 use data_components::kafka::{KafkaConfig, KafkaConsumer, KafkaMetrics, KafkaOffset};
 use data_components::schema_discovery::merge_inferred_and_declared_schemas;
+use data_connector_api::federated::FederatedTableProvider;
 use datafusion::datasource::TableProvider;
 use futures::StreamExt;
 use runtime_metrics::component::MetricsProvider;
@@ -564,7 +564,7 @@ impl DataConnector for Debezium {
 
     fn changes_stream(
         &self,
-        federated_table: Arc<FederatedTable>,
+        federated_table: Arc<dyn FederatedTableProvider>,
         _dataset: &Dataset,
     ) -> Option<ChangesStream> {
         Some(Box::pin(stream! {

@@ -29,6 +29,10 @@ use arrow::error::ArrowError;
 use async_trait::async_trait;
 use data_accelerator_api::{BootstrapStatus, get_primary_keys_from_constraints};
 use data_components::cdc::ChangesStream;
+use data_connector_api::accelerated::{
+    AcceleratorSetup, RefreshRequestError, RefreshRequester, RegisteredAcceleratedTable,
+    TableGoneSnafu,
+};
 use datafusion::catalog::Session;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::logical_expr::TableProviderFilterPushDown;
@@ -1511,6 +1515,44 @@ impl Drop for AcceleratedTable {
         for handler in self.handlers.drain(..) {
             handler.abort();
         }
+    }
+}
+
+impl AcceleratorSetup for Builder {
+    fn accelerator(&self) -> Arc<dyn TableProvider> {
+        self.get_accelerator()
+    }
+
+    fn set_accelerator(&mut self, accelerator: Arc<dyn TableProvider>) {
+        Builder::set_accelerator(self, accelerator);
+    }
+}
+
+impl RegisteredAcceleratedTable for AcceleratedTable {
+    fn refresh_requester(&self) -> Option<Arc<dyn RefreshRequester>> {
+        self.refresh_trigger()
+            .cloned()
+            .map(|trigger| Arc::new(RefreshTrigger { trigger }) as Arc<dyn RefreshRequester>)
+    }
+
+    fn attach_task(&mut self, task: JoinHandle<()>) {
+        self.handlers.push(task);
+    }
+}
+
+/// [`RefreshRequester`] over an accelerated table's refresh-trigger channel.
+///
+/// A request carries no overrides: the connector-side callers ask for the
+/// dataset's configured refresh, not a modified one.
+#[derive(Debug)]
+struct RefreshTrigger {
+    trigger: mpsc::Sender<Option<RefreshOverrides>>,
+}
+
+#[async_trait]
+impl RefreshRequester for RefreshTrigger {
+    async fn request_refresh(&self) -> Result<(), RefreshRequestError> {
+        self.trigger.send(None).await.ok().context(TableGoneSnafu)
     }
 }
 
