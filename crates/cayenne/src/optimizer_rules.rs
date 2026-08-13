@@ -799,11 +799,20 @@ fn try_rewrite_oversized_join(
             return Ok(None);
         }
         let Some(build_row_count) = build_input_row_estimate(hash_join) else {
+            tracing::info!(
+                join_type = ?hash_join.join_type(),
+                "Cayenne oversized-join gate declined: build-side row statistics are absent"
+            );
             return Ok(None);
         };
         let Some(estimated_build_bytes) =
             build_side_memory_estimate(hash_join.left().as_ref(), build_row_count)
         else {
+            tracing::info!(
+                join_type = ?hash_join.join_type(),
+                build_row_count,
+                "Cayenne oversized-join gate declined: build side has no byte estimate (unsupported key or column type)"
+            );
             return Ok(None);
         };
 
@@ -818,7 +827,10 @@ fn try_rewrite_oversized_join(
         let effective_gate = gate_bytes.min(fair_share);
         let fire = estimated_build_bytes > effective_gate;
 
-        tracing::debug!(
+        // Info-level on purpose: this fires once per hash join per planned
+        // query, and it is the only visibility into why an oversized join was
+        // or was not rewritten on a benchmark box where RUST_LOG cannot be set.
+        tracing::info!(
             join_type = ?hash_join.join_type(),
             build_row_count,
             estimated_build_bytes,
@@ -913,6 +925,12 @@ fn try_rewrite_oversized_join(
                     // An index past the combined join schema cannot be
                     // reconstructed; keep the original join rather than risk a
                     // wrong schema.
+                    tracing::warn!(
+                        join_type = ?hash_join.join_type(),
+                        index,
+                        join_schema_fields = join_schema.fields().len(),
+                        "Cayenne oversized-join rewrite declined: embedded projection index is out of range"
+                    );
                     return Ok(None);
                 };
                 exprs.push((
@@ -925,6 +943,12 @@ fn try_rewrite_oversized_join(
             // addresses columns by position. Decline rather than emit a
             // mismatched plan.
             if projected.schema() != hash_join.schema() {
+                tracing::warn!(
+                    join_type = ?hash_join.join_type(),
+                    expected_schema = ?hash_join.schema(),
+                    reconstructed_schema = ?projected.schema(),
+                    "Cayenne oversized-join rewrite declined: hoisted projection does not reproduce the join's output schema"
+                );
                 return Ok(None);
             }
             projected
