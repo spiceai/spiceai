@@ -245,7 +245,7 @@ fn reject_cloud_region(cloud_region: Option<&str>) -> Result<()> {
             "--cloud-region {region} does not apply to `spice connect`. Spice Cloud selects this \
              instance's gateway from the location supplied to `spiced --region` during \
              `spiced --token` enrollment and returns it in the enroll response, falling back \
-             to the home stamp for a location it does not recognise. Use --endpoint <url> \
+             to the home stamp for a location it does not recognize. Use --endpoint <url> \
              here only to inspect or release state through another Spice Cloud control plane. \
              See: https://spiceai.org/docs"
         ),
@@ -293,7 +293,15 @@ async fn connect_existing(
 /// unreadable identity would report success, but every `spiced` restart would
 /// reject that identity and run without Cloud Connect.
 fn has_enrolled_identity(config_dir: &Path) -> Result<bool> {
-    runtime_cloud_connect::identity::IdentityStore::load_optional(&config_dir.join(IDENTITY_FILE))
+    let mut config = runtime_cloud_connect::CloudConnectConfig::from_env_at(
+        env!("CARGO_PKG_VERSION"),
+        config_dir.to_path_buf(),
+    );
+    // An installed service carries only SPICE_CONFIG_DIR. A gateway override
+    // inherited from the invoking shell is transient and cannot make an
+    // otherwise unusable durable identity safe to install.
+    config.gateway_endpoint = None;
+    runtime_cloud_connect::load_reconnectable_identity(&config)
         .map(|identity| identity.is_some())
         .map_err(|e| Error::CloudConnectIo {
             message: format!("load identity: {e}"),
@@ -367,10 +375,16 @@ fn instance_dir_for(config_dir: &Path) -> PathBuf {
 async fn print_status(config_dir: &Path, endpoint: Option<&str>) -> Result<()> {
     let identity_path = config_dir.join(IDENTITY_FILE);
 
-    let identity = runtime_cloud_connect::identity::IdentityStore::load_optional(&identity_path)
-        .map_err(|e| Error::CloudConnectIo {
+    let mut config = runtime_cloud_connect::CloudConnectConfig::from_env_at(
+        env!("CARGO_PKG_VERSION"),
+        config_dir.to_path_buf(),
+    );
+    config.gateway_endpoint = None;
+    let identity = runtime_cloud_connect::load_reconnectable_identity(&config).map_err(|e| {
+        Error::CloudConnectIo {
             message: format!("load identity: {e}"),
-        })?;
+        }
+    })?;
 
     if let Some(id) = identity {
         let expiry = id.not_after_unix.map_or_else(
@@ -628,10 +642,12 @@ async fn remove_identity(
 
     if had_identity {
         // Clearing this also destroys the cache key, which is only in this file.
-        runtime_cloud_connect::identity::IdentityStore::clear(&identity_path).map_err(|e| {
-            Error::CloudConnectIo {
-                message: format!("clear identity: {e}"),
-            }
+        runtime_cloud_connect::identity::IdentityStore::clear_with_transaction(
+            &identity_path,
+            &enrollment_transaction,
+        )
+        .map_err(|e| Error::CloudConnectIo {
+            message: format!("clear identity: {e}"),
         })?;
     }
 
@@ -799,6 +815,32 @@ mod tests {
         let error = has_enrolled_identity(dir.path())
             .expect_err("a malformed identity must not enable service installation");
         assert!(error.to_string().contains("load identity"), "{error}");
+    }
+
+    #[test]
+    fn a_parseable_but_unusable_identity_is_not_accepted_as_enrolled_state() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join(IDENTITY_FILE);
+        std::fs::write(
+            path,
+            serde_json::json!({
+                "identifier": "",
+                "identity_cert_pem": "credential-that-must-not-be-printed",
+                "private_key_pem": "private-key-that-must-not-be-printed",
+                "public_key_pem": "public-key",
+                "gateway_addr": "gateway.example:443"
+            })
+            .to_string(),
+        )
+        .expect("write unusable identity");
+
+        let error = has_enrolled_identity(dir.path())
+            .expect_err("an unusable identity must not enable service installation");
+        let rendered = error.to_string();
+        assert!(rendered.contains("cannot be used"), "{rendered}");
+        assert!(rendered.contains("identifier is empty"), "{rendered}");
+        assert!(!rendered.contains("credential-that-must-not-be-printed"));
+        assert!(!rendered.contains("private-key-that-must-not-be-printed"));
     }
 
     #[test]

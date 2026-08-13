@@ -64,6 +64,10 @@ const LOCK_WAIT_BUDGET: std::time::Duration = std::time::Duration::from_secs(30)
 #[cfg(test)]
 const LOCK_WAIT_BUDGET: std::time::Duration = std::time::Duration::from_millis(250);
 const LOCK_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
+#[cfg(not(test))]
+const REMOVAL_LOCK_WAIT_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+#[cfg(test)]
+const REMOVAL_LOCK_WAIT_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Current schema of the draft file.
 const DRAFT_SCHEMA_VERSION: u32 = 2;
@@ -90,6 +94,12 @@ pub enum Error {
         path: PathBuf,
         source: serde_json::Error,
     },
+
+    #[snafu(display(
+        "The enrollment draft at {} cannot be replayed safely: {reason}. Preserve the draft and contact Spice Cloud support before removing it or starting a new enrollment",
+        path.display()
+    ))]
+    Invalid { path: PathBuf, reason: &'static str },
 
     #[snafu(display(
         "The enrollment draft at {} uses unsupported schema {found} (this runtime requires \
@@ -139,6 +149,10 @@ impl EnrollmentTransactionLock {
         Self::acquire_with_budget(config_dir, std::time::Duration::ZERO)
     }
 
+    pub(crate) fn acquire_for_removal(config_dir: &Path) -> Result<Self> {
+        Self::acquire_with_budget(config_dir, REMOVAL_LOCK_WAIT_BUDGET)
+    }
+
     fn acquire_with_budget(config_dir: &Path, wait_budget: std::time::Duration) -> Result<Self> {
         let draft_path = EnrollmentDraft::path_in(config_dir);
         if let Some(parent) = draft_path.parent() {
@@ -169,14 +183,18 @@ impl EnrollmentTransactionLock {
             .map_err(|source| Error::AcquireTaskPanicked { source })?
     }
 
+    pub(crate) fn protects(&self, path: &Path) -> bool {
+        self.draft_path.parent() == path.parent()
+    }
+
     pub(crate) fn load_or_create(
         &self,
         instance: &InstanceFacts,
         region: Option<&str>,
     ) -> Result<EnrollmentDraft> {
-        match std::fs::read_to_string(&self.draft_path) {
-            Ok(contents) => EnrollmentDraft::load_published(&self.draft_path, &contents),
-            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+        match crate::identity::read_regular_file_optional(&self.draft_path) {
+            Ok(Some(contents)) => EnrollmentDraft::load_published(&self.draft_path, &contents),
+            Ok(None) => {
                 EnrollmentDraft::publish_locked(&self.draft_path, &self.file, instance, region)
             }
             Err(source) => Err(Error::Io {
@@ -301,9 +319,16 @@ impl EnrollmentDraft {
                 found: header.schema_version,
             });
         }
-        serde_json::from_str::<Self>(contents).context(ParseSnafu {
+        let draft = serde_json::from_str::<Self>(contents).context(ParseSnafu {
             path: path.to_path_buf(),
-        })
+        })?;
+        if let Some(reason) = draft.material().validation_error() {
+            return Err(Error::Invalid {
+                path: path.to_path_buf(),
+                reason,
+            });
+        }
+        Ok(draft)
     }
 
     fn load_published(path: &Path, contents: &str) -> Result<Self> {
@@ -402,9 +427,9 @@ impl EnrollmentDraft {
         // another process can publish before this process owns it. Re-read
         // while locked so a delayed creator cannot replace the durable winner
         // through the atomic rename below.
-        match std::fs::read_to_string(path) {
-            Ok(contents) => return Self::parse_at(path, &contents),
-            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+        match crate::identity::read_regular_file_optional(path) {
+            Ok(Some(contents)) => return Self::parse_at(path, &contents),
+            Ok(None) => {}
             Err(source) => {
                 return Err(Error::Io {
                     path: path.to_path_buf(),
@@ -574,6 +599,27 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(path).expect("corrupt draft remains"),
             "{not json",
+            "ambiguous enrollment state must not be silently replaced"
+        );
+    }
+
+    #[test]
+    fn cryptographically_inconsistent_draft_is_never_replayed_or_replaced() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = EnrollmentDraft::path_in(dir.path());
+        let mut corrupted = load_or_create(dir.path()).expect("create draft");
+        corrupted.enc_public_key_pem = IdentityStore::generate_enrollment()
+            .expect("generate mismatched material")
+            .enc_public_key_pem;
+        let serialized = serde_json::to_string_pretty(&corrupted).expect("serialize draft");
+        std::fs::write(&path, &serialized).expect("write corrupt draft");
+
+        let error = load_or_create(dir.path()).expect_err("must refuse unsafe replay");
+        assert!(matches!(error, Error::Invalid { .. }), "{error}");
+        assert!(error.to_string().contains("do not match"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(path).expect("corrupt draft remains"),
+            serialized,
             "ambiguous enrollment state must not be silently replaced"
         );
     }
@@ -812,6 +858,55 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(mode, 0o600, "the draft holds private key material");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn draft_reads_reject_symlinks_without_reading_the_target() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("outside.json");
+        let path = EnrollmentDraft::path_in(dir.path());
+        std::fs::write(&target, "sensitive target").expect("write target");
+        symlink(&target, &path).expect("create draft symlink");
+
+        let error = load_or_create(dir.path()).expect_err("symlink must be rejected");
+        assert!(matches!(error, Error::Io { .. }), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(target).expect("target remains readable"),
+            "sensitive target"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn draft_reads_reject_fifos_without_blocking() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt as _;
+        use std::os::unix::fs::FileTypeExt as _;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = EnrollmentDraft::path_in(dir.path());
+        let path_c = CString::new(path.as_os_str().as_bytes()).expect("FIFO path has no NUL");
+        // SAFETY: `path_c` is a valid NUL-terminated path and `0o600` is a
+        // valid mode. `mkfifo` retains neither argument.
+        let result = unsafe { libc::mkfifo(path_c.as_ptr(), 0o600) };
+        assert_eq!(
+            result,
+            0,
+            "create FIFO: {}",
+            std::io::Error::last_os_error()
+        );
+
+        let error = load_or_create(dir.path()).expect_err("FIFO must be rejected");
+        assert!(matches!(error, Error::Io { .. }), "{error}");
+        assert!(
+            std::fs::metadata(path)
+                .expect("FIFO metadata")
+                .file_type()
+                .is_fifo()
+        );
     }
 
     #[cfg(unix)]

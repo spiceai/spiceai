@@ -850,6 +850,34 @@ mod connect {
             .stdout(predicate::str::contains("load identity"))
             .stdout(predicate::str::contains("not valid JSON").not());
     }
+
+    #[test]
+    fn install_rejects_a_parseable_but_unusable_identity_before_service_setup() {
+        let config_dir = TempDir::new().expect("create config directory");
+        fs::write(
+            config_dir.path().join("identity.json"),
+            serde_json::json!({
+                "identifier": "",
+                "identity_cert_pem": "credential-that-must-not-be-printed",
+                "private_key_pem": "private-key-that-must-not-be-printed",
+                "public_key_pem": "public-key",
+                "gateway_addr": "gateway.example:443"
+            })
+            .to_string(),
+        )
+        .expect("write unusable identity");
+
+        spice_cmd()
+            .env("SPICE_CONFIG_DIR", config_dir.path())
+            .arg("connect")
+            .arg("--install")
+            .assert()
+            .failure()
+            .stdout(predicate::str::contains("cannot be used"))
+            .stdout(predicate::str::contains("identifier is empty"))
+            .stdout(predicate::str::contains("credential-that-must-not-be-printed").not())
+            .stdout(predicate::str::contains("private-key-that-must-not-be-printed").not());
+    }
 }
 
 // ============================================================================

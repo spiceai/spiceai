@@ -29,8 +29,8 @@ limitations under the License.
 //!    then enrolls this instance *before the runtime is built or any
 //!    listener binds*, so the durable identity exists by the time anything
 //!    else here runs.
-//! 2. `$SPICE_CONFIG_DIR/identity.json` exists (a previously enrolled
-//!    instance) — reconnection is automatic, with no flag.
+//! 2. `$SPICE_CONFIG_DIR/identity.json` contains a usable previously-enrolled
+//!    identity — reconnection is automatic, with no flag.
 //!
 //! If neither is true, this module never opens a connection. An existing
 //! identity always wins over a supplied `--token`: the key is not redeemed
@@ -78,9 +78,9 @@ use runtime::Runtime;
 use runtime::datafusion::query::Error as QueryError;
 use runtime::metrics_reader::MetricsReader;
 use runtime::status::ComponentStatus;
-use runtime_cloud_connect::config::{
-    CLOUD_MANAGED_SPICEPOD_FILE, CloudConnectConfig, IDENTITY_FILE,
-};
+#[cfg(test)]
+use runtime_cloud_connect::config::IDENTITY_FILE;
+use runtime_cloud_connect::config::{CLOUD_MANAGED_SPICEPOD_FILE, CloudConnectConfig};
 use runtime_cloud_connect::handlers::{
     ApplyOutcome, Capability, CommandError, MAX_QUERY_RESULT_BYTES, QueryOutcome, RuntimeHandle,
     RuntimePhase, SpicepodDeployment, StatusReport, effective_max_rows,
@@ -111,22 +111,17 @@ const DEFAULT_LOG_TAIL_LINES: usize = 500;
 /// one that holds even if that budget is raised or a phase hangs.
 const DEPLOYMENT_DRAIN_BUDGET: Duration = Duration::from_mins(2);
 
-/// Cheap probe for whether Spice Cloud Connect is configured for this
-/// instance, using the same signals as [`maybe_start`]: a `--token`
-/// enrollment bootstrap in progress, or an on-disk identity.
+/// Whether this instance has durable state that can activate Cloud Connect.
 ///
-/// Called from `init_tracing` (before [`maybe_start`]) to decide whether to
-/// install the log-capture layer. It runs in the same process — hence the
-/// same working directory — as [`maybe_start`], so both resolve the config
-/// directory identically. This is a lightweight existence check; it does not
-/// read or validate the file (that happens in `maybe_start`).
-pub(crate) fn is_configured(token_supplied: bool) -> bool {
-    if token_supplied {
-        return true;
-    }
-    CloudConnectConfig::default_config_dir()
-        .join(IDENTITY_FILE)
-        .exists()
+/// The one-time `--token` is consumed before this runs, so it is never an
+/// activation signal. A usable identity is the only signal shared by early
+/// metrics/log/deployment setup and the control client itself.
+pub(crate) async fn is_configured() -> runtime_cloud_connect::Result<bool> {
+    runtime_cloud_connect::load_reconnectable_identity_async(&build_config(env!(
+        "CARGO_PKG_VERSION"
+    )))
+    .await
+    .map(|identity| identity.is_some())
 }
 
 /// Read the optional instance-local `cloud-endpoint` override file. This
@@ -292,9 +287,9 @@ pub struct CloudManagedSpicepodReadError {
 /// Reads files only — no control-plane round trip — so an instance whose
 /// gateway is unreachable still comes up on its deployed configuration.
 pub async fn cloud_managed_spicepod(
-    token_supplied: bool,
+    configured: bool,
 ) -> std::result::Result<Option<CloudManagedSpicepod>, CloudManagedSpicepodReadError> {
-    if !is_configured(token_supplied) {
+    if !configured {
         return Ok(None);
     }
     let config_dir = CloudConnectConfig::default_config_dir();
@@ -339,9 +334,9 @@ pub struct DeliveredSecretsState {
 pub async fn restore_delivered_secrets(
     runtime_version: &str,
     runtime: &Arc<Runtime>,
-    token_supplied: bool,
+    configured: bool,
 ) -> Option<DeliveredSecretsState> {
-    if !is_configured(token_supplied) {
+    if !configured {
         return None;
     }
     let config = build_config(runtime_version);
@@ -392,7 +387,8 @@ pub async fn maybe_start(
     // treating it as "not enrolled", so a broken identity file is visible
     // to the operator instead of quietly disabling Cloud Connect.
     let mut persisted_app_id = None;
-    let has_identity = match IdentityStore::load_optional(&config.identity_path) {
+    let has_identity = match runtime_cloud_connect::load_reconnectable_identity_async(&config).await
+    {
         Ok(opt) => {
             // Restores the metrics attribution across a restart. Without it the
             // instance exports nothing until its next deploy, which may be days.

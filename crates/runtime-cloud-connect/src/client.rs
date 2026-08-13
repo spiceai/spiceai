@@ -311,19 +311,7 @@ impl ClientDriver {
     /// `None` when the identity carries no gateway address (a pre-split
     /// identity file) — non-recoverable without re-enrolling.
     fn stream_endpoint(&self) -> Option<String> {
-        if let Some(ref endpoint) = self.config.gateway_endpoint {
-            return Some(endpoint.clone());
-        }
-        let identity = self.identity.as_ref()?;
-        if identity.gateway_addr.is_empty() {
-            return None;
-        }
-        let scheme = if self.config.insecure {
-            "http"
-        } else {
-            "https"
-        };
-        Some(format!("{scheme}://{}", identity.gateway_addr))
+        self.config.stream_endpoint(self.identity.as_ref()?)
     }
 
     /// Renew the identity against the cloud `/renew` endpoint with a fresh

@@ -223,6 +223,11 @@ pub enum Error {
     #[snafu(display("Failed to reach the Spice Cloud endpoint {url}: {source}"))]
     Http { url: String, source: reqwest::Error },
 
+    #[snafu(display(
+        "Failed to construct the Spice Cloud request for {url}: the endpoint URL or request headers are invalid"
+    ))]
+    InvalidRequest { url: String },
+
     #[snafu(display("Failed to read the Spice Cloud response from {url}: {source}"))]
     ResponseBody { url: String, source: reqwest::Error },
 
@@ -269,25 +274,26 @@ impl Error {
     /// `true` only when the cloud *authoritatively rejected* the request
     /// ([`Error::Denied`]): retrying the same request cannot succeed.
     ///
-    /// Everything else is retryable: transport failures and 408/429/5xx are
-    /// transient, [`Error::CertificateValidity`] (a skewed host clock) is
-    /// fixable and the request never reached the cloud, and a local
-    /// proof-of-possession failure never left this host.
+    /// Every other variant is a local failure, a transient response, or an
+    /// unusable response rather than an authoritative cloud rejection.
     #[must_use]
     pub fn is_authoritative_rejection(&self) -> bool {
         matches!(self, Error::Denied { .. })
     }
 
     /// `true` when retrying the same enrollment operation cannot produce a
-    /// different outcome. A denied request is authoritative, while a malformed
-    /// decoded successful response with invalid required fields is committed
-    /// under the operation's idempotency key and will therefore replay the same
-    /// unusable semantics. Body transport and JSON decode failures remain
-    /// retryable because an unframed partial body is indistinguishable from
-    /// response loss.
+    /// different outcome. A locally invalid request was never sent, a denied
+    /// request is authoritative, and a decoded successful response with
+    /// invalid required fields is committed under the operation's idempotency
+    /// key and will therefore replay the same unusable semantics. Body
+    /// transport and JSON decode failures remain retryable because an unframed
+    /// partial body is indistinguishable from response loss.
     #[must_use]
     pub fn is_terminal_enrollment_failure(&self) -> bool {
-        matches!(self, Error::Denied { .. } | Error::InvalidResponse { .. })
+        matches!(
+            self,
+            Error::Denied { .. } | Error::InvalidRequest { .. } | Error::InvalidResponse { .. }
+        )
     }
 
     /// `true` only when the *credential itself* was rejected (HTTP 401).
@@ -671,6 +677,11 @@ impl EnrollClient {
         let response = match builder.send().await {
             Ok(response) => response,
             Err(source) => {
+                if source.is_builder() {
+                    return Err(Error::InvalidRequest {
+                        url: url.to_string(),
+                    });
+                }
                 // A TLS validity rejection is the shape a wrong host clock
                 // produces at every layer of this flow. Diagnose it here
                 // rather than handing the operator a bare certificate error.
@@ -965,6 +976,9 @@ fn denial_remediation(source: &Error) -> &'static str {
         Error::Denied { code, .. } => code.remediation(),
         Error::InvalidResponse { .. } => {
             "Spice Cloud returned unusable data for this pending operation. Preserve enrollment-draft.json and contact Spice Cloud support before removing it or starting a new enrollment"
+        }
+        Error::InvalidRequest { .. } => {
+            "Fix the configured Spice Cloud endpoint or organization name and retry"
         }
         _ => "Fix the reported problem and retry",
     }
@@ -1444,6 +1458,15 @@ mod tests {
             "an invalid response is not a credential revocation signal"
         );
 
+        let invalid_request = Error::InvalidRequest {
+            url: "not a URL".to_string(),
+        };
+        assert!(
+            invalid_request.is_terminal_enrollment_failure(),
+            "a locally invalid request cannot improve on retry"
+        );
+        assert!(!invalid_request.is_authoritative_rejection());
+
         let pop = Error::ProofOfPossession {
             reason: "key material generation failed".to_string(),
         };
@@ -1460,6 +1483,42 @@ mod tests {
             skew.to_string().contains("clock"),
             "the message must name the clock: {skew}"
         );
+    }
+
+    #[tokio::test]
+    async fn invalid_request_construction_is_terminal_without_network_retry() {
+        let client = EnrollClient::new(&test_config("http://127.0.0.1:9")).expect("client");
+        let invalid_url = "://not-a-url";
+        let request = client.http.get(invalid_url);
+        let Err(error) = client
+            .send::<EnrollResponseWire>(invalid_url, request, None)
+            .await
+        else {
+            panic!("an invalid URL must fail locally");
+        };
+
+        assert!(matches!(error, Error::InvalidRequest { .. }), "{error}");
+        assert!(error.is_terminal_enrollment_failure());
+    }
+
+    #[tokio::test]
+    async fn invalid_organization_header_is_terminal_and_redacted() {
+        let client = EnrollClient::new(&test_config("http://127.0.0.1:9")).expect("client");
+        let authority = EnrollmentAuthority::AuthenticatedSession {
+            access_token: SessionToken::new("session-secret-never-printed".to_string()),
+            org: "invalid\norganization".to_string(),
+        };
+        let material = IdentityStore::generate_enrollment().expect("enrollment material");
+        let error = client
+            .enroll(&authority, "test-operation", &material, &test_facts(), None)
+            .await
+            .expect_err("an invalid header must fail locally");
+
+        assert!(matches!(error, Error::InvalidRequest { .. }), "{error}");
+        assert!(error.is_terminal_enrollment_failure());
+        let rendered = error.to_string();
+        assert!(!rendered.contains("session-secret-never-printed"));
+        assert!(!rendered.contains("invalid\norganization"));
     }
 
     #[tokio::test]

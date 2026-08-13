@@ -44,7 +44,7 @@ rand = { workspace = true }
 # Pin the aws_lc_rs backend (matching `crates/runtime`, which forces it via
 # feature unification in the spiced build) so key generation uses the same
 # backend in every build target.
-rcgen = { version = "0.14", default-features = false, features = ["pem", "aws_lc_rs"] }
+rcgen = { version = "0.14", default-features = false, features = ["pem", "aws_lc_rs", "x509-parser"] }
 # Out-of-band HTTPS enroll/renew against the cloud control plane.
 reqwest = { workspace = true }
 spice-cloud-client = { workspace = true }

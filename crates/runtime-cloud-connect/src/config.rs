@@ -140,6 +140,22 @@ pub struct CloudConnectConfig {
 }
 
 impl CloudConnectConfig {
+    /// Resolve the control-stream endpoint for a persisted identity.
+    ///
+    /// A configured override is already a complete URL. Otherwise the enroll
+    /// response supplies `host:port`, and transport mode supplies the scheme.
+    #[must_use]
+    pub fn stream_endpoint(&self, identity: &crate::identity::Identity) -> Option<String> {
+        if let Some(ref endpoint) = self.gateway_endpoint {
+            return Some(endpoint.clone());
+        }
+        if identity.gateway_addr.trim().is_empty() {
+            return None;
+        }
+        let scheme = if self.insecure { "http" } else { "https" };
+        Some(format!("{scheme}://{}", identity.gateway_addr))
+    }
+
     /// Resolve the Cloud Connect config directory to its canonical location.
     ///
     /// Precedence:

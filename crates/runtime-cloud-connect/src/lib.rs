@@ -134,6 +134,12 @@ pub enum Error {
         source: identity::Error,
     },
 
+    #[snafu(display("Identity load task failed for {}: {source}", path.display()))]
+    IdentityLoadTaskPanicked {
+        path: std::path::PathBuf,
+        source: tokio::task::JoinError,
+    },
+
     #[snafu(display(
         "The Cloud Connect identity at {} cannot be used: {reason}. Stop spiced, run `spice connect remove --yes` from this instance directory, mint a new enrollment key in the Spice Cloud portal, and restart with `spiced --token <enrollment-key>`. See: https://spiceai.org/docs",
         path.display()
@@ -160,6 +166,74 @@ pub enum Error {
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+/// Load the durable identity that may activate Cloud Connect.
+///
+/// This is the shared activation boundary for the runtime, early bootstrap
+/// facilities, and service installation. A file being present or parseable is
+/// insufficient: the credential, key relationships, renewal window, and exact
+/// endpoint shape used by the control client must all be usable.
+///
+/// # Errors
+///
+/// Returns [`Error::IdentityLoad`] when the state path is unreadable, unsafe, or
+/// malformed, and [`Error::IdentityUnusable`] when its durable contents cannot
+/// establish or renew a control stream.
+pub fn load_reconnectable_identity(config: &CloudConnectConfig) -> Result<Option<Identity>> {
+    let identity_path = config.identity_path.clone();
+    let Some(identity) =
+        IdentityStore::load_optional(&identity_path).map_err(|source| Error::IdentityLoad {
+            path: identity_path.clone(),
+            source,
+        })?
+    else {
+        return Ok(None);
+    };
+
+    if enroll::past_renewal_grace(&identity) {
+        return Err(Error::IdentityUnusable {
+            path: identity_path,
+            reason: "the certificate expired past the renewal grace window",
+        });
+    }
+    if let Some(reason) = identity.reconnect_validation_error(config.gateway_endpoint.as_deref()) {
+        return Err(Error::IdentityUnusable {
+            path: identity_path,
+            reason,
+        });
+    }
+    let endpoint = config
+        .stream_endpoint(&identity)
+        .ok_or_else(|| Error::IdentityUnusable {
+            path: identity_path.clone(),
+            reason: "the gateway address is empty",
+        })?;
+    if tonic::transport::Endpoint::from_shared(endpoint).is_err() {
+        return Err(Error::IdentityUnusable {
+            path: identity_path,
+            reason: "the gateway endpoint is invalid",
+        });
+    }
+
+    Ok(Some(identity))
+}
+
+/// Async variant of [`load_reconnectable_identity`] for startup paths running
+/// on Tokio. File and certificate parsing stay on the blocking pool.
+///
+/// # Errors
+///
+/// Returns the same errors as [`load_reconnectable_identity`], plus
+/// [`Error::IdentityLoadTaskPanicked`] if the blocking task fails.
+pub async fn load_reconnectable_identity_async(
+    config: &CloudConnectConfig,
+) -> Result<Option<Identity>> {
+    let config = config.clone();
+    let path = config.identity_path.clone();
+    tokio::task::spawn_blocking(move || load_reconnectable_identity(&config))
+        .await
+        .map_err(|source| Error::IdentityLoadTaskPanicked { path, source })?
+}
 
 /// Handle for a running `CloudConnect` client.
 ///
@@ -189,24 +263,12 @@ impl CloudConnect {
     /// `config.identity_path` but cannot be read or parsed, or
     /// [`Error::IdentityUnusable`] if its reconnect credentials are
     /// internally inconsistent.
-    #[expect(
-        clippy::unused_async,
-        reason = "spawns a background tokio task, so it must be called from within a tokio runtime context"
-    )]
     pub async fn start(
         config: CloudConnectConfig,
         runtime: Arc<dyn RuntimeHandle>,
     ) -> Result<Option<Self>> {
         let identity_path = config.identity_path.clone();
-        let identity = match IdentityStore::load_optional(&identity_path) {
-            Ok(identity) => identity,
-            Err(source) => {
-                return Err(Error::IdentityLoad {
-                    path: identity_path,
-                    source,
-                });
-            }
-        };
+        let identity = load_reconnectable_identity_async(&config).await?;
 
         let Some(identity) = identity else {
             tracing::debug!(
@@ -215,14 +277,6 @@ impl CloudConnect {
             );
             return Ok(None);
         };
-        if let Some(reason) =
-            identity.reconnect_validation_error(config.gateway_endpoint.as_deref())
-        {
-            return Err(Error::IdentityUnusable {
-                path: identity_path,
-                reason,
-            });
-        }
         let identity = Some(identity);
 
         let shutdown = Shutdown::new();
@@ -271,7 +325,7 @@ impl CloudConnect {
 /// than any catalog the CLI shipped with, or in no cloud region at all
 /// (`on-prem-syd`), and both must enroll. The catalog is used cloud-side for
 /// display and gateway-stamp selection, which fall back to the home stamp for
-/// a label it does not recognise.
+/// a label it does not recognize.
 ///
 /// The rule mirrors the cloud's own enroll validation (2–64 lowercase letters,
 /// digits, and hyphens, starting and ending alphanumeric) so the CLI never
@@ -291,6 +345,85 @@ pub fn is_valid_instance_region(region: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_config(config_dir: &std::path::Path) -> CloudConnectConfig {
+        CloudConnectConfig {
+            enroll_endpoint: "https://api.spice.ai".to_string(),
+            gateway_endpoint: None,
+            ca_cert_pem: None,
+            insecure: false,
+            identity_path: config_dir.join(config::IDENTITY_FILE),
+            config_dir: config_dir.to_path_buf(),
+            instance_region: None,
+            runtime_version: "v0-test".to_string(),
+            heartbeat_interval: std::time::Duration::from_secs(30),
+            telemetry_interval: std::time::Duration::from_mins(1),
+            metrics_interval: std::time::Duration::from_secs(30),
+            renewal_lead: std::time::Duration::from_hours(12),
+            query_deadline: std::time::Duration::from_secs(25),
+        }
+    }
+
+    fn test_identity() -> Identity {
+        use rcgen::{CertificateParams, KeyPair};
+
+        let material = IdentityStore::generate_enrollment().expect("generate enrollment material");
+        let keypair = KeyPair::from_pem(&material.private_key_pem).expect("parse identity key");
+        let certificate = CertificateParams::new(Vec::<String>::new())
+            .expect("certificate parameters")
+            .self_signed(&keypair)
+            .expect("sign certificate");
+        Identity {
+            identifier: "inst_test".to_string(),
+            identity_cert_pem: certificate.pem(),
+            private_key_pem: material.private_key_pem,
+            public_key_pem: material.public_key_pem,
+            ca_bundle_pem: String::new(),
+            gateway_addr: "gateway.example:443".to_string(),
+            not_after_unix: None,
+            enc_private_key_pem: material.enc_private_key_pem,
+            enc_public_key_pem: material.enc_public_key_pem,
+            enc_previous_private_key_pem: String::new(),
+            cache_key_b64: String::new(),
+            app_id: None,
+            org_name: None,
+            app_name: None,
+            monitor_url: None,
+        }
+    }
+
+    #[test]
+    fn durable_activation_requires_a_reconnectable_identity() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = test_config(dir.path());
+        let identity = test_identity();
+        IdentityStore::store(&config.identity_path, &identity).expect("store identity");
+
+        let loaded = load_reconnectable_identity(&config)
+            .expect("validate identity")
+            .expect("identity is present");
+        assert_eq!(loaded.identifier, identity.identifier);
+    }
+
+    #[test]
+    fn durable_activation_rejects_past_grace_and_invalid_endpoints() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = test_config(dir.path());
+        let mut identity = test_identity();
+        identity.not_after_unix = Some(1);
+        IdentityStore::store(&config.identity_path, &identity).expect("store expired identity");
+        let expired = load_reconnectable_identity(&config).expect_err("past grace must fail");
+        assert!(expired.to_string().contains("renewal grace"), "{expired}");
+
+        identity.not_after_unix = None;
+        identity.gateway_addr = "not a valid gateway".to_string();
+        IdentityStore::store(&config.identity_path, &identity).expect("store invalid endpoint");
+        let invalid = load_reconnectable_identity(&config).expect_err("endpoint must fail");
+        assert!(
+            invalid.to_string().contains("endpoint is invalid"),
+            "{invalid}"
+        );
+    }
 
     #[test]
     fn accepts_catalog_and_non_catalog_regions() {
