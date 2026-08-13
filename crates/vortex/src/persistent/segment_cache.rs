@@ -402,12 +402,20 @@ impl SharedSegmentCache {
             return;
         }
 
-        // Mark every still-open path retired before enumerating keys. A put
-        // that started before this mark increments `active_puts`, so waiting
-        // for zero proves its insert is visible to the enumeration. A later
-        // put observes `retired` and skips insertion. This closes the
-        // delete/invalidate/late-put race without permanent path tombstones:
-        // the state disappears when the last open file cache is dropped.
+        // Mark every path that is *currently registered* retired before
+        // enumerating keys. A put that started before this mark incremented
+        // `active_puts`, so waiting for zero proves its insert is visible to the
+        // enumeration; a later put through one of these states observes `retired`
+        // and skips insertion.
+        //
+        // That covers openers this snapshot can see, and no more. A path whose
+        // registry entry is absent or whose weak has expired can be opened again
+        // after the snapshot: `for_path` mints a fresh state with
+        // `retired == false`, and a put through it can land after the key scan,
+        // leaving the retired path repopulated. Closing that needs a retirement
+        // marker installed under the same shard lock and kept until no stale
+        // opener can appear — tracked in spiceai/spiceai#12963, since it changes
+        // the no-permanent-tombstones property this design was built around.
         let states: Vec<_> = self
             .path_states
             .as_ref()
