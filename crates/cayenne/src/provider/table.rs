@@ -952,6 +952,21 @@ struct CachedTableStatistics {
     /// COUNT(*) fold declines rather than answering from a possibly-drifted count.
     /// Defaults `false` (conservative: an uninitialized cache is not trusted exact).
     count_exact: bool,
+    /// Whether an abandoned statistics update left the maintained count short:
+    /// the rows it did not describe are already visible to scans, and no
+    /// persisted count includes them.
+    ///
+    /// Sticky, because the gap does not close on its own. The next persist
+    /// derives its exactness from the *record*, which is the pre-gap baseline, so
+    /// a later `Delta { exact: true }` would compute `true` over a short count and
+    /// overwrite `count_exact` with it — republishing exactly the wrong answer
+    /// this demotion exists to prevent. Only an authoritative
+    /// [`RowCountUpdate::Set`] (compaction/overwrite materializes exactly the live
+    /// rows) re-baselines the count and clears it.
+    ///
+    /// Deliberately survives `clear_cached_table_statistics_unlocked`: dropping
+    /// the cache does not fill the gap.
+    abandoned_update_outstanding: bool,
 }
 
 /// The outcome of reading a table's persisted statistics record.
@@ -6335,6 +6350,7 @@ impl CayenneTableProvider {
                 optimizer: table_statistics,
                 raw: None, // will be populated on first load/persist
                 count_exact: table_statistics_count_exact,
+                abandoned_update_outstanding: false,
             })),
             table_statistics_persistence_lock: Arc::new(tokio::sync::Mutex::new(())),
             retention_filters,
@@ -21130,12 +21146,6 @@ impl CayenneTableProvider {
             .await;
     }
 
-    /// Persist merged/replaced stats.
-    ///
-    /// `replace_aggregate` true ignores any existing aggregate (overwrite); false
-    /// merges this write into it. `num_rows_update` sets the live count relative
-    /// to the previous aggregate (`Delta`), to an authoritative value (`Set`), or
-    /// leaves it (`Unchanged`).
     /// Abandon a statistics update, demoting the cached exactness on the way out.
     ///
     /// Every failing exit of [`Self::persist_table_stats_locked`] returns through
@@ -21149,18 +21159,33 @@ impl CayenneTableProvider {
     /// very update being abandoned, and it has already cleared the in-memory
     /// proxies (resident inline rows, mem-tier tombstones) that would otherwise
     /// demote the stats. Without this, that path serves an `Exact` count which no
-    /// persisted record describes. Cache-only, so unlike a durable taint it cannot
-    /// fail in turn, and it self-heals: the next successful persist restores
-    /// exactness from the record it writes.
+    /// persisted record describes.
+    ///
+    /// The demotion is recorded as an outstanding gap
+    /// ([`CachedTableStatistics::abandoned_update_outstanding`]) rather than a
+    /// bare `count_exact = false`, because the next persist derives its exactness
+    /// from the *record* — the pre-gap baseline — and would otherwise compute
+    /// `true` over a short count and overwrite the demotion with it. Cache-only,
+    /// so unlike a durable taint it cannot fail in turn; an authoritative
+    /// [`RowCountUpdate::Set`] is what closes the gap.
     fn abandon_table_stats_update(&self, reason: &str) -> bool {
         tracing::warn!(
             "Abandoning table stats update for {}: {reason}",
             self.table_metadata.table_name
         );
-        self.table_statistics.write().count_exact = false;
+        let mut cache = self.table_statistics.write();
+        cache.count_exact = false;
+        cache.abandoned_update_outstanding = true;
         false
     }
 
+    /// Persist merged/replaced stats.
+    ///
+    /// `replace_aggregate` true ignores any existing aggregate (overwrite); false
+    /// merges this write into it. `num_rows_update` sets the live count relative
+    /// to the previous aggregate (`Delta`), to an authoritative value (`Set`), or
+    /// leaves it (`Unchanged`).
+    ///
     /// Returns whether the update reached the metastore and the cache. Every
     /// bail-out abandons `num_rows_update` and leaves the durable record as it
     /// was, so each one goes through [`Self::abandon_table_stats_update`] to
@@ -21251,13 +21276,22 @@ impl CayenneTableProvider {
         // taints it; `Unchanged` preserves. A tainted (`false`) count is served
         // `Inexact` so the COUNT(*) fold declines rather than answering from a
         // possibly-over-counted maintained value.
+        //
+        // An earlier abandoned update carries its own veto: the baseline this
+        // merge reads predates rows that are already visible to scans, so an
+        // incremental result over it is short however exact the delta itself is.
+        // Only a `Set` re-materializes the live count and closes the gap.
+        let update_is_authoritative = matches!(num_rows_update, RowCountUpdate::Set(_));
+        let abandoned_update_outstanding =
+            self.table_statistics.read().abandoned_update_outstanding;
+        let incremental_exactness_holds = prev_num_rows_exact && !abandoned_update_outstanding;
         let (num_rows, num_rows_exact) = match num_rows_update {
             RowCountUpdate::Delta { delta, exact } => (
                 prev_num_rows.saturating_add(delta).max(0),
-                exact && prev_num_rows_exact,
+                exact && incremental_exactness_holds,
             ),
             RowCountUpdate::Set(n) => (n.max(0), true),
-            RowCountUpdate::Unchanged => (prev_num_rows, prev_num_rows_exact),
+            RowCountUpdate::Unchanged => (prev_num_rows, incremental_exactness_holds),
         };
 
         let stats = TableStatistics {
@@ -21284,6 +21318,13 @@ impl CayenneTableProvider {
         cache.optimizer = df_stats;
         cache.optimizer_inexact = df_stats_inexact;
         cache.count_exact = stats.num_rows_exact;
+        // Only an authoritative `Set` closes an outstanding gap — it materialized
+        // exactly the live rows, so whatever an earlier abandon left undescribed is
+        // now counted. An incremental update merged onto the same short baseline
+        // and leaves the gap open.
+        if update_is_authoritative {
+            cache.abandoned_update_outstanding = false;
+        }
         // Keep the raw blob for the next persist to avoid a catalog read.
         cache.raw = Some(stats);
         true
@@ -39196,16 +39237,7 @@ mod tests {
         (provider, catalog, temp_dir)
     }
 
-    /// Make the statistics READ fail while leaving the write leg working.
-    ///
-    /// The blob column is `NOT NULL`, but it has BLOB affinity, so SQLite stores
-    /// a text value in it unconverted — and the row mapper's blob accessor
-    /// rejects a text value, so `get_table_statistics` returns `Err`. The UPSERT
-    /// a merge performs afterwards still succeeds. That asymmetry is what makes a
-    /// merge onto a missing baseline durable, so it is what the fixture has to
-    /// reproduce: dropping the whole table would fail the write too, and prove
-    /// nothing.
-    /// Open the metastore SQLite file directly, bypassing the catalog. The path
+    /// Open the metastore `SQLite` file directly, bypassing the catalog. The path
     /// layout is the one `create_reopenable_append_table` and its siblings build.
     fn open_metastore_db(temp_dir: &std::path::Path) -> rusqlite::Connection {
         let conn = rusqlite::Connection::open(temp_dir.join("metadata").join("cayenne.db"))
@@ -39215,6 +39247,15 @@ mod tests {
         conn
     }
 
+    /// Make the statistics READ fail while leaving the write leg working.
+    ///
+    /// The blob column is `NOT NULL`, but it has BLOB affinity, so `SQLite` stores
+    /// a text value in it unconverted — and the row mapper's blob accessor
+    /// rejects a text value, so `get_table_statistics` returns `Err`. The UPSERT
+    /// a merge performs afterwards still succeeds. That asymmetry is what makes a
+    /// merge onto a missing baseline durable, so it is what the fixture has to
+    /// reproduce: dropping the whole table would fail the write too, and prove
+    /// nothing.
     fn make_table_statistics_unreadable(temp_dir: &std::path::Path, table_id: &str) {
         let conn = open_metastore_db(temp_dir);
         let updated = conn
@@ -39535,6 +39576,162 @@ mod tests {
             "an abandoned update must demote the cached exactness: its rows are already visible \
              to scans and no persisted count describes them, so a caller that discards the \
              returned bool must not go on serving an Exact count"
+        );
+    }
+
+    /// Regression for #13010: the demotion must survive the *next* successful
+    /// incremental persist, and clear only on an authoritative `Set`.
+    ///
+    /// A one-shot `count_exact = false` does not hold. The next persist derives
+    /// `prev_num_rows_exact` from the record it reads — the pre-gap baseline, still
+    /// flagged exact — and then writes that back over the demotion, so a mem-tier
+    /// checkpoint that abandons its delta (its caller discards the bool) followed
+    /// by a staged append's `Delta { exact: true }` republishes a short count as
+    /// exact, durably. Only compaction/overwrite materializes the live rows and can
+    /// honestly re-baseline.
+    #[tokio::test]
+    async fn an_abandoned_update_keeps_the_count_inexact_until_a_set_rebaselines_it() {
+        let runtime_env = SessionContext::new().runtime_env();
+        let schema = listing_parity_schema();
+        let (provider, catalog, temp_dir) = create_reopenable_append_table(
+            "stats_abandoned_gap_outlives_next_persist",
+            Arc::clone(&schema),
+            false,
+            Arc::clone(&runtime_env),
+        )
+        .await;
+        let table_id = provider.table_metadata.table_id.clone();
+
+        let ctx = SessionContext::new();
+        insert_batch_with_context(
+            &ctx,
+            &provider,
+            make_listing_parity_batch(Arc::clone(&schema), 0, 16),
+        )
+        .await;
+        provider
+            .flush_pending_maintenance()
+            .await
+            .expect("persist the baseline statistics");
+        drop(provider);
+
+        let reopened =
+            CayenneTableProviderBuilder::new(Arc::clone(&catalog), Arc::clone(&runtime_env))
+                .open("stats_abandoned_gap_outlives_next_persist")
+                .await
+                .expect("reopen over an intact statistics record");
+
+        let accumulator = ColumnStatsAccumulator::new(&schema);
+        accumulator.update(&make_listing_parity_batch(Arc::clone(&schema), 16, 4));
+        assert!(
+            accumulator.row_count() > 0,
+            "precondition: the accumulator must produce a blob, or the persist bails early"
+        );
+
+        // Warm the cache with an intact baseline, and keep a copy of it: the
+        // steady-state path merges onto this cached blob without a catalog read, so
+        // restoring it below is what makes the post-abandon persist SUCCEED. That
+        // success is the whole point — a failing one proves nothing about whether
+        // the demotion survives.
+        assert!(
+            reopened
+                .persist_table_stats(
+                    &accumulator,
+                    RowCountUpdate::Delta {
+                        delta: 4,
+                        exact: true
+                    }
+                )
+                .await,
+            "precondition: an intact record persists and warms the cache"
+        );
+        let intact_raw = reopened.table_statistics.read().raw.clone();
+        assert!(
+            intact_raw.as_ref().is_some_and(|raw| raw.num_rows_exact),
+            "precondition: the warmed baseline is flagged exact — that is what a later \
+             delta would otherwise inherit"
+        );
+
+        // Abandon one update, exactly as a mem-tier checkpoint would: break the read
+        // and force the cold-`raw` path that has to reach the catalog.
+        make_table_statistics_unreadable(temp_dir.path(), &table_id);
+        reopened.table_statistics.write().raw = None;
+        assert!(
+            !reopened
+                .persist_table_stats(
+                    &accumulator,
+                    RowCountUpdate::Delta {
+                        delta: 4,
+                        exact: false
+                    }
+                )
+                .await,
+            "precondition: an unreadable record must abandon the update"
+        );
+
+        // The gap is now open: 4 rows are visible to scans that no persisted count
+        // includes. Restore the warm cache and let a later exact delta through.
+        reopened.table_statistics.write().raw = intact_raw;
+        assert!(
+            reopened
+                .persist_table_stats(
+                    &accumulator,
+                    RowCountUpdate::Delta {
+                        delta: 4,
+                        exact: true
+                    }
+                )
+                .await,
+            "the later persist must succeed — the gap is carried, not the failure"
+        );
+        assert!(
+            !reopened.table_statistics.read().count_exact,
+            "a successful exact delta over a gapped baseline must NOT restore exactness: it \
+             merged onto a count that is short by the abandoned update's rows"
+        );
+        let durable = read_durable_stats_row(temp_dir.path(), &table_id);
+        assert!(
+            !durable.blob_is_text,
+            "precondition: the later persist really rewrote the record"
+        );
+        assert!(
+            !durable.num_rows_exact,
+            "the short count must be recorded Inexact durably, or a restart re-declares it exact"
+        );
+
+        // A full rewrite materializes exactly the live rows, so it — and only it —
+        // may re-baseline.
+        reopened
+            .replace_table_stats_after_rewrite(&accumulator)
+            .await;
+        assert!(
+            reopened.table_statistics.read().count_exact,
+            "an authoritative Set must clear the gap, or the table is stuck Inexact forever"
+        );
+        assert!(
+            read_durable_stats_row(temp_dir.path(), &table_id).num_rows_exact,
+            "the re-baselined count must be durably exact"
+        );
+
+        // The `Set` writing `true` proves nothing on its own — it does that whether
+        // or not the gap was closed. What proves it is the NEXT incremental delta:
+        // a gap left open would veto it, and the table would be Inexact forever.
+        assert!(
+            reopened
+                .persist_table_stats(
+                    &accumulator,
+                    RowCountUpdate::Delta {
+                        delta: 4,
+                        exact: true
+                    }
+                )
+                .await,
+            "the post-rebaseline delta must persist"
+        );
+        assert!(
+            reopened.table_statistics.read().count_exact,
+            "once re-baselined, an ordinary exact delta must be trusted again — a gap that \
+             never clears leaves the table permanently Inexact"
         );
     }
 
