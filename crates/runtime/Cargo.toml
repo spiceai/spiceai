@@ -155,6 +155,7 @@ runtime-search = { path = "../runtime-search" }
 runtime-tools = { path = "../runtime-tools" }
 runtime-datafusion-index = { path = "../runtime-datafusion-index" }
 runtime-datafusion-udfs = { path = "../runtime-datafusion-udfs" }
+runtime-tls = { path = "../runtime-tls" }
 runtime-execution-plans = { path = "../runtime-execution-plans" }
 runtime-table = { path = "../runtime-table" }
 runtime-resources = { path = "../runtime-resources" }

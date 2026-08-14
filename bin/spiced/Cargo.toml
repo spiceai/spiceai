@@ -54,6 +54,7 @@ crash-handler.workspace = true
 event_stream = { path = "../../crates/event_stream" }
 podswatcher = { path = "../../crates/podswatcher" }
 repl = { path = "../../crates/repl" }
+runtime-tls = { path = "../../crates/runtime-tls" }
 futures.workspace = true
 libc = "0.2"
 mimalloc = { version = "0.1.48", optional = true }

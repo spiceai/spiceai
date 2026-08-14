@@ -71,9 +71,9 @@ use model::{EmbeddingModelStore, LLMChatCompletionsModelStore};
 
 use crate::tools::{Tooling, factory::default_available_catalogs};
 pub use notify::Error as NotifyError;
+use runtime_tls::TlsConfig;
 use snafu::prelude::*;
 use status::ComponentStatus;
-use tls::TlsConfig;
 
 use tokio::sync::{RwLock, oneshot::error::RecvError};
 use tokio_util::sync::CancellationToken;
@@ -144,7 +144,6 @@ mod secrets_preflight;
 pub mod spice_metrics;
 pub mod status;
 pub mod task_history;
-pub mod tls;
 pub mod token_providers;
 pub mod tools;
 mod tracing_util;

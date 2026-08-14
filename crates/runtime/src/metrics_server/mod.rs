@@ -16,7 +16,6 @@ limitations under the License.
 
 pub mod cluster;
 
-use crate::tls::TlsConfig;
 use bytes::Bytes;
 use cluster::ClusterMetricsCollector;
 use governor::{
@@ -37,6 +36,7 @@ use prometheus::{
     Encoder, TextEncoder,
     proto::{Bucket, Histogram, LabelPair, Metric, MetricFamily, MetricType},
 };
+use runtime_tls::TlsConfig;
 use snafu::prelude::*;
 use std::collections::HashMap;
 use std::fmt::Write as FmtWrite;

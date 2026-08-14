@@ -19,6 +19,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8b5ace29ee3216de37c0546865ad08edef58b0f9e76838ed8959a84a990e58c5"
 
 [[package]]
+name = "accelerator-memory-budget"
+version = "2.2.0-unstable"
+
+[[package]]
 name = "adbc_core"
 version = "0.23.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -14887,6 +14891,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "podswatcher"
+version = "2.2.0-unstable"
+dependencies = [
+ "notify",
+ "parking_lot",
+ "spicepod",
+ "tokio",
+]
+
+[[package]]
 name = "polling"
 version = "3.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -16795,6 +16809,7 @@ dependencies = [
 name = "runtime"
 version = "2.2.0-unstable"
 dependencies = [
+ "accelerator-memory-budget",
  "adbc_core",
  "adbc_driver_manager",
  "anyhow",
@@ -16945,6 +16960,7 @@ dependencies = [
  "pem",
  "percent-encoding",
  "pin-project",
+ "podswatcher",
  "postcard",
  "prometheus",
  "prost",
@@ -16971,6 +16987,7 @@ dependencies = [
  "runtime-datafusion",
  "runtime-datafusion-index",
  "runtime-datafusion-udfs",
+ "runtime-execution-plans",
  "runtime-metrics",
  "runtime-object-store",
  "runtime-parameters",
@@ -16985,6 +17002,7 @@ dependencies = [
  "runtime-status",
  "runtime-table",
  "runtime-table-partition",
+ "runtime-tls",
  "runtime-tools",
  "runtime-udfs-api",
  "rusqlite",
@@ -17386,6 +17404,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "runtime-execution-plans"
+version = "2.2.0-unstable"
+dependencies = [
+ "arrow-schema",
+ "data_components",
+ "datafusion",
+ "futures",
+ "iceberg-datafusion",
+ "runtime-datafusion",
+ "runtime-proto",
+ "tokio",
+]
+
+[[package]]
 name = "runtime-metrics"
 version = "2.2.0-unstable"
 dependencies = [
@@ -17728,6 +17760,24 @@ dependencies = [
  "tokio-stream",
  "tracing",
  "util",
+]
+
+[[package]]
+name = "runtime-tls"
+version = "2.2.0-unstable"
+dependencies = [
+ "arc-swap",
+ "futures",
+ "notify",
+ "opentelemetry",
+ "rustls",
+ "sha2 0.10.9",
+ "snafu",
+ "tempfile",
+ "tokio",
+ "tokio-rustls",
+ "tokio-stream",
+ "x509-certificate",
 ]
 
 [[package]]
@@ -19498,6 +19548,7 @@ dependencies = [
  "opentelemetry_sdk",
  "otel-arrow",
  "parking_lot",
+ "podswatcher",
  "prometheus",
  "repl",
  "reqwest 0.13.4",
@@ -19509,6 +19560,7 @@ dependencies = [
  "runtime-query-engine",
  "runtime-request-context",
  "runtime-secrets",
+ "runtime-tls",
  "rustls",
  "serde_json",
  "snafu",
@@ -20471,13 +20523,16 @@ version = "2.2.0-unstable"
 dependencies = [
  "arrow",
  "async-trait",
+ "datafusion-common-runtime",
  "flight_client",
  "futures",
  "hostname 0.4.2",
  "opentelemetry",
+ "opentelemetry-proto",
  "opentelemetry_sdk",
  "otel-arrow",
  "pin-project",
+ "prost",
  "sha2 0.10.9",
  "snafu",
  "sysinfo 0.38.4",

@@ -256,7 +256,7 @@ async fn test_tls_hot_reload_all_endpoints() -> Result<(), anyhow::Error> {
             std::fs::write(&key_path, &pki_v1.leaf_key_pem)?;
 
             // 2. Build TlsConfig from those paths so the watcher is wired in.
-            let control = runtime::tls::TlsControl::new()?;
+            let control = runtime_tls::TlsControl::new()?;
             let tls_config = Arc::new(
                 TlsConfig::try_new_from_paths(cert_path.clone(), key_path.clone(), &control)
                     .map_err(|e| anyhow::anyhow!("build TlsConfig: {e}"))?,
@@ -404,7 +404,7 @@ async fn test_tls_hot_reload_rejects_malformed_pem() -> Result<(), anyhow::Error
             std::fs::write(&cert_path, &pki.leaf_cert_pem)?;
             std::fs::write(&key_path, &pki.leaf_key_pem)?;
 
-            let control = runtime::tls::TlsControl::new()?;
+            let control = runtime_tls::TlsControl::new()?;
             let tls_config = Arc::new(
                 TlsConfig::try_new_from_paths(cert_path.clone(), key_path.clone(), &control)
                     .map_err(|e| anyhow::anyhow!("build TlsConfig: {e}"))?,

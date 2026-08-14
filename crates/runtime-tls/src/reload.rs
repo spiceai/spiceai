@@ -28,7 +28,7 @@ limitations under the License.
 //!   automatically. In-flight connections keep using the cert they were
 //!   established with.
 //!
-//! - Cluster mTLS uses [`crate::cluster::pki::ClusterPkiBundle`], which
+//! - Cluster mTLS uses `ClusterPkiBundle` (in the runtime cluster PKI), which
 //!   atomically swaps server cert + client verifier + outbound
 //!   `ClientTlsConfig` together via a single [`ArcSwap`] of a snapshot.
 //!
@@ -404,7 +404,7 @@ fn shim_for(swap: &Arc<ArcSwap<Arc<dyn ClientCertVerifier>>>) -> Arc<dyn ClientC
     // here, because `ClientCertVerifier::root_hint_subjects`
     // returns `&[DistinguishedName]` — a borrow that cannot point
     // into an `ArcSwap::load` result. This matches the design
-    // choice in `crate::cluster::pki::ClusterPkiBundle`: the set
+    // choice in `ClusterPkiBundle`: the set
     // of advertised CA subjects is pinned at startup and a
     // rotated CA file does **not** change the
     // `CertificateRequest` hint list. Operators rotating a CA in

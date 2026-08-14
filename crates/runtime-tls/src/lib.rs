@@ -136,7 +136,7 @@ pub struct TlsConfig {
 /// Whether and how the public TLS listeners enforce client
 /// certificates. Drives both the per-listener rustls verifier choice
 /// inside [`build_server_configs`] and the per-request gate on
-/// [`crate::http::routes`] that 401s non-probe HTTP requests when the
+/// the runtime HTTP router that 401s non-probe HTTP requests when the
 /// connection presented no client cert. The Flight listener
 /// independently consults its own (strict vs lax)
 /// `WebPkiClientVerifier` baked into [`TlsConfig::flight_server_config`].
