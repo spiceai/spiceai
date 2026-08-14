@@ -19,18 +19,18 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use data_components::cdc::ChangesStream;
+use data_connector_api::accelerated::{AcceleratorSetup, RegisteredAcceleratedTable};
+use data_connector_api::federated::FederatedTableProvider;
 use datafusion::datasource::TableProvider;
 use futures::StreamExt;
 use runtime_metrics::component::MetricsProvider;
 
-use crate::accelerated::{self, AcceleratedTable};
 use crate::component::{
     ComponentInitialization,
     dataset::{Dataset, acceleration::RefreshMode},
 };
 use crate::dataconnector::{DataConnector, DataConnectorResult};
 use crate::drasi::{DeliveryMode, forward_change_envelope};
-use crate::federated::FederatedTable;
 
 /// A [`DataConnector`] middleware that publishes the wrapped connector's change
 /// stream to a Drasi source before it reaches the accelerator.
@@ -116,7 +116,7 @@ impl DataConnector for DrasiConnector {
     async fn on_accelerator_setup(
         &self,
         dataset: &Dataset,
-        builder: &mut accelerated::Builder,
+        builder: &mut dyn AcceleratorSetup,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.inner_connector
             .on_accelerator_setup(dataset, builder)
@@ -126,7 +126,7 @@ impl DataConnector for DrasiConnector {
     async fn on_accelerated_table_registration(
         &self,
         dataset: &Dataset,
-        accelerated_table: &mut AcceleratedTable,
+        accelerated_table: &mut dyn RegisteredAcceleratedTable,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.inner_connector
             .on_accelerated_table_registration(dataset, accelerated_table)
@@ -147,7 +147,7 @@ impl DataConnector for DrasiConnector {
 
     fn changes_stream(
         &self,
-        federated_table: Arc<FederatedTable>,
+        federated_table: Arc<dyn FederatedTableProvider>,
         dataset: &Dataset,
     ) -> Option<ChangesStream> {
         self.with_forwarded_stream(
@@ -160,7 +160,10 @@ impl DataConnector for DrasiConnector {
         self.inner_connector.supports_append_stream()
     }
 
-    fn append_stream(&self, federated_table: Arc<FederatedTable>) -> Option<ChangesStream> {
+    fn append_stream(
+        &self,
+        federated_table: Arc<dyn FederatedTableProvider>,
+    ) -> Option<ChangesStream> {
         self.with_forwarded_stream(self.inner_connector.append_stream(federated_table))
     }
 }
