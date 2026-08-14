@@ -1292,7 +1292,7 @@ pub fn get_tpcds_test_queries(
         {
             remove_tpcds_query!(
                 queries,
-                78 // SF100 Resources exhausted error https://github.com/spiceai/spiceai/issues/10965
+                78, 97 // SF100 Resources exhausted error https://github.com/spiceai/spiceai/issues/10965
             )
         }
         Some(_) | None => queries,
