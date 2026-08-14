@@ -118,6 +118,7 @@ impl Catalog {
 pub fn table_selector(catalog: &CatalogSpec) -> TableSelector {
     TableSelector::new(catalog.include.clone(), catalog.exclude.clone())
         .with_include_patterns(&catalog.orig_include)
+        .with_exclude_patterns(&catalog.orig_exclude)
 }
 
 pub struct CatalogBuilder {
@@ -380,6 +381,20 @@ mod tests {
             "an excluded table must not be selected"
         );
         assert!(!selector.selects_table("reporting", "orders"));
+
+        // The raw patterns travel too, and by a separate path: `selects_table`
+        // reads the compiled sets, so dropping either `with_*_patterns` call
+        // leaves every assertion above passing while a diagnostic naming the
+        // configuration silently omits half of it.
+        let described = selector.describe();
+        assert!(
+            described.contains("include: ['public.*']"),
+            "the include patterns should reach the selector verbatim: {described}"
+        );
+        assert!(
+            described.contains("exclude: ['public.audit_log']"),
+            "the exclude patterns should reach the selector verbatim: {described}"
+        );
     }
 
     /// An `exclude` with no `include` still withholds: the connectors that only
