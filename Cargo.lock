@@ -3560,7 +3560,6 @@ name = "cayenne"
 version = "2.2.0-unstable"
 dependencies = [
  "aegis",
- "ahash 0.8.12",
  "arc-swap",
  "arrow",
  "arrow-flight",
@@ -3594,7 +3593,6 @@ dependencies = [
  "datafusion-pruning",
  "datafusion-table-providers",
  "duckdb",
- "fastbloom 0.17.0",
  "flatbuffers",
  "futures",
  "globset",
@@ -3636,7 +3634,6 @@ dependencies = [
  "vortex-io",
  "vortex-scan",
  "vortex-session",
- "xorf",
 ]
 
 [[package]]
@@ -8133,19 +8130,6 @@ checksum = "4e7f34442dbe69c60fe8eaf58a8cafff81a1f278816d8ab4db255b3bef4ac3c4"
 dependencies = [
  "getrandom 0.3.4",
  "libm",
- "siphasher",
-]
-
-[[package]]
-name = "fastbloom"
-version = "0.17.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ef975e30683b2d965054bb0a836f8973857c4ebf6acf274fe46617cd285060d8"
-dependencies = [
- "foldhash 0.2.0",
- "libm",
- "portable-atomic",
- "rand 0.9.4",
  "siphasher",
 ]
 
@@ -21856,7 +21840,7 @@ dependencies = [
  "crossbeam-utils",
  "either",
  "fallible-iterator 0.3.0",
- "fastbloom 0.14.1",
+ "fastbloom",
  "hex",
  "icu_collator",
  "icu_locale",
@@ -24741,16 +24725,6 @@ name = "xmlwriter"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ec7a2a501ed189703dba8b08142f057e887dfc4b2cc4db2d343ac6376ba3e0b9"
-
-[[package]]
-name = "xorf"
-version = "0.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "45e820b97864028eb5069aabf2d90ad7bc279a0ed0292f1306451ce4b91adc13"
-dependencies = [
- "libm",
- "rand 0.8.6",
-]
 
 [[package]]
 name = "y4m"

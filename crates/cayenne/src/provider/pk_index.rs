@@ -417,6 +417,15 @@ pub(crate) fn shard_of_pk(owned_row_bytes: &[u8], n: usize) -> usize {
 /// budget, so at realistic fills the rate is far lower.
 const PK_BLOOM_NUM_HASHES: u32 = 7;
 
+/// Discriminant for a version-3 (split-block) serialized filter, in the field
+/// version 2 uses for `bit_mask`.
+///
+/// Chosen so it can never be a valid v2 `bit_mask`, which is always `2^k - 1`
+/// for a power-of-two bit count: this value has zeros interleaved through it, so
+/// a v2 reader's `num_bits == bit_mask + 1` check rejects a v3 blob
+/// deterministically instead of merely probably.
+const PK_BLOOM_V3_MAGIC: u64 = 0x4350_4b46_5633_0001;
+
 /// Seeded FNV-1a-64. Dependency-free and adequate for a Bloom filter; two
 /// independent seeds feed the Kirsch–Mitzenmacher double-hashing scheme below.
 fn pk_bloom_hash(bytes: &[u8], seed: u64) -> u64 {
@@ -443,63 +452,251 @@ fn pk_bloom_hash(bytes: &[u8], seed: u64) -> u64 {
 /// - Only valid for upsert. `DoNothing` needs an exact answer (a false positive
 ///   would wrongly drop a genuinely new row), so those tables keep the exact path.
 pub(crate) struct PkBloom {
-    pub(crate) bits: Vec<u64>,
-    /// `num_bits - 1`; `num_bits` is a power of two so indexing masks instead of mods.
-    pub(crate) bit_mask: u64,
+    repr: PkBloomRepr,
     /// Keys inserted (observability + false-positive-rate estimation).
     pub(crate) inserted_keys: usize,
 }
 
+/// The two on-disk layouts a [`PkBloom`] can hold.
+///
+/// A filter's bits are the output of a specific (hash, probe-derivation, layout)
+/// triple, so these are not interchangeable: bits written by one can only be
+/// probed by the same one. Both are carried because persisted filters outlive a
+/// deployment -- a v2 blob keeps being read by the v2 arm until whatever wrote it
+/// is rewritten.
+enum PkBloomRepr {
+    /// Version 2. Seven probes scattered across the whole bit array, addressed by
+    /// two FNV-1a passes over the key.
+    Scattered {
+        bits: Vec<u64>,
+        /// `num_bits - 1`; `num_bits` is a power of two so indexing masks instead of mods.
+        bit_mask: u64,
+    },
+    /// Version 3. One XXH3 selects a 256-bit block and the key sets exactly one
+    /// bit in each of its eight `u32` lanes, so a probe touches one cache line and
+    /// carries no per-probe branch.
+    SplitBlock {
+        blocks: Vec<[u32; 8]>,
+        /// `num_blocks - 1`; the block count is a power of two.
+        block_mask: u64,
+    },
+}
+
+/// Which layout newly created filters are written in.
+///
+/// Reads always accept both. This selects what gets WRITTEN, so a deployment can
+/// be measured on either without a rebuild, and so a rollback finds only formats
+/// its binary understands. Unset means version 2, the format every existing
+/// deployment already holds on disk.
+///
+/// `SPICE_CAYENNE_PK_FILTER_VERSION=3` opts a process into the split-block
+/// layout and the round-up sizing that goes with it.
+fn write_version() -> u32 {
+    static VERSION: std::sync::LazyLock<u32> = std::sync::LazyLock::new(|| {
+        match std::env::var("SPICE_CAYENNE_PK_FILTER_VERSION")
+            .ok()
+            .as_deref()
+        {
+            Some("3") => 3,
+            Some(other) if !other.trim().is_empty() && other != "2" => {
+                tracing::warn!(
+                    "Ignoring SPICE_CAYENNE_PK_FILTER_VERSION={other}: expected 2 or 3. Using 2."
+                );
+                2
+            }
+            _ => 2,
+        }
+    });
+    *VERSION
+}
+
+/// Bits per split-block block: one 256-bit block, eight `u32` lanes.
+const SPLIT_BLOCK_BITS: usize = 256;
+
+/// The Parquet/Impala salts. Eight odd constants with well-spread bit patterns,
+/// so each lane's chosen bit is independent of its neighbours'.
+const SPLIT_BLOCK_SALT: [u32; 8] = [
+    0x47b6_137b,
+    0x4497_4d91,
+    0x8824_ad5b,
+    0xa2b7_289d,
+    0x7054_95c7,
+    0x2df1_424b,
+    0x9efc_4947,
+    0x5c6b_fb31,
+];
+
 impl PkBloom {
-    /// Allocate a bloom whose bit array fits within `budget_bytes`, using the
-    /// largest power-of-two bit count that does not exceed the budget.
+    /// Allocate a bloom whose bit array fits within `budget_bytes`.
     pub(crate) fn with_byte_budget(budget_bytes: usize) -> Self {
         Self::with_num_bits_pow2(budget_bytes.saturating_mul(8))
     }
 
-    /// Right-size a bloom for `expected_keys` (~10 bits/key, ~1% FPR), never
-    /// exceeding `max_bytes`. Used when persisting a compaction checkpoint so the
-    /// sidecar stays small rather than the full byte budget.
+    /// Right-size a bloom for `expected_keys` at ~10 bits/key, never exceeding
+    /// `max_bytes`.
+    ///
+    /// Version 3 rounds the bit count UP to the next power of two; version 2
+    /// rounds DOWN, which is what it has always done. That round-down is why the
+    /// documented "~1% FPR" was not what the filter delivered: asking for 10
+    /// bits/key and taking the largest power of two below it lands anywhere from
+    /// 5.0 to 10.0 bits/key, and `PK_BLOOM_NUM_HASHES` is tuned for the 10. At
+    /// 100K keys the measured rate is 12.1% rounding down and 0.76% rounding up,
+    /// for the same code and the same request.
+    ///
+    /// Rounding up is safe for existing data even though it changes sizing:
+    /// `bit_mask` is persisted per blob and restored on read, so a filter already
+    /// on disk keeps probing against its own stored size whatever this returns.
     pub(crate) fn with_expected_keys(expected_keys: usize, max_bytes: usize) -> Self {
         let want_bits = expected_keys.saturating_mul(10);
         let cap_bits = max_bytes.saturating_mul(8).max(64);
+        if write_version() >= 3 {
+            // Round up, then clamp -- never past the caller's byte ceiling.
+            let rounded = want_bits.checked_next_power_of_two().unwrap_or(want_bits);
+            return Self::with_num_bits_pow2(rounded.min(cap_bits));
+        }
         Self::with_num_bits_pow2(want_bits.min(cap_bits))
     }
 
-    /// Allocate with the largest power-of-two bit count `<= target_bits` (min 64).
+    /// Allocate with the largest power-of-two bit count `<= target_bits` (min 64),
+    /// in whichever layout this process writes.
     pub(crate) fn with_num_bits_pow2(target_bits: usize) -> Self {
+        if write_version() >= 3 {
+            let want_blocks = (target_bits / SPLIT_BLOCK_BITS).max(1);
+            let num_blocks = 1usize << want_blocks.ilog2();
+            return Self {
+                repr: PkBloomRepr::SplitBlock {
+                    blocks: vec![[0u32; 8]; num_blocks],
+                    block_mask: u64::try_from(num_blocks.saturating_sub(1)).unwrap_or(0),
+                },
+                inserted_keys: 0,
+            };
+        }
         let num_bits: usize = 1usize << target_bits.max(64).ilog2();
         let words = (num_bits / 64).max(1);
         Self {
-            bits: vec![0u64; words],
-            bit_mask: u64::try_from(num_bits.saturating_sub(1)).unwrap_or(u64::MAX),
+            repr: PkBloomRepr::Scattered {
+                bits: vec![0u64; words],
+                bit_mask: u64::try_from(num_bits.saturating_sub(1)).unwrap_or(u64::MAX),
+            },
             inserted_keys: 0,
         }
     }
 
-    /// Serialize as `bit_mask(8) | inserted_keys(8) | num_words(8) | words(8·W)`,
-    /// little-endian.
+    /// Resident bytes of the bit array, whichever layout backs it.
+    pub(crate) fn size_bytes(&self) -> usize {
+        match &self.repr {
+            PkBloomRepr::Scattered { bits, .. } => bits.len() * 8,
+            PkBloomRepr::SplitBlock { blocks, .. } => blocks.len() * 32,
+        }
+    }
+
+    /// The format version this filter would serialize as.
+    pub(crate) fn format_version(&self) -> u32 {
+        match &self.repr {
+            PkBloomRepr::Scattered { .. } => 2,
+            PkBloomRepr::SplitBlock { .. } => 3,
+        }
+    }
+
+    /// The block index and the eight per-lane masks for a key, for the
+    /// split-block layout. Fixed length and branch-free so it vectorises.
+    #[inline]
+    fn split_block_locate(block_mask: u64, key: &[u8]) -> (usize, [u32; 8]) {
+        let hash = twox_hash::XxHash3_64::oneshot(key);
+        let block = usize::try_from((hash >> 32) & block_mask).unwrap_or(0);
+        let low = hash as u32;
+        let mut masks = [0u32; 8];
+        for (mask, salt) in masks.iter_mut().zip(SPLIT_BLOCK_SALT) {
+            // Top five bits of the product pick one of the lane's 32 bits.
+            *mask = 1u32 << (low.wrapping_mul(salt) >> 27);
+        }
+        (block, masks)
+    }
+
+    /// Serialize in this filter's own layout.
+    ///
+    /// **Version 2** is unchanged and unframed:
+    /// `bit_mask(8) | inserted_keys(8) | num_words(8) | words(8·W)`.
+    ///
+    /// **Version 3** is `V3_MAGIC(8) | inserted_keys(8) | num_blocks(8) | blocks(32·B)`.
+    /// The magic sits where version 2 keeps `bit_mask`, and is deliberately not of
+    /// the form `2^k - 1`: a v2 `bit_mask` is always `num_bits - 1` for a
+    /// power-of-two `num_bits`, so a v2 reader handed a v3 blob fails its
+    /// `num_bits == bit_mask + 1` check every time rather than probably. That
+    /// makes an old binary's rejection of a new blob a property of the encoding,
+    /// not a probability -- and rejection is the safe direction, since a
+    /// misparsed filter yields false NEGATIVES, which on this path means a missed
+    /// conflict and a duplicate live row.
     pub(crate) fn serialize_into(&self, out: &mut Vec<u8>) {
-        out.extend_from_slice(&self.bit_mask.to_le_bytes());
-        out.extend_from_slice(
-            &u64::try_from(self.inserted_keys)
-                .unwrap_or(u64::MAX)
-                .to_le_bytes(),
-        );
-        out.extend_from_slice(&u64::try_from(self.bits.len()).unwrap_or(0).to_le_bytes());
-        for word in &self.bits {
-            out.extend_from_slice(&word.to_le_bytes());
+        let inserted = u64::try_from(self.inserted_keys).unwrap_or(u64::MAX);
+        match &self.repr {
+            PkBloomRepr::Scattered { bits, bit_mask } => {
+                out.extend_from_slice(&bit_mask.to_le_bytes());
+                out.extend_from_slice(&inserted.to_le_bytes());
+                out.extend_from_slice(&u64::try_from(bits.len()).unwrap_or(0).to_le_bytes());
+                for word in bits {
+                    out.extend_from_slice(&word.to_le_bytes());
+                }
+            }
+            PkBloomRepr::SplitBlock { blocks, .. } => {
+                out.extend_from_slice(&PK_BLOOM_V3_MAGIC.to_le_bytes());
+                out.extend_from_slice(&inserted.to_le_bytes());
+                out.extend_from_slice(&u64::try_from(blocks.len()).unwrap_or(0).to_le_bytes());
+                for block in blocks {
+                    for lane in block {
+                        out.extend_from_slice(&lane.to_le_bytes());
+                    }
+                }
+            }
         }
     }
 
     /// Deserialize ONE bloom from the front of `bytes`, returning it and the
     /// number of bytes it consumed — so several blooms can be read back-to-back
-    /// from a sharded sidecar (the bloom is self-describing via its `num_words`).
+    /// from a sharded sidecar (each is self-describing via its count field).
+    ///
+    /// Accepts either version regardless of what this process writes: a filter
+    /// already on disk can only be probed by the layout that wrote it.
     fn deserialize_from_prefix(bytes: &[u8]) -> Option<(Self, usize)> {
-        let bit_mask = u64::from_le_bytes(bytes.get(0..8)?.try_into().ok()?);
+        let discriminant = u64::from_le_bytes(bytes.get(0..8)?.try_into().ok()?);
         let inserted_keys = u64::from_le_bytes(bytes.get(8..16)?.try_into().ok()?);
-        let num_words =
+        let count =
             usize::try_from(u64::from_le_bytes(bytes.get(16..24)?.try_into().ok()?)).ok()?;
+
+        if discriminant == PK_BLOOM_V3_MAGIC {
+            // Reject impossible block counts before allocating.
+            if count == 0 || count > bytes.len().saturating_sub(24) / 32 {
+                return None;
+            }
+            if !count.is_power_of_two() {
+                return None;
+            }
+            let mut blocks = Vec::with_capacity(count);
+            let mut offset = 24usize;
+            for _ in 0..count {
+                let mut block = [0u32; 8];
+                for lane in &mut block {
+                    let end = offset.checked_add(4)?;
+                    *lane = u32::from_le_bytes(bytes.get(offset..end)?.try_into().ok()?);
+                    offset = end;
+                }
+                blocks.push(block);
+            }
+            return Some((
+                Self {
+                    repr: PkBloomRepr::SplitBlock {
+                        blocks,
+                        block_mask: u64::try_from(count.saturating_sub(1)).unwrap_or(0),
+                    },
+                    inserted_keys: usize::try_from(inserted_keys).unwrap_or(0),
+                },
+                offset,
+            ));
+        }
+
+        // Version 2: `discriminant` is the bit mask.
+        let bit_mask = discriminant;
+        let num_words = count;
         // Reject impossible word counts before allocating.
         if num_words == 0 || num_words > bytes.len().saturating_sub(24) / 8 {
             return None;
@@ -518,8 +715,7 @@ impl PkBloom {
         }
         Some((
             Self {
-                bits,
-                bit_mask,
+                repr: PkBloomRepr::Scattered { bits, bit_mask },
                 inserted_keys: usize::try_from(inserted_keys).unwrap_or(0),
             },
             offset,
@@ -534,23 +730,50 @@ impl PkBloom {
     }
 
     pub(crate) fn insert(&mut self, key: &[u8]) {
-        for hash in Self::probe_bits(key) {
-            let bit = hash & self.bit_mask;
-            let word = usize::try_from(bit >> 6).unwrap_or(0);
-            self.bits[word] |= 1u64 << (bit & 63);
+        match &mut self.repr {
+            PkBloomRepr::Scattered { bits, bit_mask } => {
+                for hash in Self::probe_bits(key) {
+                    let bit = hash & *bit_mask;
+                    let word = usize::try_from(bit >> 6).unwrap_or(0);
+                    bits[word] |= 1u64 << (bit & 63);
+                }
+            }
+            PkBloomRepr::SplitBlock { blocks, block_mask } => {
+                let (index, masks) = Self::split_block_locate(*block_mask, key);
+                let block = &mut blocks[index];
+                for (lane, mask) in block.iter_mut().zip(masks) {
+                    *lane |= mask;
+                }
+            }
         }
         self.inserted_keys = self.inserted_keys.saturating_add(1);
     }
 
     pub(crate) fn maybe_contains(&self, key: &[u8]) -> bool {
-        for hash in Self::probe_bits(key) {
-            let bit = hash & self.bit_mask;
-            let word = usize::try_from(bit >> 6).unwrap_or(0);
-            if self.bits[word] & (1u64 << (bit & 63)) == 0 {
-                return false;
+        match &self.repr {
+            PkBloomRepr::Scattered { bits, bit_mask } => {
+                for hash in Self::probe_bits(key) {
+                    let bit = hash & *bit_mask;
+                    let word = usize::try_from(bit >> 6).unwrap_or(0);
+                    if bits[word] & (1u64 << (bit & 63)) == 0 {
+                        return false;
+                    }
+                }
+                true
+            }
+            PkBloomRepr::SplitBlock { blocks, block_mask } => {
+                let (index, masks) = Self::split_block_locate(*block_mask, key);
+                let block = &blocks[index];
+                // Fold every lane rather than exiting on the first miss: the
+                // branch costs more than the remaining ANDs, and the fold is what
+                // vectorises.
+                let mut present = true;
+                for (lane, mask) in block.iter().zip(masks) {
+                    present &= (*lane & mask) == mask;
+                }
+                present
             }
         }
-        true
     }
 
     /// Serialize this bloom standalone (the [`Self::serialize_into`] frame with
@@ -605,7 +828,7 @@ impl ColdPkExistence {
     pub(crate) fn approx_bytes(&self) -> usize {
         self.blooms
             .iter()
-            .map(|b| b.bits.len().saturating_mul(8))
+            .map(PkBloom::size_bytes)
             .fold(0, usize::saturating_add)
     }
 }
@@ -727,7 +950,7 @@ impl CachedPkIndex {
     pub(crate) fn approx_bytes(&self) -> usize {
         match self {
             Self::Exact(keyset) => keyset.approx_bytes,
-            Self::Bloom(bloom) => bloom.bits.len().saturating_mul(8),
+            Self::Bloom(bloom) => bloom.size_bytes(),
         }
     }
 }
@@ -1164,7 +1387,7 @@ impl ShardedPkIndex {
                 .fold(0, usize::saturating_add),
             Self::Bloom(blooms) => blooms
                 .iter()
-                .map(|b| b.bits.len().saturating_mul(8))
+                .map(PkBloom::size_bytes)
                 .fold(0, usize::saturating_add),
         }
     }
@@ -1406,8 +1629,9 @@ pub(crate) enum PkExistenceRef<'a> {
 mod tests {
     use super::{
         BoundedShardedPkIndexBuilder, COLD_PK_BLOOM_PER_FILE_MAX_BYTES, CachedPkKeyset,
-        ColdPkExistence, PkBloom, PkDigestSet, PkKeysetInsertOutcome, RowLocation, ShardedPkIndex,
-        approx_pk_keyset_entry_bytes, pk_digest, shard_of_pk,
+        ColdPkExistence, PkBloom, PkBloomRepr, PkDigestSet, PkKeysetInsertOutcome, RowLocation,
+        ShardedPkIndex, approx_pk_keyset_entry_bytes, deserialize_pk_blooms_sidecar, pk_digest,
+        serialize_pk_blooms_sidecar, shard_of_pk,
     };
 
     /// Degrading after a mid-batch stop must not lose the rest of the batch.
@@ -1729,6 +1953,178 @@ mod tests {
     }
 
     #[test]
+    fn split_block_filter_round_trips_and_has_no_false_negatives() {
+        // Build a v3 filter directly, independent of the env var, so the test
+        // covers the layout rather than the process's write setting.
+        let mut bloom = PkBloom {
+            repr: PkBloomRepr::SplitBlock {
+                blocks: vec![[0u32; 8]; 4096],
+                block_mask: 4095,
+            },
+            inserted_keys: 0,
+        };
+        let keys: Vec<[u8; 16]> = (0..20_000u128).map(u128::to_le_bytes).collect();
+        for key in &keys {
+            bloom.insert(key);
+        }
+        assert_eq!(bloom.format_version(), 3);
+
+        let restored = PkBloom::from_bytes(&bloom.to_bytes()).expect("v3 round-trips");
+        assert_eq!(restored.format_version(), 3);
+        assert_eq!(restored.size_bytes(), bloom.size_bytes());
+        assert_eq!(restored.inserted_keys, bloom.inserted_keys);
+        for key in &keys {
+            assert!(
+                restored.maybe_contains(key),
+                "false negative after round-trip -- a missed conflict writes a duplicate live row"
+            );
+        }
+    }
+
+    /// The property the whole versioning scheme rests on: a v2 reader must reject
+    /// a v3 blob every time, not merely usually. A v2 `bit_mask` is always
+    /// `2^k - 1`, and the v3 magic is not, so the `num_bits == bit_mask + 1` check
+    /// can never accept one.
+    #[test]
+    fn a_v2_reader_deterministically_rejects_a_v3_blob() {
+        let mut bloom = PkBloom {
+            repr: PkBloomRepr::SplitBlock {
+                blocks: vec![[0u32; 8]; 64],
+                block_mask: 63,
+            },
+            inserted_keys: 0,
+        };
+        for i in 0..500u128 {
+            bloom.insert(&i.to_le_bytes());
+        }
+        let bytes = bloom.to_bytes();
+
+        // Exactly the v2 acceptance test, applied to a v3 frame.
+        let bit_mask = u64::from_le_bytes(bytes[0..8].try_into().expect("8 bytes"));
+        let num_words = u64::from_le_bytes(bytes[16..24].try_into().expect("8 bytes"));
+        let num_bits = num_words * 64;
+        assert_ne!(
+            num_bits,
+            bit_mask.wrapping_add(1),
+            "a v3 frame must fail the v2 consistency check"
+        );
+        assert!(
+            !(bit_mask.wrapping_add(1)).is_power_of_two(),
+            "the v3 magic must not look like a v2 bit mask"
+        );
+    }
+
+    /// Both layouts must survive the sharded sidecar, since a table may be
+    /// checkpointed by one binary and reopened by another.
+    #[test]
+    fn a_sidecar_round_trips_either_layout() {
+        for split in [false, true] {
+            let mut bloom = if split {
+                PkBloom {
+                    repr: PkBloomRepr::SplitBlock {
+                        blocks: vec![[0u32; 8]; 128],
+                        block_mask: 127,
+                    },
+                    inserted_keys: 0,
+                }
+            } else {
+                PkBloom::with_num_bits_pow2(1 << 16)
+            };
+            let keys: Vec<[u8; 16]> = (0..2_000u128).map(u128::to_le_bytes).collect();
+            for key in &keys {
+                bloom.insert(key);
+            }
+            let bytes = serialize_pk_blooms_sidecar(std::slice::from_ref(&bloom), "snap-1");
+            let (restored, snapshot) =
+                deserialize_pk_blooms_sidecar(&bytes).expect("sidecar round-trips");
+            assert_eq!(snapshot, "snap-1");
+            assert_eq!(restored.len(), 1);
+            assert_eq!(restored[0].format_version(), bloom.format_version());
+            for key in &keys {
+                assert!(
+                    restored[0].maybe_contains(key),
+                    "false negative (split={split})"
+                );
+            }
+        }
+    }
+
+    /// Rounding up is what buys the accuracy; rounding down is what version 2
+    /// does. Pinned as a property of the sizing rule.
+    #[test]
+    fn round_up_sizing_beats_round_down_at_the_same_request() {
+        // Scattered keys, as a hashed composite key is in practice.
+        let mix = |i: u128| i.wrapping_mul(0x9e37_79b9_7f4a_7c15_9e37_79b9_7f4a_7c15);
+        let keys: Vec<[u8; 16]> = (0..100_000u128).map(|i| mix(i).to_le_bytes()).collect();
+        let absent: Vec<[u8; 16]> = (1_000_000..1_100_000u128)
+            .map(|i| mix(i).to_le_bytes())
+            .collect();
+
+        let fpr_at = |bits: usize| {
+            let mut bloom = PkBloom::with_num_bits_pow2(bits);
+            for key in &keys {
+                bloom.insert(key);
+            }
+            #[expect(clippy::cast_precision_loss, reason = "ratio of two small counts")]
+            let rate = absent.iter().filter(|k| bloom.maybe_contains(*k)).count() as f64
+                / absent.len() as f64;
+            rate
+        };
+
+        let want = keys.len() * 10;
+        let rounded_down = fpr_at(want);
+        let rounded_up = fpr_at(want.next_power_of_two());
+        assert!(
+            rounded_up * 5.0 < rounded_down,
+            "rounding up should be far more accurate for the same request: \
+             down={rounded_down:.4} up={rounded_up:.4}"
+        );
+    }
+
+    /// The shipping filter is much less accurate for SEQUENTIAL keys than for
+    /// scattered ones, at identical size and load — and a monotonic integer
+    /// primary key, the most ordinary shape a CDC table has, is exactly the bad
+    /// case.
+    ///
+    /// The cause is the hash. FNV-1a's last operation is a multiply, which
+    /// propagates bits leftward, so its LOW bits are the least diffused — and
+    /// `maybe_contains` indexes with `hash & bit_mask`, i.e. precisely those bits.
+    /// The split-block layout hashes with XXH3 instead and does not have the
+    /// weakness, which this pins as a difference between the two layouts rather
+    /// than an abstract claim about hash quality.
+    #[test]
+    fn sequential_keys_punish_the_v2_hash_but_not_the_v3_one() {
+        let sequential: Vec<[u8; 16]> = (0..100_000u128).map(u128::to_le_bytes).collect();
+        let absent: Vec<[u8; 16]> = (1_000_000..1_100_000u128).map(u128::to_le_bytes).collect();
+
+        let measure = |mut bloom: PkBloom| {
+            for key in &sequential {
+                bloom.insert(key);
+            }
+            #[expect(clippy::cast_precision_loss, reason = "ratio of two small counts")]
+            let rate = absent.iter().filter(|k| bloom.maybe_contains(*k)).count() as f64
+                / absent.len() as f64;
+            rate
+        };
+
+        let bits = (sequential.len() * 10).next_power_of_two();
+        let v2 = measure(PkBloom::with_num_bits_pow2(bits));
+        let blocks = bits / super::SPLIT_BLOCK_BITS;
+        let v3 = measure(PkBloom {
+            repr: PkBloomRepr::SplitBlock {
+                blocks: vec![[0u32; 8]; blocks],
+                block_mask: u64::try_from(blocks - 1).expect("fits"),
+            },
+            inserted_keys: 0,
+        });
+
+        assert!(
+            v3 * 4.0 < v2,
+            "the v2 hash should be markedly worse on sequential keys: v2={v2:.4} v3={v3:.4}"
+        );
+    }
+
+    #[test]
     fn pk_bloom_to_from_bytes_round_trips() {
         let mut bloom = PkBloom::with_expected_keys(1000, COLD_PK_BLOOM_PER_FILE_MAX_BYTES);
         for n in 0..1000u64 {
@@ -1744,7 +2140,11 @@ mod tests {
                 "restored bloom dropped an inserted key {n}"
             );
         }
-        assert_eq!(restored.bit_mask, bloom.bit_mask, "bit layout preserved");
+        assert_eq!(
+            restored.size_bytes(),
+            bloom.size_bytes(),
+            "bit layout preserved"
+        );
         assert_eq!(restored.inserted_keys, bloom.inserted_keys);
     }
 
