@@ -1307,23 +1307,27 @@ impl IdentityStore {
                 // The monitor page is Cloud-constructed portal metadata that the
                 // runtime prints and an operator opens, so it passes the one
                 // portal-link rule here, at the writer — the same place the
-                // enrollment validates its create-project page. A link the rule
-                // rejects is dropped rather than stored: the attachment is still
-                // recorded, it just carries no page to point at.
+                // enrollment validates its create-project page.
+                //
+                // The outer `Option` is what keeps presence-updates and
+                // absence-preserves intact through that check: a command that
+                // named a page the rule rejects has still *named* one, so it
+                // clears the stale page rather than leaving the old one standing
+                // behind an invalid delivery. Only an omitted page preserves.
                 let delivered = attachment
                     .monitor_url
                     .as_deref()
-                    .and_then(crate::config::safe_portal_url);
+                    .map(crate::config::safe_portal_url);
                 let (app_name, monitor_url) = if same_app {
                     (
                         attachment
                             .app_name
                             .clone()
                             .or_else(|| identity.app_name.clone()),
-                        delivered.or_else(|| identity.monitor_url.clone()),
+                        delivered.unwrap_or_else(|| identity.monitor_url.clone()),
                     )
                 } else {
-                    (attachment.app_name.clone(), delivered)
+                    (attachment.app_name.clone(), delivered.flatten())
                 };
                 AttachmentState {
                     app_id: Some(attachment.app_id.clone()),
@@ -2906,6 +2910,63 @@ mod tests {
             // Back to detached so the next iteration starts from the same state.
             IdentityStore::set_attachment(&path, None).expect("detach");
         }
+    }
+
+    /// A rejected page is not the same as an omitted one. Naming a page the rule
+    /// refuses clears the stale one — leaving the old page standing would point an
+    /// operator at metadata this attachment never delivered — while omitting the
+    /// field preserves what is stored.
+    #[test]
+    fn a_rejected_monitor_page_clears_a_stale_one_but_an_omitted_page_preserves_it() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join("identity.json");
+        IdentityStore::store(&path, &sample_identity()).expect("store");
+        IdentityStore::set_attachment(&path, Some(&sample_attachment())).expect("attach");
+        let stored = IdentityStore::load_optional(&path)
+            .expect("load")
+            .expect("present");
+        assert_eq!(
+            stored.monitor_url.as_deref(),
+            Some("https://spice.ai/acme/retail-analytics/monitor"),
+            "the delivered page is the starting state"
+        );
+
+        // Omitted: the stored page survives.
+        let omitted = AppAttachment {
+            monitor_url: None,
+            ..sample_attachment()
+        };
+        IdentityStore::set_attachment(&path, Some(&omitted)).expect("attach");
+        assert_eq!(
+            IdentityStore::load_optional(&path)
+                .expect("load")
+                .expect("present")
+                .monitor_url
+                .as_deref(),
+            Some("https://spice.ai/acme/retail-analytics/monitor"),
+            "an omitted page preserves what is stored"
+        );
+
+        // Named but rejected: the stale page goes.
+        let rejected = AppAttachment {
+            monitor_url: Some("javascript:alert(1)".to_string()),
+            ..sample_attachment()
+        };
+        let persisted = IdentityStore::set_attachment(&path, Some(&rejected))
+            .expect("attach")
+            .expect("the identity still exists");
+        assert_eq!(
+            persisted.monitor_url, None,
+            "a rejected page must not be reported as this attachment's page"
+        );
+        assert_eq!(
+            IdentityStore::load_optional(&path)
+                .expect("load")
+                .expect("present")
+                .monitor_url,
+            None,
+            "a rejected page must clear the stale one rather than leave it standing"
+        );
     }
 
     /// An identity written before the enrollment portal page was recorded must

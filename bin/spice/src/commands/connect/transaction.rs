@@ -386,6 +386,26 @@ async fn execute_with<P: Prompter>(
         .as_ref()
         .and(draft.as_ref())
         .map(|draft| draft.enrollment_operation_id.clone());
+    // A resumed operation replays the location recorded when it was published:
+    // the enrollment request is built from the draft, and the draft deliberately
+    // keeps its region so a differing `--region` on a retry cannot invalidate
+    // exact-replay state. The journal has to record that same value or it
+    // describes a request that was never sent — and then rejects the retry that
+    // names the region the operation actually carries.
+    let region = match resumable.as_ref().and(draft.as_ref()) {
+        Some(pending) => {
+            if let Some(requested) = request.region.as_deref()
+                && pending.region.as_deref() != Some(requested)
+            {
+                println!(
+                    "The pending enrollment declares location {}, which is what it replays; --region {requested} applies to a new enrollment.",
+                    pending.region.as_deref().unwrap_or("(none)")
+                );
+            }
+            pending.region.clone()
+        }
+        None => request.region.clone(),
+    };
     let token = request.token.take();
 
     let key_enrollment =
@@ -394,7 +414,7 @@ async fn execute_with<P: Prompter>(
             config_dir: &config_dir,
             directory: &directory,
             endpoint: &resolved_endpoint,
-            region: request.region.clone(),
+            region: region.clone(),
             expected_org,
             resumed_operation,
         };
@@ -434,6 +454,7 @@ async fn execute_with<P: Prompter>(
                     config_dir: &config_dir,
                     directory: &directory,
                     endpoint: &resolved_endpoint,
+                    region,
                     organization,
                     resumed_operation,
                 },
@@ -555,6 +576,7 @@ async fn execute_with<P: Prompter>(
             config_dir: &config_dir,
             directory: &directory,
             endpoint: &resolved_endpoint,
+            region,
             organization: selected.name,
             login,
             resumed_operation: None,
@@ -723,6 +745,9 @@ struct LoginEnrollment<'a> {
     config_dir: &'a Path,
     directory: &'a Path,
     endpoint: &'a TransactionEndpoint,
+    /// The location this enrollment declares. A resumed operation carries the
+    /// one its draft recorded, not this invocation's flag.
+    region: Option<String>,
     organization: String,
     login: LoginCredential,
     /// As [`KeyEnrollment::resumed_operation`].
@@ -742,7 +767,7 @@ async fn enroll_with_login<P: Prompter>(
         config_dir: context.config_dir,
         directory: context.directory,
         endpoint: context.endpoint,
-        region: request.region.clone(),
+        region: context.region,
         journal_org: context.organization.clone(),
         authority: EnrollmentAuthority::AuthenticatedSession {
             access_token: context.login.token.clone(),
@@ -794,6 +819,8 @@ struct PendingLogin<'a> {
     config_dir: &'a Path,
     directory: &'a Path,
     endpoint: &'a TransactionEndpoint,
+    /// As [`LoginEnrollment::region`].
+    region: Option<String>,
     organization: String,
     /// As [`KeyEnrollment::resumed_operation`].
     resumed_operation: Option<String>,
@@ -871,6 +898,7 @@ async fn resume_pending_login<P: Prompter>(
             config_dir: context.config_dir,
             directory: context.directory,
             endpoint: context.endpoint,
+            region: context.region,
             organization: context.organization,
             login,
             resumed_operation: context.resumed_operation,
