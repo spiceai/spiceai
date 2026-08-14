@@ -17,7 +17,10 @@ limitations under the License.
 
 use std::{
     collections::HashMap,
-    sync::{Arc, LazyLock},
+    sync::{
+        Arc, LazyLock,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -45,13 +48,20 @@ static CONTAINER_SEMAPHORE: LazyLock<Arc<Semaphore>> =
 pub struct RunningContainer<'a> {
     name: &'a str,
     docker: Docker,
+    /// Whether the container has already been removed, so dropping one a test
+    /// cleaned up explicitly does not attempt it a second time.
+    removed: AtomicBool,
     // Store the permit to release it when the container is dropped
     _permit: tokio::sync::OwnedSemaphorePermit,
 }
 
 impl RunningContainer<'_> {
     pub async fn remove(&self) -> Result<(), anyhow::Error> {
-        remove(&self.docker, self.name).await
+        let result = remove(&self.docker, self.name).await;
+        if result.is_ok() {
+            self.removed.store(true, Ordering::Relaxed);
+        }
+        result
     }
 
     pub async fn stop(&self) -> Result<(), anyhow::Error> {
@@ -102,12 +112,66 @@ impl RunningContainer<'_> {
     }
 }
 
+/// Removes the container when the test that started it is finished with it,
+/// including when that test panicked partway through.
+///
+/// Explicit cleanup cannot cover this on its own: a `.remove()` call at the end
+/// of a test is skipped by the `?` or the failed assertion that ends the test
+/// early, which is exactly when a suite is being run repeatedly.
+///
+/// `Drop` cannot await, and the removal must work whether or not the test's
+/// runtime is still running -- a `#[tokio::test]` drops its runtime while
+/// unwinding, and spawning onto a runtime that is shutting down silently drops
+/// the task. So the removal gets a runtime of its own, on a thread joined
+/// before the drop returns. Best-effort by construction: a failure here must
+/// not mask the test result that is already on its way out.
+impl Drop for RunningContainer<'_> {
+    fn drop(&mut self) {
+        if *self.removed.get_mut() {
+            return;
+        }
+
+        let docker = self.docker.clone();
+        let name = self.name.to_string();
+        let removal = std::thread::spawn(move || {
+            let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                return Err(anyhow::anyhow!("could not build a runtime for cleanup"));
+            };
+            runtime.block_on(remove(&docker, &name))
+        });
+
+        // Report rather than panic: a panicking `Drop` during an unwind aborts
+        // the process, which would replace a readable test failure with none.
+        match removal.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => eprintln!("failed to remove test container {}: {e}", self.name),
+            Err(_) => eprintln!(
+                "the cleanup thread for test container {} panicked",
+                self.name
+            ),
+        }
+    }
+}
+
+/// Removes a container that a test has finished with, and every test *must*
+/// reach this -- directly or by dropping its [`RunningContainer`].
+///
+/// A leaked container is not merely untidy: each one holds a running database
+/// and an anonymous volume carrying its data directory, so a few runs of the
+/// suite are enough to exhaust memory (a concurrent build gets OOM-killed) and
+/// tens of gigabytes of disk that nothing reclaims.
 pub async fn remove(docker: &Docker, name: &str) -> Result<(), anyhow::Error> {
     Ok(docker
         .remove_container(
             name,
             Some(RemoveContainerOptions {
                 force: true,
+                // The data directory is an anonymous volume, which outlives the
+                // container unless it is removed with it.
+                v: true,
                 ..Default::default()
             }),
         )
@@ -312,6 +376,7 @@ impl<'a> ContainerRunner<'a> {
         Ok(RunningContainer::<'a> {
             name: self.name,
             docker: self.docker,
+            removed: AtomicBool::new(false),
             _permit: permit,
         })
     }
