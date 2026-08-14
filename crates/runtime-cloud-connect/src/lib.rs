@@ -67,6 +67,7 @@ pub mod enroll;
 pub mod enrollment_key;
 pub mod handlers;
 pub mod identity;
+pub mod mutation_lock;
 pub mod release;
 pub mod runtime_lock;
 pub mod sealed_secrets;
@@ -115,6 +116,7 @@ pub use handlers::{
     RuntimeHandle, RuntimePhase, SpicepodDeployment, StatusReport, effective_max_rows,
 };
 pub use identity::{AppAttachment, AttachmentState, Identity, IdentityStore};
+pub use mutation_lock::{MUTATION_LOCK_FILE, MutationLock};
 pub use runtime_lock::{RuntimeLock, RuntimeLockOwner};
 pub use session::{AcknowledgedSession, SessionAck};
 

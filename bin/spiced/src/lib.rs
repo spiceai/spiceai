@@ -822,7 +822,7 @@ pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
             );
         } else {
             tracing::warn!(
-                "Starting in pods watcher mode without a valid spicepod.yaml. The runtime will load components once a valid spicepod.yaml is provided.\n{err}"
+                "Starting in pods watcher mode without a valid spicepod.yaml. The runtime will load components once a valid spicepod.yaml is provided: {err}"
             );
         }
     }

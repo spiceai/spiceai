@@ -746,7 +746,7 @@ async fn remove_identity(
     assume_yes: bool,
     force: bool,
 ) -> Result<()> {
-    let _connect_lock = state::ConnectLock::acquire(config_dir, "remove")
+    let _connect_lock = runtime_cloud_connect::MutationLock::acquire(config_dir, "remove")
         .await
         .map_err(|error| Error::CloudConnectIo {
             message: error.to_string(),

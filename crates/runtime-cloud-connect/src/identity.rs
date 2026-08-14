@@ -1304,19 +1304,26 @@ impl IdentityStore {
         let resolved = match attachment {
             Some(attachment) => {
                 let same_app = identity.app_id.as_deref() == Some(attachment.app_id.as_str());
+                // The monitor page is Cloud-constructed portal metadata that the
+                // runtime prints and an operator opens, so it passes the one
+                // portal-link rule here, at the writer — the same place the
+                // enrollment validates its create-project page. A link the rule
+                // rejects is dropped rather than stored: the attachment is still
+                // recorded, it just carries no page to point at.
+                let delivered = attachment
+                    .monitor_url
+                    .as_deref()
+                    .and_then(crate::config::safe_portal_url);
                 let (app_name, monitor_url) = if same_app {
                     (
                         attachment
                             .app_name
                             .clone()
                             .or_else(|| identity.app_name.clone()),
-                        attachment
-                            .monitor_url
-                            .clone()
-                            .or_else(|| identity.monitor_url.clone()),
+                        delivered.or_else(|| identity.monitor_url.clone()),
                     )
                 } else {
-                    (attachment.app_name.clone(), attachment.monitor_url.clone())
+                    (attachment.app_name.clone(), delivered)
                 };
                 AttachmentState {
                     app_id: Some(attachment.app_id.clone()),
@@ -2859,6 +2866,46 @@ mod tests {
             loaded.new_project_url.as_deref(),
             Some("https://spice.ai/acme/new?instance=inst_1")
         );
+    }
+
+    /// A monitor page the portal-link rule rejects is not stored, and never
+    /// reaches the log line or the browser that would open it. The attachment
+    /// itself still lands — losing the page is not losing the attachment.
+    #[test]
+    fn an_unsafe_monitor_page_is_not_stored() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join("identity.json");
+        IdentityStore::store(&path, &sample_identity()).expect("store");
+
+        for unsafe_url in [
+            "javascript:alert(1)",
+            "http://attacker.example/acme/monitor",
+            "https://user:secret@spice.ai/acme/monitor",
+            "/acme/monitor",
+        ] {
+            let attachment = AppAttachment {
+                monitor_url: Some(unsafe_url.to_string()),
+                ..sample_attachment()
+            };
+            let persisted = IdentityStore::set_attachment(&path, Some(&attachment))
+                .expect("attach")
+                .expect("the identity still exists");
+            assert_eq!(
+                persisted.monitor_url, None,
+                "{unsafe_url} must not be reported as this attachment's page"
+            );
+            let loaded = IdentityStore::load_optional(&path)
+                .expect("load")
+                .expect("present");
+            assert_eq!(loaded.monitor_url, None, "{unsafe_url} must not be stored");
+            assert_eq!(
+                loaded.app_id.as_deref(),
+                Some(attachment.app_id.as_str()),
+                "the attachment itself must still land"
+            );
+            // Back to detached so the next iteration starts from the same state.
+            IdentityStore::set_attachment(&path, None).expect("detach");
+        }
     }
 
     /// An identity written before the enrollment portal page was recorded must

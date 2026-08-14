@@ -40,7 +40,7 @@ use crate::error::{CloudErrorCode, Error, Result};
 
 use super::naming::{collision_suggestion, initial_suggestion, validate_project_name};
 use super::project::{ProjectAttachment, ProjectClient, ProjectMutation};
-use super::state::{ConnectLock, ConnectOperation, IdentityFacts, ProjectOperation};
+use super::state::{ConnectOperation, IdentityFacts, ProjectOperation};
 
 pub(super) struct ConnectRequest {
     pub org: Option<String>,
@@ -305,22 +305,25 @@ async fn execute_with<P: Prompter>(
     // fresh-enrollment guidance. Deferring instead reaches the draft loader under
     // the lock, which is the layer that reports the real I/O failure.
     let draft_pending = !matches!(
-        runtime_cloud_connect::EnrollmentDraft::path_in(&config_dir).try_exists(),
+        tokio::fs::try_exists(runtime_cloud_connect::EnrollmentDraft::path_in(&config_dir)).await,
         Ok(false)
     );
+    let identity_present = tokio::fs::try_exists(&identity_path).await.unwrap_or(true);
     if !prompter.interactive()
         && request.token.is_none()
         && (request.org.is_none() || request.project.is_none())
-        && !identity_path.exists()
+        && !identity_present
         && !draft_pending
     {
         return Err(invalid_usage(
             "non-interactive Cloud Connect requires either a login with --org <org> --project <name>, or --token <enrollment-key>.",
         ));
     }
-    let _lock = ConnectLock::acquire(&config_dir, "connect")
+    let _lock = runtime_cloud_connect::MutationLock::acquire(&config_dir, "connect")
         .await
-        .map_err(|error| state_error(&error))?;
+        .map_err(|source| Error::CloudConnectIo {
+            message: source.to_string(),
+        })?;
     let identity = load_identity(&identity_path).await?;
     if let Some(identity) = identity.as_ref() {
         validate_existing_identity(&identity_path, identity)?;
@@ -1203,26 +1206,49 @@ async fn enroll(attempt: EnrollAttempt<'_>) -> Result<EnrollmentResult> {
     };
     let (enrollment_transaction, mut operation) = tokio::task::spawn_blocking(move || {
         let facts = InstanceFacts::gather(&runtime_version);
+        // A resumed run exists to finish one operation, so it settles that
+        // question before anything can publish a new one. `load_or_create`
+        // creates when the draft is absent, and creating here would answer a
+        // vanished operation by leaving a phantom one on disk for the next run to
+        // resume — so the resumed case is decided first, from what the
+        // transaction can now see, and refuses instead.
+        //
+        // The binding check inside `load_or_create` cannot stand in for this: it
+        // admits a corrected organization assertion, which is what lets a
+        // mistyped `--org` recover, and therefore cannot tell a replay from a
+        // different operation published under the same binding.
+        if let Some(resumed) = resumed_operation.as_deref() {
+            match runtime_cloud_connect::EnrollmentDraft::load_optional(&prepare_dir)
+                .map_err(|source| Error::CloudConnectIo {
+                    message: format!("read the pending enrollment: {source}"),
+                })?
+            {
+                Some(pending) if pending.enrollment_operation_id == resumed => {}
+                Some(_) => {
+                    return Err(invalid_usage(
+                        "the pending enrollment for this directory changed while this run was preparing: it now holds a different operation. Nothing was sent. Re-run `spice connect` to continue the operation that is pending now, or run `spice connect remove --yes` to abandon it explicitly.",
+                    ));
+                }
+                None if prepare_dir
+                    .join(runtime_cloud_connect::config::IDENTITY_FILE)
+                    .exists() =>
+                {
+                    return Err(invalid_usage(
+                        "this directory finished enrolling while this run was preparing, so the pending operation is gone. Nothing was sent, and the enrollment key was not redeemed. Re-run `spice connect` to start the instance.",
+                    ));
+                }
+                None => {
+                    return Err(invalid_usage(
+                        "the pending enrollment for this directory was removed while this run was preparing. Nothing was sent, and the enrollment key was not redeemed. Re-run `spice connect` to enroll this directory again.",
+                    ));
+                }
+            }
+        }
         let draft = enrollment_transaction
             .load_or_create(&facts, region.as_deref(), &draft_binding)
             .map_err(|source| Error::CloudConnectIo {
                 message: format!("prepare retry-safe enrollment: {source}"),
             })?;
-        // A resumed run routed on a draft it read before this transaction was
-        // held, so the operation it decided for is only now verifiable. The
-        // binding check above deliberately admits a corrected organization
-        // assertion, which means it cannot tell a replayed operation from a
-        // different one published under the same binding — this can, and refuses
-        // to spend the credential this run collected on an operation it never
-        // showed the operator.
-        if let Some(resumed) = resumed_operation.as_deref()
-            && draft.enrollment_operation_id != resumed
-        {
-            return Err(invalid_usage(format!(
-                "the pending enrollment for this directory changed while this run was preparing: it now holds a different operation. Nothing was sent. Re-run `spice connect` to continue the operation that is pending now, or run `spice connect remove --yes` to abandon it explicitly. The exact-replay state was preserved (expected operation {resumed}, found {}).",
-                draft.enrollment_operation_id
-            )));
-        }
         let operation = ConnectOperation::prepare(
             &prepare_dir,
             &canonical_dir,
@@ -2021,6 +2047,9 @@ mod tests {
         key: Option<String>,
         config_dir: std::path::PathBuf,
         replacement: Option<EnrollmentRequestBinding>,
+        /// Remove the pending draft without publishing another, the way a
+        /// release does.
+        remove: bool,
     }
 
     impl Prompter for RacingPrompter {
@@ -2033,12 +2062,14 @@ mod tests {
         }
 
         async fn read_enrollment_key(&mut self, _portal_url: &str) -> Result<Option<String>> {
-            if let Some(binding) = self.replacement.take() {
-                // What another process does when it takes the transaction: the
-                // operation this run routed on is gone, and a different one is
-                // pending in its place.
+            // What another process does when it takes the transaction: the
+            // operation this run routed on is gone, and either a different one is
+            // pending in its place or nothing is.
+            if self.remove || self.replacement.is_some() {
                 std::fs::remove_file(EnrollmentDraft::path_in(&self.config_dir))
                     .expect("remove the pending draft");
+            }
+            if let Some(binding) = self.replacement.take() {
                 EnrollmentDraft::load_or_create(
                     &self.config_dir,
                     &InstanceFacts::gather("v0.0.0-racing-test"),
@@ -2367,86 +2398,100 @@ mod tests {
         );
     }
 
-    /// The same replacement, under a binding the draft layer cannot tell apart.
+    /// The authority is routed from a draft read before the enrollment
+    /// transaction is held, so another process can replace the operation while
+    /// the key prompt is open — the one place a resumed run waits on a human.
     ///
-    /// `validate_request` compares the endpoint and the authority kind, and every
-    /// token binding matches every other so a corrected organization assertion
-    /// can still recover its operation. That check therefore cannot see a
-    /// *different operation* published under the same binding — only the routed
-    /// operation ID can, and it has to hold, or this run spends the key the
-    /// operator just typed on an operation it never showed them.
+    /// What refuses is the operation's identity, whatever else the replacement
+    /// changed. The binding cannot stand in for it: every token binding matches
+    /// every other so a corrected organization assertion can still recover its
+    /// operation, which leaves a *different* operation under the same binding
+    /// indistinguishable. Both replacements below are therefore refused the same
+    /// way, with nothing sent, nothing enrolled, and the operation the other
+    /// process published left exactly as it wrote it.
     #[tokio::test(start_paused = true)]
-    async fn an_operation_replaced_under_the_same_binding_fails_closed() {
-        let instance = tempfile::tempdir().expect("create instance directory");
-        let directory = instance.path().canonicalize().expect("canonical tempdir");
-        let config_dir = CloudConnectConfig::resolve_config_dir(Some(&directory));
+    async fn an_operation_replaced_while_prompting_fails_closed() {
         let endpoint = closed_endpoint();
-        let binding = EnrollmentRequestBinding {
+        let routed_binding = EnrollmentRequestBinding {
             endpoint: endpoint.clone(),
             authority: EnrollmentAuthorityBinding::Token {
                 expected_org: Some("acme".to_string()),
             },
         };
-        let routed = EnrollmentDraft::load_or_create(
-            &config_dir,
-            &InstanceFacts::gather("v0.0.0-racing-test"),
-            Some("lab-seoul"),
-            &binding,
-        )
-        .expect("publish a pending enrollment draft");
-
-        // The replacement carries the identical binding, so only its operation
-        // ID distinguishes it.
-        let mut prompter = RacingPrompter {
-            key: Some("spice-enroll-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string()),
-            config_dir: config_dir.clone(),
-            replacement: Some(binding.clone()),
-        };
-
-        let error = execute_with(
-            &RuntimeContext::new().expect("runtime context"),
-            ConnectRequest {
-                dir: Some(directory.clone()),
-                endpoint: Some(endpoint.clone()),
-                ..connect_request()
+        let replacements = [
+            // Indistinguishable by binding: only the operation ID differs.
+            routed_binding.clone(),
+            // A different authority entirely.
+            EnrollmentRequestBinding {
+                endpoint: endpoint.clone(),
+                authority: EnrollmentAuthorityBinding::AuthenticatedSession {
+                    organization: "globex".to_string(),
+                },
             },
-            &mut prompter,
-        )
-        .await
-        .expect_err("an operation this run never routed on must not be enrolled");
-        let rendered = error.to_string();
-        assert!(
-            rendered.contains("changed while this run was preparing")
-                && rendered.contains("Nothing was sent"),
-            "the transaction must refuse the replaced operation: {rendered}"
-        );
+        ];
 
-        let surviving = EnrollmentDraft::load_optional(&config_dir)
-            .expect("read the draft state")
-            .expect("the replacement is still pending");
-        assert_ne!(
-            surviving.enrollment_operation_id, routed.enrollment_operation_id,
-            "the replacement is a different operation, which is the whole point"
-        );
-        assert_eq!(
-            surviving.binding, binding,
-            "the operation the other process published must be left exactly as written"
-        );
-        assert!(
-            !config_dir
-                .join(runtime_cloud_connect::config::IDENTITY_FILE)
-                .exists(),
-            "a refused resume must enroll nothing"
-        );
+        for replacement in replacements {
+            let instance = tempfile::tempdir().expect("create instance directory");
+            let directory = instance.path().canonicalize().expect("canonical tempdir");
+            let config_dir = CloudConnectConfig::resolve_config_dir(Some(&directory));
+            let routed = EnrollmentDraft::load_or_create(
+                &config_dir,
+                &InstanceFacts::gather("v0.0.0-racing-test"),
+                Some("lab-seoul"),
+                &routed_binding,
+            )
+            .expect("publish a pending enrollment draft");
+
+            let mut prompter = RacingPrompter {
+                key: Some("spice-enroll-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string()),
+                config_dir: config_dir.clone(),
+                replacement: Some(replacement.clone()),
+                remove: false,
+            };
+            let error = execute_with(
+                &RuntimeContext::new().expect("runtime context"),
+                ConnectRequest {
+                    dir: Some(directory.clone()),
+                    endpoint: Some(endpoint.clone()),
+                    ..connect_request()
+                },
+                &mut prompter,
+            )
+            .await
+            .expect_err("an operation this run never routed on must not be enrolled");
+            let rendered = error.to_string();
+            assert!(
+                rendered.contains("changed while this run was preparing")
+                    && rendered.contains("Nothing was sent"),
+                "the transaction must refuse the replaced operation: {rendered}"
+            );
+
+            let surviving = EnrollmentDraft::load_optional(&config_dir)
+                .expect("read the draft state")
+                .expect("the replacement is still pending");
+            assert_eq!(
+                surviving.binding, replacement,
+                "the operation the other process published must be left exactly as written"
+            );
+            assert_ne!(
+                surviving.enrollment_operation_id, routed.enrollment_operation_id,
+                "the replacement is a different operation, which is what refuses"
+            );
+            assert!(
+                !config_dir
+                    .join(runtime_cloud_connect::config::IDENTITY_FILE)
+                    .exists(),
+                "a refused resume must enroll nothing"
+            );
+        }
     }
 
-    /// The authority is routed from a draft read before the enrollment
-    /// transaction is held, so another process can replace the operation while
-    /// the key prompt is open. The re-check under the transaction is what makes
-    /// that safe: the run fails closed, enrolls nothing, and leaves the operation
-    /// the other process published exactly as it wrote it.
+    /// A resumed run whose operation is gone refuses and publishes nothing. The
+    /// prepare step creates a draft when none exists, and creating one here would
+    /// answer a vanished operation by leaving a phantom for the next run to
+    /// resume — so it is decided before anything can create.
     #[tokio::test(start_paused = true)]
-    async fn a_draft_replaced_while_prompting_fails_closed() {
+    async fn a_resumed_operation_that_vanished_publishes_nothing() {
         let instance = tempfile::tempdir().expect("create instance directory");
         let directory = instance.path().canonicalize().expect("canonical tempdir");
         let config_dir = CloudConnectConfig::resolve_config_dir(Some(&directory));
@@ -2464,18 +2509,13 @@ mod tests {
         )
         .expect("publish a pending enrollment draft");
 
-        let replacement = EnrollmentRequestBinding {
-            endpoint: endpoint.clone(),
-            authority: EnrollmentAuthorityBinding::AuthenticatedSession {
-                organization: "globex".to_string(),
-            },
-        };
         let mut prompter = RacingPrompter {
             key: Some("spice-enroll-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string()),
             config_dir: config_dir.clone(),
-            replacement: Some(replacement.clone()),
+            // No replacement: the operation is simply removed, as a release does.
+            replacement: None,
+            remove: true,
         };
-
         let error = execute_with(
             &RuntimeContext::new().expect("runtime context"),
             ConnectRequest {
@@ -2486,20 +2526,18 @@ mod tests {
             &mut prompter,
         )
         .await
-        .expect_err("a replaced operation must not be enrolled under the routed authority");
+        .expect_err("a vanished operation must not be replaced by a new one");
+        let rendered = error.to_string();
         assert!(
-            error
-                .to_string()
-                .contains("different control plane or authority"),
-            "the transaction must refuse the replaced operation: {error}"
+            rendered.contains("was removed while this run was preparing")
+                && rendered.contains("was not redeemed"),
+            "the failure must say the operation is gone and the key unspent: {rendered}"
         );
-
-        let surviving = EnrollmentDraft::load_optional(&config_dir)
-            .expect("read the draft state")
-            .expect("the replacement is still pending");
-        assert_eq!(
-            surviving.binding, replacement,
-            "the operation the other process published must be left exactly as written"
+        assert!(
+            EnrollmentDraft::load_optional(&config_dir)
+                .expect("read the draft state")
+                .is_none(),
+            "a refused resume must not publish a phantom operation"
         );
         assert!(
             !config_dir
