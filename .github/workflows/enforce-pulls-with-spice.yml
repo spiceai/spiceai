@@ -79,14 +79,21 @@ jobs:
           required_label_prefixes: 'kind/,area/'
           banned_labels: 'invalid,wontfix,nomerge,duplicate'
           # GitHub's assignees API silently drops App accounts, so `auto_assign_author`
-          # below cannot satisfy `require_assignee` on a Dependabot PR — the required
+          # below cannot satisfy `require_assignee` on a PR an App opened — the required
           # check is then red forever with nothing any author or reviewer can do about
           # it. #12358 is the shape: every other gate green, blocked solely on
           # `❌ At least one assignee is required`, until a maintainer hand-assigned
           # themselves. `pr.yml` already fast-tracks Dependabot for the same reason.
+          #
+          # The exemption keys on the author's account *type* rather than naming one
+          # App, because the API behaviour it works around is a property of App
+          # accounts in general: `github-actions[bot]` hits it too, which is why every
+          # `Update openapi.json` PR the schema workflow opens is unmergeable. Our own
+          # bots (`claudespice`, `grokspice`) are ordinary `User` accounts and are
+          # unaffected — they can be assigned, so they must still carry an assignee.
           # This exempts nothing else — the title-length, `kind/`/`area/` label and
-          # banned-label gates still apply to dependency bumps exactly as before.
-          require_assignee: ${{ github.event.pull_request.user.login == 'dependabot[bot]' && 'false' || 'true' }}
+          # banned-label gates still apply to App-authored PRs exactly as before.
+          require_assignee: ${{ github.event.pull_request.user.type == 'Bot' && 'false' || 'true' }}
           auto_label: 'true'
           # No auto_label_size: GitHub applies size labels natively now, and the
           # action's input defaults to false, so leaving it out is the whole
