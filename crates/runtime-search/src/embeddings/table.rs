@@ -1017,7 +1017,7 @@ impl TableLayer for EmbeddingTable {
         let projected_schema = self.schema_over(below);
         let mut stats = Statistics::new_unknown(&projected_schema);
         stats.num_rows = base.num_rows;
-        stats.total_byte_size = base.total_byte_size;
+        stats.total_byte_size = datafusion::common::stats::Precision::Absent;
         Some(stats)
     }
 
