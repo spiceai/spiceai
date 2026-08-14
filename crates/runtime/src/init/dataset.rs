@@ -81,7 +81,7 @@ use util::{error_spaced, warn_spaced};
 /// This bounds one dataset, not one apply: `apply_dataset_diff` updates changed
 /// datasets sequentially, so an apply changing several of them can spend this
 /// bound once per dataset.
-const HOT_RELOAD_INITIAL_REFRESH_TIMEOUT: Duration = Duration::from_secs(300);
+const HOT_RELOAD_INITIAL_REFRESH_TIMEOUT: Duration = Duration::from_mins(5);
 
 impl Runtime {
     pub(crate) async fn load_datasets(self: Arc<Self>) {
@@ -1957,14 +1957,14 @@ async fn await_hot_reload_initial_refresh(
     // `notify_waiters` is what both producers call. So a refresh completing
     // between here and the `select!` still wakes this wait; constructing after
     // the check would drop it and cost the whole bound.
-    let notified = notifier.notified();
+    let refresh_notified = notifier.notified();
 
     if initial_load_completed() {
         return Ok(());
     }
 
     tokio::select! {
-        () = notified => return Ok(()),
+        () = refresh_notified => return Ok(()),
         () = shutdown_token.cancelled() => return Ok(()),
         () = tokio::time::sleep(timeout) => {}
     }
