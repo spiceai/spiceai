@@ -32,6 +32,7 @@ use arrow::temporal_conversions::NANOSECONDS;
 use async_trait::async_trait;
 use datafusion::error::DataFusionError;
 use datafusion::execution::SendableRecordBatchStream;
+use datafusion::physical_plan::EmptyRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::sql::TableReference;
 use datafusion_table_providers::sql::db_connection_pool::dbconnection::{
@@ -256,7 +257,7 @@ impl<'a> AsyncDbConnection<Arc<SnowflakeApi>, &'a dyn Sync> for SnowflakeConnect
 /// contradicts the columns the query selected.
 fn empty_result_stream(projected_schema: Option<SchemaRef>) -> SendableRecordBatchStream {
     let schema = projected_schema.unwrap_or_else(|| Arc::new(Schema::empty()));
-    Box::pin(RecordBatchStreamAdapter::new(schema, stream::empty()))
+    Box::pin(EmptyRecordBatchStream::new(schema))
 }
 
 fn to_execution_error(e: impl Into<Box<dyn std::error::Error>>) -> DataFusionError {

@@ -25,13 +25,14 @@ use async_stream::stream;
 use clickhouse_rs::{Block, ClientHandle, Pool};
 use datafusion::error::DataFusionError;
 use datafusion::execution::SendableRecordBatchStream;
+use datafusion::physical_plan::EmptyRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::sql::TableReference;
 use datafusion_table_providers::sql::db_connection_pool::dbconnection::{
     self, AsyncDbConnection, DbConnection,
 };
 use futures::lock::Mutex;
-use futures::{Stream, StreamExt, stream};
+use futures::{Stream, StreamExt};
 use snafu::prelude::*;
 
 #[derive(Debug, Snafu)]
@@ -226,7 +227,7 @@ impl<'a> AsyncDbConnection<ClientHandle, &'a dyn Sync> for ClickhouseConnection 
 /// contradicts the columns the query selected.
 fn empty_result_stream(projected_schema: Option<SchemaRef>) -> SendableRecordBatchStream {
     let schema = projected_schema.unwrap_or_else(|| Arc::new(Schema::empty()));
-    Box::pin(RecordBatchStreamAdapter::new(schema, stream::empty()))
+    Box::pin(EmptyRecordBatchStream::new(schema))
 }
 
 fn query_to_stream(

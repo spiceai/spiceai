@@ -22,7 +22,8 @@ use arrow::{
 use async_trait::async_trait;
 use datafusion::{
     datasource::TableProvider, error::DataFusionError, execution::SendableRecordBatchStream,
-    physical_plan::stream::RecordBatchStreamAdapter, sql::TableReference,
+    physical_plan::EmptyRecordBatchStream, physical_plan::stream::RecordBatchStreamAdapter,
+    sql::TableReference,
 };
 use datafusion_table_providers::sql::{
     db_connection_pool::{
@@ -2049,10 +2050,7 @@ impl<'a> AsyncDbConnection<Arc<SqlWarehouseApi>, &'a dyn Sync> for SqlWarehouseC
 /// — schema discovery, for one — pass `None` and keep the empty schema.
 fn empty_result_stream(projected_schema: Option<SchemaRef>) -> SendableRecordBatchStream {
     let schema = projected_schema.unwrap_or_else(|| Arc::new(Schema::empty()));
-    let empty_stream: Pin<Box<dyn Stream<Item = Result<RecordBatch, DataFusionError>> + Send>> =
-        Box::pin(stream::empty::<Result<RecordBatch, DataFusionError>>());
-
-    Box::pin(RecordBatchStreamAdapter::new(schema, empty_stream)) as SendableRecordBatchStream
+    Box::pin(EmptyRecordBatchStream::new(schema))
 }
 
 fn databricks_dialect() -> super::dialect::DatabricksDialect {
