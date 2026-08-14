@@ -1007,8 +1007,18 @@ impl TableLayer for EmbeddingTable {
         Ok(push_downs)
     }
 
-    fn statistics(&self, _below: &Arc<dyn TableProvider>) -> Option<Statistics> {
-        None
+    fn statistics(&self, below: &Arc<dyn TableProvider>) -> Option<Statistics> {
+        // The embedding layer only appends derived columns, so the row count
+        // and total byte size are unchanged from the base table. Preserve those
+        // estimates (the optimizer's most valuable signal) but widen the
+        // per-column statistics to the projected schema with the derived columns
+        // left Unknown, so no exact per-column stat is misattributed.
+        let base = below.statistics()?;
+        let projected_schema = self.schema_over(below);
+        let mut stats = Statistics::new_unknown(&projected_schema);
+        stats.num_rows = base.num_rows;
+        stats.total_byte_size = base.total_byte_size;
+        Some(stats)
     }
 
     async fn scan_with_args<'a>(
