@@ -146,9 +146,17 @@ def render_diagrams(sources: list[str]) -> list[str]:
         src.write_text(doc, encoding="utf-8")
         # `--no-sandbox` because CI runners commonly cannot use the browser
         # sandbox; the only input is this repository's own diagram source.
+        cfg = {"args": ["--no-sandbox", "--disable-dev-shm-usage"]}
+        # Name the browser binary outright when we know it. Puppeteer's own
+        # resolution looks up a build in its cache directory and fails with
+        # "Could not find Chrome (ver. ...)" even when that exact version is
+        # installed there, so the path `puppeteer browsers install` reports is
+        # what CI passes through this variable.
+        browser = os.environ.get("PUPPETEER_EXECUTABLE_PATH")
+        if browser:
+            cfg["executablePath"] = browser
         puppeteer_cfg = tmp / "puppeteer.json"
-        puppeteer_cfg.write_text(json.dumps({"args": ["--no-sandbox", "--disable-dev-shm-usage"]}),
-                                 encoding="utf-8")
+        puppeteer_cfg.write_text(json.dumps(cfg), encoding="utf-8")
         out = tmp / "rendered.md"
         print(f"Rendering {len(sources)} mermaid diagrams with {cmd[0]}...", flush=True)
         proc = subprocess.run(
@@ -156,8 +164,15 @@ def render_diagrams(sources: list[str]) -> list[str]:
             capture_output=True, text=True, check=False,
         )
         if proc.returncode != 0:
+            hint = ""
+            if "Could not find Chrome" in proc.stderr:
+                hint = (
+                    "\nThe browser mermaid renders in is missing, or puppeteer cannot resolve "
+                    "the copy it installed. Run 'npx puppeteer browsers install chrome' here and "
+                    "set PUPPETEER_EXECUTABLE_PATH to the path it prints."
+                )
             raise RuntimeError(
-                f"mermaid-cli failed (exit {proc.returncode}).\n"
+                f"mermaid-cli failed (exit {proc.returncode}).{hint}\n"
                 f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
             )
         svgs = []

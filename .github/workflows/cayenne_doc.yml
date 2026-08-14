@@ -97,14 +97,31 @@ jobs:
           path: ~/.cache/puppeteer
           key: puppeteer-${{ runner.os }}-${{ hashFiles('docs/cayenne/package-lock.json') }}
 
-      - name: Install the headless browser
-        if: steps.browser_cache.outputs.cache-hit != 'true'
+      # Always run, cache hit or not: `browsers install` is idempotent — with the
+      # cache restored it resolves the browser already there instead of
+      # downloading again — and it reports the executable path either way.
+      #
+      # That path is what the render actually launches. Puppeteer's own
+      # resolution fails with "Could not find Chrome (ver. ...)" even when that
+      # exact version sits in the cache directory it names, so build_pdf.py
+      # passes this straight through to mermaid-cli rather than letting
+      # puppeteer look it up.
+      - name: Resolve the headless browser
         working-directory: docs/cayenne
-        run: npx puppeteer browsers install chrome
+        run: |
+          installed=$(npx puppeteer browsers install chrome)
+          echo "$installed"
+          # Output is `<browser>@<version> <path>`; the path may contain spaces,
+          # so strip only through the FIRST space.
+          echo "PUPPETEER_EXECUTABLE_PATH=${installed#* }" >> "$GITHUB_ENV"
 
       - name: Report the renderer version
         working-directory: docs/cayenne
-        run: ./node_modules/.bin/mmdc --version | tee -a "$GITHUB_STEP_SUMMARY"
+        run: |
+          {
+            echo "mermaid-cli $(./node_modules/.bin/mmdc --version)"
+            echo "browser: $("$PUPPETEER_EXECUTABLE_PATH" --version)"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
 
       # Guard against a stale or uncommitted figure: regenerating waterfall.svg
       # from gen_waterfall.py must leave the working tree clean. --porcelain
