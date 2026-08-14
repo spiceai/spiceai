@@ -119,3 +119,10 @@ fn metric_callback_type(metric_callback: &ObserveMetricCallback) -> &'static str
         ObserveMetricCallback::F64(_) => "f64",
     }
 }
+
+/// Publishes this module's unlabelled counters at zero, so a series a healthy
+/// runtime never increments is exported rather than absent. Lives beside the
+/// declarations so the list cannot drift away from them.
+pub fn publish_counters_at_zero() {
+    REGISTERED_COUNT.add(0, &[]);
+}

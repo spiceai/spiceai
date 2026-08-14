@@ -57,3 +57,10 @@ pub static ACCELERATION_TABLES_BY_KIND: LazyLock<Gauge<u64>> = LazyLock::new(|| 
         )
         .build()
 });
+
+/// Publishes this module's unlabelled counters at zero, so a series a healthy
+/// runtime never increments is exported rather than absent. Lives beside the
+/// declarations so the list cannot drift away from them.
+pub fn publish_counters_at_zero() {
+    LOAD_ERROR.add(0, &[]);
+}

@@ -32,7 +32,9 @@ use hyper::{
     header::{CONTENT_TYPE, RETRY_AFTER},
 };
 use hyper_util::{rt::TokioIo, server::conn::auto::Builder as AutoBuilder};
+use opentelemetry_prometheus::PrometheusExporter;
 use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
+use opentelemetry_sdk::error::OTelSdkError;
 use prometheus::{
     Encoder, TextEncoder,
     proto::{Bucket, Histogram, LabelPair, Metric, MetricFamily, MetricType},
@@ -71,6 +73,30 @@ pub enum Error {
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
+
+/// Builds the Prometheus reader that `/metrics` is served from.
+///
+/// The suffixes a dashboard query has to match are decided here, not at the
+/// instrument: `without_counter_suffixes` keeps `query_executions` from being
+/// exposed as `query_executions_total`, and `without_units` keeps `_milliseconds`
+/// off every duration histogram. `spiced` and the metrics tests share this so
+/// neither can drift on those names.
+///
+/// # Errors
+///
+/// Returns an error when the exporter cannot register its collector with
+/// `registry`.
+pub fn prometheus_reader(
+    registry: prometheus::Registry,
+) -> Result<PrometheusExporter, OTelSdkError> {
+    opentelemetry_prometheus::exporter()
+        .with_registry(registry)
+        .without_scope_info()
+        .without_units()
+        .without_counter_suffixes()
+        .without_target_info()
+        .build()
+}
 
 pub(crate) async fn start<A>(
     bind_address: Option<A>,

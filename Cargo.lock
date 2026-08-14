@@ -19493,7 +19493,6 @@ dependencies = [
  "mimalloc",
  "opentelemetry",
  "opentelemetry-http",
- "opentelemetry-prometheus",
  "opentelemetry-zipkin",
  "opentelemetry_sdk",
  "otel-arrow",

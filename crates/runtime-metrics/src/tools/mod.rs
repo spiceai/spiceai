@@ -40,3 +40,10 @@ pub static LOAD_ERROR: LazyLock<Counter<u64>> = LazyLock::new(|| {
         .with_description("Number of errors loading the LLM tool.")
         .build()
 });
+
+/// Publishes this module's unlabelled counters at zero, so a series a healthy
+/// runtime never increments is exported rather than absent. Lives beside the
+/// declarations so the list cannot drift away from them.
+pub fn publish_counters_at_zero() {
+    LOAD_ERROR.add(0, &[]);
+}

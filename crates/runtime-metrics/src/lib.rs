@@ -39,3 +39,31 @@ pub mod telemetry;
 pub mod tools;
 pub mod views;
 pub mod workers;
+
+/// Publishes every component counter at zero.
+///
+/// A `LazyLock` counter that has never fired exports no series at all, and an
+/// absent series reads as a broken exporter rather than as zero (#12687).
+///
+/// Only counters whose real emission is unlabelled qualify. An unlabelled zero in
+/// a family that is otherwise labelled — `dataset_active_count{engine}`,
+/// `dataset_acceleration_refresh_errors{dataset}` — is a phantom series that no
+/// record will ever update, and it puts an empty group into any `sum by (..)`.
+/// Publishing those needs one zero per known label value, at the point the label
+/// is known, the way `cache::metrics::EvictionReason::ALL` does it.
+///
+/// Gauges qualify only where zero is the genuine initial reading:
+/// `results_cache_hit_ratio` does, `dataset_load_state` does not, because 0 there
+/// means `Initializing`.
+///
+/// Must be called after the operator's meter provider is installed (#12667).
+pub fn publish_component_counters_at_zero() {
+    catalogs::publish_counters_at_zero();
+    components::publish_counters_at_zero();
+    datasets::publish_counters_at_zero();
+    embeddings::publish_counters_at_zero();
+    models::publish_counters_at_zero();
+    rerankers::publish_counters_at_zero();
+    tools::publish_counters_at_zero();
+    views::publish_counters_at_zero();
+}
