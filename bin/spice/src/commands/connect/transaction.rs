@@ -377,16 +377,24 @@ async fn execute_with<P: Prompter>(
         .as_ref()
         .map(|draft| resumable_authority(draft, &request, prompter.interactive()))
         .transpose()?;
+    // The operation the decision above was made for. Carried so the enrollment
+    // transaction can refuse an operation this run never routed on.
+    let resumed_operation = resumable
+        .as_ref()
+        .and(draft.as_ref())
+        .map(|draft| draft.enrollment_operation_id.clone());
     let token = request.token.take();
 
-    let key_enrollment = |expected_org: Option<String>| KeyEnrollment {
-        ctx,
-        config_dir: &config_dir,
-        directory: &directory,
-        endpoint: &resolved_endpoint,
-        region: request.region.clone(),
-        expected_org,
-    };
+    let key_enrollment =
+        |expected_org: Option<String>, resumed_operation: Option<String>| KeyEnrollment {
+            ctx,
+            config_dir: &config_dir,
+            directory: &directory,
+            endpoint: &resolved_endpoint,
+            region: request.region.clone(),
+            expected_org,
+            resumed_operation,
+        };
 
     match resumable {
         Some(ResumableAuthority::EnrollmentKey { expected_org }) => {
@@ -409,7 +417,12 @@ async fn execute_with<P: Prompter>(
                     message: source.to_string(),
                 })?
             };
-            return enroll_with_key(key_enrollment(expected_org), key, &telemetry).await;
+            return enroll_with_key(
+                key_enrollment(expected_org, resumed_operation),
+                key,
+                &telemetry,
+            )
+            .await;
         }
         Some(ResumableAuthority::Login { organization }) => {
             return resume_pending_login(
@@ -419,6 +432,7 @@ async fn execute_with<P: Prompter>(
                     directory: &directory,
                     endpoint: &resolved_endpoint,
                     organization,
+                    resumed_operation,
                 },
                 &request,
                 prompter,
@@ -430,7 +444,7 @@ async fn execute_with<P: Prompter>(
     }
 
     if let Some(key) = token {
-        return enroll_with_key(key_enrollment(request.org.clone()), key, &telemetry).await;
+        return enroll_with_key(key_enrollment(request.org.clone(), None), key, &telemetry).await;
     }
 
     if !prompter.interactive() && (request.org.is_none() || request.project.is_none()) {
@@ -479,7 +493,8 @@ async fn execute_with<P: Prompter>(
                 let key = EnrollmentKey::parse(&raw).map_err(|source| Error::InvalidUsage {
                     message: source.to_string(),
                 })?;
-                return enroll_with_key(key_enrollment(request.org.clone()), key, &telemetry).await;
+                return enroll_with_key(key_enrollment(request.org.clone(), None), key, &telemetry)
+                    .await;
             }
             None => {
                 telemetry.complete("cancelled");
@@ -525,7 +540,8 @@ async fn execute_with<P: Prompter>(
             let key = EnrollmentKey::parse(&raw).map_err(|source| Error::InvalidUsage {
                 message: source.to_string(),
             })?;
-            return enroll_with_key(key_enrollment(request.org.clone()), key, &telemetry).await;
+            return enroll_with_key(key_enrollment(request.org.clone(), None), key, &telemetry)
+                .await;
         }
         Err(error) => return Err(error),
     };
@@ -538,6 +554,7 @@ async fn execute_with<P: Prompter>(
             endpoint: &resolved_endpoint,
             organization: selected.name,
             login,
+            resumed_operation: None,
         },
         &request,
         prompter,
@@ -659,6 +676,10 @@ struct KeyEnrollment<'a> {
     directory: &'a Path,
     endpoint: &'a TransactionEndpoint,
     region: Option<String>,
+    /// The operation a resumed run routed on, verified under the enrollment
+    /// transaction before the key is spent. `None` for a fresh enrollment,
+    /// which has no operation to hold to.
+    resumed_operation: Option<String>,
     /// The organization this attempt asserts the key belongs to, checked
     /// against the enrollment response. `None` asserts nothing.
     expected_org: Option<String>,
@@ -673,15 +694,16 @@ async fn enroll_with_key(
     telemetry.auth("token");
     telemetry.stage("enrollment");
     let expected_org = context.expected_org;
-    let enrolled = enroll(
-        context.ctx,
-        context.config_dir,
-        context.directory,
-        context.endpoint,
-        context.region,
-        expected_org.clone().unwrap_or_default(),
-        EnrollmentAuthority::Token { key, expected_org },
-    )
+    let enrolled = enroll(EnrollAttempt {
+        ctx: context.ctx,
+        config_dir: context.config_dir,
+        directory: context.directory,
+        endpoint: context.endpoint,
+        region: context.region,
+        journal_org: expected_org.clone().unwrap_or_default(),
+        authority: EnrollmentAuthority::Token { key, expected_org },
+        resumed_operation: context.resumed_operation,
+    })
     .await?;
     print_enrollment_result(&enrolled);
     telemetry.complete(if enrolled.identity.app_id.is_some() {
@@ -700,6 +722,8 @@ struct LoginEnrollment<'a> {
     endpoint: &'a TransactionEndpoint,
     organization: String,
     login: LoginCredential,
+    /// As [`KeyEnrollment::resumed_operation`].
+    resumed_operation: Option<String>,
 }
 
 /// Enroll under a login session, then attach a project when one is named.
@@ -710,18 +734,19 @@ async fn enroll_with_login<P: Prompter>(
     telemetry: &FlowTelemetry,
 ) -> Result<()> {
     telemetry.stage("enrollment");
-    let enrolled = enroll(
-        context.ctx,
-        context.config_dir,
-        context.directory,
-        context.endpoint,
-        request.region.clone(),
-        context.organization.clone(),
-        EnrollmentAuthority::AuthenticatedSession {
+    let enrolled = enroll(EnrollAttempt {
+        ctx: context.ctx,
+        config_dir: context.config_dir,
+        directory: context.directory,
+        endpoint: context.endpoint,
+        region: request.region.clone(),
+        journal_org: context.organization.clone(),
+        authority: EnrollmentAuthority::AuthenticatedSession {
             access_token: context.login.token.clone(),
             org: context.organization.clone(),
         },
-    )
+        resumed_operation: context.resumed_operation,
+    })
     .await?;
 
     if enrolled.already_enrolled && enrolled.identity.app_id.is_some() {
@@ -767,6 +792,8 @@ struct PendingLogin<'a> {
     directory: &'a Path,
     endpoint: &'a TransactionEndpoint,
     organization: String,
+    /// As [`KeyEnrollment::resumed_operation`].
+    resumed_operation: Option<String>,
 }
 
 /// The credential a resumed login operation presents.
@@ -843,6 +870,7 @@ async fn resume_pending_login<P: Prompter>(
             endpoint: context.endpoint,
             organization: context.organization,
             login,
+            resumed_operation: context.resumed_operation,
         },
         request,
         prompter,
@@ -1109,15 +1137,35 @@ fn legacy_endpoint_requires_explicit_authority(endpoint: &str) -> Error {
     ))
 }
 
-async fn enroll(
-    ctx: &RuntimeContext,
-    config_dir: &Path,
-    directory: &Path,
-    endpoint: &TransactionEndpoint,
+/// One enrollment attempt: where it goes, what authorizes it, and what it has to
+/// stay faithful to.
+struct EnrollAttempt<'a> {
+    ctx: &'a RuntimeContext,
+    config_dir: &'a Path,
+    directory: &'a Path,
+    endpoint: &'a TransactionEndpoint,
     region: Option<String>,
+    /// The organization recorded in the enrollment journal, which is compared
+    /// case-insensitively on every replay.
     journal_org: String,
     authority: EnrollmentAuthority,
-) -> Result<EnrollmentResult> {
+    /// The operation a resumed run routed on, verified under the enrollment
+    /// transaction before the credential is spent. `None` for a fresh
+    /// enrollment, which has no operation to hold to.
+    resumed_operation: Option<String>,
+}
+
+async fn enroll(attempt: EnrollAttempt<'_>) -> Result<EnrollmentResult> {
+    let EnrollAttempt {
+        ctx,
+        config_dir,
+        directory,
+        endpoint,
+        region,
+        journal_org,
+        authority,
+        resumed_operation,
+    } = attempt;
     let runtime_version = ctx
         .runtime_version()
         .unwrap_or_else(|_| crate::commands::version::cli_version());
@@ -1160,6 +1208,21 @@ async fn enroll(
             .map_err(|source| Error::CloudConnectIo {
                 message: format!("prepare retry-safe enrollment: {source}"),
             })?;
+        // A resumed run routed on a draft it read before this transaction was
+        // held, so the operation it decided for is only now verifiable. The
+        // binding check above deliberately admits a corrected organization
+        // assertion, which means it cannot tell a replayed operation from a
+        // different one published under the same binding — this can, and refuses
+        // to spend the credential this run collected on an operation it never
+        // showed the operator.
+        if let Some(resumed) = resumed_operation.as_deref()
+            && draft.enrollment_operation_id != resumed
+        {
+            return Err(invalid_usage(format!(
+                "the pending enrollment for this directory changed while this run was preparing: it now holds a different operation. Nothing was sent. Re-run `spice connect` to continue the operation that is pending now, or run `spice connect remove --yes` to abandon it explicitly. The exact-replay state was preserved (expected operation {resumed}, found {}).",
+                draft.enrollment_operation_id
+            )));
+        }
         let operation = ConnectOperation::prepare(
             &prepare_dir,
             &canonical_dir,
@@ -2301,6 +2364,79 @@ mod tests {
         assert!(
             !contents.contains("spice-enroll-"),
             "the enrollment key must never be persisted"
+        );
+    }
+
+    /// The same replacement, under a binding the draft layer cannot tell apart.
+    ///
+    /// `validate_request` compares the endpoint and the authority kind, and every
+    /// token binding matches every other so a corrected organization assertion
+    /// can still recover its operation. That check therefore cannot see a
+    /// *different operation* published under the same binding — only the routed
+    /// operation ID can, and it has to hold, or this run spends the key the
+    /// operator just typed on an operation it never showed them.
+    #[tokio::test(start_paused = true)]
+    async fn an_operation_replaced_under_the_same_binding_fails_closed() {
+        let instance = tempfile::tempdir().expect("create instance directory");
+        let directory = instance.path().canonicalize().expect("canonical tempdir");
+        let config_dir = CloudConnectConfig::resolve_config_dir(Some(&directory));
+        let endpoint = closed_endpoint();
+        let binding = EnrollmentRequestBinding {
+            endpoint: endpoint.clone(),
+            authority: EnrollmentAuthorityBinding::Token {
+                expected_org: Some("acme".to_string()),
+            },
+        };
+        let routed = EnrollmentDraft::load_or_create(
+            &config_dir,
+            &InstanceFacts::gather("v0.0.0-racing-test"),
+            Some("lab-seoul"),
+            &binding,
+        )
+        .expect("publish a pending enrollment draft");
+
+        // The replacement carries the identical binding, so only its operation
+        // ID distinguishes it.
+        let mut prompter = RacingPrompter {
+            key: Some("spice-enroll-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string()),
+            config_dir: config_dir.clone(),
+            replacement: Some(binding.clone()),
+        };
+
+        let error = execute_with(
+            &RuntimeContext::new().expect("runtime context"),
+            ConnectRequest {
+                dir: Some(directory.clone()),
+                endpoint: Some(endpoint.clone()),
+                ..connect_request()
+            },
+            &mut prompter,
+        )
+        .await
+        .expect_err("an operation this run never routed on must not be enrolled");
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("changed while this run was preparing")
+                && rendered.contains("Nothing was sent"),
+            "the transaction must refuse the replaced operation: {rendered}"
+        );
+
+        let surviving = EnrollmentDraft::load_optional(&config_dir)
+            .expect("read the draft state")
+            .expect("the replacement is still pending");
+        assert_ne!(
+            surviving.enrollment_operation_id, routed.enrollment_operation_id,
+            "the replacement is a different operation, which is the whole point"
+        );
+        assert_eq!(
+            surviving.binding, binding,
+            "the operation the other process published must be left exactly as written"
+        );
+        assert!(
+            !config_dir
+                .join(runtime_cloud_connect::config::IDENTITY_FILE)
+                .exists(),
+            "a refused resume must enroll nothing"
         );
     }
 

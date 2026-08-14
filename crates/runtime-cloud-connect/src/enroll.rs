@@ -1258,6 +1258,11 @@ pub async fn enroll_now_with_transaction(
         .map(str::trim)
         .filter(|url| !url.is_empty())
         .and_then(crate::config::safe_portal_url);
+    // Sanitized at the boundary, not per consumer: this outcome is returned to
+    // the caller, and `spiced --token` logs the page it names straight from it.
+    // Replacing the field here means no consumer can print a link the rule
+    // rejected.
+    outcome.metadata.new_project_url = new_project_url.clone();
 
     // Atomic promotion: the draft's provisional key material becomes the
     // identity, written owner-only via atomic rename; the draft is deleted

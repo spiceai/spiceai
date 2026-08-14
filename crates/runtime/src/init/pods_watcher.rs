@@ -333,20 +333,90 @@ impl Runtime {
                 .await;
         }
 
+        // What a reload cannot install, a start with no app never installed
+        // either — so unlike every other reload, nothing is already running to
+        // fall back on. Say which sections those are rather than serve less than
+        // the app describes in silence.
+        if current_app.is_none() {
+            warn_on_sections_only_a_start_installs(&new_app);
+        }
+
         *self.app.write().await = Some(new_app);
 
-        // Task history reads its configuration from the app, so a start with no
-        // app skipped it entirely; it is initialized from the app that arrived.
-        // Idempotent, so the ordinary case where the load already registered the
-        // table changes nothing.
-        if current_app.is_none()
-            && let Err(err) = Arc::clone(&self).init_task_history().await
-        {
-            tracing::warn!("Creating internal task history table: {err}");
+        if current_app.is_none() {
+            // Task history reads its configuration from the app, so a start with
+            // no app skipped it entirely; it is initialized from the app that
+            // arrived. Idempotent, so the ordinary case where the load already
+            // registered the table changes nothing.
+            if let Err(err) = Arc::clone(&self).init_task_history().await {
+                tracing::warn!("Creating internal task history table: {err}");
+            }
         }
 
         true
     }
+}
+
+/// Name the sections of `app` that [`Runtime::apply_app`] does not install.
+///
+/// The reload path reconciles catalogs, datasets, views, models and functions
+/// (and workers, in a build without the `models` feature). Everything else in a
+/// spicepod configures something built while the process starts — the secret
+/// stores, the extensions, the embedding and reranking models, the tools — and
+/// nothing re-reads it.
+///
+/// On an ordinary reload that is invisible, because those components were built
+/// at startup from the app the process booted on and are still running. A start
+/// with **no app** built none of them, so an app arriving afterwards is serving
+/// less than it describes until the next start, and a dataset that references one
+/// of them fails to load. That is worth one line.
+///
+/// The app is destructured rather than field-matched so that a new section does
+/// not compile until it has been classified as installed by a reload or not.
+fn warn_on_sections_only_a_start_installs(app: &App) {
+    let App {
+        secrets,
+        extensions,
+        embeddings,
+        rerankers,
+        tools,
+        management,
+        snapshots,
+        workers,
+        // Installed by the diffs in `apply_app_diff`.
+        catalogs: _,
+        datasets: _,
+        views: _,
+        models: _,
+        functions: _,
+        // Reported by `warn_on_start_time_only_changes`, and identity rather
+        // than configuration.
+        runtime: _,
+        name: _,
+        spicepods: _,
+    } = app;
+
+    let pending = [
+        ("secrets", !secrets.is_empty()),
+        ("extensions", !extensions.is_empty()),
+        ("embeddings", !embeddings.is_empty()),
+        ("rerankers", !rerankers.is_empty()),
+        ("tools", !tools.is_empty()),
+        ("management", management.is_some()),
+        ("snapshots", snapshots.is_some()),
+        // Reconciled by the diff only in a build without the `models` feature.
+        ("workers", cfg!(feature = "models") && !workers.is_empty()),
+    ]
+    .into_iter()
+    .filter_map(|(section, present)| present.then_some(section))
+    .collect::<Vec<_>>();
+    if pending.is_empty() {
+        return;
+    }
+    tracing::warn!(
+        "This instance had no configuration when it started, so it built none of the components `{}` describes. Those sections are read when spiced starts: restart it to serve them. Everything else in the spicepod is running now.",
+        pending.join("`, `")
+    );
 }
 
 #[cfg(test)]
@@ -370,8 +440,9 @@ mod tests {
     use tracing_subscriber::fmt::MakeWriter;
 
     use super::{
-        Arc, CacheKeyType, Query, SpicepodRuntime, StartTimeScope, UserAgentCollection,
-        start_time_only_changes, warn_on_start_time_only_changes,
+        App, Arc, CacheKeyType, Query, SpicepodRuntime, StartTimeScope, UserAgentCollection,
+        start_time_only_changes, warn_on_sections_only_a_start_installs,
+        warn_on_start_time_only_changes,
     };
 
     /// An edit to one setting of a spicepod `runtime:` section.
@@ -833,6 +904,71 @@ mod tests {
         fn make_writer(&'a self) -> Self::Writer {
             self.clone()
         }
+    }
+
+    fn capture_start_only_sections(app: &App) -> String {
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(logs.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            warn_on_sections_only_a_start_installs(app);
+        });
+        let captured = logs.0.lock().clone();
+        String::from_utf8_lossy(&captured).into_owned()
+    }
+
+    /// A first app carrying components only a start builds is named, because the
+    /// instance is serving less than that app describes until it restarts.
+    #[test]
+    fn a_first_app_names_the_sections_only_a_start_installs() {
+        let mut app = App::default();
+        app.embeddings
+            .push(spicepod::component::embeddings::Embeddings {
+                from: "openai".to_string(),
+                name: "arriving".to_string(),
+                files: Vec::new(),
+                params: std::collections::HashMap::default(),
+                datasets: Vec::new(),
+                depends_on: Vec::new(),
+                metrics: None,
+            });
+
+        let logs = capture_start_only_sections(&app);
+        assert!(
+            logs.contains("`embeddings`"),
+            "the unbuilt section should be named: {logs}"
+        );
+        assert!(
+            logs.contains("restart"),
+            "the report should say what installs it: {logs}"
+        );
+        assert!(
+            !logs.contains("`datasets`"),
+            "a section the reload installs must not be reported as pending: {logs}"
+        );
+    }
+
+    /// An app whose every section the reload installs has nothing to report.
+    #[test]
+    fn a_first_app_the_reload_fully_installs_reports_nothing() {
+        let mut app = App::default();
+        app.views.push(spicepod::component::view::View {
+            name: "v".to_string(),
+            sql: Some("SELECT 1".to_string()),
+            description: None,
+            metadata: std::collections::HashMap::default(),
+            columns: Vec::new(),
+            sql_ref: None,
+            acceleration: None,
+            ready_state: spicepod::component::dataset::ReadyState::default(),
+            vectors: None,
+            params: None,
+            depends_on: Vec::new(),
+        });
+
+        assert_eq!(capture_start_only_sections(&app), "");
     }
 
     fn capture_warnings(current: &SpicepodRuntime, new: &SpicepodRuntime) -> String {
