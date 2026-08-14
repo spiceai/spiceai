@@ -101,10 +101,13 @@ use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
 pub use config::CloudConnectConfig;
-pub use draft::{EnrollmentDraft, EnrollmentTransactionLock};
+pub use draft::{
+    EnrollmentAuthorityBinding, EnrollmentDraft, EnrollmentRequestBinding,
+    EnrollmentTransactionLock,
+};
 pub use enroll::{
     EnrollNowError, EnrollNowOutcome, EnrollmentAuthority, EnrollmentMetadata, RetryPolicy,
-    SessionToken, enroll_now,
+    SessionToken, enroll_now, enroll_now_with_transaction, sign_identity_proof,
 };
 pub use enrollment_key::{EnrollmentKey, InvalidEnrollmentKey};
 pub use handlers::{
@@ -512,22 +515,29 @@ mod tests {
     }
 
     fn test_identity() -> Identity {
-        use rcgen::{CertificateParams, KeyPair};
+        use rcgen::{CertificateParams, ExtendedKeyUsagePurpose, KeyPair};
 
         let material = IdentityStore::generate_enrollment().expect("generate enrollment material");
         let keypair = KeyPair::from_pem(&material.private_key_pem).expect("parse identity key");
-        let certificate = CertificateParams::new(Vec::<String>::new())
-            .expect("certificate parameters")
-            .self_signed(&keypair)
-            .expect("sign certificate");
+        let mut params =
+            CertificateParams::new(Vec::<String>::new()).expect("certificate parameters");
+        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+        let certificate = params.self_signed(&keypair).expect("sign certificate");
+        let (_, parsed_certificate) =
+            x509_parser::prelude::parse_x509_certificate(certificate.der().as_ref())
+                .expect("parse test identity certificate");
+        let not_after_unix = u64::try_from(parsed_certificate.validity().not_after.timestamp())
+            .expect("test identity expiry after the Unix epoch");
+        let certificate_pem = certificate.pem();
         Identity {
             identifier: "inst_test".to_string(),
-            identity_cert_pem: certificate.pem(),
+            identity_cert_pem: certificate_pem.clone(),
             private_key_pem: material.private_key_pem,
             public_key_pem: material.public_key_pem,
-            ca_bundle_pem: String::new(),
+            ca_bundle_pem: certificate_pem,
             gateway_addr: "gateway.example:443".to_string(),
-            not_after_unix: None,
+            not_after_unix: Some(not_after_unix),
+            control_plane_endpoint: None,
             enc_private_key_pem: material.enc_private_key_pem,
             enc_public_key_pem: material.enc_public_key_pem,
             enc_previous_private_key_pem: String::new(),
@@ -545,17 +555,25 @@ mod tests {
         not_before: (i32, u8, u8),
         not_after: (i32, u8, u8),
     ) {
-        use rcgen::{CertificateParams, KeyPair};
+        use rcgen::{CertificateParams, ExtendedKeyUsagePurpose, KeyPair};
 
         let keypair = KeyPair::from_pem(&identity.private_key_pem).expect("parse identity key");
         let mut params =
             CertificateParams::new(Vec::<String>::new()).expect("certificate parameters");
         params.not_before = rcgen::date_time_ymd(not_before.0, not_before.1, not_before.2);
         params.not_after = rcgen::date_time_ymd(not_after.0, not_after.1, not_after.2);
-        identity.identity_cert_pem = params
-            .self_signed(&keypair)
-            .expect("sign certificate")
-            .pem();
+        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+        let certificate = params.self_signed(&keypair).expect("sign certificate");
+        let (_, parsed_certificate) =
+            x509_parser::prelude::parse_x509_certificate(certificate.der().as_ref())
+                .expect("parse test identity certificate");
+        identity.not_after_unix = Some(
+            u64::try_from(parsed_certificate.validity().not_after.timestamp())
+                .expect("test identity expiry after the Unix epoch"),
+        );
+        let certificate_pem = certificate.pem();
+        identity.identity_cert_pem.clone_from(&certificate_pem);
+        identity.ca_bundle_pem = certificate_pem;
     }
 
     fn set_certificate_validity_from_now(
@@ -596,7 +614,6 @@ mod tests {
         let config = test_config(dir.path());
         let mut identity = test_identity();
         set_certificate_validity(&mut identity, (2019, 1, 1), (2020, 1, 1));
-        identity.not_after_unix = Some(4_102_444_800);
         IdentityStore::store(&config.identity_path, &identity).expect("store expired identity");
         let expired = load_reconnectable_identity(&config)
             .expect("the control plane decides whether the identity remains renewable")

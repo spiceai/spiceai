@@ -98,6 +98,13 @@ pub(crate) fn spawn(
     serving: CancellationToken,
     withdrawn: CancellationToken,
 ) {
+    if already_reported() {
+        tracing::debug!(
+            "The process that started this runtime has already reported the Cloud connection; not repeating it"
+        );
+        return;
+    }
+
     tokio::spawn(async move {
         if let Some(session) = await_completion(&session_ack, &serving, &withdrawn).await {
             // Resolved now rather than at acknowledgement: an `AttachApp` can
@@ -107,6 +114,19 @@ pub(crate) fn spawn(
             CompletionReport::of(&session.refreshed().await).emit();
         }
     });
+}
+
+/// Whether the process that started this runtime has already told the operator
+/// that this instance is connected.
+///
+/// `spice connect` completes a connect transaction and prints that block before
+/// it hands the terminal to the runtime, so repeating it here would put the same
+/// two lines on the same terminal twice. It is a private handshake from that
+/// launcher — never a documented setting, and absent from every start the CLI
+/// does not parent, which is why a direct `spiced` or `spice run` still reports
+/// for itself.
+fn already_reported() -> bool {
+    std::env::var_os("SPICE_CONNECTION_REPORTED").is_some_and(|value| !value.is_empty())
 }
 
 /// Wait for both halves of the completion, or for the report to be withdrawn.

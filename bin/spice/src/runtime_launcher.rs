@@ -37,6 +37,30 @@ use crate::error::{
     ChildProcessIdSnafu, InvalidArgumentSnafu, Result, RuntimeExecutionSnafu, SignalHandlerSnafu,
 };
 
+/// Who tells the operator that this instance is connected to Spice Cloud.
+///
+/// The runtime is the default reporter, and the only one for a direct `spiced`
+/// or `spice run` start: it is the process that knows when the instance is
+/// actually serving and Spice Cloud has answered it. A caller that has just
+/// completed a connect transaction has already printed that block, so it says
+/// so here rather than letting the same two lines arrive twice.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionReport {
+    /// The runtime reports it, once both facts are true.
+    #[default]
+    Runtime,
+    /// The caller already reported it; the runtime stays quiet.
+    AlreadyReported,
+}
+
+/// The environment variable that carries [`ConnectionReport::AlreadyReported`]
+/// to the runtime.
+///
+/// A private handshake between this launcher and the runtime it starts, not a
+/// configuration surface: it is never documented for operators, never read from
+/// a spicepod, and absent for every start the CLI does not parent.
+const CONNECTION_REPORTED_ENV: &str = "SPICE_CONNECTION_REPORTED";
+
 /// How the runtime should be started.
 #[derive(Debug, Default, Clone)]
 pub struct RunConfig {
@@ -52,6 +76,8 @@ pub struct RunConfig {
     pub verbosity: u8,
     /// Arguments passed through to `spiced` verbatim.
     pub args: Vec<String>,
+    /// Who reports the Cloud connection once the runtime is serving.
+    pub connection_report: ConnectionReport,
     /// The directory the runtime runs in. It resolves the spicepod *and* the
     /// per-instance `.spice` state, so a caller acting on an instance directory
     /// (`spice connect --dir`) has to set it rather than assume the CLI was
@@ -116,6 +142,10 @@ async fn start_runtime(
 
     if let Some(dir) = &config.working_dir {
         cmd.current_dir(dir);
+    }
+
+    if config.connection_report == ConnectionReport::AlreadyReported {
+        cmd.env(CONNECTION_REPORTED_ENV, "1");
     }
 
     cmd.stdin(Stdio::inherit())
@@ -315,7 +345,6 @@ mod tests {
     #[cfg(unix)]
     mod child_process {
         use super::*;
-        use std::path::PathBuf;
         use std::time::{Duration, Instant};
 
         /// How long a stub is given to reach the state a test waits for. Only
@@ -338,7 +367,7 @@ mod tests {
 
         /// Wait for the stub to report the state a test needs, rather than
         /// sleeping for a duration that is either flaky or slow.
-        async fn wait_for(path: &PathBuf) {
+        async fn wait_for(path: &std::path::Path) {
             let deadline = Instant::now() + READY_BUDGET;
             while !path.exists() {
                 assert!(

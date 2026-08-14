@@ -19,11 +19,81 @@ limitations under the License.
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use snafu::Snafu;
+
 /// Default enroll endpoint for the Spice Cloud control plane (state
 /// plane): the base URL the out-of-band HTTPS `/v1/cloud-connect/enroll`
 /// and `/v1/cloud-connect/renew` requests are made against. The gateway
 /// (stream) address is returned by the enroll response, not configured.
 pub const DEFAULT_ENDPOINT: &str = "https://api.spice.ai";
+
+#[derive(Debug, Snafu)]
+#[snafu(display(
+    "the control-plane endpoint must be an absolute HTTPS base URL without credentials, query, or fragment (plain HTTP is allowed only for a loopback fixture)"
+))]
+pub struct InvalidControlPlaneEndpoint;
+
+#[derive(Debug, Snafu)]
+pub enum EnrollmentEndpointOverrideError {
+    #[snafu(display(
+        "Failed to read the Cloud Connect endpoint override at {}: {source}",
+        path.display()
+    ))]
+    Read {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+
+    #[snafu(display(
+        "The Cloud Connect endpoint override at {} is invalid: {source}",
+        path.display()
+    ))]
+    Invalid {
+        path: PathBuf,
+        source: InvalidControlPlaneEndpoint,
+    },
+}
+
+/// Validate and canonicalize a Cloud Connect control-plane base URL.
+///
+/// # Errors
+///
+/// Returns [`InvalidControlPlaneEndpoint`] for unsafe or non-base URLs.
+pub fn normalize_control_plane_endpoint(
+    endpoint: &str,
+) -> std::result::Result<String, InvalidControlPlaneEndpoint> {
+    let parsed = reqwest::Url::parse(endpoint).map_err(|_| InvalidControlPlaneEndpoint)?;
+    if !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+        || parsed.host_str().is_none()
+    {
+        return Err(InvalidControlPlaneEndpoint);
+    }
+    let local_http = parsed.scheme() == "http" && parsed.host_str().is_some_and(is_loopback_host);
+    if parsed.scheme() != "https" && !local_http {
+        return Err(InvalidControlPlaneEndpoint);
+    }
+    Ok(parsed.to_string().trim_end_matches('/').to_string())
+}
+
+/// Whether a URL host names the loopback interface.
+///
+/// This is the sole gate on sending a credential over plaintext HTTP, so every
+/// caller that decides `https_only` must ask this one function rather than
+/// re-deriving the rule.
+#[must_use]
+pub fn is_loopback_host(host: &str) -> bool {
+    let host = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
 
 /// Default lead time before the identity cert's `not_after` at which the
 /// client renews. The cloud issues 24h leaves, so a 12h lead yields the
@@ -208,6 +278,36 @@ impl CloudConnectConfig {
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty())
         })
+    }
+
+    /// Read and normalize the legacy instance-local control-plane endpoint.
+    ///
+    /// Enrollment and state-management front ends share this helper so a
+    /// fresh or pre-binding instance cannot choose different control planes in
+    /// `spice` and `spiced`. Durable identity/draft bindings still take
+    /// precedence at each caller; this file is only the fallback before such a
+    /// binding exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the file exists but is unsafe/unreadable, or when
+    /// its non-empty value is not a safe control-plane base URL.
+    pub fn read_normalized_enroll_endpoint_override(
+        config_dir: &Path,
+    ) -> std::result::Result<Option<String>, EnrollmentEndpointOverrideError> {
+        let path = config_dir.join("cloud-endpoint");
+        let Some(endpoint) = Self::read_enroll_endpoint_override(config_dir).map_err(|source| {
+            EnrollmentEndpointOverrideError::Read {
+                path: path.clone(),
+                source,
+            }
+        })?
+        else {
+            return Ok(None);
+        };
+        normalize_control_plane_endpoint(&endpoint)
+            .map(Some)
+            .map_err(|source| EnrollmentEndpointOverrideError::Invalid { path, source })
     }
 
     /// Resolve the Cloud Connect config directory to its canonical location.
@@ -460,6 +560,7 @@ mod tests {
         let config = CloudConnectConfig::from_env("v0.0.0-test");
         let identity = crate::identity::Identity {
             identifier: "inst_test".to_string(),
+            control_plane_endpoint: None,
             identity_cert_pem: String::new(),
             private_key_pem: String::new(),
             public_key_pem: String::new(),
@@ -502,6 +603,17 @@ mod tests {
                 .as_deref(),
             Some("https://cloud.example.test")
         );
+        assert_eq!(
+            CloudConnectConfig::read_normalized_enroll_endpoint_override(dir.path())
+                .expect("normalize override")
+                .as_deref(),
+            Some("https://cloud.example.test")
+        );
+
+        std::fs::write(dir.path().join("cloud-endpoint"), "not an endpoint\n")
+            .expect("write invalid override");
+        CloudConnectConfig::read_normalized_enroll_endpoint_override(dir.path())
+            .expect_err("an invalid configured endpoint must fail closed");
     }
 
     #[cfg(unix)]

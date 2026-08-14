@@ -50,12 +50,16 @@ limitations under the License.
 use std::{sync::Arc, time::Duration};
 
 use base64::Engine as _;
+use futures::StreamExt as _;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use snafu::{ResultExt, Snafu};
 use zeroize::Zeroizing;
 
 use crate::config::CloudConnectConfig;
-use crate::draft::{EnrollmentDraft, EnrollmentTransactionLock};
+use crate::draft::{
+    EnrollmentAuthorityBinding, EnrollmentDraft, EnrollmentRequestBinding,
+    EnrollmentTransactionLock,
+};
 use crate::enrollment_key::EnrollmentKey;
 use crate::identity::{EnrollmentMaterial, Identity, IdentityStore};
 
@@ -77,6 +81,8 @@ pub const INTERACTIVE_RETRY_DEADLINE: Duration = Duration::from_mins(2);
 const RETRY_BACKOFF_BASE: Duration = Duration::from_secs(1);
 /// Full-jitter backoff ceiling: no retry window grows past this.
 const RETRY_BACKOFF_CAP: Duration = Duration::from_secs(30);
+/// Maximum body accepted from the enrollment control plane.
+const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 
 /// A logged-in Spice Cloud session's bearer token, wrapped so it cannot
 /// leak through `Debug` and is wiped on drop. Constructed by callers that
@@ -216,6 +222,11 @@ pub enum Error {
 
     #[snafu(display("Failed to read the Spice Cloud response from {url}: {source}"))]
     ResponseBody { url: String, source: reqwest::Error },
+
+    #[snafu(display(
+        "Failed to read the Spice Cloud response from {url}: the body exceeded the 64 KiB limit"
+    ))]
+    ResponseTooLarge { url: String },
 
     #[snafu(display("Failed to decode the Spice Cloud response from {url}: {reason}"))]
     ResponseDecode { url: String, reason: String },
@@ -484,6 +495,11 @@ impl EnrollClient {
     /// used — the production path, where the cloud serves a
     /// publicly-trusted certificate.
     pub(crate) fn new(config: &CloudConnectConfig) -> Result<Self> {
+        let base = crate::config::normalize_control_plane_endpoint(&config.enroll_endpoint)
+            .map_err(|source| Error::InvalidResponse {
+                url: config.enroll_endpoint.clone(),
+                reason: source.to_string(),
+            })?;
         let mut builder = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
             .connect_timeout(Duration::from_secs(10))
@@ -499,12 +515,11 @@ impl EnrollClient {
             }
         }
         let http = builder.build().context(ClientBuildSnafu)?;
-        let base = config.enroll_endpoint.trim_end_matches('/');
         Ok(Self {
             http,
             enroll_url: format!("{base}{ENROLL_PATH}"),
             renew_url: format!("{base}{RENEW_PATH}"),
-            base_url: base.to_string(),
+            base_url: base,
             ca_cert_pem: config.ca_cert_pem.clone(),
         })
     }
@@ -695,13 +710,7 @@ impl EnrollClient {
 
         let status = response.status();
         if status.is_success() {
-            let body = response
-                .bytes()
-                .await
-                .map_err(|source| Error::ResponseBody {
-                    url: url.to_string(),
-                    source,
-                })?;
+            let body = bounded_response_body(url, response).await?;
             return serde_json::from_slice::<Resp>(&body).map_err(|source| {
                 let reason = format!("failed to decode response body: {source}");
                 Error::ResponseDecode {
@@ -720,8 +729,8 @@ impl EnrollClient {
         // why. A proxy or defensive server can echo a rejected credential,
         // so redact the authority before parsing or bounding the message and
         // again after JSON decoding (escapes can reconstruct it).
-        let (code, message) = match response.text().await {
-            Ok(text) => parse_error_body(&text, sensitive),
+        let (code, message) = match bounded_response_body(url, response).await {
+            Ok(body) => parse_error_body(&String::from_utf8_lossy(&body), sensitive),
             Err(_) => (None, String::new()),
         };
         let message = match skew {
@@ -750,6 +759,24 @@ impl EnrollClient {
             })
         }
     }
+}
+
+async fn bounded_response_body(url: &str, response: reqwest::Response) -> Result<Vec<u8>> {
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|source| Error::ResponseBody {
+            url: url.to_string(),
+            source,
+        })?;
+        if body.len().saturating_add(chunk.len()) > MAX_RESPONSE_BYTES {
+            return Err(Error::ResponseTooLarge {
+                url: url.to_string(),
+            });
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
 }
 
 fn redact_sensitive(text: &str, sensitive: Option<&str>) -> String {
@@ -1067,7 +1094,35 @@ pub async fn enroll_now(
                 })
             })
             .context(DraftSnafu)?;
+    enroll_now_with_transaction(config, authority, retry, enrollment_transaction).await
+}
+
+/// Enroll while retaining a transaction acquired by the caller.
+///
+/// This entry point lets a caller bind its own crash-recovery journal to the
+/// exact enrollment draft before any request is sent. The supplied guard is
+/// held through identity promotion and draft cleanup.
+///
+/// # Errors
+///
+/// Returns the same errors as [`enroll_now`].
+pub async fn enroll_now_with_transaction(
+    config: &CloudConnectConfig,
+    authority: &EnrollmentAuthority,
+    retry: RetryPolicy,
+    enrollment_transaction: EnrollmentTransactionLock,
+) -> std::result::Result<EnrollNowOutcome, EnrollNowError> {
     let enrollment_transaction = Arc::new(enrollment_transaction);
+    let config_dir = config.config_dir.clone();
+    let normalized_endpoint = crate::config::normalize_control_plane_endpoint(
+        &config.enroll_endpoint,
+    )
+    .map_err(|source| EnrollNowError::Client {
+        source: Error::InvalidResponse {
+            url: config.enroll_endpoint.clone(),
+            reason: source.to_string(),
+        },
+    })?;
 
     // Existing identity wins without redeeming the supplied authority.
     let identity_path = config.identity_path.clone();
@@ -1118,9 +1173,22 @@ pub async fn enroll_now(
     let facts = InstanceFacts::gather(&config.runtime_version);
     let draft_facts = facts.clone();
     let draft_region = config.instance_region.clone();
+    let draft_binding = EnrollmentRequestBinding {
+        endpoint: normalized_endpoint,
+        authority: match authority {
+            EnrollmentAuthority::Token { expected_org, .. } => EnrollmentAuthorityBinding::Token {
+                expected_org: expected_org.clone(),
+            },
+            EnrollmentAuthority::AuthenticatedSession { org, .. } => {
+                EnrollmentAuthorityBinding::AuthenticatedSession {
+                    organization: org.clone(),
+                }
+            }
+        },
+    };
     let draft_transaction = Arc::clone(&enrollment_transaction);
     let draft = tokio::task::spawn_blocking(move || {
-        draft_transaction.load_or_create(&draft_facts, draft_region.as_deref())
+        draft_transaction.load_or_create(&draft_facts, draft_region.as_deref(), &draft_binding)
     })
     .await
     .unwrap_or_else(|join| {
@@ -1149,6 +1217,33 @@ pub async fn enroll_now(
     // optional portal metadata must not discard the issued identity. Normalize
     // harmless surrounding whitespace and treat a blank org as absent.
     let normalized_org_name = outcome.metadata.organization.name.trim().to_string();
+    let expected_org = match authority {
+        EnrollmentAuthority::AuthenticatedSession { org, .. } => Some(org.as_str()),
+        EnrollmentAuthority::Token { expected_org, .. } => expected_org.as_deref(),
+    }
+    .filter(|org| !org.is_empty());
+    validate_enrollment_organization(&client.enroll_url, expected_org, &normalized_org_name)
+        .map_err(|source| EnrollNowError::Rejected { source })?;
+    validate_enrollment_region(
+        &client.enroll_url,
+        draft.region.as_deref(),
+        outcome.metadata.region.as_deref(),
+    )
+    .map_err(|source| EnrollNowError::Rejected { source })?;
+    for (field, value) in [
+        ("instance_id", outcome.instance_id.as_str()),
+        ("gateway_addr", outcome.gateway_addr.as_str()),
+        ("organization", normalized_org_name.as_str()),
+    ] {
+        if value.chars().any(char::is_control) {
+            return Err(EnrollNowError::Rejected {
+                source: Error::InvalidResponse {
+                    url: client.enroll_url.clone(),
+                    reason: format!("{field} contained control characters"),
+                },
+            });
+        }
+    }
     let org_name = (!normalized_org_name.is_empty()).then(|| normalized_org_name.clone());
     outcome.metadata.organization.name = normalized_org_name;
     let new_project_url = outcome
@@ -1181,6 +1276,7 @@ pub async fn enroll_now(
         // Recorded now because the enroll response is the only place it is
         // reported, and every later start has to name the same page.
         new_project_url,
+        control_plane_endpoint: Some(draft.binding.endpoint.clone()),
         enc_private_key_pem: material.enc_private_key_pem,
         enc_public_key_pem: material.enc_public_key_pem,
         // A fresh enrollment has no prior key to retain.
@@ -1232,6 +1328,35 @@ pub async fn enroll_now(
         identity,
         metadata: outcome.metadata,
     })
+}
+
+fn validate_enrollment_organization(url: &str, expected: Option<&str>, actual: &str) -> Result<()> {
+    if expected
+        .filter(|expected| !expected.is_empty())
+        .is_some_and(|expected| !actual.eq_ignore_ascii_case(expected))
+    {
+        return Err(Error::InvalidResponse {
+            url: url.to_string(),
+            reason: "organization did not match the authenticated enrollment authority".to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_enrollment_region(
+    url: &str,
+    expected: Option<&str>,
+    actual: Option<&str>,
+) -> Result<()> {
+    if let Some(expected) = expected
+        && actual != Some(expected)
+    {
+        return Err(Error::InvalidResponse {
+            url: url.to_string(),
+            reason: "region did not match the durable enrollment request".to_string(),
+        });
+    }
+    Ok(())
 }
 
 async fn cleanup_enrollment_draft(enrollment_transaction: &Arc<EnrollmentTransactionLock>) {
@@ -1288,6 +1413,20 @@ pub(crate) fn sign_pop_payload(
         .sign(&rng, payload)
         .map_err(|source| format!("signing failed: {source}"))?;
     Ok(base64::engine::general_purpose::STANDARD.encode(signature.as_ref()))
+}
+
+/// Sign a domain-separated control-plane request with an enrolled identity.
+/// Servers verify the signature against `identity_cert_pem` before mutating
+/// state, so knowing an instance identifier is not sufficient authority.
+///
+/// # Errors
+///
+/// Returns a redaction-safe reason when the stored private key is unusable.
+pub fn sign_identity_proof(
+    private_key_pem: &str,
+    payload: &[u8],
+) -> std::result::Result<String, String> {
+    sign_pop_payload(private_key_pem, payload)
 }
 
 /// Parse an RFC 3339 `not_after` timestamp from an enroll response into Unix
@@ -1438,6 +1577,16 @@ mod tests {
     }
 
     #[test]
+    fn enrollment_response_organization_must_match_the_authority() {
+        validate_enrollment_organization("https://api.spice.ai", Some("acme"), "ACME")
+            .expect("organization comparison is case-insensitive");
+        let error =
+            validate_enrollment_organization("https://api.spice.ai", Some("acme"), "globex")
+                .expect_err("cross-organization identity must fail closed");
+        assert!(matches!(error, Error::InvalidResponse { .. }));
+    }
+
+    #[test]
     fn rejection_classification() {
         // Only an authoritative 4xx cloud rejection is terminal; everything
         // else is retryable.
@@ -1569,6 +1718,42 @@ mod tests {
             !err.is_terminal_enrollment_failure(),
             "an incomplete response can succeed when the operation is replayed"
         );
+    }
+
+    #[tokio::test]
+    async fn oversized_enrollment_responses_are_bounded() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let address = listener.local_addr().expect("test server address");
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept request");
+            let mut request = [0_u8; 4096];
+            let _ = socket.read(&mut request).await.expect("read request");
+            let body = vec![b'x'; MAX_RESPONSE_BYTES + 1];
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            socket
+                .write_all(headers.as_bytes())
+                .await
+                .expect("write headers");
+            socket.write_all(&body).await.expect("write body");
+        });
+
+        let base = format!("http://{address}");
+        let url = format!("{base}/oversized");
+        let client = EnrollClient::new(&test_config(&base)).expect("client");
+        let request = client.http.get(&url);
+        let error = client
+            .send::<serde_json::Value>(&url, request, None)
+            .await
+            .expect_err("oversized body must fail");
+        server.await.expect("test server task");
+        assert!(matches!(error, Error::ResponseTooLarge { .. }));
     }
 
     #[tokio::test]

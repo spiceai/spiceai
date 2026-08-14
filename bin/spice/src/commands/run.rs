@@ -18,7 +18,7 @@ limitations under the License.
 
 use crate::context::RuntimeContext;
 use crate::error::Result;
-use crate::runtime_launcher::{RunConfig, run_runtime};
+use crate::runtime_launcher::{ConnectionReport, RunConfig, run_runtime};
 use clap::Args;
 
 /// Arguments for the run command.
@@ -78,6 +78,9 @@ pub async fn execute(ctx: &RuntimeContext, args: &RunArgs, verbosity: u8) -> Res
             verbosity,
             args: args.args.clone(),
             working_dir: None,
+            // Nothing precedes this command, so the runtime it starts is the
+            // only process that can report the Cloud connection.
+            connection_report: ConnectionReport::Runtime,
         },
     )
     .await

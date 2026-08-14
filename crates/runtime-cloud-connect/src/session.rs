@@ -239,6 +239,7 @@ mod tests {
             app_name: None,
             monitor_url: None,
             new_project_url: Some("https://spice.ai/acme/new".to_string()),
+            control_plane_endpoint: None,
         };
         IdentityStore::store(&path, &detached).expect("store the enrolled identity");
 
@@ -299,6 +300,7 @@ mod tests {
             app_name: Some("other-project".to_string()),
             monitor_url: Some("https://spice.ai/other-org/other-project/monitor".to_string()),
             new_project_url: None,
+            control_plane_endpoint: None,
         };
         IdentityStore::store(&path, &replacement).expect("store the replacement identity");
         assert_eq!(acknowledged.refreshed().await, acknowledged);

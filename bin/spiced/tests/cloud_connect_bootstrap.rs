@@ -79,8 +79,10 @@ fn sign_enrollment_csr(csr_pem: &str) -> (String, String) {
         .self_signed(&ca_key)
         .expect("self-sign enrollment test CA");
     let issuer = Issuer::new(ca_params, ca_key);
-    let identity_certificate = CertificateSigningRequestParams::from_pem(csr_pem)
-        .expect("parse enrollment CSR")
+    let mut identity_params =
+        CertificateSigningRequestParams::from_pem(csr_pem).expect("parse enrollment CSR");
+    identity_params.params.not_after = rcgen::date_time_ymd(2099, 1, 1);
+    let identity_certificate = identity_params
         .signed_by(&issuer)
         .expect("sign enrollment CSR");
     (identity_certificate.pem(), ca_certificate.pem())

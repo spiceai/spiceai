@@ -47,7 +47,8 @@ rand = { workspace = true }
 # backend in every build target.
 rcgen = { version = "0.14", default-features = false, features = ["pem", "aws_lc_rs", "x509-parser"] }
 # Out-of-band HTTPS enroll/renew against the cloud control plane.
-reqwest = { workspace = true }
+futures.workspace = true
+reqwest = { workspace = true, features = ["stream"] }
 spice-cloud-client = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -60,7 +61,7 @@ tonic-prost = "0.14"
 tracing = { workspace = true }
 # Parse the stored client leaf before honoring existing-identity precedence;
 # the leaf's public key must match the persisted private key.
-x509-parser = "0.18"
+x509-parser = { version = "0.18", features = ["verify-aws"] }
 # Enrollment operation IDs (`Idempotency-Key`) for retry-safe enrollment.
 uuid = { workspace = true, features = ["v4"] }
 # Key material and decrypted secret values are held in `Zeroizing` so a freed
@@ -71,6 +72,15 @@ zeroize = "1.8"
 # Refuse symlink and special-file enrollment locks before privileged callers
 # change permissions or wait for the advisory lock.
 libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Memory",
+] }
 
 [build-dependencies]
 tonic-prost-build = "0.14"

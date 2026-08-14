@@ -346,6 +346,19 @@ impl ClientDriver {
         let expected_public_key_pem = current.public_key_pem.clone();
         let outcome = client.renew(&current, &material).await?;
 
+        // Identities written before endpoint binding was added relied on the
+        // instance-local `cloud-endpoint` file. `spiced` resolves that legacy
+        // source before constructing this client; the first successful renewal
+        // promotes the exact endpoint that accepted the credential into the
+        // identity so every later start is independent of the migration file.
+        let control_plane_endpoint = match current.control_plane_endpoint.as_deref() {
+            Some(endpoint) => Some(endpoint.to_string()),
+            None => Some(
+                crate::config::normalize_control_plane_endpoint(&self.config.enroll_endpoint)
+                    .map_err(|error| client.invalid_renew_response(error.to_string()))?,
+            ),
+        };
+
         let mut rotated = Identity {
             identifier: current.identifier,
             identity_cert_pem: outcome.identity_cert_pem,
@@ -367,6 +380,7 @@ impl ClientDriver {
             app_name: current.app_name,
             monitor_url: current.monitor_url,
             new_project_url: current.new_project_url,
+            control_plane_endpoint,
             // Seeded with the OUTGOING keypair and rotated by the call below,
             // which shifts it into `enc_previous_private_key_pem` — assigning
             // `material` here instead would leave the retained key equal to the
@@ -1883,6 +1897,7 @@ mod tests {
             app_name: None,
             monitor_url: None,
             new_project_url: None,
+            control_plane_endpoint: None,
         };
         current.ensure_cache_key();
         IdentityStore::store(&identity_path, &current).expect("store current identity");
@@ -1947,6 +1962,7 @@ mod tests {
             app_name: None,
             monitor_url: None,
             new_project_url: None,
+            control_plane_endpoint: None,
         }
     }
 

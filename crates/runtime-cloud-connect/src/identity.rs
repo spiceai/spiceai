@@ -236,6 +236,11 @@ pub struct Identity {
     /// control plane that reported none.
     #[serde(default)]
     pub new_project_url: Option<String>,
+    /// Normalized control-plane endpoint that issued this identity. Bound at
+    /// enrollment so later commands never trust an unrelated repository file
+    /// when deciding where to send credentials.
+    #[serde(default)]
+    pub control_plane_endpoint: Option<String>,
 }
 
 /// The control plane's app attachment state for this instance, as one tuple:
@@ -293,6 +298,7 @@ impl std::fmt::Debug for Identity {
             .field("app_name", &self.app_name)
             .field("monitor_url", &self.monitor_url)
             .field("new_project_url", &self.new_project_url)
+            .field("control_plane_endpoint", &self.control_plane_endpoint)
             .finish()
     }
 }
@@ -332,9 +338,13 @@ impl Identity {
     /// existing-identity precedence rule. Credentials, the cloud identifier,
     /// and a durable gateway address are always required; a process-local
     /// override may redirect a running client but cannot activate an identity.
-    pub(crate) fn reconnect_validation_error(&self) -> Option<&'static str> {
+    #[must_use]
+    pub fn reconnect_validation_error(&self) -> Option<&'static str> {
         if self.identifier.trim().is_empty() {
             return Some("the cloud-assigned instance identifier is empty");
+        }
+        if self.identifier.chars().any(char::is_control) {
+            return Some("the cloud-assigned instance identifier contains control characters");
         }
         if self.identity_cert_pem.trim().is_empty() {
             return Some("the client identity certificate is empty");
@@ -374,6 +384,9 @@ impl Identity {
         if self.gateway_addr.trim().is_empty() {
             return Some("the gateway address is empty");
         }
+        if self.gateway_addr.chars().any(char::is_control) {
+            return Some("the gateway address contains control characters");
+        }
         match (
             self.enc_private_key_pem.trim().is_empty(),
             self.enc_public_key_pem.trim().is_empty(),
@@ -404,6 +417,11 @@ impl Identity {
                 }
             }
             _ => return Some("the secret-delivery keypair is incomplete"),
+        }
+        if let Some(endpoint) = self.control_plane_endpoint.as_deref()
+            && crate::config::normalize_control_plane_endpoint(endpoint).is_err()
+        {
+            return Some("the bound control-plane endpoint is invalid");
         }
         None
     }
@@ -671,33 +689,16 @@ pub(crate) fn read_regular_file_optional(path: &Path) -> std::io::Result<Option<
 
     #[cfg(windows)]
     let mut file = {
-        use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
-
         match validate_state_path_ancestors(path) {
             Ok(()) => {}
             Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(source) => return Err(source),
         }
-
-        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
-        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-        let file = match std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-            .open(path)
-        {
+        match open_windows_regular_file_for_read(path) {
             Ok(file) => file,
             Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(source) => return Err(source),
-        };
-        let metadata = file.metadata()?;
-        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 || !metadata.is_file() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "the state path must be a regular file",
-            ));
         }
-        file
     };
 
     #[cfg(not(any(unix, windows)))]
@@ -929,6 +930,207 @@ fn validate_state_path_ancestors(_path: &Path) -> std::io::Result<()> {
         std::io::ErrorKind::Unsupported,
         "secure state-file reads are unsupported on this platform",
     ))
+}
+
+/// Open or create a Windows state file with a protected owner-only DACL.
+///
+/// `create_new` refuses an existing destination. `truncate` replaces an
+/// existing destination; otherwise an existing regular file is opened in
+/// place. Every disposition opens the reparse point itself so validation can
+/// reject it instead of following it.
+#[cfg(windows)]
+pub(crate) fn open_windows_owner_only_file(
+    path: &Path,
+    create_new: bool,
+    truncate: bool,
+) -> std::io::Result<std::fs::File> {
+    use std::os::windows::ffi::OsStrExt as _;
+    use std::os::windows::io::{FromRawHandle as _, RawHandle};
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE, LocalFree};
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1, SE_FILE_OBJECT,
+        SetSecurityInfo,
+    };
+    use windows_sys::Win32::Security::{
+        DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl, PROTECTED_DACL_SECURITY_INFORMATION,
+        SECURITY_ATTRIBUTES,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        CREATE_ALWAYS, CREATE_NEW, CreateFileW, FILE_ATTRIBUTE_NORMAL,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_DELETE,
+        FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_ALWAYS,
+    };
+
+    let path = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let sddl = "D:P(A;;GA;;;OW)"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let mut descriptor = std::ptr::null_mut();
+    let converted = unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl.as_ptr(),
+            SDDL_REVISION_1,
+            &mut descriptor,
+            std::ptr::null_mut(),
+        )
+    };
+    if converted == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut security = SECURITY_ATTRIBUTES {
+        nLength: u32::try_from(std::mem::size_of::<SECURITY_ATTRIBUTES>()).unwrap_or(u32::MAX),
+        lpSecurityDescriptor: descriptor,
+        bInheritHandle: 0,
+    };
+    let disposition = if create_new {
+        CREATE_NEW
+    } else if truncate {
+        CREATE_ALWAYS
+    } else {
+        OPEN_ALWAYS
+    };
+    let handle = unsafe {
+        CreateFileW(
+            path.as_ptr(),
+            FILE_GENERIC_READ | FILE_GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            &mut security,
+            disposition,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        unsafe {
+            let _ = LocalFree(descriptor.cast());
+        }
+        return Err(std::io::Error::last_os_error());
+    }
+
+    let mut dacl_present = 0;
+    let mut dacl = std::ptr::null_mut();
+    let mut dacl_defaulted = 0;
+    let got_dacl = unsafe {
+        GetSecurityDescriptorDacl(
+            descriptor,
+            &mut dacl_present,
+            &mut dacl,
+            &mut dacl_defaulted,
+        )
+    };
+    if got_dacl == 0 || dacl_present == 0 {
+        let source = if got_dacl == 0 {
+            std::io::Error::last_os_error()
+        } else {
+            std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "owner-only state-file descriptor did not contain a DACL",
+            )
+        };
+        unsafe {
+            let _ = LocalFree(descriptor.cast());
+            let _ = CloseHandle(handle);
+        }
+        return Err(source);
+    }
+    let acl_result = unsafe {
+        SetSecurityInfo(
+            handle,
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            dacl,
+            std::ptr::null_mut(),
+        )
+    };
+    unsafe {
+        let _ = LocalFree(descriptor.cast());
+    }
+    if acl_result != 0 {
+        unsafe {
+            let _ = CloseHandle(handle);
+        }
+        return Err(std::io::Error::from_raw_os_error(
+            i32::try_from(acl_result).unwrap_or(i32::MAX),
+        ));
+    }
+
+    let file = unsafe { std::fs::File::from_raw_handle(handle as RawHandle) };
+    validate_windows_regular_single_link(&file)?;
+    Ok(file)
+}
+
+/// Reject Windows directories, reparse points, and multiply-linked state
+/// files after opening the object itself rather than following it.
+#[cfg(windows)]
+pub(crate) fn validate_windows_regular_single_link(file: &std::fs::File) -> std::io::Result<()> {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
+        GetFileInformationByHandle,
+    };
+
+    let mut information = BY_HANDLE_FILE_INFORMATION::default();
+    let result =
+        unsafe { GetFileInformationByHandle(file.as_raw_handle().cast(), &mut information) };
+    if result == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if information.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT) != 0
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "the state path must be a regular file, not a directory or reparse point",
+        ));
+    }
+    if information.nNumberOfLinks != 1 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "the state path must not be hard-linked",
+        ));
+    }
+    Ok(())
+}
+
+/// Open a Windows state file without following a reparse point.
+#[cfg(windows)]
+pub(crate) fn open_windows_regular_file_for_read(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::windows::ffi::OsStrExt as _;
+    use std::os::windows::io::{FromRawHandle as _, RawHandle};
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, FILE_SHARE_DELETE,
+        FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+
+    let path = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let handle = unsafe {
+        CreateFileW(
+            path.as_ptr(),
+            FILE_GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_OPEN_REPARSE_POINT,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(std::io::Error::last_os_error());
+    }
+    let file = unsafe { std::fs::File::from_raw_handle(handle as RawHandle) };
+    validate_windows_regular_single_link(&file)?;
+    Ok(file)
 }
 
 impl IdentityStore {
@@ -1193,6 +1395,13 @@ impl IdentityStore {
         merged.app_name = current.app_name;
         merged.monitor_url = current.monitor_url;
         merged.new_project_url = current.new_project_url;
+        // A durable binding already on disk wins over a stale renewal clone.
+        // A legacy identity has no binding, so retain the endpoint the renewal
+        // just proved by succeeding and promote it atomically with the rotated
+        // credential.
+        if current.control_plane_endpoint.is_some() {
+            merged.control_plane_endpoint = current.control_plane_endpoint;
+        }
         Self::store_locked(path, &merged)?;
         Ok(CredentialUpdateOutcome::Stored(merged))
     }
@@ -1755,6 +1964,7 @@ mod tests {
             app_name: None,
             monitor_url: None,
             new_project_url: None,
+            control_plane_endpoint: None,
             enc_private_key_pem: encryption_keypair.to_pkcs8_pem().to_string(),
             enc_public_key_pem: encryption_keypair.public_key_spki_pem(),
             enc_previous_private_key_pem: String::new(),
@@ -2671,6 +2881,46 @@ mod tests {
         assert_eq!(
             loaded.new_project_url.as_deref(),
             Some("https://spice.ai/acme/new?instance=inst_1")
+        );
+    }
+
+    #[test]
+    fn credential_update_backfills_but_never_replaces_the_control_plane_binding() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join("identity.json");
+        let legacy = sample_identity();
+        IdentityStore::store(&path, &legacy).expect("store legacy identity");
+
+        let mut renewed = legacy.clone();
+        renewed.control_plane_endpoint = Some("https://private.example".to_string());
+        let CredentialUpdateOutcome::Stored(backfilled) = IdentityStore::store_credential_update(
+            &path,
+            &legacy.identifier,
+            &legacy.public_key_pem,
+            &renewed,
+        )
+        .expect("store endpoint backfill") else {
+            panic!("the legacy credential generation must remain present");
+        };
+        assert_eq!(
+            backfilled.control_plane_endpoint.as_deref(),
+            Some("https://private.example")
+        );
+
+        let mut stale_renewal = backfilled.clone();
+        stale_renewal.control_plane_endpoint = Some("https://wrong.example".to_string());
+        let CredentialUpdateOutcome::Stored(preserved) = IdentityStore::store_credential_update(
+            &path,
+            &backfilled.identifier,
+            &backfilled.public_key_pem,
+            &stale_renewal,
+        )
+        .expect("store stale renewal") else {
+            panic!("the bound credential generation must remain present");
+        };
+        assert_eq!(
+            preserved.control_plane_endpoint.as_deref(),
+            Some("https://private.example")
         );
     }
 

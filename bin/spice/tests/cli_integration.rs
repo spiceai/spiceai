@@ -781,92 +781,139 @@ mod connect {
     use super::*;
 
     #[test]
-    fn test_connect_help_describes_runtime_enrollment_and_state_management() {
-        let mut cmd = spice_cmd();
-        cmd.arg("connect")
-            .arg("--help")
-            .assert()
-            .success()
-            .stdout(predicate::str::contains("spiced --token <enrollment-key>"))
-            .stdout(predicate::str::contains("status"))
-            .stdout(predicate::str::contains("remove"))
-            .stdout(predicate::str::contains("service install"))
-            .stdout(predicate::str::contains("--install").not())
-            .stdout(predicate::str::contains("SPICE-ADOPT").not())
-            .stdout(predicate::str::contains("pending-adopt-code").not())
-            .stdout(predicate::str::contains("--app-name").not())
-            .stdout(predicate::str::contains("--create").not());
-    }
-
-    #[test]
-    fn connect_help_says_a_bare_connect_starts_the_instance() {
-        // The command ends at a running instance, not at a report, and which
-        // process runs it depends on whether a service is installed.
-        spice_cmd()
-            .args(["connect", "--help"])
-            .assert()
-            .success()
-            .stdout(predicate::str::contains("Start this directory's instance"))
-            .stdout(predicate::str::contains("foreground"))
-            .stdout(predicate::str::contains("starts that service"));
-    }
-
-    #[test]
-    fn a_bare_connect_without_an_identity_names_the_command_that_enrolls() {
-        // Nothing is started for a directory that has no instance yet, and the
-        // remedy is the runtime's own enrollment — never a second command that
-        // would have to be discovered.
-        let config_dir = TempDir::new().expect("create config directory");
-
-        spice_cmd()
-            .env("SPICE_CONFIG_DIR", config_dir.path())
+    fn test_connect_help() {
+        let output = spice_cmd()
             .arg("connect")
-            .assert()
-            .failure()
-            .stdout(predicate::str::contains("is not connected to Spice Cloud"))
-            .stdout(predicate::str::contains("spiced --token <enrollment-key>"));
-    }
-
-    #[test]
-    fn positional_enrollment_keys_are_rejected_without_echoing_the_secret() {
-        let secret = "A".repeat(32);
-        for key in [
-            format!("spice-enroll-{secret}"),
-            format!("spice-enroll-{secret}!"),
-            format!("SPICE-ENROLL-{secret}"),
-            format!("spice_enroll_{secret}"),
-            format!("\u{feff}spice-enroll-{secret}"),
-            format!("spice-enroll-{secret}\n"),
-            format!("spcie-enroll-{secret}"),
-            format!("acme/spice-enroll-{secret}"),
+            .arg("--help")
+            .output()
+            .expect("run connect help");
+        assert!(output.status.success());
+        let stdout = String::from_utf8(output.stdout).expect("help is utf8");
+        insta::assert_snapshot!("connect_help", stdout);
+        for expected in [
+            "--org",
+            "--project",
+            "--token",
+            "--region",
+            "status",
+            "remove",
+            "service",
         ] {
-            spice_cmd()
-                .arg("connect")
-                .arg(&key)
-                .assert()
-                .failure()
-                .stdout(predicate::str::contains("spiced --token"))
-                .stdout(predicate::str::contains(key.clone()).not())
-                .stdout(predicate::str::contains(secret.clone()).not())
-                .stderr(predicate::str::contains(key).not())
-                .stderr(predicate::str::contains(secret.clone()).not());
+            assert!(stdout.contains(expected), "missing {expected} from help");
+        }
+        for removed in ["--install", "--app-name", "--create", "SPICE-ADOPT"] {
+            assert!(
+                !stdout.contains(removed),
+                "legacy surface {removed} remains"
+            );
         }
     }
 
     #[test]
-    fn deleted_enrollment_flags_do_not_parse() {
-        for flag in ["--app-name", "--create", "--region"] {
+    fn removed_connect_surface_does_not_parse() {
+        for removed in ["--app-name", "--create", "--install"] {
             spice_cmd()
                 .arg("connect")
-                .arg(flag)
+                .arg(removed)
                 .assert()
-                .failure()
-                .stderr(predicate::str::contains("unexpected argument"));
+                .code(2)
+                .stderr(
+                    predicate::str::contains("unexpected argument")
+                        .or(predicate::str::contains("unrecognized subcommand")),
+                );
         }
     }
 
     #[test]
-    fn install_rejects_a_malformed_persisted_identity_before_service_setup() {
+    fn malformed_enrollment_key_is_never_echoed() {
+        const MALFORMED_KEY: &str = "spice-enroll-THIS_SHOULD_NEVER_LEAK";
+        let instance = TempDir::new().expect("create instance directory");
+        let output = spice_cmd()
+            .arg("connect")
+            .arg("--token")
+            .arg(MALFORMED_KEY)
+            .arg("--dir")
+            .arg(instance.path())
+            .output()
+            .expect("run connect with malformed enrollment key");
+
+        assert!(!output.status.success());
+        let rendered = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            rendered.contains("not a valid enrollment key"),
+            "unexpected validation output: {rendered}"
+        );
+        assert!(
+            !rendered.contains(MALFORMED_KEY),
+            "malformed enrollment key leaked: {rendered}"
+        );
+    }
+
+    #[test]
+    fn rejected_positional_enrollment_key_is_never_echoed() {
+        const POSITIONAL_KEY: &str = "spice-enroll-POSITIONAL_SHOULD_NEVER_LEAK";
+        for machine in [false, true] {
+            let mut command = spice_cmd();
+            if machine {
+                command.arg("--machine");
+            }
+            let output = command
+                .arg("connect")
+                .arg(POSITIONAL_KEY)
+                .output()
+                .expect("reject positional enrollment key");
+            assert_eq!(output.status.code(), Some(2));
+            let rendered = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                !rendered.contains(POSITIONAL_KEY),
+                "positional enrollment key leaked: {rendered}"
+            );
+            assert!(
+                rendered.contains("--token <enrollment-key>"),
+                "safe rejection did not identify the supported argument: {rendered}"
+            );
+            if machine {
+                let value: serde_json::Value =
+                    serde_json::from_str(rendered.trim()).expect("machine parse failure is JSON");
+                assert_eq!(value["error"]["code"], "invalid_argument");
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_project_and_region_fail_before_local_state_is_created() {
+        for invalid_args in [
+            ["--project", "INVALID PROJECT"],
+            ["--region", "INVALID_REGION"],
+        ] {
+            let instance = TempDir::new().expect("create instance directory");
+            let output = spice_cmd()
+                .arg("connect")
+                .arg("--org")
+                .arg("acme")
+                .args(invalid_args)
+                .arg("--dir")
+                .arg(instance.path())
+                .output()
+                .expect("run invalid preflight");
+            assert_eq!(output.status.code(), Some(2));
+            assert!(
+                !instance.path().join(".spice").exists(),
+                "invalid input created durable state"
+            );
+        }
+    }
+
+    #[test]
+    fn service_install_rejects_a_malformed_persisted_identity_before_setup() {
         let config_dir = TempDir::new().expect("create config directory");
         fs::write(config_dir.path().join("identity.json"), "not valid JSON")
             .expect("write malformed identity");
@@ -876,12 +923,14 @@ mod connect {
             .args(["connect", "service", "install"])
             .assert()
             .failure()
-            .stdout(predicate::str::contains("validate the durable"))
+            .stdout(predicate::str::contains(
+                "load enrolled Cloud Connect endpoint",
+            ))
             .stdout(predicate::str::contains("not valid JSON").not());
     }
 
     #[test]
-    fn install_rejects_a_missing_identity_before_service_setup() {
+    fn service_install_rejects_a_missing_identity_before_setup() {
         let config_dir = TempDir::new().expect("create config directory");
 
         spice_cmd()
@@ -894,7 +943,7 @@ mod connect {
     }
 
     #[test]
-    fn install_rejects_a_parseable_but_unusable_identity_before_service_setup() {
+    fn service_install_rejects_an_unusable_identity_without_leaking_it() {
         let config_dir = TempDir::new().expect("create config directory");
         fs::write(
             config_dir.path().join("identity.json"),
@@ -920,6 +969,115 @@ mod connect {
             .stdout(predicate::str::contains("private-key-that-must-not-be-printed").not());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn test_connect_auth_menu_on_a_real_pseudo_terminal() {
+        use std::io::{Read as _, Write as _};
+        use std::process::{Command as StdCommand, Stdio};
+        use std::time::{Duration, Instant};
+
+        let instance = TempDir::new().expect("create instance directory");
+        let home = TempDir::new().expect("create isolated home");
+        let pty = nix::pty::openpty(None, None).expect("open pseudo terminal");
+        let slave = std::fs::File::from(pty.slave);
+        let stdin = slave.try_clone().expect("clone pseudo terminal input");
+        let stdout = slave.try_clone().expect("clone pseudo terminal output");
+
+        let mut child = StdCommand::new(assert_cmd::cargo::cargo_bin!("spice"))
+            .arg("connect")
+            .arg("--dir")
+            .arg(instance.path())
+            .env("HOME", home.path())
+            .env_remove("SPICE_CONFIG_DIR")
+            .env_remove("SPICE_SPICEAI_TOKEN")
+            .stdin(Stdio::from(stdin))
+            .stdout(Stdio::from(stdout))
+            .stderr(Stdio::from(slave))
+            .spawn()
+            .expect("spawn spice under pseudo terminal");
+
+        let mut master = std::fs::File::from(pty.master);
+        let mut reader = master.try_clone().expect("clone pseudo terminal reader");
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let reader_capture = std::sync::Arc::clone(&captured);
+        let reader = std::thread::spawn(move || {
+            let mut chunk = [0_u8; 1024];
+            while let Ok(count) = reader.read(&mut chunk) {
+                if count == 0 {
+                    break;
+                }
+                reader_capture
+                    .lock()
+                    .expect("lock pseudo terminal capture")
+                    .extend_from_slice(&chunk[..count]);
+            }
+        });
+
+        let wait_for_output = |needle: &str| {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while Instant::now() < deadline {
+                let found = {
+                    let bytes = captured.lock().expect("lock pseudo terminal capture");
+                    String::from_utf8_lossy(&bytes).contains(needle)
+                };
+                if found {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let bytes = captured.lock().expect("lock pseudo terminal capture");
+            panic!(
+                "pseudo terminal never rendered {needle:?}: {}",
+                String::from_utf8_lossy(&bytes)
+            );
+        };
+
+        wait_for_output("Use an enrollment key");
+        master
+            .write_all(b"\x1b[B\r")
+            .expect("choose enrollment-key path");
+        master.flush().expect("flush terminal input");
+        wait_for_output("Enrollment key");
+        master
+            .write_all(b"not-a-key\r")
+            .expect("submit malformed secret");
+        master.flush().expect("flush secret input");
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let status = loop {
+            if let Some(status) = child.try_wait().expect("poll spice process") {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                child.kill().expect("terminate stuck pseudo terminal test");
+                let bytes = captured.lock().expect("lock pseudo terminal capture");
+                panic!(
+                    "spice connect did not reject terminal input within 10 seconds: {}",
+                    String::from_utf8_lossy(&bytes)
+                );
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        drop(master);
+        reader.join().expect("join terminal reader");
+        let captured = captured.lock().expect("lock final terminal capture");
+        let output = String::from_utf8_lossy(&captured);
+        assert_eq!(
+            status.code(),
+            Some(2),
+            "unexpected terminal result: {output}"
+        );
+        assert!(
+            output.contains("Log in to Spice Cloud (recommended)")
+                && output.contains("Use an enrollment key"),
+            "the exact two authentication choices were not rendered: {output}"
+        );
+        assert!(
+            !output.contains("not-a-key"),
+            "secret input leaked: {output}"
+        );
+    }
+
     #[test]
     fn status_uses_signed_expiry_without_treating_the_host_clock_as_credential_authority() {
         use rcgen::{CertificateParams, KeyPair};
@@ -943,6 +1101,7 @@ mod connect {
             // Deliberately inconsistent: status and activation must trust the
             // signed certificate rather than this unsigned cache field.
             not_after_unix: Some(4_102_444_800),
+            control_plane_endpoint: None,
             enc_private_key_pem: material.enc_private_key_pem,
             enc_public_key_pem: material.enc_public_key_pem,
             enc_previous_private_key_pem: String::new(),

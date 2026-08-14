@@ -156,19 +156,7 @@ impl StartupState {
 }
 
 pub(crate) async fn load_startup_state() -> StartupState {
-    let mut config = CloudConnectConfig::from_env(env!("CARGO_PKG_VERSION"));
-    if std::env::var_os("SPICE_CLOUD_ENDPOINT").is_none()
-        && let Err(error) = apply_endpoint_override(&mut config)
-    {
-        tracing::error!(
-            "Spice Cloud Connect is disabled for this start because the enrollment endpoint override at {} could not be read safely: {error}",
-            config.config_dir.join("cloud-endpoint").display()
-        );
-        let mut state = load_startup_state_from_config(&config).await;
-        state.reconnectable_identity = None;
-        return state;
-    }
-    load_startup_state_from_config(&config).await
+    load_startup_state_from_config(&build_config(env!("CARGO_PKG_VERSION"))).await
 }
 
 /// Load the durable activation snapshot without making an optional Cloud
@@ -220,11 +208,148 @@ fn identity_contents_were_observed(error: &runtime_cloud_connect::Error) -> bool
 /// the caller cannot silently renew against another control plane.
 fn apply_endpoint_override(config: &mut CloudConnectConfig) -> std::io::Result<()> {
     if let Some(override_endpoint) =
-        CloudConnectConfig::read_enroll_endpoint_override(&config.config_dir)?
+        CloudConnectConfig::read_normalized_enroll_endpoint_override(&config.config_dir)
+            .map_err(std::io::Error::other)?
     {
         config.enroll_endpoint = override_endpoint;
     }
     Ok(())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum DiskControlPlaneEndpoint {
+    Absent,
+    Resolved(String),
+    Invalid,
+}
+
+/// Read the control plane durably bound by enrollment. A malformed durable
+/// state file is distinct from an absent binding: callers must fail closed
+/// instead of silently substituting the public control plane.
+fn read_bound_endpoint(config_dir: &Path) -> DiskControlPlaneEndpoint {
+    let identity_path = config_dir.join(runtime_cloud_connect::config::IDENTITY_FILE);
+    let identity = match runtime_cloud_connect::IdentityStore::load_optional(&identity_path) {
+        Ok(identity) => identity,
+        Err(error) => {
+            tracing::warn!(
+                "Spice Cloud Connect could not read the enrolled control-plane binding in {}: {error}",
+                identity_path.display()
+            );
+            return DiskControlPlaneEndpoint::Invalid;
+        }
+    };
+    if let Some(endpoint) = identity.and_then(|identity| identity.control_plane_endpoint) {
+        return normalize_disk_endpoint(config_dir, &endpoint, "enrolled");
+    }
+
+    match runtime_cloud_connect::EnrollmentDraft::load_optional(config_dir) {
+        Ok(Some(draft)) => normalize_disk_endpoint(config_dir, &draft.binding.endpoint, "pending"),
+        Ok(None) => DiskControlPlaneEndpoint::Absent,
+        Err(error) => {
+            tracing::warn!(
+                "Spice Cloud Connect could not read the pending control-plane binding in {}: {error}",
+                config_dir.display()
+            );
+            DiskControlPlaneEndpoint::Invalid
+        }
+    }
+}
+
+fn normalize_disk_endpoint(
+    config_dir: &Path,
+    endpoint: &str,
+    binding: &str,
+) -> DiskControlPlaneEndpoint {
+    match runtime_cloud_connect::config::normalize_control_plane_endpoint(endpoint) {
+        Ok(endpoint) => DiskControlPlaneEndpoint::Resolved(endpoint),
+        Err(error) => {
+            tracing::warn!(
+                "Spice Cloud Connect found an invalid {binding} control-plane binding in {}: {error}",
+                config_dir.display()
+            );
+            DiskControlPlaneEndpoint::Invalid
+        }
+    }
+}
+
+/// Resolve the endpoint stored on disk. A durable identity/draft binding wins;
+/// the operator-authored legacy file is consulted only before a binding exists
+/// and is then promoted into the identity by enrollment or successful renewal.
+fn read_disk_endpoint(config_dir: &Path) -> DiskControlPlaneEndpoint {
+    match read_bound_endpoint(config_dir) {
+        DiskControlPlaneEndpoint::Absent => {}
+        resolved => return resolved,
+    }
+
+    match CloudConnectConfig::read_normalized_enroll_endpoint_override(config_dir) {
+        Ok(Some(endpoint)) => DiskControlPlaneEndpoint::Resolved(endpoint),
+        Ok(None) => DiskControlPlaneEndpoint::Absent,
+        Err(error) => {
+            tracing::warn!(
+                "Spice Cloud Connect could not read the configured control-plane endpoint in {}: {error}",
+                config_dir.display()
+            );
+            DiskControlPlaneEndpoint::Invalid
+        }
+    }
+}
+
+/// Build a [`CloudConnectConfig`] from env + on-disk state.
+fn build_config(runtime_version: &str) -> CloudConnectConfig {
+    let mut config = CloudConnectConfig::from_env(runtime_version);
+    let Some(requested) = std::env::var_os("SPICE_CLOUD_ENDPOINT")
+        .and_then(|value| value.into_string().ok())
+        .filter(|value| !value.is_empty())
+    else {
+        match read_disk_endpoint(&config.config_dir) {
+            DiskControlPlaneEndpoint::Resolved(endpoint) => config.enroll_endpoint = endpoint,
+            DiskControlPlaneEndpoint::Absent => {}
+            // Leave an invalid value in the config so enrollment/renewal client
+            // construction refuses to send credentials anywhere. Falling back
+            // to the public endpoint would turn a local read error into a
+            // cross-control-plane request.
+            DiskControlPlaneEndpoint::Invalid => config.enroll_endpoint.clear(),
+        }
+        return config;
+    };
+
+    match reconcile_requested_endpoint(&requested, read_bound_endpoint(&config.config_dir)) {
+        Ok(endpoint) => config.enroll_endpoint = endpoint,
+        Err(reason) => {
+            tracing::error!("Spice Cloud Connect is disabled for this start because {reason}");
+            config.enroll_endpoint.clear();
+        }
+    }
+    config
+}
+
+/// Reconcile `SPICE_CLOUD_ENDPOINT` against the control plane bound on disk.
+///
+/// An environment override never silently retargets an instance that already
+/// enrolled somewhere: renewal would send this instance's credential to a
+/// control plane it never enrolled with. `spice connect` rejects exactly this
+/// mismatch, so the runtime has to agree with it rather than quietly win.
+///
+/// The legacy endpoint file is deliberately not consulted — it is superseded
+/// once a binding exists, and it was never an enrollment.
+fn reconcile_requested_endpoint(
+    requested: &str,
+    bound: DiskControlPlaneEndpoint,
+) -> std::result::Result<String, String> {
+    let requested = runtime_cloud_connect::config::normalize_control_plane_endpoint(requested)
+        .map_err(|error| {
+            format!("SPICE_CLOUD_ENDPOINT is not a usable control-plane endpoint: {error}")
+        })?;
+    match bound {
+        DiskControlPlaneEndpoint::Absent => Ok(requested),
+        DiskControlPlaneEndpoint::Resolved(bound) if requested == bound => Ok(bound),
+        DiskControlPlaneEndpoint::Resolved(bound) => Err(format!(
+            "SPICE_CLOUD_ENDPOINT ({requested}) does not match the control plane this instance enrolled with ({bound}). Unset the variable, or release the instance with `spice connect remove` before enrolling elsewhere."
+        )),
+        DiskControlPlaneEndpoint::Invalid => {
+            Err("the control-plane binding on disk could not be read, so the requested endpoint cannot be checked against it.".to_string())
+        }
+    }
 }
 
 /// Why a `--token` bootstrap could not produce a durable identity. Every
@@ -1957,6 +2082,84 @@ mod tests {
         dir
     }
 
+    #[test]
+    fn legacy_endpoint_file_is_used_only_until_a_durable_binding_exists() {
+        let dir = scratch_dir("legacy-control-plane-endpoint");
+        std::fs::write(
+            dir.join("cloud-endpoint"),
+            "https://legacy-control.example/\n",
+        )
+        .expect("write legacy endpoint");
+        assert_eq!(
+            read_disk_endpoint(&dir),
+            DiskControlPlaneEndpoint::Resolved("https://legacy-control.example".to_string())
+        );
+
+        let identity_path = dir.join(IDENTITY_FILE);
+        enroll_with_a_cache_key(&identity_path);
+        let mut identity = IdentityStore::load_optional(&identity_path)
+            .expect("load identity")
+            .expect("identity exists");
+        identity.control_plane_endpoint = Some("https://bound-control.example".to_string());
+        IdentityStore::store(&identity_path, &identity).expect("store durable binding");
+        assert_eq!(
+            read_disk_endpoint(&dir),
+            DiskControlPlaneEndpoint::Resolved("https://bound-control.example".to_string())
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unreadable_durable_binding_never_falls_back_to_an_endpoint_file() {
+        let dir = scratch_dir("invalid-control-plane-binding");
+        std::fs::write(dir.join(IDENTITY_FILE), "not identity JSON")
+            .expect("write invalid identity");
+        std::fs::write(
+            dir.join("cloud-endpoint"),
+            "https://attacker-controlled.example\n",
+        )
+        .expect("write fallback endpoint");
+
+        assert_eq!(read_disk_endpoint(&dir), DiskControlPlaneEndpoint::Invalid);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An environment override must not retarget an enrolled instance: renewal
+    /// would carry this instance's credential to a control plane it never
+    /// enrolled with. `spice connect` refuses the same mismatch.
+    #[test]
+    fn an_environment_endpoint_never_overrides_a_durable_binding() {
+        let bound = || DiskControlPlaneEndpoint::Resolved("https://bound.example".to_string());
+
+        assert_eq!(
+            reconcile_requested_endpoint("https://bound.example/", bound()),
+            Ok("https://bound.example".to_string())
+        );
+        assert!(
+            reconcile_requested_endpoint("https://elsewhere.example", bound()).is_err(),
+            "a mismatched environment endpoint must fail closed"
+        );
+        assert!(
+            reconcile_requested_endpoint(
+                "https://elsewhere.example",
+                DiskControlPlaneEndpoint::Invalid
+            )
+            .is_err(),
+            "an unreadable binding must fail closed rather than trust the environment"
+        );
+        assert_eq!(
+            reconcile_requested_endpoint("https://fresh.example", DiskControlPlaneEndpoint::Absent),
+            Ok("https://fresh.example".to_string()),
+            "without a binding the environment endpoint still selects the control plane"
+        );
+        assert!(
+            reconcile_requested_endpoint("not a url", DiskControlPlaneEndpoint::Absent).is_err(),
+            "an unusable environment endpoint must fail closed"
+        );
+    }
+
     #[tokio::test]
     async fn an_unusable_identity_disables_cloud_connect_without_aborting_startup() {
         let dir = scratch_dir("unusable-startup-identity");
@@ -2773,6 +2976,7 @@ views:
             app_name: None,
             monitor_url: None,
             new_project_url: None,
+            control_plane_endpoint: None,
             enc_private_key_pem: mock_pem,
             enc_public_key_pem: "-----BEGIN PUBLIC KEY-----\nMOCKENC\n-----END PUBLIC KEY-----\n"
                 .to_string(),

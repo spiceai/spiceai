@@ -14,7 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! `spice connect` — Spice Cloud Connect instance management.
+//! `spice connect` — enroll this directory with Spice Cloud, create its
+//! project transactionally, and manage the resulting instance.
 //!
 //! Two distinct use cases share this command:
 //!
@@ -34,8 +35,12 @@ limitations under the License.
 //!    deprecation notice and behaves like `spice add <pod>` with Spice.ai
 //!    Cloud authentication headers.
 
+mod naming;
+mod project;
 mod service;
+mod state;
 mod status;
+mod transaction;
 
 use std::{
     path::{Path, PathBuf},
@@ -48,6 +53,8 @@ use crate::error::{Error, Result};
 use crate::output::OutputFormat;
 use clap::{Args, Subcommand};
 use runtime_cloud_connect::config::{CloudConnectConfig, IDENTITY_FILE};
+use runtime_cloud_connect::enrollment_key::EnrollmentKey;
+use zeroize::Zeroizing;
 
 use service::ServiceState;
 use status::{ConnectStatus, ConnectionState};
@@ -59,27 +66,24 @@ const CLOUD_ENDPOINT_FILE: &str = "cloud-endpoint";
 /// Arguments for the `spice connect` command.
 #[derive(Args, Debug)]
 #[command(
-    about = "Start this directory's Spice Cloud Connect instance (or add a cloud-hosted Spicepod)",
-    long_about = r#"`spice connect` starts and manages this directory's Spice Cloud Connect
-instance.
+    about = "Connect this directory to Spice Cloud and start its instance",
+    long_about = r#"`spice connect` enrolls this directory with Spice Cloud and manages its instance.
 
-Enrollment is performed by the runtime, not this command: mint an enrollment
-key in the Spice Cloud portal and start the runtime with it —
+With a logged-in user session, the command resolves one owner/admin
+organization, enrolls the local instance, and atomically creates and attaches a
+new project. Without a login, an interactive terminal offers inline login
+(recommended) or secure enrollment-key entry. Enrollment-key mode always
+leaves the instance unattached and prints the Cloud-provided recovery link.
 
-  spiced --token <enrollment-key>
+The transaction is retry-safe: an interrupted enrollment reuses its durable
+operation and key material, while project creation uses the enrolled instance's
+single attachment as its exact replay key. Existing identities always win and
+are never duplicated.
 
-The runtime enrolls before it serves traffic, stores the issued identity under
-`.spice/`, and every later `spiced` or `spice run` start in that directory
-reconnects automatically from the identity alone.
+NON-INTERACTIVE
+  Login mode requires both --org <org> and --project <name>.
+  Key mode requires --token <enrollment-key> and rejects --project.
 
-  spice connect                           Start this directory's instance. With
-                                          no service installed it runs in the
-                                          foreground, attached to this terminal
-                                          until you stop it; with one installed
-                                          it starts that service instead of a
-                                          second runtime. Either way the
-                                          instance reconnects to Spice Cloud on
-                                          its own.
   spice connect status                    Show this directory's Cloud
                                           connection, service, and deployment
                                           state. `--output json` prints the
@@ -121,7 +125,9 @@ DEPRECATED POD-ADD BEHAVIOR:
 
 EXAMPLES
   spice connect
-  spice connect --dir /srv/edge
+  spice connect --org acme --project retail-analytics
+  spice connect --token <enrollment-key> --org acme
+  spice connect --dir /srv/edge --region us-west-2
   spice connect status
   spice connect status --output json
   sudo spice connect service install
@@ -140,6 +146,25 @@ pub struct ConnectArgs {
     /// runtime as `spiced --token <enrollment-key>`.
     #[arg(value_name = "TARGET")]
     pub target: Option<String>,
+
+    /// Organization to enroll into, or the expected organization for an
+    /// enrollment key. Login mode validates owner/admin membership.
+    #[arg(long, value_name = "SLUG")]
+    pub org: Option<String>,
+
+    /// Project to create and attach. Required for non-interactive login mode;
+    /// rejected in enrollment-key mode.
+    #[arg(long, value_name = "SLUG")]
+    pub project: Option<String>,
+
+    /// One-time enrollment key. The value is redacted from Debug/errors and is
+    /// never persisted. This mode always remains unattached.
+    #[arg(long, value_name = "SECRET")]
+    pub token: Option<EnrollmentKeyArgument>,
+
+    /// Declared location label for the enrolled instance.
+    #[arg(long, value_name = "LABEL")]
+    pub region: Option<String>,
 
     /// Override the Spice Cloud endpoint used when inspecting state or
     /// reporting a release. Defaults to `https://api.spice.ai`. Also
@@ -216,6 +241,35 @@ pub struct StatusArgs {
     pub output: OutputFormat,
 }
 
+/// A raw enrollment-key argument whose command-line parsing cannot echo an
+/// invalid secret. Validation happens after `clap` has rendered its own
+/// diagnostics, and both `Debug` and destruction keep the raw value out of
+/// logs and reusable memory.
+#[derive(Clone)]
+pub struct EnrollmentKeyArgument(Zeroizing<String>);
+
+impl std::str::FromStr for EnrollmentKeyArgument {
+    type Err = std::convert::Infallible;
+
+    fn from_str(raw: &str) -> std::result::Result<Self, Self::Err> {
+        Ok(Self(Zeroizing::new(raw.to_string())))
+    }
+}
+
+impl std::fmt::Debug for EnrollmentKeyArgument {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("EnrollmentKeyArgument([REDACTED])")
+    }
+}
+
+impl EnrollmentKeyArgument {
+    fn into_enrollment_key(self) -> Result<EnrollmentKey> {
+        EnrollmentKey::parse(self.0.as_str()).map_err(|source| Error::InvalidUsage {
+            message: source.to_string(),
+        })
+    }
+}
+
 impl ConnectArgs {
     /// Whether this invocation writes JSON to stdout, so the dispatcher can
     /// suppress the version banner that would otherwise foul it.
@@ -260,6 +314,15 @@ pub async fn execute(ctx: &RuntimeContext, args: ConnectArgs) -> Result<()> {
 
     if let Some(cmd) = args.command {
         reject_cloud_region(args.cloud_region.as_deref())?;
+        if args.org.is_some()
+            || args.project.is_some()
+            || args.token.is_some()
+            || args.region.is_some()
+        {
+            return Err(Error::InvalidUsage {
+                message: "--org, --project, --token, and --region apply to enrollment, not to a `connect` subcommand.".to_string(),
+            });
+        }
         return match cmd {
             ConnectCommand::Status(status_args) => {
                 print_status(&config_dir, args.endpoint.as_deref(), status_args.output).await
@@ -268,7 +331,7 @@ pub async fn execute(ctx: &RuntimeContext, args: ConnectArgs) -> Result<()> {
                 remove_identity(&config_dir, args.endpoint.as_deref(), args.yes, args.force).await
             }
             ConnectCommand::Service(service_args) => {
-                let endpoint = resolved_endpoint(&config_dir, args.endpoint.as_deref())?;
+                let endpoint = endpoint_for_local_reporting(&config_dir, args.endpoint.as_deref());
                 service::cli::execute(
                     ctx,
                     service_args,
@@ -281,43 +344,70 @@ pub async fn execute(ctx: &RuntimeContext, args: ConnectArgs) -> Result<()> {
         };
     }
 
-    // Rejected on the Cloud Connect branches only. The deprecated pod-add
-    // fallthrough below is a Spice.ai Cloud fetch, where `--cloud-region` has
-    // always been meaningful, so refusing it there would be a regression.
-    let Some(target) = args.target.as_deref() else {
-        reject_cloud_region(args.cloud_region.as_deref())?;
-        return connect_existing(
+    // The deprecated pod-add fallthrough is a Spice.ai Cloud fetch, where
+    // `--cloud-region` has always been meaningful, so it is not rejected here.
+    if let Some(target) = args.target.as_deref() {
+        if args.org.is_some()
+            || args.project.is_some()
+            || args.token.is_some()
+            || args.region.is_some()
+        {
+            return Err(Error::InvalidUsage {
+                message: "--org, --project, --token, and --region cannot be combined with the deprecated `connect <org>/<pod>` form.".to_string(),
+            });
+        }
+
+        // A secret must never ride a positional argument. Reject canonical keys
+        // and close near misses without echoing either.
+        if runtime_cloud_connect::enrollment_key::looks_like_enrollment_key(target) {
+            return Err(Error::InvalidArgument {
+                message: "An enrollment key is not accepted as a positional argument. Pass it with `spice connect --token <enrollment-key>`. See: https://spiceai.org/docs".to_string(),
+            });
+        }
+
+        eprintln!(
+            "warning: `spice connect <org>/<pod>` is deprecated and will be removed in a future release; use `spice add {target}` instead."
+        );
+        return execute_add_or_connect(
             ctx,
-            &config_dir,
-            args.endpoint.as_deref(),
-            args.dir.as_deref(),
-            args.verbosity,
+            AddArgs {
+                pod_path: target.to_string(),
+            },
+            true,
         )
         .await;
-    };
-
-    // A secret must never ride a positional argument. Reject canonical keys
-    // and close near misses — and never echo either — instead of falling
-    // through to the pod-add path, which would treat the key as a pod name and
-    // reproduce it in errors and requests.
-    if runtime_cloud_connect::enrollment_key::looks_like_enrollment_key(target) {
-        return Err(Error::InvalidArgument {
-            message: "An enrollment key is not accepted as a positional argument. \
-                      Enrollment is performed by the runtime: start it with \
-                      `spiced --token <enrollment-key>` from the instance directory. \
-                      See: https://spiceai.org/docs"
-                .to_string(),
-        });
     }
 
-    // Deprecated pod-add behavior, forwarded to `spice add`.
-    eprintln!(
-        "warning: `spice connect <org>/<pod>` is deprecated and will be removed in a future release; use `spice add {target}` instead."
-    );
-    let add_args = AddArgs {
-        pod_path: target.to_string(),
-    };
-    execute_add_or_connect(ctx, add_args, true).await
+    reject_cloud_region(args.cloud_region.as_deref())?;
+    let token = args
+        .token
+        .map(EnrollmentKeyArgument::into_enrollment_key)
+        .transpose()?;
+    let endpoint = args.endpoint.clone();
+    let dir = args.dir.clone();
+    transaction::execute(
+        ctx,
+        transaction::ConnectRequest {
+            org: args.org,
+            project: args.project,
+            token,
+            region: args.region,
+            dir: args.dir,
+            endpoint: args.endpoint,
+        },
+    )
+    .await?;
+
+    // The transaction has committed this directory's durable state, so the
+    // command ends where the operator asked it to: at a running instance.
+    start_instance(
+        ctx,
+        &config_dir,
+        endpoint.as_deref(),
+        dir.as_deref(),
+        args.verbosity,
+    )
+    .await
 }
 
 /// Reject `--cloud-region` on Cloud Connect state-management commands.
@@ -354,19 +444,16 @@ fn reject_cloud_region(cloud_region: Option<&str>) -> Result<()> {
     })
 }
 
-/// Bare `spice connect` (no subcommand, no pod path): leave this directory's
-/// instance running.
+/// Leave this directory's instance running, once its Cloud Connect state is
+/// durable.
 ///
-/// The command ends at a running instance rather than at a report, because
-/// that is what the operator asked for — `spice connect status` is the command
-/// that reports. Which process runs it is decided by what is already installed:
-/// a supervised instance is started through its supervisor and this command
+/// The command ends at a running instance rather than at a report, because that
+/// is what the operator asked for — `spice connect status` is the command that
+/// reports. Which process runs it is decided by what is already installed: a
+/// supervised instance is started through its supervisor and this command
 /// returns, an unsupervised one runs in the foreground and this command stays
 /// attached to it until it exits.
-///
-/// A directory with no identity has nothing to start — enrollment belongs to
-/// the runtime — so it errors with the exact command that does enroll.
-async fn connect_existing(
+async fn start_instance(
     ctx: &RuntimeContext,
     config_dir: &Path,
     endpoint: Option<&str>,
@@ -376,29 +463,15 @@ async fn connect_existing(
     let instance_dir = instance_dir_for(config_dir);
     let status = collect_status(config_dir, endpoint).await?;
 
-    // Nothing to start: there is no instance here yet. An unfinished enrollment
-    // is the same answer with one more fact — its draft is retry-safe, so
-    // supplying the key again resumes that enrollment rather than starting a
-    // second one.
+    // There is nothing to start. The transaction that ran before this has
+    // already said why — an enrollment the operator cancelled, or a project
+    // prompt they declined — and starting an unmanaged runtime on top of that
+    // would contradict it.
     if matches!(
         status.connection.state,
         ConnectionState::NotConnected | ConnectionState::EnrollmentIncomplete
     ) {
-        let resume = if status.connection.state == ConnectionState::EnrollmentIncomplete {
-            " An earlier enrollment in this directory did not finish; its draft is retry-safe, so \
-             the same command resumes it rather than enrolling twice."
-        } else {
-            ""
-        };
-        return Err(Error::InvalidArgument {
-            message: format!(
-                "This directory ({}) is not connected to Spice Cloud. Mint an enrollment key in \
-                 the Spice Cloud portal and start the runtime with it: \
-                 `spiced --token <enrollment-key>`. Later starts reconnect automatically from the \
-                 stored identity.{resume} See: https://spiceai.org/docs",
-                instance_dir.display()
-            ),
-        });
+        return Ok(());
     }
 
     // An identity that cannot activate Cloud Connect would start a runtime that
@@ -412,6 +485,19 @@ async fn connect_existing(
         return render_status(&status, OutputFormat::Table);
     }
 
+    // A host where this CLI does not manage a local runtime — native Windows,
+    // outside WSL — is enrolled and reconnects like any other; it just starts
+    // its runtime under the operator's own supervisor. Naming that beats
+    // failing a transaction that has already committed.
+    if ctx.ensure_local_runtime_supported().is_err() {
+        println!(
+            "This directory is connected. Start its runtime with `spiced` from {} \
+             (or under your own supervisor); it reconnects from the stored identity.",
+            instance_dir.display()
+        );
+        return Ok(());
+    }
+
     // What owns the process, and so what this command starts. An instance a
     // supervisor already owns must not also be started in the terminal: the
     // host would hold two runtimes for one identity, which is what the second
@@ -419,6 +505,7 @@ async fn connect_existing(
     // was starting.
     let backend = service::backend();
     let Some(manifest) = service::resolve(backend, &instance_dir, config_dir)? else {
+        println!("Starting the Spice runtime. Press Ctrl-C to stop it.");
         return crate::runtime_launcher::run_runtime(
             ctx,
             &crate::runtime_launcher::RunConfig {
@@ -428,6 +515,12 @@ async fn connect_existing(
                 // from.
                 working_dir: dir.map(Path::to_path_buf),
                 verbosity,
+                // The transaction above has already printed this instance's
+                // connection block, so the runtime must not print it a second
+                // time a few seconds later. A `spice run` or `spiced` start,
+                // which no transaction precedes, still gets it from the
+                // runtime.
+                connection_report: crate::runtime_launcher::ConnectionReport::AlreadyReported,
                 ..crate::runtime_launcher::RunConfig::default()
             },
         )
@@ -450,9 +543,6 @@ async fn connect_existing(
         manifest.name,
         manifest.supervisor
     );
-    if let Some(monitor) = &status.connection.monitor_url {
-        println!("Monitor: {monitor}");
-    }
     println!();
     println!("Manage it with:");
     println!("  spice connect status");
@@ -462,7 +552,7 @@ async fn connect_existing(
 
 /// Collect the one status snapshot used by the bare and explicit status forms.
 async fn collect_status(config_dir: &Path, endpoint: Option<&str>) -> Result<ConnectStatus> {
-    let endpoint = resolved_endpoint(config_dir, endpoint)?;
+    let endpoint = endpoint_for_local_reporting(config_dir, endpoint);
     Ok(ConnectStatus::collect(
         service::backend(),
         &instance_dir_for(config_dir),
@@ -585,14 +675,21 @@ async fn release_instance(
     config_dir: &Path,
     endpoint: Option<&str>,
     identity: &runtime_cloud_connect::Identity,
-) -> Result<ReleaseVerdict> {
-    let endpoint = resolved_endpoint(config_dir, endpoint)?;
+) -> ReleaseVerdict {
+    let endpoint = match resolved_endpoint(config_dir, endpoint) {
+        Ok(endpoint) => endpoint,
+        Err(error) => {
+            return ReleaseVerdict::Unconfirmed {
+                reason: format!("the persisted control-plane binding is unusable: {error}"),
+            };
+        }
+    };
     let ca = (!identity.ca_bundle_pem.is_empty()).then_some(identity.ca_bundle_pem.as_str());
 
-    Ok(classify_release(
+    classify_release(
         runtime_cloud_connect::release::release(&endpoint, identity, ca).await,
         &endpoint,
-    ))
+    )
 }
 
 /// [`release_instance`] without the request: the classification of what the
@@ -645,6 +742,11 @@ async fn remove_identity(
     assume_yes: bool,
     force: bool,
 ) -> Result<()> {
+    let _connect_lock = state::ConnectLock::acquire(config_dir, "remove")
+        .await
+        .map_err(|error| Error::CloudConnectIo {
+            message: error.to_string(),
+        })?;
     // Own the complete state transition before inspecting any file. Without
     // this boundary, removal can clear old state while enrollment is still
     // promoting a replacement identity under the same directory lock.
@@ -658,6 +760,8 @@ async fn remove_identity(
 
     let identity_path = config_dir.join(IDENTITY_FILE);
     let draft_path = runtime_cloud_connect::EnrollmentDraft::path_in(config_dir);
+    let journal_path = config_dir.join(state::CONNECT_OPERATION_FILE);
+    let project_journal_path = config_dir.join(state::PROJECT_OPERATION_FILE);
     let endpoint_path = config_dir.join(CLOUD_ENDPOINT_FILE);
     let cache_path = config_dir.join(runtime_cloud_connect::secret_cache::SECRET_CACHE_FILE);
     let instance_dir = instance_dir_for(config_dir);
@@ -673,10 +777,19 @@ async fn remove_identity(
 
     let had_identity = identity.is_some();
     let had_draft = draft_path.exists();
+    let had_journal = journal_path.exists();
+    let had_project_journal = project_journal_path.exists();
     let had_endpoint = endpoint_path.exists();
     let had_cache = cache_path.exists();
 
-    if !had_identity && !had_draft && !had_endpoint && !had_cache && installed.is_none() {
+    if !had_identity
+        && !had_draft
+        && !had_journal
+        && !had_project_journal
+        && !had_endpoint
+        && !had_cache
+        && installed.is_none()
+    {
         println!("Spice Cloud Connect: nothing to remove.");
         return Ok(());
     }
@@ -710,7 +823,7 @@ async fn remove_identity(
     // Reported before anything is cleared: the identity leaf is the credential
     // that authorises the release, so it has to still exist.
     if let Some(ref identity) = identity {
-        match release_instance(config_dir, endpoint, identity).await? {
+        match release_instance(config_dir, endpoint, identity).await {
             ReleaseVerdict::Confirmed { outcome } => {
                 println!("Released this instance in Spice Cloud.");
                 if !outcome.status.is_empty() {
@@ -791,6 +904,16 @@ async fn remove_identity(
                 message: format!("remove enrollment draft: {e}"),
             })?;
     }
+    if had_journal {
+        state::ConnectOperation::delete(config_dir).map_err(|e| Error::CloudConnectIo {
+            message: format!("remove enrollment journal: {e}"),
+        })?;
+    }
+    if had_project_journal {
+        state::ProjectOperation::delete(config_dir).map_err(|e| Error::CloudConnectIo {
+            message: format!("remove project assignment journal: {e}"),
+        })?;
+    }
     // Also clear any `cloud-endpoint` override so a later enrollment
     // without `SPICE_CLOUD_ENDPOINT` doesn't silently keep using the stale
     // endpoint.
@@ -855,28 +978,84 @@ fn confirm(prompt: &str) -> Result<bool> {
     ))
 }
 
-/// Resolve the endpoint `spiced` will actually contact, mirroring the
-/// precedence used at runtime: an explicit `--endpoint` first, then the
-/// `SPICE_CLOUD_ENDPOINT` env var, then the on-disk `cloud-endpoint` override
-/// in the config dir, then the built-in default.
+/// Resolve the control-plane endpoint from explicit process configuration,
+/// durable enrollment state, or the legacy instance-local endpoint file.
 fn resolved_endpoint(config_dir: &Path, explicit: Option<&str>) -> Result<String> {
-    if let Some(endpoint) = explicit.filter(|e| !e.is_empty()) {
-        return Ok(endpoint.to_string());
+    let requested = explicit
+        .filter(|endpoint| !endpoint.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            std::env::var("SPICE_CLOUD_ENDPOINT")
+                .ok()
+                .filter(|endpoint| !endpoint.is_empty())
+        })
+        .map(|endpoint| {
+            runtime_cloud_connect::config::normalize_control_plane_endpoint(&endpoint).map_err(
+                |source| Error::InvalidUsage {
+                    message: format!("invalid Cloud Connect endpoint: {source}"),
+                },
+            )
+        })
+        .transpose()?;
+
+    let identity =
+        runtime_cloud_connect::IdentityStore::load_optional(&config_dir.join(IDENTITY_FILE))
+            .map_err(|source| Error::CloudConnectIo {
+                message: format!("load enrolled Cloud Connect endpoint: {source}"),
+            })?;
+    let bound = match identity.and_then(|identity| identity.control_plane_endpoint) {
+        Some(endpoint) => Some(endpoint),
+        None => runtime_cloud_connect::EnrollmentDraft::load_optional(config_dir)
+            .map_err(|source| Error::CloudConnectIo {
+                message: format!("load pending Cloud Connect endpoint: {source}"),
+            })?
+            .map(|draft| draft.binding.endpoint),
     }
-    if let Ok(env) = std::env::var("SPICE_CLOUD_ENDPOINT")
-        && !env.is_empty()
+    .map(|endpoint| {
+        runtime_cloud_connect::config::normalize_control_plane_endpoint(&endpoint).map_err(
+            |source| Error::CloudConnectIo {
+                message: format!("stored Cloud Connect endpoint is invalid: {source}"),
+            },
+        )
+    })
+    .transpose()?;
+
+    if let (Some(requested), Some(bound)) = (requested.as_deref(), bound.as_deref())
+        && requested != bound
     {
-        return Ok(env);
-    }
-    match runtime_cloud_connect::CloudConnectConfig::read_enroll_endpoint_override(config_dir) {
-        Ok(Some(endpoint)) => Ok(endpoint),
-        Ok(None) => Ok(runtime_cloud_connect::config::DEFAULT_ENDPOINT.to_string()),
-        Err(source) => Err(Error::CloudConnectIo {
+        return Err(Error::InvalidUsage {
             message: format!(
-                "read the Cloud Connect endpoint override at {}: {source}",
-                config_dir.join(CLOUD_ENDPOINT_FILE).display()
+                "endpoint {requested} does not match this instance's enrolled control plane {bound}"
             ),
-        }),
+        });
+    }
+
+    if let Some(endpoint) = requested.or(bound) {
+        return Ok(endpoint);
+    }
+
+    runtime_cloud_connect::CloudConnectConfig::read_normalized_enroll_endpoint_override(config_dir)
+        .map_err(|source| Error::CloudConnectIo {
+            message: source.to_string(),
+        })?
+        .map_or_else(
+            || Ok(runtime_cloud_connect::config::DEFAULT_ENDPOINT.to_string()),
+            Ok,
+        )
+}
+
+/// Resolve the endpoint for operations whose primary purpose is local state
+/// inspection or service management. A damaged endpoint binding must not hide
+/// an unreadable identity report or block stop, uninstall, and log access.
+fn endpoint_for_local_reporting(config_dir: &Path, explicit: Option<&str>) -> String {
+    match resolved_endpoint(config_dir, explicit) {
+        Ok(endpoint) => endpoint,
+        Err(error) => {
+            eprintln!(
+                "Cloud Connect endpoint could not be resolved for this local operation: {error}"
+            );
+            runtime_cloud_connect::config::DEFAULT_ENDPOINT.to_string()
+        }
     }
 }
 
@@ -1117,19 +1296,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_directory_with_no_identity_names_the_command_that_enrolls() {
+    async fn a_directory_the_transaction_left_unconnected_is_not_started() {
+        // The transaction that runs before this has already said why nothing
+        // was enrolled — a cancelled login, a declined prompt — so starting an
+        // unmanaged runtime here would contradict it.
         let dir = tempfile::tempdir().expect("create tempdir");
         let ctx = crate::context::RuntimeContext::new().expect("build a runtime context");
-        let error = connect_existing(&ctx, &dir.path().join(".spice"), None, Some(dir.path()), 0)
+        start_instance(&ctx, &dir.path().join(".spice"), None, Some(dir.path()), 0)
             .await
-            .expect_err("an unenrolled directory has nothing to start");
-        assert!(error.to_string().contains("spiced --token"), "{error}");
-        assert!(
-            error
-                .to_string()
-                .contains("is not connected to Spice Cloud"),
-            "{error}"
-        );
+            .expect("an unconnected directory is not an error here");
     }
 
     #[test]
@@ -1203,36 +1378,37 @@ mod tests {
         let dir = tempfile::tempdir().expect("create tempdir");
         assert_eq!(
             resolved_endpoint(dir.path(), Some("https://explicit.example"))
-                .expect("explicit endpoint"),
+                .expect("resolve explicit endpoint"),
             "https://explicit.example"
         );
     }
 
     #[test]
-    fn resolved_endpoint_reads_the_on_disk_override_then_the_default() {
+    fn resolved_endpoint_uses_an_unbound_legacy_override() {
         let dir = tempfile::tempdir().expect("create tempdir");
 
         // Nothing on disk: the built-in default.
         assert_eq!(
-            resolved_endpoint(dir.path(), None).expect("default endpoint"),
+            resolved_endpoint(dir.path(), None).expect("resolve default endpoint"),
             runtime_cloud_connect::config::DEFAULT_ENDPOINT
         );
 
-        // The override file wins over the default.
+        // Before a durable binding exists, the legacy operator-authored file
+        // is the only record of a private control plane.
         std::fs::write(
             dir.path().join(CLOUD_ENDPOINT_FILE),
             "https://override.example\n",
         )
         .expect("write override");
         assert_eq!(
-            resolved_endpoint(dir.path(), None).expect("persisted endpoint"),
+            resolved_endpoint(dir.path(), None).expect("resolve endpoint with unbound file"),
             "https://override.example"
         );
 
         // A blank override is not an endpoint.
         std::fs::write(dir.path().join(CLOUD_ENDPOINT_FILE), "  \n").expect("write blank override");
         assert_eq!(
-            resolved_endpoint(dir.path(), None).expect("blank override uses the default"),
+            resolved_endpoint(dir.path(), None).expect("resolve endpoint with blank file"),
             runtime_cloud_connect::config::DEFAULT_ENDPOINT
         );
     }
@@ -1262,9 +1438,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn local_status_reports_an_unreadable_identity_when_endpoint_resolution_fails() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        std::fs::write(dir.path().join(IDENTITY_FILE), "not valid identity JSON")
+            .expect("write malformed identity");
+
+        let status = collect_status(dir.path(), None)
+            .await
+            .expect("local status collection remains available");
+
+        assert_eq!(status.connection.state, status::ConnectionState::Unreadable);
+        assert_eq!(
+            status.connection.endpoint,
+            runtime_cloud_connect::config::DEFAULT_ENDPOINT
+        );
+    }
+
+    #[tokio::test]
     async fn removal_does_not_touch_state_without_enrollment_transaction_ownership() {
         let dir = tempfile::tempdir().expect("create tempdir");
-        let config_dir = dir.path().join(".spice");
+        let config_dir = dir
+            .path()
+            .canonicalize()
+            .expect("canonical tempdir")
+            .join(".spice");
         let active =
             runtime_cloud_connect::EnrollmentTransactionLock::try_acquire_async(&config_dir)
                 .await
@@ -1381,7 +1578,11 @@ mod tests {
         // directory a retry can finish the removal from. Clearing the identity
         // first would orphan a registry row nobody local can release any more.
         let dir = tempfile::tempdir().expect("create tempdir");
-        let config_dir = dir.path().join(".spice");
+        let config_dir = dir
+            .path()
+            .canonicalize()
+            .expect("canonical tempdir")
+            .join(".spice");
         std::fs::create_dir_all(&config_dir).expect("create config dir");
 
         let identity_path = config_dir.join(IDENTITY_FILE);
@@ -1430,6 +1631,7 @@ mod tests {
             app_name: None,
             monitor_url: None,
             new_project_url: None,
+            control_plane_endpoint: None,
         }
     }
 }
