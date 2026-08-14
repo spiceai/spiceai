@@ -32,6 +32,7 @@ use data_components::oracle::connection::{
 };
 use datafusion::datasource::TableProvider;
 use runtime::component::dataset::Dataset;
+use runtime_component::dataset::DatasetSpec;
 use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorFactory, DataConnectorResult,
 };
@@ -333,7 +334,7 @@ impl DataConnector for Oracle {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         let provider = OracleTableProvider::new(Arc::clone(&self.conn), &dataset.path().into())
             .await

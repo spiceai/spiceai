@@ -38,6 +38,7 @@ use datafusion::sql::TableReference;
 use opentelemetry::KeyValue;
 use runtime::component::ComponentInitialization;
 use runtime::component::dataset::Dataset;
+use runtime_component::dataset::DatasetSpec;
 use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult, NewDataConnectorResult,
@@ -675,7 +676,7 @@ impl Databricks {
         &self,
         uc_client: &UnityCatalogClient,
         table_reference: &TableReference,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> DataConnectorResult<()> {
         let full_name = table_reference.to_string();
         let requires_permission_check = match uc_client.get_table(table_reference).await {
@@ -990,7 +991,7 @@ impl DataConnector for Databricks {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         let table_reference = TableReference::from(dataset.path());
 
@@ -1025,7 +1026,7 @@ impl DataConnector for Databricks {
 
     async fn register_object_stores(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
         runtime_env: &Arc<RuntimeEnv>,
     ) -> DataConnectorResult<()> {
         // Only `delta_lake` mode produces object-store-backed scans on the
@@ -1111,7 +1112,7 @@ impl DataConnector for Databricks {
 /// into permanent, non-retriable errors so the runtime surfaces them
 /// immediately instead of retrying indefinitely.
 fn classify_table_provider_error(
-    dataset: &Dataset,
+    dataset: &DatasetSpec,
     source: Box<dyn std::error::Error + Send + Sync>,
 ) -> DataConnectorError {
     if let Some(message) = databricks_invalid_configuration_message(&*source) {

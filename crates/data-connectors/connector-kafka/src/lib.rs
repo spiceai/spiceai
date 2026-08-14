@@ -47,6 +47,7 @@ use runtime_metrics::component::{MetricSpec, MetricType, MetricsProvider, Observ
 use runtime_parameters::{ExposedParamLookup, ParameterSpec, Parameters};
 use snafu::prelude::*;
 use tonic::async_trait;
+use runtime_component::dataset::DatasetSpec;
 
 /// The name used to identify this connector in configuration.
 pub const CONNECTOR_NAME: &str = "kafka";
@@ -193,7 +194,7 @@ impl Kafka {
     /// Resolve the offset store over this dataset's accelerator.
     async fn offset_store(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> Result<Arc<dyn KafkaCheckpointStore>, CheckpointError> {
         let context = self
             .context
@@ -371,7 +372,7 @@ impl DataConnector for Kafka {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         let Some(acceleration) = dataset
             .acceleration
@@ -483,7 +484,7 @@ impl DataConnector for Kafka {
 }
 
 async fn init_kafka_consumer(
-    dataset: &Dataset,
+    dataset: &DatasetSpec,
     topic: &str,
     kafka_config: &KafkaConfig,
     json_options: &Arc<SpiceJsonOptions>,
@@ -621,7 +622,7 @@ impl KafkaOffsetCommitHook for SidecarOffsetCommitHook {
 }
 
 async fn bootstrap_new_kafka_consumer(
-    dataset: &Dataset,
+    dataset: &DatasetSpec,
     topic: &str,
     kafka_config: &KafkaConfig,
     json_options: &Arc<SpiceJsonOptions>,

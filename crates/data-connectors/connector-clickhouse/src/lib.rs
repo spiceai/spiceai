@@ -37,6 +37,7 @@ use factory::ClickhouseTableFactory;
 use ns_lookup::verify_ns_lookup_and_tcp_connect;
 use pool::ClickhouseConnectionPool;
 use runtime::component::dataset::Dataset;
+use runtime_component::dataset::DatasetSpec;
 use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult, NewDataConnectorResult,
@@ -261,7 +262,7 @@ impl DataConnector for Clickhouse {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         Ok(
             Read::table_provider(&self.clickhouse_factory, dataset.path().into())

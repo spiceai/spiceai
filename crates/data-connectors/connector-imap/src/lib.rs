@@ -29,6 +29,7 @@ use async_trait::async_trait;
 use datafusion::datasource::TableProvider;
 use regex::Regex;
 use runtime::component::dataset::Dataset;
+use runtime_component::dataset::DatasetSpec;
 use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult, NewDataConnectorResult,
@@ -293,7 +294,7 @@ impl DataConnector for Imap {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         Ok(Arc::new(ImapTableProvider::new(
             self.session.clone(),

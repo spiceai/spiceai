@@ -28,6 +28,7 @@ use flight_client::Credentials;
 use flight_client::FlightClient;
 use ns_lookup::verify_endpoint_connection;
 use runtime::component::dataset::Dataset;
+use runtime_component::dataset::DatasetSpec;
 use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult, NewDataConnectorResult,
@@ -193,7 +194,7 @@ impl DataConnector for Dremio {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         let table_reference = match RemoteTableRef::parse_with_default_dialect(dataset.path()) {
             Ok(table_reference) => table_reference.table_ref,
@@ -232,7 +233,7 @@ impl DataConnector for Dremio {
 
     async fn read_write_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> Option<DataConnectorResult<Arc<dyn TableProvider>>> {
         let read_write_result =
             ReadWrite::table_provider(&self.flight_factory, dataset.path().into())

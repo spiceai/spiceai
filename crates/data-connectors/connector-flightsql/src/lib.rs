@@ -25,6 +25,7 @@ use flight_client::cookie::{CookieService, CookieStore};
 use flight_client::tls::{ClientIdentity, ClientTlsOptions, new_tls_flight_channel_with_options};
 use flight_client::{MAX_DECODING_MESSAGE_SIZE, MAX_ENCODING_MESSAGE_SIZE};
 use runtime::component::dataset::Dataset;
+use runtime_component::dataset::DatasetSpec;
 use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult, NewDataConnectorResult,
@@ -292,7 +293,7 @@ impl DataConnector for FlightSQL {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         match Read::table_provider(&self.flightsql_factory, dataset.path().into()).await {
             Ok(provider) => Ok(provider),

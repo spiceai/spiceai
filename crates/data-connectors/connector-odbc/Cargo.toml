@@ -36,6 +36,7 @@ linkme.workspace = true
 odbc-api.workspace = true
 paste.workspace = true
 runtime = { path = "../../runtime" }
+runtime-component = { path = "../../runtime-component" }
 runtime-parameters = { path = "../../runtime-parameters" }
 runtime-udfs-api = { path = "../../runtime-udfs-api" }
 secrecy.workspace = true

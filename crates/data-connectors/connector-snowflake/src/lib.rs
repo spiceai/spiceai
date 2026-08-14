@@ -33,6 +33,7 @@ use datafusion::datasource::TableProvider;
 use datafusion_table_providers::sql::db_connection_pool::DbConnectionPool;
 use db_connection_pool::snowflakepool::SnowflakeConnectionPool;
 use runtime::component::dataset::Dataset;
+use runtime_component::dataset::DatasetSpec;
 use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult, NewDataConnectorResult,
@@ -243,7 +244,7 @@ impl From<ReadProviderError> for DataConnectorError {
     }
 }
 
-fn snowflake_table_path(dataset: &Dataset) -> DataConnectorResult<String> {
+fn snowflake_table_path(dataset: &DatasetSpec) -> DataConnectorResult<String> {
     quote_snowflake_table_path(dataset.path()).map_err(|source| {
         DataConnectorError::InvalidConfiguration {
             dataconnector: CONNECTOR_NAME.to_string(),
@@ -265,7 +266,7 @@ impl DataConnector for Snowflake {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         let path = snowflake_table_path(dataset)?;
 
@@ -279,7 +280,7 @@ impl DataConnector for Snowflake {
 
     async fn read_write_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> Option<DataConnectorResult<Arc<dyn TableProvider>>> {
         let path = match snowflake_table_path(dataset) {
             Ok(path) => path,

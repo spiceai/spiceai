@@ -38,6 +38,7 @@ use datafusion_table_providers::sql::db_connection_pool::{
 };
 use datafusion_table_providers::sql::sql_provider_datafusion::{SqlTable, expr::Engine};
 use runtime::component::dataset::Dataset;
+use runtime_component::dataset::DatasetSpec;
 use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult, NewDataConnectorResult, parameters::ConnectorContext,
@@ -885,7 +886,7 @@ fn natural_order_sort_candidate(
 /// independently at debug level, so a partial gap may surface no info log.
 async fn enrich_with_postgres_metadata(
     pool: &Arc<PostgresConnectionPool>,
-    dataset: &Dataset,
+    dataset: &DatasetSpec,
     provider: Arc<dyn TableProvider>,
 ) -> Arc<dyn TableProvider> {
     let (mut table_metadata, field_metadata) =
@@ -985,7 +986,7 @@ impl DataConnector for Postgres {
 
     async fn read_write_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> Option<DataConnectorResult<Arc<dyn TableProvider>>> {
         match self
             .factory
@@ -1035,7 +1036,7 @@ impl DataConnector for Postgres {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         match federated_postgres_table_provider(Arc::clone(&self.pool), dataset.path().into()).await
         {
@@ -1084,7 +1085,7 @@ impl DataConnector for Postgres {
     fn changes_stream(
         &self,
         federated_table: Arc<dyn data_connector_api::federated::FederatedTableProvider>,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> Option<data_components::cdc::ChangesStream> {
         Some(replication::build_changes_stream(
             &self.params,

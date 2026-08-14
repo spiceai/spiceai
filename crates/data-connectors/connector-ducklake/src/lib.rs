@@ -32,6 +32,7 @@ use datafusion_table_providers::sql::db_connection_pool::dbconnection::duckdbcon
 use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
 use duckdb::AccessMode;
 use runtime::component::dataset::Dataset;
+use runtime_component::dataset::DatasetSpec;
 use runtime::dataconnector::{
     AnyErrorResult, ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError,
     DataConnectorFactory,
@@ -344,7 +345,7 @@ impl DataConnectorFactory for DuckLakeFactory {
 }
 
 impl DuckLake {
-    fn resolve_table_reference(&self, dataset: &Dataset) -> TableReference {
+    fn resolve_table_reference(&self, dataset: &DatasetSpec) -> TableReference {
         let path = dataset.path();
         if path.contains('.') {
             format!("{}.{path}", self.catalog_name).into()
@@ -362,7 +363,7 @@ impl DataConnector for DuckLake {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> runtime::dataconnector::DataConnectorResult<Arc<dyn TableProvider>> {
         let table_ref = self.resolve_table_reference(dataset);
 
@@ -376,7 +377,7 @@ impl DataConnector for DuckLake {
 
     async fn read_write_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> Option<runtime::dataconnector::DataConnectorResult<Arc<dyn TableProvider>>> {
         let table_ref = self.resolve_table_reference(dataset);
 

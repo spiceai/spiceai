@@ -30,6 +30,7 @@ use dynamodb_streams::{Checkpoint, Metrics, MetricsCollector};
 use futures::stream::{self, StreamExt};
 use opentelemetry::KeyValue;
 use runtime::component::dataset::Dataset;
+use runtime_component::dataset::DatasetSpec;
 use runtime::component::dataset::acceleration::RefreshMode;
 use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
@@ -267,14 +268,14 @@ impl DataConnector for DynamoDB {
 
     async fn read_write_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> Option<Result<Arc<dyn TableProvider>, DataConnectorError>> {
         Some(self.read_provider(dataset).await)
     }
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> Result<Arc<dyn TableProvider>, DataConnectorError> {
         if let Some(acceleration) = &dataset.acceleration
             && let Some(refresh_mode) = acceleration.refresh_mode
@@ -472,7 +473,7 @@ impl DataConnector for DynamoDB {
     fn changes_stream(
         &self,
         federated_table: Arc<dyn FederatedTableProvider>,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> Option<ChangesStream> {
         let dataset = dataset.clone();
 

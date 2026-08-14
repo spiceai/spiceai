@@ -49,6 +49,7 @@ use projects::ProjectsTableArgs;
 use pull_requests::PullRequestTableArgs;
 use rate_limit::GitHubRateLimiter;
 use runtime::component::dataset::Dataset;
+use runtime_component::dataset::DatasetSpec;
 use runtime_rate_control::{JitterConfig, RateController, RateControllerBuilder};
 use secrecy::ExposeSecret;
 use snafu::ResultExt;
@@ -571,7 +572,7 @@ impl Github {
         owner: &str,
         repo: &str,
         requested_ref: Option<&str>,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         let client = self.create_rest_client().context(
             runtime::dataconnector::UnableToGetReadProviderSnafu {
@@ -624,7 +625,7 @@ impl Github {
         owner: &str,
         repo: &str,
         requested_ref: Option<&str>,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         let table_args = Arc::new(CommitsTableArgs {
             owner: owner.to_string(),
@@ -1100,7 +1101,7 @@ impl DataConnector for Github {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         let path = dataset.path().to_string();
 

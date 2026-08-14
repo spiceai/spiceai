@@ -48,6 +48,7 @@ use runtime_checkpoint_api::mongodb::{MongoCheckpointMetadata, MongoCheckpointSt
 use runtime_parameters::{ExposedParamLookup, Parameters};
 use std::{sync::Arc, time::Duration};
 use tokio_stream::StreamExt as TokioStreamExt;
+use runtime_component::dataset::DatasetSpec;
 
 const DEFAULT_CHANGE_STREAM_BATCH_MAX_SIZE: usize = 1_000;
 const DEFAULT_CHANGE_STREAM_BATCH_SIZE: u32 = 1_000;
@@ -297,7 +298,7 @@ pub fn build_changes_stream(
 
 async fn initialize_mongo_sys(
     context: Option<&Arc<dyn ConnectorContext>>,
-    dataset: &Dataset,
+    dataset: &DatasetSpec,
 ) -> Option<Arc<dyn MongoCheckpointStore>> {
     // No context means no runtime is attached, which only happens in unit tests.
     let context = context?;
@@ -316,7 +317,7 @@ async fn initialize_mongo_sys(
 
 async fn persisted_checkpoint(
     mongo_sys: Option<&dyn MongoCheckpointStore>,
-    dataset: &Dataset,
+    dataset: &DatasetSpec,
     current_schema_json: Option<&str>,
 ) -> Option<MongoCheckpointMetadata> {
     let sys = mongo_sys?;
@@ -339,7 +340,7 @@ async fn persisted_checkpoint(
     Some(metadata)
 }
 
-async fn clear_persisted_token(mongo_sys: Option<&dyn MongoCheckpointStore>, dataset: &Dataset) {
+async fn clear_persisted_token(mongo_sys: Option<&dyn MongoCheckpointStore>, dataset: &DatasetSpec) {
     if let Some(sys) = mongo_sys
         && let Err(error) = sys.delete().await
     {
@@ -548,7 +549,7 @@ async fn snapshot_stream(
 
 fn collect_change_events(
     batch: Vec<mongodb::error::Result<ChangeStreamEvent<Document>>>,
-    dataset: &Dataset,
+    dataset: &DatasetSpec,
 ) -> Result<Vec<ChangeStreamEvent<Document>>, data_components::cdc::StreamError> {
     batch
         .into_iter()

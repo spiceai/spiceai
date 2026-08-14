@@ -1137,7 +1137,7 @@ fn auth_permission_hint(driver_name: &str) -> &'static str {
 fn classify_adbc_error(
     error: Box<dyn std::error::Error + Send + Sync>,
     driver_name: &str,
-    dataset: &Dataset,
+    dataset: &DatasetSpec,
     fallback_variant: fn(
         String,
         ConnectorComponent,
@@ -1165,7 +1165,7 @@ impl DataConnector for Adbc {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         let adbc_factory =
             self.factory
@@ -1201,7 +1201,7 @@ impl DataConnector for Adbc {
 
     async fn read_write_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> Option<DataConnectorResult<Arc<dyn TableProvider>>> {
         let adbc_factory =
             self.factory
@@ -1810,7 +1810,7 @@ mod tests {
 
         async fn read_provider(
             &self,
-            _dataset: &Dataset,
+            _dataset: &DatasetSpec,
         ) -> DataConnectorResult<Arc<dyn TableProvider>> {
             unreachable!("test connector is not used to read data")
         }

@@ -30,6 +30,7 @@ use data_http_rate_control::{
 };
 use datafusion::datasource::TableProvider;
 use runtime::component::dataset::Dataset;
+use runtime_component::dataset::DatasetSpec;
 use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult, NewDataConnectorResult, default_spice_client,
@@ -160,7 +161,7 @@ impl DataConnectorFactory for GraphQLFactory {
 impl GraphQL {
     async fn get_client(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> DataConnectorResult<(
         GraphQLClient,
         http_rate_control::SharedRateControllerReservation,
@@ -303,7 +304,7 @@ impl DataConnector for GraphQL {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         let query = self.params.get("query").expose().ok_or_else(|p| {
             DataConnectorError::InvalidConfigurationNoSource {

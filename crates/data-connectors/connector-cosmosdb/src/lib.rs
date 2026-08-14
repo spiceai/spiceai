@@ -39,6 +39,7 @@ use opentelemetry::KeyValue;
 use tokio::sync::Semaphore;
 
 use runtime::component::dataset::Dataset;
+use runtime_component::dataset::DatasetSpec;
 use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
 };
@@ -223,7 +224,7 @@ impl DataConnectorFactory for CosmosDBFactory {
 impl CosmosDB {
     fn build_credential(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> Result<CosmosDBCredential, DataConnectorError> {
         if let Some(conn_str) = self.params.get("connection_string").expose().ok() {
             return Ok(CosmosDBCredential::ConnectionString(conn_str.to_string()));
@@ -334,7 +335,7 @@ fn parse_database_and_container(
 }
 
 fn resolve_database_and_container(
-    dataset: &Dataset,
+    dataset: &DatasetSpec,
     database_param: Option<&str>,
 ) -> Result<(String, String), DataConnectorError> {
     parse_database_and_container(dataset.path(), database_param).map_err(|message| {
@@ -354,7 +355,7 @@ impl DataConnector for CosmosDB {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> Result<Arc<dyn TableProvider>, DataConnectorError> {
         let credential = self.build_credential(dataset)?;
 

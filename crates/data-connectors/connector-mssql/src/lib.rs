@@ -30,6 +30,7 @@ use data_components::mssql::{
 };
 use datafusion::datasource::TableProvider;
 use runtime::component::dataset::Dataset;
+use runtime_component::dataset::DatasetSpec;
 use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult, NewDataConnectorResult,
@@ -260,7 +261,7 @@ impl DataConnector for SqlServer {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         let provider = SqlServerTableProvider::new(Arc::clone(&self.conn), &dataset.path().into())
             .await

@@ -44,6 +44,7 @@ humantime.workspace = true
 linkme.workspace = true
 opentelemetry.workspace = true
 runtime = { path = "../../runtime" }
+runtime-component = { path = "../../runtime-component" }
 runtime-api-types = { path = "../../runtime-api-types" }
 runtime-checkpoint-api = { path = "../../runtime-checkpoint-api" }
 runtime-metrics = { path = "../../runtime-metrics" }

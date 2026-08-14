@@ -29,6 +29,7 @@ use datafusion::datasource::TableProvider;
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use opentelemetry::KeyValue;
 use runtime::component::dataset::Dataset;
+use runtime_component::dataset::DatasetSpec;
 use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult,
@@ -243,7 +244,7 @@ impl Git {
 
     async fn create_table_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         let path = dataset.path();
         let component = ConnectorComponent::from(dataset);
@@ -353,7 +354,7 @@ impl DataConnector for Git {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         self.create_table_provider(dataset).await
     }
