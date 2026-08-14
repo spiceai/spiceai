@@ -20,6 +20,8 @@ use crate::accelerated::refresh::Refresh;
 use crate::accelerated::refresh_task::deletion::{
     build_batch_delete_expr_from_change_batch, build_pk_only_batch_from_change_batch,
 };
+#[cfg(not(windows))]
+use crate::accelerated::write::{CayenneWriteTarget, dual_write::extract_cayenne_write_target};
 use arrow::array::{
     Array, ArrayRef, Int32Array, Int64Array, RecordBatch, StringArray, UInt32Array,
 };
@@ -2695,6 +2697,34 @@ impl RefreshTask {
                     );
                     emit_schema_evolution_event(&dataset, "cdc_live", &change, false);
                     return Ok(());
+                }
+                // A partitioned Cayenne acceleration reaches here because
+                // `cayenne_accelerator()` cannot resolve a provider through the
+                // partition fan-out, not because the engine cannot evolve. The
+                // "cast and carry on" fallback below is only safe when a restart
+                // repairs the divergence, and for this target it does not: the
+                // accelerator pins the partitioned provider to
+                // `SchemaEvolutionMode::Disabled` when it builds it, so a
+                // restart re-classifies and refuses again (#12999).
+                #[cfg(not(windows))]
+                if matches!(
+                    extract_cayenne_write_target(&self.accelerator),
+                    Some(CayenneWriteTarget::Partitioned(_))
+                ) {
+                    SCHEMA_EVOLUTION_FAILED.add(
+                        1,
+                        &schema_evolution_labels(&dataset, kind, "partitioned_unsupported"),
+                    );
+                    emit_schema_evolution_event(&dataset, "partitioned_unsupported", &change, true);
+                    return Err(crate::accelerated::Error::FailedToWriteData {
+                        source: DataFusionError::Execution(format!(
+                            "widening schema change detected on the CDC stream for {dataset} ({change}), \
+                             but a partitioned Cayenne acceleration cannot evolve its schema and a restart will not apply it either. \
+                             The change was refused rather than applied lossily, so the source keeps its position. \
+                             Remove `partition_by` from the acceleration to allow evolution, or drop and recreate the dataset against the new source schema. \
+                             See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+                        )),
+                    });
                 }
                 SCHEMA_EVOLUTION_FAILED.add(
                     1,
@@ -6697,6 +6727,249 @@ mod tests {
                 .is_error(),
             "mixed-schema concat failure under block must mark the dataset status as error"
         );
+    }
+
+    // -- Partitioned Cayenne: a widened CDC batch is refused, never acked -----
+
+    #[cfg(not(windows))]
+    use data_accelerator_api::upsert_dedup::wrap_with_upsert_dedup_if_needed;
+    #[cfg(not(windows))]
+    use data_components::poly::PolyTableProvider;
+    #[cfg(not(windows))]
+    use datafusion::common::Constraints;
+    #[cfg(not(windows))]
+    use datafusion::logical_expr::TableProviderFilterPushDown;
+    #[cfg(not(windows))]
+    use datafusion::scalar::ScalarValue;
+    #[cfg(not(windows))]
+    use runtime_table_partition::creator::{Error as PartitionCreatorError, PartitionCreator};
+    #[cfg(not(windows))]
+    use runtime_table_partition::{Partition, expression::PartitionedBy};
+
+    /// A [`PartitionCreator`] that starts empty and backs each new partition
+    /// with a writable in-memory table.
+    ///
+    /// Writable on purpose: with the refusal removed, the widened batch is cast
+    /// down and lands here, which is the reported defect. A creator that
+    /// refused the write would make the regression tests below pass for the
+    /// wrong reason — the run would abort on the failed write rather than on
+    /// the refusal.
+    ///
+    /// `direct_writes` mirrors what the accelerator opts into: the Cayenne
+    /// *accelerator* builds its creator `.with_direct_partition_writes()`, while
+    /// a `CREATE TABLE … PARTITIONED BY` one does not — and that flag is what
+    /// [`extract_cayenne_write_target`] reads to tell a Cayenne partitioned
+    /// write target from any other partitioned provider.
+    #[cfg(not(windows))]
+    #[derive(Debug)]
+    struct MemPartitionCreator {
+        direct_writes: bool,
+    }
+
+    #[cfg(not(windows))]
+    #[async_trait]
+    impl PartitionCreator for MemPartitionCreator {
+        fn accepts_direct_partition_writes(&self) -> bool {
+            self.direct_writes
+        }
+
+        async fn create_partition(
+            &self,
+            partition_values: Vec<ScalarValue>,
+        ) -> Result<Partition, PartitionCreatorError> {
+            Ok(Partition {
+                partition_values,
+                table_provider: Arc::new(
+                    MemTable::try_new(Arc::new(create_test_data_schema()), vec![vec![]])
+                        .expect("partition mem table should be created"),
+                ),
+            })
+        }
+
+        async fn infer_existing_partitions(&self) -> Result<Vec<Partition>, PartitionCreatorError> {
+            Ok(Vec::new())
+        }
+
+        fn supports_filters_pushdown(
+            &self,
+            filters: &[&Expr],
+        ) -> Result<Vec<TableProviderFilterPushDown>, DataFusionError> {
+            Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()])
+        }
+    }
+
+    /// A partitioned accelerator stack, built the way the Cayenne accelerator
+    /// builds one: the partition provider, optionally behind the upsert-dedup
+    /// wrapper, under a `PolyTableProvider` and then an index layer.
+    ///
+    /// Every layer here is load-bearing for the resolution under test —
+    /// [`extract_cayenne_write_target`] crosses the index layer to find the
+    /// poly layer, follows its *writer* rather than the layer below it, and
+    /// unwraps the dedup wrapper. A fixture that skipped the poly layer would
+    /// resolve to `None` and quietly stop testing the refusal.
+    ///
+    /// `direct_writes` picks whether the partitions are a Cayenne
+    /// accelerator's (see [`MemPartitionCreator`]).
+    #[cfg(not(windows))]
+    async fn partitioned_accelerator(dedup: bool, direct_writes: bool) -> Arc<dyn TableProvider> {
+        let partitioned = Arc::new(
+            PartitionTableProvider::new(
+                Arc::new(MemPartitionCreator { direct_writes }),
+                vec![PartitionedBy {
+                    name: "name".to_string(),
+                    expression: datafusion::prelude::col("name"),
+                }],
+                Arc::new(create_test_data_schema()),
+            )
+            .await
+            .expect("partition provider should be created"),
+        );
+        let write_provider: Arc<dyn TableProvider> = if dedup {
+            wrap_with_upsert_dedup_if_needed(
+                partitioned,
+                &HashMap::from([("upsert_remove_duplicates".to_string(), "true".to_string())]),
+                Constraints::default(),
+            )
+        } else {
+            partitioned
+        };
+        let poly = Arc::new(PolyTableProvider::new(
+            Arc::clone(&write_provider),
+            write_provider,
+        ))
+        .into_table() as Arc<dyn TableProvider>;
+        SpiceTable::over(Arc::new(IndexLayer::new()), poly) as Arc<dyn TableProvider>
+    }
+
+    /// Apply one widened CDC envelope under `on_schema_change:
+    /// append_new_columns`, and report `(run applied, committed envelope ids,
+    /// dataset status is error)`.
+    #[cfg(not(windows))]
+    async fn apply_widened_envelope(
+        name: &str,
+        accelerator: Arc<dyn TableProvider>,
+    ) -> (bool, Vec<i32>, bool) {
+        let dataset_name = TableReference::bare(name.to_string());
+        let metric_labels = DatasetMetricLabels::new(&dataset_name);
+        install_cdc_schema_evolution(
+            &dataset_name,
+            CdcSchemaEvolution {
+                policy: OnSchemaChange::AppendNewColumns,
+                constraint_columns: vec!["id".to_string()],
+            },
+        );
+
+        let task = make_refresh_task_named(name, accelerator);
+        let log = CommitLog::new();
+        let initial_load_completed = Arc::new(AtomicBool::new(false));
+        let mut pending_finalize = None;
+        let mut pending_commit = None;
+        let write_ctx = SessionContext::new();
+        let write_session_state = write_ctx.state();
+        let refresh = Arc::new(RwLock::new(Refresh::default()));
+        let mut context = ApplyContext {
+            refresh_sql: None,
+            refresh: &refresh,
+            dataset_name: &dataset_name,
+            metric_labels: &metric_labels,
+            caching: None,
+            ready_sender: None,
+            initial_load_completed: &initial_load_completed,
+            write_ctx: &write_ctx,
+            write_session_state: &write_session_state,
+            commit_timeout: Duration::from_secs(5),
+            pending_finalize: &mut pending_finalize,
+            pending_commit: &mut pending_commit,
+            deferred_commits: None,
+        };
+
+        let applied = task
+            .apply_envelope_run(
+                &mut context,
+                vec![make_widened_tracked_envelope(1, Arc::clone(&log))],
+            )
+            .await;
+
+        // Reset the process-global registry entry.
+        remove_cdc_schema_evolution(&dataset_name);
+
+        if let Some(handle) = context.pending_commit.take() {
+            handle
+                .await
+                .expect("commit task join")
+                .expect("commit task should succeed");
+        }
+        let status_is_error = task
+            .runtime_status
+            .get_component_status(&format!("dataset:{name}"))
+            .is_some_and(|status| status.is_error());
+        (applied, log.ids().await, status_is_error)
+    }
+
+    /// Regression test for #13051. A partitioned Cayenne acceleration cannot
+    /// evolve in place and a restart will not repair it either, so a widening
+    /// CDC batch must fail the apply rather than be cast down to the old
+    /// schema and reported as applied — the acknowledgement is what makes the
+    /// dropped values unrecoverable.
+    ///
+    /// Run for both stack shapes: the upsert-dedup wrapper must not hide the
+    /// partition provider from the refusal.
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn test_widened_cdc_batch_on_partitioned_cayenne_is_never_acked() {
+        for dedup in [false, true] {
+            let (applied, committed, status_is_error) = apply_widened_envelope(
+                &format!("schema_evo_partitioned_cayenne_dedup_{dedup}"),
+                partitioned_accelerator(dedup, true).await,
+            )
+            .await;
+
+            assert_eq!(
+                committed,
+                Vec::<i32>::new(),
+                "dedup={dedup}: the source position must not advance past a widening the acceleration cannot apply"
+            );
+            assert!(
+                !applied,
+                "dedup={dedup}: the run must stop rather than continue past an uncommitted gap"
+            );
+            assert!(
+                status_is_error,
+                "dedup={dedup}: refusing the widening must surface as a dataset error, not a silent skip"
+            );
+        }
+    }
+
+    /// Control: the refusal is specific to a Cayenne partitioned write target.
+    ///
+    /// An unpartitioned accelerator keeps the documented cast-and-warn
+    /// behavior, which a restart repairs, so its envelope still commits — and
+    /// so does a partitioned provider whose creator does not accept direct
+    /// partition writes, which is what distinguishes a Cayenne accelerator's
+    /// partitions from any other engine's. Without these, the test above would
+    /// also pass if the refusal fired for every dataset, or for every
+    /// partitioned one.
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn test_widened_cdc_batch_outside_a_partitioned_cayenne_still_commits() {
+        for (case, accelerator) in [
+            ("unpartitioned", make_mem_table() as Arc<dyn TableProvider>),
+            (
+                "partitioned_non_cayenne",
+                partitioned_accelerator(false, false).await,
+            ),
+        ] {
+            let (applied, committed, status_is_error) =
+                apply_widened_envelope(&format!("schema_evo_{case}"), accelerator).await;
+
+            assert_eq!(
+                committed,
+                vec![1],
+                "{case}: must keep committing under the restart-repaired fallback"
+            );
+            assert!(applied, "{case}: the run must continue");
+            assert!(!status_is_error, "{case}: the dataset must not be errored");
+        }
     }
 
     // -- Correctness: clean termination on stream end -------------------------
