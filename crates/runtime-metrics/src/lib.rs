@@ -42,24 +42,18 @@ pub mod workers;
 
 /// Publishes every component counter at zero.
 ///
-/// A `LazyLock` counter that has never fired exports no series at all, and an
-/// absent series reads as a broken exporter rather than as zero (#12687).
+/// A counter that never fires exports no series at all, and an absent series reads
+/// as a broken exporter rather than as zero (#12687). Each module owns its list,
+/// beside the declarations, so a new counter cannot be forgotten here.
 ///
-/// Each module owns its own list, beside the declarations, so a counter added
-/// there cannot be forgotten here.
+/// Qualifying is narrow. The emission must be unlabelled: an unlabelled zero in a
+/// labelled family like `dataset_active_count{engine}` is a phantom series nothing
+/// updates, and adds an empty group to `sum by (..)`. Those need one zero per label
+/// value, as `cache::metrics::EvictionReason::ALL` does. Gauges qualify only where
+/// zero is the true initial reading — `results_cache_hit_ratio` does,
+/// `dataset_load_state` does not, since 0 there means `Initializing`.
 ///
-/// Only counters whose real emission is unlabelled qualify. An unlabelled zero in
-/// a family that is otherwise labelled — `dataset_active_count{engine}`,
-/// `dataset_acceleration_refresh_errors{dataset}` — is a phantom series that no
-/// record will ever update, and it puts an empty group into any `sum by (..)`.
-/// Publishing those needs one zero per known label value, at the point the label
-/// is known, the way `cache::metrics::EvictionReason::ALL` does it.
-///
-/// Gauges qualify only where zero is the genuine initial reading:
-/// `results_cache_hit_ratio` does, `dataset_load_state` does not, because 0 there
-/// means `Initializing`.
-///
-/// Must be called after the operator's meter provider is installed (#12667).
+/// Call after the meter provider is installed (#12667).
 pub fn publish_component_counters_at_zero() {
     catalogs::publish_counters_at_zero();
     components::publish_counters_at_zero();

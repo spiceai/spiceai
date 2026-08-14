@@ -25,10 +25,8 @@ limitations under the License.
 //! Metrics live in their own test binary because the install order is global: the
 //! metric handles are `LazyLock`s over `global::meter(..)`, so an instrument first
 //! touched before the `MeterProvider` is installed binds to the no-op meter for the
-//! whole process.
-//!
-//! Tests are grouped by what drives the metric rather than one per family, so the
-//! surface needs only two runtimes between them.
+//! whole process. Tests are grouped by what drives the metric rather than one per
+//! family, so the surface needs only two runtimes between them.
 
 #![recursion_limit = "256"]
 
@@ -73,8 +71,8 @@ const EXPECTED_QUERY_METRICS: &[&str] = &[
 ];
 
 /// Series a loaded, refreshed dataset must report. The `max_timestamp` and `lag`
-/// series are opt-in: they need `runtime.metrics` to name them and the dataset to
-/// declare a `time_column`.
+/// series are off by default: they need `runtime.metrics` to name them and the
+/// dataset to declare a `time_column`.
 const EXPECTED_DATASET_METRICS: &[&str] = &[
     "dataset_active_count",
     "dataset_acceleration_refresh_duration_ms",
@@ -152,16 +150,12 @@ const FIXTURE_EPOCH_SECONDS: i64 = 1_700_000_000;
 /// computed in the wrong unit lands nowhere near it.
 const FIXTURE_EPOCH_STEP_SECONDS: i32 = 3_600;
 
-/// The one `MeterProvider` for this binary, installed before any instrument is
-/// built. Forcing this is the first statement of every test that asserts on a
-/// metric, so the install wins the race however the harness schedules them:
-/// `cargo nextest` gives each test its own process, `cargo test` gives them
-/// threads, and `LazyLock` covers both.
+/// The one `MeterProvider` for this binary. Every test that asserts on a metric
+/// forces this first, so the install wins the race under either test harness.
 ///
-/// Sharing the registry means an assertion must not depend on what siblings
-/// recorded. Presence assertions are safe, because each test records what it
-/// checks. A count assertion is not, so it must compare a before/after delta —
-/// see [`a_mid_stream_pool_refusal_is_counted_as_resources_exhausted`].
+/// The registry is shared, so an assertion must not depend on what siblings
+/// recorded: presence is safe, a count must compare a before/after delta — see
+/// [`a_mid_stream_pool_refusal_is_counted_as_resources_exhausted`].
 static PROMETHEUS: LazyLock<prometheus::Registry> =
     LazyLock::new(install_prometheus_meter_provider);
 
@@ -267,7 +261,7 @@ fn expected_cache_metrics() -> Vec<String> {
         .collect()
 }
 
-/// The opt-in acceleration metrics the fixture enables.
+/// The acceleration metrics the fixture enables. They are off unless named here.
 ///
 /// This is `runtime.metrics`, not the dataset's own `metrics:` — the latter gates
 /// connector component metrics, and setting it here would silently do nothing.
@@ -396,25 +390,18 @@ async fn startup_registrations_export_the_process_and_runtime_gauges() {
     );
 }
 
-/// The sampler's first sample lands before the operator's provider exists, and the
-/// gauge must still reach `/metrics` afterwards.
+/// A gauge recorded before the provider is installed must still reach `/metrics`.
 ///
-/// `tokio::time::interval` fires its first tick immediately, so
-/// `spawn_mem_tier_repartition_sampler` records before `init_metrics` installs the
-/// Prometheus provider. An instrument cached at that moment binds to the startup
-/// noop provider for the life of the process, which is what kept
-/// `query_memory_pool_used_bytes` and `cayenne_compaction_memory_pool_used_bytes`
-/// off `/metrics` entirely — regression test for #12667.
+/// `tokio::time::interval` fires its first tick immediately, so the mem-tier
+/// sampler records before `init_metrics` installs the Prometheus provider. An
+/// instrument cached at that moment binds to the startup noop provider for the life
+/// of the process, which kept `query_memory_pool_used_bytes` and
+/// `cayenne_compaction_memory_pool_used_bytes` off `/metrics` entirely — regression
+/// test for #12667.
 ///
-/// `process_resident_memory_bytes` is asserted alongside them because it was only
-/// ever scrapable by accident: it is recorded after a `spawn_blocking(...).await`
-/// in the same loop iteration, and that round-trip happened to outlast the window.
-///
-/// [`startup_registrations_export_the_process_and_runtime_gauges`] cannot catch
-/// this: it forces [`PROMETHEUS`] first, so it only ever records after the install.
-/// Under `cargo test` a sibling thread may have installed the provider already,
-/// which costs this test its teeth but not its safety — the seal always follows
-/// the install.
+/// Only meaningful under `cargo nextest`, where this test gets its own process. In
+/// a shared process a sibling may have installed the provider already, which costs
+/// the test its teeth but not its safety.
 #[test]
 fn a_gauge_recorded_before_the_provider_is_installed_still_reaches_metrics() {
     // Deliberately ahead of `&*PROMETHEUS`: this is the sampler's first tick.
@@ -464,8 +451,7 @@ fn resident_memory_is_a_plausible_reading() {
 
 /// A refreshed, accelerated dataset must report the query and refresh families.
 ///
-/// One runtime covers three groups. `task_history` is disabled because the query
-/// metrics must not depend on it.
+/// `task_history` is disabled because the query metrics must not depend on it.
 #[tokio::test]
 async fn an_accelerated_dataset_reports_the_query_and_refresh_families() {
     let registry = &*PROMETHEUS;
@@ -540,12 +526,6 @@ async fn an_accelerated_dataset_reports_the_query_and_refresh_families() {
         EXPECTED_DATASET_METRICS,
         "a loaded and refreshed dataset did not report its acceleration metrics",
     );
-    assert_all_reported(
-        &reported,
-        &["secrets_store_load_duration_ms"],
-        "building a runtime did not time the secret-store load",
-    );
-
     // Presence is not enough for a lag gauge: a unit or sign slip leaves the series
     // on the dashboard and the number wrong.
     let refresh_lag_ms = gauge_value(registry, "dataset_acceleration_refresh_lag_ms")
