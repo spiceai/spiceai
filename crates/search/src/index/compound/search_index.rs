@@ -31,9 +31,12 @@ use crate::index::{SearchIndex, VectorIndex};
 use super::{
     COMPOUND_WRITE_COMPLETE_FAILURE_IS_FATAL, COMPOUND_WRITE_START_FAILURE_IS_FATAL,
     CompoundReadMode, CompoundVectorIndex, Error, compound_delete_by_keys,
-    compound_on_write_complete, compound_on_write_start, compound_required_columns, compound_write,
+    compound_delete_by_predicate, compound_on_write_complete, compound_on_write_start,
+    compound_required_columns, compound_resolve_delete_keys, compound_write,
     fallback::fallback_on_empty_plan, validate_compatibility,
 };
+use datafusion::catalog::{Session, TableProvider};
+use datafusion::prelude::Expr;
 
 /// A [`SearchIndex`] that writes through to two compatible underlying indexes and serves
 /// reads from the primary (optionally falling back to the secondary on empty results).
@@ -81,6 +84,10 @@ impl CompoundSearchIndex {
 }
 
 #[async_trait]
+// Fail the build if the `Index` trait grows a defaulted method this compound
+// wrapper does not explicitly forward — a silent no-op default here would fail
+// to fan a new operation out to both halves.
+#[deny(clippy::missing_trait_methods)]
 impl Index for CompoundSearchIndex {
     fn name(&self) -> &'static str {
         "CompoundSearchIndex"
@@ -120,6 +127,31 @@ impl Index for CompoundSearchIndex {
 
     async fn delete_by_keys(&self, keys: RecordBatch) -> DataFusionResult<()> {
         compound_delete_by_keys(self.primary.as_ref(), self.secondary.as_ref(), keys).await
+    }
+
+    async fn resolve_delete_keys(
+        &self,
+        table: &Arc<dyn TableProvider>,
+        session: &dyn Session,
+        filters: Vec<Expr>,
+    ) -> DataFusionResult<Option<RecordBatch>> {
+        compound_resolve_delete_keys(self.required_columns(), table, session, filters).await
+    }
+
+    async fn delete_by_predicate(
+        &self,
+        table: &Arc<dyn TableProvider>,
+        session: &dyn Session,
+        filters: Vec<Expr>,
+    ) -> DataFusionResult<()> {
+        compound_delete_by_predicate(
+            self.primary.as_ref(),
+            self.secondary.as_ref(),
+            table,
+            session,
+            filters,
+        )
+        .await
     }
 
     fn deletes_by_partial_key(&self) -> bool {
