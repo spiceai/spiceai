@@ -184,16 +184,13 @@ impl<'a> AsyncDbConnection<ClientHandle, &'a dyn Sync> for ClickhouseConnection 
         &self,
         sql: &str,
         _: &[&'a dyn Sync],
-        _projected_schema: Option<SchemaRef>,
+        projected_schema: Option<SchemaRef>,
     ) -> Result<SendableRecordBatchStream, Box<dyn std::error::Error + Send + Sync>> {
         let conn = self.pool.get_handle().await.context(ConnectionPoolSnafu)?;
         let mut block_stream = conn.query_owned(sql).stream_blocks();
         let first_block = block_stream.next().await;
         if first_block.is_none() {
-            return Ok(Box::pin(RecordBatchStreamAdapter::new(
-                Arc::new(Schema::empty()),
-                stream::empty(),
-            )));
+            return Ok(empty_result_stream(projected_schema));
         }
         let first_block = first_block
             .unwrap_or(Ok(Block::new()))
@@ -219,6 +216,17 @@ impl<'a> AsyncDbConnection<ClientHandle, &'a dyn Sync> for ClickhouseConnection 
         // Shouldn't be an issue for now since we don't have a data accelerator for now.
         Ok(0)
     }
+}
+
+/// The stream for a result set the server answered with no blocks.
+///
+/// Every other schema on this path is read off the first block, so when there is
+/// no block the schema has to come from the projected schema the plan was built
+/// from. Falling back to [`Schema::empty`] would hand back a stream whose schema
+/// contradicts the columns the query selected.
+fn empty_result_stream(projected_schema: Option<SchemaRef>) -> SendableRecordBatchStream {
+    let schema = projected_schema.unwrap_or_else(|| Arc::new(Schema::empty()));
+    Box::pin(RecordBatchStreamAdapter::new(schema, stream::empty()))
 }
 
 fn query_to_stream(
@@ -309,6 +317,40 @@ fn map_clickhouse_type_to_arrow(type_str: &str) -> Result<DataType, clickhouse_r
 mod tests {
     use super::*;
     use arrow::datatypes::DataType;
+
+    /// Regression test for #13015: a query the server answered with no blocks
+    /// reported `Schema::empty()`, so an empty result dropped every projected
+    /// column instead of returning an empty table with the right columns.
+    #[test]
+    fn empty_result_stream_keeps_the_projected_schema() {
+        let projected: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+
+        let mut stream = empty_result_stream(Some(Arc::clone(&projected)));
+
+        assert_eq!(
+            stream.schema().as_ref(),
+            projected.as_ref(),
+            "an empty result must carry the projected schema"
+        );
+        assert!(
+            futures::executor::block_on(stream.next()).is_none(),
+            "an empty result must not yield a batch"
+        );
+    }
+
+    #[test]
+    fn empty_result_stream_without_a_projection_has_no_columns() {
+        let stream = empty_result_stream(None);
+
+        assert_eq!(
+            stream.schema().fields().len(),
+            0,
+            "with no projected schema there is nothing to preserve"
+        );
+    }
 
     #[test]
     fn test_map_clickhouse_type_to_arrow() {
