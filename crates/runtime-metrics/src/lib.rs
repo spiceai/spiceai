@@ -45,6 +45,9 @@ pub mod workers;
 /// A `LazyLock` counter that has never fired exports no series at all, and an
 /// absent series reads as a broken exporter rather than as zero (#12687).
 ///
+/// Each module owns its own list, beside the declarations, so a counter added
+/// there cannot be forgotten here.
+///
 /// Only counters whose real emission is unlabelled qualify. An unlabelled zero in
 /// a family that is otherwise labelled — `dataset_active_count{engine}`,
 /// `dataset_acceleration_refresh_errors{dataset}` — is a phantom series that no

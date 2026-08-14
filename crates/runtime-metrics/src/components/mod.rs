@@ -120,9 +120,7 @@ fn metric_callback_type(metric_callback: &ObserveMetricCallback) -> &'static str
     }
 }
 
-/// Publishes this module's unlabelled counters at zero, so a series a healthy
-/// runtime never increments is exported rather than absent. Lives beside the
-/// declarations so the list cannot drift away from them.
+/// See [`crate::publish_component_counters_at_zero`].
 pub fn publish_counters_at_zero() {
     REGISTERED_COUNT.add(0, &[]);
 }
