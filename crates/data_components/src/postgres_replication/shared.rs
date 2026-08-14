@@ -489,9 +489,12 @@ struct MemberHandle {
     /// source-commit time is within this of now, so the dataset becomes Ready
     /// only once it has caught up to the source head.
     ready_lag: std::time::Duration,
-    /// Where this member's applied-LSN watermark is recorded; cloned into each
-    /// envelope's committer. See `SharedLsnCommitter::applied_lsn_store`.
+    /// Where this member's applied-LSN watermark is recorded. Only
+    /// [`run_applied_lsn_writer`] writes it, which is what keeps concurrent
+    /// producers from landing out of order.
     applied_lsn_store: Arc<dyn AppliedLsnStore>,
+    /// Wakes the applied-position writer when this member publishes a position.
+    watermark_notify: Arc<Notify>,
 }
 
 /// `LIVE`: the member is attached and routing to it is allowed. Cleared on
@@ -548,9 +551,21 @@ struct AckSlot {
     /// the premise [`flush_idle_watermarks`] needs before it may carry the position
     /// forward over an interval that contained nothing to apply.
     ///
-    /// Still within the one 64-byte line this type is aligned to (25 of 64 bytes
+    /// Still within the one 64-byte line this type is aligned to (33 of 64 bytes
     /// used), so it adds no false sharing.
     recorded: AtomicU64,
+    /// Highest position *proven durable and eligible to record*, published by
+    /// whichever producer established it — an envelope commit, a snapshot/rebuild
+    /// boundary, or the idle carry-forward sweep — and drained by the single
+    /// applied-position writer ([`run_applied_lsn_writer`]).
+    ///
+    /// Producers advance it with a monotonic max rather than a store, because they
+    /// run on different tasks and can publish out of order; taking the max makes
+    /// "the furthest position anyone has proven" observable at any instant without
+    /// a lock, and makes a late straggler a no-op instead of a regression. Starts at
+    /// 0: a position is only ever published by something that has proven it durable,
+    /// never by registration.
+    pending: AtomicU64,
 }
 
 impl AckSlot {
@@ -560,6 +575,7 @@ impl AckSlot {
             delivered: AtomicU64::new(at),
             state: AtomicU8::new(LIVE | if snapshotting { SNAPSHOTTING } else { 0 }),
             recorded: AtomicU64::new(0),
+            pending: AtomicU64::new(0),
         }
     }
 
@@ -573,6 +589,7 @@ impl AckSlot {
             delivered: AtomicU64::new(at),
             state: AtomicU8::new(0),
             recorded: AtomicU64::new(0),
+            pending: AtomicU64::new(0),
         }
     }
 
@@ -590,10 +607,21 @@ impl AckSlot {
     }
 
     /// Note that `lsn` is now durably recorded for this member (monotonic). Called
-    /// after a successful store write, and once at attach for a member resuming on
-    /// a position a previous process recorded.
+    /// by the writer after a successful store write, and once at attach for a member
+    /// resuming on a position a previous process recorded.
     fn note_recorded(&self, lsn: u64) {
         advance_monotonic(&self.recorded, lsn);
+    }
+
+    /// The highest position published for recording, 0 if none.
+    fn pending(&self) -> u64 {
+        self.pending.load(Ordering::Acquire)
+    }
+
+    /// Publish `lsn` as proven durable and eligible to record (monotonic). Cheap
+    /// enough for the commit path: one atomic max, no I/O and no lock.
+    fn note_pending(&self, lsn: u64) {
+        advance_monotonic(&self.pending, lsn);
     }
 
     /// Advance this member's committed floor (monotonic). Called lock-free from
@@ -844,43 +872,29 @@ struct SharedLsnCommitter {
     /// Source-commit timestamp (ms since the Unix epoch) of the batch this
     /// commit acks; `None` when the transaction carried no commit time.
     source_commit_ts_ms: Option<i64>,
-    /// Where this member's applied-LSN watermark is recorded.
+    /// Wakes the applied-position writer once this commit publishes its position.
     ///
-    /// Written from [`CommitChange::commit`] specifically, which is the only
-    /// point at which the acked changes are known durable: this committer
-    /// supports deferral, so under an in-memory CDC durability tier the runtime
-    /// holds it until the covering checkpoint is durable
-    /// (`SlotAdvancer::on_checkpoint_durable`). Recording the watermark anywhere
-    /// earlier — when a batch reaches the memory tier — would claim rows a
-    /// restart loses, and the next start would then resume *past* changes the
-    /// acceleration never durably received.
-    applied_lsn_store: Arc<dyn AppliedLsnStore>,
+    /// The position is published from [`CommitChange::commit`] specifically, which
+    /// is the only point at which the acked changes are known durable: this
+    /// committer supports deferral, so under an in-memory CDC durability tier the
+    /// runtime holds it until the covering checkpoint is durable
+    /// (`SlotAdvancer::on_checkpoint_durable`). Publishing anywhere earlier — when a
+    /// batch reaches the memory tier — would claim rows a restart loses, and the
+    /// next start would then resume *past* changes the acceleration never durably
+    /// received.
+    watermark_notify: Arc<Notify>,
 }
 
 #[async_trait]
 impl CommitChange for SharedLsnCommitter {
     async fn commit(&self) -> std::result::Result<(), CommitError> {
         self.slot.commit(self.flush_to);
-        // Record the watermark alongside the slot ack, never ahead of it. A
-        // failure here is logged rather than surfaced: the ack already happened,
-        // so failing the commit would stall CDC over bookkeeping, and a stale
-        // watermark only ever costs a redundant rebuild on the next start —
-        // whereas a watermark ahead of durable data would resume past changes
-        // the acceleration does not hold.
-        match self
-            .applied_lsn_store
-            .save(AppliedLsn { lsn: self.flush_to })
-            .await
-        {
-            // Marks the position durable so idle crediting may carry it forward
-            // later without a further write (see `flush_idle_watermarks`).
-            Ok(()) => self.slot.note_recorded(self.flush_to),
-            Err(e) => tracing::warn!(
-                dataset = %self.dataset,
-                "could not record how far this acceleration has been advanced (lsn={}); if the process restarts before this succeeds, the acceleration is rebuilt from the source rather than resumed: {e}",
-                self.flush_to,
-            ),
-        }
+        // Publish the position alongside the slot ack, never ahead of it, and let
+        // the writer persist it. Publishing is an atomic max and a wakeup, so the
+        // commit path does no I/O: positions established while a write is in flight
+        // coalesce into that write's successor instead of queueing behind it.
+        self.slot.note_pending(self.flush_to);
+        self.watermark_notify.notify_one();
         crate::cdc::log_committer_progress(
             "postgres",
             &self.dataset,
@@ -890,34 +904,11 @@ impl CommitChange for SharedLsnCommitter {
         Ok(())
     }
 
-    /// Same argument as the per-dataset `LsnCommitter`: the slot retains WAL
-    /// until the shared floor advances past this commit, so a crash before a
-    /// deferred commit re-streams the un-acked tail. Safe to defer.
+    /// The runtime may hold this commit until the covering checkpoint is durable;
+    /// see `slot`'s and `watermark_notify`'s docs for why that gate is what makes a
+    /// published position safe.
     fn supports_deferral(&self) -> bool {
         true
-    }
-
-    /// Fold another shared-slot commit that targets the *same* member slot into
-    /// this one by keeping the higher LSN. Sound because [`Self::commit`] is a
-    /// monotonic `max` into the slot's `committed` — infallible and
-    /// order-insensitive, so folding N consecutive commits to their max is
-    /// identical to running them in order. A different slot (or a non-shared
-    /// committer) is refused, so a mixed run never coalesces across members.
-    fn try_absorb(&mut self, other: &dyn CommitChange) -> bool {
-        match other
-            .as_any()
-            .and_then(|a| a.downcast_ref::<SharedLsnCommitter>())
-        {
-            Some(other) if Arc::ptr_eq(&self.slot, &other.slot) => {
-                self.flush_to = self.flush_to.max(other.flush_to);
-                true
-            }
-            _ => false,
-        }
-    }
-
-    fn as_any(&self) -> Option<&dyn std::any::Any> {
-        Some(self)
     }
 }
 
@@ -929,7 +920,7 @@ impl CommitChange for SharedLsnCommitter {
 /// cannot be built.
 fn snapshot_watermark_envelope(
     schema: &SchemaRef,
-    applied_lsn_store: Arc<dyn AppliedLsnStore>,
+    watermark_notify: Arc<Notify>,
     slot: Option<Arc<AckSlot>>,
     lsn: u64,
     dataset: String,
@@ -941,7 +932,7 @@ fn snapshot_watermark_envelope(
         .map_err(|e| StreamError::External(e.to_string()))?;
     Ok(ChangeEnvelope::from_parts(
         Box::new(SnapshotWatermarkCommitter {
-            applied_lsn_store,
+            watermark_notify,
             slot,
             lsn,
             dataset,
@@ -968,7 +959,7 @@ fn snapshot_watermark_envelope(
 /// durable before their watermark claims them. Same contract as
 /// `mysql_replication`'s snapshot-boundary committer.
 struct SnapshotWatermarkCommitter {
-    applied_lsn_store: Arc<dyn AppliedLsnStore>,
+    watermark_notify: Arc<Notify>,
     /// The member's ack slot, so a successful write marks the position durable for
     /// [`flush_idle_watermarks`]. Carried by both boundary envelopes — a snapshot's
     /// and a rebuild's — because for a table that then sees no changes this is the
@@ -987,22 +978,13 @@ struct SnapshotWatermarkCommitter {
 #[async_trait]
 impl CommitChange for SnapshotWatermarkCommitter {
     async fn commit(&self) -> std::result::Result<(), CommitError> {
-        match self
-            .applied_lsn_store
-            .save(AppliedLsn { lsn: self.lsn })
-            .await
-        {
-            Ok(()) => {
-                if let Some(slot) = &self.slot {
-                    slot.note_recorded(self.lsn);
-                }
-            }
-            Err(e) => tracing::warn!(
-                dataset = %self.dataset,
-                "could not record the snapshot's applied position (lsn={}); the acceleration is correct, but a restart before the next acknowledgement will rebuild it from the source rather than resume: {e}",
-                self.lsn,
-            ),
+        // This committer refuses deferral, so the rows this position describes are
+        // durable by the time it runs; publishing it here is what lets the idle
+        // carry-forward extend it later.
+        if let Some(slot) = &self.slot {
+            slot.note_pending(self.lsn);
         }
+        self.watermark_notify.notify_one();
         crate::cdc::log_committer_progress(
             "postgres",
             &self.dataset,
@@ -1018,8 +1000,8 @@ struct PendingPgEnvelope {
     slot: Arc<AckSlot>,
     flush_to: u64,
     dataset: String,
-    /// Cloned from the member; see `SharedLsnCommitter::applied_lsn_store`.
-    applied_lsn_store: Arc<dyn AppliedLsnStore>,
+    /// Cloned from the member; see [`run_applied_lsn_writer`].
+    watermark_notify: Arc<Notify>,
     is_dataset_ready: bool,
     first_received_at: std::time::Instant,
 }
@@ -1053,8 +1035,8 @@ impl PendingPgEnvelope {
             flush_to,
             dataset,
             // Same member (the `slot` pointer check above proves it), so both
-            // sides carry the same store; either may be kept.
-            applied_lsn_store,
+            // sides carry the same notify; either may be kept.
+            watermark_notify,
             is_dataset_ready,
             first_received_at,
         } = other;
@@ -1066,7 +1048,7 @@ impl PendingPgEnvelope {
                 slot,
                 flush_to,
                 dataset,
-                applied_lsn_store,
+                watermark_notify,
                 is_dataset_ready,
                 first_received_at,
             });
@@ -1090,7 +1072,7 @@ impl PendingPgEnvelope {
                 flush_to: self.flush_to,
                 dataset: self.dataset,
                 source_commit_ts_ms,
-                applied_lsn_store: self.applied_lsn_store,
+                watermark_notify: self.watermark_notify,
             }),
             Box::new(self.rows),
             self.is_dataset_ready,
@@ -1533,6 +1515,11 @@ struct SharedSource {
     /// Set when the pump has exited (fatal error or all members detached).
     /// Subscribers seeing this create a fresh source.
     dead: AtomicBool,
+    /// Wakes [`run_applied_lsn_writer`] when a member publishes a position.
+    watermark_notify: Arc<Notify>,
+    /// Positions published by members that have since detached, which the writer's
+    /// member sweep can no longer reach. See [`OrphanedPosition`].
+    orphaned_positions: Mutex<Vec<OrphanedPosition>>,
     /// Whether the slot was created fresh by this process. Members that join
     /// later must snapshot even if their table already sat in the publication:
     /// a fresh slot has no history for anyone.
@@ -1566,6 +1553,8 @@ impl SharedSource {
             pump_started: AtomicBool::new(false),
             restart_requested: AtomicBool::new(false),
             dead: AtomicBool::new(false),
+            watermark_notify: Arc::new(Notify::new()),
+            orphaned_positions: Mutex::new(Vec::new()),
             slot_created_fresh: AtomicBool::new(false),
             detached: Mutex::new(HashSet::new()),
             reservations: Mutex::new(HashMap::new()),
@@ -1645,6 +1634,20 @@ impl SharedSource {
     /// re-subscription, which re-attaches immediately — only WARN).
     fn detach_member(&self, key: &MemberKey, reason: &str, stalls_slot: bool) {
         let removed = lock(&self.members).remove(key);
+        // The writer sweeps members, so anything this one published but had not yet
+        // had written would be dropped on the floor by the removal above. Hand it
+        // over rather than writing it here, which would make a second writer.
+        if let Some(member) = &removed
+            && let Some(slot) = self.ack.slot(key)
+            && slot.pending() > slot.recorded()
+        {
+            lock(&self.orphaned_positions).push(OrphanedPosition {
+                dataset: member.dataset_name.clone(),
+                store: Arc::clone(&member.applied_lsn_store),
+                slot,
+            });
+            self.watermark_notify.notify_one();
+        }
         let was_snapshotting = self.ack.detach(key);
         lock(&self.detached).insert(key.clone());
         if let Some(member) = removed {
@@ -2124,6 +2127,7 @@ async fn attach_member(
         && !rebuild_via_consumer
     {
         slot.note_recorded(resumed.lsn);
+        slot.note_pending(resumed.lsn);
     }
     lock(&source.members).insert(
         member_key.clone(),
@@ -2137,6 +2141,7 @@ async fn attach_member(
             metrics: Arc::clone(&metrics),
             ready_lag: params.ready_lag,
             applied_lsn_store: Arc::clone(&applied_lsn_store),
+            watermark_notify: Arc::clone(&source.watermark_notify),
         }),
     );
     // Membership liveness is now observable (`dataset_postgres_replication_member_attached`):
@@ -2169,7 +2174,7 @@ async fn attach_member(
     if !source.pump_started.swap(true, Ordering::AcqRel) {
         let pump_source = Arc::clone(source);
         tokio::spawn(run_pump(pump_source));
-        tokio::spawn(run_watermark_flusher(
+        tokio::spawn(run_applied_lsn_writer(
             Arc::clone(source),
             params.watermark_flush_interval,
         ));
@@ -2230,7 +2235,7 @@ async fn attach_member(
         // ordering.
         let signal_item = snapshot_watermark_envelope(
             &schema,
-            Arc::clone(&applied_lsn_store),
+            Arc::clone(&source.watermark_notify),
             ack_slot,
             setup.slot.consistent_lsn,
             dataset_name.clone(),
@@ -2257,7 +2262,7 @@ async fn attach_member(
         // Built before `dataset_name` is moved into the snapshot input below.
         let watermark_boundary = snapshot_watermark_envelope(
             &schema,
-            Arc::clone(&applied_lsn_store),
+            Arc::clone(&source.watermark_notify),
             ack_slot,
             setup.slot.consistent_lsn,
             dataset_name.clone(),
@@ -2400,78 +2405,106 @@ async fn member_fatal(source: &Arc<SharedSource>, key: &MemberKey, message: Stri
 
 /// Mark the source dead and drop it from the registry (only if the registry
 /// still points at this instance — a replacement may already exist).
-/// Periodically carry idle members' recorded positions forward, off the pump's
-/// decode path, until the pump is done.
+/// A member's applied position that outlived its member, kept so the last thing it
+/// proved durable is still written. A detached member is removed from the source's
+/// member map, so the writer's normal sweep can no longer see it.
+struct OrphanedPosition {
+    dataset: String,
+    store: Arc<dyn AppliedLsnStore>,
+    slot: Arc<AckSlot>,
+}
+
+/// The **only** writer of applied positions for a source.
 ///
-/// A dedicated task rather than work inside the pump loop: the store write is I/O
-/// against the dataset's own accelerator, and the pump must reach an `.await` on the
-/// replication socket promptly or it stalls decode for every member on the slot.
-/// One task per source, ticking sequentially, also means no two flushes can overlap.
+/// Producers publish a position onto their member's [`AckSlot::pending`] with an
+/// atomic max and wake this task; it persists whatever the furthest published
+/// position is when it gets there. Two properties follow, and both matter:
 ///
-/// The tick is coarse on purpose — see `watermark_flush_interval`. A graceful
-/// shutdown does not rely on it: the pump flushes once more on its way out, so an
-/// ordinary restart resumes exactly. After a crash the record can be up to one tick
-/// behind what the slot acknowledged, which costs one rebuild and never a wrong
-/// resume.
-async fn run_watermark_flusher(source: Arc<SharedSource>, interval: std::time::Duration) {
+///   * **No reordering.** [`AppliedLsnStore::save`] overwrites rather than taking a
+///     maximum, so concurrent writers could land out of order and move a recorded
+///     position backwards — costing a rebuild that does not self-correct until the
+///     member advances past the lost value. One writer makes that unrepresentable.
+///   * **Coalescing.** Positions published while a write is in flight collapse into
+///     that write's successor, so a busy member costs writes at the store's pace
+///     rather than one per commit.
+///
+/// It also wakes on a timer for the idle carry-forward, which has no producer to
+/// wake it: see [`publish_idle_positions`].
+async fn run_applied_lsn_writer(source: Arc<SharedSource>, interval: std::time::Duration) {
     loop {
-        tokio::time::sleep(interval).await;
+        tokio::select! {
+            () = source.watermark_notify.notified() => {}
+            () = tokio::time::sleep(interval) => {}
+        }
+        publish_idle_positions(&source);
+        write_published_positions(&source).await;
         if source.dead.load(Ordering::Acquire) {
-            flush_idle_watermarks(&source).await;
             return;
         }
-        flush_idle_watermarks(&source).await;
     }
 }
 
-/// Carry each idle member's durably-recorded position forward to what the slot has
-/// acknowledged on its behalf.
+/// Carry each idle member's position forward to what the slot has acknowledged on
+/// its behalf, by publishing it like any other producer.
 ///
 /// The slot's acknowledgement advances for a member that had nothing to apply, via
-/// [`AckTable::credit_idle`], which routes no envelope and therefore runs no
-/// committer and records nothing. Left alone the two drift apart for any quiet
-/// table, and the next start reads a recorded position behind the slot's
+/// [`AckTable::credit_idle`], which routes no envelope and so runs no committer.
+/// Left alone the recorded position and the acknowledgement drift apart for any
+/// quiet table, and the next start reads a position behind the slot's
 /// `confirmed_flush_lsn` — indistinguishable from changes acknowledged but never
 /// applied, so a healthy acceleration is rebuilt on every restart.
 ///
-/// Advancing the record here claims nothing new: crediting requires
-/// `delivered == committed`, so everything routed to the member has been committed
-/// (durability-gated), and the interval being carried over contained no changes for
-/// it. Two conditions keep that reasoning honest, and both are enforced below:
+/// Publishing here claims nothing new: crediting requires `delivered == committed`,
+/// so everything routed to the member has been committed (durability-gated), and the
+/// interval carried over contained no changes for it. Two conditions keep that
+/// reasoning honest:
 ///
-///   * the member must be **streaming** — a member still bootstrapping has a held
-///     floor rather than an applied position;
-///   * something must already be **durably recorded** for it
-///     ([`AckSlot::recorded`] non-zero) — otherwise there is no established
-///     durable prefix to extend, and a snapshot whose rows are not durable yet
-///     would have its floor recorded as though they were (#11896).
-///
-/// Only members whose `committed` has moved past their recorded position are
-/// written, so a busy member (whose commits already record it) costs nothing here.
-async fn flush_idle_watermarks(source: &Arc<SharedSource>) {
+///   * the member must be **streaming** — one still bootstrapping has a held floor
+///     rather than an applied position;
+///   * a position must already have been **recorded** for it ([`AckSlot::recorded`]
+///     non-zero) — otherwise there is no established durable prefix to extend, and a
+///     snapshot whose rows are not durable yet would have its floor recorded as
+///     though they were (#11896).
+fn publish_idle_positions(source: &Arc<SharedSource>) {
+    for (member_key, _) in source.live_members() {
+        let Some(slot) = source.ack.slot(&member_key) else {
+            continue;
+        };
+        if !slot.has(STREAMING) || slot.recorded() == 0 {
+            continue;
+        }
+        slot.note_pending(slot.committed());
+    }
+}
+
+/// Persist every member whose published position has moved past what is recorded,
+/// plus any left behind by a detached member. Called only from the writer task and
+/// from the pump's shutdown, which never run concurrently: the pump sets `dead`
+/// before its final flush, and the writer exits on seeing it.
+async fn write_published_positions(source: &Arc<SharedSource>) {
+    let orphans = std::mem::take(&mut *lock(&source.orphaned_positions));
+    for orphan in orphans {
+        write_one(&orphan.dataset, &orphan.store, &orphan.slot).await;
+    }
     for (member_key, member) in source.live_members() {
         let Some(slot) = source.ack.slot(&member_key) else {
             continue;
         };
-        if !slot.has(STREAMING) {
-            continue;
-        }
-        let recorded = slot.recorded();
-        let committed = slot.committed();
-        if recorded == 0 || committed <= recorded {
-            continue;
-        }
-        match member
-            .applied_lsn_store
-            .save(AppliedLsn { lsn: committed })
-            .await
-        {
-            Ok(()) => slot.note_recorded(committed),
-            Err(e) => tracing::debug!(
-                dataset = %member.dataset_name,
-                "could not carry this acceleration's recorded position forward to the slot's acknowledged position (lsn={committed}); it will be retried, and a restart before it succeeds costs one rebuild: {e}"
-            ),
-        }
+        write_one(&member.dataset_name, &member.applied_lsn_store, &slot).await;
+    }
+}
+
+async fn write_one(dataset: &str, store: &Arc<dyn AppliedLsnStore>, slot: &Arc<AckSlot>) {
+    let pending = slot.pending();
+    if pending == 0 || pending <= slot.recorded() {
+        return;
+    }
+    match store.save(AppliedLsn { lsn: pending }).await {
+        Ok(()) => slot.note_recorded(pending),
+        Err(e) => tracing::warn!(
+            dataset = %dataset,
+            "could not record how far this acceleration has been advanced (lsn={pending}); it will be retried, and a restart before it succeeds rebuilds from the source rather than resuming: {e}"
+        ),
     }
 }
 
@@ -2614,8 +2647,9 @@ async fn run_pump(source: Arc<SharedSource>) {
                 slot = %slot_name,
                 "runtime shutdown; releasing shared replication connection and slot"
             );
-            flush_idle_watermarks(&source).await;
+            publish_idle_positions(&source);
             finish_pump(&source);
+            write_published_positions(&source).await;
             drop_slot_if_ephemeral(&source).await;
             return;
         }
@@ -2726,8 +2760,9 @@ async fn run_pump(source: Arc<SharedSource>) {
                     "runtime shutdown; releasing shared replication connection and slot"
                 );
                 drop(client);
-                flush_idle_watermarks(&source).await;
+                publish_idle_positions(&source);
                 finish_pump(&source);
+                write_published_positions(&source).await;
                 // After `drop(client)`: Postgres refuses to drop a slot its
                 // walsender still holds.
                 drop_slot_if_ephemeral(&source).await;
@@ -3694,7 +3729,7 @@ async fn deliver_commit(
             slot: Arc::clone(slot),
             flush_to: boundary.end_lsn,
             dataset: member.dataset_name.clone(),
-            applied_lsn_store: Arc::clone(&member.applied_lsn_store),
+            watermark_notify: Arc::clone(&member.watermark_notify),
             is_dataset_ready: is_ready,
             first_received_at: std::time::Instant::now(),
         };
@@ -3792,7 +3827,7 @@ mod tests {
                 Some(source_commit_ts_ms),
             ),
             slot: Arc::clone(slot),
-            applied_lsn_store: Arc::new(crate::postgres_replication::NoopAppliedLsnStore),
+            watermark_notify: Arc::new(Notify::new()),
             flush_to,
             dataset: "ds".to_string(),
             is_dataset_ready: ready,
@@ -3964,6 +3999,7 @@ mod tests {
                 member_key.clone(),
                 Arc::new(MemberHandle {
                     applied_lsn_store: Arc::new(crate::postgres_replication::NoopAppliedLsnStore),
+                    watermark_notify: Arc::new(Notify::new()),
                     dataset_name: format!("ds{i}"),
                     schema: Arc::clone(&schema),
                     primary_keys: vec![],
@@ -4002,6 +4038,7 @@ mod tests {
             member_key.clone(),
             Arc::new(MemberHandle {
                 applied_lsn_store: Arc::new(crate::postgres_replication::NoopAppliedLsnStore),
+                watermark_notify: Arc::new(Notify::new()),
                 dataset_name: "users".into(),
                 schema,
                 primary_keys: vec!["id".into()],
@@ -4121,6 +4158,7 @@ mod tests {
                 member_key.clone(),
                 Arc::new(MemberHandle {
                     applied_lsn_store: Arc::new(crate::postgres_replication::NoopAppliedLsnStore),
+                    watermark_notify: Arc::new(Notify::new()),
                     dataset_name: "users".into(),
                     schema,
                     primary_keys: vec!["id".into()],
@@ -5327,7 +5365,7 @@ mod tests {
         ack.seed(10);
         ack.register(&key("a"), false);
         let committer = SharedLsnCommitter {
-            applied_lsn_store: Arc::new(crate::postgres_replication::NoopAppliedLsnStore),
+            watermark_notify: Arc::new(Notify::new()),
             slot: ack.slot(&key("a")).expect("slot registered"),
             flush_to: 42,
             dataset: "test".to_string(),
@@ -5336,6 +5374,29 @@ mod tests {
         assert!(committer.supports_deferral());
         committer.commit().await.expect("commit");
         assert_eq!(ack.flush_lsn(), 42);
+    }
+
+    /// Producers publish positions from different tasks — envelope commits, the
+    /// snapshot/rebuild boundary, and the idle sweep — and can do so out of order.
+    /// Publishing takes the max rather than storing, so a straggler is a no-op
+    /// instead of moving the position backwards; a plain store here would make the
+    /// writer persist a stale position and rebuild the acceleration on the next
+    /// start, without self-correcting until the member advanced past the lost value.
+    #[test]
+    fn a_position_published_out_of_order_never_moves_backwards() {
+        let slot = AckSlot::new(0, false);
+        assert_eq!(slot.pending(), 0, "registration publishes nothing");
+
+        slot.note_pending(200);
+        slot.note_pending(100);
+        assert_eq!(
+            slot.pending(),
+            200,
+            "a position published late but superseded must not lower what is observable"
+        );
+
+        slot.note_pending(300);
+        assert_eq!(slot.pending(), 300);
     }
 
     #[test]

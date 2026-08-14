@@ -192,10 +192,10 @@ impl AppliedLsnStore for InMemoryAppliedLsnStore {
 /// [`input_for`] with a watermark store that actually records, so the gap
 /// decision is reachable. Pass the same store across two streams to model a
 /// restart against acceleration files that survived.
-fn input_with_watermark(
+fn input_with_watermark<S: AppliedLsnStore + 'static>(
     port: u16,
     table: &str,
-    store: &Arc<InMemoryAppliedLsnStore>,
+    store: &Arc<S>,
 ) -> ReplicationStreamInput {
     let mut input = input_for(port, table);
     input.applied_lsn_store = Arc::clone(store) as Arc<dyn AppliedLsnStore>;
@@ -1246,6 +1246,129 @@ async fn a_bootstrap_lost_before_it_was_durable_is_reloaded_not_resumed()
     Ok(())
 }
 
+/// An applied-position store whose writes are slow, for showing that the commit path
+/// does not wait on them.
+#[derive(Default)]
+struct SlowAppliedLsnStore {
+    recorded: std::sync::Mutex<Option<AppliedLsn>>,
+    saves: std::sync::atomic::AtomicUsize,
+}
+
+impl SlowAppliedLsnStore {
+    const DELAY: Duration = Duration::from_millis(250);
+
+    fn shared() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    fn saves(&self) -> usize {
+        self.saves.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+#[async_trait::async_trait]
+impl AppliedLsnStore for SlowAppliedLsnStore {
+    async fn load(
+        &self,
+    ) -> std::result::Result<RecordedPosition, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(self
+            .recorded
+            .lock()
+            .expect("watermark mutex")
+            .map_or(RecordedPosition::Absent, RecordedPosition::At))
+    }
+
+    async fn save(
+        &self,
+        applied: AppliedLsn,
+    ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        tokio::time::sleep(Self::DELAY).await;
+        *self.recorded.lock().expect("watermark mutex") = Some(applied);
+        self.saves.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Ok(())
+    }
+
+    async fn clear(&self) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        *self.recorded.lock().expect("watermark mutex") = None;
+        Ok(())
+    }
+
+    fn records_positions(&self) -> bool {
+        true
+    }
+}
+
+/// Committing publishes a position and returns; only the applied-position writer
+/// touches the store. So a store that is slow to write must not make commits slow —
+/// if it did, every dataset on a shared slot would apply changes at the speed of its
+/// accelerator's bookkeeping writes.
+///
+/// The delay is fixed because store latency is the thing under test.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_slow_position_store_does_not_slow_the_commit_path() -> Result<(), anyhow::Error> {
+    const COMMITS: usize = 8;
+
+    let _tracing = init_tracing(Some("data_components::postgres_replication=debug,info"));
+
+    let port = common::get_random_port()?;
+    let _container = common::start_postgres_docker_container_with_logical_wal(port).await?;
+    let port = u16::try_from(port).expect("port fits in u16");
+    let source = pg_client(port).await?;
+
+    create_table(&source, "slow_store", &[(1, "one")]).await?;
+
+    let store = SlowAppliedLsnStore::shared();
+    let mut member = start_replication_stream(input_with_watermark(port, "slow_store", &store));
+    next_envelope(&mut member, "bootstrap")
+        .await?
+        .commit()
+        .await?;
+
+    let mut committed = 0_usize;
+    let mut spent_committing = Duration::ZERO;
+    for id in 0..COMMITS {
+        source
+            .execute(
+                "INSERT INTO public.slow_store (id, name) VALUES ($1, 'row')",
+                &[&i32::try_from(id + 10).expect("id fits")],
+            )
+            .await?;
+        if let Ok(envelope) = next_envelope(&mut member, "change").await {
+            let started = std::time::Instant::now();
+            envelope.commit().await?;
+            spent_committing += started.elapsed();
+            committed += 1;
+        }
+    }
+    anyhow::ensure!(
+        committed > 0,
+        "no change was committed, so nothing about the commit path was measured"
+    );
+
+    let serialized = SlowAppliedLsnStore::DELAY * u32::try_from(committed).expect("fits");
+    eprintln!(
+        "commit path: {spent_committing:?} across {committed} commit(s); \
+         waiting for each {:?} store write would have cost {serialized:?}; \
+         store writes so far: {}",
+        SlowAppliedLsnStore::DELAY,
+        store.saves()
+    );
+    anyhow::ensure!(
+        spent_committing * 2 < serialized,
+        "commits are waiting on the applied-position store: {spent_committing:?} across \
+         {committed} commit(s), against {serialized:?} if each had waited for its write. \
+         Publishing the position must not put store I/O on the commit path"
+    );
+
+    drop(member);
+    wait_for_walsender_count(&source, 0).await?;
+    drop_replication_slot_when_inactive(&source, SLOT).await?;
+    source
+        .simple_query(&format!("DROP PUBLICATION IF EXISTS {PUBLICATION}"))
+        .await?;
+    Ok(())
+}
+
 /// The counterpart to the rebuild tests: a dataset that simply restarts must
 /// **resume**, not rebuild. Without this, a rule that classifies gaps too eagerly
 /// passes every rebuild test while re-reading the whole table on every restart.
@@ -1291,7 +1414,11 @@ async fn a_quiet_dataset_resumes_across_a_restart_rather_than_rebuilding()
     let flush_every = input_for(port, "quiet").params.watermark_flush_interval;
     let drift_started = std::time::Instant::now();
     create_table(&source, "noisy", &[(1, "n1")]).await?;
-    let mut noisy = start_replication_stream(input_for(port, "noisy"));
+    // The busy member records its position through its own commits. Counting its
+    // writes against its commits is what shows they are coalesced by the single
+    // writer rather than issued one per commit.
+    let noisy_store = InMemoryAppliedLsnStore::shared();
+    let mut noisy = start_replication_stream(input_with_watermark(port, "noisy", &noisy_store));
     next_envelope(&mut noisy, "bootstrap noisy")
         .await?
         .commit()
@@ -1300,6 +1427,7 @@ async fn a_quiet_dataset_resumes_across_a_restart_rather_than_rebuilding()
     let deadline = std::time::Instant::now() + Duration::from_mins(1);
     let mut drifted = false;
     let mut churn_id = 100;
+    let mut noisy_commits = 0_usize;
     while std::time::Instant::now() < deadline {
         churn_id += 1;
         source
@@ -1310,6 +1438,7 @@ async fn a_quiet_dataset_resumes_across_a_restart_rather_than_rebuilding()
             .await?;
         if let Ok(envelope) = next_envelope(&mut noisy, "noisy churn").await {
             envelope.commit().await?;
+            noisy_commits += 1;
         }
         if let Ok(envelope) = next_envelope(&mut quiet, "quiet heartbeat").await {
             envelope.commit().await?;
@@ -1350,10 +1479,12 @@ async fn a_quiet_dataset_resumes_across_a_restart_rather_than_rebuilding()
         reason = "counter is small; the comparison is a loose bound"
     )]
     let saves_f = saves as f64;
-    // Integration-test worker logs are dropped, so print the measurement.
+    // Integration-test worker logs are dropped, so print the measurements.
+    let noisy_saves = noisy_store.saves();
     eprintln!(
         "quiet-member position writes: {saves} over {elapsed_ticks:.1} flush interval(s) of {flush_every:?}"
     );
+    eprintln!("busy-member position writes: {noisy_saves} for {noisy_commits} commit(s)");
     anyhow::ensure!(
         saves_f <= elapsed_ticks + 3.0,
         "the recorded position is being written far more often than once per flush interval \
