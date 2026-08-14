@@ -664,6 +664,13 @@ const UTF8_BOM: [u8; 3] = [0xEF, 0xBB, 0xBF];
 /// nothing was skipped that could have mattered, and the reader chosen below
 /// reports the empty body in its own terms.
 ///
+/// That exemption is keyed on the [`EmptyDetectionInput`] marker rather than on
+/// `ErrorKind::UnexpectedEof`, because the kind alone cannot tell the two apart:
+/// every `fill_buf` in the peek can surface an `UnexpectedEof` of its own from a
+/// truncated body, and matching on the kind would coerce that read failure to
+/// `false` after the peek had already consumed a BOM prefix — the exact
+/// discard-then-misparse this function exists to prevent.
+///
 /// # Errors
 ///
 /// Returns the detection error for any body it could not classify without
@@ -671,9 +678,32 @@ const UTF8_BOM: [u8; 3] = [0xEF, 0xBB, 0xBF];
 pub fn body_opens_a_json_array<R: BufRead>(reader: &mut R) -> io::Result<bool> {
     match peek_first_non_ws_byte(reader) {
         Ok(byte) => Ok(byte == b'['),
-        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Ok(false),
+        Err(e) if is_empty_detection_input(&e) => Ok(false),
         Err(e) => Err(e),
     }
+}
+
+/// Marks the `UnexpectedEof` that [`peek_first_non_ws_byte`] raises itself when a
+/// body holds no non-whitespace byte, so it can be told apart from an
+/// `UnexpectedEof` propagated out of the reader.
+#[derive(Debug)]
+struct EmptyDetectionInput;
+
+impl std::fmt::Display for EmptyDetectionInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Empty input while detecting JSON format")
+    }
+}
+
+impl std::error::Error for EmptyDetectionInput {}
+
+fn empty_detection_input_error() -> io::Error {
+    io::Error::new(io::ErrorKind::UnexpectedEof, EmptyDetectionInput)
+}
+
+fn is_empty_detection_input(e: &io::Error) -> bool {
+    e.get_ref()
+        .is_some_and(<dyn std::error::Error + Send + Sync>::is::<EmptyDetectionInput>)
 }
 
 /// Peek at the first non-whitespace byte from a `BufRead` reader without
@@ -732,10 +762,7 @@ pub fn peek_first_non_ws_byte<R: BufRead>(reader: &mut R) -> io::Result<u8> {
     loop {
         let buf = reader.fill_buf()?;
         if buf.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "Empty input while detecting JSON format",
-            ));
+            return Err(empty_detection_input_error());
         }
         for (i, &byte) in buf.iter().enumerate() {
             if !is_json_whitespace(byte) {
@@ -3179,6 +3206,65 @@ mod tests {
                     want,
                     "for {}",
                     String::from_utf8_lossy(body)
+                );
+            }
+        }
+
+        /// A `BufRead` that yields some bytes and then fails with
+        /// `UnexpectedEof` — a truncated body is the ordinary way to get one out
+        /// of an object-store or network reader.
+        struct TruncatingReader {
+            prefix: Vec<u8>,
+            pos: usize,
+        }
+
+        impl io::Read for TruncatingReader {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                let src = self.fill_buf()?;
+                let n = src.len().min(buf.len());
+                buf[..n].copy_from_slice(&src[..n]);
+                self.consume(n);
+                Ok(n)
+            }
+        }
+
+        impl BufRead for TruncatingReader {
+            fn fill_buf(&mut self) -> io::Result<&[u8]> {
+                if self.pos >= self.prefix.len() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "truncated body",
+                    ));
+                }
+                // One byte at a time, so the peek is forced back into `fill_buf`
+                // after each `consume` and meets the truncation mid-scan.
+                Ok(&self.prefix[self.pos..=self.pos])
+            }
+
+            fn consume(&mut self, amt: usize) {
+                self.pos += amt;
+            }
+        }
+
+        /// The empty-body exemption keys on the marker, not on the error *kind*.
+        /// `UnexpectedEof` is also what a truncated body raises out of
+        /// `fill_buf`, and by the time that surfaces the peek may already have
+        /// consumed a BOM prefix — so answering `false` on the kind alone would
+        /// hand the non-array reader a body with its first bytes deleted, which
+        /// is the discard-then-misparse this whole path exists to prevent.
+        #[test]
+        fn array_detection_propagates_a_truncated_read_it_did_not_raise() {
+            for prefix in [&b"\xEF"[..], &b"\xEF\xBB"[..], &b"   "[..]] {
+                let mut reader = TruncatingReader {
+                    prefix: prefix.to_vec(),
+                    pos: 0,
+                };
+                let err = body_opens_a_json_array(&mut reader)
+                    .expect_err("a read failure from the body must propagate, not answer `false`");
+                assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+                assert!(
+                    err.to_string().contains("truncated body"),
+                    "expected the reader's own error to survive, got: {err}"
                 );
             }
         }
