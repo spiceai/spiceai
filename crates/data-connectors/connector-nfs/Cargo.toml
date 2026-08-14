@@ -1,11 +1,9 @@
 # This crate is excluded from the workspace because it requires system libnfs library.
 # Build with: cargo build -p connector-nfs --manifest-path crates/data-connectors/connector-nfs/Cargo.toml
 
-# Its own workspace root, so the exclusion holds wherever the repository is checked out.
-# The root manifest excludes this crate by a path relative to itself, which does not match a
-# checkout nested inside another one (a `git worktree` under the primary clone): cargo then
-# resolves the nearest ancestor manifest instead and rejects the package as believing it is in
-# a workspace it is not a member of. That aborts `cargo fmt --all` for the whole tree.
+# Prevent this from interfering with workspaces: the root manifest's `exclude` entry holds only
+# in a top-level checkout, and `bin/spiced` path-depends on this crate, so without its own
+# workspace root a nested checkout aborts `cargo fmt --all`. See docs/dev/ci_signoff.md
 [workspace]
 
 [package]

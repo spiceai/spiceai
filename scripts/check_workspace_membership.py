@@ -17,13 +17,22 @@
 # a path relative to *itself*. When the repository is checked out inside another
 # copy of itself — which is where `git worktree` checkouts under `.claude/`
 # live — the nested copy's path does not match the outer root's `exclude` entry,
-# the outer root claims the package, and the resolution fails. That aborts
-# `cargo metadata`, and with it `cargo fmt --all`, `make lint`, and `make
-# signoff` for the whole tree (#13093).
+# the outer root claims the package, and the resolution fails.
+#
+# A package a workspace member path-depends on is resolved as part of walking
+# that member, so the failure is not local to it: it aborts `cargo fmt --all`,
+# and with it `make lint` and `make signoff`, for the whole tree (#13093). A
+# package nothing depends on fails only when addressed directly, but it is the
+# same defect one dependency edge away from the same outcome.
 #
 # The check is on the DECLARATION, not on whether `cargo metadata` currently
 # resolves: in a plain checkout the root `exclude` does match, so a resolution
 # probe passes on exactly the manifests this guard exists to catch.
+#
+# Membership is read from the ROOT workspace only. A legitimate nested
+# sub-workspace would have its own members flagged here; none exists today, and
+# the remedy if one appears is to union in the members of every manifest that
+# declares a workspace of its own.
 #
 # Usage:
 #   scripts/check_workspace_membership.py         # validate (exit 1 on violation)
@@ -77,20 +86,16 @@ def declares_workspace(manifest: dict) -> bool:
     return "workspace" in manifest
 
 
-def find_violations(
-    manifests: dict[Path, dict], members: set[Path], root: Path
-) -> list[Path]:
+def find_violations(manifests: dict[Path, dict], members: set[Path]) -> list[Path]:
     """Non-member packages that leave their workspace root to an ancestor lookup.
 
-    `manifests` maps a manifest path to its parsed contents, `members` holds the
-    manifest paths of the root workspace's members, and `root` is the repository
-    root manifest.
+    The root manifest needs no special case: a workspace root declares
+    `[workspace]` by definition, and this repository's is virtual besides.
     """
     return sorted(
         path
         for path, manifest in manifests.items()
-        if path != root
-        and path not in members
+        if path not in members
         and is_package(manifest)
         and not declares_workspace(manifest)
     )
@@ -112,26 +117,39 @@ def tracked_manifests() -> list[Path]:
 
 
 def workspace_members() -> set[Path]:
-    """Manifest paths of the root workspace's members, from cargo itself."""
+    """Manifest paths of the root workspace's members, from cargo itself.
+
+    `--locked` because this is a fast, side-effect-free lint guard, and it opens
+    `lint-rust`: it should fail on a stale `Cargo.lock` rather than rewrite one.
+    """
     try:
         out = subprocess.run(
-            ["cargo", "metadata", "--no-deps", "--format-version", "1"],
+            ["cargo", "metadata", "--no-deps", "--locked", "--format-version", "1"],
             cwd=REPO,
             capture_output=True,
             check=True,
             text=True,
         ).stdout
     except FileNotFoundError:
-        print("error: `cargo` not found on PATH.", file=sys.stderr)
+        print(
+            "error: `cargo` not found on PATH — is the Rust toolchain installed?",
+            file=sys.stderr,
+        )
         raise SystemExit(2)
     except subprocess.CalledProcessError as e:
         print(f"error: `cargo metadata` failed:\n{e.stderr}", file=sys.stderr)
         raise SystemExit(2)
-    return {Path(p["manifest_path"]) for p in json.loads(out)["packages"]}
+    try:
+        return {Path(p["manifest_path"]) for p in json.loads(out)["packages"]}
+    except (json.JSONDecodeError, KeyError) as e:
+        print(f"error: could not read `cargo metadata` output: {e}", file=sys.stderr)
+        raise SystemExit(2)
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(
+        description="Check that every package outside the root workspace declares its own."
+    )
     parser.add_argument(
         "--list",
         action="store_true",
@@ -139,26 +157,36 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    root = REPO / "Cargo.toml"
     members = workspace_members()
     manifests = {p: read_manifest(p) for p in tracked_manifests()}
+    violations = find_violations(manifests, members)
 
     if args.list:
-        for path in sorted(manifests):
-            manifest = manifests[path]
-            if not is_package(manifest) and path != root:
+        # Classified by the same predicate the check uses, so the listing cannot
+        # disagree with the verdict.
+        undeclared = set(violations)
+        for path, manifest in sorted(manifests.items()):
+            if not is_package(manifest):
                 continue
-            if path == root or path in members:
+            if path in members:
                 owner = "root workspace"
-            elif declares_workspace(manifest):
-                owner = "itself"
-            else:
+            elif path in undeclared:
                 owner = "UNDECLARED"
+            else:
+                owner = "itself"
             print(f"{owner:<15} {path.relative_to(REPO).as_posix()}")
         return 0
 
-    violations = find_violations(manifests, members, root)
     if not violations:
+        outside = sum(
+            1
+            for path, manifest in manifests.items()
+            if is_package(manifest) and path not in members
+        )
+        print(
+            f"workspace membership OK: {len(manifests)} tracked manifest(s), "
+            f"{outside} outside the root workspace, each declaring its own."
+        )
         return 0
 
     print(

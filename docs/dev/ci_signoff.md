@@ -235,19 +235,28 @@ rejects it, because the package is not in that workspace's `members`.
 manifest that declares it, so it stops matching as soon as the repository is
 checked out *inside* another copy of itself, which is where agent `git worktree`
 checkouts under `.claude/worktrees/` live. The nested root excludes the package
-correctly, cargo keeps walking, and the outer root claims it. The failure is not
-local to that package: `cargo fmt --all` resolves it while walking the tree, so
-`make lint` and `make signoff` abort before running a single check
-([#13093](https://github.com/spiceai/spiceai/issues/13093)). An empty
+correctly, cargo keeps walking, and the outer root claims it. An empty
 `[workspace]` table in the package's own manifest ends the walk wherever the
 repository sits.
+
+When a workspace member path-depends on the claimed package, the failure stops
+being local to it: resolving the member resolves the dependency, so `cargo fmt
+--all` aborts and takes `make lint` and `make signoff` with it before a single
+check runs. That is how
+[#13093](https://github.com/spiceai/spiceai/issues/13093) presented —
+`bin/spiced` has an optional path dependency on `connector-nfs`. A package
+nothing depends on fails only when addressed directly, but it is the same defect
+one dependency edge away from the same outcome. The guard therefore runs ahead
+of `cargo fmt --check`, unlike the other guards: a guard placed after it would
+never be reached to explain what the raw cargo error means.
 
 The guard checks the declaration rather than probing whether `cargo metadata`
 resolves today: in a plain checkout the root `exclude` does match, so a probe
 passes on exactly the manifests the guard exists to catch.
 `scripts/test_check_workspace_membership.py` covers the parser and rebuilds the
-nested-checkout shape with cargo, so the behaviour the guard relies on is pinned
-rather than assumed.
+nested-checkout shape with cargo — including the path dependency that puts the
+package on the walk — so the behaviour the guard relies on is pinned rather than
+assumed.
 
 ### Dependabot bumps are fast-tracked
 

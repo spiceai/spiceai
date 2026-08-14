@@ -1,5 +1,4 @@
-# Its own workspace root: this package is not a member of the repository's root workspace,
-# and cargo would otherwise bind it to the nearest ancestor workspace manifest.
+# Prevent this from interfering with workspaces. See docs/dev/ci_signoff.md
 [workspace]
 
 [package]

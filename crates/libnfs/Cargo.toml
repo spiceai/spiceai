@@ -1,5 +1,5 @@
-# This crate is excluded from the workspace because it requires system libnfs library.
-# Build with: cargo build -p libnfs --manifest-path crates/libnfs/Cargo.toml
+# This crate is a workspace member, but it requires the system libnfs library, so the
+# compile-time gates pass `--exclude libnfs`. Build with: cargo build -p libnfs
 [package]
 name = "libnfs"
 version = "0.1.0"

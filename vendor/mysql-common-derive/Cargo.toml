@@ -9,8 +9,7 @@
 #   output (`FromValue`/`FromRow`) is unchanged for valid input.
 #
 # Wired in via `[patch.crates-io]` in the workspace root Cargo.toml.
-# Its own workspace root: this package is not a member of the repository's root workspace,
-# and cargo would otherwise bind it to the nearest ancestor workspace manifest.
+# Prevent this from interfering with workspaces. See docs/dev/ci_signoff.md
 [workspace]
 
 [package]

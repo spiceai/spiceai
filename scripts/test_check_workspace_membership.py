@@ -16,16 +16,20 @@ from __future__ import annotations
 import subprocess
 import sys
 import tempfile
-import tomllib
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+# Imported before `tomllib` so that on Python < 3.11 the guard's own actionable
+# message is what prints. This file runs first in `lint-rust`, so importing
+# `tomllib` here directly would front the recipe with a raw ModuleNotFoundError.
 from check_workspace_membership import (  # noqa: E402
     declares_workspace,
     find_violations,
     is_package,
 )
+
+import tomllib  # noqa: E402
 
 failures = 0
 checks = 0
@@ -60,19 +64,16 @@ check(
     True,
 )
 check(
-    "a [workspace] carrying keys still declares one",
-    declares_workspace(parse('[workspace]\nmembers = []\n' + PACKAGE)),
-    True,
-)
-check(
-    "[workspace.package] alone does not declare one",
-    # Inherited-field tables key off `workspace`, so a manifest that only reads
-    # them (`version.workspace = true`) must not be mistaken for a root.
+    "an inherited `workspace = true` value does not declare one",
+    # `workspace = true` on a dependency reads a value from the workspace this
+    # package belongs to. It is nested under `dependencies`, so it must not be
+    # mistaken for the top-level table that makes a package a root.
     declares_workspace(parse(PACKAGE + '[dependencies]\nx = { workspace = true }\n')),
     False,
 )
 
 print("\nfind_violations")
+ROOT_MANIFEST = parse('[workspace]\nmembers = ["crates/a"]\n')
 root = Path("/repo/Cargo.toml")
 member = Path("/repo/crates/a/Cargo.toml")
 loose = Path("/repo/crates/b/Cargo.toml")
@@ -80,63 +81,34 @@ virtual_child = Path("/repo/crates/c/Cargo.toml")
 
 check(
     "a non-member package with no [workspace] is a violation",
-    find_violations(
-        {root: parse('[workspace]\nmembers = ["crates/a"]\n'), loose: parse(PACKAGE)},
-        {member},
-        root,
-    ),
+    find_violations({root: ROOT_MANIFEST, loose: parse(PACKAGE)}, {member}),
     [loose],
 )
 check(
     "the same package is clean once it declares its own workspace",
     find_violations(
-        {
-            root: parse('[workspace]\nmembers = ["crates/a"]\n'),
-            loose: parse("[workspace]\n" + PACKAGE),
-        },
-        {member},
-        root,
+        {root: ROOT_MANIFEST, loose: parse("[workspace]\n" + PACKAGE)}, {member}
     ),
     [],
 )
 check(
     "a member does not need to declare a workspace",
-    find_violations(
-        {root: parse('[workspace]\nmembers = ["crates/a"]\n'), member: parse(PACKAGE)},
-        {member},
-        root,
-    ),
-    [],
-)
-check(
-    "the root manifest is never its own violation",
-    # It defines the workspace every member resolves to, and a virtual root has
-    # no `[package]` table to test.
-    find_violations({root: parse('[workspace]\nmembers = []\n')}, set(), root),
+    find_violations({root: ROOT_MANIFEST, member: parse(PACKAGE)}, {member}),
     [],
 )
 check(
     "a non-member virtual manifest is not a package, so it is skipped",
     find_violations(
-        {
-            root: parse('[workspace]\nmembers = ["crates/a"]\n'),
-            virtual_child: parse('[workspace]\nmembers = ["d"]\n'),
-        },
+        {root: ROOT_MANIFEST, virtual_child: parse('[workspace]\nmembers = ["d"]\n')},
         {member},
-        root,
     ),
     [],
 )
 check(
     "every violating manifest is reported, not just the first",
     find_violations(
-        {
-            root: parse('[workspace]\nmembers = []\n'),
-            loose: parse(PACKAGE),
-            virtual_child: parse(PACKAGE),
-        },
-        set(),
-        root,
+        {root: ROOT_MANIFEST, loose: parse(PACKAGE), virtual_child: parse(PACKAGE)},
+        {member},
     ),
     [loose, virtual_child],
 )
@@ -149,51 +121,84 @@ def nested_tree(directory: str, *, package_declares_workspace: bool) -> Path:
 
     Both roots exclude the path `pkg` relative to themselves, so the inner root
     excludes exactly the package below it — the arrangement the repository has
-    for `crates/data-connectors/connector-nfs`. Returns the package manifest.
+    for `crates/data-connectors/connector-nfs`. A member of the inner workspace
+    path-depends on `pkg`, which is what puts the excluded package on the
+    dependency walk and so makes `cargo fmt --all` resolve it. Returns the inner
+    workspace root.
     """
-    workspace = '[workspace]\nresolver = "3"\nmembers = []\nexclude = ["pkg"]\n'
     outer = Path(directory) / "outer"
-    pkg = outer / "nested" / "pkg"
+    inner = outer / "nested"
+    pkg = inner / "pkg"
+    app = inner / "app"
     (pkg / "src").mkdir(parents=True)
-    (outer / "Cargo.toml").write_text(workspace, encoding="utf-8")
-    (outer / "nested" / "Cargo.toml").write_text(workspace, encoding="utf-8")
-    (pkg / "src" / "lib.rs").write_text("", encoding="utf-8")
-    manifest = pkg / "Cargo.toml"
-    manifest.write_text(
+    (app / "src").mkdir(parents=True)
+    # Both roots exclude `pkg` relative to themselves, so only the inner one
+    # actually names this package. The outer root must otherwise be a valid,
+    # empty workspace: give it a member it does not have and cargo fails on
+    # *that* instead, which would pass the negative case for the wrong reason.
+    (outer / "Cargo.toml").write_text(
+        '[workspace]\nresolver = "3"\nmembers = []\nexclude = ["pkg"]\n',
+        encoding="utf-8",
+    )
+    (inner / "Cargo.toml").write_text(
+        '[workspace]\nresolver = "3"\nmembers = ["app"]\nexclude = ["pkg"]\n',
+        encoding="utf-8",
+    )
+    # Already rustfmt-clean, so a formatting difference cannot be mistaken for
+    # the resolution failure under test.
+    (pkg / "src" / "lib.rs").write_text("pub fn f() {}\n", encoding="utf-8")
+    (app / "src" / "lib.rs").write_text("pub fn g() {}\n", encoding="utf-8")
+    (app / "Cargo.toml").write_text(
+        '[package]\nname = "app"\nversion = "0.0.0"\nedition = "2024"\n\n'
+        '[dependencies]\np = { path = "../pkg", optional = true }\n',
+        encoding="utf-8",
+    )
+    (pkg / "Cargo.toml").write_text(
         ("[workspace]\n\n" if package_declares_workspace else "") + PACKAGE,
         encoding="utf-8",
     )
-    return manifest
+    return inner
 
 
-def resolves(manifest: Path) -> bool:
-    """Whether cargo can settle the package's workspace at all."""
-    return (
-        subprocess.run(
-            ["cargo", "metadata", "--no-deps", "--format-version", "1",
-             "--manifest-path", str(manifest)],
-            capture_output=True,
-            text=True,
-        ).returncode
-        == 0
+def fmt_all(workspace_root: Path) -> tuple[int, str]:
+    """Run the gate's opening command, returning its status and combined output.
+
+    This is the harm the issue reports: `cargo fmt --all` aborting for the whole
+    tree because one package it path-walks into cannot be resolved.
+    """
+    p = subprocess.run(
+        ["cargo", "fmt", "--all", "--", "--check"],
+        cwd=workspace_root,
+        capture_output=True,
+        text=True,
     )
+    return p.returncode, p.stdout + p.stderr
 
 
 with tempfile.TemporaryDirectory() as d:
     # Without the declaration the inner root's `exclude` does not end the search:
     # cargo keeps walking up, and the outer root — whose `exclude` names a path
-    # one level too shallow to match — claims the package and the resolve fails.
+    # one level too shallow to match — claims the package. `cargo fmt --all`
+    # reaches it through `app`'s path dependency and dies on the whole tree.
+    status, output = fmt_all(nested_tree(d, package_declares_workspace=False))
+    check("cargo fmt --all fails when the package declares no workspace", status != 0, True)
+    # Asserted on the message, not just the status: every other way this fixture
+    # could fail (a malformed root, a formatting difference, a missing member)
+    # also exits non-zero, and would pass the check above for the wrong reason.
     check(
-        "a nested non-member package with no [workspace] does not resolve",
-        resolves(nested_tree(d, package_declares_workspace=False)),
-        False,
+        "...and it fails on the workspace resolution, not something else",
+        "believes it's in a workspace when it's not" in output,
+        True,
     )
 
 with tempfile.TemporaryDirectory() as d:
+    status, output = fmt_all(nested_tree(d, package_declares_workspace=True))
+    # Compared as a pair so a failure reports cargo's own reason rather than
+    # just "1 != 0".
     check(
-        "the same package resolves once it declares its own workspace",
-        resolves(nested_tree(d, package_declares_workspace=True)),
-        True,
+        "the same tree formats once the package declares its own workspace",
+        (status, output.strip()[:200]),
+        (0, ""),
     )
 
 print()
