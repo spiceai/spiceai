@@ -24,15 +24,16 @@ use crate::graphql::{
 };
 use async_trait::async_trait;
 use data_components::rate_limit::RateLimiter;
+use data_connector_api::{
+    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
+    DataConnectorResult, NewDataConnectorResult,
+};
 use data_http_rate_control as http_rate_control;
 use data_http_rate_control::{
     HttpRateControlMetricSource, HttpRateControlMetrics, HttpRateControlMetricsProvider,
 };
 use datafusion::datasource::TableProvider;
-use runtime::dataconnector::{
-    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
-    DataConnectorResult, NewDataConnectorResult, default_spice_client,
-};
+use runtime::dataconnector::default_spice_client;
 use runtime_component::dataset::DatasetSpec;
 use runtime_metrics::component::MetricsProvider;
 use runtime_parameters::{ParameterSpec, Parameters};
@@ -543,10 +544,10 @@ mod tests {
     }
 }
 
-// Self-register into runtime's linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
+// Self-register into `data-connector-api`'s linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
 // should see this connector must force-link the crate (`use connector_graphql as _;`) -- a plain
 // Cargo dependency won't link the slice static. See `register_data_connector!` docs.
-runtime::register_data_connector!(
+data_connector_api::register_data_connector!(
     register_graphql_connector,
     GRAPHQL_CONNECTOR_REGISTRATION,
     CONNECTOR_NAME,

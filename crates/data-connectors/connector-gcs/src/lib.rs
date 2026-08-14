@@ -15,12 +15,12 @@ limitations under the License.
 */
 
 use app::App;
-use runtime::dataconnector::listing::{
+use data_connector_api::listing::{
     LISTING_TABLE_PARAMETERS, ListingTableConnector, ObjectVersionType, build_fragments,
     object_store_timeout_message,
 };
-use runtime::dataconnector::parameters::{Validator, gcs::GcsAuthValidator};
-use runtime::dataconnector::{
+use data_connector_api::parameters::{Validator, gcs::GcsAuthValidator};
+use data_connector_api::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult,
 };
@@ -43,7 +43,7 @@ const GCS_DOCS: &str = "https://spiceai.org/docs/components/data-connectors/gcs"
 static VALIDATORS: LazyLock<
     Vec<
         Box<
-            dyn Validator<Error = runtime::dataconnector::parameters::gcs::Error>
+            dyn Validator<Error = data_connector_api::parameters::gcs::Error>
                 + Send
                 + Sync
                 + 'static,
@@ -149,7 +149,7 @@ impl DataConnectorFactory for GoogleCloudStorageFactory {
     fn create(
         &self,
         mut params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = runtime::dataconnector::NewDataConnectorResult> + Send>> {
+    ) -> Pin<Box<dyn Future<Output = data_connector_api::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             // Run all validators
             for validator in VALIDATORS.iter() {
@@ -209,7 +209,7 @@ impl ListingTableConnector for GoogleCloudStorage {
         let mut gcs_url =
             Url::parse(url)
                 .boxed()
-                .context(runtime::dataconnector::InvalidConfigurationSnafu {
+                .context(data_connector_api::InvalidConfigurationSnafu {
                     dataconnector: format!("{self}"),
                     message: format!("The specified URL is not valid: {url}. Ensure the URL is valid and try again. For details, visit: https://spiceai.org/docs/components/data-connectors/{PREFIX}#from"),
                     connector_component: ConnectorComponent::from(dataset)
@@ -324,10 +324,10 @@ pub fn factory() -> Arc<dyn DataConnectorFactory> {
     GoogleCloudStorageFactory::new_arc()
 }
 
-// Self-register into runtime's linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
+// Self-register into `data-connector-api`'s linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
 // should see this connector must force-link the crate (`use connector_gcs as _;`) -- a plain
 // Cargo dependency won't link the slice static. See `register_data_connector!` docs.
-runtime::register_data_connector!(
+data_connector_api::register_data_connector!(
     register_gcs_connector,
     GCS_CONNECTOR_REGISTRATION,
     CONNECTOR_NAME,

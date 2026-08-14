@@ -10,6 +10,7 @@ description = "Git data connector for Spice.ai runtime"
 arrow.workspace = true
 async-trait.workspace = true
 dashmap = "6.1"
+data-connector-api = { path = "../../data-connector-api" }
 data_components = { path = "../../data_components" }
 datafusion.workspace = true
 git2.workspace = true

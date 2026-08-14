@@ -18,6 +18,10 @@ use async_trait::async_trait;
 use data_components::cdc::{InitialSnapshotMode, InvalidCheckpointBehavior};
 use data_components::inferred_schema::InferredSchema;
 use data_components::mysql_replication::{ReplicationMetrics, ReplicationMetricsCollector};
+use data_connector_api::{
+    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
+    DataConnectorResult, NewDataConnectorResult, parameters::ConnectorContext,
+};
 use datafusion::datasource::TableProvider;
 use datafusion::sql::sqlparser::dialect::MySqlDialect;
 use datafusion_table_providers::mysql::MySQLTableFactory;
@@ -28,10 +32,6 @@ use datafusion_table_providers::sql::db_connection_pool::{
 };
 use mysql_async::{Metrics, prelude::Queryable};
 use opentelemetry::KeyValue;
-use runtime::dataconnector::{
-    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
-    DataConnectorResult, NewDataConnectorResult, parameters::ConnectorContext,
-};
 use runtime_api_types::v1::ComponentType;
 use runtime_component::dataset::DatasetSpec;
 use runtime_metrics::component::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback};
@@ -867,10 +867,10 @@ pub fn factory() -> Arc<dyn DataConnectorFactory> {
     MySQLFactory::new_arc()
 }
 
-// Self-register into runtime's linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
+// Self-register into `data-connector-api`'s linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
 // should see this connector must force-link the crate (`use connector_mysql as _;`) -- a plain
 // Cargo dependency won't link the slice static. See `register_data_connector!` docs.
-runtime::register_data_connector!(
+data_connector_api::register_data_connector!(
     register_mysql_connector,
     MYSQL_CONNECTOR_REGISTRATION,
     CONNECTOR_NAME,

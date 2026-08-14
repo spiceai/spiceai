@@ -17,15 +17,15 @@ limitations under the License.
 use async_trait::async_trait;
 use data_components::Read;
 use data_components::delta_lake::DeltaTableFactory;
+use data_connector_api::listing::build_table_parquet_options;
+use data_connector_api::{
+    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
+    DataConnectorResult, NewDataConnectorResult,
+};
 use datafusion::config::TableParquetOptions;
 use datafusion::datasource::TableProvider;
 use datafusion::datasource::listing::ListingTableUrl;
 use datafusion::execution::runtime_env::RuntimeEnv;
-use runtime::dataconnector::listing::build_table_parquet_options;
-use runtime::dataconnector::{
-    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
-    DataConnectorResult, NewDataConnectorResult,
-};
 use runtime_component::dataset::DatasetSpec;
 use runtime_parameters::{ParameterSpec, Parameters};
 use secrecy::ExposeSecret;
@@ -344,10 +344,10 @@ mod tests {
     }
 }
 
-// Self-register into runtime's linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
+// Self-register into `data-connector-api`'s linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
 // should see this connector must force-link the crate (`use connector_delta_lake as _;`) -- a plain
 // Cargo dependency won't link the slice static. See `register_data_connector!` docs.
-runtime::register_data_connector!(
+data_connector_api::register_data_connector!(
     register_delta_lake_connector,
     DELTA_LAKE_CONNECTOR_REGISTRATION,
     CONNECTOR_NAME,

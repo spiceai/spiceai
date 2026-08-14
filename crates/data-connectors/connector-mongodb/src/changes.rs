@@ -24,6 +24,7 @@ use data_components::cdc::{
     build_ready_signal_envelope, wrap_data_as_change_batch,
 };
 use data_connector_api::federated::FederatedTableProvider;
+use data_connector_api::parameters::ConnectorContext;
 use data_connector_api::schema_projection::{ProjectionPolicy, parse_schema_projection};
 use datafusion::{
     arrow::datatypes::SchemaRef, datasource::TableProvider,
@@ -37,10 +38,7 @@ use mongodb::{
     change_stream::{ChangeStream, event::ChangeStreamEvent, event::ResumeToken},
     options::FullDocumentType,
 };
-use runtime::{
-    component::dataset::acceleration::{Acceleration, Engine, OnConflictBehavior},
-    dataconnector::parameters::ConnectorContext,
-};
+use runtime::component::dataset::acceleration::{Acceleration, Engine, OnConflictBehavior};
 use runtime_checkpoint_api::mongodb::{MongoCheckpointMetadata, MongoCheckpointStore};
 use runtime_component::dataset::DatasetSpec;
 use runtime_parameters::{ExposedParamLookup, Parameters};

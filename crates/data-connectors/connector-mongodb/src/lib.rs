@@ -30,16 +30,16 @@ use async_trait::async_trait;
 use data_components::inferred_schema::{InferredIndex, InferredSchema, InferredSortColumn};
 use data_connector_api::federated::FederatedTableProvider;
 use data_connector_api::schema_projection::{ProjectionPolicy, parse_schema_projection};
+use data_connector_api::{
+    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
+    DataConnectorResult, parameters::ConnectorContext,
+};
 use datafusion::datasource::TableProvider;
 use datafusion_table_providers::mongodb::{
     Error as MongoDBError, MongoDBTableFactory, connection_pool::MongoDBConnectionPool,
 };
 use mongodb::bson::{Bson, Document, doc};
 use runtime::component::dataset::acceleration::RefreshMode;
-use runtime::dataconnector::{
-    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
-    DataConnectorResult, parameters::ConnectorContext,
-};
 use runtime_component::dataset::DatasetSpec;
 use runtime_parameters::{ParameterSpec, Parameters};
 use secrecy::ExposeSecret;
@@ -182,7 +182,7 @@ impl DataConnectorFactory for MongoDBFactory {
     fn create(
         &self,
         mut params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = runtime::dataconnector::NewDataConnectorResult> + Send>> {
+    ) -> Pin<Box<dyn Future<Output = data_connector_api::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             // If a full connection_string is provided, warn about ignored connection details.
             if params.parameters.get("connection_string").ok().is_some() {
@@ -1144,10 +1144,10 @@ mod inferred_schema_tests {
     }
 }
 
-// Self-register into runtime's linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
+// Self-register into `data-connector-api`'s linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
 // should see this connector must force-link the crate (`use connector_mongodb as _;`) -- a plain
 // Cargo dependency won't link the slice static. See `register_data_connector!` docs.
-runtime::register_data_connector!(
+data_connector_api::register_data_connector!(
     register_mongodb_connector,
     MONGODB_CONNECTOR_REGISTRATION,
     CONNECTOR_NAME,

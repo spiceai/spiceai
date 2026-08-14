@@ -1948,13 +1948,13 @@ impl ListingTableConnector for HttpListingConnector {
     }
 }
 
-register_data_connector!(
+data_connector_api::register_data_connector!(
     register_http_connector,
     REGISTER_HTTP_CONNECTOR,
     "http",
     HttpsFactory
 );
-register_data_connector!(
+data_connector_api::register_data_connector!(
     register_https_connector,
     REGISTER_HTTPS_CONNECTOR,
     "https",

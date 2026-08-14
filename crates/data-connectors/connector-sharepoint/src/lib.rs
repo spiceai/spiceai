@@ -26,7 +26,7 @@ limitations under the License.
 //!
 //! - **Object-store tabular / blob**: `from: sharepoint://me/Documents/...`.
 //!   Delegates to [`SharepointListingConnector`] which implements
-//!   [`runtime::dataconnector::listing::ListingTableConnector`]. DataFusion's
+//!   [`data_connector_api::listing::ListingTableConnector`]. DataFusion's
 //!   `ListingTable` provides `SELECT`, `INSERT INTO`, `COPY TO`, `COPY FROM`
 //!   for CSV/JSON/Parquet; binary formats (PDF, PPTX, etc.) go through the
 //!   `ObjectStore` as raw bytes. Writes create new versions by default —
@@ -49,18 +49,18 @@ use crate::sharepoint::table::SharepointTableProvider;
 use crate::sharepoint::url::DriveRef;
 use app::App;
 use async_trait::async_trait;
+use data_connector_api::listing::{
+    LISTING_TABLE_PARAMETERS, ListingTableConnector, ObjectVersionType,
+};
+use data_connector_api::{
+    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
+    DataConnectorResult, NewDataConnectorResult,
+};
 use datafusion::datasource::TableProvider;
 use datafusion::execution::context::SessionContext;
 use datafusion::execution::runtime_env::RuntimeEnv;
 use document_parse::DocumentParser;
 use graph_rs_sdk::GraphClient;
-use runtime::dataconnector::listing::{
-    LISTING_TABLE_PARAMETERS, ListingTableConnector, ObjectVersionType,
-};
-use runtime::dataconnector::{
-    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
-    DataConnectorResult, NewDataConnectorResult,
-};
 use runtime_component::dataset::DatasetSpec;
 use runtime_parameters::{ParameterSpec, Parameters};
 use secrecy::SecretString;
@@ -1055,10 +1055,10 @@ mod tests {
     }
 }
 
-// Self-register into runtime's linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
+// Self-register into `data-connector-api`'s linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
 // should see this connector must force-link the crate (`use connector_sharepoint as _;`) -- a plain
 // Cargo dependency won't link the slice static. See `register_data_connector!` docs.
-runtime::register_data_connector!(
+data_connector_api::register_data_connector!(
     register_sharepoint_connector,
     SHAREPOINT_CONNECTOR_REGISTRATION,
     CONNECTOR_NAME,

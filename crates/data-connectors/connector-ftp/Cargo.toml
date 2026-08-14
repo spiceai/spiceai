@@ -7,6 +7,7 @@ license-file.workspace = true
 description = "FTP data connector for Spice.ai runtime"
 
 [dependencies]
+data-connector-api = { path = "../../data-connector-api" }
 linkme.workspace = true
 paste.workspace = true
 runtime = { path = "../../runtime" }

@@ -277,4 +277,4 @@ impl DisplayAs for SinkDataSink {
     }
 }
 
-register_data_connector!("sink", SinkConnectorFactory);
+data_connector_api::register_data_connector!("sink", SinkConnectorFactory);

@@ -21,6 +21,7 @@ license-file.workspace = true
 description = "GitHub data connector for Spice.ai runtime"
 
 [dependencies]
+data-connector-api = { path = "../../data-connector-api" }
 linkme.workspace = true
 app = { path = "../../app" }
 arrow.workspace = true

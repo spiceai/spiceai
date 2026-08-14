@@ -9,6 +9,7 @@ description = "Dremio data connector for Spice.ai runtime"
 [dependencies]
 arrow.workspace = true
 async-trait.workspace = true
+data-connector-api = { path = "../../data-connector-api" }
 data_components = { path = "../../data_components" }
 datafusion.workspace = true
 datafusion-federation.workspace = true

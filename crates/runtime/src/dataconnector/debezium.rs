@@ -345,7 +345,7 @@ impl DataConnectorFactory for DebeziumFactory {
     }
 }
 
-register_data_connector!("debezium", DebeziumFactory);
+data_connector_api::register_data_connector!("debezium", DebeziumFactory);
 
 #[async_trait]
 impl DataConnector for Debezium {

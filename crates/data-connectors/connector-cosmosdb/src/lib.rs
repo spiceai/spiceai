@@ -38,7 +38,7 @@ use datafusion_table_providers::UnsupportedTypeAction as DFUnsupportedTypeAction
 use opentelemetry::KeyValue;
 use tokio::sync::Semaphore;
 
-use runtime::dataconnector::{
+use data_connector_api::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
 };
 use runtime_api_types::v1::ComponentType;
@@ -195,7 +195,7 @@ impl DataConnectorFactory for CosmosDBFactory {
     fn create(
         &self,
         params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = runtime::dataconnector::NewDataConnectorResult> + Send>> {
+    ) -> Pin<Box<dyn Future<Output = data_connector_api::NewDataConnectorResult> + Send>> {
         let unsupported_type_action = params.unsupported_type_action;
         Box::pin(async move {
             let conn = CosmosDB {
@@ -444,10 +444,10 @@ pub fn factory() -> Arc<dyn DataConnectorFactory> {
     CosmosDBFactory::new_arc()
 }
 
-// Self-register into runtime's linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
+// Self-register into `data-connector-api`'s linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
 // should see this connector must force-link the crate (`use connector_cosmosdb as _;`) -- a plain
 // Cargo dependency won't link the slice static. See `register_data_connector!` docs.
-runtime::register_data_connector!(
+data_connector_api::register_data_connector!(
     register_cosmosdb_connector,
     COSMOSDB_CONNECTOR_REGISTRATION,
     CONNECTOR_NAME,

@@ -25,6 +25,7 @@ description = "Oracle data connector for Spice.ai runtime"
 [dependencies]
 async-trait.workspace = true
 base64.workspace = true
+data-connector-api = { path = "../../data-connector-api" }
 data_components = { path = "../../data_components", features = ["oracle"] }
 datafusion.workspace = true
 linkme.workspace = true

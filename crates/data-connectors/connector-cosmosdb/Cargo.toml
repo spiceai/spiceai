@@ -8,6 +8,7 @@ description = "Azure Cosmos DB data connector for Spice.ai runtime"
 
 [dependencies]
 arrow.workspace = true
+data-connector-api = { path = "../../data-connector-api" }
 linkme.workspace = true
 async-trait.workspace = true
 azure_core = "0.31.0"

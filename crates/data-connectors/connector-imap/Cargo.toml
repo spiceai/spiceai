@@ -11,6 +11,7 @@ arrow.workspace = true
 async-trait.workspace = true
 charset.workspace = true
 chrono.workspace = true
+data-connector-api = { path = "../../data-connector-api" }
 data_components = { path = "../../data_components" }
 datafusion.workspace = true
 imap.workspace = true

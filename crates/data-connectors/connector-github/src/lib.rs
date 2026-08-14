@@ -62,7 +62,7 @@ use token_provider::{StaticTokenProvider, TokenProvider};
 use tokio::sync::{Mutex, RwLock, Semaphore};
 use url::Url;
 
-use runtime::dataconnector::{
+use data_connector_api::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult, NewDataConnectorResult,
 };
@@ -463,7 +463,7 @@ impl Github {
         let connector_component_name = format!("{}", table_args.get_component());
         let graphql_values = table_args.get_graphql_values();
         let client = self.create_graphql_client(&table_args).await.context(
-            runtime::dataconnector::UnableToGetReadProviderSnafu {
+            data_connector_api::UnableToGetReadProviderSnafu {
                 dataconnector: "github".to_string(),
                 connector_component: table_args.get_component(),
             },
@@ -505,7 +505,7 @@ impl Github {
             );
 
             let fallback_client = self.create_graphql_client(&table_args).await.context(
-                runtime::dataconnector::UnableToGetReadProviderSnafu {
+                data_connector_api::UnableToGetReadProviderSnafu {
                     dataconnector: "github".to_string(),
                     connector_component: table_args.get_component(),
                 },
@@ -574,7 +574,7 @@ impl Github {
         dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         let client = self.create_rest_client().context(
-            runtime::dataconnector::UnableToGetReadProviderSnafu {
+            data_connector_api::UnableToGetReadProviderSnafu {
                 dataconnector: "github".to_string(),
                 connector_component: ConnectorComponent::from(dataset),
             },
@@ -647,7 +647,7 @@ impl Github {
         let delegate = Arc::new(delegate_provider) as Arc<dyn TableProvider>;
 
         let rest_client = self.create_rest_client().context(
-            runtime::dataconnector::UnableToGetReadProviderSnafu {
+            data_connector_api::UnableToGetReadProviderSnafu {
                 dataconnector: "github".to_string(),
                 connector_component: ConnectorComponent::from(dataset),
             },
@@ -1268,7 +1268,7 @@ impl DataConnector for Github {
             ("workflows", Some(repo)) => {
                 warn_if_provided(pull_request_specific_params, "workflows", &component);
 
-                let client = self.create_rest_client().context(runtime::dataconnector::UnableToGetReadProviderSnafu {
+                let client = self.create_rest_client().context(data_connector_api::UnableToGetReadProviderSnafu {
                     dataconnector: "github".to_string(),
                     connector_component: component.clone(),
                 })?;
@@ -1401,7 +1401,7 @@ pub fn parse_globs(
         let trimmed_pattern = pattern.trim();
         if !trimmed_pattern.is_empty() {
             builder.add(Glob::new(trimmed_pattern).context(
-                runtime::dataconnector::InvalidGlobPatternSnafu {
+                data_connector_api::InvalidGlobPatternSnafu {
                     pattern,
                     dataconnector: "github".to_string(),
                     connector_component: component.clone(),
@@ -1412,7 +1412,7 @@ pub fn parse_globs(
 
     let glob_set = builder
         .build()
-        .context(runtime::dataconnector::InvalidGlobPatternSnafu {
+        .context(data_connector_api::InvalidGlobPatternSnafu {
             pattern: input,
             dataconnector: "github".to_string(),
             connector_component: component.clone(),
@@ -1903,12 +1903,12 @@ mod tests {
         parse_github_path,
         sanitize_github_validation_body,
     };
+    use data_connector_api::{
+        ConnectorComponent, ConnectorParams, DataConnectorError, DataConnectorFactory,
+    };
     use runtime::Runtime;
     use runtime::component::dataset::builder::DatasetBuilder;
     use runtime::dataconnector::parameters::RuntimeConnectorContext;
-    use runtime::dataconnector::{
-        ConnectorComponent, ConnectorParams, DataConnectorError, DataConnectorFactory,
-    };
     use runtime_parameters::Parameters;
     use runtime_secrets::Secrets;
     use std::sync::Arc;
@@ -1975,9 +1975,7 @@ mod tests {
         }
     }
 
-    fn github_available_permits(
-        connector: &Arc<dyn runtime::dataconnector::DataConnector>,
-    ) -> usize {
+    fn github_available_permits(connector: &Arc<dyn data_connector_api::DataConnector>) -> usize {
         connector
             .as_any()
             .downcast_ref::<Github>()
@@ -2196,10 +2194,10 @@ mod tests {
     }
 }
 
-// Self-register into runtime's linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
+// Self-register into `data-connector-api`'s linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
 // should see this connector must force-link the crate (`use connector_github as _;`) -- a plain
 // Cargo dependency won't link the slice static. See `register_data_connector!` docs.
-runtime::register_data_connector!(
+data_connector_api::register_data_connector!(
     register_github_connector,
     GITHUB_CONNECTOR_REGISTRATION,
     CONNECTOR_NAME,

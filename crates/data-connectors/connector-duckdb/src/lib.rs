@@ -25,6 +25,10 @@ limitations under the License.
 
 use async_trait::async_trait;
 use data_components::Read;
+use data_connector_api::{
+    AnyErrorResult, ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError,
+    DataConnectorFactory, DataConnectorResult,
+};
 use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
 use datafusion_table_providers::UnsupportedTypeAction;
@@ -32,10 +36,6 @@ use datafusion_table_providers::duckdb::DuckDBTableFactory;
 use datafusion_table_providers::sql::db_connection_pool::dbconnection::duckdbconn::is_table_function;
 use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
 use duckdb::AccessMode;
-use runtime::dataconnector::{
-    AnyErrorResult, ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError,
-    DataConnectorFactory, DataConnectorResult,
-};
 use runtime_component::dataset::DatasetSpec;
 use runtime_datafusion::dialect::new_duckdb_dialect;
 use runtime_datafusion::function_support::deny_spice_functions_for_duckdb_table_providers;
@@ -174,7 +174,7 @@ impl DataConnectorFactory for DuckDBFactory {
     fn create(
         &self,
         params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = runtime::dataconnector::NewDataConnectorResult> + Send>> {
+    ) -> Pin<Box<dyn Future<Output = data_connector_api::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             let duckdb_factory =
                 if let Some(db_path) = params.parameters.clone().get("open").expose().ok() {
@@ -264,10 +264,10 @@ impl DataConnector for DuckDB {
     }
 }
 
-// Self-register into runtime's linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
+// Self-register into `data-connector-api`'s linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
 // should see this connector must force-link the crate (`use connector_duckdb as _;`) -- a plain
 // Cargo dependency won't link the slice static. See `register_data_connector!` docs.
-runtime::register_data_connector!(
+data_connector_api::register_data_connector!(
     register_duckdb_connector,
     DUCKDB_CONNECTOR_REGISTRATION,
     CONNECTOR_NAME,

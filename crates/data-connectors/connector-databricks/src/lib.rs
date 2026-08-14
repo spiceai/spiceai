@@ -30,6 +30,10 @@ use data_components::databricks::DatabricksSparkConnect;
 use data_components::databricks::sql_warehouse::DatabricksMetrics;
 use data_components::databricks::{DatabricksDelta, DatabricksSqlWarehouse, sql_warehouse};
 use data_components::unity_catalog::{Endpoint, UnityCatalog as UnityCatalogClient};
+use data_connector_api::{
+    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
+    DataConnectorResult, NewDataConnectorResult,
+};
 use data_http_rate_control as http_rate_control;
 use datafusion::datasource::TableProvider;
 use datafusion::datasource::listing::ListingTableUrl;
@@ -37,10 +41,6 @@ use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::sql::TableReference;
 use opentelemetry::KeyValue;
 use runtime::component::ComponentInitialization;
-use runtime::dataconnector::{
-    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
-    DataConnectorResult, NewDataConnectorResult,
-};
 use runtime::token_providers::databricks::{
     AUTH_MODE_DESCRIPTION, AUTH_MODES, AuthConfigError, AuthCredentials,
     DatabricksM2MTokenProvider, DatabricksU2MTokenProvider,
@@ -2117,10 +2117,10 @@ mod tests {
     }
 }
 
-// Self-register into runtime's linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
+// Self-register into `data-connector-api`'s linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
 // should see this connector must force-link the crate (`use connector_databricks as _;`) -- a plain
 // Cargo dependency won't link the slice static. See `register_data_connector!` docs.
-runtime::register_data_connector!(
+data_connector_api::register_data_connector!(
     register_databricks_connector,
     DATABRICKS_CONNECTOR_REGISTRATION,
     CONNECTOR_NAME,

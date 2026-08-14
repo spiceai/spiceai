@@ -24,16 +24,16 @@ use data_components::cdc::{
 };
 use data_connector_api::federated::FederatedTableProvider;
 use data_connector_api::schema_projection::{ProjectionPolicy, parse_schema_projection};
+use data_connector_api::{
+    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
+    parameters::{ConnectorContext, aws::initiate_config_with_auth_method},
+};
 use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
 use dynamodb_streams::{Checkpoint, Metrics, MetricsCollector};
 use futures::stream::{self, StreamExt};
 use opentelemetry::KeyValue;
 use runtime::component::dataset::acceleration::RefreshMode;
-use runtime::dataconnector::{
-    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
-    parameters::{ConnectorContext, aws::initiate_config_with_auth_method},
-};
 use runtime_api_types::v1::ComponentType;
 use runtime_checkpoint_api::BlobCheckpointStore;
 use runtime_component::dataset::DatasetSpec;
@@ -239,7 +239,7 @@ impl DataConnectorFactory for DynamoDBFactory {
     fn create(
         &self,
         params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = runtime::dataconnector::NewDataConnectorResult> + Send>> {
+    ) -> Pin<Box<dyn Future<Output = data_connector_api::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             let dynamodb = DynamoDB {
                 context: params.context.clone(),
@@ -329,7 +329,7 @@ impl DataConnector for DynamoDB {
             .unwrap_or(Duration::from_secs(0));
 
         let unnest_depth = match self.params.get("unnest_depth").expose() {
-            ExposedParamLookup::Present(unnest_depth_str) => Some(usize::from_str(unnest_depth_str).boxed().context(runtime::dataconnector::InvalidConfigurationSnafu {
+            ExposedParamLookup::Present(unnest_depth_str) => Some(usize::from_str(unnest_depth_str).boxed().context(data_connector_api::InvalidConfigurationSnafu {
                 dataconnector: "dynamodb".to_string(),
                 message: format!(
                     "DynamoDB parameter 'unnest_depth' must be an integer, not {unnest_depth_str}"),
@@ -348,7 +348,7 @@ impl DataConnector for DynamoDB {
         {
             SEGMENTS_AUTO_STR => None,
             config_segments_str => {
-                let config_segments = usize::from_str(config_segments_str).boxed().context(runtime::dataconnector::InvalidConfigurationSnafu {
+                let config_segments = usize::from_str(config_segments_str).boxed().context(data_connector_api::InvalidConfigurationSnafu {
                     dataconnector: "dynamodb".to_string(),
                     message: format!(
                         "DynamoDB parameter 'scan_segments' must be either an integer > 0 or 'auto', not {config_segments_str}"),

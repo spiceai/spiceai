@@ -24,6 +24,7 @@ description = "MS SQL Server data connector for Spice.ai runtime"
 
 [dependencies]
 async-trait.workspace = true
+data-connector-api = { path = "../../data-connector-api" }
 data_components = { path = "../../data_components", features = ["mssql"] }
 datafusion.workspace = true
 linkme.workspace = true

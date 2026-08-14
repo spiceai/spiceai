@@ -30,10 +30,10 @@ use data_components::oracle::OracleTableProvider;
 use data_components::oracle::connection::{
     OracleConnectionParams, OracleConnectionPool, OracleDirectConnectionParamsBuilder,
 };
-use datafusion::datasource::TableProvider;
-use runtime::dataconnector::{
+use data_connector_api::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorFactory, DataConnectorResult,
 };
+use datafusion::datasource::TableProvider;
 use runtime_component::dataset::DatasetSpec;
 use runtime_parameters::{ParameterSpec, Parameters};
 use snafu::{ResultExt, Snafu};
@@ -275,7 +275,7 @@ impl DataConnectorFactory for OracleFactory {
     fn create(
         &self,
         params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = runtime::dataconnector::NewDataConnectorResult> + Send>> {
+    ) -> Pin<Box<dyn Future<Output = data_connector_api::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             Ok(Arc::new(Oracle::new(&params.parameters).await?) as Arc<dyn DataConnector>)
         })
@@ -309,14 +309,14 @@ enum ReadProviderError {
     },
 }
 
-impl From<ReadProviderError> for runtime::dataconnector::DataConnectorError {
+impl From<ReadProviderError> for data_connector_api::DataConnectorError {
     fn from(err: ReadProviderError) -> Self {
         match err {
             ReadProviderError::UnableToGetReadProvider {
                 dataconnector,
                 connector_component,
                 source,
-            } => runtime::dataconnector::DataConnectorError::UnableToGetReadProvider {
+            } => data_connector_api::DataConnectorError::UnableToGetReadProvider {
                 dataconnector: dataconnector.to_string(),
                 connector_component,
                 source,
@@ -347,10 +347,10 @@ impl DataConnector for Oracle {
     }
 }
 
-// Self-register into runtime's linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
+// Self-register into `data-connector-api`'s linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
 // should see this connector must force-link the crate (`use connector_oracle as _;`) -- a plain
 // Cargo dependency won't link the slice static. See `register_data_connector!` docs.
-runtime::register_data_connector!(
+data_connector_api::register_data_connector!(
     register_oracle_connector,
     ORACLE_CONNECTOR_REGISTRATION,
     CONNECTOR_NAME,

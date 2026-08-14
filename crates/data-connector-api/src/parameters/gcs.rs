@@ -88,12 +88,12 @@ impl Validator for GcsAuthValidator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::builder::RuntimeBuilder;
-    use crate::component::dataset::builder::DatasetBuilder;
-    use crate::dataconnector::ConnectorComponent;
-    use crate::parameters::{ParameterSpec, Parameters};
+    use crate::ConnectorComponent;
     use app::AppBuilder;
     use datafusion_table_providers::util::secrets::to_secret_map;
+    use runtime::builder::RuntimeBuilder;
+    use runtime::component::dataset::builder::DatasetBuilder;
+    use runtime_parameters::{ParameterSpec, Parameters};
     use std::collections::HashMap;
     use std::sync::Arc;
     use tokio::runtime::Handle;

@@ -1,5 +1,5 @@
 [package]
-description = "The data-connector contract shared by the Spice runtime and every connector: the component configuration a connector is built for, and the errors it reports."
+description = "The data-connector contract shared by the Spice runtime and every connector: the `DataConnector` trait and its factory, the component configuration a connector is built for, the runtime capabilities it is handed, and the errors it reports."
 edition.workspace = true
 exclude.workspace = true
 homepage.workspace = true
@@ -10,14 +10,55 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+app = { path = "../app" }
+arrow = { workspace = true }
+arrow-schema = { workspace = true, features = ["serde"] }
+arrow_tools = { path = "../arrow_tools" }
 async-trait.workspace = true
+aws-config.workspace = true
+aws-sdk-credential-bridge = { path = "../aws-sdk-credential-bridge" }
+data-connector-types = { path = "../data-connector-types" }
+data-http-rate-control = { path = "../data-http-rate-control" }
 data_components = { path = "../data_components" }
+dataformat-json = { path = "../dataformat-json" }
 datafusion.workspace = true
+datafusion-datasource.workspace = true
+datafusion-expr.workspace = true
+datafusion-table-providers = { workspace = true }
+document_parse = { path = "../document_parse" }
+futures.workspace = true
 globset = { workspace = true }
+itertools.workspace = true
+linkme.workspace = true
+object_store = { workspace = true, features = ["aws", "http", "azure", "gcp"] }
+runtime-checkpoint-api = { path = "../runtime-checkpoint-api" }
 runtime-component = { path = "../runtime-component" }
+runtime-datafusion = { path = "../runtime-datafusion" }
+runtime-metrics = { path = "../runtime-metrics" }
+runtime-object-store = { path = "../runtime-object-store" }
+runtime-parameters = { path = "../runtime-parameters" }
 serde_json.workspace = true
 snafu.workspace = true
+token_provider = { path = "../token_provider" }
 tokio.workspace = true
+tonic.workspace = true
+tracing.workspace = true
+url.workspace = true
+util = { path = "../util", features = ["datafusion"] }
+
+[target.'cfg(not(windows))'.dependencies]
+vortex-datafusion.workspace = true
+
+[dev-dependencies]
+app = { path = "../app" }
+chrono.workspace = true
+paste.workspace = true
+# The listing-connector tests build a `Dataset`, which is bound to a `Runtime`.
+# A dev-dependency does not form a layering edge (the guard exempts them) and
+# cargo permits the cycle, so the tests keep exercising the real component.
+runtime = { path = "../runtime" }
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [lints]
 workspace = true

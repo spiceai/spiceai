@@ -26,12 +26,12 @@ use crate::imap::{
     session::{ImapAuthMode, ImapAuthModeParameter, ImapSSLMode, ImapSession},
 };
 use async_trait::async_trait;
-use datafusion::datasource::TableProvider;
-use regex::Regex;
-use runtime::dataconnector::{
+use data_connector_api::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult, NewDataConnectorResult,
 };
+use datafusion::datasource::TableProvider;
+use regex::Regex;
 use runtime_component::dataset::DatasetSpec;
 use runtime_parameters::ParameterSpec;
 use secrecy::SecretString;
@@ -311,10 +311,10 @@ pub fn factory() -> Arc<dyn DataConnectorFactory> {
     ImapFactory::new_arc()
 }
 
-// Self-register into runtime's linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
+// Self-register into `data-connector-api`'s linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
 // should see this connector must force-link the crate (`use connector_imap as _;`) -- a plain
 // Cargo dependency won't link the slice static. See `register_data_connector!` docs.
-runtime::register_data_connector!(
+data_connector_api::register_data_connector!(
     register_imap_connector,
     IMAP_CONNECTOR_REGISTRATION,
     CONNECTOR_NAME,

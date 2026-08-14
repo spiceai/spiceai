@@ -316,6 +316,12 @@ impl ListingTableConnector for S3 {
         Some(ObjectVersionType::Version)
     }
 
+    /// S3 returns a stable ETag (and, with versioning enabled, a version ID) on
+    /// `HEAD`, so an unchanged object can be served from cache.
+    fn supports_single_file_version_cache(&self) -> bool {
+        true
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -415,7 +421,7 @@ impl ListingTableConnector for S3 {
     }
 }
 
-register_data_connector!("s3", S3Factory);
+data_connector_api::register_data_connector!("s3", S3Factory);
 
 #[cfg(test)]
 mod tests {

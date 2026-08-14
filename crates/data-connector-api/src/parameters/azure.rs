@@ -17,7 +17,7 @@ limitations under the License.
 use snafu::prelude::*;
 use tonic::async_trait;
 
-use crate::parameters::ParamLookup;
+use runtime_parameters::ParamLookup;
 
 use super::{ConnectorParams, Validator};
 
@@ -230,12 +230,12 @@ impl Validator for AzureSasTokenNormalizer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::builder::RuntimeBuilder;
-    use crate::component::dataset::builder::DatasetBuilder;
-    use crate::dataconnector::ConnectorComponent;
-    use crate::parameters::{ParameterSpec, Parameters};
+    use crate::ConnectorComponent;
     use app::AppBuilder;
     use datafusion_table_providers::util::secrets::to_secret_map;
+    use runtime::builder::RuntimeBuilder;
+    use runtime::component::dataset::builder::DatasetBuilder;
+    use runtime_parameters::{ParameterSpec, Parameters};
     use std::collections::HashMap;
     use std::sync::Arc;
     use tokio::runtime::Handle;

@@ -27,6 +27,10 @@ use data_components::federation::create_spice_federated_table_provider;
 use data_components::inferred_schema::{
     InferredColumnStats, InferredIndex, InferredSchema, InferredSortColumn,
 };
+use data_connector_api::{
+    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
+    DataConnectorResult, NewDataConnectorResult, parameters::ConnectorContext,
+};
 use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
 use datafusion::sql::unparser::dialect::PostgreSqlDialect;
@@ -37,10 +41,6 @@ use datafusion_table_providers::sql::db_connection_pool::{
     postgrespool::{self, PostgresConnectionPool},
 };
 use datafusion_table_providers::sql::sql_provider_datafusion::{SqlTable, expr::Engine};
-use runtime::dataconnector::{
-    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
-    DataConnectorResult, NewDataConnectorResult, parameters::ConnectorContext,
-};
 use runtime_component::dataset::DatasetSpec;
 use runtime_datafusion::function_support::deny_spice_functions_for_postgres_table_providers;
 use runtime_metrics::component::MetricsProvider;
@@ -1695,10 +1695,10 @@ mod inferred_schema_tests {
     }
 }
 
-// Self-register into runtime's linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
+// Self-register into `data-connector-api`'s linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
 // should see this connector must force-link the crate (`use connector_postgres as _;`) -- a plain
 // Cargo dependency won't link the slice static. See `register_data_connector!` docs.
-runtime::register_data_connector!(
+data_connector_api::register_data_connector!(
     register_postgres_connector,
     POSTGRES_CONNECTOR_REGISTRATION,
     CONNECTOR_NAME,

@@ -399,4 +399,4 @@ impl DataConnector for IcebergDataConnector {
     }
 }
 
-register_data_connector!("iceberg", IcebergDataConnectorFactory);
+data_connector_api::register_data_connector!("iceberg", IcebergDataConnectorFactory);

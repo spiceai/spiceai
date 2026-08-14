@@ -125,6 +125,18 @@ runtime = "runtime"
 # interface crates a connector needs (data-connector-api) name a component's
 # configuration without pulling in the orchestrator.
 runtime-component = "shared-utility"
+# The data-connector contract: the `DataConnector` trait and its factory, the
+# link-time registration, the `ConnectorParams`/`ConnectorContext` a connector is
+# handed, the listing-table connector, and the parameter validators. Below
+# `runtime` so a connector names the contract without the orchestrator, and
+# `shared-utility` rather than `extension-utility` because `runtime`'s own
+# in-body connectors (file/s3/https, iceberg, glue) build on it too.
+data-connector-api = "shared-utility"
+# The vocabulary both the contract and the crates a connector builds on need:
+# which component a connector is for, and the errors it reports. Below
+# `data-connector-api` because `data-http-rate-control` reports a
+# `DataConnectorError` and sits below the contract, not above it.
+data-connector-types = "shared-utility"
 # Connector HTTP rate control carved out of the `runtime` crate body: the
 # per-dataset parameters, the process-wide per-origin registry, and its metrics.
 # `shared-utility`, NOT `extension-utility`, even though it is a connector-facing

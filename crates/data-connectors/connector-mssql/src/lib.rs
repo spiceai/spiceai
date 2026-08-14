@@ -28,11 +28,11 @@ use data_components::mssql::connection_manager::SqlServerConnectionManager;
 use data_components::mssql::{
     self, SqlServerTableProvider, connection_manager::SqlServerConnectionPool,
 };
-use datafusion::datasource::TableProvider;
-use runtime::dataconnector::{
+use data_connector_api::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult, NewDataConnectorResult,
 };
+use datafusion::datasource::TableProvider;
 use runtime_component::dataset::DatasetSpec;
 use runtime_parameters::{ParameterSpec, Parameters};
 use snafu::{ResultExt, Snafu};
@@ -274,10 +274,10 @@ impl DataConnector for SqlServer {
     }
 }
 
-// Self-register into runtime's linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
+// Self-register into `data-connector-api`'s linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
 // should see this connector must force-link the crate (`use connector_mssql as _;`) -- a plain
 // Cargo dependency won't link the slice static. See `register_data_connector!` docs.
-runtime::register_data_connector!(
+data_connector_api::register_data_connector!(
     register_mssql_connector,
     MSSQL_CONNECTOR_REGISTRATION,
     CONNECTOR_NAME,

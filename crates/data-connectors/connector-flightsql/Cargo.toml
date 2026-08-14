@@ -10,6 +10,7 @@ description = "FlightSQL data connector for Spice.ai runtime"
 arrow.workspace = true
 arrow-flight = { workspace = true, features = ["flight-sql-experimental"] }
 async-trait.workspace = true
+data-connector-api = { path = "../../data-connector-api" }
 data_components = { path = "../../data_components", features = ["flightsql"] }
 datafusion.workspace = true
 flight_client = { path = "../../flight_client" }

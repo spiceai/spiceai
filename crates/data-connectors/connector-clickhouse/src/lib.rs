@@ -31,15 +31,15 @@ mod pool;
 use async_trait::async_trait;
 use clickhouse_rs::Options;
 use data_components::Read;
+use data_connector_api::{
+    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
+    DataConnectorResult, NewDataConnectorResult,
+};
 use datafusion::datasource::TableProvider;
 use datafusion_table_providers::sql::db_connection_pool::Error as DbConnectionPoolError;
 use factory::ClickhouseTableFactory;
 use ns_lookup::verify_ns_lookup_and_tcp_connect;
 use pool::ClickhouseConnectionPool;
-use runtime::dataconnector::{
-    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
-    DataConnectorResult, NewDataConnectorResult,
-};
 use runtime_component::dataset::DatasetSpec;
 use runtime_parameters::{ParamLookup, ParameterSpec, Parameters};
 use runtime_udfs_api::deny_spice_specific_functions;
@@ -482,10 +482,10 @@ mod tests {
     }
 }
 
-// Self-register into runtime's linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
+// Self-register into `data-connector-api`'s linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
 // should see this connector must force-link the crate (`use connector_clickhouse as _;`) -- a plain
 // Cargo dependency won't link the slice static. See `register_data_connector!` docs.
-runtime::register_data_connector!(
+data_connector_api::register_data_connector!(
     register_clickhouse_connector,
     CLICKHOUSE_CONNECTOR_REGISTRATION,
     CONNECTOR_NAME,

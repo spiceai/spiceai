@@ -27,6 +27,7 @@ arrow.workspace = true
 arrow-odbc.workspace = true
 async-stream.workspace = true
 async-trait.workspace = true
+data-connector-api = { path = "../../data-connector-api" }
 datafusion.workspace = true
 data_components = { path = "../../data_components", features = ["federation"] }
 datafusion-table-providers.workspace = true

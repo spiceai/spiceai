@@ -24,6 +24,7 @@ description = "DuckDB data connector for Spice.ai runtime"
 
 [dependencies]
 async-trait.workspace = true
+data-connector-api = { path = "../../data-connector-api" }
 data_components = { path = "../../data_components", features = ["duckdb"] }
 datafusion.workspace = true
 datafusion-table-providers = { workspace = true, features = ["duckdb"] }

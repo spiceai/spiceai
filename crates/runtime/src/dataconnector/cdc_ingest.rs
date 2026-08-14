@@ -353,7 +353,7 @@ impl DataConnectorFactory for CdcIngestFactory {
     }
 }
 
-crate::register_data_connector!("cdc", CdcIngestFactory);
+data_connector_api::register_data_connector!("cdc", CdcIngestFactory);
 
 #[async_trait]
 impl DataConnector for CdcIngest {

@@ -30,6 +30,7 @@ bigdecimal.workspace = true
 chrono.workspace = true
 chrono-tz = "0.8.6"
 clickhouse-rs.workspace = true
+data-connector-api = { path = "../../data-connector-api" }
 data_components = { path = "../../data_components", features = ["federation"] }
 datafusion.workspace = true
 datafusion-table-providers.workspace = true

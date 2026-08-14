@@ -14,12 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::parameters::{ParamLookup, Parameters};
 use aws_config::ConfigLoader;
 use aws_sdk_credential_bridge::{
     initiate_config_auth_iam_env, initiate_config_auth_iam_metadata, initiate_config_auth_key,
     initiate_config_default_auth,
 };
+use runtime_parameters::{ParamLookup, Parameters};
 use snafu::prelude::*;
 use tonic::async_trait;
 
@@ -110,7 +110,7 @@ pub enum Error {
     InvalidIamRoleSource { key: String, iam_source: String },
 }
 
-pub(crate) struct S3EndpointValidator;
+pub struct S3EndpointValidator;
 
 #[async_trait]
 impl Validator for S3EndpointValidator {
@@ -139,7 +139,7 @@ impl Validator for S3EndpointValidator {
     }
 }
 
-pub(crate) struct RegionValidator;
+pub struct RegionValidator;
 
 #[async_trait]
 impl Validator for RegionValidator {
@@ -172,7 +172,7 @@ impl Validator for RegionValidator {
     }
 }
 
-pub(crate) struct AuthValidator;
+pub struct AuthValidator;
 
 #[async_trait]
 impl Validator for AuthValidator {

@@ -7,6 +7,7 @@ license-file.workspace = true
 description = "DuckLake data connector for Spice.ai runtime"
 
 [dependencies]
+data-connector-api = { path = "../../data-connector-api" }
 linkme.workspace = true
 async-trait.workspace = true
 data_components = { path = "../../data_components", features = ["duckdb"] }

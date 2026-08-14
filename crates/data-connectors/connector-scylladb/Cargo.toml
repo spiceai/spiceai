@@ -26,6 +26,7 @@ description = "ScyllaDB data connector for Spice.ai runtime"
 arrow.workspace = true
 async-stream.workspace = true
 async-trait.workspace = true
+data-connector-api = { path = "../../data-connector-api" }
 data_components = { path = "../../data_components" }
 datafusion.workspace = true
 datafusion-table-providers = { workspace = true, features = ["federation"] }

@@ -25,18 +25,16 @@ use data_components::{
     kafka::{KafkaConfig, KafkaConsumer, KafkaMetrics, KafkaOffset, KafkaOffsetCommitHook},
 };
 use data_connector_api::federated::FederatedTableProvider;
+use data_connector_api::{
+    ConnectorComponent, DataConnector, DataConnectorError, DataConnectorFactory,
+    DataConnectorResult, InvalidConfigurationNoSourceSnafu, NewDataConnectorResult,
+    UnableToGetReadProviderSnafu,
+    parameters::{ConnectorContext, ConnectorParams},
+};
 use dataformat_json::{SpiceJsonOptions, unnest_struct_schema};
 use datafusion::catalog::TableProvider;
 use futures::StreamExt;
-use runtime::{
-    component::dataset::acceleration::RefreshMode,
-    dataconnector::{
-        ConnectorComponent, DataConnector, DataConnectorError, DataConnectorFactory,
-        DataConnectorResult, InvalidConfigurationNoSourceSnafu, NewDataConnectorResult,
-        UnableToGetReadProviderSnafu,
-        parameters::{ConnectorContext, ConnectorParams},
-    },
-};
+use runtime::component::dataset::acceleration::RefreshMode;
 use runtime_api_types::v1::ComponentType;
 use runtime_checkpoint_api::{
     CheckpointError,
@@ -824,10 +822,10 @@ pub fn factory() -> Arc<dyn DataConnectorFactory> {
     KafkaFactory::new_arc()
 }
 
-// Self-register into runtime's linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
+// Self-register into `data-connector-api`'s linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
 // should see this connector must force-link the crate (`use connector_kafka as _;`) -- a plain
 // Cargo dependency won't link the slice static. See `register_data_connector!` docs.
-runtime::register_data_connector!(
+data_connector_api::register_data_connector!(
     register_kafka_connector,
     KAFKA_CONNECTOR_REGISTRATION,
     CONNECTOR_NAME,

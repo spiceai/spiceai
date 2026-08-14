@@ -20,14 +20,14 @@ use arrow_flight::sql::client::FlightSqlServiceClient;
 use async_trait::async_trait;
 use data_components::Read;
 use data_components::flightsql::FlightSQLFactory as DataComponentFlightSQLFactory;
+use data_connector_api::{
+    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
+    DataConnectorResult, NewDataConnectorResult,
+};
 use datafusion::datasource::TableProvider;
 use flight_client::cookie::{CookieService, CookieStore};
 use flight_client::tls::{ClientIdentity, ClientTlsOptions, new_tls_flight_channel_with_options};
 use flight_client::{MAX_DECODING_MESSAGE_SIZE, MAX_ENCODING_MESSAGE_SIZE};
-use runtime::dataconnector::{
-    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
-    DataConnectorResult, NewDataConnectorResult,
-};
 use runtime_component::dataset::DatasetSpec;
 use runtime_parameters::ParameterSpec;
 use runtime_udfs_api::deny_spice_specific_functions;
@@ -314,10 +314,10 @@ pub fn factory() -> Arc<dyn DataConnectorFactory> {
     FlightSQLFactory::new_arc()
 }
 
-// Self-register into runtime's linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
+// Self-register into `data-connector-api`'s linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
 // should see this connector must force-link the crate (`use connector_flightsql as _;`) -- a plain
 // Cargo dependency won't link the slice static. See `register_data_connector!` docs.
-runtime::register_data_connector!(
+data_connector_api::register_data_connector!(
     register_flightsql_connector,
     FLIGHTSQL_CONNECTOR_REGISTRATION,
     CONNECTOR_NAME,

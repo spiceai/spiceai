@@ -24,6 +24,10 @@ use data_components::ducklake::writer::DuckDbFederatedTableWriter;
 use data_components::ducklake::{
     DuckLakeS3Params, build_ducklake_attach_sql, configure_duckdb_httpfs,
 };
+use data_connector_api::{
+    AnyErrorResult, ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError,
+    DataConnectorFactory,
+};
 use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
 use datafusion_table_providers::UnsupportedTypeAction;
@@ -31,10 +35,6 @@ use datafusion_table_providers::duckdb::DuckDBTableFactory;
 use datafusion_table_providers::sql::db_connection_pool::dbconnection::duckdbconn::DuckDbConnection;
 use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
 use duckdb::AccessMode;
-use runtime::dataconnector::{
-    AnyErrorResult, ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError,
-    DataConnectorFactory,
-};
 use runtime_component::dataset::DatasetSpec;
 use runtime_datafusion::dialect::new_duckdb_dialect;
 use runtime_parameters::ParameterSpec;
@@ -269,7 +269,7 @@ impl DataConnectorFactory for DuckLakeFactory {
     fn create(
         &self,
         params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = runtime::dataconnector::NewDataConnectorResult> + Send>> {
+    ) -> Pin<Box<dyn Future<Output = data_connector_api::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             let connection_string: String = params
                 .parameters
@@ -363,12 +363,12 @@ impl DataConnector for DuckLake {
     async fn read_provider(
         &self,
         dataset: &DatasetSpec,
-    ) -> runtime::dataconnector::DataConnectorResult<Arc<dyn TableProvider>> {
+    ) -> data_connector_api::DataConnectorResult<Arc<dyn TableProvider>> {
         let table_ref = self.resolve_table_reference(dataset);
 
         Ok(Read::table_provider(&self.duckdb_factory, table_ref)
             .await
-            .context(runtime::dataconnector::UnableToGetReadProviderSnafu {
+            .context(data_connector_api::UnableToGetReadProviderSnafu {
                 dataconnector: "ducklake",
                 connector_component: ConnectorComponent::from(dataset),
             })?)
@@ -377,12 +377,12 @@ impl DataConnector for DuckLake {
     async fn read_write_provider(
         &self,
         dataset: &DatasetSpec,
-    ) -> Option<runtime::dataconnector::DataConnectorResult<Arc<dyn TableProvider>>> {
+    ) -> Option<data_connector_api::DataConnectorResult<Arc<dyn TableProvider>>> {
         let table_ref = self.resolve_table_reference(dataset);
 
         let read_provider = match Read::table_provider(&self.duckdb_factory, table_ref.clone())
             .await
-            .context(runtime::dataconnector::UnableToGetReadProviderSnafu {
+            .context(data_connector_api::UnableToGetReadProviderSnafu {
                 dataconnector: "ducklake",
                 connector_component: ConnectorComponent::from(dataset),
             }) {
@@ -408,10 +408,10 @@ pub fn factory() -> Arc<dyn DataConnectorFactory> {
     DuckLakeFactory::new_arc()
 }
 
-// Self-register into runtime's linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
+// Self-register into `data-connector-api`'s linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
 // should see this connector must force-link the crate (`use connector_ducklake as _;`) -- a plain
 // Cargo dependency won't link the slice static. See `register_data_connector!` docs.
-runtime::register_data_connector!(
+data_connector_api::register_data_connector!(
     register_ducklake_connector,
     DUCKLAKE_CONNECTOR_REGISTRATION,
     CONNECTOR_NAME,

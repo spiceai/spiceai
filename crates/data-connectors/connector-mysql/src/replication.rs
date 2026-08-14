@@ -37,11 +37,11 @@ use data_components::mysql_replication::{
     StoreError, derive_server_id, process_nonce, start_replication_stream,
 };
 use data_connector_api::federated::FederatedTableProvider;
+use data_connector_api::parameters::ConnectorContext;
 use datafusion::sql::TableReference;
 use futures::StreamExt;
 use mysql_async::{Opts, OptsBuilder, SslOpts};
 use opentelemetry::KeyValue;
-use runtime::dataconnector::parameters::ConnectorContext;
 use runtime_checkpoint_api::mysql_binlog::{MySqlBinlogCheckpoint, MySqlBinlogStore};
 use runtime_component::dataset::DatasetSpec;
 use runtime_metrics::component::{MetricSpec, MetricType, ObserveMetricCallback};

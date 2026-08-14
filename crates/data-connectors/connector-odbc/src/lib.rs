@@ -28,14 +28,14 @@ use crate::odbcconn::ODBCDbConnectionPool;
 use crate::odbcpool::ODBCPool;
 use async_trait::async_trait;
 use data_components::Read;
+use data_connector_api::{
+    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorFactory, DataConnectorResult,
+    NewDataConnectorResult,
+};
 use datafusion::datasource::TableProvider;
 use datafusion::sql::unparser::dialect::{
     CustomDialect, CustomDialectBuilder, DateFieldExtractStyle, DefaultDialect, Dialect,
     IntervalStyle, MySqlDialect, PostgreSqlDialect, SqliteDialect,
-};
-use runtime::dataconnector::{
-    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorFactory, DataConnectorResult,
-    NewDataConnectorResult,
 };
 use runtime_component::dataset::DatasetSpec;
 use runtime_parameters::{ParameterSpec, Parameters};
@@ -318,7 +318,7 @@ where
             Read::table_provider(&self.odbc_factory, dataset.path().into())
                 .await
                 .map_err(|source| {
-                    runtime::dataconnector::DataConnectorError::UnableToGetReadProvider {
+                    data_connector_api::DataConnectorError::UnableToGetReadProvider {
                         dataconnector: "odbc".to_string(),
                         connector_component: ConnectorComponent::from(dataset),
                         source,
@@ -373,10 +373,10 @@ mod test {
     }
 }
 
-// Self-register into runtime's linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
+// Self-register into `data-connector-api`'s linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
 // should see this connector must force-link the crate (`use connector_odbc as _;`) -- a plain
 // Cargo dependency won't link the slice static. See `register_data_connector!` docs.
-runtime::register_data_connector!(
+data_connector_api::register_data_connector!(
     register_odbc_connector,
     ODBC_CONNECTOR_REGISTRATION,
     CONNECTOR_NAME,

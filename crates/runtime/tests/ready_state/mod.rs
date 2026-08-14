@@ -49,12 +49,13 @@ use datafusion_federation::sql::{SQLExecutor, SQLFederationProvider, SQLTableSou
 use datafusion_federation::{FederatedTableProviderAdaptor, sql::RemoteTableRef};
 use futures::{Stream, TryStreamExt};
 
+use data_connector_api::ConnectorParams;
 use runtime::{
     Runtime,
     component::dataset::DatasetSpec,
     dataconnector::{
         self, ConnectorComponent, DataConnector, DataConnectorError, DataConnectorFactory,
-        NewDataConnectorResult, parameters::ConnectorParams,
+        NewDataConnectorResult,
     },
 };
 use runtime_parameters::ParameterSpec;

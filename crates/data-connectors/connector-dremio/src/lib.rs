@@ -17,6 +17,10 @@ limitations under the License.
 use async_trait::async_trait;
 use data_components::ReadWrite;
 use data_components::flight::FlightFactory;
+use data_connector_api::{
+    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
+    DataConnectorResult, NewDataConnectorResult,
+};
 use datafusion::datasource::TableProvider;
 use datafusion::sql::sqlparser::ast::TimezoneInfo;
 use datafusion::sql::sqlparser::ast::WindowFrameBound;
@@ -27,10 +31,6 @@ use datafusion_federation::sql::RemoteTableRef;
 use flight_client::Credentials;
 use flight_client::FlightClient;
 use ns_lookup::verify_endpoint_connection;
-use runtime::dataconnector::{
-    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
-    DataConnectorResult, NewDataConnectorResult,
-};
 use runtime_component::dataset::DatasetSpec;
 use runtime_parameters::ParameterSpec;
 use runtime_udfs_api::deny_spice_specific_functions;
@@ -256,10 +256,10 @@ pub fn factory() -> Arc<dyn DataConnectorFactory> {
     DremioFactory::new_arc()
 }
 
-// Self-register into runtime's linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
+// Self-register into `data-connector-api`'s linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
 // should see this connector must force-link the crate (`use connector_dremio as _;`) -- a plain
 // Cargo dependency won't link the slice static. See `register_data_connector!` docs.
-runtime::register_data_connector!(
+data_connector_api::register_data_connector!(
     register_dremio_connector,
     DREMIO_CONNECTOR_REGISTRATION,
     CONNECTOR_NAME,

@@ -110,4 +110,4 @@ impl DataConnector for LocalPodConnector {
     }
 }
 
-register_data_connector!("localpod", LocalPodFactory);
+data_connector_api::register_data_connector!("localpod", LocalPodFactory);

@@ -29,13 +29,13 @@ use data_components::snowflake::{
     quote_snowflake_table_path,
 };
 use data_components::{Read, ReadWrite};
-use datafusion::datasource::TableProvider;
-use datafusion_table_providers::sql::db_connection_pool::DbConnectionPool;
-use db_connection_pool::snowflakepool::SnowflakeConnectionPool;
-use runtime::dataconnector::{
+use data_connector_api::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult, NewDataConnectorResult,
 };
+use datafusion::datasource::TableProvider;
+use datafusion_table_providers::sql::db_connection_pool::DbConnectionPool;
+use db_connection_pool::snowflakepool::SnowflakeConnectionPool;
 use runtime_component::dataset::DatasetSpec;
 use runtime_parameters::ParameterSpec;
 use runtime_udfs_api::deny_spice_specific_functions;
@@ -483,10 +483,10 @@ mod tests {
     }
 }
 
-// Self-register into runtime's linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
+// Self-register into `data-connector-api`'s linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
 // should see this connector must force-link the crate (`use connector_snowflake as _;`) -- a plain
 // Cargo dependency won't link the slice static. See `register_data_connector!` docs.
-runtime::register_data_connector!(
+data_connector_api::register_data_connector!(
     register_snowflake_connector,
     SNOWFLAKE_CONNECTOR_REGISTRATION,
     CONNECTOR_NAME,

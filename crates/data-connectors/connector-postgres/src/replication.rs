@@ -33,10 +33,10 @@ use data_components::postgres_replication::{
     SchemaEvolutionPolicy, config, start_replication_stream,
 };
 use data_connector_api::federated::FederatedTableProvider;
+use data_connector_api::parameters::ConnectorContext;
 use datafusion::sql::TableReference;
 use futures::StreamExt;
 use opentelemetry::KeyValue;
-use runtime::dataconnector::parameters::ConnectorContext;
 use runtime_api_types::v1::ComponentType;
 use runtime_checkpoint_api::BlobCheckpointStore;
 use runtime_component::dataset::DatasetSpec;

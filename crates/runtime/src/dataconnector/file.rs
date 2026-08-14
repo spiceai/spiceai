@@ -234,7 +234,7 @@ impl ListingTableConnector for File {
     }
 }
 
-register_data_connector!("file", FileFactory);
+data_connector_api::register_data_connector!("file", FileFactory);
 
 fn get_path(dataset: &DatasetSpec) -> PathBuf {
     PathBuf::from(dataset.path())

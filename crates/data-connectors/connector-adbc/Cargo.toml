@@ -21,6 +21,7 @@ license-file.workspace = true
 description = "ADBC (Arrow Database Connectivity) data connector for Spice.ai runtime"
 
 [dependencies]
+data-connector-api = { path = "../../data-connector-api" }
 linkme.workspace = true
 adbc_core.workspace = true
 adbc_driver_manager.workspace = true
