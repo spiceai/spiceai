@@ -42,7 +42,7 @@ use llms::embeddings::Embed;
 use rayon::prelude::*;
 use snafu::ResultExt;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 
 use super::EmbeddingModelStore;
 use crate::udtf::{EmbeddingColumnConfig, EmbeddingInputMode};
@@ -951,16 +951,33 @@ async fn get_vectors_with_chunker(
     Ok((vectors, content_offsets))
 }
 
+/// Rayon thread pools reused across embedding batches, keyed by thread count.
+/// Building a pool spawns OS threads, so it must not happen once per record
+/// batch per column on the in-process embedding path.
+static EMBEDDING_POOLS: LazyLock<Mutex<HashMap<usize, Arc<ThreadPool>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
 fn build_embedding_pool(
     model_parallelism: Option<usize>,
-) -> Result<ThreadPool, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<Arc<ThreadPool>, Box<dyn std::error::Error + Send + Sync>> {
     let parallelism =
         model_parallelism.unwrap_or_else(|| cpu_budget::cpu_budget().embedding_pool_threads());
 
-    rayon::ThreadPoolBuilder::new()
-        .num_threads(parallelism)
-        .build()
-        .map_err(Into::into)
+    let mut pools = EMBEDDING_POOLS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+
+    if let Some(pool) = pools.get(&parallelism) {
+        return Ok(Arc::clone(pool));
+    }
+
+    let pool = Arc::new(
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(parallelism)
+            .build()?,
+    );
+    pools.insert(parallelism, Arc::clone(&pool));
+    Ok(pool)
 }
 
 #[expect(clippy::float_cmp)]
