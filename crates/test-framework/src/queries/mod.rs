@@ -1291,8 +1291,8 @@ pub fn get_tpcds_test_queries(
             if scale_factor.is_some_and(|sf| (sf - 100.0).abs() < f64::EPSILON) =>
         {
             remove_tpcds_query!(
-                queries,
-                78, 97 // SF100 Resources exhausted error https://github.com/spiceai/spiceai/issues/10965
+                queries, 78,
+                97 // SF100 Resources exhausted error https://github.com/spiceai/spiceai/issues/10965
             )
         }
         Some(_) | None => queries,
