@@ -22,6 +22,7 @@ use data_components::cdc::{
     ChangeEnvelope, ChangesStream, CommitChange, CommitError, InitialSnapshotMode,
     InvalidCheckpointBehavior, NoOpCommitter,
 };
+use data_connector_api::federated::FederatedTableProvider;
 use data_connector_api::schema_projection::{ProjectionPolicy, parse_schema_projection};
 use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
@@ -35,7 +36,6 @@ use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     parameters::aws::initiate_config_with_auth_method,
 };
-use runtime::federated::FederatedTable;
 use runtime_api_types::v1::ComponentType;
 use runtime_checkpoint_api::BlobCheckpointStore;
 use runtime_metrics::component::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback};
@@ -455,7 +455,7 @@ impl DataConnector for DynamoDB {
 
     fn changes_stream(
         &self,
-        federated_table: Arc<FederatedTable>,
+        federated_table: Arc<dyn FederatedTableProvider>,
         dataset: &Dataset,
     ) -> Option<ChangesStream> {
         let dataset = dataset.clone();

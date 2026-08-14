@@ -24,8 +24,9 @@ use super::{
     },
 };
 
+use app::App;
+
 use crate::{
-    Runtime,
     component::dataset::Dataset,
     dataconnector::listing::{LISTING_TABLE_PARAMETERS, ObjectVersionType},
 };
@@ -103,21 +104,21 @@ pub enum Error {
 
 pub struct S3 {
     pub(crate) params: Parameters,
-    pub(crate) runtime: Option<Runtime>,
+    pub(crate) app: Option<Arc<App>>,
     pub(crate) tokio_io_runtime: tokio::runtime::Handle,
 }
 
 impl S3 {
-    /// Creates a new `S3` connector with the given parameters, runtime, and I/O runtime handle.
+    /// Creates a new `S3` connector with the given parameters, app, and I/O runtime handle.
     #[must_use]
     pub fn new(
         params: Parameters,
-        runtime: Option<Runtime>,
+        app: Option<Arc<App>>,
         tokio_io_runtime: tokio::runtime::Handle,
     ) -> Self {
         Self {
             params,
-            runtime,
+            app,
             tokio_io_runtime,
         }
     }
@@ -281,10 +282,10 @@ impl DataConnectorFactory for S3Factory {
                 }
             }
 
-            let runtime = params.runtime().map(Arc::unwrap_or_clone);
+            let app = params.app();
             let s3 = S3 {
                 params: params.parameters,
-                runtime,
+                app,
                 tokio_io_runtime: params.io_runtime,
             };
             Ok(Arc::new(s3) as Arc<dyn DataConnector>)
@@ -361,8 +362,8 @@ impl ListingTableConnector for S3 {
         Ok(s3_url)
     }
 
-    fn get_runtime(&self) -> Option<Runtime> {
-        self.runtime.clone()
+    fn get_app(&self) -> Option<Arc<App>> {
+        self.app.clone()
     }
 
     fn handle_object_store_error(
@@ -431,7 +432,7 @@ mod tests {
     fn create_test_connector(params: Parameters) -> S3 {
         S3 {
             params,
-            runtime: None,
+            app: None,
             tokio_io_runtime: tokio::runtime::Handle::current(),
         }
     }
