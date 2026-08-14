@@ -289,6 +289,22 @@ impl CloudConnectConfig {
         Ok(endpoint)
     }
 
+    /// The `spice connect` operation journals, relative to the config directory:
+    /// the enrollment journal and the project-assignment journal.
+    ///
+    /// Named here because a release deletes them. `spice connect` owns the
+    /// writers (`commands::connect::state`), where these same names are declared
+    /// `pub(super)`; a later consolidation should have that module read them from
+    /// here rather than keep its own copy.
+    ///
+    /// They cannot outlive the identity: a journal left in the enrolled phase
+    /// with no identity beside it makes the next `spice connect` quarantine it
+    /// rather than resume, and a project journal in the same state fails as a
+    /// pending-project mismatch.
+    pub const CONNECT_OPERATION_FILE: &str = "connect-operation.json";
+    /// See [`Self::CONNECT_OPERATION_FILE`].
+    pub const PROJECT_OPERATION_FILE: &str = "connect-project-operation.json";
+
     /// The instance-local control-plane endpoint override, relative to the
     /// config directory.
     ///

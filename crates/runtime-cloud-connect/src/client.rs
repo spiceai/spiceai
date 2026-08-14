@@ -1520,6 +1520,31 @@ async fn release_local_state(
         retained.push("enrollment draft".to_string());
     }
 
+    // The journals go with the draft, for the same reason: `spice connect` writes
+    // them to resume an interrupted operation, and either one left beside a
+    // removed identity stops the next enrollment rather than helping it — the
+    // enrollment journal is quarantined, the project journal fails as a pending
+    // mismatch.
+    for (label, file) in [
+        (
+            "enrollment journal",
+            CloudConnectConfig::CONNECT_OPERATION_FILE,
+        ),
+        (
+            "project assignment journal",
+            CloudConnectConfig::PROJECT_OPERATION_FILE,
+        ),
+    ] {
+        let path = config.config_dir.join(file);
+        if let Err(err) = remove_file_if_present(path.clone()).await {
+            tracing::warn!(
+                "Cloud Connect: failed to remove the {label} at {}: {err}; the instance is released, but the next enrollment in this directory will stop on it",
+                path.display()
+            );
+            retained.push(format!("{label} at {}", path.display()));
+        }
+    }
+
     let endpoint_path = config
         .config_dir
         .join(CloudConnectConfig::ENDPOINT_OVERRIDE_FILE);
@@ -1540,7 +1565,10 @@ async fn release_local_state(
 /// removals here and keep one failure vocabulary across them.
 async fn remove_file_if_present(path: PathBuf) -> std::result::Result<(), String> {
     tokio::task::spawn_blocking(move || match std::fs::remove_file(&path) {
-        Ok(()) => Ok(()),
+        // Sync the directory, as the identity and draft removals do: without it
+        // the unlink is acknowledged while the entry can still come back after a
+        // crash, and a released host would silently hold cloud state again.
+        Ok(()) => crate::identity::sync_parent_directory(&path).map_err(|err| err.to_string()),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(err) => Err(err.to_string()),
     })
@@ -2269,6 +2297,13 @@ mod tests {
                     .expect("write secrets cache");
                 std::fs::write(EnrollmentDraft::path_in(&config.config_dir), "{}")
                     .expect("write enrollment draft");
+                for journal in [
+                    CloudConnectConfig::CONNECT_OPERATION_FILE,
+                    CloudConnectConfig::PROJECT_OPERATION_FILE,
+                ] {
+                    std::fs::write(config.config_dir.join(journal), "{}")
+                        .expect("write operation journal");
+                }
                 Self { _dir: dir, config }
             }
 
@@ -2285,7 +2320,13 @@ mod tests {
             }
 
             fn endpoint_path(&self) -> std::path::PathBuf {
-                self.config.config_dir.join("cloud-endpoint")
+                self.config
+                    .config_dir
+                    .join(CloudConnectConfig::ENDPOINT_OVERRIDE_FILE)
+            }
+
+            fn journal_path(&self, file: &str) -> std::path::PathBuf {
+                self.config.config_dir.join(file)
             }
 
             async fn release(&self) -> std::result::Result<Vec<String>, String> {
@@ -2316,6 +2357,39 @@ mod tests {
             assert!(
                 !host.draft_path().exists(),
                 "a draft is reused verbatim, so one left behind replays the removed enrollment"
+            );
+            for journal in [
+                CloudConnectConfig::CONNECT_OPERATION_FILE,
+                CloudConnectConfig::PROJECT_OPERATION_FILE,
+            ] {
+                assert!(
+                    !host.journal_path(journal).exists(),
+                    "{journal} left beside a removed identity stops the next enrollment"
+                );
+            }
+        }
+
+        /// The journals are non-fatal like the cache and the draft: the instance
+        /// is released either way, and what could not be taken is named.
+        #[tokio::test]
+        async fn an_unremovable_journal_still_releases_the_instance_and_is_reported() {
+            let host = Host::enrolled();
+            let journal = host.journal_path(CloudConnectConfig::CONNECT_OPERATION_FILE);
+            std::fs::remove_file(&journal).expect("replace the journal with a directory");
+            std::fs::create_dir(&journal).expect("create the journal directory");
+            std::fs::write(journal.join("occupant"), "x").expect("occupy it");
+
+            let retained = host.release().await.expect("the removal still succeeds");
+
+            assert!(
+                !host.config.identity_path.exists(),
+                "the instance must still be released"
+            );
+            assert!(
+                retained
+                    .iter()
+                    .any(|item| item.contains("enrollment journal")),
+                "the operator has to learn the next enrollment will stop on it: {retained:?}"
             );
         }
 
