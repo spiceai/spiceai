@@ -649,6 +649,33 @@ peek_first_non_ws_byte – auto-detect JSON format
 /// UTF-8 BOM prefix (`\xEF\xBB\xBF`).
 const UTF8_BOM: [u8; 3] = [0xEF, 0xBB, 0xBF];
 
+/// Whether the body `reader` holds opens a JSON array, for the formats that
+/// decide by looking at it.
+///
+/// Every caller that dispatches on the answer must go through this rather than
+/// testing [`peek_first_non_ws_byte`] with `is_ok_and`. Detection *consumes*
+/// what it inspects, so an error from it means the reader has already moved
+/// past bytes it could not accept; answering `false` there hands the
+/// non-array reader a body whose rejected prefix is gone, and it parses what
+/// is left as though it were the whole file. That is how `\xEF{"a":1}` was
+/// read as the clean row `{"a":1}`.
+///
+/// An empty or all-whitespace body is the one error that is safe to answer:
+/// nothing was skipped that could have mattered, and the reader chosen below
+/// reports the empty body in its own terms.
+///
+/// # Errors
+///
+/// Returns the detection error for any body it could not classify without
+/// discarding part of.
+pub fn body_opens_a_json_array<R: BufRead>(reader: &mut R) -> io::Result<bool> {
+    match peek_first_non_ws_byte(reader) {
+        Ok(byte) => Ok(byte == b'['),
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
 /// Peek at the first non-whitespace byte from a `BufRead` reader without
 /// consuming non-whitespace content.
 ///
@@ -656,9 +683,13 @@ const UTF8_BOM: [u8; 3] = [0xEF, 0xBB, 0xBF];
 /// Leading whitespace bytes are consumed from the buffer, but the first
 /// non-whitespace byte remains available for subsequent reads.
 ///
+/// Callers that dispatch on the answer want [`body_opens_a_json_array`]: this
+/// consumes what it inspects, so its errors cannot be coerced to a decision.
+///
 /// # Errors
 ///
-/// Returns an error if the reader is empty or contains only whitespace.
+/// Returns an error if the reader is empty, contains only whitespace, or
+/// opens with part of a UTF-8 BOM and then something else.
 pub fn peek_first_non_ws_byte<R: BufRead>(reader: &mut R) -> io::Result<u8> {
     // Skip UTF-8 BOM if present at the start of the stream.
     // Handle incrementally: the BOM bytes may arrive split across buffers.
@@ -3104,6 +3135,50 @@ mod tests {
                 assert!(
                     err.to_string().contains("byte-order mark"),
                     "expected the incomplete-BOM verdict for {input:?}, got: {err}"
+                );
+            }
+        }
+
+        /// Every caller that dispatches on "is this an array" goes through
+        /// `body_opens_a_json_array`, so the decision to propagate rather than
+        /// answer `false` is made once. Testing it here is what covers the two
+        /// scan paths in `source.rs`, which have no unit-test harness of their
+        /// own: they are correct because they call this, not because each
+        /// spells the rule out again.
+        ///
+        /// An empty or all-whitespace body is the one error it may answer,
+        /// because detection skipped nothing that could have mattered.
+        #[test]
+        fn array_detection_propagates_an_error_that_consumed_bytes() {
+            for body in [
+                &b"\xEF{\"a\":1}"[..],
+                &b"\xEF\xBB{\"a\":1}"[..],
+                &b"\xEF["[..],
+            ] {
+                let mut reader = BufReader::with_capacity(1, Cursor::new(body.to_vec()));
+                let err = body_opens_a_json_array(&mut reader).expect_err(
+                    "a body whose prefix detection already consumed must not answer `false`",
+                );
+                assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+            }
+
+            for body in [&b""[..], &b"   \n\t"[..]] {
+                let mut reader = BufReader::new(Cursor::new(body.to_vec()));
+                assert!(
+                    !body_opens_a_json_array(&mut reader)
+                        .expect("an empty body is answerable, not an error to propagate"),
+                    "{:?} is not an array",
+                    String::from_utf8_lossy(body)
+                );
+            }
+
+            for (body, want) in [(&b"  [1]"[..], true), (&br#"{"a":1}"#[..], false)] {
+                let mut reader = BufReader::new(Cursor::new(body.to_vec()));
+                assert_eq!(
+                    body_opens_a_json_array(&mut reader).expect("a well-formed body classifies"),
+                    want,
+                    "for {}",
+                    String::from_utf8_lossy(body)
                 );
             }
         }

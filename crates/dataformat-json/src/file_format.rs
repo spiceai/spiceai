@@ -26,7 +26,7 @@ use std::sync::Arc;
 use crate::source::SpiceJsonSource;
 use crate::{
     ArrayToNdjson, ArrayToNdjsonPush, JsonPointerReader, ReadResult, SodaReader,
-    extract_flattened_from_nested, is_soda_response, peek_first_non_ws_byte, unnest_struct_schema,
+    body_opens_a_json_array, extract_flattened_from_nested, is_soda_response, unnest_struct_schema,
 };
 
 use arrow::array::RecordBatch;
@@ -654,7 +654,7 @@ fn infer_json_schema_for_format(
                     .to_string(),
             ));
         }
-        Format::Auto | Format::Json => peek_first_non_ws_byte(&mut reader).is_ok_and(|b| b == b'['),
+        Format::Auto | Format::Json => body_opens_a_json_array(&mut reader)?,
     };
 
     if is_array {
@@ -800,7 +800,18 @@ mod tests {
     #[test]
     fn a_leading_form_feed_is_not_eaten_by_format_detection() {
         for format in [Format::Auto, Format::Json, Format::Array] {
-            for body in [&b"\x0c[{\"a\":1}]"[..], &b"\x0b[{\"a\":1}]"[..]] {
+            for body in [
+                &b"\x0c[{\"a\":1}]"[..],
+                &b"\x0b[{\"a\":1}]"[..],
+                // A prefix that starts like a BOM and is not one. Inference
+                // rejects these on its own — it re-parses the original buffer
+                // rather than the reader detection advanced — so these rows
+                // pin that, not the propagation fix. What the *scan* paths do
+                // with the same bodies is
+                // `array_detection_propagates_an_error_that_consumed_bytes`.
+                &b"\xEF{\"a\":1}"[..],
+                &b"\xEF\xBB{\"a\":1}"[..],
+            ] {
                 let mut take = || true;
                 assert!(
                     infer_json_schema_for_format(body, format, &mut take).is_err(),
