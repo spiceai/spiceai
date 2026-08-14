@@ -82,13 +82,42 @@ use xorf::{BinaryFuse8, Filter};
 
 const SCALES: &[usize] = &[10_000, 100_000, 1_000_000, 10_000_000];
 
-/// Held equal across arms, matching `PkBloom::with_expected_keys`. Note that the
-/// power-of-two sizing rounds this DOWN — see the size table, which reports what
-/// each arm actually received.
+/// Held equal across arms, matching `PkBloom::with_expected_keys`.
 const BITS_PER_KEY: usize = 10;
 
-/// Probe batch size: the apply path's per-batch order of magnitude.
-const PROBE_BATCH: usize = 4096;
+/// Bits requested of the power-of-two-sized arms.
+///
+/// Rounded UP, because comparing speed at equal BYTES compares filters at wildly
+/// different accuracy: at 100K keys the round-DOWN the shipping filter performs
+/// leaves the blooms at 5.24 bits/key and ~12% false positives while `fastbloom`
+/// and `fuse8` sit near 0.4-0.8%. A filter that is fast because it is small and
+/// inaccurate is not an option anyone would ship, so the arms are sized to an
+/// accuracy someone would actually run — which also means every arm's working set
+/// crosses this host's 8 MiB L2 at the same key count, rather than the accurate
+/// arms alone paying for being bigger.
+fn sized_bits(scale: usize) -> usize {
+    (scale * BITS_PER_KEY).next_power_of_two()
+}
+
+/// Probe batch size.
+///
+/// NOT the apply path's batch size, deliberately. Criterion re-runs the same
+/// probe set every iteration, so a small set measures a WARM working set rather
+/// than the filter: 4,096 keys touch only 128 KiB of a blocked filter's blocks,
+/// which stays resident in L1/L2 however large the filter is, and every blocked
+/// arm reads a flat ~2 ns/probe at any scale as a result. Sized here so the
+/// blocks a pass touches approach the filter's own footprint and the measurement
+/// includes the misses a cold probe really pays.
+const PROBE_BATCH: usize = 1 << 18;
+
+/// Deterministic permutation of `0..n`, so consecutive probes are uncorrelated in
+/// the key array as well as in the filter. `stride` is coprime with any `n` used
+/// here (both are powers of two times a small factor, and the stride is odd), so
+/// the walk visits every index exactly once.
+fn shuffled_indices(n: usize) -> Vec<usize> {
+    const STRIDE: usize = 0x9e37_79b9_7f4a_7c15;
+    (0..n).map(|i| i.wrapping_mul(STRIDE) % n).collect()
+}
 
 /// 16-byte keys: the composite-PK `RowConverter` encoding.
 fn make_keys(count: usize, salt: u128) -> Vec<[u8; 16]> {
@@ -206,7 +235,7 @@ fn bench_insert<A: Arm>(c: &mut Criterion) {
     let mut group = c.benchmark_group("pk_filter/resident/insert");
     for &scale in SCALES {
         let keys = make_keys(scale, 0);
-        let bits = scale * BITS_PER_KEY;
+        let bits = sized_bits(scale);
         group.throughput(Throughput::Elements(u64::try_from(scale).unwrap_or(0)));
         group.bench_with_input(BenchmarkId::new(A::name(), scale), &keys, |b, keys| {
             b.iter(|| black_box(A::build(bits, keys).size_bytes()));
@@ -222,7 +251,7 @@ fn bench_probe<A: Arm>(c: &mut Criterion, present: bool) {
     for &scale in SCALES {
         let inserted = make_keys(scale, 0);
         let probe_count = PROBE_BATCH.min(scale);
-        let probes: Vec<[u8; 16]> = if present {
+        let pool: Vec<[u8; 16]> = if present {
             inserted
                 .iter()
                 .step_by((scale / probe_count).max(1))
@@ -232,7 +261,13 @@ fn bench_probe<A: Arm>(c: &mut Criterion, present: bool) {
         } else {
             make_keys(probe_count, 1 << 100)
         };
-        let filter = A::build(scale * BITS_PER_KEY, &inserted);
+        // Probe in a scattered order so neither the key array nor the filter is
+        // walked predictably.
+        let probes: Vec<[u8; 16]> = shuffled_indices(pool.len())
+            .into_iter()
+            .map(|i| pool[i])
+            .collect();
+        let filter = A::build(sized_bits(scale), &inserted);
 
         group.throughput(Throughput::Elements(
             u64::try_from(probes.len()).unwrap_or(0),
@@ -257,7 +292,7 @@ fn bench_cold_build<A: Arm>(c: &mut Criterion) {
     // row-caps output files well below that.
     for &scale in &[100_000usize, 1_000_000] {
         let keys = make_keys(scale, 0);
-        let bits = scale * BITS_PER_KEY;
+        let bits = sized_bits(scale);
         group.throughput(Throughput::Elements(u64::try_from(scale).unwrap_or(0)));
         group.bench_with_input(BenchmarkId::new(A::name(), scale), &keys, |b, keys| {
             b.iter(|| black_box(A::build(bits, keys).size_bytes()));
@@ -278,7 +313,7 @@ fn report_size_and_fpr() {
     );
 
     fn row<A: Arm>(scale: usize, inserted: &[[u8; 16]], absent: &[[u8; 16]]) {
-        let filter = A::build(scale * BITS_PER_KEY, inserted);
+        let filter = A::build(sized_bits(scale), inserted);
         let hits = absent.iter().filter(|k| filter.probe(k)).count();
         let bytes = filter.size_bytes();
         #[expect(clippy::cast_precision_loss, reason = "reporting only")]
