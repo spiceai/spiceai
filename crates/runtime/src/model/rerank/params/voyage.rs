@@ -22,7 +22,7 @@ use secrecy::SecretString;
 #[params(prefix = "voyage")]
 pub struct VoyageRerankerParams {
     /// The Voyage API key.
-    #[param(runtime, autoload_secret, alias = "voyage_api_key")]
+    #[param(runtime, alias = "voyage_api_key")]
     pub api_key: SecretString,
     /// The Voyage API base endpoint.
     #[param(runtime)]
