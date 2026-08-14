@@ -13,6 +13,7 @@ notify = "8.2.0"
 parking_lot.workspace = true
 spicepod = { path = "../spicepod" }
 tokio = { workspace = true, features = ["rt", "sync"] }
+tracing.workspace = true
 
 [lints]
 workspace = true
