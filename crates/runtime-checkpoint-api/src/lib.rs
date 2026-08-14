@@ -47,11 +47,22 @@ limitations under the License.
 //! connector's on-disk schema intact (no forced blob migration) while still letting
 //! every store be reached as a small object-safe `Arc<dyn …Store>`.
 //!
-//! Persistence for each shape is implemented **per storage engine** in the sibling
-//! `runtime-checkpoint-{duckdb,sqlite,postgres,turso}` crates (one crate per engine so
-//! the stitch binary links only the engines it enables — `feature = crate`); the
-//! `runtime` crate resolves a dataset to its accelerator connection and constructs the
-//! matching store.
+//! # Where each shape is implemented
+//!
+//! In every case the `runtime` crate resolves a dataset to its accelerator connection
+//! and constructs the matching store, so a caller never names an engine. Where the SQL
+//! for that store lives differs by shape today:
+//!
+//! - [`BlobCheckpointStore`] is implemented **per storage engine** in the sibling
+//!   `runtime-checkpoint-{duckdb,sqlite,postgres,turso}` crates — one crate per engine,
+//!   so the stitch binary links only the engines it enables (`feature = crate`).
+//! - The structured shapes ([`kafka`], [`mysql_binlog`], [`mongodb`]) are implemented
+//!   inside `runtime`, on the `spice_sys` sidecar types, with their per-engine SQL
+//!   behind `runtime`'s accelerator-backend features.
+//!
+//! The split is incidental rather than a design distinction: the engine crates are where
+//! per-engine persistence belongs, and the structured shapes have not moved there yet.
+//! Nothing in this crate's contract depends on which side a store is implemented on.
 
 use std::time::SystemTime;
 
