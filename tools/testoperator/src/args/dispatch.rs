@@ -968,34 +968,64 @@ tests:
     }
 
     /// The accelerator and source overrides must reach the dispatched workflow as
-    /// two distinct inputs: collapsing them would shrink the measured query set
-    /// on whichever source needs a gate-only exclusion.
+    /// two distinct inputs, each carrying its own value: collapsing or crossing
+    /// them would shrink the measured query set by whatever the source excludes.
+    /// Distinct values on both fields are what makes a mix-up visible.
     #[test]
     fn test_htap_section_carries_accelerator_and_source_overrides_separately() {
         let yaml = "
 tests:
   htap:
-    spicepod_path: accelerated/mysql-cayenne[file]-adaptive.yaml
+    spicepod_path: accelerated/mysql-duckdb[file].yaml
     runner_type: spiceai-dev-xlarge-runners
     scale_factor: 1000
     terminals: 100
     duration: 900
     ready_wait: 900
+    query_overrides: duckdb
     source_query_overrides: chbench-skip-slow
     rate: 9250
 ";
 
         let test_file: DispatchTestFile = yaml::from_str(yaml).expect("Failed to deserialize");
         let htap = &test_file.tests.htap[0];
-        assert!(htap.query_overrides.is_none());
+        assert!(matches!(
+            htap.query_overrides,
+            Some(QueryOverridesArg::Duckdb)
+        ));
         assert!(matches!(
             htap.source_query_overrides,
             Some(QueryOverridesArg::ChbenchSkipSlow)
         ));
 
         let serialized = serde_json::to_value(htap).expect("Failed to serialize");
+        assert_eq!(serialized["query_overrides"], "duckdb");
         assert_eq!(serialized["source_query_overrides"], "chbench-skip-slow");
-        // Omitted rather than sent empty, so the workflow falls back to its default.
+    }
+
+    /// An unset override is omitted from the payload rather than sent empty, so
+    /// the dispatched workflow falls back to its own default.
+    #[test]
+    fn test_htap_section_omits_unset_query_overrides() {
+        let yaml = "
+tests:
+  htap:
+    spicepod_path: accelerated/postgres-cayenne[file]-adaptive.yaml
+    runner_type: spiceai-dev-xlarge-runners
+    scale_factor: 1000
+    terminals: 100
+    duration: 900
+    ready_wait: 900
+    rate: 9250
+";
+
+        let test_file: DispatchTestFile = yaml::from_str(yaml).expect("Failed to deserialize");
+        let htap = &test_file.tests.htap[0];
+        assert!(htap.query_overrides.is_none());
+        assert!(htap.source_query_overrides.is_none());
+
+        let serialized = serde_json::to_value(htap).expect("Failed to serialize");
         assert!(serialized.get("query_overrides").is_none());
+        assert!(serialized.get("source_query_overrides").is_none());
     }
 }

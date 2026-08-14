@@ -17,6 +17,9 @@ name: postgres-duckdb[file]-4slot
 #   - The CDC pump knobs pinned under `runtime.params` below (deep prefetch + coalescing).
 #     These are engine-agnostic — they govern the shared CDC source-reader → apply channel,
 #     upstream of whichever accelerator applies the burst.
+#   - Flight `lz4_frame` IPC compression. This sits on the analytical result path, so leaving
+#     it at the default would charge DuckDB an uncompressed transfer for the same result set
+#     and land in QPH and query latency — the headline metrics the comparison reads.
 #
 # Varying by design: the accelerator (duckdb vs cayenne), and with it the per-table
 # primary_key / on_conflict declarations. Cayenne relies on schema inference to detect the
@@ -35,6 +38,8 @@ postgres_connection_params: &postgres_params
   pg_sslmode: disable
 
 runtime:
+  flight:
+    ipc_compression: lz4_frame
   caching:
     sql_results:
       enabled: false
