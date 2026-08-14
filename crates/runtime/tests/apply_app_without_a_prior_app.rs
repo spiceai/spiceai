@@ -57,6 +57,7 @@ async fn an_app_arriving_after_an_empty_start() {
     an_arriving_app_decides_whether_queries_emit_task_history().await;
     an_arriving_app_that_enables_task_history_gets_a_table_and_emission().await;
     a_second_initialization_restores_emission_it_found_turned_off().await;
+    a_name_conflict_the_operator_fixes_is_retried_not_left_until_restart().await;
 }
 
 /// Emission and the table have to agree. Both were decided when `DataFusion` was
@@ -161,6 +162,63 @@ async fn a_second_initialization_restores_emission_it_found_turned_off() {
     assert!(
         rt.datafusion().task_history_emission_enabled(),
         "so emission must come back on rather than stay off for the process's life"
+    );
+}
+
+/// The conflict error tells the operator to rename the dataset using the name, so
+/// the rename has to be able to take effect.
+///
+/// It arrives as another app. Initialization that ran only for the first app
+/// would leave task history absent until the process restarted, which is not what
+/// the operator was just told to do.
+async fn a_name_conflict_the_operator_fixes_is_retried_not_left_until_restart() {
+    let rt = Arc::new(
+        Runtime::builder()
+            .with_app_opt(Some(Arc::new(App::default())))
+            .build()
+            .await,
+    );
+
+    let contested = TableReference::partial("runtime", "task_history");
+    rt.datafusion()
+        .ctx
+        .register_table(
+            contested.clone(),
+            Arc::new(datafusion::datasource::empty::EmptyTable::new(Arc::new(
+                arrow::datatypes::Schema::empty(),
+            ))),
+        )
+        .expect("something takes the name first");
+    Arc::clone(&rt)
+        .init_task_history()
+        .await
+        .expect_err("which is a conflict");
+    assert!(
+        !rt.datafusion().task_history_emission_enabled(),
+        "nothing is emitted while the name belongs to something else"
+    );
+
+    // The rename: the component using the name is gone, and the app that says so
+    // arrives the way any other app does — a changed app, since a rename changes
+    // one.
+    rt.datafusion()
+        .ctx
+        .deregister_table(contested.clone())
+        .expect("an unreserved name is the app's to release");
+    let mut renamed = App::default();
+    renamed.views.push(view("renamed", "SELECT 1 AS answer"));
+    assert!(
+        Arc::clone(&rt).apply_app(Arc::new(renamed)).await,
+        "the app that carries the rename is a change"
+    );
+
+    assert!(
+        rt.datafusion().table_exists(&contested),
+        "the retry brings task history up once the name is free"
+    );
+    assert!(
+        rt.datafusion().task_history_emission_enabled(),
+        "and queries record into it without a restart"
     );
 }
 

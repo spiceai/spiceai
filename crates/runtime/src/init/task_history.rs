@@ -27,6 +27,14 @@ use std::sync::Arc;
 
 impl Runtime {
     pub async fn init_task_history(self: Arc<Self>) -> Result<()> {
+        // Held across everything below, so that reading the app, deciding what
+        // emission should be, registering the table and recording that this
+        // runtime owns it are one step. Callers race each other here — a cluster
+        // executor's component load runs alongside the bind that installs its app
+        // — and any check made outside this lock can be acted on after another
+        // caller has already changed the answer.
+        let _initializing = self.task_history_init_lock.lock().await;
+
         // Skip task history initialization if there's no valid spicepod
         // Task history requires App infrastructure (datasets, table providers) to function
         let Some(app) = self.read_app().await else {
@@ -35,11 +43,10 @@ impl Runtime {
             // confirm, and leaving it on makes every query report a table that
             // was deliberately not created.
             //
-            // Unless this runtime has since registered the table. A cluster
-            // executor's component load reaches this concurrently with the bind
-            // that installs its app, so "no app" can be a stale answer by the
-            // time it is acted on — and emission describes the table, which the
-            // other caller may already have brought up.
+            // Unless this runtime has already registered the table, which a caller
+            // that ran while the app was being installed may have done. Emission
+            // describes the table, so the answer belongs to whoever brought it up,
+            // not to a caller that found no configuration.
             if !self
                 .task_history_initialized
                 .load(std::sync::atomic::Ordering::SeqCst)
@@ -70,10 +77,6 @@ impl Runtime {
         // the internal table, report success, and send every task-history write
         // to it. So a name that is taken while this runtime has registered
         // nothing is a conflict, and it is reported rather than written into.
-        // Held for the rest of this function: check, register, and record are one
-        // step, or a caller racing this one mistakes a half-finished
-        // initialization for a foreign table.
-        let _initializing = self.task_history_init_lock.lock().await;
         if self
             .task_history_initialized
             .load(std::sync::atomic::Ordering::SeqCst)
@@ -167,6 +170,13 @@ impl Runtime {
         .await
         .map_err(|source| Error::UnableToTrackTaskHistory { source })?;
 
+        let local =
+            TableReference::partial(SPICE_RUNTIME_SCHEMA, task_history::LOCAL_TASK_HISTORY_TABLE);
+        // Two names are claimed in scheduler mode and the pair is not atomic, so a
+        // failure after the first one is claimed hands it back rather than leaving
+        // a reserved table nothing exposes.
+        let mut reserved_local = false;
+
         // In cluster scheduler mode, wrap the local table with FederatedTaskHistoryTable
         // to enable cluster-wide task history queries, and also register the local table
         // separately for use by the GetTaskHistory RPC handler
@@ -194,15 +204,21 @@ impl Runtime {
                 // This avoids infinite recursion when peers query each other
                 let local_table_provider: Arc<dyn TableProvider> =
                     local_table.into_table() as Arc<dyn TableProvider>;
-                self.df
-                    .register_table_as_writable_and_with_schema(
-                        TableReference::partial(
-                            SPICE_RUNTIME_SCHEMA,
-                            task_history::LOCAL_TASK_HISTORY_TABLE,
-                        ),
-                        Arc::clone(&local_table_provider),
-                    )
-                    .context(UnableToCreateBackendSnafu)?;
+                // Reserved on the same terms as the federated name: peer queries
+                // are rewritten to this one, so a dataset that took it would come
+                // back to the scheduler as task history.
+                if let Some(_taken) = self
+                    .df
+                    .reserve_internal_table(local.clone(), Arc::clone(&local_table_provider))
+                    .context(UnableToCreateBackendSnafu)?
+                {
+                    return Err(Error::UnableToTrackTaskHistory {
+                        source: task_history::Error::TableNameTaken {
+                            table: local.to_string(),
+                        },
+                    });
+                }
+                reserved_local = true;
 
                 let federated = task_history::federated::FederatedTaskHistoryTable::new(
                     schema,
@@ -229,6 +245,9 @@ impl Runtime {
             .reserve_internal_table(table.clone(), table_to_register)
             .context(UnableToCreateBackendSnafu)?
         {
+            if reserved_local {
+                self.df.release_internal_table(&local);
+            }
             return Err(Error::UnableToTrackTaskHistory {
                 source: task_history::Error::TableNameTaken {
                     table: table.to_string(),
@@ -248,6 +267,49 @@ impl Runtime {
 mod tests {
     use super::*;
     use ::app::App;
+
+    /// Every decision this makes is under the initialization lock, including the
+    /// one a caller with no app makes.
+    ///
+    /// Otherwise that caller can read no app, find the table unregistered, and
+    /// only then turn emission off — by which time another caller holding the lock
+    /// may have registered the table and turned emission on, leaving it off for
+    /// the life of the process. The window is a few instructions wide and cannot
+    /// be hit on demand, so what is asserted instead is the property that closes
+    /// it: while the lock is held, this makes no progress at all.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn no_decision_is_made_outside_the_initialization_lock() {
+        let rt = Arc::new(Runtime::builder().with_app_opt(None).build().await);
+
+        let initializing = rt.task_history_init_lock.lock().await;
+        let racing = tokio::spawn({
+            let rt = Arc::clone(&rt);
+            async move { rt.init_task_history().await }
+        });
+
+        // A negative can only be observed over a window: the call has to be given
+        // room to run and still not have run. Short, because the failure it guards
+        // against — returning before the lock, as the no-app path used to — takes
+        // microseconds to show up.
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !racing.is_finished(),
+            "initialization decided something while the lock was held"
+        );
+
+        drop(initializing);
+        racing
+            .await
+            .expect("the racing call ran")
+            .expect("a call that finds no app is not a failure");
+        assert!(
+            !rt.df.task_history_emission_enabled(),
+            "and having found no app, it left emission off"
+        );
+    }
 
     /// Emission describes the table, so a caller that reads no app must not turn
     /// it off once the table exists.

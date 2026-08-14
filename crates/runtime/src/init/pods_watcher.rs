@@ -351,23 +351,32 @@ impl Runtime {
 
         *self.app.write().await = Some(new_app);
 
-        if current_app.is_none() {
-            // Task history reads its configuration from the app, so a start with
-            // no app skipped it entirely and every query since has had nowhere
-            // to record itself. It is initialized here from the app as
-            // installed, which is not always the app as deployed: a Cloud
-            // deployment keeps this process's `runtime` section and reports the
-            // deployed one as needing a restart, so a deployed task-history
-            // setting takes effect at that restart and this initialization uses
-            // the settings in effect now. Idempotent, so the ordinary case where
-            // the load already registered the table changes nothing.
-            // Emission was fixed when `DataFusion` was built, from the
-            // configuration this process had then — which was none — so it has to
-            // follow the app that has arrived. `init_task_history` is what moves
-            // it, in step with the table it describes.
-            if let Err(err) = Arc::clone(&self).init_task_history().await {
-                tracing::warn!("Creating internal task history table: {err}");
-            }
+        // Task history reads its configuration from the app, so a start with no
+        // app skipped it entirely and every query since has had nowhere to record
+        // itself. It is initialized here from the app as installed, which is not
+        // always the app as deployed: a Cloud deployment keeps this process's
+        // `runtime` section and reports the deployed one as needing a restart, so
+        // a deployed task-history setting takes effect at that restart and this
+        // initialization uses the settings in effect now. Emission was fixed when
+        // `DataFusion` was built, from the configuration this process had then —
+        // which was none — so it has to follow the app that has arrived;
+        // `init_task_history` is what moves it, in step with the table it
+        // describes.
+        //
+        // Every arriving app, not only the first: an initialization that found the
+        // name taken tells the operator to rename the dataset using it, and the
+        // rename arrives as another app. Gated on the value this process started
+        // with, because `runtime.task_history` takes effect at a start — so a
+        // reload cannot turn task history on, only finish turning it on. The
+        // ordinary case, where the component load already registered the table,
+        // does not reach this at all.
+        if !self
+            .task_history_initialized
+            .load(std::sync::atomic::Ordering::SeqCst)
+            && self.df.task_history_enabled_at_start()
+            && let Err(err) = Arc::clone(&self).init_task_history().await
+        {
+            tracing::warn!("Creating internal task history table: {err}");
         }
 
         true
@@ -432,7 +441,7 @@ fn warn_on_sections_only_a_start_installs(app: &App) {
         return;
     }
     tracing::warn!(
-        "This instance had no configuration when it started, so it built none of the components `{}` describes. Those sections are read when spiced starts: restart it to serve them.",
+        "This instance had no configuration when it started, so it built none of the components these sections describe: `{}`. Those sections are read when spiced starts: restart it to serve them.",
         pending.join("`, `")
     );
 }

@@ -1276,6 +1276,7 @@ impl DataFusionBuilder {
             acceleration_refresh_semaphore: self.accelerated_refresh_semaphore,
             query_admission_semaphore: self.query_admission_semaphore,
             task_history_enabled: std::sync::atomic::AtomicBool::new(self.task_history_enabled),
+            task_history_enabled_at_start: self.task_history_enabled,
             temp_directory: self.temp_directory.clone(),
             cpu_runtime: OnceLock::new(),
             refresh_runtime: OnceLock::new(),

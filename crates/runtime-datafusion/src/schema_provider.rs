@@ -96,6 +96,29 @@ impl SpiceSchemaProvider {
     pub fn is_reserved(&self, name: &str) -> bool {
         self.reserved.contains(name)
     }
+
+    /// Give up a reservation this runtime made, removing its table with it.
+    ///
+    /// A name that is not reserved belongs to something else and is left alone.
+    /// The [`SchemaProvider`] API cannot do this, deliberately: only the component
+    /// that claimed a name may hand it back, so a reservation abandoned partway
+    /// through bringing several tables up does not outlive the attempt.
+    pub fn release_reserved_table(&self, name: &str) {
+        match self.tables.entry(name.to_string()) {
+            Entry::Occupied(occupied) => {
+                if !self.reserved.contains(occupied.key()) {
+                    return;
+                }
+                // Both under the entry, so a reservation being made on this name
+                // cannot interleave and be erased by the removal.
+                self.reserved.remove(occupied.key());
+                occupied.remove();
+            }
+            Entry::Vacant(_) => {
+                self.reserved.remove(name);
+            }
+        }
+    }
 }
 
 fn reserved_name_error(name: &str) -> DataFusionError {
@@ -318,6 +341,47 @@ mod reservation_tests {
         assert!(
             provider.is_reserved("task_history"),
             "and the reservation is not cleared by a caller that does not own it"
+        );
+    }
+
+    /// Bringing several internal tables up is not atomic as a whole, so a
+    /// component that claims one name and then fails on the next has to be able
+    /// to hand the first back — otherwise a failed initialization leaves a name
+    /// reserved that nothing owns.
+    #[test]
+    fn a_reservation_can_be_handed_back_by_the_component_that_made_it() {
+        let provider = SpiceSchemaProvider::new();
+        provider
+            .reserve_table("local_task_history".to_string(), table("internal"))
+            .expect("reserve");
+
+        provider.release_reserved_table("local_task_history");
+        assert!(!provider.is_reserved("local_task_history"));
+        assert!(
+            provider.table_sync("local_task_history").is_none(),
+            "the released name holds nothing"
+        );
+
+        provider
+            .register_table("local_task_history".to_string(), table("dataset"))
+            .expect("and the name is free for whatever wants it next");
+    }
+
+    #[test]
+    fn releasing_a_name_the_runtime_never_reserved_leaves_it_alone() {
+        let provider = SpiceSchemaProvider::new();
+        let dataset = table("dataset");
+        provider
+            .register_table("orders".to_string(), Arc::clone(&dataset))
+            .expect("register a dataset");
+
+        provider.release_reserved_table("orders");
+        let held = provider
+            .table_sync("orders")
+            .expect("an unreserved name is not this API's to take");
+        assert!(
+            Arc::ptr_eq(&held, &dataset),
+            "so the dataset is still registered, untouched"
         );
     }
 

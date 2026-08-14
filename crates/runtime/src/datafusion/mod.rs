@@ -836,6 +836,9 @@ pub struct DataFusion {
     /// build, so a stale value would either fill a table nothing created or spend
     /// every query writing to one that is not the runtime's.
     pub(crate) task_history_enabled: std::sync::atomic::AtomicBool,
+    /// The value `runtime.task_history.enabled` had when this process started.
+    /// See [`DataFusion::task_history_enabled_at_start`].
+    task_history_enabled_at_start: bool,
     // Dedicated runtime for CPU-bound DataFusion queries
     cpu_runtime: OnceLock<ManagedTokioRuntime>,
     // Dedicated runtime for CPU-bound DataFusion acceleration for dataset acceleration refresh tasks
@@ -1190,6 +1193,23 @@ impl DataFusion {
             .insert(table_name);
 
         Ok(None)
+    }
+
+    /// Hand back a reservation made by [`DataFusion::reserve_internal_table`].
+    ///
+    /// For a component that claims more than one name and fails partway: the
+    /// names it did claim are released rather than left holding tables nothing
+    /// exposes.
+    pub fn release_internal_table(&self, table_name: &TableReference) {
+        if let Some(schema_name) = table_name.schema()
+            && let Some(registered_schema) = self.schema(schema_name)
+            && let Some(spice_schema) = registered_schema.downcast_ref::<SpiceSchemaProvider>()
+        {
+            spice_schema.release_reserved_table(table_name.table());
+        }
+        if let Ok(mut writers) = self.data_writers.write() {
+            writers.remove(table_name);
+        }
     }
 
     pub async fn register_catalog(
@@ -2544,6 +2564,19 @@ impl DataFusion {
     /// Called when the app that decides it becomes known — which, for a runtime
     /// that started with no configuration, is after this was built — and when a
     /// conflict means the runtime must stop writing to a table it does not own.
+    /// Whether the configuration this process started with asked for task
+    /// history, as distinct from whether queries are emitting into it now.
+    ///
+    /// `runtime.task_history` is a start-time section: a reload installs the new
+    /// value in the app but the running process keeps what it booted with. This is
+    /// that booted value, and it is what decides whether an initialization is
+    /// worth retrying — never the mutable emission flag, which describes the table
+    /// as it stands.
+    #[must_use]
+    pub fn task_history_enabled_at_start(&self) -> bool {
+        self.task_history_enabled_at_start
+    }
+
     pub fn set_task_history_enabled(&self, enabled: bool) {
         self.task_history_enabled
             .store(enabled, std::sync::atomic::Ordering::Relaxed);
@@ -6689,6 +6722,44 @@ mod tests {
                 Arc::ptr_eq(&held, &incumbent),
                 "nothing was displaced to find that out"
             );
+        }
+        /// Task history claims two names in scheduler mode and the pair is not
+        /// atomic, so the first has to be releasable when the second is lost.
+        #[tokio::test]
+        async fn a_reservation_is_released_without_touching_the_others() {
+            let df = DataFusionBuilder::new(
+                RuntimeStatus::new(),
+                Arc::new(AcceleratorEngineRegistry::new()),
+                Handle::current(),
+            )
+            .build();
+            let first = TableReference::partial(SPICE_RUNTIME_SCHEMA, "local_task_history");
+            let second = TableReference::partial(SPICE_RUNTIME_SCHEMA, "task_history");
+
+            df.reserve_internal_table(first.clone(), table("local"))
+                .expect("reserve the first name");
+            df.reserve_internal_table(second.clone(), table("federated"))
+                .expect("reserve the second name");
+
+            df.release_internal_table(&first);
+
+            assert!(
+                !df.table_exists(&first),
+                "the released name holds nothing and is free again"
+            );
+            df.ctx
+                .register_table(first.clone(), table("dataset"))
+                .expect("so something else may take it");
+
+            assert!(
+                df.table_exists(&second),
+                "and the name that was kept is untouched"
+            );
+            let error = df
+                .ctx
+                .register_table(second.clone(), table("dataset"))
+                .expect_err("still reserved");
+            assert!(error.to_string().contains("reserved"), "{error}");
         }
     }
 
