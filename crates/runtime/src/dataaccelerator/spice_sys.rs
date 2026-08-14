@@ -62,7 +62,7 @@ use {
 
 use crate::component::dataset::acceleration::Engine;
 use crate::dataaccelerator::AcceleratorEngineRegistry;
-use runtime_checkpoint_api::BlobCheckpointStore;
+use runtime_checkpoint_api::{BlobCheckpointStore, CheckpointError};
 
 pub mod dataset_checkpoint;
 #[cfg(feature = "debezium")]
@@ -70,15 +70,6 @@ pub mod debezium_kafka;
 
 #[cfg(feature = "kafka")]
 pub mod kafka;
-
-// Driver-free sidecar (SQL + JSON only, like `dataset_checkpoint`/`caching_engine`),
-// so it is always compiled: the `connector-dynamodb` crate calls
-// `dynamodb::init_checkpoint_store` regardless of which accelerator backend is enabled.
-pub mod dynamodb;
-
-// Same driver-free shape, for the same reason: `connector-postgres` resolves the
-// replication watermark store without depending on the accelerator backends.
-pub mod postgres_replication;
 
 #[cfg(feature = "mongodb")]
 pub mod mongodb;
@@ -215,6 +206,19 @@ impl Error {
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+/// Reports a sidecar failure over the checkpoint-store seam.
+///
+/// The store traits are the contract a connector sees, so the engine-specific cause is
+/// boxed rather than named: a connector must not have to match on which accelerator
+/// engine failed, and `CheckpointError` deliberately carries no accelerator vocabulary.
+impl From<Error> for runtime_checkpoint_api::CheckpointError {
+    fn from(source: Error) -> Self {
+        Self::Store {
+            source: Box::new(source),
+        }
+    }
+}
 
 /// Runs a synchronous `DuckDB` sidecar operation on the blocking pool.
 ///
@@ -456,6 +460,91 @@ pub async fn checkpoint_store(
 ) -> Option<Arc<dyn BlobCheckpointStore>> {
     let _ = (dataset, table_name);
     None
+}
+
+/// Construct the **Kafka** checkpoint store over this dataset's accelerator.
+///
+/// Unlike [`checkpoint_store`] this reports a resolution failure as an error: the Kafka
+/// connector refuses to register a dataset whose offsets it cannot persist, because
+/// replaying a topic from the beginning into an append accelerator duplicates rows.
+#[cfg(feature = "kafka")]
+pub async fn kafka_checkpoint_store(
+    dataset: &crate::component::dataset::Dataset,
+) -> std::result::Result<
+    Arc<dyn runtime_checkpoint_api::kafka::KafkaCheckpointStore>,
+    CheckpointError,
+> {
+    let sys = kafka::KafkaSys::try_new(dataset, OpenOption::CreateIfNotExists).await?;
+    Ok(Arc::new(sys))
+}
+
+/// Kafka support is not compiled in, so there is no sidecar to resolve. Signature parity
+/// with the variant above (see it for the full contract).
+#[cfg(not(feature = "kafka"))]
+pub async fn kafka_checkpoint_store(
+    dataset: &crate::component::dataset::Dataset,
+) -> std::result::Result<
+    Arc<dyn runtime_checkpoint_api::kafka::KafkaCheckpointStore>,
+    CheckpointError,
+> {
+    let _ = dataset;
+    Err(CheckpointError::Store {
+        source: "Spice wasn't built with Kafka support enabled".into(),
+    })
+}
+
+/// Construct the **`MySQL` binlog** position store over this dataset's accelerator.
+#[cfg(feature = "mysql")]
+pub async fn mysql_binlog_store(
+    dataset: &crate::component::dataset::Dataset,
+) -> std::result::Result<
+    Arc<dyn runtime_checkpoint_api::mysql_binlog::MySqlBinlogStore>,
+    CheckpointError,
+> {
+    let sys = mysql_binlog::MySqlBinlogSys::try_new(dataset, OpenOption::CreateIfNotExists).await?;
+    Ok(Arc::new(sys))
+}
+
+/// `MySQL` support is not compiled in, so there is no sidecar to resolve. Signature
+/// parity with the variant above (see it for the full contract).
+#[cfg(not(feature = "mysql"))]
+pub async fn mysql_binlog_store(
+    dataset: &crate::component::dataset::Dataset,
+) -> std::result::Result<
+    Arc<dyn runtime_checkpoint_api::mysql_binlog::MySqlBinlogStore>,
+    CheckpointError,
+> {
+    let _ = dataset;
+    Err(CheckpointError::Store {
+        source: "Spice wasn't built with MySQL support enabled".into(),
+    })
+}
+
+/// Construct the **`MongoDB`** resume-token store over this dataset's accelerator.
+#[cfg(feature = "mongodb")]
+pub async fn mongo_checkpoint_store(
+    dataset: &crate::component::dataset::Dataset,
+) -> std::result::Result<
+    Arc<dyn runtime_checkpoint_api::mongodb::MongoCheckpointStore>,
+    CheckpointError,
+> {
+    let sys = mongodb::MongoSys::try_new(dataset, OpenOption::CreateIfNotExists).await?;
+    Ok(Arc::new(sys))
+}
+
+/// `MongoDB` support is not compiled in, so there is no sidecar to resolve. Signature
+/// parity with the variant above (see it for the full contract).
+#[cfg(not(feature = "mongodb"))]
+pub async fn mongo_checkpoint_store(
+    dataset: &crate::component::dataset::Dataset,
+) -> std::result::Result<
+    Arc<dyn runtime_checkpoint_api::mongodb::MongoCheckpointStore>,
+    CheckpointError,
+> {
+    let _ = dataset;
+    Err(CheckpointError::Store {
+        source: "Spice wasn't built with MongoDB support enabled".into(),
+    })
 }
 
 async fn acceleration_connection(

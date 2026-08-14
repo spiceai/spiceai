@@ -37,7 +37,9 @@ use datafusion::sql::TableReference;
 use futures::StreamExt;
 use opentelemetry::KeyValue;
 use runtime::component::dataset::Dataset;
+use runtime::dataconnector::parameters::ConnectorContext;
 use runtime_api_types::v1::ComponentType;
+use runtime_checkpoint_api::BlobCheckpointStore;
 use runtime_metrics::component::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback};
 use runtime_parameters::{ExposedParamLookup, Parameters};
 use secrecy::SecretString;
@@ -55,6 +57,25 @@ const MAX_BOOTSTRAP_BATCH_SIZE: usize = 1_048_576;
 // front of the accelerator prefetch, not an unbounded buffer.
 const MAX_MEMBER_CHANNEL_CAPACITY: usize = 1_048_576;
 
+/// Sidecar table, in the dataset's own accelerator, holding the serialized applied-LSN
+/// watermark.
+const WATERMARK_TABLE: &str = "spice_sys_postgres_replication";
+
+/// Resolve the applied-LSN watermark store over the dataset's own accelerator.
+///
+/// `None` means nothing durable can record a position — no runtime attached, or no
+/// usable accelerator connection. The caller treats that as "never loaded", which is
+/// correct: an acceleration that cannot persist a watermark cannot have persisted rows
+/// for one to describe.
+async fn resolve_watermark_store(
+    context: Option<&Arc<dyn ConnectorContext>>,
+    dataset: &Dataset,
+) -> Option<Arc<dyn BlobCheckpointStore>> {
+    context?
+        .blob_checkpoint_store(dataset, WATERMARK_TABLE)
+        .await
+}
+
 /// [`AppliedLsnStore`] over the accelerator's `spice_sys_postgres_replication`
 /// sidecar.
 ///
@@ -62,7 +83,7 @@ const MAX_MEMBER_CHANNEL_CAPACITY: usize = 1_048_576;
 /// so the record can gain fields (a slot identity, a snapshot as-of marker)
 /// without a migration.
 struct SidecarAppliedLsnStore {
-    blobs: Arc<dyn runtime::dataaccelerator::spice_sys::postgres_replication::WatermarkBlobStore>,
+    blobs: Arc<dyn BlobCheckpointStore>,
     /// Which source the recorded position belongs to (see [`source_identity`]).
     ///
     /// LSNs are only comparable within one source's history. Without this, a
@@ -148,6 +169,7 @@ impl AppliedLsnStore for SidecarAppliedLsnStore {
 pub fn build_changes_stream(
     params: &Parameters,
     dataset: &Dataset,
+    context: Option<Arc<dyn ConnectorContext>>,
     federated_table: Arc<dyn FederatedTableProvider>,
     metrics: Arc<ReplicationMetricsCollector>,
 ) -> ChangesStream {
@@ -335,11 +357,7 @@ pub fn build_changes_stream(
         let applied_lsn_store: Arc<dyn AppliedLsnStore> = if ephemeral {
             Arc::new(NoopAppliedLsnStore)
         } else {
-            match runtime::dataaccelerator::spice_sys::postgres_replication::init_watermark_store(
-                &dataset_for_watermark,
-            )
-            .await
-            {
+            match resolve_watermark_store(context.as_ref(), &dataset_for_watermark).await {
                 Some(blobs) => Arc::new(SidecarAppliedLsnStore {
                     blobs,
                     identity: source_identity(&params_for_stream, &schema_name, &table_name),
