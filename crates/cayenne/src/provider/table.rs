@@ -7694,10 +7694,6 @@ impl CayenneTableProvider {
         self.seq_allocator.lock().await.next - 1
     }
 
-    /// Load the persisted optimizer statistics AND their exactness flag
-    /// ([`TableStatistics::num_rows_exact`]) at open. The flag rides alongside the
-    /// derived `Statistics` so the cache can serve the count `Inexact` when it is
-    /// not a provably-exact live count.
     /// Read a table's persisted statistics record, keeping "there is no record"
     /// distinct from "the record could not be read" (see
     /// [`PersistedTableStatistics`]). Every reader of the persisted statistics
@@ -7719,13 +7715,15 @@ impl CayenneTableProvider {
         }
     }
 
-    /// Load the statistics an opening provider serves, with whether its
-    /// maintained count may be served as a provably-exact live count.
+    /// Load the persisted optimizer statistics an opening provider serves, with
+    /// whether its maintained count ([`TableStatistics::num_rows_exact`]) may be
+    /// served as a provably-exact live count. The flag rides alongside the derived
+    /// `Statistics` so the cache can serve the count `Inexact` when it is not.
     ///
-    /// An unreadable record yields `false`: nothing is known about the count, so
-    /// it must not be folded into a `COUNT(*)` answer. This matches the
-    /// schema-evolution re-derivation, which likewise refuses to trust a count
-    /// it cannot read. A genuinely absent record keeps the documented
+    /// An unreadable record yields `false` — nothing is known about the count, so
+    /// it must not be folded into a `COUNT(*)` answer — matching the
+    /// schema-evolution re-derivation, which likewise refuses to trust a count it
+    /// cannot read. Only a genuinely absent record keeps the documented
     /// trusted-exact-once migration behaviour.
     async fn load_table_statistics(
         catalog: &Arc<dyn MetadataCatalog>,
@@ -21138,10 +21136,38 @@ impl CayenneTableProvider {
     /// merges this write into it. `num_rows_update` sets the live count relative
     /// to the previous aggregate (`Delta`), to an authoritative value (`Set`), or
     /// leaves it (`Unchanged`).
-    /// Returns whether the update reached the metastore and the cache. All three
-    /// bail-outs below abandon `num_rows_update` while leaving `count_exact`
-    /// as it was, so a caller that folds the failure into "the count is current"
-    /// would serve a drifted count as `Exact`.
+    /// Abandon a statistics update, demoting the cached exactness on the way out.
+    ///
+    /// Every failing exit of [`Self::persist_table_stats_locked`] returns through
+    /// here, so the demotion is a property of "the update was abandoned" rather
+    /// than of any one branch — a fourth bail-out cannot silently skip it.
+    ///
+    /// The demotion is what makes abandoning safe. The post-write maintenance
+    /// drain reads the returned `bool` and keeps its live-rows delta outstanding,
+    /// which holds the count `Inexact` on its own; the mem-tier checkpoint does
+    /// not — it discards the `bool`, the `Delta { exact: false }` it passes is the
+    /// very update being abandoned, and it has already cleared the in-memory
+    /// proxies (resident inline rows, mem-tier tombstones) that would otherwise
+    /// demote the stats. Without this, that path serves an `Exact` count which no
+    /// persisted record describes. Cache-only, so unlike a durable taint it cannot
+    /// fail in turn, and it self-heals: the next successful persist restores
+    /// exactness from the record it writes.
+    fn abandon_table_stats_update(&self, reason: &str) -> bool {
+        tracing::warn!(
+            "Abandoning table stats update for {}: {reason}",
+            self.table_metadata.table_name
+        );
+        self.table_statistics.write().count_exact = false;
+        false
+    }
+
+    /// Returns whether the update reached the metastore and the cache. Every
+    /// bail-out abandons `num_rows_update` and leaves the durable record as it
+    /// was, so each one goes through [`Self::abandon_table_stats_update`] to
+    /// demote the cached exactness — a caller that discards the returned `bool`
+    /// would otherwise fold the failure into "the count is current" and serve a
+    /// drifted count as `Exact`. The one exception is an accumulator with no
+    /// rows: it has nothing to describe, so there is nothing to abandon.
     async fn persist_table_stats_locked(
         &self,
         accumulator: &ColumnStatsAccumulator,
@@ -21150,7 +21176,14 @@ impl CayenneTableProvider {
     ) -> bool {
         let Some((new_blob, _new_rows)) = accumulator.to_file_statistics_blob_with_row_count()
         else {
-            return false;
+            // A zero-row accumulator abandons nothing, so the cached exactness
+            // still describes the corpus. Any other failure here (serialization,
+            // a poisoned mutex) drops rows that ARE already visible to scans.
+            if accumulator.row_count() == 0 {
+                return false;
+            }
+            return self
+                .abandon_table_stats_update("this write's statistics blob could not be built");
         };
         let new_ndv = accumulator.to_ndv_sketches();
 
@@ -21172,33 +21205,13 @@ impl CayenneTableProvider {
                 {
                     PersistedTableStatistics::Present(stats) => Some(stats),
                     PersistedTableStatistics::Absent => None,
-                    // A merge needs a baseline and an unreadable record is not
-                    // one. Continuing would treat the previous count as zero, so
-                    // a `Delta` would write only this write's rows as the table's
-                    // total, an `exact` one would flag that partial total exact,
-                    // and the merged blob would replace the accumulated
-                    // aggregate — durably, and indistinguishably from a
-                    // legitimate baseline once written. Abandon the update
-                    // instead: the caller leaves its live-rows delta outstanding
-                    // on `false`, which holds the served count at `Inexact` until
-                    // a later persist or a full-rewrite `Set` re-baselines it.
+                    // A merge needs a baseline; see
+                    // [`PersistedTableStatistics::Unreadable`] for what merging
+                    // without one publishes.
                     PersistedTableStatistics::Unreadable => {
-                        tracing::warn!(
-                            "Abandoning table stats update for {}: the existing statistics record could not be read, so this write has no baseline to merge onto",
-                            self.table_metadata.table_name
+                        return self.abandon_table_stats_update(
+                            "the existing statistics record could not be read, so this write has no baseline to merge onto",
                         );
-                        // Abandoning is only safe if nothing goes on serving the
-                        // cached count as exact. The maintenance drain keeps its
-                        // live-rows delta outstanding on `false`, which covers it
-                        // — but the mem-tier checkpoint discards this `bool`, and
-                        // its own `Delta { exact: false }` (the update just
-                        // abandoned) is what would have demoted the count, while
-                        // the checkpoint clears the in-memory proxies that hold it
-                        // `Inexact` in the meantime. Demote here so every caller
-                        // is covered by construction. Cache-only, so unlike a
-                        // durable taint it cannot fail in turn.
-                        self.table_statistics.write().count_exact = false;
-                        return false;
                     }
                 }
             }
@@ -21260,7 +21273,7 @@ impl CayenneTableProvider {
                 "Failed to persist table stats for {}: {e}",
                 self.table_metadata.table_name
             );
-            return false;
+            return self.abandon_table_stats_update("the statistics record could not be written");
         }
 
         let df_stats = Self::table_statistics_to_df(&self.table_schema(), &stats);
@@ -38377,6 +38390,17 @@ mod tests {
         insert_batch_with_context(&ctx, provider, batch).await;
     }
 
+    /// The schema [`make_listing_parity_batch`] builds: it hard-codes
+    /// `Int64Array / StringArray / Int64Array` in this order and panics on any other
+    /// shape, so the two belong together.
+    fn listing_parity_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("category", DataType::Utf8, false),
+            Field::new("value", DataType::Int64, false),
+        ]))
+    }
+
     fn make_listing_parity_batch(schema: SchemaRef, start: i64, row_count: usize) -> RecordBatch {
         use arrow::array::StringArray;
         let row_count = i64::try_from(row_count).expect("test row count fits in i64");
@@ -38482,11 +38506,7 @@ mod tests {
 
     #[tokio::test]
     async fn direct_snapshot_scan_matches_listing_table_scan_behavior() {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-            Field::new("category", DataType::Utf8, false),
-            Field::new("value", DataType::Int64, false),
-        ]));
+        let schema = listing_parity_schema();
         let config = SessionConfig::new()
             .with_target_partitions(2)
             .set_usize("datafusion.execution.meta_fetch_concurrency", 1);
@@ -38937,11 +38957,7 @@ mod tests {
     /// listing (so an unpopulated manifest can never make a scan miss a file).
     #[tokio::test]
     async fn scan_from_manifest_listing_equals_directory_listing() {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-            Field::new("category", DataType::Utf8, false),
-            Field::new("value", DataType::Int64, false),
-        ]));
+        let schema = listing_parity_schema();
         let config = SessionConfig::new()
             .with_target_partitions(2)
             .set_usize("datafusion.execution.meta_fetch_concurrency", 1);
@@ -39180,15 +39196,6 @@ mod tests {
         (provider, catalog, temp_dir)
     }
 
-    /// Schema shared by the statistics-read-failure tests below.
-    fn unreadable_stats_schema() -> SchemaRef {
-        Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-            Field::new("category", DataType::Utf8, false),
-            Field::new("value", DataType::Int64, false),
-        ]))
-    }
-
     /// Make the statistics READ fail while leaving the write leg working.
     ///
     /// The blob column is `NOT NULL`, but it has BLOB affinity, so SQLite stores
@@ -39198,11 +39205,18 @@ mod tests {
     /// merge onto a missing baseline durable, so it is what the fixture has to
     /// reproduce: dropping the whole table would fail the write too, and prove
     /// nothing.
-    fn make_table_statistics_unreadable(temp_dir: &std::path::Path, table_id: &str) {
+    /// Open the metastore SQLite file directly, bypassing the catalog. The path
+    /// layout is the one `create_reopenable_append_table` and its siblings build.
+    fn open_metastore_db(temp_dir: &std::path::Path) -> rusqlite::Connection {
         let conn = rusqlite::Connection::open(temp_dir.join("metadata").join("cayenne.db"))
             .expect("open metastore db directly");
         conn.busy_timeout(std::time::Duration::from_secs(5))
             .expect("busy timeout");
+        conn
+    }
+
+    fn make_table_statistics_unreadable(temp_dir: &std::path::Path, table_id: &str) {
+        let conn = open_metastore_db(temp_dir);
         let updated = conn
             .execute(
                 "UPDATE cayenne_table_statistics SET statistics_blob = 'unreadable'
@@ -39216,27 +39230,29 @@ mod tests {
         );
     }
 
-    /// Read the durable statistics row directly, bypassing the catalog — whose
-    /// own reader is the thing the fixture has broken.
-    ///
-    /// Returns `(num_rows, num_rows_exact, blob_still_unreadable)`. The third
-    /// field distinguishes "left alone" from "rewritten": only a real write
-    /// replaces the fixture's text sentinel with a blob.
-    fn read_durable_stats_row(temp_dir: &std::path::Path, table_id: &str) -> (i64, bool, bool) {
-        let conn = rusqlite::Connection::open(temp_dir.join("metadata").join("cayenne.db"))
-            .expect("open metastore db directly");
-        conn.busy_timeout(std::time::Duration::from_secs(5))
-            .expect("busy timeout");
+    /// The durable statistics row, read directly — the catalog's own reader is
+    /// the thing the fixture has broken.
+    struct DurableStatsRow {
+        num_rows: i64,
+        num_rows_exact: bool,
+        /// Whether the blob is still the fixture's text sentinel. Distinguishes
+        /// "left alone" from "rewritten": only a real write replaces it with a
+        /// blob.
+        blob_is_text: bool,
+    }
+
+    fn read_durable_stats_row(temp_dir: &std::path::Path, table_id: &str) -> DurableStatsRow {
+        let conn = open_metastore_db(temp_dir);
         conn.query_row(
             "SELECT num_rows, num_rows_exact, typeof(statistics_blob) = 'text'
              FROM cayenne_table_statistics WHERE table_id = ?1",
             [table_id],
             |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, i64>(1)? != 0,
-                    row.get::<_, i64>(2)? != 0,
-                ))
+                Ok(DurableStatsRow {
+                    num_rows: row.get::<_, i64>(0)?,
+                    num_rows_exact: row.get::<_, i64>(1)? != 0,
+                    blob_is_text: row.get::<_, i64>(2)? != 0,
+                })
             },
         )
         .expect("read the durable statistics row")
@@ -39257,7 +39273,7 @@ mod tests {
         const SECOND_WRITE_ROWS: usize = 8;
 
         let runtime_env = SessionContext::new().runtime_env();
-        let schema = unreadable_stats_schema();
+        let schema = listing_parity_schema();
         let (provider, catalog, temp_dir) = create_reopenable_append_table(
             "stats_unreadable_partial_count",
             Arc::clone(&schema),
@@ -39321,20 +39337,19 @@ mod tests {
             .expect("the maintenance pass must succeed even when it abandons the stats update");
 
         // State first, so a regression names the harm rather than the mechanism.
-        let (durable_rows, durable_exact, blob_left_alone) =
-            read_durable_stats_row(temp_dir.path(), &table_id);
+        let durable = read_durable_stats_row(temp_dir.path(), &table_id);
         assert_eq!(
-            durable_rows,
+            durable.num_rows,
             i64::try_from(BASELINE_ROWS).expect("row count fits in i64"),
             "a failed statistics read must leave the durable count alone; rewriting it to this \
              write's {SECOND_WRITE_ROWS} rows publishes a partial count as the table's total"
         );
         assert!(
-            durable_exact,
+            durable.num_rows_exact,
             "the untouched record keeps its own exactness; the fix must not rewrite it at all"
         );
         assert!(
-            blob_left_alone,
+            durable.blob_is_text,
             "the aggregate blob must be left as-is: merging without a baseline would replace the \
              accumulated min/max and NDV with this single write's"
         );
@@ -39369,7 +39384,7 @@ mod tests {
     #[tokio::test]
     async fn reopening_over_an_unreadable_stats_record_does_not_trust_the_count_as_exact() {
         let runtime_env = SessionContext::new().runtime_env();
-        let schema = unreadable_stats_schema();
+        let schema = listing_parity_schema();
         let (provider, catalog, temp_dir) = create_reopenable_append_table(
             "stats_unreadable_open_exactness",
             Arc::clone(&schema),
@@ -39433,7 +39448,7 @@ mod tests {
     #[tokio::test]
     async fn abandoning_a_stats_update_demotes_the_cached_exactness() {
         let runtime_env = SessionContext::new().runtime_env();
-        let schema = unreadable_stats_schema();
+        let schema = listing_parity_schema();
         let (provider, catalog, temp_dir) = create_reopenable_append_table(
             "stats_unreadable_cached_exactness",
             Arc::clone(&schema),
@@ -39532,11 +39547,7 @@ mod tests {
     #[tokio::test]
     async fn backfill_on_open_populates_empty_manifest_from_directory() {
         let runtime_env = SessionContext::new().runtime_env();
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-            Field::new("category", DataType::Utf8, false),
-            Field::new("value", DataType::Int64, false),
-        ]));
+        let schema = listing_parity_schema();
         let (provider, catalog, _temp_dir) = create_reopenable_append_table(
             "manifest_backfill_on_open",
             Arc::clone(&schema),
@@ -44032,10 +44043,7 @@ mod tests {
 
         // Poison the metastore read path: any `get_inlined_data` round trip
         // from here on errors with `no such table`.
-        let db_path = tmp.path().join("metadata").join("cayenne.db");
-        let conn = rusqlite::Connection::open(&db_path).expect("open metastore db directly");
-        conn.busy_timeout(std::time::Duration::from_secs(5))
-            .expect("busy timeout");
+        let conn = open_metastore_db(tmp.path());
         conn.execute_batch(
             "ALTER TABLE cayenne_inlined_data RENAME TO cayenne_inlined_data_hidden;",
         )
