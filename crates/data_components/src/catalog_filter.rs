@@ -336,6 +336,9 @@ mod tests {
             &["public.orders", "sales.*"],
             &["public.*", "*.audit_log"],
             &["pg_*.*"],
+            &[r"pub\lic.*"],
+            &["otherdb.orders", "sales_*.orders"],
+            &["{public,sales}.*", "north.*"],
         ];
         let containers = [
             "public",
@@ -344,10 +347,22 @@ mod tests {
             "sales_",
             "audit",
             "pg_toast",
+            "north",
             "s",
             "",
+            // A container whose own name holds the separator: the candidate the
+            // prune reasons about is still `"{container}.{table}"`.
+            "public.nested",
         ];
-        let tables = ["orders", "order1", "audit_log", "lineitem", "x", ""];
+        let tables = [
+            "orders",
+            "order1",
+            "audit_log",
+            "lineitem",
+            "x",
+            "",
+            "orders.v2",
+        ];
 
         for patterns in pattern_sets {
             let selector = sel(patterns);
