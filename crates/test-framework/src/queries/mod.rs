@@ -1417,8 +1417,9 @@ mod tests {
         assert!(duckdb.contains(&"chbench_q18".to_string()));
         assert_eq!(duckdb.len(), 21);
 
-        // An override with no CH-benCH exclusions must not shrink the set —
-        // `get_chbench_test_queries` is reached with every engine's override.
+        // Most overrides name an engine that excludes nothing from CH-benCH, and
+        // those must leave the set whole — Cayenne is the accelerator under test
+        // in most configs, and MySQL reaches this as a source override.
         assert_eq!(chbench_query_names(&[QueryOverrides::Cayenne]).len(), 22);
         assert_eq!(chbench_query_names(&[QueryOverrides::MySQL]).len(), 22);
     }

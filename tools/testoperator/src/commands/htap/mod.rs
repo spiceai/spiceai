@@ -566,7 +566,7 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
                 // so it excludes what *either* engine cannot serve — unlike the
                 // measured phase above, which only ever queries spiced and so
                 // applies the accelerator's overrides alone.
-                let query_overrides = test_args.resolved_comparison_query_overrides();
+                let query_overrides = args.resolved_comparison_query_overrides();
                 let analytical_result = correctness::verify_analytical_results(
                     Arc::clone(&driver),
                     &spice_clients,

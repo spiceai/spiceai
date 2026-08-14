@@ -91,15 +91,6 @@ pub struct DatasetTestArgs {
     #[arg(long)]
     pub(crate) query_overrides: Option<QueryOverridesArg>,
 
-    /// Additional query overrides for the *source* engine, applied only where a
-    /// query must also run against the source: the HTAP analytical-correctness
-    /// gate, which executes each query on both the source and spiced to diff the
-    /// results. Unioned with `--query-overrides` there, and ignored everywhere
-    /// else — so a query the source cannot serve is excluded from the gate
-    /// without shrinking the measured query set.
-    #[arg(long)]
-    pub(crate) source_query_overrides: Option<QueryOverridesArg>,
-
     #[arg(long, action = ArgAction::Set, default_value_t = false, default_missing_value = "true", num_args = 0..=1, require_equals = false)]
     pub(crate) validate: bool,
 
@@ -389,22 +380,14 @@ impl DatasetTestArgs {
     }
 
     /// Overrides for the engine serving the measured queries (the accelerator).
+    /// Every command's measured queries run against spiced alone, so this is the
+    /// only resolver they need; the HTAP gate additionally folds in the source's
+    /// overrides via [`HtapArgs::resolved_comparison_query_overrides`].
+    ///
+    /// [`HtapArgs::resolved_comparison_query_overrides`]: super::HtapArgs::resolved_comparison_query_overrides
     #[must_use]
     pub fn resolved_query_overrides(&self) -> Option<QueryOverrides> {
         self.query_overrides.clone().map(QueryOverrides::from)
-    }
-
-    /// Overrides for every engine a source-comparing phase touches: the
-    /// accelerator plus the source. Only the HTAP analytical-correctness gate
-    /// runs queries against the source, so only it uses this.
-    #[must_use]
-    pub fn resolved_comparison_query_overrides(&self) -> Vec<QueryOverrides> {
-        self.query_overrides
-            .clone()
-            .into_iter()
-            .chain(self.source_query_overrides.clone())
-            .map(QueryOverrides::from)
-            .collect()
     }
 
     /// The simulated client fleet, when the three fleet flags were given.
