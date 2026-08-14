@@ -252,6 +252,87 @@ fn embedding_col(search_column: &str) -> String {
     format!("{search_column}_embedding")
 }
 
+/// Why an embedding vector cannot be indexed.
+///
+/// [`Display`](std::fmt::Display) renders the defect as a sentence fragment, so a caller that
+/// already names the index and the row can splice it into its own message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EmbeddingDefect {
+    /// At least one element is `NaN` or infinite, so every distance computed against the
+    /// vector is undefined. For a graph index (DuckDB HNSW) a single such vector also
+    /// degrades the neighbour lists other rows are found through.
+    NonFinite,
+    /// Every element is zero, so the vector has no direction and cosine distance against
+    /// it is undefined.
+    AllZero,
+}
+
+impl std::fmt::Display for EmbeddingDefect {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NonFinite => f.write_str("contains a NaN or infinite value"),
+            Self::AllZero => f.write_str("is all zeroes"),
+        }
+    }
+}
+
+/// The single definition of "this embedding cannot be indexed", shared by every write path
+/// so that one backend cannot disagree with another about what a usable vector is.
+///
+/// Returns `None` when the vector is usable. The test is per element and includes the
+/// infinities, so a vector that mixes real values with a `NaN` — `[NaN, 2.0, 3.0]` — is
+/// rejected.
+///
+/// A write-side guard does not remove the need for the read side to screen the same values:
+/// [`native_vector::NativeVectorIndex`] indexes a column written by the accelerator sink, and
+/// `cosine_distance` is registered for any numeric list column, so a vector can reach a query
+/// with no Spice-side embedding code on the path. Today only `cosine_distance` screens a
+/// non-finite value on that end (#13127).
+pub(crate) fn embedding_defect(vector: &[f32]) -> Option<EmbeddingDefect> {
+    if vector.iter().any(|value| !value.is_finite()) {
+        return Some(EmbeddingDefect::NonFinite);
+    }
+
+    if vector.iter().all(|&value| value == 0.0) {
+        return Some(EmbeddingDefect::AllZero);
+    }
+
+    None
+}
+
+/// Counts the rows a write path left out of its index, so that a batch in which the
+/// embedding model has degraded logs once with a sample of the rows rather than once per
+/// row — up to 8192 warnings, for a defect whose cause is the same on every row.
+#[derive(Debug, Default)]
+pub(crate) struct SkippedEmbeddings {
+    count: usize,
+    /// The first few row indices, to make the batch findable without logging all of them.
+    sample: Vec<usize>,
+}
+
+impl SkippedEmbeddings {
+    const SAMPLE_LIMIT: usize = 5;
+
+    pub(crate) fn record(&mut self, row: usize) {
+        self.count += 1;
+        if self.sample.len() < Self::SAMPLE_LIMIT {
+            self.sample.push(row);
+        }
+    }
+
+    /// Emit one warning for everything recorded, naming `context` (the index the rows were
+    /// destined for). Does nothing when no row was skipped.
+    pub(crate) fn warn(&self, context: &str, defect: EmbeddingDefect) {
+        if self.count == 0 {
+            return;
+        }
+        let (count, sample) = (self.count, &self.sample);
+        tracing::warn!(
+            "Not indexing {count} row(s) for {context}: the embedding vector {defect}, so it cannot be searched. Sample row indices: {sample:?}"
+        );
+    }
+}
+
 /// Projection expressions selecting `fields` by name — the key columns
 /// [`VectorIndex::list_all_entry_keys`] promises, used both to narrow a listing to them and to
 /// bring two stores' listings to a common schema before combining them.
@@ -263,6 +344,51 @@ pub(crate) fn primary_key_projection(fields: &[Field]) -> Vec<Expr> {
 mod tests {
     use super::*;
     use std::any::Any;
+
+    #[test]
+    fn usable_embeddings_have_no_defect() {
+        assert_eq!(embedding_defect(&[1.0, 2.0, 3.0]), None);
+        // One zero among real values still leaves a direction.
+        assert_eq!(embedding_defect(&[0.0, 0.0, 1.0]), None);
+        assert_eq!(embedding_defect(&[-1.0, 0.0, f32::MIN_POSITIVE]), None);
+    }
+
+    /// The gap this predicate exists to close: a vector that mixes real values with a
+    /// single non-finite element. `all(|x| x == 0.0 || x.is_nan())` reported these as
+    /// usable, and they were written and indexed (regression test for #13089).
+    #[test]
+    fn a_single_non_finite_element_makes_a_vector_unusable() {
+        for vector in [
+            vec![f32::NAN, 2.0, 3.0],
+            vec![1.0, f32::NAN, 3.0],
+            vec![1.0, 2.0, f32::INFINITY],
+            vec![f32::NEG_INFINITY, 2.0, 3.0],
+            // The all-zero filter did catch these two; they must stay caught.
+            vec![f32::NAN, f32::NAN],
+            vec![0.0, f32::NAN],
+        ] {
+            assert_eq!(
+                embedding_defect(&vector),
+                Some(EmbeddingDefect::NonFinite),
+                "expected {vector:?} to be rejected as non-finite"
+            );
+        }
+    }
+
+    #[test]
+    fn an_all_zero_vector_has_no_direction() {
+        assert_eq!(
+            embedding_defect(&[0.0, 0.0]),
+            Some(EmbeddingDefect::AllZero)
+        );
+        // IEEE-754 negative zero compares equal to zero, and carries no direction either.
+        assert_eq!(
+            embedding_defect(&[-0.0, 0.0, -0.0]),
+            Some(EmbeddingDefect::AllZero)
+        );
+        // An empty vector has no direction; the dimension checks reject it separately.
+        assert_eq!(embedding_defect(&[]), Some(EmbeddingDefect::AllZero));
+    }
 
     #[test]
     fn as_search_index_recognizes_a_known_concrete_type() {

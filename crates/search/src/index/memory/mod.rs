@@ -44,7 +44,7 @@ use snafu::{ResultExt, Snafu, ensure};
 use spice_table::{Index, WriteWindow};
 
 use crate::index::{
-    SearchIndex, VectorIndex, embedding_col,
+    SearchIndex, VectorIndex, embedding_col, embedding_defect,
     memory::{
         provider::{MemoryVectorListTable, MemoryVectorQueryTable},
         store::MemoryVectorStore,
@@ -206,17 +206,14 @@ impl MemoryVectorIndex {
             .map(|(key, vector)| {
                 let keep = match (key, vector) {
                     (Some(key), Some(vector)) => {
-                        // A vector with no defined direction, or with an element that makes
-                        // every distance undefined, would corrupt similarity scores — skip it.
-                        match write_util::embedding_defect(vector) {
+                        match embedding_defect(vector) {
                             None => {
                                 keys.push(key.clone());
                                 true
                             }
                             Some(defect) => {
-                                let reason = defect.reason();
                                 tracing::warn!(
-                                    "Skipping record '{key}' for memory vector index '{INDEX_NAME}': the embedding vector {reason}, so it cannot be searched."
+                                    "Skipping record '{key}' for memory vector index '{INDEX_NAME}': the embedding vector {defect}, so it cannot be searched."
                                 );
                                 false
                             }

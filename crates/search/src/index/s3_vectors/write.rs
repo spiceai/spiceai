@@ -27,10 +27,10 @@ use snafu::{ResultExt, Snafu};
 use spice_table::Index;
 
 use crate::index::write_util::{
-    self, embed_column, embedding_defect, extract_and_format_primary_key,
-    sort_columns_alphabetically, update_embedding_column_in_batch,
+    self, embed_column, extract_and_format_primary_key, sort_columns_alphabetically,
+    update_embedding_column_in_batch,
 };
-use crate::index::{SearchIndex, embedding_col, s3_vectors::S3Vector};
+use crate::index::{SearchIndex, embedding_col, embedding_defect, s3_vectors::S3Vector};
 
 #[derive(Snafu, Debug)]
 pub enum Error {
@@ -292,9 +292,8 @@ fn filter_unusable_vectors(
                 .get(i)
                 .and_then(|k| k.as_ref().map(String::as_str))
                 .unwrap_or("unknown");
-            let reason = defect.reason();
             tracing::warn!(
-                "Skipping record '{key_str}' for S3 Vector index '{index_name}': the embedding vector {reason}, so it cannot be searched."
+                "Skipping record '{key_str}' for S3 Vector index '{index_name}': the embedding vector {defect}, so it cannot be searched."
             );
 
             embeddings.remove(i);

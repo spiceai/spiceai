@@ -38,7 +38,7 @@ use util::{convert_string_arrow_to_iterator, distribute_nulls};
 
 use crate::index::elasticsearch::ElasticsearchIndex;
 use crate::index::embedding_col;
-use crate::index::write_util::{self, EmbeddingDefect};
+use crate::index::{EmbeddingDefect, embedding_defect};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -289,22 +289,16 @@ fn build_documents(
             });
         }
 
-        match write_util::embedding_defect(embedding) {
-            Some(EmbeddingDefect::AllZero) => {
-                all_zero_skips += 1;
-                if all_zero_samples.len() < SAMPLE_LIMIT {
-                    all_zero_samples.push(row);
-                }
-                continue;
+        if let Some(defect) = embedding_defect(embedding) {
+            let (skips, samples) = match defect {
+                EmbeddingDefect::AllZero => (&mut all_zero_skips, &mut all_zero_samples),
+                EmbeddingDefect::NonFinite => (&mut non_finite_skips, &mut non_finite_samples),
+            };
+            *skips += 1;
+            if samples.len() < SAMPLE_LIMIT {
+                samples.push(row);
             }
-            Some(EmbeddingDefect::NonFinite) => {
-                non_finite_skips += 1;
-                if non_finite_samples.len() < SAMPLE_LIMIT {
-                    non_finite_samples.push(row);
-                }
-                continue;
-            }
-            None => {}
+            continue;
         }
 
         let mut doc = serde_json::Map::with_capacity(column_encoders.len() + 1);
@@ -345,12 +339,14 @@ fn build_documents(
     }
     if all_zero_skips > 0 {
         tracing::warn!(
-            "Skipped {all_zero_skips} record(s) for Elasticsearch index '{es_index}': embedding vector is all zeroes, so it has no direction to search by. Sample row indices: {all_zero_samples:?}"
+            "Skipped {all_zero_skips} record(s) for Elasticsearch index '{es_index}': the embedding vector {defect}, so it cannot be searched. Sample row indices: {all_zero_samples:?}",
+            defect = EmbeddingDefect::AllZero
         );
     }
     if non_finite_skips > 0 {
         tracing::warn!(
-            "Skipped {non_finite_skips} record(s) for Elasticsearch index '{es_index}': embedding vector contains non-finite values (NaN or infinity). Sample row indices: {non_finite_samples:?}"
+            "Skipped {non_finite_skips} record(s) for Elasticsearch index '{es_index}': the embedding vector {defect}, so it cannot be searched. Sample row indices: {non_finite_samples:?}",
+            defect = EmbeddingDefect::NonFinite
         );
     }
     if missing_embedding_skips > 0 {
@@ -472,11 +468,11 @@ fn create_embedding_array(
     builder = builder.with_field(item_field);
 
     for (row, emb) in embedding_vectors.iter().enumerate() {
-        match emb {
-            Some(v) if v.len() == expected => {
-                builder.values().append_slice(v);
-                builder.append(true);
-            }
+        // `build_documents` has already left an unusable vector out of Elasticsearch; leave
+        // it out of the column too, so the batch that lands in the accelerated table agrees
+        // with the index about which rows are searchable.
+        let usable = match emb {
+            Some(v) if v.len() == expected => embedding_defect(v).is_none().then_some(v),
             Some(v) => {
                 return Err(Error::EmbeddingDimensionMismatch {
                     index: es_index.to_string(),
@@ -485,11 +481,16 @@ fn create_embedding_array(
                     row_index: row,
                 });
             }
-            None => {
-                // Store `f32` child values, not `Option<f32>`; the list slot represents a null embedding.
-                builder.values().append_value_n(0.0, expected);
-                builder.append(false);
-            }
+            None => None,
+        };
+
+        if let Some(v) = usable {
+            builder.values().append_slice(v);
+            builder.append(true);
+        } else {
+            // Store `f32` child values, not `Option<f32>`; the list slot represents a null embedding.
+            builder.values().append_value_n(0.0, expected);
+            builder.append(false);
         }
     }
 

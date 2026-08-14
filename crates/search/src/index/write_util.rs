@@ -14,9 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Store-agnostic helpers shared by external-store [`crate::index::VectorIndex`]
-//! implementations (S3 Vectors, in-memory): primary-key formatting, search-column
-//! embedding, and embedding-column construction on write.
+//! Store-agnostic helpers shared by [`crate::index::VectorIndex`] implementations:
+//! primary-key formatting, search-column embedding, and embedding-column construction on
+//! write.
 
 use std::{num::TryFromIntError, sync::Arc};
 
@@ -31,7 +31,7 @@ use serde_json::Value;
 use snafu::{ResultExt, Snafu};
 use util::{convert_string_arrow_to_iterator, distribute_nulls};
 
-use crate::index::embedding_col;
+use crate::index::{EmbeddingDefect, SkippedEmbeddings, embedding_col, embedding_defect};
 
 #[derive(Snafu, Debug)]
 #[snafu(visibility(pub(crate)))]
@@ -91,49 +91,6 @@ pub enum Error {
         actual: usize,
         row_index: usize,
     },
-}
-
-/// Why an embedding vector cannot be indexed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum EmbeddingDefect {
-    /// At least one element is `NaN` or infinite, so every distance computed against the
-    /// vector is undefined. For a graph index (DuckDB HNSW) a single such vector also
-    /// degrades the neighbour lists other rows are found through.
-    NonFinite,
-    /// Every element is zero, so the vector has no direction and cosine distance against
-    /// it is undefined.
-    AllZero,
-}
-
-impl EmbeddingDefect {
-    /// The defect as a message fragment, for a log line or an error that already names the
-    /// index and the row.
-    pub(crate) fn reason(self) -> &'static str {
-        match self {
-            Self::NonFinite => "contains a NaN or infinite value",
-            Self::AllZero => "is all zeroes",
-        }
-    }
-}
-
-/// The single definition of "this embedding cannot be indexed", shared by every write path
-/// so that one backend cannot disagree with another about what a usable vector is.
-///
-/// Returns `None` when the vector is usable. The test is per element and includes the
-/// infinities, so a vector that mixes real values with a `NaN` — `[NaN, 2.0, 3.0]` — is
-/// rejected. The read side screens the same values (`cosine_distance` returns NULL for a
-/// distance that is not defined), and both ends need the check: a vector column can reach
-/// an index from a source with no Spice-side embedding code on the path.
-pub(crate) fn embedding_defect(vector: &[f32]) -> Option<EmbeddingDefect> {
-    if vector.iter().any(|value| !value.is_finite()) {
-        return Some(EmbeddingDefect::NonFinite);
-    }
-
-    if vector.iter().all(|&value| value == 0.0) {
-        return Some(EmbeddingDefect::AllZero);
-    }
-
-    None
 }
 
 /// Given a [`RecordBatch`] of data from a [`crate::index::SearchIndex`]'s associated
@@ -328,6 +285,13 @@ pub fn update_embedding_column_in_batch(
 }
 
 /// Create an Arrow array from embedding vectors.
+///
+/// A vector that cannot be indexed ([`embedding_defect`]) becomes a null slot rather than a
+/// stored value. The backends that call this also drop such a record from their own store,
+/// but the batch built here is what lands in the accelerated table — and a vector column
+/// there is searchable on its own, through `native_vector_indexes_for_schema`, so leaving
+/// the value in the column would make the column and the index disagree about which rows
+/// are searchable.
 #[expect(clippy::cast_sign_loss)]
 pub fn create_embedding_array(
     embedding_vectors: &[Option<Vec<f32>>],
@@ -356,6 +320,8 @@ pub fn create_embedding_array(
     builder = builder.with_field(field);
 
     let expected_dim = dimension as usize;
+    let mut non_finite = SkippedEmbeddings::default();
+    let mut all_zero = SkippedEmbeddings::default();
     for (row_index, embedding_opt) in embedding_vectors.iter().enumerate() {
         if let Some(embedding) = embedding_opt {
             // Validate embedding dimension matches expected dimension
@@ -365,6 +331,15 @@ pub fn create_embedding_array(
                     actual: embedding.len(),
                     row_index,
                 }));
+            }
+            if let Some(defect) = embedding_defect(embedding) {
+                match defect {
+                    EmbeddingDefect::NonFinite => non_finite.record(row_index),
+                    EmbeddingDefect::AllZero => all_zero.record(row_index),
+                }
+                builder.values().append_value_n(0.0, expected_dim);
+                builder.append(false);
+                continue;
             }
             // Optimized: append_slice automatically marks all values as valid
             // without needing to allocate a separate validity vector
@@ -377,6 +352,9 @@ pub fn create_embedding_array(
             builder.append(false);
         }
     }
+
+    non_finite.warn("the embedding column", EmbeddingDefect::NonFinite);
+    all_zero.warn("the embedding column", EmbeddingDefect::AllZero);
 
     Ok(Arc::new(builder.finish()))
 }
@@ -407,51 +385,6 @@ mod tests {
     use super::*;
     use arrow::array::{FixedSizeListArray, Float32Array, Float32Builder, Int32Array, StringArray};
     use arrow::datatypes::{DataType, Schema};
-
-    #[test]
-    fn usable_embeddings_have_no_defect() {
-        assert_eq!(embedding_defect(&[1.0, 2.0, 3.0]), None);
-        // One zero among real values still leaves a direction.
-        assert_eq!(embedding_defect(&[0.0, 0.0, 1.0]), None);
-        assert_eq!(embedding_defect(&[-1.0, 0.0, f32::MIN_POSITIVE]), None);
-    }
-
-    /// The gap this predicate exists to close: a vector that mixes real values with a
-    /// single non-finite element. `all(|x| x == 0.0 || x.is_nan())` reported these as
-    /// usable, and they were written and indexed (regression test for #13089).
-    #[test]
-    fn a_single_non_finite_element_makes_a_vector_unusable() {
-        for vector in [
-            vec![f32::NAN, 2.0, 3.0],
-            vec![1.0, f32::NAN, 3.0],
-            vec![1.0, 2.0, f32::INFINITY],
-            vec![f32::NEG_INFINITY, 2.0, 3.0],
-            // The all-zero filter did catch these two; they must stay caught.
-            vec![f32::NAN, f32::NAN],
-            vec![0.0, f32::NAN],
-        ] {
-            assert_eq!(
-                embedding_defect(&vector),
-                Some(EmbeddingDefect::NonFinite),
-                "expected {vector:?} to be rejected as non-finite"
-            );
-        }
-    }
-
-    #[test]
-    fn an_all_zero_vector_has_no_direction() {
-        assert_eq!(
-            embedding_defect(&[0.0, 0.0]),
-            Some(EmbeddingDefect::AllZero)
-        );
-        // IEEE-754 negative zero compares equal to zero, and carries no direction either.
-        assert_eq!(
-            embedding_defect(&[-0.0, 0.0, -0.0]),
-            Some(EmbeddingDefect::AllZero)
-        );
-        // An empty vector has no direction; the dimension checks reject it separately.
-        assert_eq!(embedding_defect(&[]), Some(EmbeddingDefect::AllZero));
-    }
 
     // Helper function to create a test RecordBatch with text and embedding columns
     #[expect(clippy::cast_sign_loss)]
@@ -523,6 +456,30 @@ mod tests {
             ],
         )
         .expect("valid composite primary key batch")
+    }
+
+    /// The record is dropped from the index's own store by the caller, but the batch this
+    /// builds is what lands in the accelerated table — where the vector column is
+    /// searchable in its own right. Leaving the value in would make the column and the
+    /// index disagree about which rows are searchable (regression test for #13089).
+    #[test]
+    fn an_unusable_embedding_becomes_a_null_slot() {
+        let embeddings = vec![
+            Some(vec![1.0, 2.0, 3.0]),
+            Some(vec![1.0, f32::NAN, 3.0]),
+            Some(vec![0.0, 0.0, 0.0]),
+            None,
+            Some(vec![4.0, 5.0, 6.0]),
+        ];
+
+        let array = create_embedding_array(&embeddings, 3)
+            .expect("the batch is built, minus the unusable vectors");
+
+        assert_eq!(array.len(), 5, "every row keeps its slot");
+        assert_eq!(
+            (0..5).map(|i| array.is_null(i)).collect::<Vec<_>>(),
+            vec![false, true, true, true, false]
+        );
     }
 
     #[test]
