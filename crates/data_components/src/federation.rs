@@ -323,7 +323,7 @@ mod tests {
 
     /// The upstream fixes these guard live in the `spiceai/datafusion` fork on
     /// `spiceai-54`, so nothing here fails if a later pin bump drops them. The
-    /// fork's branch is re-cut per DataFusion major and takes its own tests with
+    /// fork's branch is re-cut per `DataFusion` major and takes its own tests with
     /// it; these stay. Extend them whenever a pin bump carries another unparser
     /// fix — #13081 tracks the three this bump left unguarded.
     ///
