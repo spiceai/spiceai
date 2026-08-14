@@ -472,6 +472,32 @@ fn contains_view_type(data_type: &DataType) -> bool {
     }
 }
 
+/// Whether `data_type` is, or holds anywhere within it, a dictionary.
+///
+/// This recurses because its consumer does: `MutableArrayData::new` builds a
+/// child `MutableArrayData` for every struct field, list value and union
+/// variant, so a dictionary nested inside a container reaches the same
+/// dictionary-key overflow that a top-level one does.
+fn contains_dictionary(data_type: &DataType) -> bool {
+    match data_type {
+        DataType::Dictionary(_, _) => true,
+        DataType::List(field)
+        | DataType::LargeList(field)
+        | DataType::ListView(field)
+        | DataType::LargeListView(field)
+        | DataType::FixedSizeList(field, _)
+        | DataType::Map(field, _)
+        | DataType::RunEndEncoded(_, field) => contains_dictionary(field.data_type()),
+        DataType::Struct(fields) => fields
+            .iter()
+            .any(|field| contains_dictionary(field.data_type())),
+        DataType::Union(fields, _) => fields
+            .iter()
+            .any(|(_, field)| contains_dictionary(field.data_type())),
+        _ => false,
+    }
+}
+
 /// How many bytes are reclaimable from a column retaining `retained` where its
 /// rows need `needed`, or `None` when the copy would not pay for itself.
 fn worth_compacting(retained: usize, needed: usize) -> Option<usize> {
@@ -539,8 +565,10 @@ fn reclaimable_bytes(column: &ArrayRef) -> Option<usize> {
         // dictionary whose value count does not fit its key type — a
         // `Dictionary(UInt8, _)` holding exactly 256 values is valid Arrow and
         // trips it (`build_extend_dictionary` returns `None`, which
-        // `MutableArrayData::with_capacities` unwraps with `expect`).
-        DataType::Dictionary(_, _) => return None,
+        // `MutableArrayData::with_capacities` unwraps with `expect`). Both
+        // reasons hold for a dictionary at any depth: the extend is built per
+        // child, so a `Struct<Dictionary<UInt8, _>>` reaches the same `expect`.
+        data_type if contains_dictionary(data_type) => return None,
         _ => {}
     }
 
@@ -1502,6 +1530,51 @@ mod test {
         assert!(
             Arc::ptr_eq(sliced.column(0), compacted.column(0)),
             "a dictionary column must not be compacted"
+        );
+        assert_eq!(compacted.num_rows(), 1);
+    }
+
+    /// `MutableArrayData` builds an extend per child, so a dictionary nested in
+    /// a struct reaches the same key-overflow `expect` as a top-level one. The
+    /// guard has to recurse to keep it away from that path.
+    #[test]
+    fn compact_retained_buffers_leaves_a_struct_wrapped_full_range_dictionary_alone() {
+        use arrow::array::{DictionaryArray, StructArray, UInt8Array};
+        use arrow::datatypes::UInt8Type;
+
+        let values = StringArray::from(
+            (0..256)
+                .map(|value| format!("value-{value}"))
+                .collect::<Vec<_>>(),
+        );
+        let keys = UInt8Array::from(
+            (0..200_000)
+                .map(|row| u8::try_from(row % 256).unwrap_or_default())
+                .collect::<Vec<_>>(),
+        );
+        let dictionary: ArrayRef = Arc::new(
+            DictionaryArray::<UInt8Type>::try_new(keys, Arc::new(values))
+                .expect("valid dictionary"),
+        );
+        let inner = Field::new("d", dictionary.data_type().clone(), true);
+        let column: ArrayRef = Arc::new(StructArray::from(vec![(
+            Arc::new(inner),
+            Arc::clone(&dictionary),
+        )]));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "s",
+            column.data_type().clone(),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(schema, vec![column]).expect("valid batch");
+        let sliced = batch.slice(100_000, 1);
+
+        // Must not panic, and must hand back the column untouched.
+        let compacted = compact_retained_buffers(&sliced);
+
+        assert!(
+            Arc::ptr_eq(sliced.column(0), compacted.column(0)),
+            "a struct holding a dictionary must not be compacted"
         );
         assert_eq!(compacted.num_rows(), 1);
     }
