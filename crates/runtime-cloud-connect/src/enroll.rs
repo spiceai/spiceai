@@ -1246,6 +1246,18 @@ pub async fn enroll_now_with_transaction(
     }
     let org_name = (!normalized_org_name.is_empty()).then(|| normalized_org_name.clone());
     outcome.metadata.organization.name = normalized_org_name;
+    // The page an unattached instance is sent to. It is untrusted input that
+    // ends up in a log line and in a browser, so it passes the one portal-link
+    // rule before it becomes durable: an unusable link is dropped rather than
+    // stored, and the enrollment still succeeds, because the link is guidance
+    // and not credential material.
+    let new_project_url = outcome
+        .metadata
+        .new_project_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+        .and_then(crate::config::safe_portal_url);
 
     // Atomic promotion: the draft's provisional key material becomes the
     // identity, written owner-only via atomic rename; the draft is deleted
@@ -1265,17 +1277,11 @@ pub async fn enroll_now_with_transaction(
         org_name,
         app_name: None,
         monitor_url: None,
+        // Where a still-unattached instance is sent to create a project.
+        // Recorded now because the enroll response is the only place it is
+        // reported, and every later start has to name the same page.
+        new_project_url,
         control_plane_endpoint: Some(draft.binding.endpoint.clone()),
-        // The page that attaches this instance to a project, kept so any later
-        // start can point an operator at it. Validated here rather than at the
-        // log site: an unsafe or non-absolute link is dropped before it is
-        // durable, and the enrollment still succeeds — the link is guidance, not
-        // credential material.
-        new_project_url: outcome
-            .metadata
-            .new_project_url
-            .as_deref()
-            .and_then(crate::config::safe_portal_url),
         enc_private_key_pem: material.enc_private_key_pem,
         enc_public_key_pem: material.enc_public_key_pem,
         // A fresh enrollment has no prior key to retain.

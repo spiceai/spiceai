@@ -75,7 +75,7 @@ use crate::error::{Error, Result};
 
 pub(crate) use backend::{InstallRequest, LogRequest, ServiceBackend, for_host as backend};
 pub(crate) use manifest::{ServiceManifest, ServiceOwner};
-pub(crate) use model::{ServiceScope, ServiceStatus};
+pub(crate) use model::{ServiceScope, ServiceState, ServiceStatus};
 
 /// Longest directory-name fragment carried into a service name, so a deeply-named
 /// instance directory cannot produce an unwieldy name. The appended digest is

@@ -317,9 +317,9 @@ fn uninstall(backend: &dyn ServiceBackend, instance_dir: &Path, config_dir: &Pat
     println!("Removed the Spice Cloud Connect service {}.", manifest.name);
     println!(
         "The Cloud identity, project attachment, delivered secrets, and instance files were \
-         retained — `spice connect service install` resumes the same enrollment, and `spice run` \
-         starts the instance in the foreground. `spice connect remove` is the command that \
-         releases the Cloud identity."
+         retained — `spice connect service install` resumes the same enrollment, and \
+         `spice connect` starts the instance in the foreground. `spice connect remove` is the \
+         command that releases the Cloud identity."
     );
     Ok(())
 }

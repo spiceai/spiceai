@@ -68,8 +68,10 @@ pub mod enrollment_key;
 pub mod handlers;
 pub mod identity;
 pub mod release;
+pub mod runtime_lock;
 pub mod sealed_secrets;
 pub mod secret_cache;
+pub mod session;
 
 mod client;
 mod fingerprint;
@@ -113,6 +115,8 @@ pub use handlers::{
     RuntimeHandle, RuntimePhase, SpicepodDeployment, StatusReport, effective_max_rows,
 };
 pub use identity::{AppAttachment, AttachmentState, Identity, IdentityStore};
+pub use runtime_lock::{RuntimeLock, RuntimeLockOwner};
+pub use session::{AcknowledgedSession, SessionAck};
 
 /// Revision of the `spice.cloud.v1` contract this client implements,
 /// announced in `Hello.protocol_version`.
@@ -198,28 +202,6 @@ impl ReconnectableIdentity {
     #[must_use]
     pub fn app_id(&self) -> Option<&str> {
         self.identity.app_id.as_deref()
-    }
-
-    /// The organization this instance is enrolled in, as the control plane last
-    /// reported it.
-    #[must_use]
-    pub fn org_name(&self) -> Option<&str> {
-        self.identity.org_name.as_deref()
-    }
-
-    /// The attached project's name, when one is attached and the control plane
-    /// named it.
-    #[must_use]
-    pub fn app_name(&self) -> Option<&str> {
-        self.identity.app_name.as_deref()
-    }
-
-    /// The Cloud-provided page that creates a project for this instance, when
-    /// the enrollment recorded one. Absent for identities enrolled before the
-    /// link was persisted — no substitute is derived.
-    #[must_use]
-    pub fn new_project_url(&self) -> Option<&str> {
-        self.identity.new_project_url.as_deref()
     }
 
     /// Decode the local delivered-secrets cache key without exposing the
@@ -421,7 +403,7 @@ impl CloudConnect {
             );
             return Ok(None);
         };
-        Ok(Some(Self::start_reconnectable(runtime, identity)))
+        Ok(Some(Self::start_reconnectable(runtime, identity, None)))
     }
 
     /// Start from the exact identity snapshot validated during early startup.
@@ -429,10 +411,15 @@ impl CloudConnect {
     /// This does not reload on-disk state: metrics, logging, managed
     /// configuration, cached secrets, and the control client must all follow
     /// one activation decision for this process.
+    ///
+    /// `session_ack` receives the first control-plane acknowledgement, for a
+    /// caller that reports the connection once the runtime is also serving.
+    /// `None` for callers that report nothing.
     #[must_use]
     pub fn start_reconnectable(
         runtime: Arc<dyn RuntimeHandle>,
         identity: ReconnectableIdentity,
+        session_ack: Option<Arc<SessionAck>>,
     ) -> Self {
         let ReconnectableIdentity { identity, config } = identity;
         let identity = Some(identity);
@@ -442,8 +429,13 @@ impl CloudConnect {
 
         let runtime_for_task = runtime;
         let task = tokio::spawn(async move {
-            let driver =
-                client::ClientDriver::new(config, runtime_for_task, shutdown_for_task, identity);
+            let driver = client::ClientDriver::new(
+                config,
+                runtime_for_task,
+                shutdown_for_task,
+                identity,
+                session_ack,
+            );
             if let Err(err) = driver.run().await {
                 tracing::error!("Cloud Connect driver exited with error: {err}");
             }
