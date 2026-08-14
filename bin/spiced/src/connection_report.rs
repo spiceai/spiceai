@@ -137,6 +137,9 @@ mod tests {
     fn session(app_name: Option<&str>) -> AcknowledgedSession {
         AcknowledgedSession {
             identifier: "inst_abc".to_string(),
+            // No identity on disk: `refreshed` then falls back to this
+            // snapshot, which is what these cases are about.
+            identity_path: std::path::PathBuf::from("/nonexistent/identity.json"),
             org_name: Some("acme".to_string()),
             app_name: app_name.map(str::to_string),
             monitor_url: Some("https://spice.ai/acme/edge/monitor".to_string()),
