@@ -148,7 +148,6 @@ default = [
     "iceberg-write",
     "turso",
     "smb",
-    "pingora",
     "scylladb",
     "models",
     "aws-secrets-manager",
