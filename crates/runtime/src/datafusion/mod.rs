@@ -1106,7 +1106,10 @@ impl DataFusion {
         // that caches its tables (`SpiceSchemaProvider`, the Iceberg catalog's
         // `IcebergSchemaProvider`, …). See `sync_table` for how to extend it to
         // another catalog.
-        runtime_execution_plans::sync_table::resolve_table_sync(schema_provider.as_ref(), table_reference.table())
+        runtime_execution_plans::sync_table::resolve_table_sync(
+            schema_provider.as_ref(),
+            table_reference.table(),
+        )
     }
 
     /// Register a table with its [`SchemaProvider`] if it exists and marks it as writable.

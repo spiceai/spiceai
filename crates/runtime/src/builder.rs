@@ -29,7 +29,6 @@ use crate::config::Config;
 use crate::dataaccelerator::cayenne::CayenneAccelerator;
 use crate::datafusion::builder::CayenneOptimizerRules;
 use crate::datafusion::udf::register_udfs;
-use telemetry::metrics_reader::MetricsReader;
 use crate::{
     Runtime, catalogconnector,
     dataaccelerator::AcceleratorEngineRegistry,
@@ -49,6 +48,7 @@ use spicepod::component::runtime::RuntimeReadyState as SpicepodRuntimeReadyState
 use spicepod::component::runtime::SourceRateControl as SpicepodSourceRateControl;
 use spicepod::component::runtime::TelemetryConfig;
 use std::{collections::HashMap, net::SocketAddr, str::FromStr, sync::Arc, time::Duration};
+use telemetry::metrics_reader::MetricsReader;
 use telemetry::timing::TimeMeasurement;
 use token_provider::registry::TokenProviderRegistry;
 use tokio::runtime::Handle;

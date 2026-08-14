@@ -990,8 +990,7 @@ impl DataAccelerator for DuckDBAccelerator {
         // limit: memory_limit is per-instance (last dataset created wins), so
         // auto-capping an un-limited sibling there would clobber the explicit value.
         if !cmd.options.contains_key("memory_limit")
-            && let Some(auto_limit) =
-                accelerator_memory_budget::duckdb_auto_memory_limit_option()
+            && let Some(auto_limit) = accelerator_memory_budget::duckdb_auto_memory_limit_option()
         {
             let has_explicit_sibling = match source {
                 Some(src) => self.instance_has_explicit_limit_sibling(src).await,
