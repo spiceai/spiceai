@@ -1055,13 +1055,25 @@ impl ExecutionPlan for RerankExec {
         let stream = futures::stream::once(async move {
             // 1. Execute the child plan and collect candidate batches.
             tracing::debug!(document = %document, "RerankExec: collecting candidate batches..");
-            let child_stream = datafusion::physical_plan::execute_stream(input, context)?;
-            let mut batches: Vec<RecordBatch> = child_stream.try_collect().await?;
+            let mut child_stream = datafusion::physical_plan::execute_stream(input, context)?;
+            // Pull batches only until the candidate cap is reached for a flat
+            // input. `DEFAULT_MAX_CANDIDATES` is also pushed down as a LIMIT, but
+            // if the child provider ignores it, `try_collect` would materialize
+            // the entire table into memory before truncating. Stop early instead.
+            let mut batches: Vec<RecordBatch> = Vec::new();
+            let mut total: usize = 0;
+            while let Some(batch) = child_stream.try_next().await? {
+                total += batch.num_rows();
+                batches.push(batch);
+                if !input_is_nested && total >= DEFAULT_MAX_CANDIDATES {
+                    break;
+                }
+            }
 
             // Defensive hard cap on materialized candidates.
-            let total: usize = batches.iter().map(RecordBatch::num_rows).sum();
             if !input_is_nested && total > DEFAULT_MAX_CANDIDATES {
                 batches = truncate_batches(batches, DEFAULT_MAX_CANDIDATES);
+                total = DEFAULT_MAX_CANDIDATES;
             }
 
             tracing::debug!(candidates = total, document = %document, "RerankExec: collected candidate batches");
