@@ -96,7 +96,7 @@ impl FullTextConnector {
 /// registers a `CompoundSearchIndex` in its place, with the tantivy tier nested as its primary
 /// (or, in principle, wrapped in a `ChunkedSearchIndex`) — so this peels through the composing
 /// index types that can hold one before giving up.
-pub(super) fn mark_full_text_cdc_attached(index: &dyn Any) {
+fn mark_full_text_cdc_attached(index: &dyn Any) {
     if let Some(full_text) = index.downcast_ref::<FullTextDatabaseIndex>() {
         full_text.mark_cdc_attached();
     } else if let Some(compound) = index.downcast_ref::<CompoundSearchIndex>() {

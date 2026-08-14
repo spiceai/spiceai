@@ -37,7 +37,6 @@ use crate::component::{
 };
 use crate::dataconnector::{DataConnector, DataConnectorError, DataConnectorResult};
 use crate::federated::FederatedTable;
-use crate::search::full_text::connector::mark_full_text_cdc_attached;
 use crate::search::full_text::table::add_compound_fts_to_table;
 use data_connector_api::accelerated::{AcceleratorSetup, RegisteredAcceleratedTable};
 use data_connector_api::federated::FederatedTableProvider;
@@ -134,18 +133,7 @@ impl ElasticsearchFullTextConnector {
             spice_table::nodes(table_provider.as_ref(), spice_table::LayerWalk::Index)
                 .find(|node| !node.indexes().is_empty())?;
 
-        let all_indexes = indexed_table.indexes().to_vec();
-
-        // A full-text index written by this change stream must not defer its commits
-        // to the sink write lifecycle: the two share one tantivy writer, so a window
-        // commit would publish a partial refresh and a window rollback would discard
-        // these change-stream documents (#12061). The warm tantivy tier is nested as
-        // the primary of the compound this connector builds, so peel through to it.
-        for index in &all_indexes {
-            mark_full_text_cdc_attached(index.as_any());
-        }
-
-        let indexes = Indexes::new(all_indexes);
+        let indexes = Indexes::new(indexed_table.indexes().to_vec());
         let underlying_table =
             Arc::new(FederatedTable::Immediate(Arc::clone(indexed_table.below())));
 
