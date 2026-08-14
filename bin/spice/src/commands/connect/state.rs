@@ -17,9 +17,8 @@ limitations under the License.
 //! Per-directory serialization and the non-secret enrollment journal.
 
 use std::fs::OpenOptions;
-// The Windows reader below returns a `File`; the moved mutation lock took every
-// other use of it with it, so importing it unconditionally would be unused
-// everywhere else.
+// Only the Windows reader below needs `File`, so an unconditional import would
+// be unused everywhere else.
 #[cfg(windows)]
 use std::fs::File;
 use std::io::{Read as _, Write as _};

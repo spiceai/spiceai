@@ -468,6 +468,16 @@ async fn execute_with<P: Prompter>(
     }
 
     if let Some(key) = token {
+        // A key cannot create a project, in any mode. This sits below the draft
+        // decision so that a pending operation answers first: a login-mode
+        // operation asked to finish with a key names the command that finishes it
+        // and the one that abandons it, which is more use than a rule about two
+        // flags.
+        if request.project.is_some() {
+            return Err(invalid_usage(
+                "--project cannot be used with --token; an enrollment key can enroll an instance but cannot create a project.",
+            ));
+        }
         return enroll_with_key(key_enrollment(request.org.clone(), None), key, &telemetry).await;
     }
 
@@ -1786,20 +1796,13 @@ fn safe_recovery_url(candidate: &str) -> Option<String> {
 /// Validate what this invocation asks for on its own terms, before any state is
 /// read or any lock is taken.
 ///
-/// This runs ahead of the pending-draft rules deliberately. Everything it rejects
-/// is invalid whatever is on disk — an enrollment key cannot create a project in
-/// any mode — so rejecting it here costs no I/O and touches nothing. The trade is
-/// that one combination (`--token` with `--project`, over a pending login-mode
-/// operation) is answered by the flag rule rather than by the draft-aware
-/// finish/abandon guidance: dropping the flag that can never apply then reaches
-/// that guidance. Deferring these checks to make one message richer would make
-/// every invalid pair depend on state it cannot change.
+/// Everything here is wrong whatever is on disk — a malformed project name, an
+/// impossible region, an unusable endpoint — so rejecting it costs no I/O and
+/// touches nothing. Rules that a pending operation can answer better are not
+/// here: those wait until the draft has been read, so an operator with an
+/// operation in flight is always told about *that* operation rather than about
+/// the flags in the abstract.
 fn preflight_request(request: &ConnectRequest) -> Result<()> {
-    if request.token.is_some() && request.project.is_some() {
-        return Err(invalid_usage(
-            "--project cannot be used with --token; an enrollment key can enroll an instance but cannot create a project.",
-        ));
-    }
     if let Some(project) = request.project.as_deref() {
         validate_project_name(project)
             .map_err(|reason| invalid_usage(format!("invalid --project value: {reason}.")))?;
@@ -2512,6 +2515,73 @@ mod tests {
                 "a refused resume must enroll nothing"
             );
         }
+    }
+
+    /// The conflict rules are asserted through the command, not only through the
+    /// decision function, because their value is which message an operator
+    /// actually gets — and that depends on the order the command applies them in.
+    ///
+    /// `--token` with `--project` is invalid in every mode, but over a pending
+    /// login-mode operation the useful answer is the one about that operation, so
+    /// the flag rule must not pre-empt it.
+    #[tokio::test(start_paused = true)]
+    async fn a_pending_login_draft_answers_before_the_flag_rules_do() {
+        let instance = tempfile::tempdir().expect("create instance directory");
+        let directory = instance.path().canonicalize().expect("canonical tempdir");
+        let config_dir = CloudConnectConfig::resolve_config_dir(Some(&directory));
+        let endpoint = closed_endpoint();
+        let published = EnrollmentDraft::load_or_create(
+            &config_dir,
+            &InstanceFacts::gather("v0.0.0-ordering-test"),
+            Some("lab-seoul"),
+            &EnrollmentRequestBinding {
+                endpoint: endpoint.clone(),
+                authority: EnrollmentAuthorityBinding::AuthenticatedSession {
+                    organization: "acme".to_string(),
+                },
+            },
+        )
+        .expect("publish a pending enrollment draft");
+
+        let mut prompter = ResumePrompter {
+            interactive: true,
+            key: None,
+            key_prompts: 0,
+        };
+        let error = execute_with(
+            &RuntimeContext::new().expect("runtime context"),
+            ConnectRequest {
+                token: Some(
+                    EnrollmentKey::parse("spice-enroll-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+                        .expect("fixture enrollment key"),
+                ),
+                project: Some("retail".to_string()),
+                dir: Some(directory.clone()),
+                endpoint: Some(endpoint.clone()),
+                ..connect_request()
+            },
+            &mut prompter,
+        )
+        .await
+        .expect_err("a key cannot finish a pending login-mode operation");
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("spice connect --project <name>")
+                && rendered.contains("spice connect remove --yes"),
+            "the pending operation must answer, naming what finishes and what abandons it: {rendered}"
+        );
+        assert_eq!(
+            prompter.key_prompts, 0,
+            "a refusal must not ask for anything first"
+        );
+        assert_eq!(
+            EnrollmentDraft::load_optional(&config_dir)
+                .expect("read the draft state")
+                .expect("the operation is still pending")
+                .enrollment_operation_id,
+            published.enrollment_operation_id,
+            "a refused invocation leaves the pending operation exactly as it was"
+        );
     }
 
     /// A resumed run whose operation is gone refuses and publishes nothing. The

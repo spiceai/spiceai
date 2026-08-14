@@ -338,6 +338,14 @@ impl Runtime {
         // fall back on. Say which sections those are rather than serve less than
         // the app describes in silence.
         if current_app.is_none() {
+            // The reload path reports start-time-only `runtime.*` edits by
+            // diffing against the app it is replacing. There is no such app
+            // here, and the process was built from no configuration at all —
+            // which is what the default describes — so that is the baseline this
+            // start compares against. Without it a first spicepod could set the
+            // CPU budget, the servers or the caches and have none of it take
+            // effect, unreported.
+            warn_on_start_time_only_changes(&SpicepodRuntime::default(), &new_app.runtime);
             warn_on_sections_only_a_start_installs(&new_app);
         }
 
@@ -394,9 +402,10 @@ fn warn_on_sections_only_a_start_installs(app: &App) {
         views: _,
         models: _,
         functions: _,
-        // Reported by `warn_on_start_time_only_changes`, and identity rather
-        // than configuration.
+        // Reported by `warn_on_start_time_only_changes`, which this path calls
+        // against the default baseline just above.
         runtime: _,
+        // Identity rather than configuration.
         name: _,
         spicepods: _,
     } = app;
