@@ -38,12 +38,11 @@ use datafusion_table_providers::UnsupportedTypeAction as DFUnsupportedTypeAction
 use opentelemetry::KeyValue;
 use tokio::sync::Semaphore;
 
-use runtime::component::dataset::Dataset;
-use runtime_component::dataset::DatasetSpec;
 use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
 };
 use runtime_api_types::v1::ComponentType;
+use runtime_component::dataset::DatasetSpec;
 use runtime_metrics::component::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback};
 use runtime_parameters::{ParameterSpec, Parameters};
 

@@ -37,8 +37,6 @@ use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::sql::TableReference;
 use opentelemetry::KeyValue;
 use runtime::component::ComponentInitialization;
-use runtime::component::dataset::Dataset;
-use runtime_component::dataset::DatasetSpec;
 use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult, NewDataConnectorResult,
@@ -48,6 +46,7 @@ use runtime::token_providers::databricks::{
     DatabricksM2MTokenProvider, DatabricksU2MTokenProvider,
 };
 use runtime_api_types::v1::ComponentType;
+use runtime_component::dataset::DatasetSpec;
 use runtime_metrics::component::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback};
 use runtime_parameters::{ParameterSpec, Parameters};
 use runtime_rate_control::RateController;
@@ -1384,6 +1383,7 @@ mod tests {
         datasource::MemTable,
     };
     use runtime::Runtime;
+    use runtime::component::dataset::Dataset;
     use runtime::component::dataset::builder::DatasetBuilder;
     use secrecy::ExposeSecret;
     use std::{

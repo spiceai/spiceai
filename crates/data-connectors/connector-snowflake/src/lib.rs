@@ -32,12 +32,11 @@ use data_components::{Read, ReadWrite};
 use datafusion::datasource::TableProvider;
 use datafusion_table_providers::sql::db_connection_pool::DbConnectionPool;
 use db_connection_pool::snowflakepool::SnowflakeConnectionPool;
-use runtime::component::dataset::Dataset;
-use runtime_component::dataset::DatasetSpec;
 use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult, NewDataConnectorResult,
 };
+use runtime_component::dataset::DatasetSpec;
 use runtime_parameters::ParameterSpec;
 use runtime_udfs_api::deny_spice_specific_functions;
 use snafu::prelude::*;

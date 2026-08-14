@@ -37,12 +37,11 @@ use async_trait::async_trait;
 use data_components::Read;
 use datafusion::datasource::TableProvider;
 use ns_lookup::verify_ns_lookup_and_tcp_connect;
-use runtime::component::dataset::Dataset;
-use runtime_component::dataset::DatasetSpec;
 use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult,
 };
+use runtime_component::dataset::DatasetSpec;
 use runtime_parameters::{ParameterSpec, Parameters};
 use scylla::client::session::Session;
 use scylla::client::session_builder::SessionBuilder;

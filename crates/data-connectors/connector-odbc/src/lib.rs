@@ -33,12 +33,11 @@ use datafusion::sql::unparser::dialect::{
     CustomDialect, CustomDialectBuilder, DateFieldExtractStyle, DefaultDialect, Dialect,
     IntervalStyle, MySqlDialect, PostgreSqlDialect, SqliteDialect,
 };
-use runtime::component::dataset::Dataset;
-use runtime_component::dataset::DatasetSpec;
 use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorFactory, DataConnectorResult,
     NewDataConnectorResult,
 };
+use runtime_component::dataset::DatasetSpec;
 use runtime_parameters::{ParameterSpec, Parameters};
 use runtime_udfs_api::deny_spice_specific_functions;
 use snafu::prelude::*;

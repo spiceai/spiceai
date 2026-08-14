@@ -48,7 +48,6 @@ use issues::IssuesTableArgs;
 use projects::ProjectsTableArgs;
 use pull_requests::PullRequestTableArgs;
 use rate_limit::GitHubRateLimiter;
-use runtime::component::dataset::Dataset;
 use runtime_component::dataset::DatasetSpec;
 use runtime_rate_control::{JitterConfig, RateController, RateControllerBuilder};
 use secrecy::ExposeSecret;

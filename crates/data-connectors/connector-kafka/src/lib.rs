@@ -29,7 +29,7 @@ use dataformat_json::{SpiceJsonOptions, unnest_struct_schema};
 use datafusion::catalog::TableProvider;
 use futures::StreamExt;
 use runtime::{
-    component::dataset::{Dataset, acceleration::RefreshMode},
+    component::dataset::acceleration::RefreshMode,
     dataconnector::{
         ConnectorComponent, DataConnector, DataConnectorError, DataConnectorFactory,
         DataConnectorResult, InvalidConfigurationNoSourceSnafu, NewDataConnectorResult,
@@ -42,12 +42,12 @@ use runtime_checkpoint_api::{
     CheckpointError,
     kafka::{KafkaCheckpoint, KafkaCheckpointStore},
 };
+use runtime_component::dataset::DatasetSpec;
 use runtime_datafusion::refresh_sql;
 use runtime_metrics::component::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback};
 use runtime_parameters::{ExposedParamLookup, ParameterSpec, Parameters};
 use snafu::prelude::*;
 use tonic::async_trait;
-use runtime_component::dataset::DatasetSpec;
 
 /// The name used to identify this connector in configuration.
 pub const CONNECTOR_NAME: &str = "kafka";

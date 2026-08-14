@@ -38,17 +38,14 @@ use mongodb::{
     options::FullDocumentType,
 };
 use runtime::{
-    component::dataset::{
-        Dataset,
-        acceleration::{Acceleration, Engine, OnConflictBehavior},
-    },
+    component::dataset::acceleration::{Acceleration, Engine, OnConflictBehavior},
     dataconnector::parameters::ConnectorContext,
 };
 use runtime_checkpoint_api::mongodb::{MongoCheckpointMetadata, MongoCheckpointStore};
+use runtime_component::dataset::DatasetSpec;
 use runtime_parameters::{ExposedParamLookup, Parameters};
 use std::{sync::Arc, time::Duration};
 use tokio_stream::StreamExt as TokioStreamExt;
-use runtime_component::dataset::DatasetSpec;
 
 const DEFAULT_CHANGE_STREAM_BATCH_MAX_SIZE: usize = 1_000;
 const DEFAULT_CHANGE_STREAM_BATCH_SIZE: u32 = 1_000;
@@ -58,7 +55,7 @@ const DEFAULT_CHANGE_STREAM_MAX_AWAIT_TIME: Duration = Duration::from_secs(1);
 pub fn build_changes_stream(
     pool: Arc<MongoDBConnectionPool>,
     params: Parameters,
-    dataset: Dataset,
+    dataset: DatasetSpec,
     context: Option<Arc<dyn ConnectorContext>>,
     federated_table: Arc<dyn FederatedTableProvider>,
 ) -> ChangesStream {
@@ -340,7 +337,10 @@ async fn persisted_checkpoint(
     Some(metadata)
 }
 
-async fn clear_persisted_token(mongo_sys: Option<&dyn MongoCheckpointStore>, dataset: &DatasetSpec) {
+async fn clear_persisted_token(
+    mongo_sys: Option<&dyn MongoCheckpointStore>,
+    dataset: &DatasetSpec,
+) {
     if let Some(sys) = mongo_sys
         && let Err(error) = sys.delete().await
     {

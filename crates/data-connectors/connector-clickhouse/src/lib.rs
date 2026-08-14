@@ -36,12 +36,11 @@ use datafusion_table_providers::sql::db_connection_pool::Error as DbConnectionPo
 use factory::ClickhouseTableFactory;
 use ns_lookup::verify_ns_lookup_and_tcp_connect;
 use pool::ClickhouseConnectionPool;
-use runtime::component::dataset::Dataset;
-use runtime_component::dataset::DatasetSpec;
 use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult, NewDataConnectorResult,
 };
+use runtime_component::dataset::DatasetSpec;
 use runtime_parameters::{ParamLookup, ParameterSpec, Parameters};
 use runtime_udfs_api::deny_spice_specific_functions;
 use secrecy::ExposeSecret;

@@ -17,7 +17,7 @@ limitations under the License.
 use super::{ConnectorParams, DataConnector, DataConnectorFactory, ParameterSpec, Parameters};
 use crate::accelerated::refresh_task::changes::{CdcSchemaEvolution, install_cdc_schema_evolution};
 use crate::component::dataset::acceleration::{Engine, RefreshMode};
-use crate::component::dataset::{Dataset, DatasetSpec, OnSchemaChange};
+use crate::component::dataset::{DatasetSpec, OnSchemaChange};
 use crate::dataconnector::parameters::ConnectorContext;
 use crate::dataconnector::schema_projection::{ProjectionPolicy, parse_schema_projection};
 use crate::dataconnector::{ConnectorComponent, kafka::SidecarOffsetCommitHook};
@@ -1122,7 +1122,7 @@ async fn refresh_schema_if_evolved(
 
 /// Returns the primary key column names from `acceleration.primary_key`, used as a
 /// fallback when no Kafka messages are available to extract Debezium primary keys from.
-fn primary_keys_from_acceleration(dataset: &Dataset) -> Vec<String> {
+fn primary_keys_from_acceleration(dataset: &DatasetSpec) -> Vec<String> {
     dataset
         .acceleration
         .as_ref()

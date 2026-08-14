@@ -31,11 +31,10 @@ use data_components::oracle::connection::{
     OracleConnectionParams, OracleConnectionPool, OracleDirectConnectionParamsBuilder,
 };
 use datafusion::datasource::TableProvider;
-use runtime::component::dataset::Dataset;
-use runtime_component::dataset::DatasetSpec;
 use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorFactory, DataConnectorResult,
 };
+use runtime_component::dataset::DatasetSpec;
 use runtime_parameters::{ParameterSpec, Parameters};
 use snafu::{ResultExt, Snafu};
 use std::any::Any;

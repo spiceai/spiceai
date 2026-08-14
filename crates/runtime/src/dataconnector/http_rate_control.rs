@@ -52,6 +52,7 @@ pub fn resolve_config<S: BuildHasher>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::component::dataset::Dataset;
     use crate::component::dataset::builder::DatasetBuilder;
     #[cfg(feature = "rate-control")]
     use std::num::NonZeroU32;

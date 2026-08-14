@@ -29,8 +29,6 @@ use datafusion::sql::TableReference;
 use dynamodb_streams::{Checkpoint, Metrics, MetricsCollector};
 use futures::stream::{self, StreamExt};
 use opentelemetry::KeyValue;
-use runtime::component::dataset::Dataset;
-use runtime_component::dataset::DatasetSpec;
 use runtime::component::dataset::acceleration::RefreshMode;
 use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
@@ -38,6 +36,7 @@ use runtime::dataconnector::{
 };
 use runtime_api_types::v1::ComponentType;
 use runtime_checkpoint_api::BlobCheckpointStore;
+use runtime_component::dataset::DatasetSpec;
 use runtime_metrics::component::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback};
 use runtime_parameters::{ExposedParamLookup, ParameterSpec, Parameters};
 use snafu::ResultExt;
@@ -1196,6 +1195,7 @@ impl CommitChange for DynamoDBStreamCommitter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use runtime::component::dataset::Dataset;
     use runtime::component::dataset::builder::DatasetBuilder;
     use serde_json::json;
     use spicepod::semantic::Column;

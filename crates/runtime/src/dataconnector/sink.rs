@@ -20,7 +20,7 @@ use datafusion_datasource::sink::{DataSink, DataSinkExec};
 
 use std::{any::Any, fmt, pin::Pin, sync::Arc};
 
-use crate::component::dataset::{Dataset, acceleration::RefreshMode, DatasetSpec};
+use crate::component::dataset::{Dataset, DatasetSpec, acceleration::RefreshMode};
 use crate::dataaccelerator::spice_sys::OpenOption;
 use crate::dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpoint;
 use datafusion::{

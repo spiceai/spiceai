@@ -41,7 +41,6 @@ use datafusion::{
     scalar::ScalarValue,
 };
 use futures::{TryFutureExt, TryStreamExt};
-use runtime::component::dataset::Dataset;
 use runtime_component::dataset::DatasetSpec;
 use std::{any::Any, collections::HashMap, sync::Arc};
 

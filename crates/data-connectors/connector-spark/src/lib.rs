@@ -28,12 +28,11 @@ use data_components::Read;
 use data_components::spark_connect::SparkConnect;
 use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
-use runtime::component::dataset::Dataset;
-use runtime_component::dataset::DatasetSpec;
 use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult,
 };
+use runtime_component::dataset::DatasetSpec;
 use runtime_parameters::{ParameterSpec, Parameters};
 use snafu::prelude::*;
 use std::any::Any;

@@ -29,12 +29,11 @@ use data_components::mssql::{
     self, SqlServerTableProvider, connection_manager::SqlServerConnectionPool,
 };
 use datafusion::datasource::TableProvider;
-use runtime::component::dataset::Dataset;
-use runtime_component::dataset::DatasetSpec;
 use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult, NewDataConnectorResult,
 };
+use runtime_component::dataset::DatasetSpec;
 use runtime_parameters::{ParameterSpec, Parameters};
 use snafu::{ResultExt, Snafu};
 use std::any::Any;

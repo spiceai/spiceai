@@ -51,7 +51,7 @@ use futures::{Stream, TryStreamExt};
 
 use runtime::{
     Runtime,
-    component::dataset::Dataset,
+    component::dataset::DatasetSpec,
     dataconnector::{
         self, ConnectorComponent, DataConnector, DataConnectorError, DataConnectorFactory,
         NewDataConnectorResult, parameters::ConnectorParams,
@@ -132,7 +132,7 @@ impl DataConnector for SlowNativeDataConnector {
 
     async fn read_provider(
         &self,
-        _dataset: &Dataset,
+        _dataset: &DatasetSpec,
     ) -> Result<Arc<dyn TableProvider>, DataConnectorError> {
         // Create wrapper table provider that delays the stream
         let delayed_provider = DelayedNativeTableProvider {
@@ -167,7 +167,7 @@ impl DataConnector for SlowFederatedDataConnector {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> Result<Arc<dyn TableProvider>, DataConnectorError> {
         // Create SQLExecutor implementation
         let executor = Arc::new(MockSQLExecutor {
@@ -450,7 +450,7 @@ impl DataConnector for AuthErrorDataConnector {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> Result<Arc<dyn TableProvider>, DataConnectorError> {
         Err(
             DataConnectorError::UnableToConnectInvalidUsernameOrPassword {

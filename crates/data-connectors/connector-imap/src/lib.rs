@@ -28,12 +28,11 @@ use crate::imap::{
 use async_trait::async_trait;
 use datafusion::datasource::TableProvider;
 use regex::Regex;
-use runtime::component::dataset::Dataset;
-use runtime_component::dataset::DatasetSpec;
 use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult, NewDataConnectorResult,
 };
+use runtime_component::dataset::DatasetSpec;
 use runtime_parameters::ParameterSpec;
 use secrecy::SecretString;
 use snafu::prelude::*;

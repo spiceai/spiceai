@@ -32,7 +32,6 @@ use crate::{
     UnknownDataConnectorSnafu,
     accelerated::AcceleratedTable,
     component::dataset::{
-        DatasetSpec,
         Dataset,
         acceleration::{Acceleration, RefreshMode},
         builder::DatasetBuilder,
@@ -1365,6 +1364,7 @@ impl Runtime {
                 data_connector,
                 Arc::clone(&self.embeds),
                 self.secrets(),
+                Arc::downgrade(&self.datafusion()),
             ));
         }
 
@@ -1959,6 +1959,7 @@ async fn update_cached_dataset_timestamps(dataset: &Dataset) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::component::dataset::DatasetSpec;
     use crate::dataconnector::{
         ConnectorParams, DataConnectorFactory, DataConnectorResult, NewDataConnectorResult,
         register_connector_factory,

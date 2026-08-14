@@ -53,7 +53,7 @@ use {
     datafusion_datasource::file_format::FileFormatFactory, vortex_datafusion::VortexFormatFactory,
 };
 
-use crate::component::dataset::{Dataset, DatasetSpec};
+use crate::component::dataset::DatasetSpec;
 use crate::dataconnector::{
     ConnectorComponent, DataConnector, DataConnectorError, DataConnectorResult,
     listing::infer::{infer_partitions_with_types_from_files, infer_partitions_with_types_prefix},
@@ -1882,6 +1882,7 @@ fn parquet_page_index_options(app: &Arc<App>) -> ParquetPageIndexOptions {
 
 #[cfg(test)]
 mod tests {
+    use crate::component::dataset::Dataset;
     use arrow::array::RecordBatch;
     use chrono::{TimeZone, Utc};
     use datafusion_table_providers::util::secrets::to_secret_map;

@@ -49,7 +49,7 @@ use futures::future::BoxFuture;
 use tokio::sync::Semaphore;
 
 use crate::Error as RuntimeError;
-use crate::component::dataset::{Dataset, DatasetSpec};
+use crate::component::dataset::Dataset;
 use crate::dataaccelerator::BootstrapStatus;
 use crate::dataconnector::{DataConnector, NewDataConnectorResult};
 use crate::{Result, Runtime, accelerated::AcceleratedTable};
@@ -361,6 +361,8 @@ fn arrow_schemas_equal(a: &SchemaRef, b: &SchemaRef) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use crate::component::dataset::Dataset;
+    use crate::component::dataset::DatasetSpec;
     use std::any::Any;
     use std::sync::Arc;
 
@@ -370,7 +372,6 @@ mod tests {
     use datafusion::datasource::TableProvider;
 
     use super::{DatasetInitialization, LazyConnectorBuilder};
-    use crate::component::dataset::Dataset;
     use crate::component::dataset::builder::DatasetBuilder;
     use crate::dataaccelerator::BootstrapStatus;
     use crate::dataconnector::{

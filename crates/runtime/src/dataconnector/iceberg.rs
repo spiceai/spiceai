@@ -36,7 +36,7 @@ use crate::{
         ICEBERG_PARAM_LEN, get_rest_catalog, map_param_name_to_iceberg_prop,
         parse_hadoop_table_url, parse_table_url, verify_s3_endpoint,
     },
-    component::dataset::{Dataset, DatasetSpec},
+    component::dataset::DatasetSpec,
     dataconnector::{
         ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError as Error,
         parameters::aws::initiate_config_with_credentials,
@@ -130,7 +130,7 @@ impl IcebergDataConnector {
     /// identity, used to build read, read-write, and distributed providers.
     async fn create_iceberg_table_parts(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> super::DataConnectorResult<IcebergTableParts> {
         let source = dataset.path();
 
@@ -272,7 +272,7 @@ impl IcebergDataConnector {
     async fn load_hadoop_catalog(
         props: HashMap<String, String>,
         storage_factory: Option<Arc<dyn StorageFactory>>,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
         source: &str,
         metadata_mode: MetadataMode,
     ) -> super::DataConnectorResult<IcebergTableParts> {

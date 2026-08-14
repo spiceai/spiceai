@@ -351,7 +351,11 @@ pub trait DataConnectorFactory: Send + Sync {
     /// Default: `None`. Most connectors do not have an intrinsic
     /// configuration-only schema and instead rely on either source
     /// inference or the user-declared `columns:` fallback.
-    fn static_schema(&self, _params: &ConnectorParams, _dataset: &DatasetSpec) -> Option<SchemaRef> {
+    fn static_schema(
+        &self,
+        _params: &ConnectorParams,
+        _dataset: &DatasetSpec,
+    ) -> Option<SchemaRef> {
         None
     }
 }
@@ -368,8 +372,10 @@ pub trait DataConnector: Debug + Send + Sync + 'static {
         refresh_mode.unwrap_or(RefreshMode::Full)
     }
 
-    async fn read_provider(&self, dataset: &DatasetSpec)
-    -> DataConnectorResult<Arc<dyn TableProvider>>;
+    async fn read_provider(
+        &self,
+        dataset: &DatasetSpec,
+    ) -> DataConnectorResult<Arc<dyn TableProvider>>;
 
     async fn read_write_provider(
         &self,
@@ -845,6 +851,7 @@ mod tests {
             Arc::clone(&inner),
             Arc::new(RwLock::new(std::collections::HashMap::new())),
             Arc::new(RwLock::new(Secrets::default())),
+            std::sync::Weak::new(),
         );
         assert!(
             embedding.supports_durable_write_back_delivery(),

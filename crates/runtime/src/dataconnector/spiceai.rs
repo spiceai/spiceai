@@ -50,7 +50,7 @@ use super::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     ParameterSpec,
 };
-use crate::component::dataset::{Dataset, DatasetSpec};
+use crate::component::dataset::DatasetSpec;
 use data_components::cdc::{
     self, ChangeBatch, ChangeEnvelope, ChangesStream, CommitChange, CommitError,
 };
@@ -620,7 +620,7 @@ impl SpiceAI {
     ///
     /// Spice AI datasets have the following format for `dataset.path()`:
     /// `<org>/<app>/datasets/<dataset_name>`.
-    fn spice_dataset_path<T: Borrow<Dataset>>(dataset: T) -> Result<SpiceAIDatasetPath> {
+    fn spice_dataset_path<T: Borrow<DatasetSpec>>(dataset: T) -> Result<SpiceAIDatasetPath> {
         let dataset = dataset.borrow();
         let path = dataset.path();
         if is_flight_endpoint_path(path) {
@@ -863,7 +863,8 @@ mod tests {
                 .build()
                 .expect("Failed to build dataset");
 
-            let dataset_path = SpiceAI::spice_dataset_path(&dataset).expect("a valid dataset path");
+            let dataset_path =
+                SpiceAI::spice_dataset_path(&dataset.spec).expect("a valid dataset path");
             assert_eq!(dataset_path, expected, "Failed for input: {input}");
         }
     }

@@ -35,13 +35,12 @@ use datafusion_table_providers::mongodb::{
     Error as MongoDBError, MongoDBTableFactory, connection_pool::MongoDBConnectionPool,
 };
 use mongodb::bson::{Bson, Document, doc};
-use runtime::component::dataset::Dataset;
-use runtime_component::dataset::DatasetSpec;
 use runtime::component::dataset::acceleration::RefreshMode;
 use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult, parameters::ConnectorContext,
 };
+use runtime_component::dataset::DatasetSpec;
 use runtime_parameters::{ParameterSpec, Parameters};
 use secrecy::ExposeSecret;
 use snafu::prelude::*;

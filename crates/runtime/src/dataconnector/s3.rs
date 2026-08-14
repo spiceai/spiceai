@@ -27,7 +27,7 @@ use super::{
 use app::App;
 
 use crate::{
-    component::dataset::{Dataset, DatasetSpec},
+    component::dataset::DatasetSpec,
     dataconnector::listing::{LISTING_TABLE_PARAMETERS, ObjectVersionType},
 };
 

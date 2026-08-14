@@ -17,7 +17,7 @@ limitations under the License.
 use std::{any::Any, sync::Arc};
 
 use super::DataConnector;
-use crate::component::{ComponentInitialization, dataset::Dataset};
+use crate::component::ComponentInitialization;
 use crate::component::dataset::DatasetSpec;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;

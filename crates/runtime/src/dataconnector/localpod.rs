@@ -27,10 +27,7 @@ use datafusion::sql::TableReference;
 
 use crate::DataConnector;
 use crate::datafusion::DataFusion;
-use crate::{
-    component::dataset::{Dataset, DatasetSpec},
-    parameters::ParameterSpec,
-};
+use crate::{component::dataset::DatasetSpec, parameters::ParameterSpec};
 
 use super::{ConnectorComponent, ConnectorParams, DataConnectorFactory};
 

@@ -18,7 +18,6 @@ use datafusion::sql::TableReference;
 
 use crate::{
     component::dataset::{
-        DatasetSpec,
         Dataset,
         acceleration::{self, Acceleration, Mode, RefreshMode, ZeroResultsAction},
     },
@@ -125,6 +124,7 @@ fn acceleration_info(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::component::dataset::DatasetSpec;
     use crate::component::dataset::acceleration::Engine;
     use crate::component::dataset::builder::DatasetBuilder;
     use crate::dataconnector::DataConnectorResult;

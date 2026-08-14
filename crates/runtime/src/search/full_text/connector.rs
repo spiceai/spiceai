@@ -24,10 +24,7 @@ use std::sync::Arc;
 
 use crate::changes::{Indexes, index_change_envelope};
 use crate::component::dataset::DatasetSpec;
-use crate::component::{
-    ComponentInitialization,
-    dataset::{Dataset, acceleration::RefreshMode},
-};
+use crate::component::{ComponentInitialization, dataset::acceleration::RefreshMode};
 use crate::dataconnector::{DataConnector, DataConnectorError, DataConnectorResult};
 use crate::federated::FederatedTable;
 use crate::search::full_text::table::add_full_text_search_to_table;

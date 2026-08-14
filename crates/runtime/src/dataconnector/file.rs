@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::component::dataset::{Dataset, DatasetSpec};
+use crate::component::dataset::DatasetSpec;
 use crate::dataconnector::ConnectorComponent;
 use crate::dataconnector::listing::LISTING_TABLE_PARAMETERS;
 use async_trait::async_trait;

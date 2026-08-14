@@ -46,7 +46,6 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::component::dataset::{
     DatasetSpec,
-    Dataset,
     acceleration::{Engine, RefreshMode},
 };
 use data_connector_api::federated::FederatedTableProvider;
