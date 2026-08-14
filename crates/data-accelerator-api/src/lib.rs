@@ -29,7 +29,7 @@ limitations under the License.
 //! machinery) can implement or consume the contract without depending on `runtime`.
 
 use ::arrow::datatypes::SchemaRef;
-use arrow_tools::type_rewrite::TypeRewriteRule;
+use arrow_tools::type_rewrite::TypeRewriteRules;
 use async_trait::async_trait;
 use datafusion::common::{Constraint, DFSchema};
 use datafusion::execution::runtime_env::RuntimeEnv;
@@ -391,7 +391,7 @@ pub trait DataAccelerator: Send + Sync {
     ///
     /// The default is "no rewrites", which is correct for any engine that stores the
     /// incoming types verbatim.
-    fn type_rewrite_rules(&self) -> &'static [&'static dyn TypeRewriteRule] {
+    fn type_rewrite_rules(&self) -> TypeRewriteRules {
         &[]
     }
 

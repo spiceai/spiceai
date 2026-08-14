@@ -36,8 +36,8 @@ pub enum AccelerationSink {
 }
 
 impl AccelerationSink {
-    pub fn new(table_provider: Arc<dyn TableProvider>) -> Self {
-        Self::Table(TableSink::new(table_provider))
+    pub fn new(table_provider: Arc<dyn TableProvider>, dataset_name: String) -> Self {
+        Self::Table(TableSink::new(table_provider, dataset_name))
     }
 
     pub fn with_sink_indexes(self, indexes: Vec<Arc<dyn Index + Send + Sync>>) -> Self {
@@ -58,14 +58,13 @@ impl AccelerationSink {
     /// nowhere to apply there.
     pub fn with_engine_type_rewrites(
         self,
-        dataset_name: String,
-        rules: &'static [&'static dyn arrow_tools::type_rewrite::TypeRewriteRule],
+        rules: arrow_tools::type_rewrite::TypeRewriteRules,
     ) -> Self {
         match self {
             AccelerationSink::Table(sink) => {
-                AccelerationSink::Table(sink.with_engine_type_rewrites(dataset_name, rules))
+                AccelerationSink::Table(sink.with_engine_type_rewrites(rules))
             }
-            AccelerationSink::Multi(sink) => AccelerationSink::Multi(sink),
+            other @ AccelerationSink::Multi(_) => other,
         }
     }
 

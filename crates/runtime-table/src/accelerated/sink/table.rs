@@ -19,14 +19,13 @@ use std::{pin::Pin, sync::Arc};
 use arrow_schema::SchemaRef;
 use arrow_tools::{
     schema_evolution::is_widening_cast,
-    type_rewrite::{TypeRewriteRule, apply_rules, normalize_dictionary_types},
+    type_rewrite::{TypeRewriteRules, normalize_dictionary_types, rewrite_data_type},
 };
 use data_components::index_maintenance::perform_index_maintenance;
 use datafusion::{
     catalog::TableProvider, execution::RecordBatchStream, logical_expr::dml::InsertOp,
     physical_plan::collect, prelude::SessionContext,
 };
-use opentelemetry::KeyValue;
 use runtime_datafusion::execution_plan::schema_cast::SchemaCastScanExec;
 use runtime_table_partition::provider::PartitionTableProvider;
 use spice_table::{Index, SpiceTable, WriteWindow};
@@ -38,7 +37,7 @@ use crate::accelerated::{
     sink::{finalize_indexes, prepare_indexes, rollback_indexes},
 };
 use runtime_acceleration::dataupdate::StreamingDataUpdateExecutionPlan;
-use runtime_component::schema_evolution::SCHEMA_EVOLUTION_DETECTED;
+use runtime_component::schema_evolution::{SCHEMA_EVOLUTION_DETECTED, schema_evolution_labels};
 use runtime_datafusion::error::find_datafusion_root;
 
 /// What casting `input_schema` to `target_schema` does to each column.
@@ -76,7 +75,7 @@ impl SchemaCastChanges {
 fn narrowing_schema_cast_changes(
     input_schema: &SchemaRef,
     target_schema: &SchemaRef,
-    engine_type_rewrites: &[&'static dyn TypeRewriteRule],
+    engine_type_rewrites: TypeRewriteRules,
 ) -> SchemaCastChanges {
     // Hot path: this runs once per insert. Identical schemas (the common
     // no-schema-change case) cannot narrow, so skip the two
@@ -87,16 +86,14 @@ fn narrowing_schema_cast_changes(
         return SchemaCastChanges::default();
     }
     let input = normalize_dictionary_types(input_schema);
-    let rewritten = if engine_type_rewrites.is_empty() {
-        None
-    } else {
-        Some(apply_rules(&input, engine_type_rewrites))
-    };
     let target = normalize_dictionary_types(target_schema);
 
     let mut changes = SchemaCastChanges::default();
-    for (index, input_field) in input.fields().iter().enumerate() {
-        let Ok(target_field) = target.field_with_name(input_field.name()) else {
+    for input_field in input.fields() {
+        // `Fields::find` rather than `Schema::field_with_name`: the miss is an ordinary
+        // outcome here (a dropped column), and `field_with_name` builds a `Vec` of every
+        // field name plus a formatted error to report it.
+        let Some((_, target_field)) = target.fields().find(input_field.name()) else {
             changes.dropped.push(input_field.name().clone());
             continue;
         };
@@ -106,13 +103,12 @@ fn narrowing_schema_cast_changes(
             continue;
         }
         let description = format!("{}: {from} -> {to}", input_field.name());
-        // `rewritten` is `input` under the engine's rules, so it is field-for-field
-        // parallel to it and the index is the same field.
-        match rewritten.as_ref().map(|r| r.field(index).data_type()) {
-            Some(engine_type) if engine_type == to => {
-                changes.engine_normalized.push(description);
-            }
-            _ => changes.narrowed.push(description),
+        // Ask the rules about this one type rather than rewriting the whole schema:
+        // only a column that already looks narrowed can be explained by them.
+        if rewrite_data_type(from, engine_type_rewrites) == *to {
+            changes.engine_normalized.push(description);
+        } else {
+            changes.narrowed.push(description);
         }
     }
     changes
@@ -130,7 +126,7 @@ fn warn_on_narrowing_schema_cast(
     dataset: &str,
     input_schema: &SchemaRef,
     target_schema: &SchemaRef,
-    engine_type_rewrites: &[&'static dyn TypeRewriteRule],
+    engine_type_rewrites: TypeRewriteRules,
 ) {
     let changes = narrowing_schema_cast_changes(input_schema, target_schema, engine_type_rewrites);
     if changes.is_empty() {
@@ -146,10 +142,7 @@ fn warn_on_narrowing_schema_cast(
             );
             SCHEMA_EVOLUTION_DETECTED.add(
                 1,
-                &[
-                    KeyValue::new("kind", "engine_normalized"),
-                    KeyValue::new("action", "sink_engine_type_rewrite"),
-                ],
+                &schema_evolution_labels(dataset, "engine_normalized", "sink_engine_type_rewrite"),
             );
         }
     }
@@ -158,28 +151,26 @@ fn warn_on_narrowing_schema_cast(
         return;
     }
 
-    let mut described: Vec<String> = Vec::new();
-    // The two cases have different remediations, and only the dropped-column one is
-    // answered by `on_schema_change`: it adopts a source change when the change is a
-    // lossless widening, which a narrowing is not by construction. Advising it for a
-    // narrowed column sends operators through settings that cannot alter the stored
-    // type.
-    let mut remedies: Vec<&str> = Vec::new();
+    // Each case carries its own remediation, kept beside the change it answers so the
+    // two cannot drift apart. Only the dropped-column case is answered by
+    // `on_schema_change`: it adopts a source change when the change is a lossless
+    // widening, which a narrowing is not by construction, so advising it for a narrowed
+    // column sends operators through settings that cannot alter the stored type.
+    let mut cases: Vec<(String, &str)> = Vec::new();
     if !changes.dropped.is_empty() {
-        described.push(format!("dropping columns [{}]", changes.dropped.join(", ")));
-        remedies.push(
+        cases.push((
+            format!("dropping columns [{}]", changes.dropped.join(", ")),
             "Set `on_schema_change` and restart Spice to evolve the accelerated table with the new columns",
-        );
+        ));
     }
     if !changes.narrowed.is_empty() {
-        described.push(format!(
-            "narrowing column types [{}]",
-            changes.narrowed.join(", ")
-        ));
-        remedies.push(
+        cases.push((
+            format!("narrowing column types [{}]", changes.narrowed.join(", ")),
             "The narrowed columns need an accelerated table built for the source's types; `on_schema_change` adopts only lossless widenings and will not change them",
-        );
+        ));
     }
+    let described: Vec<&str> = cases.iter().map(|(change, _)| change.as_str()).collect();
+    let remedies: Vec<&str> = cases.iter().map(|(_, remedy)| *remedy).collect();
     tracing::warn!(
         dataset = %dataset,
         "TableSink: the accelerated table schema for {dataset} is behind the incoming data; the write cast is {}. Values in these columns are silently lost or lossily cast. {}. See: https://spiceai.org/docs/components/data-accelerators",
@@ -188,10 +179,7 @@ fn warn_on_narrowing_schema_cast(
     );
     SCHEMA_EVOLUTION_DETECTED.add(
         1,
-        &[
-            KeyValue::new("kind", "incompatible"),
-            KeyValue::new("action", "sink_narrowing_cast"),
-        ],
+        &schema_evolution_labels(dataset, "incompatible", "sink_narrowing_cast"),
     );
 }
 
@@ -208,19 +196,19 @@ pub(crate) struct TableSink {
     /// The acceleration engine's own type rewrites, used to tell an engine-imposed
     /// type from a stale acceleration schema. Empty for engines that store the
     /// incoming types verbatim.
-    pub(super) engine_type_rewrites: &'static [&'static dyn TypeRewriteRule],
+    pub(super) engine_type_rewrites: TypeRewriteRules,
     /// Names the dataset in the schema-cast diagnostics, and scopes the once-only
     /// engine-rewrite notice so two datasets of the same shape each get one.
     pub(super) dataset_name: String,
 }
 
 impl TableSink {
-    pub fn new(table_provider: Arc<dyn TableProvider>) -> Self {
+    pub fn new(table_provider: Arc<dyn TableProvider>, dataset_name: String) -> Self {
         Self {
             table_provider,
             sink_indexes: vec![],
             engine_type_rewrites: &[],
-            dataset_name: String::new(),
+            dataset_name,
         }
     }
 
@@ -229,12 +217,7 @@ impl TableSink {
         self
     }
 
-    pub fn with_engine_type_rewrites(
-        mut self,
-        dataset_name: String,
-        rules: &'static [&'static dyn TypeRewriteRule],
-    ) -> Self {
-        self.dataset_name = dataset_name;
+    pub fn with_engine_type_rewrites(mut self, rules: TypeRewriteRules) -> Self {
         self.engine_type_rewrites = rules;
         self
     }
@@ -405,17 +388,11 @@ async fn run_on_write_failed(
 mod tests {
     use super::*;
     use arrow_schema::{DataType, Field, Schema, TimeUnit};
-    use arrow_tools::type_rewrite::{Float16ToFloat32, TimestampToMicrosecond};
+    use cayenne::CAYENNE_TYPE_REWRITE_RULES;
 
     fn schema(fields: Vec<Field>) -> SchemaRef {
         Arc::new(Schema::new(fields))
     }
-
-    /// Mirrors `cayenne::CAYENNE_TYPE_REWRITE_RULES`, which this crate sits below and
-    /// so cannot name. `cayenne_rules_match_transform_for_supported_types` is what
-    /// keeps the real list honest against the transform it describes.
-    static CAYENNE_LIKE_RULES: &[&dyn TypeRewriteRule] =
-        &[&Float16ToFloat32, &TimestampToMicrosecond];
 
     #[test]
     fn narrowing_cast_detects_dropped_and_narrowed_columns() {
@@ -474,7 +451,7 @@ mod tests {
             true,
         )]);
 
-        let changes = narrowing_schema_cast_changes(&input, &target, CAYENNE_LIKE_RULES);
+        let changes = narrowing_schema_cast_changes(&input, &target, CAYENNE_TYPE_REWRITE_RULES);
         assert!(changes.dropped.is_empty(), "{:?}", changes.dropped);
         assert!(changes.narrowed.is_empty(), "{:?}", changes.narrowed);
         // Not silent: the cast still happens, so it is reported as the engine's own
@@ -516,7 +493,7 @@ mod tests {
             Field::new("count", DataType::Int32, false),
         ]);
 
-        let changes = narrowing_schema_cast_changes(&input, &target, CAYENNE_LIKE_RULES);
+        let changes = narrowing_schema_cast_changes(&input, &target, CAYENNE_TYPE_REWRITE_RULES);
         assert_eq!(changes.dropped, ["only_in_source".to_string()]);
         assert_eq!(changes.narrowed, ["count: Int64 -> Int32".to_string()]);
         assert_eq!(
@@ -544,7 +521,7 @@ mod tests {
             true,
         )]);
 
-        let changes = narrowing_schema_cast_changes(&input, &target, CAYENNE_LIKE_RULES);
+        let changes = narrowing_schema_cast_changes(&input, &target, CAYENNE_TYPE_REWRITE_RULES);
         assert!(changes.dropped.is_empty(), "{:?}", changes.dropped);
         assert!(changes.narrowed.is_empty(), "{:?}", changes.narrowed);
         assert_eq!(changes.engine_normalized.len(), 1);
@@ -555,7 +532,7 @@ mod tests {
     /// is a real narrowing and must still be reported.
     #[test]
     fn an_engine_rewrite_it_does_not_perform_is_still_a_narrowing() {
-        static DUCKDB_LIKE_RULES: &[&dyn TypeRewriteRule] =
+        static DUCKDB_LIKE_RULES: TypeRewriteRules =
             &[&arrow_tools::type_rewrite::TimestampTzToMicrosecond];
 
         let input = schema(vec![Field::new(

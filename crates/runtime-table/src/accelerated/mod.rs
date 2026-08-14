@@ -424,7 +424,7 @@ pub struct Builder {
     /// Whether the acceleration uses S3 Express One Zone storage.
     is_s3_express_acceleration: bool,
     /// The acceleration engine's own type rewrites, forwarded to the refresh sink.
-    engine_type_rewrites: &'static [&'static dyn arrow_tools::type_rewrite::TypeRewriteRule],
+    engine_type_rewrites: arrow_tools::type_rewrite::TypeRewriteRules,
     acceleration_layout: Option<runtime_acceleration::snapshot::AccelerationLayout>,
     cluster_role: Option<ClusterRole>,
     user_facing_schema: Option<SchemaRef>,
@@ -735,7 +735,7 @@ impl Builder {
     /// tell an engine-imposed type from a stale acceleration schema.
     pub fn engine_type_rewrites(
         &mut self,
-        rules: &'static [&'static dyn arrow_tools::type_rewrite::TypeRewriteRule],
+        rules: arrow_tools::type_rewrite::TypeRewriteRules,
     ) -> &mut Self {
         self.engine_type_rewrites = rules;
         self

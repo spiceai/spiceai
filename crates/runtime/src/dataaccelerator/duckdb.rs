@@ -673,9 +673,7 @@ impl DataAccelerator for DuckDBAccelerator {
         "duckdb"
     }
 
-    fn type_rewrite_rules(
-        &self,
-    ) -> &'static [&'static dyn arrow_tools::type_rewrite::TypeRewriteRule] {
+    fn type_rewrite_rules(&self) -> arrow_tools::type_rewrite::TypeRewriteRules {
         DUCKDB_TYPE_REWRITE_RULES
     }
 

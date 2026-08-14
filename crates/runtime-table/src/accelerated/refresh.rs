@@ -572,7 +572,7 @@ pub struct Refresher {
     /// Whether the acceleration uses S3 Express One Zone storage.
     is_s3_express_acceleration: bool,
     /// The acceleration engine's own type rewrites, forwarded to the refresh sink.
-    engine_type_rewrites: &'static [&'static dyn arrow_tools::type_rewrite::TypeRewriteRule],
+    engine_type_rewrites: arrow_tools::type_rewrite::TypeRewriteRules,
     /// Per-dataset `cdc_*` parameter overrides drawn from `dataset.acceleration.params`.
     cdc_param_overrides: Option<Arc<HashMap<String, String>>>,
 }
@@ -742,7 +742,7 @@ impl Refresher {
     /// Declare the acceleration engine's own type rewrites.
     pub fn with_engine_type_rewrites(
         &mut self,
-        rules: &'static [&'static dyn arrow_tools::type_rewrite::TypeRewriteRule],
+        rules: arrow_tools::type_rewrite::TypeRewriteRules,
     ) -> &mut Self {
         self.engine_type_rewrites = rules;
         self

@@ -16,7 +16,7 @@ limitations under the License.
 
 use std::sync::Arc;
 
-use arrow_schema::{DataType, Field, IntervalUnit, Schema, TimeUnit};
+use arrow_schema::{DataType, Field, FieldRef, IntervalUnit, Schema, TimeUnit};
 
 /// A rewrite rule applied by [`apply_rules`] to every [`DataType`] node in a schema.
 ///
@@ -137,20 +137,25 @@ impl TypeRewriteRule for TimestampToMicrosecond {
     }
 }
 
+/// A rule list an acceleration engine declares once and hands out by reference.
+pub type TypeRewriteRules = &'static [&'static dyn TypeRewriteRule];
+
 /// Applies `rules` to every type in `schema`, descending post-order into nested container types.
 ///
 /// Returns a new schema with the same metadata; fields whose types are unchanged are cloned as-is.
 #[must_use]
 pub fn apply_rules(schema: &Schema, rules: &[&dyn TypeRewriteRule]) -> Schema {
-    let fields: Vec<Field> = schema
+    // An unchanged field is shared by refcount rather than deep-copied: most fields match
+    // no rule, and cloning one copies its name and metadata map.
+    let fields: Vec<FieldRef> = schema
         .fields()
         .iter()
         .map(|f| {
             let new_type = rewrite_data_type(f.data_type(), rules);
             if &new_type == f.data_type() {
-                f.as_ref().clone()
+                Arc::clone(f)
             } else {
-                f.as_ref().clone().with_data_type(new_type)
+                Arc::new(f.as_ref().clone().with_data_type(new_type))
             }
         })
         .collect();
@@ -171,7 +176,11 @@ pub fn normalize_dictionary_types(schema: &Schema) -> Schema {
 }
 
 /// Post-order recursive type rewriter: children are rewritten before the parent.
-fn rewrite_data_type(dt: &DataType, rules: &[&dyn TypeRewriteRule]) -> DataType {
+///
+/// Public so a caller holding one [`DataType`] can ask what the rules make of it without
+/// building a whole [`Schema`] to hold it.
+#[must_use]
+pub fn rewrite_data_type(dt: &DataType, rules: &[&dyn TypeRewriteRule]) -> DataType {
     let dt = match dt {
         DataType::Dictionary(key_type, value_type) => {
             let inner = rewrite_data_type(value_type.as_ref(), rules);

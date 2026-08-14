@@ -61,7 +61,7 @@ pub struct RefreshTaskRunnerBuilder {
     initial_load_completed: Option<Arc<AtomicBool>>,
     /// Whether the acceleration uses S3 Express One Zone storage.
     is_s3_express_acceleration: bool,
-    engine_type_rewrites: &'static [&'static dyn arrow_tools::type_rewrite::TypeRewriteRule],
+    engine_type_rewrites: arrow_tools::type_rewrite::TypeRewriteRules,
     snapshot_refresh_state: Option<crate::accelerated::snapshots::SnapshotRefreshState>,
 }
 
@@ -154,7 +154,7 @@ impl RefreshTaskRunnerBuilder {
     #[must_use]
     pub fn with_engine_type_rewrites(
         mut self,
-        rules: &'static [&'static dyn arrow_tools::type_rewrite::TypeRewriteRule],
+        rules: arrow_tools::type_rewrite::TypeRewriteRules,
     ) -> Self {
         self.engine_type_rewrites = rules;
         self

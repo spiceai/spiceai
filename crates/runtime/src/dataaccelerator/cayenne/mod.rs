@@ -2834,9 +2834,7 @@ impl DataAccelerator for CayenneAccelerator {
         "cayenne"
     }
 
-    fn type_rewrite_rules(
-        &self,
-    ) -> &'static [&'static dyn arrow_tools::type_rewrite::TypeRewriteRule] {
+    fn type_rewrite_rules(&self) -> arrow_tools::type_rewrite::TypeRewriteRules {
         cayenne::CAYENNE_TYPE_REWRITE_RULES
     }
 

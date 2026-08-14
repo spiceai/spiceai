@@ -674,13 +674,26 @@ fn cdc_schema_evolution_for(dataset_name: &TableReference) -> Option<Arc<CdcSche
 /// Fast path: the CDC data struct matches the accelerator schema by name and
 /// type in order. Nullability is ignored — the CDC `data` struct is built
 /// nullable-everywhere by design (DELETE old-tuples carry nulls).
-fn cdc_data_schema_matches(target: &SchemaRef, incoming: &SchemaRef) -> bool {
+/// Whether the accelerated table already stores exactly what this CDC batch carries.
+///
+/// A field whose types differ is re-tested under the engine's own creation-time rewrites
+/// (`engine_type_rewrites`): the accelerated table holds the rewritten type, so a
+/// difference the engine itself imposes is a match, not a schema change. Only the
+/// differing fields are rewritten, and only one `DataType` at a time.
+fn cdc_data_schema_matches(
+    target: &SchemaRef,
+    incoming: &SchemaRef,
+    engine_type_rewrites: arrow_tools::type_rewrite::TypeRewriteRules,
+) -> bool {
     target.fields().len() == incoming.fields().len()
-        && target
-            .fields()
-            .iter()
-            .zip(incoming.fields())
-            .all(|(t, i)| t.name() == i.name() && t.data_type() == i.data_type())
+        && target.fields().iter().zip(incoming.fields()).all(|(t, i)| {
+            t.name() == i.name()
+                && (t.data_type() == i.data_type()
+                    || arrow_tools::type_rewrite::rewrite_data_type(
+                        i.data_type(),
+                        engine_type_rewrites,
+                    ) == *t.data_type())
+        })
 }
 
 /// Re-tighten the nullable-everywhere CDC data struct to the accelerator's
@@ -2638,11 +2651,24 @@ impl RefreshTask {
             return Ok(());
         }
         let target_schema = self.accelerator.schema();
-        // Normalize with the engine's own creation-time rewrites first. The accelerated
-        // table holds the rewritten type by construction (Cayenne/Vortex stores every
-        // timestamp at microsecond precision), so without this the classifier reads that
-        // rewrite as `Incompatible` drift on every CDC batch — which under
-        // `on_schema_change: fail` stops replication for a schema that never changed.
+        // The accelerated table holds the engine's own creation-time rewrite by
+        // construction (Cayenne/Vortex stores every timestamp at microsecond precision),
+        // so the comparison has to be made against what the engine would store from this
+        // input. Without it the classifier reads that permanent rewrite as `Incompatible`
+        // drift on every CDC batch, and `on_schema_change: fail` stops replication for a
+        // schema that never changed.
+        //
+        // The match test is rule-aware rather than rebuilding the schema up front: this
+        // runs per upsert sub-batch and almost always matches, and rewriting one
+        // `DataType` for the few columns that differ is cheaper than allocating a whole
+        // `Schema` that is then discarded.
+        if cdc_data_schema_matches(
+            &target_schema,
+            incoming_data_schema,
+            self.engine_type_rewrites,
+        ) {
+            return Ok(());
+        }
         let normalized_incoming: SchemaRef = if self.engine_type_rewrites.is_empty() {
             Arc::clone(incoming_data_schema)
         } else {
@@ -2652,9 +2678,6 @@ impl RefreshTask {
             ))
         };
         let incoming_data_schema = &normalized_incoming;
-        if cdc_data_schema_matches(&target_schema, incoming_data_schema) {
-            return Ok(());
-        }
         let aligned = align_nullability_for_classify(&target_schema, incoming_data_schema);
         let ctx = EvolutionContext {
             constraint_columns: &evolution.constraint_columns,
@@ -4802,11 +4825,7 @@ mod tests {
         use crate::accelerated::refresh_task::RefreshTaskBuilder;
         use crate::federated::FederatedTable;
         use arrow::datatypes::TimeUnit;
-        use arrow_tools::type_rewrite::{Float16ToFloat32, TimestampToMicrosecond};
-
-        // Mirrors `cayenne::CAYENNE_TYPE_REWRITE_RULES`, which this crate sits below.
-        static CAYENNE_LIKE_RULES: &[&dyn arrow_tools::type_rewrite::TypeRewriteRule] =
-            &[&Float16ToFloat32, &TimestampToMicrosecond];
+        use cayenne::CAYENNE_TYPE_REWRITE_RULES;
 
         let stored = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int32, false),
@@ -4825,7 +4844,7 @@ mod tests {
             ),
         ]));
 
-        let build = |name: &str, rules: &'static [&'static dyn arrow_tools::type_rewrite::TypeRewriteRule]| {
+        let build = |name: &str, rules: arrow_tools::type_rewrite::TypeRewriteRules| {
             let accelerator: Arc<dyn TableProvider> = Arc::new(
                 MemTable::try_new(Arc::clone(&stored), vec![vec![]])
                     .expect("mem table should be created"),
@@ -4839,7 +4858,7 @@ mod tests {
                 },
             );
             let federated = Arc::new(FederatedTable::new_unchecked(Arc::clone(&accelerator)));
-            let task = RefreshTaskBuilder::new(
+            RefreshTaskBuilder::new(
                 runtime_status::RuntimeStatus::new(),
                 dataset,
                 federated,
@@ -4849,11 +4868,10 @@ mod tests {
                 Arc::new(tokio::sync::Mutex::new(())),
             )
             .with_engine_type_rewrites(rules)
-            .build();
-            task
+            .build()
         };
 
-        let task = build("cdc_engine_rewrite_accepted", CAYENNE_LIKE_RULES);
+        let task = build("cdc_engine_rewrite_accepted", CAYENNE_TYPE_REWRITE_RULES);
         task.maybe_evolve_schema_for_cdc(&incoming).await.expect(
             "an engine-required rewrite is not a schema change and must not fail the write",
         );

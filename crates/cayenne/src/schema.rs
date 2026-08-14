@@ -18,17 +18,19 @@ limitations under the License.
 
 use std::sync::Arc;
 
-use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
-use arrow_tools::type_rewrite::{Float16ToFloat32, TimestampToMicrosecond, TypeRewriteRule};
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow_tools::type_rewrite::{Float16ToFloat32, TimestampToMicrosecond, TypeRewriteRules};
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion_table_providers::UnsupportedTypeAction;
 
-/// The type rewrites Cayenne always applies when it creates a table, expressed as
-/// [`TypeRewriteRule`]s so callers that only need the always-applied part of
-/// [`transform_schema_for_vortex`] can reuse it without the unsupported-type handling.
+/// The type rewrites Cayenne always applies when it creates a table, because Vortex
+/// cannot represent the incoming type.
 ///
-/// `cayenne_rules_match_transform_for_supported_types` pins the two together.
-pub static CAYENNE_TYPE_REWRITE_RULES: &[&dyn TypeRewriteRule] =
+/// This is the definition [`transform_schema_for_vortex`] itself applies, published so
+/// callers that need only the always-applied part — the acceleration write path, which
+/// must tell an engine-imposed type from a schema that has genuinely drifted — can reuse
+/// it without the unsupported-type handling.
+pub static CAYENNE_TYPE_REWRITE_RULES: TypeRewriteRules =
     &[&Float16ToFloat32, &TimestampToMicrosecond];
 
 fn is_vortex_supported_type(data_type: &DataType) -> bool {
@@ -66,19 +68,17 @@ fn transform_data_type_for_vortex(
     top_level: bool,
     unsupported_fields: &mut Vec<String>,
 ) -> Option<DataType> {
-    if matches!(data_type, DataType::Float16) {
-        tracing::debug!("Converting Float16 field '{path}' to Float32 for Vortex compatibility");
-        return Some(DataType::Float32);
-    }
-
-    if let DataType::Timestamp(unit, tz) = data_type
-        && !matches!(unit, TimeUnit::Microsecond)
-    {
-        tracing::debug!(
-            "Converting timestamp field '{path}' from {:?} to Microsecond for Vortex compatibility",
-            unit
-        );
-        return Some(DataType::Timestamp(TimeUnit::Microsecond, tz.clone()));
+    // The always-applied rewrites. These are leaf rules (never a container type), so
+    // consulting them before the nested walk below is what `apply_rules` would do too -
+    // which is what lets `CAYENNE_TYPE_REWRITE_RULES` be published as an equivalent
+    // description of this step rather than a second copy of it.
+    for rule in CAYENNE_TYPE_REWRITE_RULES {
+        if let Some(rewritten) = rule.rewrite(data_type) {
+            tracing::debug!(
+                "Converting field '{path}' from {data_type:?} to {rewritten:?} for Vortex compatibility"
+            );
+            return Some(rewritten);
+        }
     }
 
     if !is_vortex_supported_type(data_type) {
@@ -302,79 +302,7 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
     use datafusion_table_providers::UnsupportedTypeAction;
 
-    use super::{CAYENNE_TYPE_REWRITE_RULES, transform_schema_for_vortex};
-
-    /// `CAYENNE_TYPE_REWRITE_RULES` is a second statement of the always-applied half of
-    /// `transform_schema_for_vortex`, published so callers that must reason about the
-    /// engine's stored types (the acceleration write path) can apply it without the
-    /// unsupported-type handling. The two are only useful while they agree, so pin
-    /// them against a schema exercising every rewritten type, at the top level and
-    /// nested.
-    #[test]
-    fn cayenne_rules_match_transform_for_supported_types() {
-        let schema = Schema::new(vec![
-            Field::new("untouched", DataType::Utf8, false),
-            Field::new("half", DataType::Float16, true),
-            Field::new(
-                "tz_ts",
-                DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
-                true,
-            ),
-            Field::new(
-                "naive_ts",
-                DataType::Timestamp(TimeUnit::Second, None),
-                true,
-            ),
-            Field::new(
-                "already_micros",
-                DataType::Timestamp(TimeUnit::Microsecond, None),
-                true,
-            ),
-            Field::new(
-                "list_of_ts",
-                DataType::List(Arc::new(Field::new(
-                    "item",
-                    DataType::Timestamp(TimeUnit::Millisecond, None),
-                    true,
-                ))),
-                true,
-            ),
-            Field::new(
-                "record",
-                DataType::Struct(
-                    vec![
-                        Field::new("score", DataType::Float16, true),
-                        Field::new(
-                            "seen_at",
-                            DataType::Timestamp(TimeUnit::Nanosecond, Some("+02:00".into())),
-                            true,
-                        ),
-                    ]
-                    .into(),
-                ),
-                true,
-            ),
-            Field::new(
-                "dict",
-                DataType::Dictionary(
-                    Box::new(DataType::Int32),
-                    Box::new(DataType::Timestamp(TimeUnit::Nanosecond, None)),
-                ),
-                true,
-            ),
-        ]);
-
-        let transformed = transform_schema_for_vortex(&schema, UnsupportedTypeAction::Error)
-            .expect("schema contains only Vortex-supported types");
-        let by_rules = arrow_tools::type_rewrite::apply_rules(&schema, CAYENNE_TYPE_REWRITE_RULES);
-
-        assert_eq!(
-            transformed, by_rules,
-            "CAYENNE_TYPE_REWRITE_RULES has drifted from transform_schema_for_vortex"
-        );
-        // Guard against both sides being trivially the input schema.
-        assert_ne!(transformed, schema, "the fixture must exercise a rewrite");
-    }
+    use super::transform_schema_for_vortex;
 
     #[test]
     fn float16_converts_to_float32() {

@@ -3182,10 +3182,9 @@ impl DataFusion {
             .accelerator_engine_registry
             .get_accelerator_engine(acceleration_settings.engine)
             .await
-            .map_or::<&'static [&'static dyn arrow_tools::type_rewrite::TypeRewriteRule], _>(
-                &[],
-                |accel| accel.type_rewrite_rules(),
-            );
+            .map_or::<arrow_tools::type_rewrite::TypeRewriteRules, _>(&[], |accel| {
+                accel.type_rewrite_rules()
+            });
         accelerated_table_builder.engine_type_rewrites(engine_type_rewrites);
 
         source

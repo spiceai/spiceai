@@ -238,7 +238,7 @@ pub struct RefreshTaskBuilder {
     is_s3_express_acceleration: bool,
     /// The acceleration engine's own type rewrites, forwarded to the sink so an
     /// engine-imposed type is not reported as a stale acceleration schema.
-    engine_type_rewrites: &'static [&'static dyn arrow_tools::type_rewrite::TypeRewriteRule],
+    engine_type_rewrites: arrow_tools::type_rewrite::TypeRewriteRules,
     /// State for `refresh_mode: snapshot`. Required when the refresh mode is
     /// [`RefreshMode::Snapshot`]; ignored otherwise.
     snapshot_refresh_state: Option<crate::accelerated::snapshots::SnapshotRefreshState>,
@@ -350,7 +350,7 @@ impl RefreshTaskBuilder {
     #[must_use]
     pub fn with_engine_type_rewrites(
         mut self,
-        rules: &'static [&'static dyn arrow_tools::type_rewrite::TypeRewriteRule],
+        rules: arrow_tools::type_rewrite::TypeRewriteRules,
     ) -> RefreshTaskBuilder {
         self.engine_type_rewrites = rules;
         self
@@ -403,12 +403,9 @@ impl RefreshTaskBuilder {
         // lifecycle hooks without needing to be manually plumbed through as sink_indexes.
         let federated_indexes = indexes_from_federated(&self.federated);
         let sink = Arc::new(RwLock::new(
-            AccelerationSink::new(Arc::clone(&self.accelerator))
+            AccelerationSink::new(Arc::clone(&self.accelerator), self.dataset_name.to_string())
                 .with_sink_indexes(federated_indexes)
-                .with_engine_type_rewrites(
-                    self.dataset_name.to_string(),
-                    self.engine_type_rewrites,
-                ),
+                .with_engine_type_rewrites(self.engine_type_rewrites),
         ));
 
         let dataset_metric_labels = DatasetMetricLabels::new(&self.dataset_name);
