@@ -1399,12 +1399,12 @@ impl ClientDriver {
     ///    the endpoint themselves re-supplies it, which is what the local command
     ///    already makes them do.
     ///
-    /// Only the identity is fatal. The cache and the draft are reported and
-    /// logged but do not stop the removal, because the alternative — aborting
-    /// with the identity intact — leaves a live credential on an instance the
-    /// control plane has already released, which is worse than leaving a file
-    /// behind. This is the one place the ordering differs from the local
-    /// command, which can abort and let the operator retry.
+    /// Only the identity is fatal. The cache, the draft, and the endpoint
+    /// override are reported and logged but do not stop the removal, because the
+    /// alternative — aborting with the identity intact — leaves a live credential
+    /// on an instance the control plane has already released, which is worse than
+    /// leaving a file behind. This is the one place the ordering differs from the
+    /// local command, which can abort and let the operator retry.
     async fn handle_remove(
         &mut self,
         tx: &mpsc::Sender<proto::ClientMessage>,
@@ -1469,8 +1469,8 @@ impl ClientDriver {
 ///
 /// `Ok` names whatever could not be removed, for the command result; an `Err`
 /// carries the message for a failed `Remove`, and only the identity can produce
-/// one. See [`ClientDriver::handle_remove`] for the ordering and for why the
-/// `cloud-endpoint` override is not touched.
+/// one. See [`ClientDriver::handle_remove`] for what is removed, in which order,
+/// and why.
 async fn release_local_state(
     config: &CloudConnectConfig,
     transaction: &Arc<EnrollmentTransactionLock>,
