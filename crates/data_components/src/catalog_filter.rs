@@ -149,6 +149,13 @@ impl TableSelector {
     /// This is why a pattern beginning with a metacharacter never prunes:
     /// `*.orders` has an empty literal prefix, and `*` matches `.` in
     /// `globset`, so it can match a table in any container.
+    ///
+    /// **This assumes `include` was compiled case-sensitively**, as `Glob::new`
+    /// does by default. A case-insensitive `GlobSet` can match a candidate that
+    /// differs from its own literal prefix in case, so the comparison below
+    /// would have to become case-insensitive alongside it -- otherwise whole
+    /// containers start vanishing from the catalog, which is the silent failure
+    /// this prune is built to avoid.
     #[must_use]
     pub fn may_select_within(&self, container: &str) -> bool {
         // No patterns recorded: either none were configured (an absent `include`
@@ -252,14 +259,22 @@ mod tests {
     #[test]
     fn glob_literal_prefix_stops_at_the_first_metacharacter() {
         assert_eq!(glob_literal_prefix("public.orders"), "public.orders");
+        assert_eq!(glob_literal_prefix("mydb"), "mydb");
         assert_eq!(glob_literal_prefix("public.*"), "public.");
         assert_eq!(glob_literal_prefix("sales_*.orders"), "sales_");
         assert_eq!(glob_literal_prefix("*.orders"), "");
         assert_eq!(glob_literal_prefix("*"), "");
+        assert_eq!(glob_literal_prefix("**"), "");
         assert_eq!(glob_literal_prefix("{public,sales}.*"), "");
         assert_eq!(glob_literal_prefix("[ps]ublic.*"), "");
         assert_eq!(glob_literal_prefix("?ublic.orders"), "");
         assert_eq!(glob_literal_prefix(r"pub\lic.orders"), "pub");
+        // A metacharacter mid-string ends the prefix just as one at the start
+        // does -- the contract is "everything before the first", not "before the
+        // first separator".
+        assert_eq!(glob_literal_prefix("public.ord?rs"), "public.ord");
+        assert_eq!(glob_literal_prefix("public.[a-z]*"), "public.");
+        assert_eq!(glob_literal_prefix(r"public.ord\*ers"), "public.ord");
     }
 
     #[test]
@@ -336,6 +351,9 @@ mod tests {
             &["public.orders", "sales.*"],
             &["public.*", "*.audit_log"],
             &["pg_*.*"],
+            &[r"pub\lic.*"],
+            &["otherdb.orders", "sales_*.orders"],
+            &["{public,sales}.*", "north.*"],
         ];
         let containers = [
             "public",
@@ -344,10 +362,22 @@ mod tests {
             "sales_",
             "audit",
             "pg_toast",
+            "north",
             "s",
             "",
+            // A container whose own name holds the separator: the candidate the
+            // prune reasons about is still `"{container}.{table}"`.
+            "public.nested",
         ];
-        let tables = ["orders", "order1", "audit_log", "lineitem", "x", ""];
+        let tables = [
+            "orders",
+            "order1",
+            "audit_log",
+            "lineitem",
+            "x",
+            "",
+            "orders.v2",
+        ];
 
         for patterns in pattern_sets {
             let selector = sel(patterns);
