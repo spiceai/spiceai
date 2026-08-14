@@ -48,6 +48,7 @@ limitations under the License.
 //! driver stays connected with the still-valid identity rather than
 //! falsely reporting the instance as released.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -60,6 +61,7 @@ use tonic::Streaming;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint};
 
 use crate::config::CloudConnectConfig;
+use crate::draft::EnrollmentTransactionLock;
 use crate::enroll::EnrollClient;
 use crate::handlers::{
     Capability, CommandError, MAX_QUERY_RESULT_BYTES, RestartMode, RuntimeHandle,
@@ -1324,9 +1326,13 @@ impl ClientDriver {
         .await;
     }
 
-    /// Handle a `Remove` command. Returns `true` only if the on-disk identity
-    /// was actually removed (or was already absent) — i.e. the instance is
-    /// genuinely released and the caller may exit as such.
+    /// Handle a `Remove` command: release this instance from cloud management by
+    /// clearing the cloud-issued state it holds on disk, the way
+    /// `spice connect remove` does locally.
+    ///
+    /// Returns `true` only if the on-disk identity was actually removed (or was
+    /// already absent) — i.e. the instance is genuinely released and the caller
+    /// may exit as such.
     ///
     /// If clearing `identity.json` fails, the file would still be loaded on the
     /// next start and Cloud Connect would silently reconnect, so reporting
@@ -1334,43 +1340,165 @@ impl ClientDriver {
     /// in-memory identity, report the command as failed, and return `false`
     /// so the driver stays connected with the still-valid identity instead of
     /// exiting as removed.
+    ///
+    /// What it removes, and in this order:
+    ///
+    /// 1. The **delivered-secrets cache**, before the identity. The only key
+    ///    that opens it lives in `identity.json`, so clearing the identity first
+    ///    leaves the app's secrets behind on a released host as ciphertext
+    ///    nothing can open, audit, or even identify — the hazard
+    ///    [`crate::secret_cache::remove`] exists to prevent.
+    /// 2. The **identity**, which is what actually releases the instance and
+    ///    stops it reconnecting.
+    /// 3. The **enrollment draft**, so the next enrollment in this directory
+    ///    starts clean. A draft is reused verbatim by
+    ///    `EnrollmentTransactionLock::load_or_create`, replay key and all, so one
+    ///    left behind sends the next `spiced --token` either into a replay of the
+    ///    operation that produced the instance just removed, or into an
+    ///    idempotency mismatch whose guidance is to preserve the file and contact
+    ///    support.
+    ///
+    /// It deliberately does NOT remove the `cloud-endpoint` override. Nothing in
+    /// this codebase writes that file — it is operator-authored configuration
+    /// for which control plane a future enrollment talks to, so it is not the
+    /// control plane's to delete, and leaving it affects only an enrollment the
+    /// operator themselves starts. The local command removes it because the
+    /// operator asked to remove everything from that host.
+    ///
+    /// Only the identity is fatal. The cache and the draft are reported and
+    /// logged but do not stop the removal, because the alternative — aborting
+    /// with the identity intact — leaves a live credential on an instance the
+    /// control plane has already released, which is worse than leaving a file
+    /// behind. This is the one place the ordering differs from the local
+    /// command, which can abort and let the operator retry.
     async fn handle_remove(
         &mut self,
         tx: &mpsc::Sender<proto::ClientMessage>,
         command_id: &str,
         live_identifier: &Arc<RwLock<String>>,
     ) -> bool {
-        // Clear identity from disk first. Use the async clear so the remote
-        // `Remove` path does not block a Tokio worker on `std::fs` I/O while
-        // the Cloud Connect stream is active. `clear_async` treats a missing
-        // file as success, so reaching the error branch means the file exists
-        // but could not be removed.
-        if let Err(err) = IdentityStore::clear_async(&self.config.identity_path).await {
-            tracing::warn!(
-                "Cloud Connect: failed to clear identity at {}: {err}; \
-                 reporting Remove as failed and staying connected (the unchanged \
-                 identity would otherwise reconnect on restart)",
-                self.config.identity_path.display()
-            );
-            send_failed(
-                tx,
-                command_id,
-                &format!(
-                    "failed to clear identity at {}: {err}",
-                    self.config.identity_path.display()
-                ),
-            )
-            .await;
-            return false;
-        }
+        // Own the whole state transition before touching a file, the same
+        // boundary the local command takes: without it a removal can clear old
+        // state while an enrollment is promoting a replacement identity under
+        // this directory's lock. One non-blocking attempt — a contended
+        // directory means an enrollment is in flight, and letting the control
+        // plane retry beats holding the control stream while we wait on it.
+        let transaction = match EnrollmentTransactionLock::try_acquire_async(
+            &self.config.config_dir,
+        )
+        .await
+        {
+            Ok(transaction) => Arc::new(transaction),
+            Err(err) => {
+                tracing::warn!(
+                    "Cloud Connect: failed to acquire the enrollment transaction for {} before removal: {err}; reporting Remove as failed and staying connected",
+                    self.config.config_dir.display()
+                );
+                send_failed(
+                    tx,
+                    command_id,
+                    &format!(
+                        "failed to acquire the enrollment transaction for {}: {err}",
+                        self.config.config_dir.display()
+                    ),
+                )
+                .await;
+                return false;
+            }
+        };
+
+        let retained = match release_local_state(&self.config, &transaction).await {
+            Ok(retained) => retained,
+            Err(message) => {
+                send_failed(tx, command_id, &message).await;
+                return false;
+            }
+        };
 
         // Disk identity is gone — drop it from memory too and report success.
         self.identity = None;
         live_identifier.write().await.clear();
 
-        send_ok_json(tx, command_id, &serde_json::json!({ "status": "removed" })).await;
+        let mut result = serde_json::json!({ "status": "removed" });
+        if !retained.is_empty()
+            && let Some(result) = result.as_object_mut()
+        {
+            result.insert("retained".to_string(), serde_json::json!(retained));
+        }
+        send_ok_json(tx, command_id, &result).await;
         true
     }
+}
+
+/// Clear the cloud-issued state this instance holds on disk, under an enrollment
+/// transaction the caller already owns.
+///
+/// `Ok` names whatever could not be removed, for the command result; an `Err`
+/// carries the message for a failed `Remove`, and only the identity can produce
+/// one. See [`ClientDriver::handle_remove`] for the ordering and for why the
+/// `cloud-endpoint` override is not touched.
+async fn release_local_state(
+    config: &CloudConnectConfig,
+    transaction: &Arc<EnrollmentTransactionLock>,
+) -> std::result::Result<Vec<String>, String> {
+    // Named in the command result so the control plane and the portal learn that
+    // a released host still holds something, rather than the operator
+    // discovering it later.
+    let mut retained: Vec<String> = Vec::new();
+
+    let cache_path = config
+        .config_dir
+        .join(crate::secret_cache::SECRET_CACHE_FILE);
+    if let Err(err) = remove_secret_cache(cache_path.clone()).await {
+        tracing::warn!(
+            "Cloud Connect: failed to remove the delivered-secrets cache at {}: {err}; the instance is still being released, but this host retains secrets it can no longer open",
+            cache_path.display()
+        );
+        retained.push(format!(
+            "delivered-secrets cache at {}",
+            cache_path.display()
+        ));
+    }
+
+    if let Err(err) = IdentityStore::clear_with_transaction_async(
+        config.identity_path.clone(),
+        Arc::clone(transaction),
+    )
+    .await
+    {
+        tracing::warn!(
+            "Cloud Connect: failed to clear identity at {}: {err}; \
+             reporting Remove as failed and staying connected (the unchanged \
+             identity would otherwise reconnect on restart)",
+            config.identity_path.display()
+        );
+        return Err(format!(
+            "failed to clear identity at {}: {err}",
+            config.identity_path.display()
+        ));
+    }
+
+    if let Err(err) = transaction.delete_draft_async().await {
+        tracing::warn!(
+            "Cloud Connect: failed to remove the enrollment draft in {}: {err}; the instance is released, but the next enrollment in this directory will need it removed first",
+            config.config_dir.display()
+        );
+        retained.push("enrollment draft".to_string());
+    }
+
+    Ok(retained)
+}
+
+/// Delete the delivered-secrets cache off the Tokio driver task.
+///
+/// [`crate::secret_cache::remove`] is synchronous `std::fs`, and this runs while
+/// the Cloud Connect stream is live, so it goes to the blocking pool rather than
+/// stalling a worker.
+async fn remove_secret_cache(path: PathBuf) -> std::result::Result<(), String> {
+    tokio::task::spawn_blocking(move || crate::secret_cache::remove(&path))
+        .await
+        .map_err(|source| format!("the removal task stopped unexpectedly: {source}"))?
+        .map_err(|source| source.to_string())
 }
 
 /// Outcome of the pre-connect credential phase
@@ -2051,5 +2179,162 @@ mod tests {
         let trust = server_trust("", None);
         assert!(trust.native_roots);
         assert!(trust.extra_cas.is_empty());
+    }
+
+    /// A cloud-dispatched `Remove` has to leave the host in the state
+    /// `spice connect remove` leaves it in: none of the cloud-issued state
+    /// behind, and in particular no secrets whose key it just destroyed.
+    mod removal {
+        use super::super::{EnrollmentTransactionLock, release_local_state};
+        use crate::config::CloudConnectConfig;
+        use crate::draft::EnrollmentDraft;
+        use crate::secret_cache::SECRET_CACHE_FILE;
+        use std::sync::Arc;
+
+        struct Host {
+            _dir: tempfile::TempDir,
+            config: CloudConnectConfig,
+        }
+
+        impl Host {
+            /// A config directory holding every piece of cloud-issued state a
+            /// released instance could have on disk.
+            fn enrolled() -> Self {
+                let dir = tempfile::tempdir().expect("create tempdir");
+                let config =
+                    CloudConnectConfig::from_env_at("test-runtime", dir.path().to_path_buf());
+                std::fs::write(&config.identity_path, "{}").expect("write identity");
+                std::fs::write(Self::cache_path_in(&config), "cached-secrets")
+                    .expect("write secrets cache");
+                std::fs::write(EnrollmentDraft::path_in(&config.config_dir), "{}")
+                    .expect("write enrollment draft");
+                Self { _dir: dir, config }
+            }
+
+            fn cache_path_in(config: &CloudConnectConfig) -> std::path::PathBuf {
+                config.config_dir.join(SECRET_CACHE_FILE)
+            }
+
+            fn cache_path(&self) -> std::path::PathBuf {
+                Self::cache_path_in(&self.config)
+            }
+
+            fn draft_path(&self) -> std::path::PathBuf {
+                EnrollmentDraft::path_in(&self.config.config_dir)
+            }
+
+            fn endpoint_path(&self) -> std::path::PathBuf {
+                self.config.config_dir.join("cloud-endpoint")
+            }
+
+            async fn release(&self) -> std::result::Result<Vec<String>, String> {
+                let transaction = Arc::new(
+                    EnrollmentTransactionLock::try_acquire_async(&self.config.config_dir)
+                        .await
+                        .expect("acquire the enrollment transaction"),
+                );
+                release_local_state(&self.config, &transaction).await
+            }
+        }
+
+        #[tokio::test]
+        async fn it_clears_the_identity_the_secrets_cache_and_the_draft() {
+            let host = Host::enrolled();
+
+            let retained = host.release().await.expect("the removal succeeds");
+
+            assert!(retained.is_empty(), "nothing should be left: {retained:?}");
+            assert!(
+                !host.config.identity_path.exists(),
+                "the identity is what actually releases the instance"
+            );
+            assert!(
+                !host.cache_path().exists(),
+                "a released host must not keep the app's secrets"
+            );
+            assert!(
+                !host.draft_path().exists(),
+                "a draft is reused verbatim, so one left behind replays the removed enrollment"
+            );
+        }
+
+        /// The `cloud-endpoint` override is operator-authored configuration that
+        /// nothing in this codebase writes, so the control plane does not delete
+        /// it — the deliberate difference from the local command.
+        #[tokio::test]
+        async fn it_leaves_the_operator_s_endpoint_override_alone() {
+            let host = Host::enrolled();
+            std::fs::write(host.endpoint_path(), "https://api.spice.ai")
+                .expect("write endpoint override");
+
+            host.release().await.expect("the removal succeeds");
+
+            assert!(host.endpoint_path().exists());
+        }
+
+        #[tokio::test]
+        async fn it_succeeds_with_nothing_on_disk_to_remove() {
+            let dir = tempfile::tempdir().expect("create tempdir");
+            let config = CloudConnectConfig::from_env_at("test-runtime", dir.path().to_path_buf());
+            let transaction = Arc::new(
+                EnrollmentTransactionLock::try_acquire_async(&config.config_dir)
+                    .await
+                    .expect("acquire the enrollment transaction"),
+            );
+
+            let retained = release_local_state(&config, &transaction)
+                .await
+                .expect("a removal with nothing to remove is not a failure");
+
+            assert!(retained.is_empty(), "{retained:?}");
+        }
+
+        /// This is what the cache-before-identity ordering buys. A directory in
+        /// the cache's place cannot be unlinked, so the removal continues to the
+        /// identity — releasing the instance — and names what it could not take.
+        /// Aborting instead would leave a live credential on an instance the
+        /// control plane has already released.
+        #[tokio::test]
+        async fn an_unremovable_secrets_cache_still_releases_the_instance_and_is_reported() {
+            let host = Host::enrolled();
+            std::fs::remove_file(host.cache_path()).expect("replace the cache with a directory");
+            std::fs::create_dir(host.cache_path()).expect("create the cache directory");
+            std::fs::write(host.cache_path().join("occupant"), "x").expect("occupy it");
+
+            let retained = host.release().await.expect("the removal still succeeds");
+
+            assert!(
+                !host.config.identity_path.exists(),
+                "the instance must still be released"
+            );
+            assert!(
+                retained.iter().any(|item| item.contains("secrets cache")),
+                "the operator has to learn the host kept secrets: {retained:?}"
+            );
+        }
+
+        /// The identity is the only fatal part: if it survives, the instance
+        /// reconnects on the next start, so reporting success would lie to the
+        /// control plane. The secrets are already gone by then — which is the
+        /// point of removing them first.
+        #[tokio::test]
+        async fn an_unremovable_identity_fails_the_removal_after_the_secrets_are_gone() {
+            let host = Host::enrolled();
+            std::fs::remove_file(&host.config.identity_path)
+                .expect("replace the identity with a directory");
+            std::fs::create_dir(&host.config.identity_path).expect("create the identity directory");
+            std::fs::write(host.config.identity_path.join("occupant"), "x").expect("occupy it");
+
+            let message = host
+                .release()
+                .await
+                .expect_err("an identity left on disk must fail the removal");
+
+            assert!(message.contains("failed to clear identity"), "{message}");
+            assert!(
+                !host.cache_path().exists(),
+                "the secrets go first, so they are gone even when the identity cannot be cleared"
+            );
+        }
     }
 }
