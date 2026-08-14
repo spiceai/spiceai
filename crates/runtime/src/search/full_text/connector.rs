@@ -311,7 +311,7 @@ mod tests {
             .full_text_search_field_index("content")
             .expect("failed to create FullTextSearchFieldIndex");
         let rb = search_index
-            .search("apple".to_string(), &[], 1000)
+            .search("apple".to_string(), vec![], 1000)
             .expect("search failed")
             .try_collect::<Vec<_>>()
             .await
