@@ -21187,6 +21187,17 @@ impl CayenneTableProvider {
                             "Abandoning table stats update for {}: the existing statistics record could not be read, so this write has no baseline to merge onto",
                             self.table_metadata.table_name
                         );
+                        // Abandoning is only safe if nothing goes on serving the
+                        // cached count as exact. The maintenance drain keeps its
+                        // live-rows delta outstanding on `false`, which covers it
+                        // — but the mem-tier checkpoint discards this `bool`, and
+                        // its own `Delta { exact: false }` (the update just
+                        // abandoned) is what would have demoted the count, while
+                        // the checkpoint clears the in-memory proxies that hold it
+                        // `Inexact` in the meantime. Demote here so every caller
+                        // is covered by construction. Cache-only, so unlike a
+                        // durable taint it cannot fail in turn.
+                        self.table_statistics.write().count_exact = false;
                         return false;
                     }
                 }
@@ -39406,6 +39417,109 @@ mod tests {
             !reopened.table_statistics.read().count_exact,
             "a statistics record that could not be read says nothing about the count, so it must \
              not reopen flagged exact"
+        );
+    }
+
+    /// Regression for #13010: abandoning the update must also stop the *cached*
+    /// count being served exact, for the callers that discard the returned bool.
+    ///
+    /// The maintenance drain reads that bool and keeps its live-rows delta
+    /// outstanding, which holds the count `Inexact` on its own. The mem-tier
+    /// checkpoint does not: it discards the bool, the `Delta { exact: false }` it
+    /// passes is the very update being abandoned, and the checkpoint clears the
+    /// in-memory proxies (resident rows, tombstones) that would otherwise demote
+    /// the stats. Without an explicit demotion that path serves an `Exact` count
+    /// which does not describe the corpus.
+    #[tokio::test]
+    async fn abandoning_a_stats_update_demotes_the_cached_exactness() {
+        let runtime_env = SessionContext::new().runtime_env();
+        let schema = unreadable_stats_schema();
+        let (provider, catalog, temp_dir) = create_reopenable_append_table(
+            "stats_unreadable_cached_exactness",
+            Arc::clone(&schema),
+            false,
+            Arc::clone(&runtime_env),
+        )
+        .await;
+        let table_id = provider.table_metadata.table_id.clone();
+
+        let ctx = SessionContext::new();
+        insert_batch_with_context(
+            &ctx,
+            &provider,
+            make_listing_parity_batch(Arc::clone(&schema), 0, 16),
+        )
+        .await;
+        provider
+            .flush_pending_maintenance()
+            .await
+            .expect("persist the baseline statistics");
+        drop(provider);
+
+        // Reopen over the INTACT record: `optimizer` is populated and
+        // `count_exact` is true, while `raw` starts cold — the one state that
+        // reaches the catalog read on the next persist.
+        let reopened =
+            CayenneTableProviderBuilder::new(Arc::clone(&catalog), Arc::clone(&runtime_env))
+                .open("stats_unreadable_cached_exactness")
+                .await
+                .expect("reopen over an intact statistics record");
+        assert!(
+            reopened.table_statistics.read().count_exact,
+            "precondition: the reopened provider serves the persisted count as exact"
+        );
+
+        // A non-empty accumulator: an empty one bails before the read, which would
+        // pass this test without ever exercising the failure under test.
+        let accumulator = ColumnStatsAccumulator::new(&schema);
+        accumulator.update(&make_listing_parity_batch(Arc::clone(&schema), 16, 4));
+        assert!(
+            accumulator.row_count() > 0,
+            "precondition: the accumulator must produce a blob, or the persist bails early"
+        );
+
+        // Control: with the record readable, this same call persists and the count
+        // stays exact — so the demotion below is the read failure's doing, not this
+        // call shape's.
+        assert!(
+            reopened
+                .persist_table_stats(
+                    &accumulator,
+                    RowCountUpdate::Delta {
+                        delta: 4,
+                        exact: true
+                    }
+                )
+                .await,
+            "control: a readable record must let the update through"
+        );
+        assert!(
+            reopened.table_statistics.read().count_exact,
+            "control: a successful exact delta leaves the count exact"
+        );
+
+        // Now break the read, and clear the cached `raw` the successful persist
+        // just populated so the next one has to reach the catalog again.
+        make_table_statistics_unreadable(temp_dir.path(), &table_id);
+        reopened.table_statistics.write().raw = None;
+
+        assert!(
+            !reopened
+                .persist_table_stats(
+                    &accumulator,
+                    RowCountUpdate::Delta {
+                        delta: 4,
+                        exact: false
+                    }
+                )
+                .await,
+            "an unreadable record must abandon the update"
+        );
+        assert!(
+            !reopened.table_statistics.read().count_exact,
+            "an abandoned update must demote the cached exactness: its rows are already visible \
+             to scans and no persisted count describes them, so a caller that discards the \
+             returned bool must not go on serving an Exact count"
         );
     }
 
