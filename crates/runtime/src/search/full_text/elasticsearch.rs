@@ -292,7 +292,7 @@ impl DataConnector for ElasticsearchFullTextConnector {
 /// The dataset's configured `on_zero_results` acceleration setting, defaulting to
 /// [`ZeroResultsAction::ReturnEmpty`] when no acceleration is configured. Drives the compound
 /// full-text index's read mode: whether an empty warm-tier result falls back to Elasticsearch.
-fn on_zero_results(dataset: &Dataset) -> ZeroResultsAction {
+fn on_zero_results(dataset: &DatasetSpec) -> ZeroResultsAction {
     dataset
         .acceleration
         .as_ref()
