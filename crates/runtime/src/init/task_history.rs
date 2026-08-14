@@ -301,15 +301,22 @@ mod tests {
         let rt = Arc::new(Runtime::builder().with_app_opt(None).build().await);
 
         let initializing = rt.task_history_init_lock.lock().await;
+        let (started, has_started) = tokio::sync::oneshot::channel();
         let racing = tokio::spawn({
             let rt = Arc::clone(&rt);
-            async move { rt.init_task_history().await }
+            async move {
+                let _ = started.send(());
+                rt.init_task_history().await
+            }
         });
 
-        // A negative can only be observed over a window: the call has to be given
-        // room to run and still not have run. Short, because the failure it guards
-        // against — returning before the lock, as the no-app path used to — takes
-        // microseconds to show up.
+        // Waiting on the signal is what makes the negative below mean anything: a
+        // task that has not been scheduled has also "not finished", and asserting
+        // that would hold whether or not the lock covered anything. Past this
+        // point the call is running, and the only thing left to stop it is the
+        // lock — the no-app path this guards used to return in microseconds
+        // without ever reaching it.
+        has_started.await.expect("the racing call started");
         for _ in 0..32 {
             tokio::task::yield_now().await;
         }

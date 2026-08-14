@@ -40,7 +40,7 @@ use crate::error::{CloudErrorCode, Error, Result};
 
 use super::naming::{collision_suggestion, initial_suggestion, validate_project_name};
 use super::project::{ProjectAttachment, ProjectClient, ProjectMutation};
-use super::state::{ConnectOperation, IdentityFacts, ProjectOperation};
+use super::state::{ConnectOperation, IdentityFacts, OrganizationBinding, ProjectOperation};
 
 pub(super) struct ConnectRequest {
     pub org: Option<String>,
@@ -626,20 +626,6 @@ fn resumable_authority(
 ) -> Result<ResumableAuthority> {
     match &draft.binding.authority {
         runtime_cloud_connect::EnrollmentAuthorityBinding::Token { expected_org } => {
-            if let Some(requested) = request.org.as_deref()
-                && !expected_org
-                    .as_deref()
-                    .is_some_and(|pending| pending.eq_ignore_ascii_case(requested))
-            {
-                return Err(pending_operation_conflict(
-                    &format!(
-                        "asserts organization {}",
-                        expected_org.as_deref().unwrap_or("(none)")
-                    ),
-                    &format!("--org {requested}"),
-                    "re-run without --org, or with the organization the pending operation asserts",
-                ));
-            }
             if request.project.is_some() {
                 return Err(pending_operation_conflict(
                     "was authorized by an enrollment key, which cannot create a project",
@@ -652,9 +638,21 @@ fn resumable_authority(
                     "this directory has a pending enrollment that was authorized by an enrollment key. Enrollment keys are never stored, so finishing it non-interactively requires --token <enrollment-key>.",
                 ));
             }
-            Ok(ResumableAuthority::EnrollmentKey {
-                expected_org: expected_org.clone(),
-            })
+            // `--org` on a resume corrects the assertion rather than
+            // contradicting it. Spice Cloud checks the assertion before it
+            // consumes the key, so an operation that failed on a mistyped one is
+            // still replayable — and refusing the correction here would strand the
+            // draft with no way to finish it but abandoning it. A flag naming the
+            // organization the draft already asserts is not a correction, and
+            // replays the draft's own value.
+            let expected_org = match (request.org.as_deref(), expected_org.as_deref()) {
+                (Some(requested), Some(pending)) if requested.eq_ignore_ascii_case(pending) => {
+                    expected_org.clone()
+                }
+                (Some(requested), _) => Some(requested.to_string()),
+                (None, _) => expected_org.clone(),
+            };
+            Ok(ResumableAuthority::EnrollmentKey { expected_org })
         }
         runtime_cloud_connect::EnrollmentAuthorityBinding::AuthenticatedSession {
             organization,
@@ -1218,6 +1216,13 @@ async fn enroll(attempt: EnrollAttempt<'_>) -> Result<EnrollmentResult> {
         authority,
         resumed_operation,
     } = attempt;
+    // Which authority is enrolling decides whether the organization recorded for
+    // this operation can still be corrected: an enrollment key asserts one and is
+    // checked before it is spent, a session is issued for one.
+    let organization_binding = match &authority {
+        EnrollmentAuthority::Token { .. } => OrganizationBinding::Assertion,
+        EnrollmentAuthority::AuthenticatedSession { .. } => OrganizationBinding::Fixed,
+    };
     let runtime_version = ctx
         .runtime_version()
         .unwrap_or_else(|_| crate::commands::version::cli_version());
@@ -1303,6 +1308,7 @@ async fn enroll(attempt: EnrollAttempt<'_>) -> Result<EnrollmentResult> {
             &canonical_dir,
             &draft.enrollment_operation_id,
             &journal_org,
+            organization_binding,
             &journal_endpoint,
             region.as_deref(),
         )
@@ -2207,28 +2213,13 @@ mod tests {
         }
     }
 
-    /// An explicit input that would move the pending operation to another
-    /// organization, or ask an enrollment key to create a project, fails before
-    /// anything is prompted for or sent — and says what finishes it instead.
+    /// An explicit input an enrollment-key operation cannot replay — a project it
+    /// has no authority to create, a key it cannot be given — fails before
+    /// anything is prompted for or sent, and says what finishes it instead.
     #[test]
     fn a_token_draft_rejects_inputs_it_cannot_replay() {
         let dir = tempfile::tempdir().expect("create tempdir");
         let draft = token_draft(dir.path(), Some("acme"));
-
-        let another_org = resumable_authority(
-            &draft,
-            &ConnectRequest {
-                org: Some("globex".to_string()),
-                ..connect_request()
-            },
-            true,
-        )
-        .expect_err("another organization must not be applied to the pending operation");
-        assert!(
-            another_org.to_string().contains("acme")
-                && another_org.to_string().contains("--org globex"),
-            "{another_org}"
-        );
 
         let with_project = resumable_authority(
             &draft,
@@ -2256,6 +2247,53 @@ mod tests {
         assert_eq!(
             resumable_authority(&unasserted, &connect_request(), true).expect("resume token mode"),
             ResumableAuthority::EnrollmentKey { expected_org: None }
+        );
+    }
+
+    /// `--org` on a pending token operation corrects the assertion rather than
+    /// contradicting it.
+    ///
+    /// Spice Cloud checks `expected_org` before it consumes the key, so an
+    /// operation that failed on a mistyped organization still holds an unspent
+    /// key and is replayable with the right one. Refusing the correction would
+    /// leave abandoning the draft as the only way forward.
+    #[test]
+    fn a_token_draft_takes_a_corrected_organization_assertion() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let draft = token_draft(dir.path(), Some("acme-typo"));
+
+        let corrected = resumable_authority(
+            &draft,
+            &ConnectRequest {
+                org: Some("acme".to_string()),
+                ..connect_request()
+            },
+            true,
+        )
+        .expect("a corrected assertion replays the pending operation");
+        assert_eq!(
+            corrected,
+            ResumableAuthority::EnrollmentKey {
+                expected_org: Some("acme".to_string())
+            },
+            "the corrected organization is what the replay asserts"
+        );
+
+        // And one is supplied where the draft asserted nothing at all.
+        let unasserted = token_draft(tempfile::tempdir().expect("create tempdir").path(), None);
+        assert_eq!(
+            resumable_authority(
+                &unasserted,
+                &ConnectRequest {
+                    org: Some("acme".to_string()),
+                    ..connect_request()
+                },
+                true,
+            )
+            .expect("resume token mode"),
+            ResumableAuthority::EnrollmentKey {
+                expected_org: Some("acme".to_string())
+            }
         );
     }
 

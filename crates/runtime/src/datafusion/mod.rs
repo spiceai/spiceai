@@ -2559,24 +2559,24 @@ impl DataFusion {
         Ok(table_provider.schema().as_ref().clone())
     }
 
-    /// Turn task-history emission on or off for every later query.
-    ///
-    /// Called when the app that decides it becomes known — which, for a runtime
-    /// that started with no configuration, is after this was built — and when a
-    /// conflict means the runtime must stop writing to a table it does not own.
-    /// Whether the configuration this process started with asked for task
-    /// history, as distinct from whether queries are emitting into it now.
+    /// The value `runtime.task_history.enabled` had when this process started.
     ///
     /// `runtime.task_history` is a start-time section: a reload installs the new
-    /// value in the app but the running process keeps what it booted with. This is
-    /// that booted value, and it is what decides whether an initialization is
-    /// worth retrying — never the mutable emission flag, which describes the table
-    /// as it stands.
+    /// value in the app but the running process keeps what it booted with. A start
+    /// with no configuration booted from a default instead, which is why this is
+    /// only the fallback until an app has decided the setting — never the mutable
+    /// emission flag, which describes the table as it stands rather than what was
+    /// asked for.
     #[must_use]
     pub fn task_history_enabled_at_start(&self) -> bool {
         self.task_history_enabled_at_start
     }
 
+    /// Turn task-history emission on or off for every later query.
+    ///
+    /// Called when the app that decides it becomes known — which, for a runtime
+    /// that started with no configuration, is after this was built — and when a
+    /// conflict means the runtime must stop writing to a table it does not own.
     pub fn set_task_history_enabled(&self, enabled: bool) {
         self.task_history_enabled
             .store(enabled, std::sync::atomic::Ordering::Relaxed);

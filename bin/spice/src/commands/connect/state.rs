@@ -162,24 +162,49 @@ pub(super) struct ConnectOperation {
     pub instance_id: Option<String>,
 }
 
+/// How firmly an operation is tied to the organization recorded for it.
+///
+/// The two enrollment authorities differ here, and the journal has to match them
+/// or it refuses a retry the enrollment itself would accept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum OrganizationBinding {
+    /// A login-session operation is bound to one organization for its lifetime:
+    /// the session was issued for it, and another organization is another
+    /// operation.
+    Fixed,
+    /// An enrollment key asserts the organization it expects, and Spice Cloud
+    /// checks the assertion *before* consuming the key — so a mismatch leaves the
+    /// key unspent and the operation replayable with the assertion corrected.
+    Assertion,
+}
+
 impl ConnectOperation {
     pub(super) fn prepare(
         config_dir: &Path,
         directory: &Path,
         enrollment_operation_id: &str,
         organization: &str,
+        binding: OrganizationBinding,
         endpoint: &str,
         region: Option<&str>,
     ) -> Result<Self> {
-        if let Some(existing) = Self::load_optional(config_dir)? {
+        if let Some(mut existing) = Self::load_optional(config_dir)? {
+            let same_organization = existing.organization.eq_ignore_ascii_case(organization);
             if existing.schema_version == CONNECT_OPERATION_SCHEMA_VERSION
                 && existing.directory == directory
                 && existing.enrollment_operation_id == enrollment_operation_id
-                && existing.organization.eq_ignore_ascii_case(organization)
+                && (same_organization || binding == OrganizationBinding::Assertion)
                 && existing.endpoint == endpoint
                 && region.is_none_or(|region| existing.region.as_deref() == Some(region))
                 && existing.phase == EnrollmentPhase::Prepared
             {
+                if !same_organization {
+                    // The corrected assertion, replaying the same operation. It is
+                    // recorded now so that the identity this run enrolls is checked
+                    // against what was asked for, not against what was mistyped.
+                    existing.organization = organization.to_string();
+                    existing.store(config_dir)?;
+                }
                 return Ok(existing);
             }
             return Err(Error::PendingRequestMismatch {
@@ -690,6 +715,7 @@ mod tests {
             dir.path(),
             "operation-1",
             "acme",
+            OrganizationBinding::Fixed,
             "https://api.spice.ai",
             None,
         )
@@ -715,6 +741,7 @@ mod tests {
             dir.path(),
             "operation-1",
             "acme",
+            OrganizationBinding::Fixed,
             "https://api.spice.ai",
             None,
         )
@@ -739,6 +766,64 @@ mod tests {
         );
     }
 
+    /// An enrollment key asserts the organization it expects and Spice Cloud
+    /// checks the assertion before consuming the key, so a mismatch leaves the
+    /// operation replayable with the assertion corrected. The journal has to
+    /// accept that correction, or the draft it preserved can never be finished.
+    #[test]
+    fn a_corrected_assertion_replays_the_same_token_operation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        ConnectOperation::prepare(
+            dir.path(),
+            dir.path(),
+            "operation-1",
+            "acme-typo",
+            OrganizationBinding::Assertion,
+            "https://api.spice.ai",
+            None,
+        )
+        .expect("prepare the operation that asserted the wrong organization");
+
+        let corrected = ConnectOperation::prepare(
+            dir.path(),
+            dir.path(),
+            "operation-1",
+            "acme",
+            OrganizationBinding::Assertion,
+            "https://api.spice.ai",
+            None,
+        )
+        .expect("the corrected assertion replays the same operation");
+        assert_eq!(
+            corrected.enrollment_operation_id, "operation-1",
+            "the operation is replayed, not replaced"
+        );
+        assert_eq!(
+            corrected.organization, "acme",
+            "and the journal records what was asked for"
+        );
+
+        // Persisted, so the identity this run enrolls is checked against the
+        // corrected organization rather than the mistyped one.
+        let reloaded = ConnectOperation::load_optional(dir.path())
+            .expect("load")
+            .expect("the journal is still there");
+        assert_eq!(reloaded.organization, "acme");
+
+        // A login-bound operation is not an assertion and does not move.
+        let fixed = ConnectOperation::prepare(
+            dir.path(),
+            dir.path(),
+            "operation-1",
+            "globex",
+            OrganizationBinding::Fixed,
+            "https://api.spice.ai",
+            None,
+        )
+        .expect_err("a session is issued for one organization");
+        assert!(matches!(fixed, Error::PendingRequestMismatch { .. }));
+    }
+
     #[test]
     fn changed_pending_request_preserves_exact_replay_state() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -749,6 +834,7 @@ mod tests {
             dir.path(),
             "operation-1",
             "acme",
+            OrganizationBinding::Fixed,
             "https://control-a.example",
             None,
         )
@@ -766,6 +852,7 @@ mod tests {
             dir.path(),
             "operation-1",
             "globex",
+            OrganizationBinding::Fixed,
             "https://control-a.example",
             None,
         )
@@ -791,6 +878,7 @@ mod tests {
             dir.path(),
             "operation-1",
             "acme",
+            OrganizationBinding::Fixed,
             "https://api.spice.ai",
             Some("us-east-1"),
         )
@@ -800,6 +888,7 @@ mod tests {
             dir.path(),
             "operation-1",
             "acme",
+            OrganizationBinding::Fixed,
             "https://api.spice.ai",
             Some("eu-west-1"),
         )
@@ -819,6 +908,7 @@ mod tests {
             dir.path(),
             "operation-1",
             "acme",
+            OrganizationBinding::Fixed,
             "https://api.spice.ai",
             None,
         )
@@ -890,6 +980,7 @@ mod tests {
             dir.path(),
             "operation-1",
             "acme",
+            OrganizationBinding::Fixed,
             "https://api.spice.ai",
             None,
         )
