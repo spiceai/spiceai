@@ -494,7 +494,9 @@ async fn an_accelerated_dataset_reports_the_query_and_refresh_families() {
         .await
         .expect("the refresh request to be accepted")
         .expect("an accelerated table to return a refresh notifier");
-    notifier.notified().await;
+    tokio::time::timeout(Duration::from_mins(1), notifier.notified())
+        .await
+        .expect("the refresh to complete within a minute");
 
     let mut result = QueryBuilder::new("SELECT id, score FROM scores", rt.datafusion())
         .build()

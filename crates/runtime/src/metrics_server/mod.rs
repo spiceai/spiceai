@@ -76,12 +76,6 @@ type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// Builds the Prometheus reader that `/metrics` is served from.
 ///
-/// The suffixes a dashboard query has to match are decided here, not at the
-/// instrument: `without_counter_suffixes` keeps `query_executions` from being
-/// exposed as `query_executions_total`, and `without_units` keeps `_milliseconds`
-/// off every duration histogram. `spiced` and the metrics tests share this so
-/// neither can drift on those names.
-///
 /// # Errors
 ///
 /// Returns an error when the exporter cannot register its collector with
