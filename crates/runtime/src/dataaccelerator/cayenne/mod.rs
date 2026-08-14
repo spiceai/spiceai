@@ -25,7 +25,7 @@ pub mod snapshot_engine;
 use std::any::Any;
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, OnceLock};
 use std::time::Duration;
 
 use arrow_schema::{DataType, Schema};
@@ -305,6 +305,18 @@ pub(crate) fn transform_schema_for_vortex(
 
 pub struct CayenneAccelerator {
     catalog: Arc<OnceCell<Arc<dyn cayenne::MetadataCatalog>>>,
+    /// The metastore directory that actually initialized [`Self::catalog`].
+    ///
+    /// `catalog` is one cell per accelerator instance, so whichever dataset opens
+    /// it first decides where the metastore lives and every later dataset shares
+    /// that catalog regardless of its own `cayenne_metadata_dir`. A later
+    /// dataset's data directory can therefore contain the *live* catalog while
+    /// the metastore its own params resolve to sits somewhere harmless, so the
+    /// deletion guard checks this recorded path alongside the ones a
+    /// configuration can name. Recorded inside the initializer, which only the
+    /// dataset that wins the cell runs, so a race cannot record a directory whose
+    /// catalog was discarded.
+    active_metadata_dir: Arc<OnceLock<String>>,
     /// Separate catalog for `mode: memory` (in-RAM) tables, backed by an in-memory
     /// `SQLite` `memdb` metastore. File-mode and memory-mode tables cannot share one
     /// metastore (memory-mode data must never touch disk), so memory tables use this.
@@ -985,21 +997,52 @@ fn fs_probe_path(path: &str) -> &str {
 /// compare equal.
 ///
 /// Neither directory necessarily exists when the comparison is made, so
-/// `canonicalize` cannot be applied to the whole path: `.`/`..` are folded
-/// lexically, then the deepest *existing* ancestor is canonicalized and the
-/// remaining components re-appended. Canonicalizing that prefix is what resolves
-/// symlinks, which matters on macOS where the temporary directory is
-/// `/var/folders/...` behind a `/private` symlink and would otherwise compare
+/// `canonicalize` cannot be applied to the whole path: the deepest *existing*
+/// ancestor is canonicalized, the remaining components are re-appended, and only
+/// then is `.`/`..` folded out of that unresolved remainder.
+///
+/// That order is the load-bearing part. Canonicalizing first is what makes the
+/// answer agree with the kernel when a symlink precedes a `..`: with
+/// `/root/link -> /root/actual/child`, deleting `/root/link/../data` unlinks
+/// `/root/actual/data`, because `..` is resolved from the link's *target*.
+/// Folding first would answer `/root/data` and compare a directory the deletion
+/// never touches. Folding the remainder afterwards is exact, because a component
+/// that does not exist cannot be a symlink.
+///
+/// Canonicalizing the prefix also resolves the `/var` -> `/private/var` symlink
+/// macOS puts in front of the temporary directory, which would otherwise compare
 /// unequal to the same directory reached through `/private`.
 fn normalize_local_dir(path: &str) -> PathBuf {
     let raw = Path::new(fs_probe_path(path).trim_end_matches('/'));
     // `absolute` anchors a relative path to the working directory without
-    // touching the filesystem, and deliberately preserves `..`, which the fold
-    // below removes.
+    // touching the filesystem, and deliberately preserves `..` — which is what
+    // leaves them for `canonicalize` to resolve against the real filesystem.
     let absolute = std::path::absolute(raw).unwrap_or_else(|_| raw.to_path_buf());
 
+    // `canonicalize` requires every component of what it is handed to exist, so
+    // walk outwards to the deepest ancestor that does. `ancestors` yields the
+    // whole path first, so a directory that already exists is resolved entirely
+    // by the kernel and nothing is left to fold.
+    let resolved = absolute.ancestors().find_map(|ancestor| {
+        let canonical = ancestor.canonicalize().ok()?;
+        let rest = absolute.strip_prefix(ancestor).ok()?;
+        Some(canonical.join(rest))
+    });
+
+    // Nothing on the path exists yet, so the lexical fold is the whole answer
+    // available.
+    fold_dot_components(&resolved.unwrap_or(absolute))
+}
+
+/// Fold `.` and `..` out of a path lexically, without consulting the filesystem.
+///
+/// Only sound for components that do not exist — a path that resolves must be
+/// canonicalized instead, since a `..` after a symlink does not mean the parent
+/// directory it was written beside. See [`normalize_local_dir`], which applies
+/// this to the unresolved tail only.
+fn fold_dot_components(path: &Path) -> PathBuf {
     let mut folded = PathBuf::new();
-    for component in absolute.components() {
+    for component in path.components() {
         match component {
             Component::CurDir => {}
             // `..` at the root stays at the root, matching the filesystem.
@@ -1009,17 +1052,6 @@ fn normalize_local_dir(path: &str) -> PathBuf {
             other => folded.push(other),
         }
     }
-
-    for ancestor in folded.ancestors() {
-        if let Ok(canonical) = ancestor.canonicalize()
-            && let Ok(rest) = folded.strip_prefix(ancestor)
-        {
-            return canonical.join(rest);
-        }
-    }
-
-    // Nothing on the path exists yet, so the lexically folded form is the best
-    // answer available.
     folded
 }
 
@@ -1052,14 +1084,23 @@ fn metastore_is_inside_data_dir(data_dir: &str, metadata_dir: &str) -> bool {
 /// given acceleration is configured.
 ///
 /// The catalog is instance-wide, so checking only the dataset's *own* resolved
-/// metastore is not enough: a dataset named `metadata` that points its
-/// `cayenne_metadata_dir` somewhere else still has a data directory sitting on
-/// `{spice_data_base_path()}/metadata`, which is where every dataset that did
-/// not override the param resolves. Those fallbacks are therefore checked too,
-/// whether or not this dataset uses them — an operator can add a dataset that
-/// does at any time, and by then the directory is already gone.
-fn candidate_metastore_dirs(acceleration: Option<&Acceleration>) -> Vec<String> {
-    let mut candidates: Vec<String> = Vec::with_capacity(3);
+/// metastore is not enough, in two distinct ways:
+///
+/// - `active_metadata_dir` is the directory that actually initialized the shared
+///   catalog, whatever any later dataset's params say. It is listed first, so a
+///   refusal names the catalog genuinely at risk rather than a path that merely
+///   also collides. It is `None` until some dataset opens the catalog.
+/// - A dataset named `metadata` that points its `cayenne_metadata_dir` somewhere
+///   else still has a data directory sitting on
+///   `{spice_data_base_path()}/metadata`, which is where every dataset that did
+///   not override the param resolves. Those fallbacks are therefore checked too,
+///   whether or not this dataset uses them — an operator can add a dataset that
+///   does at any time, and by then the directory is already gone.
+fn candidate_metastore_dirs(
+    acceleration: Option<&Acceleration>,
+    active_metadata_dir: Option<&str>,
+) -> Vec<String> {
+    let mut candidates: Vec<String> = Vec::with_capacity(4);
     let mut add = |dir: String| {
         // Not `Vec::dedup`, which only collapses *adjacent* equals: the
         // dataset's resolved metastore and the `cayenne_file_path` fallback are
@@ -1069,6 +1110,10 @@ fn candidate_metastore_dirs(acceleration: Option<&Acceleration>) -> Vec<String> 
             candidates.push(dir);
         }
     };
+
+    if let Some(active) = active_metadata_dir {
+        add(active.to_string());
+    }
 
     add(CayenneAccelerator::resolve_metadata_dir(acceleration));
     add(format!("{}/metadata", spice_data_base_path()));
@@ -1089,8 +1134,9 @@ fn ensure_metastore_outside_data_dir(
     dataset: &str,
     data_dir: &str,
     acceleration: Option<&Acceleration>,
+    active_metadata_dir: Option<&str>,
 ) -> Result<()> {
-    for metadata_dir in candidate_metastore_dirs(acceleration) {
+    for metadata_dir in candidate_metastore_dirs(acceleration, active_metadata_dir) {
         ensure!(
             !metastore_is_inside_data_dir(data_dir, &metadata_dir),
             MetastoreInsideDataDirectorySnafu {
@@ -1115,8 +1161,9 @@ async fn remove_acceleration_data_dir(
     dataset: &str,
     data_dir: &str,
     acceleration: Option<&Acceleration>,
+    active_metadata_dir: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    ensure_metastore_outside_data_dir(dataset, data_dir, acceleration)?;
+    ensure_metastore_outside_data_dir(dataset, data_dir, acceleration, active_metadata_dir)?;
     tokio::fs::remove_dir_all(data_dir).await?;
     Ok(())
 }
@@ -1137,6 +1184,7 @@ impl CayenneAccelerator {
     pub fn with_footer_cache_mb(footer_cache_mb: Option<usize>) -> Self {
         Self {
             catalog: Arc::new(OnceCell::new()),
+            active_metadata_dir: Arc::new(OnceLock::new()),
             memory_catalog: Arc::new(OnceCell::new()),
             instance_id: CAYENNE_ACCELERATOR_INSTANCE_COUNTER
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
@@ -2226,9 +2274,13 @@ impl CayenneAccelerator {
     /// Lazily initialize a Cayenne catalog into `cell` from `connection_string`,
     /// sharing the init/`OnceCell` machinery between the file-mode and memory-mode
     /// catalog getters.
+    /// `on_initialized` runs only for the caller that actually initializes `cell`
+    /// — the losers of the race are handed the winner's catalog and never reach
+    /// it — so anything it records describes the catalog the instance shares.
     async fn init_cayenne_catalog(
         cell: &OnceCell<Arc<dyn cayenne::MetadataCatalog>>,
         connection_string: String,
+        on_initialized: impl FnOnce() + Send,
     ) -> Result<Arc<dyn cayenne::MetadataCatalog>> {
         cell.get_or_try_init(move || {
             let connection_string = connection_string;
@@ -2244,6 +2296,8 @@ impl CayenneAccelerator {
                     .await
                     .boxed()
                     .context(AccelerationInitializationFailedSnafu)?;
+
+                on_initialized();
 
                 Ok::<Arc<dyn cayenne::MetadataCatalog>, Error>(catalog)
             }
@@ -2261,7 +2315,15 @@ impl CayenneAccelerator {
             "turso" => format!("libsql://{metadata_dir}/cayenne.db"),
             _ => format!("sqlite://{metadata_dir}/cayenne.db"), // Default to SQLite
         };
-        Self::init_cayenne_catalog(&self.catalog, connection_string).await
+
+        let record_dir = Arc::clone(&self.active_metadata_dir);
+        let metadata_dir = metadata_dir.to_string();
+        Self::init_cayenne_catalog(&self.catalog, connection_string, move || {
+            // `set` cannot already be occupied: only the dataset that initializes
+            // the catalog reaches here, and it does so once.
+            drop(record_dir.set(metadata_dir));
+        })
+        .await
     }
 
     /// Get or create the shared in-memory (`memdb`) catalog for `mode: memory`
@@ -2271,7 +2333,9 @@ impl CayenneAccelerator {
     async fn get_or_create_memory_catalog(&self) -> Result<Arc<dyn cayenne::MetadataCatalog>> {
         let connection_string =
             format!("sqlite://file:/cayenne-mem-{}?vfs=memdb", self.instance_id);
-        Self::init_cayenne_catalog(&self.memory_catalog, connection_string).await
+        // Nothing to record: an in-RAM metastore occupies no directory, so no
+        // teardown can delete it.
+        Self::init_cayenne_catalog(&self.memory_catalog, connection_string, || {}).await
     }
 
     /// Apply the `mode: memory` overrides to a table's [`cayenne::metadata::VortexConfig`]:
@@ -3089,6 +3153,7 @@ impl DataAccelerator for CayenneAccelerator {
             &source.name().to_string(),
             &dir_path,
             source.acceleration(),
+            self.active_metadata_dir.get().map(String::as_str),
         )?;
 
         // Handle S3 Express One Zone configuration
@@ -3235,6 +3300,7 @@ impl DataAccelerator for CayenneAccelerator {
                     &source.name().to_string(),
                     &dir_path,
                     Some(acceleration),
+                    self.active_metadata_dir.get().map(String::as_str),
                 )
                 .await
                 .context(AccelerationInitializationFailedSnafu)?;
@@ -3742,7 +3808,13 @@ impl DataAccelerator for CayenneAccelerator {
         let dir_path = self.cayenne_data_dir(source).boxed()?;
         let path_buf = PathBuf::from(&dir_path);
         if path_buf.exists() {
-            remove_acceleration_data_dir(table_name, &dir_path, source.acceleration()).await?;
+            remove_acceleration_data_dir(
+                table_name,
+                &dir_path,
+                source.acceleration(),
+                self.active_metadata_dir.get().map(String::as_str),
+            )
+            .await?;
             tracing::info!(
                 "Removed Cayenne data directory '{dir_path}' for schema recreation (file_update mode)"
             );
@@ -4892,7 +4964,7 @@ mod tests {
             "'{data_dir}' and '{metadata_dir}' are the same directory"
         );
 
-        let err = ensure_metastore_outside_data_dir("metadata", &data_dir, None)
+        let err = ensure_metastore_outside_data_dir("metadata", &data_dir, None, None)
             .expect_err("a data directory that IS the metastore must be refused");
         assert!(
             matches!(err, Error::MetastoreInsideDataDirectory { .. }),
@@ -4912,7 +4984,7 @@ mod tests {
 
         assert_eq!(data_dir, "/persistent/metadata/");
         assert_eq!(metadata_dir, "/persistent/metadata");
-        ensure_metastore_outside_data_dir("metadata", &data_dir, Some(&acceleration))
+        ensure_metastore_outside_data_dir("metadata", &data_dir, Some(&acceleration), None)
             .expect_err("a trailing slash is not a different directory");
     }
 
@@ -4943,8 +5015,11 @@ mod tests {
             "the dataset's own metastore is genuinely outside its data directory"
         );
 
-        let err = ensure_metastore_outside_data_dir("metadata", &data_dir, Some(&acceleration))
-            .expect_err("the default metastore other datasets share is still inside {data_dir}");
+        let err =
+            ensure_metastore_outside_data_dir("metadata", &data_dir, Some(&acceleration), None)
+                .expect_err(
+                    "the default metastore other datasets share is still inside {data_dir}",
+                );
         assert!(
             err.to_string().contains(&format!("{base}/metadata")),
             "the error must name the metastore actually at risk, got: {err}"
@@ -5024,6 +5099,73 @@ mod tests {
         }
     }
 
+    /// A `..` written after a symlink does not mean the directory it was written
+    /// beside: the kernel resolves it from the link's target, so the deletion
+    /// lands somewhere a lexical fold of the path never names. Folding `..`
+    /// before canonicalizing therefore compares an innocent directory and lets
+    /// the metastore through.
+    #[cfg(unix)]
+    #[test]
+    fn a_parent_dir_component_after_a_symlink_resolves_like_the_filesystem() {
+        let temp = tempfile::TempDir::new().expect("temp dir");
+        let root = temp.path();
+
+        // `link` -> `actual/child`, so `link/..` is `actual`, not `root`.
+        std::fs::create_dir_all(root.join("actual/child")).expect("link target");
+        std::fs::create_dir_all(root.join("actual/data/metadata")).expect("metastore directory");
+        std::os::unix::fs::symlink(root.join("actual/child"), root.join("link"))
+            .expect("symlink the data directory's parent");
+
+        let data_dir = format!("{}/link/../data", root.display());
+        let metadata_dir = root
+            .join("actual/data/metadata")
+            .to_string_lossy()
+            .to_string();
+
+        // `remove_dir_all(data_dir)` unlinks `actual/data`, taking the metastore
+        // inside it. A lexical fold answers `{root}/data`, which holds nothing.
+        assert!(
+            metastore_is_inside_data_dir(&data_dir, &metadata_dir),
+            "deleting '{data_dir}' unlinks '{metadata_dir}'"
+        );
+    }
+
+    /// The shared catalog is opened once per accelerator instance, by whichever
+    /// dataset gets there first, and every later dataset uses that catalog
+    /// whatever its own `cayenne_metadata_dir` says. So a dataset whose *own*
+    /// resolved metastore is harmless can still have a data directory sitting on
+    /// the catalog the instance is actually using — checking only the
+    /// configuration would accept it and delete the live catalog.
+    #[test]
+    fn the_metastore_actually_in_use_is_refused_even_when_the_params_look_safe() {
+        let acceleration = Acceleration {
+            params: [(
+                "cayenne_metadata_dir".to_string(),
+                "/elsewhere/metadata".to_string(),
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        let data_dir = "/persistent/orders/";
+        let active_metadata_dir = "/persistent/orders/live-catalog";
+
+        ensure_metastore_outside_data_dir("orders", data_dir, Some(&acceleration), None)
+            .expect("nothing the configuration names is inside the data directory");
+
+        let err = ensure_metastore_outside_data_dir(
+            "orders",
+            data_dir,
+            Some(&acceleration),
+            Some(active_metadata_dir),
+        )
+        .expect_err("the catalog the instance opened is inside the data directory");
+        assert!(
+            err.to_string().contains(active_metadata_dir),
+            "the error must name the metastore actually at risk, got: {err}"
+        );
+    }
+
     /// A normally-named dataset must keep loading — the guard's whole risk is
     /// rejecting a layout that works today.
     #[test]
@@ -5034,7 +5176,7 @@ mod tests {
             let data_dir =
                 CayenneAccelerator::resolve_custom_data_path(dataset_name, "/persistent")
                     .expect("a local custom path resolves");
-            ensure_metastore_outside_data_dir(dataset_name, &data_dir, Some(&acceleration))
+            ensure_metastore_outside_data_dir(dataset_name, &data_dir, Some(&acceleration), None)
                 .expect("a sibling data directory must be accepted");
         }
     }
