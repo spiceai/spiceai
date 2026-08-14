@@ -24,6 +24,7 @@ use data_components::{
     cdc::{ChangesStream, CommitError},
     kafka::{KafkaConfig, KafkaConsumer, KafkaMetrics, KafkaOffset, KafkaOffsetCommitHook},
 };
+use data_connector_api::federated::FederatedTableProvider;
 use dataformat_json::{SpiceJsonOptions, unnest_struct_schema};
 use datafusion::catalog::TableProvider;
 use futures::StreamExt;
@@ -35,7 +36,6 @@ use runtime::{
         DataConnectorResult, InvalidConfigurationNoSourceSnafu, NewDataConnectorResult,
         UnableToGetReadProviderSnafu, parameters::ConnectorParams,
     },
-    federated::FederatedTable,
 };
 use runtime_api_types::v1::ComponentType;
 use runtime_datafusion::refresh_sql;
@@ -413,7 +413,10 @@ impl DataConnector for Kafka {
         true
     }
 
-    fn append_stream(&self, federated_table: Arc<FederatedTable>) -> Option<ChangesStream> {
+    fn append_stream(
+        &self,
+        federated_table: Arc<dyn FederatedTableProvider>,
+    ) -> Option<ChangesStream> {
         Some(Box::pin(stream! {
             let table_provider = federated_table.table_provider().await;
             let Some(kafka) = table_provider.downcast_ref::<data_components::kafka::Kafka>() else {

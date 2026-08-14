@@ -533,7 +533,7 @@ async fn create_s3_provider(
     params.insert("file_format".into(), input_format.file_format().into());
     let s3 = S3 {
         params,
-        runtime: Some(Arc::unwrap_or_clone(dataset.runtime())),
+        app: Some(dataset.app()),
         tokio_io_runtime,
     };
 

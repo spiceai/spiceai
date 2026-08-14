@@ -4630,6 +4630,7 @@ dependencies = [
  "arrow-schema",
  "async-stream",
  "async-trait",
+ "data-connector-api",
  "data_components",
  "dataformat-json",
  "datafusion",
@@ -4701,6 +4702,7 @@ dependencies = [
  "async-stream",
  "async-trait",
  "chrono",
+ "data-connector-api",
  "data_components",
  "datafusion",
  "datafusion-table-providers",
@@ -4784,6 +4786,7 @@ version = "2.2.0-unstable"
 dependencies = [
  "async-stream",
  "async-trait",
+ "data-connector-api",
  "data_components",
  "datafusion",
  "datafusion-table-providers",
@@ -4853,6 +4856,7 @@ dependencies = [
 name = "connector-sharepoint"
 version = "2.2.0-unstable"
 dependencies = [
+ "app",
  "arrow",
  "async-stream",
  "async-trait",
@@ -5998,11 +6002,14 @@ dependencies = [
 name = "data-connector-api"
 version = "2.2.0-unstable"
 dependencies = [
+ "async-trait",
  "data_components",
+ "datafusion",
  "globset",
  "runtime-component",
  "serde_json",
  "snafu",
+ "tokio",
 ]
 
 [[package]]
