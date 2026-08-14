@@ -264,10 +264,10 @@ impl RefreshableCatalogProvider for GlueCatalogProvider {
                 // table, so skip its `GetTables` pagination entirely; every
                 // database that survives is still filtered table by table.
                 //
-                // Unlike the `PostgreSQL` connector, which registers a pruned
-                // schema empty so pruning never changes the catalog's namespace,
-                // Glue drops the database from `schema_names` altogether. That
-                // is the behaviour this connector has always had.
+                // Skipping the database also drops it from `schema_names`, so
+                // pruning narrows this catalog's namespace — unlike the
+                // `PostgreSQL` connector, which registers a pruned schema empty
+                // and keeps the namespace fixed.
                 if !self.selector.may_select_within(&db.name) {
                     tracing::debug!("skipping database {}", &db.name);
                     continue;
@@ -407,7 +407,7 @@ mod tests {
         assert!(!s.may_select_within("private"));
     }
 
-    /// Pattern shapes the database prune used to reject outright, each naming a
+    /// Pattern shapes the database prune must not reject, each naming a
     /// database whose tables the per-table filter accepts. Regression test for
     /// #12630.
     #[test]
