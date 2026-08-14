@@ -111,7 +111,9 @@ use runtime_acceleration::snapshot::AccelerationLayout;
 ))]
 use runtime_acceleration::snapshot::SnapshotManager;
 use runtime_async::ManagedTokioRuntime;
-use runtime_datafusion::schema_provider::{EnsureSchemaError, ensure_schema_exists};
+use runtime_datafusion::schema_provider::{
+    EnsureSchemaError, SpiceSchemaProvider, ensure_schema_exists,
+};
 use runtime_query_engine::query_engine::Error as QueryEngineError;
 use runtime_table_partition::provider::PartitionTableProvider;
 use snafu::prelude::*;
@@ -275,6 +277,11 @@ pub enum Error {
         schema: String,
         source: DataFusionError,
     },
+
+    #[snafu(display(
+        "Failed to create the internal table {table}: the {schema} schema cannot reserve a name for it, so the runtime cannot keep the table it writes to. This is a bug in Spice; please report it at https://github.com/spiceai/spiceai/issues"
+    ))]
+    UnableToReserveInternalTable { table: String, schema: String },
 
     #[snafu(display("Expected acceleration settings for {name}, found None"))]
     ExpectedAccelerationSettings { name: String },
@@ -1139,39 +1146,41 @@ impl DataFusion {
         Ok(())
     }
 
-    /// Register an internal table, but only if nothing already holds its name.
+    /// Register an internal table under a name no one else may then take.
     ///
-    /// Returns the provider that holds `table_name`, leaving it registered, when
-    /// the name is taken. [`SchemaProvider::register_table`] overwrites silently,
-    /// so a caller that checks the name first and registers second leaves a
-    /// window in which a dataset load can claim it: the check and the claim have
-    /// to be the same step for the answer to be true when it is acted on.
-    pub fn register_internal_table_if_name_is_free(
+    /// Returns the provider that already holds `table_name`, left in place, when
+    /// the name is taken. Otherwise the name is reserved: registrations that come
+    /// afterwards — a dataset load, a view, a `CREATE TABLE` — are refused rather
+    /// than silently replacing a table the runtime resolves by name every time it
+    /// writes to it.
+    ///
+    /// The test and the claim happen inside [`SpiceSchemaProvider::reserve_table`]
+    /// as one step. Component loading registers datasets concurrently with the
+    /// runtime's own tables, so a caller that checks the name and registers second
+    /// can act on an answer that is no longer true.
+    pub fn reserve_internal_table(
         &self,
         table_name: TableReference,
         table: Arc<dyn datafusion::datasource::TableProvider>,
     ) -> Result<Option<Arc<dyn datafusion::datasource::TableProvider>>> {
-        if let Some(schema) = table_name.schema()
-            && let Some(registered_schema) = self.schema(schema)
+        if let Some(schema_name) = table_name.schema()
+            && let Some(registered_schema) = self.schema(schema_name)
         {
-            let displaced = registered_schema
-                .register_table(table_name.table().to_string(), table)
-                .map_err(find_datafusion_root)
-                .context(UnableToRegisterTableToDataFusionSchemaSnafu {
-                    schema: SPICE_EVAL_SCHEMA,
+            // Only this provider can promise the name will still be free when it
+            // is claimed. Anything else is refused rather than registered without
+            // that promise: an internal table quietly replaced later is how
+            // internal rows end up in someone's dataset.
+            let spice_schema = registered_schema
+                .downcast_ref::<SpiceSchemaProvider>()
+                .context(UnableToReserveInternalTableSnafu {
+                    table: table_name.to_string(),
+                    schema: schema_name.to_string(),
                 })?;
 
-            if let Some(displaced) = displaced {
-                // The insert already happened — it is the only atomic point — so
-                // the name is given back to whoever held it before this call
-                // decided it had lost.
-                registered_schema
-                    .register_table(table_name.table().to_string(), Arc::clone(&displaced))
-                    .map_err(find_datafusion_root)
-                    .context(UnableToRegisterTableToDataFusionSchemaSnafu {
-                        schema: SPICE_EVAL_SCHEMA,
-                    })?;
-                return Ok(Some(displaced));
+            if let Err(incumbent) =
+                spice_schema.reserve_table(table_name.table().to_string(), table)
+            {
+                return Ok(Some(incumbent));
             }
         }
 
@@ -6595,11 +6604,9 @@ mod tests {
         }
     }
 
-    /// The claim an internal table makes on its name has to be the same step as
-    /// the check that the name is free: [`SchemaProvider::register_table`]
-    /// overwrites silently, and dataset loading runs concurrently with the
-    /// internal registrations.
-    mod register_internal_table_if_name_is_free_tests {
+    /// The runtime's own tables are reserved through the schema provider, so a
+    /// name it holds cannot be taken by a dataset load afterwards.
+    mod reserve_internal_table_tests {
         use crate::dataaccelerator::AcceleratorEngineRegistry;
         use crate::datafusion::{SPICE_RUNTIME_SCHEMA, builder::DataFusionBuilder};
         use crate::status::RuntimeStatus;
@@ -6620,47 +6627,67 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn a_free_name_is_claimed_and_a_taken_one_is_left_alone() {
+        async fn a_free_name_is_reserved_and_kept_against_a_later_registration() {
             let df = DataFusionBuilder::new(
                 RuntimeStatus::new(),
                 Arc::new(AcceleratorEngineRegistry::new()),
                 Handle::current(),
             )
             .build();
-            let name = TableReference::partial(SPICE_RUNTIME_SCHEMA, "claimed");
+            let name = TableReference::partial(SPICE_RUNTIME_SCHEMA, "reserved");
 
-            let displaced = df
-                .register_internal_table_if_name_is_free(name.clone(), table("mine"))
-                .expect("claim a free name");
-            assert!(displaced.is_none(), "nothing held the name");
-            assert!(df.table_exists(&name), "so the internal table now holds it");
+            let taken = df
+                .reserve_internal_table(name.clone(), table("internal"))
+                .expect("reserve a free name");
+            assert!(taken.is_none(), "nothing held the name");
 
-            let incumbent = df
-                .get_table(&name)
-                .await
-                .expect("the claimed table resolves");
+            let incumbent = df.get_table(&name).await.expect("the table resolves");
 
-            let theirs = table("theirs");
-            let displaced = df
-                .register_internal_table_if_name_is_free(name.clone(), Arc::clone(&theirs))
-                .expect("a taken name is reported, not an error");
-            let displaced = displaced.expect("the caller is told who holds the name");
+            // What a dataset named `runtime.reserved` would do.
+            let error = df
+                .ctx
+                .register_table(name.clone(), table("dataset"))
+                .expect_err("a reserved name is refused, not overwritten");
             assert!(
-                Arc::ptr_eq(&displaced, &incumbent),
-                "and told which provider that is"
+                error.to_string().contains("reserved"),
+                "and the refusal says why: {error}"
             );
 
-            let still_registered = df
-                .get_table(&name)
-                .await
-                .expect("the name is still registered");
+            let held = df.get_table(&name).await.expect("the table still resolves");
             assert!(
-                Arc::ptr_eq(&still_registered, &incumbent),
-                "the incumbent keeps the name: a losing claim displaces nothing"
+                Arc::ptr_eq(&held, &incumbent),
+                "the runtime keeps the table it resolves by name at write time"
             );
+        }
+
+        #[tokio::test]
+        async fn a_name_already_taken_is_reported_and_left_alone() {
+            let df = DataFusionBuilder::new(
+                RuntimeStatus::new(),
+                Arc::new(AcceleratorEngineRegistry::new()),
+                Handle::current(),
+            )
+            .build();
+            let name = TableReference::partial(SPICE_RUNTIME_SCHEMA, "occupied");
+
+            df.ctx
+                .register_table(name.clone(), table("dataset"))
+                .expect("something registers first");
+            let incumbent = df.get_table(&name).await.expect("the dataset resolves");
+
+            let taken = df
+                .reserve_internal_table(name.clone(), table("internal"))
+                .expect("a taken name is reported, not an error")
+                .expect("the caller is told who holds it");
             assert!(
-                !Arc::ptr_eq(&still_registered, &theirs),
-                "and the table that lost is not silently in its place"
+                Arc::ptr_eq(&taken, &incumbent),
+                "and which provider that is"
+            );
+
+            let held = df.get_table(&name).await.expect("the name is still held");
+            assert!(
+                Arc::ptr_eq(&held, &incumbent),
+                "nothing was displaced to find that out"
             );
         }
     }

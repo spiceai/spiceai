@@ -17,7 +17,7 @@ limitations under the License.
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet, mapref::entry::Entry};
 use datafusion::{
     catalog::SchemaProvider,
     datasource::TableProvider,
@@ -29,9 +29,16 @@ use snafu::{OptionExt, Snafu};
 
 /// Copy of default `MemorySchemaProvider` that allows `register_table` to atomically overwrite any existing tables
 /// `<https://github.com/apache/datafusion/blob/deebda78a34251b2bddf0c5f66edfaa112c4559b/datafusion/core/src/catalog/schema.rs#L84>`
+///
+/// Overwriting is deliberate — a dataset whose definition changes is re-registered
+/// in place — so the schema cannot tell an internal table from a dataset by
+/// looking at the provider. [`SpiceSchemaProvider::reserve_table`] records the
+/// names the runtime holds for itself, and every registration path checks that
+/// record, so a reserved name is refused rather than silently taken.
 #[derive(Debug)]
 pub struct SpiceSchemaProvider {
     tables: DashMap<String, Arc<dyn TableProvider>>,
+    reserved: DashSet<String>,
 }
 
 impl SpiceSchemaProvider {
@@ -39,6 +46,7 @@ impl SpiceSchemaProvider {
     pub fn new() -> Self {
         Self {
             tables: DashMap::new(),
+            reserved: DashSet::new(),
         }
     }
 
@@ -46,6 +54,51 @@ impl SpiceSchemaProvider {
     pub fn table_sync(&self, name: &str) -> Option<Arc<dyn TableProvider>> {
         self.tables.get(name).map(|table| Arc::clone(table.value()))
     }
+
+    /// Register `table` under `name` and reserve the name, but only if it is free.
+    ///
+    /// Returns the provider that already holds `name`, untouched, when it is not.
+    /// The test and the claim are a single step: everything registering into this
+    /// schema competes for the same entry, so a name found free by an earlier call
+    /// can be taken by the time that call acts on it.
+    ///
+    /// A reserved name is refused by [`SchemaProvider::register_table`] from then
+    /// on, which is what keeps a runtime component's table — resolved by name
+    /// whenever it is written to — from being replaced by something else.
+    ///
+    /// # Errors
+    ///
+    /// Returns the provider registered under `name`, still registered, when the
+    /// name was already taken. Nothing is reserved and nothing is displaced.
+    pub fn reserve_table(
+        &self,
+        name: String,
+        table: Arc<dyn TableProvider>,
+    ) -> std::result::Result<(), Arc<dyn TableProvider>> {
+        match self.tables.entry(name) {
+            Entry::Occupied(occupied) => Err(Arc::clone(occupied.get())),
+            Entry::Vacant(vacant) => {
+                // Recorded while the entry is held, so a registration waiting on
+                // this same entry cannot pass the reservation check and then find
+                // the name reserved.
+                self.reserved.insert(vacant.key().clone());
+                vacant.insert(table);
+                Ok(())
+            }
+        }
+    }
+
+    /// Whether `name` is held for a runtime component.
+    #[must_use]
+    pub fn is_reserved(&self, name: &str) -> bool {
+        self.reserved.contains(name)
+    }
+}
+
+fn reserved_name_error(name: &str) -> DataFusionError {
+    DataFusionError::Execution(format!(
+        "Failed to register table {name}: that name is reserved for an internal Spice runtime table. Rename the dataset or view. See: https://spiceai.org/docs/reference/spicepod/datasets"
+    ))
 }
 
 impl Default for SpiceSchemaProvider {
@@ -72,11 +125,33 @@ impl SchemaProvider for SpiceSchemaProvider {
         name: String,
         table: Arc<dyn TableProvider>,
     ) -> Result<Option<Arc<dyn TableProvider>>> {
-        Ok(self.tables.insert(name, table))
+        // Through the entry, not `insert`, so this shares the one point at which
+        // the name is decided with `reserve_table` — a check made outside it
+        // could be stale by the time the insert happened.
+        match self.tables.entry(name) {
+            Entry::Occupied(mut occupied) => {
+                if self.reserved.contains(occupied.key()) {
+                    return Err(reserved_name_error(occupied.key()));
+                }
+                let displaced = occupied.insert(table);
+                Ok(Some(displaced))
+            }
+            Entry::Vacant(vacant) => {
+                if self.reserved.contains(vacant.key()) {
+                    return Err(reserved_name_error(vacant.key()));
+                }
+                vacant.insert(table);
+                Ok(None)
+            }
+        }
     }
 
     fn deregister_table(&self, name: &str) -> Result<Option<Arc<dyn TableProvider>>> {
-        Ok(self.tables.remove(name).map(|(_, table)| table))
+        let removed = self.tables.remove(name).map(|(_, table)| table);
+        // The reservation described a table that is no longer here, so the name is
+        // free for whatever wants it next.
+        self.reserved.remove(name);
+        Ok(removed)
     }
 
     fn table_exist(&self, name: &str) -> bool {
@@ -124,5 +199,162 @@ pub fn ensure_schema_exists(
     match catalog_provider.register_schema(schema_name, schema_provider) {
         Ok(_) => Ok(()),
         Err(_) => unreachable!("register_schema will never fail"),
+    }
+}
+
+#[cfg(test)]
+mod reservation_tests {
+    use super::*;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::datasource::empty::EmptyTable;
+
+    fn table(field: &str) -> Arc<dyn TableProvider> {
+        Arc::new(EmptyTable::new(Arc::new(Schema::new(vec![Field::new(
+            field,
+            DataType::Int64,
+            true,
+        )]))))
+    }
+
+    #[test]
+    fn a_reserved_name_is_refused_to_every_other_registration() {
+        let provider = SpiceSchemaProvider::new();
+        let internal = table("internal");
+
+        provider
+            .reserve_table("task_history".to_string(), Arc::clone(&internal))
+            .expect("a free name is reserved");
+        assert!(provider.is_reserved("task_history"));
+
+        let error = provider
+            .register_table("task_history".to_string(), table("dataset"))
+            .expect_err("a reserved name is not something else's to take");
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("reserved") && rendered.contains("Rename"),
+            "the refusal has to say what to do about it: {rendered}"
+        );
+
+        let held = provider
+            .table_sync("task_history")
+            .expect("the name is still registered");
+        assert!(
+            Arc::ptr_eq(&held, &internal),
+            "and the runtime keeps the table it writes to"
+        );
+    }
+
+    #[test]
+    fn a_taken_name_is_reported_without_being_disturbed() {
+        let provider = SpiceSchemaProvider::new();
+        let dataset = table("dataset");
+        provider
+            .register_table("task_history".to_string(), Arc::clone(&dataset))
+            .expect("a dataset registers first");
+
+        let incumbent = provider
+            .reserve_table("task_history".to_string(), table("internal"))
+            .expect_err("the name is taken");
+        assert!(
+            Arc::ptr_eq(&incumbent, &dataset),
+            "the caller is told which provider holds it"
+        );
+        assert!(
+            !provider.is_reserved("task_history"),
+            "a losing reservation reserves nothing"
+        );
+
+        let held = provider
+            .table_sync("task_history")
+            .expect("the name is still registered");
+        assert!(
+            Arc::ptr_eq(&held, &dataset),
+            "and nothing was displaced to find that out"
+        );
+    }
+
+    #[test]
+    fn deregistering_a_reserved_table_frees_its_name() {
+        let provider = SpiceSchemaProvider::new();
+        provider
+            .reserve_table("task_history".to_string(), table("internal"))
+            .expect("reserve");
+
+        provider
+            .deregister_table("task_history")
+            .expect("deregister")
+            .expect("the reserved table comes back out");
+        assert!(
+            !provider.is_reserved("task_history"),
+            "the reservation described a table that is no longer here"
+        );
+
+        provider
+            .register_table("task_history".to_string(), table("dataset"))
+            .expect("so the name is free for whatever wants it next");
+    }
+
+    /// Component loading registers datasets concurrently with the runtime's own
+    /// tables, so the reservation is only worth anything if it holds when both
+    /// reach the same name at once.
+    ///
+    /// The assertion is on the invariant rather than on who wins: whoever takes
+    /// the name keeps it, and a name that ends up reserved is held by the table
+    /// that reserved it — never by a registration that arrived afterwards.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_race_for_one_name_leaves_exactly_one_holder() {
+        for round in 0..200 {
+            let provider = Arc::new(SpiceSchemaProvider::new());
+            let internal = table("internal");
+
+            let claiming = {
+                let provider = Arc::clone(&provider);
+                let internal = Arc::clone(&internal);
+                tokio::spawn(async move {
+                    provider
+                        .reserve_table("task_history".to_string(), internal)
+                        .is_ok()
+                })
+            };
+            let registrars: Vec<_> = (0..4)
+                .map(|which| {
+                    let provider = Arc::clone(&provider);
+                    tokio::spawn(async move {
+                        provider
+                            .register_table(
+                                "task_history".to_string(),
+                                table(&format!("dataset{which}")),
+                            )
+                            .is_ok()
+                    })
+                })
+                .collect();
+
+            let reserved = claiming.await.expect("the reserving task ran");
+            let mut any_registered = false;
+            for registrar in registrars {
+                any_registered |= registrar.await.expect("a registering task ran");
+            }
+
+            assert_eq!(
+                reserved, !any_registered,
+                "round {round}: the name is either reserved or registered, never both"
+            );
+            assert_eq!(
+                reserved,
+                provider.is_reserved("task_history"),
+                "round {round}: the reservation is recorded exactly when it succeeded"
+            );
+
+            let held = provider
+                .table_sync("task_history")
+                .expect("something holds the name");
+            if reserved {
+                assert!(
+                    Arc::ptr_eq(&held, &internal),
+                    "round {round}: a reserved name is held by the table that reserved it"
+                );
+            }
+        }
     }
 }

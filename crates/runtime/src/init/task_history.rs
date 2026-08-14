@@ -217,16 +217,16 @@ impl Runtime {
             _ => local_table.into_table() as Arc<dyn TableProvider>,
         };
 
-        // Claiming the name and finding it free are one step. Dataset loading runs
-        // concurrently with this on both the normal bring-up and the arriving-app
-        // path, and registration overwrites whatever it finds, so a check made
+        // Claiming the name and finding it free are one step, and the name stays
+        // this runtime's afterwards. Dataset loading runs concurrently with this
+        // on both the normal bring-up and the arriving-app path, so a check made
         // earlier can be false by the time it is acted on — and acting on it
         // wrongly means either displacing a dataset or aiming internal task rows
         // at one. The exporter resolves this table by name at write time, so a
-        // name this runtime does not own leaves emission off (it already is).
+        // name this runtime does not hold leaves emission off (it already is).
         if let Some(_taken) = self
             .df
-            .register_internal_table_if_name_is_free(table.clone(), table_to_register)
+            .reserve_internal_table(table.clone(), table_to_register)
             .context(UnableToCreateBackendSnafu)?
         {
             return Err(Error::UnableToTrackTaskHistory {
