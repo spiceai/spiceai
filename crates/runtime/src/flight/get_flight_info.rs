@@ -69,7 +69,18 @@ async fn dispatch(request: Request<FlightDescriptor>) -> Result<Response<FlightI
         return get_flight_info_simple(request).await;
     };
 
-    match Command::try_from(message).map_err(to_tonic_err)? {
+    // Recorded here rather than by the arms below: a descriptor that decodes as a
+    // `prost` message but not as a `Command` never reaches one of them, and this
+    // is the only `get_flight_info` path that would otherwise report nothing.
+    let command = match Command::try_from(message) {
+        Ok(command) => command,
+        Err(e) => {
+            let _start = metrics::track_flight_request("get_flight_info", None).await;
+            return Err(to_tonic_err(e));
+        }
+    };
+
+    match command {
         Command::CommandStatementQuery(token) => {
             flightsql::statement_query::get_flight_info(token, request).await
         }

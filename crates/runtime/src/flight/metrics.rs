@@ -40,6 +40,17 @@ pub(crate) static FLIGHT_REQUEST_DURATION_MS: LazyLock<Histogram<f64>> = LazyLoc
 });
 
 /// Track a Flight RPC. `command` is a static label for fixed RPC variants.
+///
+/// Record exactly once per RPC, in the handler that knows the command — a second
+/// timer over the same RPC doubles both the counter and the histogram.
+///
+/// The returned [`TimeMeasurement`] records on drop, so hold it for the span you
+/// want measured: bind it for the length of the handler, or move it into a
+/// [`telemetry::timing::TimedStream`] to span a streamed response. It must be
+/// `.await`ed — `let _start = track_flight_request(..)` binds the *future*,
+/// which is then dropped unpolled and records nothing at all. Naming the binding
+/// suppresses `unused_must_use`, and `clippy::let_underscore_future` only fires
+/// on the `let _` form, so nothing catches that but a test.
 pub async fn track_flight_request(
     method: &'static str,
     command: Option<&'static str>,

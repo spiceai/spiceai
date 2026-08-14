@@ -52,7 +52,18 @@ pub(crate) async fn handle(
         }
     };
 
-    match Command::try_from(msg).map_err(to_tonic_err)? {
+    // Recorded here rather than by the arms below: a ticket that decodes as a
+    // `prost` message but not as a `Command` never reaches one of them, and this
+    // is the only `do_get` path that would otherwise report nothing.
+    let command = match Command::try_from(msg) {
+        Ok(command) => command,
+        Err(e) => {
+            let _start = metrics::track_flight_request("do_get", None).await;
+            return Err(to_tonic_err(e));
+        }
+    };
+
+    match command {
         Command::CommandStatementQuery(command) => {
             Box::pin(flightsql::statement_query::do_get(command)).await
         }
