@@ -52,6 +52,7 @@ telemetry = { path = "../telemetry" }
 tokio-rusqlite = { workspace = true }
 serde_json = { workspace = true }
 snafu = { workspace = true }
+twox-hash = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "fs"] }
 tracing = { workspace = true }
 turso = { workspace = true, optional = true }
@@ -118,6 +119,13 @@ vortex-io = { workspace = true }
 # longer depends on arrow-row's (unstable) row format.
 arrow-row = { workspace = true }
 criterion = { version = "0.7", features = ["html_reports", "async_tokio"] }
+# Bench-only. BinaryFuse8 stands in for the static solve-at-build filter family
+# (ribbon, XOR, fuse) in benches/pk_filter.rs. Never linked into the library.
+xorf = "0.12"
+# Bench-only. The maintained reference implementation to measure ours against:
+# if it wins, the answer is to use it rather than hand-roll a replacement.
+fastbloom = "0.17"
+ahash = { workspace = true }
 datafusion-federation.workspace = true
 datafusion-functions-aggregate = { workspace = true }
 datafusion-functions = { workspace = true }
@@ -534,3 +542,7 @@ required-features = ["result-correctness-duckdb"]
 
 [lints]
 workspace = true
+
+[[bench]]
+harness = false
+name = "pk_filter"
