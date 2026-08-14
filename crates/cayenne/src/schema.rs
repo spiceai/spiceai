@@ -18,9 +18,20 @@ limitations under the License.
 
 use std::sync::Arc;
 
-use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow_tools::type_rewrite::{Float16ToFloat32, TimestampToMicrosecond, TypeRewriteRules};
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion_table_providers::UnsupportedTypeAction;
+
+/// The type rewrites Cayenne always applies when it creates a table, because Vortex
+/// cannot represent the incoming type.
+///
+/// This is the definition [`transform_schema_for_vortex`] itself applies, published so
+/// callers that need only the always-applied part — the acceleration write path, which
+/// must tell an engine-imposed type from a schema that has genuinely drifted — can reuse
+/// it without the unsupported-type handling.
+pub static CAYENNE_TYPE_REWRITE_RULES: TypeRewriteRules =
+    &[&Float16ToFloat32, &TimestampToMicrosecond];
 
 fn is_vortex_supported_type(data_type: &DataType) -> bool {
     !matches!(
@@ -57,19 +68,17 @@ fn transform_data_type_for_vortex(
     top_level: bool,
     unsupported_fields: &mut Vec<String>,
 ) -> Option<DataType> {
-    if matches!(data_type, DataType::Float16) {
-        tracing::debug!("Converting Float16 field '{path}' to Float32 for Vortex compatibility");
-        return Some(DataType::Float32);
-    }
-
-    if let DataType::Timestamp(unit, tz) = data_type
-        && !matches!(unit, TimeUnit::Microsecond)
-    {
-        tracing::debug!(
-            "Converting timestamp field '{path}' from {:?} to Microsecond for Vortex compatibility",
-            unit
-        );
-        return Some(DataType::Timestamp(TimeUnit::Microsecond, tz.clone()));
+    // The always-applied rewrites. These are leaf rules (never a container type), so
+    // consulting them before the nested walk below is what `apply_rules` would do too -
+    // which is what lets `CAYENNE_TYPE_REWRITE_RULES` be published as an equivalent
+    // description of this step rather than a second copy of it.
+    for rule in CAYENNE_TYPE_REWRITE_RULES {
+        if let Some(rewritten) = rule.rewrite(data_type) {
+            tracing::debug!(
+                "Converting field '{path}' from {data_type:?} to {rewritten:?} for Vortex compatibility"
+            );
+            return Some(rewritten);
+        }
     }
 
     if !is_vortex_supported_type(data_type) {

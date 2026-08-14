@@ -33,16 +33,20 @@ pub struct CachedAggregationResult {
 }
 
 impl CachedAggregationResult {
+    /// Batches are compacted on the way in, for the same reason
+    /// [`crate::CachedQueryResult`] compacts its own: a top-k search plan emits
+    /// zero-copy slices, and storing one as it arrives would pin — and, through
+    /// [`Sizeable`] below, bill — the whole scan batch it was carved from.
     #[must_use]
     pub fn new(
-        records: Arc<Vec<RecordBatch>>,
+        records: Vec<RecordBatch>,
         primary_keys: Vec<String>,
         data_columns: Vec<String>,
         matches: HashMap<String, Vec<String>>,
         schema: SchemaRef,
     ) -> Self {
         Self {
-            records,
+            records: Arc::new(crate::result::compact_for_storage(records)),
             primary_keys,
             data_columns,
             matches,
@@ -84,5 +88,80 @@ impl Sizeable for CachedSearchResult {
                         .sum::<usize>()
             })
             .sum()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::StringArray;
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    /// Regression test for <https://github.com/spiceai/spiceai/issues/12921>.
+    /// A top-k search plan emits slices, and an entry built from one must not
+    /// hold — or be billed — the scan batch it was carved out of.
+    #[test]
+    fn a_sliced_search_result_is_billed_its_own_rows() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "payload",
+            DataType::Utf8,
+            false,
+        )]));
+        let payloads: Vec<String> = (0..2_000)
+            .map(|row| {
+                std::iter::repeat_n(
+                    char::from(b'a' + u8::try_from(row % 26).unwrap_or_default()),
+                    4_096,
+                )
+                .collect()
+            })
+            .collect();
+        let scan_batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(StringArray::from(payloads))],
+        )
+        .expect("should create batch");
+        let sliced = scan_batch.slice(1_000, 1);
+        let expected = sliced
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("payload is a StringArray")
+            .value(0)
+            .to_string();
+
+        let result = CachedAggregationResult::new(
+            vec![sliced],
+            vec!["id".to_string()],
+            vec!["payload".to_string()],
+            HashMap::new(),
+            schema,
+        );
+
+        let cached = CachedSearchResult {
+            results: Arc::new(HashMap::from([(
+                TableReference::bare("docs"),
+                result.clone(),
+            )])),
+            input_tables: Arc::new(HashSet::new()),
+        };
+        assert!(
+            cached.get_memory_size() * 100 < scan_batch.get_array_memory_size(),
+            "a one-row search entry should be billed a small fraction of its parent, got {} of {}",
+            cached.get_memory_size(),
+            scan_batch.get_array_memory_size()
+        );
+
+        assert_eq!(result.records.len(), 1);
+        assert_eq!(
+            result.records[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("payload is a StringArray")
+                .value(0),
+            expected,
+            "compacting the entry must not change the row it holds"
+        );
     }
 }

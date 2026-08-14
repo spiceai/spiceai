@@ -31,10 +31,9 @@ use futures::stream::{self, StreamExt};
 use opentelemetry::KeyValue;
 use runtime::component::dataset::Dataset;
 use runtime::component::dataset::acceleration::RefreshMode;
-use runtime::dataaccelerator::spice_sys::dynamodb::init_checkpoint_store;
 use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
-    parameters::aws::initiate_config_with_auth_method,
+    parameters::{ConnectorContext, aws::initiate_config_with_auth_method},
 };
 use runtime_api_types::v1::ComponentType;
 use runtime_checkpoint_api::BlobCheckpointStore;
@@ -51,10 +50,26 @@ use util::time_format::is_valid_format;
 // DynamoDB retention is 24h, and shards expire every 4h. 2h are added for safety.
 const CHECKPOINT_EXPIRATION_HOURS: u64 = 18;
 
-#[derive(Debug)]
+/// Sidecar table, in the dataset's own accelerator, holding this connector's
+/// serialized stream checkpoint.
+const CHECKPOINT_TABLE: &str = "spice_sys_dynamodb_streams";
+
 pub struct DynamoDB {
     params: Parameters,
+    /// Retained so the change stream can resolve the checkpoint store over the
+    /// dataset's accelerator. `None` only in unit tests, which build params without a
+    /// runtime attached.
+    context: Option<Arc<dyn ConnectorContext>>,
     metrics_collector: Arc<MetricsCollector>,
+}
+
+// Hand-written because the retained `ConnectorContext` handle is not `Debug`.
+impl std::fmt::Debug for DynamoDB {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DynamoDB")
+            .field("params", &self.params)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Default, Debug, Copy, Clone)]
@@ -227,6 +242,7 @@ impl DataConnectorFactory for DynamoDBFactory {
     ) -> Pin<Box<dyn Future<Output = runtime::dataconnector::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             let dynamodb = DynamoDB {
+                context: params.context.clone(),
                 params: params.parameters,
                 metrics_collector: Arc::new(MetricsCollector::default()),
             };
@@ -465,6 +481,7 @@ impl DataConnector for DynamoDB {
         let snapshot_mode = parse_snapshot_mode(&self.params, &dataset.name);
 
         let metrics_collector = Arc::clone(&self.metrics_collector);
+        let context = self.context.clone();
 
         Some(Box::pin(
             stream::once(async move {
@@ -478,7 +495,17 @@ impl DataConnector for DynamoDB {
                 let dynamodb = Arc::new(dynamodb_ref.clone());
                 let dynamodb_sys: Option<Arc<dyn BlobCheckpointStore>> =
                     if dataset.is_file_accelerated() {
-                        init_checkpoint_store(&dataset).await
+                        // `None` here is a graceful "checkpointing unavailable"
+                        // degradation, and the accessor already logs why, so it is not
+                        // logged again.
+                        match context.as_ref() {
+                            Some(context) => {
+                                context
+                                    .blob_checkpoint_store(&dataset, CHECKPOINT_TABLE)
+                                    .await
+                            }
+                            None => None,
+                        }
                     } else {
                         tracing::warn!(
                             dataset = %dataset_name,

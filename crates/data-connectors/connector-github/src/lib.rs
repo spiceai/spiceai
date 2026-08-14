@@ -1970,7 +1970,7 @@ mod tests {
             parameters,
             unsupported_type_action: None,
             component: ConnectorComponent::from(&dataset),
-            context: Some(Arc::new(RuntimeConnectorContext::new(app, runtime))),
+            context: Some(Arc::new(RuntimeConnectorContext::new(app, &runtime))),
             io_runtime: tokio::runtime::Handle::current(),
         }
     }

@@ -36,8 +36,8 @@ pub enum AccelerationSink {
 }
 
 impl AccelerationSink {
-    pub fn new(table_provider: Arc<dyn TableProvider>) -> Self {
-        Self::Table(TableSink::new(table_provider))
+    pub fn new(table_provider: Arc<dyn TableProvider>, dataset_name: String) -> Self {
+        Self::Table(TableSink::new(table_provider, dataset_name))
     }
 
     pub fn with_sink_indexes(self, indexes: Vec<Arc<dyn Index + Send + Sync>>) -> Self {
@@ -48,6 +48,23 @@ impl AccelerationSink {
             AccelerationSink::Multi(sink) => {
                 AccelerationSink::Multi(sink.with_sink_indexes(indexes))
             }
+        }
+    }
+
+    /// Declares the acceleration engine's own type rewrites, so a type the engine
+    /// imposes at table creation is not reported as a stale acceleration schema.
+    ///
+    /// Only [`TableSink`] runs that check; [`MultiSink`] does not, so the rules have
+    /// nowhere to apply there.
+    pub fn with_engine_type_rewrites(
+        self,
+        rules: arrow_tools::type_rewrite::TypeRewriteRules,
+    ) -> Self {
+        match self {
+            AccelerationSink::Table(sink) => {
+                AccelerationSink::Table(sink.with_engine_type_rewrites(rules))
+            }
+            other @ AccelerationSink::Multi(_) => other,
         }
     }
 
