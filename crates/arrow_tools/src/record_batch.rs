@@ -513,7 +513,17 @@ fn view_reclaimable_bytes<B: ByteViewType>(column: &ArrayRef) -> Option<usize> {
     // keeps an already-compact column — the common case — off that walk.
     worth_compacting(retained, views_bytes)?;
 
-    worth_compacting(retained, views_bytes + array.total_buffer_bytes_used())
+    let bytes_used = array.total_buffer_bytes_used();
+    if bytes_used == 0 {
+        // No view references out-of-line data — either the column has no data
+        // buffers at all, or the slice's own rows all fit inline. `gc` takes a
+        // fast path in both cases that reuses the views buffer as it stands,
+        // which for a slice is the parent's whole allocation. There is nothing
+        // it would reclaim.
+        return None;
+    }
+
+    worth_compacting(retained, views_bytes + bytes_used)
 }
 
 /// How many bytes compacting `column` would reclaim, or `None` when the copy
@@ -523,6 +533,14 @@ fn reclaimable_bytes(column: &ArrayRef) -> Option<usize> {
         DataType::Utf8View => return view_reclaimable_bytes::<StringViewType>(column),
         DataType::BinaryView => return view_reclaimable_bytes::<BinaryViewType>(column),
         data_type if contains_view_type(data_type) => return None,
+        // A dictionary is declined on both counts. `MutableArrayData` shares
+        // the values wholesale rather than narrowing them, so only the keys
+        // could be reclaimed; and it panics outright building an extend for a
+        // dictionary whose value count does not fit its key type — a
+        // `Dictionary(UInt8, _)` holding exactly 256 values is valid Arrow and
+        // trips it (`build_extend_dictionary` returns `None`, which
+        // `MutableArrayData::with_capacities` unwraps with `expect`).
+        DataType::Dictionary(_, _) => return None,
         _ => {}
     }
 
@@ -1442,6 +1460,125 @@ mod test {
         assert!(
             Arc::ptr_eq(sliced.column(0), compacted.column(0)),
             "a nested view column must not be compacted"
+        );
+    }
+
+    /// A `Dictionary(UInt8, _)` holding exactly 256 values is valid Arrow, but
+    /// arrow's `MutableArrayData` panics building an extend for it. Compaction
+    /// must never reach that path — a cache write is not allowed to abort the
+    /// query that filled it.
+    #[test]
+    fn compact_retained_buffers_leaves_a_full_range_dictionary_alone() {
+        use arrow::array::{DictionaryArray, UInt8Array};
+        use arrow::datatypes::UInt8Type;
+
+        let values = StringArray::from(
+            (0..256)
+                .map(|value| format!("value-{value}"))
+                .collect::<Vec<_>>(),
+        );
+        // A key buffer far past the reclaim floor, so nothing but the type
+        // check can keep this column away from compaction.
+        let keys = UInt8Array::from(
+            (0..200_000)
+                .map(|row| u8::try_from(row % 256).unwrap_or_default())
+                .collect::<Vec<_>>(),
+        );
+        let dictionary: ArrayRef = Arc::new(
+            DictionaryArray::<UInt8Type>::try_new(keys, Arc::new(values))
+                .expect("valid dictionary"),
+        );
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "d",
+            dictionary.data_type().clone(),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(schema, vec![dictionary]).expect("valid batch");
+        let sliced = batch.slice(100_000, 1);
+
+        // Must not panic, and must hand back the column untouched.
+        let compacted = compact_retained_buffers(&sliced);
+
+        assert!(
+            Arc::ptr_eq(sliced.column(0), compacted.column(0)),
+            "a dictionary column must not be compacted"
+        );
+        assert_eq!(compacted.num_rows(), 1);
+    }
+
+    /// When every value fits inline, `gc` reuses the views buffer as it stands
+    /// — for a slice, that is the parent's whole allocation. Predicting a
+    /// reclaim there would bill an entry less than it holds.
+    #[test]
+    fn compact_retained_buffers_leaves_an_inline_view_column_alone() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "payload",
+            DataType::Utf8View,
+            true,
+        )]));
+        // 12 bytes or fewer is stored inline, with no data buffer.
+        let values: Vec<String> = (0..200_000).map(|row| format!("r{row:0>8}")).collect();
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StringViewArray::from_iter_values(values))],
+        )
+        .expect("valid batch");
+        let sliced = batch.slice(100_000, 1);
+
+        let compacted = compact_retained_buffers(&sliced);
+
+        assert!(
+            Arc::ptr_eq(sliced.column(0), compacted.column(0)),
+            "an inline-only view column must not be compacted"
+        );
+        assert_eq!(
+            compacted_memory_size(&sliced),
+            sliced.get_array_memory_size(),
+            "and the estimate must not claim a reclaim that gc would not make"
+        );
+    }
+
+    /// The same fast path is reached from the other side: a column that does
+    /// have data buffers, sliced down to rows whose values all fit inline.
+    /// `gc` reuses the views buffer there too, so there is still no reclaim.
+    #[test]
+    fn compact_retained_buffers_leaves_an_inline_slice_of_a_mixed_view_column_alone() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "payload",
+            DataType::Utf8View,
+            true,
+        )]));
+        // Row 0 is long enough to force a data buffer; every other row is
+        // inline, so a slice past row 0 references none of it.
+        let mut values: Vec<String> = vec![std::iter::repeat_n('L', 65_536).collect()];
+        values.extend((1..200_000).map(|row| format!("r{row:0>8}")));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StringViewArray::from_iter_values(values))],
+        )
+        .expect("valid batch");
+        let sliced = batch.slice(100_000, 1);
+
+        let column = sliced
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringViewArray>()
+            .expect("StringViewArray");
+        assert!(
+            !column.data_buffers().is_empty() && column.total_buffer_bytes_used() == 0,
+            "the slice must retain a data buffer while referencing none of it"
+        );
+
+        let compacted = compact_retained_buffers(&sliced);
+
+        assert!(
+            Arc::ptr_eq(sliced.column(0), compacted.column(0)),
+            "an inline-only slice must not be compacted"
+        );
+        assert_eq!(
+            compacted_memory_size(&sliced),
+            sliced.get_array_memory_size(),
+            "and the estimate must not claim a reclaim that gc would not make"
         );
     }
 

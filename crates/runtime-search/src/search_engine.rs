@@ -727,8 +727,21 @@ fn wrap_cache_to_result(
             while let Some(batch_result) = stream.next().await {
                 if records_size < cache_max_size
                     && let Ok(batch) = &batch_result {
-                        records.push(batch.clone());
-                        records_size += batch.get_array_memory_size();
+                        // Accumulate compacted batches: a top-k plan yields
+                        // zero-copy slices, so holding one keeps its whole scan
+                        // batch alive and bills the entry for it — which would
+                        // reject a small result whose parent happens to be
+                        // large. Measure first so the copy is only paid for a
+                        // result that can still be cached.
+                        records_size = records_size.saturating_add(
+                            arrow_tools::record_batch::compacted_memory_size(batch),
+                        );
+                        if records_size < cache_max_size {
+                            records.push(arrow_tools::record_batch::compact_retained_buffers(batch));
+                        } else {
+                            records.clear();
+                            records.shrink_to_fit();
+                        }
                     }
 
                 yield batch_result;

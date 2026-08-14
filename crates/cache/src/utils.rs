@@ -215,16 +215,23 @@ pub fn to_cached_record_batch_stream(
 
         while let Some(batch_result) = stream.next().await {
             if records_size < raw_size_limit && let Ok(batch) = &batch_result {
-                records.push(batch.clone());
-                // Bill the batch what the entry will hold, not what the batch
-                // retains: a `LIMIT`/`OFFSET` plan yields zero-copy slices, and
-                // storing one compacts it (see `CachedQueryResult`), so it will
-                // cost its own rows rather than the scan batch it was carved
-                // from. Measuring rather than compacting here is what keeps a
-                // result too large to cache from being copied in full before it
-                // is abandoned below.
+                // Accumulate compacted batches, not the batches as they arrive.
+                // A `LIMIT`/`OFFSET` plan yields zero-copy slices, so holding
+                // one keeps its whole scan batch alive until the stream drains
+                // — and `records_size` would then bound a figure unrelated to
+                // what is actually retained.
+                //
+                // Measure before copying, so the copy is only paid for a result
+                // that can still be cached: `compacted_memory_size` is what the
+                // batch will occupy, computed without allocating.
                 records_size = records_size
                     .saturating_add(arrow_tools::record_batch::compacted_memory_size(batch));
+                if records_size < raw_size_limit {
+                    records.push(arrow_tools::record_batch::compact_retained_buffers(batch));
+                } else {
+                    records.clear();
+                    records.shrink_to_fit();
+                }
             } else if !records.is_empty() && records_size >= raw_size_limit {
                 // The result can no longer fit in the cache: eagerly drop the
                 // accumulated batches. Caching must be abandoned entirely —
