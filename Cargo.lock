@@ -12473,7 +12473,7 @@ dependencies = [
 [[package]]
 name = "model2vec-rs"
 version = "0.1.3"
-source = "git+https://github.com/spiceai/model2vec-rs.git?rev=724ba911dbf7b73f345e1f2ad0821bf4fa4d5073#724ba911dbf7b73f345e1f2ad0821bf4fa4d5073"
+source = "git+https://github.com/spiceai/model2vec-rs.git?rev=55fef28a3556895b20204634b788f7c836b610bc#55fef28a3556895b20204634b788f7c836b610bc"
 dependencies = [
  "anyhow",
  "clap",
