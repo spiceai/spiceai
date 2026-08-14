@@ -715,7 +715,11 @@ pub trait ListingTableConnector: DataConnector {
             )),
             #[cfg(not(windows))]
             (Some("vortex"), _) | (None, Some("vortex")) => Ok((
-                Some(VortexFormatFactory::new().default()),
+                Some(
+                    VortexFormatFactory::new()
+                        .with_cache_name(dataset.name.to_string())
+                        .default(),
+                ),
                 listing_extension(
                     configured_extension.as_ref(),
                     path_extension.as_ref(),
@@ -806,7 +810,11 @@ pub trait ListingTableConnector: DataConnector {
                     )),
                     #[cfg(not(windows))]
                     Some("vortex") => Ok((
-                        Some(VortexFormatFactory::new().default()),
+                        Some(
+                            VortexFormatFactory::new()
+                                .with_cache_name(dataset.name.to_string())
+                                .default(),
+                        ),
                         listing_extension(
                             configured_extension.as_ref(),
                             path_extension.as_ref(),

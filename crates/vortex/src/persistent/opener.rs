@@ -103,6 +103,10 @@ pub(crate) struct VortexOpener {
     pub expression_convertor: Arc<dyn ExpressionConvertor>,
     pub file_metadata_cache: Option<Arc<dyn FileMetadataCache>>,
     pub segment_cache: Option<Arc<SharedSegmentCache>>,
+    /// URL of the object store this scan reads from. Part of every segment-cache
+    /// key: `ObjectMeta::location` is store-relative, and the cache is shared by
+    /// every table, so two stores could otherwise collide on the same path.
+    pub object_store_url: Arc<str>,
     /// Whether to enable expression pushdown into the underlying Vortex scan.
     pub projection_pushdown: bool,
     pub scan_concurrency: Option<usize>,
@@ -131,6 +135,7 @@ impl FileOpener for VortexOpener {
         let expr_adapter_factory = Arc::clone(&self.expr_adapter_factory);
         let file_metadata_cache = self.file_metadata_cache.as_ref().map(Arc::clone);
         let segment_cache = self.segment_cache.as_ref().map(Arc::clone);
+        let object_store_url = Arc::clone(&self.object_store_url);
 
         let unified_file_schema = Arc::clone(self.table_schema.file_schema());
         let batch_size = self.batch_size;
@@ -198,9 +203,10 @@ impl FileOpener for VortexOpener {
                 .with_labels(labels);
 
             if let Some(segment_cache) = segment_cache {
-                open_opts = open_opts.with_segment_cache(
-                    segment_cache.for_path(file.object_meta.location.clone()),
-                );
+                open_opts = open_opts.with_segment_cache(segment_cache.for_path(
+                    Arc::clone(&object_store_url),
+                    file.object_meta.location.clone(),
+                ));
             }
 
             if let Some(file_metadata_cache) = file_metadata_cache
@@ -762,6 +768,7 @@ mod tests {
             expression_convertor: Arc::new(DefaultExpressionConvertor::default()),
             file_metadata_cache: None,
             segment_cache: None,
+            object_store_url: Arc::from("memory:///"),
             projection_pushdown: false,
             scan_concurrency: None,
         }
@@ -897,6 +904,7 @@ mod tests {
             expression_convertor: Arc::new(DefaultExpressionConvertor::default()),
             file_metadata_cache: None,
             segment_cache: None,
+            object_store_url: Arc::from("memory:///"),
             projection_pushdown: false,
             scan_concurrency: None,
         };
@@ -985,6 +993,7 @@ mod tests {
             expression_convertor: Arc::new(DefaultExpressionConvertor::default()),
             file_metadata_cache: None,
             segment_cache: None,
+            object_store_url: Arc::from("memory:///"),
             projection_pushdown: false,
             scan_concurrency: None,
         };
@@ -1141,6 +1150,7 @@ mod tests {
             expression_convertor: Arc::new(DefaultExpressionConvertor::default()),
             file_metadata_cache: None,
             segment_cache: None,
+            object_store_url: Arc::from("memory:///"),
             projection_pushdown: false,
             scan_concurrency: None,
         };
@@ -1202,6 +1212,7 @@ mod tests {
             expression_convertor: Arc::new(DefaultExpressionConvertor::default()),
             file_metadata_cache: None,
             segment_cache: None,
+            object_store_url: Arc::from("memory:///"),
             projection_pushdown: false,
             scan_concurrency: None,
         }
@@ -1410,6 +1421,7 @@ mod tests {
             expression_convertor: Arc::new(DefaultExpressionConvertor::default()),
             file_metadata_cache: None,
             segment_cache: None,
+            object_store_url: Arc::from("memory:///"),
             projection_pushdown: false,
             scan_concurrency: None,
         };
