@@ -1013,6 +1013,14 @@ fn fs_probe_path(path: &str) -> &str {
     }
 }
 
+/// A local directory path as written, anchored to the working directory but not
+/// resolved: `..` components are deliberately preserved, which is what leaves
+/// them for the filesystem to resolve rather than a lexical fold.
+fn absolute_local_dir(path: &str) -> PathBuf {
+    let raw = Path::new(fs_probe_path(path).trim_end_matches('/'));
+    std::path::absolute(raw).unwrap_or_else(|_| raw.to_path_buf())
+}
+
 /// Normalize a local directory path so two spellings of the same directory
 /// compare equal.
 ///
@@ -1033,11 +1041,7 @@ fn fs_probe_path(path: &str) -> &str {
 /// macOS puts in front of the temporary directory, which would otherwise compare
 /// unequal to the same directory reached through `/private`.
 fn normalize_local_dir(path: &str) -> PathBuf {
-    let raw = Path::new(fs_probe_path(path).trim_end_matches('/'));
-    // `absolute` anchors a relative path to the working directory without
-    // touching the filesystem, and deliberately preserves `..` — which is what
-    // leaves them for `canonicalize` to resolve against the real filesystem.
-    let absolute = std::path::absolute(raw).unwrap_or_else(|_| raw.to_path_buf());
+    let absolute = absolute_local_dir(path);
 
     // `canonicalize` requires every component of what it is handed to exist, so
     // walk outwards to the deepest ancestor that does. `ancestors` yields the
@@ -1087,6 +1091,10 @@ fn fold_dot_components(path: &Path) -> PathBuf {
 /// the data directory is `{spice_data_base_path()}/{dataset_name}/` and the
 /// metastore is `{spice_data_base_path()}/metadata`.
 ///
+/// Where the metastore *resolves* is not the only way `data_dir` can destroy it:
+/// a metastore resolving outside the data directory is still lost if it is
+/// reached *through* it, so the symlinks on the way there are checked as well.
+///
 /// `Path::starts_with` compares whole components, so it covers the equal-paths
 /// case as well as containment, and does not mistake `/data/metadata-archive`
 /// for a child of `/data/metadata`.
@@ -1097,7 +1105,69 @@ fn metastore_is_inside_data_dir(data_dir: &str, metadata_dir: &str) -> bool {
         return false;
     }
 
-    normalize_local_dir(metadata_dir).starts_with(normalize_local_dir(data_dir))
+    let data_root = normalize_local_dir(data_dir);
+    normalize_local_dir(metadata_dir).starts_with(&data_root)
+        || symlink_inside_leads_to(&data_root, &absolute_local_dir(metadata_dir))
+}
+
+/// True when a symlink inside `data_root` is one of the components `metadata_dir`
+/// is reached through.
+///
+/// A link on the way to the metastore is part of the metastore's identity, not
+/// just a spelling of it. Both catalog-open paths `create_dir_all` the metadata
+/// directory and then open `cayenne.db` inside it, so a link a teardown unlinks
+/// comes back as a real, empty directory and the instance-wide catalog silently
+/// becomes a fresh empty database: with data at `/data` and
+/// `cayenne_metadata_dir: /data/catalog` pointing at `/shared/catalog`, the
+/// manifests, snapshot pointers and partition rows of every Cayenne dataset
+/// survive under `/shared` with nothing able to reach them. That is worse than
+/// the deletion this guard was written for, because the bytes are still there.
+///
+/// Only symlinks count, which is what keeps the answer exact. A plain directory
+/// component is re-created where it was, so the path still resolves to the same
+/// place and reporting it would refuse a harmless teardown; a link re-created as
+/// a directory does not. A component that does not exist cannot be a symlink —
+/// the same reasoning [`fold_dot_components`] relies on — while any other stat
+/// error counts as one, so a component this cannot inspect fails closed.
+///
+/// The walk is one `symlink_metadata` per component of a single path, the cost
+/// class [`normalize_local_dir`] already pays beside it. Both are synchronous
+/// filesystem calls on an async teardown path, tracked with the ones already
+/// there in [#13108](https://github.com/spiceai/spiceai/issues/13108).
+fn symlink_inside_leads_to(data_root: &Path, metadata_dir: &Path) -> bool {
+    // Resolved as it grows, so a link's target — not the directory the link was
+    // written beside — is what a later `..` pops, matching the kernel.
+    let mut resolved = PathBuf::new();
+
+    for component in metadata_dir.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                resolved.pop();
+            }
+            other => {
+                resolved.push(other);
+                let is_symlink = match std::fs::symlink_metadata(&resolved) {
+                    Ok(metadata) => metadata.is_symlink(),
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
+                    Err(_) => true,
+                };
+                if !is_symlink {
+                    continue;
+                }
+                if resolved.starts_with(data_root) {
+                    return true;
+                }
+                // A link outside the deleted tree still has to be followed: the
+                // components after it hang off its target, not off the link.
+                if let Ok(target) = resolved.canonicalize() {
+                    resolved = target;
+                }
+            }
+        }
+    }
+
+    false
 }
 
 /// Every directory this instance's Cayenne metastore can resolve to while the
@@ -1199,10 +1269,14 @@ fn is_metastore_file(file_name: &std::ffi::OsStr) -> bool {
 /// Reading the directory needs no such knowledge: whatever is about to be
 /// unlinked is right there to be found.
 ///
-/// Symlinks are deliberately not followed, matching `remove_dir_all`: a
-/// metastore reachable only *through* a link under `data_dir` survives the
-/// teardown, which unlinks the link itself, so refusing on it would be a false
-/// alarm. A `data_dir` that is itself a link is left alone for the same reason.
+/// Symlinks are deliberately not followed, matching `remove_dir_all`: a catalog
+/// this instance never configured, reachable only *through* a link under
+/// `data_dir`, survives the teardown — which unlinks the link itself — so
+/// refusing on it would be a false alarm. A `data_dir` that is itself a link is
+/// left alone for the same reason. A *configured* metastore reached through such
+/// a link is a different matter, because Cayenne re-creates the missing component
+/// and opens an empty catalog at that path; [`symlink_inside_leads_to`] is the
+/// half that covers it, and it can because the path is named.
 ///
 /// The walk is linear in the entries under `data_dir`, which is the work the
 /// `remove_dir_all` immediately after it was going to do regardless. A missing
@@ -5464,6 +5538,61 @@ mod tests {
             !data_dir.exists(),
             "the teardown left the data directory behind"
         );
+    }
+
+    /// The counterpart to the test above: the same link, but this time it is the
+    /// configured `cayenne_metadata_dir`, so unlinking it is not harmless.
+    ///
+    /// The catalog resolves outside the data directory, so the resolved-path
+    /// comparison clears it, and the on-disk walk skips the link — yet the
+    /// teardown takes the only path Cayenne reaches the catalog through, and the
+    /// next `create_dir_all` puts a real, empty directory where the link was and
+    /// opens a fresh catalog inside it. Every dataset's manifests and snapshot
+    /// pointers are still on disk under the old target and unreachable.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_configured_metastore_reached_through_a_link_inside_the_data_dir_is_refused() {
+        let temp = tempfile::TempDir::new().expect("temp dir");
+        let shared_metastore_dir = temp.path().join("shared/catalog");
+        std::fs::create_dir_all(&shared_metastore_dir).expect("shared metastore directory");
+        std::fs::write(shared_metastore_dir.join("cayenne.db"), b"catalog")
+            .expect("shared metastore file");
+
+        let data_dir = temp.path().join("data");
+        std::fs::create_dir_all(&data_dir).expect("data directory");
+        let configured_metastore_dir = data_dir.join("catalog");
+        std::os::unix::fs::symlink(&shared_metastore_dir, &configured_metastore_dir)
+            .expect("symlink the configured metastore out of the data directory");
+
+        let acceleration = Acceleration {
+            params: [(
+                "cayenne_metadata_dir".to_string(),
+                configured_metastore_dir.to_string_lossy().to_string(),
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+
+        let err = remove_acceleration_data_dir(
+            "orders",
+            &data_dir.to_string_lossy(),
+            Some(&acceleration),
+            &[],
+        )
+        .await
+        .err();
+
+        // The state assertion comes first so a regression names the loss rather
+        // than a missing error: the catalog file itself is never deleted here, so
+        // letting this through looks harmless right up to the point where the
+        // configured path stops resolving to it.
+        assert!(
+            configured_metastore_dir.join("cayenne.db").exists(),
+            "the teardown unlinked '{}', the only path the shared catalog is reached through",
+            configured_metastore_dir.display()
+        );
+        assert_refused_for_metastore_overlap(err);
     }
 
     /// A temp directory holding a stand-in shared catalog at `metadata/cayenne.db`
