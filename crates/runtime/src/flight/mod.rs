@@ -121,16 +121,12 @@ impl Service {
     }
 }
 
-/// Each RPC records exactly one `flight_requests` / `flight_request_duration_ms`
-/// sample, and records it in the handler that knows the command — so the sample
-/// carries a `command` label, and, where the response is a stream, spans the
-/// drain rather than the setup. `list_flights` and `poll_flight_info` are the
-/// exceptions: they are unimplemented, have no handler to delegate to, and so
-/// record here.
-///
-/// A timer started here *in addition* would double every sample: the counter
-/// would report twice the RPC rate, and the histogram would mix each real
-/// latency with a shorter prefix of itself, pulling reported quantiles down.
+/// The handler each RPC delegates to records its own `flight_requests` /
+/// `flight_request_duration_ms` sample, so the sample carries a `command` label
+/// and, where the response is a stream, spans the drain rather than the setup.
+/// Starting a timer here as well would double every sample, so don't.
+/// `list_flights` and `poll_flight_info` are the exceptions — they are
+/// unimplemented, have no handler to delegate to, and record here.
 #[tonic::async_trait]
 impl FlightService for Service {
     type HandshakeStream = BoxStream<'static, Result<HandshakeResponse, Status>>;

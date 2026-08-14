@@ -41,16 +41,16 @@ pub(crate) static FLIGHT_REQUEST_DURATION_MS: LazyLock<Histogram<f64>> = LazyLoc
 
 /// Track a Flight RPC. `command` is a static label for fixed RPC variants.
 ///
-/// Record exactly once per RPC, in the handler that knows the command — a second
-/// timer over the same RPC doubles both the counter and the histogram.
+/// Record once per RPC, in the handler that knows the command — a second timer
+/// over the same RPC doubles the counter and the histogram. The returned
+/// [`TimeMeasurement`] records on drop: bind it for the span you want measured,
+/// or move it into a [`telemetry::timing::TimedStream`] to span a streamed
+/// response.
 ///
-/// The returned [`TimeMeasurement`] records on drop, so hold it for the span you
-/// want measured: bind it for the length of the handler, or move it into a
-/// [`telemetry::timing::TimedStream`] to span a streamed response. It must be
-/// `.await`ed — `let _start = track_flight_request(..)` binds the *future*,
-/// which is then dropped unpolled and records nothing at all. Naming the binding
-/// suppresses `unused_must_use`, and `clippy::let_underscore_future` only fires
-/// on the `let _` form, so nothing catches that but a test.
+/// Await the call. `let _start = track_flight_request(..)` binds the future, not
+/// the measurement, and a future dropped unpolled records nothing at all —
+/// naming the binding suppresses `unused_must_use`, and
+/// `clippy::let_underscore_future` only fires on the `let _` form.
 pub async fn track_flight_request(
     method: &'static str,
     command: Option<&'static str>,
@@ -74,7 +74,10 @@ pub(crate) async fn track_flight_request_value(
     dimensions.extend(request_context.to_dimensions());
 
     FLIGHT_REQUESTS.add(1, dimensions.as_slice());
-    TimeMeasurement::new(&FLIGHT_REQUEST_DURATION_MS, dimensions.as_slice())
+    // Moved, not borrowed: `TimeMeasurement::new` takes `impl Into<Vec<KeyValue>>`,
+    // so a slice would deep-clone every label — including the owned `user_agent`
+    // string the request context contributes.
+    TimeMeasurement::new(&FLIGHT_REQUEST_DURATION_MS, dimensions)
 }
 
 pub(crate) static DO_EXCHANGE_DATA_UPDATES_SENT: LazyLock<Counter<u64>> = LazyLock::new(|| {

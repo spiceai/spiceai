@@ -69,9 +69,8 @@ async fn dispatch(request: Request<FlightDescriptor>) -> Result<Response<FlightI
         return get_flight_info_simple(request).await;
     };
 
-    // Recorded here rather than by the arms below: a descriptor that decodes as a
-    // `prost` message but not as a `Command` never reaches one of them, and this
-    // is the only `get_flight_info` path that would otherwise report nothing.
+    // The arms below record per-command; a descriptor that is not a `Command`
+    // reaches none of them, so it is recorded here.
     let command = match Command::try_from(message) {
         Ok(command) => command,
         Err(e) => {

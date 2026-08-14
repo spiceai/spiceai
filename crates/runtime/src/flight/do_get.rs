@@ -52,9 +52,8 @@ pub(crate) async fn handle(
         }
     };
 
-    // Recorded here rather than by the arms below: a ticket that decodes as a
-    // `prost` message but not as a `Command` never reaches one of them, and this
-    // is the only `do_get` path that would otherwise report nothing.
+    // The arms below record per-command; a ticket that is not a `Command` reaches
+    // none of them, so it is recorded here.
     let command = match Command::try_from(msg) {
         Ok(command) => command,
         Err(e) => {
