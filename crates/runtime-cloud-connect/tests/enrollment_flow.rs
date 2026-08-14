@@ -86,6 +86,7 @@ fn reconnect_identity(identifier: &str, gateway_addr: String) -> runtime_cloud_c
         org_name: None,
         app_name: None,
         monitor_url: None,
+        control_plane_endpoint: None,
         enc_private_key_pem: String::new(),
         enc_public_key_pem: String::new(),
         enc_previous_private_key_pem: String::new(),

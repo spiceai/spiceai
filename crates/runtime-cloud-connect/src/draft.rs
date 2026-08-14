@@ -68,9 +68,28 @@ const LOCK_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis
 const REMOVAL_LOCK_WAIT_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
 #[cfg(test)]
 const REMOVAL_LOCK_WAIT_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+const MAX_DRAFT_BYTES: u64 = 1024 * 1024;
 
 /// Current schema of the draft file.
-const DRAFT_SCHEMA_VERSION: u32 = 2;
+const DRAFT_SCHEMA_VERSION: u32 = 3;
+
+/// Non-secret enrollment authority facts for one operation. The actual
+/// bearer/enrollment key is deliberately absent. Token assertions may change
+/// during recovery; an authenticated operation remains bound to its org.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum EnrollmentAuthorityBinding {
+    Token { expected_org: Option<String> },
+    AuthenticatedSession { organization: String },
+}
+
+/// Control-plane and authority provenance for one enrollment operation.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct EnrollmentRequestBinding {
+    pub endpoint: String,
+    pub authority: EnrollmentAuthorityBinding,
+}
 
 #[derive(Deserialize)]
 struct DraftSchemaHeader {
@@ -118,6 +137,12 @@ pub enum Error {
 
     #[snafu(display("Failed to generate enrollment key material: {source}"))]
     Material { source: crate::identity::Error },
+
+    #[snafu(display(
+        "The pending enrollment at {} belongs to a different control plane or authority. Retry with the original endpoint and organization; the exact-replay state was preserved",
+        path.display()
+    ))]
+    RequestBindingMismatch { path: PathBuf },
 
     #[snafu(display(
         "Another live process is still enrolling this config directory under the lock at {}. Wait for that process to finish and retry",
@@ -192,15 +217,51 @@ impl EnrollmentTransactionLock {
         self.draft_path.parent() == path.parent()
     }
 
-    pub(crate) fn load_or_create(
+    /// Acquire exclusive ownership of a config directory's enrollment
+    /// transaction without blocking a Tokio worker thread.
+    ///
+    /// Callers that need to publish additional retry state beside the
+    /// enrollment draft retain this guard and pass it to
+    /// `enroll_now_with_transaction`, closing the gap between the two durable
+    /// writes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the transaction cannot be acquired or the blocking
+    /// task panics.
+    pub async fn acquire_async(config_dir: &Path) -> Result<Self> {
+        let config_dir = config_dir.to_path_buf();
+        tokio::task::spawn_blocking(move || Self::acquire(&config_dir))
+            .await
+            .map_err(|source| Error::AcquireTaskPanicked { source })?
+    }
+
+    /// Load the published draft, or durably create it while this transaction
+    /// owns the directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the draft cannot be read, validated, or published.
+    pub fn load_or_create(
         &self,
         instance: &InstanceFacts,
         region: Option<&str>,
+        binding: &EnrollmentRequestBinding,
     ) -> Result<EnrollmentDraft> {
-        match crate::identity::read_regular_file_optional(&self.draft_path) {
-            Ok(Some(contents)) => EnrollmentDraft::load_published(&self.draft_path, &contents),
-            Ok(None) => {
-                EnrollmentDraft::publish_locked(&self.draft_path, &self.file, instance, region)
+        match read_bounded_regular_file(&self.draft_path, MAX_DRAFT_BYTES) {
+            Ok(contents) => {
+                let draft = EnrollmentDraft::load_published(&self.draft_path, &contents)?;
+                draft.validate_request(&self.draft_path, binding)?;
+                Ok(draft)
+            }
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                EnrollmentDraft::publish_locked(
+                    &self.draft_path,
+                    &self.file,
+                    instance,
+                    region,
+                    binding,
+                )
             }
             Err(source) => Err(Error::Io {
                 path: self.draft_path.clone(),
@@ -260,6 +321,10 @@ pub struct EnrollmentDraft {
     /// process reuses this value even if its command-line configuration
     /// changed while the operation was pending.
     pub region: Option<String>,
+    /// The normalized control-plane endpoint and non-secret authority facts.
+    /// These prevent a lost response from being replayed to another cloud or
+    /// under a different organization by a later process.
+    pub binding: EnrollmentRequestBinding,
 }
 
 impl std::fmt::Debug for EnrollmentDraft {
@@ -274,6 +339,7 @@ impl std::fmt::Debug for EnrollmentDraft {
             .field("enc_public_key_pem", &"[PUBLIC KEY]")
             .field("instance", &self.instance)
             .field("region", &self.region)
+            .field("binding", &self.binding)
             .finish()
     }
 }
@@ -283,6 +349,20 @@ impl EnrollmentDraft {
     #[must_use]
     pub fn path_in(config_dir: &Path) -> PathBuf {
         config_dir.join(ENROLLMENT_DRAFT_FILE)
+    }
+
+    /// Load an existing draft without creating or mutating enrollment state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for unreadable, malformed, or unsupported draft data.
+    pub fn load_optional(config_dir: &Path) -> Result<Option<Self>> {
+        let path = Self::path_in(config_dir);
+        match read_bounded_regular_file(&path, MAX_DRAFT_BYTES) {
+            Ok(contents) => Self::parse_at(&path, &contents).map(Some),
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(source) => Err(Error::Io { path, source }),
+        }
     }
 
     fn lock_path(path: &Path) -> PathBuf {
@@ -306,16 +386,17 @@ impl EnrollmentDraft {
         config_dir: &Path,
         instance: &InstanceFacts,
         region: Option<&str>,
+        binding: &EnrollmentRequestBinding,
     ) -> Result<Self> {
-        EnrollmentTransactionLock::acquire(config_dir)?.load_or_create(instance, region)
+        EnrollmentTransactionLock::acquire(config_dir)?.load_or_create(instance, region, binding)
     }
 
-    fn parse_at(path: &Path, contents: &str) -> Result<Self> {
+    fn parse_at(path: &Path, contents: &[u8]) -> Result<Self> {
         // Read only the version first. A future schema may add fields that the
         // current strict draft parser deliberately rejects, but operators must
         // still receive the unsupported-schema recovery guidance rather than a
         // generic parse error that obscures the pending enrollment identity.
-        let header = serde_json::from_str::<DraftSchemaHeader>(contents).context(ParseSnafu {
+        let header = serde_json::from_slice::<DraftSchemaHeader>(contents).context(ParseSnafu {
             path: path.to_path_buf(),
         })?;
         if header.schema_version != DRAFT_SCHEMA_VERSION {
@@ -324,7 +405,7 @@ impl EnrollmentDraft {
                 found: header.schema_version,
             });
         }
-        let draft = serde_json::from_str::<Self>(contents).context(ParseSnafu {
+        let draft = serde_json::from_slice::<Self>(contents).context(ParseSnafu {
             path: path.to_path_buf(),
         })?;
         if let Some(reason) = draft.material().validation_error() {
@@ -336,14 +417,19 @@ impl EnrollmentDraft {
         Ok(draft)
     }
 
-    fn load_published(path: &Path, contents: &str) -> Result<Self> {
+    fn load_published(path: &Path, contents: &[u8]) -> Result<Self> {
         Self::parse_at(path, contents)
     }
 
     /// Generate a fresh draft and persist it at `path` before returning it,
     /// so the operation ID is durable before the first request that uses it.
     #[cfg(test)]
-    fn create_at(path: &Path, instance: &InstanceFacts, region: Option<&str>) -> Result<Self> {
+    fn create_at(
+        path: &Path,
+        instance: &InstanceFacts,
+        region: Option<&str>,
+        binding: &EnrollmentRequestBinding,
+    ) -> Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).context(IoSnafu {
                 path: parent.to_path_buf(),
@@ -352,7 +438,7 @@ impl EnrollmentDraft {
 
         let lock_path = Self::lock_path(path);
         let publication_lock = Self::acquire_publication_lock(&lock_path)?;
-        Self::publish_locked(path, &publication_lock, instance, region)
+        Self::publish_locked(path, &publication_lock, instance, region, binding)
     }
 
     #[cfg(test)]
@@ -367,7 +453,9 @@ impl EnrollmentDraft {
         #[cfg(unix)]
         use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 
+        #[cfg(not(windows))]
         let mut options = std::fs::OpenOptions::new();
+        #[cfg(not(windows))]
         options.create(true).read(true).write(true);
         #[cfg(unix)]
         options
@@ -375,9 +463,16 @@ impl EnrollmentDraft {
             // A hostile FIFO/device must never block a privileged caller
             // before the descriptor's file type can be checked below.
             .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        #[cfg(not(windows))]
         let file = options.open(lock_path).context(IoSnafu {
             path: lock_path.to_path_buf(),
         })?;
+        #[cfg(windows)]
+        let file = crate::identity::open_windows_owner_only_file(lock_path, false, false).context(
+            IoSnafu {
+                path: lock_path.to_path_buf(),
+            },
+        )?;
         #[cfg(unix)]
         if !file
             .metadata()
@@ -399,6 +494,10 @@ impl EnrollmentDraft {
             .context(IoSnafu {
                 path: lock_path.to_path_buf(),
             })?;
+        #[cfg(windows)]
+        crate::identity::validate_windows_regular_single_link(&file).context(IoSnafu {
+            path: lock_path.to_path_buf(),
+        })?;
         file.sync_all().context(IoSnafu {
             path: lock_path.to_path_buf(),
         })?;
@@ -427,14 +526,19 @@ impl EnrollmentDraft {
         _publication_lock: &std::fs::File,
         instance: &InstanceFacts,
         region: Option<&str>,
+        binding: &EnrollmentRequestBinding,
     ) -> Result<Self> {
         // A caller may have observed NotFound before acquiring the lock, but
         // another process can publish before this process owns it. Re-read
         // while locked so a delayed creator cannot replace the durable winner
         // through the atomic rename below.
-        match crate::identity::read_regular_file_optional(path) {
-            Ok(Some(contents)) => return Self::parse_at(path, &contents),
-            Ok(None) => {}
+        match read_bounded_regular_file(path, MAX_DRAFT_BYTES) {
+            Ok(contents) => {
+                let draft = Self::parse_at(path, &contents)?;
+                draft.validate_request(path, binding)?;
+                return Ok(draft);
+            }
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
             Err(source) => {
                 return Err(Error::Io {
                     path: path.to_path_buf(),
@@ -454,12 +558,44 @@ impl EnrollmentDraft {
             enc_public_key_pem: material.enc_public_key_pem,
             instance: instance.clone(),
             region: region.map(str::to_string),
+            binding: binding.clone(),
         };
         let bytes = serde_json::to_vec_pretty(&draft).context(SerializeSnafu)?;
         crate::identity::atomic_write_owner_only(path, &bytes).context(IoSnafu {
             path: path.to_path_buf(),
         })?;
         Ok(draft)
+    }
+
+    /// Confirm a retry targets the same control plane and authority as the
+    /// durable draft.
+    ///
+    /// The declared region is deliberately not part of the replay key: a
+    /// resumed enrollment keeps the region recorded when the draft was
+    /// published, so a differing `--region` on a retry must not invalidate
+    /// exact-replay state.
+    fn validate_request(&self, path: &Path, binding: &EnrollmentRequestBinding) -> Result<()> {
+        let authority_matches = match (&self.binding.authority, &binding.authority) {
+            (
+                EnrollmentAuthorityBinding::Token { .. },
+                EnrollmentAuthorityBinding::Token { .. },
+            ) => true,
+            (
+                EnrollmentAuthorityBinding::AuthenticatedSession {
+                    organization: persisted,
+                },
+                EnrollmentAuthorityBinding::AuthenticatedSession {
+                    organization: requested,
+                },
+            ) => persisted == requested,
+            _ => false,
+        };
+        if self.binding.endpoint != binding.endpoint || !authority_matches {
+            return Err(Error::RequestBindingMismatch {
+                path: path.to_path_buf(),
+            });
+        }
+        Ok(())
     }
 
     /// Remove the draft for `config_dir`. A missing file is success. Deletion
@@ -521,9 +657,63 @@ impl EnrollmentDraft {
     }
 }
 
+fn read_bounded_regular_file(path: &Path, max_bytes: u64) -> std::io::Result<Vec<u8>> {
+    use std::io::Read as _;
+
+    #[cfg(not(windows))]
+    let mut options = std::fs::OpenOptions::new();
+    #[cfg(not(windows))]
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(not(windows))]
+    let file = options.open(path)?;
+    #[cfg(windows)]
+    let file = crate::identity::open_windows_regular_file_for_read(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() > max_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "the enrollment draft was not a bounded regular file",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if metadata.nlink() != 1 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "the enrollment draft must not be hard-linked",
+            ));
+        }
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > max_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "the enrollment draft exceeded its size limit",
+        ));
+    }
+    Ok(bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_binding() -> EnrollmentRequestBinding {
+        EnrollmentRequestBinding {
+            endpoint: "https://api.spice.ai".to_string(),
+            authority: EnrollmentAuthorityBinding::Token {
+                expected_org: Some("acme".to_string()),
+            },
+        }
+    }
 
     fn test_instance(runtime_version: &str) -> InstanceFacts {
         InstanceFacts {
@@ -540,6 +730,7 @@ mod tests {
             config_dir,
             &test_instance("v2.2.0-test"),
             Some("us-west-2"),
+            &test_binding(),
         )
     }
 
@@ -566,7 +757,8 @@ mod tests {
         let second = EnrollmentDraft::load_or_create(
             dir.path(),
             &test_instance("v9.9.9-replacement"),
-            Some("eu-west-1"),
+            Some("us-west-2"),
+            &test_binding(),
         )
         .expect("reload");
 
@@ -578,6 +770,82 @@ mod tests {
         assert_eq!(first.csr_pem, second.csr_pem);
         assert_eq!(first.instance, second.instance);
         assert_eq!(first.region, second.region);
+    }
+
+    #[test]
+    fn token_recovery_reuses_the_draft_across_a_new_assertion_and_region() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let first = load_or_create(dir.path()).expect("create");
+        let recovered = EnrollmentDraft::load_or_create(
+            dir.path(),
+            &test_instance("v9.9.9-replacement"),
+            Some("eu-west-1"),
+            &EnrollmentRequestBinding {
+                endpoint: "https://api.spice.ai".to_string(),
+                authority: EnrollmentAuthorityBinding::Token {
+                    expected_org: Some("corrected-org".to_string()),
+                },
+            },
+        )
+        .expect("a new token assertion recovers the exact operation");
+
+        assert_eq!(
+            recovered.enrollment_operation_id,
+            first.enrollment_operation_id
+        );
+        assert_eq!(recovered.region, first.region);
+        assert_eq!(recovered.binding, first.binding);
+    }
+
+    #[test]
+    fn recovery_rejects_another_endpoint_or_authenticated_org() {
+        let endpoint_dir = tempfile::tempdir().expect("endpoint tempdir");
+        load_or_create(endpoint_dir.path()).expect("create token draft");
+        let endpoint_error = EnrollmentDraft::load_or_create(
+            endpoint_dir.path(),
+            &test_instance("v2.2.0-test"),
+            Some("us-west-2"),
+            &EnrollmentRequestBinding {
+                endpoint: "https://other.example".to_string(),
+                authority: EnrollmentAuthorityBinding::Token { expected_org: None },
+            },
+        )
+        .expect_err("another endpoint cannot receive the persisted operation");
+        assert!(
+            matches!(endpoint_error, Error::RequestBindingMismatch { .. }),
+            "{endpoint_error}"
+        );
+
+        let auth_dir = tempfile::tempdir().expect("auth tempdir");
+        let original = EnrollmentRequestBinding {
+            endpoint: "https://api.spice.ai".to_string(),
+            authority: EnrollmentAuthorityBinding::AuthenticatedSession {
+                organization: "acme".to_string(),
+            },
+        };
+        EnrollmentDraft::load_or_create(
+            auth_dir.path(),
+            &test_instance("v2.2.0-test"),
+            None,
+            &original,
+        )
+        .expect("create authenticated draft");
+        let org_error = EnrollmentDraft::load_or_create(
+            auth_dir.path(),
+            &test_instance("v2.2.0-test"),
+            None,
+            &EnrollmentRequestBinding {
+                endpoint: original.endpoint,
+                authority: EnrollmentAuthorityBinding::AuthenticatedSession {
+                    organization: "other".to_string(),
+                },
+            },
+        )
+        .expect_err("another authenticated org cannot receive the operation");
+        assert!(
+            matches!(org_error, Error::RequestBindingMismatch { .. }),
+            "{org_error}"
+        );
     }
 
     #[test]
@@ -701,7 +969,8 @@ mod tests {
         let delayed = EnrollmentDraft::create_at(
             &path,
             &test_instance("v9.9.9-delayed"),
-            Some("eu-central-1"),
+            Some("us-west-2"),
+            &test_binding(),
         )
         .expect("delayed creator loads the winner");
 
@@ -824,7 +1093,11 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let transaction = EnrollmentTransactionLock::acquire(dir.path()).expect("acquire lock");
         transaction
-            .load_or_create(&test_instance("v2.2.0-test"), Some("us-west-2"))
+            .load_or_create(
+                &test_instance("v2.2.0-test"),
+                Some("us-west-2"),
+                &test_binding(),
+            )
             .expect("publish draft while locked");
 
         let error = EnrollmentDraft::delete(dir.path()).expect_err("live enrollment owns draft");
@@ -844,7 +1117,11 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let transaction = EnrollmentTransactionLock::acquire(dir.path()).expect("acquire lock");
         transaction
-            .load_or_create(&test_instance("v2.2.0-test"), Some("us-west-2"))
+            .load_or_create(
+                &test_instance("v2.2.0-test"),
+                Some("us-west-2"),
+                &test_binding(),
+            )
             .expect("publish draft while locked");
 
         let started = std::time::Instant::now();
@@ -1026,6 +1303,7 @@ mod tests {
         assert_eq!(
             fields,
             vec![
+                "binding",
                 "csr_pem",
                 "enc_private_key_pem",
                 "enc_public_key_pem",

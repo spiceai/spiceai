@@ -192,6 +192,10 @@ pub enum Error {
     #[snafu(display("Invalid argument: {message}"))]
     InvalidArgument { message: String },
 
+    /// Invalid command usage that should use Clap's usage-error exit code.
+    #[snafu(display("Invalid argument: {message}"))]
+    InvalidUsage { message: String },
+
     /// A Spice Cloud operation failed, carrying a stable code scripts can branch on.
     #[snafu(display(
         "{message}{}",
@@ -277,6 +281,10 @@ pub enum Error {
     /// a non-zero status instead of aborting.
     #[snafu(display("{message}"))]
     NotImplemented { message: String },
+
+    /// Atomic Cloud Connect project creation/attachment failed.
+    #[snafu(display("Failed to create and attach the Spice Cloud project: {message}"))]
+    CloudConnectProject { message: String },
 }
 
 impl Error {
@@ -366,9 +374,9 @@ impl Error {
             // validation, so it belongs on the same code clap already uses for
             // a usage error — otherwise automation cannot tell bad input from
             // an operation that tried and failed.
-            Self::InvalidArgument { .. } | Self::ServiceNotInstalled { .. } => {
-                Self::USAGE_EXIT_CODE
-            }
+            Self::InvalidArgument { .. }
+            | Self::InvalidUsage { .. }
+            | Self::ServiceNotInstalled { .. } => Self::USAGE_EXIT_CODE,
             Self::Interrupted => Self::INTERRUPTED_EXIT_CODE,
             _ => Self::FAILURE_EXIT_CODE,
         }

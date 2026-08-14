@@ -1,0 +1,141 @@
+---
+source: bin/spice/tests/cli_integration.rs
+expression: stdout
+---
+`spice connect` enrolls this directory with Spice Cloud and manages its instance.
+
+With a logged-in user session, the command resolves one owner/admin
+organization, enrolls the local instance, and atomically creates and attaches a
+new project. Without a login, an interactive terminal offers inline login
+(recommended) or secure enrollment-key entry. Enrollment-key mode always
+leaves the instance unattached and prints the Cloud-provided recovery link.
+
+The transaction is retry-safe: an interrupted enrollment reuses its durable
+operation and key material, while project creation uses the enrolled instance's
+single attachment as its exact replay key. Existing identities always win and
+are never duplicated.
+
+NON-INTERACTIVE
+  Login mode requires both --org <org> and --project <name>.
+  Key mode requires --token <enrollment-key> and rejects --project.
+
+  spice connect status                    Show this directory's Cloud
+                                          connection, service, and deployment
+                                          state. `--output json` prints the
+                                          same report for automation.
+  spice connect service install           Install and start `spiced` as a
+                                          persistent service so the instance
+                                          survives reboots and closed
+                                          terminals. Re-run to upgrade in
+                                          place: latest binary, rewritten
+                                          service definition, service
+                                          restarted, identity untouched.
+  spice connect service ...               The rest of the service lifecycle:
+                                          uninstall, start, stop, restart,
+                                          status, logs.
+  spice connect remove                    Release this instance: report the
+                                          release to Spice Cloud, uninstall the
+                                          service when one was installed, and
+                                          clear the local identity on disk.
+                                          A running `spiced` keeps its
+                                          in-memory identity until it is
+                                          restarted or the cloud sends a Remove
+                                          command (a mere stream drop just
+                                          reconnects with the same identity),
+                                          so restart spiced to stop remote
+                                          management immediately.
+
+Use `--dir <path>` to manage an instance rooted at a different directory:
+per-instance state lives under `<dir>/.spice`, so multiple instances on one
+host enroll independently. `SPICE_CONFIG_DIR` overrides the derived location
+entirely and wins over `--dir`.
+
+A service needs either Linux with systemd or macOS with launchd. Containers
+pass the enrollment key directly to the runtime (`spiced --token`) under the
+container runtime's restart policy; Windows enrolls and runs under the user's
+own supervisor.
+
+DEPRECATED POD-ADD BEHAVIOR:
+  spice connect <org>/<pod>               Deprecated; use `spice add <org>/<pod>`.
+
+EXAMPLES
+  spice connect
+  spice connect --org acme --project retail-analytics
+  spice connect --token <enrollment-key> --org acme
+  spice connect --dir /srv/edge --region us-west-2
+  spice connect status
+  spice connect status --output json
+  sudo spice connect service install
+  sudo spice connect remove
+
+Docs: https://spiceai.org/docs
+
+Usage: spice connect [OPTIONS] [TARGET] [COMMAND]
+
+Commands:
+  status   Show this directory's Spice Cloud Connect state: connection, service, and deployment, from one snapshot
+  remove   Release this instance: report the release to Spice Cloud, uninstall an installed service, and clear the local identity. spiced will continue running unmanaged after the next restart
+  service  Install and manage the persistent service for this instance directory
+  help     Print this message or the help of the given subcommand(s)
+
+Arguments:
+  [TARGET]
+          A Spicepod path (`<org>/<pod>`) for the deprecated pod-add behavior. Secrets are never accepted positionally: enrollment keys go to the runtime as `spiced --token <enrollment-key>`
+
+Options:
+  -v, --verbose...
+          Increase log verbosity (-v for debug, -vv for trace)
+
+      --machine
+          Machine-readable mode for LLMs and automation: prefer JSON output where supported and always emit structured JSON errors
+
+      --api-key <API_KEY>
+          API key used to authenticate with the runtime or Spice.ai Cloud
+          
+          [env: SPICE_API_KEY=]
+
+      --cloud
+          Target Spice.ai Cloud instead of a local runtime (requires --api-key)
+
+      --org <SLUG>
+          Organization to enroll into, or the expected organization for an enrollment key. Login mode validates owner/admin membership
+
+      --cloud-region <CLOUD_REGION>
+          Spice.ai Cloud runtime endpoint region used with --cloud.
+          
+          Not declared `requires = "cloud"`, because clap's generic missing-required-argument error is the wrong diagnosis on `spice connect`: there the flag is a confusion with `--region` (where the instance runs) or `--endpoint` (which control plane to enroll against), and the command says so itself. The `--cloud` requirement is enforced for every other command by [`validate_cloud_region_usage`].
+
+      --project <SLUG>
+          Project to create and attach. Required for non-interactive login mode; rejected in enrollment-key mode
+
+      --http-endpoint <HTTP_ENDPOINT>
+          HTTP endpoint of the Spice runtime to talk to (default `http://127.0.0.1:8090`).
+          
+          The default is applied by the runtime context rather than by clap, so that omitting this flag stays distinguishable from passing the default value: `spice sql` refuses to send a natural-language query to an HTTP endpoint nobody chose. See #11005.
+
+      --token <SECRET>
+          One-time enrollment key. The value is redacted from Debug/errors and is never persisted. This mode always remains unattached
+
+      --region <LABEL>
+          Declared location label for the enrolled instance
+
+      --tls-root-certificate-file <TLS_ROOT_CERTIFICATE_FILE>
+          Path to a PEM root certificate used to verify the runtime's TLS server certificate
+
+      --endpoint <URL>
+          Override the Spice Cloud endpoint used when inspecting state or reporting a release. Defaults to `https://api.spice.ai`. Also configurable via `SPICE_CLOUD_ENDPOINT`
+
+      --dir <PATH>
+          The instance directory: per-instance Cloud Connect state (the enrolled identity) lives under `<dir>/.spice`. Defaults to the current directory. `SPICE_CONFIG_DIR` overrides the derived `.spice` location entirely. Applies to `status`, `remove`, and `service`
+
+  -y, --yes
+          Skip the confirmation prompt. Applies to `remove`, which otherwise asks before releasing the instance and stopping its service
+
+      --force
+          Clear this directory's local state even when Spice Cloud could not confirm the release. Applies to `remove`, which otherwise keeps the identity so a retry can finish. Use it when the instance is already deleted in the portal, or when the control plane that issued it is gone: the portal-side delete is authoritative either way
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version

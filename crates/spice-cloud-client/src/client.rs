@@ -18,6 +18,7 @@ limitations under the License.
 
 use std::time::Duration;
 
+use futures::StreamExt as _;
 use reqwest::{Client, RequestBuilder};
 use snafu::ResultExt;
 
@@ -33,6 +34,8 @@ use crate::types::{
 
 const DEFAULT_BASE_URL: &str = "https://api.spice.ai";
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_RESPONSE_BYTES: usize = 64 * 1024;
+const MAX_SUCCESS_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 
 /// Header carrying the organization a management request should act on. Tokens
 /// minted for a single org ignore it; the server is the authority on membership.
@@ -43,14 +46,27 @@ const ORG_HEADER: &str = "X-Org-Name";
 /// Both constructors go through here so the settings cannot drift apart — in particular the
 /// same-origin redirect policy, which is what keeps a bearer token, and the auth code that
 /// `exchange_code` puts in a request body, from following a `Location` off origin.
-fn build_http_client(timeout: Duration) -> Result<Client> {
+fn build_http_client(base_url: &str, timeout: Duration) -> Result<Client> {
+    let allow_local_http = reqwest::Url::parse(base_url)
+        .is_ok_and(|url| url.scheme() == "http" && url.host_str().is_some_and(is_loopback_host));
     Client::builder()
         .connect_timeout(Duration::from_secs(10))
         .timeout(timeout)
-        .https_only(true)
+        .https_only(!allow_local_http)
         .redirect(same_origin_redirect_policy())
         .build()
         .context(HttpRequestSnafu)
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    let host = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
 }
 
 /// HTTP client for the Spice Cloud API.
@@ -72,7 +88,7 @@ impl CloudClient {
     /// Use [`Self::with_token`] to set an authentication token, and
     /// [`Self::with_timeout`] to override the default 30-second timeout.
     pub fn new(base_url: &str) -> Result<Self> {
-        let client = build_http_client(DEFAULT_TIMEOUT)?;
+        let client = build_http_client(base_url, DEFAULT_TIMEOUT)?;
 
         Ok(Self {
             base_url: base_url.trim_end_matches('/').to_string(),
@@ -110,7 +126,7 @@ impl CloudClient {
     ///
     /// Returns an error if the HTTP client cannot be rebuilt with the given timeout.
     pub fn with_timeout(mut self, timeout: Duration) -> Result<Self> {
-        self.client = build_http_client(timeout)?;
+        self.client = build_http_client(&self.base_url, timeout)?;
         Ok(self)
     }
 
@@ -581,11 +597,13 @@ impl CloudClient {
         response: reqwest::Response,
     ) -> Result<T> {
         let status = response.status();
-        let body = response.text().await.context(HttpRequestSnafu)?;
+        if status.is_success() {
+            let body = bounded_response_body(response, MAX_SUCCESS_RESPONSE_BYTES).await?;
+            return serde_json::from_slice(&body)
+                .map_err(|source| error::Error::JsonParse { source });
+        }
+        let body = self.sanitized_error_body(response).await?;
         match status.as_u16() {
-            200..=202 => {
-                serde_json::from_str(&body).map_err(|source| error::Error::JsonParse { source })
-            }
             401 => error::UnauthorizedSnafu {
                 message: body_or("invalid or expired token", &body),
             }
@@ -612,10 +630,13 @@ impl CloudClient {
 
     async fn handle_empty_response(&self, response: reqwest::Response) -> Result<()> {
         let status = response.status();
-        let body = response.text().await.context(HttpRequestSnafu)?;
+        if status.is_success() {
+            let _ = bounded_response_body(response, MAX_SUCCESS_RESPONSE_BYTES).await?;
+            return Ok(());
+        }
+        let body = self.sanitized_error_body(response).await?;
 
         match status.as_u16() {
-            200..=204 => Ok(()),
             401 => error::UnauthorizedSnafu {
                 message: body_or("invalid or expired token", &body),
             }
@@ -644,6 +665,12 @@ impl CloudClient {
         self.token.as_deref().unwrap_or("")
     }
 
+    async fn sanitized_error_body(&self, response: reqwest::Response) -> Result<String> {
+        let bytes = bounded_response_body(response, MAX_RESPONSE_BYTES).await?;
+        let raw = String::from_utf8_lossy(&bytes);
+        Ok(redact_response_body(&raw, self.token.as_deref()))
+    }
+
     /// Apply the bearer token and, when set, the org context header.
     ///
     /// An org name that cannot be encoded as a header value surfaces as a
@@ -655,6 +682,55 @@ impl CloudClient {
             Some(org) => request.header(ORG_HEADER, org),
             None => request,
         }
+    }
+}
+
+async fn bounded_response_body(response: reqwest::Response, limit: usize) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.context(HttpRequestSnafu)?;
+        if bytes.len().saturating_add(chunk.len()) > limit {
+            return error::ResponseTooLargeSnafu { limit }.fail();
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
+fn redact_response_body(body: &str, sensitive: Option<&str>) -> String {
+    let Some(sensitive) = sensitive.filter(|value| !value.is_empty()) else {
+        return body.to_string();
+    };
+    let redacted = body.replace(sensitive, "[REDACTED]");
+    let Ok(mut json) = serde_json::from_str::<serde_json::Value>(&redacted) else {
+        return redacted;
+    };
+    redact_json_strings(&mut json, sensitive);
+    serde_json::to_string(&json).unwrap_or(redacted)
+}
+
+fn redact_json_strings(value: &mut serde_json::Value, sensitive: &str) {
+    match value {
+        serde_json::Value::String(value) => *value = value.replace(sensitive, "[REDACTED]"),
+        serde_json::Value::Array(values) => {
+            for value in values {
+                redact_json_strings(value, sensitive);
+            }
+        }
+        serde_json::Value::Object(values) => {
+            // Keys carry the credential just as easily as values, and parsing
+            // decodes an escaped key back to its literal bytes — so a key the
+            // raw replacement above could not match is reconstructed here and
+            // would be re-emitted by the serialization that follows.
+            let mut redacted = serde_json::Map::with_capacity(values.len());
+            for (key, mut value) in std::mem::take(values) {
+                redact_json_strings(&mut value, sensitive);
+                redacted.insert(key.replace(sensitive, "[REDACTED]"), value);
+            }
+            *values = redacted;
+        }
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
     }
 }
 
@@ -712,10 +788,43 @@ fn oauth_host(host: &str) -> Option<String> {
 mod tests {
     use super::{
         CloudClient, DEFAULT_TIMEOUT, auth_exchange_result, auth_exchange_status_is_pending,
-        same_origin_redirect_policy,
+        redact_response_body, same_origin_redirect_policy,
     };
     use crate::types::{AuthContext, AuthContextApp, AuthContextOrg, AuthContextRaw};
     use crate::{error, types::AuthExchangeResponse};
+
+    #[test]
+    fn management_error_bodies_redact_raw_and_json_escaped_bearers() {
+        let token = "secret-token";
+        let raw = redact_response_body("proxy echoed secret-token", Some(token));
+        assert!(!raw.contains(token));
+        let escaped =
+            redact_response_body(r#"{"error":"secret\u002dtoken was rejected"}"#, Some(token));
+        assert!(!escaped.contains(token));
+        assert!(escaped.contains("[REDACTED]"));
+    }
+
+    /// An escaped credential in an object *key* survives the raw replacement,
+    /// and parsing decodes it back to the literal token, so serializing the
+    /// tree again would publish it.
+    #[test]
+    fn management_error_bodies_redact_bearers_hidden_in_object_keys() {
+        let token = "secret-token";
+        for body in [
+            // Escaped in the key, so the raw replacement cannot match it.
+            r#"{"secret\u002dtoken":"rejected"}"#,
+            r#"{"outer":{"secret\u002dtoken":["rejected"]}}"#,
+            // Literal in the key, for the path the raw replacement does cover.
+            r#"{"secret-token":"rejected"}"#,
+        ] {
+            let redacted = redact_response_body(body, Some(token));
+            assert!(
+                !redacted.contains(token),
+                "object key leaked the bearer: {redacted}"
+            );
+            assert!(redacted.contains("[REDACTED]"), "{redacted}");
+        }
+    }
 
     /// Both constructors must install the same-origin redirect policy, or a bearer token —
     /// and the auth code `exchange_code` puts in a request body — could follow a `Location`
@@ -823,6 +932,31 @@ mod tests {
             reachable.requests().is_empty(),
             "neither constructor's client should have reached a plain-http origin"
         );
+    }
+
+    #[tokio::test]
+    async fn loopback_base_allows_plain_http_fixtures_and_preserves_it_when_retimed() {
+        let reachable = crate::test_support::Stub::serve(|_| crate::test_support::ok_with("ok"));
+        let base_url = reachable.url("");
+        let client = CloudClient::new(&base_url).expect("loopback client should build");
+        client
+            .client
+            .get(reachable.url("/first"))
+            .send()
+            .await
+            .expect("loopback HTTP should be allowed");
+
+        let retimed = client
+            .with_timeout(std::time::Duration::from_secs(5))
+            .expect("loopback client should be retimed");
+        retimed
+            .client
+            .get(reachable.url("/second"))
+            .send()
+            .await
+            .expect("retimed loopback HTTP should remain allowed");
+
+        assert_eq!(reachable.requests().len(), 2);
     }
 
     #[test]

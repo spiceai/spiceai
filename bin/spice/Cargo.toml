@@ -36,6 +36,7 @@ reqwest = { workspace = true, features = ["stream"] }
 # Serialization
 serde.workspace = true
 serde_json.workspace = true
+zeroize = "1.8"
 
 # Environment files
 dotenv.workspace = true
@@ -110,9 +111,18 @@ test-framework = { path = "../../crates/test-framework" }
 # Tracing/opentelemetry for trace ID handling
 opentelemetry.workspace = true
 
-# Unix signal handling, and the effective-uid check `spice connect service` gates on
+# Unix signal handling, terminal tests, and local account inspection.
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.29", features = ["signal", "process", "user"] }
+nix = { version = "0.29", features = ["signal", "process", "term", "user"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Memory",
+] }
 [build-dependencies]
 # None needed - we use include_str! for version
 
