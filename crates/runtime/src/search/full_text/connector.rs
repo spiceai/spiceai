@@ -26,7 +26,7 @@ use crate::component::{
 };
 use crate::dataconnector::{DataConnector, DataConnectorError, DataConnectorResult};
 use crate::federated::FederatedTable;
-use crate::search::full_text::table::{add_full_text_search_to_table, dataset_will_attach_cdc};
+use crate::search::full_text::table::{add_full_text_search_to_table, dataset_attaches_stream};
 use data_connector_api::accelerated::{AcceleratorSetup, RegisteredAcceleratedTable};
 use data_connector_api::federated::FederatedTableProvider;
 use futures::StreamExt;
@@ -90,7 +90,7 @@ impl DataConnector for FullTextConnector {
             &inner,
             &dataset.columns,
             &dataset.name,
-            dataset_will_attach_cdc(&self.inner_connector, dataset),
+            dataset_attaches_stream(&self.inner_connector, dataset),
         )
         .map(|idx| idx as Arc<dyn TableProvider>)
         .map_err(|e| DataConnectorError::InvalidConfiguration {
@@ -111,7 +111,7 @@ impl DataConnector for FullTextConnector {
                     &inner,
                     &dataset.columns,
                     &dataset.name,
-                    dataset_will_attach_cdc(&self.inner_connector, dataset),
+                    dataset_attaches_stream(&self.inner_connector, dataset),
                 )
                 .map(|idx| idx as Arc<dyn TableProvider>)
                 .map_err(|e| DataConnectorError::InvalidConfiguration {
@@ -233,14 +233,14 @@ mod tests {
         )
     }
 
-    fn full_text_tier(cdc_attached: bool) -> FullTextDatabaseIndex {
+    fn full_text_tier(stream_attached: bool) -> FullTextDatabaseIndex {
         FullTextDatabaseIndex::try_new(
             test_table(),
             vec!["content".to_string()],
             Some(vec!["id".to_string()]),
             None,
             &["content".to_string()],
-            cdc_attached,
+            stream_attached,
         )
         .expect("failed to create FullTextDatabaseIndex")
     }
@@ -248,10 +248,10 @@ mod tests {
     /// Regression test for #12061: the warm/external full-text tier registers a
     /// `CompoundSearchIndex` in place of its tiers, so a caller reaching the tantivy tier
     /// through the compound must have told it at construction whether a CDC/append stream
-    /// will attach — a tier built with `cdc_attached = false` keeps deferring commits and a
+    /// will attach — a tier built with `stream_attached = false` keeps deferring commits and a
     /// failed refresh discards change-stream documents for good.
     #[tokio::test]
-    async fn cdc_attached_warm_tier_never_defers_commits_through_compound() {
+    async fn stream_attached_warm_tier_never_defers_commits_through_compound() {
         let warm = full_text_tier(true);
         let compound = CompoundSearchIndex::try_new(
             Arc::new(warm.clone()) as Arc<dyn SearchIndex>,

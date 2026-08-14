@@ -225,18 +225,18 @@ pub struct FullTextDatabaseIndex {
     /// `on_write_start` sets it; `on_write_complete`/`on_write_failed` clear it.
     defer_commit: Arc<AtomicBool>,
 
-    /// True when this index is also fed by a change-data-capture stream, which
+    /// True when this index is also fed by a change-data-capture or append stream, which
     /// drives `compute_index` outside the sink write lifecycle. Fixed at construction
-    /// (see `try_new`'s `cdc_attached` parameter) and shared via `Arc` with every handle
+    /// (see `try_new`'s `stream_attached` parameter) and shared via `Arc` with every handle
     /// `with_new_base` derives from this index, since they all drive the same writer.
     ///
     /// A single [`tantivy::IndexWriter`] stages every pending operation together,
     /// so a commit cannot be scoped to one caller's documents: committing inside a
     /// deferred window would publish a partially-written refresh, and rolling the
-    /// window back would discard CDC documents staged alongside it. Deferral is
-    /// therefore disabled outright for a CDC-fed index — correctness over the
+    /// window back would discard the stream's documents staged alongside it. Deferral is
+    /// therefore disabled outright for a stream-attached index — correctness over the
     /// one-commit-per-refresh optimization.
-    cdc_attached: Arc<AtomicBool>,
+    stream_attached: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for FullTextDatabaseIndex {
@@ -302,16 +302,16 @@ impl Index for FullTextDatabaseIndex {
     }
 
     async fn on_write_start(&self, window: WriteWindow) -> Result<(), DataFusionError> {
-        // A CDC-fed index never defers: its change stream calls `compute_index`
-        // outside this lifecycle, and the shared writer cannot commit one caller's
-        // documents without also publishing (or, on rollback, discarding) the other's.
+        // A stream-attached index never defers: its change/append stream calls
+        // `compute_index` outside this lifecycle, and the shared writer cannot commit one
+        // caller's documents without also publishing (or, on rollback, discarding) the other's.
         //
         // That also rules out the `ReplaceAll` clear below, whose atomicity depends on the
         // deferred window: an immediately-committed clear would publish an empty index for the
-        // length of the refresh, and would discard change-stream documents staged alongside it.
-        // A CDC-fed index is told about deletions explicitly by its change stream, so it does
+        // length of the refresh, and would discard stream documents staged alongside it.
+        // A stream-attached index is told about deletions explicitly by its stream, so it does
         // not depend on the replace-window clear to drop rows the source removed.
-        if self.cdc_attached.load(Ordering::Acquire) {
+        if self.stream_attached.load(Ordering::Acquire) {
             return Ok(());
         }
 
@@ -409,7 +409,7 @@ impl FullTextDatabaseIndex {
         primary_key_override: Option<Vec<String>>,
         directory: Option<PathBuf>,
         store_field: &[String],
-        cdc_attached: bool,
+        stream_attached: bool,
     ) -> Result<Self, super::Error> {
         let pks = Self::validate_primary_key(&inner, primary_key_override)?;
         let tantivy_schema = Self::create_tantivy_schema(
@@ -446,7 +446,7 @@ impl FullTextDatabaseIndex {
             primary_key: pks,
             reader,
             defer_commit: Arc::new(AtomicBool::new(false)),
-            cdc_attached: Arc::new(AtomicBool::new(cdc_attached)),
+            stream_attached: Arc::new(AtomicBool::new(stream_attached)),
         })
     }
 
@@ -687,7 +687,7 @@ impl FullTextDatabaseIndex {
             defer_commit: Arc::clone(&self.defer_commit),
             // Shared for the same reason as `defer_commit`: both handles drive the
             // same tantivy writer and must agree on whether deferral is allowed.
-            cdc_attached: Arc::clone(&self.cdc_attached),
+            stream_attached: Arc::clone(&self.stream_attached),
         }
     }
 
@@ -2037,11 +2037,11 @@ mod tests {
         );
     }
 
-    /// A CDC-fed index shares one tantivy writer with the sink write path, so it must
-    /// never defer: a window commit would publish a partial refresh, and a window
-    /// rollback would discard the change stream's documents.
+    /// A stream-attached index shares one tantivy writer with the sink write path, so it
+    /// must never defer: a window commit would publish a partial refresh, and a window
+    /// rollback would discard the stream's documents.
     #[tokio::test]
-    async fn test_cdc_attached_index_never_defers_commits() {
+    async fn test_stream_attached_index_never_defers_commits() {
         let index = FullTextDatabaseIndex::try_new(
             create_test_table(),
             vec!["content".to_string()],
@@ -2052,7 +2052,7 @@ mod tests {
         )
         .expect("Failed to create FullTextDatabaseIndex");
 
-        // Opening a window is a no-op for a CDC-fed index.
+        // Opening a window is a no-op for a stream-attached index.
         index
             .on_write_start(WriteWindow::Append)
             .await
@@ -2074,7 +2074,7 @@ mod tests {
             let results = search_and_format(&search_index, "apple").await;
             assert!(
                 results.contains("apple banana"),
-                "a CDC-fed index must commit immediately even inside a write window, got:\n{results}"
+                "a stream-attached index must commit immediately even inside a write window, got:\n{results}"
             );
         }
 
@@ -2090,28 +2090,28 @@ mod tests {
         let results = search_and_format(&search_index, "apple").await;
         assert!(
             results.contains("apple banana"),
-            "committed CDC documents must survive a failed write window, got:\n{results}"
+            "committed stream documents must survive a failed write window, got:\n{results}"
         );
     }
 
     /// A warm full-text tier can be registered inside a
     /// [`CompoundSearchIndex`](crate::index::compound::CompoundSearchIndex) rather than
-    /// directly, with writes routed to it via [`SearchIndex::write`]. Once that tier is marked
-    /// CDC-attached, it must stop deferring commits regardless of whether writes reach it
+    /// directly, with writes routed to it via [`SearchIndex::write`]. Once that tier is built
+    /// stream-attached, it must stop deferring commits regardless of whether writes reach it
     /// directly or through the compound, or a failed write window discards the change
     /// stream's documents for good.
     #[tokio::test]
-    async fn test_cdc_attached_compound_primary_never_defers_commits() {
+    async fn test_stream_attached_compound_primary_never_defers_commits() {
         use crate::index::compound::{CompoundReadMode, CompoundSearchIndex};
 
-        let new_tier = |cdc_attached: bool| {
+        let new_tier = |stream_attached: bool| {
             FullTextDatabaseIndex::try_new(
                 create_test_table(),
                 vec!["content".to_string()],
                 Some(vec!["id".to_string()]),
                 None,
                 &["content".to_string()],
-                cdc_attached,
+                stream_attached,
             )
             .expect("Failed to create FullTextDatabaseIndex")
         };

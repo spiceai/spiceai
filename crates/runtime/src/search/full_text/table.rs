@@ -32,13 +32,13 @@ use search::generation::text_search::index::FullTextDatabaseIndex;
 /// Whether registering `dataset` on `connector` will attach a CDC change stream or an append
 /// stream to a full-text index built for it — i.e. whether that index must be constructed with
 /// its deferred-commit window permanently disabled (see `FullTextDatabaseIndex::try_new`'s
-/// `cdc_attached` parameter), because it will share a single tantivy writer with a change stream
+/// `stream_attached` parameter), because it will share a single tantivy writer with a change stream
 /// running outside the sink write lifecycle.
 ///
 /// Mirrors the refresh-mode resolution `DataFusion::create_accelerated_table` performs before
 /// wiring `changes_stream`/`append_stream`, computed here ahead of index construction instead of
 /// determined afterwards.
-pub(crate) fn dataset_will_attach_cdc(
+pub(crate) fn dataset_attaches_stream(
     connector: &Arc<dyn DataConnector>,
     dataset: &Dataset,
 ) -> bool {
@@ -68,7 +68,7 @@ pub(crate) fn build_full_text_database_index(
     columns: &[Column],
     tbl: &TableReference,
     store_fields_override: Option<&[String]>,
-    cdc_attached: bool,
+    stream_attached: bool,
 ) -> Result<FullTextDatabaseIndex, Box<dyn std::error::Error + Send + Sync>> {
     let schema = inner_table_provider.schema();
     for c in columns {
@@ -132,7 +132,7 @@ pub(crate) fn build_full_text_database_index(
         Some(primary_key),
         directory,
         store_fields,
-        cdc_attached,
+        stream_attached,
     )
     .boxed()
 }
@@ -168,14 +168,14 @@ pub(crate) fn add_full_text_search_to_table(
     inner_table_provider: &Arc<dyn TableProvider>,
     columns: &[Column],
     tbl: &TableReference,
-    cdc_attached: bool,
+    stream_attached: bool,
 ) -> Result<Arc<SpiceTable>, Box<dyn std::error::Error + Send + Sync>> {
     let index = build_full_text_database_index(
         Arc::clone(inner_table_provider),
         columns,
         tbl,
         None,
-        cdc_attached,
+        stream_attached,
     )?;
     Ok(register_index(
         inner_table_provider,
@@ -235,7 +235,7 @@ pub(crate) async fn add_compound_fts_to_table(
     tbl: &datafusion::sql::TableReference,
     fts_params: &runtime_search::store_params::elasticsearch::ElasticsearchFtsConfig,
     on_zero_results: &crate::component::dataset::acceleration::ZeroResultsAction,
-    cdc_attached: bool,
+    stream_attached: bool,
 ) -> Result<Arc<SpiceTable>, Box<dyn std::error::Error + Send + Sync>> {
     use crate::component::dataset::acceleration::ZeroResultsAction;
     use search::index::SearchIndex;
@@ -268,7 +268,7 @@ pub(crate) async fn add_compound_fts_to_table(
         columns,
         tbl,
         Some(&[] as &[String]),
-        cdc_attached,
+        stream_attached,
     ) {
         Ok(index) => index,
         Err(source) => {
