@@ -305,27 +305,45 @@ impl Runtime {
             // Most of `runtime.*` sizes or builds something that is already
             // running. Say so rather than silently ignoring the edit.
             warn_on_start_time_only_changes(&current_app.runtime, &new_app.runtime);
+        }
 
-            Arc::clone(&self)
-                .apply_catalog_diff(current_app, &new_app)
-                .await;
-            Arc::clone(&self)
-                .apply_dataset_diff(current_app, &new_app)
-                .await;
-            Arc::clone(&self)
-                .apply_view_diff(current_app, &new_app)
-                .await;
-            self.apply_model_diff(current_app, &new_app).await;
-            crate::datafusion::udf::apply_function_diff(&self, current_app, &new_app).await;
+        // A process that came up with no configuration at all — a Cloud-connected
+        // instance waiting for its first deployment, or a watched directory that
+        // had no `spicepod.yaml` yet — has nothing registered: its component load
+        // ran against no app. Such a start reconciles against an empty app rather
+        // than skipping the reconcile, because storing the arriving app alone
+        // would leave the instance reporting components it never loaded and
+        // serving none of them.
+        let nothing_loaded = Arc::new(App::default());
+        let baseline = current_app.unwrap_or(&nothing_loaded);
 
-            if !cfg!(feature = "models") {
-                Arc::clone(&self)
-                    .apply_worker_diff(current_app, &new_app)
-                    .await;
-            }
+        Arc::clone(&self)
+            .apply_catalog_diff(baseline, &new_app)
+            .await;
+        Arc::clone(&self)
+            .apply_dataset_diff(baseline, &new_app)
+            .await;
+        Arc::clone(&self).apply_view_diff(baseline, &new_app).await;
+        self.apply_model_diff(baseline, &new_app).await;
+        crate::datafusion::udf::apply_function_diff(&self, baseline, &new_app).await;
+
+        if !cfg!(feature = "models") {
+            Arc::clone(&self)
+                .apply_worker_diff(baseline, &new_app)
+                .await;
         }
 
         *self.app.write().await = Some(new_app);
+
+        // Task history reads its configuration from the app, so a start with no
+        // app skipped it entirely; it is initialized from the app that arrived.
+        // Idempotent, so the ordinary case where the load already registered the
+        // table changes nothing.
+        if current_app.is_none()
+            && let Err(err) = Arc::clone(&self).init_task_history().await
+        {
+            tracing::warn!("Creating internal task history table: {err}");
+        }
 
         true
     }

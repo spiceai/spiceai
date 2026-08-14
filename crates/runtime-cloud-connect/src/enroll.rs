@@ -1266,6 +1266,16 @@ pub async fn enroll_now_with_transaction(
         app_name: None,
         monitor_url: None,
         control_plane_endpoint: Some(draft.binding.endpoint.clone()),
+        // The page that attaches this instance to a project, kept so any later
+        // start can point an operator at it. Validated here rather than at the
+        // log site: an unsafe or non-absolute link is dropped before it is
+        // durable, and the enrollment still succeeds — the link is guidance, not
+        // credential material.
+        new_project_url: outcome
+            .metadata
+            .new_project_url
+            .as_deref()
+            .and_then(crate::config::safe_portal_url),
         enc_private_key_pem: material.enc_private_key_pem,
         enc_public_key_pem: material.enc_public_key_pem,
         // A fresh enrollment has no prior key to retain.

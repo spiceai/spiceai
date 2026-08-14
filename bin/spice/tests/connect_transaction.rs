@@ -107,6 +107,13 @@ struct Fixture {
 
 impl Fixture {
     fn start() -> Self {
+        Self::start_expecting(5)
+    }
+
+    /// The fixture returns once `expected` requests have arrived and the socket
+    /// goes idle, so a flow that makes fewer requests than another does not have
+    /// to wait out the deadline to prove it.
+    fn start_expecting(expected: usize) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind HTTP fixture");
         listener
             .set_nonblocking(true)
@@ -131,7 +138,7 @@ impl Fixture {
                             .expect("lock fixture state")
                             .requests
                             .len()
-                            >= 5
+                            >= expected
                         {
                             return;
                         }
@@ -393,6 +400,7 @@ fn unattached_identity() -> runtime_cloud_connect::Identity {
         app_name: None,
         monitor_url: None,
         control_plane_endpoint: None,
+        new_project_url: None,
     }
 }
 
@@ -957,4 +965,622 @@ fn token_mode_stays_unattached_and_existing_identity_prevents_reenrollment() {
         .arg(&endpoint)
         .assert()
         .success();
+}
+
+/// A pending operation's own state is published the way the runtime publishes
+/// it, so these exercises resume exactly what a lost response leaves behind.
+fn publish_pending_draft(
+    config_dir: &std::path::Path,
+    endpoint: &str,
+    authority: runtime_cloud_connect::EnrollmentAuthorityBinding,
+) -> runtime_cloud_connect::EnrollmentDraft {
+    runtime_cloud_connect::EnrollmentDraft::load_or_create(
+        config_dir,
+        &runtime_cloud_connect::enroll::InstanceFacts::gather("v0.0.0-integration"),
+        Some("lab-seoul"),
+        &runtime_cloud_connect::EnrollmentRequestBinding {
+            endpoint: endpoint.to_string(),
+            authority,
+        },
+    )
+    .expect("publish a pending enrollment draft")
+}
+
+/// A loopback address nothing listens on: a command that reaches the control
+/// plane fails visibly differently from one that fails on its own inputs.
+fn closed_endpoint() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("reserve a loopback port");
+    let address = listener.local_addr().expect("reserved port");
+    drop(listener);
+    format!("http://{address}")
+}
+
+fn connect_at(instance: &TempDir, home: &TempDir, endpoint: &str) -> Command {
+    let mut command = spice_cmd();
+    command
+        .current_dir(instance.path())
+        .env("HOME", home.path())
+        .env_remove("SPICE_CONFIG_DIR")
+        .env_remove("SPICE_CLOUD_ENDPOINT")
+        .env_remove("SPICE_SPICEAI_TOKEN")
+        .arg("connect")
+        .arg("--endpoint")
+        .arg(endpoint);
+    command
+}
+
+fn output_of(command: &mut Command) -> (bool, String) {
+    let output = command.output().expect("run spice connect");
+    (
+        output.status.success(),
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ),
+    )
+}
+
+#[test]
+fn a_pending_token_draft_replays_its_operation_and_organization_assertion() {
+    let instance = TempDir::new().expect("create instance directory");
+    let home = TempDir::new().expect("create isolated home");
+    let config_dir = instance.path().join(".spice");
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind resume fixture");
+    let endpoint = format!(
+        "http://{}",
+        listener.local_addr().expect("resume fixture address")
+    );
+    let draft = publish_pending_draft(
+        &config_dir,
+        &endpoint,
+        runtime_cloud_connect::EnrollmentAuthorityBinding::Token {
+            expected_org: Some("acme".to_string()),
+        },
+    );
+
+    let operation = draft.enrollment_operation_id;
+    let csr = draft.csr_pem;
+    let server = std::thread::spawn(move || {
+        let ca = TestCa::new();
+        let (mut stream, _) = listener.accept().expect("accept resumed enrollment");
+        let request = read_request(&mut stream);
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.path, "/v1/cloud-connect/enroll");
+        assert!(!request.headers.contains_key("authorization"));
+        assert_eq!(
+            request.headers.get("idempotency-key"),
+            Some(&operation),
+            "a resumed operation must carry the durable operation ID"
+        );
+        let body: serde_json::Value =
+            serde_json::from_str(&request.body).expect("resumed enrollment body JSON");
+        assert_eq!(
+            body["csr_pem"].as_str(),
+            Some(csr.as_str()),
+            "a resumed operation must replay the provisional key material"
+        );
+        assert_eq!(
+            body["expected_org"], "acme",
+            "the draft's organization assertion survives a run that never named one"
+        );
+        assert_eq!(
+            body["region"], "lab-seoul",
+            "the draft's declared location survives a run that never named one"
+        );
+        let identity_cert_pem = ca.sign_csr(csr.as_str());
+        write_response(
+            &mut stream,
+            200,
+            &serde_json::json!({
+                "kind": "standalone",
+                "instance_id": "inst_resumed_fixture",
+                "identity_cert_pem": identity_cert_pem,
+                "ca_bundle_pem": ca.cert_pem,
+                "gateway_addr": "127.0.0.1:443",
+                "not_after": NOT_AFTER_RFC3339,
+                "organization": {"id": 42, "name": "acme"},
+                "region": "lab-seoul",
+                "portal": {"new_project_url": "https://spice.ai/acme/new?instance=inst_resumed_fixture"},
+                "attachment": null,
+                "recovered": true
+            })
+            .to_string(),
+        );
+    });
+
+    // No --org and no --region: everything the replay needs comes from the
+    // draft, which is the only place it was ever durable.
+    let (success, output) = output_of(
+        connect_at(&instance, &home, &endpoint)
+            .arg("--token")
+            .arg("spice-enroll-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+    );
+    assert!(success, "resumed token enrollment failed: {output}");
+    server.join().expect("resume fixture completed");
+
+    let identity =
+        runtime_cloud_connect::IdentityStore::load_optional(&config_dir.join("identity.json"))
+            .expect("load resumed identity")
+            .expect("the resumed enrollment is durable");
+    assert_eq!(identity.identifier, "inst_resumed_fixture");
+    assert_eq!(identity.org_name.as_deref(), Some("acme"));
+    assert_eq!(
+        identity.new_project_url.as_deref(),
+        Some("https://spice.ai/acme/new?instance=inst_resumed_fixture"),
+        "the Cloud's create-project page is persisted so any later start can offer it"
+    );
+    assert!(
+        runtime_cloud_connect::EnrollmentDraft::load_optional(&config_dir)
+            .expect("read the draft state")
+            .is_none(),
+        "a promoted identity retires the draft"
+    );
+}
+
+#[test]
+fn a_pending_token_draft_names_the_key_flag_without_a_terminal() {
+    let instance = TempDir::new().expect("create instance directory");
+    let home = TempDir::new().expect("create isolated home");
+    let config_dir = instance.path().join(".spice");
+    let endpoint = closed_endpoint();
+    let draft = publish_pending_draft(
+        &config_dir,
+        &endpoint,
+        runtime_cloud_connect::EnrollmentAuthorityBinding::Token {
+            expected_org: Some("acme".to_string()),
+        },
+    );
+
+    let (success, output) = output_of(&mut connect_at(&instance, &home, &endpoint));
+    assert!(!success, "a key cannot be prompted for without a terminal");
+    assert!(
+        output.contains("pending enrollment that was authorized by an enrollment key")
+            && output.contains("--token <enrollment-key>"),
+        "the failure must name the pending operation and what finishes it: {output}"
+    );
+
+    let preserved = runtime_cloud_connect::EnrollmentDraft::load_optional(&config_dir)
+        .expect("read the preserved draft")
+        .expect("a refused run keeps the retry-safe state");
+    assert_eq!(
+        preserved.enrollment_operation_id, draft.enrollment_operation_id,
+        "an actionable failure must not discard the pending operation"
+    );
+}
+
+#[test]
+fn a_pending_login_draft_refuses_an_enrollment_key() {
+    let instance = TempDir::new().expect("create instance directory");
+    let home = TempDir::new().expect("create isolated home");
+    let config_dir = instance.path().join(".spice");
+    let endpoint = closed_endpoint();
+    let draft = publish_pending_draft(
+        &config_dir,
+        &endpoint,
+        runtime_cloud_connect::EnrollmentAuthorityBinding::AuthenticatedSession {
+            organization: "acme".to_string(),
+        },
+    );
+
+    let (success, output) = output_of(
+        connect_at(&instance, &home, &endpoint)
+            .arg("--token")
+            .arg("spice-enroll-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+    );
+    assert!(
+        !success,
+        "an enrollment key must not replace the pending login authority"
+    );
+    assert!(
+        output.contains("spice connect --org acme"),
+        "the failure must name what finishes the pending operation: {output}"
+    );
+
+    let preserved = runtime_cloud_connect::EnrollmentDraft::load_optional(&config_dir)
+        .expect("read the preserved draft")
+        .expect("a refused run keeps the retry-safe state");
+    assert_eq!(
+        preserved.enrollment_operation_id, draft.enrollment_operation_id,
+        "a rejected authority must not discard the pending operation"
+    );
+    assert_eq!(preserved.binding, draft.binding);
+}
+
+#[test]
+fn a_pending_login_draft_resumes_its_organization_without_the_org_flag() {
+    let fixture = Fixture::start_expecting(4);
+    let instance = TempDir::new().expect("create instance directory");
+    let home = TempDir::new().expect("create isolated home");
+    let config_dir = instance.path().join(".spice");
+    let draft = publish_pending_draft(
+        &config_dir,
+        &fixture.endpoint,
+        runtime_cloud_connect::EnrollmentAuthorityBinding::AuthenticatedSession {
+            organization: "acme".to_string(),
+        },
+    );
+
+    // No --org: the pending operation is already bound to one, and a resumed
+    // run must not need the flag — nor let anything else choose.
+    let (success, output) = output_of(
+        connect_at(&instance, &home, &fixture.endpoint)
+            .env("SPICE_SPICEAI_TOKEN", LOGIN_TOKEN)
+            .env("SPICE_SPICEAI_TOKEN_ACME", LOGIN_TOKEN)
+            .arg("--project")
+            .arg(PROJECT_NAME),
+    );
+    assert!(success, "resumed login enrollment failed: {output}");
+
+    let state = fixture.finish();
+    let state = state.lock().expect("lock final fixture state");
+    assert_eq!(state.instance_mutations, 1, "instance must be created once");
+    assert_eq!(state.project_mutations, 1, "project must be created once");
+    assert!(
+        state
+            .enrollment_operations
+            .iter()
+            .all(|operation| *operation == draft.enrollment_operation_id),
+        "every attempt must carry the pending operation ID"
+    );
+    assert!(
+        state
+            .requests
+            .iter()
+            .all(|request| request.path.starts_with("/v1/cloud-connect/")),
+        "a bound organization needs no discovery: {:?}",
+        state.requests.iter().map(|r| &r.path).collect::<Vec<_>>()
+    );
+    let body: serde_json::Value =
+        serde_json::from_str(&state.enrollment_bodies[0]).expect("enrollment body JSON");
+    assert_eq!(
+        body["csr_pem"].as_str(),
+        Some(draft.csr_pem.as_str()),
+        "a resumed operation must replay the provisional key material"
+    );
+
+    let identity =
+        runtime_cloud_connect::IdentityStore::load_optional(&config_dir.join("identity.json"))
+            .expect("load resumed identity")
+            .expect("the resumed enrollment is durable");
+    assert_eq!(identity.identifier, INSTANCE_ID);
+    assert_eq!(identity.org_name.as_deref(), Some("acme"));
+    assert_eq!(identity.app_name.as_deref(), Some(PROJECT_NAME));
+    assert!(
+        runtime_cloud_connect::EnrollmentDraft::load_optional(&config_dir)
+            .expect("read the draft state")
+            .is_none(),
+        "a promoted identity retires the draft"
+    );
+}
+
+#[test]
+fn a_directory_with_nothing_pending_still_requires_explicit_authority() {
+    let instance = TempDir::new().expect("create instance directory");
+    let home = TempDir::new().expect("create isolated home");
+    let endpoint = closed_endpoint();
+
+    let (success, output) = output_of(&mut connect_at(&instance, &home, &endpoint));
+    assert!(
+        !success,
+        "a fresh directory cannot enroll without authority"
+    );
+    assert!(
+        output.contains(
+            "non-interactive Cloud Connect requires either a login with --org <org> --project <name>, or --token <enrollment-key>"
+        ),
+        "the no-draft failure must stay unchanged: {output}"
+    );
+    assert!(
+        !instance
+            .path()
+            .join(".spice")
+            .join("identity.json")
+            .exists(),
+        "a refused run enrolls nothing"
+    );
+}
+
+/// A stored login credential used to short-circuit the authentication choice
+/// before the draft was consulted, which sent `GET /api/spice-cli/auth` — a
+/// portal route — to the pending operation's control plane. The draft decides
+/// first now, so a key operation never identifies a stored credential at all.
+#[test]
+fn a_pending_token_draft_never_probes_a_stored_login_credential() {
+    let instance = TempDir::new().expect("create instance directory");
+    let home = TempDir::new().expect("create isolated home");
+    let config_dir = instance.path().join(".spice");
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind resume fixture");
+    let endpoint = format!(
+        "http://{}",
+        listener.local_addr().expect("resume fixture address")
+    );
+    let draft = publish_pending_draft(
+        &config_dir,
+        &endpoint,
+        runtime_cloud_connect::EnrollmentAuthorityBinding::Token {
+            expected_org: Some("acme".to_string()),
+        },
+    );
+
+    let csr = draft.csr_pem;
+    let server = std::thread::spawn(move || {
+        let ca = TestCa::new();
+        let (mut stream, _) = listener.accept().expect("accept resumed enrollment");
+        let request = read_request(&mut stream);
+        let identity_cert_pem = ca.sign_csr(csr.as_str());
+        write_response(
+            &mut stream,
+            200,
+            &serde_json::json!({
+                "kind": "standalone",
+                "instance_id": "inst_resumed_fixture",
+                "identity_cert_pem": identity_cert_pem,
+                "ca_bundle_pem": ca.cert_pem,
+                "gateway_addr": "127.0.0.1:443",
+                "not_after": NOT_AFTER_RFC3339,
+                "organization": {"id": 42, "name": "acme"},
+                "region": "lab-seoul",
+                "portal": {"new_project_url": "https://spice.ai/acme/new?instance=inst_resumed_fixture"},
+                "attachment": null,
+                "recovered": true
+            })
+            .to_string(),
+        );
+        request
+    });
+
+    // A stored default credential exists, and both the portal and the default
+    // API origin are dead: any identification probe fails visibly instead of
+    // being answered by the control-plane fixture.
+    let (success, output) = output_of(
+        connect_at(&instance, &home, &endpoint)
+            .env("SPICE_SPICEAI_TOKEN", LOGIN_TOKEN)
+            .env("SPICE_BASE_URL", closed_endpoint())
+            .env("SPICE_CLOUD_API_URL", closed_endpoint())
+            .arg("--token")
+            .arg("spice-enroll-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+    );
+    assert!(success, "resumed token enrollment failed: {output}");
+
+    let request = server.join().expect("resume fixture completed");
+    assert_eq!(
+        request.path, "/v1/cloud-connect/enroll",
+        "the first and only request must be the enrollment replay"
+    );
+    assert!(
+        !request.headers.contains_key("authorization"),
+        "a key operation must not present a login credential"
+    );
+    let identity =
+        runtime_cloud_connect::IdentityStore::load_optional(&config_dir.join("identity.json"))
+            .expect("load resumed identity")
+            .expect("the resumed enrollment is durable");
+    assert_eq!(identity.org_name.as_deref(), Some("acme"));
+}
+
+/// Split preview origins: the portal and the control plane are different hosts.
+/// A resumed login operation must reach only the control plane its draft names,
+/// so the organization comes from the binding rather than from a portal
+/// identification route or an organization listing.
+#[test]
+fn a_pending_login_draft_resumes_without_a_portal_or_discovery_request() {
+    let fixture = Fixture::start_expecting(4);
+    let instance = TempDir::new().expect("create instance directory");
+    let home = TempDir::new().expect("create isolated home");
+    let config_dir = instance.path().join(".spice");
+    let draft = publish_pending_draft(
+        &config_dir,
+        &fixture.endpoint,
+        runtime_cloud_connect::EnrollmentAuthorityBinding::AuthenticatedSession {
+            organization: "acme".to_string(),
+        },
+    );
+
+    // Only the default credential is stored — what an inline login leaves
+    // behind — and the portal origin is dead, so identifying it there would
+    // fail the run instead of quietly succeeding on one host.
+    let (success, output) = output_of(
+        connect_at(&instance, &home, &fixture.endpoint)
+            .env("SPICE_SPICEAI_TOKEN", LOGIN_TOKEN)
+            .env("SPICE_BASE_URL", closed_endpoint())
+            .env("SPICE_CLOUD_API_URL", closed_endpoint())
+            .arg("--project")
+            .arg(PROJECT_NAME),
+    );
+    assert!(success, "resumed login enrollment failed: {output}");
+
+    let state = fixture.finish();
+    let state = state.lock().expect("lock final fixture state");
+    let paths = state
+        .requests
+        .iter()
+        .map(|request| request.path.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        paths,
+        [
+            "/v1/cloud-connect/enroll",
+            "/v1/cloud-connect/enroll",
+            "/v1/cloud-connect/project",
+            "/v1/cloud-connect/project"
+        ],
+        "a resumed login operation reaches only the enrollment control plane"
+    );
+    assert!(
+        state
+            .enrollment_operations
+            .iter()
+            .all(|operation| *operation == draft.enrollment_operation_id),
+        "every attempt must carry the pending operation ID"
+    );
+
+    let identity =
+        runtime_cloud_connect::IdentityStore::load_optional(&config_dir.join("identity.json"))
+            .expect("load resumed identity")
+            .expect("the resumed enrollment is durable");
+    assert_eq!(identity.org_name.as_deref(), Some("acme"));
+    assert_eq!(identity.app_name.as_deref(), Some(PROJECT_NAME));
+}
+
+/// A fake `spiced` on `HOME`'s runtime path. It records the working directory
+/// and arguments it was launched with, reports a signal it was sent, and exits
+/// with `exit_code`, so a launch can be observed without a real runtime.
+#[cfg(unix)]
+fn install_fake_runtime(home: &TempDir, marker: &std::path::Path, exit_code: i32) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let bin = home.path().join(".spice").join("bin");
+    std::fs::create_dir_all(&bin).expect("create fake runtime directory");
+    let spiced = bin.join("spiced");
+    std::fs::write(
+        &spiced,
+        format!(
+            r#"#!/bin/sh
+marker="{marker}"
+trap 'printf "signal\n" >> "$marker"; exit 130' INT TERM
+printf "cwd=%s\n" "$PWD" >> "$marker"
+printf "args=%s\n" "$*" >> "$marker"
+printf "started\n" >> "$marker"
+if [ "{exit_code}" = "0" ]; then
+  # Stay alive long enough for a signal to be delivered, then finish on its own
+  # so a test that never signals still terminates.
+  i=0
+  while [ "$i" -lt 200 ]; do
+    sleep 0.05
+    i=$((i + 1))
+  done
+  exit 0
+fi
+exit {exit_code}
+"#,
+            marker = marker.display(),
+        ),
+    )
+    .expect("write fake runtime");
+    std::fs::set_permissions(&spiced, std::fs::Permissions::from_mode(0o755))
+        .expect("make the fake runtime executable");
+}
+
+#[cfg(unix)]
+fn marker_contents(marker: &std::path::Path) -> String {
+    std::fs::read_to_string(marker).unwrap_or_default()
+}
+
+#[cfg(unix)]
+fn wait_for_marker(marker: &std::path::Path, needle: &str) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < deadline {
+        if marker_contents(marker).contains(needle) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    panic!(
+        "the launched runtime never reported {needle:?}: {}",
+        marker_contents(marker)
+    );
+}
+
+#[cfg(unix)]
+fn connected_instance() -> (TempDir, TempDir) {
+    let instance = TempDir::new().expect("create instance directory");
+    let home = TempDir::new().expect("create isolated home");
+    runtime_cloud_connect::IdentityStore::store(
+        &instance.path().join(".spice").join("identity.json"),
+        &unattached_identity(),
+    )
+    .expect("store the enrolled identity");
+    (instance, home)
+}
+
+/// A connected directory re-run bare is a request to run it: an unattached
+/// identity still launches the runtime, because the control stream is how a
+/// project created in the portal reaches this instance at all.
+#[cfg(unix)]
+#[test]
+fn an_existing_identity_launches_the_runtime_for_its_instance_directory() {
+    let (instance, home) = connected_instance();
+    let marker_dir = TempDir::new().expect("create marker directory");
+    let marker = marker_dir.path().join("launch.log");
+    install_fake_runtime(&home, &marker, 7);
+
+    let (success, output) = output_of(
+        spice_cmd()
+            .env("HOME", home.path())
+            .env_remove("SPICE_CONFIG_DIR")
+            .env_remove("SPICE_CLOUD_ENDPOINT")
+            .env_remove("SPICE_SPICEAI_TOKEN")
+            .arg("connect")
+            .arg("--dir")
+            .arg(instance.path()),
+    );
+    assert!(
+        !success,
+        "the launched runtime's exit status is this command's own: {output}"
+    );
+    assert!(
+        !output.contains("Enrollment key") && !output.contains("Log in to Spice Cloud"),
+        "a connected directory must not ask to authenticate again: {output}"
+    );
+
+    let recorded = marker_contents(&marker);
+    let canonical = instance
+        .path()
+        .canonicalize()
+        .expect("canonical instance directory");
+    assert!(
+        recorded.contains(&format!("cwd={}", canonical.display())),
+        "the runtime must start in the instance directory: {recorded}"
+    );
+    assert!(
+        recorded.contains("--pods-watcher-enabled"),
+        "the runtime must start with the same arguments `spice run` uses: {recorded}"
+    );
+}
+
+/// `spice connect` on a connected directory and `spice run` in it are the same
+/// foreground launch: the same failing exit status, and an interrupt reaches the
+/// runtime rather than orphaning it.
+#[cfg(unix)]
+#[test]
+fn a_connected_launch_matches_spice_run_on_exit_status_and_interrupts() {
+    let mut exit_codes = Vec::new();
+    for connect in [true, false] {
+        let (instance, home) = connected_instance();
+        let marker_dir = TempDir::new().expect("create marker directory");
+        let marker = marker_dir.path().join("launch.log");
+        install_fake_runtime(&home, &marker, 0);
+
+        let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin!("spice"));
+        command
+            .current_dir(instance.path())
+            .env("HOME", home.path())
+            .env_remove("SPICE_CONFIG_DIR")
+            .env_remove("SPICE_CLOUD_ENDPOINT")
+            .env_remove("SPICE_SPICEAI_TOKEN");
+        if connect {
+            command.arg("connect").arg("--dir").arg(instance.path());
+        } else {
+            command.arg("run");
+        }
+        let mut child = command.spawn().expect("spawn spice");
+
+        wait_for_marker(&marker, "started");
+        nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(i32::try_from(child.id()).expect("child pid fits i32")),
+            nix::sys::signal::Signal::SIGINT,
+        )
+        .expect("interrupt the foreground launch");
+        let status = child.wait().expect("await spice exit");
+        wait_for_marker(&marker, "signal");
+        exit_codes.push(status.code());
+    }
+
+    assert_eq!(
+        exit_codes[0], exit_codes[1],
+        "an interrupted `spice connect` must exit the way an interrupted `spice run` does"
+    );
 }

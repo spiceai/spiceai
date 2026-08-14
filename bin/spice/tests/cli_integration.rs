@@ -1102,6 +1102,7 @@ mod connect {
             // signed certificate rather than this unsigned cache field.
             not_after_unix: Some(4_102_444_800),
             control_plane_endpoint: None,
+            new_project_url: None,
             enc_private_key_pem: material.enc_private_key_pem,
             enc_public_key_pem: material.enc_public_key_pem,
             enc_previous_private_key_pem: String::new(),

@@ -336,6 +336,7 @@ mod tests {
             app_name: None,
             monitor_url: None,
             control_plane_endpoint: None,
+            new_project_url: None,
             enc_private_key_pem: String::new(),
             enc_public_key_pem: String::new(),
             enc_previous_private_key_pem: String::new(),
@@ -487,6 +488,7 @@ mod tests {
             app_name: None,
             monitor_url: None,
             control_plane_endpoint: None,
+            new_project_url: None,
         };
         let public_key_pem = key_pair.public_key_pem();
         (identity, public_key_pem)

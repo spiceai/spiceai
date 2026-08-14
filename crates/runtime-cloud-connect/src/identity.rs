@@ -227,6 +227,23 @@ pub struct Identity {
     /// when deciding where to send credentials.
     #[serde(default)]
     pub control_plane_endpoint: Option<String>,
+    /// Cloud-constructed portal page that creates a project for this instance,
+    /// as the enroll response delivered it.
+    ///
+    /// Persisted because an unattached instance is the state that needs it most,
+    /// and the runtime must be able to say so on any later start — not only in
+    /// the process that enrolled. It is delivered rather than derived for the
+    /// same reason [`Identity::monitor_url`] is: the Cloud owns portal routes and
+    /// environment origins, and a portal host guessed from the enrollment API's
+    /// own host is wrong wherever the two differ.
+    ///
+    /// Instance-level, never credential material, and validated by
+    /// [`crate::config::safe_portal_url`] before it is stored — nothing reaches a
+    /// log or a browser that the control plane did not send as a safe absolute
+    /// URL. Defaulted so identity files written before this field existed still
+    /// load; `None` there means no link can be offered, and none is invented.
+    #[serde(default)]
+    pub new_project_url: Option<String>,
 }
 
 /// The control plane's app attachment state for this instance, as one tuple:
@@ -284,6 +301,7 @@ impl std::fmt::Debug for Identity {
             .field("app_name", &self.app_name)
             .field("monitor_url", &self.monitor_url)
             .field("control_plane_endpoint", &self.control_plane_endpoint)
+            .field("new_project_url", &self.new_project_url)
             .finish()
     }
 }
@@ -1377,6 +1395,10 @@ impl IdentityStore {
         merged.org_name = current.org_name;
         merged.app_name = current.app_name;
         merged.monitor_url = current.monitor_url;
+        // Instance-level, like the organization: only an enrollment records it,
+        // so a renewal clone that predates the link must not drop it, and a
+        // freshly recorded one must survive a disk copy that has none.
+        merged.new_project_url = current.new_project_url.or(merged.new_project_url);
         // A durable binding already on disk wins over a stale renewal clone.
         // A legacy identity has no binding, so retain the endpoint the renewal
         // just proved by succeeding and promote it atomically with the rotated
@@ -1946,6 +1968,7 @@ mod tests {
             app_name: None,
             monitor_url: None,
             control_plane_endpoint: None,
+            new_project_url: None,
             enc_private_key_pem: encryption_keypair.to_pkcs8_pem().to_string(),
             enc_public_key_pem: encryption_keypair.public_key_spki_pem(),
             enc_previous_private_key_pem: String::new(),
@@ -2372,6 +2395,50 @@ mod tests {
         );
     }
 
+    /// An identity written before the create-project link existed must still
+    /// load, reporting no link rather than failing or inventing one; a stored
+    /// link round-trips.
+    #[test]
+    fn an_identity_without_a_create_project_link_still_loads() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join("identity.json");
+        let identity = sample_identity();
+        IdentityStore::store(&path, &identity).expect("store");
+
+        let mut document: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).expect("read identity"))
+                .expect("identity JSON");
+        document
+            .as_object_mut()
+            .expect("identity document is an object")
+            .remove("new_project_url");
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&document).expect("serialize identity"),
+        )
+        .expect("write legacy identity");
+
+        let legacy = IdentityStore::load_optional(&path)
+            .expect("a legacy identity remains loadable")
+            .expect("present");
+        assert_eq!(legacy.new_project_url, None);
+        assert_eq!(legacy.identifier, identity.identifier);
+
+        let linked = Identity {
+            new_project_url: Some("https://spice.ai/acme/new?instance=inst_1".to_string()),
+            ..identity
+        };
+        IdentityStore::store(&path, &linked).expect("store the linked identity");
+        assert_eq!(
+            IdentityStore::load_optional(&path)
+                .expect("load")
+                .expect("present")
+                .new_project_url
+                .as_deref(),
+            Some("https://spice.ai/acme/new?instance=inst_1")
+        );
+    }
+
     #[test]
     fn set_attachment_persists_the_full_tuple_and_preserves_the_credential() {
         let dir = tempfile::tempdir().expect("create tempdir");
@@ -2556,6 +2623,35 @@ mod tests {
         assert_eq!(loaded.org_name.as_deref(), Some("acme"));
         assert_eq!(loaded.identity_cert_pem, identity.identity_cert_pem);
         assert_eq!(loaded.private_key_pem, identity.private_key_pem);
+    }
+
+    /// The create-project link is instance-level, like the organization: an
+    /// instance that becomes unattached needs it most, so attaching and
+    /// detaching must both leave it alone.
+    #[test]
+    fn the_create_project_link_survives_attach_and_detach() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join("identity.json");
+        let linked = Identity {
+            new_project_url: Some("https://spice.ai/acme/new?instance=inst_1".to_string()),
+            ..sample_identity()
+        };
+        IdentityStore::store(&path, &linked).expect("store");
+
+        for attachment in [Some(sample_attachment()), None] {
+            IdentityStore::set_attachment(&path, attachment.as_ref())
+                .expect("update the attachment")
+                .expect("the identity still exists");
+            assert_eq!(
+                IdentityStore::load_optional(&path)
+                    .expect("load")
+                    .expect("present")
+                    .new_project_url
+                    .as_deref(),
+                Some("https://spice.ai/acme/new?instance=inst_1"),
+                "an attachment change must not disturb the instance's create-project link"
+            );
+        }
     }
 
     /// The attachment arrives over an established stream, which requires an

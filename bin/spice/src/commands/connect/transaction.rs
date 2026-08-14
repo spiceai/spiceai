@@ -23,7 +23,6 @@ use std::time::{Duration, Instant};
 
 use dialoguer::theme::ColorfulTheme;
 use dialoguer::{Confirm, Input, Password, Select};
-use runtime_cloud_connect::config::is_loopback_host;
 use runtime_cloud_connect::enroll::{
     EnrollNowOutcome, EnrollmentAuthority, InstanceFacts, RetryPolicy, SessionToken,
 };
@@ -74,6 +73,7 @@ enum EndpointSource {
     CompiledDefault,
 }
 
+#[derive(Debug)]
 struct TransactionEndpoint {
     value: String,
     source: EndpointSource,
@@ -285,7 +285,7 @@ pub(super) async fn execute(ctx: &RuntimeContext, request: ConnectRequest) -> Re
 
 async fn execute_with<P: Prompter>(
     ctx: &RuntimeContext,
-    request: ConnectRequest,
+    mut request: ConnectRequest,
     prompter: &mut P,
 ) -> Result<()> {
     let telemetry = FlowTelemetry::new();
@@ -294,10 +294,16 @@ async fn execute_with<P: Prompter>(
     let directory = canonical_instance_directory(request.dir.as_deref()).await?;
     let config_dir = CloudConnectConfig::resolve_config_dir(Some(&directory));
     let identity_path = config_dir.join(runtime_cloud_connect::config::IDENTITY_FILE);
+    // A pending draft names the authority its operation already committed to,
+    // so it decides what a resumed run needs — and says so in terms of that
+    // operation. This guard stays a cheap pre-lock probe and defers to
+    // [`resumable_authority`] once the draft can be read under the lock.
+    let draft_pending = runtime_cloud_connect::EnrollmentDraft::path_in(&config_dir).exists();
     if !prompter.interactive()
         && request.token.is_none()
         && (request.org.is_none() || request.project.is_none())
         && !identity_path.exists()
+        && !draft_pending
     {
         return Err(invalid_usage(
             "non-interactive Cloud Connect requires either a login with --org <org> --project <name>, or --token <enrollment-key>.",
@@ -328,6 +334,7 @@ async fn execute_with<P: Prompter>(
             &request,
             prompter,
             ExistingIdentityContext {
+                ctx,
                 config_dir: &config_dir,
                 directory: &directory,
                 identity_path: &identity_path,
@@ -342,29 +349,67 @@ async fn execute_with<P: Prompter>(
         .await;
     }
 
-    if let Some(key) = request.token {
-        telemetry.auth("token");
-        telemetry.stage("enrollment");
-        let enrolled = enroll(
-            ctx,
-            &config_dir,
-            &directory,
-            &resolved_endpoint,
-            request.region,
-            request.org.clone().unwrap_or_default(),
-            EnrollmentAuthority::Token {
-                key,
-                expected_org: request.org,
-            },
-        )
-        .await?;
-        print_enrollment_result(&enrolled);
-        telemetry.complete(if enrolled.identity.app_id.is_some() {
-            "already_attached"
-        } else {
-            "unattached"
-        });
-        return Ok(());
+    // The pending draft, if any, decides the authority: the cloud may already
+    // hold its operation, so only the mode that published it can replay the
+    // operation ID and key material instead of creating a sibling instance.
+    let resumable = draft
+        .as_ref()
+        .map(|draft| resumable_authority(draft, &request, prompter.interactive()))
+        .transpose()?;
+    let token = request.token.take();
+
+    let key_enrollment = |expected_org: Option<String>| KeyEnrollment {
+        ctx,
+        config_dir: &config_dir,
+        directory: &directory,
+        endpoint: &resolved_endpoint,
+        region: request.region.clone(),
+        expected_org,
+    };
+
+    match resumable {
+        Some(ResumableAuthority::EnrollmentKey { expected_org }) => {
+            // The enrollment key is bearer material that is deliberately never
+            // persisted, so resuming asks for a current one — and only for
+            // that. Offering the authentication chooser here would offer an
+            // authority this operation cannot be finished under.
+            telemetry.auth("token");
+            let key = if let Some(key) = token {
+                key
+            } else {
+                println!(
+                    "Resuming the pending enrollment for this directory. Enrollment keys are never stored, so this needs a current one."
+                );
+                let Some(raw) = prompter.read_enrollment_key(&connect_portal_url()).await? else {
+                    telemetry.complete("cancelled");
+                    return Ok(());
+                };
+                EnrollmentKey::parse(&raw).map_err(|source| Error::InvalidUsage {
+                    message: source.to_string(),
+                })?
+            };
+            return enroll_with_key(key_enrollment(expected_org), key, &telemetry).await;
+        }
+        Some(ResumableAuthority::Login { organization }) => {
+            return resume_pending_login(
+                PendingLogin {
+                    ctx,
+                    config_dir: &config_dir,
+                    directory: &directory,
+                    endpoint: &resolved_endpoint,
+                    organization,
+                },
+                &request,
+                prompter,
+                &telemetry,
+            )
+            .await;
+        }
+        None => {}
+    }
+
+    if let Some(key) = token {
+        return enroll_with_key(key_enrollment(request.org.clone()), key, &telemetry).await;
     }
 
     if !prompter.interactive() && (request.org.is_none() || request.project.is_none()) {
@@ -413,27 +458,7 @@ async fn execute_with<P: Prompter>(
                 let key = EnrollmentKey::parse(&raw).map_err(|source| Error::InvalidUsage {
                     message: source.to_string(),
                 })?;
-                telemetry.stage("enrollment");
-                let enrolled = enroll(
-                    ctx,
-                    &config_dir,
-                    &directory,
-                    &resolved_endpoint,
-                    request.region,
-                    request.org.clone().unwrap_or_default(),
-                    EnrollmentAuthority::Token {
-                        key,
-                        expected_org: request.org,
-                    },
-                )
-                .await?;
-                print_enrollment_result(&enrolled);
-                telemetry.complete(if enrolled.identity.app_id.is_some() {
-                    "already_attached"
-                } else {
-                    "unattached"
-                });
-                return Ok(());
+                return enroll_with_key(key_enrollment(request.org.clone()), key, &telemetry).await;
             }
             None => {
                 telemetry.complete("cancelled");
@@ -479,42 +504,198 @@ async fn execute_with<P: Prompter>(
             let key = EnrollmentKey::parse(&raw).map_err(|source| Error::InvalidUsage {
                 message: source.to_string(),
             })?;
-            telemetry.stage("enrollment");
-            let enrolled = enroll(
-                ctx,
-                &config_dir,
-                &directory,
-                &resolved_endpoint,
-                request.region,
-                request.org.clone().unwrap_or_default(),
-                EnrollmentAuthority::Token {
-                    key,
-                    expected_org: request.org,
-                },
-            )
-            .await?;
-            print_enrollment_result(&enrolled);
-            telemetry.complete(if enrolled.identity.app_id.is_some() {
-                "already_attached"
-            } else {
-                "unattached"
-            });
-            return Ok(());
+            return enroll_with_key(key_enrollment(request.org.clone()), key, &telemetry).await;
         }
         Err(error) => return Err(error),
     };
 
+    enroll_with_login(
+        LoginEnrollment {
+            ctx,
+            config_dir: &config_dir,
+            directory: &directory,
+            endpoint: &resolved_endpoint,
+            organization: selected.name,
+            login,
+        },
+        &request,
+        prompter,
+        &telemetry,
+    )
+    .await
+}
+
+/// The authority a pending enrollment draft already committed to, reconciled
+/// with this invocation's explicit inputs.
+#[derive(Debug, PartialEq, Eq)]
+enum ResumableAuthority {
+    /// An enrollment-key operation. The key itself is bearer material that is
+    /// never persisted, so a resume supplies a current one; the operation ID,
+    /// key material, and organization assertion come from the draft.
+    EnrollmentKey { expected_org: Option<String> },
+    /// A login-session operation, bound to one organization for its lifetime.
+    Login { organization: String },
+}
+
+/// Decide what can finish the pending operation `draft` describes.
+///
+/// The draft is authoritative. Spice Cloud may already hold its operation under
+/// the persisted ID, so the authority that published it is the only one that
+/// can replay it — which is why a resume never asks the operator to choose an
+/// authentication mode again. Explicit inputs that would move the operation to
+/// another authority, or that cannot finish it at all, fail here: before any
+/// prompt, credential, or request, with the draft left on disk so the command
+/// the error names can still replay it exactly.
+fn resumable_authority(
+    draft: &runtime_cloud_connect::EnrollmentDraft,
+    request: &ConnectRequest,
+    interactive: bool,
+) -> Result<ResumableAuthority> {
+    match &draft.binding.authority {
+        runtime_cloud_connect::EnrollmentAuthorityBinding::Token { expected_org } => {
+            if let Some(requested) = request.org.as_deref()
+                && !expected_org
+                    .as_deref()
+                    .is_some_and(|pending| pending.eq_ignore_ascii_case(requested))
+            {
+                return Err(pending_operation_conflict(
+                    &format!(
+                        "asserts organization {}",
+                        expected_org.as_deref().unwrap_or("(none)")
+                    ),
+                    &format!("--org {requested}"),
+                    "re-run without --org, or with the organization the pending operation asserts",
+                ));
+            }
+            if request.project.is_some() {
+                return Err(pending_operation_conflict(
+                    "was authorized by an enrollment key, which cannot create a project",
+                    "--project",
+                    "re-run without --project; attach a project from the Spice Cloud portal, or after the pending enrollment finishes",
+                ));
+            }
+            if !interactive && request.token.is_none() {
+                return Err(invalid_usage(
+                    "this directory has a pending enrollment that was authorized by an enrollment key. Enrollment keys are never stored, so finishing it non-interactively requires --token <enrollment-key>.",
+                ));
+            }
+            Ok(ResumableAuthority::EnrollmentKey {
+                expected_org: expected_org.clone(),
+            })
+        }
+        runtime_cloud_connect::EnrollmentAuthorityBinding::AuthenticatedSession {
+            organization,
+        } => {
+            if request.token.is_some() {
+                return Err(pending_operation_conflict(
+                    &format!("was authorized by a login to organization {organization}"),
+                    "--token",
+                    &format!(
+                        "finish it with `spice connect --org {organization}`, or run `spice connect remove --yes` to abandon it explicitly"
+                    ),
+                ));
+            }
+            if let Some(requested) = request.org.as_deref()
+                && !requested.eq_ignore_ascii_case(organization)
+            {
+                return Err(pending_operation_conflict(
+                    &format!("is bound to organization {organization}"),
+                    &format!("--org {requested}"),
+                    &format!(
+                        "finish it with `spice connect --org {organization}`, or run `spice connect remove --yes` to abandon it explicitly"
+                    ),
+                ));
+            }
+            if !interactive && request.project.is_none() {
+                return Err(invalid_usage(format!(
+                    "this directory has a pending enrollment for organization {organization}. Finishing it non-interactively requires --project <name>."
+                )));
+            }
+            Ok(ResumableAuthority::Login {
+                organization: organization.clone(),
+            })
+        }
+    }
+}
+
+/// One message shape for every way an explicit input contradicts the pending
+/// operation: what the operation is, what contradicts it, and what to do —
+/// never a silent switch to the requested authority, and never a discarded
+/// draft.
+fn pending_operation_conflict(pending: &str, requested: &str, remedy: &str) -> Error {
+    invalid_usage(format!(
+        "this directory has a pending enrollment that {pending}, so {requested} cannot be applied to it. The exact-replay state was preserved: {remedy}."
+    ))
+}
+
+/// Everything an enrollment-key attempt needs beyond the key itself.
+struct KeyEnrollment<'a> {
+    ctx: &'a RuntimeContext,
+    config_dir: &'a Path,
+    directory: &'a Path,
+    endpoint: &'a TransactionEndpoint,
+    region: Option<String>,
+    /// The organization this attempt asserts the key belongs to, checked
+    /// against the enrollment response. `None` asserts nothing.
+    expected_org: Option<String>,
+}
+
+/// Enroll with an enrollment key and report the outcome.
+async fn enroll_with_key(
+    context: KeyEnrollment<'_>,
+    key: EnrollmentKey,
+    telemetry: &FlowTelemetry,
+) -> Result<()> {
+    telemetry.auth("token");
+    telemetry.stage("enrollment");
+    let expected_org = context.expected_org;
+    let enrolled = enroll(
+        context.ctx,
+        context.config_dir,
+        context.directory,
+        context.endpoint,
+        context.region,
+        expected_org.clone().unwrap_or_default(),
+        EnrollmentAuthority::Token { key, expected_org },
+    )
+    .await?;
+    print_enrollment_result(&enrolled);
+    telemetry.complete(if enrolled.identity.app_id.is_some() {
+        "already_attached"
+    } else {
+        "unattached"
+    });
+    Ok(())
+}
+
+/// A login-authorized enrollment and the project assignment that follows it.
+struct LoginEnrollment<'a> {
+    ctx: &'a RuntimeContext,
+    config_dir: &'a Path,
+    directory: &'a Path,
+    endpoint: &'a TransactionEndpoint,
+    organization: String,
+    login: LoginCredential,
+}
+
+/// Enroll under a login session, then attach a project when one is named.
+async fn enroll_with_login<P: Prompter>(
+    context: LoginEnrollment<'_>,
+    request: &ConnectRequest,
+    prompter: &mut P,
+    telemetry: &FlowTelemetry,
+) -> Result<()> {
     telemetry.stage("enrollment");
     let enrolled = enroll(
-        ctx,
-        &config_dir,
-        &directory,
-        &resolved_endpoint,
-        request.region,
-        selected.name.clone(),
+        context.ctx,
+        context.config_dir,
+        context.directory,
+        context.endpoint,
+        request.region.clone(),
+        context.organization.clone(),
         EnrollmentAuthority::AuthenticatedSession {
-            access_token: login.token.clone(),
-            org: selected.name.clone(),
+            access_token: context.login.token.clone(),
+            org: context.organization.clone(),
         },
     )
     .await?;
@@ -527,7 +708,8 @@ async fn execute_with<P: Prompter>(
 
     telemetry.stage("project_assignment");
     let project =
-        project_name_after_enrollment(request.project.as_deref(), &directory, prompter).await?;
+        project_name_after_enrollment(request.project.as_deref(), context.directory, prompter)
+            .await?;
     let Some(project) = project else {
         print_unattached(&enrolled.identity, enrolled.recovery_url.as_deref());
         telemetry.complete("unattached");
@@ -535,11 +717,11 @@ async fn execute_with<P: Prompter>(
     };
     let assignment = assign_project(
         ProjectAssignmentContext {
-            endpoint: &endpoint,
-            config_dir: &config_dir,
-            directory: &directory,
-            token: &login.token,
-            organization: &selected.name,
+            endpoint: &context.endpoint.value,
+            config_dir: context.config_dir,
+            directory: context.directory,
+            token: &context.login.token,
+            organization: &context.organization,
             identity: &enrolled.identity,
             recovery_url: enrolled.recovery_url.as_deref(),
         },
@@ -554,7 +736,99 @@ async fn execute_with<P: Prompter>(
     Ok(())
 }
 
+/// The pending login-mode operation this directory must finish.
+struct PendingLogin<'a> {
+    ctx: &'a RuntimeContext,
+    config_dir: &'a Path,
+    directory: &'a Path,
+    endpoint: &'a TransactionEndpoint,
+    organization: String,
+}
+
+/// The credential a resumed login operation presents.
+///
+/// The organization-bound credential is preferred; a default credential is used
+/// as it is, without asking the control plane which organization it belongs to.
+/// That identification is the `/api/spice-cli/auth` route, which a split-origin
+/// deployment serves from the portal rather than the control plane — requesting
+/// it against the pending operation's enrollment endpoint answers 404 there and
+/// is not needed anywhere: the enroll request names the bound organization, so
+/// Spice Cloud refuses a credential that is not entitled to it, and the
+/// response organization is checked against the binding before any identity is
+/// promoted. A wrong-organization credential therefore fails closed rather than
+/// enrolling somewhere the operator did not ask for.
+fn stored_resume_credential(organization: &str) -> Option<LoginCredential> {
+    cloud_org::token_for_org(organization)
+        .or_else(cloud_org::default_token)
+        .map(|token| LoginCredential {
+            token: SessionToken::new(token),
+            // Which organization a default credential belongs to is exactly
+            // what this path declines to ask, so it is not claimed here.
+            credential_org: None,
+        })
+}
+
+/// Finish a pending login-mode operation under the organization it is bound to.
+///
+/// The authentication chooser is deliberately absent: an enrollment key would
+/// publish a different authority than the operation Spice Cloud may already
+/// hold. Organization discovery is equally absent — the binding already chose
+/// the organization, so there is nothing to resolve and no way for a listing to
+/// retarget the pending operation. Spice Cloud re-validates the owner/admin role
+/// before the enrollment commits, as it does for the run that published the
+/// draft.
+async fn resume_pending_login<P: Prompter>(
+    context: PendingLogin<'_>,
+    request: &ConnectRequest,
+    prompter: &mut P,
+    telemetry: &FlowTelemetry,
+) -> Result<()> {
+    let endpoint = context.endpoint.value.as_str();
+    if !context.endpoint.permits_stored_credentials() {
+        return Err(legacy_endpoint_requires_explicit_authority(endpoint));
+    }
+    // Nothing else would explain the absent chooser or where this run is going.
+    println!(
+        "Resuming the pending enrollment for organization {}.",
+        context.organization
+    );
+    telemetry.stage("authentication");
+    let login = match stored_resume_credential(&context.organization) {
+        Some(login) => login,
+        None if !prompter.interactive() => {
+            return Err(org_credential_missing(&context.organization));
+        }
+        None => match login_inline(CredentialStore::EnvFile).await? {
+            LoginContinuation::Authenticated(session) => LoginCredential {
+                token: SessionToken::new(session.access_token().to_string()),
+                credential_org: Some(session.org_name().to_string()),
+            },
+            LoginContinuation::Cancelled => {
+                telemetry.complete("cancelled");
+                return Ok(());
+            }
+        },
+    };
+    telemetry.auth("login");
+
+    enroll_with_login(
+        LoginEnrollment {
+            ctx: context.ctx,
+            config_dir: context.config_dir,
+            directory: context.directory,
+            endpoint: context.endpoint,
+            organization: context.organization,
+            login,
+        },
+        request,
+        prompter,
+        telemetry,
+    )
+    .await
+}
+
 struct ExistingIdentityContext<'a> {
+    ctx: &'a RuntimeContext,
     config_dir: &'a Path,
     directory: &'a Path,
     identity_path: &'a Path,
@@ -572,6 +846,7 @@ async fn existing_identity_flow<P: Prompter>(
     telemetry: &FlowTelemetry,
 ) -> Result<()> {
     let ExistingIdentityContext {
+        ctx,
         config_dir,
         directory,
         identity_path,
@@ -581,6 +856,22 @@ async fn existing_identity_flow<P: Prompter>(
         identity,
         pending_project,
     } = context;
+
+    // This directory is already connected, so a bare re-run is a request to run
+    // it: start the runtime on this terminal exactly as `spice run` would. That
+    // is what makes the instance reachable — including while it is unattached,
+    // where the control stream is how a project created in the portal arrives at
+    // all. Only an explicit project-management input, or a project mutation
+    // still in flight, keeps this a state-management command.
+    if request.org.is_none() && request.project.is_none() && pending_project.is_none() {
+        if persist_endpoint_file {
+            persist_endpoint(config_dir, endpoint).await?;
+        }
+        telemetry.stage("runtime_launch");
+        telemetry.complete("runtime");
+        return crate::commands::run::execute_for_instance(ctx, directory).await;
+    }
+
     if identity.app_id.is_some() {
         if let Some(asserted) = request.org.as_deref() {
             let stored = identity.org_name.as_deref().ok_or_else(|| {
@@ -657,7 +948,7 @@ async fn existing_identity_flow<P: Prompter>(
         .or(request.project.as_deref());
     if !prompter.interactive() {
         if explicit_project.is_none() {
-            print_unattached(&identity, None);
+            print_unattached(&identity, identity.new_project_url.as_deref());
             telemetry.complete("unattached");
             return Ok(());
         }
@@ -684,7 +975,7 @@ async fn existing_identity_flow<P: Prompter>(
                 credential_org: Some(session.org_name().to_string()),
             }),
             LoginContinuation::Cancelled => {
-                print_unattached(&identity, None);
+                print_unattached(&identity, identity.new_project_url.as_deref());
                 telemetry.complete("cancelled");
                 return Ok(());
             }
@@ -703,7 +994,7 @@ async fn existing_identity_flow<P: Prompter>(
     if explicit_project.is_none() {
         let confirmed = prompter.confirm_project_assignment().await?;
         if confirmed != Some(true) {
-            print_unattached(&identity, None);
+            print_unattached(&identity, identity.new_project_url.as_deref());
             telemetry.complete(if confirmed.is_none() {
                 "cancelled"
             } else {
@@ -721,7 +1012,7 @@ async fn existing_identity_flow<P: Prompter>(
     )
     .await?;
     let Some(project) = project else {
-        print_unattached(&identity, None);
+        print_unattached(&identity, identity.new_project_url.as_deref());
         telemetry.complete("cancelled");
         return Ok(());
     };
@@ -1362,16 +1653,10 @@ fn print_enrollment_result(enrolled: &EnrollmentResult) {
     }
 }
 
+/// One rule decides which Cloud-provided link may be printed or opened, and it
+/// lives with the identity that persists them.
 fn safe_recovery_url(candidate: &str) -> Option<String> {
-    let parsed = reqwest::Url::parse(candidate).ok()?;
-    if !parsed.username().is_empty() || parsed.password().is_some() {
-        return None;
-    }
-    let local_http = parsed.scheme() == "http" && parsed.host_str().is_some_and(is_loopback_host);
-    if parsed.scheme() != "https" && !local_http {
-        return None;
-    }
-    Some(parsed.to_string())
+    runtime_cloud_connect::config::safe_portal_url(candidate)
 }
 
 fn preflight_request(request: &ConnectRequest) -> Result<()> {
@@ -1443,6 +1728,10 @@ fn ambiguous_project_error(source: &super::project::Error) -> Error {
 
 #[cfg(test)]
 mod tests {
+    use runtime_cloud_connect::{
+        EnrollmentAuthorityBinding, EnrollmentDraft, EnrollmentRequestBinding,
+    };
+
     use super::*;
 
     struct ScriptedPrompter {
@@ -1609,6 +1898,339 @@ mod tests {
         assert_eq!(resolved.source, EndpointSource::LegacyFile);
         assert!(!resolved.persist_file());
         assert!(!resolved.permits_stored_credentials());
+    }
+
+    /// A prompter that answers only the enrollment-key prompt and fails the
+    /// test if the authentication chooser — or anything past enrollment — is
+    /// ever reached. Offering a mode the pending operation cannot be finished
+    /// under is the regression this guards.
+    struct ResumePrompter {
+        interactive: bool,
+        key: Option<String>,
+        key_prompts: usize,
+    }
+
+    impl Prompter for ResumePrompter {
+        fn interactive(&self) -> bool {
+            self.interactive
+        }
+
+        async fn choose_auth(&mut self) -> Result<Option<AuthChoice>> {
+            panic!("a pending draft must resume its own authority without a chooser");
+        }
+
+        async fn read_enrollment_key(&mut self, _portal_url: &str) -> Result<Option<String>> {
+            self.key_prompts += 1;
+            Ok(self.key.take())
+        }
+
+        async fn confirm_project_assignment(&mut self) -> Result<Option<bool>> {
+            panic!("a resumed enrollment-key operation never assigns a project");
+        }
+
+        async fn project_name(&mut self, _suggestion: &str) -> Result<Option<String>> {
+            panic!("a resumed enrollment-key operation never assigns a project");
+        }
+    }
+
+    fn connect_request() -> ConnectRequest {
+        ConnectRequest {
+            org: None,
+            project: None,
+            token: None,
+            region: None,
+            dir: None,
+            endpoint: None,
+        }
+    }
+
+    fn pending_draft(config_dir: &Path, authority: EnrollmentAuthorityBinding) -> EnrollmentDraft {
+        EnrollmentDraft::load_or_create(
+            config_dir,
+            &InstanceFacts::gather("v0.0.0-resume-test"),
+            Some("lab-seoul"),
+            &EnrollmentRequestBinding {
+                endpoint: "https://api.spice.ai".to_string(),
+                authority,
+            },
+        )
+        .expect("publish a pending enrollment draft")
+    }
+
+    fn token_draft(config_dir: &Path, expected_org: Option<&str>) -> EnrollmentDraft {
+        pending_draft(
+            config_dir,
+            EnrollmentAuthorityBinding::Token {
+                expected_org: expected_org.map(str::to_string),
+            },
+        )
+    }
+
+    fn login_draft(config_dir: &Path, organization: &str) -> EnrollmentDraft {
+        pending_draft(
+            config_dir,
+            EnrollmentAuthorityBinding::AuthenticatedSession {
+                organization: organization.to_string(),
+            },
+        )
+    }
+
+    /// A loopback address nothing listens on: an enrollment attempt against it
+    /// fails without reaching a control plane.
+    fn closed_endpoint() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve a loopback port");
+        let address = listener.local_addr().expect("reserved port");
+        drop(listener);
+        format!("http://{address}")
+    }
+
+    /// A pending enrollment-key operation resumes token mode: the key prompt is
+    /// the only question, the chooser is never opened, and the persisted
+    /// organization assertion rides the replay even though no flag named it.
+    #[test]
+    fn a_token_draft_resumes_the_key_path_under_its_persisted_assertion() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let draft = token_draft(dir.path(), Some("acme"));
+
+        for requested in [None, Some("ACME")] {
+            let request = ConnectRequest {
+                org: requested.map(str::to_string),
+                ..connect_request()
+            };
+            let resumed = resumable_authority(&draft, &request, true).expect("resume token mode");
+            assert_eq!(
+                resumed,
+                ResumableAuthority::EnrollmentKey {
+                    expected_org: Some("acme".to_string())
+                },
+                "the draft's own assertion is what a resume replays"
+            );
+        }
+    }
+
+    /// An explicit input that would move the pending operation to another
+    /// organization, or ask an enrollment key to create a project, fails before
+    /// anything is prompted for or sent — and says what finishes it instead.
+    #[test]
+    fn a_token_draft_rejects_inputs_it_cannot_replay() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let draft = token_draft(dir.path(), Some("acme"));
+
+        let another_org = resumable_authority(
+            &draft,
+            &ConnectRequest {
+                org: Some("globex".to_string()),
+                ..connect_request()
+            },
+            true,
+        )
+        .expect_err("another organization must not be applied to the pending operation");
+        assert!(
+            another_org.to_string().contains("acme")
+                && another_org.to_string().contains("--org globex"),
+            "{another_org}"
+        );
+
+        let with_project = resumable_authority(
+            &draft,
+            &ConnectRequest {
+                project: Some("retail".to_string()),
+                ..connect_request()
+            },
+            true,
+        )
+        .expect_err("an enrollment-key operation cannot create a project");
+        assert!(
+            with_project.to_string().contains("--project"),
+            "{with_project}"
+        );
+
+        let headless = resumable_authority(&draft, &connect_request(), false)
+            .expect_err("a key cannot be prompted for without a terminal");
+        assert!(
+            headless.to_string().contains("--token <enrollment-key>"),
+            "{headless}"
+        );
+
+        // The unasserted case still resumes token mode rather than the chooser.
+        let unasserted = token_draft(tempfile::tempdir().expect("create tempdir").path(), None);
+        assert_eq!(
+            resumable_authority(&unasserted, &connect_request(), true).expect("resume token mode"),
+            ResumableAuthority::EnrollmentKey { expected_org: None }
+        );
+    }
+
+    /// A pending login operation resumes login mode for the organization its
+    /// binding names, with or without a matching `--org`.
+    #[test]
+    fn a_login_draft_resumes_the_organization_it_is_bound_to() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let draft = login_draft(dir.path(), "acme");
+
+        for requested in [None, Some("acme"), Some("ACME")] {
+            let request = ConnectRequest {
+                org: requested.map(str::to_string),
+                project: Some("retail".to_string()),
+                ..connect_request()
+            };
+            assert_eq!(
+                resumable_authority(&draft, &request, true).expect("resume login mode"),
+                ResumableAuthority::Login {
+                    organization: "acme".to_string()
+                }
+            );
+        }
+    }
+
+    /// A login-mode operation cannot be finished with an enrollment key or
+    /// under another organization: both fail closed, naming the command that
+    /// finishes it and the one that abandons it explicitly.
+    #[test]
+    fn a_login_draft_rejects_a_key_or_another_organization() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let draft = login_draft(dir.path(), "acme");
+
+        let with_key = resumable_authority(
+            &draft,
+            &ConnectRequest {
+                token: Some(
+                    EnrollmentKey::parse("spice-enroll-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+                        .expect("fixture enrollment key"),
+                ),
+                project: Some("retail".to_string()),
+                ..connect_request()
+            },
+            true,
+        )
+        .expect_err("a key must not replace the pending login authority");
+        let rendered = with_key.to_string();
+        assert!(
+            rendered.contains("--token")
+                && rendered.contains("spice connect --org acme")
+                && rendered.contains("spice connect remove --yes"),
+            "{rendered}"
+        );
+
+        let another_org = resumable_authority(
+            &draft,
+            &ConnectRequest {
+                org: Some("globex".to_string()),
+                project: Some("retail".to_string()),
+                ..connect_request()
+            },
+            true,
+        )
+        .expect_err("another organization must not redirect the pending operation");
+        assert!(
+            another_org
+                .to_string()
+                .contains("bound to organization acme"),
+            "{another_org}"
+        );
+
+        let headless = resumable_authority(
+            &draft,
+            &ConnectRequest {
+                org: Some("acme".to_string()),
+                ..connect_request()
+            },
+            false,
+        )
+        .expect_err("a project name cannot be prompted for without a terminal");
+        assert!(
+            headless.to_string().contains("--project <name>"),
+            "{headless}"
+        );
+    }
+
+    /// The pending draft binds the control plane: it is used when no flag names
+    /// one, and a flag naming another is refused rather than replayed there.
+    #[test]
+    fn a_pending_draft_binds_the_control_plane() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let draft = token_draft(dir.path(), Some("acme"));
+
+        let bound =
+            resolve_transaction_endpoint_with_env(dir.path(), None, None, None, Some(&draft))
+                .expect("the draft binds the endpoint");
+        assert_eq!(bound.value, "https://api.spice.ai");
+        assert_eq!(bound.source, EndpointSource::Bound);
+
+        resolve_transaction_endpoint_with_env(
+            dir.path(),
+            Some("https://other.example"),
+            None,
+            None,
+            Some(&draft),
+        )
+        .expect_err("a pending operation must not be replayed to another control plane");
+    }
+
+    /// The end-to-end resume: a plain interactive `spice connect` over a pending
+    /// enrollment-key draft asks for a key exactly once, never opens the
+    /// chooser, and leaves the retry-safe state intact when the control plane
+    /// cannot be reached.
+    #[tokio::test(start_paused = true)]
+    async fn a_pending_token_draft_resumes_without_the_chooser() {
+        let instance = tempfile::tempdir().expect("create instance directory");
+        let directory = instance.path().canonicalize().expect("canonical tempdir");
+        let config_dir = CloudConnectConfig::resolve_config_dir(Some(&directory));
+        let endpoint = closed_endpoint();
+        let published = EnrollmentDraft::load_or_create(
+            &config_dir,
+            &InstanceFacts::gather("v0.0.0-resume-test"),
+            Some("lab-seoul"),
+            &EnrollmentRequestBinding {
+                endpoint: endpoint.clone(),
+                authority: EnrollmentAuthorityBinding::Token {
+                    expected_org: Some("acme".to_string()),
+                },
+            },
+        )
+        .expect("publish a pending enrollment draft");
+
+        let mut prompter = ResumePrompter {
+            interactive: true,
+            key: Some("spice-enroll-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string()),
+            key_prompts: 0,
+        };
+        let error = execute_with(
+            &RuntimeContext::new().expect("runtime context"),
+            ConnectRequest {
+                dir: Some(directory.clone()),
+                // Named explicitly so an ambient SPICE_CLOUD_ENDPOINT cannot
+                // decide what this exercise resumes against.
+                endpoint: Some(endpoint.clone()),
+                ..connect_request()
+            },
+            &mut prompter,
+        )
+        .await
+        .expect_err("a closed control plane cannot complete an enrollment");
+
+        assert_eq!(
+            prompter.key_prompts, 1,
+            "resuming a key operation asks for exactly one key"
+        );
+        assert!(
+            matches!(error, Error::CloudConnectEnroll { .. }),
+            "the resume must reach the enrollment request: {error}"
+        );
+        let preserved = EnrollmentDraft::load_optional(&config_dir)
+            .expect("read the preserved draft")
+            .expect("a failed attempt keeps the retry-safe state");
+        assert_eq!(
+            preserved.enrollment_operation_id, published.enrollment_operation_id,
+            "a resume replays the durable operation ID"
+        );
+        assert_eq!(preserved.public_key_pem, published.public_key_pem);
+        assert_eq!(preserved.binding, published.binding);
+        let contents =
+            std::fs::read_to_string(EnrollmentDraft::path_in(&config_dir)).expect("read draft");
+        assert!(
+            !contents.contains("spice-enroll-"),
+            "the enrollment key must never be persisted"
+        );
     }
 
     #[test]

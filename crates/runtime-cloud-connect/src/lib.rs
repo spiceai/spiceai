@@ -200,6 +200,28 @@ impl ReconnectableIdentity {
         self.identity.app_id.as_deref()
     }
 
+    /// The organization this instance is enrolled in, as the control plane last
+    /// reported it.
+    #[must_use]
+    pub fn org_name(&self) -> Option<&str> {
+        self.identity.org_name.as_deref()
+    }
+
+    /// The attached project's name, when one is attached and the control plane
+    /// named it.
+    #[must_use]
+    pub fn app_name(&self) -> Option<&str> {
+        self.identity.app_name.as_deref()
+    }
+
+    /// The Cloud-provided page that creates a project for this instance, when
+    /// the enrollment recorded one. Absent for identities enrolled before the
+    /// link was persisted — no substitute is derived.
+    #[must_use]
+    pub fn new_project_url(&self) -> Option<&str> {
+        self.identity.new_project_url.as_deref()
+    }
+
     /// Decode the local delivered-secrets cache key without exposing the
     /// identity's mTLS or encryption private keys.
     #[must_use]
@@ -524,6 +546,7 @@ mod tests {
             gateway_addr: "gateway.example:443".to_string(),
             not_after_unix: Some(not_after_unix),
             control_plane_endpoint: None,
+            new_project_url: None,
             enc_private_key_pem: material.enc_private_key_pem,
             enc_public_key_pem: material.enc_public_key_pem,
             enc_previous_private_key_pem: String::new(),

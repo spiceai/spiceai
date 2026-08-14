@@ -351,6 +351,9 @@ impl ClientDriver {
             app_name: current.app_name,
             monitor_url: current.monitor_url,
             control_plane_endpoint,
+            // Recorded at enrollment and not re-sent on renewal, so it rides
+            // across the rotation the same way the attachment tuple does.
+            new_project_url: current.new_project_url,
             // Seeded with the OUTGOING keypair and rotated by the call below,
             // which shifts it into `enc_previous_private_key_pem` — assigning
             // `material` here instead would leave the retained key equal to the
@@ -1862,6 +1865,7 @@ mod tests {
             app_name: None,
             monitor_url: None,
             control_plane_endpoint: None,
+            new_project_url: None,
         };
         current.ensure_cache_key();
         IdentityStore::store(&identity_path, &current).expect("store current identity");
@@ -1925,6 +1929,7 @@ mod tests {
             app_name: None,
             monitor_url: None,
             control_plane_endpoint: None,
+            new_project_url: None,
         }
     }
 

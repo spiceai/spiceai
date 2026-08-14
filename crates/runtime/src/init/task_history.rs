@@ -41,6 +41,20 @@ impl Runtime {
             return Ok(());
         }
 
+        // A runtime that came up with no spicepod has no task-history table:
+        // there was no configuration to read it from. The app that arrives later
+        // — deployed, or written into a watched directory — initializes it, and
+        // this is what keeps that second call from registering a second table
+        // over the first.
+        let table = TableReference::partial(
+            SPICE_RUNTIME_SCHEMA,
+            task_history::DEFAULT_TASK_HISTORY_TABLE,
+        );
+        if self.df.table_exists(&table) {
+            tracing::debug!("Task history is already initialized.");
+            return Ok(());
+        }
+
         let retention_period_secs = app
             .runtime
             .task_history

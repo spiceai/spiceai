@@ -71,14 +71,7 @@ pub struct RunArgs {
 
 /// Execute the run command.
 pub async fn execute(ctx: &RuntimeContext, args: &RunArgs, verbosity: u8) -> Result<()> {
-    ctx.ensure_local_runtime_supported()?;
-
-    // Auto-install runtime if not present
-    if !ctx.is_runtime_installed() {
-        tracing::info!("Spice.ai runtime is not installed. Installing now...");
-        crate::commands::install::execute(ctx, &crate::commands::install::InstallArgs::default())
-            .await?;
-    }
+    ensure_runtime_available(ctx).await?;
 
     // Route --endpoint to the appropriate endpoint based on scheme
     let (http_endpoint, flight_endpoint) = resolve_endpoint(
@@ -108,10 +101,47 @@ pub async fn execute(ctx: &RuntimeContext, args: &RunArgs, verbosity: u8) -> Res
         spiced_args.push(metrics.clone());
     }
 
-    let std_cmd = ctx.get_run_cmd(&spiced_args, http_endpoint.as_deref())?;
+    run_in_foreground(ctx, &spiced_args, http_endpoint.as_deref(), None).await
+}
+
+/// Start `spiced` in the foreground for one instance directory — the launch
+/// `spice run` performs, rooted at `directory` so the runtime loads that
+/// instance's `.spice` state and spicepod rather than the caller's.
+pub(crate) async fn execute_for_instance(
+    ctx: &RuntimeContext,
+    directory: &std::path::Path,
+) -> Result<()> {
+    ensure_runtime_available(ctx).await?;
+    tracing::info!("Spice.ai runtime starting...");
+    run_in_foreground(ctx, &[], None, Some(directory)).await
+}
+
+/// Confirm this platform can run the local runtime, installing it when absent.
+async fn ensure_runtime_available(ctx: &RuntimeContext) -> Result<()> {
+    ctx.ensure_local_runtime_supported()?;
+    if !ctx.is_runtime_installed() {
+        tracing::info!("Spice.ai runtime is not installed. Installing now...");
+        crate::commands::install::execute(ctx, &crate::commands::install::InstallArgs::default())
+            .await?;
+    }
+    Ok(())
+}
+
+/// Spawn `spiced` on this terminal, forward signals to it, and adopt its exit
+/// status as this process's own.
+async fn run_in_foreground(
+    ctx: &RuntimeContext,
+    spiced_args: &[String],
+    http_endpoint: Option<&str>,
+    directory: Option<&std::path::Path>,
+) -> Result<()> {
+    let std_cmd = ctx.get_run_cmd(spiced_args, http_endpoint)?;
 
     // Convert std::process::Command to tokio::process::Command
     let mut cmd = tokio::process::Command::from(std_cmd);
+    if let Some(directory) = directory {
+        cmd.current_dir(directory);
+    }
 
     cmd.stdin(Stdio::inherit())
         .stdout(Stdio::inherit())

@@ -78,6 +78,31 @@ pub fn normalize_control_plane_endpoint(
     Ok(parsed.to_string().trim_end_matches('/').to_string())
 }
 
+/// Canonicalize a Cloud-provided portal link, or reject it.
+///
+/// The Cloud constructs the portal pages this runtime points operators at — a
+/// new-project page, a monitor page — because it owns the route and environment
+/// metadata a client cannot derive. What arrives is still untrusted input that
+/// ends up in a log line and in a browser, so exactly one rule decides what may
+/// be stored, printed, or opened: an absolute `https` URL (or plain `http` on
+/// loopback, for local fixtures) carrying no embedded credentials. A query
+/// string is fine — the create-project link identifies the instance with one.
+///
+/// Returns `None` for anything else, including a `javascript:` or other
+/// non-web scheme.
+#[must_use]
+pub fn safe_portal_url(candidate: &str) -> Option<String> {
+    let parsed = reqwest::Url::parse(candidate).ok()?;
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return None;
+    }
+    let local_http = parsed.scheme() == "http" && parsed.host_str().is_some_and(is_loopback_host);
+    if parsed.scheme() != "https" && !local_http {
+        return None;
+    }
+    Some(parsed.to_string())
+}
+
 /// Whether a URL host names the loopback interface.
 ///
 /// This is the sole gate on sending a credential over plaintext HTTP, so every
@@ -561,6 +586,7 @@ mod tests {
         let identity = crate::identity::Identity {
             identifier: "inst_test".to_string(),
             control_plane_endpoint: None,
+            new_project_url: None,
             identity_cert_pem: String::new(),
             private_key_pem: String::new(),
             public_key_pem: String::new(),
@@ -627,5 +653,33 @@ mod tests {
 
         CloudConnectConfig::read_enroll_endpoint_override(dir.path())
             .expect_err("a state-file symlink must be rejected");
+    }
+    /// The one rule for a Cloud-provided link: absolute, `https` (or loopback
+    /// `http` for a fixture), and carrying no credentials. A create-project link
+    /// keeps its query — that is how it names the instance.
+    #[test]
+    fn a_portal_link_is_accepted_only_when_it_is_safe_to_open() {
+        for accepted in [
+            "https://spice.ai/acme/new?instance=inst_1",
+            "https://dev.spice.ai/acme/new",
+            "http://127.0.0.1:8090/acme/new",
+            "http://localhost:8090/acme/new",
+        ] {
+            assert_eq!(
+                safe_portal_url(accepted).as_deref(),
+                Some(accepted),
+                "{accepted} should be usable as-is"
+            );
+        }
+        for rejected in [
+            "javascript:alert(1)",
+            "http://attacker.example/acme/new",
+            "https://user:secret@spice.ai/acme/new",
+            "/acme/new",
+            "not a url",
+            "",
+        ] {
+            assert_eq!(safe_portal_url(rejected), None, "{rejected} must be refused");
+        }
     }
 }
