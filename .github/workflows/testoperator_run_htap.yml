@@ -44,6 +44,7 @@ on:
           - ''
           - 'duckdb'
           - 'chbench-skip-slow'
+          - 'chbench-duckdb-parity'
       source_query_overrides:
         description: 'Additional query overrides for the source engine, applied only to the analytical-correctness gate (which runs each query on the source as well as spiced). Never shrinks the measured query set.'
         required: false
@@ -53,6 +54,7 @@ on:
           - ''
           - 'duckdb'
           - 'chbench-skip-slow'
+          - 'chbench-duckdb-parity'
       ready_wait:
         description: 'How long (in seconds) to wait for spiced to start'
         required: true

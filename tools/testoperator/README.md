@@ -31,6 +31,8 @@ An HTAP run queries two different sets of engines, so it takes two override flag
 
 Commands that never query a source reject `--source-query-overrides` outright rather than accepting it and doing nothing.
 
+Comparing two **accelerators** needs one more step. QPH counts completed queries, so it only compares across runs that measure the same mix — and an accelerator that can serve a query its partner cannot would otherwise measure a larger set. Give both runs the same exclusions: `chbench-duckdb-parity` is `--query-overrides` for a non-DuckDB run paired against a DuckDB baseline, excluding exactly what DuckDB excludes. The SF100 CH-benCH pairs in `dispatch/chbench/sf100/` are set up this way.
+
 ## Common Options
 
 - `-p, --spicepod-path <SPICEPOD_PATH>`: Path to the `spicepod.yaml` file.

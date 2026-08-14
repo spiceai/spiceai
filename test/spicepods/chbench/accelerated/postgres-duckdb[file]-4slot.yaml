@@ -21,6 +21,12 @@ name: postgres-duckdb[file]-4slot
 #     it at the default would charge DuckDB an uncompressed transfer for the same result set
 #     and land in QPH and query latency — the headline metrics the comparison reads.
 #
+# The measured query set must match too, and that is set at dispatch rather than here: this
+# config's runs exclude q21 (`query_overrides: duckdb`, #11011), so the Cayenne partner runs
+# with `query_overrides: chbench-duckdb-parity` to measure the same 21 queries. QPH counts
+# completed queries, so it only compares over an identical mix — see
+# tools/testoperator/dispatch/chbench/sf100/postgres-cayenne[file]-adaptive-duckdb-parity.yaml.
+#
 # Varying by design: the accelerator (duckdb vs cayenne), and with it the per-table
 # primary_key / on_conflict declarations. Cayenne relies on schema inference to detect the
 # PK and seed the upsert on_conflict that `refresh_mode: changes` needs; DuckDB needs them

@@ -1,0 +1,13 @@
+# Cayenne side of the SF100 accelerator A/B against mysql-duckdb[file]-matched.
+# MySQL-source counterpart to postgres-cayenne[file]-adaptive-duckdb-parity.yaml, with the
+# same inputs — see that file for why the measured set is restricted to DuckDB's 21 queries.
+tests:
+  htap:
+    spicepod_path: accelerated/mysql-cayenne[file]-adaptive.yaml
+    runner_type: spiceai-dev-xlarge-runners
+    scale_factor: 100
+    terminals: 100
+    duration: 600
+    ready_wait: 600
+    query_overrides: chbench-duckdb-parity
+    rate: 10000

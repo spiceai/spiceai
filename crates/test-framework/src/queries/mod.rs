@@ -779,6 +779,15 @@ pub enum QueryOverrides {
     BigQuery,
     ScyllaDB,
     ChbenchSkipSlow, // heaviest CH-benCH analytical queries (q10, q18)
+    /// Excludes exactly what [`QueryOverrides::DuckDB`] excludes, for a run on a
+    /// *different* accelerator that is being A/B'd against a `DuckDB` baseline.
+    ///
+    /// QPH counts completed queries, so it only compares across two runs that
+    /// measure the same query mix. An accelerator that can serve q21 would
+    /// otherwise measure 22 queries against `DuckDB`'s 21 and the pair would not
+    /// isolate the accelerator. Named for the reason rather than the engine,
+    /// because the run it appears on is not `DuckDB`.
+    ChbenchDuckdbParity,
 }
 
 impl QueryOverrides {
@@ -1338,12 +1347,17 @@ pub fn get_clickbench_test_queries(overrides: Option<QueryOverrides>) -> Vec<Que
 
 /// CH-benCH analytical queries a single override excludes, by query number.
 ///
-/// Exclusions are per-engine, so a run that touches more than one engine takes
-/// the union of their exclusions — see [`get_chbench_queries_excluding`].
+/// Most overrides name an engine and exclude what that engine cannot serve. A
+/// run that touches more than one engine takes the union of their exclusions —
+/// see [`get_chbench_queries_excluding`]. The rest name an exclusion set
+/// directly, for runs that need a particular set for a reason other than their
+/// own engine's capability.
 fn chbench_exclusions(overrides: QueryOverrides) -> &'static [u8] {
     match overrides {
-        // https://github.com/spiceai/spiceai/issues/11011
-        QueryOverrides::DuckDB => &[21],
+        // DuckDB cannot serve q21 (https://github.com/spiceai/spiceai/issues/11011).
+        // `ChbenchDuckdbParity` shares this arm so the two can never drift apart:
+        // its whole purpose is to be exactly what DuckDB excludes.
+        QueryOverrides::DuckDB | QueryOverrides::ChbenchDuckdbParity => &[21],
         // q10 and q18 are the heaviest analytical queries; skip them where the
         // run only needs the rest (e.g. large-SF engines where they dominate the
         // wall-clock).
@@ -1436,6 +1450,22 @@ mod tests {
             );
         }
         assert_eq!(names.len(), 19, "got {names:?}");
+    }
+
+    /// The parity override exists so a non-`DuckDB` run can measure `DuckDB`'s
+    /// exact query set. If the two ever diverged, an A/B pair configured with
+    /// them would silently go back to measuring different mixes.
+    #[test]
+    fn chbench_duckdb_parity_matches_the_duckdb_set_exactly() {
+        assert_eq!(
+            chbench_query_names(&[QueryOverrides::ChbenchDuckdbParity]),
+            chbench_query_names(&[QueryOverrides::DuckDB]),
+        );
+        // And it is genuinely a restriction, not a no-op.
+        assert_eq!(
+            chbench_query_names(&[QueryOverrides::ChbenchDuckdbParity]).len(),
+            21
+        );
     }
 
     #[test]

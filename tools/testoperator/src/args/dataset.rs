@@ -88,6 +88,12 @@ pub struct DatasetTestArgs {
     /// This alone decides the measured query set, so two runs that differ only
     /// in their source (e.g. Postgres vs `MySQL` feeding Cayenne) measure the
     /// same queries and stay comparable.
+    ///
+    /// Comparing two *accelerators* needs one more step, because throughput
+    /// counts completed queries and so only compares over an identical mix: a
+    /// run whose partner excludes a query it could serve must exclude it too.
+    /// The `chbench-duckdb-parity` value names that set for a non-DuckDB run
+    /// paired against a `DuckDB` baseline.
     #[arg(long)]
     pub(crate) query_overrides: Option<QueryOverridesArg>,
 
@@ -313,6 +319,9 @@ pub enum QueryOverridesArg {
     #[serde(rename = "chbench-skip-slow")]
     #[value(name = "chbench-skip-slow")]
     ChbenchSkipSlow,
+    #[serde(rename = "chbench-duckdb-parity")]
+    #[value(name = "chbench-duckdb-parity")]
+    ChbenchDuckdbParity,
 }
 
 impl From<QuerySetArg> for QuerySet {
@@ -503,6 +512,7 @@ impl From<QueryOverridesArg> for QueryOverrides {
             QueryOverridesArg::BigQuery => QueryOverrides::BigQuery,
             QueryOverridesArg::ScyllaDB => QueryOverrides::ScyllaDB,
             QueryOverridesArg::ChbenchSkipSlow => QueryOverrides::ChbenchSkipSlow,
+            QueryOverridesArg::ChbenchDuckdbParity => QueryOverrides::ChbenchDuckdbParity,
         }
     }
 }
