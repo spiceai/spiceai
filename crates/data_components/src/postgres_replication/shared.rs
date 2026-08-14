@@ -2073,17 +2073,46 @@ async fn attach_member(
             "this acceleration persists across restarts but has nowhere to record how far it has been advanced, so a replication slot that is dropped or invalidated cannot be detected and rows deleted at the source while it was gone would survive here"
         );
     }
-    // The earliest position this slot can actually stream from, which is *not* the
-    // same as the earliest it still retains. Postgres forwards a `START_REPLICATION`
-    // position below the slot's `confirmed_flush_lsn` up to it ("has been already
-    // streamed, forwarding to ..." in `CreateDecodingContext`), so once the slot has
-    // acknowledged past a change, no client can ask for it again — the WAL may still
-    // be on disk under `restart_lsn`, but it is unreachable through this slot.
-    // Comparing the watermark against `restart_lsn` alone would therefore call an
-    // unfillable gap resumable and skip the difference silently.
+    // Seat the member *before* classifying it, and classify against the floor it was
+    // actually seated at.
+    //
+    // `setup.slot.consistent_lsn` was read while the slot's DDL was being set up, and
+    // the pump does not take `setup_lock` — so it can acknowledge more WAL between
+    // that read and this registration. Classifying on the stale snapshot and then
+    // seating the member at the current floor is a silent skip in exactly the shape
+    // this change exists to fix: the watermark reads as reachable, while the member
+    // starts above it. Registering first closes the window, because the floor it is
+    // seated at is then a fact rather than a prediction.
+    //
+    // `register` also takes over any hold installed for this table through its rejoin
+    // branch, keeping the held floor — so the replay this member is owed starts where
+    // the slot resumed, not where a slot-mate was credited.
+    let (sender, receiver) = member_mailbox(params.member_channel_capacity);
+    // Grouping signal for the analysis: record which shared slot this dataset joined.
+    // (Membership liveness is marked by `mark_member_attached` below.)
+    metrics.set_slot_name(source.key.slot_name.clone());
+    source.ack.register(&member_key, snapshotting);
+    source.claim_reservation(&member_key);
+    let ack_slot = source.ack.slot(&member_key);
+
+    // The earliest position this member can actually be supplied from, which is *not*
+    // the earliest the slot still retains. Two distinct limits, and the later one
+    // binds:
+    //
+    //   * Postgres forwards a `START_REPLICATION` position below the slot's
+    //     `confirmed_flush_lsn` up to it ("has been already streamed, forwarding to
+    //     ..." in `CreateDecodingContext`), so once the slot has acknowledged past a
+    //     change no client can ask for it again — the WAL may still be on disk under
+    //     `restart_lsn`, but it is unreachable through this slot.
+    //   * this member's own seated floor, which a slot-mate's traffic may have
+    //     carried past the snapshot above.
+    //
+    // Comparing against `restart_lsn` alone would call an unfillable gap resumable
+    // and skip the difference silently.
+    let seated_floor = ack_slot.as_ref().map_or(0, |slot| slot.committed());
     let earliest_streamable_lsn = setup
         .slot_restart_lsn
-        .map(|restart_lsn| restart_lsn.max(setup.slot.consistent_lsn));
+        .map(|restart_lsn| restart_lsn.max(setup.slot.consistent_lsn).max(seated_floor));
     let rebuild_via_consumer = super::needs_rebuild(
         &watermark,
         earliest_streamable_lsn,
@@ -2101,7 +2130,9 @@ async fn attach_member(
         super::RecordedPosition::ForeignSource => {
             "the position it recorded belongs to a different source, so it does not describe these rows"
         }
-        super::RecordedPosition::At(watermark) if setup.slot.consistent_lsn > watermark.lsn => {
+        super::RecordedPosition::At(watermark)
+            if setup.slot.consistent_lsn.max(seated_floor) > watermark.lsn =>
+        {
             "the slot has been acknowledged past the position it recorded as applied, so the changes in between can no longer be streamed from it"
         }
         super::RecordedPosition::At(_) => {
@@ -2109,16 +2140,6 @@ async fn attach_member(
         }
     };
 
-    let (sender, receiver) = member_mailbox(params.member_channel_capacity);
-    // Grouping signal for the analysis: record which shared slot this dataset joined.
-    // (Membership liveness is marked by `mark_member_attached` just below.)
-    metrics.set_slot_name(source.key.slot_name.clone());
-    // `register` takes over any hold installed for this table through its
-    // rejoin branch, keeping the held floor — so the replay this member is
-    // owed starts where the slot resumed, not where a slot-mate was credited.
-    source.ack.register(&member_key, snapshotting);
-    source.claim_reservation(&member_key);
-    let ack_slot = source.ack.slot(&member_key);
     // A member resuming on a position a previous process recorded already has a
     // durable position, even though nothing has been committed in *this* process.
     // Seeding it lets an idle member carry that position forward (see
@@ -2439,6 +2460,17 @@ async fn run_applied_lsn_writer(source: Arc<SharedSource>, interval: std::time::
         publish_idle_positions(&source);
         write_published_positions(&source).await;
         if source.dead.load(Ordering::Acquire) {
+            // Nothing will retry after this, so an unwritten position is final.
+            let stranded: Vec<String> = lock(&source.orphaned_positions)
+                .iter()
+                .map(|orphan| orphan.dataset.clone())
+                .collect();
+            if !stranded.is_empty() {
+                tracing::warn!(
+                    datasets = ?stranded,
+                    "the shared replication slot is shutting down with how far these accelerations were advanced still unrecorded; each will be rebuilt from the source on the next start rather than resumed"
+                );
+            }
             return;
         }
     }
@@ -2482,9 +2514,20 @@ fn publish_idle_positions(source: &Arc<SharedSource>) {
 /// from the pump's shutdown, which never run concurrently: the pump sets `dead`
 /// before its final flush, and the writer exits on seeing it.
 async fn write_published_positions(source: &Arc<SharedSource>) {
+    // An orphan has no member left for the next sweep to rediscover, so a failed
+    // write has to be put back or the detached member's last position is lost to a
+    // transient sidecar error. Extend rather than assign, so a detach racing this
+    // pass is not clobbered.
     let orphans = std::mem::take(&mut *lock(&source.orphaned_positions));
+    let mut unwritten = Vec::new();
     for orphan in orphans {
         write_one(&orphan.dataset, &orphan.store, &orphan.slot).await;
+        if orphan.slot.pending() > orphan.slot.recorded() {
+            unwritten.push(orphan);
+        }
+    }
+    if !unwritten.is_empty() {
+        lock(&source.orphaned_positions).extend(unwritten);
     }
     for (member_key, member) in source.live_members() {
         let Some(slot) = source.ack.slot(&member_key) else {
@@ -2503,7 +2546,7 @@ async fn write_one(dataset: &str, store: &Arc<dyn AppliedLsnStore>, slot: &Arc<A
         Ok(()) => slot.note_recorded(pending),
         Err(e) => tracing::warn!(
             dataset = %dataset,
-            "could not record how far this acceleration has been advanced (lsn={pending}); it will be retried, and a restart before it succeeds rebuilds from the source rather than resuming: {e}"
+            "could not record how far this acceleration has been advanced (lsn={pending}); a restart before it is recorded rebuilds from the source rather than resuming: {e}"
         ),
     }
 }
