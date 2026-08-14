@@ -648,7 +648,7 @@ pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
 
     // Create MetricsReader for cluster mode to enable on-demand OTLP metrics collection
     let metrics_reader = if is_cluster_mode {
-        Some(runtime::metrics_reader::MetricsReader::new())
+        Some(telemetry::metrics_reader::MetricsReader::new())
     } else {
         None
     };
@@ -663,7 +663,7 @@ pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
     // which happens well before Cloud Connect starts — so the decision is made
     // from the same cheap on-disk/flag probe that gates log capture.
     let cloud_connect_metrics = if cloud_connect::is_configured(args.cloud_connect) {
-        Some(runtime::metrics_reader::MetricsReader::new_cumulative())
+        Some(telemetry::metrics_reader::MetricsReader::new_cumulative())
     } else {
         None
     };
@@ -1377,9 +1377,9 @@ struct MetricsInit<'a> {
     otel_config: Option<&'a app::spicepod::component::runtime::OtelExporterConfig>,
     resolved_otel_headers: std::collections::HashMap<String, String>,
     /// On-demand reader for cluster metrics collection.
-    metrics_reader: Option<runtime::metrics_reader::MetricsReader>,
+    metrics_reader: Option<telemetry::metrics_reader::MetricsReader>,
     /// On-demand reader for the metrics pushed over Cloud Connect.
-    cloud_connect_metrics: Option<runtime::metrics_reader::MetricsReader>,
+    cloud_connect_metrics: Option<telemetry::metrics_reader::MetricsReader>,
     /// `runtime.telemetry.properties`, as dimensions on every exported metric.
     resource_attributes: Vec<KeyValue>,
     /// `runtime.telemetry.metric_prefix`, applied as an SDK-level view.

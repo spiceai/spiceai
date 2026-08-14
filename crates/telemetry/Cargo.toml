@@ -11,12 +11,19 @@ version.workspace = true
 [dependencies]
 arrow.workspace = true
 async-trait.workspace = true
+datafusion-common-runtime.workspace = true
 flight_client = { path = "../flight_client" }
 hostname = "0.4.2"
 opentelemetry.workspace = true
+opentelemetry-proto = { version = "0.32", default-features = false, features = [
+    "gen-tonic-messages",
+    "gen-tonic",
+    "metrics",
+] }
 opentelemetry_sdk.workspace = true
 otel-arrow = { path = "../otel-arrow" }
 pin-project.workspace = true
+prost.workspace = true
 sha2.workspace = true
 snafu.workspace = true
 sysinfo.workspace = true

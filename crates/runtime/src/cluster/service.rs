@@ -83,7 +83,7 @@ use crate::cluster::{
 use crate::datafusion::{
     DataFusion, SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA, SPICE_RUNTIME_SCHEMA,
 };
-use crate::metrics_reader::MetricsReader;
+use telemetry::metrics_reader::MetricsReader;
 use crate::task_history::{DEFAULT_TASK_HISTORY_TABLE, LOCAL_TASK_HISTORY_TABLE};
 
 /// Handle for sending messages to a connected executor.
