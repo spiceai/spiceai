@@ -9,10 +9,16 @@ name: mysql-duckdb[file]-matched
 # would pay an uncompressed transfer for the same result set, landing in QPH and query latency,
 # the headline metrics the comparison reads.
 #
-# The CDC topology needs nothing pinned here: MySQL has no per-table replication slot to group,
-# and every `refresh_mode: changes` dataset in both configs coalesces onto one shared binlog
-# dump (server_id derived from the connection identity — the engine default). Neither config
-# pins CDC pump knobs, so those match at their defaults too.
+# Held constant with that Cayenne config, beyond Flight compression:
+#   - ONE SHARED BINLOG DUMP for every `refresh_mode: changes` dataset. `server_id` is part of
+#     the dump's source key, so distinct explicit `mysql_replication_server_id`s get distinct
+#     dedicated dumps — the plain mysql-duckdb[file] baseline pins seven and pays 7x redundant
+#     server-side binlog decode. Omitting them derives the id from the connection identity, so
+#     the datasets coalesce onto one dump, exactly as the Cayenne config does.
+#   - The four CDC pump knobs pinned under `runtime.params` below. The Cayenne config sets the
+#     same values per-dataset under `acceleration.params` (Cayenne declares them as per-dataset
+#     overrides); these keys are engine-agnostic and read from `runtime.params`, which is where
+#     a DuckDB dataset can reach them.
 #
 # The measured query set must also match, and that is set at dispatch rather than here: this
 # config excludes q21 (`query_overrides: duckdb`), so its Cayenne partner runs with
@@ -37,6 +43,15 @@ runtime:
       enabled: false
   task_history:
     enabled: false
+  params:
+    # Matches the values mysql-cayenne[file]-adaptive sets per-dataset: deep prefetch pinned to
+    # the runtime max (16384), plus the higher coalescing byte budget and linger window. Set
+    # here because these are CDC-layer knobs read from `runtime.params`, upstream of whichever
+    # accelerator applies the burst.
+    cdc_prefetch_buffer: '16384'
+    cdc_max_coalesced_envelopes: '16384'
+    cdc_max_coalesced_bytes: '536870912' # 512 MB
+    cdc_max_coalesce_age_ms: '2000'
 
 datasets:
   # ---- TPC-C core tables (mutated by OLTP workload) ----
@@ -46,7 +61,6 @@ datasets:
     params:
       <<: *mysql_params
       mysql_replication_initial_snapshot: auto
-      mysql_replication_server_id: '1001'
     acceleration:
       enabled: true
       engine: duckdb
@@ -61,7 +75,6 @@ datasets:
     params:
       <<: *mysql_params
       mysql_replication_initial_snapshot: auto
-      mysql_replication_server_id: '1002'
     acceleration:
       enabled: true
       engine: duckdb
@@ -76,7 +89,6 @@ datasets:
     params:
       <<: *mysql_params
       mysql_replication_initial_snapshot: auto
-      mysql_replication_server_id: '1003'
     acceleration:
       enabled: true
       engine: duckdb
@@ -91,7 +103,6 @@ datasets:
     params:
       <<: *mysql_params
       mysql_replication_initial_snapshot: auto
-      mysql_replication_server_id: '1004'
     acceleration:
       enabled: true
       engine: duckdb
@@ -106,7 +117,6 @@ datasets:
     params:
       <<: *mysql_params
       mysql_replication_initial_snapshot: auto
-      mysql_replication_server_id: '1005'
     acceleration:
       enabled: true
       engine: duckdb
@@ -121,7 +131,6 @@ datasets:
     params:
       <<: *mysql_params
       mysql_replication_initial_snapshot: auto
-      mysql_replication_server_id: '1006'
     acceleration:
       enabled: true
       engine: duckdb
@@ -136,7 +145,6 @@ datasets:
     params:
       <<: *mysql_params
       mysql_replication_initial_snapshot: auto
-      mysql_replication_server_id: '1007'
     acceleration:
       enabled: true
       engine: duckdb
