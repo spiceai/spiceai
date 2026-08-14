@@ -579,11 +579,22 @@ impl FullTextDatabaseIndex {
         // Prepare documents to insert/delete with read lock.
         let index_schema = self.reader.searcher().schema().clone();
         let terms_to_delete = self.existing_terms_to_delete(&index_schema, &rb)?;
-        let doc_json = write_to_json_string(&rb).context(InvalidIndexingSnafu {
-            context: "Failed to write data to intermediate JSON string for indexing".to_string(),
-        })?;
-        let docs = parse_json_array(&index_schema, doc_json.as_str())
-            .context(FailedToInsertDataIntoIndexSnafu)?;
+        // Convert to tantivy documents one record batch at a time. Encoding all
+        // batches into a single JSON string and parsing it into one Vec<Map> held
+        // the whole document set in memory three times over (JSON string + maps +
+        // documents); decoding per batch bounds the intermediate footprint to a
+        // single batch while the documents accumulate.
+        let mut docs = Vec::new();
+        for batch in &rb {
+            let doc_json =
+                write_to_json_string(slice::from_ref(batch)).context(InvalidIndexingSnafu {
+                    context: "Failed to write data to intermediate JSON string for indexing"
+                        .to_string(),
+                })?;
+            let mut batch_docs = parse_json_array(&index_schema, doc_json.as_str())
+                .context(FailedToInsertDataIntoIndexSnafu)?;
+            docs.append(&mut batch_docs);
+        }
 
         // The writer operations (delete_term, add_document, commit) and the reader
         // reload are synchronous tantivy work — commit fsyncs the file-backed index —
