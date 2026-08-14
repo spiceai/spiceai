@@ -209,12 +209,15 @@ mod tests {
         ))
     }
 
+    fn table_source(fields: Vec<Field>) -> Arc<dyn TableSource> {
+        Arc::new(LogicalTableSource::new(Arc::new(Schema::new(fields))))
+    }
+
     fn scan_with_projection(udf_name: &str) -> LogicalPlan {
-        let schema = Arc::new(Schema::new(vec![
+        let source = table_source(vec![
             Field::new("id", DataType::Int32, false),
             Field::new("val", DataType::Utf8, true),
-        ]));
-        let source = Arc::new(LogicalTableSource::new(schema)) as Arc<dyn TableSource>;
+        ]);
         LogicalPlanBuilder::scan("t", source, None)
             .expect("scan")
             .project(vec![Expr::ScalarFunction(ScalarFunction::new_udf(
@@ -236,9 +239,12 @@ mod tests {
         )
     }
 
+    fn test_executor() -> impl SQLExecutor + 'static {
+        DenyFunctionsSqlExecutor::new(test_sql_table(), None)
+    }
+
     fn federated_plan(plan: LogicalPlan) -> LogicalPlan {
-        let executor: Arc<dyn SQLExecutor> =
-            Arc::new(DenyFunctionsSqlExecutor::new(test_sql_table(), None));
+        let executor: Arc<dyn SQLExecutor> = Arc::new(test_executor());
         let planner = Arc::new(SQLFederationPlanner::new(executor));
         LogicalPlan::Extension(Extension {
             node: Arc::new(FederatedPlanNode::new(plan, planner)),
@@ -315,25 +321,41 @@ mod tests {
         assert_eq!(adaptor.source.schema().as_ref(), schema.as_ref());
     }
 
-    fn table_source(fields: Vec<Field>) -> Arc<dyn TableSource> {
-        Arc::new(LogicalTableSource::new(Arc::new(Schema::new(fields)))) as Arc<dyn TableSource>
-    }
-
-    /// Unparse with the dialect federation itself would use, so these tests read
-    /// the same SQL a remote engine is sent.
+    /// The upstream fixes these guard live in the `spiceai/datafusion` fork on
+    /// `spiceai-54`, so nothing here fails if a later pin bump drops them. The
+    /// fork's branch is re-cut per DataFusion major and takes its own tests with
+    /// it; these stay. Extend them whenever a pin bump carries another unparser
+    /// fix — #13081 tracks the three this bump left unguarded.
+    ///
+    /// This unparses through the federation executor, which supplies no dialect
+    /// here, so the SQL is the default dialect's rather than any one connector's.
+    /// The plan shapes, not the spelling, are what these assert.
     fn federated_sql(plan: &LogicalPlan) -> String {
-        let executor: Arc<dyn SQLExecutor> =
-            Arc::new(DenyFunctionsSqlExecutor::new(test_sql_table(), None));
-        Unparser::new(executor.dialect().as_ref())
+        Unparser::new(test_executor().dialect().as_ref())
             .plan_to_sql(plan)
             .expect("plan should unparse")
             .to_string()
+    }
+
+    /// Assert `first` is rendered before `second`, which pins the clause order
+    /// without pinning the formatting around it.
+    fn assert_precedes(sql: &str, first: &str, second: &str) {
+        let (Some(at_first), Some(at_second)) = (sql.find(first), sql.find(second)) else {
+            panic!("expected both `{first}` and `{second}` in: {sql}");
+        };
+        assert!(
+            at_first < at_second,
+            "expected `{first}` before `{second}` in: {sql}"
+        );
     }
 
     /// Regression test for #12406: a `fetch` the optimizer pushes into a join
     /// input bounds that input, not the join's output. Dropping it asks the
     /// remote engine for the whole table and evaluates the join over it, so the
     /// query can return more rows than the plan it came from.
+    ///
+    /// The scan carries a filter as well as the fetch, which is the shape the
+    /// issue reports and the one the join-input transform rebuilds.
     #[test]
     fn a_fetch_pushed_into_a_join_input_survives_unparsing() {
         let left = LogicalPlanBuilder::scan_with_filters_fetch(
@@ -355,10 +377,12 @@ mod tests {
             ]),
             None,
         )
-        .expect("scan right");
+        .expect("scan right")
+        .build()
+        .expect("build right");
         let plan = left
             .join_on(
-                right.build().expect("build right"),
+                right,
                 JoinType::Inner,
                 [col("left_table.id").eq(col("right_table.id"))],
             )
@@ -366,25 +390,9 @@ mod tests {
             .build()
             .expect("build join");
 
-        let sql = federated_sql(&plan);
-
-        // Before the fix the whole `LIMIT 5` was absent from the generated SQL.
-        assert!(
-            sql.contains("LIMIT 5"),
-            "the fetch pushed into the join input must survive: {sql}"
-        );
-        // It bounds only that input, so it has to sit inside the input's own
+        // The fetch bounds the input, so it is rendered inside that input's own
         // scope rather than trailing the join.
-        assert!(
-            sql.contains("FROM (SELECT"),
-            "the fetched join input must keep its own scope: {sql}"
-        );
-        let limit = sql.find("LIMIT 5").expect("limit present");
-        let join = sql.find("INNER JOIN").expect("join present");
-        assert!(
-            limit < join,
-            "the limit must bound the input, not the join output: {sql}"
-        );
+        assert_precedes(&federated_sql(&plan), "LIMIT 5", "INNER JOIN");
     }
 
     /// Regression test for #12591: SQL evaluates `WHERE` before `LIMIT`, so a
@@ -409,24 +417,8 @@ mod tests {
         .build()
         .expect("build");
 
-        let sql = federated_sql(&plan);
-
-        // Before the fix this rendered as `... FROM t WHERE (t.id = 'a') LIMIT 5`,
-        // which takes the matching rows and then five of them, rather than five
-        // rows and then the matching ones.
-        let limit = sql
-            .find("LIMIT 5")
-            .expect("the limit must survive unparsing");
-        let filter = sql
-            .find("WHERE")
-            .expect("the filter must survive unparsing");
-        assert!(
-            limit < filter,
-            "the limit must be applied before the filter, not after: {sql}"
-        );
-        assert!(
-            sql.contains("FROM (SELECT"),
-            "the limited input must keep its own scope: {sql}"
-        );
+        // The limit has to be taken first, so it is rendered in a scope the
+        // filter sits outside of.
+        assert_precedes(&federated_sql(&plan), "LIMIT 5", "WHERE");
     }
 }
