@@ -624,7 +624,7 @@ const SCHEMA_EVOLUTION_WARNING_KEY_LIMIT: usize = 1024;
 static SCHEMA_EVOLUTION_WARNING_KEYS: std::sync::LazyLock<parking_lot::Mutex<BoundedWarningKeys>> =
     std::sync::LazyLock::new(|| parking_lot::Mutex::new(BoundedWarningKeys::default()));
 
-fn schema_evolution_first_warn(key: String) -> bool {
+pub(crate) fn schema_evolution_first_warn(key: String) -> bool {
     SCHEMA_EVOLUTION_WARNING_KEYS
         .lock()
         .insert_new(key, SCHEMA_EVOLUTION_WARNING_KEY_LIMIT)
@@ -2638,6 +2638,20 @@ impl RefreshTask {
             return Ok(());
         }
         let target_schema = self.accelerator.schema();
+        // Normalize with the engine's own creation-time rewrites first. The accelerated
+        // table holds the rewritten type by construction (Cayenne/Vortex stores every
+        // timestamp at microsecond precision), so without this the classifier reads that
+        // rewrite as `Incompatible` drift on every CDC batch — which under
+        // `on_schema_change: fail` stops replication for a schema that never changed.
+        let normalized_incoming: SchemaRef = if self.engine_type_rewrites.is_empty() {
+            Arc::clone(incoming_data_schema)
+        } else {
+            Arc::new(arrow_tools::type_rewrite::apply_rules(
+                incoming_data_schema,
+                self.engine_type_rewrites,
+            ))
+        };
+        let incoming_data_schema = &normalized_incoming;
         if cdc_data_schema_matches(&target_schema, incoming_data_schema) {
             return Ok(());
         }
@@ -4774,6 +4788,87 @@ mod tests {
         )
         .with_cdc_param_overrides(Some(Arc::new(cdc_params)))
         .build()
+    }
+
+    /// Regression test for #13014, CDC leg. Cayenne stores every timestamp at
+    /// microsecond precision because Vortex has no other option, so a Postgres
+    /// `timestamptz` CDC stream arrives as `Timestamp(ns, "UTC")` against a
+    /// `Timestamp(us, "UTC")` accelerated table forever. `classify` reads that as
+    /// `Incompatible`, so before the engine's own rewrites were consulted here,
+    /// `on_schema_change: fail` rejected the first batch and stopped replication for a
+    /// schema that never changed.
+    #[tokio::test]
+    async fn cdc_schema_evolution_accepts_an_engine_required_timestamp_rewrite() {
+        use crate::accelerated::refresh_task::RefreshTaskBuilder;
+        use crate::federated::FederatedTable;
+        use arrow::datatypes::TimeUnit;
+        use arrow_tools::type_rewrite::{Float16ToFloat32, TimestampToMicrosecond};
+
+        // Mirrors `cayenne::CAYENNE_TYPE_REWRITE_RULES`, which this crate sits below.
+        static CAYENNE_LIKE_RULES: &[&dyn arrow_tools::type_rewrite::TypeRewriteRule] =
+            &[&Float16ToFloat32, &TimestampToMicrosecond];
+
+        let stored = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new(
+                "created_at",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                true,
+            ),
+        ]));
+        let incoming = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new(
+                "created_at",
+                DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+                true,
+            ),
+        ]));
+
+        let build = |name: &str, rules: &'static [&'static dyn arrow_tools::type_rewrite::TypeRewriteRule]| {
+            let accelerator: Arc<dyn TableProvider> = Arc::new(
+                MemTable::try_new(Arc::clone(&stored), vec![vec![]])
+                    .expect("mem table should be created"),
+            );
+            let dataset = datafusion::sql::TableReference::bare(name.to_string());
+            install_cdc_schema_evolution(
+                &dataset,
+                CdcSchemaEvolution {
+                    policy: OnSchemaChange::Fail,
+                    constraint_columns: vec![],
+                },
+            );
+            let federated = Arc::new(FederatedTable::new_unchecked(Arc::clone(&accelerator)));
+            let task = RefreshTaskBuilder::new(
+                runtime_status::RuntimeStatus::new(),
+                dataset,
+                federated,
+                None,
+                accelerator,
+                tokio::runtime::Handle::current(),
+                Arc::new(tokio::sync::Mutex::new(())),
+            )
+            .with_engine_type_rewrites(rules)
+            .build();
+            task
+        };
+
+        let task = build("cdc_engine_rewrite_accepted", CAYENNE_LIKE_RULES);
+        task.maybe_evolve_schema_for_cdc(&incoming).await.expect(
+            "an engine-required rewrite is not a schema change and must not fail the write",
+        );
+
+        // Neuter: with no engine rules the same pair is classified as incompatible and
+        // `on_schema_change: fail` rejects it - so the pass above is the rules working,
+        // not a comparison that never saw a difference.
+        let task = build("cdc_engine_rewrite_rejected", &[]);
+        let Err(e) = task.maybe_evolve_schema_for_cdc(&incoming).await else {
+            panic!("expected `on_schema_change: fail` to reject the unnormalized ns -> us change")
+        };
+        assert!(
+            e.to_string().contains("incompatible schema change"),
+            "unexpected error: {e}"
+        );
     }
 
     #[tokio::test]

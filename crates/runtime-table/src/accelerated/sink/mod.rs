@@ -58,11 +58,12 @@ impl AccelerationSink {
     /// nowhere to apply there.
     pub fn with_engine_type_rewrites(
         self,
+        dataset_name: String,
         rules: &'static [&'static dyn arrow_tools::type_rewrite::TypeRewriteRule],
     ) -> Self {
         match self {
             AccelerationSink::Table(sink) => {
-                AccelerationSink::Table(sink.with_engine_type_rewrites(rules))
+                AccelerationSink::Table(sink.with_engine_type_rewrites(dataset_name, rules))
             }
             AccelerationSink::Multi(sink) => AccelerationSink::Multi(sink),
         }

@@ -405,7 +405,10 @@ impl RefreshTaskBuilder {
         let sink = Arc::new(RwLock::new(
             AccelerationSink::new(Arc::clone(&self.accelerator))
                 .with_sink_indexes(federated_indexes)
-                .with_engine_type_rewrites(self.engine_type_rewrites),
+                .with_engine_type_rewrites(
+                    self.dataset_name.to_string(),
+                    self.engine_type_rewrites,
+                ),
         ));
 
         let dataset_metric_labels = DatasetMetricLabels::new(&self.dataset_name);
@@ -437,6 +440,7 @@ impl RefreshTaskBuilder {
             last_updated_at: self.last_updated_at,
             initial_load_completed: self.initial_load_completed,
             is_s3_express_acceleration: self.is_s3_express_acceleration,
+            engine_type_rewrites: self.engine_type_rewrites,
             snapshot_refresh_state: self.snapshot_refresh_state,
             cdc_insert_plan_cache: Arc::new(Mutex::new(None)),
             cdc_param_overrides: self.cdc_param_overrides,
@@ -506,6 +510,11 @@ pub struct RefreshTask {
     initial_load_completed: Option<Arc<AtomicBool>>,
     /// Whether the acceleration uses S3 Express One Zone storage.
     is_s3_express_acceleration: bool,
+    /// The acceleration engine's own creation-time type rewrites. The CDC
+    /// schema-evolution check normalizes the incoming schema with these so an
+    /// engine-imposed type is not classified as drift.
+    pub(crate) engine_type_rewrites:
+        &'static [&'static dyn arrow_tools::type_rewrite::TypeRewriteRule],
     /// Per-dataset state required for `RefreshMode::Snapshot`. `None` for all
     /// other refresh modes.
     snapshot_refresh_state: Option<crate::accelerated::snapshots::SnapshotRefreshState>,
