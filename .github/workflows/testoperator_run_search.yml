@@ -104,6 +104,11 @@ jobs:
       - name: Run the benchmark test - ${{ steps.extract_spicepod_filename.outputs.SPICEPOD_FILENAME }}
         env:
           BENCHMARK_DATASET: ${{ github.event.inputs.benchmark_dataset }}
+          OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
+          AWS_S3_VECTORS_KEY: ${{ secrets.AWS_S3_VECTORS_KEY }}
+          AWS_S3_VECTORS_SECRET: ${{ secrets.AWS_S3_VECTORS_SECRET }}
+          SPICEAI_BENCHMARK_METRICS_KEY: ${{ secrets.SPICEAI_BENCHMARK_METRICS_KEY }}
+          SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
         run: |
           rm -rf .spice/data
           # A "custom" (or empty) selection tests the spicepod as-is: omit --benchmark-dataset so the
@@ -118,9 +123,3 @@ jobs:
             $dataset_flag \
             --metrics \
             -p "${{ github.event.inputs.spicepod_path }}"
-        env:
-          OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
-          AWS_S3_VECTORS_KEY: ${{ secrets.AWS_S3_VECTORS_KEY }}
-          AWS_S3_VECTORS_SECRET: ${{ secrets.AWS_S3_VECTORS_SECRET }}
-          SPICEAI_BENCHMARK_METRICS_KEY: ${{ secrets.SPICEAI_BENCHMARK_METRICS_KEY }}
-          SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
