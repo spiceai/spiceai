@@ -981,63 +981,80 @@ fn fs_probe_path(path: &str) -> &str {
     }
 }
 
-/// Resolve a configured Cayenne directory to an absolute, symlink-resolved path so
-/// two directories can be compared for containment.
-///
-/// Returns `None` for object-store locations (`s3://…`), which can never overlap the
-/// metastore directory (`SQLite`/Turso cannot run on object storage, so
-/// [`CayenneAccelerator::resolve_metadata_dir`] only ever yields a local path).
-///
-/// Neither directory necessarily exists yet, so this canonicalizes the deepest
-/// ancestor that does exist — resolving symlinks in the real part of the path, which a
-/// purely lexical comparison would miss — and re-appends the components that do not.
-async fn resolve_dir_for_overlap(path: &str) -> Option<PathBuf> {
+/// Make a configured Cayenne directory absolute without resolving it, or `None` for an
+/// object-store location (`s3://…`) — which can never overlap the metastore directory,
+/// since `SQLite`/Turso cannot run on object storage and
+/// [`CayenneAccelerator::resolve_metadata_dir`] therefore only ever yields a local path.
+fn absolute_local_dir(path: &str) -> Option<PathBuf> {
     if !is_local_path(path) {
         return None;
     }
-
     let raw = Path::new(fs_probe_path(path));
-    let absolute = if raw.is_absolute() {
-        raw.to_path_buf()
+    if raw.is_absolute() {
+        Some(raw.to_path_buf())
     } else {
-        std::env::current_dir().ok()?.join(raw)
-    };
+        Some(std::env::current_dir().ok()?.join(raw))
+    }
+}
 
-    // Collapse `.` and `..` lexically. `Path::starts_with` compares components, so an
-    // unresolved `..` would make an overlapping pair look disjoint.
-    let mut lexical = PathBuf::new();
+/// Resolve `absolute` component by component, in the order the filesystem would.
+///
+/// The order is the whole point: `..` names the parent of the directory the preceding
+/// component *resolves to*, not its lexical parent. Collapsing `..` up front and
+/// canonicalizing afterwards gets this backwards — with `link -> /data/subdir`,
+/// `link/../catalog` is `/data/catalog`, but a lexical collapse yields `/catalog` and a
+/// containment check against `/data` then passes something it must refuse. Resolving in
+/// order keeps the accumulated path symlink-free, so `..` may simply pop it.
+///
+/// Components that do not exist yet resolve to themselves — neither directory
+/// necessarily exists when this runs at open time.
+async fn resolve_in_filesystem_order(absolute: &Path) -> PathBuf {
+    let mut resolved = PathBuf::new();
     for component in absolute.components() {
         match component {
             Component::CurDir => {}
             Component::ParentDir => {
-                lexical.pop();
+                resolved.pop();
             }
-            other => lexical.push(other),
+            Component::Prefix(_) | Component::RootDir => resolved.push(component),
+            Component::Normal(name) => {
+                resolved.push(name);
+                if let Ok(real) = tokio::fs::canonicalize(&resolved).await {
+                    resolved = real;
+                }
+            }
         }
     }
+    resolved
+}
 
-    let mut missing_suffix = Vec::new();
-    let mut probe = lexical.clone();
-    loop {
-        if let Ok(existing) = tokio::fs::canonicalize(&probe).await {
-            let mut resolved = existing;
-            resolved.extend(missing_suffix.iter().rev());
-            return Some(resolved);
-        }
-        // Nothing on this path exists yet (or it is the filesystem root, which always
-        // canonicalizes): fall back to the lexical form.
-        let Some(name) = probe.file_name().map(std::ffi::OsStr::to_os_string) else {
-            return Some(lexical);
-        };
-        missing_suffix.push(name);
-        if !probe.pop() {
-            return Some(lexical);
+/// Every location a recursive delete of `path` could reach, or `None` for an
+/// object-store location.
+///
+/// Two forms, because a symlink is both a place and a name:
+///
+/// 1. **Fully resolved** — where the directory's contents actually live.
+/// 2. **The entry**: parent resolved, final component left literal. `remove_dir_all`
+///    unlinks the *entry* it walks onto rather than following it, so a metastore
+///    directory whose own last component is a symlink pointing out of the tree still
+///    loses its link — the catalog file survives with nothing naming it, and the
+///    connection pool keeps writing through handles nothing can reopen.
+async fn overlap_candidates(path: &str) -> Option<Vec<PathBuf>> {
+    let absolute = absolute_local_dir(path)?;
+
+    let mut candidates = vec![resolve_in_filesystem_order(&absolute).await];
+    if let (Some(parent), Some(name)) = (absolute.parent(), absolute.file_name()) {
+        let entry = resolve_in_filesystem_order(parent).await.join(name);
+        if !candidates.contains(&entry) {
+            candidates.push(entry);
         }
     }
+    Some(candidates)
 }
 
 /// `true` when `inner` is `outer` itself or lies beneath it — i.e. a recursive delete
-/// of `outer` takes `inner` with it.
+/// of `outer` takes `inner` with it. Compares whole components, so `…/meta` does not
+/// read as containing `…/metadata`.
 fn dir_contains(outer: &Path, inner: &Path) -> bool {
     inner.starts_with(outer)
 }
@@ -1058,14 +1075,22 @@ fn dir_contains(outer: &Path, inner: &Path) -> bool {
 /// `resolve_metadata_dir` yields `{spice_data}/metadata`. An explicit
 /// `cayenne_metadata_dir` set beneath the data directory collides the same way.
 ///
-/// Returns the resolved `(data_dir, metadata_dir)` pair when they overlap.
+/// Returns the resolved `(data_dir, metadata_dir)` pair when they overlap, naming
+/// whichever metastore location the delete would reach.
+///
+/// The data directory is compared in its fully resolved form only: `remove_dir_all`
+/// refuses a final-component symlink rather than following it, so the recursive walk
+/// only ever happens at the resolved directory.
 async fn overlapping_metastore_dir(
     data_dir: &str,
     metadata_dir: &str,
 ) -> Option<(PathBuf, PathBuf)> {
-    let data = resolve_dir_for_overlap(data_dir).await?;
-    let metadata = resolve_dir_for_overlap(metadata_dir).await?;
-    dir_contains(&data, &metadata).then_some((data, metadata))
+    let data = resolve_in_filesystem_order(&absolute_local_dir(data_dir)?).await;
+    let metadata = overlap_candidates(metadata_dir)
+        .await?
+        .into_iter()
+        .find(|candidate| dir_contains(&data, candidate))?;
+    Some((data, metadata))
 }
 
 /// Process-wide counter giving each [`CayenneAccelerator`] instance a unique id,
@@ -4945,6 +4970,64 @@ mod tests {
                 "a metadata dir reached through a symlink to the data dir is still inside it"
             );
         }
+    }
+
+    /// `..` names the parent of what the preceding component *resolves to*. With
+    /// `link -> {base}/data/subdir`, `link/../catalog` is `{base}/data/catalog` — inside
+    /// the data directory — but collapsing `..` before resolving `link` yields
+    /// `{base}/catalog` and lets the delete through. Raised by Copilot on #13101.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn overlap_applies_dot_dot_after_the_symlink_that_precedes_it() {
+        let base = tempfile::tempdir().expect("temp dir");
+        let data = base.path().join("data");
+        std::fs::create_dir_all(data.join("subdir")).expect("data subdir");
+
+        let link = base.path().join("link");
+        std::os::unix::fs::symlink(data.join("subdir"), &link).expect("symlink");
+
+        let through_link = link.join("..").join("catalog");
+        assert!(
+            overlapping_metastore_dir(&data.to_string_lossy(), &through_link.to_string_lossy())
+                .await
+                .is_some(),
+            "`link/../catalog` resolves inside the data dir once `link` is followed first"
+        );
+    }
+
+    /// `remove_dir_all` unlinks the directory entry it walks onto rather than following
+    /// it, so a metastore directory whose own last component is a symlink out of the
+    /// tree still loses its link — the catalog file survives with nothing naming it.
+    /// Raised by Copilot on #13101.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn overlap_detects_a_metastore_entry_symlinked_out_of_the_data_dir() {
+        let base = tempfile::tempdir().expect("temp dir");
+        let data = base.path().join("orders");
+        std::fs::create_dir_all(&data).expect("data dir");
+
+        // The catalog's contents live outside the data directory, but the name that
+        // reaches them is inside it.
+        let real_metastore = base.path().join("real-metastore");
+        std::fs::create_dir_all(&real_metastore).expect("metastore dir");
+        let entry = data.join("catalog");
+        std::os::unix::fs::symlink(&real_metastore, &entry).expect("symlink");
+
+        // Compare against the *returned* data path: on macOS the temp dir sits under
+        // `/var`, a symlink to `/private/var`, so the path the test built is not the one
+        // the guard resolves to.
+        let (resolved_data, reached) =
+            overlapping_metastore_dir(&data.to_string_lossy(), &entry.to_string_lossy())
+                .await
+                .expect("the entry inside the data dir is unlinked by the delete");
+        assert!(
+            reached.starts_with(&resolved_data),
+            "the error must name the entry the delete removes, not its target: {reached:?}"
+        );
+        assert!(
+            !reached.starts_with(&real_metastore),
+            "the target lies outside the data dir; naming it would read as a false positive"
+        );
     }
 
     /// Object-store data paths cannot contain the metastore — `SQLite`/Turso only run
