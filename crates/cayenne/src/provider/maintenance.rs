@@ -25,7 +25,7 @@ use crate::bounded_fifo::BoundedFifoSet;
 use parking_lot::Mutex as ParkingMutex;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Cap on the number of distinct protected-snapshot warning keys retained, to
@@ -167,6 +167,11 @@ pub(crate) struct PostWriteMaintenanceState {
     /// (`inserted - superseded - deleted`). Accumulated alongside `stats` and
     /// applied as a [`RowCountUpdate::Delta`] when the stats are persisted.
     pub(crate) live_rows_delta: i64,
+    /// How many separate deltas were folded into `live_rows_delta`, carried
+    /// with the state so a drain can retire exactly the ones it persisted from
+    /// [`PostWriteMaintenance::outstanding_live_rows_deltas`]. Zero when no
+    /// delta has been queued since the last drain.
+    pub(crate) live_rows_delta_count: u64,
     /// Set when a write wants the metastore WAL drained but has no other
     /// maintenance to contribute. Every pass ends in a WAL checkpoint, so this
     /// only has to keep the pass from being skipped as empty. Coalesces with the
@@ -193,4 +198,158 @@ pub(crate) enum RetentionFailureAction {
 pub(crate) struct PostWriteMaintenance {
     pub(crate) state: ParkingMutex<PostWriteMaintenanceState>,
     pub(crate) scheduled: AtomicBool,
+    /// How many queued live-row deltas the persisted `num_rows` does not
+    /// include yet.
+    pub(crate) outstanding_live_rows_deltas: AtomicU64,
+}
+
+impl PostWriteMaintenance {
+    /// Whether a live-row delta has been queued that the persisted `num_rows`
+    /// does not yet include.
+    ///
+    /// The rows themselves are visible to scans the moment the write commits;
+    /// the count that describes them lands later, on the maintenance task. Any
+    /// reader deciding whether the maintained count is a *provably exact* live
+    /// count has to treat that gap as drift, because the in-memory proxies for
+    /// it (resident inline rows, mem-tier tombstones) are cleared by a
+    /// checkpoint that does not drain this queue.
+    ///
+    /// Errs toward reporting drift. A compaction that re-baselines the count
+    /// from the corpus already covers a delta queued before it, but does not
+    /// drain the queue, so this keeps reporting until the maintenance pass
+    /// applies that delta — briefly conservative, and the safe direction.
+    pub(crate) fn has_unapplied_live_rows_delta(&self) -> bool {
+        self.outstanding_live_rows_deltas.load(Ordering::Acquire) > 0
+    }
+
+    /// Count one delta being folded into the queued state.
+    ///
+    /// Call with [`Self::state`] held, so this and the `live_rows_delta` it
+    /// accounts for become visible to a drain together.
+    pub(crate) fn record_queued_live_rows_delta(&self) {
+        self.outstanding_live_rows_deltas
+            .fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Retire the `count` deltas a persist folded into `num_rows`.
+    ///
+    /// A count rather than a high-water mark, so a drain can only ever retire
+    /// what it actually persisted. A drain whose persist abandoned its update
+    /// retires nothing, and its deltas stay outstanding — otherwise a later
+    /// drain's success would declare the count exact over a gap it never
+    /// filled, which is the same `Exact`-and-short answer this gate exists to
+    /// refuse. Being a count also makes it order-independent: two drains that
+    /// finish out of order retire the same total either way.
+    pub(crate) fn retire_applied_live_rows_deltas(&self, count: u64) {
+        if count == 0 {
+            return;
+        }
+        // `saturating_sub` for the arithmetic alone: every retirement pairs
+        // with recorded deltas, but wrapping here would read as a permanently
+        // outstanding queue and strand the table on `Inexact`.
+        let _ = self.outstanding_live_rows_deltas.fetch_update(
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |outstanding| Some(outstanding.saturating_sub(count)),
+        );
+    }
+}
+
+#[cfg(test)]
+mod post_write_maintenance_tests {
+    use super::PostWriteMaintenance;
+
+    /// A table that has never queued a delta has nothing outstanding, so its
+    /// maintained count starts eligible to be served `Exact`.
+    #[test]
+    fn a_fresh_queue_has_nothing_outstanding() {
+        let maintenance = PostWriteMaintenance::default();
+        assert!(!maintenance.has_unapplied_live_rows_delta());
+    }
+
+    /// The signal spans the whole window between a commit queueing its delta
+    /// and the persist that folds it into `num_rows`.
+    #[test]
+    fn a_queued_delta_stays_outstanding_until_it_is_applied() {
+        let maintenance = PostWriteMaintenance::default();
+
+        maintenance.record_queued_live_rows_delta();
+        assert!(maintenance.has_unapplied_live_rows_delta());
+
+        maintenance.retire_applied_live_rows_deltas(1);
+        assert!(!maintenance.has_unapplied_live_rows_delta());
+    }
+
+    /// Maintenance coalesces: one drain persists every delta queued since the
+    /// last one, and retiring that many clears them all.
+    #[test]
+    fn one_drain_retires_every_delta_it_coalesced() {
+        let maintenance = PostWriteMaintenance::default();
+
+        maintenance.record_queued_live_rows_delta();
+        maintenance.record_queued_live_rows_delta();
+        assert!(maintenance.has_unapplied_live_rows_delta());
+
+        maintenance.retire_applied_live_rows_deltas(2);
+        assert!(!maintenance.has_unapplied_live_rows_delta());
+    }
+
+    /// A drain whose persist abandoned its update retires nothing. A later
+    /// drain that succeeds must not clear the gap that left, or the count is
+    /// served `Exact` while short by the abandoned delta — the very answer
+    /// this gate refuses.
+    #[test]
+    fn a_later_success_does_not_cover_an_abandoned_delta() {
+        let maintenance = PostWriteMaintenance::default();
+
+        maintenance.record_queued_live_rows_delta();
+        // Its drain's persist failed, so nothing is retired for it.
+        maintenance.record_queued_live_rows_delta();
+        maintenance.retire_applied_live_rows_deltas(1);
+
+        assert!(maintenance.has_unapplied_live_rows_delta());
+    }
+
+    /// Two drains can finish out of order. Retiring a count rather than a
+    /// high-water mark makes the total the same either way, so neither
+    /// re-opens a window the other closed.
+    #[test]
+    fn out_of_order_drains_retire_the_same_total() {
+        let maintenance = PostWriteMaintenance::default();
+
+        maintenance.record_queued_live_rows_delta();
+        maintenance.record_queued_live_rows_delta();
+
+        maintenance.retire_applied_live_rows_deltas(1);
+        assert!(maintenance.has_unapplied_live_rows_delta());
+        maintenance.retire_applied_live_rows_deltas(1);
+
+        assert!(!maintenance.has_unapplied_live_rows_delta());
+    }
+
+    /// A write that lands while a drain is in flight is not covered by it, so
+    /// the signal re-arms rather than staying clear.
+    #[test]
+    fn a_write_after_a_drain_re_arms_the_signal() {
+        let maintenance = PostWriteMaintenance::default();
+
+        maintenance.record_queued_live_rows_delta();
+        maintenance.retire_applied_live_rows_deltas(1);
+
+        maintenance.record_queued_live_rows_delta();
+        assert!(maintenance.has_unapplied_live_rows_delta());
+    }
+
+    /// Retiring more than is outstanding must not wrap: a wrapped counter
+    /// reads as a permanently outstanding queue and strands the table on
+    /// `Inexact` for the life of the process.
+    #[test]
+    fn retiring_more_than_is_outstanding_does_not_wrap() {
+        let maintenance = PostWriteMaintenance::default();
+
+        maintenance.record_queued_live_rows_delta();
+        maintenance.retire_applied_live_rows_deltas(5);
+
+        assert!(!maintenance.has_unapplied_live_rows_delta());
+    }
 }
