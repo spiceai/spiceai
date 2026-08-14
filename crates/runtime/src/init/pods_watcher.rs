@@ -349,6 +349,9 @@ impl Runtime {
             warn_on_sections_only_a_start_installs(&new_app);
         }
 
+        // Read before the app is installed, while it is still borrowable.
+        let arriving_task_history = new_app.runtime.task_history.enabled;
+
         *self.app.write().await = Some(new_app);
 
         if current_app.is_none() {
@@ -361,6 +364,13 @@ impl Runtime {
             // setting takes effect at that restart and this initialization uses
             // the settings in effect now. Idempotent, so the ordinary case where
             // the load already registered the table changes nothing.
+            // Emission was fixed when `DataFusion` was built, from the
+            // configuration this process had then — which was none. Align it with
+            // the app that has arrived before bringing the table up: otherwise an
+            // app that disables task history leaves every query still emitting
+            // into a table nothing created, and one that enables it creates a
+            // table no query writes to.
+            self.df.set_task_history_enabled(arriving_task_history);
             if let Err(err) = Arc::clone(&self).init_task_history().await {
                 tracing::warn!("Creating internal task history table: {err}");
             }

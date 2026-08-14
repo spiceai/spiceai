@@ -821,7 +821,14 @@ pub struct DataFusion {
     // EXECUTE (not lightweight PREPARE/DEALLOCATE/SET) — i.e. query admission
     // control; `None` = unbounded. Sized from `runtime.query.max_concurrent_queries`.
     query_admission_semaphore: Option<Arc<Semaphore>>,
-    pub(crate) task_history_enabled: bool,
+    /// Whether a query emits a task-history row.
+    ///
+    /// Settable because the app that decides it can arrive after this was built:
+    /// a runtime can start with no configuration at all, and the deployment or
+    /// watched spicepod that follows carries the setting. Read once per query
+    /// build, so a stale value would either fill a table nothing created or spend
+    /// every query writing to one that is not the runtime's.
+    pub(crate) task_history_enabled: std::sync::atomic::AtomicBool,
     // Dedicated runtime for CPU-bound DataFusion queries
     cpu_runtime: OnceLock<ManagedTokioRuntime>,
     // Dedicated runtime for CPU-bound DataFusion acceleration for dataset acceleration refresh tasks
@@ -2477,6 +2484,23 @@ impl DataFusion {
         let table_reference = dataset.into();
         let table_provider = self.get_table_provider(&table_reference).await?;
         Ok(table_provider.schema().as_ref().clone())
+    }
+
+    /// Turn task-history emission on or off for every later query.
+    ///
+    /// Called when the app that decides it becomes known — which, for a runtime
+    /// that started with no configuration, is after this was built — and when a
+    /// conflict means the runtime must stop writing to a table it does not own.
+    pub fn set_task_history_enabled(&self, enabled: bool) {
+        self.task_history_enabled
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether a query emits a task-history row right now.
+    #[must_use]
+    pub fn task_history_emission_enabled(&self) -> bool {
+        self.task_history_enabled
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     #[must_use]

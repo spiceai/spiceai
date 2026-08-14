@@ -2409,7 +2409,11 @@ async fn executor_bind_app(
     // `init_task_history` fails with "table already exists" and we re-check.
     // Fail closed if init fails and the table is still absent — otherwise the
     // executor can report Ready while scheduler federated queries break.
-    if rt.df.task_history_enabled {
+    if rt
+        .df
+        .task_history_enabled
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
         let task_history_ref = ::datafusion::sql::TableReference::partial(
             crate::datafusion::SPICE_RUNTIME_SCHEMA,
             crate::task_history::DEFAULT_TASK_HISTORY_TABLE,

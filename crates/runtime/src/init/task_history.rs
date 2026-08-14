@@ -65,6 +65,12 @@ impl Runtime {
             task_history::DEFAULT_TASK_HISTORY_TABLE,
         );
         if self.df.table_exists(&table) {
+            // Reporting the conflict is not enough on its own: the exporter
+            // resolves this table by name at write time, so leaving emission on
+            // would keep aiming internal rows at a table the runtime does not
+            // own — filling it if the schema happens to fit, and failing every
+            // export if it does not. Stop writing, then say why.
+            self.df.set_task_history_enabled(false);
             return Err(Error::UnableToTrackTaskHistory {
                 source: task_history::Error::TableNameTaken {
                     table: table.to_string(),

@@ -44,6 +44,61 @@ fn view(name: &str, sql: &str) -> View {
     }
 }
 
+/// Each case below builds a whole runtime and runs its component load, so they
+/// are driven one at a time from a single test rather than left to contend for a
+/// shared process. Splitting them into separate `#[tokio::test]` functions makes
+/// the file pass under a process-per-test runner and fail under a plain
+/// `cargo test`, which is a trap for whoever runs the obvious command.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_app_arriving_after_an_empty_start() {
+    an_app_that_arrives_after_an_empty_start_is_loaded_not_only_stored().await;
+    a_table_this_runtime_did_not_register_is_a_conflict_not_a_no_op().await;
+    an_arriving_app_decides_whether_queries_emit_task_history().await;
+    an_arriving_app_that_enables_task_history_gets_a_table_and_emission().await;
+}
+
+/// Emission and the table have to agree. Both were decided when `DataFusion` was
+/// built, from the configuration an empty start does not have — so an arriving app
+/// that disables task history must also stop queries emitting, or every query
+/// keeps writing to a table nothing created.
+async fn an_arriving_app_decides_whether_queries_emit_task_history() {
+    let rt = Arc::new(Runtime::builder().with_app_opt(None).build().await);
+    Arc::clone(&rt).load_components().await;
+
+    let mut disabled = App::default();
+    disabled.runtime.task_history.enabled = false;
+    Arc::clone(&rt).apply_app(Arc::new(disabled)).await;
+
+    assert!(
+        !rt.datafusion()
+            .table_exists(&TableReference::partial("runtime", "task_history")),
+        "a disabled arriving app creates no table"
+    );
+    assert!(
+        !rt.datafusion().task_history_emission_enabled(),
+        "and queries must stop emitting rows nothing will store"
+    );
+}
+
+/// The other direction: an arriving app that enables it gets both the table and
+/// the emission that fills it.
+async fn an_arriving_app_that_enables_task_history_gets_a_table_and_emission() {
+    let rt = Arc::new(Runtime::builder().with_app_opt(None).build().await);
+    Arc::clone(&rt).load_components().await;
+
+    Arc::clone(&rt).apply_app(Arc::new(App::default())).await;
+
+    assert!(
+        rt.datafusion()
+            .table_exists(&TableReference::partial("runtime", "task_history")),
+        "an enabled arriving app brings the table up"
+    );
+    assert!(
+        rt.datafusion().task_history_emission_enabled(),
+        "and queries emit into it"
+    );
+}
+
 /// Idempotence rests on this runtime having registered the table, never on the
 /// name being taken.
 ///
@@ -53,7 +108,6 @@ fn view(name: &str, sql: &str) -> View {
 /// send every task-history write to it. Whether a spicepod can claim that name is
 /// a question for component validation; the guard is written so that the answer
 /// does not matter.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_table_this_runtime_did_not_register_is_a_conflict_not_a_no_op() {
     // Built with an app so task history has configuration to read, and left
     // uninitialized: this is the window the arriving-app path opens, where
@@ -90,9 +144,16 @@ async fn a_table_this_runtime_did_not_register_is_a_conflict_not_a_no_op() {
         rendered.contains("already registered") && rendered.contains("Rename"),
         "the conflict must be reported with a way out: {rendered}"
     );
+
+    // Reporting is not protection. The exporter resolves this table by name when
+    // it writes, so what keeps internal rows out of the occupying table is that
+    // emission stops — a query built after this carries no task-history emitter.
+    assert!(
+        !rt.datafusion().task_history_emission_enabled(),
+        "a conflict must stop the runtime writing to a table it does not own"
+    );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_app_that_arrives_after_an_empty_start_is_loaded_not_only_stored() {
     let rt = Arc::new(Runtime::builder().with_app_opt(None).build().await);
     // The load an empty start performs: with no app, it registers nothing.
