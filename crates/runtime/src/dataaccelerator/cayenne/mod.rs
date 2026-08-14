@@ -25,7 +25,7 @@ pub mod snapshot_engine;
 use std::any::Any;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, LazyLock, RwLock, Weak};
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use arrow_schema::{DataType, Schema};
@@ -302,51 +302,27 @@ pub struct CayenneAccelerator {
     /// one in-memory database.
     instance_id: u64,
     footer_cache_mb: Option<usize>,
-    /// Shared semaphore that bounds the number of concurrent per-table
-    /// background compactions across all Cayenne tables registered with this
-    /// accelerator. Sized at the CPU budget's core count so a fleet of tables
-    /// can't oversubscribe the writer pool.
+    /// The process-wide semaphore that bounds concurrent per-table background
+    /// compactions, held here so the registration path can hand it to each
+    /// table. Sized at `cpu_budget().cayenne_compaction_permits()` so a fleet of
+    /// tables can't oversubscribe the writer pool. Every Cayenne table draws
+    /// on this one budget, including those created by `CREATE TABLE …
+    /// PARTITIONED BY`, which belong to no accelerator.
     compaction_semaphore: Arc<tokio::sync::Semaphore>,
-    /// Initial permit count of `compaction_semaphore` (the semaphore itself only
-    /// exposes *available* permits), published for the occupancy gauge's total.
-    compaction_permits_total: usize,
 }
 
-/// A `(weak handle, total permits)` view of the fleet-wide compaction semaphore,
-/// published when a real table's background compaction is spawned (see
-/// [`Self::create_cayenne_table_provider`]) so the metrics registration
-/// ([`register_cayenne_telemetry`]) can read live occupancy at scrape
-/// time without holding the accelerator alive. Published from the spawn path
-/// rather than the constructor because `CayenneAccelerator::new()` is also called
-/// for throwaway helpers (e.g. `cayenne_data_dir`), whose semaphore is dropped
-/// immediately — capturing that one would leave a dead `Weak`. A `RwLock` (not
-/// `OnceLock`) so the live accelerator's semaphore always wins; a `Weak` never
-/// resurrects a dropped semaphore.
-static COMPACTION_SEMAPHORE_FOR_METRICS: RwLock<Option<(Weak<tokio::sync::Semaphore>, usize)>> =
-    RwLock::new(None);
-
-/// Publish the fleet-wide compaction semaphore for the occupancy gauges. Called
-/// from the real table-registration path; idempotent across a fleet of tables
-/// (they share one semaphore).
-fn publish_compaction_semaphore_for_metrics(sem: &Arc<tokio::sync::Semaphore>, total: usize) {
-    // Recover through poisoning: an unrelated panic must not permanently disable the
-    // compaction-permit gauges (the guarded Weak<Semaphore> isn't corrupted by another
-    // thread's panic).
-    let mut guard = COMPACTION_SEMAPHORE_FOR_METRICS
-        .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    *guard = Some((Arc::downgrade(sem), total));
-}
-
-/// `(available, total)` permits of the fleet-wide compaction semaphore, or `None`
-/// before a real table has registered (or after teardown).
-fn compaction_semaphore_snapshot() -> Option<(u64, u64)> {
-    let guard = COMPACTION_SEMAPHORE_FOR_METRICS
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let (weak, total) = guard.as_ref()?;
-    let sem = weak.upgrade()?;
-    Some((sem.available_permits() as u64, *total as u64))
+/// `(available, total)` permits of the fleet-wide compaction budget.
+///
+/// Read straight from the `cayenne` crate's process-global budget rather than
+/// from a handle the accelerator publishes, because a `CREATE TABLE …
+/// PARTITIONED BY` table draws on that same budget while belonging to no
+/// accelerator: keying the gauges off accelerator registration would leave them
+/// silent in a process whose only compaction work is DDL-created.
+fn compaction_budget_snapshot() -> (u64, u64) {
+    (
+        cayenne::compaction_budget().available_permits() as u64,
+        cayenne::compaction_budget_permits() as u64,
+    )
 }
 
 /// Register the Cayenne write-path backpressure gauges (pull-based observable
@@ -362,6 +338,12 @@ fn compaction_semaphore_snapshot() -> Option<(u64, u64)> {
 pub fn register_cayenne_telemetry() {
     use opentelemetry::global;
     let meter = global::meter("cayenne");
+
+    // Process-wide Vortex segment cache: fill vs capacity, entries, and the
+    // access/hit counters. Registered here rather than where the cache is
+    // installed, because the cache must exist before any table is registered —
+    // well before the real meter provider replaces the startup noop one.
+    vortex_datafusion::register_segment_cache_metrics();
 
     // --- Process-global encode-concurrency budget ---
     let _ = meter
@@ -433,9 +415,8 @@ pub fn register_cayenne_telemetry() {
         )
         .with_unit("{permit}")
         .with_callback(|obs| {
-            if let Some((available, _total)) = compaction_semaphore_snapshot() {
-                obs.observe(available, &[]);
-            }
+            let (available, _total) = compaction_budget_snapshot();
+            obs.observe(available, &[]);
         })
         .build();
     let _ = meter
@@ -443,9 +424,8 @@ pub fn register_cayenne_telemetry() {
         .with_description("Total permits of the fleet-wide Cayenne compaction semaphore.")
         .with_unit("{permit}")
         .with_callback(|obs| {
-            if let Some((_available, total)) = compaction_semaphore_snapshot() {
-                obs.observe(total, &[]);
-            }
+            let (_available, total) = compaction_budget_snapshot();
+            obs.observe(total, &[]);
         })
         .build();
 }
@@ -1009,16 +989,13 @@ impl CayenneAccelerator {
 
     #[must_use]
     pub fn with_footer_cache_mb(footer_cache_mb: Option<usize>) -> Self {
-        let permits = cpu_budget::cpu_budget().cayenne_compaction_permits();
-        let compaction_semaphore = Arc::new(tokio::sync::Semaphore::new(permits));
         Self {
             catalog: Arc::new(OnceCell::new()),
             memory_catalog: Arc::new(OnceCell::new()),
             instance_id: CAYENNE_ACCELERATOR_INSTANCE_COUNTER
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             footer_cache_mb,
-            compaction_semaphore,
-            compaction_permits_total: permits,
+            compaction_semaphore: cayenne::compaction_budget(),
         }
     }
 
@@ -1352,13 +1329,20 @@ impl CayenneAccelerator {
                 config.cdc_mem_tier_min_flush_bytes = tier_caps.min_flush_bytes;
             }
 
-            // Vortex segment cache: memory-aware `auto` default (scales up on
-            // memory-rich hosts, never below the historical 256 MiB), overridable.
-            config.segment_cache_mb = autotune::auto_or_usize(
-                acceleration,
-                &["cayenne_segment_cache_mb"],
-                hw.segment_cache_mb(),
-            );
+            // Vortex segment cache: one cache serves every table, so its budget is
+            // set once at the runtime level and a per-table value has nothing to
+            // size. This memory-aware default only reaches a process with no
+            // installed cache (an embedded host that skips the runtime builder).
+            config.segment_cache_mb = hw.segment_cache_mb();
+            // Report on the key being *present*, not on it parsing: `read_knob`
+            // folds `auto` and malformed values alike into `Knob::Auto`, so
+            // matching on `Set` would leave those operators unaware their setting
+            // no longer does anything.
+            if let Some(requested_mb) = acceleration.params.get("cayenne_segment_cache_mb") {
+                tracing::warn!(
+                    "Dataset {table_name}: acceleration.params.cayenne_segment_cache_mb={requested_mb} is ignored. The Vortex segment cache is now a single budget shared by every table instead of one cache per table, so a per-table size has nothing to size. To control it, set runtime.params.cayenne_segment_cache_mb (in MB; 0 disables caching). See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+                );
+            }
 
             // PK keyset cache: `auto`/unset → memory-derived default; 0 → warn +
             // minimum 1 MiB (mirroring upload_concurrency); else the operator value.
@@ -2040,8 +2024,7 @@ impl CayenneAccelerator {
                     inferred_schema_present = workload.inferred_metadata.is_present(),
                     has_primary_key = workload.has_primary_key,
                     is_upsert = workload.is_upsert,
-                    "Cayenne auto-tuned config: segment_cache={}MB, pk_keyset_cache={:?}MB, target_file_size={}MB, upload_concurrency={}, write_concurrency_override={:?}, sort_columns={:?}, compression_strategy={:?}, delta_encoding={}, pk_conflict_detection={}, deletion_mode={:?}, compaction_trigger_files={}, compaction_trigger_protected_snapshots={}, compaction_trigger_snapshot_age_ms={}, compaction_max_levels={}, compaction_max_files_per_pick={}, compaction_background_interval_ms={}, inline_max_rows={}, inline_max_bytes={}, inline_max_buffer_bytes={}, inline_flush_max_rows={}, inline_flush_max_segments={}, inline_flush_max_bytes={}, cdc_durability={}, cdc_mem_tier_max_bytes={}, cdc_mem_tier_min_flush_bytes={}",
-                    config.segment_cache_mb,
+                    "Cayenne auto-tuned config: pk_keyset_cache={:?}MB, target_file_size={}MB, upload_concurrency={}, write_concurrency_override={:?}, sort_columns={:?}, compression_strategy={:?}, delta_encoding={}, pk_conflict_detection={}, deletion_mode={:?}, compaction_trigger_files={}, compaction_trigger_protected_snapshots={}, compaction_trigger_snapshot_age_ms={}, compaction_max_levels={}, compaction_max_files_per_pick={}, compaction_background_interval_ms={}, inline_max_rows={}, inline_max_bytes={}, inline_max_buffer_bytes={}, inline_flush_max_rows={}, inline_flush_max_segments={}, inline_flush_max_bytes={}, cdc_durability={}, cdc_mem_tier_max_bytes={}, cdc_mem_tier_min_flush_bytes={}",
                     config.pk_keyset_cache_mb,
                     config.target_vortex_file_size_mb,
                     config.upload_concurrency,
@@ -2501,12 +2484,6 @@ impl CayenneAccelerator {
         // `spawn_blocking` builds + the periodic eviction sweep that releases idle
         // cached views' pinned snapshot dirs for GC). Must run once, after `Arc::new`.
         provider.init_scan_view_cache();
-        // Publish the real, in-use compaction semaphore for the occupancy gauges
-        // (idempotent across the fleet — every table shares this one semaphore).
-        publish_compaction_semaphore_for_metrics(
-            &self.compaction_semaphore,
-            self.compaction_permits_total,
-        );
         // Memory mode never drains to Vortex (no compaction, no mem-tier
         // checkpoint/seal, no cold tier), so skip the background drain tasks
         // entirely; the provider's own guards also no-op them defensively.
@@ -2708,8 +2685,7 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
             .one_of(&["string", "error", "ignore", "warn"])
             .default("string"),
         ParameterSpec::component("segment_cache_mb")
-            .description("Size of the in-memory Vortex decompressed-segment cache in MB. 'auto' (default, or when unset) scales with machine memory (~1/128 of RAM) but never below 256 MB and never above 1024 MB. Set an explicit MB value to override.")
-            .default("auto"),
+            .description("Ignored: the in-memory Vortex segment cache is now one budget shared by every Cayenne table rather than a cache per table, so a per-table size no longer has anything to size. Set runtime.params.cayenne_segment_cache_mb instead (unset: ~1/64 of the available memory, clamped to [256 MB, 2048 MB]; 0 disables caching). A value set here is reported at startup and otherwise has no effect."),
         ParameterSpec::component("scan_concurrency")
             .description("How many splits a single Vortex file scan decodes concurrently. 'auto' (default) derives it from the query fan-out and the number of files a scan plans, so a table held in few files still decodes in parallel. 'off' decodes each file serially. An explicit count pins it. Each concurrent split holds a decoded batch, and all of them are charged to 'runtime.query.memory_limit', so lowering this cuts a scan's resident decode memory without shrinking query parallelism everywhere the way 'runtime.query.target_partitions' does.")
             .default("auto"),
