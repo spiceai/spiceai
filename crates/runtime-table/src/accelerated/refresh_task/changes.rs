@@ -1958,12 +1958,17 @@ impl RefreshTask {
         let history_unavailable = trim_to_rebuild_signal(&mut envelopes);
 
         // Read after the trim and before the retain. After, because a readiness
-        // flag from a discarded envelope must not survive it: the rebuild signal
-        // is deliberately not-ready, and honoring a stale flag would mark the
-        // dataset Ready the moment the replacement lands — before the source has
-        // reconnected at the captured head and caught up, which is exactly the
-        // stale-serving window lag-based readiness exists to prevent. Before,
-        // because the retain drops heartbeats whose ready flag IS meant to count.
+        // flag from a discarded envelope must not reach `signal_dataset_ready`,
+        // which wakes everything blocked on initial load using a flag describing
+        // a source state the rebuild is about to replace. That narrows, but does
+        // not close, the stale-serving window: on the `history_unavailable` path
+        // the dataset becomes Ready regardless, because `rebuild_from_source` is
+        // the ordinary full refresh and `RefreshTask::run` sets `Ready` (and with
+        // it `initial_load_completed`) on success, before the source has
+        // reconnected at the captured head and confirmed catch-up by lag. Closing
+        // the window needs the rebuild to run without that terminal Ready
+        // transition, tracked in #13028. Before the retain, because it drops
+        // heartbeats whose ready flag IS meant to count.
         //
         // Split envelopes into (committers, batches, ready_flags) preserving
         // arrival order. Committers will be drained sequentially in the
