@@ -89,38 +89,43 @@ impl CompletionReport {
 /// Report the connection once the runtime is serving and Spice Cloud has
 /// answered, on a task of its own.
 ///
-/// `serving` is cancelled when the initial component load settles; `shutdown`
-/// when the process is going down. The report is emitted exactly once, and only
-/// if shutdown is not the first of them to fire.
+/// `serving` is cancelled when the initial component load settles; `withdrawn`
+/// when this process may no longer report itself as connected — the servers
+/// have stopped, or the process is going down. The report is emitted exactly
+/// once, and only if `withdrawn` is not the first of them to fire.
 pub(crate) fn spawn(
     session_ack: Arc<SessionAck>,
     serving: CancellationToken,
-    shutdown: CancellationToken,
+    withdrawn: CancellationToken,
 ) {
     tokio::spawn(async move {
-        if let Some(session) = await_completion(&session_ack, &serving, &shutdown).await {
-            CompletionReport::of(&session).emit();
+        if let Some(session) = await_completion(&session_ack, &serving, &withdrawn).await {
+            // Resolved now rather than at acknowledgement: an `AttachApp` can
+            // land between the two, and the block has to name the project this
+            // instance is attached to when it prints — not the one it was
+            // attached to when Spice Cloud first answered.
+            CompletionReport::of(&session.refreshed().await).emit();
         }
     });
 }
 
-/// Wait for both halves of the completion, or for shutdown.
+/// Wait for both halves of the completion, or for the report to be withdrawn.
 ///
-/// `None` means the process went down before both were true, which is the one
-/// case where there is nothing honest to report: either the runtime never
-/// finished coming up, or Spice Cloud never answered it.
+/// `None` means the servers stopped or the process went down before both were
+/// true, which is the one case where there is nothing honest to report: either
+/// the runtime never finished coming up, or Spice Cloud never answered it.
 async fn await_completion(
     session_ack: &SessionAck,
     serving: &CancellationToken,
-    shutdown: &CancellationToken,
+    withdrawn: &CancellationToken,
 ) -> Option<AcknowledgedSession> {
     let session = tokio::select! {
         session = session_ack.wait() => session,
-        () = shutdown.cancelled() => return None,
+        () = withdrawn.cancelled() => return None,
     };
     tokio::select! {
         () = serving.cancelled() => Some(session),
-        () = shutdown.cancelled() => None,
+        () = withdrawn.cancelled() => None,
     }
 }
 

@@ -63,11 +63,43 @@ pub enum Error {
         owner: String,
     },
 
-    #[snafu(display("Failed to prepare the runtime lock at {}: {source}", path.display()))]
-    Io {
+    #[snafu(display(
+        "Failed to create the instance state directory {}: {source}",
+        path.display()
+    ))]
+    DirectoryUnavailable {
         path: PathBuf,
         source: std::io::Error,
     },
+
+    #[snafu(display("Failed to claim the runtime lock at {}: {source}", path.display()))]
+    Unusable {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+}
+
+impl Error {
+    /// Whether the filesystem itself refused the write, rather than something
+    /// about *this* lock refusing it.
+    ///
+    /// This is the one failure that says nothing about whether a second runtime
+    /// could be here: on a read-only filesystem no process can take the lock,
+    /// no process can change the instance state either, and the exclusion is
+    /// equally unavailable to every one of them. A caller may treat it as a
+    /// degradation. Everything else — a lock file this process may not open, a
+    /// symlink or device in its place, a full disk — is a specific refusal that
+    /// can perfectly well coexist with a live runtime holding the real lock, so
+    /// reading it as "no lock needed" is how the one-runtime guarantee gets
+    /// bypassed.
+    #[must_use]
+    pub fn is_read_only_filesystem(&self) -> bool {
+        let source = match self {
+            Self::AlreadyRunning { .. } => return false,
+            Self::DirectoryUnavailable { source, .. } | Self::Unusable { source, .. } => source,
+        };
+        source.kind() == std::io::ErrorKind::ReadOnlyFilesystem
+    }
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -120,17 +152,20 @@ impl RuntimeLock {
     /// # Errors
     ///
     /// [`Error::AlreadyRunning`] when another live runtime owns the directory,
-    /// and [`Error::Io`] when the lock file cannot be created or inspected.
+    /// [`Error::DirectoryUnavailable`] when the instance state directory cannot
+    /// be created, and [`Error::Unusable`] when the lock file itself cannot be
+    /// opened, checked, or locked. Only [`Error::is_read_only_filesystem`]
+    /// distinguishes a refusal a caller may safely start without.
     pub fn acquire(config_dir: &Path) -> Result<Self> {
         let path = config_dir.join(RUNTIME_LOCK_FILE);
-        std::fs::create_dir_all(config_dir).context(IoSnafu {
+        std::fs::create_dir_all(config_dir).context(DirectoryUnavailableSnafu {
             path: config_dir.to_path_buf(),
         })?;
 
         let file = open_lock_file(&path)?;
 
         if !fs4::fs_std::FileExt::try_lock_exclusive(&file)
-            .context(IoSnafu { path: path.clone() })?
+            .context(UnusableSnafu { path: path.clone() })?
         {
             return Err(Error::AlreadyRunning {
                 instance: instance_dir_of(config_dir),
@@ -140,7 +175,16 @@ impl RuntimeLock {
 
         // Only now: the contents describe a holder, and a process that never
         // held the lock must never have written them.
-        record_owner(&file, &path)?;
+        //
+        // A failure to write them is not a failure to acquire. The lock is the
+        // kernel's and this process holds it; giving it up because a diagnostic
+        // line could not be written would let a second runtime in, in exchange
+        // for a message nothing depends on.
+        if let Err(err) = record_owner(&file, &path) {
+            tracing::warn!(
+                "{err}. The instance directory is claimed regardless; only the diagnostic naming this process is missing."
+            );
+        }
 
         Ok(Self { path, _file: file })
     }
@@ -168,7 +212,7 @@ fn open_lock_file(path: &Path) -> Result<File> {
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
 
-    let file = options.open(path).context(IoSnafu {
+    let file = options.open(path).context(UnusableSnafu {
         path: path.to_path_buf(),
     })?;
 
@@ -176,12 +220,12 @@ fn open_lock_file(path: &Path) -> Result<File> {
     {
         if !file
             .metadata()
-            .context(IoSnafu {
+            .context(UnusableSnafu {
                 path: path.to_path_buf(),
             })?
             .is_file()
         {
-            return Err(Error::Io {
+            return Err(Error::Unusable {
                 path: path.to_path_buf(),
                 source: std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
@@ -190,7 +234,7 @@ fn open_lock_file(path: &Path) -> Result<File> {
             });
         }
         file.set_permissions(std::fs::Permissions::from_mode(0o600))
-            .context(IoSnafu {
+            .context(UnusableSnafu {
                 path: path.to_path_buf(),
             })?;
     }
@@ -218,16 +262,16 @@ fn record_owner(file: &File, path: &Path) -> Result<()> {
     let bytes = serde_json::to_vec(&owner).unwrap_or_default();
 
     let mut handle = file;
-    handle.set_len(0).context(IoSnafu {
+    handle.set_len(0).context(UnusableSnafu {
         path: path.to_path_buf(),
     })?;
-    handle.seek(SeekFrom::Start(0)).context(IoSnafu {
+    handle.seek(SeekFrom::Start(0)).context(UnusableSnafu {
         path: path.to_path_buf(),
     })?;
-    handle.write_all(&bytes).context(IoSnafu {
+    handle.write_all(&bytes).context(UnusableSnafu {
         path: path.to_path_buf(),
     })?;
-    handle.flush().context(IoSnafu {
+    handle.flush().context(UnusableSnafu {
         path: path.to_path_buf(),
     })?;
     Ok(())

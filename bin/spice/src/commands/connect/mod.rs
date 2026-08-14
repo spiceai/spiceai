@@ -49,6 +49,7 @@ use crate::output::OutputFormat;
 use clap::{Args, Subcommand};
 use runtime_cloud_connect::config::{CloudConnectConfig, IDENTITY_FILE};
 
+use service::ServiceState;
 use status::{ConnectStatus, ConnectionState};
 
 /// File (relative to the config dir) holding a `--endpoint` override so later
@@ -433,10 +434,15 @@ async fn connect_existing(
         .await;
     };
 
-    // Idempotent by contract: a running service stays running and its instance
-    // keeps serving. Nothing here restarts it — a restart would interrupt an
-    // instance that is already doing what this command asks for.
-    backend.start(&manifest)?;
+    // A service that is already up is the state this command asks for, so it is
+    // reported without being touched. That is not just an optimization: it is
+    // what makes `spice connect` answer on every host whose supervisor this
+    // release cannot yet drive (launchd's lifecycle actions are still
+    // unimplemented), and it is what keeps the command from interrupting a
+    // serving instance. Anything else is asked to start.
+    if status.service.state != ServiceState::Running {
+        backend.start(&manifest)?;
+    }
     println!(
         "Spice Cloud Connect: {} is running as the {} service {} ({}).",
         instance_dir.display(),

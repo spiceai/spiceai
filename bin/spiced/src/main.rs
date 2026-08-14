@@ -180,7 +180,12 @@ fn load_and_run(mut args: spiced::Args) -> Result<(), Box<dyn std::error::Error>
     // redeems an enrollment key, binds a listener, or dials the gateway. Held
     // for the rest of the process — the kernel releases it on exit, including a
     // crash — so it stays alive across `spiced::run` below.
-    let _instance = match spiced::claim_instance_directory() {
+    //
+    // Inside the temporary subscriber, not beside it: claiming reports its own
+    // degradation, and the global subscriber does not exist until `spiced::run`
+    // installs one — so a warning emitted outside this context would be
+    // dropped on the floor.
+    let _instance = match in_tracing_context(spiced::claim_instance_directory) {
         Ok(claim) => claim,
         Err(message) => {
             in_tracing_context(|| tracing::error!("{message}"));

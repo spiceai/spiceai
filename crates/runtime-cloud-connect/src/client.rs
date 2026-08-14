@@ -136,12 +136,20 @@ impl ClientDriver {
     /// instance and has dispatched to it. The `Ack` for the `Hello` is the
     /// usual first, but an instance the control plane immediately commands is
     /// no less connected. The latch keeps only the first.
+    ///
+    /// The portal metadata this carries is a snapshot, not a verdict: the
+    /// message being recorded here may be the `AttachApp` that is about to
+    /// change it, so a consumer resolves it from the durable identity when it
+    /// reports (`AcknowledgedSession::refreshed`).
     fn note_session_acknowledged(&self) {
         let (Some(ack), Some(identity)) = (self.session_ack.as_ref(), self.identity.as_ref())
         else {
             return;
         };
-        ack.record(crate::session::AcknowledgedSession::of_identity(identity));
+        ack.record(crate::session::AcknowledgedSession::of_identity(
+            identity,
+            &self.config.identity_path,
+        ));
     }
 
     /// Run the driver until shutdown is requested.

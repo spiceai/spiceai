@@ -23,22 +23,29 @@ limitations under the License.
 //! seen two sessions, or answer commands addressed to the other process.
 //!
 //! The claim is [`runtime_cloud_connect::RuntimeLock`]; what this module adds
-//! is the policy for a runtime that has to keep running: a directory owned by
-//! another live runtime is a refusal, while a lock file that cannot be created
-//! at all is not. Read-only and ephemeral filesystems are ordinary places to
-//! run `spiced` — a container image with no writable working directory, a
-//! read-only root — and none of them contains a second runtime to collide
-//! with. Refusing to start there would break deployments that are correct, to
-//! prevent a conflict that cannot occur, so an unwritable directory degrades to
-//! a warning and the start proceeds unclaimed.
+//! is the policy for a runtime that has to keep running.
+//!
+//! A directory owned by another live runtime is a refusal. So is a lock this
+//! process cannot take for any *specific* reason — a lock file it may not open,
+//! a symlink or device left in its place, a full disk — because every one of
+//! those can coexist with a live runtime holding the real lock, and starting
+//! anyway would quietly void the one-runtime guarantee exactly where it is
+//! being attacked.
+//!
+//! The single exception is a read-only filesystem. Nothing there can take the
+//! lock, and nothing there can change the instance state either, so the
+//! exclusion is equally unavailable to every process and there is no conflict
+//! to detect. A container image with a read-only root is an ordinary way to run
+//! `spiced`, so that case degrades to a warning and the start proceeds
+//! unclaimed rather than breaking a correct deployment.
 
 use runtime_cloud_connect::{CloudConnectConfig, RuntimeLock};
 
 /// This process's ownership of its instance directory, held until the process
 /// exits.
 ///
-/// The `None` case is a directory that could not be claimed for an I/O reason,
-/// which is deliberately not fatal — see the module docs.
+/// The `None` case is a read-only filesystem, where the claim is unavailable to
+/// every process alike — see the module docs.
 #[derive(Debug)]
 pub struct InstanceClaim {
     /// Held, never read: the claim lives exactly as long as this value does.
@@ -49,9 +56,10 @@ pub struct InstanceClaim {
 ///
 /// # Errors
 ///
-/// Returns the message to print when another live runtime already owns the
-/// directory. The caller exits non-zero on it, having bound nothing and
-/// connected nothing.
+/// Returns the message to print when the directory cannot be claimed: another
+/// live runtime owns it, or the lock itself could not be taken for a reason
+/// that leaves a conflict possible. The caller exits non-zero on it, having
+/// bound nothing and connected nothing.
 pub fn claim_instance_directory() -> Result<InstanceClaim, String> {
     claim(&CloudConnectConfig::default_config_dir())
 }
@@ -62,16 +70,26 @@ fn claim(config_dir: &std::path::Path) -> Result<InstanceClaim, String> {
             tracing::debug!("Instance directory claimed ({})", lock.path().display());
             Ok(InstanceClaim { _lock: Some(lock) })
         }
-        Err(err @ runtime_cloud_connect::runtime_lock::Error::AlreadyRunning { .. }) => {
-            Err(err.to_string())
-        }
-        Err(err) => {
+        // Nothing on a read-only filesystem can hold the lock, or change the
+        // state the lock protects, so there is no exclusion to lose.
+        Err(err) if err.is_read_only_filesystem() => {
             tracing::warn!(
-                "{err}. Starting anyway: this only leaves a second runtime in the same directory \
-                 undetected, and nothing else depends on the lock."
+                "{err}. Starting anyway: on a read-only filesystem no runtime can take this lock \
+                 and none can change this directory's state, so there is nothing for a second one \
+                 to corrupt."
             );
             Ok(InstanceClaim { _lock: None })
         }
+        // Everything else, including a lock file this process may not open and
+        // anything that is not the regular file the lock must be: a live
+        // runtime may well be holding the real lock, so starting would void the
+        // guarantee precisely where something is interfering with it.
+        Err(err) => Err(format!(
+            "{err}. Refusing to start: a lock that cannot be taken cannot rule out a second \
+             runtime in this directory. Fix the lock file's ownership, type, or permissions — or \
+             point this runtime at another instance directory with SPICE_CONFIG_DIR. \
+             See: https://spiceai.org/docs"
+        )),
     }
 }
 
@@ -102,22 +120,60 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn an_unwritable_config_directory_does_not_stop_the_runtime() {
-        // A read-only working directory is an ordinary deployment and contains
-        // no second runtime to collide with; refusing to start there would
-        // break a correct deployment to prevent an impossible conflict.
+    fn a_lock_this_process_may_not_open_fails_closed() {
+        // Another user's owner-only lock file is what a live runtime under a
+        // different account looks like from here. Starting anyway would put a
+        // second runtime on that instance directory — the exact outcome the
+        // lock exists to prevent — so this refuses instead of degrading.
         use std::os::unix::fs::PermissionsExt as _;
 
         let dir = tempfile::tempdir().expect("create tempdir");
-        let readonly = dir.path().join("readonly");
-        std::fs::create_dir(&readonly).expect("create the read-only parent");
-        std::fs::set_permissions(&readonly, std::fs::Permissions::from_mode(0o500))
-            .expect("make the parent read-only");
+        let config_dir = dir.path().join(".spice");
+        std::fs::create_dir_all(&config_dir).expect("create the config dir");
+        let lock_path = config_dir.join(runtime_cloud_connect::runtime_lock::RUNTIME_LOCK_FILE);
+        std::fs::write(&lock_path, b"{}").expect("create the lock file");
+        std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o000))
+            .expect("make the lock file unopenable");
 
-        let claimed = claim(&readonly.join(".spice"));
+        let claimed = claim(&config_dir);
 
-        std::fs::set_permissions(&readonly, std::fs::Permissions::from_mode(0o700))
+        std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o600))
             .expect("restore permissions so the tempdir can be cleaned up");
-        claimed.expect("an unclaimable directory must not stop the runtime");
+
+        // Root opens anything, so the refusal is only observable unprivileged;
+        // the assertion below is skipped rather than inverted, because running
+        // as root is not the case under test.
+        if !is_root() {
+            let message = claimed.expect_err("an unopenable lock must not be started past");
+            assert!(message.contains("Refusing to start"), "{message}");
+            assert!(message.contains("SPICE_CONFIG_DIR"), "{message}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_lock_file_fails_closed() {
+        // A symlink in place of the lock is someone redirecting exclusion at
+        // another file; the guarantee cannot be assumed to hold.
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let config_dir = dir.path().join(".spice");
+        std::fs::create_dir_all(&config_dir).expect("create the config dir");
+        let elsewhere = dir.path().join("elsewhere.lock");
+        std::fs::write(&elsewhere, b"{}").expect("create the redirect target");
+        std::os::unix::fs::symlink(
+            &elsewhere,
+            config_dir.join(runtime_cloud_connect::runtime_lock::RUNTIME_LOCK_FILE),
+        )
+        .expect("redirect the lock path");
+
+        let message = claim(&config_dir).expect_err("a redirected lock must not be started past");
+        assert!(message.contains("Refusing to start"), "{message}");
+    }
+
+    #[cfg(unix)]
+    fn is_root() -> bool {
+        // SAFETY: `geteuid` reads the caller's effective uid and has no
+        // preconditions, no failure mode, and no side effects.
+        unsafe { libc::geteuid() == 0 }
     }
 }

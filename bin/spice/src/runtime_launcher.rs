@@ -70,6 +70,26 @@ pub struct RunConfig {
 /// Returns an error when the runtime cannot be installed, when the endpoint
 /// flags conflict, or when the child process cannot be started or waited on.
 pub async fn run_runtime(ctx: &RuntimeContext, config: &RunConfig) -> Result<()> {
+    let status = start_runtime(ctx, config).await?;
+
+    if !status.success() {
+        // The runtime's status is this command's status: a caller in a script
+        // sees what the runtime reported, not that the CLI managed to run it.
+        std::process::exit(status.code().unwrap_or(1));
+    }
+
+    Ok(())
+}
+
+/// [`run_runtime`] up to the point where the runtime has exited, returning the
+/// status it exited with instead of adopting it.
+///
+/// Split out because adopting the status ends the process, which is exactly
+/// what a test of this behavior cannot do.
+async fn start_runtime(
+    ctx: &RuntimeContext,
+    config: &RunConfig,
+) -> Result<std::process::ExitStatus> {
     ctx.ensure_local_runtime_supported()?;
 
     // Auto-install runtime if not present
@@ -104,13 +124,7 @@ pub async fn run_runtime(ctx: &RuntimeContext, config: &RunConfig) -> Result<()>
 
     let mut child = cmd.spawn().context(RuntimeExecutionSnafu)?;
 
-    let status = run_with_signal_forwarding(&mut child).await?;
-
-    if !status.success() {
-        std::process::exit(status.code().unwrap_or(1));
-    }
-
-    Ok(())
+    run_with_signal_forwarding(&mut child).await
 }
 
 /// The `spiced` argument list a [`RunConfig`] resolves to, apart from the
@@ -294,5 +308,150 @@ mod tests {
     #[test]
     fn a_quiet_run_adds_no_flags_of_its_own() {
         assert!(spiced_args(&RunConfig::default(), None).is_empty());
+    }
+
+    /// The launcher against a stub runtime: what it does with a real child
+    /// process, which is the half no argument assertion can cover.
+    #[cfg(unix)]
+    mod child_process {
+        use super::*;
+        use std::path::PathBuf;
+        use std::time::{Duration, Instant};
+
+        /// How long a stub is given to reach the state a test waits for. Only
+        /// an upper bound on something that normally happens in milliseconds.
+        const READY_BUDGET: Duration = Duration::from_secs(10);
+        const POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+        /// Install `script` as the `spiced` a context resolves, and return that
+        /// context. The directory is the caller's to keep alive.
+        fn context_with_stub_runtime(bin_dir: &std::path::Path, script: &str) -> RuntimeContext {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            std::fs::create_dir_all(bin_dir).expect("create the stub bin directory");
+            let stub = bin_dir.join("spiced");
+            std::fs::write(&stub, script).expect("write the stub runtime");
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
+                .expect("make the stub runtime executable");
+            RuntimeContext::with_bin_dir_for_test(bin_dir.to_path_buf())
+        }
+
+        /// Wait for the stub to report the state a test needs, rather than
+        /// sleeping for a duration that is either flaky or slow.
+        async fn wait_for(path: &PathBuf) {
+            let deadline = Instant::now() + READY_BUDGET;
+            while !path.exists() {
+                assert!(
+                    Instant::now() < deadline,
+                    "the stub runtime never created {}",
+                    path.display()
+                );
+                tokio::time::sleep(POLL_INTERVAL).await;
+            }
+        }
+
+        #[tokio::test]
+        async fn the_runtime_runs_in_the_configured_working_directory() {
+            // `spice connect --dir` acts on an instance directory, and the
+            // runtime resolves both the spicepod and the `.spice` state from
+            // its working directory — so this is what makes the runtime it
+            // starts the one that directory describes.
+            let dir = tempfile::tempdir().expect("create tempdir");
+            let instance_dir = dir.path().join("instance");
+            std::fs::create_dir_all(&instance_dir).expect("create the instance directory");
+            let observed = dir.path().join("cwd");
+            let ctx = context_with_stub_runtime(
+                &dir.path().join("bin"),
+                &format!("#!/bin/sh\npwd > {}\n", observed.display()),
+            );
+
+            let status = start_runtime(
+                &ctx,
+                &RunConfig {
+                    working_dir: Some(instance_dir.clone()),
+                    ..RunConfig::default()
+                },
+            )
+            .await
+            .expect("the stub runtime runs");
+
+            assert!(status.success());
+            let reported = std::fs::read_to_string(&observed).expect("the stub reported its cwd");
+            assert_eq!(
+                std::fs::canonicalize(reported.trim()).expect("canonicalize the reported cwd"),
+                std::fs::canonicalize(&instance_dir).expect("canonicalize the instance directory"),
+            );
+        }
+
+        #[tokio::test]
+        async fn a_failing_runtime_reports_its_own_status() {
+            // The CLI adopts this as its own exit status, so a script that runs
+            // `spice connect` sees what the runtime reported rather than that
+            // the CLI managed to start it.
+            let dir = tempfile::tempdir().expect("create tempdir");
+            let ctx = context_with_stub_runtime(&dir.path().join("bin"), "#!/bin/sh\nexit 3\n");
+
+            let status = start_runtime(&ctx, &RunConfig::default())
+                .await
+                .expect("a failing runtime is an exit status, not a launcher error");
+
+            assert_eq!(status.code(), Some(3));
+        }
+
+        #[tokio::test]
+        async fn a_termination_signal_reaches_the_runtime() {
+            // Ctrl-C and `systemctl stop` reach the CLI, and the runtime is the
+            // process that has to shut down cleanly — its identity and desired
+            // state are only intact if it gets to do that itself.
+            use tokio::signal::unix::{SignalKind, signal};
+
+            // Registered before the signal is raised: this is what makes the
+            // default terminate action inapplicable, so a raise cannot kill the
+            // test process before the launcher installs its own handler.
+            let mut guard = signal(SignalKind::terminate()).expect("register SIGTERM");
+
+            let dir = tempfile::tempdir().expect("create tempdir");
+            let started = dir.path().join("started");
+            let terminated = dir.path().join("terminated");
+            // `sleep &` + `wait` rather than a foreground sleep: a shell runs a
+            // trap only between commands, so a foreground sleep would swallow
+            // the signal for its whole duration.
+            let ctx = context_with_stub_runtime(
+                &dir.path().join("bin"),
+                &format!(
+                    "#!/bin/sh\ntrap 'echo yes > {terminated}; exit 143' TERM\ntouch {started}\nsleep 30 &\nwait\n",
+                    terminated = terminated.display(),
+                    started = started.display(),
+                ),
+            );
+
+            let launched = tokio::spawn(async move {
+                start_runtime(&ctx, &RunConfig::default())
+                    .await
+                    .expect("the stub runtime runs")
+            });
+
+            wait_for(&started).await;
+            nix::sys::signal::raise(nix::sys::signal::Signal::SIGTERM)
+                .expect("raise SIGTERM in this process");
+            // Consumed so the test's own listener does not outlive the raise
+            // with a pending signal.
+            let _ = guard.recv().await;
+
+            let status = tokio::time::timeout(READY_BUDGET, launched)
+                .await
+                .expect("the launcher must return once the runtime exits")
+                .expect("the launcher task must not panic");
+
+            assert_eq!(
+                status.code(),
+                Some(143),
+                "the runtime's own exit status must reach the caller"
+            );
+            assert!(
+                terminated.exists(),
+                "the runtime must receive the signal rather than be killed by it"
+            );
+        }
     }
 }

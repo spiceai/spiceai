@@ -1124,8 +1124,24 @@ pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
     // Captured before `args` is moved into the server task below.
     let runtime_overrides = args.set_runtime.clone();
 
-    let server_thread = tokio::spawn(async move {
-        Box::pin(cloned_rt.start_servers(args.runtime, tls_config, endpoint_auth)).await
+    // Cancelled when this process may no longer report itself as connected:
+    // shutdown (it is a child of the runtime's shutdown token, so a cancelled
+    // parent cancels it) or the server task ending, whichever comes first. A
+    // bind failure is observed only where `server_thread` is awaited, well
+    // after the initial load settles, so without this a runtime that never
+    // listened could announce itself as serving and then exit.
+    let serving_ended = rt.status().shutdown_token();
+
+    let server_thread = tokio::spawn({
+        let serving_ended = serving_ended.clone();
+        async move {
+            let result =
+                Box::pin(cloned_rt.start_servers(args.runtime, tls_config, endpoint_auth)).await;
+            // Whatever the outcome — a bind that failed, or a clean
+            // termination — the servers are not running after this point.
+            serving_ended.cancel();
+            result
+        }
     });
 
     // Restore control-plane-delivered secrets from the local cache and register
@@ -1142,15 +1158,12 @@ pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
     // The connection report's two latches. The connection half is filled by the
     // control client on the first message Spice Cloud sends back; the serving
     // half below, when the initial component load settles. Whichever is second
-    // releases the report, so neither ordering loses it.
+    // releases the report, so neither ordering loses it — and `serving_ended`
+    // withdraws it if the servers stop first.
     let session_ack = cloud_connect_configured.then(|| Arc::new(SessionAck::new()));
     let serving = CancellationToken::new();
     if let Some(ack) = &session_ack {
-        connection_report::spawn(
-            Arc::clone(ack),
-            serving.clone(),
-            rt.status().shutdown_token(),
-        );
+        connection_report::spawn(Arc::clone(ack), serving.clone(), serving_ended.clone());
     }
 
     // Spice Cloud Connect. Default off — activates only from the validated
