@@ -366,6 +366,10 @@ pub fn build_changes_stream(
             }
         };
 
+        // See the note in the MySQL connector: the store is what the stream needs, and
+        // the context has served its purpose once the store is resolved.
+        drop(context);
+
         let input = ReplicationStreamInput {
             dataset_name: dataset_name.clone(),
             params: params_for_stream,

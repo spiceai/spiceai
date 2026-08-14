@@ -103,6 +103,10 @@ pub fn build_changes_stream(
             None
         };
 
+        // See the note in the MySQL connector: the store is what the stream needs, and
+        // the context has served its purpose once the store is resolved.
+        drop(context);
+
         let current_schema_json = serialize_current_schema(&schema, &dataset.name);
         let persisted =
             persisted_checkpoint(mongo_sys.as_deref(), &dataset, current_schema_json.as_deref())

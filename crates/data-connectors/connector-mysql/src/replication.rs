@@ -221,6 +221,11 @@ pub fn build_changes_stream(
             Arc::new(NoopPositionStore)
         };
 
+        // The store is all this stream needs; the context is only the route to it. The
+        // context is weak, so retaining it would not pin the runtime, but a long-lived
+        // change stream should not hold a handle it has finished with.
+        drop(context);
+
         let schema_json = match arrow_tools::schema::schema_to_json(&schema) {
             Ok(json) => Some(json),
             Err(e) => {
