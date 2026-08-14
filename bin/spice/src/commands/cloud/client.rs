@@ -861,8 +861,8 @@ fn map_cloud_error(org: Option<&str>) -> impl Fn(spice_cloud_client::error::Erro
                 format!("Spice Cloud request failed with status {status}: {message}"),
             ),
             CloudError::HttpRequest { source } => Error::HttpRequestFailed { source },
-            CloudError::ResponseTooLarge => Error::InvalidResponse {
-                message: "Spice Cloud response exceeded the 64 KiB limit".to_string(),
+            CloudError::ResponseTooLarge { limit } => Error::InvalidResponse {
+                message: format!("Spice Cloud response exceeded the {limit} byte limit"),
             },
             CloudError::JsonParse { source } => Error::InvalidResponse {
                 message: format!("Failed to parse response: {source}"),

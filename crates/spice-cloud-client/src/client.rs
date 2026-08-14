@@ -691,7 +691,7 @@ async fn bounded_response_body(response: reqwest::Response, limit: usize) -> Res
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.context(HttpRequestSnafu)?;
         if bytes.len().saturating_add(chunk.len()) > limit {
-            return error::ResponseTooLargeSnafu.fail();
+            return error::ResponseTooLargeSnafu { limit }.fail();
         }
         bytes.extend_from_slice(&chunk);
     }
@@ -719,9 +719,16 @@ fn redact_json_strings(value: &mut serde_json::Value, sensitive: &str) {
             }
         }
         serde_json::Value::Object(values) => {
-            for value in values.values_mut() {
-                redact_json_strings(value, sensitive);
+            // Keys carry the credential just as easily as values, and parsing
+            // decodes an escaped key back to its literal bytes — so a key the
+            // raw replacement above could not match is reconstructed here and
+            // would be re-emitted by the serialization that follows.
+            let mut redacted = serde_json::Map::with_capacity(values.len());
+            for (key, mut value) in std::mem::take(values) {
+                redact_json_strings(&mut value, sensitive);
+                redacted.insert(key.replace(sensitive, "[REDACTED]"), value);
             }
+            *values = redacted;
         }
         serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
     }
@@ -795,6 +802,28 @@ mod tests {
             redact_response_body(r#"{"error":"secret\u002dtoken was rejected"}"#, Some(token));
         assert!(!escaped.contains(token));
         assert!(escaped.contains("[REDACTED]"));
+    }
+
+    /// An escaped credential in an object *key* survives the raw replacement,
+    /// and parsing decodes it back to the literal token, so serializing the
+    /// tree again would publish it.
+    #[test]
+    fn management_error_bodies_redact_bearers_hidden_in_object_keys() {
+        let token = "secret-token";
+        for body in [
+            // Escaped in the key, so the raw replacement cannot match it.
+            r#"{"secret\u002dtoken":"rejected"}"#,
+            r#"{"outer":{"secret\u002dtoken":["rejected"]}}"#,
+            // Literal in the key, for the path the raw replacement does cover.
+            r#"{"secret-token":"rejected"}"#,
+        ] {
+            let redacted = redact_response_body(body, Some(token));
+            assert!(
+                !redacted.contains(token),
+                "object key leaked the bearer: {redacted}"
+            );
+            assert!(redacted.contains("[REDACTED]"), "{redacted}");
+        }
     }
 
     /// Both constructors must install the same-origin redirect policy, or a bearer token —
