@@ -969,6 +969,23 @@ struct CachedTableStatistics {
     abandoned_update_outstanding: bool,
 }
 
+impl CachedTableStatistics {
+    /// Whether the maintained count may be served as a provably-exact live count.
+    ///
+    /// The outstanding-gap veto is part of this answer rather than a separate
+    /// check at the gate, because `count_exact` is re-derived from the cached
+    /// `raw` record in places that have no reason to know about the gap — and
+    /// `raw` is only replaced by a *successful* persist, so after an abandoned one
+    /// it is the pre-gap record, still flagged exact. A re-derivation
+    /// (`evolve_schema_live`'s schema-width pass) would therefore hand back
+    /// `true` while rows that no persisted count describes are visible to scans.
+    /// Folding the veto in here means no assignment to `count_exact`, present or
+    /// future, can leak an exact short count to the `COUNT(*)` fold.
+    fn count_is_exact(&self) -> bool {
+        self.count_exact && !self.abandoned_update_outstanding
+    }
+}
+
 /// The outcome of reading a table's persisted statistics record.
 ///
 /// `Option<TableStatistics>` cannot carry this distinction, and the two absent
@@ -7833,12 +7850,15 @@ impl CayenneTableProvider {
         let cache = self.table_statistics.read();
         // Serve the Inexact view when either (a) uncheckpointed visibility changes
         // mean the persisted count over-counts live rows, OR (b) the maintained
-        // count itself is not a provably-exact live count (`count_exact == false`,
-        // set by the mem-tier checkpoint's best-effort delta and cleared by a
-        // full-rewrite `Set`). (b) is what stops a drifted count from being served
+        // count itself is not a provably-exact live count — either because
+        // `count_exact` is false (the mem-tier checkpoint's best-effort delta, cleared
+        // by a full-rewrite `Set`) or because an abandoned update left an outstanding
+        // gap, which vetoes exactness even after `count_exact` is re-derived from the
+        // pre-gap `raw` record (see [`CachedTableStatistics::count_is_exact`]).
+        // (b) is what stops a drifted count from being served
         // `Exact` to the COUNT(*) fold once no deletions are pending — the fold then
         // declines and a real scan answers, fixing the distributed over-count.
-        let serve_inexact = has_pending_visibility_changes || !cache.count_exact;
+        let serve_inexact = has_pending_visibility_changes || !cache.count_is_exact();
         let cached_ref: Option<&Statistics> = if serve_inexact {
             cache.optimizer_inexact.as_ref()
         } else {
@@ -39732,6 +39752,185 @@ mod tests {
             reopened.table_statistics.read().count_exact,
             "once re-baselined, an ordinary exact delta must be trusted again — a gap that \
              never clears leaves the table permanently Inexact"
+        );
+    }
+
+    /// Break the statistics WRITE while leaving the read leg working, so a persist
+    /// bails at the UPSERT with its cached `raw` still warm.
+    ///
+    /// That combination is what exposes the re-derivation hole: the abandon path
+    /// does not touch `raw`, and `raw` is only replaced by a *successful* persist,
+    /// so it stays at the pre-gap record — still flagged exact — for anything that
+    /// later re-derives `count_exact` from it.
+    fn hide_table_statistics_table(temp_dir: &std::path::Path) {
+        open_metastore_db(temp_dir)
+            .execute_batch(
+                "ALTER TABLE cayenne_table_statistics RENAME TO cayenne_table_statistics_hidden;",
+            )
+            .expect("hide the statistics table");
+    }
+
+    fn restore_table_statistics_table(temp_dir: &std::path::Path) {
+        open_metastore_db(temp_dir)
+            .execute_batch(
+                "ALTER TABLE cayenne_table_statistics_hidden RENAME TO cayenne_table_statistics;",
+            )
+            .expect("restore the statistics table");
+    }
+
+    /// Regression for #13010: the outstanding gap must veto exactness at the
+    /// optimizer gate, not merely in `count_exact`.
+    ///
+    /// `count_exact` is re-derived from the cached `raw` record by
+    /// `evolve_schema_live`'s schema-width pass, and `raw` is only replaced by a
+    /// *successful* persist — so after an abandoned one it is the pre-gap record,
+    /// still flagged exact. Re-deriving therefore restores `count_exact = true`
+    /// while rows no persisted count describes are visible to scans. If the gate
+    /// consults only `count_exact`, a schema evolution after a failed persist
+    /// serves that exact, short count to the distributed `COUNT(*)` fold.
+    #[tokio::test]
+    async fn an_outstanding_gap_survives_a_schema_evolution_rederiving_count_exact() {
+        let runtime_env = SessionContext::new().runtime_env();
+        let schema = listing_parity_schema();
+        let (provider, _catalog, temp_dir) = create_reopenable_append_table(
+            "stats_gap_survives_schema_evolution",
+            Arc::clone(&schema),
+            false,
+            Arc::clone(&runtime_env),
+        )
+        .await;
+
+        let ctx = SessionContext::new();
+        insert_batch_with_context(
+            &ctx,
+            &provider,
+            make_listing_parity_batch(Arc::clone(&schema), 0, 16),
+        )
+        .await;
+        provider
+            .flush_pending_maintenance()
+            .await
+            .expect("persist the baseline statistics");
+
+        // An authoritative `Set`: `raw` is now an exact record and no gap is open.
+        let accumulator = ColumnStatsAccumulator::new(&schema);
+        accumulator.update(&make_listing_parity_batch(Arc::clone(&schema), 0, 16));
+        provider
+            .replace_table_stats_after_rewrite(&accumulator)
+            .await;
+        assert!(
+            provider
+                .table_statistics
+                .read()
+                .raw
+                .as_ref()
+                .is_some_and(|raw| raw.num_rows_exact),
+            "precondition: the warm record is flagged exact — that is what a re-derivation reads"
+        );
+
+        // A widening that relaxes nullability: no added column and no type change, so
+        // the cached blob still deserializes against the evolved schema and `optimizer`
+        // stays populated. An ADDED column does not reach the hole — the blob fails to
+        // deserialize at the new width, `optimizer` goes `None`, and nothing is served.
+        let evolved_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("category", DataType::Utf8, false),
+            Field::new("value", DataType::Int64, true),
+        ]));
+        let plan = match classify(
+            &schema,
+            &evolved_schema,
+            &EvolutionContext {
+                constraint_columns: &provider.table_metadata.primary_key,
+            },
+        ) {
+            SchemaEvolution::Widening(plan) => plan,
+            other => panic!("relaxed nullability must classify as a widening, got {other:?}"),
+        };
+
+        // CONTROL: with no gap open, the same evolution leaves the count Exact.
+        // Without this the assertion below could pass because nothing ever serves
+        // Exact on this fixture.
+        provider
+            .evolve_schema_live(&plan)
+            .await
+            .expect("control: schema evolution succeeds");
+        assert!(
+            matches!(
+                provider
+                    .optimizer_table_statistics()
+                    .expect("control: statistics are served after evolution")
+                    .num_rows,
+                datafusion_common::stats::Precision::Exact(_)
+            ),
+            "control: with no outstanding gap, a re-derived exact count IS served Exact — so the \
+             assertion below is about the gap, not about this fixture never serving Exact"
+        );
+
+        // Open a gap the way a failed mem-tier persist does: the UPSERT fails while
+        // the cached `raw` stays warm, so `raw` keeps its pre-gap exact record.
+        hide_table_statistics_table(temp_dir.path());
+        assert!(
+            !provider
+                .persist_table_stats(
+                    &accumulator,
+                    RowCountUpdate::Delta {
+                        delta: 16,
+                        exact: false
+                    }
+                )
+                .await,
+            "precondition: a failed write must abandon the update"
+        );
+        restore_table_statistics_table(temp_dir.path());
+        assert!(
+            provider
+                .table_statistics
+                .read()
+                .raw
+                .as_ref()
+                .is_some_and(|raw| raw.num_rows_exact),
+            "precondition: the abandon left `raw` at the pre-gap record, still exact — this is \
+             what a re-derivation would trust"
+        );
+
+        // Re-derive exactly as the schema-width pass does. `count_exact` comes back
+        // `true` from that pre-gap record; the gap must still veto it.
+        let widened_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("category", DataType::Utf8, true),
+            Field::new("value", DataType::Int64, true),
+        ]));
+        let second_plan = match classify(
+            &evolved_schema,
+            &widened_schema,
+            &EvolutionContext {
+                constraint_columns: &provider.table_metadata.primary_key,
+            },
+        ) {
+            SchemaEvolution::Widening(plan) => plan,
+            other => panic!("the second relaxation must classify as a widening, got {other:?}"),
+        };
+        provider
+            .evolve_schema_live(&second_plan)
+            .await
+            .expect("schema evolution succeeds with a gap open");
+        assert!(
+            provider.table_statistics.read().count_exact,
+            "precondition: the re-derivation really did restore `count_exact` from the pre-gap \
+             record — without this the test would prove nothing about the veto"
+        );
+        assert!(
+            !matches!(
+                provider
+                    .optimizer_table_statistics()
+                    .expect("statistics are served after evolution")
+                    .num_rows,
+                datafusion_common::stats::Precision::Exact(_)
+            ),
+            "an outstanding gap must veto exactness at the gate: a schema evolution re-derived \
+             `count_exact` from the pre-gap record, and serving that Exact hands the COUNT(*) fold \
+             a count short by the abandoned update's rows"
         );
     }
 
