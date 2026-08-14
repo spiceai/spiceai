@@ -1790,17 +1790,30 @@ impl CayenneCatalog {
 
     /// Resolve a table name to its `table_id`, or `None` when no such table is
     /// registered.
-    async fn table_id_for_name(&self, table_name: &str) -> Option<String> {
-        self.metastore
-            .query_row_helper(
-                QueryRowParams {
+    ///
+    /// Queried as a row *set* so that "no such table" is an empty result rather
+    /// than an error to be told apart from a real one. The distinction is
+    /// load-bearing: `drop_table` reports `Ok(false)` for a table that was not
+    /// there, and its accelerator caller then deletes the dataset directory — so
+    /// a metastore error masquerading as "not found" would delete the files
+    /// while every row describing them survived. `cayenne_table(table_name)` is
+    /// unique, so at most one row can come back.
+    async fn table_id_for_name(&self, table_name: &str) -> CatalogResult<Option<String>> {
+        let mut ids: Vec<String> = self
+            .metastore
+            .query_helper(
+                QueryParams {
                     sql: "SELECT table_id FROM cayenne_table WHERE table_name = ?1",
                     params: vec![MetastoreValue::Text(table_name.to_string())],
                 },
                 |row| row.get_string(0),
             )
             .await
-            .ok()
+            .map_err(|e| CatalogError::InvalidOperation {
+                message: format!("Failed to look up table {table_name}."),
+                source: Box::new(e),
+            })?;
+        Ok(ids.pop())
     }
 
     /// `table_id`s of the per-partition child tables of `table_name`.
@@ -4818,7 +4831,7 @@ impl MetadataCatalog for CayenneCatalog {
     }
 
     async fn drop_table(&self, table_name: &str) -> CatalogResult<bool> {
-        let Some(table_id) = self.table_id_for_name(table_name).await else {
+        let Some(table_id) = self.table_id_for_name(table_name).await? else {
             return Ok(false); // Table doesn't exist
         };
 
