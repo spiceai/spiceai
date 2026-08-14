@@ -144,7 +144,7 @@ impl CayenneCatalogConnector {
             .and_then(|v| parse_num_param::<usize>(v, "segment_cache_mb"));
         if self.params.get("segment_cache_mb").expose().ok().is_some() {
             tracing::warn!(
-                "catalog.params.segment_cache_mb is ignored. The Vortex segment cache is now a single budget shared by every Cayenne table instead of one cache per catalog. To control it, set runtime.params.cayenne_segment_cache_mb (in MB; 0 disables caching). See: https://spiceai.org/docs/components/catalogs/cayenne"
+                "catalog.params.cayenne_segment_cache_mb is ignored. The Vortex segment cache is now a single budget shared by every Cayenne table instead of one cache per catalog. To control it, set runtime.params.cayenne_segment_cache_mb (in MB; 0 disables caching). See: https://spiceai.org/docs/components/catalogs/cayenne"
             );
         }
         let target_file_size_mb = self
