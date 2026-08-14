@@ -994,28 +994,40 @@ fn fs_probe_path(path: &str) -> &str {
     }
 }
 
-/// Make a configured Cayenne directory absolute without resolving it.
+/// Make a configured Cayenne directory absolute without resolving it, treating it as a
+/// filesystem path unconditionally.
 ///
-/// `Ok(None)` is the object-store exemption (`s3://…`) — such a location can never
-/// overlap the metastore directory, since `SQLite`/Turso cannot run on object storage
-/// and [`CayenneAccelerator::resolve_metadata_dir`] therefore only ever yields a local
-/// path.
+/// `Err` when the path cannot be placed — a relative path whose `current_dir()` lookup
+/// fails. Everything downstream guards `remove_dir_all`, so a path this cannot place is
+/// a path whose overlap with the metastore is unknown, and the caller must refuse rather
+/// than assume.
+fn absolute_dir(path: &str) -> std::io::Result<PathBuf> {
+    let raw = Path::new(fs_probe_path(path));
+    if raw.is_absolute() {
+        Ok(raw.to_path_buf())
+    } else {
+        Ok(std::env::current_dir()?.join(raw))
+    }
+}
+
+/// Make a configured Cayenne *data* directory absolute, or `Ok(None)` when it is an
+/// object-store location (`s3://…`) — which can never contain the metastore, since
+/// `SQLite`/Turso cannot run on object storage.
 ///
-/// A relative path that cannot be placed is `Err`, never the exemption. The exemption
-/// waves a recursive delete through, so the two must stay distinguishable: everything
-/// downstream guards `remove_dir_all`, and a path this cannot resolve is a path whose
-/// overlap with the metastore is unknown. Returning `io::Result` is what stops a failed
-/// `current_dir()` from being spelled the same way as "cannot possibly overlap".
-fn absolute_local_dir(path: &str) -> std::io::Result<Option<PathBuf>> {
+/// The exemption belongs to the data path alone, because it is the data path a recursive
+/// delete walks. It must not be applied to a metadata path: [`is_local_path`] is a
+/// substring test, so a value merely *containing* `://` would be exempted while the
+/// catalog code goes on treating it as the filesystem path it creates `cayenne.db` at —
+/// disabling the guard on a directory that never reached an object store.
+///
+/// `Err`, never the exemption, when the path cannot be placed: the exemption waves the
+/// delete through, so "cannot possibly overlap" and "cannot tell" must stay
+/// distinguishable.
+fn absolute_data_dir(path: &str) -> std::io::Result<Option<PathBuf>> {
     if !is_local_path(path) {
         return Ok(None);
     }
-    let raw = Path::new(fs_probe_path(path));
-    if raw.is_absolute() {
-        Ok(Some(raw.to_path_buf()))
-    } else {
-        Ok(Some(std::env::current_dir()?.join(raw)))
-    }
+    absolute_dir(path).map(Some)
 }
 
 /// Resolve `absolute` component by component, in the order the filesystem would.
@@ -1027,9 +1039,14 @@ fn absolute_local_dir(path: &str) -> std::io::Result<Option<PathBuf>> {
 /// containment check against `/data` then passes something it must refuse. Resolving in
 /// order keeps the accumulated path symlink-free, so `..` may simply pop it.
 ///
-/// Components that do not exist yet resolve to themselves — neither directory
-/// necessarily exists when this runs at open time.
-async fn resolve_in_filesystem_order(absolute: &Path) -> PathBuf {
+/// A component that does not exist yet resolves to itself — neither directory
+/// necessarily exists when this runs at open time. That is the *only* `canonicalize`
+/// failure this absorbs. Any other one (`PermissionDenied`, a transient filesystem
+/// error) means the component could not be resolved, so a symlink may still be
+/// unresolved and the containment check would run against a path the delete never walks;
+/// those propagate, so the caller refuses the delete instead of comparing a lexical
+/// path.
+async fn resolve_in_filesystem_order(absolute: &Path) -> std::io::Result<PathBuf> {
     let mut resolved = PathBuf::new();
     for component in absolute.components() {
         match component {
@@ -1040,17 +1057,23 @@ async fn resolve_in_filesystem_order(absolute: &Path) -> PathBuf {
             Component::Prefix(_) | Component::RootDir => resolved.push(component),
             Component::Normal(name) => {
                 resolved.push(name);
-                if let Ok(real) = tokio::fs::canonicalize(&resolved).await {
-                    resolved = real;
+                match tokio::fs::canonicalize(&resolved).await {
+                    Ok(real) => resolved = real,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error),
                 }
             }
         }
     }
-    resolved
+    Ok(resolved)
 }
 
-/// Every location a recursive delete of `path` could reach, `Ok(None)` for an
-/// object-store location, and `Err` when the path cannot be placed at all.
+/// Every location a recursive delete of `path` could reach, or `Err` when the path
+/// cannot be resolved.
+///
+/// There is no object-store exemption here: this resolves a *metastore* directory, and
+/// the metastore is only ever local — see [`absolute_data_dir`] for why applying the
+/// exemption to this side disables the guard rather than skipping an impossible case.
 ///
 /// Two forms, because a symlink is both a place and a name:
 ///
@@ -1060,19 +1083,17 @@ async fn resolve_in_filesystem_order(absolute: &Path) -> PathBuf {
 ///    directory whose own last component is a symlink pointing out of the tree still
 ///    loses its link — the catalog file survives with nothing naming it, and the
 ///    connection pool keeps writing through handles nothing can reopen.
-async fn overlap_candidates(path: &str) -> std::io::Result<Option<Vec<PathBuf>>> {
-    let Some(absolute) = absolute_local_dir(path)? else {
-        return Ok(None);
-    };
+async fn overlap_candidates(path: &str) -> std::io::Result<Vec<PathBuf>> {
+    let absolute = absolute_dir(path)?;
 
-    let mut candidates = vec![resolve_in_filesystem_order(&absolute).await];
+    let mut candidates = vec![resolve_in_filesystem_order(&absolute).await?];
     if let (Some(parent), Some(name)) = (absolute.parent(), absolute.file_name()) {
-        let entry = resolve_in_filesystem_order(parent).await.join(name);
+        let entry = resolve_in_filesystem_order(parent).await?.join(name);
         if !candidates.contains(&entry) {
             candidates.push(entry);
         }
     }
-    Ok(Some(candidates))
+    Ok(candidates)
 }
 
 /// `true` when `inner` is `outer` itself or lies beneath it — i.e. a recursive delete
@@ -1100,8 +1121,8 @@ fn dir_contains(outer: &Path, inner: &Path) -> bool {
 ///
 /// Returns `Ok(Some((data_dir, metadata_dir)))` — resolved — when they overlap, naming
 /// whichever metastore location the delete would reach; `Ok(None)` when they provably
-/// cannot overlap; and `Err` when either path cannot be placed, which the caller must
-/// treat as a refusal rather than as `Ok(None)`.
+/// cannot overlap — the data path is on object storage; and `Err` when either path
+/// cannot be resolved, which the caller must treat as a refusal rather than as `Ok(None)`.
 ///
 /// The data directory is compared in its fully resolved form only: `remove_dir_all`
 /// refuses a final-component symlink rather than following it, so the recursive walk
@@ -1110,14 +1131,12 @@ async fn overlapping_metastore_dir(
     data_dir: &str,
     metadata_dir: &str,
 ) -> std::io::Result<Option<(PathBuf, PathBuf)>> {
-    let Some(absolute_data) = absolute_local_dir(data_dir)? else {
+    let Some(absolute_data) = absolute_data_dir(data_dir)? else {
         return Ok(None);
     };
-    let data = resolve_in_filesystem_order(&absolute_data).await;
-    let Some(candidates) = overlap_candidates(metadata_dir).await? else {
-        return Ok(None);
-    };
-    Ok(candidates
+    let data = resolve_in_filesystem_order(&absolute_data).await?;
+    Ok(overlap_candidates(metadata_dir)
+        .await?
         .into_iter()
         .find(|candidate| dir_contains(&data, candidate))
         .map(|metadata| (data, metadata)))
@@ -5103,23 +5122,44 @@ mod tests {
         let cwd = std::env::current_dir().expect("a working directory");
 
         assert_eq!(
-            absolute_local_dir("relative/orders").expect("a relative path resolves"),
+            absolute_data_dir("relative/orders").expect("a relative path resolves"),
             Some(cwd.join("relative/orders")),
             "a relative local path is placed against the working directory, not exempted"
         );
         assert_eq!(
-            absolute_local_dir("/var/spice/orders").expect("an absolute path resolves"),
+            absolute_data_dir("/var/spice/orders").expect("an absolute path resolves"),
             Some(PathBuf::from("/var/spice/orders"))
         );
         assert_eq!(
-            absolute_local_dir("file:///var/spice/orders").expect("a `file://` URI resolves"),
+            absolute_data_dir("file:///var/spice/orders").expect("a `file://` URI resolves"),
             Some(PathBuf::from("/var/spice/orders")),
             "a `file://` URI names a local directory, so it must be compared, not exempted"
         );
         assert_eq!(
-            absolute_local_dir("s3://bucket/orders/").expect("an object store is not a failure"),
+            absolute_data_dir("s3://bucket/orders/").expect("an object store is not a failure"),
             None,
             "only an object-store scheme may skip the overlap check"
+        );
+    }
+
+    /// The exemption belongs to the *data* path. `is_local_path` is a substring test, so
+    /// applying it to a metadata path exempts any value merely containing `://` — while
+    /// the catalog code goes on creating `cayenne.db` at that very filesystem path,
+    /// inside the directory the recreate deletes. Raised by Copilot on #13101.
+    #[tokio::test]
+    async fn a_metadata_dir_containing_a_scheme_separator_is_still_compared() {
+        let base = tempfile::tempdir().expect("temp dir");
+        let data = base.path().join("orders");
+        std::fs::create_dir_all(&data).expect("data dir");
+
+        let nested = data.join("catalog://v1");
+        assert!(
+            overlapping_metastore_dir(&data.to_string_lossy(), &nested.to_string_lossy())
+                .await
+                .expect("the test paths resolve")
+                .is_some(),
+            "`://` inside a metadata path does not put it on object storage, and the \
+             delete still reaches it"
         );
     }
 
