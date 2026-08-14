@@ -17283,6 +17283,16 @@ impl CayenneTableProvider {
         // carry the min/max + NDV aggregate over from here rather than re-reading a
         // row that no longer exists. See `write_rebaselined_row_count`.
         let stats_baseline = self.load_persisted_table_statistics().await;
+        // Demote the served exactness BEFORE publishing. The commit below clears the
+        // deletion index, so `has_pending_deletions()` — the mask that has been
+        // keeping a delete-staled count off the `Exact` path — goes false the moment
+        // the fence releases, while the re-baseline that corrects the count only
+        // lands afterwards. `optimizer_table_statistics()` does not take
+        // `listing_fence`, so without this a distributed `COUNT(*)` can fold the
+        // stale value in that window. The `Set` restores exactness once it holds an
+        // authoritative count; if it never lands, staying inexact is the right
+        // resting state anyway.
+        self.table_statistics.write().count_exact = false;
         {
             let _fence = self.listing_fence.write().await;
             self.catalog
