@@ -1139,6 +1139,50 @@ impl DataFusion {
         Ok(())
     }
 
+    /// Register an internal table, but only if nothing already holds its name.
+    ///
+    /// Returns the provider that holds `table_name`, leaving it registered, when
+    /// the name is taken. [`SchemaProvider::register_table`] overwrites silently,
+    /// so a caller that checks the name first and registers second leaves a
+    /// window in which a dataset load can claim it: the check and the claim have
+    /// to be the same step for the answer to be true when it is acted on.
+    pub fn register_internal_table_if_name_is_free(
+        &self,
+        table_name: TableReference,
+        table: Arc<dyn datafusion::datasource::TableProvider>,
+    ) -> Result<Option<Arc<dyn datafusion::datasource::TableProvider>>> {
+        if let Some(schema) = table_name.schema()
+            && let Some(registered_schema) = self.schema(schema)
+        {
+            let displaced = registered_schema
+                .register_table(table_name.table().to_string(), table)
+                .map_err(find_datafusion_root)
+                .context(UnableToRegisterTableToDataFusionSchemaSnafu {
+                    schema: SPICE_EVAL_SCHEMA,
+                })?;
+
+            if let Some(displaced) = displaced {
+                // The insert already happened — it is the only atomic point — so
+                // the name is given back to whoever held it before this call
+                // decided it had lost.
+                registered_schema
+                    .register_table(table_name.table().to_string(), Arc::clone(&displaced))
+                    .map_err(find_datafusion_root)
+                    .context(UnableToRegisterTableToDataFusionSchemaSnafu {
+                        schema: SPICE_EVAL_SCHEMA,
+                    })?;
+                return Ok(Some(displaced));
+            }
+        }
+
+        self.data_writers
+            .write()
+            .map_err(|_| Error::UnableToLockDataWriters {})?
+            .insert(table_name);
+
+        Ok(None)
+    }
+
     pub async fn register_catalog(
         &self,
         name: &str,
@@ -6547,6 +6591,76 @@ mod tests {
                     Constraint::PrimaryKey(vec![1]),
                     Constraint::Unique(vec![2]),
                 ]))
+            );
+        }
+    }
+
+    /// The claim an internal table makes on its name has to be the same step as
+    /// the check that the name is free: [`SchemaProvider::register_table`]
+    /// overwrites silently, and dataset loading runs concurrently with the
+    /// internal registrations.
+    mod register_internal_table_if_name_is_free_tests {
+        use crate::dataaccelerator::AcceleratorEngineRegistry;
+        use crate::datafusion::{SPICE_RUNTIME_SCHEMA, builder::DataFusionBuilder};
+        use crate::status::RuntimeStatus;
+        use datafusion::datasource::TableProvider;
+        use datafusion::datasource::empty::EmptyTable;
+        use datafusion::sql::TableReference;
+        use std::sync::Arc;
+        use tokio::runtime::Handle;
+
+        fn table(field: &str) -> Arc<dyn TableProvider> {
+            Arc::new(EmptyTable::new(Arc::new(arrow::datatypes::Schema::new(
+                vec![arrow::datatypes::Field::new(
+                    field,
+                    arrow::datatypes::DataType::Int64,
+                    true,
+                )],
+            ))))
+        }
+
+        #[tokio::test]
+        async fn a_free_name_is_claimed_and_a_taken_one_is_left_alone() {
+            let df = DataFusionBuilder::new(
+                RuntimeStatus::new(),
+                Arc::new(AcceleratorEngineRegistry::new()),
+                Handle::current(),
+            )
+            .build();
+            let name = TableReference::partial(SPICE_RUNTIME_SCHEMA, "claimed");
+
+            let displaced = df
+                .register_internal_table_if_name_is_free(name.clone(), table("mine"))
+                .expect("claim a free name");
+            assert!(displaced.is_none(), "nothing held the name");
+            assert!(df.table_exists(&name), "so the internal table now holds it");
+
+            let incumbent = df
+                .get_table(&name)
+                .await
+                .expect("the claimed table resolves");
+
+            let theirs = table("theirs");
+            let displaced = df
+                .register_internal_table_if_name_is_free(name.clone(), Arc::clone(&theirs))
+                .expect("a taken name is reported, not an error");
+            let displaced = displaced.expect("the caller is told who holds the name");
+            assert!(
+                Arc::ptr_eq(&displaced, &incumbent),
+                "and told which provider that is"
+            );
+
+            let still_registered = df
+                .get_table(&name)
+                .await
+                .expect("the name is still registered");
+            assert!(
+                Arc::ptr_eq(&still_registered, &incumbent),
+                "the incumbent keeps the name: a losing claim displaces nothing"
+            );
+            assert!(
+                !Arc::ptr_eq(&still_registered, &theirs),
+                "and the table that lost is not silently in its place"
             );
         }
     }

@@ -34,7 +34,18 @@ impl Runtime {
             // the flag was built from a default this process never had an app to
             // confirm, and leaving it on makes every query report a table that
             // was deliberately not created.
-            self.df.set_task_history_enabled(false);
+            //
+            // Unless this runtime has since registered the table. A cluster
+            // executor's component load reaches this concurrently with the bind
+            // that installs its app, so "no app" can be a stale answer by the
+            // time it is acted on — and emission describes the table, which the
+            // other caller may already have brought up.
+            if !self
+                .task_history_initialized
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                self.df.set_task_history_enabled(false);
+            }
             tracing::debug!(
                 "Task history initialization skipped: no valid spicepod configuration."
             );
@@ -67,20 +78,30 @@ impl Runtime {
             .task_history_initialized
             .load(std::sync::atomic::Ordering::SeqCst)
         {
+            // This runtime owns the table and this app enables it, so emission
+            // belongs on — an earlier call that ran before the app arrived turned
+            // it off, and that answer was only right while there was no app.
+            self.df.set_task_history_enabled(true);
             tracing::debug!("Task history is already initialized.");
             return Ok(());
         }
+
+        // Nothing is registered yet, so nothing may be emitted yet: a query built
+        // during initialization would resolve a table that does not exist, and a
+        // failure below — an unusable retention setting, a backend that cannot be
+        // created — has to leave emission off rather than on, or every later query
+        // repeats the same missing-table failure with nothing to fix it. It is
+        // turned back on where the registration succeeds.
+        self.df.set_task_history_enabled(false);
+
         let table = TableReference::partial(
             SPICE_RUNTIME_SCHEMA,
             task_history::DEFAULT_TASK_HISTORY_TABLE,
         );
+        // Cheap answer first, so a spicepod that declares a dataset under this
+        // name does not pay for a backend before being told. The claim below is
+        // what decides it.
         if self.df.table_exists(&table) {
-            // Reporting the conflict is not enough on its own: the exporter
-            // resolves this table by name at write time, so leaving emission on
-            // would keep aiming internal rows at a table the runtime does not
-            // own — filling it if the schema happens to fit, and failing every
-            // export if it does not. Stop writing, then say why.
-            self.df.set_task_history_enabled(false);
             return Err(Error::UnableToTrackTaskHistory {
                 source: task_history::Error::TableNameTaken {
                     table: table.to_string(),
@@ -196,17 +217,75 @@ impl Runtime {
             _ => local_table.into_table() as Arc<dyn TableProvider>,
         };
 
-        self.df
-            .register_table_as_writable_and_with_schema(
-                TableReference::partial(
-                    SPICE_RUNTIME_SCHEMA,
-                    task_history::DEFAULT_TASK_HISTORY_TABLE,
-                ),
-                table_to_register,
-            )
-            .context(UnableToCreateBackendSnafu)?;
+        // Claiming the name and finding it free are one step. Dataset loading runs
+        // concurrently with this on both the normal bring-up and the arriving-app
+        // path, and registration overwrites whatever it finds, so a check made
+        // earlier can be false by the time it is acted on — and acting on it
+        // wrongly means either displacing a dataset or aiming internal task rows
+        // at one. The exporter resolves this table by name at write time, so a
+        // name this runtime does not own leaves emission off (it already is).
+        if let Some(_taken) = self
+            .df
+            .register_internal_table_if_name_is_free(table.clone(), table_to_register)
+            .context(UnableToCreateBackendSnafu)?
+        {
+            return Err(Error::UnableToTrackTaskHistory {
+                source: task_history::Error::TableNameTaken {
+                    table: table.to_string(),
+                },
+            });
+        }
         self.task_history_initialized
             .store(true, std::sync::atomic::Ordering::SeqCst);
+        // The table exists and is this runtime's, which is the whole condition
+        // for recording into it.
+        self.df.set_task_history_enabled(true);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ::app::App;
+
+    /// Emission describes the table, so a caller that reads no app must not turn
+    /// it off once the table exists.
+    ///
+    /// A cluster executor's component load reaches initialization concurrently
+    /// with the bind that installs its app, so one caller can read no app while
+    /// the other registers the table — and if the stale read is the last to write
+    /// the flag, the executor comes up with a task-history table nothing ever
+    /// writes to.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stale_no_app_read_does_not_stop_emission_from_a_table_that_exists() {
+        let rt = Arc::new(
+            Runtime::builder()
+                .with_app_opt(Some(Arc::new(App::default())))
+                .build()
+                .await,
+        );
+
+        Arc::clone(&rt)
+            .init_task_history()
+            .await
+            .expect("initialize task history");
+        assert!(
+            rt.df.task_history_emission_enabled(),
+            "a registered table is emitted into"
+        );
+
+        // What the racing caller sees: the app read it made before the bind
+        // installed one.
+        *rt.app.write().await = None;
+
+        Arc::clone(&rt)
+            .init_task_history()
+            .await
+            .expect("a call that finds no app is not a failure");
+        assert!(
+            rt.df.task_history_emission_enabled(),
+            "and it must not stop emission for a table this runtime registered"
+        );
     }
 }

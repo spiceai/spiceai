@@ -2388,6 +2388,11 @@ async fn executor_bind_app(
     };
 
     let grpc_client = ClusterGrpcClientConfig::from_params(&app_def.runtime.params);
+    // Read while the app is still borrowable; the gate below is about what this
+    // app asks for, which emission state cannot stand in for — a concurrent
+    // `load_components` reaching task-history initialization before this bind
+    // installs the app finds no configuration and turns emission off.
+    let app_enables_task_history = app_def.runtime.task_history.enabled;
     *rt.app.write().await = Some(app_def);
 
     // Create a cluster client for secrets. This channel outlives every secret
@@ -2409,11 +2414,7 @@ async fn executor_bind_app(
     // `init_task_history` fails with "table already exists" and we re-check.
     // Fail closed if init fails and the table is still absent — otherwise the
     // executor can report Ready while scheduler federated queries break.
-    if rt
-        .df
-        .task_history_enabled
-        .load(std::sync::atomic::Ordering::Relaxed)
-    {
+    if app_enables_task_history {
         let task_history_ref = ::datafusion::sql::TableReference::partial(
             crate::datafusion::SPICE_RUNTIME_SCHEMA,
             crate::task_history::DEFAULT_TASK_HISTORY_TABLE,

@@ -56,6 +56,7 @@ async fn an_app_arriving_after_an_empty_start() {
     a_table_this_runtime_did_not_register_is_a_conflict_not_a_no_op().await;
     an_arriving_app_decides_whether_queries_emit_task_history().await;
     an_arriving_app_that_enables_task_history_gets_a_table_and_emission().await;
+    a_second_initialization_restores_emission_it_found_turned_off().await;
 }
 
 /// Emission and the table have to agree. Both were decided when `DataFusion` was
@@ -116,6 +117,50 @@ async fn an_arriving_app_that_enables_task_history_gets_a_table_and_emission() {
     assert!(
         rt.datafusion().task_history_emission_enabled(),
         "and queries emit into it"
+    );
+}
+
+/// Emission off is only ever the right answer for as long as there is no table.
+///
+/// Callers may reach initialization before the app is installed — a cluster
+/// executor's component load races its own bind — and that call correctly turns
+/// emission off, having found no configuration. The call made once the app is
+/// there has to undo it, or the executor comes up with a task-history table that
+/// nothing ever writes to. This is also why nothing outside `init_task_history`
+/// decides the flag: a caller that gated on it would read an answer about a
+/// moment that has passed.
+async fn a_second_initialization_restores_emission_it_found_turned_off() {
+    let rt = Arc::new(
+        Runtime::builder()
+            .with_app_opt(Some(Arc::new(App::default())))
+            .build()
+            .await,
+    );
+
+    Arc::clone(&rt)
+        .init_task_history()
+        .await
+        .expect("initialize task history");
+    assert!(
+        rt.datafusion().task_history_emission_enabled(),
+        "a registered table is emitted into"
+    );
+
+    // What a racing call that ran before the app was installed leaves behind.
+    rt.datafusion().set_task_history_enabled(false);
+
+    Arc::clone(&rt)
+        .init_task_history()
+        .await
+        .expect("a second initialization is a no-op, not a failure");
+    assert!(
+        rt.datafusion()
+            .table_exists(&TableReference::partial("runtime", "task_history")),
+        "the table this runtime registered is still its own"
+    );
+    assert!(
+        rt.datafusion().task_history_emission_enabled(),
+        "so emission must come back on rather than stay off for the process's life"
     );
 }
 

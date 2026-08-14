@@ -349,9 +349,6 @@ impl Runtime {
             warn_on_sections_only_a_start_installs(&new_app);
         }
 
-        // Read before the app is installed, while it is still borrowable.
-        let arriving_task_history = new_app.runtime.task_history.enabled;
-
         *self.app.write().await = Some(new_app);
 
         if current_app.is_none() {
@@ -366,19 +363,10 @@ impl Runtime {
             // the load already registered the table changes nothing.
             // Emission was fixed when `DataFusion` was built, from the
             // configuration this process had then — which was none — so it has to
-            // follow the app that has arrived. It is turned on only once the
-            // table is there to receive rows: a query built while initialization
-            // is still running would target a table that does not exist yet, and
-            // an initialization that fails for any other reason — an unusable
-            // retention setting, a backend that cannot be created — would
-            // otherwise leave every later query repeating the same missing-table
-            // failure with nothing to fix it.
-            self.df.set_task_history_enabled(false);
-            match Arc::clone(&self).init_task_history().await {
-                Ok(()) => self.df.set_task_history_enabled(arriving_task_history),
-                Err(err) => {
-                    tracing::warn!("Creating internal task history table: {err}");
-                }
+            // follow the app that has arrived. `init_task_history` is what moves
+            // it, in step with the table it describes.
+            if let Err(err) = Arc::clone(&self).init_task_history().await {
+                tracing::warn!("Creating internal task history table: {err}");
             }
         }
 
