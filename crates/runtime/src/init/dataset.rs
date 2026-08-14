@@ -1674,8 +1674,11 @@ impl Runtime {
         // backoff, and `apply_app` holds `apply_app_lock` across this whole
         // function, so awaiting one unreachable source parks this apply and every
         // apply queued behind it until the process restarts. A dataset that cannot
-        // load lands in an error state reported through `status` and is retried on
-        // the next apply.
+        // load lands in an error state reported through `status`; a transient
+        // failure keeps retrying inside its own spawned task, while a permanent one
+        // is re-attempted only when the dataset's configuration changes — an
+        // identically-configured dataset is filtered out of `datasets_to_apply`
+        // above, so a later apply schedules no fresh load for it. Tracked in #13098.
         //
         // Built here and spawned below so a localpod dataset can be chained behind
         // the dataset it reads from, exactly as `load_datasets` does at startup:
