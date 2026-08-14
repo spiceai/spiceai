@@ -308,10 +308,7 @@ pub(crate) async fn build_elasticsearch_text_index(
     use runtime_search::store_params::elasticsearch::{
         build_client_options, build_write_options, merge_index_settings,
     };
-    use search::{
-        index::elasticsearch::ElasticsearchTextIndex,
-        metadata::{MetadataColumn, MetadataColumns},
-    };
+    use search::index::elasticsearch::ElasticsearchTextIndex;
     use secrecy::ExposeSecret;
 
     let Some(FullTextSearchDatasetConfig {
@@ -379,19 +376,6 @@ pub(crate) async fn build_elasticsearch_text_index(
         normalized_fields,
         raw_schema.metadata().clone(),
     ));
-
-    let metadata_columns: MetadataColumns = columns
-        .iter()
-        .filter_map(|column| {
-            let metadata_type = column.as_vector_metadata()?;
-            let field = source_schema.field_with_name(&column.name).ok()?.clone();
-            Some(match metadata_type {
-                MetadataType::Filterable => MetadataColumn::Filterable(Arc::new(field)),
-                MetadataType::NonFilterable => MetadataColumn::NonFilterable(Arc::new(field)),
-            })
-        })
-        .collect::<Vec<_>>()
-        .into();
 
     // Resolve primary key fields from schema, normalizing types.
     let pk_fields: Vec<Field> = primary_key
