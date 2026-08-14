@@ -590,6 +590,9 @@ pub async fn restore_delivered_secrets(
 ///
 /// `runtime_overrides` are the process's `--set-runtime` values, which a
 /// deployment has to carry the same way a start onto the same file would.
+///
+/// `session_ack` is the latch the connection report waits on; it is filled by
+/// the first message the control plane sends back.
 pub async fn maybe_start(
     runtime: Arc<Runtime>,
     identity: Option<runtime_cloud_connect::ReconnectableIdentity>,
@@ -597,6 +600,7 @@ pub async fn maybe_start(
     running_deployment: Option<CloudManagedSpicepod>,
     metrics: Option<MetricsReader>,
     runtime_overrides: Vec<(String, String)>,
+    session_ack: Option<Arc<runtime_cloud_connect::SessionAck>>,
 ) -> Option<CloudConnect> {
     let Some(identity) = identity else {
         tracing::debug!("Spice Cloud Connect: disabled (no usable persisted identity)");
@@ -665,7 +669,11 @@ pub async fn maybe_start(
             initial_load_budget: INITIAL_LOAD_BUDGET,
         }));
 
-    Some(CloudConnect::start_reconnectable(handle, identity))
+    Some(CloudConnect::start_reconnectable(
+        handle,
+        identity,
+        session_ack,
+    ))
 }
 
 /// Load the delivered-secrets cache into `store`.
@@ -1361,7 +1369,7 @@ impl RuntimeHandle for SpicedRuntimeHandle {
 
     fn unsupported_reason(&self, capability: Capability) -> String {
         match capability {
-            Capability::Restart => "Restart is unsupported on standalone spiced: it is not a control the runtime offers on demand, and no deployment needs one — a deployment applies to the running instance and reports anything it could not put into effect. To restart the instance anyway, use your process manager (systemd/Docker/Kubernetes). See: https://spiceai.org/docs".to_string(),
+            Capability::Restart => "Restart is unsupported on standalone spiced: it is not a control the runtime offers on demand, and no deployment needs one — a deployment applies to the running instance and reports anything it could not put into effect. To restart the instance anyway, run `spice connect service restart` on the host (or restart the container, for an instance a container runtime owns). See: https://spiceai.org/docs".to_string(),
             Capability::UpgradeRuntime => "UpgradeRuntime is unsupported on standalone spiced: it cannot replace its own binary. Upgrade it the way you installed it (`spice upgrade`, your container image, or your package manager). See: https://spiceai.org/docs".to_string(),
             Capability::GetLogs => "Log capture is not enabled for this runtime: Spice Cloud Connect must be configured before startup for spiced to install the log-capture layer. See: https://spiceai.org/docs".to_string(),
             Capability::ApplySpicepod
@@ -2967,6 +2975,7 @@ views:
             org_name: None,
             app_name: None,
             monitor_url: None,
+            new_project_url: None,
             control_plane_endpoint: None,
             enc_private_key_pem: mock_pem,
             enc_public_key_pem: "-----BEGIN PUBLIC KEY-----\nMOCKENC\n-----END PUBLIC KEY-----\n"

@@ -23,10 +23,12 @@ limitations under the License.
 //!    Spice Cloud). Enrollment itself is performed by the runtime: mint an
 //!    enrollment key in the Spice Cloud portal and start the runtime with
 //!    it (`spiced --token <enrollment-key>`); a directory with an enrolled
-//!    identity reconnects automatically on every later start. This command
-//!    inspects and manages that per-directory state: `status` reports it,
-//!    `service` installs and manages the persistent service that keeps it
-//!    running, and `remove` releases the instance and clears it.
+//!    identity reconnects automatically on every later start. Bare
+//!    `spice connect` starts that instance — in the foreground, or through
+//!    the installed service when there is one — and the subcommands manage
+//!    it: `status` reports it, `service` installs and manages the
+//!    persistent service that keeps it running, and `remove` releases the
+//!    instance and clears it.
 //!
 //! 2. **Deprecated pod-add behavior**: when the argument is a Spicepod
 //!    path on Spice.ai Cloud (e.g. `spiceai/quickstart`), this prints a
@@ -54,7 +56,8 @@ use runtime_cloud_connect::config::{CloudConnectConfig, IDENTITY_FILE};
 use runtime_cloud_connect::enrollment_key::EnrollmentKey;
 use zeroize::Zeroizing;
 
-use status::ConnectStatus;
+use service::ServiceState;
+use status::{ConnectStatus, ConnectionState};
 
 /// File (relative to the config dir) holding a `--endpoint` override so later
 /// `spiced` starts reach the same control plane the enroll did.
@@ -63,7 +66,7 @@ const CLOUD_ENDPOINT_FILE: &str = "cloud-endpoint";
 /// Arguments for the `spice connect` command.
 #[derive(Args, Debug)]
 #[command(
-    about = "Connect this directory to Spice Cloud and manage its instance",
+    about = "Connect this directory to Spice Cloud and start its instance",
     long_about = r#"`spice connect` enrolls this directory with Spice Cloud and manages its instance.
 
 With a logged-in user session, the command resolves one owner/admin
@@ -188,6 +191,15 @@ pub struct ConnectArgs {
     /// the portal-side delete is authoritative either way.
     #[arg(long, global = true)]
     pub force: bool,
+
+    /// The global `-v` count, forwarded by the dispatcher for the same reason
+    /// as [`ConnectArgs::cloud_region`] below: the flag is global and clap
+    /// would reject a second definition of it here.
+    ///
+    /// A foreground runtime this command starts is the command's own output,
+    /// so `spice -v connect` has to reach it exactly as `spice run -v` does.
+    #[arg(skip)]
+    pub verbosity: u8,
 
     /// The global `--cloud-region`, forwarded by the dispatcher rather than
     /// declared here (the flag is global; clap would reject a second definition
@@ -332,6 +344,8 @@ pub async fn execute(ctx: &RuntimeContext, args: ConnectArgs) -> Result<()> {
         };
     }
 
+    // The deprecated pod-add fallthrough is a Spice.ai Cloud fetch, where
+    // `--cloud-region` has always been meaningful, so it is not rejected here.
     if let Some(target) = args.target.as_deref() {
         if args.org.is_some()
             || args.project.is_some()
@@ -369,6 +383,8 @@ pub async fn execute(ctx: &RuntimeContext, args: ConnectArgs) -> Result<()> {
         .token
         .map(EnrollmentKeyArgument::into_enrollment_key)
         .transpose()?;
+    let endpoint = args.endpoint.clone();
+    let dir = args.dir.clone();
     transaction::execute(
         ctx,
         transaction::ConnectRequest {
@@ -379,6 +395,17 @@ pub async fn execute(ctx: &RuntimeContext, args: ConnectArgs) -> Result<()> {
             dir: args.dir,
             endpoint: args.endpoint,
         },
+    )
+    .await?;
+
+    // The transaction has committed this directory's durable state, so the
+    // command ends where the operator asked it to: at a running instance.
+    start_instance(
+        ctx,
+        &config_dir,
+        endpoint.as_deref(),
+        dir.as_deref(),
+        args.verbosity,
     )
     .await
 }
@@ -415,6 +442,112 @@ fn reject_cloud_region(cloud_region: Option<&str>) -> Result<()> {
              See: https://spiceai.org/docs"
         ),
     })
+}
+
+/// Leave this directory's instance running, once its Cloud Connect state is
+/// durable.
+///
+/// The command ends at a running instance rather than at a report, because that
+/// is what the operator asked for — `spice connect status` is the command that
+/// reports. Which process runs it is decided by what is already installed: a
+/// supervised instance is started through its supervisor and this command
+/// returns, an unsupervised one runs in the foreground and this command stays
+/// attached to it until it exits.
+async fn start_instance(
+    ctx: &RuntimeContext,
+    config_dir: &Path,
+    endpoint: Option<&str>,
+    dir: Option<&Path>,
+    verbosity: u8,
+) -> Result<()> {
+    let instance_dir = instance_dir_for(config_dir);
+    let status = collect_status(config_dir, endpoint).await?;
+
+    // There is nothing to start. The transaction that ran before this has
+    // already said why — an enrollment the operator cancelled, or a project
+    // prompt they declined — and starting an unmanaged runtime on top of that
+    // would contradict it.
+    if matches!(
+        status.connection.state,
+        ConnectionState::NotConnected | ConnectionState::EnrollmentIncomplete
+    ) {
+        return Ok(());
+    }
+
+    // An identity that cannot activate Cloud Connect would start a runtime that
+    // serves locally and reaches no control plane. That is reported as the
+    // failure it is — `render_status` prints the diagnosis and returns it as
+    // this command's error — rather than started as if it were a connection.
+    if matches!(
+        status.connection.state,
+        ConnectionState::Unreadable | ConnectionState::Unusable
+    ) {
+        return render_status(&status, OutputFormat::Table);
+    }
+
+    // A host where this CLI does not manage a local runtime — native Windows,
+    // outside WSL — is enrolled and reconnects like any other; it just starts
+    // its runtime under the operator's own supervisor. Naming that beats
+    // failing a transaction that has already committed.
+    if ctx.ensure_local_runtime_supported().is_err() {
+        println!(
+            "This directory is connected. Start its runtime with `spiced` from {} \
+             (or under your own supervisor); it reconnects from the stored identity.",
+            instance_dir.display()
+        );
+        return Ok(());
+    }
+
+    // What owns the process, and so what this command starts. An instance a
+    // supervisor already owns must not also be started in the terminal: the
+    // host would hold two runtimes for one identity, which is what the second
+    // one's directory lock refuses — after the operator was told their instance
+    // was starting.
+    let backend = service::backend();
+    let Some(manifest) = service::resolve(backend, &instance_dir, config_dir)? else {
+        println!("Starting the Spice runtime. Press Ctrl-C to stop it.");
+        return crate::runtime_launcher::run_runtime(
+            ctx,
+            &crate::runtime_launcher::RunConfig {
+                // The instance directory resolves both the spicepod and the
+                // `.spice` state this command just inspected, so the runtime
+                // has to start there rather than wherever the CLI was invoked
+                // from.
+                working_dir: dir.map(Path::to_path_buf),
+                verbosity,
+                // The transaction above has already printed this instance's
+                // connection block, so the runtime must not print it a second
+                // time a few seconds later. A `spice run` or `spiced` start,
+                // which no transaction precedes, still gets it from the
+                // runtime.
+                connection_report: crate::runtime_launcher::ConnectionReport::AlreadyReported,
+                ..crate::runtime_launcher::RunConfig::default()
+            },
+        )
+        .await;
+    };
+
+    // A service that is already up is the state this command asks for, so it is
+    // reported without being touched. That is not just an optimization: it is
+    // what makes `spice connect` answer on every host whose supervisor this
+    // release cannot yet drive (launchd's lifecycle actions are still
+    // unimplemented), and it is what keeps the command from interrupting a
+    // serving instance. Anything else is asked to start.
+    if status.service.state != ServiceState::Running {
+        backend.start(&manifest)?;
+    }
+    println!(
+        "Spice Cloud Connect: {} is running as the {} service {} ({}).",
+        instance_dir.display(),
+        manifest.scope,
+        manifest.name,
+        manifest.supervisor
+    );
+    println!();
+    println!("Manage it with:");
+    println!("  spice connect status");
+    println!("  spice connect service logs -f");
+    Ok(())
 }
 
 /// Collect the one status snapshot used by the bare and explicit status forms.
@@ -1162,6 +1295,18 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn a_directory_the_transaction_left_unconnected_is_not_started() {
+        // The transaction that runs before this has already said why nothing
+        // was enrolled — a cancelled login, a declined prompt — so starting an
+        // unmanaged runtime here would contradict it.
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let ctx = crate::context::RuntimeContext::new().expect("build a runtime context");
+        start_instance(&ctx, &dir.path().join(".spice"), None, Some(dir.path()), 0)
+            .await
+            .expect("an unconnected directory is not an error here");
+    }
+
     #[test]
     fn instance_dir_is_the_parent_of_a_dot_spice_config_dir() {
         assert_eq!(
@@ -1485,6 +1630,7 @@ mod tests {
             org_name: None,
             app_name: None,
             monitor_url: None,
+            new_project_url: None,
             control_plane_endpoint: None,
         }
     }

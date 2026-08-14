@@ -1246,6 +1246,13 @@ pub async fn enroll_now_with_transaction(
     }
     let org_name = (!normalized_org_name.is_empty()).then(|| normalized_org_name.clone());
     outcome.metadata.organization.name = normalized_org_name;
+    let new_project_url = outcome
+        .metadata
+        .new_project_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+        .map(str::to_string);
 
     // Atomic promotion: the draft's provisional key material becomes the
     // identity, written owner-only via atomic rename; the draft is deleted
@@ -1265,6 +1272,10 @@ pub async fn enroll_now_with_transaction(
         org_name,
         app_name: None,
         monitor_url: None,
+        // Where a still-unattached instance is sent to create a project.
+        // Recorded now because the enroll response is the only place it is
+        // reported, and every later start has to name the same page.
+        new_project_url,
         control_plane_endpoint: Some(draft.binding.endpoint.clone()),
         enc_private_key_pem: material.enc_private_key_pem,
         enc_public_key_pem: material.enc_public_key_pem,

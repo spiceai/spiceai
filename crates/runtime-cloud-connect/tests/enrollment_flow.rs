@@ -86,6 +86,7 @@ fn reconnect_identity(identifier: &str, gateway_addr: String) -> runtime_cloud_c
         org_name: None,
         app_name: None,
         monitor_url: None,
+        new_project_url: None,
         control_plane_endpoint: None,
         enc_private_key_pem: String::new(),
         enc_public_key_pem: String::new(),
@@ -497,6 +498,14 @@ async fn pre_runtime_enroll_persists_identity_and_connects() {
     assert!(identity.public_key_pem.contains("PUBLIC KEY"));
     assert!(identity.private_key_pem.contains("PRIVATE KEY"));
     assert_eq!(identity.gateway_addr, gateway_addr.to_string());
+    // The portal metadata the enroll reported is durable too: every later start
+    // reports the same organization and sends an unattached instance to the
+    // same page, without deriving a portal route of its own.
+    assert_eq!(identity.org_name.as_deref(), Some("unit-org"));
+    assert_eq!(
+        identity.new_project_url.as_deref(),
+        Some("https://cloud.test/unit-org/new?instance=inst_unit_test")
+    );
     assert_eq!(
         identity.ca_bundle_pem.matches("BEGIN CERTIFICATE").count(),
         1,

@@ -1045,6 +1045,7 @@ mod tests {
             org_name: Some(org.to_string()),
             app_name: None,
             monitor_url: None,
+            new_project_url: None,
             control_plane_endpoint: None,
         }
     }

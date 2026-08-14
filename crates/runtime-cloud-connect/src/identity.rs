@@ -222,6 +222,20 @@ pub struct Identity {
     /// route metadata. Scoped to the attachment; cleared on detach.
     #[serde(default)]
     pub monitor_url: Option<String>,
+    /// Cloud-constructed portal URL for creating a project with this instance
+    /// preselected, as the enrollment response reported it.
+    ///
+    /// Instance-level like [`Identity::org_name`], and for the same reason: it
+    /// is the destination a *detached* instance is sent to, so an attach must
+    /// not clear it and a detach must not lose it. Persisted rather than kept
+    /// only in the enrolling process because every later start reports the same
+    /// unattached state and must name the same page — the runtime never derives
+    /// a portal route itself.
+    ///
+    /// `None` for an instance enrolled before this was recorded, or against a
+    /// control plane that reported none.
+    #[serde(default)]
+    pub new_project_url: Option<String>,
     /// Normalized control-plane endpoint that issued this identity. Bound at
     /// enrollment so later commands never trust an unrelated repository file
     /// when deciding where to send credentials.
@@ -283,6 +297,7 @@ impl std::fmt::Debug for Identity {
             .field("org_name", &self.org_name)
             .field("app_name", &self.app_name)
             .field("monitor_url", &self.monitor_url)
+            .field("new_project_url", &self.new_project_url)
             .field("control_plane_endpoint", &self.control_plane_endpoint)
             .finish()
     }
@@ -1372,11 +1387,14 @@ impl IdentityStore {
         let mut merged = credential_update.clone();
         // The whole attachment tuple, not just the app id: a command handler
         // may have written any of these after the caller cloned its identity,
-        // and a credential update must not revert them.
+        // and a credential update must not revert them. The enrollment's
+        // new-project page travels with them: it is portal metadata this
+        // process may never have loaded, and a renewal must not erase it.
         merged.app_id = current.app_id;
         merged.org_name = current.org_name;
         merged.app_name = current.app_name;
         merged.monitor_url = current.monitor_url;
+        merged.new_project_url = current.new_project_url;
         // A durable binding already on disk wins over a stale renewal clone.
         // A legacy identity has no binding, so retain the endpoint the renewal
         // just proved by succeeding and promote it atomically with the rotated
@@ -1945,6 +1963,7 @@ mod tests {
             org_name: None,
             app_name: None,
             monitor_url: None,
+            new_project_url: None,
             control_plane_endpoint: None,
             enc_private_key_pem: encryption_keypair.to_pkcs8_pem().to_string(),
             enc_public_key_pem: encryption_keypair.public_key_spki_pem(),
@@ -2806,6 +2825,63 @@ mod tests {
             Some("https://spice.ai/acme/retail-analytics/monitor")
         );
         assert_eq!(merged.org_name.as_deref(), Some("acme"));
+    }
+
+    #[test]
+    fn credential_update_preserves_the_enrollment_portal_page() {
+        // The new-project page is enrollment metadata, not credential material:
+        // a renewal writing back a clone that predates it would strand a
+        // detached instance with nowhere to send its operator.
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join("identity.json");
+        let mut enrolled = sample_identity();
+        enrolled.new_project_url = Some("https://spice.ai/acme/new?instance=inst_1".to_string());
+        IdentityStore::store(&path, &enrolled).expect("store");
+
+        let mut rotated = enrolled.clone();
+        rotated.new_project_url = None;
+        rotated.private_key_pem = "ROTATED-KEY".to_string();
+        let CredentialUpdateOutcome::Stored(_) = IdentityStore::store_credential_update(
+            &path,
+            &enrolled.identifier,
+            &enrolled.public_key_pem,
+            &rotated,
+        )
+        .expect("store rotated") else {
+            panic!("the expected credential generation must still be present");
+        };
+
+        let loaded = IdentityStore::load_optional(&path)
+            .expect("load")
+            .expect("present");
+        assert_eq!(loaded.private_key_pem, "ROTATED-KEY");
+        assert_eq!(
+            loaded.new_project_url.as_deref(),
+            Some("https://spice.ai/acme/new?instance=inst_1")
+        );
+    }
+
+    #[test]
+    fn an_attachment_never_clears_the_enrollment_portal_page() {
+        // Attaching and detaching are project-scoped; the org's new-project
+        // page is the recovery destination for a detached instance and belongs
+        // to the enrollment, so neither may touch it.
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join("identity.json");
+        let mut enrolled = sample_identity();
+        enrolled.new_project_url = Some("https://spice.ai/acme/new?instance=inst_1".to_string());
+        IdentityStore::store(&path, &enrolled).expect("store");
+
+        IdentityStore::set_attachment(&path, Some(&sample_attachment())).expect("attach");
+        IdentityStore::set_attachment(&path, None).expect("detach");
+
+        let loaded = IdentityStore::load_optional(&path)
+            .expect("load")
+            .expect("present");
+        assert_eq!(
+            loaded.new_project_url.as_deref(),
+            Some("https://spice.ai/acme/new?instance=inst_1")
+        );
     }
 
     #[test]

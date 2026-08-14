@@ -1110,6 +1110,7 @@ mod connect {
             org_name: None,
             app_name: None,
             monitor_url: None,
+            new_project_url: None,
         };
         runtime_cloud_connect::identity::IdentityStore::store(
             &config_dir.path().join("identity.json"),

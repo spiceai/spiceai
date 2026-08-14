@@ -19520,6 +19520,7 @@ dependencies = [
  "tempfile",
  "tikv-jemallocator",
  "tokio",
+ "tokio-util",
  "tpc-extension",
  "tracing",
  "tracing-log",

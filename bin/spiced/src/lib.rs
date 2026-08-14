@@ -112,10 +112,12 @@ use runtime::secrets::ExposeSecret;
 use runtime::spice_metrics;
 use runtime::{Runtime, auth::EndpointAuth, extension::ExtensionFactory};
 use runtime_async::ManagedTokioRuntime;
+use runtime_cloud_connect::SessionAck;
 use snafu::prelude::*;
 use spice_cloud::SpiceExtensionFactory;
 use spiced_tracing::LogVerbosity;
 use tokio::runtime::Handle;
+use tokio_util::sync::CancellationToken;
 #[cfg(feature = "tpc-extension")]
 use tpc_extension::TpcExtensionFactory;
 use util::in_tracing_context;
@@ -128,8 +130,11 @@ mod cloud_connect;
 pub use cloud_connect::{
     BootstrapEnrollmentError, bootstrap_enrollment as cloud_connect_bootstrap,
 };
+mod connection_report;
 pub mod crash_handler;
 mod log_capture;
+mod runtime_lock;
+pub use runtime_lock::{InstanceClaim, claim_instance_directory};
 #[path = "tracing.rs"]
 mod spiced_tracing;
 mod tls;
@@ -1119,8 +1124,24 @@ pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
     // Captured before `args` is moved into the server task below.
     let runtime_overrides = args.set_runtime.clone();
 
-    let server_thread = tokio::spawn(async move {
-        Box::pin(cloned_rt.start_servers(args.runtime, tls_config, endpoint_auth)).await
+    // Cancelled when this process may no longer report itself as connected:
+    // shutdown (it is a child of the runtime's shutdown token, so a cancelled
+    // parent cancels it) or the server task ending, whichever comes first. A
+    // bind failure is observed only where `server_thread` is awaited, well
+    // after the initial load settles, so without this a runtime that never
+    // listened could announce itself as serving and then exit.
+    let serving_ended = rt.status().shutdown_token();
+
+    let server_thread = tokio::spawn({
+        let serving_ended = serving_ended.clone();
+        async move {
+            let result =
+                Box::pin(cloned_rt.start_servers(args.runtime, tls_config, endpoint_auth)).await;
+            // Whatever the outcome — a bind that failed, or a clean
+            // termination — the servers are not running after this point.
+            serving_ended.cancel();
+            result
+        }
     });
 
     // Restore control-plane-delivered secrets from the local cache and register
@@ -1133,6 +1154,17 @@ pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
     // gateway is unreachable.
     let delivered_secrets =
         cloud_connect::restore_delivered_secrets(&rt, cloud_connect_identity.as_ref()).await;
+
+    // The connection report's two latches. The connection half is filled by the
+    // control client on the first message Spice Cloud sends back; the serving
+    // half below, when the initial component load settles. Whichever is second
+    // releases the report, so neither ordering loses it — and `serving_ended`
+    // withdraws it if the servers stop first.
+    let session_ack = cloud_connect_configured.then(|| Arc::new(SessionAck::new()));
+    let serving = CancellationToken::new();
+    if let Some(ack) = &session_ack {
+        connection_report::spawn(Arc::clone(ack), serving.clone(), serving_ended.clone());
+    }
 
     // Spice Cloud Connect. Default off — activates only from the validated
     // durable identity snapshot loaded before the runtime was built (which a
@@ -1155,11 +1187,20 @@ pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
         running_deployment,
         cloud_connect_metrics,
         runtime_overrides,
+        session_ack,
     )
     .await;
 
     tokio::select! {
-        () = Arc::clone(&rt).load_components() => {},
+        () = Arc::clone(&rt).load_components() => {
+            // The initial load has settled — every component the app declares
+            // has been registered and had its first load attempt. This, rather
+            // than `RuntimeStatus::is_ready`, is what says a *Cloud Connect*
+            // instance is serving: a freshly enrolled one has no components at
+            // all until its first deployment lands, and readiness over an empty
+            // component set is never reported.
+            serving.cancel();
+        },
         () = runtime::shutdown_signal() => {
             tracing::debug!("Cancelling runtime initializing!");
         },

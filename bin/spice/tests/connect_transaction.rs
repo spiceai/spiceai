@@ -39,6 +39,29 @@ fn spice_cmd() -> Command {
     cargo_bin_cmd!("spice")
 }
 
+/// Install a runtime that exits immediately into an isolated home.
+///
+/// A completed `spice connect` ends at a running instance, so every fixture
+/// here would otherwise install and run a real `spiced`. The stub keeps these
+/// tests about the transaction: the CLI starts it, it exits 0, and the command
+/// returns.
+#[cfg(unix)]
+fn stub_runtime(home: &TempDir) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let bin = home.path().join(".spice").join("bin");
+    std::fs::create_dir_all(&bin).expect("create the stub runtime directory");
+    let stub = bin.join("spiced");
+    std::fs::write(&stub, "#!/bin/sh\nexit 0\n").expect("write the stub runtime");
+    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
+        .expect("make the stub runtime executable");
+}
+
+/// No stub is needed where the CLI does not manage a local runtime: `connect`
+/// completes the transaction and names how to start the instance instead.
+#[cfg(not(unix))]
+fn stub_runtime(_home: &TempDir) {}
+
 struct Request {
     method: String,
     path: String,
@@ -340,6 +363,7 @@ fn write_response(stream: &mut TcpStream, status: u16, body: &str) {
 }
 
 fn connect_command(instance: &TempDir, home: &TempDir, endpoint: &str, project: &str) -> Command {
+    stub_runtime(home);
     let mut command = spice_cmd();
     command
         .current_dir(instance.path())
@@ -392,6 +416,7 @@ fn unattached_identity() -> runtime_cloud_connect::Identity {
         org_name: Some("acme".to_string()),
         app_name: None,
         monitor_url: None,
+        new_project_url: None,
         control_plane_endpoint: None,
     }
 }
@@ -532,6 +557,7 @@ fn a_default_credential_for_another_org_never_reaches_a_mutation() {
             .expect("store enrolled unattached identity");
         }
 
+        stub_runtime(&home);
         let output = spice_cmd()
             .current_dir(instance.path())
             .env("HOME", home.path())
@@ -908,6 +934,7 @@ fn token_mode_stays_unattached_and_existing_identity_prevents_reenrollment() {
 
     let instance = TempDir::new().expect("create instance directory");
     let home = TempDir::new().expect("create isolated home");
+    stub_runtime(&home);
     let first = spice_cmd()
         .current_dir(instance.path())
         .env("HOME", home.path())

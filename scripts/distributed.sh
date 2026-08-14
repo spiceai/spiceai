@@ -115,6 +115,9 @@ start_scheduler() {
         echo "  Log: ${LOG_DIR}/scheduler.log"
     else
         echo -e "${YELLOW}  Run in a separate terminal:${NC}"
+        # Each node runs in its own working directory: one directory serves one
+        # runtime, and a second started in the same one refuses at its lock.
+        echo "  mkdir -p ${DISTRIBUTED_DIR}/scheduler && cd ${DISTRIBUTED_DIR}/scheduler"
         echo "  ~/.spice/bin/spiced --role scheduler \\"
         echo "    --node-bind-address 127.0.0.1:${SCHEDULER_NODE_PORT} \\"
         echo "    --node-advertise-address 127.0.0.1:${SCHEDULER_NODE_PORT} \\"
@@ -171,6 +174,7 @@ start_executor() {
         echo "  Log: ${LOG_DIR}/${executor_name}.log"
     else
         echo -e "${YELLOW}  Run in a separate terminal:${NC}"
+        echo "  mkdir -p ${DISTRIBUTED_DIR}/${executor_name} && cd ${DISTRIBUTED_DIR}/${executor_name}"
         echo "  ~/.spice/bin/spiced --role executor \\"
         echo "    --http 127.0.0.1:${http_port} \\"
         echo "    --scheduler-address ${SCHEDULER_ADDRESS} \\"

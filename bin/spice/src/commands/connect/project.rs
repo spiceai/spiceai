@@ -445,6 +445,7 @@ mod tests {
             org_name: None,
             app_name: None,
             monitor_url: None,
+            new_project_url: None,
             control_plane_endpoint: None,
         }
     }
