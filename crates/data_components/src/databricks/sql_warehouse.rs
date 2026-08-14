@@ -2086,9 +2086,9 @@ mod tests {
     use arrow::datatypes::DataType;
     use serde_json::json;
 
-    /// Regression test for #13015: a statement whose result carried no chunks
-    /// reported `Schema::empty()`, so an empty result dropped every projected
-    /// column instead of returning an empty table with the right columns.
+    /// Regression test for #13015: a statement whose result carries no chunks
+    /// must still carry the projected schema, so an empty result is an empty
+    /// table with the columns the query selected rather than no columns at all.
     #[test]
     fn empty_result_stream_keeps_the_projected_schema() {
         let projected: SchemaRef = Arc::new(Schema::new(vec![

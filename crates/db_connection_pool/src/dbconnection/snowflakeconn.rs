@@ -824,9 +824,9 @@ mod tests {
     use arrow::util::display;
     use std::sync::Arc;
 
-    /// Regression test for #13015: a query Snowflake answered with no batches
-    /// reported `Schema::empty()`, so an empty result dropped every projected
-    /// column instead of returning an empty table with the right columns.
+    /// Regression test for #13015: a query Snowflake answers with no batches
+    /// must still carry the projected schema, so an empty result is an empty
+    /// table with the columns the query selected rather than no columns at all.
     #[test]
     fn empty_result_stream_keeps_the_projected_schema() {
         let projected: SchemaRef = Arc::new(Schema::new(vec![
