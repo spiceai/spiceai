@@ -327,7 +327,7 @@ impl<R: Read + Send> ArrayToNdjson<R> {
             // The element's own bytes have already been drained, so whatever
             // is left in tee.buf starts just after it: serde's lookahead, plus
             // anything read here on an earlier pass.
-            if let Some(&b) = tee.buf.iter().find(|b| !b.is_ascii_whitespace()) {
+            if let Some(&b) = tee.buf.iter().find(|b| !is_json_whitespace(**b)) {
                 return Ok(b); // found it – return without consuming
             }
 
@@ -359,7 +359,7 @@ impl<R: Read + Send> ArrayToNdjson<R> {
 
         // 1️⃣  Drop leading whitespace that we may have read while peeking.
         while let Some(&b) = tee.buf.first() {
-            if !b.is_ascii_whitespace() {
+            if !is_json_whitespace(b) {
                 break;
             }
             tee.drain_front(1);
@@ -409,9 +409,22 @@ impl<R: Read + Send> BufRead for ArrayToNdjson<R> {
 
 /* ---------- shared utilities ---------- */
 
-/// The first byte of `bytes` that is not ASCII whitespace, if there is one.
+/// Whether `byte` is whitespace as far as JSON is concerned.
+///
+/// RFC 8259 admits exactly four: space, horizontal tab, carriage return and
+/// line feed. `u8::is_ascii_whitespace` is a wider set — it follows the WHATWG
+/// Infra definition, which also counts form feed (`0x0C`) — so using it to
+/// decide what may follow a document accepts a byte `serde_json` itself
+/// reports as `trailing characters`. It excludes vertical tab (`0x0B`), so
+/// only form feed differs, but one byte is enough: a tail of form feeds is a
+/// body the guard is supposed to reject and would wave through.
+fn is_json_whitespace(byte: u8) -> bool {
+    matches!(byte, b' ' | b'\t' | b'\r' | b'\n')
+}
+
+/// The first byte of `bytes` that is not JSON whitespace, if there is one.
 fn first_non_whitespace(bytes: &[u8]) -> Option<u8> {
-    bytes.iter().find(|b| !b.is_ascii_whitespace()).copied()
+    bytes.iter().find(|b| !is_json_whitespace(**b)).copied()
 }
 
 /// The error both readers report for content that follows the array's `]`.
@@ -507,7 +520,7 @@ fn skip_ws_until<R: Read>(r: &mut R, expect: u8) -> io::Result<()> {
             }
         }
         match byte[0] {
-            b if b.is_ascii_whitespace() => {}
+            b if is_json_whitespace(b) => {}
             b if b == expect => return Ok(()),
             b => {
                 return Err(io::Error::new(
@@ -1306,7 +1319,7 @@ impl ArrayToNdjsonPush {
                     "EOF while peeking next byte",
                 ));
             }
-            if !byte[0].is_ascii_whitespace() {
+            if !is_json_whitespace(byte[0]) {
                 return Ok(byte[0]);
             }
         }
@@ -2304,6 +2317,11 @@ mod tests {
                 &b"[1]]"[..],
                 &b"[1],"[..],
                 &b"[]x"[..],
+                // Not JSON whitespace, so a tail of these is content — see
+                // `is_json_whitespace`. Both readers have to agree on that.
+                &b"[1]\x0c"[..],
+                &b"[1]\x0b"[..],
+                &b"[]\x0c"[..],
             ] {
                 let mut adapter = ArrayToNdjsonPush::new();
                 let Err(err) = adapter.push_bytes(body) else {
@@ -4439,6 +4457,12 @@ mod tests {
                 &b"[1]]"[..],
                 &b"[1],"[..],
                 &b"[]x"[..],
+                // Form feed and vertical tab are not JSON whitespace, so a
+                // tail of them is content. Rust's `is_ascii_whitespace` counts
+                // the form feed and would read this body clean.
+                &b"[1]\x0c"[..],
+                &b"[1]\x0b"[..],
+                &b"[]\x0c"[..],
             ] {
                 let Err(err) = ndjson_lines(body) else {
                     panic!(
@@ -4577,6 +4601,53 @@ mod tests {
             assert!(
                 err.to_string().contains("after the closing ']'"),
                 "expected the trailing-content verdict, got: {err}"
+            );
+        }
+
+        /// The tail is not the only place a document's validity turns on what
+        /// counts as whitespace. `serde_json` rejects a form feed between
+        /// tokens, so the scans this crate writes itself — the prologue before
+        /// `[`, and the one that decides an array is empty — have to reject it
+        /// too, or a body serde would refuse reads clean through them.
+        ///
+        /// Vertical tab is in the table because it is the byte the reported
+        /// version of this got wrong: `is_ascii_whitespace` already excludes
+        /// it, so it was rejected before this change and must stay rejected.
+        ///
+        /// Deliberately unchanged: `peek_first_non_ws_byte`, which only
+        /// decides whether a body *looks* like an array, and
+        /// `filter_element_bytes`, which trims a row serde has already
+        /// accepted. Neither decides whether the input is valid, and
+        /// tightening detection would route a bad body to a worse error than
+        /// the one the guards now give it.
+        #[test]
+        fn a_form_feed_is_not_whitespace_to_either_reader() {
+            for body in [
+                &b"\x0c[1]"[..],
+                &b"\x0b[1]"[..],
+                &b"[\x0c]"[..],
+                &b"[\x0b]"[..],
+            ] {
+                assert!(
+                    ndjson_lines(body).is_err(),
+                    "pull reader accepted {:?}, which serde_json rejects",
+                    String::from_utf8_lossy(body)
+                );
+
+                let mut adapter = ArrayToNdjsonPush::new();
+                let accepted = adapter.push_bytes(body).is_ok() && adapter.finish().is_ok();
+                assert!(
+                    !accepted,
+                    "push reader accepted {:?}, which serde_json rejects",
+                    String::from_utf8_lossy(body)
+                );
+            }
+
+            // The four bytes JSON does admit stay admitted, in the same spots.
+            assert_eq!(
+                ndjson_lines(b" \t\r\n[ \t\r\n1 \t\r\n] \t\r\n")
+                    .expect("JSON whitespace must remain acceptable everywhere"),
+                vec!["1"]
             );
         }
     }
