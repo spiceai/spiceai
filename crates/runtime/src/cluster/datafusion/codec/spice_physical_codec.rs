@@ -16,7 +16,7 @@ limitations under the License.
 
 use crate::Runtime;
 use crate::dataconnector::iceberg_cluster::IcebergClusterTableProvider;
-use crate::execution_plan::{IcebergScanExec, UdtfExec};
+use runtime_execution_plans::{IcebergScanExec, UdtfExec};
 use arrow_schema::Schema;
 use ballista_core::serde::BallistaPhysicalExtensionCodec;
 #[cfg(not(windows))]

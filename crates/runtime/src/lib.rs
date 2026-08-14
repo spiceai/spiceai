@@ -99,7 +99,6 @@ pub mod datasets_health_monitor;
 pub use runtime_acceleration::dataupdate;
 pub(crate) mod egress;
 pub mod embeddings;
-pub mod execution_plan;
 pub mod executor_table;
 pub mod extension;
 pub use runtime_table::federated;
