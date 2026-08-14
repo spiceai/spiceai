@@ -206,17 +206,21 @@ impl MemoryVectorIndex {
             .map(|(key, vector)| {
                 let keep = match (key, vector) {
                     (Some(key), Some(vector)) => {
-                        // All-zero / all-NaN vectors have no defined direction and
-                        // would corrupt similarity scores — skip them.
-                        let valid = !vector.iter().all(|&v| v == 0.0 || v.is_nan());
-                        if valid {
-                            keys.push(key.clone());
-                        } else {
-                            tracing::warn!(
-                                "Skipping record '{key}' for memory vector index '{INDEX_NAME}': Embedding vector is all zeroes or contains only invalid values"
-                            );
+                        // A vector with no defined direction, or with an element that makes
+                        // every distance undefined, would corrupt similarity scores — skip it.
+                        match write_util::embedding_defect(vector) {
+                            None => {
+                                keys.push(key.clone());
+                                true
+                            }
+                            Some(defect) => {
+                                let reason = defect.reason();
+                                tracing::warn!(
+                                    "Skipping record '{key}' for memory vector index '{INDEX_NAME}': the embedding vector {reason}, so it cannot be searched."
+                                );
+                                false
+                            }
                         }
-                        valid
                     }
                     (None, _) => {
                         tracing::warn!(
@@ -542,12 +546,45 @@ mod tests {
         ))
     }
 
+    /// Returns a vector whose second element is `NAN` for row 2, and a usable vector
+    /// otherwise — the shape a provider produces when one response is corrupt.
+    #[derive(Debug)]
+    struct OneNanEmbed;
+
+    #[async_trait]
+    impl Embed for OneNanEmbed {
+        async fn embed(&self, input: EmbeddingInput) -> llms::embeddings::Result<Vec<Vec<f32>>> {
+            let vector_for = |text: &str| {
+                if text == "row 2" {
+                    vec![1.0, f32::NAN, 3.0]
+                } else {
+                    byte_vector(text)
+                }
+            };
+            match input {
+                EmbeddingInput::String(s) => Ok(vec![vector_for(&s)]),
+                EmbeddingInput::StringArray(v) => {
+                    Ok(v.iter().map(|s| vector_for(s)).collect::<Vec<_>>())
+                }
+                _ => Ok(vec![]),
+            }
+        }
+
+        fn size(&self) -> i32 {
+            DIM
+        }
+    }
+
     fn memory_index() -> MemoryVectorIndex {
+        memory_index_with(Arc::new(ByteEmbed))
+    }
+
+    fn memory_index_with(embedder: Arc<dyn Embed>) -> MemoryVectorIndex {
         MemoryVectorIndex::try_new(
             "content".to_string(),
             vec![Field::new("id", DataType::Int64, false)],
             MetadataColumns::none(),
-            Arc::new(ByteEmbed),
+            embedder,
             embed_udf(),
             "model_name".to_string(),
             MemoryDistanceMetric::Cosine,
@@ -609,6 +646,26 @@ mod tests {
             .on_write_complete()
             .await
             .expect("the write window closes");
+    }
+
+    /// A vector that mixes real values with a `NaN` is not indexable: every distance
+    /// computed against it is undefined. The `all(|v| v == 0.0 || v.is_nan())` filter this
+    /// replaced only caught a vector that was *entirely* zeroes and NaNs, so row 2 was
+    /// stored and searched (regression test for #13089).
+    #[tokio::test]
+    async fn a_partially_non_finite_embedding_is_not_indexed() {
+        let index = memory_index_with(Arc::new(OneNanEmbed));
+
+        index
+            .compute_index(vec![batch(&[1, 2, 3])])
+            .await
+            .expect("the rows are indexed");
+
+        assert_eq!(
+            indexed_ids(&index),
+            vec![1, 3],
+            "row 2's embedding carries a NaN, so it has no usable distance to any query"
+        );
     }
 
     /// The regression test. A `refresh_mode: full` refresh removes a row by not re-sending

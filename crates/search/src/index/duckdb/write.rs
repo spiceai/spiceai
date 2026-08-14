@@ -27,7 +27,7 @@ use llms::embeddings::{Embed, EmbeddingInput};
 use snafu::{ResultExt, Snafu};
 use util::{convert_string_arrow_to_iterator, distribute_nulls};
 
-use crate::index::{duckdb::DuckDBVectorIndex, embedding_col};
+use crate::index::{duckdb::DuckDBVectorIndex, embedding_col, write_util};
 
 #[derive(Debug, Snafu)]
 pub(super) enum WriteError {
@@ -54,6 +54,14 @@ pub(super) enum WriteError {
         expected: usize,
         actual: usize,
         row_index: usize,
+    },
+
+    #[snafu(display(
+        "Failed to build DuckDB vector embedding column: the embedding at row {row_index} {reason}, so it cannot be indexed. Check the embedding model's output for that row. See: https://spiceai.org/docs/components/embeddings"
+    ))]
+    UnusableEmbedding {
+        row_index: usize,
+        reason: &'static str,
     },
 }
 
@@ -179,6 +187,17 @@ fn create_embedding_array(
     for (row, embedding) in embedding_vectors.iter().enumerate() {
         match embedding {
             Some(vector) if vector.len() == expected => {
+                // Unlike the row-filtering backends (S3 Vectors, in-memory, Elasticsearch),
+                // this column is written beside the source row in the accelerated table, so
+                // there is no row to drop — and an unusable vector cannot be quietly stored
+                // either: HNSW builds neighbour lists from these values, so one undefined
+                // distance degrades the results returned for other rows. Reject the write.
+                if let Some(defect) = write_util::embedding_defect(vector) {
+                    return Err(WriteError::UnusableEmbedding {
+                        row_index: row,
+                        reason: defect.reason(),
+                    });
+                }
                 builder.values().append_slice(vector);
                 builder.append(true);
             }
@@ -198,4 +217,71 @@ fn create_embedding_array(
     }
 
     Ok(Arc::new(builder.finish()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The DuckDB write path is the one site that cannot skip the row — the embedding is a
+    /// column beside the source data — so an unusable vector has to fail the write rather
+    /// than reach the HNSW index, where an undefined distance degrades the neighbour lists
+    /// other rows are found through. Before this fix nothing was checked here at all:
+    /// `validate_vector` was only ever called on the query vector (regression test for
+    /// #13089).
+    #[test]
+    fn a_partially_non_finite_embedding_is_rejected() {
+        let embeddings = vec![Some(vec![1.0, 2.0, 3.0]), Some(vec![1.0, f32::NAN, 3.0])];
+
+        let err = create_embedding_array(&embeddings, 3)
+            .expect_err("a NaN element must not reach the vector index");
+
+        let WriteError::UnusableEmbedding { row_index, reason } = err else {
+            panic!("expected UnusableEmbedding, got {err:?}");
+        };
+        assert_eq!(row_index, 1);
+        assert!(
+            reason.contains("NaN"),
+            "the message must name the defect, got '{reason}'"
+        );
+    }
+
+    #[test]
+    fn an_infinite_element_is_rejected() {
+        let embeddings = vec![Some(vec![f32::INFINITY, 2.0, 3.0])];
+
+        let err = create_embedding_array(&embeddings, 3)
+            .expect_err("an infinite element must not reach the vector index");
+
+        assert!(matches!(
+            err,
+            WriteError::UnusableEmbedding { row_index: 0, .. }
+        ));
+    }
+
+    #[test]
+    fn an_all_zero_embedding_is_rejected() {
+        let embeddings = vec![Some(vec![0.0, 0.0, 0.0])];
+
+        let err = create_embedding_array(&embeddings, 3)
+            .expect_err("a vector with no direction must not reach the vector index");
+
+        assert!(matches!(
+            err,
+            WriteError::UnusableEmbedding { row_index: 0, .. }
+        ));
+    }
+
+    /// A NULL embedding is not a defect: the row simply has nothing to index, and the list
+    /// slot is null. Rejecting it would fail every batch with a NULL search column.
+    #[test]
+    fn a_null_embedding_stays_a_null_slot() {
+        let embeddings = vec![Some(vec![1.0, 2.0, 3.0]), None];
+
+        let array = create_embedding_array(&embeddings, 3).expect("a null embedding is allowed");
+
+        assert_eq!(array.len(), 2);
+        assert!(!array.is_null(0));
+        assert!(array.is_null(1));
+    }
 }

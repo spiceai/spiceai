@@ -93,6 +93,49 @@ pub enum Error {
     },
 }
 
+/// Why an embedding vector cannot be indexed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EmbeddingDefect {
+    /// At least one element is `NaN` or infinite, so every distance computed against the
+    /// vector is undefined. For a graph index (DuckDB HNSW) a single such vector also
+    /// degrades the neighbour lists other rows are found through.
+    NonFinite,
+    /// Every element is zero, so the vector has no direction and cosine distance against
+    /// it is undefined.
+    AllZero,
+}
+
+impl EmbeddingDefect {
+    /// The defect as a message fragment, for a log line or an error that already names the
+    /// index and the row.
+    pub(crate) fn reason(self) -> &'static str {
+        match self {
+            Self::NonFinite => "contains a NaN or infinite value",
+            Self::AllZero => "is all zeroes",
+        }
+    }
+}
+
+/// The single definition of "this embedding cannot be indexed", shared by every write path
+/// so that one backend cannot disagree with another about what a usable vector is.
+///
+/// Returns `None` when the vector is usable. The test is per element and includes the
+/// infinities, so a vector that mixes real values with a `NaN` — `[NaN, 2.0, 3.0]` — is
+/// rejected. The read side screens the same values (`cosine_distance` returns NULL for a
+/// distance that is not defined), and both ends need the check: a vector column can reach
+/// an index from a source with no Spice-side embedding code on the path.
+pub(crate) fn embedding_defect(vector: &[f32]) -> Option<EmbeddingDefect> {
+    if vector.iter().any(|value| !value.is_finite()) {
+        return Some(EmbeddingDefect::NonFinite);
+    }
+
+    if vector.iter().all(|&value| value == 0.0) {
+        return Some(EmbeddingDefect::AllZero);
+    }
+
+    None
+}
+
 /// Given a [`RecordBatch`] of data from a [`crate::index::SearchIndex`]'s associated
 /// `TableProvider`, extract and format the primary key into one string per row.
 ///
@@ -364,6 +407,51 @@ mod tests {
     use super::*;
     use arrow::array::{FixedSizeListArray, Float32Array, Float32Builder, Int32Array, StringArray};
     use arrow::datatypes::{DataType, Schema};
+
+    #[test]
+    fn usable_embeddings_have_no_defect() {
+        assert_eq!(embedding_defect(&[1.0, 2.0, 3.0]), None);
+        // One zero among real values still leaves a direction.
+        assert_eq!(embedding_defect(&[0.0, 0.0, 1.0]), None);
+        assert_eq!(embedding_defect(&[-1.0, 0.0, f32::MIN_POSITIVE]), None);
+    }
+
+    /// The gap this predicate exists to close: a vector that mixes real values with a
+    /// single non-finite element. `all(|x| x == 0.0 || x.is_nan())` reported these as
+    /// usable, and they were written and indexed (regression test for #13089).
+    #[test]
+    fn a_single_non_finite_element_makes_a_vector_unusable() {
+        for vector in [
+            vec![f32::NAN, 2.0, 3.0],
+            vec![1.0, f32::NAN, 3.0],
+            vec![1.0, 2.0, f32::INFINITY],
+            vec![f32::NEG_INFINITY, 2.0, 3.0],
+            // The all-zero filter did catch these two; they must stay caught.
+            vec![f32::NAN, f32::NAN],
+            vec![0.0, f32::NAN],
+        ] {
+            assert_eq!(
+                embedding_defect(&vector),
+                Some(EmbeddingDefect::NonFinite),
+                "expected {vector:?} to be rejected as non-finite"
+            );
+        }
+    }
+
+    #[test]
+    fn an_all_zero_vector_has_no_direction() {
+        assert_eq!(
+            embedding_defect(&[0.0, 0.0]),
+            Some(EmbeddingDefect::AllZero)
+        );
+        // IEEE-754 negative zero compares equal to zero, and carries no direction either.
+        assert_eq!(
+            embedding_defect(&[-0.0, 0.0, -0.0]),
+            Some(EmbeddingDefect::AllZero)
+        );
+        // An empty vector has no direction; the dimension checks reject it separately.
+        assert_eq!(embedding_defect(&[]), Some(EmbeddingDefect::AllZero));
+    }
 
     // Helper function to create a test RecordBatch with text and embedding columns
     #[expect(clippy::cast_sign_loss)]

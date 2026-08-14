@@ -38,6 +38,7 @@ use util::{convert_string_arrow_to_iterator, distribute_nulls};
 
 use crate::index::elasticsearch::ElasticsearchIndex;
 use crate::index::embedding_col;
+use crate::index::write_util::{self, EmbeddingDefect};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -253,8 +254,8 @@ fn build_documents(
 
     let mut null_pk_skips: usize = 0;
     let mut null_pk_samples: Vec<usize> = Vec::new();
-    let mut zero_or_nan_skips: usize = 0;
-    let mut zero_or_nan_samples: Vec<usize> = Vec::new();
+    let mut all_zero_skips: usize = 0;
+    let mut all_zero_samples: Vec<usize> = Vec::new();
     let mut non_finite_skips: usize = 0;
     let mut non_finite_samples: Vec<usize> = Vec::new();
     let mut missing_embedding_skips: usize = 0;
@@ -288,20 +289,22 @@ fn build_documents(
             });
         }
 
-        if embedding.iter().all(|&x| x == 0.0 || x.is_nan()) {
-            zero_or_nan_skips += 1;
-            if zero_or_nan_samples.len() < SAMPLE_LIMIT {
-                zero_or_nan_samples.push(row);
+        match write_util::embedding_defect(embedding) {
+            Some(EmbeddingDefect::AllZero) => {
+                all_zero_skips += 1;
+                if all_zero_samples.len() < SAMPLE_LIMIT {
+                    all_zero_samples.push(row);
+                }
+                continue;
             }
-            continue;
-        }
-
-        if embedding.iter().any(|x| !x.is_finite()) {
-            non_finite_skips += 1;
-            if non_finite_samples.len() < SAMPLE_LIMIT {
-                non_finite_samples.push(row);
+            Some(EmbeddingDefect::NonFinite) => {
+                non_finite_skips += 1;
+                if non_finite_samples.len() < SAMPLE_LIMIT {
+                    non_finite_samples.push(row);
+                }
+                continue;
             }
-            continue;
+            None => {}
         }
 
         let mut doc = serde_json::Map::with_capacity(column_encoders.len() + 1);
@@ -340,9 +343,9 @@ fn build_documents(
             "Skipped {null_pk_skips} record(s) for Elasticsearch index '{es_index}': NULL primary key value(s) (would produce non-idempotent auto-generated document IDs). Sample row indices: {null_pk_samples:?}"
         );
     }
-    if zero_or_nan_skips > 0 {
+    if all_zero_skips > 0 {
         tracing::warn!(
-            "Skipped {zero_or_nan_skips} record(s) for Elasticsearch index '{es_index}': embedding vector is all zeros or NaN. Sample row indices: {zero_or_nan_samples:?}"
+            "Skipped {all_zero_skips} record(s) for Elasticsearch index '{es_index}': embedding vector is all zeroes, so it has no direction to search by. Sample row indices: {all_zero_samples:?}"
         );
     }
     if non_finite_skips > 0 {

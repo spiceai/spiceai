@@ -27,8 +27,8 @@ use snafu::{ResultExt, Snafu};
 use spice_table::Index;
 
 use crate::index::write_util::{
-    self, embed_column, extract_and_format_primary_key, sort_columns_alphabetically,
-    update_embedding_column_in_batch,
+    self, embed_column, embedding_defect, extract_and_format_primary_key,
+    sort_columns_alphabetically, update_embedding_column_in_batch,
 };
 use crate::index::{SearchIndex, embedding_col, s3_vectors::S3Vector};
 
@@ -184,9 +184,9 @@ async fn process_single_batch(
     )
     .map_err(|e| Error::from(*e))?;
 
-    // Filter out zero vectors to prevent cosine similarity calculation errors
+    // Drop records whose embedding cannot be searched, so they never reach the index.
     let (filtered_embeddings, filtered_primary_key, filtered_metadata) =
-        filter_zero_vectors(embedding_vectors, primary_key, metadata, index.name());
+        filter_unusable_vectors(embedding_vectors, primary_key, metadata, index.name());
 
     let spill_index = index.spill_index().await.context(CannotWriteIndexSnafu {
         index: index.name().to_string(),
@@ -264,18 +264,16 @@ pub fn extract_and_format_metadata(
     Ok(metadata)
 }
 
-/// Filter out invalid embedding vectors where all values are either zero or NaN.
+/// Drop the records whose embedding cannot be indexed, per [`embedding_defect`].
 ///
-/// This filters vectors that consist entirely of invalid values (zeros and/or NaNs).
-/// A vector with any valid non-zero, non-NaN value is kept.
 /// For example:
-/// - `[0.0, 0.0]` -> filtered (all zeros)
-/// - `[NaN, NaN]` -> filtered (all NaN)
-/// - `[0.0, NaN]` -> filtered (all values are either zero or NaN)
-/// - `[1.0, 0.0]` -> kept (has a valid non-zero value)
-/// - `[1.0, NaN]` -> kept (has a valid non-NaN value)
+/// - `[0.0, 0.0]` -> filtered (all zeroes)
+/// - `[NaN, NaN]` -> filtered (not finite)
+/// - `[0.0, NaN]` -> filtered (not finite)
+/// - `[1.0, NaN]` -> filtered (not finite — one bad element makes every distance undefined)
+/// - `[1.0, 0.0]` -> kept
 #[expect(clippy::type_complexity)]
-fn filter_zero_vectors(
+fn filter_unusable_vectors(
     mut embeddings: Vec<Option<Vec<f32>>>,
     mut primary_keys: Vec<Option<String>>,
     mut metadata: HashMap<String, Vec<Option<Value>>>,
@@ -288,15 +286,15 @@ fn filter_zero_vectors(
     // Filter in reverse order to avoid index shifting when removing elements
     for i in (0..embeddings.len()).rev() {
         if let Some(embedding) = &embeddings[i]
-            // Single pass: check if all values are zero or NaN (both are invalid embeddings)
-            && embedding.iter().all(|&x| x == 0.0 || x.is_nan())
+            && let Some(defect) = embedding_defect(embedding)
         {
             let key_str = primary_keys
                 .get(i)
                 .and_then(|k| k.as_ref().map(String::as_str))
                 .unwrap_or("unknown");
+            let reason = defect.reason();
             tracing::warn!(
-                "Skipping record '{key_str}' for S3 Vector index '{index_name}': Embedding vector is all zeroes or contains only invalid values"
+                "Skipping record '{key_str}' for S3 Vector index '{index_name}': the embedding vector {reason}, so it cannot be searched."
             );
 
             embeddings.remove(i);
@@ -317,7 +315,7 @@ mod tests {
     use arrow_schema::{DataType, Schema, UnionFields, UnionMode};
 
     #[test]
-    fn test_filter_zero_vectors() {
+    fn test_filter_unusable_vectors() {
         use serde_json::Value;
         use std::collections::HashMap;
 
@@ -345,7 +343,7 @@ mod tests {
         );
 
         let (filtered_embeddings, filtered_keys, filtered_metadata) =
-            filter_zero_vectors(embeddings, keys, metadata, "test_index");
+            filter_unusable_vectors(embeddings, keys, metadata, "test_index");
 
         assert_eq!(filtered_embeddings.len(), 3);
         assert_eq!(filtered_keys.len(), 3);
@@ -357,7 +355,7 @@ mod tests {
         assert_eq!(filtered_embeddings[2], Some(vec![3.0, 4.0]));
     }
 
-    /// Test that filter_zero_vectors correctly filters out NaN embeddings.
+    /// Test that `filter_unusable_vectors` correctly filters out NaN embeddings.
     #[test]
     fn test_filter_nan_vectors() {
         use serde_json::Value;
@@ -390,7 +388,7 @@ mod tests {
         );
 
         let (filtered_embeddings, filtered_keys, filtered_metadata) =
-            filter_zero_vectors(embeddings, keys, metadata, "test_index");
+            filter_unusable_vectors(embeddings, keys, metadata, "test_index");
 
         // Should keep only the 2 valid vectors
         assert_eq!(filtered_embeddings.len(), 2);
@@ -402,6 +400,35 @@ mod tests {
         assert_eq!(filtered_embeddings[1], Some(vec![3.0, 4.0]));
         assert_eq!(filtered_keys[0], Some("key1".to_string()));
         assert_eq!(filtered_keys[1], Some("key4".to_string()));
+    }
+
+    /// A vector that mixes real values with a non-finite one is unusable: every distance
+    /// computed against it is undefined. The `all(|x| x == 0.0 || x.is_nan())` filter this
+    /// replaced kept these (regression test for #13089).
+    #[test]
+    fn partially_non_finite_vectors_are_filtered() {
+        use serde_json::Value;
+        use std::collections::HashMap;
+
+        let embeddings = vec![
+            Some(vec![f32::NAN, 2.0, 3.0]), // Filter out — one NaN among real values
+            Some(vec![1.0, f32::INFINITY, 3.0]), // Filter out — +inf
+            Some(vec![1.0, 2.0, f32::NEG_INFINITY]), // Filter out — -inf
+            Some(vec![1.0, 2.0, 3.0]),      // Keep
+        ];
+        let keys = (1..=4).map(|i| Some(format!("key{i}"))).collect::<Vec<_>>();
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            "test".to_string(),
+            vec![Some(Value::String("a".to_string())); 4],
+        );
+
+        let (filtered_embeddings, filtered_keys, filtered_metadata) =
+            filter_unusable_vectors(embeddings, keys, metadata, "test_index");
+
+        assert_eq!(filtered_embeddings, vec![Some(vec![1.0, 2.0, 3.0])]);
+        assert_eq!(filtered_keys, vec![Some("key4".to_string())]);
+        assert_eq!(filtered_metadata["test"].len(), 1);
     }
 
     #[test]
