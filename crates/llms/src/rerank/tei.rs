@@ -112,10 +112,11 @@ impl TeiRerank {
         .into_iter()
         .collect();
 
-        let model_root = link_files_into_tmp_dir(files).map_err(|e| Error::LocalModelLoadFailed {
-            model: name.clone(),
-            source: Box::new(e),
-        })?;
+        let model_root =
+            link_files_into_tmp_dir(files).map_err(|e| Error::LocalModelLoadFailed {
+                model: name.clone(),
+                source: Box::new(e),
+            })?;
         Self::from_dir(name, &model_root, max_seq_length_overwrite, truncation).await
     }
 
@@ -129,11 +130,11 @@ impl TeiRerank {
     ) -> Result<Self> {
         let name = name.into();
 
-        let (_, _, token) = load_tokenization(root, max_seq_length_overwrite).boxed().context(
-            LocalModelLoadFailedSnafu {
+        let (_, _, token) = load_tokenization(root, max_seq_length_overwrite)
+            .boxed()
+            .context(LocalModelLoadFailedSnafu {
                 model: name.clone(),
-            },
-        )?;
+            })?;
 
         // A cross-encoder reranker is a sequence-classification model: load it
         // with `Classifier` (no pooling) so `Infer::predict` — gated on
