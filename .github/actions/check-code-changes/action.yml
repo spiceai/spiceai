@@ -59,9 +59,12 @@ inputs:
         - 'scripts/check_table_layers.py'
         - 'scripts/check_rust_gate_paths.py'
         - 'scripts/check_module_reachability.py'
-        # The reachability guard's own regression harness runs in `lint-rust`,
-        # so a change to it changes what the Rust gate enforces.
+        - 'scripts/check_workspace_membership.py'
+        # The reachability and workspace-membership guards run their own
+        # regression harnesses in `lint-rust`, so a change to either changes what
+        # the Rust gate enforces.
         - 'scripts/test_check_module_reachability.py'
+        - 'scripts/test_check_workspace_membership.py'
         - 'rust-toolchain'
         - 'rust-toolchain.toml'
 

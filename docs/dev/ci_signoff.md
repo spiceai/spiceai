@@ -183,8 +183,8 @@ files the gate itself reads**:
   the root `clippy.toml`; `[.]rustfmt.toml`
 - `.config/nextest.toml` — retries, slow-test timeouts, test groups
 - `layers.toml`, `scripts/check_crate_layers.py`,
-  `scripts/check_rust_gate_paths.py`, and
-  `scripts/check_module_reachability.py` — the no-compile guards it runs
+  `scripts/check_rust_gate_paths.py`, `scripts/check_module_reachability.py`,
+  and `scripts/check_workspace_membership.py` — the no-compile guards it runs
 - the root `Makefile` — it holds every `-Dclippy::…` flag the gate enforces
 
 The merge queue still runs the full suite on the merged result — its
@@ -222,6 +222,32 @@ The walk handles the cases a regex over `mod` alone gets wrong — `#[path = "�
 redirects, declarations behind `#[cfg(…)]` (still declarations), inline
 `mod x { … }` nesting, and `mod` tokens inside comments and string literals.
 `scripts/test_check_module_reachability.py` covers each one.
+
+### The workspace-membership guard
+
+`make lint-rust` also runs `scripts/check_workspace_membership.py`, which fails
+when a tracked package is neither a member of the root workspace nor its own
+workspace root. Cargo resolves such a package's workspace by walking up the
+directory tree, so whichever ancestor manifest it reaches first claims it — and
+rejects it, because the package is not in that workspace's `members`.
+
+`workspace.exclude` does not settle this. It excludes a path relative to the
+manifest that declares it, so it stops matching as soon as the repository is
+checked out *inside* another copy of itself, which is where agent `git worktree`
+checkouts under `.claude/worktrees/` live. The nested root excludes the package
+correctly, cargo keeps walking, and the outer root claims it. The failure is not
+local to that package: `cargo fmt --all` resolves it while walking the tree, so
+`make lint` and `make signoff` abort before running a single check
+([#13093](https://github.com/spiceai/spiceai/issues/13093)). An empty
+`[workspace]` table in the package's own manifest ends the walk wherever the
+repository sits.
+
+The guard checks the declaration rather than probing whether `cargo metadata`
+resolves today: in a plain checkout the root `exclude` does match, so a probe
+passes on exactly the manifests the guard exists to catch.
+`scripts/test_check_workspace_membership.py` covers the parser and rebuilds the
+nested-checkout shape with cargo, so the behaviour the guard relies on is pinned
+rather than assumed.
 
 ### Dependabot bumps are fast-tracked
 

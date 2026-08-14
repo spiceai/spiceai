@@ -262,6 +262,10 @@ lint-rust:
 	python3 scripts/check_table_layers.py
 	## Rust-gate path-list guard (fast, no compile): the sign-off, Attestation, and merge-queue path lists must agree. See docs/dev/ci_signoff.md
 	python3 scripts/check_rust_gate_paths.py
+	## Workspace-membership guard (fast, no compile): a package outside the root workspace must declare its own, or an ancestor manifest claims it and cargo metadata fails
+	## Its parser and the cargo behaviour it relies on are exercised first: in a plain checkout every manifest resolves, so the live-tree scan alone cannot tell a correct manifest from a broken one
+	python3 scripts/test_check_workspace_membership.py
+	python3 scripts/check_workspace_membership.py
 	## Unreachable-module guard (fast, no compile): every file under a crate's src/ must be reachable from its crate root, or nothing compiles it
 	## Its parser is exercised first: the live-tree scan only covers the shapes today's workspace happens to contain, so a parser regression for any other shape would pass unnoticed
 	python3 scripts/test_check_module_reachability.py

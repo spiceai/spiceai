@@ -1,3 +1,7 @@
+# Its own workspace root: this package is not a member of the repository's root workspace,
+# and cargo would otherwise bind it to the nearest ancestor workspace manifest.
+[workspace]
+
 [package]
 authors = ["Junfeng Liu <china.liujunfeng@gmail.com>"]
 description = "A utility for PDF document manipulation."
