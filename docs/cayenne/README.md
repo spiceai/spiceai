@@ -100,8 +100,14 @@ rebuild the PDF (and commit the regenerated `waterfall.svg`).
   a change is still in review. A row is worth adding only for something a reader
   would act on — a new or renamed parameter, a schema change, a behavior or
   correctness change, or a structural revision to the document; skip internal
-  refactors and behavior-identical perf work. Cite a **merged PR number or a
-  `trunk` commit**, never a pre-merge branch SHA, which is squashed away on merge.
+  refactors and behavior-identical perf work. Judge that against what the
+  document is for: **how Cayenne sustains high-rate ingestion and low-latency
+  reads on one table** — synchronization and locking, the write and compaction
+  paths, tiering, visibility. Bookkeeping that only keeps the accounting honest
+  (how a cache charges entries, where a byte budget is enforced) is described in
+  the body beside the structure it governs, and needs no changelog row. Cite a
+  **merged PR number or a `trunk` commit**, never a pre-merge branch SHA, which
+  is squashed away on merge.
 - **Prose style**: minimal formatting, no over-bolding; breadth-first; honest
   about design alternatives and version accuracy.
 
