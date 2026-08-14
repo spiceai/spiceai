@@ -59,6 +59,7 @@ async fn an_app_arriving_after_an_empty_start() {
     a_second_initialization_restores_emission_it_found_turned_off().await;
     a_name_conflict_the_operator_fixes_is_retried_not_left_until_restart().await;
     a_reload_cannot_turn_task_history_on_after_the_first_app_turned_it_off().await;
+    a_retry_builds_what_the_first_app_asked_for_not_the_current_one().await;
 }
 
 /// Emission and the table have to agree. Both were decided when `DataFusion` was
@@ -254,6 +255,57 @@ async fn a_reload_cannot_turn_task_history_on_after_the_first_app_turned_it_off(
     assert!(
         !rt.datafusion().task_history_emission_enabled(),
         "so nothing emits into a table that was deliberately not created"
+    );
+}
+
+/// The whole `runtime.task_history` section the first app carried is what a retry
+/// builds, not only whether it was enabled.
+///
+/// A start with no app decides nothing, so the first app to arrive does. If its
+/// initialization fails and the operator fixes the conflict, the retry has to
+/// build the table that app asked for — a reload that disables task history, or
+/// changes its retention, describes a section this process already read.
+async fn a_retry_builds_what_the_first_app_asked_for_not_the_current_one() {
+    let rt = Arc::new(Runtime::builder().with_app_opt(None).build().await);
+    Arc::clone(&rt).load_components().await;
+
+    // The first app enables it, but the name is taken, so initialization fails.
+    let contested = TableReference::partial("runtime", "task_history");
+    rt.datafusion()
+        .ctx
+        .register_table(
+            contested.clone(),
+            Arc::new(datafusion::datasource::empty::EmptyTable::new(Arc::new(
+                arrow::datatypes::Schema::empty(),
+            ))),
+        )
+        .expect("something takes the name first");
+    let mut first = App::default();
+    first.views.push(view("first", "SELECT 1 AS answer"));
+    Arc::clone(&rt).apply_app(Arc::new(first)).await;
+    assert!(
+        !rt.datafusion().task_history_emission_enabled(),
+        "the conflict stopped it"
+    );
+
+    // The operator frees the name. The app that arrives with the fix happens to
+    // disable task history — a section this process read once, at its first app.
+    rt.datafusion()
+        .ctx
+        .deregister_table(contested.clone())
+        .expect("an unreserved name is the app's to release");
+    let mut later = App::default();
+    later.runtime.task_history.enabled = false;
+    later.views.push(view("later", "SELECT 1 AS answer"));
+    Arc::clone(&rt).apply_app(Arc::new(later)).await;
+
+    assert!(
+        rt.datafusion().table_exists(&contested),
+        "the retry builds what the first app asked for"
+    );
+    assert!(
+        rt.datafusion().task_history_emission_enabled(),
+        "and records into it, the later app's setting having arrived too late"
     );
 }
 

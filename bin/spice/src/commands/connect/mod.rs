@@ -78,9 +78,12 @@ leaves the instance unattached and prints the Cloud-provided recovery link.
 The transaction is retry-safe: an interrupted enrollment reuses its durable
 operation and key material, while project creation uses the enrolled instance's
 single attachment as its exact replay key. Existing identities always win and
-are never duplicated. A re-run continues the pending enrollment in the mode and
-organization that started it — it never asks which authentication to use again,
-and an enrollment key is asked for again only because keys are never stored.
+are never duplicated. A re-run continues the pending enrollment in the mode that
+started it — it never asks which authentication to use again, and an enrollment
+key is asked for again only because keys are never stored. A login operation
+keeps the organization it was authorized for; a key operation asserts one, and
+--org corrects that assertion so an operation that named the wrong organization
+can still be redeemed.
 
 NON-INTERACTIVE
   Login mode requires both --org <org> and --project <name>.

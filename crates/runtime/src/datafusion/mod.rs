@@ -1166,25 +1166,35 @@ impl DataFusion {
         table_name: TableReference,
         table: Arc<dyn datafusion::datasource::TableProvider>,
     ) -> Result<Option<Arc<dyn datafusion::datasource::TableProvider>>> {
-        if let Some(schema_name) = table_name.schema()
-            && let Some(registered_schema) = self.schema(schema_name)
-        {
-            // Only this provider can promise the name will still be free when it
-            // is claimed. Anything else is refused rather than registered without
-            // that promise: an internal table quietly replaced later is how
-            // internal rows end up in someone's dataset.
-            let spice_schema = registered_schema
-                .downcast_ref::<SpiceSchemaProvider>()
+        // Every branch that cannot reserve the name is an error, never a quiet
+        // success: this method's whole guarantee is that the name is held
+        // afterwards, and reporting one that was never claimed is how an internal
+        // table ends up replaced by something else.
+        let schema_name = table_name
+            .schema()
+            .context(UnableToReserveInternalTableSnafu {
+                table: table_name.to_string(),
+                schema: "(unqualified)",
+            })?
+            .to_string();
+        let registered_schema =
+            self.schema(&schema_name)
                 .context(UnableToReserveInternalTableSnafu {
                     table: table_name.to_string(),
-                    schema: schema_name.to_string(),
+                    schema: schema_name.clone(),
                 })?;
+        // Only this provider can promise the name will still be free when it is
+        // claimed. Anything else is refused rather than registered without that
+        // promise.
+        let spice_schema = registered_schema
+            .downcast_ref::<SpiceSchemaProvider>()
+            .context(UnableToReserveInternalTableSnafu {
+                table: table_name.to_string(),
+                schema: schema_name,
+            })?;
 
-            if let Err(incumbent) =
-                spice_schema.reserve_table(table_name.table().to_string(), table)
-            {
-                return Ok(Some(incumbent));
-            }
+        if let Err(incumbent) = spice_schema.reserve_table(table_name.table().to_string(), table) {
+            return Ok(Some(incumbent));
         }
 
         self.data_writers
@@ -6723,6 +6733,36 @@ mod tests {
                 "nothing was displaced to find that out"
             );
         }
+        /// The guarantee is that the name is held when this returns `Ok(None)`, so
+        /// a reference it cannot reserve has to be an error rather than a quiet
+        /// success that registered nothing.
+        #[tokio::test]
+        async fn a_name_that_cannot_be_reserved_is_an_error_not_a_quiet_success() {
+            let df = DataFusionBuilder::new(
+                RuntimeStatus::new(),
+                Arc::new(AcceleratorEngineRegistry::new()),
+                Handle::current(),
+            )
+            .build();
+
+            let bare = TableReference::bare("unqualified");
+            let error = df
+                .reserve_internal_table(bare.clone(), table("internal"))
+                .expect_err("a name with no schema cannot be reserved");
+            assert!(error.to_string().contains("unqualified"), "{error}");
+            assert!(!df.table_exists(&bare), "and nothing was registered");
+
+            let elsewhere = TableReference::partial("not_a_registered_schema", "internal");
+            let error = df
+                .reserve_internal_table(elsewhere.clone(), table("internal"))
+                .expect_err("an unregistered schema cannot be reserved in");
+            assert!(
+                error.to_string().contains("not_a_registered_schema"),
+                "{error}"
+            );
+            assert!(!df.table_exists(&elsewhere), "and nothing was registered");
+        }
+
         /// Task history claims two names in scheduler mode and the pair is not
         /// atomic, so the first has to be releasable when the second is lost.
         #[tokio::test]

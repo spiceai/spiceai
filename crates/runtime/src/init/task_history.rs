@@ -32,10 +32,10 @@ impl Runtime {
     /// value this process started with. It answers whether an initialization is
     /// worth attempting; whether one has succeeded is `task_history_initialized`.
     pub(crate) fn task_history_is_wanted(&self) -> bool {
-        self.task_history_setting
-            .get()
-            .copied()
-            .unwrap_or_else(|| self.df.task_history_enabled_at_start())
+        self.task_history_settings.get().map_or_else(
+            || self.df.task_history_enabled_at_start(),
+            |settings| settings.enabled,
+        )
     }
 
     pub async fn init_task_history(self: Arc<Self>) -> Result<()> {
@@ -71,14 +71,16 @@ impl Runtime {
             return Ok(());
         };
 
-        // The first app to be read decides the setting for this process, whatever
-        // happens to the table below. A reload installs a new value in the app but
-        // does not change what this process does with it.
-        let _ = self
-            .task_history_setting
-            .set(app.runtime.task_history.enabled);
+        // The first app to be read decides the configuration for this process,
+        // whatever happens to the table below. A reload installs a new value in the
+        // app but does not change what this process does with it — including a
+        // retry after a failed initialization, which has to build the table the
+        // first app asked for and not the one the current app describes.
+        let settings = self
+            .task_history_settings
+            .get_or_init(|| app.runtime.task_history.clone());
 
-        if !app.runtime.task_history.enabled {
+        if !settings.enabled {
             self.df.set_task_history_enabled(false);
             tracing::debug!("Task history is disabled via configuration.");
             return Ok(());
@@ -131,20 +133,18 @@ impl Runtime {
             });
         }
 
-        let retention_period_secs = app
-            .runtime
-            .task_history
-            .retention_period_as_secs()
-            .map_err(|e| Error::UnableToTrackTaskHistory {
-                source: task_history::Error::InvalidConfiguration { source: e },
-            })?;
+        let retention_period_secs =
+            settings
+                .retention_period_as_secs()
+                .map_err(|e| Error::UnableToTrackTaskHistory {
+                    source: task_history::Error::InvalidConfiguration { source: e },
+                })?;
 
-        let retention_check_interval_secs = app
-            .runtime
-            .task_history
-            .retention_check_interval_as_secs()
-            .map_err(|e| Error::UnableToTrackTaskHistory {
-                source: task_history::Error::InvalidConfiguration { source: e },
+        let retention_check_interval_secs =
+            settings.retention_check_interval_as_secs().map_err(|e| {
+                Error::UnableToTrackTaskHistory {
+                    source: task_history::Error::InvalidConfiguration { source: e },
+                }
             })?;
 
         // Log task history configuration details
@@ -152,23 +152,23 @@ impl Runtime {
             "Task history enabled: retention_period={retention_period_secs}s, retention_check_interval={retention_check_interval_secs}s"
         );
 
-        if app.runtime.task_history.captured_context.as_ref() != "truncated" {
-            let captured_context = &app.runtime.task_history.captured_context;
+        if settings.captured_context.as_ref() != "truncated" {
+            let captured_context = &settings.captured_context;
             let _ = write!(config_details, ", captured_context={captured_context}");
         }
 
         // Add min_sql_duration if configured
-        if let Some(min_sql_duration) = &app.runtime.task_history.min_sql_duration {
+        if let Some(min_sql_duration) = &settings.min_sql_duration {
             let _ = write!(config_details, ", min_sql_duration={min_sql_duration}");
         }
 
         // Add captured_plan and min_plan_duration if configured
-        if let Some(captured_plan) = &app.runtime.task_history.captured_plan
+        if let Some(captured_plan) = &settings.captured_plan
             && captured_plan.as_ref() != "none"
         {
             let _ = write!(config_details, ", captured_plan={captured_plan}");
 
-            if let Some(min_plan_duration) = &app.runtime.task_history.min_plan_duration {
+            if let Some(min_plan_duration) = &settings.min_plan_duration {
                 let _ = write!(config_details, ", min_plan_duration={min_plan_duration}");
             }
         }
