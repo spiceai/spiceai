@@ -13,9 +13,11 @@ arrow.workspace = true
 async-trait.workspace = true
 flight_client = { path = "../flight_client" }
 hostname = "0.4.2"
+libc.workspace = true
 opentelemetry.workspace = true
 opentelemetry_sdk.workspace = true
 otel-arrow = { path = "../otel-arrow" }
+parking_lot.workspace = true
 pin-project.workspace = true
 sha2.workspace = true
 snafu.workspace = true

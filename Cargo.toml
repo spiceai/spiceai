@@ -299,6 +299,7 @@ indexmap = "2"
 insta = { version = "1.46.3", features = ["filters"] }
 itertools = "0.14"
 linkme = "0.3.35"
+libc = "0.2"
 log = "0.4.22"
 logos = "0.16.1"
 # Model-checked concurrency primitives for cayenne's `StructuralVersion` seqlock

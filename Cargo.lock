@@ -19518,6 +19518,7 @@ dependencies = [
  "tracing-opentelemetry",
  "tracing-subscriber",
  "util",
+ "uuid 1.23.2",
  "yaml",
 ]
 
@@ -20478,9 +20479,11 @@ dependencies = [
  "flight_client",
  "futures",
  "hostname 0.4.2",
+ "libc",
  "opentelemetry",
  "opentelemetry_sdk",
  "otel-arrow",
+ "parking_lot",
  "pin-project",
  "sha2 0.10.9",
  "snafu",
