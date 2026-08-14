@@ -432,7 +432,7 @@ pub enum Error {
 
     #[snafu(display(
         "Failed to initialize task history: the table {table} is already registered by something else. \
-        Rename the dataset using that name — it is reserved for the runtime's own task history. \
+        Rename the dataset or view using that name — it is reserved for the runtime's own task history. \
         See: https://spiceai.org/docs"
     ))]
     TableNameTaken { table: String },

@@ -62,9 +62,12 @@ impl SpiceSchemaProvider {
     /// schema competes for the same entry, so a name found free by an earlier call
     /// can be taken by the time that call acts on it.
     ///
-    /// A reserved name is refused by [`SchemaProvider::register_table`] from then
-    /// on, which is what keeps a runtime component's table — resolved by name
-    /// whenever it is written to — from being replaced by something else.
+    /// A reserved name is refused by [`SchemaProvider::register_table`] and
+    /// [`SchemaProvider::deregister_table`] from then on, which is what keeps a
+    /// runtime component's table — resolved by name whenever it is written to —
+    /// from being replaced or removed by something else. A reservation lasts as
+    /// long as the schema; nothing releases it through the general API, because a
+    /// caller reaching that API is by definition not the table's owner.
     ///
     /// # Errors
     ///
@@ -97,7 +100,13 @@ impl SpiceSchemaProvider {
 
 fn reserved_name_error(name: &str) -> DataFusionError {
     DataFusionError::Execution(format!(
-        "Failed to register table {name}: that name is reserved for an internal Spice runtime table. Rename the dataset or view. See: https://spiceai.org/docs/reference/spicepod/datasets"
+        "Failed to register table {name}: that name is reserved for an internal Spice runtime table. Rename the dataset or view using it. See: https://spiceai.org/docs/reference/spicepod/datasets"
+    ))
+}
+
+fn reserved_name_removal_error(name: &str) -> DataFusionError {
+    DataFusionError::Execution(format!(
+        "Failed to remove table {name}: that name is reserved for an internal Spice runtime table, which is not removed along with a dataset or view. See: https://spiceai.org/docs/reference/spicepod/datasets"
     ))
 }
 
@@ -147,11 +156,20 @@ impl SchemaProvider for SpiceSchemaProvider {
     }
 
     fn deregister_table(&self, name: &str) -> Result<Option<Arc<dyn TableProvider>>> {
-        let removed = self.tables.remove(name).map(|(_, table)| table);
-        // The reservation described a table that is no longer here, so the name is
-        // free for whatever wants it next.
-        self.reserved.remove(name);
-        Ok(removed)
+        // Through the entry for the same reason registration is, and refusing
+        // rather than removing: a dataset that lost the race for a reserved name
+        // was never registered under it, so removing that dataset must not take
+        // the runtime's table with it. The marker is never cleared here either —
+        // doing so would race a reservation being made on the same name.
+        match self.tables.entry(name.to_string()) {
+            Entry::Occupied(occupied) => {
+                if self.reserved.contains(occupied.key()) {
+                    return Err(reserved_name_removal_error(occupied.key()));
+                }
+                Ok(Some(occupied.remove()))
+            }
+            Entry::Vacant(_) => Ok(None),
+        }
     }
 
     fn table_exist(&self, name: &str) -> bool {
@@ -273,25 +291,55 @@ mod reservation_tests {
         );
     }
 
+    /// A dataset that lost the race for a reserved name was never registered
+    /// under it, so removing that dataset — an app diff dropping it, a failed load
+    /// being cleaned up — must not take the runtime's table with it.
     #[test]
-    fn deregistering_a_reserved_table_frees_its_name() {
+    fn a_reserved_table_is_not_removed_through_the_schema_api() {
         let provider = SpiceSchemaProvider::new();
+        let internal = table("internal");
         provider
-            .reserve_table("task_history".to_string(), table("internal"))
+            .reserve_table("task_history".to_string(), Arc::clone(&internal))
             .expect("reserve");
 
-        provider
+        let error = provider
             .deregister_table("task_history")
-            .expect("deregister")
-            .expect("the reserved table comes back out");
+            .expect_err("a reserved table is not a dataset's to remove");
+        let rendered = error.to_string();
         assert!(
-            !provider.is_reserved("task_history"),
-            "the reservation described a table that is no longer here"
+            rendered.contains("reserved") && rendered.contains("not removed"),
+            "the refusal has to say why: {rendered}"
         );
 
+        let held = provider
+            .table_sync("task_history")
+            .expect("the runtime still has the table it writes to");
+        assert!(Arc::ptr_eq(&held, &internal));
+        assert!(
+            provider.is_reserved("task_history"),
+            "and the reservation is not cleared by a caller that does not own it"
+        );
+    }
+
+    #[test]
+    fn an_unreserved_table_is_removed_as_before() {
+        let provider = SpiceSchemaProvider::new();
         provider
-            .register_table("task_history".to_string(), table("dataset"))
-            .expect("so the name is free for whatever wants it next");
+            .register_table("orders".to_string(), table("dataset"))
+            .expect("register a dataset");
+
+        provider
+            .deregister_table("orders")
+            .expect("deregister")
+            .expect("the dataset comes back out");
+        assert!(provider.table_sync("orders").is_none());
+        assert!(
+            provider
+                .deregister_table("orders")
+                .expect("deregister")
+                .is_none(),
+            "and removing what is not there is not an error"
+        );
     }
 
     /// Component loading registers datasets concurrently with the runtime's own
