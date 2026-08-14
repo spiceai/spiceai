@@ -393,6 +393,17 @@ pub enum Error {
     #[snafu(display("Unable to receive accelerated table status: {source}"))]
     UnableToReceiveAcceleratedTableStatus { source: RecvError },
 
+    #[snafu(display(
+        "Failed to reload dataset {dataset}: its acceleration did not complete a refresh within {timeout_secs}s of being recreated. \
+        Reloading the dataset from scratch instead. \
+        Check that the dataset's source is reachable, and for 'refresh_mode: changes' that its change stream is producing data. \
+        See: https://spiceai.org/docs/components/data-accelerators"
+    ))]
+    HotReloadRefreshTimedOut {
+        dataset: TableReference,
+        timeout_secs: u64,
+    },
+
     #[snafu(display("Unable to start local metrics: {source}"))]
     UnableToStartLocalMetrics { source: spice_metrics::Error },
 
