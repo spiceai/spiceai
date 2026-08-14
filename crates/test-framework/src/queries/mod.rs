@@ -170,17 +170,6 @@ macro_rules! generate_chbench_queries {
     }
 }
 
-macro_rules! remove_chbench_query {
-    ( $queries:expr, $( $i:literal ),* ) => {
-        {
-            let query_names: Vec<Arc<str>> = vec![ $( concat!("chbench_q", stringify!($i)).into(), )* ];
-            $queries.into_iter()
-                .filter(|query| !query_names.contains(&query.name))
-                .collect()
-        }
-    };
-}
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct Query {
     pub name: Arc<str>,
@@ -1347,26 +1336,113 @@ pub fn get_clickbench_test_queries(overrides: Option<QueryOverrides>) -> Vec<Que
     queries
 }
 
+/// CH-benCH analytical queries a single override excludes, by query number.
+///
+/// Exclusions are per-engine, so a run that touches more than one engine takes
+/// the union of their exclusions — see [`get_chbench_queries_excluding`].
+fn chbench_exclusions(overrides: QueryOverrides) -> &'static [u8] {
+    match overrides {
+        // https://github.com/spiceai/spiceai/issues/11011
+        QueryOverrides::DuckDB => &[21],
+        // q10 and q18 are the heaviest analytical queries; skip them where the
+        // run only needs the rest (e.g. large-SF engines where they dominate the
+        // wall-clock).
+        QueryOverrides::ChbenchSkipSlow => &[10, 18],
+        _ => &[],
+    }
+}
+
+/// The CH-benCH analytical query set for a single engine.
+///
+/// Use this for the query set a benchmark *measures* — it runs only against
+/// spiced, so only the accelerator's exclusions apply. A correctness gate that
+/// also runs each query against the source engine must use
+/// [`get_chbench_queries_excluding`] with both engines' overrides instead.
 #[must_use]
 pub fn get_chbench_test_queries(overrides: Option<QueryOverrides>) -> Vec<Query> {
+    get_chbench_queries_excluding(overrides.as_slice())
+}
+
+/// The CH-benCH analytical query set with the exclusions of *every* supplied
+/// override applied (their union).
+///
+/// A query has to be runnable on every engine a phase touches, so the phase that
+/// spans several engines — the analytical-correctness gate, which runs each query
+/// against both the source and spiced — passes each engine's overrides here.
+#[must_use]
+pub fn get_chbench_queries_excluding(overrides: &[QueryOverrides]) -> Vec<Query> {
     let queries = generate_chbench_queries!(
         1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22
     );
 
-    match overrides {
-        // https://github.com/spiceai/spiceai/issues/11011
-        Some(QueryOverrides::DuckDB) => remove_chbench_query!(queries, 21),
-        // q10 and q18 are the heaviest analytical queries; skip them where the
-        // run only needs the rest (e.g. large-SF sources where they dominate the
-        // gate/QPH wall-clock).
-        Some(QueryOverrides::ChbenchSkipSlow) => remove_chbench_query!(queries, 10, 18),
-        Some(_) | None => queries,
-    }
+    let excluded: Vec<Arc<str>> = overrides
+        .iter()
+        .flat_map(|overrides| chbench_exclusions(*overrides))
+        .map(|number| format!("chbench_q{number}").into())
+        .collect();
+
+    queries
+        .into_iter()
+        .filter(|query| !excluded.contains(&query.name))
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn chbench_query_names(overrides: &[QueryOverrides]) -> Vec<String> {
+        get_chbench_queries_excluding(overrides)
+            .into_iter()
+            .map(|query| query.name.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn chbench_no_overrides_keeps_every_query() {
+        let names = chbench_query_names(&[]);
+        assert_eq!(names.len(), 22, "got {names:?}");
+        assert!(names.contains(&"chbench_q10".to_string()));
+        assert!(names.contains(&"chbench_q18".to_string()));
+        assert!(names.contains(&"chbench_q21".to_string()));
+    }
+
+    #[test]
+    fn chbench_single_override_excludes_only_its_own_queries() {
+        // An accelerator-only run (the measured phase) drops just the
+        // accelerator's exclusions, whatever the source is.
+        let duckdb = chbench_query_names(&[QueryOverrides::DuckDB]);
+        assert!(!duckdb.contains(&"chbench_q21".to_string()));
+        assert!(duckdb.contains(&"chbench_q10".to_string()));
+        assert!(duckdb.contains(&"chbench_q18".to_string()));
+        assert_eq!(duckdb.len(), 21);
+
+        // An override with no CH-benCH exclusions must not shrink the set —
+        // `get_chbench_test_queries` is reached with every engine's override.
+        assert_eq!(chbench_query_names(&[QueryOverrides::Cayenne]).len(), 22);
+        assert_eq!(chbench_query_names(&[QueryOverrides::MySQL]).len(), 22);
+    }
+
+    #[test]
+    fn chbench_multiple_overrides_take_the_union_of_exclusions() {
+        // The analytical gate runs each query against the source *and* spiced, so
+        // it excludes what either engine cannot serve.
+        let names = chbench_query_names(&[QueryOverrides::DuckDB, QueryOverrides::ChbenchSkipSlow]);
+        for excluded in ["chbench_q10", "chbench_q18", "chbench_q21"] {
+            assert!(
+                !names.contains(&excluded.to_string()),
+                "{excluded} should be excluded, got {names:?}"
+            );
+        }
+        assert_eq!(names.len(), 19, "got {names:?}");
+    }
+
+    #[test]
+    fn chbench_test_queries_applies_a_single_engines_exclusions() {
+        let with_override = get_chbench_test_queries(Some(QueryOverrides::ChbenchSkipSlow));
+        assert_eq!(with_override.len(), 20);
+        assert_eq!(get_chbench_test_queries(None).len(), 22);
+    }
 
     #[test]
     fn test_to_sql_with_inlined_params_named_format() {

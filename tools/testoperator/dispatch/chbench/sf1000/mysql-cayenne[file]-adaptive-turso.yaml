@@ -6,5 +6,5 @@ tests:
     terminals: 100
     duration: 900
     ready_wait: 900
-    query_overrides: chbench-skip-slow
+    source_query_overrides: chbench-skip-slow
     rate: 9250

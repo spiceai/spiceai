@@ -39,7 +39,7 @@ use test_framework::anyhow;
 use test_framework::queries::validation::{
     QueryValidationFailReason, QueryValidationResult, validate_with_expected_batches,
 };
-use test_framework::queries::{Query, QueryOverrides, get_chbench_test_queries};
+use test_framework::queries::{Query, QueryOverrides, get_chbench_queries_excluding};
 
 /// Number of rows of context printed on either side of an analytical-gate
 /// mismatch, from both the reference (source) and Spice result sets.
@@ -218,18 +218,20 @@ impl AnalyticalReport {
 pub async fn verify_analytical_results(
     driver: Arc<dyn ChBenchDriver>,
     spice: &SpiceClients,
-    query_overrides: Option<QueryOverrides>,
+    query_overrides: &[QueryOverrides],
     concurrency: usize,
 ) -> anyhow::Result<AnalyticalReport> {
-    // All 22 CH-benCH analytical queries are executed and reported. q15 is
-    // advisory (run but non-gating — see `ADVISORY_QUERIES`): its
-    // `total_revenue = (SELECT MAX(total_revenue) ...)` is a knife-edge equality
-    // over a floating SUM of DOUBLE PRECISION `ol_amount`
+    // Every CH-benCH analytical query both engines can serve is executed and
+    // reported — `query_overrides` carries the accelerator's *and* the source's
+    // overrides, because each query here runs against both. q15 is advisory (run
+    // but non-gating — see `ADVISORY_QUERIES`): its `total_revenue = (SELECT
+    // MAX(total_revenue) ...)` is a knife-edge equality over a floating SUM of
+    // DOUBLE PRECISION `ol_amount`
     // (https://github.com/spiceai/spiceai/issues/11212). The source and Spice
     // can accumulate that sum in a different order, so the predicate can admit a
     // different number of rows even when both sums are numerically correct — a
     // query artifact, not an engine divergence, so it is surfaced but not gated.
-    let queries = get_chbench_test_queries(query_overrides);
+    let queries = get_chbench_queries_excluding(query_overrides);
     let n = queries.len();
     // At least one in-flight query, and never more than the query count.
     let workers = concurrency.clamp(1, n.max(1));

@@ -1,0 +1,12 @@
+# DuckDB baseline that holds the CDC topology and pump knobs constant with
+# postgres-cayenne[file]-adaptive, so a comparison against it isolates the accelerator.
+tests:
+  htap:
+    spicepod_path: accelerated/postgres-duckdb[file]-4slot.yaml
+    runner_type: spiceai-dev-xlarge-runners
+    scale_factor: 100
+    terminals: 100
+    duration: 600
+    ready_wait: 600
+    query_overrides: duckdb
+    rate: 10000

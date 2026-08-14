@@ -1,0 +1,215 @@
+version: v1
+kind: Spicepod
+name: postgres-duckdb[file]-4slot
+
+# DuckDB baseline for A/B against postgres-cayenne[file]-adaptive, with everything
+# outside the accelerator held constant so a comparison isolates the accelerator itself.
+# The plain postgres-duckdb[file] baseline differs from that Cayenne config in two further
+# dimensions — slot-per-table CDC topology and default CDC pump knobs — so a Cayenne-vs-DuckDB
+# delta measured against it cannot be attributed to the accelerator alone.
+#
+# Held constant with postgres-cayenne[file]-adaptive:
+#   - FOUR SHARED REPLICATION SLOTS group the changes-mode tables (vs one slot per table):
+#     the two heaviest producers (order_line, stock) each get their own slot/pump, the bursty
+#     apply-bound new_order is isolated, and the four light-write tables
+#     (customer/district/oorder/warehouse) share `spice_light`. Each group derives its own
+#     `{slot}_pub`; server WAL decode is held at 4x rather than 7x.
+#   - The CDC pump knobs pinned under `runtime.params` below (deep prefetch + coalescing).
+#     These are engine-agnostic — they govern the shared CDC source-reader → apply channel,
+#     upstream of whichever accelerator applies the burst.
+#
+# Varying by design: the accelerator (duckdb vs cayenne), and with it the per-table
+# primary_key / on_conflict declarations. Cayenne relies on schema inference to detect the
+# PK and seed the upsert on_conflict that `refresh_mode: changes` needs; DuckDB needs them
+# declared, exactly as in the postgres-duckdb[file] baseline.
+#
+# sql_results / task_history stay off to match both configs, so a comparison isolates the
+# accelerator, not caching/history overhead.
+
+postgres_connection_params: &postgres_params
+  pg_host: ${env:CHBENCH_PG_HOST}
+  pg_port: 5432
+  pg_db: chbench
+  pg_user: bench
+  pg_pass: bench
+  pg_sslmode: disable
+
+runtime:
+  caching:
+    sql_results:
+      enabled: false
+  task_history:
+    enabled: false
+  params:
+    # Deep prefetch: pin the CDC source-reader→apply channel and coalescing envelope cap to
+    # the runtime max (16384).
+    cdc_prefetch_buffer: '16384'
+    cdc_max_coalesced_envelopes: '16384'
+    # Higher-coalescing byte budget plus a linger window, so the apply loop forms big bursts
+    # (fewer, larger applies amortize per-burst stats/checkpoint/publish over more rows). The
+    # linger deadline is anchored at the previous apply's start, so apply-bound tables barely
+    # wait; 2000ms bounds the added freshness latency for lighter tables.
+    cdc_max_coalesced_bytes: '536870912' # 512 MB
+    cdc_max_coalesce_age_ms: '2000'
+
+datasets:
+  # ---- TPC-C core tables (mutated by OLTP workload) ----
+
+  - from: postgres:warehouse
+    name: warehouse
+    params:
+      <<: *postgres_params
+      pg_replication_slot: spice_light
+      pg_replication_initial_snapshot: auto
+    acceleration:
+      enabled: true
+      engine: duckdb
+      mode: file
+      refresh_mode: changes
+      primary_key: w_id
+      on_conflict:
+        w_id: upsert
+
+  - from: postgres:district
+    name: district
+    params:
+      <<: *postgres_params
+      pg_replication_slot: spice_light
+      pg_replication_initial_snapshot: auto
+    acceleration:
+      enabled: true
+      engine: duckdb
+      mode: file
+      refresh_mode: changes
+      primary_key: (d_w_id, d_id)
+      on_conflict:
+        (d_w_id, d_id): upsert
+
+  - from: postgres:customer
+    name: customer
+    params:
+      <<: *postgres_params
+      pg_replication_slot: spice_light
+      pg_replication_initial_snapshot: auto
+    acceleration:
+      enabled: true
+      engine: duckdb
+      mode: file
+      refresh_mode: changes
+      primary_key: (c_w_id, c_d_id, c_id)
+      on_conflict:
+        (c_w_id, c_d_id, c_id): upsert
+
+  - from: postgres:new_order
+    name: new_order
+    params:
+      <<: *postgres_params
+      pg_replication_slot: spice_new_order
+      pg_replication_initial_snapshot: auto
+    acceleration:
+      enabled: true
+      engine: duckdb
+      mode: file
+      refresh_mode: changes
+      primary_key: (no_w_id, no_d_id, no_o_id)
+      on_conflict:
+        (no_w_id, no_d_id, no_o_id): upsert
+
+  - from: postgres:oorder
+    name: oorder
+    params:
+      <<: *postgres_params
+      pg_replication_slot: spice_light
+      pg_replication_initial_snapshot: auto
+    acceleration:
+      enabled: true
+      engine: duckdb
+      mode: file
+      refresh_mode: changes
+      primary_key: (o_w_id, o_d_id, o_id)
+      on_conflict:
+        (o_w_id, o_d_id, o_id): upsert
+
+  - from: postgres:order_line
+    name: order_line
+    params:
+      <<: *postgres_params
+      pg_replication_slot: spice_order_line
+      pg_replication_initial_snapshot: auto
+    acceleration:
+      enabled: true
+      engine: duckdb
+      mode: file
+      refresh_mode: changes
+      primary_key: (ol_w_id, ol_d_id, ol_o_id, ol_number)
+      on_conflict:
+        (ol_w_id, ol_d_id, ol_o_id, ol_number): upsert
+
+  - from: postgres:stock
+    name: stock
+    params:
+      <<: *postgres_params
+      pg_replication_slot: spice_stock
+      pg_replication_initial_snapshot: auto
+    acceleration:
+      enabled: true
+      engine: duckdb
+      mode: file
+      refresh_mode: changes
+      primary_key: (s_w_id, s_i_id)
+      on_conflict:
+        (s_w_id, s_i_id): upsert
+
+  # ---- Static reference tables (no OLTP mutations, full refresh) ----
+
+  - from: postgres:item
+    name: item
+    params:
+      <<: *postgres_params
+    acceleration:
+      enabled: true
+      engine: duckdb
+      mode: file
+      refresh_mode: full
+      primary_key: i_id
+      on_conflict:
+        i_id: upsert
+
+  - from: postgres:region
+    name: region
+    params:
+      <<: *postgres_params
+    acceleration:
+      enabled: true
+      engine: duckdb
+      mode: file
+      refresh_mode: full
+      primary_key: r_regionkey
+      on_conflict:
+        r_regionkey: upsert
+
+  - from: postgres:nation
+    name: nation
+    params:
+      <<: *postgres_params
+    acceleration:
+      enabled: true
+      engine: duckdb
+      mode: file
+      refresh_mode: full
+      primary_key: n_nationkey
+      on_conflict:
+        n_nationkey: upsert
+
+  - from: postgres:supplier
+    name: supplier
+    params:
+      <<: *postgres_params
+    acceleration:
+      enabled: true
+      engine: duckdb
+      mode: file
+      refresh_mode: full
+      primary_key: su_suppkey
+      on_conflict:
+        su_suppkey: upsert
