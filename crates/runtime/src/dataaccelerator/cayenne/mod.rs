@@ -24,7 +24,7 @@ pub mod snapshot_engine;
 
 use std::any::Any;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
@@ -106,6 +106,18 @@ pub enum Error {
 
     #[snafu(display("RuntimeEnv is required for Cayenne accelerator but was not provided"))]
     RuntimeEnvRequired,
+
+    #[snafu(display(
+        "Failed to accelerate dataset {dataset} (cayenne): The acceleration data directory '{data_dir}' contains the Cayenne metastore '{metadata_dir}'. \
+        Recreating this acceleration deletes its data directory, which would take the metastore with it -- and that catalog is shared by every Cayenne dataset in this instance. \
+        Point 'acceleration.params.cayenne_metadata_dir' at a directory outside '{data_dir}', or rename the dataset so its data directory no longer resolves onto the metastore. \
+        See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+    ))]
+    MetastoreInsideDataDirectory {
+        dataset: Arc<str>,
+        data_dir: Arc<str>,
+        metadata_dir: Arc<str>,
+    },
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -967,6 +979,99 @@ fn fs_probe_path(path: &str) -> &str {
     } else {
         path.strip_prefix("file:").unwrap_or(path)
     }
+}
+
+/// Normalize a local directory path so two spellings of the same directory
+/// compare equal.
+///
+/// Neither directory necessarily exists when the comparison is made, so
+/// `canonicalize` cannot be applied to the whole path: `.`/`..` are folded
+/// lexically, then the deepest *existing* ancestor is canonicalized and the
+/// remaining components re-appended. Canonicalizing that prefix is what resolves
+/// symlinks, which matters on macOS where the temporary directory is
+/// `/var/folders/...` behind a `/private` symlink and would otherwise compare
+/// unequal to the same directory reached through `/private`.
+fn normalize_local_dir(path: &str) -> PathBuf {
+    let raw = Path::new(fs_probe_path(path).trim_end_matches('/'));
+    let absolute = if raw.is_absolute() {
+        raw.to_path_buf()
+    } else {
+        std::env::current_dir().map_or_else(|_| raw.to_path_buf(), |cwd| cwd.join(raw))
+    };
+
+    let mut folded = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::CurDir => {}
+            // `..` at the root stays at the root, matching the filesystem.
+            Component::ParentDir => {
+                folded.pop();
+            }
+            other => folded.push(other),
+        }
+    }
+
+    let mut unresolved_suffix: Vec<std::ffi::OsString> = Vec::new();
+    let mut probe = folded.clone();
+    loop {
+        if let Ok(canonical) = probe.canonicalize() {
+            let mut resolved = canonical;
+            resolved.extend(unresolved_suffix.iter().rev());
+            return resolved;
+        }
+        // No existing ancestor left to canonicalize: the lexically folded path
+        // is the best answer available.
+        let Some(name) = probe.file_name().map(std::ffi::OsStr::to_os_string) else {
+            return folded;
+        };
+        unresolved_suffix.push(name);
+        if !probe.pop() {
+            return folded;
+        }
+    }
+}
+
+/// True when deleting `data_dir` would also unlink the Cayenne metastore.
+///
+/// Both Cayenne teardown paths — `file_create` bootstrap and the `drop_table`
+/// used for a schema recreate — `remove_dir_all` the acceleration's data
+/// directory. A metastore at or below that directory is destroyed with it, and
+/// that catalog holds the manifests, snapshot pointers and partition rows of
+/// *every* Cayenne dataset in the instance, not just this one. With stock
+/// defaults the two resolve to the same path for a dataset named `metadata`:
+/// the data directory is `{spice_data_base_path()}/{dataset_name}/` and the
+/// metastore is `{spice_data_base_path()}/metadata`.
+///
+/// `Path::starts_with` compares whole components, so it covers the equal-paths
+/// case as well as containment, and does not mistake `/data/metadata-archive`
+/// for a child of `/data/metadata`.
+fn metastore_is_inside_data_dir(data_dir: &str, metadata_dir: &str) -> bool {
+    // Object-store data paths are never handed to `remove_dir_all`, and the
+    // metastore is always local, so the two cannot overlap.
+    if !is_local_path(data_dir) {
+        return false;
+    }
+
+    normalize_local_dir(metadata_dir).starts_with(normalize_local_dir(data_dir))
+}
+
+/// Refuse a configuration whose acceleration data directory contains the Cayenne
+/// metastore. Failing here — at load, rather than at teardown when the operator
+/// is already committed — is the point.
+fn ensure_metastore_outside_data_dir(
+    dataset: &str,
+    data_dir: &str,
+    metadata_dir: &str,
+) -> Result<()> {
+    ensure!(
+        !metastore_is_inside_data_dir(data_dir, metadata_dir),
+        MetastoreInsideDataDirectorySnafu {
+            dataset: Arc::<str>::from(dataset),
+            data_dir: Arc::<str>::from(data_dir),
+            metadata_dir: Arc::<str>::from(metadata_dir),
+        }
+    );
+    Ok(())
 }
 
 /// Process-wide counter giving each [`CayenneAccelerator`] instance a unique id,
@@ -2930,6 +3035,15 @@ impl DataAccelerator for CayenneAccelerator {
         let dir_path = self.file_path(source)?;
         let is_s3_express = s3::is_s3_express_data_path(source);
 
+        // Refuse a data directory that contains the metastore before anything is
+        // opened, so the shared catalog can never be reached by the teardown
+        // paths below.
+        ensure_metastore_outside_data_dir(
+            &source.name().to_string(),
+            &dir_path,
+            &Self::resolve_metadata_dir(source.acceleration()),
+        )?;
+
         // Handle S3 Express One Zone configuration
         if is_s3_express {
             if s3::is_multi_zone_s3_express(source) {
@@ -3043,6 +3157,16 @@ impl DataAccelerator for CayenneAccelerator {
         {
             let path_buf = PathBuf::from(&dir_path);
             if path_buf.exists() {
+                // Re-check what the config gate above already proved, because
+                // this is the call that is unrecoverable if the two directories
+                // overlap. Before the snapshot, so a colliding layout costs
+                // nothing rather than archiving the metastore as table data.
+                ensure_metastore_outside_data_dir(
+                    &source.name().to_string(),
+                    &dir_path,
+                    &Self::resolve_metadata_dir(Some(acceleration)),
+                )?;
+
                 let metadata_dir_for_snapshot =
                     PathBuf::from(Self::resolve_metadata_dir(Some(acceleration)));
                 let snapshot_layout = runtime_acceleration::snapshot::AccelerationLayout::cayenne(
@@ -3578,6 +3702,15 @@ impl DataAccelerator for CayenneAccelerator {
         let dir_path = self.cayenne_data_dir(source).boxed()?;
         let path_buf = PathBuf::from(&dir_path);
         if path_buf.exists() {
+            // The same guard `init` applies at load time. A schema recreate is
+            // reached long after load, so re-prove the metastore is not about to
+            // be deleted along with the data directory.
+            ensure_metastore_outside_data_dir(
+                table_name,
+                &dir_path,
+                &Self::resolve_metadata_dir(source.acceleration()),
+            )?;
+
             tokio::fs::remove_dir_all(&path_buf).await.boxed()?;
             tracing::info!(
                 "Removed Cayenne data directory '{dir_path}' for schema recreation (file_update mode)"
@@ -4711,6 +4844,228 @@ mod tests {
             result.ends_with(".spice/data/metadata"),
             "Expected path to end with '.spice/data/metadata', got: {result}"
         );
+    }
+
+    /// The collision reachable with stock defaults and no unusual configuration:
+    /// the default data directory is `{base}/{dataset_name}/` and the default
+    /// metastore is `{base}/metadata`, and `dataset_name` is only
+    /// `.`/`/`-normalized — so a dataset named `metadata` resolves onto the
+    /// catalog every Cayenne dataset in the instance shares.
+    #[test]
+    fn a_dataset_named_metadata_resolves_onto_the_default_metastore() {
+        let data_dir = CayenneAccelerator::resolve_default_data_path("metadata");
+        let metadata_dir = CayenneAccelerator::resolve_metadata_dir(None);
+
+        assert!(
+            metastore_is_inside_data_dir(&data_dir, &metadata_dir),
+            "'{data_dir}' and '{metadata_dir}' are the same directory"
+        );
+
+        let err = ensure_metastore_outside_data_dir("metadata", &data_dir, &metadata_dir)
+            .expect_err("a data directory that IS the metastore must be refused");
+        assert!(
+            matches!(err, Error::MetastoreInsideDataDirectory { .. }),
+            "expected the metastore-overlap error, got: {err}"
+        );
+    }
+
+    /// The same collision through `cayenne_file_path`, which is how a persistent
+    /// acceleration is normally configured.
+    #[test]
+    fn a_dataset_named_metadata_resolves_onto_a_custom_path_metastore() {
+        let acceleration = Acceleration {
+            params: [("cayenne_file_path".to_string(), "/persistent".to_string())]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        };
+
+        let data_dir = CayenneAccelerator::resolve_custom_data_path("metadata", "/persistent")
+            .expect("a local custom path resolves");
+        let metadata_dir = CayenneAccelerator::resolve_metadata_dir(Some(&acceleration));
+
+        assert_eq!(data_dir, "/persistent/metadata/");
+        assert_eq!(metadata_dir, "/persistent/metadata");
+        assert!(
+            metastore_is_inside_data_dir(&data_dir, &metadata_dir),
+            "a trailing slash is not a different directory"
+        );
+    }
+
+    /// An explicit `cayenne_metadata_dir` nested anywhere below the data
+    /// directory is destroyed by the same `remove_dir_all`, even though the two
+    /// paths are not equal.
+    #[test]
+    fn a_metastore_nested_under_the_data_directory_is_refused() {
+        assert!(
+            metastore_is_inside_data_dir("/persistent/orders/", "/persistent/orders/catalog"),
+            "a metastore below the data directory is deleted with it"
+        );
+    }
+
+    /// The layouts that must keep working: a normally-named dataset alongside the
+    /// shared metastore, and a sibling directory that merely shares a name
+    /// prefix. `Path::starts_with` compares components, so `metadata-archive` is
+    /// not a child of `metadata`.
+    #[test]
+    fn a_normal_layout_keeps_the_metastore_outside_the_data_directory() {
+        let acceleration = Acceleration {
+            params: [("cayenne_file_path".to_string(), "/persistent".to_string())]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        };
+        let metadata_dir = CayenneAccelerator::resolve_metadata_dir(Some(&acceleration));
+
+        for dataset_name in ["orders", "metadata_archive", "meta"] {
+            let data_dir =
+                CayenneAccelerator::resolve_custom_data_path(dataset_name, "/persistent")
+                    .expect("a local custom path resolves");
+            assert!(
+                !metastore_is_inside_data_dir(&data_dir, &metadata_dir),
+                "'{data_dir}' does not contain '{metadata_dir}'"
+            );
+            ensure_metastore_outside_data_dir(dataset_name, &data_dir, &metadata_dir)
+                .expect("a sibling data directory must be accepted");
+        }
+
+        // A name that shares the metastore's prefix is a sibling, not a parent.
+        assert!(!metastore_is_inside_data_dir(
+            "/persistent/metadata-archive/",
+            "/persistent/metadata"
+        ));
+    }
+
+    /// Data files in object storage are never handed to `remove_dir_all`, and the
+    /// metastore is always local, so an S3 data path can never contain it — the
+    /// guard must not reject those configurations.
+    #[test]
+    fn an_object_store_data_directory_never_contains_the_metastore() {
+        assert!(!metastore_is_inside_data_dir(
+            "s3://bucket--usw2-az1--x-s3/metadata/",
+            "/persistent/metadata"
+        ));
+    }
+
+    /// Two spellings of one directory must compare equal, or the guard is
+    /// bypassed by writing the path differently. `file://` spelling is accepted
+    /// by `cayenne_file_path`, and a `.`/`..` detour is a legal path.
+    #[test]
+    fn the_guard_normalizes_equivalent_spellings_of_one_directory() {
+        assert!(metastore_is_inside_data_dir(
+            "file:///persistent/metadata/",
+            "/persistent/metadata"
+        ));
+        assert!(metastore_is_inside_data_dir(
+            "/persistent/orders/../metadata",
+            "/persistent/./metadata"
+        ));
+        // A relative data directory is resolved against the working directory,
+        // which is where `spice_data_base_path()` also anchors.
+        let base = spice_data_base_path();
+        assert!(metastore_is_inside_data_dir(
+            "./.spice/data/metadata",
+            &format!("{base}/metadata")
+        ));
+    }
+
+    /// Regression test for #13068: `file_create` bootstrap `remove_dir_all`s the
+    /// data directory, so a dataset whose data directory resolves onto the
+    /// metastore unlinks the shared catalog. The acceleration must be refused at
+    /// load instead, with the metastore left intact.
+    #[tokio::test]
+    async fn file_create_bootstrap_refuses_to_delete_the_metastore() {
+        let temp = tempfile::TempDir::new().expect("temp dir");
+        let base = temp.path().to_string_lossy().to_string();
+
+        // Stand in for the shared catalog: `resolve_metadata_dir` puts it at
+        // `{cayenne_file_path}/metadata`, which is also where a dataset named
+        // `metadata` puts its data directory.
+        let metastore_dir = temp.path().join("metadata");
+        std::fs::create_dir_all(&metastore_dir).expect("metastore directory");
+        let metastore_db = metastore_dir.join("cayenne.db");
+        std::fs::write(&metastore_db, b"catalog").expect("metastore file");
+
+        let dataset = cayenne_dataset("metadata", Mode::FileCreate, &base).await;
+        let registry = Arc::new(AcceleratorEngineRegistry::new());
+        let accelerator = CayenneAccelerator::new();
+
+        let err = accelerator
+            .init(&dataset, registry)
+            .await
+            .expect_err("an acceleration whose data directory is the metastore must be refused");
+
+        assert!(
+            metastore_db.exists(),
+            "the shared metastore must survive: {err}"
+        );
+        assert!(
+            err.to_string().contains("contains the Cayenne metastore"),
+            "expected the metastore-overlap error, got: {err}"
+        );
+    }
+
+    /// The second teardown path from #13068: a schema recreate (`file_update`)
+    /// calls `drop_table`, which `remove_dir_all`s the same directory.
+    #[tokio::test]
+    async fn a_schema_recreate_refuses_to_delete_the_metastore() {
+        let temp = tempfile::TempDir::new().expect("temp dir");
+        let base = temp.path().to_string_lossy().to_string();
+
+        let metastore_dir = temp.path().join("metadata");
+        std::fs::create_dir_all(&metastore_dir).expect("metastore directory");
+        let metastore_db = metastore_dir.join("cayenne.db");
+        std::fs::write(&metastore_db, b"catalog").expect("metastore file");
+
+        let dataset = cayenne_dataset("metadata", Mode::FileUpdate, &base).await;
+        let accelerator = CayenneAccelerator::new();
+
+        let err = accelerator
+            .drop_table("metadata", &dataset)
+            .await
+            .expect_err("a schema recreate must not delete the metastore");
+
+        assert!(
+            metastore_db.exists(),
+            "the shared metastore must survive: {err}"
+        );
+        assert!(
+            err.to_string().contains("contains the Cayenne metastore"),
+            "expected the metastore-overlap error, got: {err}"
+        );
+    }
+
+    /// A file-accelerated Cayenne dataset rooted at `cayenne_file_path`, so the
+    /// resolved data and metastore directories are inside the test's temp
+    /// directory rather than the process working directory.
+    async fn cayenne_dataset(
+        name: &str,
+        mode: Mode,
+        cayenne_file_path: &str,
+    ) -> crate::component::dataset::Dataset {
+        let app = Arc::new(AppBuilder::new("metastore-guard").build());
+        let rt = Arc::new(crate::Runtime::builder().build().await);
+
+        let mut dataset = DatasetBuilder::try_new(name.to_string(), name)
+            .expect("dataset builder")
+            .with_app(app)
+            .with_runtime(rt)
+            .build()
+            .expect("build dataset");
+
+        dataset.acceleration = Some(Acceleration {
+            engine: Engine::Cayenne,
+            mode,
+            params: [(
+                "cayenne_file_path".to_string(),
+                cayenne_file_path.to_string(),
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        });
+
+        dataset
     }
 
     #[tokio::test]
