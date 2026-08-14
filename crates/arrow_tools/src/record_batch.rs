@@ -16,11 +16,13 @@ limitations under the License.
 
 use arrow::{
     array::{
-        Array, ArrayRef, BinaryViewArray, ListArray, MutableArrayData, RecordBatch,
-        RecordBatchOptions, StringViewArray, StructArray, make_array, new_null_array,
+        Array, ArrayRef, BinaryViewArray, GenericByteViewArray, ListArray, MutableArrayData,
+        RecordBatch, RecordBatchOptions, StringViewArray, StructArray, make_array, new_null_array,
     },
     buffer::{Buffer, OffsetBuffer},
-    datatypes::{DataType, Field, SchemaRef, TimeUnit},
+    datatypes::{
+        BinaryViewType, ByteViewType, DataType, Field, SchemaRef, StringViewType, TimeUnit,
+    },
     error::ArrowError,
 };
 use arrow_cast::{CastOptions, cast_with_options};
@@ -440,18 +442,18 @@ const COMPACTION_RETENTION_RATIO: usize = 2;
 /// How many bytes a compaction must actually reclaim to be worth its copy.
 const COMPACTION_MIN_RECLAIMED_BYTES: usize = 64 * 1024;
 
-/// Whether a type keeps data in buffers that
-/// [`ArrayData::get_slice_memory_size`] does not walk, and that
-/// [`compact_view_column`] cannot reach either.
+/// Whether a type holds data in variadic buffers, which
+/// [`ArrayData::get_slice_memory_size`] does not walk.
 ///
-/// The view types hold their bytes in variadic data buffers, which the layout
-/// `get_slice_memory_size` reads does not describe — it counts only the
-/// 16-byte views. A top-level view column is measured and compacted by the
-/// view-specific path below; one *nested* inside a container is not reachable
-/// that way, so such a column is measured as if the data buffers were free and
-/// must be left alone rather than copied on every store for nothing.
-fn retains_unmeasured_buffers(data_type: &DataType) -> bool {
+/// The view types are the ones that do: they keep their bytes in data buffers
+/// the layout does not describe, so `get_slice_memory_size` counts only their
+/// 16-byte views. A *top-level* view column is measured and compacted by the
+/// view-specific path below; one nested inside a container is reachable by
+/// neither, so such a column would be measured as if its data buffers were
+/// free, and must be left alone rather than copied on every store for nothing.
+fn contains_view_type(data_type: &DataType) -> bool {
     match data_type {
+        DataType::Utf8View | DataType::BinaryView => true,
         DataType::List(field)
         | DataType::LargeList(field)
         | DataType::ListView(field)
@@ -470,9 +472,13 @@ fn retains_unmeasured_buffers(data_type: &DataType) -> bool {
     }
 }
 
-fn contains_view_type(data_type: &DataType) -> bool {
-    matches!(data_type, DataType::Utf8View | DataType::BinaryView)
-        || retains_unmeasured_buffers(data_type)
+/// How many bytes are reclaimable from a column retaining `retained` where its
+/// rows need `needed`, or `None` when the copy would not pay for itself.
+fn worth_compacting(retained: usize, needed: usize) -> Option<usize> {
+    let reclaimed = retained.checked_sub(needed)?;
+    (reclaimed >= COMPACTION_MIN_RECLAIMED_BYTES
+        && retained >= needed.saturating_mul(COMPACTION_RETENTION_RATIO))
+    .then_some(reclaimed)
 }
 
 /// How many bytes a view column retains beyond the bytes its own rows use.
@@ -483,100 +489,76 @@ fn contains_view_type(data_type: &DataType) -> bool {
 /// matters by default rather than in a corner: `DataFusion` reads Parquet
 /// `Utf8`/`Binary` columns as `Utf8View`/`BinaryView`
 /// (`schema_force_view_types`), so ordinary string results take this path.
-fn view_reclaimable_bytes(column: &ArrayRef) -> Option<usize> {
+///
+/// The ratio this decides on is arrow's own: `InProgressByteViewArray` gcs a
+/// source when its data buffers exceed twice the bytes its views reference
+/// (`arrow-select`, `coalesce/byte_view.rs`), for the same reason.
+fn view_reclaimable_bytes<B: ByteViewType>(column: &ArrayRef) -> Option<usize> {
+    let array = column.as_any().downcast_ref::<GenericByteViewArray<B>>()?;
+
     // `gc` rebuilds both halves of a view array — the views themselves and the
-    // data buffers they point into — so both are counted here. A short-string
-    // column can be almost all views, and a wide-string one almost all data.
-    let (retained, needed) = match column.data_type() {
-        DataType::Utf8View => {
-            let array = column.as_any().downcast_ref::<StringViewArray>()?;
-            (
-                view_bytes(array.views().inner(), array.data_buffers()),
-                compacted_view_bytes(array.len(), array.total_buffer_bytes_used()),
-            )
-        }
-        DataType::BinaryView => {
-            let array = column.as_any().downcast_ref::<BinaryViewArray>()?;
-            (
-                view_bytes(array.views().inner(), array.data_buffers()),
-                compacted_view_bytes(array.len(), array.total_buffer_bytes_used()),
-            )
-        }
-        _ => return None,
-    };
+    // data buffers they point into — so both are counted. A short-string column
+    // can be almost all views, and a wide-string one almost all data. The null
+    // buffer is excluded because `gc` reuses it as-is.
+    let retained = array.views().inner().capacity()
+        + array
+            .data_buffers()
+            .iter()
+            .map(Buffer::capacity)
+            .sum::<usize>();
+    let views_bytes = array.len().saturating_mul(std::mem::size_of::<u128>());
 
-    let reclaimed = retained.checked_sub(needed)?;
-    (reclaimed >= COMPACTION_MIN_RECLAIMED_BYTES
-        && retained >= needed.saturating_mul(COMPACTION_RETENTION_RATIO))
-    .then_some(reclaimed)
-}
+    // `total_buffer_bytes_used` walks every view, so bound the reclaim first:
+    // the compacted array cannot be smaller than its views alone. This is what
+    // keeps an already-compact column — the common case — off that walk.
+    worth_compacting(retained, views_bytes)?;
 
-/// What a view column's views and data buffers hold today. The null buffer is
-/// excluded because `gc` reuses it as-is, so it is not reclaimable either way.
-fn view_bytes(views: &Buffer, data_buffers: &[Buffer]) -> usize {
-    views.capacity() + data_buffers.iter().map(Buffer::capacity).sum::<usize>()
-}
-
-/// What those same buffers would hold after `gc`: one view per row, and only
-/// the bytes the out-of-line views reference.
-fn compacted_view_bytes(rows: usize, bytes_used: usize) -> usize {
-    rows.saturating_mul(std::mem::size_of::<u128>()) + bytes_used
+    worth_compacting(retained, views_bytes + array.total_buffer_bytes_used())
 }
 
 /// How many bytes compacting `column` would reclaim, or `None` when the copy
 /// would not pay for itself.
 fn reclaimable_bytes(column: &ArrayRef) -> Option<usize> {
-    if matches!(
-        column.data_type(),
-        DataType::Utf8View | DataType::BinaryView
-    ) {
-        return view_reclaimable_bytes(column);
-    }
-    if retains_unmeasured_buffers(column.data_type()) {
-        return None;
+    match column.data_type() {
+        DataType::Utf8View => return view_reclaimable_bytes::<StringViewType>(column),
+        DataType::BinaryView => return view_reclaimable_bytes::<BinaryViewType>(column),
+        data_type if contains_view_type(data_type) => return None,
+        _ => {}
     }
 
-    let retained = column.get_array_memory_size();
     // `Err` means the type's buffers cannot be measured from its layout, which
     // is the same situation as a nested view type: there is no honest
     // comparison to make, so leave the column alone.
     let needed = column.to_data().get_slice_memory_size().ok()?;
 
-    let reclaimed = retained.checked_sub(needed)?;
-    (reclaimed >= COMPACTION_MIN_RECLAIMED_BYTES
-        && retained >= needed.saturating_mul(COMPACTION_RETENTION_RATIO))
-    .then_some(reclaimed)
+    worth_compacting(column.get_array_memory_size(), needed)
 }
 
 /// Copies `column`'s rows into buffers sized for exactly those rows.
 ///
-/// This is what [`arrow::compute::concat`] does for more than one array; it
-/// cannot be used here because `concat` returns a single input untouched.
+/// For most types this is what [`arrow::compute::concat`] does for more than
+/// one array; `concat` cannot be used because it returns a single input
+/// untouched. A view array instead needs `gc`, which rebuilds the data buffers
+/// its views point into — `MutableArrayData` copies those wholesale.
 fn compact_column(column: &ArrayRef) -> ArrayRef {
-    if let Some(compacted) = compact_view_column(column) {
-        return compacted;
+    match column.data_type() {
+        DataType::Utf8View => {
+            if let Some(array) = column.as_any().downcast_ref::<StringViewArray>() {
+                return Arc::new(array.gc());
+            }
+        }
+        DataType::BinaryView => {
+            if let Some(array) = column.as_any().downcast_ref::<BinaryViewArray>() {
+                return Arc::new(array.gc());
+            }
+        }
+        _ => {}
     }
+
     let data = column.to_data();
     let mut compacted = MutableArrayData::new(vec![&data], false, column.len());
     compacted.extend(0, 0, column.len());
     make_array(compacted.freeze())
-}
-
-/// Rebuilds a view column's data buffers around the bytes its rows actually
-/// reference. `MutableArrayData` copies a view array's data buffers wholesale,
-/// so it cannot do this; `gc` is the kernel that can.
-fn compact_view_column(column: &ArrayRef) -> Option<ArrayRef> {
-    match column.data_type() {
-        DataType::Utf8View => column
-            .as_any()
-            .downcast_ref::<StringViewArray>()
-            .map(|array| Arc::new(array.gc()) as ArrayRef),
-        DataType::BinaryView => column
-            .as_any()
-            .downcast_ref::<BinaryViewArray>()
-            .map(|array| Arc::new(array.gc()) as ArrayRef),
-        _ => None,
-    }
 }
 
 /// Returns `batch` with every column that retains substantially more memory
@@ -598,22 +580,28 @@ fn compact_view_column(column: &ArrayRef) -> Option<ArrayRef> {
 /// *before* paying for it.
 #[must_use]
 pub fn compact_retained_buffers(batch: &RecordBatch) -> RecordBatch {
-    let mut columns: Option<Vec<ArrayRef>> = None;
+    let plan: Vec<bool> = batch
+        .columns()
+        .iter()
+        .map(|column| reclaimable_bytes(column).is_some())
+        .collect();
 
-    for (idx, column) in batch.columns().iter().enumerate() {
-        if reclaimable_bytes(column).is_none() {
-            continue;
-        }
-        let compacted = compact_column(column);
-        let columns = columns.get_or_insert_with(|| batch.columns().to_vec());
-        if let Some(slot) = columns.get_mut(idx) {
-            *slot = compacted;
-        }
+    if !plan.contains(&true) {
+        return batch.clone();
     }
 
-    let Some(columns) = columns else {
-        return batch.clone();
-    };
+    let columns: Vec<ArrayRef> = batch
+        .columns()
+        .iter()
+        .zip(&plan)
+        .map(|(column, compact)| {
+            if *compact {
+                compact_column(column)
+            } else {
+                Arc::clone(column)
+            }
+        })
+        .collect();
 
     // The row count is carried explicitly so a batch with no columns keeps it.
     let options = RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
@@ -1202,6 +1190,20 @@ mod test {
         );
     }
 
+    /// `rows` strings of `value_len` identical characters, varying by row so a
+    /// compaction that took the wrong row is visible.
+    fn payloads(rows: usize, value_len: usize) -> Vec<String> {
+        (0..rows)
+            .map(|row| {
+                std::iter::repeat_n(
+                    char::from(b'a' + u8::try_from(row % 26).unwrap_or_default()),
+                    value_len,
+                )
+                .collect()
+            })
+            .collect()
+    }
+
     /// A batch of wide strings, big enough that slicing one row out of it
     /// retains far more than that row needs.
     fn wide_string_batch(rows: usize, value_len: usize) -> RecordBatch {
@@ -1210,21 +1212,12 @@ mod test {
             Field::new("payload", DataType::Utf8, true),
         ]));
         let ids: Vec<i32> = (0..i32::try_from(rows).expect("rows fits in i32")).collect();
-        let payloads: Vec<String> = (0..rows)
-            .map(|row| {
-                std::iter::repeat_n(
-                    char::from(b'a' + u8::try_from(row % 26).unwrap_or_default()),
-                    value_len,
-                )
-                .collect()
-            })
-            .collect();
 
         RecordBatch::try_new(
             schema,
             vec![
                 Arc::new(Int32Array::from(ids)),
-                Arc::new(StringArray::from(payloads)),
+                Arc::new(StringArray::from(payloads(rows, value_len))),
             ],
         )
         .expect("valid batch")
@@ -1301,14 +1294,10 @@ mod test {
             DataType::Utf8,
             true,
         )]));
-        let values: Vec<Option<String>> = (0..2_000)
-            .map(|row| {
-                if row % 3 == 0 {
-                    None
-                } else {
-                    Some(std::iter::repeat_n('x', 4_096).collect())
-                }
-            })
+        let values: Vec<Option<String>> = payloads(2_000, 4_096)
+            .into_iter()
+            .enumerate()
+            .map(|(row, value)| (row % 3 != 0).then_some(value))
             .collect();
         let batch = RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(values))])
             .expect("valid batch");
@@ -1371,19 +1360,11 @@ mod test {
             DataType::Utf8View,
             true,
         )]));
-        let values: Vec<String> = (0..rows)
-            .map(|row| {
-                std::iter::repeat_n(
-                    char::from(b'a' + u8::try_from(row % 26).unwrap_or_default()),
-                    value_len,
-                )
-                .collect()
-            })
-            .collect();
-
         RecordBatch::try_new(
             schema,
-            vec![Arc::new(StringViewArray::from_iter_values(values))],
+            vec![Arc::new(StringViewArray::from_iter_values(payloads(
+                rows, value_len,
+            )))],
         )
         .expect("valid batch")
     }
@@ -1442,12 +1423,7 @@ mod test {
     /// view path, so such a column is left alone rather than copied blindly.
     #[test]
     fn compact_retained_buffers_leaves_a_nested_view_column_alone() {
-        use arrow::array::{ArrayRef as _ArrayRef, StringViewArray as _SVA};
-
-        let values: Vec<String> = (0..2_000)
-            .map(|_| std::iter::repeat_n('v', 4_096).collect())
-            .collect();
-        let inner: _ArrayRef = Arc::new(_SVA::from_iter_values(values));
+        let inner: ArrayRef = Arc::new(StringViewArray::from_iter_values(payloads(2_000, 4_096)));
         let struct_array = StructArray::from(vec![(
             Arc::new(Field::new("payload", DataType::Utf8View, true)),
             inner,

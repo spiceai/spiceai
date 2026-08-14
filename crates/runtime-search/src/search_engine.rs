@@ -736,7 +736,7 @@ fn wrap_cache_to_result(
 
             if records_size < cache_max_size {
                 let cached_result = CachedAggregationResult::new(
-                    Arc::new(records),
+                    records,
                     cloned_primary_key,
                     cloned_data_columns,
                     cloned_matches,

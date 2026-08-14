@@ -68,21 +68,6 @@ pub struct CachedQueryResult {
     encoder: Option<Arc<dyn Encoder>>,
 }
 
-/// Compacts batches that retain more memory than their own rows need, so an
-/// entry holds — and is billed — what it stores.
-///
-/// Every raw store funnels through here rather than through its call sites:
-/// `LIMIT`/`OFFSET` emits zero-copy slices of the scan batches they came from,
-/// and an entry built from one of those pins the whole scan batch for the
-/// lifetime of the entry. Encoded entries need no equivalent, because
-/// serialization already writes only the rows the batch holds.
-fn compact_for_storage(mut batches: Vec<RecordBatch>) -> Vec<RecordBatch> {
-    for batch in &mut batches {
-        *batch = arrow_tools::record_batch::compact_retained_buffers(batch);
-    }
-    batches
-}
-
 impl CachedQueryResult {
     /// Create a new cached query result with raw `RecordBatches`.
     ///
@@ -97,7 +82,7 @@ impl CachedQueryResult {
         read_started_at: Instant,
     ) -> Self {
         Self {
-            data: CachedData::Raw(Arc::new(compact_for_storage(batches))),
+            data: CachedData::Raw(Arc::new(super::compact_for_storage(batches))),
             schema,
             input_tables,
             cached_at,
@@ -148,7 +133,7 @@ impl CachedQueryResult {
             let encoded_data = encoder.encode(&records).await?;
             CachedData::Encoded(Bytes::from(encoded_data))
         } else {
-            CachedData::Raw(Arc::new(compact_for_storage(records)))
+            CachedData::Raw(Arc::new(super::compact_for_storage(records)))
         };
 
         Ok(Self {
@@ -460,27 +445,7 @@ mod tests {
         );
     }
 
-    /// A batch of wide strings, large enough that slicing one row out of it
-    /// retains far more than that row needs.
-    fn wide_string_batch(rows: usize) -> RecordBatch {
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "payload",
-            DataType::Utf8,
-            false,
-        )]));
-        let payloads: Vec<String> = (0..rows)
-            .map(|row| {
-                std::iter::repeat_n(
-                    char::from(b'a' + u8::try_from(row % 26).unwrap_or_default()),
-                    4_096,
-                )
-                .collect()
-            })
-            .collect();
-
-        RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(payloads))])
-            .expect("should create batch")
-    }
+    use crate::utils::tests::wide_string_batch;
 
     fn only_payload(batch: &RecordBatch) -> String {
         batch

@@ -215,24 +215,16 @@ pub fn to_cached_record_batch_stream(
 
         while let Some(batch_result) = stream.next().await {
             if records_size < raw_size_limit && let Ok(batch) = &batch_result {
-                // Keep a compacted copy rather than the batch as it arrives: a
-                // `LIMIT`/`OFFSET` plan yields zero-copy slices, so retaining
-                // one holds its whole scan batch alive for as long as the entry
-                // lives, and bills the entry for it.
-                //
-                // Bill the batch what it will occupy once compacted, and pay
-                // for the copy only once the result is known to still fit. The
-                // budget is what bounds this work: a result already too large
-                // to cache is abandoned here rather than copied in full and
-                // then discarded.
+                records.push(batch.clone());
+                // Bill the batch what the entry will hold, not what the batch
+                // retains: a `LIMIT`/`OFFSET` plan yields zero-copy slices, and
+                // storing one compacts it (see `CachedQueryResult`), so it will
+                // cost its own rows rather than the scan batch it was carved
+                // from. Measuring rather than compacting here is what keeps a
+                // result too large to cache from being copied in full before it
+                // is abandoned below.
                 records_size = records_size
                     .saturating_add(arrow_tools::record_batch::compacted_memory_size(batch));
-                if records_size < raw_size_limit {
-                    records.push(arrow_tools::record_batch::compact_retained_buffers(batch));
-                } else if !records.is_empty() {
-                    records.clear();
-                    records.shrink_to_fit();
-                }
             } else if !records.is_empty() && records_size >= raw_size_limit {
                 // The result can no longer fit in the cache: eagerly drop the
                 // accumulated batches. Caching must be abandoned entirely —
@@ -343,6 +335,32 @@ pub(crate) mod tests {
     use datafusion::execution::config::SessionConfig;
     use datafusion::execution::context::SessionContext;
     use std::collections::HashSet;
+
+    /// A batch of wide strings, large enough that slicing one row out of it
+    /// retains far more than that row needs. Shared with the `result::query`
+    /// tests, which assert against the same premise.
+    pub(crate) fn wide_string_batch(rows: usize) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "payload",
+            DataType::Utf8,
+            false,
+        )]));
+        let payloads: Vec<String> = (0..rows)
+            .map(|row| {
+                std::iter::repeat_n(
+                    char::from(b'a' + u8::try_from(row % 26).unwrap_or_default()),
+                    4_096,
+                )
+                .collect()
+            })
+            .collect();
+
+        RecordBatch::try_new(
+            schema,
+            vec![Arc::new(arrow::array::StringArray::from(payloads))],
+        )
+        .expect("should create batch")
+    }
 
     pub(crate) async fn parse_sql_to_logical_plan(sql: &str) -> LogicalPlan {
         let ctx = create_session_context();
@@ -1554,26 +1572,9 @@ pub(crate) mod tests {
             .expect("valid cache provider"),
         );
 
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "payload",
-            DataType::Utf8,
-            false,
-        )]));
         // 2,000 rows x 4 KiB is ~8 MiB of payload — well past the 1 MiB budget.
-        let payloads: Vec<String> = (0..2_000)
-            .map(|row| {
-                std::iter::repeat_n(
-                    char::from(b'a' + u8::try_from(row % 26).unwrap_or_default()),
-                    4_096,
-                )
-                .collect()
-            })
-            .collect();
-        let scan_batch = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![Arc::new(StringArray::from(payloads))],
-        )
-        .expect("to create batch");
+        let scan_batch = wide_string_batch(2_000);
+        let schema = scan_batch.schema();
         assert!(
             scan_batch.get_array_memory_size() > 1024 * 1024,
             "the scan batch must exceed the cache budget for this test to mean anything"
