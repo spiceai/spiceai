@@ -1466,5 +1466,31 @@ mod tests {
                 "streaming adapter accepted a truncated array the buffered reader rejects"
             );
         }
+
+        /// A body carrying more than the array it opens with is the other way
+        /// a file can be read short, and the two readers have to agree about
+        /// it as well: whichever one a dataset happens to be scanned through,
+        /// the same file has to reach the same verdict.
+        #[test]
+        fn both_readers_reject_the_same_trailing_content() {
+            let body = br#"[{"a":1}]{"a":2}"#;
+
+            let mut pulled = Vec::new();
+            let pull = ArrayToNdjson::try_new(std::io::Cursor::new(body.to_vec()))
+                .expect("array start is present")
+                .read_to_end(&mut pulled);
+            assert!(
+                pull.is_err(),
+                "buffered reader read a second array as part of the first"
+            );
+
+            let schema = schema();
+            let mut dec = decoder(&schema);
+            let decoded = dec.decode(body);
+            assert!(
+                decoded.is_err() || dec.flush().is_err(),
+                "streaming adapter accepted trailing content the buffered reader rejects"
+            );
+        }
     }
 }

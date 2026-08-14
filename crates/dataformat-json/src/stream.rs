@@ -168,6 +168,13 @@ impl<R: Read + Send> ArrayToNdjson<R> {
                     if matches!(self.peek_next_non_ws_byte(), Ok(b']')) {
                         // Empty array - consume the closing bracket and mark as EOF
                         self.consume_delimiter()?;
+                        // `eof` is set only once the tail is known to be clean:
+                        // it short-circuits `fill_pending`, so setting it first
+                        // would report a rejected body as a clean end of input
+                        // on every read after the one that failed.
+                        self.ensure_only_trailing_whitespace().inspect_err(|_| {
+                            self.malformed = true;
+                        })?;
                         self.eof = true;
                         return Ok(());
                     }
@@ -237,11 +244,57 @@ impl<R: Read + Send> ArrayToNdjson<R> {
             self.malformed = true;
         })?;
         if next == b']' {
+            // Checked before the element is published: a body that is not the
+            // single array it was read as is rejected whole, rather than
+            // handing back its first array's last row and then failing.
+            self.ensure_only_trailing_whitespace().inspect_err(|_| {
+                self.malformed = true;
+            })?;
             self.eof = true;
         }
 
         self.pending.append(&mut element_out);
         Ok(())
+    }
+
+    /// Verify that nothing but whitespace follows the array's closing `]`.
+    ///
+    /// The rule, and its wording, are [`trailing_content_error`]'s; the push
+    /// adapter applies the same one to the same bodies.
+    ///
+    /// Everything the source still holds is read here, because trailing content
+    /// can sit behind any amount of whitespace and only the end of the input
+    /// proves there is none. It is examined a chunk at a time and discarded, so
+    /// a long tail costs a fixed buffer rather than its own size. The inner
+    /// reader is therefore at EOF once this returns.
+    fn ensure_only_trailing_whitespace(&mut self) -> io::Result<()> {
+        let mut tee = match self.shared.lock() {
+            Ok(tee) => tee,
+            Err(e) => e.into_inner(),
+        };
+
+        // Whatever the delimiter scan read past `]` is still buffered, so it is
+        // the first thing the tail check has to account for.
+        if let Some(byte) = first_non_whitespace(&tee.buf) {
+            return Err(trailing_content_error(byte));
+        }
+        tee.buf.clear();
+
+        let mut chunk = [0u8; 4096];
+        loop {
+            let read = match tee.inner.read(&mut chunk) {
+                Ok(0) => return Ok(()),
+                Ok(read) => read,
+                // A read may be cut short by a signal without anything being
+                // wrong with the input; treating that as a verdict would fail a
+                // well-formed file.
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            };
+            if let Some(byte) = first_non_whitespace(&chunk[..read]) {
+                return Err(trailing_content_error(byte));
+            }
+        }
     }
 
     /// Consume the `,` or `]` that follows an element, and report which it was.
@@ -355,6 +408,29 @@ impl<R: Read + Send> BufRead for ArrayToNdjson<R> {
 // unsafe impl<R: Read + Send + Sync> Sync for ArrayToNdjson<R> {}
 
 /* ---------- shared utilities ---------- */
+
+/// The first byte of `bytes` that is not ASCII whitespace, if there is one.
+fn first_non_whitespace(bytes: &[u8]) -> Option<u8> {
+    bytes.iter().find(|b| !b.is_ascii_whitespace()).copied()
+}
+
+/// The error both readers report for content that follows the array's `]`.
+///
+/// Reaching `]` ends the array but not necessarily the input. A body holding
+/// more than the one array it was read as — a second concatenated array, or a
+/// larger document that merely starts with one — would otherwise yield that
+/// first array's rows and report success, which is the same silent short read
+/// as a truncated file. The pull and push readers are handed the same bodies,
+/// so they state the verdict in the same words.
+fn trailing_content_error(byte: u8) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "Failed to read JSON array: found '{byte}' after the closing ']'. The body holds more than the single JSON array it was read as, so the rows returned are only its first array. Check the file for concatenated or trailing content, or set the dataset's 'format' to match its contents.",
+            byte = byte.escape_ascii()
+        ),
+    )
+}
 
 /// Filter out newlines and carriage returns from JSON element bytes,
 /// also skip leading and trailing whitespace. Used by both pull and push implementations.
@@ -1198,22 +1274,10 @@ impl ArrayToNdjsonPush {
     }
 
     fn ensure_only_trailing_whitespace(&self) -> io::Result<()> {
-        let Some(byte) = self
-            .buffer
-            .iter()
-            .find(|b| !b.is_ascii_whitespace())
-            .copied()
-        else {
-            return Ok(());
-        };
-
-        Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "Failed to read JSON array: found '{byte}' after the closing ']'. The body holds more than the single JSON array it was read as, so the rows returned are only its first array. Check the file for concatenated or trailing content, or set the dataset's 'format' to match its contents.",
-                byte = byte.escape_ascii()
-            ),
-        ))
+        match first_non_whitespace(&self.buffer) {
+            Some(byte) => Err(trailing_content_error(byte)),
+            None => Ok(()),
+        }
     }
 
     /// Whether the buffer ends part-way through a token, so that bytes still
@@ -1654,13 +1718,22 @@ mod tests {
         assert_eq!(lines, vec!["{}"]);
     }
 
+    /// A body that carries more than the array it opens with is reported, not
+    /// read as that array. Returning `{}` here and reporting success is the
+    /// same silent short read as a truncated file: the caller cannot tell the
+    /// rows it got apart from the whole of the input.
     #[test]
-    fn test_finish_method_recovers_reader() {
+    fn test_content_after_the_array_is_reported() {
         let input = "[{}]remaining data";
         let cursor = Cursor::new(input);
         let adapter = ArrayToNdjson::try_new(cursor).expect("Test should not fail");
-        let lines = read_all_lines(adapter).expect("Test should not fail");
-        assert_eq!(lines, vec!["{}"]);
+        let err = read_all_lines(adapter)
+            .expect_err("content after the closing ']' must not be dropped in silence");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("after the closing ']'"),
+            "expected the trailing-content verdict, got: {err}"
+        );
     }
 
     #[test]
@@ -4197,13 +4270,24 @@ mod tests {
             }
         }
 
-        /// An element is only ever the bytes serde committed to it. A body
-        /// with a stray byte after the array must still yield `1`, not `1]` —
-        /// a row that is not valid JSON and is not in the file.
+        /// An element is only ever the bytes serde committed to it, so the
+        /// stray `]` in `[1]]` is never folded into the row. It is not part of
+        /// the array either, which makes it trailing content: the body is
+        /// reported rather than read as the array it merely starts with.
+        ///
+        /// Asserting the error's own wording is what separates the two
+        /// failures. A row of `1]` would be reported too — as invalid JSON, by
+        /// a different message — and an assertion on `is_err` alone would pass
+        /// for that regression as readily as for the behaviour under test.
         #[test]
         fn a_trailing_byte_is_never_folded_into_the_element() {
-            let got = ndjson_lines(br"[1]]").expect("should read the closed array");
-            assert_eq!(got, vec!["1"]);
+            let err = ndjson_lines(br"[1]]")
+                .expect_err("a stray ']' after the array must not read clean");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+            assert!(
+                err.to_string().contains("after the closing ']'"),
+                "expected the trailing-content verdict, got: {err}"
+            );
         }
 
         /// An array cut short mid-scalar has no closing `]`, and must be
@@ -4230,7 +4314,7 @@ mod tests {
         /// and any failure breaks that: the element's bytes have already left
         /// the inner reader, so nothing can be re-read from the right place.
         /// Every read from there on has to keep saying so.
-        fn assert_stays_failed(body: &[u8], reads_before_failure: usize) {
+        pub(super) fn assert_stays_failed(body: &[u8], reads_before_failure: usize) {
             let mut reader =
                 ArrayToNdjson::try_new(Cursor::new(body.to_vec())).expect("array start");
             let mut buf = [0u8; 64];
@@ -4321,6 +4405,179 @@ mod tests {
                 lines.push(line.trim_end().to_owned());
             }
             assert_eq!(lines, vec!["1", "2", "3"]);
+        }
+    }
+
+    /// Reaching `]` ends the array but not the input. Whatever follows it is
+    /// not part of the array, so reading the array's rows and reporting
+    /// success would leave a caller unable to tell those rows from the whole
+    /// of the file — the same silent short read as a truncated body.
+    ///
+    /// The bodies below are the ones `push_tests` uses for the same rule. Both
+    /// readers are handed the same files, so a body either reader accepts and
+    /// the other rejects is a disagreement about what the file contains.
+    mod pull_trailing_content {
+        use super::*;
+
+        /// Drive `ArrayToNdjson` over a whole body and split what it produces
+        /// into lines.
+        fn ndjson_lines(body: &[u8]) -> io::Result<Vec<String>> {
+            let mut out = String::new();
+            ArrayToNdjson::try_new(Cursor::new(body.to_vec()))?.read_to_string(&mut out)?;
+            Ok(out.lines().map(ToOwned::to_owned).collect())
+        }
+
+        #[test]
+        fn trailing_content_after_the_closing_bracket_is_reported() {
+            for body in [
+                &b"[1]garbage"[..],
+                &b"[1][2]"[..],
+                &br#"[{"a":1}] {"b":2}"#[..],
+                &br#"[{"a":1}]garbage"#[..],
+                // A stray delimiter is trailing content too: the array is
+                // already closed, so neither can belong to it.
+                &b"[1]]"[..],
+                &b"[1],"[..],
+                &b"[]x"[..],
+            ] {
+                let Err(err) = ndjson_lines(body) else {
+                    panic!(
+                        "{} must be reported, not silently truncated to its first array",
+                        String::from_utf8_lossy(body)
+                    )
+                };
+                assert_eq!(
+                    err.kind(),
+                    io::ErrorKind::InvalidData,
+                    "{} reported the wrong error kind",
+                    String::from_utf8_lossy(body)
+                );
+                assert!(
+                    err.to_string().contains("after the closing ']'"),
+                    "{} reported something other than the trailing-content verdict: {err}",
+                    String::from_utf8_lossy(body)
+                );
+            }
+        }
+
+        /// The guard must reject only what cannot belong to the file. A JSON
+        /// array ending in a newline is the ordinary case, and rejecting it
+        /// would turn every well-formed file into a read failure.
+        #[test]
+        fn whitespace_after_the_closing_bracket_is_accepted() {
+            for (body, expected) in [
+                (&b"[1]\n"[..], vec!["1"]),
+                (&b"[1] "[..], vec!["1"]),
+                (&br#"[{"a":1}]  "#[..], vec![r#"{"a":1}"#]),
+                (&b"[{\"a\":1}]\r\n\t "[..], vec![r#"{"a":1}"#]),
+                (&b"[]\n"[..], vec![]),
+            ] {
+                let got = ndjson_lines(body).unwrap_or_else(|e| {
+                    panic!(
+                        "{} is well formed and must not error: {e}",
+                        String::from_utf8_lossy(body)
+                    )
+                });
+                assert_eq!(
+                    got,
+                    expected,
+                    "{} produced the wrong rows",
+                    String::from_utf8_lossy(body)
+                );
+            }
+        }
+
+        /// The tail can be arbitrarily long, and it is only whitespace that
+        /// has to be read through before the content behind it is reached.
+        /// Reading it must not depend on it fitting anywhere.
+        #[test]
+        fn content_behind_a_long_whitespace_tail_is_still_found() {
+            let mut body = br#"[{"a":1}]"#.to_vec();
+            body.extend(std::iter::repeat_n(b' ', 64 * 1024));
+
+            let mut clean = body.clone();
+            clean.extend(b"\n\t  ");
+            assert_eq!(
+                ndjson_lines(&clean).expect("a whitespace tail must read cleanly"),
+                vec![r#"{"a":1}"#]
+            );
+
+            body.extend(br#"{"b":2}"#);
+            let err = ndjson_lines(&body)
+                .expect_err("content behind the whitespace must still be reported");
+            assert!(
+                err.to_string().contains("after the closing ']'"),
+                "expected the trailing-content verdict, got: {err}"
+            );
+        }
+
+        /// A consumer that logs the error and reads on must not then be handed
+        /// a clean end of input: `Ok(0)` there says the file ended where the
+        /// array did, which is the reading this fix exists to remove.
+        ///
+        /// `[1]]` fails on the read that closes the array, so no read succeeds
+        /// first; `[1,2]x` emits `1` before failing on the one that reaches
+        /// `]`, which is where the last element is withheld.
+        #[test]
+        fn a_reported_body_never_reads_clean_afterwards() {
+            bare_scalar_elements::assert_stays_failed(br"[1]]", 0);
+            bare_scalar_elements::assert_stays_failed(br"[1,2]x", 1);
+        }
+
+        /// Reads the body one byte at a time, returning `Interrupted` before
+        /// each. A `Cursor` never does this, so nothing else in these tests
+        /// reaches the retry the tail scan needs to survive.
+        struct InterruptsEveryRead {
+            body: Vec<u8>,
+            at: usize,
+            interrupt_next: bool,
+        }
+
+        impl Read for InterruptsEveryRead {
+            fn read(&mut self, dst: &mut [u8]) -> io::Result<usize> {
+                if self.interrupt_next {
+                    self.interrupt_next = false;
+                    return Err(io::Error::new(io::ErrorKind::Interrupted, "signal"));
+                }
+                self.interrupt_next = true;
+                if self.at >= self.body.len() || dst.is_empty() {
+                    return Ok(0);
+                }
+                dst[0] = self.body[self.at];
+                self.at += 1;
+                Ok(1)
+            }
+        }
+
+        /// A read cut short by a signal says nothing about the input, so the
+        /// tail scan has to resume rather than treat it as a verdict — in
+        /// either direction. Reporting it as an I/O failure would reject a
+        /// well-formed file; taking it for the end of the input would accept
+        /// the trailing content sitting behind it.
+        #[test]
+        fn an_interrupted_read_of_the_tail_is_resumed() {
+            let interrupted = |body: &[u8]| {
+                let mut out = String::new();
+                ArrayToNdjson::try_new(InterruptsEveryRead {
+                    body: body.to_vec(),
+                    at: 0,
+                    interrupt_next: false,
+                })?
+                .read_to_string(&mut out)?;
+                Ok::<_, io::Error>(out.lines().map(ToOwned::to_owned).collect::<Vec<_>>())
+            };
+
+            assert_eq!(
+                interrupted(b"[1]   \n  ").expect("a whitespace tail must still read cleanly"),
+                vec!["1"]
+            );
+
+            let err = interrupted(b"[1]   \n  x")
+                .expect_err("trailing content behind an interrupt must still be reported");
+            assert!(
+                err.to_string().contains("after the closing ']'"),
+                "expected the trailing-content verdict, got: {err}"
+            );
         }
     }
 
