@@ -23,9 +23,9 @@ pub mod s3;
 pub mod snapshot_engine;
 
 use std::any::Any;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Arc, LazyLock, OnceLock};
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use arrow_schema::{DataType, Schema};
@@ -305,18 +305,26 @@ pub(crate) fn transform_schema_for_vortex(
 
 pub struct CayenneAccelerator {
     catalog: Arc<OnceCell<Arc<dyn cayenne::MetadataCatalog>>>,
-    /// The metastore directory that actually initialized [`Self::catalog`].
+    /// Every directory this accelerator has opened a Cayenne metastore in.
     ///
-    /// `catalog` is one cell per accelerator instance, so whichever dataset opens
-    /// it first decides where the metastore lives and every later dataset shares
-    /// that catalog regardless of its own `cayenne_metadata_dir`. A later
-    /// dataset's data directory can therefore contain the *live* catalog while
-    /// the metastore its own params resolve to sits somewhere harmless, so the
-    /// deletion guard checks this recorded path alongside the ones a
-    /// configuration can name. Recorded inside the initializer, which only the
-    /// dataset that wins the cell runs, so a race cannot record a directory whose
-    /// catalog was discarded.
-    active_metadata_dir: Arc<OnceLock<String>>,
+    /// The deletion guard cannot work from the configuration alone, because the
+    /// directory a dataset's params resolve to is not necessarily the directory
+    /// its catalog is in, and the two open paths break that assumption in
+    /// different ways:
+    ///
+    /// - [`Self::catalog`] is one cell per accelerator instance, so whichever
+    ///   dataset opens it first decides where the shared metastore lives and
+    ///   every later dataset uses that catalog regardless of its own
+    ///   `cayenne_metadata_dir`.
+    /// - the partitioned path in `create_external_table` builds its own
+    ///   `CayenneCatalog` instead of going through that cell, so several
+    ///   partitioned datasets can hold catalogs open in several *different*
+    ///   directories at once — which is why this is a set and not one slot.
+    ///
+    /// Both paths record here, the shared one from inside its initializer so a
+    /// racer that loses the cell cannot record a directory whose catalog was
+    /// discarded.
+    opened_metastore_dirs: Arc<parking_lot::RwLock<BTreeSet<String>>>,
     /// Separate catalog for `mode: memory` (in-RAM) tables, backed by an in-memory
     /// `SQLite` `memdb` metastore. File-mode and memory-mode tables cannot share one
     /// metastore (memory-mode data must never touch disk), so memory tables use this.
@@ -1086,10 +1094,11 @@ fn metastore_is_inside_data_dir(data_dir: &str, metadata_dir: &str) -> bool {
 /// The catalog is instance-wide, so checking only the dataset's *own* resolved
 /// metastore is not enough, in two distinct ways:
 ///
-/// - `active_metadata_dir` is the directory that actually initialized the shared
-///   catalog, whatever any later dataset's params say. It is listed first, so a
-///   refusal names the catalog genuinely at risk rather than a path that merely
-///   also collides. It is `None` until some dataset opens the catalog.
+/// - `opened_metastore_dirs` are the directories this accelerator has actually
+///   opened catalogs in, whatever any dataset's params say. They are listed
+///   first, so a refusal names a catalog genuinely at risk rather than a path
+///   that merely also collides. The set is empty until the first catalog opens,
+///   which is the window `init` runs in for the first dataset.
 /// - A dataset named `metadata` that points its `cayenne_metadata_dir` somewhere
 ///   else still has a data directory sitting on
 ///   `{spice_data_base_path()}/metadata`, which is where every dataset that did
@@ -1098,9 +1107,9 @@ fn metastore_is_inside_data_dir(data_dir: &str, metadata_dir: &str) -> bool {
 ///   does at any time, and by then the directory is already gone.
 fn candidate_metastore_dirs(
     acceleration: Option<&Acceleration>,
-    active_metadata_dir: Option<&str>,
+    opened_metastore_dirs: &[String],
 ) -> Vec<String> {
-    let mut candidates: Vec<String> = Vec::with_capacity(4);
+    let mut candidates: Vec<String> = Vec::with_capacity(opened_metastore_dirs.len() + 3);
     let mut add = |dir: String| {
         // Not `Vec::dedup`, which only collapses *adjacent* equals: the
         // dataset's resolved metastore and the `cayenne_file_path` fallback are
@@ -1111,8 +1120,8 @@ fn candidate_metastore_dirs(
         }
     };
 
-    if let Some(active) = active_metadata_dir {
-        add(active.to_string());
+    for opened in opened_metastore_dirs {
+        add(opened.clone());
     }
 
     add(CayenneAccelerator::resolve_metadata_dir(acceleration));
@@ -1134,9 +1143,9 @@ fn ensure_metastore_outside_data_dir(
     dataset: &str,
     data_dir: &str,
     acceleration: Option<&Acceleration>,
-    active_metadata_dir: Option<&str>,
+    opened_metastore_dirs: &[String],
 ) -> Result<()> {
-    for metadata_dir in candidate_metastore_dirs(acceleration, active_metadata_dir) {
+    for metadata_dir in candidate_metastore_dirs(acceleration, opened_metastore_dirs) {
         ensure!(
             !metastore_is_inside_data_dir(data_dir, &metadata_dir),
             MetastoreInsideDataDirectorySnafu {
@@ -1161,9 +1170,9 @@ async fn remove_acceleration_data_dir(
     dataset: &str,
     data_dir: &str,
     acceleration: Option<&Acceleration>,
-    active_metadata_dir: Option<&str>,
+    opened_metastore_dirs: &[String],
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    ensure_metastore_outside_data_dir(dataset, data_dir, acceleration, active_metadata_dir)?;
+    ensure_metastore_outside_data_dir(dataset, data_dir, acceleration, opened_metastore_dirs)?;
     tokio::fs::remove_dir_all(data_dir).await?;
     Ok(())
 }
@@ -1184,7 +1193,7 @@ impl CayenneAccelerator {
     pub fn with_footer_cache_mb(footer_cache_mb: Option<usize>) -> Self {
         Self {
             catalog: Arc::new(OnceCell::new()),
-            active_metadata_dir: Arc::new(OnceLock::new()),
+            opened_metastore_dirs: Arc::new(parking_lot::RwLock::new(BTreeSet::new())),
             memory_catalog: Arc::new(OnceCell::new()),
             instance_id: CAYENNE_ACCELERATOR_INSTANCE_COUNTER
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
@@ -2274,6 +2283,13 @@ impl CayenneAccelerator {
     /// Lazily initialize a Cayenne catalog into `cell` from `connection_string`,
     /// sharing the init/`OnceCell` machinery between the file-mode and memory-mode
     /// catalog getters.
+    /// The metastore directories currently open, copied out so the lock is never
+    /// held across the `.await` on the deletion that consumes them. A directory
+    /// opened after the copy is a separate concern — see #13109.
+    fn opened_metastore_dirs_snapshot(&self) -> Vec<String> {
+        self.opened_metastore_dirs.read().iter().cloned().collect()
+    }
+
     /// `on_initialized` runs only for the caller that actually initializes `cell`
     /// — the losers of the race are handed the winner's catalog and never reach
     /// it — so anything it records describes the catalog the instance shares.
@@ -2316,12 +2332,10 @@ impl CayenneAccelerator {
             _ => format!("sqlite://{metadata_dir}/cayenne.db"), // Default to SQLite
         };
 
-        let record_dir = Arc::clone(&self.active_metadata_dir);
+        let record_dirs = Arc::clone(&self.opened_metastore_dirs);
         let metadata_dir = metadata_dir.to_string();
         Self::init_cayenne_catalog(&self.catalog, connection_string, move || {
-            // `set` cannot already be occupied: only the dataset that initializes
-            // the catalog reaches here, and it does so once.
-            drop(record_dir.set(metadata_dir));
+            record_dirs.write().insert(metadata_dir);
         })
         .await
     }
@@ -3153,7 +3167,7 @@ impl DataAccelerator for CayenneAccelerator {
             &source.name().to_string(),
             &dir_path,
             source.acceleration(),
-            self.active_metadata_dir.get().map(String::as_str),
+            &self.opened_metastore_dirs_snapshot(),
         )?;
 
         // Handle S3 Express One Zone configuration
@@ -3300,7 +3314,7 @@ impl DataAccelerator for CayenneAccelerator {
                     &source.name().to_string(),
                     &dir_path,
                     Some(acceleration),
-                    self.active_metadata_dir.get().map(String::as_str),
+                    &self.opened_metastore_dirs_snapshot(),
                 )
                 .await
                 .context(AccelerationInitializationFailedSnafu)?;
@@ -3592,6 +3606,14 @@ impl DataAccelerator for CayenneAccelerator {
                 .boxed()
                 .context(AccelerationInitializationFailedSnafu)?;
 
+            // This path does not go through `get_or_create_catalog`, so record the
+            // directory here too: the deletion guard treats an opened metastore as
+            // at-risk regardless of which path opened it, and partitioned datasets
+            // can hold catalogs in several directories at once.
+            self.opened_metastore_dirs
+                .write()
+                .insert(metadata_dir.clone());
+
             // Get or create table_id from catalog
             let table_metadata = catalog
                 .get_table(&table_name)
@@ -3812,7 +3834,7 @@ impl DataAccelerator for CayenneAccelerator {
                 table_name,
                 &dir_path,
                 source.acceleration(),
-                self.active_metadata_dir.get().map(String::as_str),
+                &self.opened_metastore_dirs_snapshot(),
             )
             .await?;
             tracing::info!(
@@ -4964,7 +4986,7 @@ mod tests {
             "'{data_dir}' and '{metadata_dir}' are the same directory"
         );
 
-        let err = ensure_metastore_outside_data_dir("metadata", &data_dir, None, None)
+        let err = ensure_metastore_outside_data_dir("metadata", &data_dir, None, &[])
             .expect_err("a data directory that IS the metastore must be refused");
         assert!(
             matches!(err, Error::MetastoreInsideDataDirectory { .. }),
@@ -4984,7 +5006,7 @@ mod tests {
 
         assert_eq!(data_dir, "/persistent/metadata/");
         assert_eq!(metadata_dir, "/persistent/metadata");
-        ensure_metastore_outside_data_dir("metadata", &data_dir, Some(&acceleration), None)
+        ensure_metastore_outside_data_dir("metadata", &data_dir, Some(&acceleration), &[])
             .expect_err("a trailing slash is not a different directory");
     }
 
@@ -5016,7 +5038,7 @@ mod tests {
         );
 
         let err =
-            ensure_metastore_outside_data_dir("metadata", &data_dir, Some(&acceleration), None)
+            ensure_metastore_outside_data_dir("metadata", &data_dir, Some(&acceleration), &[])
                 .expect_err(
                     "the default metastore other datasets share is still inside {data_dir}",
                 );
@@ -5130,14 +5152,19 @@ mod tests {
         );
     }
 
-    /// The shared catalog is opened once per accelerator instance, by whichever
+    /// Every open metastore is at risk, not just the one this dataset's params
+    /// name and not just the first one opened.
+    ///
+    /// The shared catalog is opened once per accelerator instance by whichever
     /// dataset gets there first, and every later dataset uses that catalog
-    /// whatever its own `cayenne_metadata_dir` says. So a dataset whose *own*
-    /// resolved metastore is harmless can still have a data directory sitting on
-    /// the catalog the instance is actually using — checking only the
-    /// configuration would accept it and delete the live catalog.
+    /// whatever its own `cayenne_metadata_dir` says; the partitioned path opens
+    /// its own catalog without going through that cell at all, so several
+    /// directories can hold live catalogs simultaneously. A dataset whose own
+    /// resolved metastore is harmless can therefore still have a data directory
+    /// sitting on one of them, and checking only the configuration — or only one
+    /// recorded directory — would accept it and delete a live catalog.
     #[test]
-    fn the_metastore_actually_in_use_is_refused_even_when_the_params_look_safe() {
+    fn every_open_metastore_is_refused_even_when_the_params_look_safe() {
         let acceleration = Acceleration {
             params: [(
                 "cayenne_metadata_dir".to_string(),
@@ -5148,20 +5175,40 @@ mod tests {
             ..Default::default()
         };
         let data_dir = "/persistent/orders/";
-        let active_metadata_dir = "/persistent/orders/live-catalog";
+        let opened_metastore_dir = "/persistent/orders/live-catalog".to_string();
 
-        ensure_metastore_outside_data_dir("orders", data_dir, Some(&acceleration), None)
+        ensure_metastore_outside_data_dir("orders", data_dir, Some(&acceleration), &[])
             .expect("nothing the configuration names is inside the data directory");
 
         let err = ensure_metastore_outside_data_dir(
             "orders",
             data_dir,
             Some(&acceleration),
-            Some(active_metadata_dir),
+            std::slice::from_ref(&opened_metastore_dir),
         )
         .expect_err("the catalog the instance opened is inside the data directory");
         assert!(
-            err.to_string().contains(active_metadata_dir),
+            err.to_string().contains(&opened_metastore_dir),
+            "the error must name the metastore actually at risk, got: {err}"
+        );
+
+        // The offender is the *second* directory here: a partitioned dataset can
+        // open a catalog somewhere harmless and another one inside this data
+        // directory, so checking only the first recorded metastore misses it.
+        let err = ensure_metastore_outside_data_dir(
+            "orders",
+            data_dir,
+            Some(&acceleration),
+            &[
+                "/harmless/catalog".to_string(),
+                opened_metastore_dir.clone(),
+            ],
+        )
+        .expect_err(
+            "an open catalog inside the data directory must be refused wherever it is in the set",
+        );
+        assert!(
+            err.to_string().contains(&opened_metastore_dir),
             "the error must name the metastore actually at risk, got: {err}"
         );
     }
@@ -5176,7 +5223,7 @@ mod tests {
             let data_dir =
                 CayenneAccelerator::resolve_custom_data_path(dataset_name, "/persistent")
                     .expect("a local custom path resolves");
-            ensure_metastore_outside_data_dir(dataset_name, &data_dir, Some(&acceleration), None)
+            ensure_metastore_outside_data_dir(dataset_name, &data_dir, Some(&acceleration), &[])
                 .expect("a sibling data directory must be accepted");
         }
     }
