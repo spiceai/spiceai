@@ -22,10 +22,12 @@ limitations under the License.
 //!    Spice Cloud). Enrollment itself is performed by the runtime: mint an
 //!    enrollment key in the Spice Cloud portal and start the runtime with
 //!    it (`spiced --token <enrollment-key>`); a directory with an enrolled
-//!    identity reconnects automatically on every later start. This command
-//!    inspects and manages that per-directory state: `status` reports it,
-//!    `service` installs and manages the persistent service that keeps it
-//!    running, and `remove` releases the instance and clears it.
+//!    identity reconnects automatically on every later start. Bare
+//!    `spice connect` starts that instance — in the foreground, or through
+//!    the installed service when there is one — and the subcommands manage
+//!    it: `status` reports it, `service` installs and manages the
+//!    persistent service that keeps it running, and `remove` releases the
+//!    instance and clears it.
 //!
 //! 2. **Deprecated pod-add behavior**: when the argument is a Spicepod
 //!    path on Spice.ai Cloud (e.g. `spiceai/quickstart`), this prints a
@@ -56,8 +58,9 @@ const CLOUD_ENDPOINT_FILE: &str = "cloud-endpoint";
 /// Arguments for the `spice connect` command.
 #[derive(Args, Debug)]
 #[command(
-    about = "Manage this host's Spice Cloud Connect state (or add a cloud-hosted Spicepod)",
-    long_about = r#"`spice connect` manages this directory's Spice Cloud Connect state.
+    about = "Start this directory's Spice Cloud Connect instance (or add a cloud-hosted Spicepod)",
+    long_about = r#"`spice connect` starts and manages this directory's Spice Cloud Connect
+instance.
 
 Enrollment is performed by the runtime, not this command: mint an enrollment
 key in the Spice Cloud portal and start the runtime with it —
@@ -68,6 +71,14 @@ The runtime enrolls before it serves traffic, stores the issued identity under
 `.spice/`, and every later `spiced` or `spice run` start in that directory
 reconnects automatically from the identity alone.
 
+  spice connect                           Start this directory's instance. With
+                                          no service installed it runs in the
+                                          foreground, attached to this terminal
+                                          until you stop it; with one installed
+                                          it starts that service instead of a
+                                          second runtime. Either way the
+                                          instance reconnects to Spice Cloud on
+                                          its own.
   spice connect status                    Show this directory's Cloud
                                           connection, service, and deployment
                                           state. `--output json` prints the
@@ -108,6 +119,8 @@ DEPRECATED POD-ADD BEHAVIOR:
   spice connect <org>/<pod>               Deprecated; use `spice add <org>/<pod>`.
 
 EXAMPLES
+  spice connect
+  spice connect --dir /srv/edge
   spice connect status
   spice connect status --output json
   sudo spice connect service install
@@ -152,6 +165,15 @@ pub struct ConnectArgs {
     /// the portal-side delete is authoritative either way.
     #[arg(long, global = true)]
     pub force: bool,
+
+    /// The global `-v` count, forwarded by the dispatcher for the same reason
+    /// as [`ConnectArgs::cloud_region`] below: the flag is global and clap
+    /// would reject a second definition of it here.
+    ///
+    /// A foreground runtime this command starts is the command's own output,
+    /// so `spice -v connect` has to reach it exactly as `spice run -v` does.
+    #[arg(skip)]
+    pub verbosity: u8,
 
     /// The global `--cloud-region`, forwarded by the dispatcher rather than
     /// declared here (the flag is global; clap would reject a second definition
@@ -263,7 +285,14 @@ pub async fn execute(ctx: &RuntimeContext, args: ConnectArgs) -> Result<()> {
     // always been meaningful, so refusing it there would be a regression.
     let Some(target) = args.target.as_deref() else {
         reject_cloud_region(args.cloud_region.as_deref())?;
-        return connect_existing(&config_dir, args.endpoint.as_deref()).await;
+        return connect_existing(
+            ctx,
+            &config_dir,
+            args.endpoint.as_deref(),
+            args.dir.as_deref(),
+            args.verbosity,
+        )
+        .await;
     };
 
     // A secret must never ride a positional argument. Reject canonical keys
@@ -324,31 +353,105 @@ fn reject_cloud_region(cloud_region: Option<&str>) -> Result<()> {
     })
 }
 
-/// Bare `spice connect` (no subcommand, no pod path): report the existing
-/// per-directory state.
+/// Bare `spice connect` (no subcommand, no pod path): leave this directory's
+/// instance running.
 ///
-/// A directory with no identity has nothing this command can act on —
-/// enrollment belongs to the runtime — so it errors with the exact command that
-/// does enroll.
-async fn connect_existing(config_dir: &Path, endpoint: Option<&str>) -> Result<()> {
+/// The command ends at a running instance rather than at a report, because
+/// that is what the operator asked for — `spice connect status` is the command
+/// that reports. Which process runs it is decided by what is already installed:
+/// a supervised instance is started through its supervisor and this command
+/// returns, an unsupervised one runs in the foreground and this command stays
+/// attached to it until it exits.
+///
+/// A directory with no identity has nothing to start — enrollment belongs to
+/// the runtime — so it errors with the exact command that does enroll.
+async fn connect_existing(
+    ctx: &RuntimeContext,
+    config_dir: &Path,
+    endpoint: Option<&str>,
+    dir: Option<&Path>,
+    verbosity: u8,
+) -> Result<()> {
+    let instance_dir = instance_dir_for(config_dir);
     let status = collect_status(config_dir, endpoint).await?;
-    if status.connection.state != ConnectionState::NotConnected {
-        if status.connection.state == ConnectionState::Enrolled {
-            println!("This host is already enrolled with Spice Cloud.");
-            println!();
-        }
+
+    // Nothing to start: there is no instance here yet. An unfinished enrollment
+    // is the same answer with one more fact — its draft is retry-safe, so
+    // supplying the key again resumes that enrollment rather than starting a
+    // second one.
+    if matches!(
+        status.connection.state,
+        ConnectionState::NotConnected | ConnectionState::EnrollmentIncomplete
+    ) {
+        let resume = if status.connection.state == ConnectionState::EnrollmentIncomplete {
+            " An earlier enrollment in this directory did not finish; its draft is retry-safe, so \
+             the same command resumes it rather than enrolling twice."
+        } else {
+            ""
+        };
+        return Err(Error::InvalidArgument {
+            message: format!(
+                "This directory ({}) is not connected to Spice Cloud. Mint an enrollment key in \
+                 the Spice Cloud portal and start the runtime with it: \
+                 `spiced --token <enrollment-key>`. Later starts reconnect automatically from the \
+                 stored identity.{resume} See: https://spiceai.org/docs",
+                instance_dir.display()
+            ),
+        });
+    }
+
+    // An identity that cannot activate Cloud Connect would start a runtime that
+    // serves locally and reaches no control plane. That is reported as the
+    // failure it is — `render_status` prints the diagnosis and returns it as
+    // this command's error — rather than started as if it were a connection.
+    if matches!(
+        status.connection.state,
+        ConnectionState::Unreadable | ConnectionState::Unusable
+    ) {
         return render_status(&status, OutputFormat::Table);
     }
 
-    Err(Error::InvalidArgument {
-        message: format!(
-            "This directory ({}) is not connected to Spice Cloud. Mint an enrollment key in \
-             the Spice Cloud portal and start the runtime with it: \
-             `spiced --token <enrollment-key>`. Later starts reconnect automatically from the \
-             stored identity. See: https://spiceai.org/docs",
-            instance_dir_for(config_dir).display()
-        ),
-    })
+    // What owns the process, and so what this command starts. An instance a
+    // supervisor already owns must not also be started in the terminal: the
+    // host would hold two runtimes for one identity, which is what the second
+    // one's directory lock refuses — after the operator was told their instance
+    // was starting.
+    let backend = service::backend();
+    let Some(manifest) = service::resolve(backend, &instance_dir, config_dir)? else {
+        return crate::runtime_launcher::run_runtime(
+            ctx,
+            &crate::runtime_launcher::RunConfig {
+                // The instance directory resolves both the spicepod and the
+                // `.spice` state this command just inspected, so the runtime
+                // has to start there rather than wherever the CLI was invoked
+                // from.
+                working_dir: dir.map(Path::to_path_buf),
+                verbosity,
+                ..crate::runtime_launcher::RunConfig::default()
+            },
+        )
+        .await;
+    };
+
+    // Idempotent by contract: a running service stays running and its instance
+    // keeps serving. Nothing here restarts it — a restart would interrupt an
+    // instance that is already doing what this command asks for.
+    backend.start(&manifest)?;
+    println!(
+        "Spice Cloud Connect: {} is running as the {} service {} ({}).",
+        instance_dir.display(),
+        manifest.scope,
+        manifest.name,
+        manifest.supervisor
+    );
+    if let Some(monitor) = &status.connection.monitor_url {
+        println!("Monitor: {monitor}");
+    }
+    println!();
+    println!("Manage it with:");
+    println!("  spice connect status");
+    println!("  spice connect service logs -f");
+    Ok(())
 }
 
 /// Collect the one status snapshot used by the bare and explicit status forms.
@@ -1007,6 +1110,22 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn a_directory_with_no_identity_names_the_command_that_enrolls() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let ctx = crate::context::RuntimeContext::new().expect("build a runtime context");
+        let error = connect_existing(&ctx, &dir.path().join(".spice"), None, Some(dir.path()), 0)
+            .await
+            .expect_err("an unenrolled directory has nothing to start");
+        assert!(error.to_string().contains("spiced --token"), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("is not connected to Spice Cloud"),
+            "{error}"
+        );
+    }
+
     #[test]
     fn instance_dir_is_the_parent_of_a_dot_spice_config_dir() {
         assert_eq!(
@@ -1304,6 +1423,7 @@ mod tests {
             org_name: None,
             app_name: None,
             monitor_url: None,
+            new_project_url: None,
         }
     }
 }

@@ -68,8 +68,10 @@ pub mod enrollment_key;
 pub mod handlers;
 pub mod identity;
 pub mod release;
+pub mod runtime_lock;
 pub mod sealed_secrets;
 pub mod secret_cache;
+pub mod session;
 
 mod client;
 mod fingerprint;
@@ -110,6 +112,8 @@ pub use handlers::{
     RuntimeHandle, RuntimePhase, SpicepodDeployment, StatusReport, effective_max_rows,
 };
 pub use identity::{AppAttachment, AttachmentState, Identity, IdentityStore};
+pub use runtime_lock::{RuntimeLock, RuntimeLockOwner};
+pub use session::{AcknowledgedSession, SessionAck};
 
 /// Revision of the `spice.cloud.v1` contract this client implements,
 /// announced in `Hello.protocol_version`.
@@ -396,7 +400,7 @@ impl CloudConnect {
             );
             return Ok(None);
         };
-        Ok(Some(Self::start_reconnectable(runtime, identity)))
+        Ok(Some(Self::start_reconnectable(runtime, identity, None)))
     }
 
     /// Start from the exact identity snapshot validated during early startup.
@@ -404,10 +408,15 @@ impl CloudConnect {
     /// This does not reload on-disk state: metrics, logging, managed
     /// configuration, cached secrets, and the control client must all follow
     /// one activation decision for this process.
+    ///
+    /// `session_ack` receives the first control-plane acknowledgement, for a
+    /// caller that reports the connection once the runtime is also serving.
+    /// `None` for callers that report nothing.
     #[must_use]
     pub fn start_reconnectable(
         runtime: Arc<dyn RuntimeHandle>,
         identity: ReconnectableIdentity,
+        session_ack: Option<Arc<SessionAck>>,
     ) -> Self {
         let ReconnectableIdentity { identity, config } = identity;
         let identity = Some(identity);
@@ -417,8 +426,13 @@ impl CloudConnect {
 
         let runtime_for_task = runtime;
         let task = tokio::spawn(async move {
-            let driver =
-                client::ClientDriver::new(config, runtime_for_task, shutdown_for_task, identity);
+            let driver = client::ClientDriver::new(
+                config,
+                runtime_for_task,
+                shutdown_for_task,
+                identity,
+                session_ack,
+            );
             if let Err(err) = driver.run().await {
                 tracing::error!("Cloud Connect driver exited with error: {err}");
             }
@@ -522,6 +536,7 @@ mod tests {
             org_name: None,
             app_name: None,
             monitor_url: None,
+            new_project_url: None,
         }
     }
 

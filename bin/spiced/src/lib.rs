@@ -112,10 +112,12 @@ use runtime::secrets::ExposeSecret;
 use runtime::spice_metrics;
 use runtime::{Runtime, auth::EndpointAuth, extension::ExtensionFactory};
 use runtime_async::ManagedTokioRuntime;
+use runtime_cloud_connect::SessionAck;
 use snafu::prelude::*;
 use spice_cloud::SpiceExtensionFactory;
 use spiced_tracing::LogVerbosity;
 use tokio::runtime::Handle;
+use tokio_util::sync::CancellationToken;
 #[cfg(feature = "tpc-extension")]
 use tpc_extension::TpcExtensionFactory;
 use util::in_tracing_context;
@@ -128,8 +130,11 @@ mod cloud_connect;
 pub use cloud_connect::{
     BootstrapEnrollmentError, bootstrap_enrollment as cloud_connect_bootstrap,
 };
+mod connection_report;
 pub mod crash_handler;
 mod log_capture;
+mod runtime_lock;
+pub use runtime_lock::{InstanceClaim, claim_instance_directory};
 #[path = "tracing.rs"]
 mod spiced_tracing;
 mod tls;
@@ -1134,6 +1139,20 @@ pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
     let delivered_secrets =
         cloud_connect::restore_delivered_secrets(&rt, cloud_connect_identity.as_ref()).await;
 
+    // The connection report's two latches. The connection half is filled by the
+    // control client on the first message Spice Cloud sends back; the serving
+    // half below, when the initial component load settles. Whichever is second
+    // releases the report, so neither ordering loses it.
+    let session_ack = cloud_connect_configured.then(|| Arc::new(SessionAck::new()));
+    let serving = CancellationToken::new();
+    if let Some(ack) = &session_ack {
+        connection_report::spawn(
+            Arc::clone(ack),
+            serving.clone(),
+            rt.status().shutdown_token(),
+        );
+    }
+
     // Spice Cloud Connect. Default off — activates only from the validated
     // durable identity snapshot loaded before the runtime was built (which a
     // successful `--token` bootstrap creates). Failures here are non-fatal:
@@ -1155,11 +1174,20 @@ pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
         running_deployment,
         cloud_connect_metrics,
         runtime_overrides,
+        session_ack,
     )
     .await;
 
     tokio::select! {
-        () = Arc::clone(&rt).load_components() => {},
+        () = Arc::clone(&rt).load_components() => {
+            // The initial load has settled — every component the app declares
+            // has been registered and had its first load attempt. This, rather
+            // than `RuntimeStatus::is_ready`, is what says a *Cloud Connect*
+            // instance is serving: a freshly enrolled one has no components at
+            // all until its first deployment lands, and readiness over an empty
+            // component set is never reported.
+            serving.cancel();
+        },
         () = runtime::shutdown_signal() => {
             tracing::debug!("Cancelling runtime initializing!");
         },

@@ -799,6 +799,35 @@ mod connect {
     }
 
     #[test]
+    fn connect_help_says_a_bare_connect_starts_the_instance() {
+        // The command ends at a running instance, not at a report, and which
+        // process runs it depends on whether a service is installed.
+        spice_cmd()
+            .args(["connect", "--help"])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("Start this directory's instance"))
+            .stdout(predicate::str::contains("foreground"))
+            .stdout(predicate::str::contains("starts that service"));
+    }
+
+    #[test]
+    fn a_bare_connect_without_an_identity_names_the_command_that_enrolls() {
+        // Nothing is started for a directory that has no instance yet, and the
+        // remedy is the runtime's own enrollment — never a second command that
+        // would have to be discovered.
+        let config_dir = TempDir::new().expect("create config directory");
+
+        spice_cmd()
+            .env("SPICE_CONFIG_DIR", config_dir.path())
+            .arg("connect")
+            .assert()
+            .failure()
+            .stdout(predicate::str::contains("is not connected to Spice Cloud"))
+            .stdout(predicate::str::contains("spiced --token <enrollment-key>"));
+    }
+
+    #[test]
     fn positional_enrollment_keys_are_rejected_without_echoing_the_secret() {
         let secret = "A".repeat(32);
         for key in [
@@ -922,6 +951,7 @@ mod connect {
             org_name: None,
             app_name: None,
             monitor_url: None,
+            new_project_url: None,
         };
         runtime_cloud_connect::identity::IdentityStore::store(
             &config_dir.path().join("identity.json"),

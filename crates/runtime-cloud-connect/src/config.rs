@@ -470,6 +470,7 @@ mod tests {
             org_name: None,
             app_name: None,
             monitor_url: None,
+            new_project_url: None,
             enc_private_key_pem: String::new(),
             enc_public_key_pem: String::new(),
             enc_previous_private_key_pem: String::new(),

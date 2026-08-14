@@ -1,0 +1,298 @@
+/*
+Copyright 2024-2026 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+//! Starting the runtime in the foreground, from any command that needs to.
+//!
+//! `spice run` is not the only command that ends with a runtime attached to the
+//! terminal — `spice connect` does too, and anything that leaves the user at a
+//! running instance must behave identically: install the runtime if it is
+//! missing, resolve the same endpoint flags, inherit the terminal so the
+//! runtime's own output *is* the command's output, forward the signals that
+//! stop it, and exit with the status the runtime exited with.
+//!
+//! One launcher is what keeps those identical. Re-invoking the `spice run`
+//! subcommand from another command would add a third process to every Ctrl-C
+//! and put the CLI's argument parsing between the caller and the runtime.
+
+use std::path::PathBuf;
+use std::process::Stdio;
+
+use snafu::{OptionExt, ResultExt, ensure};
+
+use crate::context::RuntimeContext;
+use crate::error::{
+    ChildProcessIdSnafu, InvalidArgumentSnafu, Result, RuntimeExecutionSnafu, SignalHandlerSnafu,
+};
+
+/// How the runtime should be started.
+#[derive(Debug, Default, Clone)]
+pub struct RunConfig {
+    /// `--endpoint`: routed to the HTTP or Flight endpoint by its scheme.
+    pub endpoint: Option<String>,
+    /// `--http-endpoint`, the address the runtime binds its HTTP API on.
+    pub http_endpoint: Option<String>,
+    /// `--flight-endpoint`, the address the runtime binds Flight on.
+    pub flight_endpoint: Option<String>,
+    /// `--metrics-endpoint`, the address the runtime serves Prometheus on.
+    pub metrics_endpoint: Option<String>,
+    /// `-v` count, forwarded to the runtime as its own verbosity flag.
+    pub verbosity: u8,
+    /// Arguments passed through to `spiced` verbatim.
+    pub args: Vec<String>,
+    /// The directory the runtime runs in. It resolves the spicepod *and* the
+    /// per-instance `.spice` state, so a caller acting on an instance directory
+    /// (`spice connect --dir`) has to set it rather than assume the CLI was
+    /// invoked from there. `None` inherits this process's working directory.
+    pub working_dir: Option<PathBuf>,
+}
+
+/// Start the runtime in the foreground and stay attached to it until it exits.
+///
+/// Installs the runtime first if this host has none. Returns only when the
+/// runtime has exited: a non-zero exit is propagated as this process's own
+/// status, so a caller in a script sees what the runtime reported.
+///
+/// # Errors
+///
+/// Returns an error when the runtime cannot be installed, when the endpoint
+/// flags conflict, or when the child process cannot be started or waited on.
+pub async fn run_runtime(ctx: &RuntimeContext, config: &RunConfig) -> Result<()> {
+    ctx.ensure_local_runtime_supported()?;
+
+    // Auto-install runtime if not present
+    if !ctx.is_runtime_installed() {
+        tracing::info!("Spice.ai runtime is not installed. Installing now...");
+        crate::commands::install::execute(ctx, &crate::commands::install::InstallArgs::default())
+            .await?;
+    }
+
+    // Route --endpoint to the appropriate endpoint based on scheme
+    let (http_endpoint, flight_endpoint) = resolve_endpoint(
+        config.endpoint.as_deref(),
+        config.http_endpoint.as_deref(),
+        config.flight_endpoint.as_deref(),
+    )?;
+
+    tracing::info!("Spice.ai runtime starting...");
+
+    let spiced_args = spiced_args(config, flight_endpoint.as_deref());
+    let std_cmd = ctx.get_run_cmd(&spiced_args, http_endpoint.as_deref())?;
+
+    // Convert std::process::Command to tokio::process::Command
+    let mut cmd = tokio::process::Command::from(std_cmd);
+
+    if let Some(dir) = &config.working_dir {
+        cmd.current_dir(dir);
+    }
+
+    cmd.stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+
+    let mut child = cmd.spawn().context(RuntimeExecutionSnafu)?;
+
+    let status = run_with_signal_forwarding(&mut child).await?;
+
+    if !status.success() {
+        std::process::exit(status.code().unwrap_or(1));
+    }
+
+    Ok(())
+}
+
+/// The `spiced` argument list a [`RunConfig`] resolves to, apart from the
+/// endpoint and defaults [`RuntimeContext::get_run_cmd`] supplies.
+///
+/// Pass-through arguments come first so a flag the caller repeats explicitly is
+/// the one `spiced`'s parser sees last only where that is intended.
+fn spiced_args(config: &RunConfig, flight_endpoint: Option<&str>) -> Vec<String> {
+    let mut args = config.args.clone();
+
+    if config.verbosity > 0 {
+        args.push(format!("-{}", "v".repeat(config.verbosity as usize)));
+    }
+
+    if let Some(flight) = flight_endpoint {
+        args.push("--flight".to_string());
+        args.push(flight.to_string());
+    }
+
+    if let Some(metrics) = &config.metrics_endpoint {
+        args.push("--metrics".to_string());
+        args.push(metrics.clone());
+    }
+
+    args
+}
+
+/// Run the child process and forward signals (SIGTERM, SIGINT) to it.
+///
+/// On Unix systems, this listens for SIGTERM and SIGINT and forwards them
+/// to the child process so it can perform graceful shutdown.
+#[cfg(unix)]
+async fn run_with_signal_forwarding(
+    child: &mut tokio::process::Child,
+) -> Result<std::process::ExitStatus> {
+    use nix::sys::signal::{Signal, kill};
+    use nix::unistd::Pid;
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let pid = child
+        .id()
+        .map(|id| Pid::from_raw(id as i32))
+        .context(ChildProcessIdSnafu)?;
+
+    let mut sigterm = signal(SignalKind::terminate()).context(SignalHandlerSnafu)?;
+    let mut sigint = signal(SignalKind::interrupt()).context(SignalHandlerSnafu)?;
+
+    tokio::select! {
+        status = child.wait() => {
+            status.context(RuntimeExecutionSnafu)
+        }
+        _ = sigterm.recv() => {
+            tracing::debug!("Received SIGTERM, forwarding to child process");
+            let _ = kill(pid, Signal::SIGTERM);
+            child.wait().await.context(RuntimeExecutionSnafu)
+        }
+        _ = sigint.recv() => {
+            tracing::debug!("Received SIGINT, forwarding to child process");
+            let _ = kill(pid, Signal::SIGINT);
+            child.wait().await.context(RuntimeExecutionSnafu)
+        }
+    }
+}
+
+/// On non-Unix systems (Windows), just wait for the child process.
+/// Windows handles Ctrl+C differently and typically propagates it to child processes
+/// in the same console automatically.
+#[cfg(not(unix))]
+async fn run_with_signal_forwarding(
+    child: &mut tokio::process::Child,
+) -> Result<std::process::ExitStatus> {
+    child.wait().await.context(RuntimeExecutionSnafu)
+}
+
+/// Resolve `--endpoint` into the appropriate HTTP or Flight endpoint based on its URL scheme.
+///
+/// Returns `(http_endpoint, flight_endpoint)`. If `--endpoint` is provided, it takes precedence
+/// over the corresponding specific endpoint flag. An error is returned if `--endpoint` has no
+/// recognized scheme or conflicts with an already-specified endpoint.
+fn resolve_endpoint(
+    endpoint: Option<&str>,
+    http_endpoint: Option<&str>,
+    flight_endpoint: Option<&str>,
+) -> Result<(Option<String>, Option<String>)> {
+    let Some(ep) = endpoint else {
+        return Ok((
+            http_endpoint.map(String::from),
+            flight_endpoint.map(String::from),
+        ));
+    };
+
+    if ep.starts_with("http://") || ep.starts_with("https://") {
+        ensure!(
+            http_endpoint.is_none(),
+            InvalidArgumentSnafu {
+                message: "--endpoint with http(s):// scheme cannot be combined with --http-endpoint"
+            }
+        );
+        Ok((Some(ep.to_string()), flight_endpoint.map(String::from)))
+    } else if ep.starts_with("grpc://") || ep.starts_with("grpc+tls://") {
+        ensure!(
+            flight_endpoint.is_none(),
+            InvalidArgumentSnafu {
+                message: "--endpoint with grpc:// scheme cannot be combined with --flight-endpoint"
+            }
+        );
+        let addr = ep
+            .trim_start_matches("grpc+tls://")
+            .trim_start_matches("grpc://");
+        Ok((http_endpoint.map(String::from), Some(addr.to_string())))
+    } else {
+        Err(InvalidArgumentSnafu {
+            message: format!(
+                "Unrecognized scheme in --endpoint '{ep}'. Use http://, https://, grpc://, or grpc+tls://"
+            ),
+        }
+        .build())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn endpoint_routes_by_scheme() {
+        assert_eq!(
+            resolve_endpoint(Some("http://127.0.0.1:8090"), None, None).expect("http scheme"),
+            (Some("http://127.0.0.1:8090".to_string()), None)
+        );
+        // The Flight address is passed to `spiced` without its scheme.
+        assert_eq!(
+            resolve_endpoint(Some("grpc://127.0.0.1:50051"), None, None).expect("grpc scheme"),
+            (None, Some("127.0.0.1:50051".to_string()))
+        );
+        assert_eq!(
+            resolve_endpoint(Some("grpc+tls://127.0.0.1:50051"), None, None).expect("grpc+tls"),
+            (None, Some("127.0.0.1:50051".to_string()))
+        );
+    }
+
+    #[test]
+    fn endpoint_conflicts_and_unknown_schemes_are_refused() {
+        resolve_endpoint(Some("http://a:1"), Some("http://b:2"), None)
+            .expect_err("two HTTP endpoints must not both be honoured");
+        resolve_endpoint(Some("grpc://a:1"), None, Some("b:2"))
+            .expect_err("two Flight endpoints must not both be honoured");
+        resolve_endpoint(Some("a:1"), None, None).expect_err("a scheme is required");
+    }
+
+    #[test]
+    fn without_an_endpoint_the_specific_flags_pass_through() {
+        assert_eq!(
+            resolve_endpoint(None, Some("http://a:1"), Some("b:2")).expect("pass through"),
+            (Some("http://a:1".to_string()), Some("b:2".to_string()))
+        );
+    }
+
+    #[test]
+    fn verbosity_metrics_and_flight_reach_the_runtime() {
+        let config = RunConfig {
+            metrics_endpoint: Some("127.0.0.1:9090".to_string()),
+            verbosity: 2,
+            args: vec!["--dataset-path".to_string(), "x".to_string()],
+            ..RunConfig::default()
+        };
+        assert_eq!(
+            spiced_args(&config, Some("127.0.0.1:50051")),
+            vec![
+                "--dataset-path",
+                "x",
+                "-vv",
+                "--flight",
+                "127.0.0.1:50051",
+                "--metrics",
+                "127.0.0.1:9090",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_quiet_run_adds_no_flags_of_its_own() {
+        assert!(spiced_args(&RunConfig::default(), None).is_empty());
+    }
+}

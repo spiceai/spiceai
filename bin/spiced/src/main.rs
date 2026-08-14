@@ -175,6 +175,19 @@ fn main() {
 /// current-thread runtime and handed to `spiced::run`, so it is read exactly
 /// once and all three configuration surfaces resolve through one path.
 fn load_and_run(mut args: spiced::Args) -> Result<(), Box<dyn std::error::Error>> {
+    // Claimed before anything this process does can be observed from outside
+    // it: a second runtime in one instance directory must refuse before it
+    // redeems an enrollment key, binds a listener, or dials the gateway. Held
+    // for the rest of the process — the kernel releases it on exit, including a
+    // crash — so it stays alive across `spiced::run` below.
+    let _instance = match spiced::claim_instance_directory() {
+        Ok(claim) => claim,
+        Err(message) => {
+            in_tracing_context(|| tracing::error!("{message}"));
+            std::process::exit(1);
+        }
+    };
+
     // One temporary subscriber for the whole window before `spiced::run` installs the
     // global one, so every line the spicepod load and the CPU budget emit — including
     // any added later — has somewhere to go. Both the bootstrap runtime and
