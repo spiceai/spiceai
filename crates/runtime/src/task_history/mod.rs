@@ -429,4 +429,11 @@ pub enum Error {
     InvalidConfiguration {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
+
+    #[snafu(display(
+        "Failed to initialize task history: the table {table} is already registered by something else. \
+        Rename the dataset using that name — it is reserved for the runtime's own task history. \
+        See: https://spiceai.org/docs"
+    ))]
+    TableNameTaken { table: String },
 }

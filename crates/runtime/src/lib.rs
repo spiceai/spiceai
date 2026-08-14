@@ -589,6 +589,15 @@ pub struct Runtime {
     /// cannot wait for it can stop it. See [`Runtime::supersede_initial_load`].
     /// Shared, not copied, so every clone of the runtime supersedes the same load.
     initial_load: Arc<InitialLoad>,
+    /// Set once this runtime has registered the internal task-history table.
+    ///
+    /// Task history is initialized from the app, and an app can arrive after a
+    /// start that had none, so initialization can be reached twice. What makes the
+    /// second call a no-op is this flag and not the table's name: a spicepod may
+    /// declare a dataset called `runtime.task_history`, and on the arriving-app
+    /// path datasets are registered first — so a name check would mistake that
+    /// dataset for the internal table and send every task-history write to it.
+    task_history_initialized: Arc<AtomicBool>,
     df: Arc<DataFusion>,
     llm_runtime_stores: Arc<model::LlmRuntimeStores>,
     http_rate_control_registry: Arc<dataconnector::http_rate_control::HttpRateControlRegistry>,

@@ -43,16 +43,33 @@ impl Runtime {
 
         // A runtime that came up with no spicepod has no task-history table:
         // there was no configuration to read it from. The app that arrives later
-        // — deployed, or written into a watched directory — initializes it, and
-        // this is what keeps that second call from registering a second table
-        // over the first.
+        // — deployed, or written into a watched directory — initializes it, so
+        // this can be reached twice, and the second call has to be a no-op.
+        //
+        // What decides that is this runtime's own record of having registered the
+        // table, never the table's name: a spicepod may declare a dataset called
+        // `runtime.task_history`, and on the arriving-app path datasets are
+        // registered before this runs. A name check would take that dataset for
+        // the internal table, report success, and send every task-history write
+        // to it. So a name that is taken while this runtime has registered
+        // nothing is a conflict, and it is reported rather than written into.
+        if self
+            .task_history_initialized
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            tracing::debug!("Task history is already initialized.");
+            return Ok(());
+        }
         let table = TableReference::partial(
             SPICE_RUNTIME_SCHEMA,
             task_history::DEFAULT_TASK_HISTORY_TABLE,
         );
         if self.df.table_exists(&table) {
-            tracing::debug!("Task history is already initialized.");
-            return Ok(());
+            return Err(Error::UnableToTrackTaskHistory {
+                source: task_history::Error::TableNameTaken {
+                    table: table.to_string(),
+                },
+            });
         }
 
         let retention_period_secs = app
@@ -171,6 +188,9 @@ impl Runtime {
                 ),
                 table_to_register,
             )
-            .context(UnableToCreateBackendSnafu)
+            .context(UnableToCreateBackendSnafu)?;
+        self.task_history_initialized
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
     }
 }

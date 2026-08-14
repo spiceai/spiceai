@@ -806,6 +806,7 @@ impl RuntimeBuilder {
             app: shared_app,
             apply_app_lock: Arc::new(tokio::sync::Mutex::new(())),
             initial_load: Arc::new(crate::InitialLoad::default()),
+            task_history_initialized: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             df,
             llm_runtime_stores: Arc::new(crate::model::LlmRuntimeStores::default()),
             http_rate_control_registry,

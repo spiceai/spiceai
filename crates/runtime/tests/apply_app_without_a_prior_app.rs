@@ -44,6 +44,54 @@ fn view(name: &str, sql: &str) -> View {
     }
 }
 
+/// Idempotence rests on this runtime having registered the table, never on the
+/// name being taken.
+///
+/// The distinction matters because the arriving-app path registers an app's own
+/// components before this runs, so a name check would treat anything already
+/// occupying `runtime.task_history` as the internal table, report success, and
+/// send every task-history write to it. Whether a spicepod can claim that name is
+/// a question for component validation; the guard is written so that the answer
+/// does not matter.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_table_this_runtime_did_not_register_is_a_conflict_not_a_no_op() {
+    // Built with an app so task history has configuration to read, and left
+    // uninitialized: this is the window the arriving-app path opens, where
+    // components are registered before task history is brought up.
+    let rt = Arc::new(
+        Runtime::builder()
+            .with_app_opt(Some(Arc::new(App::default())))
+            .build()
+            .await,
+    );
+
+    // Something else occupies the name before task history is initialized.
+    let occupied = TableReference::partial("runtime", "task_history");
+    rt.datafusion()
+        .ctx
+        .register_table(
+            occupied.clone(),
+            Arc::new(datafusion::datasource::empty::EmptyTable::new(Arc::new(
+                arrow::datatypes::Schema::empty(),
+            ))),
+        )
+        .expect("occupy the task-history name");
+    assert!(
+        rt.datafusion().table_exists(&occupied),
+        "the name is taken before initialization runs"
+    );
+
+    let error = Arc::clone(&rt)
+        .init_task_history()
+        .await
+        .expect_err("a table this runtime did not register must not be adopted");
+    let rendered = error.to_string();
+    assert!(
+        rendered.contains("already registered") && rendered.contains("Rename"),
+        "the conflict must be reported with a way out: {rendered}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_app_that_arrives_after_an_empty_start_is_loaded_not_only_stored() {
     let rt = Arc::new(Runtime::builder().with_app_opt(None).build().await);
