@@ -867,7 +867,6 @@ impl DataConnectorFactory for DatabricksFactory {
 
             Box::pin(async move {
                 let app = context.app();
-                let runtime = context.runtime();
 
                 // Initialize AWS SDK credentials if not using explicit credentials
                 if !aws_sdk_credential_bridge::has_explicit_credentials(
@@ -913,7 +912,7 @@ impl DataConnectorFactory for DatabricksFactory {
                 let rate_control_reservation = reserve_databricks_rate_controller(
                     &params.parameters,
                     Some(&app.runtime.params),
-                    runtime.http_rate_control_registry(),
+                    context.http_rate_control_registry(),
                     &params.component,
                     app.name.as_str(),
                 )
@@ -925,7 +924,7 @@ impl DataConnectorFactory for DatabricksFactory {
                 let databricks_result = Databricks::new(
                     params.parameters,
                     params.io_runtime,
-                    runtime.token_provider_registry(),
+                    context.token_provider_registry(),
                     shared_semaphore,
                     rate_controller,
                 )

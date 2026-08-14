@@ -22,7 +22,6 @@ use search::index::compound::CompoundSearchIndex;
 use std::any::Any;
 use std::sync::Arc;
 
-use crate::accelerated::{self, AcceleratedTable};
 use crate::changes::{Indexes, index_change_envelope};
 use crate::component::{
     ComponentInitialization,
@@ -31,6 +30,8 @@ use crate::component::{
 use crate::dataconnector::{DataConnector, DataConnectorError, DataConnectorResult};
 use crate::federated::FederatedTable;
 use crate::search::full_text::table::add_full_text_search_to_table;
+use data_connector_api::accelerated::{AcceleratorSetup, RegisteredAcceleratedTable};
+use data_connector_api::federated::FederatedTableProvider;
 use futures::StreamExt;
 use runtime_metrics::component::MetricsProvider;
 use spice_table::LayerWalk;
@@ -49,11 +50,11 @@ impl FullTextConnector {
     #[expect(clippy::needless_pass_by_value)]
     fn with_indexed_stream<F>(
         &self,
-        federated_table: Arc<FederatedTable>,
+        federated_table: Arc<dyn FederatedTableProvider>,
         f: F,
     ) -> Option<ChangesStream>
     where
-        F: Fn(&Arc<dyn DataConnector>, Arc<FederatedTable>) -> Option<ChangesStream>,
+        F: Fn(&Arc<dyn DataConnector>, Arc<dyn FederatedTableProvider>) -> Option<ChangesStream>,
     {
         let table_provider = federated_table.try_table_provider_sync()?;
         let indexed_table = spice_table::nodes(table_provider.as_ref(), LayerWalk::Index)
@@ -176,17 +177,17 @@ impl DataConnector for FullTextConnector {
     async fn on_accelerator_setup(
         &self,
         dataset: &Dataset,
-        builder: &mut accelerated::Builder,
+        accelerator: &mut dyn AcceleratorSetup,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.inner_connector
-            .on_accelerator_setup(dataset, builder)
+            .on_accelerator_setup(dataset, accelerator)
             .await
     }
 
     async fn on_accelerated_table_registration(
         &self,
         dataset: &Dataset,
-        accelerated_table: &mut AcceleratedTable,
+        accelerated_table: &mut dyn RegisteredAcceleratedTable,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.inner_connector
             .on_accelerated_table_registration(dataset, accelerated_table)
@@ -207,7 +208,7 @@ impl DataConnector for FullTextConnector {
 
     fn changes_stream(
         &self,
-        federated_table: Arc<FederatedTable>,
+        federated_table: Arc<dyn FederatedTableProvider>,
         dataset: &Dataset,
     ) -> Option<ChangesStream> {
         self.with_indexed_stream(federated_table, |inner, ft| {
@@ -219,7 +220,10 @@ impl DataConnector for FullTextConnector {
         self.inner_connector.supports_append_stream()
     }
 
-    fn append_stream(&self, federated_table: Arc<FederatedTable>) -> Option<ChangesStream> {
+    fn append_stream(
+        &self,
+        federated_table: Arc<dyn FederatedTableProvider>,
+    ) -> Option<ChangesStream> {
         self.with_indexed_stream(federated_table, |inner, ft| inner.append_stream(ft))
     }
 
@@ -307,7 +311,7 @@ mod tests {
             .full_text_search_field_index("content")
             .expect("failed to create FullTextSearchFieldIndex");
         let rb = search_index
-            .search("apple".to_string(), &[], 1000)
+            .search("apple".to_string(), vec![], 1000)
             .expect("search failed")
             .try_collect::<Vec<_>>()
             .await

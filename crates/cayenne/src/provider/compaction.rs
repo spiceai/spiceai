@@ -67,6 +67,25 @@ use tokio::task::JoinHandle;
 /// `dedicated_thread_pool=disabled` — compaction falls back to [`tokio::spawn`]
 /// on the ambient runtime, preserving prior behavior.
 static COMPACTION_RUNTIME: LazyLock<RwLock<Option<Handle>>> = LazyLock::new(|| RwLock::new(None));
+
+/// Process-wide budget bounding how many Cayenne interval background
+/// compactions run at once. Every table in the process draws on it, however it
+/// was created.
+///
+/// Two engines open Cayenne tables — the accelerator, and `CREATE TABLE …
+/// PARTITIONED BY` — and a catalog-level table has no narrower owner to charge
+/// than the process itself. One budget for both is what holds total compaction
+/// concurrency at the CPU budget regardless of the mix: a budget per engine
+/// would let a process running both oversubscribe the writer pool by a factor
+/// of two, and a budget per table would fan out without any ceiling at all.
+///
+/// Sized like the other Cayenne maintenance budgets, from
+/// [`compaction_budget_permits`]. Post-write compaction
+/// (`schedule_post_write_compaction`) is scheduled independently and does not
+/// draw on this.
+static COMPACTION_BUDGET: LazyLock<Arc<Semaphore>> =
+    LazyLock::new(|| Arc::new(Semaphore::new(compaction_budget_permits())));
+
 static COMPACTION_SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
 static IN_FLIGHT_COMPACTION_PASSES: LazyLock<CompactionPassTracker> =
     LazyLock::new(CompactionPassTracker::default);
@@ -150,6 +169,20 @@ pub(crate) fn try_track_compaction_pass() -> Option<CompactionPassGuard<'static>
     } else {
         Some(guard)
     }
+}
+
+/// The process-wide compaction budget every Cayenne table's interval
+/// background compactor draws on. See [`COMPACTION_BUDGET`].
+#[must_use]
+pub fn compaction_budget() -> Arc<Semaphore> {
+    Arc::clone(&COMPACTION_BUDGET)
+}
+
+/// Permits in the process-wide compaction budget — its ceiling, which the
+/// semaphore itself cannot report (it only exposes *available* permits).
+#[must_use]
+pub fn compaction_budget_permits() -> usize {
+    cpu_budget::cpu_budget().cayenne_compaction_permits()
 }
 
 /// Prevent new Cayenne compaction-runtime maintenance passes from starting.

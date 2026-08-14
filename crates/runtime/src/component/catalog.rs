@@ -118,6 +118,7 @@ impl Catalog {
 pub fn table_selector(catalog: &CatalogSpec) -> TableSelector {
     TableSelector::new(catalog.include.clone(), catalog.exclude.clone())
         .with_include_patterns(&catalog.orig_include)
+        .with_exclude_patterns(&catalog.orig_exclude)
 }
 
 pub struct CatalogBuilder {
@@ -380,6 +381,20 @@ mod tests {
             "an excluded table must not be selected"
         );
         assert!(!selector.selects_table("reporting", "orders"));
+
+        // The raw patterns travel too, and by a separate path: `selects_table`
+        // reads the compiled sets, so dropping either `with_*_patterns` call
+        // leaves every assertion above passing while a diagnostic naming the
+        // configuration silently omits half of it.
+        let described = selector.describe();
+        assert!(
+            described.contains("include: ['public.*']"),
+            "the include patterns should reach the selector verbatim: {described}"
+        );
+        assert!(
+            described.contains("exclude: ['public.audit_log']"),
+            "the exclude patterns should reach the selector verbatim: {described}"
+        );
     }
 
     /// An `exclude` with no `include` still withholds: the connectors that only
@@ -448,6 +463,48 @@ mod tests {
             Some("/data")
         );
         assert!(mapped.is_durable());
+    }
+
+    /// The dataset acceleration a catalog converts into. Two consumers depend on
+    /// this being exactly what the accelerated tables are configured with: the
+    /// catalog connector, which adds only the per-table key on top of it, and the
+    /// runtime builder's Cayenne memory budgets, which classify it (#13013).
+    #[test]
+    fn test_catalog_acceleration_converts_to_the_dataset_acceleration() {
+        let acceleration = CatalogAcceleration::from(cayenne_file_acceleration());
+
+        let converted = acceleration.to_dataset_acceleration();
+
+        assert!(converted.enabled);
+        assert_eq!(converted.engine.as_deref(), Some("cayenne"));
+        assert_eq!(
+            converted.refresh_mode,
+            Some(spicepod::acceleration::RefreshMode::Changes)
+        );
+        assert_eq!(converted.mode, spicepod::acceleration::Mode::File);
+        assert_eq!(
+            converted
+                .params
+                .as_ref()
+                .map(spicepod::param::Params::as_string_map)
+                .unwrap_or_default()
+                .get("cayenne_file_path")
+                .map(String::as_str),
+            Some("/data")
+        );
+        // The per-table key is the connector's to fill in; the catalog schema has no
+        // place to declare one, so leaving a stale value here would key every table
+        // on the same columns.
+        assert_eq!(converted.primary_key, None);
+        assert!(converted.on_conflict.is_empty());
+
+        // Params are omitted entirely rather than serialized as an empty block, so an
+        // converted acceleration matches a hand-written one with no `params`.
+        let no_params = CatalogAcceleration::from(spicepod_catalog::CatalogAcceleration {
+            params: None,
+            ..cayenne_file_acceleration()
+        });
+        assert_eq!(no_params.to_dataset_acceleration().params, None);
     }
 
     // Without `postgres` there is no `pg` catalog connector compiled in, so no

@@ -43,7 +43,9 @@ use tokio_util::sync::CancellationToken;
 use util::{RetryError, fibonacci_backoff::FibonacciBackoffBuilder, retry};
 
 use crate::refresh_source::RefreshSource;
+use async_trait::async_trait;
 use data_connector_api::DataConnectorError;
+use data_connector_api::federated::FederatedTableProvider;
 use runtime_component::dataset::{DatasetSpec, OnSchemaChange, acceleration::RefreshMode};
 use runtime_component::schema_evolution::{
     SCHEMA_EVOLUTION_DETECTED, SCHEMA_EVOLUTION_FAILED, dataset_constraint_columns,
@@ -616,5 +618,16 @@ impl FederatedTable {
             dataset_name: dataset_name_str,
             schema_change_failure: None,
         }
+    }
+}
+
+#[async_trait]
+impl FederatedTableProvider for FederatedTable {
+    async fn table_provider(&self) -> Arc<dyn TableProvider> {
+        FederatedTable::table_provider(self).await
+    }
+
+    fn try_table_provider_sync(&self) -> Option<Arc<dyn TableProvider>> {
+        FederatedTable::try_table_provider_sync(self)
     }
 }

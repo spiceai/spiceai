@@ -23,6 +23,7 @@ use data_components::cdc::{
     ChangeEnvelope, ChangesStream, CommitChange, CommitError, NoOpCommitter, StreamError,
     build_ready_signal_envelope, wrap_data_as_change_batch,
 };
+use data_connector_api::federated::FederatedTableProvider;
 use data_connector_api::schema_projection::{ProjectionPolicy, parse_schema_projection};
 use datafusion::{
     arrow::datatypes::SchemaRef, datasource::TableProvider,
@@ -45,7 +46,6 @@ use runtime::{
         OpenOption,
         mongodb::{MongoCheckpointMetadata, MongoSys},
     },
-    federated::FederatedTable,
 };
 use runtime_parameters::{ExposedParamLookup, Parameters};
 use std::{sync::Arc, time::Duration};
@@ -60,7 +60,7 @@ pub fn build_changes_stream(
     pool: Arc<MongoDBConnectionPool>,
     params: Parameters,
     dataset: Dataset,
-    federated_table: Arc<FederatedTable>,
+    federated_table: Arc<dyn FederatedTableProvider>,
 ) -> ChangesStream {
     // `try_stream!` keeps MongoDB cursor polling, snapshot reads, and commit-aware
     // CDC yields in one backpressured stream; a spawned channel would risk buffering
