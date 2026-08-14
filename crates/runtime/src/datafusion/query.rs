@@ -1914,35 +1914,51 @@ fn attach_query_tracker_to_stream(
 
 /// This guard guarantees:
 ///  * If we incremented nested query count, we will decrement. And vice versa.
-///  * If we incremented active query count, we will decrement. And vice versa.
+///  * A request that goes from idle to busy increments the active query count
+///    exactly once, and decrements it exactly once when it goes back to idle.
 ///  * Active query count decrement will be called with the same dimensions as increment.
+///
+/// The increment and the decrement are taken from the two *edges* of the
+/// request's query count — idle to busy, and busy back to idle — rather than
+/// from a flag remembered on the guard that saw the first edge. Independent
+/// queries can share one request context and overlap (a search fans out one
+/// query per table and per embedding column; NSQL samples datasets with
+/// `buffer_unordered`, which yields in completion order), so the guard that
+/// opened the request is not guaranteed to be the one that closes it. Anchoring
+/// the release on that guard instead of on the edge fails whichever way it is
+/// written: releasing only when it is *also* the last one out strands the
+/// decrement every time it is not, and releasing unconditionally fires it while
+/// siblings are still running.
+///
+/// Each guard keeps the dimensions it was built with, which pins the pair for
+/// a request that runs one query at a time. Across overlapping queries the two
+/// edges can land on different guards, and those agree because
+/// `to_protocol_dimensions` interns one `'static` slice per `Protocol` and the
+/// only writer of a context's protocol is `set_flightsql_protocol`, which every
+/// `FlightSQL` handler calls before it runs a query.
 pub struct QueryActiveGuard {
     request_context: Arc<RequestContext>,
     dimensions: &'static [KeyValue],
-    active: bool,
 }
 
 impl QueryActiveGuard {
     pub fn new(request_context: Arc<RequestContext>) -> Self {
         let dimensions = request_context.to_protocol_dimensions();
 
-        let active = request_context.entered_top_level_query();
-        if active {
+        if request_context.entered_top_level_query() {
             runtime_metrics::telemetry::inc_query_active_count(dimensions);
         }
 
         Self {
             request_context,
             dimensions,
-            active,
         }
     }
 }
 
 impl Drop for QueryActiveGuard {
     fn drop(&mut self) {
-        let exited = self.request_context.exited_top_level_query();
-        if self.active && exited {
+        if self.request_context.exited_top_level_query() {
             runtime_metrics::telemetry::dec_query_active_count(self.dimensions);
         }
     }

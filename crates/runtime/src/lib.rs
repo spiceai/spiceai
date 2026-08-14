@@ -1795,11 +1795,9 @@ impl Runtime {
         // when task history itself is disabled.
         self.init_drasi_forwarders().await;
 
-        // Must be loaded before datasets
-        self.load_embeddings().await;
-        self.load_rerankers().await;
-
-        // Spawn each component load in its own task to run in parallel
+        // Spawned before `load_embeddings`/`load_rerankers` so the table is registered as early as
+        // possible: it depends only on the app config, not on embeddings/rerankers being loaded, and
+        // other startup paths (tracing, `datasets_health_monitor`) start querying it immediately.
         let task_history = tokio::spawn({
             let self_clone = Arc::clone(&self);
             async move {
@@ -1809,6 +1807,11 @@ impl Runtime {
             }
         });
 
+        // Must be loaded before datasets
+        self.load_embeddings().await;
+        self.load_rerankers().await;
+
+        // Spawn each remaining component load in its own task to run in parallel
         let datasets = tokio::spawn({
             let self_clone = Arc::clone(&self);
             async move {

@@ -48,11 +48,11 @@ use crate::{
 /// Hive-style subdirectories under `base_path`.
 ///
 /// Two callers construct this: `CREATE TABLE … PARTITIONED BY` in
-/// [`crate::ddl::operations`], and the Cayenne accelerator in `runtime`. They
-/// differ in exactly two ways, and both are opt-in on top of the DDL defaults:
-/// the accelerator shares one background-compaction budget across every
-/// partition ([`Self::with_background_compaction`]), and its tables are targets
-/// for the accelerated dual-write path ([`Self::with_direct_partition_writes`]).
+/// [`crate::ddl::operations`], and the Cayenne accelerator in `runtime`. Both
+/// run their partitions' interval compaction through the process-wide budget
+/// ([`Self::with_background_compaction`]); they differ only in that the
+/// accelerator's tables are targets for the accelerated dual-write path
+/// ([`Self::with_direct_partition_writes`]).
 pub struct CayennePartitionCreator {
     table_name: String,
     base_path: PathBuf,
@@ -109,10 +109,10 @@ impl std::fmt::Debug for CayennePartitionCreator {
 }
 
 impl CayennePartitionCreator {
-    /// Create a partition creator with the `CREATE TABLE … PARTITIONED BY`
-    /// defaults: no shared compaction budget, and not a dual-write target.
-    /// The accelerator opts into both with [`Self::with_background_compaction`]
-    /// and [`Self::with_direct_partition_writes`].
+    /// Create a partition creator that runs no interval compaction and is not a
+    /// dual-write target. Both engines that open Cayenne tables opt into a
+    /// compaction budget with [`Self::with_background_compaction`]; only the
+    /// accelerator opts into [`Self::with_direct_partition_writes`].
     #[expect(clippy::too_many_arguments)]
     #[must_use]
     pub fn new(

@@ -32,11 +32,11 @@ use data_components::postgres_replication::{
     ReplicationMetrics, ReplicationMetricsCollector, ReplicationParams, ReplicationStreamInput,
     SchemaEvolutionPolicy, config, start_replication_stream,
 };
+use data_connector_api::federated::FederatedTableProvider;
 use datafusion::sql::TableReference;
 use futures::StreamExt;
 use opentelemetry::KeyValue;
 use runtime::component::dataset::Dataset;
-use runtime::federated::FederatedTable;
 use runtime_api_types::v1::ComponentType;
 use runtime_metrics::component::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback};
 use runtime_parameters::{ExposedParamLookup, Parameters};
@@ -148,7 +148,7 @@ impl AppliedLsnStore for SidecarAppliedLsnStore {
 pub fn build_changes_stream(
     params: &Parameters,
     dataset: &Dataset,
-    federated_table: Arc<FederatedTable>,
+    federated_table: Arc<dyn FederatedTableProvider>,
     metrics: Arc<ReplicationMetricsCollector>,
 ) -> ChangesStream {
     let dataset_name = dataset.name.to_string();

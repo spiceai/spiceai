@@ -1,0 +1,99 @@
+{
+  "_comment": "Frozen output of `gh pr view <num> --json title,body,author,labels` for every PR in commits.txt. Captured for the writeReleaseNotes eval; do not query GitHub when using this fixture.",
+  "12010": {
+    "title": "feat(snowflake): add on_conflict write-back behaviour",
+    "author": { "login": "Jeadie" },
+    "labels": ["kind/enhancement", "connector/snowflake"],
+    "body": "Adds an `on_conflict` parameter to the Snowflake data connector for `INSERT INTO` write-back. Accepts `error` (default, preserves today's behaviour), `skip`, and `replace`. `replace` issues a MERGE keyed on the dataset primary key.\n\n```yaml\ndatasets:\n  - from: snowflake:SALES.PUBLIC.ORDERS\n    name: orders\n    params:\n      on_conflict: replace\n```\n\nDocs: https://spiceai.org/docs/components/data-connectors/snowflake"
+  },
+  "12014": {
+    "title": "feat(cayenne): add cayenne_scan_concurrency setting",
+    "author": { "login": "lukekim" },
+    "labels": ["kind/enhancement", "accelerator/cayenne"],
+    "body": "Adds `cayenne_scan_concurrency` to bound how many Vortex files Cayenne decodes at once. Default `auto` derives the bound from the CPU budget. An explicit integer pins it.\n\nOn a 96-core node with a 4-core entitlement the old code opened one decode task per file group, which pushed resident memory to 3.2x the query memory limit on TPC-DS q64. Bounding decode concurrency holds peak resident memory within the limit and leaves scan throughput unchanged in the SF-100 benchmark.\n\n```yaml\nacceleration:\n  engine: cayenne\n  params:\n    cayenne_scan_concurrency: auto # 'auto' (default) or an integer\n```"
+  },
+  "12019": {
+    "title": "fix(postgres): retry replication slot creation on SQLSTATE 55006",
+    "author": { "login": "sgrebnov" },
+    "labels": ["kind/bug", "connector/postgres"],
+    "body": "During a rolling deploy the outgoing runtime can still hold a replication slot when the incoming one starts. Slot creation then failed with SQLSTATE 55006 (`replication slot is active for PID`) and terminated the CDC stream permanently.\n\nSlot creation now classifies 55006 as transient and retries with Fibonacci backoff for up to 60s. A dataset that cannot acquire the slot within that window reports a structured error naming the slot and the holding PID."
+  },
+  "12021": {
+    "title": "fix(cayenne): correct row counts after deletion-vector compaction",
+    "author": { "login": "phillipleblanc" },
+    "labels": ["kind/bug", "accelerator/cayenne", "priority/p0"],
+    "body": "`SELECT COUNT(*)` on a Cayenne table returned the pre-compaction row count for up to one compaction interval after a deletion-vector compaction. Compaction rewrote the file manifest but did not invalidate the cached statistics, so the optimizer answered the count from stale exact statistics.\n\nCompaction now invalidates the cached statistics in the same transaction that publishes the new manifest. Statistics for a table with an active overlay are reported as inexact, so DataFusion recomputes the count instead of substituting it.\n\nThis was a correctness bug: the returned count was wrong, not merely stale in a bounded way."
+  },
+  "12025": {
+    "title": "feat(runtime)!: rename runtime.cpu.cores to runtime.cpu.limit",
+    "author": { "login": "lukekim" },
+    "labels": ["kind/enhancement", "breaking-change"],
+    "body": "BREAKING: `runtime.cpu.cores` is renamed to `runtime.cpu.limit`, `--cpu-cores` to `--cpu-limit`, and `SPICE_CPU_CORES` to `SPICE_CPU_LIMIT`. The value format is unchanged (`auto`, `4`, `3.5`, `3500m`).\n\n`cores` read as a count of physical cores. The value is a fractional CPU entitlement, matching the Kubernetes `limits.cpu` it usually mirrors, so `limit` is the accurate name.\n\nThe old names still load with a deprecation warning and will be removed in v3.0.\n\n```yaml\n# Before\nruntime:\n  cpu:\n    cores: 4\n\n# After\nruntime:\n  cpu:\n    limit: 4\n```"
+  },
+  "12027": {
+    "title": "chore(deps): bump duckdb from 1.5.3 to 1.6.0",
+    "author": { "login": "dependabot[bot]" },
+    "labels": ["dependencies"],
+    "body": "Bumps the vendored DuckDB from v1.5.3 to v1.6.0. Picks up the DuckDB 1.6 query optimizer changes and a fix for HNSW index persistence."
+  },
+  "12028": {
+    "title": "chore(deps): bump serde from 1.0.219 to 1.0.221",
+    "author": { "login": "dependabot[bot]" },
+    "labels": ["dependencies"],
+    "body": "Routine transitive bump. No user-visible change."
+  },
+  "12002": {
+    "title": "fix(tests): update snapshots for DataFusion 54",
+    "author": { "login": "github-actions[bot]" },
+    "labels": ["kind/chore"],
+    "body": "Regenerates insta snapshots after the DataFusion 54 plan formatting change. Test-only."
+  },
+  "12005": {
+    "title": "chore(ci): rewrite the benchmark dispatch workflow",
+    "author": { "login": "phillipleblanc" },
+    "labels": ["kind/chore", "area/ci"],
+    "body": "Replaces the matrix-of-matrices benchmark dispatch with a single reusable workflow. No runtime change; CI only."
+  },
+  "12031": {
+    "title": "fix(flight): return 503 instead of 500 when the memory pool refuses a query",
+    "author": { "login": "bjchambers" },
+    "labels": ["kind/bug", "area/api"],
+    "body": "A query refused by the memory pool surfaced over Arrow Flight as `Internal` / HTTP 500, so clients retried it as a server fault and amplified the load.\n\nA pool refusal now maps to `ResourcesExhausted` / HTTP 503 with a `Retry-After` header. The HTTP SQL API already returned 503; this brings Flight in line."
+  },
+  "12033": {
+    "title": "docs: fix typo in acceleration README",
+    "author": { "login": "karifabri" },
+    "labels": ["kind/chore", "area/docs"],
+    "body": "Fixes `acclerated` -> `accelerated` in the acceleration README."
+  },
+  "12035": {
+    "title": "chore: Clean up Cargo.lock",
+    "author": { "login": "lukekim" },
+    "labels": ["kind/chore"],
+    "body": "Removes duplicate entries after the DuckDB bump."
+  },
+  "12038": {
+    "title": "feat(search): add recency_decay parameter to rrf()",
+    "author": { "login": "karifabri" },
+    "labels": ["kind/enhancement", "area/search"],
+    "body": "Adds an optional `recency_decay` argument to the `rrf()` reciprocal-rank-fusion function. It applies an exponential decay to each match by the age of a named timestamp column, so fresher documents rank higher at equal relevance. The decay half-life is given as a duration.\n\n```sql\nSELECT * FROM rrf(\n  vector_search(docs, 'replication lag'),\n  text_search(docs, 'replication lag'),\n  recency_decay => '30d'\n);\n```\n\nOmitting the argument preserves today's ranking exactly.\n\nDocs: https://spiceai.org/docs/features/search"
+  },
+  "12040": {
+    "title": "revert: \"feat(cayenne): experimental spill-to-disk\"",
+    "author": { "login": "phillipleblanc" },
+    "labels": ["kind/chore"],
+    "body": "Reverts #11990, which landed after v2.1.3 was cut and never shipped in a release. The spill path deadlocked under concurrent compaction."
+  },
+  "12042": {
+    "title": "fix(duckdb): honor memory_limit for file-mode accelerations",
+    "author": { "login": "sgrebnov" },
+    "labels": ["kind/bug", "accelerator/duckdb"],
+    "body": "A DuckDB file-mode acceleration ignored `runtime.memory_limit` and sized its buffer pool from total host memory. On a 32 GiB host with an 8 GiB limit, a refresh of a large dataset drove the process to 24 GiB resident and the container was OOM-killed.\n\nThe DuckDB buffer pool is now sized from the runtime memory limit. Where no limit is set, it is sized from the process cgroup limit rather than host memory."
+  },
+  "12044": {
+    "title": "chore(benchmarks): disable flaky tpcds q78 in CI",
+    "author": { "login": "github-actions[bot]" },
+    "labels": ["kind/chore", "area/ci"],
+    "body": "q78 times out intermittently on the shared runner. Disabled pending investigation."
+  }
+}
