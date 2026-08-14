@@ -787,6 +787,38 @@ mod tests {
             .expect("field should exist in schema");
     }
 
+    /// Format detection runs before the array reader and *consumes* the
+    /// prefix it skips, so whichever predicate it uses decides what the
+    /// reader's own guards ever get to see. With the wider
+    /// `is_ascii_whitespace`, a leading form feed — which `serde_json` rejects
+    /// — was eaten here and the body reached `ArrayToNdjson` already looking
+    /// well formed.
+    ///
+    /// This goes through `infer_json_schema_for_format`, the wiring the
+    /// default `Format::Auto` actually uses; a test that constructs the
+    /// adapter itself passes whether or not detection is correct.
+    #[test]
+    fn a_leading_form_feed_is_not_eaten_by_format_detection() {
+        for format in [Format::Auto, Format::Json, Format::Array] {
+            for body in [&b"\x0c[{\"a\":1}]"[..], &b"\x0b[{\"a\":1}]"[..]] {
+                let mut take = || true;
+                assert!(
+                    infer_json_schema_for_format(body, format, &mut take).is_err(),
+                    "{format:?} accepted {:?}, which serde_json rejects",
+                    String::from_utf8_lossy(body)
+                );
+            }
+        }
+
+        // The four bytes JSON does admit still reach the array reader.
+        let mut take = || true;
+        let schema = infer_json_schema_for_format(b" \t\r\n[{\"a\":1}]", Format::Auto, &mut take)
+            .expect("JSON whitespace before the array must remain acceptable");
+        schema
+            .field_with_name("a")
+            .expect("field should exist in schema");
+    }
+
     #[test]
     fn test_infer_schema_object_pretty_printed() {
         let buf = b"{\n  \"airports\": 23\n}";

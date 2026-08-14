@@ -690,8 +690,13 @@ pub fn peek_first_non_ws_byte<R: BufRead>(reader: &mut R) -> io::Result<u8> {
             ));
         }
         for (i, &byte) in buf.iter().enumerate() {
-            if !byte.is_ascii_whitespace() {
-                // Consume only the leading whitespace, leave the non-ws byte
+            if !is_json_whitespace(byte) {
+                // Consume only the leading whitespace, leave the non-ws byte.
+                // The predicate has to be JSON's, not `is_ascii_whitespace`'s:
+                // this consumes what it skips, so a wider one would eat a form
+                // feed here and hand `ArrayToNdjson` a body whose invalid
+                // prefix is already gone — the prologue guard would then never
+                // see the byte it exists to reject.
                 reader.consume(i);
                 return Ok(byte);
             }
@@ -4614,12 +4619,14 @@ mod tests {
         /// version of this got wrong: `is_ascii_whitespace` already excludes
         /// it, so it was rejected before this change and must stay rejected.
         ///
-        /// Deliberately unchanged: `peek_first_non_ws_byte`, which only
-        /// decides whether a body *looks* like an array, and
-        /// `filter_element_bytes`, which trims a row serde has already
-        /// accepted. Neither decides whether the input is valid, and
-        /// tightening detection would route a bad body to a worse error than
-        /// the one the guards now give it.
+        /// Format detection is covered too, in `file_format`: it *consumes*
+        /// the prefix it skips, so a wider predicate there deletes the invalid
+        /// byte before any guard runs. Calling the adapters directly, as this
+        /// test does, cannot see that.
+        ///
+        /// Deliberately unchanged: `filter_element_bytes`, which trims a row
+        /// `serde_json` has already accepted. It formats output rather than
+        /// judging input, so JSON's whitespace rules do not govern it.
         #[test]
         fn a_form_feed_is_not_whitespace_to_either_reader() {
             for body in [
