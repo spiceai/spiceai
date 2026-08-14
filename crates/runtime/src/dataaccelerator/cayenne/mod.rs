@@ -2845,6 +2845,10 @@ impl DataAccelerator for CayenneAccelerator {
         "cayenne"
     }
 
+    fn type_rewrite_rules(&self) -> arrow_tools::type_rewrite::TypeRewriteRules {
+        cayenne::CAYENNE_TYPE_REWRITE_RULES
+    }
+
     fn valid_file_extensions(&self) -> Vec<&'static str> {
         vec!["cayenne"]
     }

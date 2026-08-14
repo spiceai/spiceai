@@ -40,7 +40,7 @@ use datafusion_table_providers::sql::sql_provider_datafusion::{SqlTable, expr::E
 use runtime::component::dataset::Dataset;
 use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
-    DataConnectorResult, NewDataConnectorResult,
+    DataConnectorResult, NewDataConnectorResult, parameters::ConnectorContext,
 };
 use runtime_datafusion::function_support::deny_spice_functions_for_postgres_table_providers;
 use runtime_metrics::component::MetricsProvider;
@@ -67,6 +67,10 @@ pub struct Postgres {
     factory: PostgresTableFactory,
     pool: Arc<PostgresConnectionPool>,
     params: Parameters,
+    /// Retained so the replication stream can resolve the applied-LSN watermark store
+    /// over the dataset's accelerator. `None` only in unit tests, which build params
+    /// without a runtime attached.
+    context: Option<Arc<dyn ConnectorContext>>,
     replication_metrics:
         std::sync::Arc<data_components::postgres_replication::ReplicationMetricsCollector>,
 }
@@ -293,6 +297,7 @@ impl DataConnectorFactory for PostgresFactory {
                         factory,
                         pool,
                         params: params_for_replication,
+                        context: params.context.clone(),
                         replication_metrics:
                             data_components::postgres_replication::ReplicationMetricsCollector::new(
                             ),
@@ -1084,6 +1089,7 @@ impl DataConnector for Postgres {
         Some(replication::build_changes_stream(
             &self.params,
             dataset,
+            self.context.clone(),
             federated_table,
             Arc::clone(&self.replication_metrics),
         ))

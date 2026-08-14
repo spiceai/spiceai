@@ -53,7 +53,8 @@ use super::on_conflict::{
     PkDeletionSnapshot, PkKeysetInvalidatingDeletionSink, PreparedInsertStream,
     PreparedOnConflictDeletionPublish, PreparedOnConflictDurablePayload,
     PreparedProtectedSnapshotUpdate, PreparedShardedInsertStream, ProtectedSnapshotScan,
-    RowKeyDeletionDelta, ShardedApplyResult, pk_deletion_snapshot_for_strategy,
+    RowCountExactnessTaintingDeletionSink, RowKeyDeletionDelta, ShardedApplyResult,
+    pk_deletion_snapshot_for_strategy,
 };
 use super::pk_index::{
     BoundedShardedPkIndexBuilder, COLD_PK_BLOOM_PER_FILE_MAX_BYTES, CachedPkIndex, CachedPkKeyset,
@@ -952,38 +953,6 @@ struct CachedTableStatistics {
     /// COUNT(*) fold declines rather than answering from a possibly-drifted count.
     /// Defaults `false` (conservative: an uninitialized cache is not trusted exact).
     count_exact: bool,
-    /// Whether an abandoned statistics update left the maintained count short:
-    /// the rows it did not describe are already visible to scans, and no
-    /// persisted count includes them.
-    ///
-    /// Sticky, because the gap does not close on its own. The next persist
-    /// derives its exactness from the *record*, which is the pre-gap baseline, so
-    /// a later `Delta { exact: true }` would compute `true` over a short count and
-    /// overwrite `count_exact` with it — republishing exactly the wrong answer
-    /// this demotion exists to prevent. Only an authoritative
-    /// [`RowCountUpdate::Set`] (compaction/overwrite materializes exactly the live
-    /// rows) re-baselines the count and clears it.
-    ///
-    /// Deliberately survives `clear_cached_table_statistics_unlocked`: dropping
-    /// the cache does not fill the gap.
-    abandoned_update_outstanding: bool,
-}
-
-impl CachedTableStatistics {
-    /// Whether the maintained count may be served as a provably-exact live count.
-    ///
-    /// The outstanding-gap veto is part of this answer rather than a separate
-    /// check at the gate, because `count_exact` is re-derived from the cached
-    /// `raw` record in places that have no reason to know about the gap — and
-    /// `raw` is only replaced by a *successful* persist, so after an abandoned one
-    /// it is the pre-gap record, still flagged exact. A re-derivation
-    /// (`evolve_schema_live`'s schema-width pass) would therefore hand back
-    /// `true` while rows that no persisted count describes are visible to scans.
-    /// Folding the veto in here means no assignment to `count_exact`, present or
-    /// future, can leak an exact short count to the `COUNT(*)` fold.
-    fn count_is_exact(&self) -> bool {
-        self.count_exact && !self.abandoned_update_outstanding
-    }
 }
 
 /// The outcome of reading a table's persisted statistics record.
@@ -1571,6 +1540,16 @@ pub struct CayenneTableProvider {
     /// concurrent maintenance tasks cannot merge from the same cached base and
     /// overwrite each other's row-count or column-stat deltas.
     table_statistics_persistence_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Set when a durable `num_rows_exact` taint (or an authoritative `Set`) failed
+    /// to persist, so the metastore's exactness bit is known to over-claim.
+    ///
+    /// The local demotion in the statistics cache is not enough on its own: the
+    /// statistics merge re-derives the prior exactness from the persisted record,
+    /// which still reads exact, so the next provably-exact `Delta` would republish
+    /// the stale count as `Exact` and undo the demotion. While this is set, no merge
+    /// may report an exact count and every later `DELETE` retries the durable write.
+    /// Cleared by the write that finally lands.
+    row_count_taint_pending: Arc<AtomicBool>,
     /// Optional retention filters that should be applied immediately after writes.
     retention_filters: Vec<Expr>,
     /// Optional builder to construct time-based retention filter.
@@ -6367,9 +6346,9 @@ impl CayenneTableProvider {
                 optimizer: table_statistics,
                 raw: None, // will be populated on first load/persist
                 count_exact: table_statistics_count_exact,
-                abandoned_update_outstanding: false,
             })),
             table_statistics_persistence_lock: Arc::new(tokio::sync::Mutex::new(())),
+            row_count_taint_pending: Arc::new(AtomicBool::new(false)),
             retention_filters,
             time_retention_filter_builder,
             context,
@@ -7563,6 +7542,7 @@ impl CayenneTableProvider {
             scan_file_statistics: Arc::clone(&self.scan_file_statistics),
             table_statistics: Arc::clone(&self.table_statistics),
             table_statistics_persistence_lock: Arc::clone(&self.table_statistics_persistence_lock),
+            row_count_taint_pending: Arc::clone(&self.row_count_taint_pending),
             context: Arc::clone(&self.context),
             retention_filters: self.retention_filters.clone(),
             time_retention_filter_builder: self.time_retention_filter_builder.clone(),
@@ -7850,15 +7830,15 @@ impl CayenneTableProvider {
         let cache = self.table_statistics.read();
         // Serve the Inexact view when either (a) uncheckpointed visibility changes
         // mean the persisted count over-counts live rows, OR (b) the maintained
-        // count itself is not a provably-exact live count — either because
-        // `count_exact` is false (the mem-tier checkpoint's best-effort delta, cleared
-        // by a full-rewrite `Set`) or because an abandoned update left an outstanding
-        // gap, which vetoes exactness even after `count_exact` is re-derived from the
-        // pre-gap `raw` record (see [`CachedTableStatistics::count_is_exact`]).
+        // count itself is not a provably-exact live count (`count_exact == false`,
+        // set by the mem-tier checkpoint's best-effort delta, by an abandoned update
+        // via `arm_row_count_taint_retry` — which also drops `raw`, so no later
+        // re-derivation can resurrect exactness from the pre-gap record — and cleared
+        // by a full-rewrite `Set`).
         // (b) is what stops a drifted count from being served
         // `Exact` to the COUNT(*) fold once no deletions are pending — the fold then
         // declines and a real scan answers, fixing the distributed over-count.
-        let serve_inexact = has_pending_visibility_changes || !cache.count_is_exact();
+        let serve_inexact = has_pending_visibility_changes || !cache.count_exact;
         let cached_ref: Option<&Statistics> = if serve_inexact {
             cache.optimizer_inexact.as_ref()
         } else {
@@ -17232,6 +17212,10 @@ impl CayenneTableProvider {
     /// read-optimized Vortex files, returning one [`ColdTierFile`] per written
     /// file with accurate per-file footer statistics (for listing-time pruning).
     ///
+    /// A file whose footer row count cannot be read is still returned — dropping
+    /// it would lose rows — carrying the placeholder `row_count` of 0 that
+    /// [`Self::promote_warm_to_cold_inner`] treats as an unknown count.
+    ///
     /// Single ordered run (`target_partitions = 1`) so the Z-order survives across
     /// cold files — each file is a contiguous slice of the sorted order, giving
     /// tight, non-overlapping zone maps. Bloom-eligible tables split the stream
@@ -17378,12 +17362,24 @@ impl CayenneTableProvider {
             let stats = format
                 .infer_stats(session_state.as_ref(), &store, self.table_schema(), &meta)
                 .await?;
-            let row_count = stats
+            let inferred_row_count = stats
                 .num_rows
                 .get_value()
                 .copied()
-                .and_then(|v| i64::try_from(v).ok())
-                .unwrap_or(0);
+                .and_then(|v| i64::try_from(v).ok());
+            if inferred_row_count.is_none() {
+                // The manifest still records this file (dropping it would lose
+                // rows), but its row count falls back to the placeholder 0 below,
+                // which the promotion reads as "unknown" and refuses to build an
+                // exact live count from.
+                tracing::warn!(
+                    target: "cayenne::compaction",
+                    table = self.table_metadata.table_name.as_str(),
+                    file = %meta.location,
+                    "Datalake file row count could not be read from its footer; the maintained row count stays inexact until the next full rewrite"
+                );
+            }
+            let row_count = inferred_row_count.unwrap_or(0);
             total_rows += u64::try_from(row_count.max(0)).unwrap_or(0);
             let statistics_blob =
                 crate::stats::statistics_to_persisted_blob(&stats, &self.table_metadata.schema)
@@ -17938,6 +17934,21 @@ impl CayenneTableProvider {
             "Committing the datalake manifest + snapshot flip under fence"
         );
         let cold_files = Arc::new(cold_files);
+        // Captured BEFORE the commit: `commit_overwrite_to_cold` deletes this
+        // table's `cayenne_table_statistics` row, so the re-baseline below has to
+        // carry the min/max + NDV aggregate over from here rather than re-reading a
+        // row that no longer exists. See `write_rebaselined_row_count`.
+        let stats_baseline = self.load_persisted_table_statistics().await;
+        // Demote the served exactness BEFORE publishing. The commit below clears the
+        // deletion index, so `has_pending_deletions()` — the mask that has been
+        // keeping a delete-staled count off the `Exact` path — goes false the moment
+        // the fence releases, while the re-baseline that corrects the count only
+        // lands afterwards. `optimizer_table_statistics()` does not take
+        // `listing_fence`, so without this a distributed `COUNT(*)` can fold the
+        // stale value in that window. The `Set` restores exactness once it holds an
+        // authoritative count; if it never lands, staying inexact is the right
+        // resting state anyway.
+        self.table_statistics.write().count_exact = false;
         {
             let _fence = self.listing_fence.write().await;
             self.catalog
@@ -17957,6 +17968,54 @@ impl CayenneTableProvider {
             // metastore read, and no capture can observe one half without the other.
             self.store_cold_manifest(&new_snapshot_id, &cold_files);
         }
+
+        // Re-baseline the maintained live row count from the manifest this commit
+        // just registered. Promotion is a full-rewrite fold: it applies every
+        // tombstone physically and clears the deletion index, which drops
+        // `has_pending_deletions()` — the only thing masking a count a standalone
+        // delete left stale. Compaction and overwrite `Set` their count for the
+        // same reason; without this, promotion instead restores `Exact` over the
+        // stale value, and an exact statistic may be substituted into a result
+        // (a distributed `COUNT(*)` then over-counts by the deleted rows).
+        //
+        // The committed manifest IS the whole live set: warm and the prior cold
+        // manifest were overwrite-cleared, and the mem/inline tiers were
+        // checkpointed into the rewrite above. Its sum may only be claimed exact
+        // when every entry's count is known, judged over the WHOLE manifest — a
+        // carried-forward clean file's count comes from the prior manifest, where
+        // an earlier promotion may have left the placeholder 0 for a footer it
+        // could not read, so checking only the files this promotion wrote would
+        // mark the sum `Exact` while omitting every row in that carried file. Any
+        // non-positive count therefore reads as unknown; a genuinely empty file
+        // costs the metadata `COUNT(*)` fast path until the next full rewrite,
+        // which is the safe direction to be wrong in.
+        // `checked_add`, not `saturating_add`: a clamp to `i64::MAX` would publish an
+        // undercount as exact. An overflowing total reads as unknown like any other
+        // unreadable count. (Unreachable for a real table — it needs more live rows
+        // than `i64::MAX` — but the exactness claim should not rest on that.)
+        let mut live_rows: Option<i64> = Some(0);
+        let mut counts_known = true;
+        for file in cold_files.iter() {
+            live_rows = live_rows.and_then(|sum| sum.checked_add(file.row_count.max(0)));
+            counts_known &= file.row_count > 0;
+        }
+        let counts_known = counts_known && live_rows.is_some();
+        let live_rows = live_rows.unwrap_or(0);
+        if !counts_known {
+            tracing::debug!(
+                target: "cayenne::compaction",
+                table = self.table_metadata.table_name.as_str(),
+                manifest_files = cold_files.len(),
+                "Datalake manifest carries an unknown row count; leaving the maintained count inexact"
+            );
+        }
+        if counts_known {
+            self.set_persisted_row_count(stats_baseline, live_rows)
+                .await;
+        } else {
+            self.taint_persisted_row_count_exactness().await;
+        }
+
         if let Err(error) = self.prune_snapshot_manifest_to(&new_snapshot_id).await {
             tracing::warn!(
                 target: "cayenne::compaction",
@@ -21166,37 +21225,235 @@ impl CayenneTableProvider {
             .await;
     }
 
-    /// Abandon a statistics update, demoting the cached exactness on the way out.
+    /// Abandon a statistics update, arming the row-count taint on the way out.
     ///
     /// Every failing exit of [`Self::persist_table_stats_locked`] returns through
     /// here, so the demotion is a property of "the update was abandoned" rather
     /// than of any one branch — a fourth bail-out cannot silently skip it.
     ///
-    /// The demotion is what makes abandoning safe. The post-write maintenance
-    /// drain reads the returned `bool` and keeps its live-rows delta outstanding,
-    /// which holds the count `Inexact` on its own; the mem-tier checkpoint does
-    /// not — it discards the `bool`, the `Delta { exact: false }` it passes is the
-    /// very update being abandoned, and it has already cleared the in-memory
-    /// proxies (resident inline rows, mem-tier tombstones) that would otherwise
-    /// demote the stats. Without this, that path serves an `Exact` count which no
-    /// persisted record describes.
+    /// It is what makes abandoning safe. The post-write maintenance drain reads the
+    /// returned `bool` and keeps its live-rows delta outstanding, which holds the
+    /// count `Inexact` on its own; the mem-tier checkpoint does not — it discards
+    /// the `bool`, the `Delta { exact: false }` it passes is the very update being
+    /// abandoned, and it has already cleared the in-memory proxies (resident inline
+    /// rows, mem-tier tombstones) that would otherwise demote the stats. Without
+    /// this, that path serves an `Exact` count no persisted record describes.
     ///
-    /// The demotion is recorded as an outstanding gap
-    /// ([`CachedTableStatistics::abandoned_update_outstanding`]) rather than a
-    /// bare `count_exact = false`, because the next persist derives its exactness
-    /// from the *record* — the pre-gap baseline — and would otherwise compute
-    /// `true` over a short count and overwrite the demotion with it. Cache-only,
-    /// so unlike a durable taint it cannot fail in turn; an authoritative
-    /// [`RowCountUpdate::Set`] is what closes the gap.
+    /// [`Self::arm_row_count_taint_retry`] is exactly the right primitive and is
+    /// reused rather than duplicated: an abandoned update and a failed exactness
+    /// taint leave the same defect — a durable `num_rows_exact` that over-claims
+    /// relative to what is visible to scans — so they need the same three effects.
+    /// It demotes the served count, drops `raw` so no later re-derivation can
+    /// resurrect exactness from the pre-gap record, and leaves the correction owed
+    /// so a later `DELETE` retries it durably, which a cache-only flag cannot do.
     fn abandon_table_stats_update(&self, reason: &str) -> bool {
         tracing::warn!(
             "Abandoning table stats update for {}: {reason}",
             self.table_metadata.table_name
         );
+        self.arm_row_count_taint_retry();
+        false
+    }
+
+    /// Read the persisted statistics record, preferring the in-memory raw blob so
+    /// the common case costs no catalog round-trip. `None` means the table has no
+    /// statistics row (nothing serves a count) or the read failed.
+    async fn load_persisted_table_statistics(&self) -> Option<TableStatistics> {
+        if let Some(raw) = self.table_statistics.read().raw.clone() {
+            return Some(raw);
+        }
+        match self
+            .catalog
+            .get_table_statistics(&self.table_metadata.table_id)
+            .await
+        {
+            Ok(stats) => stats,
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to load table stats for {} while amending the maintained row count: {e}",
+                    self.table_metadata.table_name
+                );
+                None
+            }
+        }
+    }
+
+    /// Apply `num_rows_update` to the persisted statistics **without** a write
+    /// accumulator to merge — for the callers that change how many rows are live
+    /// without producing one.
+    ///
+    /// The row-count arms are [`Self::persist_table_stats_locked`]'s, shared via
+    /// [`Self::apply_row_count_update`]; the min/max + NDV blob is carried forward
+    /// verbatim. That is sound for both kinds of caller: a delete can only narrow
+    /// the live aggregate, so the existing one stays a valid superset, and a
+    /// datalake promotion writes through the cold Vortex sink, which accumulates no
+    /// column stats to merge.
+    ///
+    /// The record is read **inside** the persistence lock. Reading it outside would
+    /// be a lost update: a maintenance persist can commit a row-count delta and
+    /// refresh the cached record between the read and the lock, and writing the
+    /// older record back would drop that delta along with the column statistics it
+    /// merged.
+    ///
+    /// `fallback_baseline` is used only when no record can be read under the lock.
+    /// Datalake promotion needs it because `commit_overwrite_to_cold` routes through
+    /// `commit_overwrite_in_txn`, which deletes the table's
+    /// `cayenne_table_statistics` row — so it captures the record before committing
+    /// and hands it here. A record that *does* exist under the lock is preferred
+    /// over it, being at least as new.
+    ///
+    /// Best-effort like [`Self::persist_table_stats`], with one asymmetry: a failure
+    /// arms [`Self::row_count_taint_pending`], because continuing to serve or
+    /// re-derive an exact count is the wrong-answer direction.
+    async fn write_rebaselined_row_count(
+        &self,
+        fallback_baseline: Option<TableStatistics>,
+        num_rows_update: RowCountUpdate,
+    ) {
+        let _stats_persistence_guard = self.table_statistics_persistence_lock.lock().await;
+
+        let Some(baseline) = self
+            .load_persisted_table_statistics()
+            .await
+            .or(fallback_baseline)
+        else {
+            // Either no statistics record exists or the read failed —
+            // `load_persisted_table_statistics` cannot tell the two apart. Both
+            // demote: the derived cache can still be serving an exact count loaded
+            // at open, and the caller has just invalidated it.
+            self.arm_row_count_taint_retry();
+            return;
+        };
+
+        let (num_rows, num_rows_exact) = Self::apply_row_count_update(
+            num_rows_update,
+            baseline.num_rows,
+            baseline.num_rows_exact,
+        );
+        let stats = TableStatistics {
+            num_rows,
+            num_rows_exact,
+            ..baseline
+        };
+        if let Err(e) = self.catalog.upsert_table_statistics(&stats).await {
+            tracing::warn!(
+                "Failed to persist the amended maintained row count for {}: {e}",
+                self.table_metadata.table_name
+            );
+            self.arm_row_count_taint_retry();
+            return;
+        }
+
+        // The durable bit now matches what is served, so nothing is owed.
+        self.row_count_taint_pending.store(false, Ordering::Release);
+        // `num_rows` feeds the derived `Statistics`, so both cached views are
+        // rebuilt rather than only flipping `count_exact`.
+        self.store_cached_table_statistics(stats);
+    }
+
+    /// Record that the durable exactness bit over-claims and could not be corrected:
+    /// stop serving the count `Exact`, stop any merge re-deriving exactness from the
+    /// persisted record, and leave the write owed so a later `DELETE` retries it.
+    ///
+    /// `raw` is dropped alongside so the next merge re-reads the catalog rather than
+    /// building on a record this process already distrusts.
+    fn arm_row_count_taint_retry(&self) {
+        self.row_count_taint_pending.store(true, Ordering::Release);
         let mut cache = self.table_statistics.write();
         cache.count_exact = false;
-        cache.abandoned_update_outstanding = true;
-        false
+        cache.raw = None;
+    }
+
+    /// Re-baseline the maintained live row count to an authoritative live count,
+    /// re-establishing exactness — the datalake-promotion counterpart to
+    /// compaction's and overwrite's `Set`. `baseline` must have been captured
+    /// before the promotion's commit; see [`Self::write_rebaselined_row_count`].
+    ///
+    /// Carrying the previous column aggregate forward alongside an exact count is
+    /// deliberate and safe: the metadata-only `MIN`/`MAX`/`SUM` fold
+    /// ([`crate::stats_aggregate`]) consumes the *scan's* statistics, which come
+    /// from the live files' footers, and the table-level aggregate only refills
+    /// columns the scan leaves `Absent` (`restore_absent_column_statistics`). So the
+    /// carried blob — a documented superset whose min/max only ever widened — cannot
+    /// displace a live footer value and be folded into an answer.
+    pub(crate) async fn set_persisted_row_count(
+        &self,
+        baseline: Option<TableStatistics>,
+        live_rows: i64,
+    ) {
+        self.write_rebaselined_row_count(baseline, RowCountUpdate::Set(live_rows))
+            .await;
+    }
+
+    /// Mark the maintained live row count as no longer a provably-exact live count,
+    /// durably, so no later fold of a tombstone can serve a stale count `Exact` and
+    /// the taint survives a restart.
+    pub(crate) async fn taint_persisted_row_count_exactness(&self) {
+        // Cheap pre-lock reject: this runs on every user `DELETE` statement, so once
+        // the taint cannot change anything, skip the async mutex, the catalog read,
+        // and the derived-statistics rebuild. Both terms are needed. The evidence
+        // must be the cached *record* rather than `count_exact`, because a failed
+        // persist demotes `count_exact` locally while the durable bit stays exact;
+        // and `row_count_taint_pending` must clear the reject outright, since a
+        // dropped `raw` after such a failure would otherwise let an absent record
+        // read as "nothing owed". Racing with a concurrent persist costs at most a
+        // redundant write below, never a missed taint — the write path re-reads the
+        // record under the persistence lock.
+        if !self.row_count_taint_pending.load(Ordering::Acquire)
+            && self
+                .table_statistics
+                .read()
+                .raw
+                .as_ref()
+                .is_some_and(|raw| !raw.num_rows_exact)
+        {
+            return;
+        }
+        self.write_rebaselined_row_count(
+            None,
+            RowCountUpdate::Delta {
+                delta: 0,
+                exact: false,
+            },
+        )
+        .await;
+    }
+
+    /// Resolve a [`RowCountUpdate`] against the previous count and its exactness.
+    ///
+    /// Shared by [`Self::persist_table_stats_locked`] and
+    /// [`Self::write_rebaselined_row_count`] so the two cannot drift: a `Set` is
+    /// authoritative and re-establishes exactness, an `exact` `Delta` preserves the
+    /// prior exactness, a best-effort `Delta` taints it, and `Unchanged` preserves
+    /// both. The count never goes negative.
+    fn apply_row_count_update(
+        update: RowCountUpdate,
+        prev_num_rows: i64,
+        prev_num_rows_exact: bool,
+    ) -> (i64, bool) {
+        match update {
+            RowCountUpdate::Delta { delta, exact } => (
+                prev_num_rows.saturating_add(delta).max(0),
+                exact && prev_num_rows_exact,
+            ),
+            RowCountUpdate::Set(n) => (n.max(0), true),
+            RowCountUpdate::Unchanged => (prev_num_rows, prev_num_rows_exact),
+        }
+    }
+
+    /// Publish freshly-persisted statistics into the in-memory cache: both derived
+    /// views, the exactness bit `cached_table_statistics_for_optimizer` gates on,
+    /// and the raw blob the next persist reads instead of the catalog.
+    fn store_cached_table_statistics(&self, stats: TableStatistics) {
+        let df_stats = Self::table_statistics_to_df(&self.table_schema(), &stats);
+        let df_stats_inexact = df_stats
+            .as_ref()
+            .map(|s| Self::statistics_to_inexact(s.clone()));
+        let mut cache = self.table_statistics.write();
+        cache.optimizer = df_stats;
+        cache.optimizer_inexact = df_stats_inexact;
+        cache.count_exact = stats.num_rows_exact;
+        cache.raw = Some(stats);
     }
 
     /// Persist merged/replaced stats.
@@ -21266,7 +21523,12 @@ impl CayenneTableProvider {
         let prev_num_rows = existing_stats.as_ref().map_or(0, |e| e.num_rows);
         // Whether the prior count was provably exact. Absent existing stats (first
         // write / overwrite-replace) start exact; a `Set` overrides regardless.
-        let prev_num_rows_exact = existing_stats.as_ref().is_none_or(|e| e.num_rows_exact);
+        // A pending taint retry means the persisted `num_rows_exact` over-claims, so
+        // the prior exactness it would otherwise supply cannot be trusted — without
+        // this, the next provably-exact `Delta` republishes the stale count `Exact`
+        // and undoes the demotion the failed taint was supposed to make.
+        let prev_num_rows_exact = existing_stats.as_ref().is_none_or(|e| e.num_rows_exact)
+            && !self.row_count_taint_pending.load(Ordering::Acquire);
         let statistics_blob = match &existing_stats {
             Some(existing) => accumulator
                 .merged_file_statistics_blob(&existing.statistics_blob)
@@ -21296,23 +21558,8 @@ impl CayenneTableProvider {
         // taints it; `Unchanged` preserves. A tainted (`false`) count is served
         // `Inexact` so the COUNT(*) fold declines rather than answering from a
         // possibly-over-counted maintained value.
-        //
-        // An earlier abandoned update carries its own veto: the baseline this
-        // merge reads predates rows that are already visible to scans, so an
-        // incremental result over it is short however exact the delta itself is.
-        // Only a `Set` re-materializes the live count and closes the gap.
-        let update_is_authoritative = matches!(num_rows_update, RowCountUpdate::Set(_));
-        let abandoned_update_outstanding =
-            self.table_statistics.read().abandoned_update_outstanding;
-        let incremental_exactness_holds = prev_num_rows_exact && !abandoned_update_outstanding;
-        let (num_rows, num_rows_exact) = match num_rows_update {
-            RowCountUpdate::Delta { delta, exact } => (
-                prev_num_rows.saturating_add(delta).max(0),
-                exact && incremental_exactness_holds,
-            ),
-            RowCountUpdate::Set(n) => (n.max(0), true),
-            RowCountUpdate::Unchanged => (prev_num_rows, incremental_exactness_holds),
-        };
+        let (num_rows, num_rows_exact) =
+            Self::apply_row_count_update(num_rows_update, prev_num_rows, prev_num_rows_exact);
 
         let stats = TableStatistics {
             table_id: self.table_metadata.table_id.clone(),
@@ -21330,23 +21577,14 @@ impl CayenneTableProvider {
             return self.abandon_table_stats_update("the statistics record could not be written");
         }
 
-        let df_stats = Self::table_statistics_to_df(&self.table_schema(), &stats);
-        let df_stats_inexact = df_stats
-            .as_ref()
-            .map(|s| Self::statistics_to_inexact(s.clone()));
-        let mut cache = self.table_statistics.write();
-        cache.optimizer = df_stats;
-        cache.optimizer_inexact = df_stats_inexact;
-        cache.count_exact = stats.num_rows_exact;
-        // Only an authoritative `Set` closes an outstanding gap — it materialized
-        // exactly the live rows, so whatever an earlier abandon left undescribed is
-        // now counted. An incremental update merged onto the same short baseline
-        // and leaves the gap open.
-        if update_is_authoritative {
-            cache.abandoned_update_outstanding = false;
+        // An authoritative exact count settles anything a failed taint left owed:
+        // a full-rewrite `Set` measured the live rows directly, so the durable bit
+        // it just wrote is correct regardless of what the previous one claimed.
+        if stats.num_rows_exact {
+            self.row_count_taint_pending.store(false, Ordering::Release);
         }
-        // Keep the raw blob for the next persist to avoid a catalog read.
-        cache.raw = Some(stats);
+        // Keeping the raw blob also avoids a catalog read on the next persist.
+        self.store_cached_table_statistics(stats);
         true
     }
 
@@ -29212,12 +29450,12 @@ impl TableProvider for CayenneTableProvider {
         let file_sink = self
             .build_deletion_vector_sink(&filters, None, DeletionRequestSource::User)
             .await?;
-        Ok(Arc::new(DeletionExec::new(Arc::new(
-            InlineAwareDeletionSink {
+        Ok(Arc::new(DeletionExec::new(self.taint_row_count_exactness(
+            Arc::new(InlineAwareDeletionSink {
                 table: self.clone_for_write(),
                 file_sink,
                 filters,
-            },
+            }),
         ))))
     }
 
@@ -29398,13 +29636,23 @@ impl CayenneTableProvider {
             Arc::clone(&self.write_lock),
             Arc::clone(&self.listing_fence),
         ));
-        Ok(Arc::new(DeletionExec::new(Arc::new(
-            PkKeysetInvalidatingDeletionSink {
+        Ok(Arc::new(DeletionExec::new(self.taint_row_count_exactness(
+            Arc::new(PkKeysetInvalidatingDeletionSink {
                 table: self.clone_for_write(),
                 inner: sink,
                 filters: filters.to_vec(),
-            },
+            }),
         ))))
+    }
+
+    /// Wrap a user-`DELETE` sink so a delete that removed rows taints the
+    /// maintained row count's exactness — see
+    /// [`RowCountExactnessTaintingDeletionSink`].
+    fn taint_row_count_exactness(&self, inner: Arc<dyn DeletionSink>) -> Arc<dyn DeletionSink> {
+        Arc::new(RowCountExactnessTaintingDeletionSink {
+            table: self.clone_for_write(),
+            inner,
+        })
     }
 
     /// Main deletion-vector path via [`CayenneDeletionSink`].
@@ -29420,12 +29668,12 @@ impl CayenneTableProvider {
             )
             .await?,
         );
-        Ok(Arc::new(DeletionExec::new(Arc::new(
-            PkKeysetInvalidatingDeletionSink {
+        Ok(Arc::new(DeletionExec::new(self.taint_row_count_exactness(
+            Arc::new(PkKeysetInvalidatingDeletionSink {
                 table: self.clone_for_write(),
                 inner: sink,
                 filters: filters.to_vec(),
-            },
+            }),
         ))))
     }
 
@@ -39778,18 +40026,18 @@ mod tests {
             .expect("restore the statistics table");
     }
 
-    /// Regression for #13010: the outstanding gap must veto exactness at the
-    /// optimizer gate, not merely in `count_exact`.
+    /// Regression for #13010: a schema evolution after an abandoned persist must
+    /// not resurrect the exact, short count.
     ///
-    /// `count_exact` is re-derived from the cached `raw` record by
-    /// `evolve_schema_live`'s schema-width pass, and `raw` is only replaced by a
-    /// *successful* persist — so after an abandoned one it is the pre-gap record,
-    /// still flagged exact. Re-deriving therefore restores `count_exact = true`
-    /// while rows no persisted count describes are visible to scans. If the gate
-    /// consults only `count_exact`, a schema evolution after a failed persist
-    /// serves that exact, short count to the distributed `COUNT(*)` fold.
+    /// `evolve_schema_live`'s width pass re-derives `count_exact` from the cached
+    /// `raw` record, and a persist only replaces `raw` on success — so an abandoned
+    /// one would otherwise leave the pre-gap record there, still flagged exact, for
+    /// the re-derivation to trust. What prevents that is `arm_row_count_taint_retry`
+    /// dropping `raw` as part of abandoning: the re-derivation then has nothing to
+    /// trust and yields `false`. This pins that behaviour, because the demotion is
+    /// only as good as the assignment sites that cannot undo it.
     #[tokio::test]
-    async fn an_outstanding_gap_survives_a_schema_evolution_rederiving_count_exact() {
+    async fn a_schema_evolution_after_an_abandoned_persist_does_not_resurrect_exactness() {
         let runtime_env = SessionContext::new().runtime_env();
         let schema = listing_parity_schema();
         let (provider, _catalog, temp_dir) = create_reopenable_append_table(
@@ -39884,14 +40132,9 @@ mod tests {
         );
         restore_table_statistics_table(temp_dir.path());
         assert!(
-            provider
-                .table_statistics
-                .read()
-                .raw
-                .as_ref()
-                .is_some_and(|raw| raw.num_rows_exact),
-            "precondition: the abandon left `raw` at the pre-gap record, still exact — this is \
-             what a re-derivation would trust"
+            provider.table_statistics.read().raw.is_none(),
+            "precondition: abandoning drops the cached record, so the re-derivation below has no \
+             pre-gap baseline to resurrect exactness from"
         );
 
         // Re-derive exactly as the schema-width pass does. `count_exact` comes back
@@ -39916,21 +40159,19 @@ mod tests {
             .await
             .expect("schema evolution succeeds with a gap open");
         assert!(
-            provider.table_statistics.read().count_exact,
-            "precondition: the re-derivation really did restore `count_exact` from the pre-gap \
-             record — without this the test would prove nothing about the veto"
+            !provider.table_statistics.read().count_exact,
+            "the re-derivation must not restore exactness after an abandoned persist"
         );
         assert!(
-            !matches!(
-                provider
-                    .optimizer_table_statistics()
-                    .expect("statistics are served after evolution")
-                    .num_rows,
-                datafusion_common::stats::Precision::Exact(_)
-            ),
-            "an outstanding gap must veto exactness at the gate: a schema evolution re-derived \
-             `count_exact` from the pre-gap record, and serving that Exact hands the COUNT(*) fold \
-             a count short by the abandoned update's rows"
+            provider
+                .optimizer_table_statistics()
+                .is_none_or(|stats| !matches!(
+                    stats.num_rows,
+                    datafusion_common::stats::Precision::Exact(_)
+                )),
+            "a schema evolution after an abandoned persist must not serve an Exact count: the \
+             durable record over-claims exactness relative to what is visible to scans, so \
+             handing it to the COUNT(*) fold answers short"
         );
     }
 

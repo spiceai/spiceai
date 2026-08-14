@@ -142,10 +142,11 @@ mod tests {
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::datasource::TableProvider;
     use datafusion::logical_expr::{
-        ColumnarValue, Expr, Extension, LogicalPlan, LogicalPlanBuilder, ScalarUDF, TableSource,
-        Volatility, builder::LogicalTableSource, create_udf, expr::ScalarFunction,
+        ColumnarValue, Expr, Extension, JoinType, LogicalPlan, LogicalPlanBuilder, ScalarUDF,
+        TableSource, Volatility, builder::LogicalTableSource, create_udf, expr::ScalarFunction,
     };
-    use datafusion::prelude::col;
+    use datafusion::prelude::{col, lit};
+    use datafusion::sql::unparser::Unparser;
     use datafusion_federation::sql::SQLExecutor;
     use datafusion_federation::{FederatedPlanNode, sql::SQLFederationPlanner};
     use datafusion_table_providers::sql::db_connection_pool::{
@@ -208,12 +209,15 @@ mod tests {
         ))
     }
 
+    fn table_source(fields: Vec<Field>) -> Arc<dyn TableSource> {
+        Arc::new(LogicalTableSource::new(Arc::new(Schema::new(fields))))
+    }
+
     fn scan_with_projection(udf_name: &str) -> LogicalPlan {
-        let schema = Arc::new(Schema::new(vec![
+        let source = table_source(vec![
             Field::new("id", DataType::Int32, false),
             Field::new("val", DataType::Utf8, true),
-        ]));
-        let source = Arc::new(LogicalTableSource::new(schema)) as Arc<dyn TableSource>;
+        ]);
         LogicalPlanBuilder::scan("t", source, None)
             .expect("scan")
             .project(vec![Expr::ScalarFunction(ScalarFunction::new_udf(
@@ -235,9 +239,12 @@ mod tests {
         )
     }
 
+    fn test_executor() -> impl SQLExecutor + 'static {
+        DenyFunctionsSqlExecutor::new(test_sql_table(), None)
+    }
+
     fn federated_plan(plan: LogicalPlan) -> LogicalPlan {
-        let executor: Arc<dyn SQLExecutor> =
-            Arc::new(DenyFunctionsSqlExecutor::new(test_sql_table(), None));
+        let executor: Arc<dyn SQLExecutor> = Arc::new(test_executor());
         let planner = Arc::new(SQLFederationPlanner::new(executor));
         LogicalPlan::Extension(Extension {
             node: Arc::new(FederatedPlanNode::new(plan, planner)),
@@ -312,5 +319,106 @@ mod tests {
 
         // Federation source schema must match the SqlTable schema verbatim.
         assert_eq!(adaptor.source.schema().as_ref(), schema.as_ref());
+    }
+
+    /// The upstream fixes these guard live in the `spiceai/datafusion` fork on
+    /// `spiceai-54`, so nothing here fails if a later pin bump drops them. The
+    /// fork's branch is re-cut per `DataFusion` major and takes its own tests with
+    /// it; these stay. Extend them whenever a pin bump carries another unparser
+    /// fix — #13081 tracks the three this bump left unguarded.
+    ///
+    /// This unparses through the federation executor, which supplies no dialect
+    /// here, so the SQL is the default dialect's rather than any one connector's.
+    /// The plan shapes, not the spelling, are what these assert.
+    fn federated_sql(plan: &LogicalPlan) -> String {
+        Unparser::new(test_executor().dialect().as_ref())
+            .plan_to_sql(plan)
+            .expect("plan should unparse")
+            .to_string()
+    }
+
+    /// Assert `first` is rendered before `second`, which pins the clause order
+    /// without pinning the formatting around it.
+    fn assert_precedes(sql: &str, first: &str, second: &str) {
+        let (Some(at_first), Some(at_second)) = (sql.find(first), sql.find(second)) else {
+            panic!("expected both `{first}` and `{second}` in: {sql}");
+        };
+        assert!(
+            at_first < at_second,
+            "expected `{first}` before `{second}` in: {sql}"
+        );
+    }
+
+    /// Regression test for #12406: a `fetch` the optimizer pushes into a join
+    /// input bounds that input, not the join's output. Dropping it asks the
+    /// remote engine for the whole table and evaluates the join over it, so the
+    /// query can return more rows than the plan it came from.
+    ///
+    /// The scan carries a filter as well as the fetch, which is the shape the
+    /// issue reports and the one the join-input transform rebuilds.
+    #[test]
+    fn a_fetch_pushed_into_a_join_input_survives_unparsing() {
+        let left = LogicalPlanBuilder::scan_with_filters_fetch(
+            "left_table",
+            table_source(vec![
+                Field::new("id", DataType::Utf8, false),
+                Field::new("name", DataType::Utf8, true),
+            ]),
+            None,
+            vec![col("left_table.id").eq(lit("a"))],
+            Some(5),
+        )
+        .expect("scan left");
+        let right = LogicalPlanBuilder::scan(
+            "right_table",
+            table_source(vec![
+                Field::new("id", DataType::Utf8, false),
+                Field::new("age", DataType::Int32, true),
+            ]),
+            None,
+        )
+        .expect("scan right")
+        .build()
+        .expect("build right");
+        let plan = left
+            .join_on(
+                right,
+                JoinType::Inner,
+                [col("left_table.id").eq(col("right_table.id"))],
+            )
+            .expect("join")
+            .build()
+            .expect("build join");
+
+        // The fetch bounds the input, so it is rendered inside that input's own
+        // scope rather than trailing the join.
+        assert_precedes(&federated_sql(&plan), "LIMIT 5", "INNER JOIN");
+    }
+
+    /// Regression test for #12591: SQL evaluates `WHERE` before `LIMIT`, so a
+    /// `Filter` above a `Limit` rendered as one `SELECT` carrying both means the
+    /// opposite of the plan — it can keep rows the plan excludes, and more rows
+    /// than the plan can produce.
+    #[test]
+    fn a_filter_above_a_limit_keeps_the_limit_scoped() {
+        let plan = LogicalPlanBuilder::scan(
+            "t",
+            table_source(vec![
+                Field::new("id", DataType::Utf8, false),
+                Field::new("name", DataType::Utf8, true),
+            ]),
+            None,
+        )
+        .expect("scan")
+        .limit(0, Some(5))
+        .expect("limit")
+        .filter(col("t.id").eq(lit("a")))
+        .expect("filter")
+        .build()
+        .expect("build");
+
+        // The limit has to be taken first, so it is rendered in a scope the
+        // filter sits outside of.
+        assert_precedes(&federated_sql(&plan), "LIMIT 5", "WHERE");
     }
 }
