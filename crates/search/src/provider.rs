@@ -53,6 +53,12 @@ pub enum UdtfSource {
         column: Option<String>,
         limit: Option<usize>,
         include_score: Option<bool>,
+        /// Encoded global BM25 collection statistics
+        /// ([`crate::generation::text_search::GlobalBm25Stats`], JSON) a
+        /// distributed search scores against. `None` scores with the local
+        /// partition's statistics.
+        #[serde(default)]
+        global_stats: Option<String>,
     },
     /// Created by `vector_search(tbl, query, [col], [limit], [include_score], [distance_metric => "cosine" | "l2"])`
     VectorSearch {

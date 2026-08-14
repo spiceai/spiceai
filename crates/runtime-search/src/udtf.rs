@@ -344,6 +344,11 @@ pub fn parse_limit_scalar(scalar: &ScalarValue) -> DataFusionResult<u64> {
 
 pub static TEXT_SEARCH_UDTF_NAME: &str = "text_search";
 
+/// Named argument that carries the encoded global BM25 collection statistics a
+/// distributed `text_search` scores against. Reserved for runtime use: the
+/// scheduler sets it on each executor's scored query; users do not pass it.
+pub static TEXT_SEARCH_GLOBAL_STATS_ARG: &str = "global_stats";
+
 #[derive(Debug, PartialEq, Clone)]
 pub struct TextSearchTableFuncArgs {
     pub tbl: TableReference,
@@ -351,6 +356,10 @@ pub struct TextSearchTableFuncArgs {
     pub column: Option<String>,
     pub limit: Option<usize>,
     pub include_score: Option<bool>,
+    /// Encoded global BM25 collection statistics (`GlobalBm25Stats`, JSON) to
+    /// score against, set on an executor by a distributed search. `None` scores
+    /// with the local partition's statistics.
+    pub global_stats: Option<String>,
 }
 
 impl TextSearchTableFuncArgs {
@@ -377,6 +386,20 @@ impl TextSearchTableFuncArgs {
             expr.push(Expr::Literal(
                 ScalarValue::Boolean(Some(include_score)),
                 None,
+            ));
+        }
+
+        // `global_stats` is a named argument (`global_stats => '<encoded>'`) so
+        // it stays distinct from the positional column/limit/include_score
+        // arguments regardless of which of those are present.
+        if let Some(global_stats) = self.global_stats.as_ref() {
+            let meta = FieldMetadata::new(BTreeMap::from([(
+                "spice.parameter_name".to_string(),
+                TEXT_SEARCH_GLOBAL_STATS_ARG.to_string(),
+            )]));
+            expr.push(Expr::Literal(
+                ScalarValue::Utf8(Some(global_stats.clone())),
+                Some(meta),
             ));
         }
 

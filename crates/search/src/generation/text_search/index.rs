@@ -40,9 +40,9 @@ use crate::aggregation::write_to_json_string;
 use crate::generation::text_search::query::FullTextSearchQuery;
 use crate::generation::text_search::util::{array_to_terms, with_json_subset_column};
 use crate::generation::text_search::{
-    FailedToInsertDataIntoIndexSnafu, FullTextSearchFieldIndex, IndexCreationSnafu,
-    InvalidIndexingSnafu, PersistedIndexColumnChangedSnafu, PersistedIndexMissingColumnsSnafu,
-    TextSearchIndexingSnafu,
+    FailedToInsertDataIntoIndexSnafu, FullTextSearchFieldIndex, GlobalBm25Stats,
+    IndexCreationSnafu, InvalidIndexingSnafu, PersistedIndexColumnChangedSnafu,
+    PersistedIndexMissingColumnsSnafu, TextSearchIndexingSnafu,
 };
 use crate::generation::util::get_primary_keys;
 use crate::index::SearchIndex;
@@ -235,6 +235,12 @@ pub struct FullTextDatabaseIndex {
     /// therefore disabled outright for a CDC-fed index — correctness over the
     /// one-commit-per-refresh optimization.
     cdc_attached: Arc<AtomicBool>,
+
+    /// Global BM25 collection statistics to score against, set on an executor
+    /// when a distributed search injects statistics summed across every
+    /// partition. Propagated to the [`FullTextSearchFieldIndex`] that scores.
+    /// `None` scores with the local partition's statistics.
+    global_stats: Option<Arc<GlobalBm25Stats>>,
 }
 
 impl std::fmt::Debug for FullTextDatabaseIndex {
@@ -444,6 +450,7 @@ impl FullTextDatabaseIndex {
             reader,
             defer_commit: Arc::new(AtomicBool::new(false)),
             cdc_attached: Arc::new(AtomicBool::new(false)),
+            global_stats: None,
         })
     }
 
@@ -480,7 +487,17 @@ impl FullTextDatabaseIndex {
             self.primary_key.clone(),
         )?;
         search_index.add_type_hints(&self.underlying_table().schema());
-        Ok(search_index)
+        Ok(search_index.with_global_stats(self.global_stats.clone()))
+    }
+
+    /// Score queries against the given global BM25 collection statistics instead
+    /// of the local partition's statistics. Set on an executor when a
+    /// distributed search injects statistics summed across every partition, so
+    /// scores are comparable across executors.
+    #[must_use]
+    pub fn with_global_stats(mut self, global_stats: Option<Arc<GlobalBm25Stats>>) -> Self {
+        self.global_stats = global_stats;
+        self
     }
 
     /// Given a [`RecordBatch`] of new data, find all [`Term`]s we need to delete. These terms are
@@ -693,6 +710,7 @@ impl FullTextDatabaseIndex {
             // Shared for the same reason as `defer_commit`: both handles drive the
             // same tantivy writer and must agree on whether deferral is allowed.
             cdc_attached: Arc::clone(&self.cdc_attached),
+            global_stats: self.global_stats.clone(),
         }
     }
 
@@ -1122,6 +1140,96 @@ mod tests {
             .collect();
         ids.sort_unstable();
         ids
+    }
+
+    /// `local_bm25_stats` reports the partition's document count and each query
+    /// term's document frequency, tokenized and stemmed the same way the scored
+    /// query is. These are the additive quantities a distributed search sums.
+    #[tokio::test]
+    async fn local_bm25_stats_reports_collection_size_and_doc_frequency() {
+        let index = new_test_index();
+        index
+            .compute_index(vec![
+                record_batch!(
+                    ("id", Int32, [1, 2, 3, 4]),
+                    (
+                        "content",
+                        Utf8,
+                        ["apple banana", "apple cherry", "banana date", "apple fig"]
+                    )
+                )
+                .expect("Failed to create test batch"),
+            ])
+            .await
+            .expect("failed to compute_index");
+        index.reader.reload().expect("failed to reload the reader");
+
+        let field_index = index
+            .full_text_search_field_index("content")
+            .expect("Failed to create FullTextSearchFieldIndex");
+        let stats = field_index
+            .local_bm25_stats("apple")
+            .expect("Failed to gather local BM25 statistics");
+
+        assert_eq!(stats.total_num_docs, 4, "four documents in the collection");
+        assert_eq!(stats.doc_freq.len(), 1, "a single query term");
+        assert_eq!(
+            stats.doc_freq.values().copied().sum::<u64>(),
+            3,
+            "'apple' appears in three of the four documents"
+        );
+        assert!(
+            stats.total_num_tokens >= 8,
+            "each document has two tokens, so at least eight in total"
+        );
+    }
+
+    /// Scoring against global statistics that equal the local statistics must
+    /// reproduce local scoring exactly. This is the faithfulness property the
+    /// distributed path relies on: over one partition, the global sum equals the
+    /// local statistics, so a distributed search of a single partition returns
+    /// the single-node result unchanged.
+    #[tokio::test]
+    async fn injected_stats_equal_to_local_reproduce_local_scores() {
+        let index = new_test_index();
+        index
+            .compute_index(vec![
+                record_batch!(
+                    ("id", Int32, [1, 2, 3, 4]),
+                    (
+                        "content",
+                        Utf8,
+                        [
+                            "apple banana",
+                            "apple cherry",
+                            "banana date",
+                            "apple fig grape"
+                        ]
+                    )
+                )
+                .expect("Failed to create test batch"),
+            ])
+            .await
+            .expect("failed to compute_index");
+        index.reader.reload().expect("failed to reload the reader");
+
+        let local = index
+            .full_text_search_field_index("content")
+            .expect("Failed to create FullTextSearchFieldIndex");
+        let stats = local
+            .local_bm25_stats("apple")
+            .expect("Failed to gather local BM25 statistics");
+        let injected = index
+            .full_text_search_field_index("content")
+            .expect("Failed to create FullTextSearchFieldIndex")
+            .with_global_stats(Some(std::sync::Arc::new(stats)));
+
+        let local_out = search_and_format(&local, "apple").await;
+        let injected_out = search_and_format(&injected, "apple").await;
+        assert_eq!(
+            local_out, injected_out,
+            "injecting the local statistics must leave scores unchanged"
+        );
     }
 
     /// A direct `delete_by_keys` removes the matching documents from the tantivy index — the

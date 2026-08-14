@@ -110,6 +110,7 @@ impl SpiceLogicalCodec {
                     column: text_args.column,
                     limit: text_args.limit.map(Self::limit_from_u64).transpose()?,
                     include_score: text_args.include_score,
+                    global_stats: text_args.global_stats,
                 }
                 .to_expr();
                 udtf.call(&exprs)
@@ -355,12 +356,14 @@ impl LogicalExtensionCodec for SpiceLogicalCodec {
                     column,
                     limit,
                     include_score,
+                    global_stats,
                 } => UdtfArgs::text_search(TextSearchArgs {
                     table: table.clone(),
                     query: query.clone(),
                     column: column.clone(),
                     limit: limit.map(|l| l as u64),
                     include_score: *include_score,
+                    global_stats: global_stats.clone(),
                 }),
                 UdtfSource::VectorSearch {
                     table,

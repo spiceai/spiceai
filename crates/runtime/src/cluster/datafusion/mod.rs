@@ -21,6 +21,8 @@ use datafusion_optimizer_rules::physical_plan::cluster::ensure_supported_file_sc
 
 pub mod codec;
 pub mod datafusion_scheduler_ext;
+pub mod distributed_search;
+pub mod distributed_search_rewrite;
 
 #[must_use]
 pub fn datafusion_and_cluster_physical_optimizers()

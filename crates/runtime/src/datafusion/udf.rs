@@ -38,6 +38,7 @@ use runtime_datafusion_udfs::{ai::Ai, embed};
 #[cfg(all(test, feature = "models"))]
 use runtime_datafusion_udfs::{ai::AI_UDF_NAME, embed::EMBED_UDF_NAME};
 use runtime_query_engine::query_engine::QueryEngine;
+use runtime_search::full_text_stats_udtf::{TEXT_SEARCH_STATS_UDTF_NAME, TextSearchStatsTableFunc};
 use runtime_search::full_text_udtf::TextSearchTableFunc;
 use runtime_search::rerank::{RERANK_UDTF_NAME, RerankTableFunc};
 use runtime_search::rrf;
@@ -77,6 +78,18 @@ pub async fn register_udfs(runtime: &crate::Runtime) {
     ctx.register_udtf(
         TEXT_SEARCH_UDTF_NAME,
         Arc::new(TextSearchTableFunc::new(
+            Arc::downgrade(&runtime.df) as _,
+            crate::search::util::RuntimeTableProviderExplorer,
+        )),
+    );
+
+    // `text_search_stats('tbl','query'[,column])` — gather one partition's local
+    // BM25 collection statistics. The scheduler fans this out to every executor
+    // and sums the rows into the global statistics that a distributed
+    // `text_search` scores against.
+    ctx.register_udtf(
+        TEXT_SEARCH_STATS_UDTF_NAME,
+        Arc::new(TextSearchStatsTableFunc::new(
             Arc::downgrade(&runtime.df) as _,
             crate::search::util::RuntimeTableProviderExplorer,
         )),

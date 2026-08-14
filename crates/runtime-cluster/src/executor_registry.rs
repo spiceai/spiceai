@@ -749,6 +749,79 @@ impl ExecutorRegistry {
             self.node_id.as_deref(),
         )
     }
+
+    /// Resolve the disjoint covering set of executors for a distributed search
+    /// over `table`, as `(executor_id, FlightSqlClient)` pairs.
+    ///
+    /// Distributed full-text search queries each executor's local index directly
+    /// and merges the results, so the executor set must be disjoint — a replica
+    /// counted twice would return duplicate rows and skew the merged ranking.
+    /// This is the same minimal-cover selection a partitioned table scan uses.
+    #[must_use]
+    pub fn resolve_search_executors(
+        &self,
+        table: &TableReference,
+    ) -> Vec<(String, FlightSqlClient)> {
+        let Ok(connections) = self.connections.try_read() else {
+            tracing::warn!("Failed to acquire read lock on connections");
+            return Vec::new();
+        };
+        let Ok(flight_sql_clients) = self.flight_sql_clients.try_read() else {
+            tracing::warn!("Failed to acquire read lock on flight_sql_clients");
+            return Vec::new();
+        };
+        let executors = ready_executors(&connections, &flight_sql_clients);
+        covering_executor_ids(&self.accelerations_partition_store, &executors, table)
+            .into_iter()
+            .filter_map(|id| {
+                let (_, client) = executors.get(&id)?;
+                Some((id, (*client).clone()))
+            })
+            .collect()
+    }
+}
+
+/// The disjoint covering set of executor ids for `table`: a single live executor
+/// when there is no partition metadata (it holds the whole table), otherwise the
+/// minimal set of executors that together cover every partition. Empty when a
+/// partition has no live executor.
+fn covering_executor_ids(
+    partition_store: &PartitionStore,
+    executors: &HashMap<String, (&ExecutorConnection, &FlightSqlClient)>,
+    table: &TableReference,
+) -> Vec<String> {
+    let Some(table_metadata) = partition_store.get_cached_table_metadata(table) else {
+        // No partition metadata: route to a single live executor to avoid
+        // duplicate results, matching `get_partitions_from_store`.
+        return executors.keys().min().cloned().into_iter().collect();
+    };
+
+    let required_partitions: Vec<HashMap<String, Option<String>>> = table_metadata
+        .partitions
+        .iter()
+        .map(|p| p.partition_value.clone())
+        .collect();
+    if required_partitions.is_empty() {
+        return Vec::new();
+    }
+
+    let mut executor_partition_map: HashMap<String, Vec<PartitionValue>> = HashMap::new();
+    for partition_meta in &table_metadata.partitions {
+        for executor_id in &partition_meta.assigned_executors {
+            if !executors.contains_key(executor_id) {
+                continue;
+            }
+            executor_partition_map
+                .entry(executor_id.clone())
+                .or_default()
+                .push(partition_meta.partition_value.clone());
+        }
+    }
+
+    match executor_selection::select_executors(&required_partitions, &executor_partition_map) {
+        Ok(selected) => selected,
+        Err(executor_selection::Error::MissingPartitions(_)) => Vec::new(),
+    }
 }
 
 /// Returns executors that have both an active connection and a `FlightSQL` client.

@@ -50,6 +50,7 @@ impl CandidateGeneration for TextSearchCandidate {
             column: Some(self.inner.field.clone()),
             limit: None,
             include_score: Some(true),
+            global_stats: None,
         }
         .to_expr();
 

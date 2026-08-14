@@ -388,6 +388,9 @@ message TextSearchArgs {
     optional uint64 limit = 4;
     // Whether to include the score column in results (default: true).
     optional bool include_score = 5;
+    // Encoded global BM25 collection statistics (GlobalBm25Stats, JSON) a
+    // distributed search scores against. Absent scores with local statistics.
+    optional string global_stats = 6;
 }
 
 // Arguments for vector_search(tbl, query, [col], [limit], [include_score], [distance_metric]).

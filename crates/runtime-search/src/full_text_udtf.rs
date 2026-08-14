@@ -40,6 +40,7 @@ use datafusion::{
 use datafusion_expr::{ScalarFunctionArgs, ScalarUDFImpl};
 
 use futures::FutureExt;
+use search::generation::text_search::GlobalBm25Stats;
 use search::generation::text_search::index::FullTextDatabaseIndex;
 #[cfg(feature = "elasticsearch")]
 use search::index::compound::CompoundSearchIndex;
@@ -54,7 +55,8 @@ use std::sync::{Arc, Weak};
 
 use crate::table_provider_explorer::TableProviderExplorer;
 use crate::udtf::{
-    TEXT_SEARCH_UDTF_NAME, TextSearchTableFuncArgs, parse_limit_scalar, table_ref_from_column_expr,
+    TEXT_SEARCH_GLOBAL_STATS_ARG, TEXT_SEARCH_UDTF_NAME, TextSearchTableFuncArgs,
+    parse_limit_scalar, table_ref_from_column_expr,
 };
 use runtime_query_engine::query_engine::QueryEngine;
 use runtime_request_context::{AsyncMarker, RequestContext};
@@ -79,6 +81,9 @@ pub static TEXT_SEARCH_SIGNATURE: LazyLock<Signature> = LazyLock::new(|| {
         "limit".to_string(),
         "include_score".to_string(),
         "rank_weight".to_string(),
+        // Reserved for runtime use: a distributed search binds the global BM25
+        // collection statistics on each executor's scored query.
+        TEXT_SEARCH_GLOBAL_STATS_ARG.to_string(),
     ];
     // SAFETY: These are valid ASCII parameter names
     Signature::user_defined(Volatility::Stable)
@@ -237,6 +242,7 @@ impl<E: TableProviderExplorer> TextSearchTableFunc<E> {
             column: Some(column),
             limit: args.limit,
             include_score: args.include_score,
+            global_stats: args.global_stats.clone(),
         };
 
         let normalized_table = owned.normalize_source_table(table_provider)?;
@@ -398,6 +404,13 @@ impl<E: TableProviderExplorer> TextSearchTableFunc<E> {
         // user-provided `include_score => false` can still flip the default.
         let include_score = include_score.or(Some(true));
 
+        // `global_stats` is a runtime-only named argument carrying the encoded
+        // global BM25 collection statistics a distributed search scores against.
+        let global_stats = match named.get(TEXT_SEARCH_GLOBAL_STATS_ARG) {
+            Some(Expr::Literal(ScalarValue::Utf8(Some(s)), _)) => Some(s.clone()),
+            _ => None,
+        };
+
         let limit_usize = limit
             .map(|l| {
                 usize::try_from(l).map_err(|_| {
@@ -415,6 +428,7 @@ impl<E: TableProviderExplorer> TextSearchTableFunc<E> {
             column,
             limit: limit_usize,
             include_score,
+            global_stats,
         })
     }
 }
@@ -496,6 +510,7 @@ impl<E: TableProviderExplorer + 'static> TableFunctionImpl for TextSearchTableFu
                     column: Some(column),
                     limit: args.limit,
                     include_score: args.include_score,
+                    global_stats: args.global_stats.clone(),
                 };
                 return Ok(Arc::new(
                     SearchQueryProvider::try_from_index(
@@ -592,6 +607,19 @@ impl<E: TableProviderExplorer + 'static> TableFunctionImpl for TextSearchTableFu
         let mut fts_index = fts_index;
         fts_index.search_fields = vec![column.clone()];
 
+        // A distributed search binds global BM25 collection statistics on this
+        // executor's scored query so its scores are comparable with every other
+        // executor's. Decode and attach them; absent, scoring stays local.
+        if let Some(encoded) = args.global_stats.as_deref() {
+            let stats = GlobalBm25Stats::decode(encoded).map_err(|e| {
+                DataFusionError::Plan(format!(
+                    "text_search on '{}': invalid global_stats argument: {e}",
+                    args.tbl
+                ))
+            })?;
+            fts_index = fts_index.with_global_stats(Some(Arc::new(stats)));
+        }
+
         // Create UDTF source for distributed serialization
         let udtf_source = UdtfSource::TextSearch {
             table: args.tbl.to_string(),
@@ -599,6 +627,7 @@ impl<E: TableProviderExplorer + 'static> TableFunctionImpl for TextSearchTableFu
             column: Some(column),
             limit: args.limit,
             include_score: args.include_score,
+            global_stats: args.global_stats.clone(),
         };
 
         Ok(Arc::new(
@@ -698,6 +727,7 @@ mod tests {
             column: column.map(str::to_string),
             limit: None,
             include_score: Some(true),
+            global_stats: None,
         }
     }
 

@@ -243,6 +243,12 @@ fn walk_to_flight_exec(plan: &Arc<dyn ExecutionPlan>) -> Option<&FlightSqlExec> 
     let mut current: &Arc<dyn ExecutionPlan> = plan;
     loop {
         if let Some(flight) = current.downcast_ref::<FlightSqlExec>() {
+            // A table-function FROM (distributed full-text search) renders its own
+            // FROM clause; `build_aggregate_sql` would instead emit the plain table
+            // name and send wrong SQL, so leave this leaf un-rewritten.
+            if flight.from_function().is_some() {
+                return None;
+            }
             return Some(flight);
         }
 

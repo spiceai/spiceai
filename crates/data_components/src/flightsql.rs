@@ -224,6 +224,10 @@ pub struct FlightSQLTable {
     /// sent to the Flight SQL server. See issue #10703.
     function_support: Option<FunctionSupport>,
     token: Option<String>,
+    /// When `Some`, the scans this provider creates render their FROM clause from
+    /// this raw table-function call instead of `table_reference`. Used by
+    /// distributed full-text search, where the source is a UDTF, not a plain table.
+    from_function: Option<String>,
 }
 
 #[expect(clippy::needless_pass_by_value)]
@@ -247,6 +251,7 @@ impl FlightSQLTable {
             statistics: None,
             function_support: None,
             token: None,
+            from_function: None,
         })
     }
 
@@ -269,7 +274,16 @@ impl FlightSQLTable {
             statistics: None,
             function_support: None,
             token: None,
+            from_function: None,
         }
+    }
+
+    /// Render the scans' FROM clause from a raw table-function call (a valid
+    /// quoted UDTF invocation) instead of the plain `table_reference`.
+    #[must_use]
+    pub fn with_from_function(mut self, from_function: String) -> Self {
+        self.from_function = Some(from_function);
+        self
     }
 
     /// Attach statistics to be reported by the scans this provider creates.
@@ -483,6 +497,7 @@ impl FlightSQLTable {
             Arc::clone(&self.cookie_store),
         )?;
         let exec = exec.with_token(self.token.clone());
+        let exec = exec.with_from_function(self.from_function.clone());
         // Project the table-level statistics onto the scan's (projected) output
         // schema so the column-statistics list lines up with the output columns.
         //
@@ -534,6 +549,15 @@ impl TableProvider for FlightSQLTable {
         &self,
         filters: &[&Expr],
     ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
+        // A table-function FROM clause cannot absorb predicates, so no filter can
+        // be pushed down when the scan's source is a UDTF.
+        if self.from_function.is_some() {
+            return Ok(vec![
+                TableProviderFilterPushDown::Unsupported;
+                filters.len()
+            ]);
+        }
+
         let mut filter_push_down = vec![];
         for filter in filters {
             match to_sql_preserving_precedence(filter) {
@@ -582,6 +606,12 @@ pub struct FlightSqlExec {
     /// hash-join build-side selection can use them.
     statistics: Statistics,
     token: Option<String>,
+    /// When `Some`, renders the FROM clause of the emitted SQL from this raw
+    /// string (a table-function call such as
+    /// `text_search_stats("cat"."sch"."tbl", 'query', "col")`) instead of the
+    /// quoted `table_reference`. Used by distributed full-text search, where the
+    /// scan leg's source is a UDTF rather than a plain table.
+    from_function: Option<String>,
 }
 
 impl FlightSqlExec {
@@ -614,6 +644,7 @@ impl FlightSqlExec {
             trace_parent: None,
             statistics,
             token: None,
+            from_function: None,
         })
     }
 
@@ -642,6 +673,21 @@ impl FlightSqlExec {
     pub fn with_token(mut self, token: Option<String>) -> Self {
         self.token = token;
         self
+    }
+
+    /// Render the FROM clause from a raw table-function call (e.g.
+    /// `text_search_stats("cat"."sch"."tbl", 'query', "col")`) instead of the
+    /// quoted `table_reference`. `None` keeps the plain-table behavior.
+    #[must_use]
+    pub fn with_from_function(mut self, from_function: Option<String>) -> Self {
+        self.from_function = from_function;
+        self
+    }
+
+    /// Returns the raw table-function FROM source, if this scan is over a UDTF.
+    #[must_use]
+    pub fn from_function(&self) -> Option<&str> {
+        self.from_function.as_deref()
     }
 
     /// Returns the currently configured W3C `traceparent` value, if any.
@@ -748,10 +794,14 @@ impl FlightSqlExec {
             format!("ORDER BY {}", sort_terms.join(", "))
         };
 
-        let mut sql = format!(
-            "SELECT {columns} FROM {table_reference}",
-            table_reference = self.table_reference.to_quoted_string(),
-        );
+        // When the scan's source is a table-function call (distributed full-text
+        // search), `from_function` already holds a valid quoted UDTF invocation
+        // and renders verbatim; otherwise fall back to the quoted table reference.
+        let from_clause = match &self.from_function {
+            Some(from_function) => from_function.clone(),
+            None => self.table_reference.to_quoted_string(),
+        };
+        let mut sql = format!("SELECT {columns} FROM {from_clause}");
         if !where_expr.is_empty() {
             sql.push(' ');
             sql.push_str(&where_expr);
@@ -841,6 +891,7 @@ impl ExecutionPlan for FlightSqlExec {
             trace_parent: self.trace_parent.clone(),
             statistics: self.statistics.clone(),
             token: self.token.clone(),
+            from_function: self.from_function.clone(),
         };
 
         Ok(SortOrderPushdownResult::Exact {
@@ -949,6 +1000,7 @@ impl ExecutionPlan for FlightSqlExec {
             trace_parent: self.trace_parent.clone(),
             statistics,
             token: self.token.clone(),
+            from_function: self.from_function.clone(),
         };
 
         Some(Arc::new(new_plan))
