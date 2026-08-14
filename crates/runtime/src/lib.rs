@@ -134,6 +134,7 @@ pub mod resource_monitor {
 pub(crate) use runtime_parameters as parameters;
 
 pub mod podswatcher;
+pub use metrics_server::prometheus_reader;
 pub mod request;
 mod scheduling;
 pub(crate) use runtime_component::schema_evolution;
@@ -1285,6 +1286,13 @@ impl Runtime {
         if caching.embeddings.is_some() {
             CachedEmbeddingResult::init();
         }
+    }
+
+    /// Publishes the component counters at zero. Must be called after
+    /// `init_metrics` in spiced, for the same reason as
+    /// [`Runtime::init_cache_metrics`].
+    pub fn init_component_metrics(&self) {
+        runtime_metrics::publish_component_counters_at_zero();
     }
 
     /// Requests a loaded extension, or will attempt to load it if part of the autoloaded extensions.

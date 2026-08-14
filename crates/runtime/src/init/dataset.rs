@@ -2778,22 +2778,15 @@ mod tests {
     /// when they are first touched, and that binding survives a later
     /// `set_meter_provider`. So this rewires the meter for the whole process and only
     /// the first caller in it wins -- keep it to a single test, as
-    /// `tests/query_failure_err_code.rs` does.
+    /// `tests/metrics.rs` does.
     fn install_prometheus_meter_provider() -> prometheus::Registry {
         let registry = prometheus::Registry::new();
 
-        let exporter = opentelemetry_prometheus::exporter()
-            .with_registry(registry.clone())
-            .without_scope_info()
-            .without_units()
-            .without_counter_suffixes()
-            .without_target_info()
-            .build()
-            .expect("to build the prometheus exporter");
-
         let provider = opentelemetry_sdk::metrics::SdkMeterProvider::builder()
             .with_resource(opentelemetry_sdk::Resource::builder().build())
-            .with_reader(exporter)
+            .with_reader(
+                crate::prometheus_reader(registry.clone()).expect("to build the prometheus reader"),
+            )
             .build();
         opentelemetry::global::set_meter_provider(provider);
 
