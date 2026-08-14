@@ -3117,7 +3117,40 @@ impl DataAccelerator for CayenneAccelerator {
                     None,
                 )
                 .await;
+            }
 
+            // Metadata before files, and its failures are fatal — the same
+            // ordering `drop_table` uses, and for the same reason. Deleting the
+            // directory first and then continuing past a failed catalog drop
+            // leaves rows describing files that are gone, and for a partitioned
+            // table leaves the per-partition children whose stale schemas this
+            // rebuild exists to discard. Failing first leaves an acceleration
+            // the operator can retry.
+            let metadata_dir = Self::resolve_metadata_dir(Some(acceleration));
+
+            let metastore_type = acceleration
+                .params
+                .get("cayenne_metastore")
+                .map_or("sqlite", String::as_str);
+
+            let table_name = source.name().to_string();
+            let catalog = self
+                .get_or_create_catalog(&metadata_dir, metastore_type)
+                .await
+                .boxed()
+                .context(AccelerationInitializationFailedSnafu)?;
+            if catalog
+                .drop_table(&table_name)
+                .await
+                .boxed()
+                .context(AccelerationInitializationFailedSnafu)?
+            {
+                tracing::info!(
+                    "Dropped existing Cayenne table metadata for '{table_name}' (file_create mode)"
+                );
+            }
+
+            if path_buf.exists() {
                 tracing::warn!(
                     "Cayenne acceleration mode is 'file_create', removing existing directory: {}",
                     dir_path
@@ -3126,37 +3159,6 @@ impl DataAccelerator for CayenneAccelerator {
                     .await
                     .boxed()
                     .context(AccelerationInitializationFailedSnafu)?;
-            }
-
-            // Also drop the table from metadata catalog to clean up stale metadata
-            let metadata_dir = Self::resolve_metadata_dir(Some(acceleration));
-
-            let metastore_type = acceleration
-                .params
-                .get("cayenne_metastore")
-                .map_or("sqlite", String::as_str);
-
-            // Get or create catalog and drop the table if it exists
-            if let Ok(catalog) = self
-                .get_or_create_catalog(&metadata_dir, metastore_type)
-                .await
-            {
-                let table_name = source.name().to_string();
-                match catalog.drop_table(&table_name).await {
-                    Ok(true) => {
-                        tracing::info!(
-                            "Dropped existing Cayenne table metadata for '{table_name}' (file_create mode)"
-                        );
-                    }
-                    Ok(false) => {
-                        // Table didn't exist in metadata, nothing to drop
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            "Failed to drop Cayenne table metadata for '{table_name}': {e}. Continuing anyway."
-                        );
-                    }
-                }
             }
         }
 
