@@ -78,7 +78,13 @@ pub fn normalize_control_plane_endpoint(
     Ok(parsed.to_string().trim_end_matches('/').to_string())
 }
 
-fn is_loopback_host(host: &str) -> bool {
+/// Whether a URL host names the loopback interface.
+///
+/// This is the sole gate on sending a credential over plaintext HTTP, so every
+/// caller that decides `https_only` must ask this one function rather than
+/// re-deriving the rule.
+#[must_use]
+pub fn is_loopback_host(host: &str) -> bool {
     let host = host
         .strip_prefix('[')
         .and_then(|host| host.strip_suffix(']'))

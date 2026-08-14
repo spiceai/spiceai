@@ -73,11 +73,39 @@ pub(super) enum Error {
     ))]
     PendingProjectMismatch { reason: String },
 
-    #[snafu(display("The Cloud Connect enrollment journal at {} uses unsupported schema {found}; expected schema {CONNECT_OPERATION_SCHEMA_VERSION}.", path.display()))]
-    UnsupportedSchema { path: PathBuf, found: u32 },
+    #[snafu(display("The Cloud Connect enrollment journal at {} uses unsupported schema {found}; expected schema {expected}.", path.display()))]
+    UnsupportedSchema {
+        path: PathBuf,
+        found: u32,
+        expected: u32,
+    },
 }
 
 pub(super) type Result<T, E = Error> = std::result::Result<T, E>;
+
+/// The non-secret identity fields journal reconciliation compares against.
+///
+/// Reconciliation runs on a blocking task, so handing it the whole [`Identity`]
+/// would copy the PEM-encoded certificate and both private keys onto the heap —
+/// where nothing zeroizes them — to perform four string comparisons.
+#[derive(Debug, Clone)]
+pub(super) struct IdentityFacts {
+    identifier: String,
+    org_name: Option<String>,
+    app_id: Option<String>,
+    app_name: Option<String>,
+}
+
+impl From<&Identity> for IdentityFacts {
+    fn from(identity: &Identity) -> Self {
+        Self {
+            identifier: identity.identifier.clone(),
+            org_name: identity.org_name.clone(),
+            app_id: identity.app_id.clone(),
+            app_name: identity.app_name.clone(),
+        }
+    }
+}
 
 /// Held for the complete enrollment/project mutation boundary.
 #[derive(Debug)]
@@ -586,6 +614,7 @@ impl ConnectOperation {
             return Err(Error::UnsupportedSchema {
                 path,
                 found: operation.schema_version,
+                expected: CONNECT_OPERATION_SCHEMA_VERSION,
             });
         }
         Ok(Some(operation))
@@ -600,7 +629,7 @@ impl ConnectOperation {
         config_dir: &Path,
         directory: &Path,
         endpoint: &str,
-        identity: Option<&Identity>,
+        identity: Option<&IdentityFacts>,
     ) -> Result<()> {
         let Some(operation) = Self::load_optional(config_dir)? else {
             return Ok(());
@@ -703,7 +732,7 @@ impl ProjectOperation {
         config_dir: &Path,
         directory: &Path,
         endpoint: &str,
-        identity: Option<&Identity>,
+        identity: Option<&IdentityFacts>,
     ) -> Result<Option<Self>> {
         let Some(operation) = Self::load_optional(config_dir)? else {
             return Ok(None);
@@ -764,6 +793,7 @@ impl ProjectOperation {
             return Err(Error::UnsupportedSchema {
                 path,
                 found: operation.schema_version,
+                expected: PROJECT_OPERATION_SCHEMA_VERSION,
             });
         }
         Ok(Some(operation))
@@ -1038,7 +1068,7 @@ mod tests {
             dir.path(),
             dir.path(),
             "https://api.spice.ai",
-            Some(&identity("inst_1", "acme")),
+            Some(&IdentityFacts::from(&identity("inst_1", "acme"))),
         )
         .expect("reconcile");
         assert!(!dir.path().join(CONNECT_OPERATION_FILE).exists());
@@ -1063,7 +1093,7 @@ mod tests {
             dir.path(),
             dir.path(),
             "https://api.spice.ai",
-            Some(&identity("inst_other", "acme")),
+            Some(&IdentityFacts::from(&identity("inst_other", "acme"))),
         )
         .expect_err("mismatch must quarantine");
         assert!(matches!(err, Error::Quarantined { .. }));

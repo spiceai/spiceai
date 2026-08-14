@@ -19,6 +19,7 @@ limitations under the License.
 use futures::StreamExt as _;
 use reqwest::{StatusCode, redirect::Policy};
 use runtime_cloud_connect::Identity;
+use runtime_cloud_connect::config::is_loopback_host;
 use runtime_cloud_connect::enroll::SessionToken;
 use serde::{Deserialize, Serialize};
 use snafu::Snafu;
@@ -84,36 +85,15 @@ impl Error {
         )
     }
 
-    #[must_use]
-    pub(super) fn is_retryable(&self) -> bool {
-        matches!(self, Self::Transport { .. } | Self::ResponseBody { .. })
-            || matches!(
-                self,
-                Self::Denied {
-                    retryable: true,
-                    ..
-                }
-            )
-    }
-
     /// A response that may have followed a committed mutation but did not
     /// prove the authoritative result. Exact replay is the only safe recovery.
+    ///
+    /// The complement is exactly the non-retryable structured denial, which
+    /// proves the requested mutation did not commit — so a negated call is how
+    /// a caller asks "is it accurate to report this identity as unattached?".
     #[must_use]
     pub(super) fn is_attachment_ambiguous(&self) -> bool {
         !matches!(
-            self,
-            Self::Denied {
-                retryable: false,
-                ..
-            }
-        )
-    }
-
-    /// A non-retryable structured denial proves that the requested mutation
-    /// did not commit, so reporting the still-unattached identity is accurate.
-    #[must_use]
-    pub(super) fn is_authoritative_non_mutation(&self) -> bool {
-        matches!(
             self,
             Self::Denied {
                 retryable: false,
@@ -305,17 +285,6 @@ fn parse_denial(status: StatusCode, body: &[u8]) -> std::result::Result<Error, E
         code,
         retryable: transport_retryable,
     })
-}
-
-fn is_loopback_host(host: &str) -> bool {
-    let host = host
-        .strip_prefix('[')
-        .and_then(|host| host.strip_suffix(']'))
-        .unwrap_or(host);
-    host.eq_ignore_ascii_case("localhost")
-        || host
-            .parse::<std::net::IpAddr>()
-            .is_ok_and(|ip| ip.is_loopback())
 }
 
 async fn bounded_body(response: reqwest::Response) -> std::result::Result<Vec<u8>, Error> {
@@ -657,7 +626,6 @@ mod tests {
             code: ProjectErrorCode::ProjectNameConflict,
             retryable: false,
         };
-        assert!(denied.is_authoritative_non_mutation());
         assert!(!denied.is_attachment_ambiguous());
 
         for ambiguous in [
@@ -667,7 +635,6 @@ mod tests {
             },
         ] {
             assert!(ambiguous.is_attachment_ambiguous());
-            assert!(!ambiguous.is_authoritative_non_mutation());
         }
     }
 }

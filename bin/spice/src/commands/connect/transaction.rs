@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 
 use dialoguer::theme::ColorfulTheme;
 use dialoguer::{Confirm, Input, Password, Select};
+use runtime_cloud_connect::config::is_loopback_host;
 use runtime_cloud_connect::enroll::{
     EnrollNowOutcome, EnrollmentAuthority, InstanceFacts, RetryPolicy, SessionToken,
 };
@@ -40,7 +41,7 @@ use crate::error::{CloudErrorCode, Error, Result};
 
 use super::naming::{collision_suggestion, initial_suggestion, validate_project_name};
 use super::project::{ProjectAttachment, ProjectClient, ProjectMutation};
-use super::state::{ConnectLock, ConnectOperation, ProjectOperation};
+use super::state::{ConnectLock, ConnectOperation, IdentityFacts, ProjectOperation};
 
 pub(super) struct ConnectRequest {
     pub org: Option<String>,
@@ -57,10 +58,43 @@ struct EnrollmentResult {
     already_enrolled: bool,
 }
 
+/// How the control plane for this transaction was chosen. Both downstream
+/// rules are functions of this, so the source is carried instead of the
+/// derived flags — that keeps "persist a file we were never given" and
+/// "withhold a credential we are allowed to send" unrepresentable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EndpointSource {
+    /// `--endpoint` or `SPICE_CLOUD_ENDPOINT`.
+    Explicit,
+    /// The durable identity or pending draft binding.
+    Bound,
+    /// The operator-authored instance-local `cloud-endpoint` file.
+    LegacyFile,
+    /// No binding, no override: the compiled-in public control plane.
+    CompiledDefault,
+}
+
 struct TransactionEndpoint {
     value: String,
-    persist_file: bool,
-    permits_stored_credentials: bool,
+    source: EndpointSource,
+}
+
+impl TransactionEndpoint {
+    /// Only an explicit request or a durable binding is eligible to create or
+    /// replace the endpoint file: the legacy file already holds its own value,
+    /// and the compiled default needs no state file at all.
+    fn persist_file(&self) -> bool {
+        matches!(
+            self.source,
+            EndpointSource::Explicit | EndpointSource::Bound
+        )
+    }
+
+    /// A repo-local `cloud-endpoint` file does not authorize sending a stored
+    /// login credential to the control plane it names.
+    fn permits_stored_credentials(&self) -> bool {
+        !matches!(self.source, EndpointSource::LegacyFile)
+    }
 }
 
 const PROJECT_RETRY_DEADLINE: Duration = Duration::from_secs(30);
@@ -193,21 +227,10 @@ fn map_optional_prompt<T>(result: dialoguer::Result<Option<T>>, what: &str) -> R
     }
 }
 
+/// The same interrupt/EOF-to-cancellation mapping for a prompt whose success
+/// value is unconditional.
 fn map_required_prompt<T>(result: dialoguer::Result<T>, what: &str) -> Result<Option<T>> {
-    match result {
-        Ok(value) => Ok(Some(value)),
-        Err(dialoguer::Error::IO(source))
-            if matches!(
-                source.kind(),
-                std::io::ErrorKind::Interrupted | std::io::ErrorKind::UnexpectedEof
-            ) =>
-        {
-            Ok(None)
-        }
-        Err(source) => Err(Error::CloudConnectIo {
-            message: format!("read {what}: {source}"),
-        }),
-    }
+    map_optional_prompt(result.map(Some), what)
 }
 
 struct LoginCredential {
@@ -309,8 +332,8 @@ async fn execute_with<P: Prompter>(
                 directory: &directory,
                 identity_path: &identity_path,
                 endpoint: &endpoint,
-                persist_endpoint_file: resolved_endpoint.persist_file,
-                permits_stored_credentials: resolved_endpoint.permits_stored_credentials,
+                persist_endpoint_file: resolved_endpoint.persist_file(),
+                permits_stored_credentials: resolved_endpoint.permits_stored_credentials(),
                 identity,
                 pending_project: project_operation,
             },
@@ -351,14 +374,14 @@ async fn execute_with<P: Prompter>(
     }
 
     telemetry.stage("authentication");
-    let login = match if resolved_endpoint.permits_stored_credentials {
+    let login = match if resolved_endpoint.permits_stored_credentials() {
         stored_user_login(&endpoint, request.org.as_deref()).await?
     } else {
         None
     } {
         Some(login) => login,
         None if !prompter.interactive() => {
-            if !resolved_endpoint.permits_stored_credentials {
+            if !resolved_endpoint.permits_stored_credentials() {
                 return Err(legacy_endpoint_requires_explicit_authority(&endpoint));
             }
             return Err(invalid_usage(
@@ -367,7 +390,7 @@ async fn execute_with<P: Prompter>(
         }
         None => match prompter.choose_auth().await? {
             Some(AuthChoice::Login) => {
-                if !resolved_endpoint.permits_stored_credentials {
+                if !resolved_endpoint.permits_stored_credentials() {
                     return Err(legacy_endpoint_requires_explicit_authority(&endpoint));
                 }
                 match login_inline(CredentialStore::EnvFile).await? {
@@ -797,20 +820,13 @@ async fn enroll(
     journal_org: String,
     authority: EnrollmentAuthority,
 ) -> Result<EnrollmentResult> {
-    if let Some(region) = region.as_deref()
-        && !runtime_cloud_connect::is_valid_instance_region(region)
-    {
-        return Err(invalid_usage(format!(
-            "invalid --region value '{region}': expected 2-64 lowercase letters, digits, and hyphens, starting and ending with a letter or digit."
-        )));
-    }
     let runtime_version = ctx
         .runtime_version()
         .unwrap_or_else(|_| crate::commands::version::cli_version());
     let mut config =
         CloudConnectConfig::from_env_at(runtime_version.clone(), config_dir.to_path_buf());
     config.enroll_endpoint.clone_from(&endpoint.value);
-    if endpoint.persist_file {
+    if endpoint.persist_file() {
         persist_endpoint(config_dir, &endpoint.value).await?;
     }
     let endpoint = endpoint.value.as_str();
@@ -1003,7 +1019,7 @@ async fn assign_project<P: Prompter>(
             // locally. Never tell the operator it is unattached.
             Err(error) if error.is_already_attached() => return Err(project_error(&error)),
             Err(error)
-                if (error.is_retryable() || error.is_attachment_ambiguous())
+                if error.is_attachment_ambiguous()
                     && retry_attempt + 1 < PROJECT_MAX_ATTEMPTS
                     && started.elapsed() < PROJECT_RETRY_DEADLINE =>
             {
@@ -1014,7 +1030,7 @@ async fn assign_project<P: Prompter>(
                 let delay = Duration::from_millis(rand::random_range(1..=window_ms));
                 tokio::time::sleep(delay).await;
             }
-            Err(error) if error.is_authoritative_non_mutation() => {
+            Err(error) if !error.is_attachment_ambiguous() => {
                 delete_project_operation(context.config_dir).await?;
                 print_unattached(context.identity, context.recovery_url);
                 return Err(project_error(&error));
@@ -1211,15 +1227,13 @@ fn resolve_transaction_endpoint_with_env(
     if let Some(value) = requested {
         return Ok(TransactionEndpoint {
             value,
-            persist_file: true,
-            permits_stored_credentials: true,
+            source: EndpointSource::Explicit,
         });
     }
     if let Some(value) = bound {
         return Ok(TransactionEndpoint {
             value,
-            persist_file: true,
-            permits_stored_credentials: true,
+            source: EndpointSource::Bound,
         });
     }
 
@@ -1228,15 +1242,15 @@ fn resolve_transaction_endpoint_with_env(
             message: source.to_string(),
         },
     )?;
-    let permits_stored_credentials = legacy.is_none();
-    Ok(TransactionEndpoint {
-        value: legacy
-            .unwrap_or_else(|| runtime_cloud_connect::config::DEFAULT_ENDPOINT.to_string()),
-        // The legacy file already contains its operator-authored value, while
-        // the compiled default needs no state file. Only an explicit request
-        // or durable binding is eligible to create/replace this file.
-        persist_file: false,
-        permits_stored_credentials,
+    Ok(match legacy {
+        Some(value) => TransactionEndpoint {
+            value,
+            source: EndpointSource::LegacyFile,
+        },
+        None => TransactionEndpoint {
+            value: runtime_cloud_connect::config::DEFAULT_ENDPOINT.to_string(),
+            source: EndpointSource::CompiledDefault,
+        },
     })
 }
 
@@ -1249,7 +1263,7 @@ async fn reconcile_journal(
     let config_dir = config_dir.to_path_buf();
     let directory = directory.to_path_buf();
     let endpoint = endpoint.to_string();
-    let identity = identity.cloned();
+    let identity = identity.map(IdentityFacts::from);
     tokio::task::spawn_blocking(move || {
         ConnectOperation::reconcile(&config_dir, &directory, &endpoint, identity.as_ref())
             .map_err(|error| state_error(&error))
@@ -1269,7 +1283,7 @@ async fn reconcile_project_journal(
     let config_dir = config_dir.to_path_buf();
     let directory = directory.to_path_buf();
     let endpoint = endpoint.to_string();
-    let identity = identity.cloned();
+    let identity = identity.map(IdentityFacts::from);
     tokio::task::spawn_blocking(move || {
         ProjectOperation::reconcile(&config_dir, &directory, &endpoint, identity.as_ref())
             .map_err(|error| state_error(&error))
@@ -1329,17 +1343,6 @@ fn normalize_control_plane_endpoint(endpoint: &str) -> Result<String> {
 #[cfg(test)]
 fn validate_control_plane_endpoint(endpoint: &str) -> Result<()> {
     normalize_control_plane_endpoint(endpoint).map(|_| ())
-}
-
-fn is_loopback_host(host: &str) -> bool {
-    let host = host
-        .strip_prefix('[')
-        .and_then(|host| host.strip_suffix(']'))
-        .unwrap_or(host);
-    host.eq_ignore_ascii_case("localhost")
-        || host
-            .parse::<std::net::IpAddr>()
-            .is_ok_and(|ip| ip.is_loopback())
 }
 
 fn print_unattached(identity: &Identity, recovery_url: Option<&str>) {
@@ -1587,8 +1590,9 @@ mod tests {
         let fresh = resolve_transaction_endpoint_with_env(dir.path(), None, None, None, None)
             .expect("resolve fresh endpoint");
         assert_eq!(fresh.value, runtime_cloud_connect::config::DEFAULT_ENDPOINT);
-        assert!(!fresh.persist_file);
-        assert!(fresh.permits_stored_credentials);
+        assert_eq!(fresh.source, EndpointSource::CompiledDefault);
+        assert!(!fresh.persist_file());
+        assert!(fresh.permits_stored_credentials());
     }
 
     #[test]
@@ -1602,8 +1606,9 @@ mod tests {
         let resolved = resolve_transaction_endpoint_with_env(dir.path(), None, None, None, None)
             .expect("resolve legacy endpoint");
         assert_eq!(resolved.value, "https://private.example");
-        assert!(!resolved.persist_file);
-        assert!(!resolved.permits_stored_credentials);
+        assert_eq!(resolved.source, EndpointSource::LegacyFile);
+        assert!(!resolved.persist_file());
+        assert!(!resolved.permits_stored_credentials());
     }
 
     #[test]

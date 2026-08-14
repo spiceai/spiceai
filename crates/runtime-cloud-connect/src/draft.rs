@@ -251,7 +251,7 @@ impl EnrollmentTransactionLock {
         match read_bounded_regular_file(&self.draft_path, MAX_DRAFT_BYTES) {
             Ok(contents) => {
                 let draft = EnrollmentDraft::load_published(&self.draft_path, &contents)?;
-                draft.validate_request(&self.draft_path, region, binding)?;
+                draft.validate_request(&self.draft_path, binding)?;
                 Ok(draft)
             }
             Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
@@ -535,7 +535,7 @@ impl EnrollmentDraft {
         match read_bounded_regular_file(path, MAX_DRAFT_BYTES) {
             Ok(contents) => {
                 let draft = Self::parse_at(path, &contents)?;
-                draft.validate_request(path, region, binding)?;
+                draft.validate_request(path, binding)?;
                 return Ok(draft);
             }
             Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
@@ -567,12 +567,14 @@ impl EnrollmentDraft {
         Ok(draft)
     }
 
-    fn validate_request(
-        &self,
-        path: &Path,
-        _region: Option<&str>,
-        binding: &EnrollmentRequestBinding,
-    ) -> Result<()> {
+    /// Confirm a retry targets the same control plane and authority as the
+    /// durable draft.
+    ///
+    /// The declared region is deliberately not part of the replay key: a
+    /// resumed enrollment keeps the region recorded when the draft was
+    /// published, so a differing `--region` on a retry must not invalidate
+    /// exact-replay state.
+    fn validate_request(&self, path: &Path, binding: &EnrollmentRequestBinding) -> Result<()> {
         let authority_matches = match (&self.binding.authority, &binding.authority) {
             (
                 EnrollmentAuthorityBinding::Token { .. },
