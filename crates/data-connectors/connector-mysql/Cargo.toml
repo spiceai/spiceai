@@ -26,6 +26,7 @@ description = "MySQL data connector for Spice.ai runtime"
 async-stream.workspace = true
 async-trait.workspace = true
 chrono.workspace = true
+data-connector-api = { path = "../../data-connector-api" }
 data_components = { path = "../../data_components", features = ["mysql"] }
 datafusion.workspace = true
 datafusion-table-providers = { workspace = true, features = ["mysql", "mysql-federation"] }

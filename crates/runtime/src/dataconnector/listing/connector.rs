@@ -53,18 +53,18 @@ use {
     datafusion_datasource::file_format::FileFormatFactory, vortex_datafusion::VortexFormatFactory,
 };
 
-use crate::Runtime;
-use crate::accelerated::AcceleratedTable;
 use crate::component::dataset::Dataset;
 use crate::dataconnector::{
     ConnectorComponent, DataConnector, DataConnectorError, DataConnectorResult,
     listing::infer::{infer_partitions_with_types_from_files, infer_partitions_with_types_prefix},
 };
 use crate::parameters::{ExposedParamLookup, Parameters};
+use app::App;
 use data_components::object::{
     metadata::{MetadataColumn, ObjectStoreMetadataTable},
     text::ObjectStoreTextTable,
 };
+use data_connector_api::accelerated::RegisteredAcceleratedTable;
 
 use super::{
     DelimitedFormat, ParsedFileExtension, detect_file_extension_from_path,
@@ -547,7 +547,12 @@ pub trait ListingTableConnector: DataConnector {
             })
     }
 
-    fn get_runtime(&self) -> Option<Runtime> {
+    /// The loaded app, for the runtime-level configuration this connector's
+    /// reads consult (currently `runtime.params.parquet_page_index`).
+    ///
+    /// `None` where no runtime is attached — connector unit tests that build the
+    /// connector directly.
+    fn get_app(&self) -> Option<Arc<App>> {
         None
     }
 
@@ -1005,16 +1010,13 @@ pub trait ListingTableConnector: DataConnector {
     where
         Self: Display,
     {
-        let runtime = self.get_runtime();
-        build_table_parquet_options(runtime.as_ref())
-            .await
-            .map_err(
-                |e| crate::dataconnector::DataConnectorError::UnableToConnectInternal {
-                    dataconnector: format!("{self}"),
-                    connector_component: ConnectorComponent::from(dataset),
-                    source: Box::new(e),
-                },
-            )
+        build_table_parquet_options(self.get_app().as_ref()).map_err(|e| {
+            crate::dataconnector::DataConnectorError::UnableToConnectInternal {
+                dataconnector: format!("{self}"),
+                connector_component: ConnectorComponent::from(dataset),
+                source: Box::new(e),
+            }
+        })
     }
 
     /// A hook that is called when an accelerated table is registered to the
@@ -1026,7 +1028,7 @@ pub trait ListingTableConnector: DataConnector {
     async fn on_accelerated_table_registration(
         &self,
         _dataset: &Dataset,
-        _accelerated_table: &mut AcceleratedTable,
+        _accelerated_table: &mut dyn RegisteredAcceleratedTable,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Ok(())
     }
@@ -1444,7 +1446,7 @@ impl<T: ListingTableConnector + Display> DataConnector for T {
     async fn on_accelerated_table_registration(
         &self,
         dataset: &Dataset,
-        accelerated_table: &mut AcceleratedTable,
+        accelerated_table: &mut dyn RegisteredAcceleratedTable,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         ListingTableConnector::on_accelerated_table_registration(self, dataset, accelerated_table)
             .await
@@ -1825,14 +1827,14 @@ impl SensitiveListingTableUrl {
 /// `runtime.params.parquet_page_index` (`required` | `auto` | `skip`) and
 /// sets `enable_page_index` accordingly. When no runtime is available,
 /// `enable_page_index` retains the `DataFusion` default (`true`).
-pub async fn build_table_parquet_options(
-    runtime: Option<&Runtime>,
+pub fn build_table_parquet_options(
+    app: Option<&Arc<App>>,
 ) -> std::result::Result<TableParquetOptions, DataFusionError> {
     let mut opts = TableParquetOptions::new();
     opts.set("pushdown_filters", "true")?;
 
-    if let Some(rt) = runtime {
-        let page_index_options = parquet_page_index_options(rt).await;
+    if let Some(app) = app {
+        let page_index_options = parquet_page_index_options(app);
         opts.set(
             "enable_page_index",
             &page_index_options.enable_page_index.to_string(),
@@ -1863,11 +1865,11 @@ impl Default for ParquetPageIndexOptions {
 ///   params:
 ///     parquet_page_index: required # skip, auto
 /// ```
-async fn parquet_page_index_options(runtime: &Runtime) -> ParquetPageIndexOptions {
-    let runtime_app = runtime.app();
-    let app = runtime_app.read().await;
+fn parquet_page_index_options(app: &Arc<App>) -> ParquetPageIndexOptions {
+    // `App::get_runtime_param` reads the `Option<Arc<App>>` the runtime stores.
+    let app = Some(Arc::clone(app));
     let parquet_page_index_param =
-        app::App::get_runtime_param(&app, "parquet_page_index", "required".to_string());
+        App::get_runtime_param(&app, "parquet_page_index", "required".to_string());
 
     match parquet_page_index_param.as_str() {
         // Note: "auto" and "required" both enable page index now. The difference was that "auto"
@@ -3031,33 +3033,27 @@ mod tests {
         assert_eq!(get_url_prefix(&url), "file:///");
     }
 
-    #[tokio::test]
-    async fn test_parquet_page_index_options_default() {
-        let app = app::AppBuilder::new("test").build();
-        let runtime = crate::Runtime::builder()
-            .with_app_opt(Some(Arc::new(app)))
-            .build()
-            .await;
+    #[test]
+    fn test_parquet_page_index_options_default() {
+        let app = Arc::new(app::AppBuilder::new("test").build());
 
-        let options = parquet_page_index_options(&runtime).await;
+        let options = parquet_page_index_options(&app);
         assert!(options.enable_page_index);
     }
 
-    #[tokio::test]
-    async fn test_parquet_page_index_options_auto() {
+    #[test]
+    fn test_parquet_page_index_options_auto() {
         let mut params = std::collections::HashMap::new();
         params.insert("parquet_page_index".to_string(), "auto".to_string());
-        let app = app::AppBuilder::new("test")
-            .with_runtime_params(params)
-            .build();
-        let runtime = crate::Runtime::builder()
-            .with_app_opt(Some(Arc::new(app)))
-            .build()
-            .await;
+        let app = Arc::new(
+            app::AppBuilder::new("test")
+                .with_runtime_params(params)
+                .build(),
+        );
 
         // "auto" and "required" now behave the same since tolerate_missing_page_index
         // was removed in DataFusion v51. Page index reading handles missing indexes gracefully.
-        let options = parquet_page_index_options(&runtime).await;
+        let options = parquet_page_index_options(&app);
         assert!(options.enable_page_index);
     }
 
@@ -3163,52 +3159,48 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_parquet_page_index_options_skip() {
+    #[test]
+    fn test_parquet_page_index_options_skip() {
         let mut params = std::collections::HashMap::new();
         params.insert("parquet_page_index".to_string(), "skip".to_string());
-        let app = app::AppBuilder::new("test")
-            .with_runtime_params(params)
-            .build();
-        let runtime = crate::Runtime::builder()
-            .with_app_opt(Some(Arc::new(app)))
-            .build()
-            .await;
+        let app = Arc::new(
+            app::AppBuilder::new("test")
+                .with_runtime_params(params)
+                .build(),
+        );
 
-        let options = parquet_page_index_options(&runtime).await;
+        let options = parquet_page_index_options(&app);
         assert!(!options.enable_page_index);
     }
 
-    #[tokio::test]
-    async fn test_parquet_page_index_options_required() {
+    #[test]
+    fn test_parquet_page_index_options_required() {
         let mut params = std::collections::HashMap::new();
         params.insert("parquet_page_index".to_string(), "required".to_string());
-        let app = app::AppBuilder::new("test")
-            .with_runtime_params(params)
-            .build();
-        let runtime = crate::Runtime::builder()
-            .with_app_opt(Some(Arc::new(app)))
-            .build()
-            .await;
+        let app = Arc::new(
+            app::AppBuilder::new("test")
+                .with_runtime_params(params)
+                .build(),
+        );
 
-        let options = parquet_page_index_options(&runtime).await;
+        let options = parquet_page_index_options(&app);
         assert!(options.enable_page_index);
     }
 
-    #[tokio::test]
-    async fn test_parquet_page_index_options_invalid() {
+    #[test]
+    fn test_parquet_page_index_options_invalid() {
         let mut params = std::collections::HashMap::new();
         params.insert("parquet_page_index".to_string(), "invalid".to_string());
-        let app = app::AppBuilder::new("test")
-            .with_runtime_params(params)
-            .build();
-        let runtime = crate::Runtime::builder()
-            .with_app_opt(Some(Arc::new(app)))
-            .build()
-            .await;
+        let app = Arc::new(
+            app::AppBuilder::new("test")
+                .with_runtime_params(params)
+                .build(),
+        );
 
-        let options = parquet_page_index_options(&runtime).await;
-        // Should fall back to default
-        assert!(options.enable_page_index);
+        let options = parquet_page_index_options(&app);
+        assert!(
+            options.enable_page_index,
+            "an invalid value falls back to the default"
+        );
     }
 }

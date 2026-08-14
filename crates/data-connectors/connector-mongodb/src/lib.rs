@@ -28,6 +28,7 @@ pub mod stream;
 
 use async_trait::async_trait;
 use data_components::inferred_schema::{InferredIndex, InferredSchema, InferredSortColumn};
+use data_connector_api::federated::FederatedTableProvider;
 use data_connector_api::schema_projection::{ProjectionPolicy, parse_schema_projection};
 use datafusion::datasource::TableProvider;
 use datafusion_table_providers::mongodb::{
@@ -40,7 +41,6 @@ use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult,
 };
-use runtime::federated::FederatedTable;
 use runtime_parameters::{ParameterSpec, Parameters};
 use secrecy::ExposeSecret;
 use snafu::prelude::*;
@@ -798,7 +798,7 @@ impl DataConnector for MongoDB {
 
     fn changes_stream(
         &self,
-        federated_table: Arc<FederatedTable>,
+        federated_table: Arc<dyn FederatedTableProvider>,
         dataset: &Dataset,
     ) -> Option<data_components::cdc::ChangesStream> {
         Some(changes::build_changes_stream(

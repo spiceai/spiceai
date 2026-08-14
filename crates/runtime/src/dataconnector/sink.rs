@@ -140,16 +140,11 @@ impl DataConnectorFactory for SinkConnectorFactory {
             // Reading the checkpoint needs the accelerator engine registry and the secrets, so
             // the spec is rebound to the runtime handles from the connector context; without a
             // context (connector unit tests) there is no accelerator to inherit from.
-            let schema = match (&params.component, params.app(), params.runtime()) {
-                (ConnectorComponent::Dataset(spec), Some(app), Some(runtime)) => {
-                    let dataset = Dataset {
-                        spec: spec.as_ref().clone(),
-                        app,
-                        runtime,
-                    };
-                    accelerated_checkpoint_schema(&dataset).await
+            let schema = match &params.component {
+                ConnectorComponent::Dataset(spec) => {
+                    params.accelerated_checkpoint_schema(spec).await
                 }
-                _ => None,
+                ConnectorComponent::Catalog(_) => None,
             }
             .unwrap_or_else(placeholder_schema);
 

@@ -14,10 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use arrow::{
-    array::{RecordBatch, new_empty_array},
-    datatypes::SchemaRef,
-};
+use arrow::{array::RecordBatch, datatypes::SchemaRef};
 use async_trait::async_trait;
 use datafusion::{
     catalog::Session,
@@ -38,9 +35,7 @@ use futures::StreamExt;
 use snafu::ResultExt;
 use std::{fmt, sync::Arc};
 
-use super::{
-    ArrowInternalSnafu, ErrorChecker, GraphQLContext, ResultTransformSnafu, client::GraphQLClient,
-};
+use super::{ErrorChecker, GraphQLContext, ResultTransformSnafu, client::GraphQLClient};
 use super::{Result, client::GraphQLQuery};
 
 pub type TransformFn =
@@ -52,13 +47,9 @@ fn derive_table_schema(
 ) -> Result<SchemaRef> {
     match transform_fn {
         Some(transform_fn) => {
-            let empty_columns = gql_schema
-                .fields()
-                .iter()
-                .map(|field| new_empty_array(field.data_type()))
-                .collect();
-            let empty_batch = RecordBatch::try_new(Arc::clone(gql_schema), empty_columns)
-                .context(ArrowInternalSnafu)?;
+            // `new_empty` rather than `try_new`, which cannot build a batch from a fieldless
+            // schema — see `derive_table_schema_handles_a_fieldless_schema`.
+            let empty_batch = RecordBatch::new_empty(Arc::clone(gql_schema));
 
             Ok(transform_fn(&empty_batch)
                 .context(ResultTransformSnafu)?
@@ -458,6 +449,49 @@ mod tests {
         )]));
 
         RecordBatch::try_new(schema, vec![Arc::clone(batch.column(0))]).map_err(Into::into)
+    }
+
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "signature is fixed by TransformFn, which fallible transforms also implement"
+    )]
+    fn fixed_output_schema(
+        _batch: &RecordBatch,
+    ) -> Result<RecordBatch, Box<dyn std::error::Error + Send + Sync>> {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "cast_id",
+            DataType::Utf8,
+            true,
+        )]));
+
+        Ok(RecordBatch::new_empty(schema))
+    }
+
+    /// Regression test for #13004: with nothing configured to fall back to, an empty first page
+    /// leaves a fieldless schema, and building the transform's probe batch out of it used to fail
+    /// with "must either specify a row count or at least one column" — failing the whole dataset.
+    #[test]
+    fn derive_table_schema_handles_a_fieldless_schema() {
+        let empty: SchemaRef = Arc::new(Schema::empty());
+
+        let derived = derive_table_schema(&empty, Some(fixed_output_schema))
+            .expect("a fieldless schema is not a reason to fail the dataset");
+
+        assert_eq!(derived.field(0).name(), "cast_id");
+    }
+
+    /// The probe batch a transform sees still carries every configured field, so a transform that
+    /// inspects its input keeps working.
+    #[test]
+    fn derive_table_schema_passes_configured_fields_to_the_transform() {
+        let schema: SchemaRef =
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
+
+        let derived = derive_table_schema(&schema, Some(rename_first_column))
+            .expect("transform to run over the configured fields");
+
+        assert_eq!(derived.field(0).name(), "renamed_id");
+        assert_eq!(derived.field(0).data_type(), &DataType::Int64);
     }
 
     #[test]

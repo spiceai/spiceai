@@ -57,6 +57,7 @@ use crate::secrets::Secrets;
 use crate::tracing_util::view_registered_trace;
 use crate::view::prepare_view;
 use crate::{status, view};
+use data_connector_api::federated::FederatedTableProvider;
 use runtime_search::udtf::TEXT_SEARCH_UDTF_NAME;
 
 use snafu::ResultExt;
@@ -3095,7 +3096,10 @@ impl DataFusion {
                 },
             );
 
-            let changes_stream = source.changes_stream(Arc::clone(&source_table_provider), dataset);
+            let changes_stream = source.changes_stream(
+                Arc::clone(&source_table_provider) as Arc<dyn FederatedTableProvider>,
+                dataset,
+            );
 
             if let Some(changes_stream) = changes_stream {
                 accelerated_table_builder.changes_stream(changes_stream);
