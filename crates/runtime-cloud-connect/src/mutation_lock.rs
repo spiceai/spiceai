@@ -175,7 +175,8 @@ fn acquire_lock(config_dir: &Path, action: &str, timeout: Duration) -> Result<Mu
             .context(IoSnafu { path: path.clone() })?;
     }
     #[cfg(windows)]
-    validate_windows_lock(&file).context(IoSnafu { path: path.clone() })?;
+    crate::identity::validate_windows_regular_single_link(&file)
+        .context(IoSnafu { path: path.clone() })?;
     let started = Instant::now();
 
     loop {
@@ -412,36 +413,6 @@ fn open_windows_owner_only_lock_file(path: &Path) -> std::io::Result<File> {
         ));
     }
     Ok(unsafe { File::from_raw_handle(handle as RawHandle) })
-}
-
-#[cfg(windows)]
-fn validate_windows_lock(file: &File) -> std::io::Result<()> {
-    use std::os::windows::io::AsRawHandle as _;
-    use windows_sys::Win32::Storage::FileSystem::{
-        BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
-        GetFileInformationByHandle,
-    };
-
-    let mut information = BY_HANDLE_FILE_INFORMATION::default();
-    let result =
-        unsafe { GetFileInformationByHandle(file.as_raw_handle().cast(), &mut information) };
-    if result == 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    if information.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT) != 0
-    {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "the Cloud Connect state path must be a regular file, not a directory or reparse point",
-        ));
-    }
-    if information.nNumberOfLinks != 1 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "the Cloud Connect state path must not be hard-linked",
-        ));
-    }
-    Ok(())
 }
 
 fn lock_owner_suffix(file: &mut File) -> String {

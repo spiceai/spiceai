@@ -345,9 +345,14 @@ impl Runtime {
 
         if current_app.is_none() {
             // Task history reads its configuration from the app, so a start with
-            // no app skipped it entirely; it is initialized from the app that
-            // arrived. Idempotent, so the ordinary case where the load already
-            // registered the table changes nothing.
+            // no app skipped it entirely and every query since has had nowhere
+            // to record itself. It is initialized here from the app as
+            // installed, which is not always the app as deployed: a Cloud
+            // deployment keeps this process's `runtime` section and reports the
+            // deployed one as needing a restart, so a deployed task-history
+            // setting takes effect at that restart and this initialization uses
+            // the settings in effect now. Idempotent, so the ordinary case where
+            // the load already registered the table changes nothing.
             if let Err(err) = Arc::clone(&self).init_task_history().await {
                 tracing::warn!("Creating internal task history table: {err}");
             }
@@ -414,7 +419,7 @@ fn warn_on_sections_only_a_start_installs(app: &App) {
         return;
     }
     tracing::warn!(
-        "This instance had no configuration when it started, so it built none of the components `{}` describes. Those sections are read when spiced starts: restart it to serve them. Everything else in the spicepod is running now.",
+        "This instance had no configuration when it started, so it built none of the components `{}` describes. Those sections are read when spiced starts: restart it to serve them.",
         pending.join("`, `")
     );
 }

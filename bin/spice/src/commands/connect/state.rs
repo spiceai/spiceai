@@ -17,6 +17,11 @@ limitations under the License.
 //! Per-directory serialization and the non-secret enrollment journal.
 
 use std::fs::OpenOptions;
+// The Windows reader below returns a `File`; the moved mutation lock took every
+// other use of it with it, so importing it unconditionally would be unused
+// everywhere else.
+#[cfg(windows)]
+use std::fs::File;
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -134,7 +139,7 @@ fn open_windows_regular_file_for_read(path: &Path) -> std::io::Result<File> {
         return Err(std::io::Error::last_os_error());
     }
     let file = unsafe { File::from_raw_handle(handle as RawHandle) };
-    validate_windows_lock(&file)?;
+    runtime_cloud_connect::identity::validate_windows_regular_single_link(&file)?;
     Ok(file)
 }
 

@@ -1091,8 +1091,13 @@ pub(crate) fn open_windows_owner_only_file(
 
 /// Reject Windows directories, reparse points, and multiply-linked state
 /// files after opening the object itself rather than following it.
+///
+/// Public because every Cloud Connect state file — the identity, the mutation
+/// lock, the journals the CLI writes beside them — needs the same check on the
+/// handle it just opened, and a security check with three copies is a security
+/// check with three chances to drift.
 #[cfg(windows)]
-pub(crate) fn validate_windows_regular_single_link(file: &std::fs::File) -> std::io::Result<()> {
+pub fn validate_windows_regular_single_link(file: &std::fs::File) -> std::io::Result<()> {
     use std::os::windows::io::AsRawHandle as _;
     use windows_sys::Win32::Storage::FileSystem::{
         BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
