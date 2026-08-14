@@ -886,7 +886,7 @@ sequenceDiagram
     FIN->>FIN: Stage B under visibility_lock + listing_fence + scan_state_lock:
     FIN->>DI: extend_max_conflicts: fuse {delete_seq, insert_seq} per key (ArcSwap swap)
     FIN->>STG: publish as PROTECTED snapshot (threshold = its snapshot_sequence)
-    FIN->>FIN: activate exact staged tombstone IDs in memory under the same fence;<br/>queue durable published=true flips, bump inline generation
+    FIN->>FIN: activate exact staged tombstone IDs in memory under the same fence,<br/>queue durable published=true flips, bump inline generation
     Note over FIN,DI: now visible: old copy hidden (delete_seq), new copy shown (insert_seq > delete_seq)
 ```
 
