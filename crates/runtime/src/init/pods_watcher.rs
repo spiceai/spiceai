@@ -365,14 +365,20 @@ impl Runtime {
             // the settings in effect now. Idempotent, so the ordinary case where
             // the load already registered the table changes nothing.
             // Emission was fixed when `DataFusion` was built, from the
-            // configuration this process had then — which was none. Align it with
-            // the app that has arrived before bringing the table up: otherwise an
-            // app that disables task history leaves every query still emitting
-            // into a table nothing created, and one that enables it creates a
-            // table no query writes to.
-            self.df.set_task_history_enabled(arriving_task_history);
-            if let Err(err) = Arc::clone(&self).init_task_history().await {
-                tracing::warn!("Creating internal task history table: {err}");
+            // configuration this process had then — which was none — so it has to
+            // follow the app that has arrived. It is turned on only once the
+            // table is there to receive rows: a query built while initialization
+            // is still running would target a table that does not exist yet, and
+            // an initialization that fails for any other reason — an unusable
+            // retention setting, a backend that cannot be created — would
+            // otherwise leave every later query repeating the same missing-table
+            // failure with nothing to fix it.
+            self.df.set_task_history_enabled(false);
+            match Arc::clone(&self).init_task_history().await {
+                Ok(()) => self.df.set_task_history_enabled(arriving_task_history),
+                Err(err) => {
+                    tracing::warn!("Creating internal task history table: {err}");
+                }
             }
         }
 

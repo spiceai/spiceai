@@ -30,6 +30,11 @@ impl Runtime {
         // Skip task history initialization if there's no valid spicepod
         // Task history requires App infrastructure (datasets, table providers) to function
         let Some(app) = self.read_app().await else {
+            // No configuration means no table, so emission has to be off as well:
+            // the flag was built from a default this process never had an app to
+            // confirm, and leaving it on makes every query report a table that
+            // was deliberately not created.
+            self.df.set_task_history_enabled(false);
             tracing::debug!(
                 "Task history initialization skipped: no valid spicepod configuration."
             );
@@ -37,6 +42,7 @@ impl Runtime {
         };
 
         if !app.runtime.task_history.enabled {
+            self.df.set_task_history_enabled(false);
             tracing::debug!("Task history is disabled via configuration.");
             return Ok(());
         }

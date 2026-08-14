@@ -415,23 +415,47 @@ fn open_windows_owner_only_lock_file(path: &Path) -> std::io::Result<File> {
     Ok(unsafe { File::from_raw_handle(handle as RawHandle) })
 }
 
+/// The most of the lock file that is ever read to describe its holder.
+///
+/// The file belongs to whoever holds the lock, so formatting a timeout message
+/// must not size an allocation from it. The bound is on the read itself and not
+/// on the truncation that follows: reading the whole file first would let a large
+/// payload cost memory before a single character was discarded.
+const LOCK_DIAGNOSTICS_BYTES: u64 = 1024;
+
+/// How much of the sanitized text reaches the message.
+const LOCK_DIAGNOSTICS_CHARS: usize = 160;
+
 fn lock_owner_suffix(file: &mut File) -> String {
-    file.rewind()
-        .and_then(|()| {
-            let mut value = String::new();
-            file.read_to_string(&mut value).map(|_| value)
-        })
-        .ok()
-        .map(|value| {
-            value
-                .chars()
-                .filter(|character| !character.is_control())
-                .take(160)
-                .collect::<String>()
-        })
-        .filter(|value| !value.is_empty())
-        .map(|value| format!(" ({value})"))
-        .unwrap_or_default()
+    let owner = read_bounded_lock_diagnostics(file)
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(LOCK_DIAGNOSTICS_CHARS)
+        .collect::<String>();
+    if owner.is_empty() {
+        return String::new();
+    }
+    format!(" ({owner})")
+}
+
+/// Read at most [`LOCK_DIAGNOSTICS_BYTES`] of `file` from the start.
+///
+/// Lossy rather than strict UTF-8 because these bytes are diagnostics: a lock
+/// file someone filled with anything at all should still produce a message,
+/// bounded and stripped, rather than none.
+fn read_bounded_lock_diagnostics(file: &mut File) -> String {
+    if file.rewind().is_err() {
+        return String::new();
+    }
+    let mut bytes = Vec::new();
+    if file
+        .take(LOCK_DIAGNOSTICS_BYTES)
+        .read_to_end(&mut bytes)
+        .is_err()
+    {
+        return String::new();
+    }
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 #[cfg(test)]
@@ -515,6 +539,29 @@ mod tests {
 
     /// The lock file is opened without following links, so a link planted where
     /// it belongs cannot make the lock write through to another file.
+    /// The bound is on the read. A lock file far larger than the message could
+    /// ever carry must not be pulled into memory to describe its holder.
+    #[test]
+    fn lock_diagnostics_read_at_most_their_bound() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join("large.lock");
+        let payload = "a".repeat(4 * 1024 * 1024);
+        std::fs::write(&path, &payload).expect("write a large lock file");
+        let mut file = std::fs::File::open(&path).expect("open the large lock file");
+
+        let read = read_bounded_lock_diagnostics(&mut file);
+        assert!(
+            read.len() as u64 <= LOCK_DIAGNOSTICS_BYTES,
+            "the read itself must be bounded, not only the message: {} bytes",
+            read.len()
+        );
+        assert_eq!(
+            lock_owner_suffix(&mut file).chars().count(),
+            LOCK_DIAGNOSTICS_CHARS + 3,
+            "the message carries the bounded text inside its parentheses"
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn a_symlink_never_becomes_the_lock() {

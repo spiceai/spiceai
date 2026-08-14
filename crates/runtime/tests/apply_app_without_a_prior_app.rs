@@ -52,6 +52,7 @@ fn view(name: &str, sql: &str) -> View {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_app_arriving_after_an_empty_start() {
     an_app_that_arrives_after_an_empty_start_is_loaded_not_only_stored().await;
+    an_app_less_start_does_not_emit_task_history().await;
     a_table_this_runtime_did_not_register_is_a_conflict_not_a_no_op().await;
     an_arriving_app_decides_whether_queries_emit_task_history().await;
     an_arriving_app_that_enables_task_history_gets_a_table_and_emission().await;
@@ -77,6 +78,25 @@ async fn an_arriving_app_decides_whether_queries_emit_task_history() {
     assert!(
         !rt.datafusion().task_history_emission_enabled(),
         "and queries must stop emitting rows nothing will store"
+    );
+}
+
+/// An app-less start leaves nothing to record into, so emission has to be off
+/// until an app arrives — otherwise every query reports a table that was
+/// deliberately never created, which is the failure this whole path exists to
+/// stop.
+async fn an_app_less_start_does_not_emit_task_history() {
+    let rt = Arc::new(Runtime::builder().with_app_opt(None).build().await);
+    Arc::clone(&rt).load_components().await;
+
+    assert!(
+        !rt.datafusion()
+            .table_exists(&TableReference::partial("runtime", "task_history")),
+        "an app-less start creates no table"
+    );
+    assert!(
+        !rt.datafusion().task_history_emission_enabled(),
+        "so nothing may emit into it"
     );
 }
 
