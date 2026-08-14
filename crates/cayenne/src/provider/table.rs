@@ -58,9 +58,10 @@ use super::on_conflict::{
 };
 use super::pk_index::{
     BoundedShardedPkIndexBuilder, COLD_PK_BLOOM_PER_FILE_MAX_BYTES, CachedPkIndex, CachedPkKeyset,
-    ColdPkExistence, PK_INDEX_PERSIST_MAX_BYTES, PkBloom, PkDigestSet, PkExistenceRef,
-    PkKeysetInsertOutcome, RowLocation, ShardedPkIndex, approx_captured_file_bytes,
-    deserialize_pk_bloom_sidecar, pk_digest, serialize_pk_bloom_sidecar, shard_of_pk,
+    ColdPkExistence, PK_INDEX_PERSIST_MAX_BYTES, PendingPkExistence, PendingPkKeys, PkBloom,
+    PkDigestSet, PkExistenceRef, PkKeysetInsertOutcome, RowLocation, ShardedPkIndex,
+    approx_captured_file_bytes, deserialize_pk_bloom_sidecar, pk_digest,
+    serialize_pk_bloom_sidecar, shard_of_pk,
 };
 use super::streaming::StreamingExec;
 use crate::bounded_fifo::BoundedFifoSet;
@@ -1664,6 +1665,16 @@ pub struct CayenneTableProvider {
     /// `build_sharded_pk_index` / the sharded validate path; routed by
     /// `shard_of_pk` so a key co-locates with its tier segments + tombstones.
     sharded_pk_keyset_cache: Arc<ParkingMutex<Option<ShardedPkIndex>>>,
+    /// Keys committed by other writers while `pk_keyset_cache` was checked out for
+    /// validation, and its `sharded_pk_keyset_cache` twin (see [`PendingPkKeys`]).
+    /// Without them a concurrent commit's existence entries are dropped and the
+    /// restored index answers "absent" for a live key, which reads as a new primary
+    /// key and duplicates the row.
+    ///
+    /// Lock order: each log is taken WHILE its cache's mutex is held (or on its own
+    /// for the read-only validation probe) — never the other way round.
+    pk_keyset_pending: Arc<ParkingMutex<PendingPkKeys>>,
+    sharded_pk_keyset_pending: Arc<ParkingMutex<PendingPkKeys>>,
     /// One-shot latch for the write-path warm-cache probe
     /// (`maybe_install_warm_pk_caches`): probe once per cache lifetime,
     /// re-armed by `clear_cached_pk_keyset`. Shared across clones so every
@@ -6100,6 +6111,8 @@ impl CayenneTableProvider {
             )),
             pk_keyset_cache: Arc::new(ParkingMutex::new(None)),
             sharded_pk_keyset_cache: Arc::new(ParkingMutex::new(None)),
+            pk_keyset_pending: Arc::new(ParkingMutex::new(PendingPkKeys::default())),
+            sharded_pk_keyset_pending: Arc::new(ParkingMutex::new(PendingPkKeys::default())),
             pk_warm_probe_done: Arc::new(AtomicBool::new(false)),
             pk_keyset_bytes_single: Arc::new(AtomicUsize::new(0)),
             pk_keyset_bytes_sharded: Arc::new(AtomicUsize::new(0)),
@@ -7295,6 +7308,8 @@ impl CayenneTableProvider {
             ),
             pk_keyset_cache: Arc::clone(&self.pk_keyset_cache),
             sharded_pk_keyset_cache: Arc::clone(&self.sharded_pk_keyset_cache),
+            pk_keyset_pending: Arc::clone(&self.pk_keyset_pending),
+            sharded_pk_keyset_pending: Arc::clone(&self.sharded_pk_keyset_pending),
             pk_warm_probe_done: Arc::clone(&self.pk_warm_probe_done),
             pk_keyset_bytes_single: Arc::clone(&self.pk_keyset_bytes_single),
             pk_keyset_bytes_sharded: Arc::clone(&self.pk_keyset_bytes_sharded),
@@ -7519,9 +7534,16 @@ impl CayenneTableProvider {
         // supersedes) hide rows the persisted counts still include, so they must
         // ALSO demote the stats to the inexact variant until the checkpoint
         // publishes them into the durable deletion index.
+        // Those first three terms are proxies for "rows exist that the
+        // persisted count does not describe yet", and a checkpoint clears all
+        // of them at once. It does not drain post-write maintenance, though, so
+        // a commit whose `live_rows_delta` is still queued survives every proxy
+        // and would be served `Exact`-and-short. The fourth term reads that
+        // queue directly, which no checkpoint can clear out from under it.
         let has_pending_visibility_changes = self.has_pending_deletions()
             || self.inlined_row_count.load(Ordering::Relaxed) > 0
-            || self.mem_tier.any_tombstones();
+            || self.mem_tier.any_tombstones()
+            || self.post_write_maintenance.has_unapplied_live_rows_delta();
 
         let cache = self.table_statistics.read();
         // Serve the Inexact view when either (a) uncheckpointed visibility changes
@@ -7691,8 +7713,40 @@ impl CayenneTableProvider {
         self.scan_file_statistics.clear();
     }
 
+    /// Check the table-wide PK index out for validation. The cell is left empty for
+    /// the whole (lazily consumed) validation stream, so open a
+    /// [`PendingPkKeys`] window over that gap: keys committed meanwhile are held
+    /// there and merged back by [`Self::store_cached_pk_index`].
+    ///
+    /// Returns `None` when no index is cached — the caller then rebuilds one from
+    /// the table, which is equally a checkout: the rebuild reads a snapshot of the
+    /// table and every key committed after it must still reach the restored index.
     fn take_cached_pk_index(&self) -> Option<CachedPkIndex> {
-        self.pk_keyset_cache.lock().take()
+        let mut guard = self.pk_keyset_cache.lock();
+        self.pk_keyset_pending.lock().begin_checkout();
+        guard.take()
+    }
+
+    /// Close a checkout opened by [`Self::take_cached_pk_index`] without restoring
+    /// an index (the validation never got one — it failed while rebuilding). The
+    /// cache stays empty, so the next validation rebuilds and sees every committed
+    /// key; holding the log open past that point would only accumulate keys nothing
+    /// will replay.
+    fn abandon_cached_pk_index_checkout(&self) {
+        let _guard = self.pk_keyset_cache.lock();
+        let _ = self.pk_keyset_pending.lock().end_checkout();
+    }
+
+    /// Existence view over the keys committed while the table-wide index has been
+    /// checked out, for the validation holding that index. `None` when there are
+    /// none (the common case).
+    pub(crate) fn pending_pk_existence(&self) -> Option<PendingPkExistence> {
+        self.pk_keyset_pending.lock().existence()
+    }
+
+    /// [`Self::pending_pk_existence`] for the per-shard index.
+    pub(crate) fn pending_sharded_pk_existence(&self) -> Option<PendingPkExistence> {
+        self.sharded_pk_keyset_pending.lock().existence()
     }
 
     /// Whether this table may fall back to a bounded bloom existence filter when
@@ -7791,8 +7845,84 @@ impl CayenneTableProvider {
         bloom
     }
 
+    /// Restore the table-wide PK index to its cache, closing the checkout window
+    /// [`Self::take_cached_pk_index`] opened: the keys committed while the index was
+    /// out are replayed into it first, so the cache regains every key it would have
+    /// recorded had nothing been checked out. When the pending log overflowed those
+    /// keys are gone, and the index is dropped instead of cached — an index missing
+    /// a live key answers "absent" for it, which reads as a new primary key and
+    /// duplicates the row.
     pub(crate) fn store_cached_pk_index(&self, index: CachedPkIndex) {
         let max_bytes = self.effective_single_keyset_budget();
+        // Held from closing the checkout window through the store, so no writer can
+        // slip a key in between: it would find the cell empty, see no checkout, and
+        // drop the key.
+        let mut guard = self.pk_keyset_cache.lock();
+        let restored = self.pk_keyset_pending.lock().end_checkout();
+        if restored.index_must_be_discarded() {
+            drop(guard);
+            tracing::debug!(
+                table = self.table_metadata.table_name.as_str(),
+                key_count = index.len(),
+                "Dropping the primary-key index instead of caching it: it no longer describes the \
+                 table's live keys (the cache was invalidated, or concurrent commits during \
+                 validation exceeded the pending-key budget)"
+            );
+            self.clear_cached_pk_keyset();
+            return;
+        }
+        let mut index = index;
+        let mut replayed_keys = 0_usize;
+        let mut replay_over_budget = false;
+        for (keys, location, sequence) in restored.batches() {
+            replayed_keys = replayed_keys.saturating_add(keys.len());
+            if !Self::apply_keys_to_index(&mut index, keys, location, sequence, max_bytes) {
+                // Replaying pushed the exact keyset over budget. Convert exactly as
+                // `record_pk_keys_with_location` would have at commit time, feeding
+                // the WHOLE batch into the bloom: the conversion only carries the
+                // keys already inserted, so the ones the insert stopped short of
+                // would be false negatives. `DoNothing` needs exactness and instead
+                // drops the keyset below.
+                if !self.upsert_bloom_eligible() {
+                    replay_over_budget = true;
+                    break;
+                }
+                let mut bloom = match &index {
+                    CachedPkIndex::Exact(keyset) => Self::bloom_from_keyset(keyset, max_bytes),
+                    CachedPkIndex::Bloom(_) => PkBloom::with_byte_budget(max_bytes),
+                };
+                for key in keys.iter() {
+                    bloom.insert(key.as_ref());
+                }
+                index = CachedPkIndex::Bloom(bloom);
+            }
+        }
+        if replayed_keys > 0 {
+            tracing::debug!(
+                table = self.table_metadata.table_name.as_str(),
+                replayed_keys,
+                replay_over_budget,
+                "Replayed primary keys committed while the existence index was checked out"
+            );
+        }
+
+        if replay_over_budget {
+            // A `DoNothing` table cannot fall back to a bloom, so a replay that ran
+            // past the budget leaves the keyset unusable — drop it and let the next
+            // validation rebuild, exactly as the over-budget arm below does.
+            tracing::debug!(
+                table = self.table_metadata.table_name.as_str(),
+                max_bytes,
+                "Clearing the primary-key keyset cache: replaying the keys committed while it \
+                 was checked out would exceed the byte budget"
+            );
+            *guard = None;
+            drop(guard);
+            self.pk_keyset_occ_degraded.store(false, Ordering::Release);
+            self.publish_single_keyset_bytes(0);
+            return;
+        }
+
         let to_store = match index {
             CachedPkIndex::Exact(keyset) if keyset.approx_bytes > max_bytes => {
                 if self.upsert_bloom_eligible() {
@@ -7816,7 +7946,8 @@ impl CayenneTableProvider {
                         max_bytes,
                         "Skipping primary-key keyset cache because it exceeds the configured byte budget"
                     );
-                    *self.pk_keyset_cache.lock() = None;
+                    *guard = None;
+                    drop(guard);
                     // Full invalidation: the next access rebuilds a trustworthy
                     // keyset (floor-stamped, or a Bloom that takes the per-table
                     // fallback), so clear any degraded flag or it would stay stuck
@@ -7831,7 +7962,8 @@ impl CayenneTableProvider {
         };
 
         let bytes = to_store.approx_bytes();
-        *self.pk_keyset_cache.lock() = Some(to_store);
+        *guard = Some(to_store);
+        drop(guard);
         self.publish_single_keyset_bytes(bytes);
     }
 
@@ -7934,7 +8066,14 @@ impl CayenneTableProvider {
     }
 
     pub(crate) fn clear_cached_pk_keyset(&self) {
-        *self.pk_keyset_cache.lock() = None;
+        {
+            let mut guard = self.pk_keyset_cache.lock();
+            // An index checked out for validation is not in the cell, so emptying it
+            // would not reach that index — and its restore would put a superseded
+            // one straight back. Tell the checkout to drop it instead.
+            self.pk_keyset_pending.lock().invalidate();
+            *guard = None;
+        }
         // The keyset is gone: while it is `None`, `transaction_has_conflict`
         // already takes the per-table fallback, and the next rebuild floor-stamps
         // every key to the current high-water (`load_existing_pk_index`) or returns
@@ -7946,7 +8085,11 @@ impl CayenneTableProvider {
         // invalidates the single keyset (delete, compaction, snapshot rewrite,
         // recovery) equally invalidates the sharded view. At N=1 the sharded cache
         // is never populated, so this is a no-op there.
-        *self.sharded_pk_keyset_cache.lock() = None;
+        {
+            let mut sharded = self.sharded_pk_keyset_cache.lock();
+            self.sharded_pk_keyset_pending.lock().invalidate();
+            *sharded = None;
+        }
         // The cold-tier PK existence view is tied to the same keyset generation
         // (a promotion that changes the cold manifest calls this on commit), so
         // drop it too; the next apply's cache miss rebuilds it from the current
@@ -7982,6 +8125,13 @@ impl CayenneTableProvider {
                     *location = RowLocation::FileUnlocated;
                 }
             }
+        } else {
+            // An index checked out for validation is not in the cell, so its entries
+            // keep saying `Inlined` for rows this checkpoint just moved into files.
+            // An upsert of such a key would tombstone the inline copy only and leave
+            // the file copy live, so drop that index at its restore instead — the
+            // rebuild reads the post-checkpoint locations.
+            self.pk_keyset_pending.lock().invalidate();
         }
         drop(guard);
         // The N>1 sharded cache carries the same per-key `RowLocation`s; flip them
@@ -7996,7 +8146,93 @@ impl CayenneTableProvider {
                     }
                 }
             }
+        } else if sharded.is_none() {
+            // Checked out for validation (or cold, where this is a no-op) — see the
+            // single-index arm above.
+            self.sharded_pk_keyset_pending.lock().invalidate();
         }
+    }
+
+    /// Record one committed key batch into an owned PK existence index. Returns
+    /// `false` when an `Exact` keyset hit `max_bytes` mid-batch, leaving the rest of
+    /// the batch unrecorded — the caller then converts to a bloom (upsert) or drops
+    /// the index (`DoNothing`), and MUST re-record the whole batch into whatever it
+    /// builds: a key the insert stopped short of would be a false negative, which
+    /// under upsert reads as a new primary key and writes a duplicate live row.
+    ///
+    /// Shared by the commit path ([`Self::record_pk_keys_with_location`]) and the
+    /// checkout replay ([`Self::store_cached_pk_index`]) so a key recorded while the
+    /// index was checked out lands exactly as it would have at commit time.
+    fn apply_keys_to_index(
+        index: &mut CachedPkIndex,
+        keys: &PkDigestSet,
+        location: &RowLocation,
+        sequence: i64,
+        max_bytes: usize,
+    ) -> bool {
+        match index {
+            CachedPkIndex::Bloom(bloom) => {
+                for key in keys.iter() {
+                    bloom.insert(key.as_ref());
+                }
+                true
+            }
+            CachedPkIndex::Exact(keyset) => {
+                // Existence-only insert. Under `deletion_mode: position`, real
+                // `(file, position)` for File rows is captured separately by the
+                // row_idx() read-back, which upgrades these to `FilePositioned`.
+                // Reuse each key's stored digest (the keyset is digest-keyed) and
+                // fold the presence check and the insert into a single hash
+                // lookup — the common case on re-touched PKs (e.g. CDC updates)
+                // is "present", where this clones neither the key nor re-hashes.
+                for (digest, key) in keys.iter_with_digest() {
+                    match keyset.try_insert_with_digest(digest, key, location.clone(), max_bytes) {
+                        PkKeysetInsertOutcome::OverBudget => return false,
+                        PkKeysetInsertOutcome::Updated | PkKeysetInsertOutcome::Inserted => {
+                            // Stamp the key's last-commit sequence for per-key OCC.
+                            keyset.record_sequence(digest, sequence);
+                        }
+                    }
+                }
+                true
+            }
+        }
+    }
+
+    /// Hold a committed key batch for the index checked out of `pending`'s cache,
+    /// and account the bytes it adds against that cache's share of the memory pool —
+    /// the keys are resident until the checkout replays them.
+    ///
+    /// A no-op when nothing is checked out: the cache is then simply cold, and the
+    /// next validation rebuilds an index that already reads this commit from the
+    /// table. Callers hold the corresponding cache lock (see `pk_keyset_pending`).
+    fn record_pending_pk_keys(
+        &self,
+        pending: &ParkingMutex<PendingPkKeys>,
+        accounted_bytes: &AtomicUsize,
+        keys: &PkDigestSet,
+        location: &RowLocation,
+        sequence: i64,
+        cache_budget: usize,
+    ) {
+        let max_bytes = PendingPkKeys::budget_from_cache_budget(cache_budget);
+        let (before, after) = {
+            let mut log = pending.lock();
+            let before = log.approx_bytes();
+            log.record(keys, location, sequence, max_bytes);
+            (before, log.approx_bytes())
+        };
+        if after == before {
+            return;
+        }
+        let _ = accounted_bytes.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |held| {
+            Some(if after > before {
+                held.saturating_add(after - before)
+            } else {
+                held.saturating_sub(before - after)
+            })
+        });
+        self.publish_keyset_bytes_total();
     }
 
     fn record_pk_keys_with_location(
@@ -8018,6 +8254,21 @@ impl CayenneTableProvider {
         {
             let mut sharded = self.sharded_pk_keyset_cache.lock();
             let mut drop_index = false;
+            if sharded.is_none() {
+                // Either the sharded index is checked out for validation
+                // (`build_sharded_pk_index`) or the table has no sharded cache at
+                // all (N=1, or a cold cache). Hold the keys for the checkout to
+                // replay; with nothing checked out this is a no-op, because the next
+                // validation rebuilds the index and reads this commit from the table.
+                self.record_pending_pk_keys(
+                    &self.sharded_pk_keyset_pending,
+                    &self.pk_keyset_bytes_sharded,
+                    keys,
+                    location,
+                    sequence,
+                    self.effective_sharded_keyset_budget(),
+                );
+            }
             if let Some(index) = sharded.as_mut() {
                 // Budget enforced DURING the insert, not after it. Recording the
                 // whole batch first and reconciling afterwards made the budget a
@@ -8059,46 +8310,32 @@ impl CayenneTableProvider {
         // Take ownership so an over-budget Exact keyset can be replaced by a
         // bloom without a borrow conflict; the index is restored before return.
         let Some(mut index) = guard.take() else {
-            // The shared keyset is checked out by a concurrent writer, so this
-            // committed write's key stamps (and existence entries) are dropped on
-            // the floor. A later per-key OCC check against the eventually
-            // stored-back keyset would then miss this write (it is floor-stamped
-            // to the CONCURRENT writer's begin high-water, which is below this
-            // write's sequence) — a silent lost update. Degrade to the per-table
-            // fallback until the next rebuild floor-stamps past this sequence.
+            // The shared keyset is checked out by a concurrent writer (or absent).
+            // Hold this commit's keys for the checkout to replay: dropping them
+            // would leave the restored keyset missing an existence entry for a live
+            // row, and a later upsert probing that keyset would miss, classify the
+            // key as new, emit no supersede, and leave two live rows for one primary
+            // key. `PendingPkKeys` also serves them to the in-flight validation, so
+            // the writer holding the checked-out keyset does not read this key as
+            // new either.
+            self.record_pending_pk_keys(
+                &self.pk_keyset_pending,
+                &self.pk_keyset_bytes_single,
+                keys,
+                location,
+                sequence,
+                max_bytes,
+            );
+            // The replay restores the entries but stamps them with this write's
+            // sequence AFTER the checked-out keyset's own floor-stamp, so per-key
+            // OCC stays on the conservative per-table fallback until the next
+            // rebuild (over-abort, never a missed conflict).
             self.mark_pk_keyset_occ_degraded();
             return;
         };
 
-        let mut convert_to_bloom = false;
-        match &mut index {
-            CachedPkIndex::Bloom(bloom) => {
-                for key in keys.iter() {
-                    bloom.insert(key.as_ref());
-                }
-            }
-            CachedPkIndex::Exact(keyset) => {
-                // Existence-only insert. Under `deletion_mode: position`, real
-                // `(file, position)` for File rows is captured separately by the
-                // row_idx() read-back, which upgrades these to `FilePositioned`.
-                // Reuse each key's stored digest (the keyset is digest-keyed) and
-                // fold the presence check and the insert into a single hash
-                // lookup — the common case on re-touched PKs (e.g. CDC updates)
-                // is "present", where this clones neither the key nor re-hashes.
-                for (digest, key) in keys.iter_with_digest() {
-                    match keyset.try_insert_with_digest(digest, key, location.clone(), max_bytes) {
-                        PkKeysetInsertOutcome::OverBudget => {
-                            convert_to_bloom = true;
-                            break;
-                        }
-                        PkKeysetInsertOutcome::Updated | PkKeysetInsertOutcome::Inserted => {
-                            // Stamp the key's last-commit sequence for per-key OCC.
-                            keyset.record_sequence(digest, sequence);
-                        }
-                    }
-                }
-            }
-        }
+        let convert_to_bloom =
+            !Self::apply_keys_to_index(&mut index, keys, location, sequence, max_bytes);
 
         if convert_to_bloom {
             if self.upsert_bloom_eligible() {
@@ -8150,9 +8387,59 @@ impl CayenneTableProvider {
     /// it (step 6 of `validate_and_append_sharded`). Restored BEFORE the appends so each
     /// `append_to_shard` can grow its shard's existence view UNDER `locks[s]` for
     /// the just-validated/MISS keys (§5 Phase 6).
+    ///
+    /// Closes the checkout window `build_sharded_pk_index` opened, replaying the
+    /// keys committed while the index was out (the sharded twin of
+    /// `store_cached_pk_index` — see there for why an index that is missing a live
+    /// key must be dropped rather than cached).
     fn store_sharded_pk_index(&self, index: ShardedPkIndex) {
+        let max_bytes = self.effective_sharded_keyset_budget();
+        // Held from closing the checkout window through the store — see
+        // `store_cached_pk_index`.
+        let mut guard = self.sharded_pk_keyset_cache.lock();
+        let restored = self.sharded_pk_keyset_pending.lock().end_checkout();
+        if restored.index_must_be_discarded() {
+            drop(guard);
+            tracing::debug!(
+                table = self.table_metadata.table_name.as_str(),
+                "Dropping the per-shard primary-key index instead of caching it: it no longer \
+                 describes the table's live keys"
+            );
+            self.clear_cached_pk_keyset();
+            return;
+        }
+        let mut index = index;
+        let mut drop_index = false;
+        // The per-shard index carries existence and location only — per-key OCC
+        // stamps live on the table-wide keyset — so the recorded sequence has no
+        // slot here.
+        for (keys, location, _sequence) in restored.batches() {
+            if !index.record_keys_bounded(keys, location, max_bytes) {
+                // Over budget: upsert degrades to per-shard blooms, `DoNothing` needs
+                // exactness and drops the index — the same policy the commit path
+                // applies in `record_pk_keys_with_location`.
+                if !self.upsert_bloom_eligible() {
+                    drop_index = true;
+                    break;
+                }
+                let per_shard = max_bytes / index.shard_count().max(1);
+                index.degrade_to_blooms(per_shard);
+                // The bounded insert stopped at the budget, so the keys after the
+                // stop are absent from the blooms it converted — backfill the whole
+                // batch (see `record_keys_after_degrade`).
+                index.record_keys_after_degrade(keys);
+            }
+        }
+
+        if drop_index {
+            *guard = None;
+            drop(guard);
+            self.publish_sharded_keyset_bytes(0);
+            return;
+        }
         let bytes = index.approx_bytes();
-        *self.sharded_pk_keyset_cache.lock() = Some(index);
+        *guard = Some(index);
+        drop(guard);
         self.publish_sharded_keyset_bytes(bytes);
     }
 
@@ -9529,8 +9816,19 @@ impl CayenneTableProvider {
             );
             existing_keys
         } else {
-            self.load_pk_index_for_validation(&pk_indices, &converter)
-                .await?
+            // `take_cached_pk_index` already opened the checkout window, so close it
+            // if the rebuild fails: nothing will restore an index, and the keys it
+            // would hold are read from the table by the next validation's rebuild.
+            match self
+                .load_pk_index_for_validation(&pk_indices, &converter)
+                .await
+            {
+                Ok(existing_keys) => existing_keys,
+                Err(error) => {
+                    self.abandon_cached_pk_index_checkout();
+                    return Err(error);
+                }
+            }
         };
 
         let on_conflict = self
@@ -9751,7 +10049,17 @@ impl CayenneTableProvider {
         // the single source of truth restored after validation by
         // `store_sharded_pk_index` (before the appends), then grown per shard UNDER
         // `locks[s]` by the kept-key insert inside `append_to_shard` (§5 Phase 6).
-        if let Some(cached) = self.sharded_pk_keyset_cache.lock().take() {
+        let cached = {
+            let mut guard = self.sharded_pk_keyset_cache.lock();
+            // Open the checkout window over the gap this leaves in the cache, so a
+            // key committed before the index is restored is held rather than dropped
+            // (see `take_cached_pk_index`). Opened for the rebuild below too: it
+            // reads a snapshot of the table, and a key committed after that snapshot
+            // must still reach the restored index.
+            self.sharded_pk_keyset_pending.lock().begin_checkout();
+            guard.take()
+        };
+        if let Some(cached) = cached {
             // The stored shard count is fixed at the table's `cdc_mem_tier_shards`
             // and never changes for the table's lifetime, so it always matches `n`.
             if cached.shard_count() == n {
@@ -10057,7 +10365,16 @@ impl CayenneTableProvider {
 
             let keep_row = match ctx.existing {
                 PkExistenceRef::Exact(existing_keys) => {
-                    if let Some(existing) = existing_keys.location_by_digest(digest) {
+                    // A key committed by another writer since this keyset was checked
+                    // out is absent from it, so fall through to the pending log
+                    // before concluding the key is new (see `PendingPkKeys`). The
+                    // log carries the location the commit recorded, so the supersede
+                    // below masks the row where it actually lives.
+                    let existing = existing_keys.location_by_digest(digest).or_else(|| {
+                        ctx.pending
+                            .and_then(|pending| pending.location_by_digest(digest))
+                    });
+                    if let Some(existing) = existing {
                         match ctx.on_conflict {
                             OnConflict::DoNothingAll | OnConflict::DoNothing(_) => false,
                             OnConflict::Upsert(_) => {
@@ -10117,12 +10434,23 @@ impl CayenneTableProvider {
                     } else if cold_existence
                         .as_ref()
                         .is_some_and(|c| c.maybe_contains(key.as_ref()))
+                        || (matches!(ctx.on_conflict, OnConflict::Upsert(_))
+                            && ctx.pending.is_some_and(PendingPkExistence::is_incomplete))
                     {
                         // Not in the warm/mem keyset, but a datalake (cold) file
                         // MAY hold this key — record a key-based supersede so the
                         // cold copy is masked (the exact analog of a warm `Bloom`
                         // HIT). A bloom false positive masks nothing and is a
                         // harmless no-op under upsert.
+                        //
+                        // The same shape covers an overflowed pending log: keys
+                        // committed during this checkout went unrecorded, so a miss
+                        // no longer proves the key is absent and the supersede is
+                        // what keeps a concurrent commit from surviving as a second
+                        // live row. Upsert only — `DoNothing` must not emit deletes,
+                        // and keeps the row rather than risk dropping a genuinely
+                        // new one (its restored index is discarded and rebuilt, so
+                        // the uncertainty ends with this batch).
                         push_key_supersede(
                             row_idx,
                             &key,
@@ -10162,7 +10490,14 @@ impl CayenneTableProvider {
                     // delete to BOTH the file and inline lists, so the prior version
                     // is masked wherever it lives. A false positive matches nothing
                     // and is a no-op. No `delete_specs` — we have no row location.
-                    if bloom.maybe_contains(key.as_ref()) {
+                    //
+                    // A key committed since this bloom was checked out cannot be in
+                    // it, so the pending log is consulted alongside it; an overflowed
+                    // log means no miss proves absence (see the `Exact` arm).
+                    let pending_hit = ctx.pending.is_some_and(|pending| {
+                        pending.is_incomplete() || pending.location_by_digest(digest).is_some()
+                    });
+                    if bloom.maybe_contains(key.as_ref()) || pending_hit {
                         match &self.pk_deletion_strategy {
                             PkDeletionStrategyWithCache::Int64Pk { .. } => {
                                 if let Some(arr) = int64_pk_array {
@@ -10265,6 +10600,7 @@ impl CayenneTableProvider {
         batch: &RecordBatch,
         bloom: &PkBloom,
         cold_existence: Option<&ColdPkExistence>,
+        pending_existence: Option<&PendingPkExistence>,
         pk_indices: &[usize],
         converter: &RowConverter,
         incoming_keys: &PkDigestSet,
@@ -10295,8 +10631,17 @@ impl CayenneTableProvider {
             let cold_hit = cold_existence.is_some_and(|c| c.maybe_contains(key.as_ref()));
             // One hash per row, reused for both existence-set probes below.
             let digest = pk_digest(&key);
+            // A concurrent writer committed this key after the index was checked
+            // out, so the bloom cannot hold it — route it to the HIT path, which
+            // supersedes the row it committed. Fast-pathing it as brand-new would
+            // leave two live rows for one primary key. `is_incomplete` means keys
+            // went unrecorded, so no MISS here proves absence.
+            let pending_hit = pending_existence.is_some_and(|pending| {
+                pending.is_incomplete() || pending.location_by_digest(digest).is_some()
+            });
             let is_miss = !null_pk
                 && !cold_hit
+                && !pending_hit
                 && !bloom.maybe_contains(key.as_ref())
                 && !incoming_keys.contains_digest(digest)
                 && !miss_keys.contains_digest(digest);
@@ -10367,6 +10712,11 @@ impl CayenneTableProvider {
         // Table-global (not sharded): every shard consults the same view for its
         // own keys so a cold-resident key never fast-paths as brand-new.
         let cold_existence = self.cold_pk_existence.lock().clone();
+        // Keys committed since this apply's index was checked out
+        // (`build_sharded_pk_index`), which the index itself cannot know about.
+        // Table-global like the cold view: a key routes to exactly one shard, so a
+        // shard only ever matches its own keys here.
+        let pending_existence = self.pending_sharded_pk_existence();
         let mut incoming_keys: PkDigestSet = PkDigestSet::default();
         let mut delete_specs: HashMap<Arc<str>, Vec<u64>> = HashMap::new();
         let mut deleted_pk_i64: Vec<i64> = Vec::new();
@@ -10408,6 +10758,7 @@ impl CayenneTableProvider {
                         &batch,
                         bloom,
                         cold_existence.as_deref(),
+                        pending_existence.as_ref(),
                         pk_indices,
                         converter,
                         &incoming_keys,
@@ -10439,6 +10790,7 @@ impl CayenneTableProvider {
                 on_conflict,
                 upsert_options: &upsert_options,
                 existing: index.existence_ref(s),
+                pending: pending_existence.as_ref(),
                 incoming_keys: &incoming_keys,
             };
             let result = self.apply_on_conflict_to_batch(hit_batch, &mut ctx)?;
@@ -14399,6 +14751,15 @@ impl CayenneTableProvider {
             maintenance_state.live_rows_delta = maintenance_state
                 .live_rows_delta
                 .saturating_add(live_rows_delta);
+            if live_rows_delta != 0 {
+                // Count this delta under the same lock that folds it in, so
+                // `has_unapplied_live_rows_delta` reports this write from the
+                // moment its rows become visible until the persist that folds
+                // them into `num_rows` lands.
+                maintenance_state.live_rows_delta_count =
+                    maintenance_state.live_rows_delta_count.saturating_add(1);
+                self.post_write_maintenance.record_queued_live_rows_delta();
+            }
         }
 
         self.spawn_post_write_maintenance_loop();
@@ -14500,14 +14861,27 @@ impl CayenneTableProvider {
             // `COUNT(*)` as `Exact`.
             let delta_is_exact =
                 self.table_metadata.on_conflict.is_none() && !state.retention_requested;
-            self.persist_table_stats(
-                &stats,
-                RowCountUpdate::Delta {
-                    delta: state.live_rows_delta,
-                    exact: delta_is_exact,
-                },
-            )
-            .await;
+            let persisted = self
+                .persist_table_stats(
+                    &stats,
+                    RowCountUpdate::Delta {
+                        delta: state.live_rows_delta,
+                        exact: delta_is_exact,
+                    },
+                )
+                .await;
+            if persisted {
+                // Only now does the persisted count describe these rows. Until
+                // this point the exactness gate must serve `Inexact`, because
+                // the rows have been visible to scans since their commit.
+                //
+                // Retire only what this drain persisted. A drain that lands
+                // here with `persisted == false` abandoned its delta, and
+                // leaving it outstanding is what stops the *next* drain's
+                // success from declaring the count exact over that gap.
+                self.post_write_maintenance
+                    .retire_applied_live_rows_deltas(state.live_rows_delta_count);
+            }
         }
 
         let mut retention_deleted = 0_u64;
@@ -20529,14 +20903,18 @@ impl CayenneTableProvider {
     ///
     /// Best-effort: logs a warning and continues if stats persistence fails,
     /// since stats are an optimization and not critical for correctness.
+    /// Returns whether `num_rows_update` was actually folded into the persisted
+    /// aggregate. A `false` return means the count still describes the state
+    /// before this update, and any caller tracking count freshness must keep
+    /// treating the update as outstanding.
     pub(crate) async fn persist_table_stats(
         &self,
         accumulator: &ColumnStatsAccumulator,
         num_rows_update: RowCountUpdate,
-    ) {
+    ) -> bool {
         let _stats_persistence_guard = self.table_statistics_persistence_lock.lock().await;
         self.persist_table_stats_locked(accumulator, num_rows_update, false)
-            .await;
+            .await
     }
 
     /// Replace the aggregate entirely with the overwrite's accumulator and reset
@@ -20777,15 +21155,19 @@ impl CayenneTableProvider {
     /// merges this write into it. `num_rows_update` sets the live count relative
     /// to the previous aggregate (`Delta`), to an authoritative value (`Set`), or
     /// leaves it (`Unchanged`).
+    /// Returns whether the update reached the metastore and the cache. Both
+    /// bail-outs below abandon `num_rows_update` while leaving `count_exact`
+    /// as it was, so a caller that folds the failure into "the count is current"
+    /// would serve a drifted count as `Exact`.
     async fn persist_table_stats_locked(
         &self,
         accumulator: &ColumnStatsAccumulator,
         num_rows_update: RowCountUpdate,
         replace_aggregate: bool,
-    ) {
+    ) -> bool {
         let Some((new_blob, _new_rows)) = accumulator.to_file_statistics_blob_with_row_count()
         else {
-            return;
+            return false;
         };
         let new_ndv = accumulator.to_ndv_sketches();
 
@@ -20874,7 +21256,7 @@ impl CayenneTableProvider {
                 "Failed to persist table stats for {}: {e}",
                 self.table_metadata.table_name
             );
-            return;
+            return false;
         }
 
         // An authoritative exact count settles anything a failed taint left owed:
@@ -20885,6 +21267,7 @@ impl CayenneTableProvider {
         }
         // Keeping the raw blob also avoids a catalog read on the next persist.
         self.store_cached_table_statistics(stats);
+        true
     }
 
     /// Write small batches directly to the metastore, optionally atomically
@@ -42254,6 +42637,113 @@ mod tests {
         }
     }
 
+    /// The maintained count must never be served `Exact` while a live-row delta
+    /// is still queued: `optimizer_table_statistics()` is what
+    /// `local_executor_table_statistics` reports to the coordinator, and the
+    /// coordinator folds `COUNT(*)` on it precisely when it is `Exact`. A
+    /// commit publishes its rows at once but hands the matching `num_rows`
+    /// delta to the debounced maintenance task, so the two are apart for a
+    /// window.
+    ///
+    /// Exactness is decided from proxies for "rows the persisted count does not
+    /// describe yet" — pending deletions, resident inline rows, mem-tier
+    /// tombstones — and a checkpoint clears all of them at once without
+    /// draining that queue. The queue is therefore consulted directly; without
+    /// it a reader landing after such a checkpoint folds `COUNT(*)` on a count
+    /// short by the undrained delta, with nothing to mark it stale.
+    ///
+    /// Queueing a delta with no accumulator behind it keeps the window open for
+    /// the whole test rather than racing the 100 ms debounce: the drain has
+    /// nothing to persist, so the delta is never applied and the assertion
+    /// holds however the background task happens to be scheduled.
+    #[tokio::test]
+    async fn queued_live_rows_delta_is_never_served_exact() {
+        const ROWS: i64 = 9;
+        const QUEUED_DELTA: i64 = 2;
+
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) =
+            create_append_only_table("queued_delta_exactness", ctx.runtime_env()).await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        insert_batch(
+            &provider,
+            id_value_batch_for_range(Arc::clone(&schema), 0, ROWS),
+        )
+        .await;
+        provider
+            .flush_pending_maintenance()
+            .await
+            .expect("drain post-write maintenance");
+
+        // Baseline: an append-only table whose maintenance has drained has no
+        // pending visibility changes, so the count is served Exact and the
+        // distributed fold engages.
+        let stats = provider
+            .optimizer_table_statistics()
+            .expect("maintained stats present after append");
+        assert_eq!(
+            stats.num_rows,
+            DFPrecision::Exact(usize::try_from(ROWS).expect("row count fits usize")),
+            "a drained append-only table must serve its maintained count Exact",
+        );
+
+        // A commit makes two more rows live and queues their delta for a
+        // maintenance pass that does not apply it.
+        provider.schedule_post_write_maintenance(None, false, false, QUEUED_DELTA);
+
+        let stats = provider
+            .optimizer_table_statistics()
+            .expect("maintained stats present while a delta is queued");
+        assert!(
+            matches!(stats.num_rows, DFPrecision::Inexact(_)),
+            "a queued-but-unapplied live-row delta must demote the maintained count to \
+             Inexact so the distributed COUNT(*) fold declines and a real scan answers, \
+             got {:?}",
+            stats.num_rows,
+        );
+    }
+
+    /// The counterpart to `queued_live_rows_delta_is_never_served_exact`: once
+    /// maintenance applies the delta the signal has to clear, or every table
+    /// would be stranded on `Inexact` and the distributed `COUNT(*)` fold would
+    /// never engage again.
+    #[tokio::test]
+    async fn a_drained_live_rows_delta_restores_exact_statistics() {
+        const FIRST: i64 = 9;
+        const SECOND: i64 = 2;
+
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) =
+            create_append_only_table("drained_delta_exactness", ctx.runtime_env()).await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        insert_batch(
+            &provider,
+            id_value_batch_for_range(Arc::clone(&schema), 0, FIRST),
+        )
+        .await;
+        insert_batch(
+            &provider,
+            id_value_batch_for_range(Arc::clone(&schema), FIRST, SECOND),
+        )
+        .await;
+        provider
+            .flush_pending_maintenance()
+            .await
+            .expect("drain post-write maintenance");
+
+        let stats = provider
+            .optimizer_table_statistics()
+            .expect("maintained stats present after appends");
+        assert_eq!(
+            stats.num_rows,
+            DFPrecision::Exact(usize::try_from(FIRST + SECOND).expect("row count fits usize")),
+            "every queued delta has been applied, so the maintained count must be served \
+             Exact at the live row count",
+        );
+    }
+
     /// A RAM-tier CDC append must NOT invalidate the inline-view cache: it
     /// never mutates the metastore inline corpus, so `append_to_mem_tier`
     /// (exercised here via the memory-mode CDC upsert path; the delete-only
@@ -48976,5 +49466,265 @@ mod tests {
             "a floor-stamped rebuild (the production clear->load_existing_pk_index \
              path) must still conflict the stage_seq=5 txn against high-water 7"
         );
+    }
+
+    /// Primary keys for `ids`, encoded the way the write path encodes them, so a
+    /// keyset entry recorded from this set matches what validation probes for.
+    fn pk_digest_set_for_ids(converter: &RowConverter, ids: &[i64]) -> PkDigestSet {
+        use arrow::array::{ArrayRef, Int64Array};
+
+        let column: ArrayRef = Arc::new(Int64Array::from(ids.to_vec()));
+        let rows = converter
+            .convert_columns(&[column])
+            .expect("convert the pk column");
+        let mut keys = PkDigestSet::with_capacity(ids.len());
+        for row_idx in 0..ids.len() {
+            let key = rows.row(row_idx).owned();
+            keys.insert_with_digest(pk_digest(&key), key);
+        }
+        keys
+    }
+
+    /// Regression for #12956: a write that commits while the shared PK keyset is
+    /// checked out for validation must not lose its existence entries.
+    ///
+    /// The cross-partition append coordinator publishes its validated keys with no
+    /// checkout of its own (`PreparedStagedAppend::publish_validated_file_keys` →
+    /// `record_file_pk_keys`) and holds only each participant's listing fence, so it
+    /// runs concurrently with a mainline write holding the table write lock — and
+    /// lands here while that write has the keyset out. Dropping the entry leaves the
+    /// restored keyset a strict under-approximation of the live rows, and the next
+    /// upsert of that key misses, treats it as new, emits no supersede, and leaves
+    /// two live rows for one declared primary key.
+    #[tokio::test]
+    async fn keys_committed_while_the_keyset_is_checked_out_survive_the_restore() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "pk_checkout_replay",
+            ctx.runtime_env(),
+            VortexConfig::default(),
+        )
+        .await;
+        let schema = provider.table_schema();
+        let pk_indices = provider
+            .primary_key_indices()
+            .expect("primary key indices resolve")
+            .expect("the table declares a primary key");
+        let converter = provider
+            .build_pk_converter(&pk_indices)
+            .expect("primary key converter");
+
+        // Seed one row so the table has a live keyset to check out.
+        insert_batch(&provider, id_value_batch(Arc::clone(&schema), &[1], &[10])).await;
+        let checked_out = provider
+            .take_cached_pk_index()
+            .expect("the seed insert leaves a cached keyset");
+
+        // The concurrent writer commits id=7 while the keyset is out.
+        let committed = pk_digest_set_for_ids(&converter, &[7]);
+        let committed_digest = committed
+            .iter_with_digest()
+            .next()
+            .expect("one committed key")
+            .0;
+        provider.record_file_pk_keys(&committed, 11);
+
+        // The validation holding the keyset must see the commit too — its snapshot
+        // predates it, and without this the SAME writer classifies id=7 as new.
+        let pending = provider.pending_pk_existence();
+        assert!(
+            pending
+                .as_ref()
+                .is_some_and(|pending| pending.location_by_digest(committed_digest).is_some()),
+            "in-flight validation must see a key committed while it holds the keyset"
+        );
+
+        // The writer finishes and returns the keyset.
+        provider.store_cached_pk_index(checked_out);
+
+        let guard = provider.pk_keyset_cache.lock();
+        match guard.as_ref() {
+            Some(CachedPkIndex::Exact(keyset)) => match keyset.location_by_digest(committed_digest)
+            {
+                Some(RowLocation::FileUnlocated) => {}
+                Some(other) => panic!(
+                    "id=7 must be replayed at the location it was committed at, got {other:?}"
+                ),
+                None => panic!(
+                    "the restored keyset must know id=7: a concurrent commit's existence entry \
+                     was dropped, so the next upsert would keep both rows"
+                ),
+            },
+            other => panic!(
+                "expected the restored keyset to be exact, present={}",
+                other.is_some()
+            ),
+        }
+    }
+
+    /// The in-flight half of #12956: the writer holding the checked-out keyset must
+    /// supersede a key another writer committed mid-validation, rather than keep it
+    /// as a new primary key.
+    #[tokio::test]
+    async fn validation_supersedes_a_key_committed_while_it_holds_the_keyset() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "pk_checkout_inflight",
+            ctx.runtime_env(),
+            VortexConfig::default(),
+        )
+        .await;
+        let schema = provider.table_schema();
+        let pk_indices = provider
+            .primary_key_indices()
+            .expect("primary key indices resolve")
+            .expect("the table declares a primary key");
+        let converter = provider
+            .build_pk_converter(&pk_indices)
+            .expect("primary key converter");
+
+        insert_batch(&provider, id_value_batch(Arc::clone(&schema), &[1], &[10])).await;
+        let checked_out = provider
+            .take_cached_pk_index()
+            .expect("the seed insert leaves a cached keyset");
+        provider.record_file_pk_keys(&pk_digest_set_for_ids(&converter, &[7]), 11);
+
+        let pending = provider.pending_pk_existence();
+        let existing = match &checked_out {
+            CachedPkIndex::Exact(keyset) => PkExistenceRef::Exact(keyset),
+            CachedPkIndex::Bloom(bloom) => PkExistenceRef::Bloom(bloom),
+        };
+        let on_conflict = OnConflict::Upsert(
+            datafusion_table_providers::util::column_reference::ColumnReference::new(vec![
+                "id".to_string(),
+            ]),
+        );
+        let upsert_options = on_conflict.get_upsert_options();
+        let incoming_keys = PkDigestSet::default();
+        let mut validation_ctx = OnConflictContext {
+            pk_indices: &pk_indices,
+            converter: &converter,
+            on_conflict: &on_conflict,
+            upsert_options: &upsert_options,
+            existing,
+            pending: pending.as_ref(),
+            incoming_keys: &incoming_keys,
+        };
+
+        let result = provider
+            .apply_on_conflict_to_batch(
+                id_value_batch(Arc::clone(&schema), &[7], &[71]),
+                &mut validation_ctx,
+            )
+            .expect("validating an upsert of the concurrently committed key");
+
+        assert_eq!(
+            result.deleted_pk_i64,
+            vec![7],
+            "the upsert must supersede the row the concurrent writer committed, not \
+             add a second live row for id=7"
+        );
+        assert_eq!(
+            result.filtered_batch.map(|batch| batch.num_rows()),
+            Some(1),
+            "the upserted row is still written; only the prior version is tombstoned"
+        );
+    }
+
+    /// End-to-end shape of #12956, driven entirely through the insert path: a write
+    /// that commits while another holds the keyset must leave ONE live row per
+    /// primary key.
+    ///
+    /// The concurrent writer restores a keyset it rebuilt BEFORE its own commit, so
+    /// the two indexes are differently aged and the last store silently reverts the
+    /// other's keys. Neither is trustworthy, so both are dropped and the next write
+    /// rebuilds from the table.
+    #[tokio::test]
+    async fn a_concurrent_commit_during_validation_leaves_one_live_row_per_key() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "pk_checkout_duplicate",
+            ctx.runtime_env(),
+            VortexConfig::default(),
+        )
+        .await;
+        let schema = provider.table_schema();
+
+        insert_batch(&provider, id_value_batch(Arc::clone(&schema), &[1], &[10])).await;
+
+        // A mainline write starts validating: it holds the keyset for its whole
+        // lazily-consumed stream.
+        let checked_out = provider
+            .take_cached_pk_index()
+            .expect("the seed insert leaves a cached keyset");
+
+        // Another writer commits id=7 in that window.
+        insert_batch(&provider, id_value_batch(Arc::clone(&schema), &[7], &[70])).await;
+
+        // The first write finishes and returns its keyset.
+        provider.store_cached_pk_index(checked_out);
+
+        // A later upsert of the same key must replace the committed row.
+        insert_batch(&provider, id_value_batch(Arc::clone(&schema), &[7], &[71])).await;
+
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, "pk_checkout_duplicate").await,
+            vec![(1, 10), (7, 71)],
+            "id=7 must have exactly one live row, carrying the upserted value"
+        );
+    }
+
+    /// The per-shard index has the same checkout gap as the table-wide keyset
+    /// (`build_sharded_pk_index` takes it, the appends restore it), so a commit
+    /// landing in that window must survive the restore there too.
+    #[tokio::test]
+    async fn keys_committed_while_the_sharded_index_is_checked_out_survive_the_restore() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_sharded_cdc_upsert_table_with_cap(
+            "pk_sharded_checkout_replay",
+            ctx.runtime_env(),
+            4,
+            0,
+        )
+        .await;
+        let pk_indices = provider
+            .primary_key_indices()
+            .expect("primary key indices resolve")
+            .expect("the table declares a primary key");
+        let converter = provider
+            .build_pk_converter(&pk_indices)
+            .expect("primary key converter");
+        provider.maybe_install_warm_pk_caches().await;
+
+        let checked_out = provider
+            .build_sharded_pk_index(&pk_indices, &converter, 4)
+            .await
+            .expect("the warm per-shard index is checked out");
+
+        let committed = pk_digest_set_for_ids(&converter, &[7]);
+        let committed_digest = committed
+            .iter_with_digest()
+            .next()
+            .expect("one committed key")
+            .0;
+        provider.record_file_pk_keys(&committed, 11);
+
+        provider.store_sharded_pk_index(checked_out);
+
+        match provider.sharded_pk_keyset_cache.lock().as_ref() {
+            Some(ShardedPkIndex::Exact(keysets)) => {
+                assert!(
+                    keysets
+                        .iter()
+                        .any(|keyset| keyset.location_by_digest(committed_digest).is_some()),
+                    "the restored per-shard index must know id=7: dropping a concurrent \
+                     commit's entry duplicates the row on the next upsert"
+                );
+            }
+            other => panic!(
+                "expected exact per-shard keysets, present={}",
+                other.is_some()
+            ),
+        }
     }
 }
