@@ -679,7 +679,11 @@ mod tests {
             "not a url",
             "",
         ] {
-            assert_eq!(safe_portal_url(rejected), None, "{rejected} must be refused");
+            assert_eq!(
+                safe_portal_url(rejected),
+                None,
+                "{rejected} must be refused"
+            );
         }
     }
 }

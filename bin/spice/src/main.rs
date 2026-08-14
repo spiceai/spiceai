@@ -923,6 +923,9 @@ fn run_cli(cli: Cli) -> Result<()> {
             // participates in the documented enroll-endpoint precedence
             // instead of being silently accepted and ignored.
             args.cloud_region.clone_from(&cli.cloud_region);
+            // A foreground runtime this command starts is its output, so the
+            // global verbosity has to reach it the way `spice run -v` does.
+            args.verbosity = cli.verbose;
             let rt = tokio::runtime::Runtime::new()
                 .map_err(|e| spice::error::Error::RuntimeExecution { source: e })?;
             rt.block_on(connect::execute(&ctx, args))?;

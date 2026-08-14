@@ -70,6 +70,7 @@ use crate::handlers::{
 use crate::heartbeat::{build_heartbeat, build_telemetry, now_unix};
 use crate::identity::{AppAttachment, Identity, IdentityStore};
 use crate::proto;
+use crate::session::SessionAck;
 use crate::shutdown::Shutdown;
 use crate::{Error, Result, enroll, fingerprint};
 
@@ -106,6 +107,9 @@ pub(crate) struct ClientDriver {
     /// stream so a reconnect cannot hand out a second slot while the first
     /// query is still running.
     query_slot: Arc<Semaphore>,
+    /// Latch for the first control-plane acknowledgement, when a caller asked
+    /// to be told. `None` for callers that do not report a connection.
+    session_ack: Option<Arc<SessionAck>>,
 }
 
 impl ClientDriver {
@@ -114,6 +118,7 @@ impl ClientDriver {
         runtime: Arc<dyn RuntimeHandle>,
         shutdown: Arc<Shutdown>,
         identity: Option<Identity>,
+        session_ack: Option<Arc<SessionAck>>,
     ) -> Self {
         Self {
             config,
@@ -122,7 +127,31 @@ impl ClientDriver {
             identity,
             renew_not_before: None,
             query_slot: Arc::new(Semaphore::new(1)),
+            session_ack,
         }
+    }
+
+    /// Record that the control plane has answered this session.
+    ///
+    /// Called for every message the control plane sends, because every one of
+    /// them proves the same thing: the gateway holds a session for this
+    /// instance and has dispatched to it. The `Ack` for the `Hello` is the
+    /// usual first, but an instance the control plane immediately commands is
+    /// no less connected. The latch keeps only the first.
+    ///
+    /// The portal metadata this carries is a snapshot, not a verdict: the
+    /// message being recorded here may be the `AttachApp` that is about to
+    /// change it, so a consumer resolves it from the durable identity when it
+    /// reports (`AcknowledgedSession::refreshed`).
+    fn note_session_acknowledged(&self) {
+        let (Some(ack), Some(identity)) = (self.session_ack.as_ref(), self.identity.as_ref())
+        else {
+            return;
+        };
+        ack.record(crate::session::AcknowledgedSession::of_identity(
+            identity,
+            &self.config.identity_path,
+        ));
     }
 
     /// Run the driver until shutdown is requested.
@@ -352,10 +381,8 @@ impl ClientDriver {
             org_name: current.org_name,
             app_name: current.app_name,
             monitor_url: current.monitor_url,
-            control_plane_endpoint,
-            // Recorded at enrollment and not re-sent on renewal, so it rides
-            // across the rotation the same way the attachment tuple does.
             new_project_url: current.new_project_url,
+            control_plane_endpoint,
             // Seeded with the OUTGOING keypair and rotated by the call below,
             // which shifts it into `enc_previous_private_key_pem` — assigning
             // `material` here instead would leave the retained key equal to the
@@ -791,6 +818,11 @@ impl ClientDriver {
         live_identifier: &Arc<RwLock<String>>,
         session_key: Option<&cloud_connect_crypto::EncryptionKeypair>,
     ) -> Option<ExitReason> {
+        // Before anything is decoded: the message arrived, which is what says
+        // the control plane has this session — including the messages this
+        // build cannot interpret.
+        self.note_session_acknowledged();
+
         let command_id = msg.command_id;
         let Some(body) = msg.body else {
             // A control plane newer than this build dispatched a command whose
@@ -1992,8 +2024,8 @@ mod tests {
             org_name: None,
             app_name: None,
             monitor_url: None,
-            control_plane_endpoint: None,
             new_project_url: None,
+            control_plane_endpoint: None,
         };
         current.ensure_cache_key();
         IdentityStore::store(&identity_path, &current).expect("store current identity");
@@ -2020,6 +2052,7 @@ mod tests {
             runtime,
             crate::shutdown::Shutdown::new(),
             Some(current.clone()),
+            None,
         );
 
         let error = driver
@@ -2056,8 +2089,8 @@ mod tests {
             org_name: None,
             app_name: None,
             monitor_url: None,
-            control_plane_endpoint: None,
             new_project_url: None,
+            control_plane_endpoint: None,
         }
     }
 
@@ -2117,6 +2150,7 @@ mod tests {
             runtime,
             crate::shutdown::Shutdown::new(),
             Some(identity),
+            None,
         );
         assert_eq!(
             driver.next_renewal_delay(),

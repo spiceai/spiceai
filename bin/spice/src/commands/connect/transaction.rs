@@ -343,7 +343,6 @@ async fn execute_with<P: Prompter>(
             &request,
             prompter,
             ExistingIdentityContext {
-                ctx,
                 config_dir: &config_dir,
                 directory: &directory,
                 identity_path: &identity_path,
@@ -361,6 +360,19 @@ async fn execute_with<P: Prompter>(
     // The pending draft, if any, decides the authority: the cloud may already
     // hold its operation, so only the mode that published it can replay the
     // operation ID and key material instead of creating a sibling instance.
+    //
+    // This read is not under [`EnrollmentTransactionLock`], and deliberately so:
+    // what follows it is a credential prompt, and holding the enrollment
+    // transaction across unbounded human input would block every other
+    // enrollment in this directory — including a `spiced --token` bootstrap — for
+    // as long as an operator leaves a prompt open. The decision is therefore a
+    // *routing* decision, never the safety boundary. Another process may finish,
+    // replace, or abandon the operation while this one is prompting; the
+    // authoritative re-check happens under the transaction lock inside
+    // `enroll`, where a durable identity answers `AlreadyEnrolled` and a changed
+    // binding fails closed with `RequestBindingMismatch`, leaving the state the
+    // other process wrote intact. The cost of losing that race is a prompt
+    // answered for nothing, not a wrong enrollment.
     let resumable = draft
         .as_ref()
         .map(|draft| resumable_authority(draft, &request, prompter.interactive()))
@@ -840,7 +852,6 @@ async fn resume_pending_login<P: Prompter>(
 }
 
 struct ExistingIdentityContext<'a> {
-    ctx: &'a RuntimeContext,
     config_dir: &'a Path,
     directory: &'a Path,
     identity_path: &'a Path,
@@ -858,7 +869,6 @@ async fn existing_identity_flow<P: Prompter>(
     telemetry: &FlowTelemetry,
 ) -> Result<()> {
     let ExistingIdentityContext {
-        ctx,
         config_dir,
         directory,
         identity_path,
@@ -868,21 +878,6 @@ async fn existing_identity_flow<P: Prompter>(
         identity,
         pending_project,
     } = context;
-
-    // This directory is already connected, so a bare re-run is a request to run
-    // it: start the runtime on this terminal exactly as `spice run` would. That
-    // is what makes the instance reachable — including while it is unattached,
-    // where the control stream is how a project created in the portal arrives at
-    // all. Only an explicit project-management input, or a project mutation
-    // still in flight, keeps this a state-management command.
-    if request.org.is_none() && request.project.is_none() && pending_project.is_none() {
-        if persist_endpoint_file {
-            persist_endpoint(config_dir, endpoint).await?;
-        }
-        telemetry.stage("runtime_launch");
-        telemetry.complete("runtime");
-        return crate::commands::run::execute_for_instance(ctx, directory).await;
-    }
 
     if identity.app_id.is_some() {
         if let Some(asserted) = request.org.as_deref() {
@@ -1956,6 +1951,51 @@ mod tests {
         }
     }
 
+    /// A prompter that replaces the pending draft while the key prompt is open —
+    /// the one place a resumed run waits on a human, and so the widest window a
+    /// concurrent enrollment has to change the operation under it.
+    struct RacingPrompter {
+        key: Option<String>,
+        config_dir: std::path::PathBuf,
+        replacement: Option<EnrollmentRequestBinding>,
+    }
+
+    impl Prompter for RacingPrompter {
+        fn interactive(&self) -> bool {
+            true
+        }
+
+        async fn choose_auth(&mut self) -> Result<Option<AuthChoice>> {
+            panic!("a pending draft must resume its own authority without a chooser");
+        }
+
+        async fn read_enrollment_key(&mut self, _portal_url: &str) -> Result<Option<String>> {
+            if let Some(binding) = self.replacement.take() {
+                // What another process does when it takes the transaction: the
+                // operation this run routed on is gone, and a different one is
+                // pending in its place.
+                std::fs::remove_file(EnrollmentDraft::path_in(&self.config_dir))
+                    .expect("remove the pending draft");
+                EnrollmentDraft::load_or_create(
+                    &self.config_dir,
+                    &InstanceFacts::gather("v0.0.0-racing-test"),
+                    Some("lab-seoul"),
+                    &binding,
+                )
+                .expect("publish the replacement draft");
+            }
+            Ok(self.key.take())
+        }
+
+        async fn confirm_project_assignment(&mut self) -> Result<Option<bool>> {
+            panic!("a resumed enrollment-key operation never assigns a project");
+        }
+
+        async fn project_name(&mut self, _suggestion: &str) -> Result<Option<String>> {
+            panic!("a resumed enrollment-key operation never assigns a project");
+        }
+    }
+
     fn connect_request() -> ConnectRequest {
         ConnectRequest {
             org: None,
@@ -2261,6 +2301,75 @@ mod tests {
         assert!(
             !contents.contains("spice-enroll-"),
             "the enrollment key must never be persisted"
+        );
+    }
+
+    /// The authority is routed from a draft read before the enrollment
+    /// transaction is held, so another process can replace the operation while
+    /// the key prompt is open. The re-check under the transaction is what makes
+    /// that safe: the run fails closed, enrolls nothing, and leaves the operation
+    /// the other process published exactly as it wrote it.
+    #[tokio::test(start_paused = true)]
+    async fn a_draft_replaced_while_prompting_fails_closed() {
+        let instance = tempfile::tempdir().expect("create instance directory");
+        let directory = instance.path().canonicalize().expect("canonical tempdir");
+        let config_dir = CloudConnectConfig::resolve_config_dir(Some(&directory));
+        let endpoint = closed_endpoint();
+        EnrollmentDraft::load_or_create(
+            &config_dir,
+            &InstanceFacts::gather("v0.0.0-racing-test"),
+            Some("lab-seoul"),
+            &EnrollmentRequestBinding {
+                endpoint: endpoint.clone(),
+                authority: EnrollmentAuthorityBinding::Token {
+                    expected_org: Some("acme".to_string()),
+                },
+            },
+        )
+        .expect("publish a pending enrollment draft");
+
+        let replacement = EnrollmentRequestBinding {
+            endpoint: endpoint.clone(),
+            authority: EnrollmentAuthorityBinding::AuthenticatedSession {
+                organization: "globex".to_string(),
+            },
+        };
+        let mut prompter = RacingPrompter {
+            key: Some("spice-enroll-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string()),
+            config_dir: config_dir.clone(),
+            replacement: Some(replacement.clone()),
+        };
+
+        let error = execute_with(
+            &RuntimeContext::new().expect("runtime context"),
+            ConnectRequest {
+                dir: Some(directory.clone()),
+                endpoint: Some(endpoint.clone()),
+                ..connect_request()
+            },
+            &mut prompter,
+        )
+        .await
+        .expect_err("a replaced operation must not be enrolled under the routed authority");
+        assert!(
+            error
+                .to_string()
+                .contains("different control plane or authority"),
+            "the transaction must refuse the replaced operation: {error}"
+        );
+
+        let surviving = EnrollmentDraft::load_optional(&config_dir)
+            .expect("read the draft state")
+            .expect("the replacement is still pending");
+        assert_eq!(
+            surviving.binding, replacement,
+            "the operation the other process published must be left exactly as written"
+        );
+        assert!(
+            !config_dir
+                .join(runtime_cloud_connect::config::IDENTITY_FILE)
+                .exists(),
+            "a refused resume must enroll nothing"
         );
     }
 

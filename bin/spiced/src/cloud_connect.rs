@@ -590,6 +590,9 @@ pub async fn restore_delivered_secrets(
 ///
 /// `runtime_overrides` are the process's `--set-runtime` values, which a
 /// deployment has to carry the same way a start onto the same file would.
+///
+/// `session_ack` is the latch the connection report waits on; it is filled by
+/// the first message the control plane sends back.
 pub async fn maybe_start(
     runtime: Arc<Runtime>,
     identity: Option<runtime_cloud_connect::ReconnectableIdentity>,
@@ -597,6 +600,7 @@ pub async fn maybe_start(
     running_deployment: Option<CloudManagedSpicepod>,
     metrics: Option<MetricsReader>,
     runtime_overrides: Vec<(String, String)>,
+    session_ack: Option<Arc<runtime_cloud_connect::SessionAck>>,
 ) -> Option<CloudConnect> {
     let Some(identity) = identity else {
         tracing::debug!("Spice Cloud Connect: disabled (no usable persisted identity)");
@@ -627,21 +631,6 @@ pub async fn maybe_start(
         tracing::debug!(
             "Spice Cloud Connect: the stored identity names no app; metrics are withheld until a deploy names one"
         );
-    }
-
-    // Where this instance stands, said once per start. An enrolled instance with
-    // no project is an expected, actionable state — not a fault — so it is
-    // reported at info with the Cloud's own create-project link, the same way
-    // `spice connect` reports it after enrolling. A later start after the
-    // attachment lands reads the attached identity and reports that instead, so
-    // the call to action does not follow an operator who already answered it.
-    for line in attachment_report_lines(
-        identity.org_name(),
-        identity.app_name(),
-        identity.app_id(),
-        identity.new_project_url(),
-    ) {
-        tracing::info!("{line}");
     }
 
     // Installed before `load_components()` by `restore_delivered_secrets`, so
@@ -680,7 +669,11 @@ pub async fn maybe_start(
             initial_load_budget: INITIAL_LOAD_BUDGET,
         }));
 
-    Some(CloudConnect::start_reconnectable(handle, identity))
+    Some(CloudConnect::start_reconnectable(
+        handle,
+        identity,
+        session_ack,
+    ))
 }
 
 /// Load the delivered-secrets cache into `store`.
@@ -1381,7 +1374,7 @@ impl RuntimeHandle for SpicedRuntimeHandle {
 
     fn unsupported_reason(&self, capability: Capability) -> String {
         match capability {
-            Capability::Restart => "Restart is unsupported on standalone spiced: it is not a control the runtime offers on demand, and no deployment needs one — a deployment applies to the running instance and reports anything it could not put into effect. To restart the instance anyway, use your process manager (systemd/Docker/Kubernetes). See: https://spiceai.org/docs".to_string(),
+            Capability::Restart => "Restart is unsupported on standalone spiced: it is not a control the runtime offers on demand, and no deployment needs one — a deployment applies to the running instance and reports anything it could not put into effect. To restart the instance anyway, run `spice connect service restart` on the host (or restart the container, for an instance a container runtime owns). See: https://spiceai.org/docs".to_string(),
             Capability::UpgradeRuntime => "UpgradeRuntime is unsupported on standalone spiced: it cannot replace its own binary. Upgrade it the way you installed it (`spice upgrade`, your container image, or your package manager). See: https://spiceai.org/docs".to_string(),
             Capability::GetLogs => "Log capture is not enabled for this runtime: Spice Cloud Connect must be configured before startup for spiced to install the log-capture layer. See: https://spiceai.org/docs".to_string(),
             Capability::ApplySpicepod
@@ -1701,26 +1694,7 @@ impl RuntimeHandle for SpicedRuntimeHandle {
         attachment: Option<&AppAttachment>,
     ) -> Result<serde_json::Value, CommandError> {
         let persisted = self.persist_attachment(attachment).await?;
-        let previously_attached = {
-            let current = self.app_id.read();
-            current.clone()
-        };
         (*self.app_id.write()).clone_from(&persisted.app_id);
-        // Said once, when the instance actually becomes attached. The control
-        // plane may redeliver the attachment it already sent, and a line per
-        // delivery would report an event that did not happen. The startup report
-        // reads the same persisted state, so a later start does not repeat the
-        // create-project call to action this answers.
-        if persisted.app_id.is_some() && previously_attached != persisted.app_id {
-            for line in attachment_report_lines(
-                persisted.org_name.as_deref(),
-                persisted.app_name.as_deref(),
-                persisted.app_id.as_deref(),
-                None,
-            ) {
-                tracing::info!("{line}");
-            }
-        }
         // The result reports the persisted state, not the command: the two
         // differ where absence preserves (a detach keeps the stored org).
         Ok(serde_json::json!(persisted))
@@ -2041,50 +2015,6 @@ async fn stage_cloud_managed_spicepod(
     }
 }
 
-/// The operator-facing report of where this instance stands with Spice Cloud,
-/// one log line per element.
-///
-/// Split from the logging so the wording — the part an operator acts on — is
-/// exercised directly. Lines are separate rather than one multi-line message
-/// because a log line must stay a line.
-///
-/// An unattached instance is where a freshly connected runtime *is*: it is
-/// reachable, and a project created in the portal attaches over the control
-/// stream. So the report names the state and the page that ends it, and never
-/// invents that page — an identity enrolled before the link was recorded says
-/// where to go without pretending to know the URL.
-fn attachment_report_lines(
-    organization: Option<&str>,
-    project: Option<&str>,
-    app_id: Option<&str>,
-    new_project_url: Option<&str>,
-) -> Vec<String> {
-    let organization = organization
-        .map(str::trim)
-        .filter(|org| !org.is_empty())
-        .unwrap_or("Spice Cloud");
-    if app_id.is_some_and(|app_id| !app_id.is_empty()) {
-        let project = project
-            .map(str::trim)
-            .filter(|project| !project.is_empty())
-            .unwrap_or("attached project");
-        return vec![format!(
-            "Spice Cloud Connect: connected to {organization} / {project}"
-        )];
-    }
-
-    let mut lines = vec![format!(
-        "Spice Cloud Connect: connected to {organization} — not yet attached to a project"
-    )];
-    match new_project_url.and_then(runtime_cloud_connect::config::safe_portal_url) {
-        Some(url) => lines.push(format!("Create one: {url}")),
-        None => lines.push(
-            "Create one in the Spice Cloud portal to deploy an app to this instance".to_string(),
-        ),
-    }
-    lines
-}
-
 /// Promote the validated `incoming` file onto the canonical `path` without
 /// ever leaving the runtime with no known-good config.
 ///
@@ -2141,88 +2071,6 @@ mod tests {
     use futures::TryStreamExt as _;
     use runtime_cloud_connect::handlers::MAX_QUERY_ROWS;
     use runtime_cloud_connect::sealed_secrets::{DeliveredSecrets, Zeroizing};
-
-    /// An enrolled instance with no project reports the state and the Cloud's
-    /// own page for ending it — at most one line each, no fabricated link, and
-    /// nothing that reads as a failure.
-    #[test]
-    fn an_unattached_instance_reports_how_to_attach_one() {
-        assert_eq!(
-            attachment_report_lines(
-                Some("acme"),
-                None,
-                None,
-                Some("https://spice.ai/acme/new?instance=inst_1")
-            ),
-            vec![
-                "Spice Cloud Connect: connected to acme — not yet attached to a project"
-                    .to_string(),
-                "Create one: https://spice.ai/acme/new?instance=inst_1".to_string(),
-            ]
-        );
-    }
-
-    /// An identity from before the link was persisted stays useful: it still
-    /// names the state, and says where to go without inventing a URL.
-    #[test]
-    fn an_older_identity_reports_the_state_without_a_link() {
-        let lines = attachment_report_lines(Some("acme"), None, None, None);
-        assert_eq!(
-            lines[0],
-            "Spice Cloud Connect: connected to acme — not yet attached to a project"
-        );
-        assert_eq!(
-            lines[1],
-            "Create one in the Spice Cloud portal to deploy an app to this instance"
-        );
-        assert!(
-            !lines.iter().any(|line| line.contains("http")),
-            "no link may be fabricated: {lines:?}"
-        );
-    }
-
-    /// A link the control plane did not send in a safe, absolute form is not
-    /// printed — it reaches a log and a browser.
-    #[test]
-    fn an_unsafe_link_is_never_printed() {
-        for unsafe_url in [
-            "javascript:alert(1)",
-            "http://attacker.example/connect",
-            "https://user:secret@spice.ai/connect",
-            "/acme/new",
-        ] {
-            let lines = attachment_report_lines(Some("acme"), None, None, Some(unsafe_url));
-            assert!(
-                !lines.iter().any(|line| line.contains(unsafe_url)),
-                "unsafe link {unsafe_url} was reported: {lines:?}"
-            );
-            assert_eq!(lines.len(), 2, "the state is still reported: {lines:?}");
-        }
-    }
-
-    /// Once attached, the create-project call to action is gone — an operator who
-    /// answered it must not be asked again on every later start.
-    #[test]
-    fn an_attached_instance_never_asks_for_a_project() {
-        let lines = attachment_report_lines(
-            Some("acme"),
-            Some("retail"),
-            Some("314"),
-            Some("https://spice.ai/acme/new?instance=inst_1"),
-        );
-        assert_eq!(
-            lines,
-            vec!["Spice Cloud Connect: connected to acme / retail".to_string()]
-        );
-
-        // An attachment the control plane named only by id still counts as
-        // attached: the prompt to create one would be wrong.
-        let by_id = attachment_report_lines(None, None, Some("314"), None);
-        assert_eq!(
-            by_id,
-            vec!["Spice Cloud Connect: connected to Spice Cloud / attached project".to_string()]
-        );
-    }
 
     /// Minimal valid spicepod (no components — an empty app is valid).
     const VALID_SPICEPOD: &str = "version: v2\nkind: Spicepod\nname: cloud-managed-test\n";
@@ -3132,8 +2980,8 @@ views:
             org_name: None,
             app_name: None,
             monitor_url: None,
-            control_plane_endpoint: None,
             new_project_url: None,
+            control_plane_endpoint: None,
             enc_private_key_pem: mock_pem,
             enc_public_key_pem: "-----BEGIN PUBLIC KEY-----\nMOCKENC\n-----END PUBLIC KEY-----\n"
                 .to_string(),

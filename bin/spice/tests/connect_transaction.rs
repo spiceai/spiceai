@@ -39,6 +39,29 @@ fn spice_cmd() -> Command {
     cargo_bin_cmd!("spice")
 }
 
+/// Install a runtime that exits immediately into an isolated home.
+///
+/// A completed `spice connect` ends at a running instance, so every fixture
+/// here would otherwise install and run a real `spiced`. The stub keeps these
+/// tests about the transaction: the CLI starts it, it exits 0, and the command
+/// returns.
+#[cfg(unix)]
+fn stub_runtime(home: &TempDir) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let bin = home.path().join(".spice").join("bin");
+    std::fs::create_dir_all(&bin).expect("create the stub runtime directory");
+    let stub = bin.join("spiced");
+    std::fs::write(&stub, "#!/bin/sh\nexit 0\n").expect("write the stub runtime");
+    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
+        .expect("make the stub runtime executable");
+}
+
+/// No stub is needed where the CLI does not manage a local runtime: `connect`
+/// completes the transaction and names how to start the instance instead.
+#[cfg(not(unix))]
+fn stub_runtime(_home: &TempDir) {}
+
 struct Request {
     method: String,
     path: String,
@@ -347,6 +370,7 @@ fn write_response(stream: &mut TcpStream, status: u16, body: &str) {
 }
 
 fn connect_command(instance: &TempDir, home: &TempDir, endpoint: &str, project: &str) -> Command {
+    stub_runtime(home);
     let mut command = spice_cmd();
     command
         .current_dir(instance.path())
@@ -399,8 +423,8 @@ fn unattached_identity() -> runtime_cloud_connect::Identity {
         org_name: Some("acme".to_string()),
         app_name: None,
         monitor_url: None,
-        control_plane_endpoint: None,
         new_project_url: None,
+        control_plane_endpoint: None,
     }
 }
 
@@ -540,6 +564,7 @@ fn a_default_credential_for_another_org_never_reaches_a_mutation() {
             .expect("store enrolled unattached identity");
         }
 
+        stub_runtime(&home);
         let output = spice_cmd()
             .current_dir(instance.path())
             .env("HOME", home.path())
@@ -916,6 +941,7 @@ fn token_mode_stays_unattached_and_existing_identity_prevents_reenrollment() {
 
     let instance = TempDir::new().expect("create instance directory");
     let home = TempDir::new().expect("create isolated home");
+    stub_runtime(&home);
     let first = spice_cmd()
         .current_dir(instance.path())
         .env("HOME", home.path())
@@ -996,6 +1022,10 @@ fn closed_endpoint() -> String {
 }
 
 fn connect_at(instance: &TempDir, home: &TempDir, endpoint: &str) -> Command {
+    // A completed transaction ends at a running instance, so these exercises
+    // need the same exit-immediately runtime `connect_command` installs — the
+    // subject here is what the transaction resumed, not what it started.
+    stub_runtime(home);
     let mut command = spice_cmd();
     command
         .current_dir(instance.path())
@@ -1424,164 +1454,4 @@ fn a_pending_login_draft_resumes_without_a_portal_or_discovery_request() {
             .expect("the resumed enrollment is durable");
     assert_eq!(identity.org_name.as_deref(), Some("acme"));
     assert_eq!(identity.app_name.as_deref(), Some(PROJECT_NAME));
-}
-
-/// A fake `spiced` on `HOME`'s runtime path. It records the working directory
-/// and arguments it was launched with, reports a signal it was sent, and exits
-/// with `exit_code`, so a launch can be observed without a real runtime.
-#[cfg(unix)]
-fn install_fake_runtime(home: &TempDir, marker: &std::path::Path, exit_code: i32) {
-    use std::os::unix::fs::PermissionsExt as _;
-
-    let bin = home.path().join(".spice").join("bin");
-    std::fs::create_dir_all(&bin).expect("create fake runtime directory");
-    let spiced = bin.join("spiced");
-    std::fs::write(
-        &spiced,
-        format!(
-            r#"#!/bin/sh
-marker="{marker}"
-trap 'printf "signal\n" >> "$marker"; exit 130' INT TERM
-printf "cwd=%s\n" "$PWD" >> "$marker"
-printf "args=%s\n" "$*" >> "$marker"
-printf "started\n" >> "$marker"
-if [ "{exit_code}" = "0" ]; then
-  # Stay alive long enough for a signal to be delivered, then finish on its own
-  # so a test that never signals still terminates.
-  i=0
-  while [ "$i" -lt 200 ]; do
-    sleep 0.05
-    i=$((i + 1))
-  done
-  exit 0
-fi
-exit {exit_code}
-"#,
-            marker = marker.display(),
-        ),
-    )
-    .expect("write fake runtime");
-    std::fs::set_permissions(&spiced, std::fs::Permissions::from_mode(0o755))
-        .expect("make the fake runtime executable");
-}
-
-#[cfg(unix)]
-fn marker_contents(marker: &std::path::Path) -> String {
-    std::fs::read_to_string(marker).unwrap_or_default()
-}
-
-#[cfg(unix)]
-fn wait_for_marker(marker: &std::path::Path, needle: &str) {
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while Instant::now() < deadline {
-        if marker_contents(marker).contains(needle) {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    panic!(
-        "the launched runtime never reported {needle:?}: {}",
-        marker_contents(marker)
-    );
-}
-
-#[cfg(unix)]
-fn connected_instance() -> (TempDir, TempDir) {
-    let instance = TempDir::new().expect("create instance directory");
-    let home = TempDir::new().expect("create isolated home");
-    runtime_cloud_connect::IdentityStore::store(
-        &instance.path().join(".spice").join("identity.json"),
-        &unattached_identity(),
-    )
-    .expect("store the enrolled identity");
-    (instance, home)
-}
-
-/// A connected directory re-run bare is a request to run it: an unattached
-/// identity still launches the runtime, because the control stream is how a
-/// project created in the portal reaches this instance at all.
-#[cfg(unix)]
-#[test]
-fn an_existing_identity_launches_the_runtime_for_its_instance_directory() {
-    let (instance, home) = connected_instance();
-    let marker_dir = TempDir::new().expect("create marker directory");
-    let marker = marker_dir.path().join("launch.log");
-    install_fake_runtime(&home, &marker, 7);
-
-    let (success, output) = output_of(
-        spice_cmd()
-            .env("HOME", home.path())
-            .env_remove("SPICE_CONFIG_DIR")
-            .env_remove("SPICE_CLOUD_ENDPOINT")
-            .env_remove("SPICE_SPICEAI_TOKEN")
-            .arg("connect")
-            .arg("--dir")
-            .arg(instance.path()),
-    );
-    assert!(
-        !success,
-        "the launched runtime's exit status is this command's own: {output}"
-    );
-    assert!(
-        !output.contains("Enrollment key") && !output.contains("Log in to Spice Cloud"),
-        "a connected directory must not ask to authenticate again: {output}"
-    );
-
-    let recorded = marker_contents(&marker);
-    let canonical = instance
-        .path()
-        .canonicalize()
-        .expect("canonical instance directory");
-    assert!(
-        recorded.contains(&format!("cwd={}", canonical.display())),
-        "the runtime must start in the instance directory: {recorded}"
-    );
-    assert!(
-        recorded.contains("--pods-watcher-enabled"),
-        "the runtime must start with the same arguments `spice run` uses: {recorded}"
-    );
-}
-
-/// `spice connect` on a connected directory and `spice run` in it are the same
-/// foreground launch: the same failing exit status, and an interrupt reaches the
-/// runtime rather than orphaning it.
-#[cfg(unix)]
-#[test]
-fn a_connected_launch_matches_spice_run_on_exit_status_and_interrupts() {
-    let mut exit_codes = Vec::new();
-    for connect in [true, false] {
-        let (instance, home) = connected_instance();
-        let marker_dir = TempDir::new().expect("create marker directory");
-        let marker = marker_dir.path().join("launch.log");
-        install_fake_runtime(&home, &marker, 0);
-
-        let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin!("spice"));
-        command
-            .current_dir(instance.path())
-            .env("HOME", home.path())
-            .env_remove("SPICE_CONFIG_DIR")
-            .env_remove("SPICE_CLOUD_ENDPOINT")
-            .env_remove("SPICE_SPICEAI_TOKEN");
-        if connect {
-            command.arg("connect").arg("--dir").arg(instance.path());
-        } else {
-            command.arg("run");
-        }
-        let mut child = command.spawn().expect("spawn spice");
-
-        wait_for_marker(&marker, "started");
-        nix::sys::signal::kill(
-            nix::unistd::Pid::from_raw(i32::try_from(child.id()).expect("child pid fits i32")),
-            nix::sys::signal::Signal::SIGINT,
-        )
-        .expect("interrupt the foreground launch");
-        let status = child.wait().expect("await spice exit");
-        wait_for_marker(&marker, "signal");
-        exit_codes.push(status.code());
-    }
-
-    assert_eq!(
-        exit_codes[0], exit_codes[1],
-        "an interrupted `spice connect` must exit the way an interrupted `spice run` does"
-    );
 }

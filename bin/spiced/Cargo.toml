@@ -88,6 +88,8 @@ telemetry = { path = "../../crates/telemetry" }
 # snmalloc build.
 tikv-jemallocator = { version = "0.6.0", optional = true, features = ["profiling"] }
 tokio.workspace = true
+# `CancellationToken` for the latches the connection report waits on.
+tokio-util.workspace = true
 tpc-extension = { path = "../../crates/tpc_extension", optional = true }
 tracing.workspace = true
 tracing-log = "0.2.0"

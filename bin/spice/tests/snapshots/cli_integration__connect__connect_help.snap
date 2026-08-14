@@ -17,11 +17,6 @@ are never duplicated. A re-run continues the pending enrollment in the mode and
 organization that started it — it never asks which authentication to use again,
 and an enrollment key is asked for again only because keys are never stored.
 
-Once this directory is connected, `spice connect` runs it: `spiced` starts in the
-foreground exactly as `spice run` would. That includes while the instance is
-unattached, because its Cloud Connect stream is how a project created in the
-portal reaches it. Naming --project (or --org) manages the connection instead.
-
 NON-INTERACTIVE
   Login mode requires both --org <org> and --project <name>.
   Key mode requires --token <enrollment-key> and rejects --project.
