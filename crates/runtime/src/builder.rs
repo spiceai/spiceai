@@ -805,6 +805,7 @@ impl RuntimeBuilder {
             apply_app_lock: Arc::new(tokio::sync::Mutex::new(())),
             initial_load: Arc::new(crate::InitialLoad::default()),
             task_history_initialized: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            task_history_setting: Arc::new(std::sync::OnceLock::new()),
             task_history_init_lock: Arc::new(tokio::sync::Mutex::new(())),
             df,
             llm_runtime_stores: Arc::new(crate::model::LlmRuntimeStores::default()),

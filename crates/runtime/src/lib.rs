@@ -598,6 +598,16 @@ pub struct Runtime {
     /// path datasets are registered first — so a name check would mistake that
     /// dataset for the internal table and send every task-history write to it.
     task_history_initialized: Arc<AtomicBool>,
+    /// The task-history setting of the first app this runtime read, which is the
+    /// one in effect for the life of the process.
+    ///
+    /// `runtime.task_history` takes effect at a start — `start_time_only_changes`
+    /// classifies it as `Process` and the reload path says so — but a start with no
+    /// app has no setting to take effect, so the first app to arrive is what
+    /// decides. Recorded separately from whether the table was registered, so an
+    /// initialization that lost the name can still be retried without a later
+    /// reload being able to change the answer.
+    task_history_setting: Arc<std::sync::OnceLock<bool>>,
     /// Serializes the whole of task-history initialization.
     ///
     /// The cluster executor deliberately races `init_task_history` against the

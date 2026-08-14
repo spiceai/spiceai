@@ -58,6 +58,7 @@ async fn an_app_arriving_after_an_empty_start() {
     an_arriving_app_that_enables_task_history_gets_a_table_and_emission().await;
     a_second_initialization_restores_emission_it_found_turned_off().await;
     a_name_conflict_the_operator_fixes_is_retried_not_left_until_restart().await;
+    a_reload_cannot_turn_task_history_on_after_the_first_app_turned_it_off().await;
 }
 
 /// Emission and the table have to agree. Both were decided when `DataFusion` was
@@ -219,6 +220,40 @@ async fn a_name_conflict_the_operator_fixes_is_retried_not_left_until_restart() 
     assert!(
         rt.datafusion().task_history_emission_enabled(),
         "and queries record into it without a restart"
+    );
+}
+
+/// `runtime.task_history` takes effect at a start, and the reload path says so, so
+/// the retry must not become a way around it.
+///
+/// A start with no app has no setting to take effect, so the first app to arrive
+/// decides. If that app disables task history, a later reload enabling it changes
+/// the app and nothing else — otherwise the runtime would be creating the table
+/// while telling the operator the old value stands until restart.
+async fn a_reload_cannot_turn_task_history_on_after_the_first_app_turned_it_off() {
+    let rt = Arc::new(Runtime::builder().with_app_opt(None).build().await);
+    Arc::clone(&rt).load_components().await;
+
+    let mut disabled = App::default();
+    disabled.runtime.task_history.enabled = false;
+    Arc::clone(&rt).apply_app(Arc::new(disabled)).await;
+
+    // The reload that asks for it, arriving as a changed app so the diff runs.
+    let mut enabled = App::default();
+    enabled.views.push(view("later", "SELECT 1 AS answer"));
+    assert!(
+        Arc::clone(&rt).apply_app(Arc::new(enabled)).await,
+        "the app that asks for it is a change"
+    );
+
+    assert!(
+        !rt.datafusion()
+            .table_exists(&TableReference::partial("runtime", "task_history")),
+        "the setting the first app decided is the one this process runs with"
+    );
+    assert!(
+        !rt.datafusion().task_history_emission_enabled(),
+        "so nothing emits into a table that was deliberately not created"
     );
 }
 

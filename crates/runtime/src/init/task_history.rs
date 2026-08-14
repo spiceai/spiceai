@@ -26,6 +26,18 @@ use std::fmt::Write;
 use std::sync::Arc;
 
 impl Runtime {
+    /// Whether the configuration in effect asks for task history.
+    ///
+    /// The setting the first app decided, or — before any app has been read — the
+    /// value this process started with. It answers whether an initialization is
+    /// worth attempting; whether one has succeeded is `task_history_initialized`.
+    pub(crate) fn task_history_is_wanted(&self) -> bool {
+        self.task_history_setting
+            .get()
+            .copied()
+            .unwrap_or_else(|| self.df.task_history_enabled_at_start())
+    }
+
     pub async fn init_task_history(self: Arc<Self>) -> Result<()> {
         // Held across everything below, so that reading the app, deciding what
         // emission should be, registering the table and recording that this
@@ -58,6 +70,13 @@ impl Runtime {
             );
             return Ok(());
         };
+
+        // The first app to be read decides the setting for this process, whatever
+        // happens to the table below. A reload installs a new value in the app but
+        // does not change what this process does with it.
+        let _ = self
+            .task_history_setting
+            .set(app.runtime.task_history.enabled);
 
         if !app.runtime.task_history.enabled {
             self.df.set_task_history_enabled(false);

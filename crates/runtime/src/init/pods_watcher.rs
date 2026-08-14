@@ -364,16 +364,17 @@ impl Runtime {
         // describes.
         //
         // Every arriving app, not only the first: an initialization that found the
-        // name taken tells the operator to rename the dataset using it, and the
-        // rename arrives as another app. Gated on the value this process started
-        // with, because `runtime.task_history` takes effect at a start — so a
-        // reload cannot turn task history on, only finish turning it on. The
-        // ordinary case, where the component load already registered the table,
-        // does not reach this at all.
+        // name taken tells the operator to rename the component using it, and the
+        // rename arrives as another app. What it is gated on is the setting in
+        // effect — the one the first app decided, not the one this app carries —
+        // because `runtime.task_history` takes effect at a start. So a reload can
+        // finish turning task history on, never turn it on. The ordinary case,
+        // where the component load already registered the table, does not reach
+        // this at all.
         if !self
             .task_history_initialized
             .load(std::sync::atomic::Ordering::SeqCst)
-            && self.df.task_history_enabled_at_start()
+            && self.task_history_is_wanted()
             && let Err(err) = Arc::clone(&self).init_task_history().await
         {
             tracing::warn!("Creating internal task history table: {err}");
