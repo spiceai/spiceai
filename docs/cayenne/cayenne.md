@@ -1335,7 +1335,7 @@ It takes Iceberg's sequence-ordered visibility and equality-delete idea, Delta's
 
 # Document changelog
 
-This document is a point-in-time snapshot of a fast-moving crate. Each entry records the date, the `spiceai` commit reviewed, and what changed here — so a future revision can be tied to the specific repository changes that prompted it. When updating, add a new row (newest first) and refresh the commit reference in *Scope and sourcing* at the top.
+This document is a point-in-time snapshot of a fast-moving crate. Each entry records the date, the merged pull request (or `trunk` commit) reviewed, and what changed here — so a future revision can be tied to the specific repository changes that prompted it. When updating, add a new row (newest first) and refresh the commit reference in *Scope and sourcing* at the top.
 
 **Keep each entry to one or two sentences naming what changed.** The row is an index into the history, not a retelling of it: the reasoning, the measurements, and the alternatives considered belong in the reviewed commit and its pull request, which the row already points at. Anything a reader needs in order to use Cayenne belongs in the body of this document instead, where they will actually find it.
 
@@ -1345,7 +1345,7 @@ This document is a point-in-time snapshot of a fast-moving crate. Each entry rec
 
 **Judge that against what this document is for**: how Cayenne sustains high-rate ingestion and low-latency reads on the same table — the synchronization and lock model, the write and compaction paths, the tiering, and the visibility rules. Internal bookkeeping that only keeps the accounting honest, such as how a cache charges its entries or where a byte budget is enforced, is described in the body beside the structure it governs and does not also need a row here.
 
-**Point every row at something reachable**: a merged PR number, or a commit on `trunk`. A pre-merge branch SHA is squashed away when the PR merges, leaving a reference that resolves to nothing — or, worse, to an unrelated commit.
+**Write every row from the state after its change lands**, never from where it sits in review — by the time anyone reads the row, the change is in, so a row never labels itself "pre-merge". **And point it at something reachable**: a merged PR number, or a commit on `trunk`. A pre-merge branch SHA is squashed away when the PR merges, leaving a reference that resolves to nothing — or, worse, to an unrelated commit.
 
 | Date | Reviewed commit | Changes |
 |------|-----------------|---------|
@@ -1362,14 +1362,14 @@ This document is a point-in-time snapshot of a fast-moving crate. Each entry rec
 | 2026-08-01 | PR #12338 | `refresh_mode: full` gets its own bulk-overwrite write profile with background compaction off, and host-memory sizing now follows the write profile. The per-table Vortex segment cache is counted in the off-pool reservation. |
 | 2026-08-01 | PR #12317 | Write-concurrency raises now respect the memory brake. Without it the tuner added encode shards at 0.98 memory pressure and was OOM-killed at SF-1000. |
 | 2026-07-31 | PR #12262 (fixes #12208) | `write_to_snapshot` now always creates the snapshot directory, so a write carrying no rows can no longer leave the catalog referencing a snapshot with nothing on disk. The fused commit takes the directory barrier before publishing. |
-| 2026-07-27 | PR #12005 | A demand-driven scan-view cache replaces the per-scan merge-on-read memos, building a view only for a scan-visible state some scan actually queries. Bounded staleness applies only to read-only CDC replicas, and a capture is validated against concurrent schema evolution. SF1000 CH-benCHmark: QPH +9.4%. |
+| 2026-07-27 | PR #12005 | A demand-driven scan-view cache replaces the per-scan merge-on-read memos, building a view only for a scan-visible state some scan actually queries. Bounded staleness applies only to read-only CDC replicas, and a capture is validated against concurrent schema evolution. |
 | 2026-07-25 | PR #12049 | `VortexConfig` now records sort-column provenance (`user` / `inferred`, via `cayenne_sort_columns_origin`), so an inference-derived sort order no longer shadows the adaptive layout. Layout precedence is configured > observed > inferred > primary key. |
 | 2026-07-22 | PR #11973 | Adaptive cold layout is on by default: with clustering and sort columns unset, warm rewrites and cold promotion cluster by the hottest observed filter columns, type-guarded and falling back to the primary key. |
 | 2026-07-22 | PR #11979 (fixes #11933) | Maintained `SUM`/`AVG` now support `Decimal128`, via exact `i128` accumulators that are invertible on the retract path. |
 | 2026-07-16 | PR #11920 | Datalake cadence parameter renamed to `cayenne_datalake_tiering_check_interval_ms` — a hard rename with no alias. |
-| 2026-07-16 | PR #11916 (pre-merge; on top of #11870) | Per-key OCC now falls back to the per-table high-water gate whenever a per-key stamp may be stale, dropped, or unstamped, closing three silent-lost-update holes; the fused commit marks maintained aggregates stale under the held fence. |
+| 2026-07-16 | PR #11916 (on top of #11870) | Per-key OCC now falls back to the per-table high-water gate whenever a per-key stamp may be stale, dropped, or unstamped, closing three silent-lost-update holes; the fused commit marks maintained aggregates stale under the held fence. |
 | 2026-07-15 | PR #11893 | A freshness violation now shrinks the mem-tier only when apply is also behind arrival and the stream is not mutation-heavy, rather than unconditionally. |
-| 2026-07-15 | PR #11889 (pre-merge; on top of #11870) | Write-back sinks now stage under the live request `TaskContext`, so a transaction-aware `UPDATE`/`DELETE` rolls back with its transaction instead of publishing. `DeletionSink::delete_from` now takes the `TaskContext`. |
+| 2026-07-15 | PR #11889 (on top of #11870) | Write-back sinks now stage under the live request `TaskContext`, so a transaction-aware `UPDATE`/`DELETE` rolls back with its transaction instead of publishing. `DeletionSink::delete_from` now takes the `TaskContext`. |
 | 2026-07-14 | PR #11870 | Serializable gated transactions across one or more accelerator-only tables, with per-key OCC and a retryable `WriteConflict`, plus durable federated write-back through the new `cayenne_pending_write_back` table. Appendix A now lists 13 tables. |
 | 2026-07-14 | PR #11862 | Spicepod `MIN`/`MAX` maintained aggregates with resolved-primary-key validation, N>1 mem-tier `UPDATE`/`DELETE` maintenance as one ordered IVM delta, and hardened retraction — `SUM` now restores SQL `NULL` after its last non-null contribution is retracted. |
 | 2026-07-13 | PR #11720 | New acceleration `mode: memory`: fully in-RAM Cayenne with the mem-tier as permanent store and no Vortex, compaction, seal, or datalake. New *Storage modes* section; distinct from `cdc_durability: memory` on file-mode tables. |

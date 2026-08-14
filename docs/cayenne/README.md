@@ -91,21 +91,23 @@ rebuild the PDF (and commit the regenerated `waterfall.svg`).
   (`#6366f1`), neutral-gray notes/brackets/axes (`#94a3b8`). Mermaid is
   rendered via kroki with `htmlLabels:false` — plain text + `<br/>` only, no
   `<b>`/`<i>`, and commas rather than semicolons in sequence-diagram text.
-- **Changelog**: add a row only when reviewing a new repo commit
+- **Changelog**: add a row only when reviewing a new merged PR or repo commit
   (Date | Reviewed commit | Changes), and keep it to **one or two sentences**
   naming what changed. The row indexes the history rather than retelling it —
-  the reasoning and measurements live in the commit and PR it points at, and
-  anything a reader needs to use Cayenne belongs in the body of the document.
-  **One row per merged PR**, not one per revision: revise the existing row while
-  a change is still in review. A row is worth adding only for something a reader
-  would act on — a new or renamed parameter, a schema change, a behavior or
-  correctness change, or a structural revision to the document; skip internal
-  refactors and behavior-identical perf work. Judge that against what the
-  document is for: **how Cayenne sustains high-rate ingestion and low-latency
-  reads on one table** — synchronization and locking, the write and compaction
-  paths, tiering, visibility. Bookkeeping that only keeps the accounting honest
-  (how a cache charges entries, where a byte budget is enforced) is described in
-  the body beside the structure it governs, and needs no changelog row. Cite a
+  the reasoning and measurements live in the PR it points at, and anything a
+  reader needs in order to use Cayenne belongs in the body of the document.
+  **One row per merged PR**, not one per revision: revise the existing row
+  while a change is still in review. A row is worth adding only for something
+  a reader would act on — a new or renamed parameter, a schema change, a
+  behavior or correctness change, or a structural revision to the document;
+  skip internal refactors and behavior-identical perf work. Judge that against
+  what the document is for: **how Cayenne sustains high-rate ingestion and
+  low-latency reads on one table** — synchronization and locking, the write and
+  compaction paths, tiering, visibility. Bookkeeping that only keeps the
+  accounting honest (how a cache charges entries, where a byte budget is
+  enforced) is described in the body beside the structure it governs and needs
+  no row. Write the row from the state **after** the change lands — it is read
+  once the change is in, so it never calls itself "pre-merge" — and cite a
   **merged PR number or a `trunk` commit**, never a pre-merge branch SHA, which
   is squashed away on merge.
 - **Prose style**: minimal formatting, no over-bolding; breadth-first; honest
@@ -116,5 +118,5 @@ rebuild the PDF (and commit the regenerated `waterfall.svg`).
 Cayenne moves quickly. PRs that change `crates/cayenne` behavior, config
 parameters, the metastore schema, or the CDC/compaction flows should update
 `cayenne.md` in the same PR where practical, and add a *Document changelog*
-row referencing the reviewed commit. See the note in the repository's agent
+row referencing the merged PR. See the note in the repository's agent
 instructions (`CLAUDE.md` / `.github/copilot-instructions.md`).
