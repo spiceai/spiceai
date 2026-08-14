@@ -102,12 +102,12 @@ use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::metrics::SdkMeterProvider;
 use opentelemetry_sdk::metrics::periodic_reader_with_async_runtime::PeriodicReader;
 use otel_arrow::OtelArrowExporter;
+use podswatcher::PodsWatcher;
 use repl::ReplConfig;
 use runtime::cluster::ResolvedClusterConfig;
 use runtime::config::ClusterRole;
 use runtime::config::Config as RuntimeConfig;
 use runtime::datafusion::DataFusion;
-use podswatcher::PodsWatcher;
 use runtime::spice_metrics;
 use runtime::{Runtime, auth::EndpointAuth, extension::ExtensionFactory};
 use runtime_async::ManagedTokioRuntime;
@@ -396,7 +396,7 @@ pub struct Args {
 }
 
 /// Spawn a tokio task that listens for `SIGHUP` and asks the
-/// process-wide [`runtime::tls::TlsControl`] to reload every TLS
+/// process-wide [`runtime_tls::TlsControl`] to reload every TLS
 /// material the runtime is watching. Mirrors the `nginx -s reload` /
 /// `kill -HUP <pid>` convention.
 ///
@@ -409,7 +409,7 @@ pub struct Args {
 ///
 /// On Windows or other targets without SIGHUP semantics this is a
 /// no-op: rotation still works via the polling filesystem watcher.
-fn spawn_sighup_reload_task(control: std::sync::Arc<runtime::tls::TlsControl>) {
+fn spawn_sighup_reload_task(control: std::sync::Arc<runtime_tls::TlsControl>) {
     #[cfg(unix)]
     {
         tokio::spawn(async move {
@@ -614,7 +614,7 @@ pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
     // callbacks here so we have one watcher, one dispatcher thread, one
     // SIGHUP target. Created lazily on success of `TlsControl::new`; if
     // the watcher fails to spawn we surface the error eagerly.
-    let tls_control = std::sync::Arc::new(runtime::tls::TlsControl::new().map_err(|e| {
+    let tls_control = std::sync::Arc::new(runtime_tls::TlsControl::new().map_err(|e| {
         Error::UnableToInitializeTls {
             source: Box::new(e),
         }

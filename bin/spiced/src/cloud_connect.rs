@@ -77,7 +77,6 @@ use futures::StreamExt;
 use parking_lot::RwLock;
 use runtime::Runtime;
 use runtime::datafusion::query::Error as QueryError;
-use telemetry::metrics_reader::MetricsReader;
 use runtime::status::ComponentStatus;
 use runtime_cloud_connect::config::{
     CLOUD_MANAGED_SPICEPOD_FILE, CloudConnectConfig, IDENTITY_FILE, PENDING_ADOPT_CODE_FILE,
@@ -90,6 +89,7 @@ use runtime_cloud_connect::identity::CacheKey;
 use runtime_cloud_connect::supervisor::Supervisor;
 use runtime_cloud_connect::{CloudConnect, identity::IdentityStore};
 use runtime_secrets::stores::cloud_delivered::{CLOUD_DELIVERED_STORE, CloudDeliveredSecretStore};
+use telemetry::metrics_reader::MetricsReader;
 
 use crate::log_capture::LogRingBuffer;
 

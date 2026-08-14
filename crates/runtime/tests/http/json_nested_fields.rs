@@ -33,10 +33,10 @@ use arrow::array::RecordBatch;
 use arrow::util::pretty::pretty_format_batches;
 use axum::{Router, routing::get};
 use futures::TryStreamExt;
+use podswatcher::PodsWatcher;
 use runtime::Runtime;
 use runtime::auth::EndpointAuth;
 use runtime::config::Config;
-use podswatcher::PodsWatcher;
 use tokio::net::TcpListener;
 
 use crate::utils::{
