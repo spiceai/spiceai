@@ -152,7 +152,10 @@ pub async fn to_matches(
     mut result: AggregationResult,
 ) -> std::result::Result<Vec<Match>, SearchError> {
     let mut output = vec![];
-    while let Some(Ok(rb)) = result.data.next().await {
+    // Propagate any stream error rather than terminating the loop on the first
+    // `Err`, which would silently return a partial (wrongly-shortened) result set.
+    while let Some(item) = result.data.next().await {
+        let rb = item.map_err(|source| SearchError::DatafusionError { source })?;
         let data = result.data_json(&rb)?;
         let primary_key = result.primary_key_json(&rb)?;
 
