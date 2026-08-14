@@ -422,6 +422,17 @@ fn is_json_whitespace(byte: u8) -> bool {
     matches!(byte, b' ' | b'\t' | b'\r' | b'\n')
 }
 
+/// The error for a body that opens with part of a UTF-8 byte-order mark and
+/// then something else, having read `seen` of its three bytes.
+fn incomplete_bom_error(seen: usize) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "Failed to read JSON: the body starts with {seen} of the 3 bytes of a UTF-8 byte-order mark and then something else, so it is neither a marked nor an unmarked JSON document. Check the file for a truncated or re-encoded header, or re-export it as UTF-8."
+        ),
+    )
+}
+
 /// The first byte of `bytes` that is not JSON whitespace, if there is one.
 fn first_non_whitespace(bytes: &[u8]) -> Option<u8> {
     bytes.iter().find(|b| !is_json_whitespace(**b)).copied()
@@ -656,27 +667,33 @@ pub fn peek_first_non_ws_byte<R: BufRead>(reader: &mut R) -> io::Result<u8> {
         if buf.len() >= 3 && buf[..3] == UTF8_BOM {
             reader.consume(3);
         } else if !buf.is_empty() && buf[0] == UTF8_BOM[0] {
-            // Potential partial BOM — read byte-by-byte to confirm.
-            let mut bom_buf = [0u8; 3];
-            bom_buf[0] = buf[0];
+            // Potential partial BOM — read byte-by-byte to confirm, because
+            // the BOM's bytes may straddle two buffers.
+            //
+            // Confirming costs consuming, and a `BufRead` cannot put the bytes
+            // back. So a prefix that starts like a BOM and turns out not to be
+            // one leaves the reader holding a body with its first bytes
+            // deleted. Reporting the `0xEF` and carrying on is what made
+            // `\xEF{"a":1}` load as the clean object `{"a":1}` — the corrupt
+            // prefix silently gone, and the caller handed a reader whose
+            // remaining bytes parse.
+            //
+            // Erroring refuses nothing valid: a JSON document begins with
+            // `{`, `[`, `"`, a digit, `-`, `t`, `f` or `n`, so `0xEF` can only
+            // ever be the start of a BOM.
             reader.consume(1);
             let b1 = reader.fill_buf()?;
             if !b1.is_empty() && b1[0] == UTF8_BOM[1] {
-                bom_buf[1] = b1[0];
                 reader.consume(1);
                 let b2 = reader.fill_buf()?;
                 if !b2.is_empty() && b2[0] == UTF8_BOM[2] {
                     // Full BOM consumed.
                     reader.consume(1);
                 } else {
-                    // Only 0xEF 0xBB seen — not a BOM, put back by returning 0xEF.
-                    // We can't un-consume, so treat what we read as content.
-                    // 0xEF is not ascii whitespace, so return it.
-                    return Ok(bom_buf[0]);
+                    return Err(incomplete_bom_error(2));
                 }
             } else {
-                // Only 0xEF seen — not a BOM. 0xEF is not whitespace.
-                return Ok(bom_buf[0]);
+                return Err(incomplete_bom_error(1));
             }
         }
     }
@@ -3054,13 +3071,49 @@ mod tests {
             assert_eq!(byte, b'[');
         }
 
-        /// Partial BOM prefix (only 0xEF) — not a real BOM
+        /// A prefix that starts like a BOM and is not one has to be reported,
+        /// because confirming it costs consuming it and a `BufRead` cannot put
+        /// the bytes back. Returning `0xEF` and continuing hands the caller a
+        /// reader whose corrupt prefix has been deleted — so `\xEF{"a":1}`
+        /// reads as the clean object `{"a":1}`, which is the silent-acceptance
+        /// shape the array guards exist to remove.
+        ///
+        /// The bodies here differ in how far the prefix gets (one byte, then
+        /// two) and in whether what follows would parse on its own. The
+        /// `{"a":1}` rows are the ones that mattered: `[` alone fails later
+        /// anyway, so it cannot tell a fixed reader from a broken one.
         #[test]
-        fn test_auto_detect_partial_bom_single_byte() {
-            let input = vec![0xEF, b'['];
-            let mut reader = BufReader::with_capacity(1, Cursor::new(input));
-            let byte = peek_first_non_ws_byte(&mut reader).expect("should return 0xEF");
-            assert_eq!(byte, 0xEF);
+        fn a_partial_bom_is_reported_rather_than_swallowed() {
+            for input in [
+                vec![0xEF, b'['],
+                vec![0xEF, b'{', b'"', b'a', b'"', b':', b'1', b'}'],
+                vec![0xEF, 0xBB, b'{', b'"', b'a', b'"', b':', b'1', b'}'],
+            ] {
+                let mut reader = BufReader::with_capacity(1, Cursor::new(input.clone()));
+                let err = peek_first_non_ws_byte(&mut reader)
+                    .expect_err("an incomplete BOM must not be reported as content");
+                assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+                assert!(
+                    err.to_string().contains("byte-order mark"),
+                    "expected the incomplete-BOM verdict for {input:?}, got: {err}"
+                );
+            }
+        }
+
+        /// The guard above must not touch a complete BOM, which is ordinary.
+        #[test]
+        fn a_complete_bom_is_still_skipped() {
+            for capacity in [1, 2, 8] {
+                let mut input = UTF8_BOM.to_vec();
+                input.extend(b"  [1]");
+                let mut reader = BufReader::with_capacity(capacity, Cursor::new(input));
+                assert_eq!(
+                    peek_first_non_ws_byte(&mut reader)
+                        .expect("a complete BOM must still be skipped"),
+                    b'[',
+                    "with a {capacity}-byte buffer"
+                );
+            }
         }
 
         /// Auto-detect: object
