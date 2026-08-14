@@ -23,8 +23,8 @@ use data_http_rate_control::HttpRateControlRegistry;
 use datafusion::execution::context::SessionContext;
 use datafusion_table_providers::UnsupportedTypeAction;
 use runtime_checkpoint_api::{
-    BlobCheckpointStore, CheckpointError, kafka::KafkaCheckpointStore,
-    mongodb::MongoCheckpointStore, mysql_binlog::MySqlBinlogStore,
+    BlobCheckpointStore, CheckpointError, debezium::DebeziumCheckpointStore,
+    kafka::KafkaCheckpointStore, mongodb::MongoCheckpointStore, mysql_binlog::MySqlBinlogStore,
 };
 use runtime_component::dataset::DatasetSpec;
 use token_provider::registry::TokenProviderRegistry;
@@ -118,6 +118,13 @@ pub trait ConnectorContext: Send + Sync {
         dataset: &DatasetSpec,
     ) -> Result<Arc<dyn KafkaCheckpointStore>, CheckpointError>;
 
+    /// The Debezium checkpoint store over this dataset's accelerator. See
+    /// [`Self::kafka_checkpoint_store`] for why this reports failure as an error.
+    async fn debezium_checkpoint_store(
+        &self,
+        dataset: &DatasetSpec,
+    ) -> Result<Arc<dyn DebeziumCheckpointStore>, CheckpointError>;
+
     /// The `MySQL` binlog position store over this dataset's accelerator. See
     /// [`Self::kafka_checkpoint_store`] for why this reports failure as an error.
     async fn mysql_binlog_store(
@@ -195,6 +202,13 @@ impl ConnectorContext for RuntimeConnectorContext {
         dataset: &DatasetSpec,
     ) -> Result<Arc<dyn KafkaCheckpointStore>, CheckpointError> {
         spice_sys::kafka_checkpoint_store(&self.bind(dataset)).await
+    }
+
+    async fn debezium_checkpoint_store(
+        &self,
+        dataset: &DatasetSpec,
+    ) -> Result<Arc<dyn DebeziumCheckpointStore>, CheckpointError> {
+        spice_sys::debezium_checkpoint_store(&self.bind(dataset)).await
     }
 
     async fn mysql_binlog_store(

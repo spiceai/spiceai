@@ -493,6 +493,34 @@ pub async fn kafka_checkpoint_store(
     })
 }
 
+/// Construct the **Debezium** checkpoint store over this dataset's accelerator.
+#[cfg(feature = "debezium")]
+pub async fn debezium_checkpoint_store(
+    dataset: &crate::component::dataset::Dataset,
+) -> std::result::Result<
+    Arc<dyn runtime_checkpoint_api::debezium::DebeziumCheckpointStore>,
+    CheckpointError,
+> {
+    let sys =
+        debezium_kafka::DebeziumKafkaSys::try_new(dataset, OpenOption::CreateIfNotExists).await?;
+    Ok(Arc::new(sys))
+}
+
+/// Debezium support is not compiled in, so there is no sidecar to resolve. Signature
+/// parity with the variant above (see it for the full contract).
+#[cfg(not(feature = "debezium"))]
+pub async fn debezium_checkpoint_store(
+    dataset: &crate::component::dataset::Dataset,
+) -> std::result::Result<
+    Arc<dyn runtime_checkpoint_api::debezium::DebeziumCheckpointStore>,
+    CheckpointError,
+> {
+    let _ = dataset;
+    Err(CheckpointError::Store {
+        source: "Spice wasn't built with Debezium support enabled".into(),
+    })
+}
+
 /// Construct the **`MySQL` binlog** position store over this dataset's accelerator.
 #[cfg(feature = "mysql")]
 pub async fn mysql_binlog_store(

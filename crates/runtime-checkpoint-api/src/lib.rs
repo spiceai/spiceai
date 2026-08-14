@@ -36,6 +36,7 @@ limitations under the License.
 //! |---|---|---|
 //! | [`BlobCheckpoint`] — one opaque `String` | [`BlobCheckpointStore`] | `DynamoDB`, the `PostgreSQL` replication watermark (and any connector that serializes its whole state) |
 //! | [`kafka::KafkaCheckpoint`] + [`kafka::KafkaOffset`] rows | [`kafka::KafkaCheckpointStore`] — per-partition upsert resolving to `GREATEST(new, old)` | `Kafka` |
+//! | [`debezium::DebeziumCheckpoint`] + [`kafka::KafkaOffset`] rows | [`debezium::DebeziumCheckpointStore`] | `Debezium` (its events arrive over Kafka, so the offset rows are shared) |
 //! | [`mysql_binlog::MySqlBinlogCheckpoint`] | [`mysql_binlog::MySqlBinlogStore`] | `MySQL` |
 //! | [`mongodb::MongoCheckpointMetadata`] | [`mongodb::MongoCheckpointStore`] | `MongoDB` |
 //!
@@ -56,9 +57,9 @@ limitations under the License.
 //! - [`BlobCheckpointStore`] is implemented **per storage engine** in the sibling
 //!   `runtime-checkpoint-{duckdb,sqlite,postgres,turso}` crates — one crate per engine,
 //!   so the stitch binary links only the engines it enables (`feature = crate`).
-//! - The structured shapes ([`kafka`], [`mysql_binlog`], [`mongodb`]) are implemented
-//!   inside `runtime`, on the `spice_sys` sidecar types, with their per-engine SQL
-//!   behind `runtime`'s accelerator-backend features.
+//! - The structured shapes ([`kafka`], [`debezium`], [`mysql_binlog`], [`mongodb`]) are
+//!   implemented inside `runtime`, on the `spice_sys` sidecar types, with their
+//!   per-engine SQL behind `runtime`'s accelerator-backend features.
 //!
 //! The split is incidental rather than a design distinction: the engine crates are where
 //! per-engine persistence belongs, and the structured shapes have not moved there yet.
@@ -69,6 +70,7 @@ use std::time::SystemTime;
 use async_trait::async_trait;
 use snafu::Snafu;
 
+pub mod debezium;
 pub mod kafka;
 pub mod mongodb;
 pub mod mysql_binlog;
