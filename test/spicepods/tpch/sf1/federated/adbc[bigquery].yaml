@@ -1,15 +1,3 @@
-#  PROJECT=spiceai-testing
-#  DATASET=tpch_sf1
-#  BUCKET=s3://spiceai-public-datasets/tpch
-#
-#  for t in region nation part supplier partsupp customer orders lineitem; do
-#    echo "=== $t ==="
-#    aws s3 cp "$BUCKET/$t/$t.parquet" "$t.parquet" --no-sign-request
-#    bq --project_id="$PROJECT" load --replace --source_format=PARQUET \
-#    "$DATASET.$t" "$t.parquet"
-#    rm -f "$t.parquet"
-#  done
-
 version: v1
 kind: Spicepod
 name: adbc[bigquery]-federated
