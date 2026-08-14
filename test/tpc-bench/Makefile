@@ -9,6 +9,12 @@ all: tpch-gen pg-load
 # $(TPCH_FLEET_DIR) instead, so a caller using it must pass TPCH_DATA_DIR to match.
 TPCH_DATA_DIR ?= tpch-kit/dbgen
 
+# Directory the *-tpcds-load targets read TPC-DS .dat files from. dsdgen writes to
+# tpcds-kit/tools/tmp/data (see tpcds-gen), so that is the default; tpcds-fleet-gen
+# writes to $(TPCDS_FLEET_DIR) instead, so a caller using it must pass
+# TPCDS_DATA_DIR to match.
+TPCDS_DATA_DIR ?= tpcds-kit/tools/tmp/data
+
 tpch-clone:
 	@if [ ! -d "tpch-kit" ]; then \
 		git clone https://github.com/spiceai/tpch-kit.git; \
@@ -31,11 +37,13 @@ tpch-init: tpch-clone
 
 	@echo "Initialized successfully."
 
-tpcds-init:
+tpcds-clone:
 	@if [ ! -d "tpcds-kit" ]; then \
 		git clone https://github.com/spiceai/tpcds-kit.git; \
 		cd tpcds-kit && git checkout dd01f906992e1e39837526bffb3f5b759e83b3a8; \
 	fi
+
+tpcds-init: tpcds-clone
 	@OS=`uname`; \
 	if [ -z "$(OS)" ]; then \
 		if [ "$$OS" = "Linux" ]; then \
@@ -146,6 +154,52 @@ tpch-fleet-gen: $(DUCKDB)
 	done
 	@rm -f "$(TPCH_FLEET_DIR)/gen.duckdb" "$(TPCH_FLEET_DIR)/gen.duckdb.wal"
 	@echo "Test data generated successfully in $(TPCH_FLEET_DIR) - pass TPCH_DATA_DIR=$(TPCH_FLEET_DIR) to the load targets."
+
+# tpcds-fleet-gen is the TPC-DS analog of tpch-fleet-gen above: it generates the
+# same TPC-DS dataset the rest of the benchmark fleet runs on - the s3/file
+# parquet copies and the hosted MySQL and Spice Cloud databases - which is what
+# crates/test-framework/src/queries/validation/tpcds/*.csv holds the expected
+# answers for. That dataset comes from DuckDB's tpcds extension, a
+# reimplementation whose RNG diverges from tpcds-kit's C dsdgen: schemas and row
+# counts are identical, but which customer bought which item on which ticket
+# differs, so cross-fact-table join incidence differs. Queries whose canonical
+# SF1 answers hold only 1-2 rows (q17, q25, q85 - store/catalog/web sales
+# joined to their returns) come back genuinely empty from a tpcds-kit-seeded
+# database no matter how correct the engine under test is, and value-level
+# result snapshots differ broadly. Seeding from the same generator the expected
+# answers were produced with is what makes a result mismatch mean a real bug.
+#
+# Data only - the DDL (tpcds.sql) and foreign keys (tpcds_ri.sql) still come
+# from tpcds-kit, which tpcds-clone fetches without compiling the C tools.
+# Example: DBGEN_SCALE=1 make tpcds-fleet-gen
+TPCDS_FLEET_DIR ?= ./tmp/tpcds-fleet
+
+TPCDS_TABLES = call_center catalog_page catalog_returns catalog_sales customer \
+	customer_address customer_demographics date_dim household_demographics \
+	income_band inventory item promotion reason ship_mode store store_returns \
+	store_sales time_dim warehouse web_page web_returns web_sales web_site
+
+tpcds-fleet-gen: $(DUCKDB)
+	@# Check if DBGEN_SCALE is set, else default to 1
+	$(eval DBGEN_SCALE ?= 1)
+	@mkdir -p "$(TPCDS_FLEET_DIR)"
+	@rm -f "$(TPCDS_FLEET_DIR)"/*.dat "$(TPCDS_FLEET_DIR)/gen.duckdb" "$(TPCDS_FLEET_DIR)/gen.duckdb.wal"
+	@echo "Generating TPC-DS scale factor $(DBGEN_SCALE)..."
+	@"$(DUCKDB)" "$(TPCDS_FLEET_DIR)/gen.duckdb" -c "INSTALL tpcds; LOAD tpcds; CALL dsdgen(sf=$(DBGEN_SCALE));" > /dev/null
+	@# QUOTE '' disables CSV quoting so no field is ever wrapped, and the trailing
+	@# empty column reproduces dsdgen's trailing '|'; NULLs export as empty fields,
+	@# exactly as dsdgen writes them. The result is byte-compatible with dsdgen's
+	@# .dat format, so every *-tpcds-load target reads it unchanged. Tables are
+	@# dropped as they are written to bound peak disk at the larger scales.
+	@for table in $(TPCDS_TABLES); do \
+		echo "Writing $$table.dat..."; \
+		"$(DUCKDB)" "$(TPCDS_FLEET_DIR)/gen.duckdb" -c "\
+			COPY (SELECT *, '' FROM $$table) TO '$(TPCDS_FLEET_DIR)/$$table.dat' (FORMAT CSV, DELIMITER '|', HEADER false, QUOTE ''); \
+			DROP TABLE $$table; \
+			CHECKPOINT;" > /dev/null || exit 1; \
+	done
+	@rm -f "$(TPCDS_FLEET_DIR)/gen.duckdb" "$(TPCDS_FLEET_DIR)/gen.duckdb.wal"
+	@echo "Test data generated successfully in $(TPCDS_FLEET_DIR) - pass TPCDS_DATA_DIR=$(TPCDS_FLEET_DIR) to the load targets."
 
 # Default value for DB_NAME
 DB_NAME ?= tpch
@@ -298,7 +352,7 @@ mysql-tpcds-load:
 	@mkdir -p ./tmp
 	@for table in call_center catalog_page catalog_returns catalog_sales customer customer_address customer_demographics date_dim household_demographics income_band inventory item promotion reason ship_mode store store_returns store_sales time_dim warehouse web_page web_returns web_sales web_site; do \
 		echo "Loading $$table..."; \
-		sed 's/|$$//' tpcds-kit/tools/tmp/data/$$table.dat > ./tmp/$$table.dat; \
+		sed 's/|$$//' "$(TPCDS_DATA_DIR)/$$table.dat" > ./tmp/$$table.dat; \
 		mysql -h$(DB_HOST) -u$(DB_USER) -p$(DB_PASS) -P$(DB_PORT) --local-infile=1 $(DB_NAME) -e "LOAD DATA LOCAL INFILE './tmp/$$table.dat' INTO TABLE $$table FIELDS TERMINATED BY '|' LINES TERMINATED BY '\n';"; \
 	done
 	@echo "Benchmark dataset has been successfully loaded to '$(DB_NAME)' database."
@@ -340,7 +394,7 @@ pg-tpcds-load:
 	@mkdir -p ./tmp
 	@for table in call_center catalog_page catalog_returns catalog_sales customer customer_address customer_demographics date_dim household_demographics income_band inventory item promotion reason ship_mode store store_returns store_sales time_dim warehouse web_page web_returns web_sales web_site; do \
 		echo "Loading $$table..."; \
-		sed 's/|$$//' tpcds-kit/tools/tmp/data/$$table.dat > ./tmp/$$table.dat; \
+		sed 's/|$$//' "$(TPCDS_DATA_DIR)/$$table.dat" > ./tmp/$$table.dat; \
 		psql -h $(DB_HOST) -p $(DB_PORT) -U $(DB_USER) $(DB_NAME) -c "\\copy $$table FROM './tmp/$$table.dat' CSV DELIMITER '|';"; \
 	done
 	@echo "Applying foreign keys from tpcds_ri.sql..."

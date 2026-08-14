@@ -22,7 +22,9 @@ limitations under the License.
 //! scan/update plumbing. The provider drives these from its insert/delete path.
 
 use super::delete::CayenneDeletionSink;
-use super::pk_index::{CachedPkIndex, PkDigestSet, PkExistenceRef, ShardedPkIndex};
+use super::pk_index::{
+    CachedPkIndex, PendingPkExistence, PkDigestSet, PkExistenceRef, ShardedPkIndex,
+};
 use crate::metadata::InlinedData;
 
 use arrow::record_batch::RecordBatch;
@@ -1127,6 +1129,13 @@ pub(crate) struct OnConflictContext<'a> {
     pub(crate) on_conflict: &'a OnConflict,
     pub(crate) upsert_options: &'a UpsertOptions,
     pub(crate) existing: PkExistenceRef<'a>,
+    /// Keys committed by other writers since `existing` was checked out of its
+    /// cache, which `existing` therefore cannot know about (see
+    /// [`PendingPkKeys`](super::pk_index::PendingPkKeys)).
+    /// Consulted on an `existing` miss so a key committed mid-validation is not
+    /// classified as a new primary key. `None` when nothing was committed during
+    /// this checkout — the common case.
+    pub(crate) pending: Option<&'a PendingPkExistence>,
     pub(crate) incoming_keys: &'a PkDigestSet,
 }
 
@@ -1217,12 +1226,24 @@ impl OnConflictValidationStream {
             CachedPkIndex::Bloom(bloom) => PkExistenceRef::Bloom(bloom),
         };
 
+        // Snapshot per batch, not per stream: `existing` was checked out before the
+        // first batch, and this stream is consumed lazily as the encode runs, so a
+        // concurrent writer can commit a key between two batches of it.
+        let pending = if self.store_back {
+            self.table.pending_pk_existence()
+        } else {
+            // Off-lock staging validates against a private keyset it just built —
+            // it holds no checkout, so the log is another writer's business.
+            None
+        };
+
         let mut ctx = OnConflictContext {
             pk_indices: &self.pk_indices,
             converter: &self.converter,
             on_conflict: &self.on_conflict,
             upsert_options: &self.upsert_options,
             existing,
+            pending: pending.as_ref(),
             incoming_keys: &self.incoming_keys,
         };
 
