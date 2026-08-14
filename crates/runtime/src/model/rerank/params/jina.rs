@@ -22,7 +22,7 @@ use secrecy::SecretString;
 #[params(prefix = "jina")]
 pub struct JinaRerankerParams {
     /// The Jina API key.
-    #[param(runtime, alias = "jina_api_key")]
+    #[param(runtime, autoload_secret, alias = "jina_api_key")]
     pub api_key: SecretString,
     /// The Jina API base endpoint.
     #[param(runtime)]

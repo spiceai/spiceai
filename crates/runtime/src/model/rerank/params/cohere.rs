@@ -22,7 +22,7 @@ use secrecy::SecretString;
 #[params(prefix = "cohere")]
 pub struct CohereRerankerParams {
     /// The Cohere API key.
-    #[param(runtime, alias = "cohere_api_key")]
+    #[param(runtime, autoload_secret, alias = "cohere_api_key")]
     pub api_key: SecretString,
     /// The Cohere API base endpoint.
     #[param(runtime)]

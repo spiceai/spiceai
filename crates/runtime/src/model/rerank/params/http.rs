@@ -24,7 +24,7 @@ use secrecy::SecretString;
 pub struct HttpRerankerParams {
     /// Bearer token sent as the `Authorization` header, if the service
     /// requires one.
-    #[param(runtime)]
+    #[param(runtime, autoload_secret)]
     pub api_key: Option<SecretString>,
     /// Model id to send in the request body, if the service expects one
     /// rather than pinning the model upstream.

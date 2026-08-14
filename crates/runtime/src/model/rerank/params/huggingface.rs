@@ -24,8 +24,9 @@ use super::Truncation;
 #[derive(TypedParams)]
 #[params(prefix = "huggingface")]
 pub struct HuggingFaceRerankerParams {
-    /// The Hugging Face access token.
-    #[param(runtime, autoload_secret)]
+    /// The Hugging Face access token. Also accepts `api_key`, matching the
+    /// key name used by the other reranker providers.
+    #[param(runtime, autoload_secret, alias = "api_key")]
     pub hf_token: Option<SecretString>,
     /// The maximum sequence length for the `(query, document)` pair.
     #[param(runtime)]

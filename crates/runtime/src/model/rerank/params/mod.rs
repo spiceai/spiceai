@@ -189,6 +189,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn huggingface_params_accept_api_key_alias() {
+        // `api_key` mirrors the key name used by the other reranker providers,
+        // so a `huggingface:` reranker doesn't require a `hf_token`-specific key.
+        let typed = huggingface::HuggingFaceRerankerParams::try_from_params(
+            "reranker test",
+            params(&[("api_key", "hf_abc")]),
+            &empty_secrets(),
+        )
+        .await
+        .expect("huggingface reranker params should deserialize");
+        assert_eq!(
+            typed.hf_token.as_ref().map(ExposeSecret::expose_secret),
+            Some("hf_abc")
+        );
+    }
+
+    #[tokio::test]
     async fn huggingface_params_default_truncate_is_absent() {
         let typed = huggingface::HuggingFaceRerankerParams::try_from_params(
             "reranker test",
