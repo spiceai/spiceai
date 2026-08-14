@@ -236,6 +236,9 @@ pub struct RefreshTaskBuilder {
     initial_load_completed: Option<Arc<AtomicBool>>,
     /// Whether the acceleration uses S3 Express One Zone storage.
     is_s3_express_acceleration: bool,
+    /// The acceleration engine's own type rewrites, forwarded to the sink so an
+    /// engine-imposed type is not reported as a stale acceleration schema.
+    engine_type_rewrites: &'static [&'static dyn arrow_tools::type_rewrite::TypeRewriteRule],
     /// State for `refresh_mode: snapshot`. Required when the refresh mode is
     /// [`RefreshMode::Snapshot`]; ignored otherwise.
     snapshot_refresh_state: Option<crate::accelerated::snapshots::SnapshotRefreshState>,
@@ -272,6 +275,7 @@ impl RefreshTaskBuilder {
             last_updated_at: Arc::new(AtomicI64::new(0)),
             initial_load_completed: None,
             is_s3_express_acceleration: false,
+            engine_type_rewrites: &[],
             snapshot_refresh_state: None,
             cdc_param_overrides: None,
         }
@@ -342,6 +346,16 @@ impl RefreshTaskBuilder {
         self
     }
 
+    /// Declare the acceleration engine's own type rewrites.
+    #[must_use]
+    pub fn with_engine_type_rewrites(
+        mut self,
+        rules: &'static [&'static dyn arrow_tools::type_rewrite::TypeRewriteRule],
+    ) -> RefreshTaskBuilder {
+        self.engine_type_rewrites = rules;
+        self
+    }
+
     /// Provide the snapshot-refresh state required for `RefreshMode::Snapshot`.
     #[must_use]
     pub fn with_snapshot_refresh_state(
@@ -390,7 +404,8 @@ impl RefreshTaskBuilder {
         let federated_indexes = indexes_from_federated(&self.federated);
         let sink = Arc::new(RwLock::new(
             AccelerationSink::new(Arc::clone(&self.accelerator))
-                .with_sink_indexes(federated_indexes),
+                .with_sink_indexes(federated_indexes)
+                .with_engine_type_rewrites(self.engine_type_rewrites),
         ));
 
         let dataset_metric_labels = DatasetMetricLabels::new(&self.dataset_name);

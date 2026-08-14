@@ -51,6 +51,23 @@ impl AccelerationSink {
         }
     }
 
+    /// Declares the acceleration engine's own type rewrites, so a type the engine
+    /// imposes at table creation is not reported as a stale acceleration schema.
+    ///
+    /// Only [`TableSink`] runs that check; [`MultiSink`] does not, so the rules have
+    /// nowhere to apply there.
+    pub fn with_engine_type_rewrites(
+        self,
+        rules: &'static [&'static dyn arrow_tools::type_rewrite::TypeRewriteRule],
+    ) -> Self {
+        match self {
+            AccelerationSink::Table(sink) => {
+                AccelerationSink::Table(sink.with_engine_type_rewrites(rules))
+            }
+            AccelerationSink::Multi(sink) => AccelerationSink::Multi(sink),
+        }
+    }
+
     // Adds a table provider to the AccelerationSink, converting a TableSink to a MultiSink if necessary
     pub fn add_synchronized_table(&mut self, synchronized_table: SynchronizedTable) {
         match self {

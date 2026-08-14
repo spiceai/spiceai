@@ -17,7 +17,10 @@ limitations under the License.
 use std::{pin::Pin, sync::Arc};
 
 use arrow_schema::SchemaRef;
-use arrow_tools::{schema_evolution::is_widening_cast, type_rewrite::normalize_dictionary_types};
+use arrow_tools::{
+    schema_evolution::is_widening_cast,
+    type_rewrite::{TypeRewriteRule, apply_rules, normalize_dictionary_types},
+};
 use data_components::index_maintenance::perform_index_maintenance;
 use datafusion::{
     catalog::TableProvider, execution::RecordBatchStream, logical_expr::dml::InsertOp,
@@ -42,9 +45,18 @@ use runtime_datafusion::error::find_datafusion_root;
 /// the target, and columns whose target type is neither equal nor a lossless
 /// widening. Dictionary encodings are normalized away first so a dictionary unwrap
 /// is not reported as a narrowing.
+///
+/// `engine_type_rewrites` are the rewrites the acceleration engine itself applies at
+/// table creation, declared by `DataAccelerator::type_rewrite_rules`.
+/// They are applied to the input before the comparison, so a column the engine cannot
+/// store at the source's type — Cayenne/Vortex keeping every timestamp at microsecond
+/// precision, for instance — is not reported as the acceleration lagging behind the
+/// source. The engine produces that type from this very input, so no schema change
+/// can make the two agree.
 fn narrowing_schema_cast_changes(
     input_schema: &SchemaRef,
     target_schema: &SchemaRef,
+    engine_type_rewrites: &[&'static dyn TypeRewriteRule],
 ) -> (Vec<String>, Vec<String>) {
     // Hot path: this runs once per insert. Identical schemas (the common
     // no-schema-change case) cannot narrow, so skip the two
@@ -55,6 +67,11 @@ fn narrowing_schema_cast_changes(
         return (Vec::new(), Vec::new());
     }
     let input = normalize_dictionary_types(input_schema);
+    let input = if engine_type_rewrites.is_empty() {
+        input
+    } else {
+        apply_rules(&input, engine_type_rewrites)
+    };
     let target = normalize_dictionary_types(target_schema);
 
     let mut dropped: Vec<String> = Vec::new();
@@ -82,22 +99,40 @@ fn narrowing_schema_cast_changes(
 /// [`SchemaCastScanExec`]: warns unconditionally - for every `on_schema_change`
 /// policy - when the cast target drops columns present in the input plan schema or
 /// casts them to a type that is not a lossless widening.
-fn warn_on_narrowing_schema_cast(input_schema: &SchemaRef, target_schema: &SchemaRef) {
-    let (dropped, narrowed) = narrowing_schema_cast_changes(input_schema, target_schema);
+fn warn_on_narrowing_schema_cast(
+    input_schema: &SchemaRef,
+    target_schema: &SchemaRef,
+    engine_type_rewrites: &[&'static dyn TypeRewriteRule],
+) {
+    let (dropped, narrowed) =
+        narrowing_schema_cast_changes(input_schema, target_schema, engine_type_rewrites);
     if dropped.is_empty() && narrowed.is_empty() {
         return;
     }
 
     let mut changes: Vec<String> = Vec::new();
+    // The two cases have different remediations, and only the dropped-column one is
+    // answered by `on_schema_change`: it adopts a source change when the change is a
+    // lossless widening, which a narrowing is not by construction. Advising it for a
+    // narrowed column sends operators through settings that cannot alter the stored
+    // type.
+    let mut remedies: Vec<&str> = Vec::new();
     if !dropped.is_empty() {
         changes.push(format!("dropping columns [{}]", dropped.join(", ")));
+        remedies.push(
+            "Set `on_schema_change` and restart Spice to evolve the accelerated table with the new columns",
+        );
     }
     if !narrowed.is_empty() {
         changes.push(format!("narrowing column types [{}]", narrowed.join(", ")));
+        remedies.push(
+            "The narrowed columns need an accelerated table built for the source's types; `on_schema_change` adopts only lossless widenings and will not change them",
+        );
     }
     tracing::warn!(
-        "TableSink: the accelerated table schema is behind the incoming data; the write cast is {}. Values in these columns are silently lost or lossily cast. Set `on_schema_change` and restart Spice to evolve the accelerated table where the change is a lossless widening.",
+        "TableSink: the accelerated table schema is behind the incoming data; the write cast is {}. Values in these columns are silently lost or lossily cast. {}. See: https://spiceai.org/docs/components/data-accelerators",
         changes.join(" and "),
+        remedies.join(". "),
     );
     SCHEMA_EVOLUTION_DETECTED.add(
         1,
@@ -118,6 +153,10 @@ pub(crate) struct TableSink {
     /// Used for external indexes (e.g. Elasticsearch) that must be maintained on
     /// the accelerator write path but must never be visible to the query optimizer.
     pub(super) sink_indexes: Vec<Arc<dyn Index + Send + Sync>>,
+    /// The acceleration engine's own type rewrites, used to tell an engine-imposed
+    /// type from a stale acceleration schema. Empty for engines that store the
+    /// incoming types verbatim.
+    pub(super) engine_type_rewrites: &'static [&'static dyn TypeRewriteRule],
 }
 
 impl TableSink {
@@ -125,11 +164,20 @@ impl TableSink {
         Self {
             table_provider,
             sink_indexes: vec![],
+            engine_type_rewrites: &[],
         }
     }
 
     pub fn with_sink_indexes(mut self, indexes: Vec<Arc<dyn Index + Send + Sync>>) -> Self {
         self.sink_indexes = indexes;
+        self
+    }
+
+    pub fn with_engine_type_rewrites(
+        mut self,
+        rules: &'static [&'static dyn TypeRewriteRule],
+    ) -> Self {
+        self.engine_type_rewrites = rules;
         self
     }
 
@@ -154,7 +202,11 @@ impl TableSink {
 
         let ctx = SessionContext::new();
         let target_schema = self.table_provider.schema();
-        warn_on_narrowing_schema_cast(&record_batch_stream.schema(), &target_schema);
+        warn_on_narrowing_schema_cast(
+            &record_batch_stream.schema(),
+            &target_schema,
+            self.engine_type_rewrites,
+        );
         let streaming_plan: Arc<dyn datafusion::physical_plan::ExecutionPlan> =
             Arc::new(StreamingDataUpdateExecutionPlan::new(record_batch_stream));
         let cast_plan: Arc<dyn datafusion::physical_plan::ExecutionPlan> =
@@ -293,11 +345,18 @@ async fn run_on_write_failed(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_schema::{DataType, Field, Schema};
+    use arrow_schema::{DataType, Field, Schema, TimeUnit};
+    use arrow_tools::type_rewrite::{Float16ToFloat32, TimestampToMicrosecond};
 
     fn schema(fields: Vec<Field>) -> SchemaRef {
         Arc::new(Schema::new(fields))
     }
+
+    /// Mirrors `cayenne::CAYENNE_TYPE_REWRITE_RULES`, which this crate sits below and
+    /// so cannot name. `cayenne_rules_match_transform_for_supported_types` is what
+    /// keeps the real list honest against the transform it describes.
+    static CAYENNE_LIKE_RULES: &[&dyn TypeRewriteRule] =
+        &[&Float16ToFloat32, &TimestampToMicrosecond];
 
     #[test]
     fn narrowing_cast_detects_dropped_and_narrowed_columns() {
@@ -311,7 +370,7 @@ mod tests {
             Field::new("b", DataType::Utf8, true),
         ]);
 
-        let (dropped, narrowed) = narrowing_schema_cast_changes(&input, &target);
+        let (dropped, narrowed) = narrowing_schema_cast_changes(&input, &target, &[]);
         assert_eq!(dropped, ["c".to_string()]);
         assert_eq!(narrowed, ["a: Int64 -> Int32".to_string()]);
     }
@@ -334,8 +393,112 @@ mod tests {
             Field::new("extra", DataType::Utf8, true),
         ]);
 
-        let (dropped, narrowed) = narrowing_schema_cast_changes(&input, &target);
+        let (dropped, narrowed) = narrowing_schema_cast_changes(&input, &target, &[]);
         assert!(dropped.is_empty(), "{dropped:?}");
         assert!(narrowed.is_empty(), "{narrowed:?}");
+    }
+
+    /// Regression test for #13014: a Postgres `timestamptz` is inferred as
+    /// `Timestamp(ns, "UTC")`, Cayenne stores it as `Timestamp(µs, "UTC")` because
+    /// Vortex has no other option, and every refresh then cast ns -> µs and warned
+    /// that the acceleration was stale.
+    #[test]
+    fn engine_timestamp_rewrite_is_not_a_narrowing() {
+        let input = schema(vec![Field::new(
+            "created_at",
+            DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+            true,
+        )]);
+        let target = schema(vec![Field::new(
+            "created_at",
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            true,
+        )]);
+
+        let (dropped, narrowed) =
+            narrowing_schema_cast_changes(&input, &target, CAYENNE_LIKE_RULES);
+        assert!(dropped.is_empty(), "{dropped:?}");
+        assert!(narrowed.is_empty(), "{narrowed:?}");
+
+        // Without the engine's rules the same pair is a narrowing - which is what
+        // makes the assertion above evidence rather than a schema that never differed.
+        let (_, narrowed_without_rules) = narrowing_schema_cast_changes(&input, &target, &[]);
+        assert_eq!(
+            narrowed_without_rules,
+            [r#"created_at: Timestamp(ns, "UTC") -> Timestamp(µs, "UTC")"#.to_string()]
+        );
+    }
+
+    /// The rewrite rules must not swallow a real narrowing that happens to sit beside
+    /// one they explain.
+    #[test]
+    fn engine_rewrites_do_not_suppress_a_genuine_narrowing() {
+        let input = schema(vec![
+            Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+                true,
+            ),
+            Field::new("count", DataType::Int64, false),
+            Field::new("only_in_source", DataType::Utf8, true),
+        ]);
+        let target = schema(vec![
+            Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                true,
+            ),
+            Field::new("count", DataType::Int32, false),
+        ]);
+
+        let (dropped, narrowed) =
+            narrowing_schema_cast_changes(&input, &target, CAYENNE_LIKE_RULES);
+        assert_eq!(dropped, ["only_in_source".to_string()]);
+        assert_eq!(narrowed, ["count: Int64 -> Int32".to_string()]);
+    }
+
+    /// The rules descend into nested types, matching how the engine rewrites a schema.
+    #[test]
+    fn engine_rewrites_apply_inside_nested_types() {
+        let nested = |unit: TimeUnit| {
+            DataType::Struct(vec![Field::new("at", DataType::Timestamp(unit, None), true)].into())
+        };
+        let input = schema(vec![Field::new("event", nested(TimeUnit::Second), true)]);
+        let target = schema(vec![Field::new(
+            "event",
+            nested(TimeUnit::Microsecond),
+            true,
+        )]);
+
+        let (dropped, narrowed) =
+            narrowing_schema_cast_changes(&input, &target, CAYENNE_LIKE_RULES);
+        assert!(dropped.is_empty(), "{dropped:?}");
+        assert!(narrowed.is_empty(), "{narrowed:?}");
+    }
+
+    /// An engine only excuses the rewrites it actually performs. `DuckDB` keeps the
+    /// precision of a timezone-naive timestamp, so a µs target for a ns source there
+    /// is a real narrowing and must still be reported.
+    #[test]
+    fn an_engine_rewrite_it_does_not_perform_is_still_a_narrowing() {
+        static DUCKDB_LIKE_RULES: &[&dyn TypeRewriteRule] =
+            &[&arrow_tools::type_rewrite::TimestampTzToMicrosecond];
+
+        let input = schema(vec![Field::new(
+            "naive",
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            true,
+        )]);
+        let target = schema(vec![Field::new(
+            "naive",
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            true,
+        )]);
+
+        let (_, narrowed) = narrowing_schema_cast_changes(&input, &target, DUCKDB_LIKE_RULES);
+        assert_eq!(
+            narrowed,
+            ["naive: Timestamp(ns) -> Timestamp(µs)".to_string()]
+        );
     }
 }

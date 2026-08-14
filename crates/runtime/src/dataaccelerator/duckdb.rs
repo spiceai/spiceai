@@ -673,6 +673,12 @@ impl DataAccelerator for DuckDBAccelerator {
         "duckdb"
     }
 
+    fn type_rewrite_rules(
+        &self,
+    ) -> &'static [&'static dyn arrow_tools::type_rewrite::TypeRewriteRule] {
+        DUCKDB_TYPE_REWRITE_RULES
+    }
+
     fn valid_file_extensions(&self) -> Vec<&'static str> {
         vec!["db", "ddb", "duckdb"]
     }

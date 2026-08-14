@@ -29,6 +29,7 @@ limitations under the License.
 //! machinery) can implement or consume the contract without depending on `runtime`.
 
 use ::arrow::datatypes::SchemaRef;
+use arrow_tools::type_rewrite::TypeRewriteRule;
 use async_trait::async_trait;
 use datafusion::common::{Constraint, DFSchema};
 use datafusion::execution::runtime_env::RuntimeEnv;
@@ -378,6 +379,21 @@ pub trait DataAccelerator: Send + Sync {
 
     /// The parameters of the accelerator
     fn parameters(&self) -> &'static [ParameterSpec];
+
+    /// The type rewrites this engine always applies to a schema when it creates a
+    /// table, because the storage format cannot represent the incoming type.
+    ///
+    /// These are *not* schema drift: the accelerated table holding the rewritten type
+    /// is the engine working as designed, so a writer comparing the incoming schema
+    /// against the accelerated one must normalize with these rules first. Reporting
+    /// such a difference as a stale acceleration points operators at
+    /// `on_schema_change`, which cannot change what the engine is able to store.
+    ///
+    /// The default is "no rewrites", which is correct for any engine that stores the
+    /// incoming types verbatim.
+    fn type_rewrite_rules(&self) -> &'static [&'static dyn TypeRewriteRule] {
+        &[]
+    }
 
     /// Returns the storage layout configuration for this accelerator.
     ///

@@ -21,7 +21,10 @@ use arrow_schema::{DataType, Field, IntervalUnit, Schema, TimeUnit};
 /// A rewrite rule applied by [`apply_rules`] to every [`DataType`] node in a schema.
 ///
 /// Rules are applied post-order: children are rewritten before the parent sees them.
-pub trait TypeRewriteRule: Send + Sync {
+///
+/// `Debug` is required so a rule list can sit in a `#[derive(Debug)]` struct; the unit
+/// structs below satisfy it by name.
+pub trait TypeRewriteRule: std::fmt::Debug + Send + Sync {
     /// Return `Some(replacement)` when the rule applies, `None` to leave the type unchanged.
     fn rewrite(&self, dt: &DataType) -> Option<DataType>;
 }
@@ -29,6 +32,7 @@ pub trait TypeRewriteRule: Send + Sync {
 /// Rewrites `DataType::Dictionary(_, value_type)` → `value_type` (recursively).
 ///
 /// Used by accelerators (`DuckDB`, `SQLite`, Turso) that do not support Arrow Dictionary encoding.
+#[derive(Debug)]
 pub struct DictionaryUnwrap;
 impl TypeRewriteRule for DictionaryUnwrap {
     fn rewrite(&self, dt: &DataType) -> Option<DataType> {
@@ -42,6 +46,7 @@ impl TypeRewriteRule for DictionaryUnwrap {
 /// Rewrites `DataType::Null` → `DataType::Int32`.
 ///
 /// `DuckDB` has no Null type and silently coerces it to INT32 when creating tables.
+#[derive(Debug)]
 pub struct NullToInt32;
 impl TypeRewriteRule for NullToInt32 {
     fn rewrite(&self, dt: &DataType) -> Option<DataType> {
@@ -52,6 +57,7 @@ impl TypeRewriteRule for NullToInt32 {
 /// Rewrites `DataType::Interval(YearMonth | DayTime)` → `DataType::Interval(MonthDayNano)`.
 ///
 /// `DuckDB`'s native INTERVAL storage uses the `MonthDayNano` layout.
+#[derive(Debug)]
 pub struct IntervalToMonthDayNano;
 impl TypeRewriteRule for IntervalToMonthDayNano {
     fn rewrite(&self, dt: &DataType) -> Option<DataType> {
@@ -85,6 +91,7 @@ impl TypeRewriteRule for IntervalToMonthDayNano {
 /// nanosecond `TIMESTAMP_NS` type and preserves the precision of `TIMESTAMP`
 /// columns without a zone (the runtime's internal `_fetched_at` caching column
 /// relies on this), so normalizing them would instead *introduce* a mismatch.
+#[derive(Debug)]
 pub struct TimestampTzToMicrosecond;
 impl TypeRewriteRule for TimestampTzToMicrosecond {
     fn rewrite(&self, dt: &DataType) -> Option<DataType> {
@@ -92,6 +99,39 @@ impl TypeRewriteRule for TimestampTzToMicrosecond {
             DataType::Timestamp(unit, Some(tz)) if *unit != TimeUnit::Microsecond => Some(
                 DataType::Timestamp(TimeUnit::Microsecond, Some(Arc::clone(tz))),
             ),
+            _ => None,
+        }
+    }
+}
+
+/// Rewrites `DataType::Float16` → `DataType::Float32`.
+///
+/// Vortex has no half-precision float, so Cayenne stores `Float16` columns widened
+/// to `Float32`.
+#[derive(Debug)]
+pub struct Float16ToFloat32;
+impl TypeRewriteRule for Float16ToFloat32 {
+    fn rewrite(&self, dt: &DataType) -> Option<DataType> {
+        matches!(dt, DataType::Float16).then_some(DataType::Float32)
+    }
+}
+
+/// Rewrites any non-microsecond `DataType::Timestamp(unit, tz)` →
+/// `DataType::Timestamp(Microsecond, tz)`, preserving the timezone (including its
+/// absence).
+///
+/// Vortex stores every timestamp at microsecond precision, so Cayenne normalizes the
+/// unit at table creation. This differs from [`TimestampTzToMicrosecond`] in covering
+/// timezone-naive timestamps too: `DuckDB` has a native nanosecond `TIMESTAMP` and
+/// keeps that precision when there is no zone, whereas Vortex does not.
+#[derive(Debug)]
+pub struct TimestampToMicrosecond;
+impl TypeRewriteRule for TimestampToMicrosecond {
+    fn rewrite(&self, dt: &DataType) -> Option<DataType> {
+        match dt {
+            DataType::Timestamp(unit, tz) if *unit != TimeUnit::Microsecond => {
+                Some(DataType::Timestamp(TimeUnit::Microsecond, tz.clone()))
+            }
             _ => None,
         }
     }
@@ -208,6 +248,80 @@ fn rewrite_data_type(dt: &DataType, rules: &[&dyn TypeRewriteRule]) -> DataType 
 mod tests {
     use super::*;
     use arrow_schema::{DataType, Field, IntervalUnit, Schema, UnionFields, UnionMode};
+
+    #[test]
+    fn float16_to_float32_top_level_and_nested() {
+        let schema = Schema::new(vec![
+            Field::new("half", DataType::Float16, true),
+            Field::new("single", DataType::Float32, true),
+            Field::new(
+                "halves",
+                DataType::List(Arc::new(Field::new("item", DataType::Float16, true))),
+                true,
+            ),
+        ]);
+        let result = apply_rules(&schema, &[&Float16ToFloat32]);
+        assert_eq!(result.field(0).data_type(), &DataType::Float32);
+        assert_eq!(result.field(1).data_type(), &DataType::Float32);
+        assert_eq!(
+            result.field(2).data_type(),
+            &DataType::List(Arc::new(Field::new("item", DataType::Float32, true)))
+        );
+    }
+
+    #[test]
+    fn timestamp_to_microsecond_covers_naive_and_zoned() {
+        let schema = Schema::new(vec![
+            Field::new(
+                "zoned",
+                DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+                true,
+            ),
+            Field::new("naive", DataType::Timestamp(TimeUnit::Second, None), true),
+            Field::new(
+                "already",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("+02:00".into())),
+                true,
+            ),
+        ]);
+        let result = apply_rules(&schema, &[&TimestampToMicrosecond]);
+        assert_eq!(
+            result.field(0).data_type(),
+            &DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
+        );
+        assert_eq!(
+            result.field(1).data_type(),
+            &DataType::Timestamp(TimeUnit::Microsecond, None)
+        );
+        assert_eq!(
+            result.field(2).data_type(),
+            &DataType::Timestamp(TimeUnit::Microsecond, Some("+02:00".into()))
+        );
+    }
+
+    /// The distinguishing case against [`TimestampTzToMicrosecond`], which leaves a
+    /// timezone-naive timestamp alone because `DuckDB` stores it at nanosecond
+    /// precision.
+    #[test]
+    fn timestamp_tz_rule_leaves_naive_timestamps_where_the_all_rule_rewrites_them() {
+        let schema = Schema::new(vec![Field::new(
+            "naive",
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            true,
+        )]);
+        assert_eq!(
+            apply_rules(&schema, &[&TimestampTzToMicrosecond])
+                .field(0)
+                .data_type(),
+            &DataType::Timestamp(TimeUnit::Nanosecond, None)
+        );
+        assert_eq!(
+            apply_rules(&schema, &[&TimestampToMicrosecond])
+                .field(0)
+                .data_type(),
+            &DataType::Timestamp(TimeUnit::Microsecond, None)
+        );
+    }
 
     #[test]
     fn null_to_int32_top_level() {

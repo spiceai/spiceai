@@ -61,6 +61,7 @@ pub struct RefreshTaskRunnerBuilder {
     initial_load_completed: Option<Arc<AtomicBool>>,
     /// Whether the acceleration uses S3 Express One Zone storage.
     is_s3_express_acceleration: bool,
+    engine_type_rewrites: &'static [&'static dyn arrow_tools::type_rewrite::TypeRewriteRule],
     snapshot_refresh_state: Option<crate::accelerated::snapshots::SnapshotRefreshState>,
 }
 
@@ -94,6 +95,7 @@ impl RefreshTaskRunnerBuilder {
             last_updated_at: Arc::new(AtomicI64::new(0)),
             initial_load_completed: None,
             is_s3_express_acceleration: false,
+            engine_type_rewrites: &[],
             snapshot_refresh_state: None,
         }
     }
@@ -148,6 +150,16 @@ impl RefreshTaskRunnerBuilder {
         self
     }
 
+    /// Declare the acceleration engine's own type rewrites.
+    #[must_use]
+    pub fn with_engine_type_rewrites(
+        mut self,
+        rules: &'static [&'static dyn arrow_tools::type_rewrite::TypeRewriteRule],
+    ) -> Self {
+        self.engine_type_rewrites = rules;
+        self
+    }
+
     /// Provide the snapshot-refresh state required for `RefreshMode::Snapshot`.
     #[must_use]
     pub fn with_snapshot_refresh_state(
@@ -185,6 +197,9 @@ impl RefreshTaskRunnerBuilder {
 
         refresh_task_builder =
             refresh_task_builder.with_s3_express_acceleration(self.is_s3_express_acceleration);
+
+        refresh_task_builder =
+            refresh_task_builder.with_engine_type_rewrites(self.engine_type_rewrites);
 
         refresh_task_builder =
             refresh_task_builder.with_snapshot_refresh_state(self.snapshot_refresh_state);
