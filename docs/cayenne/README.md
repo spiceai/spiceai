@@ -96,6 +96,12 @@ rebuild the PDF (and commit the regenerated `waterfall.svg`).
   naming what changed. The row indexes the history rather than retelling it —
   the reasoning and measurements live in the commit and PR it points at, and
   anything a reader needs to use Cayenne belongs in the body of the document.
+  **One row per merged PR**, not one per revision: revise the existing row while
+  a change is still in review. A row is worth adding only for something a reader
+  would act on — a new or renamed parameter, a schema change, a behavior or
+  correctness change, or a structural revision to the document; skip internal
+  refactors and behavior-identical perf work. Cite a **merged PR number or a
+  `trunk` commit**, never a pre-merge branch SHA, which is squashed away on merge.
 - **Prose style**: minimal formatting, no over-bolding; breadth-first; honest
   about design alternatives and version accuracy.
 
