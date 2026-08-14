@@ -24,9 +24,19 @@ limitations under the License.
 //! [`crate::EnrollmentTransactionLock`], which serializes one enrollment
 //! operation: a caller takes this first and that second, never the reverse.
 //!
-//! It lives here, below the CLI, because the runtime reaches the same state
-//! through the control stream and has to take the same lock. Two exclusion
+//! It lives here, below the CLI, so that the runtime can take the same lock:
+//! it reaches the same state through the control stream, and two exclusion
 //! primitives over one directory would exclude nothing.
+//!
+//! What takes it today is the CLI — the `spice connect` transaction and
+//! `spice connect remove`. The runtime's own mutation paths (the `--token`
+//! bootstrap, and the command handlers that persist an app id or an attachment)
+//! do not yet, so a runtime mutation can still interleave with a CLI
+//! transaction. Moving them onto this lock is what this module exists for, and
+//! it is deliberately not a change made from here: a control-stream handler that
+//! blocks on a directory a long CLI transaction holds stalls the stream, so each
+//! path has to adopt the lock with that in view. Until a path does, this module
+//! is the one place the exclusion is defined rather than a second one.
 //!
 //! The lock is advisory and file-descriptor-scoped: the operating system drops
 //! it when the holding process exits, so a crash cannot leave a directory

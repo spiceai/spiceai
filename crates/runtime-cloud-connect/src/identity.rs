@@ -314,6 +314,29 @@ where
 }
 
 impl Identity {
+    /// Drop any portal page this runtime would not accept today.
+    ///
+    /// Validating at the writer stops an unusable link becoming durable, but it
+    /// says nothing about links already on disk: these fields predate the rule,
+    /// so an identity written by an older runtime can hold one, and every
+    /// consumer — the startup report, `spice connect status`, a browser an
+    /// operator opens — reads the stored value rather than a freshly delivered
+    /// one. Applying the rule on the way in is what makes "nothing unusable
+    /// reaches a log or a browser" true of existing state and not just of new
+    /// writes. A dropped page is reduced to absent, never rewritten into
+    /// something else, and the file is not modified by reading it: the next write
+    /// that touches these fields persists the reduction.
+    fn drop_unusable_portal_pages(&mut self) {
+        self.monitor_url = self
+            .monitor_url
+            .take()
+            .and_then(|url| crate::config::safe_portal_url(&url));
+        self.new_project_url = self
+            .new_project_url
+            .take()
+            .and_then(|url| crate::config::safe_portal_url(&url));
+    }
+
     pub(crate) fn certificate_validity_unix(&self) -> Result<(i64, i64), &'static str> {
         let certificate_pem = pem::parse(&self.identity_cert_pem)
             .map_err(|_| "the client identity certificate is not valid PEM")?;
@@ -1147,9 +1170,10 @@ impl IdentityStore {
         })?;
         match read_regular_file_optional(path) {
             Ok(Some(s)) => {
-                let identity: Identity = serde_json::from_str(&s).context(ParseSnafu {
+                let mut identity: Identity = serde_json::from_str(&s).context(ParseSnafu {
                     path: path.to_path_buf(),
                 })?;
+                identity.drop_unusable_portal_pages();
                 Ok(Some(identity))
             }
             Ok(None) => Ok(None),
@@ -2910,6 +2934,57 @@ mod tests {
             // Back to detached so the next iteration starts from the same state.
             IdentityStore::set_attachment(&path, None).expect("detach");
         }
+    }
+
+    /// Portal pages written before the rule existed are dropped when the
+    /// identity is read, so nothing unusable reaches the startup report, a
+    /// status output, or a browser — the writer-side check cannot speak for
+    /// state that is already on disk.
+    #[test]
+    fn portal_pages_a_legacy_identity_holds_are_dropped_on_load() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join("identity.json");
+        let identity = sample_identity();
+        IdentityStore::store(&path, &identity).expect("store");
+
+        // Written straight into the file, the way a runtime without the rule
+        // would have written them.
+        let mut document: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).expect("read identity"))
+                .expect("identity JSON");
+        let object = document
+            .as_object_mut()
+            .expect("identity document is an object");
+        object.insert(
+            "monitor_url".to_string(),
+            serde_json::Value::String("javascript:alert(1)".to_string()),
+        );
+        object.insert(
+            "new_project_url".to_string(),
+            serde_json::Value::String("https://user:secret@spice.ai/acme/new".to_string()),
+        );
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&document).expect("serialize identity"),
+        )
+        .expect("write the legacy identity");
+
+        let loaded = IdentityStore::load_optional(&path)
+            .expect("a legacy identity remains loadable")
+            .expect("present");
+        assert_eq!(
+            loaded.monitor_url, None,
+            "an unusable monitor page must not reach a consumer"
+        );
+        assert_eq!(
+            loaded.new_project_url, None,
+            "an unusable create-project page must not reach a consumer"
+        );
+        assert_eq!(
+            loaded.identifier, identity.identifier,
+            "the rest of the identity is untouched"
+        );
+        assert_eq!(loaded.private_key_pem, identity.private_key_pem);
     }
 
     /// A rejected page is not the same as an omitted one. Naming a page the rule
