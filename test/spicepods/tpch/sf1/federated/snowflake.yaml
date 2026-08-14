@@ -7,9 +7,9 @@ datasets:
     params: &snowflake_params
       snowflake_warehouse: COMPUTE_WH
       snowflake_role: accountadmin
-      snowflake_account: ${secrets:snowflake_account}
-      snowflake_password: ${secrets:snowflake_password}
-      snowflake_username: ${secrets:snowflake_username}
+      snowflake_account: YNIPDWQ-US91485
+      snowflake_password: cf_35V9pTb:5gxA
+      snowflake_username: jackdoverty
   - from: snowflake:BENCHMARKS.TPCH_SF1.LINEITEM
     name: lineitem
     params: *snowflake_params

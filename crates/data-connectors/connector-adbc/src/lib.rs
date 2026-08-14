@@ -24,13 +24,14 @@ use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
 use datafusion::sql::unparser::dialect::{BigQueryDialect, Dialect};
 use datafusion_table_providers::adbc::AdbcTableFactory;
-use datafusion_table_providers::sql::db_connection_pool::DbConnectionPool;
 use datafusion_table_providers::sql::db_connection_pool::adbcpool::{
-    ADBCPool, AdbcConnectionPoolBuilder,
+    ADBCPool, AdbcConnectionPoolBuilder, hash_db_options,
 };
 use datafusion_table_providers::sql::db_connection_pool::dbconnection::query_arrow;
+use datafusion_table_providers::sql::db_connection_pool::{DbConnectionPool, JoinPushDown};
 use futures::TryStreamExt;
 use runtime::component::dataset::{Dataset, DatasetSpec};
+use secrecy::SecretString;
 #[cfg(test)]
 use sha2::{Digest, Sha256};
 use snafu::prelude::*;
@@ -372,6 +373,29 @@ impl AdbcFactory {
         let driver_options = params.parameters.get("driver_options").expose().ok();
         let db_options = build_db_options(&uri_str, username, password, driver_options);
 
+        // Identity used to decide whether two ADBC-backed tables can be joined
+        // in one federated pushdown: DataFusion's federation optimizer only
+        // merges sub-plans whose `compute_context()` strings match, and
+        // `SqlTable::compute_context()` derives that string from this pool's
+        // `join_push_down()`. Mirrors `SnowflakeConnectionPool`'s
+        // account/warehouse/role identity string.
+        let mut join_push_down_identity: HashMap<String, SecretString> = HashMap::new();
+        join_push_down_identity.insert("uri".to_string(), SecretString::from(uri_str.clone()));
+        if let Some(u) = username {
+            join_push_down_identity
+                .insert("username".to_string(), SecretString::from(u.to_string()));
+        }
+        if let Some(p) = password {
+            join_push_down_identity
+                .insert("password".to_string(), SecretString::from(p.to_string()));
+        }
+        if let Some(o) = driver_options {
+            join_push_down_identity.insert(
+                "driver_options".to_string(),
+                SecretString::from(o.to_string()),
+            );
+        }
+
         let connection_namespace =
             resolve_connection_namespace(&driver_name_owned, &params.component, &params.parameters)
                 .map_err(|e| DataConnectorError::InvalidConfigurationSourceOnly {
@@ -468,9 +492,16 @@ impl AdbcFactory {
                         uri: uri_str.clone(),
                     })?;
 
+            let join_push_down_context = hash_db_options(
+                &driver_location,
+                &join_push_down_identity,
+                conn_options.as_ref().unwrap_or(&HashMap::new()),
+            );
+
             let mut pool_builder = AdbcConnectionPoolBuilder::new(db)
                 .with_max_size(pool_size)
-                .with_min_idle(pool_min_idle);
+                .with_min_idle(pool_min_idle)
+                .with_join_push_down(JoinPushDown::AllowedFor(join_push_down_context));
 
             if let Some(conn_opts) = conn_options {
                 pool_builder = pool_builder.with_conn_options(conn_opts);
