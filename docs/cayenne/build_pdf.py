@@ -1,7 +1,14 @@
 #!/usr/bin/env python3
-"""Render cayenne.md -> styled HTML (with kroki-rendered mermaid SVGs) -> PDF."""
-import base64, zlib, re, urllib.request, sys
-from concurrent.futures import ThreadPoolExecutor
+"""Render cayenne.md -> styled HTML (with locally rendered mermaid SVGs) -> PDF.
+
+Diagrams render through mermaid-cli (`mmdc`), pinned in package.json and
+installed with `npm ci` in this directory. Rendering therefore depends on
+nothing but the checkout: no network call is made, so a build cannot fail for
+reasons outside this repository, and the same commit renders the same diagrams
+every time.
+"""
+import json, re, shutil, subprocess, sys, tempfile
+from pathlib import Path
 import markdown as md
 import os
 
@@ -93,41 +100,102 @@ rect.activation0, rect.activation1, rect.activation2 { fill:#cbd5e1 !important; 
 """
 
 
-def kroki_svg(source: str) -> str:
-    data = zlib.compress(source.encode("utf-8"), 9)
-    b64 = base64.urlsafe_b64encode(data).decode("ascii")
-    url = f"https://kroki.io/mermaid/svg/{b64}"
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-    last = None
-    for _ in range(3):
-        try:
-            with urllib.request.urlopen(req, timeout=120) as r:
-                svg = r.read().decode("utf-8")
-            # make the SVG scale to its container width
-            svg = re.sub(r"<svg ", '<svg preserveAspectRatio="xMidYMid meet" ', svg, count=1)
-            # one merged style: scale to container AND let labels draw outside the box.
-            # native-SVG text (htmlLabels off) is under-measured by mermaid, so the
-            # computed viewBox can be a hair too tight; overflow:visible + a padded
-            # viewBox stops the right/bottom edges from clipping.
-            if re.search(r'style="max-width:[^"]*"', svg):
-                svg = re.sub(r'style="max-width:[^"]*"', 'style="max-width:100%;overflow:visible"', svg, count=1)
-            else:
-                svg = re.sub(r"(<svg )", r'\1style="max-width:100%;overflow:visible" ', svg, count=1)
-            m = re.search(r'viewBox="([\-\d.]+ [\-\d.]+ [\-\d.]+ [\-\d.]+)"', svg)
-            if m:
-                x, y, w, h = map(float, m.group(1).split())
-                svg = svg.replace(
-                    f'viewBox="{m.group(1)}"',
-                    f'viewBox="{x-6} {y-6} {w + w*0.06 + 18} {h + h*0.03 + 12}"', 1)
-            # inject high-contrast overrides (placed after mermaid's own <style> so it wins)
-            if "</style>" in svg:
-                svg = svg.replace("</style>", "</style><style>" + OVERRIDE_CSS + "</style>", 1)
-            else:
-                svg = re.sub(r"(<svg[^>]*>)", r"\1<style>" + OVERRIDE_CSS + "</style>", svg, count=1)
-            return svg
-        except Exception as e:  # noqa
-            last = e
-    raise RuntimeError(f"kroki render failed: {last}")
+def find_mmdc() -> list[str]:
+    """The mermaid-cli command, preferring this directory's pinned install.
+
+    `npm ci` here puts the pinned binary in `node_modules/.bin`, which is what
+    both CI and a local build should use — a global `mmdc` on PATH is whatever
+    version that machine happens to carry, and mermaid reflows diagrams between
+    releases. PATH is the fallback so someone with a global install isn't forced
+    to run `npm ci`, at the cost of matching CI's output exactly.
+    """
+    local = Path("node_modules/.bin/mmdc")
+    if local.is_file():
+        return [str(local)]
+    found = shutil.which("mmdc")
+    if found:
+        print(f"warning: using {found}; run 'npm ci' here to render with the pinned version.",
+              file=sys.stderr, flush=True)
+        return [found]
+    raise RuntimeError(
+        "mermaid-cli (mmdc) not found. Run 'npm ci' in docs/cayenne to install the "
+        "pinned version (it downloads a headless browser on first install)."
+    )
+
+
+def render_diagrams(sources: list[str]) -> list[str]:
+    """Render every mermaid block to a styled SVG, in one mermaid-cli run.
+
+    mermaid-cli renders in a headless browser, so each invocation pays a browser
+    launch. Feeding it one markdown file holding every diagram pays that once
+    rather than 21 times; it writes `<stem>-1.svg`, `<stem>-2.svg`, ... in
+    document order, which is the order the blocks were appended in.
+    """
+    if not sources:
+        return []
+    cmd = find_mmdc()
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        # A per-diagram `%%{init}%%` in the source wins; INIT supplies the shared
+        # theme for every block that carries none.
+        doc = "\n\n".join(
+            "```mermaid\n" + ("" if s.lstrip().startswith("%%{init") else INIT) + s + "\n```"
+            for s in sources
+        )
+        src = tmp / "diagrams.md"
+        src.write_text(doc, encoding="utf-8")
+        # `--no-sandbox` because CI runners commonly cannot use the browser
+        # sandbox; the only input is this repository's own diagram source.
+        puppeteer_cfg = tmp / "puppeteer.json"
+        puppeteer_cfg.write_text(json.dumps({"args": ["--no-sandbox", "--disable-dev-shm-usage"]}),
+                                 encoding="utf-8")
+        out = tmp / "rendered.md"
+        print(f"Rendering {len(sources)} mermaid diagrams with {cmd[0]}...", flush=True)
+        proc = subprocess.run(
+            cmd + ["-i", str(src), "-o", str(out), "-p", str(puppeteer_cfg), "--quiet"],
+            capture_output=True, text=True, check=False,
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"mermaid-cli failed (exit {proc.returncode}).\n"
+                f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+            )
+        svgs = []
+        for i in range(1, len(sources) + 1):
+            path = out.with_name(f"{out.stem}-{i}.svg")
+            if not path.is_file():
+                raise RuntimeError(
+                    f"mermaid-cli reported success but produced no SVG for diagram {i} "
+                    f"({path.name}). stderr:\n{proc.stderr}"
+                )
+            svgs.append(style_svg(path.read_text(encoding="utf-8")))
+    print(" done.", flush=True)
+    return svgs
+
+
+def style_svg(svg: str) -> str:
+    """Make a rendered SVG scale to its column and read well in print."""
+    svg = re.sub(r"<svg ", '<svg preserveAspectRatio="xMidYMid meet" ', svg, count=1)
+    # one merged style: scale to container AND let labels draw outside the box.
+    # native-SVG text (htmlLabels off) is under-measured by mermaid, so the
+    # computed viewBox can be a hair too tight; overflow:visible + a padded
+    # viewBox stops the right/bottom edges from clipping.
+    if re.search(r'style="max-width:[^"]*"', svg):
+        svg = re.sub(r'style="max-width:[^"]*"', 'style="max-width:100%;overflow:visible"', svg, count=1)
+    else:
+        svg = re.sub(r"(<svg )", r'\1style="max-width:100%;overflow:visible" ', svg, count=1)
+    m = re.search(r'viewBox="([\-\d.]+ [\-\d.]+ [\-\d.]+ [\-\d.]+)"', svg)
+    if m:
+        x, y, w, h = map(float, m.group(1).split())
+        svg = svg.replace(
+            f'viewBox="{m.group(1)}"',
+            f'viewBox="{x-6} {y-6} {w + w*0.06 + 18} {h + h*0.03 + 12}"', 1)
+    # inject high-contrast overrides (placed after mermaid's own <style> so it wins)
+    if "</style>" in svg:
+        svg = svg.replace("</style>", "</style><style>" + OVERRIDE_CSS + "</style>", 1)
+    else:
+        svg = re.sub(r"(<svg[^>]*>)", r"\1<style>" + OVERRIDE_CSS + "</style>", svg, count=1)
+    return svg
 
 
 with open(SRC, encoding="utf-8") as f:
@@ -139,27 +207,8 @@ def grab(m):
     blocks.append(m.group(1))
     return f"\n@@MERMAID{len(blocks)-1}@@\n"
 text = re.sub(r"```mermaid\n(.*?)\n```", grab, text, flags=re.DOTALL)
-print(f"Found {len(blocks)} mermaid diagrams; rendering via kroki...", flush=True)
 
-# Render concurrently
-svgs = [None] * len(blocks)
-def render(i):
-    block = blocks[i]
-    # respect a per-diagram %%{init}%% if the block already carries one
-    prefix = "" if block.lstrip().startswith("%%{init") else INIT
-    svgs[i] = kroki_svg(prefix + block)
-    sys.stdout.write("."); sys.stdout.flush()
-# kroki_svg raises RuntimeError only for its own (retried) rendering
-# failures; exit 2 lets CI tell "kroki.io is flaking" apart from any other
-# uncaught exception (exit 1, e.g. a script bug or a WeasyPrint failure
-# below), which must still fail the build outright.
-try:
-    with ThreadPoolExecutor(max_workers=6) as ex:
-        list(ex.map(render, range(len(blocks))))
-except RuntimeError as e:
-    print(f"\n{e}", file=sys.stderr, flush=True)
-    sys.exit(2)
-print(" done.", flush=True)
+svgs = render_diagrams(blocks)
 
 # Markdown -> HTML
 body = md.markdown(

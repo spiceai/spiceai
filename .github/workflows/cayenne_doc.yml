@@ -7,20 +7,21 @@ name: Build Cayenne doc PDF
 # and on manual dispatch — it builds and uploads Cayenne.pdf as a
 # downloadable, linkable artifact of the current trunk.
 #
-# Deliberately not run on pull_request: rendering depends on kroki.io to
-# resolve mermaid blocks, an external service that intermittently 400s
-# (see run 29299583614) — a flake there shouldn't block unrelated PRs.
-# `docs/cayenne/build_pdf.py` can still be run locally to verify a doc change
-# renders before merging.
+# Diagrams render locally through mermaid-cli, pinned in docs/cayenne/package.json
+# and installed with `npm ci`, so the build depends on nothing but the checkout.
+# The same commit therefore renders the same diagrams every time, and no external
+# service can fail the job — which is why every failure here is a real one and
+# fails the build outright.
 #
-# The build step also tolerates that same kroki.io flakiness: build_pdf.py
-# exits 2 specifically when kroki.io rendering fails (any other error, e.g. a
-# script bug or WeasyPrint failure, exits 1 and fails the job as normal). An
-# exit-2 failure skips the artifact upload and leaves a warning annotation
-# instead of failing the job, since it's a transient external error rather
-# than a real problem with the doc change.
+# That determinism is also what lets this run on pull requests: it renders the
+# PDF to prove the document still builds (every mermaid block parses, WeasyPrint
+# succeeds) and uploads the result so a reviewer can read the rendered change.
 
 on:
+  pull_request:
+    paths:
+      - 'docs/cayenne/**'
+      - '.github/workflows/cayenne_doc.yml'
   push:
     branches: [trunk]
     paths:
@@ -28,8 +29,8 @@ on:
       - '.github/workflows/cayenne_doc.yml'
   workflow_dispatch:
 
-# Cancel a superseded run for the same ref — from either a newer push to
-# trunk or a re-dispatch of this workflow.
+# Cancel a superseded run for the same ref — a newer push to trunk or to a pull
+# request branch, or a re-dispatch of this workflow.
 concurrency:
   group: cayenne-doc-${{ github.ref }}
   cancel-in-progress: true
@@ -51,6 +52,12 @@ jobs:
         with:
           python-version: '3.12'
 
+      - uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: docs/cayenne/package-lock.json
+
       # WeasyPrint renders via Pango/HarfBuzz; DejaVu supplies the monospace
       # font the stylesheet requests. Without these the PDF step fails to load
       # libpango at runtime.
@@ -70,6 +77,35 @@ jobs:
         # updating the doc.
         run: python3 -m pip install 'markdown==3.9' 'weasyprint==66.0'
 
+      # `--ignore-scripts` keeps the dependency install from running arbitrary
+      # package lifecycle scripts; the one script that matters (puppeteer
+      # fetching its browser) is then run explicitly below, which also means the
+      # browser download does not depend on how a given npm version treats
+      # install scripts.
+      - name: Install mermaid-cli
+        working-directory: docs/cayenne
+        run: npm ci --ignore-scripts
+
+      # Cache the browser mermaid-cli renders in, keyed by the lockfile — the
+      # pinned mermaid-cli pins puppeteer, which pins the browser build, so the
+      # lockfile is exactly the key that changes when a different browser is
+      # needed.
+      - name: Cache the headless browser
+        id: browser_cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/puppeteer
+          key: puppeteer-${{ runner.os }}-${{ hashFiles('docs/cayenne/package-lock.json') }}
+
+      - name: Install the headless browser
+        if: steps.browser_cache.outputs.cache-hit != 'true'
+        working-directory: docs/cayenne
+        run: npx puppeteer browsers install chrome
+
+      - name: Report the renderer version
+        working-directory: docs/cayenne
+        run: ./node_modules/.bin/mmdc --version | tee -a "$GITHUB_STEP_SUMMARY"
+
       # Guard against a stale or uncommitted figure: regenerating waterfall.svg
       # from gen_waterfall.py must leave the working tree clean. --porcelain
       # catches a modified, untracked, or missing SVG — any of which means the
@@ -85,32 +121,13 @@ jobs:
             exit 1
           fi
 
-      # build_pdf.py exits 2 for a kroki.io rendering failure specifically
-      # (see comment there) — that's a transient hiccup, not a doc defect, so
-      # it shouldn't turn a trunk push red. Any other exit code is a real
-      # failure (script bug, WeasyPrint error, ...) and must fail the job.
       - name: Build Cayenne PDF
-        id: build
         working-directory: docs/cayenne
-        run: |
-          set +e
-          python3 build_pdf.py
-          status=$?
-          set -e
-          if [ "$status" -eq 0 ]; then
-            echo "outcome=success" >> "$GITHUB_OUTPUT"
-          elif [ "$status" -eq 2 ]; then
-            echo "outcome=kroki_failure" >> "$GITHUB_OUTPUT"
-          else
-            exit "$status"
-          fi
+        run: python3 build_pdf.py
 
-      - name: Warn on kroki render failure
-        if: steps.build.outputs.outcome == 'kroki_failure'
-        run: echo "::warning::Cayenne PDF build failed, likely a transient kroki.io rendering error — see the 'Build Cayenne PDF' step logs. Re-run the job to retry; this does not indicate a problem with the doc change itself." | tee -a "$GITHUB_STEP_SUMMARY"
-
+      # Uploaded for every trigger: off trunk it is the linkable current build,
+      # and on a pull request it is the rendered document under review.
       - name: Upload Cayenne PDF artifact
-        if: steps.build.outputs.outcome == 'success'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: Cayenne.pdf
