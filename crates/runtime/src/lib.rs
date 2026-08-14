@@ -598,6 +598,15 @@ pub struct Runtime {
     /// path datasets are registered first — so a name check would mistake that
     /// dataset for the internal table and send every task-history write to it.
     task_history_initialized: Arc<AtomicBool>,
+    /// Serializes the whole of task-history initialization.
+    ///
+    /// The cluster executor deliberately races `init_task_history` against the
+    /// component load, and the steps are not independently safe: between one
+    /// caller registering the table and recording that it did, another would see
+    /// a table it cannot account for, take it for a foreign one, and turn
+    /// emission off for the process. Holding this across check, register and
+    /// record makes the second caller observe a finished initialization instead.
+    task_history_init_lock: Arc<tokio::sync::Mutex<()>>,
     df: Arc<DataFusion>,
     llm_runtime_stores: Arc<model::LlmRuntimeStores>,
     http_rate_control_registry: Arc<dataconnector::http_rate_control::HttpRateControlRegistry>,

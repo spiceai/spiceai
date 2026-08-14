@@ -53,6 +53,10 @@ impl Runtime {
         // the internal table, report success, and send every task-history write
         // to it. So a name that is taken while this runtime has registered
         // nothing is a conflict, and it is reported rather than written into.
+        // Held for the rest of this function: check, register, and record are one
+        // step, or a caller racing this one mistakes a half-finished
+        // initialization for a foreign table.
+        let _initializing = self.task_history_init_lock.lock().await;
         if self
             .task_history_initialized
             .load(std::sync::atomic::Ordering::SeqCst)

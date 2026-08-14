@@ -937,6 +937,17 @@ async fn existing_identity_flow<P: Prompter>(
     context: ExistingIdentityContext<'_>,
     telemetry: &FlowTelemetry,
 ) -> Result<()> {
+    // An enrolled instance ignores an enrollment key — the identity wins — so
+    // accepting one here would take a secret from the operator, drop it, and then
+    // attach the project with a stored login credential instead. Moving the flag
+    // rule below the draft decision left this path unguarded; it is invalid in
+    // every mode, so it is refused wherever it is reachable.
+    if request.token.is_some() && request.project.is_some() {
+        return Err(invalid_usage(
+            "--project cannot be used with --token; an enrollment key can enroll an instance but cannot create a project.",
+        ));
+    }
+
     let ExistingIdentityContext {
         config_dir,
         directory,
