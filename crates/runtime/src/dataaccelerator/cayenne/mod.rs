@@ -104,6 +104,19 @@ pub enum Error {
     },
 
     #[snafu(display(
+        "Failed to configure dataset {table_name} (cayenne): Could not resolve the acceleration data directory '{data_dir}' or the Cayenne metastore directory '{metadata_dir}' against the working directory ({source}). \
+        Recreating this dataset deletes its data directory, and Spice will not do that without first proving the metastore is outside it. \
+        Set 'cayenne_file_path' and 'cayenne_metadata_dir' to absolute paths. \
+        See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+    ))]
+    CayenneDirsUnresolvable {
+        table_name: String,
+        data_dir: String,
+        metadata_dir: String,
+        source: std::io::Error,
+    },
+
+    #[snafu(display(
         "Unsupported data type(s) in schema: {details}. By default, unsupported types cause an error. To convert unsupported types to strings, set 'unsupported_type_action: string'; otherwise, remove the unsupported columns."
     ))]
     UnsupportedDataTypes { details: String },
@@ -981,19 +994,27 @@ fn fs_probe_path(path: &str) -> &str {
     }
 }
 
-/// Make a configured Cayenne directory absolute without resolving it, or `None` for an
-/// object-store location (`s3://…`) — which can never overlap the metastore directory,
-/// since `SQLite`/Turso cannot run on object storage and
-/// [`CayenneAccelerator::resolve_metadata_dir`] therefore only ever yields a local path.
-fn absolute_local_dir(path: &str) -> Option<PathBuf> {
+/// Make a configured Cayenne directory absolute without resolving it.
+///
+/// `Ok(None)` is the object-store exemption (`s3://…`) — such a location can never
+/// overlap the metastore directory, since `SQLite`/Turso cannot run on object storage
+/// and [`CayenneAccelerator::resolve_metadata_dir`] therefore only ever yields a local
+/// path.
+///
+/// A relative path that cannot be placed is `Err`, never the exemption. The exemption
+/// waves a recursive delete through, so the two must stay distinguishable: everything
+/// downstream guards `remove_dir_all`, and a path this cannot resolve is a path whose
+/// overlap with the metastore is unknown. Returning `io::Result` is what stops a failed
+/// `current_dir()` from being spelled the same way as "cannot possibly overlap".
+fn absolute_local_dir(path: &str) -> std::io::Result<Option<PathBuf>> {
     if !is_local_path(path) {
-        return None;
+        return Ok(None);
     }
     let raw = Path::new(fs_probe_path(path));
     if raw.is_absolute() {
-        Some(raw.to_path_buf())
+        Ok(Some(raw.to_path_buf()))
     } else {
-        Some(std::env::current_dir().ok()?.join(raw))
+        Ok(Some(std::env::current_dir()?.join(raw)))
     }
 }
 
@@ -1028,8 +1049,8 @@ async fn resolve_in_filesystem_order(absolute: &Path) -> PathBuf {
     resolved
 }
 
-/// Every location a recursive delete of `path` could reach, or `None` for an
-/// object-store location.
+/// Every location a recursive delete of `path` could reach, `Ok(None)` for an
+/// object-store location, and `Err` when the path cannot be placed at all.
 ///
 /// Two forms, because a symlink is both a place and a name:
 ///
@@ -1039,8 +1060,10 @@ async fn resolve_in_filesystem_order(absolute: &Path) -> PathBuf {
 ///    directory whose own last component is a symlink pointing out of the tree still
 ///    loses its link — the catalog file survives with nothing naming it, and the
 ///    connection pool keeps writing through handles nothing can reopen.
-async fn overlap_candidates(path: &str) -> Option<Vec<PathBuf>> {
-    let absolute = absolute_local_dir(path)?;
+async fn overlap_candidates(path: &str) -> std::io::Result<Option<Vec<PathBuf>>> {
+    let Some(absolute) = absolute_local_dir(path)? else {
+        return Ok(None);
+    };
 
     let mut candidates = vec![resolve_in_filesystem_order(&absolute).await];
     if let (Some(parent), Some(name)) = (absolute.parent(), absolute.file_name()) {
@@ -1049,7 +1072,7 @@ async fn overlap_candidates(path: &str) -> Option<Vec<PathBuf>> {
             candidates.push(entry);
         }
     }
-    Some(candidates)
+    Ok(Some(candidates))
 }
 
 /// `true` when `inner` is `outer` itself or lies beneath it — i.e. a recursive delete
@@ -1075,8 +1098,10 @@ fn dir_contains(outer: &Path, inner: &Path) -> bool {
 /// `resolve_metadata_dir` yields `{spice_data}/metadata`. An explicit
 /// `cayenne_metadata_dir` set beneath the data directory collides the same way.
 ///
-/// Returns the resolved `(data_dir, metadata_dir)` pair when they overlap, naming
-/// whichever metastore location the delete would reach.
+/// Returns `Ok(Some((data_dir, metadata_dir)))` — resolved — when they overlap, naming
+/// whichever metastore location the delete would reach; `Ok(None)` when they provably
+/// cannot overlap; and `Err` when either path cannot be placed, which the caller must
+/// treat as a refusal rather than as `Ok(None)`.
 ///
 /// The data directory is compared in its fully resolved form only: `remove_dir_all`
 /// refuses a final-component symlink rather than following it, so the recursive walk
@@ -1084,13 +1109,18 @@ fn dir_contains(outer: &Path, inner: &Path) -> bool {
 async fn overlapping_metastore_dir(
     data_dir: &str,
     metadata_dir: &str,
-) -> Option<(PathBuf, PathBuf)> {
-    let data = resolve_in_filesystem_order(&absolute_local_dir(data_dir)?).await;
-    let metadata = overlap_candidates(metadata_dir)
-        .await?
+) -> std::io::Result<Option<(PathBuf, PathBuf)>> {
+    let Some(absolute_data) = absolute_local_dir(data_dir)? else {
+        return Ok(None);
+    };
+    let data = resolve_in_filesystem_order(&absolute_data).await;
+    let Some(candidates) = overlap_candidates(metadata_dir).await? else {
+        return Ok(None);
+    };
+    Ok(candidates
         .into_iter()
-        .find(|candidate| dir_contains(&data, candidate))?;
-    Some((data, metadata))
+        .find(|candidate| dir_contains(&data, candidate))
+        .map(|metadata| (data, metadata)))
 }
 
 /// Process-wide counter giving each [`CayenneAccelerator`] instance a unique id,
@@ -1265,12 +1295,24 @@ impl CayenneAccelerator {
     /// immediately before each recursive delete: at open time neither directory need
     /// exist yet, so the resolution falls back to a lexical one, and an overlap that
     /// only a symlink reveals appears once the directories are real.
+    ///
+    /// A path that cannot be placed refuses the recreate. The guard's whole job is to
+    /// prove the delete cannot reach the metastore, and it cannot prove that about a
+    /// path it failed to resolve.
     async fn ensure_metastore_outside_data_dir(
         source: &dyn AccelerationSource,
         data_dir: &str,
     ) -> Result<()> {
         let metadata_dir = Self::resolve_metadata_dir(source.acceleration());
-        if let Some((data, metadata)) = overlapping_metastore_dir(data_dir, &metadata_dir).await {
+        let overlap = overlapping_metastore_dir(data_dir, &metadata_dir)
+            .await
+            .map_err(|source_error| Error::CayenneDirsUnresolvable {
+                table_name: source.name().to_string(),
+                data_dir: data_dir.to_string(),
+                metadata_dir: metadata_dir.clone(),
+                source: source_error,
+            })?;
+        if let Some((data, metadata)) = overlap {
             return Err(Error::MetastoreInsideDataDir {
                 table_name: source.name().to_string(),
                 data_dir: data.to_string_lossy().into_owned(),
@@ -4885,6 +4927,7 @@ mod tests {
         assert!(
             overlapping_metastore_dir(&colliding, &metastore)
                 .await
+                .expect("the test paths resolve")
                 .is_some(),
             "a dataset named `metadata` puts its data directory on top of the metastore: \
              data={colliding} metastore={metastore}"
@@ -4894,6 +4937,7 @@ mod tests {
         assert!(
             overlapping_metastore_dir(&ordinary, &metastore)
                 .await
+                .expect("the test paths resolve")
                 .is_none(),
             "an ordinary dataset name is disjoint from the metastore: \
              data={ordinary} metastore={metastore}"
@@ -4911,6 +4955,7 @@ mod tests {
         assert!(
             overlapping_metastore_dir(&data.to_string_lossy(), &metastore.to_string_lossy())
                 .await
+                .expect("the test paths resolve")
                 .is_none(),
             "`meta` and `metadata` are siblings, not nested"
         );
@@ -4927,6 +4972,7 @@ mod tests {
         assert!(
             overlapping_metastore_dir(&data.to_string_lossy(), &nested.to_string_lossy())
                 .await
+                .expect("the test paths resolve")
                 .is_some(),
             "a metadata dir beneath the data dir is deleted with it"
         );
@@ -4935,6 +4981,7 @@ mod tests {
         assert!(
             overlapping_metastore_dir(&data.to_string_lossy(), &outside.to_string_lossy())
                 .await
+                .expect("the test paths resolve")
                 .is_none(),
             "a metadata dir outside the data dir survives the recreate"
         );
@@ -4952,6 +4999,7 @@ mod tests {
         assert!(
             overlapping_metastore_dir(&data.to_string_lossy(), &traversed.to_string_lossy())
                 .await
+                .expect("the test paths resolve")
                 .is_some(),
             "`orders/sibling/../catalog` is `orders/catalog`, which the delete takes"
         );
@@ -4966,6 +5014,7 @@ mod tests {
             assert!(
                 overlapping_metastore_dir(&data.to_string_lossy(), &through_link.to_string_lossy())
                     .await
+                    .expect("the test paths resolve")
                     .is_some(),
                 "a metadata dir reached through a symlink to the data dir is still inside it"
             );
@@ -4990,6 +5039,7 @@ mod tests {
         assert!(
             overlapping_metastore_dir(&data.to_string_lossy(), &through_link.to_string_lossy())
                 .await
+                .expect("the test paths resolve")
                 .is_some(),
             "`link/../catalog` resolves inside the data dir once `link` is followed first"
         );
@@ -5019,6 +5069,7 @@ mod tests {
         let (resolved_data, reached) =
             overlapping_metastore_dir(&data.to_string_lossy(), &entry.to_string_lossy())
                 .await
+                .expect("the test paths resolve")
                 .expect("the entry inside the data dir is unlinked by the delete");
         assert!(
             reached.starts_with(&resolved_data),
@@ -5037,8 +5088,38 @@ mod tests {
         assert!(
             overlapping_metastore_dir("s3://bucket/orders/", "/var/spice/metadata")
                 .await
+                .expect("the test paths resolve")
                 .is_none(),
             "an S3 data path is disjoint from any local metastore"
+        );
+    }
+
+    /// `Ok(None)` is what waves a recursive delete through, so it must mean "object
+    /// store" and nothing else — never "could not work out where this path is". Every
+    /// local spelling, including a relative one and a `file://` URI, resolves to a path
+    /// the overlap check can compare. Raised by Copilot on #13101.
+    #[test]
+    fn only_an_object_store_scheme_reaches_the_delete_exemption() {
+        let cwd = std::env::current_dir().expect("a working directory");
+
+        assert_eq!(
+            absolute_local_dir("relative/orders").expect("a relative path resolves"),
+            Some(cwd.join("relative/orders")),
+            "a relative local path is placed against the working directory, not exempted"
+        );
+        assert_eq!(
+            absolute_local_dir("/var/spice/orders").expect("an absolute path resolves"),
+            Some(PathBuf::from("/var/spice/orders"))
+        );
+        assert_eq!(
+            absolute_local_dir("file:///var/spice/orders").expect("a `file://` URI resolves"),
+            Some(PathBuf::from("/var/spice/orders")),
+            "a `file://` URI names a local directory, so it must be compared, not exempted"
+        );
+        assert_eq!(
+            absolute_local_dir("s3://bucket/orders/").expect("an object store is not a failure"),
+            None,
+            "only an object-store scheme may skip the overlap check"
         );
     }
 
