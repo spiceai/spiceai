@@ -1581,11 +1581,20 @@ impl CayenneAccelerator {
             // v1: its hidden `__spice_cache_namespace` column is appended LAST
             // and evolution also appends at the end — the positional
             // disagreement is unfixable via column adds.
+            // A partitioned table is excluded here, where the config is built,
+            // rather than only where the partition wrapper is: this same config
+            // opens the PARENT catalog entry, which is created first. Leaving
+            // evolution on for that open lets the catalog widen the parent's
+            // stored schema while every partition keeps its own — the accelerated
+            // table then advertises a schema its data does not have, which is the
+            // silent narrowing cast of #12999 reached through the open path
+            // instead of `evolve_table_schema`.
             let is_caching_mode = acceleration.refresh_mode == Some(RefreshMode::Caching);
+            let is_partitioned = !acceleration.partition_by.is_empty();
             config.schema_evolution = source
                 .as_any()
                 .downcast_ref::<crate::component::dataset::Dataset>()
-                .filter(|_| !is_caching_mode)
+                .filter(|_| !is_caching_mode && !is_partitioned)
                 .map_or(
                     cayenne::metadata::SchemaEvolutionMode::Disabled,
                     |dataset| match dataset.on_schema_change {
@@ -3438,14 +3447,21 @@ impl DataAccelerator for CayenneAccelerator {
             .await?;
             // Partitioned tables are excluded from v1 schema evolution
             // (per-partition catalog tables would evolve lazily as each
-            // partition opens, leaving mixed schemas across partitions);
-            // keep the legacy pin-stored-schema behavior.
-            if !vortex_config.schema_evolution.is_disabled() {
+            // partition opens, leaving mixed schemas across partitions); keep
+            // the legacy pin-stored-schema behavior. The config already arrives
+            // Disabled for a partitioned table — see where `schema_evolution` is
+            // built, which has to exclude it there so the parent open cannot
+            // widen either — so this only tells an operator whose
+            // `on_schema_change` asked for evolution that it will not apply.
+            debug_assert!(
+                vortex_config.schema_evolution.is_disabled(),
+                "a partitioned Cayenne table must never carry an evolution mode"
+            );
+            if requests_schema_evolution(source) {
                 tracing::warn!(
                     dataset = %source.name(),
                     "on_schema_change schema evolution is not supported for partitioned Cayenne tables; schema changes will not be applied in place"
                 );
-                vortex_config.schema_evolution = cayenne::metadata::SchemaEvolutionMode::Disabled;
             }
 
             serialize_partition_child_writes(&mut vortex_config, &table_name);
@@ -3620,26 +3636,31 @@ impl DataAccelerator for CayenneAccelerator {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let dir_path = self.cayenne_data_dir(source).boxed()?;
         let path_buf = PathBuf::from(&dir_path);
-        if path_buf.exists() {
-            tokio::fs::remove_dir_all(&path_buf).await.boxed()?;
-            tracing::info!(
-                "Removed Cayenne data directory '{dir_path}' for schema recreation (file_update mode)"
-            );
-        }
 
-        // Also drop the table from metadata catalog
+        // Metadata first, and its failures are fatal. The caller treats a
+        // successful drop as licence to clear the dataset checkpoint and
+        // recreate, so a drop that removed the files and then failed to remove
+        // the catalog rows would hand the next create a manifest of files that
+        // no longer exist and, for a partitioned table, children still pinning
+        // the old schema. Failing before anything is deleted leaves a table the
+        // operator can retry; the reverse order leaves one nothing can repair.
         if let Some(acceleration) = source.acceleration() {
             let metadata_dir = Self::resolve_metadata_dir(Some(acceleration));
             let metastore_type = acceleration
                 .params
                 .get("cayenne_metastore")
                 .map_or("sqlite", String::as_str);
-            if let Ok(catalog) = self
+            let catalog = self
                 .get_or_create_catalog(&metadata_dir, metastore_type)
-                .await
-            {
-                let _ = catalog.drop_table(table_name).await;
-            }
+                .await?;
+            catalog.drop_table(table_name).await.boxed()?;
+        }
+
+        if path_buf.exists() {
+            tokio::fs::remove_dir_all(&path_buf).await.boxed()?;
+            tracing::info!(
+                "Removed Cayenne data directory '{dir_path}' for schema recreation (file_update mode)"
+            );
         }
 
         // Recreate the data directory so the next create_external_table works
@@ -3769,6 +3790,24 @@ impl DataAccelerator for CayenneAccelerator {
 
         Ok(())
     }
+}
+
+/// Whether the dataset's `on_schema_change` asks for in-place schema evolution.
+///
+/// The policy lives on the `Dataset` component, so a non-`Dataset` source (a
+/// view, or DDL) never asks for it.
+fn requests_schema_evolution(source: &dyn AccelerationSource) -> bool {
+    source
+        .as_any()
+        .downcast_ref::<crate::component::dataset::Dataset>()
+        .is_some_and(|dataset| {
+            matches!(
+                dataset.on_schema_change,
+                crate::component::dataset::OnSchemaChange::AppendNewColumns
+                    | crate::component::dataset::OnSchemaChange::SyncAllColumns
+                    | crate::component::dataset::OnSchemaChange::DropAndRecreate
+            )
+        })
 }
 
 /// Force partition child tables to encode serially (one write shard).
@@ -5979,6 +6018,72 @@ mod tests {
                 .to_string()
                 .contains("partitioned acceleration"),
             "an unpartitioned table must not take the partitioned refusal, got: {unpartitioned_error}"
+        );
+    }
+
+    /// The vortex config built for a partitioned dataset also opens the PARENT
+    /// catalog entry, which is created before the partition wrapper exists. If
+    /// it carried an evolution mode, the catalog would widen the parent's stored
+    /// schema at open while every partition kept its own — the same silent
+    /// narrowing as #12999, reached without ever calling `evolve_table_schema`.
+    #[tokio::test]
+    async fn a_partitioned_dataset_never_carries_a_schema_evolution_mode() {
+        use spicepod::partitioning::PartitionedBy;
+
+        let app = Arc::new(AppBuilder::new("test").build());
+        let rt = Arc::new(crate::Runtime::builder().build().await);
+        let build = |partition_by: Vec<PartitionedBy>, policy| {
+            let mut dataset = DatasetBuilder::try_new("postgres:users".to_string(), "users")
+                .expect("dataset builder")
+                .with_app(Arc::clone(&app))
+                .with_runtime(Arc::clone(&rt))
+                .build()
+                .expect("dataset");
+            dataset.on_schema_change = policy;
+            dataset.acceleration = Some(Acceleration {
+                engine: Engine::Cayenne,
+                mode: Mode::File,
+                partition_by,
+                ..Default::default()
+            });
+            dataset
+        };
+        let partitioned_by_bucket = || {
+            vec![PartitionedBy {
+                name: "bucket".to_string(),
+                expression: "bucket".to_string(),
+            }]
+        };
+        let workload = autotune::WorkloadProfile::default();
+        let evolution_mode = async |dataset: &crate::component::dataset::Dataset| {
+            CayenneAccelerator::get_vortex_config_with_footer_cache(
+                "users", dataset, None, &workload,
+            )
+            .await
+            .expect("the vortex config is built")
+            .schema_evolution
+        };
+
+        assert!(
+            evolution_mode(&build(
+                partitioned_by_bucket(),
+                crate::component::dataset::OnSchemaChange::SyncAllColumns
+            ))
+            .await
+            .is_disabled(),
+            "a partitioned dataset must not carry an evolution mode, whatever its policy asks for"
+        );
+
+        // The same policy on an unpartitioned dataset still evolves: the guard
+        // above must key on partitioning, not disable evolution outright.
+        assert!(
+            !evolution_mode(&build(
+                Vec::new(),
+                crate::component::dataset::OnSchemaChange::SyncAllColumns
+            ))
+            .await
+            .is_disabled(),
+            "an unpartitioned dataset keeps in-place evolution"
         );
     }
 }
