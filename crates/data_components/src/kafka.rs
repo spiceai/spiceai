@@ -34,6 +34,7 @@ use rdkafka::{
     topic_partition_list::TopicPartitionList,
     util::get_rdkafka_version,
 };
+pub use runtime_checkpoint_api::kafka::KafkaOffset;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use snafu::prelude::*;
@@ -145,24 +146,11 @@ fn is_transient_kafka_consumption_error(error: &rdkafka::error::KafkaError) -> b
     )
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct KafkaOffset {
-    pub topic: String,
-    pub partition: i32,
-    pub offset: i64,
-}
-
-impl KafkaOffset {
-    #[must_use]
-    pub fn next_read_offset(&self) -> i64 {
-        self.offset.saturating_add(1)
-    }
-}
-
-/// Metadata stored in the `spice_sys` sidecar for a Kafka-backed accelerated dataset.
+/// Metadata for a Kafka-backed accelerated dataset, as the consumer speaks it.
 ///
-/// This type is shared between the Kafka data connector and the `spice_sys` persistence
-/// layer so that neither needs to depend on the other.
+/// The durable form is [`runtime_checkpoint_api::kafka::KafkaCheckpoint`], which
+/// differs only in carrying the schema as JSON; the Kafka connector converts between
+/// the two.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct KafkaMetadata {
     pub consumer_group_id: String,

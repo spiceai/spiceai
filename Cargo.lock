@@ -4629,6 +4629,7 @@ name = "connector-kafka"
 version = "2.2.0-unstable"
 dependencies = [
  "arrow-schema",
+ "arrow_tools",
  "async-stream",
  "async-trait",
  "data-connector-api",
@@ -4641,6 +4642,7 @@ dependencies = [
  "opentelemetry",
  "runtime",
  "runtime-api-types",
+ "runtime-checkpoint-api",
  "runtime-datafusion",
  "runtime-metrics",
  "runtime-parameters",
@@ -4659,6 +4661,7 @@ version = "2.2.0-unstable"
 dependencies = [
  "arrow",
  "arrow-buffer",
+ "arrow_tools",
  "async-stream",
  "async-trait",
  "criterion 0.7.0",
@@ -4672,6 +4675,7 @@ dependencies = [
  "mongodb",
  "paste",
  "runtime",
+ "runtime-checkpoint-api",
  "runtime-parameters",
  "secrecy",
  "serde_json",
@@ -4700,6 +4704,7 @@ dependencies = [
 name = "connector-mysql"
 version = "2.2.0-unstable"
 dependencies = [
+ "arrow_tools",
  "async-stream",
  "async-trait",
  "chrono",
@@ -4715,6 +4720,7 @@ dependencies = [
  "paste",
  "runtime",
  "runtime-api-types",
+ "runtime-checkpoint-api",
  "runtime-metrics",
  "runtime-parameters",
  "runtime-udfs-api",
@@ -4797,6 +4803,7 @@ dependencies = [
  "opentelemetry",
  "runtime",
  "runtime-api-types",
+ "runtime-checkpoint-api",
  "runtime-datafusion",
  "runtime-metrics",
  "runtime-parameters",
@@ -6112,6 +6119,7 @@ dependencies = [
  "rdkafka",
  "regex",
  "reqwest 0.13.4",
+ "runtime-checkpoint-api",
  "runtime-rate-control",
  "runtime-request-context",
  "rusqlite",
@@ -17127,6 +17135,7 @@ name = "runtime-checkpoint-api"
 version = "2.2.0-unstable"
 dependencies = [
  "async-trait",
+ "serde",
  "snafu",
 ]
 
