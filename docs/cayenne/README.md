@@ -92,7 +92,10 @@ rebuild the PDF (and commit the regenerated `waterfall.svg`).
   rendered via kroki with `htmlLabels:false` — plain text + `<br/>` only, no
   `<b>`/`<i>`, and commas rather than semicolons in sequence-diagram text.
 - **Changelog**: add a row only when reviewing a new repo commit
-  (Date | Reviewed commit | Changes).
+  (Date | Reviewed commit | Changes), and keep it to **one or two sentences**
+  naming what changed. The row indexes the history rather than retelling it —
+  the reasoning and measurements live in the commit and PR it points at, and
+  anything a reader needs to use Cayenne belongs in the body of the document.
 - **Prose style**: minimal formatting, no over-bolding; breadth-first; honest
   about design alternatives and version accuracy.
 
