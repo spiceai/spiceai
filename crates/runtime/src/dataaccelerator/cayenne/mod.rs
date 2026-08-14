@@ -5482,9 +5482,7 @@ mod tests {
             metastore_db.exists(),
             "the teardown deleted the metastore of a dataset that had not initialized yet"
         );
-        let err = result
-            .err()
-            .expect("a data directory holding a metastore must be refused");
+        let err = result.expect_err("a data directory holding a metastore must be refused");
         assert!(
             err.to_string().contains("holds the Cayenne metastore file"),
             "expected the on-disk metastore error, got: {err}"
