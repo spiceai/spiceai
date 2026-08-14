@@ -526,28 +526,22 @@ fn make_stream(
         let fts = std::sync::Arc::new(fts);
 
         // Collect the full result set (bounded by `limit`) in a single search.
-        // The searcher is a fixed snapshot, so paging with `TopDocs` offsets is
-        // both unnecessary and quadratic: an offset page still scores
-        // `offset + page` documents, re-scoring the whole prefix on every page.
-        let hits = {
-            let fts = std::sync::Arc::clone(&fts);
-            let query = query.clone();
-            match tokio::task::spawn_blocking(move || {
-                fts.search_query_literal(query.as_str(), limit, 0)
-            })
-            .await
-            {
-                Ok(Ok(h)) => h,
-                Ok(Err(e)) => {
-                    yield Err(DataFusionError::Internal(e.to_string()));
-                    return;
-                }
-                Err(e) => {
-                    yield Err(DataFusionError::Internal(format!(
-                        "full text search task failed: {e}"
-                    )));
-                    return;
-                }
+        // The searcher is a fixed snapshot, so paging with `TopDocs` offsets is unnecessary.
+        let blocking_fts = std::sync::Arc::clone(&fts);
+        let query = query.clone();
+        let hits = match tokio::task::spawn_blocking(move || {
+            blocking_fts.search_query_literal(query.as_str(), limit, 0)
+        }).await {
+            Ok(Ok(h)) => h,
+            Ok(Err(e)) => {
+                yield Err(DataFusionError::Internal(e.to_string()));
+                return;
+            }
+            Err(e) => {
+                yield Err(DataFusionError::Internal(format!(
+                    "full text search task failed: {e}"
+                )));
+                return;
             }
         };
 

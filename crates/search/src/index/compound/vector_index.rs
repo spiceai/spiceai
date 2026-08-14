@@ -151,9 +151,6 @@ impl VectorIndex for CompoundVectorIndex {
 }
 
 #[async_trait]
-// Fail the build if the `Index` trait grows a defaulted method this compound
-// wrapper does not explicitly forward — a silent no-op default here would fail
-// to fan a new operation out to both halves.
 #[deny(clippy::missing_trait_methods)]
 impl Index for CompoundVectorIndex {
     fn name(&self) -> &'static str {
