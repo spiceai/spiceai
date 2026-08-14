@@ -142,10 +142,11 @@ mod tests {
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::datasource::TableProvider;
     use datafusion::logical_expr::{
-        ColumnarValue, Expr, Extension, LogicalPlan, LogicalPlanBuilder, ScalarUDF, TableSource,
-        Volatility, builder::LogicalTableSource, create_udf, expr::ScalarFunction,
+        ColumnarValue, Expr, Extension, JoinType, LogicalPlan, LogicalPlanBuilder, ScalarUDF,
+        TableSource, Volatility, builder::LogicalTableSource, create_udf, expr::ScalarFunction,
     };
-    use datafusion::prelude::col;
+    use datafusion::prelude::{col, lit};
+    use datafusion::sql::unparser::Unparser;
     use datafusion_federation::sql::SQLExecutor;
     use datafusion_federation::{FederatedPlanNode, sql::SQLFederationPlanner};
     use datafusion_table_providers::sql::db_connection_pool::{
@@ -312,5 +313,120 @@ mod tests {
 
         // Federation source schema must match the SqlTable schema verbatim.
         assert_eq!(adaptor.source.schema().as_ref(), schema.as_ref());
+    }
+
+    fn table_source(fields: Vec<Field>) -> Arc<dyn TableSource> {
+        Arc::new(LogicalTableSource::new(Arc::new(Schema::new(fields)))) as Arc<dyn TableSource>
+    }
+
+    /// Unparse with the dialect federation itself would use, so these tests read
+    /// the same SQL a remote engine is sent.
+    fn federated_sql(plan: &LogicalPlan) -> String {
+        let executor: Arc<dyn SQLExecutor> =
+            Arc::new(DenyFunctionsSqlExecutor::new(test_sql_table(), None));
+        Unparser::new(executor.dialect().as_ref())
+            .plan_to_sql(plan)
+            .expect("plan should unparse")
+            .to_string()
+    }
+
+    /// Regression test for #12406: a `fetch` the optimizer pushes into a join
+    /// input bounds that input, not the join's output. Dropping it asks the
+    /// remote engine for the whole table and evaluates the join over it, so the
+    /// query can return more rows than the plan it came from.
+    #[test]
+    fn a_fetch_pushed_into_a_join_input_survives_unparsing() {
+        let left = LogicalPlanBuilder::scan_with_filters_fetch(
+            "left_table",
+            table_source(vec![
+                Field::new("id", DataType::Utf8, false),
+                Field::new("name", DataType::Utf8, true),
+            ]),
+            None,
+            vec![col("left_table.id").eq(lit("a"))],
+            Some(5),
+        )
+        .expect("scan left");
+        let right = LogicalPlanBuilder::scan(
+            "right_table",
+            table_source(vec![
+                Field::new("id", DataType::Utf8, false),
+                Field::new("age", DataType::Int32, true),
+            ]),
+            None,
+        )
+        .expect("scan right");
+        let plan = left
+            .join_on(
+                right.build().expect("build right"),
+                JoinType::Inner,
+                [col("left_table.id").eq(col("right_table.id"))],
+            )
+            .expect("join")
+            .build()
+            .expect("build join");
+
+        let sql = federated_sql(&plan);
+
+        // Before the fix the whole `LIMIT 5` was absent from the generated SQL.
+        assert!(
+            sql.contains("LIMIT 5"),
+            "the fetch pushed into the join input must survive: {sql}"
+        );
+        // It bounds only that input, so it has to sit inside the input's own
+        // scope rather than trailing the join.
+        assert!(
+            sql.contains("FROM (SELECT"),
+            "the fetched join input must keep its own scope: {sql}"
+        );
+        let limit = sql.find("LIMIT 5").expect("limit present");
+        let join = sql.find("INNER JOIN").expect("join present");
+        assert!(
+            limit < join,
+            "the limit must bound the input, not the join output: {sql}"
+        );
+    }
+
+    /// Regression test for #12591: SQL evaluates `WHERE` before `LIMIT`, so a
+    /// `Filter` above a `Limit` rendered as one `SELECT` carrying both means the
+    /// opposite of the plan — it can keep rows the plan excludes, and more rows
+    /// than the plan can produce.
+    #[test]
+    fn a_filter_above_a_limit_keeps_the_limit_scoped() {
+        let plan = LogicalPlanBuilder::scan(
+            "t",
+            table_source(vec![
+                Field::new("id", DataType::Utf8, false),
+                Field::new("name", DataType::Utf8, true),
+            ]),
+            None,
+        )
+        .expect("scan")
+        .limit(0, Some(5))
+        .expect("limit")
+        .filter(col("t.id").eq(lit("a")))
+        .expect("filter")
+        .build()
+        .expect("build");
+
+        let sql = federated_sql(&plan);
+
+        // Before the fix this rendered as `... FROM t WHERE (t.id = 'a') LIMIT 5`,
+        // which takes the matching rows and then five of them, rather than five
+        // rows and then the matching ones.
+        let limit = sql
+            .find("LIMIT 5")
+            .expect("the limit must survive unparsing");
+        let filter = sql
+            .find("WHERE")
+            .expect("the filter must survive unparsing");
+        assert!(
+            limit < filter,
+            "the limit must be applied before the filter, not after: {sql}"
+        );
+        assert!(
+            sql.contains("FROM (SELECT"),
+            "the limited input must keep its own scope: {sql}"
+        );
     }
 }
