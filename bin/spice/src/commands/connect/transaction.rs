@@ -298,7 +298,16 @@ async fn execute_with<P: Prompter>(
     // so it decides what a resumed run needs — and says so in terms of that
     // operation. This guard stays a cheap pre-lock probe and defers to
     // [`resumable_authority`] once the draft can be read under the lock.
-    let draft_pending = runtime_cloud_connect::EnrollmentDraft::path_in(&config_dir).exists();
+    //
+    // Only a *definitive* absence takes the shortcut. A probe that cannot answer
+    // — a permission or metadata failure — must not be read as "nothing is
+    // pending": that would answer a protected retry state with generic
+    // fresh-enrollment guidance. Deferring instead reaches the draft loader under
+    // the lock, which is the layer that reports the real I/O failure.
+    let draft_pending = !matches!(
+        runtime_cloud_connect::EnrollmentDraft::path_in(&config_dir).try_exists(),
+        Ok(false)
+    );
     if !prompter.interactive()
         && request.token.is_none()
         && (request.org.is_none() || request.project.is_none())
@@ -586,13 +595,18 @@ fn resumable_authority(
         runtime_cloud_connect::EnrollmentAuthorityBinding::AuthenticatedSession {
             organization,
         } => {
+            // The remedy names `--project` and not `--org`: the binding already
+            // supplies the organization, and a project name is the one thing a
+            // login-mode resume cannot recover on its own. That command finishes
+            // the operation on a terminal and off one — advertising
+            // `--org <org>` alone would hand a non-interactive caller something
+            // that fails on the next line.
+            let finish = "finish it with `spice connect --project <name>`, or run `spice connect remove --yes` to abandon it explicitly";
             if request.token.is_some() {
                 return Err(pending_operation_conflict(
                     &format!("was authorized by a login to organization {organization}"),
                     "--token",
-                    &format!(
-                        "finish it with `spice connect --org {organization}`, or run `spice connect remove --yes` to abandon it explicitly"
-                    ),
+                    finish,
                 ));
             }
             if let Some(requested) = request.org.as_deref()
@@ -601,9 +615,7 @@ fn resumable_authority(
                 return Err(pending_operation_conflict(
                     &format!("is bound to organization {organization}"),
                     &format!("--org {requested}"),
-                    &format!(
-                        "finish it with `spice connect --org {organization}`, or run `spice connect remove --yes` to abandon it explicitly"
-                    ),
+                    finish,
                 ));
             }
             if !interactive && request.project.is_none() {
@@ -1659,6 +1671,17 @@ fn safe_recovery_url(candidate: &str) -> Option<String> {
     runtime_cloud_connect::config::safe_portal_url(candidate)
 }
 
+/// Validate what this invocation asks for on its own terms, before any state is
+/// read or any lock is taken.
+///
+/// This runs ahead of the pending-draft rules deliberately. Everything it rejects
+/// is invalid whatever is on disk — an enrollment key cannot create a project in
+/// any mode — so rejecting it here costs no I/O and touches nothing. The trade is
+/// that one combination (`--token` with `--project`, over a pending login-mode
+/// operation) is answered by the flag rule rather than by the draft-aware
+/// finish/abandon guidance: dropping the flag that can never apply then reaches
+/// that guidance. Deferring these checks to make one message richer would make
+/// every invalid pair depend on state it cannot change.
 fn preflight_request(request: &ConnectRequest) -> Result<()> {
     if request.token.is_some() && request.project.is_some() {
         return Err(invalid_usage(
@@ -2106,9 +2129,17 @@ mod tests {
         let rendered = with_key.to_string();
         assert!(
             rendered.contains("--token")
-                && rendered.contains("spice connect --org acme")
+                && rendered.contains("spice connect --project <name>")
                 && rendered.contains("spice connect remove --yes"),
             "{rendered}"
+        );
+        // The advertised command has to work in the mode the operator is in. A
+        // login-mode resume needs a project name off a terminal and accepts one
+        // on it, while the organization comes from the binding either way — so
+        // naming --org instead would fail the caller it was written for.
+        assert!(
+            !rendered.contains("spice connect --org"),
+            "the remedy must not advertise a command a non-interactive caller cannot finish: {rendered}"
         );
 
         let another_org = resumable_authority(

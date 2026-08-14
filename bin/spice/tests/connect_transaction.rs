@@ -1174,8 +1174,9 @@ fn a_pending_login_draft_refuses_an_enrollment_key() {
         "an enrollment key must not replace the pending login authority"
     );
     assert!(
-        output.contains("spice connect --org acme"),
-        "the failure must name what finishes the pending operation: {output}"
+        output.contains("spice connect --project <name>")
+            && output.contains("spice connect remove --yes"),
+        "the failure must name what finishes the pending operation, and what abandons it: {output}"
     );
 
     let preserved = runtime_cloud_connect::EnrollmentDraft::load_optional(&config_dir)
