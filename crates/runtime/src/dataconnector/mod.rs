@@ -17,6 +17,7 @@ limitations under the License.
 use crate::component::ComponentInitialization;
 use crate::component::catalog::Catalog;
 use crate::component::dataset::Dataset;
+use crate::component::dataset::DatasetSpec;
 use crate::component::dataset::acceleration::RefreshMode;
 // A second alias for the `runtime-parameters` types, kept crate-visible for the
 // same reason as the `parameters` alias itself: it would otherwise be a way for
@@ -350,7 +351,7 @@ pub trait DataConnectorFactory: Send + Sync {
     /// Default: `None`. Most connectors do not have an intrinsic
     /// configuration-only schema and instead rely on either source
     /// inference or the user-declared `columns:` fallback.
-    fn static_schema(&self, _params: &ConnectorParams, _dataset: &Dataset) -> Option<SchemaRef> {
+    fn static_schema(&self, _params: &ConnectorParams, _dataset: &DatasetSpec) -> Option<SchemaRef> {
         None
     }
 }
@@ -367,12 +368,12 @@ pub trait DataConnector: Debug + Send + Sync + 'static {
         refresh_mode.unwrap_or(RefreshMode::Full)
     }
 
-    async fn read_provider(&self, dataset: &Dataset)
+    async fn read_provider(&self, dataset: &DatasetSpec)
     -> DataConnectorResult<Arc<dyn TableProvider>>;
 
     async fn read_write_provider(
         &self,
-        _dataset: &Dataset,
+        _dataset: &DatasetSpec,
     ) -> Option<DataConnectorResult<Arc<dyn TableProvider>>> {
         None
     }
@@ -384,7 +385,7 @@ pub trait DataConnector: Debug + Send + Sync + 'static {
     fn changes_stream(
         &self,
         _federated_table: Arc<dyn FederatedTableProvider>,
-        _dataset: &Dataset,
+        _dataset: &DatasetSpec,
     ) -> Option<ChangesStream> {
         None
     }
@@ -429,7 +430,7 @@ pub trait DataConnector: Debug + Send + Sync + 'static {
 
     async fn metadata_provider(
         &self,
-        _dataset: &Dataset,
+        _dataset: &DatasetSpec,
     ) -> Option<DataConnectorResult<Arc<dyn TableProvider>>> {
         None
     }
@@ -449,7 +450,7 @@ pub trait DataConnector: Debug + Send + Sync + 'static {
     /// using the dataset's already secret-expanded params.
     async fn register_object_stores(
         &self,
-        _dataset: &Dataset,
+        _dataset: &DatasetSpec,
         _runtime_env: &Arc<datafusion::execution::runtime_env::RuntimeEnv>,
     ) -> DataConnectorResult<()> {
         Ok(())
@@ -465,7 +466,7 @@ pub trait DataConnector: Debug + Send + Sync + 'static {
     /// (e.g. to recreate indexes after a data refresh).
     async fn on_accelerator_setup(
         &self,
-        _dataset: &Dataset,
+        _dataset: &DatasetSpec,
         _accelerator: &mut dyn AcceleratorSetup,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Ok(())
@@ -479,7 +480,7 @@ pub trait DataConnector: Debug + Send + Sync + 'static {
     /// the table when the file is updated.
     async fn on_accelerated_table_registration(
         &self,
-        _dataset: &Dataset,
+        _dataset: &DatasetSpec,
         _accelerated_table: &mut dyn RegisteredAcceleratedTable,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Ok(())
@@ -502,7 +503,7 @@ pub trait DataConnector: Debug + Send + Sync + 'static {
     ///
     /// This method allows connectors to make initialization decisions based on the specific
     /// dataset configuration. The default implementation delegates to `initialization()`.
-    fn initialization_for_dataset(&self, _dataset: &Dataset) -> ComponentInitialization {
+    fn initialization_for_dataset(&self, _dataset: &DatasetSpec) -> ComponentInitialization {
         self.initialization()
     }
 }
@@ -658,7 +659,7 @@ mod tests {
 
             async fn read_provider(
                 &self,
-                _dataset: &Dataset,
+                _dataset: &DatasetSpec,
             ) -> DataConnectorResult<Arc<dyn TableProvider>> {
                 unimplemented!()
             }
@@ -737,7 +738,7 @@ mod tests {
 
             async fn read_provider(
                 &self,
-                _dataset: &Dataset,
+                _dataset: &DatasetSpec,
             ) -> DataConnectorResult<Arc<dyn TableProvider>> {
                 unimplemented!()
             }
@@ -800,7 +801,7 @@ mod tests {
 
         async fn read_provider(
             &self,
-            _dataset: &Dataset,
+            _dataset: &DatasetSpec,
         ) -> DataConnectorResult<Arc<dyn TableProvider>> {
             unimplemented!("capability-forwarding test never reads")
         }

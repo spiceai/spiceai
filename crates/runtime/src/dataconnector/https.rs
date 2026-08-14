@@ -201,7 +201,7 @@ impl Https {
 
     fn ensure_rate_control_supported_for_structured_dataset(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> DataConnectorResult<()> {
         let rate_control = http_rate_control::resolve_config(
             &self.params,
@@ -638,7 +638,7 @@ impl Https {
 
     fn ensure_client_identity_supported_for_structured_dataset(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> DataConnectorResult<()> {
         if !self.client_identity_params_are_configured() {
             return Ok(());
@@ -667,7 +667,7 @@ impl Https {
     /// there skips `resolve_oauth2_auth`'s validation as well.
     fn ensure_auth_supported_for_structured_dataset(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> DataConnectorResult<()> {
         if !any_oauth_param_set(&self.params) {
             return Ok(());
@@ -693,7 +693,7 @@ impl Https {
     /// `OAuth2` params this only warns: the header list is used for far more
     /// than authentication, so rejecting it would fail datasets that load and
     /// serve correctly today.
-    fn warn_ignored_http_headers(&self, dataset: &Dataset) {
+    fn warn_ignored_http_headers(&self, dataset: &DatasetSpec) {
         if param_is_set(&self.params, "http_headers") {
             tracing::warn!(
                 "Dataset {}: '{}' is not applied to structured HTTP file datasets, which are served by the listing connector. The headers are ignored; use a dynamic JSON HTTP API dataset if the endpoint requires them.",
@@ -1589,7 +1589,7 @@ impl DataConnector for Https {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         if self.is_structured_format(dataset) {
             self.ensure_rate_control_supported_for_structured_dataset(dataset)?;
@@ -1637,7 +1637,7 @@ impl DataConnector for Https {
         )))
     }
 
-    fn initialization_for_dataset(&self, dataset: &Dataset) -> ComponentInitialization {
+    fn initialization_for_dataset(&self, dataset: &DatasetSpec) -> ComponentInitialization {
         // Non-structured HTTP endpoints (using HttpTableProvider) are dynamic datasets
         // that require filters to work properly, so skip health monitoring for them.
         if self.is_structured_format(dataset) {
@@ -1841,7 +1841,7 @@ impl DataConnectorFactory for HttpsFactory {
     fn static_schema(
         &self,
         params: &ConnectorParams,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> Option<arrow_schema::SchemaRef> {
         static_schema_for_https_dataset(&params.parameters, dataset)
     }
@@ -1884,7 +1884,7 @@ impl ListingTableConnector for HttpListingConnector {
 
     fn get_object_store_url(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
         url: Option<&str>,
     ) -> DataConnectorResult<Url> {
         let url = url.unwrap_or(dataset.from.as_str());

@@ -359,7 +359,7 @@ impl DataConnector for Debezium {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
         let Some(acceleration) = dataset
             .acceleration
@@ -601,7 +601,7 @@ impl DataConnector for Debezium {
     fn changes_stream(
         &self,
         federated_table: Arc<dyn FederatedTableProvider>,
-        _dataset: &Dataset,
+        _dataset: &DatasetSpec,
     ) -> Option<ChangesStream> {
         Some(Box::pin(stream! {
             let table_provider = federated_table.table_provider().await;
@@ -683,7 +683,7 @@ async fn set_metadata_to_accelerator(
 }
 
 async fn get_metadata_from_kafka(
-    dataset: &Dataset,
+    dataset: &DatasetSpec,
     topic: &str,
     kafka_config: &KafkaConfig,
     debezium_kafka_sys: Option<&dyn DebeziumCheckpointStore>,
@@ -842,7 +842,7 @@ async fn get_metadata_from_kafka(
 /// Peek at the most recent message on `topic` using a temporary consumer.
 /// Does not touch the real consumer or its group offsets.
 async fn fetch_latest_change_event(
-    dataset: &Dataset,
+    dataset: &DatasetSpec,
     topic: &str,
     kafka_config: &KafkaConfig,
 ) -> super::DataConnectorResult<(Option<ChangeEventKey>, ChangeEvent)> {
@@ -873,7 +873,7 @@ async fn fetch_latest_change_event(
 
 /// Read the first available message.
 async fn fetch_first_event(
-    dataset: &Dataset,
+    dataset: &DatasetSpec,
     topic: &str,
     kafka_consumer: &KafkaConsumer,
 ) -> super::DataConnectorResult<(Option<ChangeEventKey>, ChangeEvent)> {
@@ -920,7 +920,7 @@ async fn fetch_first_event(
 /// `block` (legacy `schema_evolution: true`) keeps today's blind adoption.
 async fn refresh_schema_if_evolved(
     metadata: DebeziumKafkaMetadata,
-    dataset: &Dataset,
+    dataset: &DatasetSpec,
     topic: &str,
     kafka_config: &KafkaConfig,
     debezium_kafka_sys: Option<&dyn DebeziumCheckpointStore>,

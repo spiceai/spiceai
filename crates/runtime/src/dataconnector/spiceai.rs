@@ -50,7 +50,7 @@ use super::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     ParameterSpec,
 };
-use crate::component::dataset::Dataset;
+use crate::component::dataset::{Dataset, DatasetSpec};
 use data_components::cdc::{
     self, ChangeBatch, ChangeEnvelope, ChangesStream, CommitChange, CommitError,
 };
@@ -493,7 +493,7 @@ impl DataConnector for SpiceAI {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
         let dataset_path = match SpiceAI::spice_dataset_path(dataset) {
             Ok(dataset_path) => dataset_path,
@@ -535,7 +535,7 @@ impl DataConnector for SpiceAI {
 
     async fn read_write_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> Option<super::DataConnectorResult<Arc<dyn TableProvider>>> {
         let dataset_path = match SpiceAI::spice_dataset_path(dataset) {
             Ok(dataset_path) => dataset_path,
@@ -570,7 +570,7 @@ impl DataConnector for SpiceAI {
     fn changes_stream(
         &self,
         federated_table: Arc<dyn FederatedTableProvider>,
-        _dataset: &Dataset,
+        _dataset: &DatasetSpec,
     ) -> Option<ChangesStream> {
         self.append_stream(federated_table)
     }

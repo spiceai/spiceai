@@ -32,6 +32,7 @@ use crate::{
     UnknownDataConnectorSnafu,
     accelerated::AcceleratedTable,
     component::dataset::{
+        DatasetSpec,
         Dataset,
         acceleration::{Acceleration, RefreshMode},
         builder::DatasetBuilder,
@@ -2001,7 +2002,7 @@ mod tests {
         fn static_schema(
             &self,
             _params: &ConnectorParams,
-            dataset: &crate::component::dataset::Dataset,
+            dataset: &DatasetSpec,
         ) -> Option<arrow_schema::SchemaRef> {
             crate::component::dataset::declared_schema::declared_schema_for(dataset)
                 .ok()
@@ -2020,7 +2021,7 @@ mod tests {
 
         async fn read_provider(
             &self,
-            _dataset: &Dataset,
+            _dataset: &DatasetSpec,
         ) -> DataConnectorResult<Arc<dyn TableProvider>> {
             unimplemented!("on-demand startup should not create or read from this connector")
         }
@@ -2172,7 +2173,7 @@ mod tests {
 
         async fn read_provider(
             &self,
-            _dataset: &Dataset,
+            _dataset: &DatasetSpec,
         ) -> DataConnectorResult<Arc<dyn TableProvider>> {
             let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
                 "id",

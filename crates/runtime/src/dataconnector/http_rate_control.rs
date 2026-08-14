@@ -26,7 +26,7 @@ use std::hash::BuildHasher;
 
 pub use data_http_rate_control::*;
 
-use crate::component::dataset::Dataset;
+use crate::component::dataset::DatasetSpec;
 use crate::dataconnector::{ConnectorComponent, DataConnectorResult};
 use crate::parameters::Parameters;
 
@@ -38,7 +38,7 @@ use crate::parameters::Parameters;
 pub fn resolve_config<S: BuildHasher>(
     params: &Parameters,
     runtime_params: Option<&HashMap<String, String, S>>,
-    dataset: &Dataset,
+    dataset: &DatasetSpec,
     dataconnector: &'static str,
 ) -> DataConnectorResult<HttpRateControlConfig> {
     resolve_config_for_component(

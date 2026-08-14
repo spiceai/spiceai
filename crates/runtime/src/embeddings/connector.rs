@@ -16,7 +16,7 @@ limitations under the License.
 use crate::changes::Indexes;
 use crate::changes::index_change_envelope;
 use crate::component::ComponentInitialization;
-use crate::component::dataset::Dataset;
+use crate::component::dataset::{Dataset, DatasetSpec};
 #[cfg(feature = "duckdb")]
 use crate::component::dataset::acceleration::Engine;
 #[cfg(feature = "duckdb")]
@@ -245,7 +245,7 @@ impl DataConnector for EmbeddingConnector {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         self.wrap_table(self.inner_connector.read_provider(dataset).await?, dataset)
             .await
@@ -253,7 +253,7 @@ impl DataConnector for EmbeddingConnector {
 
     async fn read_write_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> Option<DataConnectorResult<Arc<dyn TableProvider>>> {
         match self.inner_connector.read_write_provider(dataset).await {
             Some(Ok(inner)) => Some(self.wrap_table(inner, dataset).await),
@@ -264,14 +264,14 @@ impl DataConnector for EmbeddingConnector {
 
     async fn metadata_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> Option<DataConnectorResult<Arc<dyn TableProvider>>> {
         self.inner_connector.metadata_provider(dataset).await
     }
 
     async fn register_object_stores(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
         runtime_env: &Arc<datafusion::execution::runtime_env::RuntimeEnv>,
     ) -> DataConnectorResult<()> {
         self.inner_connector
@@ -289,7 +289,7 @@ impl DataConnector for EmbeddingConnector {
 
     async fn on_accelerator_setup(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
         accelerator: &mut dyn AcceleratorSetup,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.inner_connector
@@ -328,7 +328,7 @@ impl DataConnector for EmbeddingConnector {
 
     async fn on_accelerated_table_registration(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
         accelerated_table: &mut dyn RegisteredAcceleratedTable,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.inner_connector
@@ -347,7 +347,7 @@ impl DataConnector for EmbeddingConnector {
     fn changes_stream(
         &self,
         federated_table: Arc<dyn FederatedTableProvider>,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> Option<ChangesStream> {
         let table_provider = federated_table.try_table_provider_sync()?;
         if let Some(indexed_table) =
@@ -485,7 +485,7 @@ impl DataConnector for EmbeddingConnector {
 
     fn initialization_for_dataset(
         &self,
-        dataset: &crate::component::dataset::Dataset,
+        dataset: &DatasetSpec,
     ) -> crate::component::ComponentInitialization {
         self.inner_connector.initialization_for_dataset(dataset)
     }
@@ -756,7 +756,7 @@ mod tests {
 
         async fn read_provider(
             &self,
-            _dataset: &Dataset,
+            _dataset: &DatasetSpec,
         ) -> DataConnectorResult<Arc<dyn TableProvider>> {
             Ok(memtable())
         }
@@ -768,7 +768,7 @@ mod tests {
         fn changes_stream(
             &self,
             _federated_table: Arc<dyn FederatedTableProvider>,
-            _dataset: &Dataset,
+            _dataset: &DatasetSpec,
         ) -> Option<ChangesStream> {
             Some(futures::stream::empty().boxed())
         }

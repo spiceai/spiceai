@@ -36,7 +36,7 @@ use std::sync::LazyLock;
 use std::{any::Any, collections::HashMap, path::Path, pin::Pin, sync::Arc};
 
 use crate::{
-    component::dataset::Dataset,
+    component::dataset::{Dataset, DatasetSpec},
     parameters::{ParameterSpec, Parameters},
 };
 
@@ -277,7 +277,7 @@ impl DataConnector for GlueDataConnector {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
         self.create_table_provider(dataset).await
     }
@@ -285,7 +285,7 @@ impl DataConnector for GlueDataConnector {
     #[cfg(feature = "iceberg-write")]
     async fn read_write_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> Option<super::DataConnectorResult<Arc<dyn TableProvider>>> {
         // Iceberg supports read and write operations through the same TableProvider interface.
         Some(self.create_table_provider(dataset).await)

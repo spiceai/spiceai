@@ -20,7 +20,7 @@ use datafusion_datasource::sink::{DataSink, DataSinkExec};
 
 use std::{any::Any, fmt, pin::Pin, sync::Arc};
 
-use crate::component::dataset::{Dataset, acceleration::RefreshMode};
+use crate::component::dataset::{Dataset, acceleration::RefreshMode, DatasetSpec};
 use crate::dataaccelerator::spice_sys::OpenOption;
 use crate::dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpoint;
 use datafusion::{
@@ -173,14 +173,14 @@ impl DataConnector for SinkConnector {
 
     async fn read_provider(
         &self,
-        _dataset: &Dataset,
+        _dataset: &DatasetSpec,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
         Ok(Arc::new(self.clone()))
     }
 
     async fn read_write_provider(
         &self,
-        _dataset: &Dataset,
+        _dataset: &DatasetSpec,
     ) -> Option<super::DataConnectorResult<Arc<dyn TableProvider>>> {
         Some(Ok(Arc::new(self.clone())))
     }

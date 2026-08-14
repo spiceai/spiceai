@@ -49,7 +49,7 @@ use futures::future::BoxFuture;
 use tokio::sync::Semaphore;
 
 use crate::Error as RuntimeError;
-use crate::component::dataset::Dataset;
+use crate::component::dataset::{Dataset, DatasetSpec};
 use crate::dataaccelerator::BootstrapStatus;
 use crate::dataconnector::{DataConnector, NewDataConnectorResult};
 use crate::{Result, Runtime, accelerated::AcceleratedTable};
@@ -424,7 +424,7 @@ mod tests {
 
         async fn read_provider(
             &self,
-            dataset: &Dataset,
+            dataset: &DatasetSpec,
         ) -> DataConnectorResult<Arc<dyn TableProvider>> {
             if self.fail_read {
                 return Err(DataConnectorError::UnableToGetReadProvider {

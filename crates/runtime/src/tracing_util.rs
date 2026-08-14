@@ -18,6 +18,7 @@ use datafusion::sql::TableReference;
 
 use crate::{
     component::dataset::{
+        DatasetSpec,
         Dataset,
         acceleration::{self, Acceleration, Mode, RefreshMode, ZeroResultsAction},
     },
@@ -144,7 +145,7 @@ mod tests {
 
         async fn read_provider(
             &self,
-            _dataset: &Dataset,
+            _dataset: &DatasetSpec,
         ) -> DataConnectorResult<Arc<dyn TableProvider>> {
             unimplemented!()
         }

@@ -27,7 +27,7 @@ pub use data_connector_api::schema_projection::{ProjectionPolicy, parse_schema_p
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::component::dataset::Dataset;
+    use crate::component::dataset::{Dataset, DatasetSpec};
     use crate::component::dataset::builder::DatasetBuilder;
     use app::AppBuilder;
     use serde_json::Value;

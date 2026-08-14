@@ -36,7 +36,7 @@ use crate::{
         ICEBERG_PARAM_LEN, get_rest_catalog, map_param_name_to_iceberg_prop,
         parse_hadoop_table_url, parse_table_url, verify_s3_endpoint,
     },
-    component::dataset::Dataset,
+    component::dataset::{Dataset, DatasetSpec},
     dataconnector::{
         ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError as Error,
         parameters::aws::initiate_config_with_credentials,
@@ -355,7 +355,7 @@ impl DataConnector for IcebergDataConnector {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
         let parts = self.create_iceberg_table_parts(dataset).await?;
 
@@ -372,7 +372,7 @@ impl DataConnector for IcebergDataConnector {
     #[cfg(feature = "iceberg-write")]
     async fn read_write_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> Option<super::DataConnectorResult<Arc<dyn TableProvider>>> {
         // Create the table parts which include catalog + identity for delete support
         let parts = match self.create_iceberg_table_parts(dataset).await {
