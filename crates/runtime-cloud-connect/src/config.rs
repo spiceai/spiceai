@@ -289,6 +289,15 @@ impl CloudConnectConfig {
         Ok(endpoint)
     }
 
+    /// The instance-local control-plane endpoint override, relative to the
+    /// config directory.
+    ///
+    /// Named here because resolution reads it and a release deletes it: `spice
+    /// connect` persists it for an explicit `--endpoint` and for a binding taken
+    /// from the durable identity or a pending draft, so it can carry cloud-issued
+    /// state that must not outlive the enrollment.
+    pub const ENDPOINT_OVERRIDE_FILE: &str = "cloud-endpoint";
+
     /// Read the optional instance-local enrollment endpoint override without
     /// following symlinks or opening special files in blocking mode.
     ///
@@ -297,7 +306,7 @@ impl CloudConnectConfig {
     /// Returns an error when the path exists but is unreadable or is not a
     /// regular file.
     pub fn read_enroll_endpoint_override(config_dir: &Path) -> std::io::Result<Option<String>> {
-        let path = config_dir.join("cloud-endpoint");
+        let path = config_dir.join(Self::ENDPOINT_OVERRIDE_FILE);
         crate::identity::read_regular_file_optional(&path).map(|contents| {
             contents
                 .map(|value| value.trim().to_string())
@@ -320,7 +329,7 @@ impl CloudConnectConfig {
     pub fn read_normalized_enroll_endpoint_override(
         config_dir: &Path,
     ) -> std::result::Result<Option<String>, EnrollmentEndpointOverrideError> {
-        let path = config_dir.join("cloud-endpoint");
+        let path = config_dir.join(Self::ENDPOINT_OVERRIDE_FILE);
         let Some(endpoint) = Self::read_enroll_endpoint_override(config_dir).map_err(|source| {
             EnrollmentEndpointOverrideError::Read {
                 path: path.clone(),

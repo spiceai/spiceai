@@ -1390,12 +1390,14 @@ impl ClientDriver {
     ///    idempotency mismatch whose guidance is to preserve the file and contact
     ///    support.
     ///
-    /// It deliberately does NOT remove the `cloud-endpoint` override. Nothing in
-    /// this codebase writes that file — it is operator-authored configuration
-    /// for which control plane a future enrollment talks to, so it is not the
-    /// control plane's to delete, and leaving it affects only an enrollment the
-    /// operator themselves starts. The local command removes it because the
-    /// operator asked to remove everything from that host.
+    /// 4. The **`cloud-endpoint` override**. `spice connect` persists it both for
+    ///    an explicit `--endpoint` and for a binding taken from the durable
+    ///    identity or a pending draft (`EndpointSource::Bound`), so it can hold a
+    ///    value derived from the very enrollment being released. Left behind, the
+    ///    next plain `spiced --token` in this directory would silently enroll
+    ///    against the released instance's control plane. An operator who chose
+    ///    the endpoint themselves re-supplies it, which is what the local command
+    ///    already makes them do.
     ///
     /// Only the identity is fatal. The cache and the draft are reported and
     /// logged but do not stop the removal, because the alternative — aborting
@@ -1518,7 +1520,32 @@ async fn release_local_state(
         retained.push("enrollment draft".to_string());
     }
 
+    let endpoint_path = config
+        .config_dir
+        .join(CloudConnectConfig::ENDPOINT_OVERRIDE_FILE);
+    if let Err(err) = remove_file_if_present(endpoint_path.clone()).await {
+        tracing::warn!(
+            "Cloud Connect: failed to remove the endpoint override at {}: {err}; the instance is released, but a later enrollment in this directory would still reach the control plane it names",
+            endpoint_path.display()
+        );
+        retained.push(format!("endpoint override at {}", endpoint_path.display()));
+    }
+
     Ok(retained)
+}
+
+/// Delete `path` off the Tokio driver task, treating a missing file as success.
+///
+/// `std::fs` on the blocking pool rather than `tokio::fs`, to match the other
+/// removals here and keep one failure vocabulary across them.
+async fn remove_file_if_present(path: PathBuf) -> std::result::Result<(), String> {
+    tokio::task::spawn_blocking(move || match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err.to_string()),
+    })
+    .await
+    .map_err(|source| format!("the removal task stopped unexpectedly: {source}"))?
 }
 
 /// Delete the delivered-secrets cache off the Tokio driver task.
@@ -2292,18 +2319,51 @@ mod tests {
             );
         }
 
-        /// The `cloud-endpoint` override is operator-authored configuration that
-        /// nothing in this codebase writes, so the control plane does not delete
-        /// it — the deliberate difference from the local command.
+        /// The endpoint override goes too. `spice connect` writes it for a
+        /// binding taken from the identity or a pending draft, so it can name the
+        /// control plane of the very enrollment being released — and a file left
+        /// behind would silently point the next `spiced --token` at it.
         #[tokio::test]
-        async fn it_leaves_the_operator_s_endpoint_override_alone() {
+        async fn it_removes_the_endpoint_override() {
             let host = Host::enrolled();
             std::fs::write(host.endpoint_path(), "https://api.spice.ai")
                 .expect("write endpoint override");
 
-            host.release().await.expect("the removal succeeds");
+            let retained = host.release().await.expect("the removal succeeds");
 
-            assert!(host.endpoint_path().exists());
+            assert!(
+                !host.endpoint_path().exists(),
+                "a released instance must not keep the control plane it was released from"
+            );
+            assert!(retained.is_empty(), "{retained:?}");
+        }
+
+        /// The draft's removal is non-fatal, like the cache's: the instance is
+        /// released either way, and what could not be taken is named rather than
+        /// silently left. Without this the branch is never exercised.
+        #[tokio::test]
+        async fn an_unremovable_draft_still_releases_the_instance_and_is_reported() {
+            let host = Host::enrolled();
+            std::fs::remove_file(host.draft_path()).expect("replace the draft with a directory");
+            std::fs::create_dir(host.draft_path()).expect("create the draft directory");
+            std::fs::write(host.draft_path().join("occupant"), "x").expect("occupy it");
+
+            let retained = host.release().await.expect("the removal still succeeds");
+
+            assert!(
+                !host.config.identity_path.exists(),
+                "the instance must still be released"
+            );
+            assert!(
+                !host.cache_path().exists(),
+                "and its secrets must still be gone"
+            );
+            assert!(
+                retained
+                    .iter()
+                    .any(|item| item.contains("enrollment draft")),
+                "the operator has to learn the next enrollment needs it cleared: {retained:?}"
+            );
         }
 
         #[tokio::test]
