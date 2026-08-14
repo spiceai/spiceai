@@ -16900,6 +16900,7 @@ dependencies = [
  "duckdb",
  "duration-parse",
  "elasticsearch",
+ "elasticsearch_datafusion_filter",
  "event_stream",
  "flight_client",
  "fundu",

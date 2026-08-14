@@ -25,8 +25,6 @@ use std::sync::Arc;
 use crate::component::column::full_text_search_config;
 use crate::component::dataset::FullTextSearchDatasetConfig;
 use crate::make_spice_data_sub_directory;
-
-#[cfg(feature = "elasticsearch")]
 use spicepod::semantic::MetadataType;
 
 use search::generation::text_search::index::FullTextDatabaseIndex;
