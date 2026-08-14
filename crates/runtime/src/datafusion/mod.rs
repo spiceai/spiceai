@@ -1193,14 +1193,20 @@ impl DataFusion {
                 schema: schema_name,
             })?;
 
-        if let Err(incumbent) = spice_schema.reserve_table(table_name.table().to_string(), table) {
+        let claimed = table_name.table().to_string();
+        if let Err(incumbent) = spice_schema.reserve_table(claimed.clone(), table) {
             return Ok(Some(incumbent));
         }
 
-        self.data_writers
-            .write()
-            .map_err(|_| Error::UnableToLockDataWriters {})?
-            .insert(table_name);
+        // Past the claim, an error may not leave the name claimed. A reservation
+        // this runtime abandoned half-made is one it would meet again as an
+        // incumbent, with nothing able to release it — the schema API refuses a
+        // reserved name and the caller was told the reservation failed.
+        let Ok(mut writers) = self.data_writers.write() else {
+            spice_schema.release_reserved_table(&claimed);
+            return Err(Error::UnableToLockDataWriters {});
+        };
+        writers.insert(table_name);
 
         Ok(None)
     }
@@ -6761,6 +6767,41 @@ mod tests {
                 "{error}"
             );
             assert!(!df.table_exists(&elsewhere), "and nothing was registered");
+        }
+
+        /// A reservation is either made and reported, or not made at all.
+        ///
+        /// The name is claimed before the writer registry is touched, so a failure
+        /// after that point has to undo the claim: the runtime would otherwise meet
+        /// its own half-made reservation as an incumbent, with nothing able to
+        /// release it.
+        #[tokio::test]
+        async fn a_failure_after_the_claim_leaves_the_name_free() {
+            let df = DataFusionBuilder::new(
+                RuntimeStatus::new(),
+                Arc::new(AcceleratorEngineRegistry::new()),
+                Handle::current(),
+            )
+            .build();
+            let name = TableReference::partial(SPICE_RUNTIME_SCHEMA, "claimed");
+
+            // What a panicking writer leaves behind.
+            let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _guard = df.data_writers.write().expect("take the writer registry");
+                panic!("poison the writer registry");
+            }));
+            assert!(poisoned.is_err(), "the panic was caught, not swallowed");
+
+            df.reserve_internal_table(name.clone(), table("internal"))
+                .expect_err("the reservation could not be completed");
+
+            assert!(
+                !df.table_exists(&name),
+                "so it left nothing registered under the name"
+            );
+            df.ctx
+                .register_table(name.clone(), table("dataset"))
+                .expect("and nothing reserved: the name is free for the next claim");
         }
 
         /// Task history claims two names in scheduler mode and the pair is not
