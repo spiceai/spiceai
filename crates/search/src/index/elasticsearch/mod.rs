@@ -1200,10 +1200,10 @@ mod write_maintenance_tests {
             .query_table_provider("query")
             .expect("text search plan should build");
         plan.schema()
-            .field_with_name("category")
+            .field_with_name(None, "category")
             .expect("filterable metadata should be returned");
         plan.schema()
-            .field_with_name("description")
+            .field_with_name(None, "description")
             .expect("non-filterable metadata should be returned");
 
         let LogicalPlan::TableScan(scan) = plan.as_ref() else {
