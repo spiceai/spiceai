@@ -954,6 +954,23 @@ struct CachedTableStatistics {
     count_exact: bool,
 }
 
+/// The outcome of reading a table's persisted statistics record.
+///
+/// `Option<TableStatistics>` cannot carry this distinction, and the two absent
+/// cases are not interchangeable: a genuinely absent record is a valid baseline
+/// — a first write merges onto nothing, and a legacy table's count is trusted
+/// exact once — while an unreadable one is no baseline at all. Treating an
+/// unreadable record as absent lets a merge publish a single write's rows as the
+/// table's whole count and mark that partial total exact, which is a wrong
+/// `COUNT(*)` answer on the distributed fold rather than a costing miss.
+enum PersistedTableStatistics {
+    Present(TableStatistics),
+    /// The table has no statistics row yet.
+    Absent,
+    /// The row could not be read, so nothing is known about the table's count.
+    Unreadable,
+}
+
 /// Block size for the in-memory sequence allocator (lever B2). Each metastore
 /// `UPDATE … += BLOCK … RETURNING` refill durably reserves this many sequence
 /// numbers in one writer acquisition; they are then served from memory until
@@ -6192,13 +6209,11 @@ impl CayenneTableProvider {
             context.file_format(),
             &pk_deletion_strategy,
         )?;
-        let loaded_table_statistics = Self::load_table_statistics(&catalog, &table_metadata).await;
         // Legacy/absent stats are trusted exact once (see the migration note); the
-        // next mem-tier checkpoint delta taints a drifted one.
-        let table_statistics_count_exact = loaded_table_statistics
-            .as_ref()
-            .is_none_or(|(_, exact)| *exact);
-        let table_statistics = loaded_table_statistics.map(|(df, _)| df);
+        // next mem-tier checkpoint delta taints a drifted one. A record that could
+        // not be read is not trusted at all.
+        let (table_statistics, table_statistics_count_exact) =
+            Self::load_table_statistics(&catalog, &table_metadata).await;
         // An empty `pk_column_indices` (no primary key) yields the legacy
         // insert-only behavior. Runtime configuration rejects no-PK MIN/MAX, and
         // direct callers remain bounded by the provider-level retained-index cap.
@@ -7683,31 +7698,55 @@ impl CayenneTableProvider {
     /// ([`TableStatistics::num_rows_exact`]) at open. The flag rides alongside the
     /// derived `Statistics` so the cache can serve the count `Inexact` when it is
     /// not a provably-exact live count.
-    async fn load_table_statistics(
+    /// Read a table's persisted statistics record, keeping "there is no record"
+    /// distinct from "the record could not be read" (see
+    /// [`PersistedTableStatistics`]). Every reader of the persisted statistics
+    /// goes through here, so neither case can be reintroduced as the other.
+    async fn read_persisted_table_statistics(
         catalog: &Arc<dyn MetadataCatalog>,
         table_metadata: &TableMetadata,
-    ) -> Option<(Statistics, bool)> {
-        let stats = match catalog.get_table_statistics(&table_metadata.table_id).await {
-            Ok(stats) => stats?,
+    ) -> PersistedTableStatistics {
+        match catalog.get_table_statistics(&table_metadata.table_id).await {
+            Ok(Some(stats)) => PersistedTableStatistics::Present(stats),
+            Ok(None) => PersistedTableStatistics::Absent,
             Err(e) => {
                 tracing::warn!(
                     "Failed to load table stats for {}: {e}",
                     table_metadata.table_name
                 );
-                return None;
+                PersistedTableStatistics::Unreadable
             }
-        };
+        }
+    }
 
-        let num_rows_exact = stats.num_rows_exact;
-        Self::table_statistics_to_df(&table_metadata.schema, &stats)
-            .map(|df| (df, num_rows_exact))
-            .or_else(|| {
-                tracing::warn!(
-                    "Failed to deserialize table stats for {}",
-                    table_metadata.table_name
-                );
-                None
-            })
+    /// Load the statistics an opening provider serves, with whether its
+    /// maintained count may be served as a provably-exact live count.
+    ///
+    /// An unreadable record yields `false`: nothing is known about the count, so
+    /// it must not be folded into a `COUNT(*)` answer. This matches the
+    /// schema-evolution re-derivation, which likewise refuses to trust a count
+    /// it cannot read. A genuinely absent record keeps the documented
+    /// trusted-exact-once migration behaviour.
+    async fn load_table_statistics(
+        catalog: &Arc<dyn MetadataCatalog>,
+        table_metadata: &TableMetadata,
+    ) -> (Option<Statistics>, bool) {
+        match Self::read_persisted_table_statistics(catalog, table_metadata).await {
+            PersistedTableStatistics::Present(stats) => {
+                let num_rows_exact = stats.num_rows_exact;
+                let df_stats = Self::table_statistics_to_df(&table_metadata.schema, &stats)
+                    .or_else(|| {
+                        tracing::warn!(
+                            "Failed to deserialize table stats for {}",
+                            table_metadata.table_name
+                        );
+                        None
+                    });
+                (df_stats, num_rows_exact)
+            }
+            PersistedTableStatistics::Absent => (None, true),
+            PersistedTableStatistics::Unreadable => (None, false),
+        }
     }
 
     fn table_statistics_to_df(
@@ -21099,7 +21138,7 @@ impl CayenneTableProvider {
     /// merges this write into it. `num_rows_update` sets the live count relative
     /// to the previous aggregate (`Delta`), to an authoritative value (`Set`), or
     /// leaves it (`Unchanged`).
-    /// Returns whether the update reached the metastore and the cache. Both
+    /// Returns whether the update reached the metastore and the cache. All three
     /// bail-outs below abandon `num_rows_update` while leaving `count_exact`
     /// as it was, so a caller that folds the failure into "the count is current"
     /// would serve a drifted count as `Exact`.
@@ -21128,18 +21167,27 @@ impl CayenneTableProvider {
             if let Some(raw) = cached_raw {
                 Some(raw)
             } else {
-                match self
-                    .catalog
-                    .get_table_statistics(&self.table_metadata.table_id)
+                match Self::read_persisted_table_statistics(&self.catalog, &self.table_metadata)
                     .await
                 {
-                    Ok(stats) => stats,
-                    Err(e) => {
+                    PersistedTableStatistics::Present(stats) => Some(stats),
+                    PersistedTableStatistics::Absent => None,
+                    // A merge needs a baseline and an unreadable record is not
+                    // one. Continuing would treat the previous count as zero, so
+                    // a `Delta` would write only this write's rows as the table's
+                    // total, an `exact` one would flag that partial total exact,
+                    // and the merged blob would replace the accumulated
+                    // aggregate — durably, and indistinguishably from a
+                    // legitimate baseline once written. Abandon the update
+                    // instead: the caller leaves its live-rows delta outstanding
+                    // on `false`, which holds the served count at `Inexact` until
+                    // a later persist or a full-rewrite `Set` re-baselines it.
+                    PersistedTableStatistics::Unreadable => {
                         tracing::warn!(
-                            "Failed to load existing table stats for {} before merge: {e}",
+                            "Abandoning table stats update for {}: the existing statistics record could not be read, so this write has no baseline to merge onto",
                             self.table_metadata.table_name
                         );
-                        None
+                        return false;
                     }
                 }
             }
@@ -39119,6 +39167,246 @@ mod tests {
             .await
             .expect("table created");
         (provider, catalog, temp_dir)
+    }
+
+    /// Schema shared by the statistics-read-failure tests below.
+    fn unreadable_stats_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("category", DataType::Utf8, false),
+            Field::new("value", DataType::Int64, false),
+        ]))
+    }
+
+    /// Make the statistics READ fail while leaving the write leg working.
+    ///
+    /// The blob column is `NOT NULL`, but it has BLOB affinity, so SQLite stores
+    /// a text value in it unconverted — and the row mapper's blob accessor
+    /// rejects a text value, so `get_table_statistics` returns `Err`. The UPSERT
+    /// a merge performs afterwards still succeeds. That asymmetry is what makes a
+    /// merge onto a missing baseline durable, so it is what the fixture has to
+    /// reproduce: dropping the whole table would fail the write too, and prove
+    /// nothing.
+    fn make_table_statistics_unreadable(temp_dir: &std::path::Path, table_id: &str) {
+        let conn = rusqlite::Connection::open(temp_dir.join("metadata").join("cayenne.db"))
+            .expect("open metastore db directly");
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .expect("busy timeout");
+        let updated = conn
+            .execute(
+                "UPDATE cayenne_table_statistics SET statistics_blob = 'unreadable'
+                 WHERE table_id = ?1",
+                [table_id],
+            )
+            .expect("store an unreadable statistics blob");
+        assert_eq!(
+            updated, 1,
+            "the fixture must corrupt exactly the one statistics row under test"
+        );
+    }
+
+    /// Read the durable statistics row directly, bypassing the catalog — whose
+    /// own reader is the thing the fixture has broken.
+    ///
+    /// Returns `(num_rows, num_rows_exact, blob_still_unreadable)`. The third
+    /// field distinguishes "left alone" from "rewritten": only a real write
+    /// replaces the fixture's text sentinel with a blob.
+    fn read_durable_stats_row(temp_dir: &std::path::Path, table_id: &str) -> (i64, bool, bool) {
+        let conn = rusqlite::Connection::open(temp_dir.join("metadata").join("cayenne.db"))
+            .expect("open metastore db directly");
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .expect("busy timeout");
+        conn.query_row(
+            "SELECT num_rows, num_rows_exact, typeof(statistics_blob) = 'text'
+             FROM cayenne_table_statistics WHERE table_id = ?1",
+            [table_id],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)? != 0,
+                    row.get::<_, i64>(2)? != 0,
+                ))
+            },
+        )
+        .expect("read the durable statistics row")
+    }
+
+    /// Regression for #13010: a statistics read that FAILS must not be treated as
+    /// "this table has no statistics row yet".
+    ///
+    /// The merge reads an absent record as a zero baseline that is trusted exact,
+    /// so routing a failed read into that branch rewrites the durable record to
+    /// hold only the current write's rows and flags that partial total exact. An
+    /// exact `num_rows` is folded straight into a distributed `COUNT(*)` answer
+    /// instead of costing a scan, and the rewritten record survives restart
+    /// looking like a legitimate exact baseline, so nothing later corrects it.
+    #[tokio::test]
+    async fn an_unreadable_stats_record_must_not_publish_a_partial_count_as_exact() {
+        const BASELINE_ROWS: usize = 24;
+        const SECOND_WRITE_ROWS: usize = 8;
+
+        let runtime_env = SessionContext::new().runtime_env();
+        let schema = unreadable_stats_schema();
+        let (provider, catalog, temp_dir) = create_reopenable_append_table(
+            "stats_unreadable_partial_count",
+            Arc::clone(&schema),
+            false,
+            Arc::clone(&runtime_env),
+        )
+        .await;
+        let table_id = provider.table_metadata.table_id.clone();
+
+        // Baseline: a persisted, exact count describing every row written.
+        let ctx = SessionContext::new();
+        insert_batch_with_context(
+            &ctx,
+            &provider,
+            make_listing_parity_batch(Arc::clone(&schema), 0, BASELINE_ROWS),
+        )
+        .await;
+        provider
+            .flush_pending_maintenance()
+            .await
+            .expect("persist the baseline statistics");
+        let baseline = catalog
+            .get_table_statistics(&table_id)
+            .await
+            .expect("baseline stats query")
+            .expect("baseline stats row present");
+        assert_eq!(
+            baseline.num_rows,
+            i64::try_from(BASELINE_ROWS).expect("row count fits in i64"),
+            "precondition: the baseline count describes every row written"
+        );
+        assert!(
+            baseline.num_rows_exact,
+            "precondition: a pure-append table's maintained count starts exact"
+        );
+
+        make_table_statistics_unreadable(temp_dir.path(), &table_id);
+
+        // Reopen: the in-memory `raw` blob starts cold, which is the only state
+        // that reaches the catalog read on the next write (#13010's reachability).
+        drop(provider);
+        let reopened =
+            CayenneTableProviderBuilder::new(Arc::clone(&catalog), Arc::clone(&runtime_env))
+                .open("stats_unreadable_partial_count")
+                .await
+                .expect("reopen over an unreadable statistics record");
+
+        insert_batch_with_context(
+            &ctx,
+            &reopened,
+            make_listing_parity_batch(
+                Arc::clone(&schema),
+                i64::try_from(BASELINE_ROWS).expect("row count fits in i64"),
+                SECOND_WRITE_ROWS,
+            ),
+        )
+        .await;
+        reopened
+            .flush_pending_maintenance()
+            .await
+            .expect("the maintenance pass must succeed even when it abandons the stats update");
+
+        // State first, so a regression names the harm rather than the mechanism.
+        let (durable_rows, durable_exact, blob_left_alone) =
+            read_durable_stats_row(temp_dir.path(), &table_id);
+        assert_eq!(
+            durable_rows,
+            i64::try_from(BASELINE_ROWS).expect("row count fits in i64"),
+            "a failed statistics read must leave the durable count alone; rewriting it to this \
+             write's {SECOND_WRITE_ROWS} rows publishes a partial count as the table's total"
+        );
+        assert!(
+            durable_exact,
+            "the untouched record keeps its own exactness; the fix must not rewrite it at all"
+        );
+        assert!(
+            blob_left_alone,
+            "the aggregate blob must be left as-is: merging without a baseline would replace the \
+             accumulated min/max and NDV with this single write's"
+        );
+
+        // Only the statistics update was abandoned. The abandoned delta stays
+        // outstanding, and that is what holds the served count at `Inexact`.
+        assert!(
+            reopened
+                .post_write_maintenance
+                .has_unapplied_live_rows_delta(),
+            "an abandoned statistics update must leave its live-rows delta outstanding, which is \
+             what stops the count being served Exact over the gap"
+        );
+        assert!(
+            reopened
+                .optimizer_table_statistics()
+                .is_none_or(|stats| !matches!(
+                    stats.num_rows,
+                    datafusion_common::stats::Precision::Exact(_)
+                )),
+            "no Exact row count may be served while a statistics update is outstanding"
+        );
+    }
+
+    /// Regression for #13010, open-time half: a statistics record that cannot be
+    /// read must not leave the maintained count flagged exact.
+    ///
+    /// On its own this is masked — the same failure also leaves `optimizer`
+    /// unset, so nothing is served from it — but it is what establishes
+    /// `count_exact = true` over a cold `raw` blob, which is the precondition the
+    /// durable rewrite above needs.
+    #[tokio::test]
+    async fn reopening_over_an_unreadable_stats_record_does_not_trust_the_count_as_exact() {
+        let runtime_env = SessionContext::new().runtime_env();
+        let schema = unreadable_stats_schema();
+        let (provider, catalog, temp_dir) = create_reopenable_append_table(
+            "stats_unreadable_open_exactness",
+            Arc::clone(&schema),
+            false,
+            Arc::clone(&runtime_env),
+        )
+        .await;
+        let table_id = provider.table_metadata.table_id.clone();
+
+        let ctx = SessionContext::new();
+        insert_batch_with_context(
+            &ctx,
+            &provider,
+            make_listing_parity_batch(Arc::clone(&schema), 0, 16),
+        )
+        .await;
+        provider
+            .flush_pending_maintenance()
+            .await
+            .expect("persist the baseline statistics");
+        drop(provider);
+
+        // Control: with the record intact, a reopen still trusts the persisted
+        // exactness — proving the fixture reaches this gate, and that the fix
+        // narrows the trust rather than removing it.
+        let intact =
+            CayenneTableProviderBuilder::new(Arc::clone(&catalog), Arc::clone(&runtime_env))
+                .open("stats_unreadable_open_exactness")
+                .await
+                .expect("reopen over an intact statistics record");
+        assert!(
+            intact.table_statistics.read().count_exact,
+            "control: a readable exact record must still reopen as exact"
+        );
+        drop(intact);
+
+        make_table_statistics_unreadable(temp_dir.path(), &table_id);
+
+        let reopened =
+            CayenneTableProviderBuilder::new(Arc::clone(&catalog), Arc::clone(&runtime_env))
+                .open("stats_unreadable_open_exactness")
+                .await
+                .expect("reopen over an unreadable statistics record");
+        assert!(
+            !reopened.table_statistics.read().count_exact,
+            "a statistics record that could not be read says nothing about the count, so it must \
+             not reopen flagged exact"
+        );
     }
 
     /// Phase 5: a table whose live snapshot has on-disk data files but NO
