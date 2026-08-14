@@ -3277,6 +3277,7 @@ version = "2.2.0-unstable"
 dependencies = [
  "ahash 0.8.12",
  "arrow",
+ "arrow_tools",
  "async-compression",
  "async-openai",
  "async-stream",
