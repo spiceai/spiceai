@@ -1806,7 +1806,7 @@ impl DataFusion {
                         total_memory,
                         pool_used,
                         compaction_used,
-                        crate::accelerator_memory_budget::duckdb_total_reservation_bytes(),
+                        accelerator_memory_budget::duckdb_total_reservation_bytes(),
                     )
                     .min(ceiling);
                     cayenne::update_global_mem_tier_total(dynamic);

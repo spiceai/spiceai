@@ -163,6 +163,7 @@ connector-postgres-common = "shared-utility"
 
 # --- foundation: near-dependency-free utilities + config/platform primitives.
 # (crates/ libraries whose full normal-dep closure stays within foundation.)
+accelerator-memory-budget = "foundation"
 ansi_colors = "foundation"
 arrow_tools = "foundation"
 aws-sdk-credential-bridge = "foundation"

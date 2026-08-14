@@ -805,7 +805,7 @@ impl DataFusionBuilder {
         let mem_tier_budget_bytes = cayenne_cdc_active.then(|| {
             let total_memory = crate::resource_monitor::get_total_memory();
             let external_reservation_bytes =
-                crate::accelerator_memory_budget::duckdb_total_reservation_bytes();
+                accelerator_memory_budget::duckdb_total_reservation_bytes();
             let budget = coordinated_mem_tier_budget(
                 total_memory,
                 query_memory_pool_bytes,

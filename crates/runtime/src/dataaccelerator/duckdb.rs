@@ -991,7 +991,7 @@ impl DataAccelerator for DuckDBAccelerator {
         // auto-capping an un-limited sibling there would clobber the explicit value.
         if !cmd.options.contains_key("memory_limit")
             && let Some(auto_limit) =
-                crate::accelerator_memory_budget::duckdb_auto_memory_limit_option()
+                accelerator_memory_budget::duckdb_auto_memory_limit_option()
         {
             let has_explicit_sibling = match source {
                 Some(src) => self.instance_has_explicit_limit_sibling(src).await,

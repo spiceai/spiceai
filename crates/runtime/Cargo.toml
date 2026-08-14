@@ -9,6 +9,7 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+accelerator-memory-budget = { path = "../accelerator-memory-budget" }
 cpu-budget = { path = "../cpu-budget" }
 runtime-udfs-api = { path = "../runtime-udfs-api" }
 adbc_core = { workspace = true, optional = true }

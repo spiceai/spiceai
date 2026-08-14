@@ -1,0 +1,14 @@
+[package]
+description = "Cgroup-aware coordinated memory budget for DuckDB accelerators and the DataFusion query pool"
+edition.workspace = true
+homepage.workspace = true
+license-file.workspace = true
+name = "accelerator-memory-budget"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true
