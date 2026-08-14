@@ -1840,41 +1840,7 @@
       "fieldConfig": {
         "defaults": {
           "color": {
-            "fixedColor": "green",
-            "mode": "fixed"
-          },
-          "custom": {
-            "axisBorderShow": false,
-            "axisCenteredZero": false,
-            "axisColorMode": "text",
-            "axisLabel": "",
-            "axisPlacement": "auto",
-            "barAlignment": 0,
-            "barWidthFactor": 0.6,
-            "drawStyle": "line",
-            "fillOpacity": 10,
-            "gradientMode": "none",
-            "hideFrom": {
-              "legend": false,
-              "tooltip": false,
-              "viz": false
-            },
-            "insertNulls": false,
-            "lineInterpolation": "smooth",
-            "lineWidth": 2,
-            "pointSize": 5,
-            "scaleDistribution": {
-              "type": "linear"
-            },
-            "showPoints": "never",
-            "spanNulls": false,
-            "stacking": {
-              "group": "A",
-              "mode": "none"
-            },
-            "thresholdsStyle": {
-              "mode": "off"
-            }
+            "mode": "thresholds"
           },
           "mappings": [],
           "max": 100,
@@ -1883,8 +1849,16 @@
             "mode": "absolute",
             "steps": [
               {
-                "color": "green",
+                "color": "red",
                 "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 50
+              },
+              {
+                "color": "green",
+                "value": 80
               }
             ]
           },
@@ -1900,18 +1874,21 @@
       },
       "id": 401,
       "options": {
-        "legend": {
+        "minVizHeight": 75,
+        "minVizWidth": 75,
+        "orientation": "auto",
+        "reduceOptions": {
           "calcs": [
-            "mean",
             "lastNotNull"
           ],
-          "displayMode": "table",
-          "placement": "bottom",
-          "showLegend": true
+          "fields": "",
+          "values": false
         },
-        "tooltip": {
-          "mode": "single",
-          "sort": "none"
+        "showThresholdLabels": false,
+        "showThresholdMarkers": true,
+        "sizing": "auto",
+        "text": {
+          "titleSize": 9
         }
       },
       "pluginVersion": "11.3.1",
@@ -1922,15 +1899,14 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "100 * sum(increase(results_cache_hits{instance=~\"($instances)\"}[$__rate_interval])) / sum(increase(results_cache_requests{instance=~\"($instances)\"}[$__rate_interval]))",
-          "legendFormat": "Hit rate",
+          "expr": "avg(results_cache_hit_ratio{instance=~\"($instances)\"}) * 100",
+          "legendFormat": "__auto",
           "range": true,
           "refId": "A"
         }
       ],
       "title": "Cache Hit Rate",
-      "type": "timeseries",
-      "description": "Share of results-cache lookups served from the cache in each interval, computed from the results_cache_hits and results_cache_requests counters. Unlike the lifetime results_cache_hit_ratio gauge, this reflects the selected time range."
+      "type": "gauge"
     },
     {
       "datasource": {
@@ -1940,7 +1916,8 @@
       "fieldConfig": {
         "defaults": {
           "color": {
-            "mode": "palette-classic"
+            "fixedColor": "dark-green",
+            "mode": "fixed"
           },
           "custom": {
             "axisBorderShow": false,
@@ -1969,7 +1946,7 @@
             "spanNulls": false,
             "stacking": {
               "group": "A",
-              "mode": "normal"
+              "mode": "percent"
             },
             "thresholdsStyle": {
               "mode": "off"
@@ -1977,7 +1954,7 @@
           },
           "mappings": [],
           "thresholds": {
-            "mode": "absolute",
+            "mode": "percentage",
             "steps": [
               {
                 "color": "green",
@@ -1985,13 +1962,13 @@
               }
             ]
           },
-          "unit": "short"
+          "unit": "percent"
         },
         "overrides": [
           {
             "matcher": {
               "id": "byName",
-              "options": "Misses"
+              "options": "Miss"
             },
             "properties": [
               {
@@ -2014,10 +1991,8 @@
       "id": 402,
       "options": {
         "legend": {
-          "calcs": [
-            "sum"
-          ],
-          "displayMode": "table",
+          "calcs": [],
+          "displayMode": "list",
           "placement": "bottom",
           "showLegend": true
         },
@@ -2034,8 +2009,8 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "sum(increase(results_cache_hits{instance=~\"($instances)\"}[$__rate_interval]))",
-          "legendFormat": "Hits",
+          "expr": "100 * sum(increase(results_cache_hits{instance=~\"($instances)\"}[$__rate_interval])) / sum(increase(results_cache_requests{instance=~\"($instances)\"}[$__rate_interval]))",
+          "legendFormat": "Hit",
           "range": true,
           "refId": "A"
         },
@@ -2045,15 +2020,14 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "sum(increase(results_cache_misses{instance=~\"($instances)\"}[$__rate_interval]))",
-          "legendFormat": "Misses",
+          "expr": "100 * (1 - sum(increase(results_cache_hits{instance=~\"($instances)\"}[$__rate_interval])) / sum(increase(results_cache_requests{instance=~\"($instances)\"}[$__rate_interval])))",
+          "legendFormat": "Miss",
           "range": true,
           "refId": "B"
         }
       ],
-      "title": "Cache Hits and Misses",
-      "type": "timeseries",
-      "description": "Results-cache lookups per interval, split into hits and misses. Stacked, the two add up to every lookup the cache served."
+      "title": "Cache Hit/Miss Over Time",
+      "type": "timeseries"
     },
     {
       "datasource": {
@@ -2316,7 +2290,7 @@
             "spanNulls": false,
             "stacking": {
               "group": "A",
-              "mode": "normal"
+              "mode": "none"
             },
             "thresholdsStyle": {
               "mode": "off"
@@ -2334,53 +2308,7 @@
           },
           "unit": "short"
         },
-        "overrides": [
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "Over capacity (size)"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "fixedColor": "orange",
-                  "mode": "fixed"
-                }
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "Expired (TTL)"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "fixedColor": "text",
-                  "mode": "fixed"
-                }
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "Invalidated (refresh/DML)"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "fixedColor": "blue",
-                  "mode": "fixed"
-                }
-              }
-            ]
-          }
-        ]
+        "overrides": []
       },
       "gridPos": {
         "h": 6,
@@ -2396,7 +2324,7 @@
           ],
           "displayMode": "table",
           "placement": "bottom",
-          "showLegend": true
+          "showLegend": false
         },
         "tooltip": {
           "mode": "multi",
@@ -2411,37 +2339,14 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "sum(increase(results_cache_evictions{instance=~\"($instances)\", reason=\"size\"}[$__rate_interval]))",
-          "legendFormat": "Over capacity (size)",
+          "expr": "sum(increase(results_cache_evictions{instance=~\"($instances)\"}[$__rate_interval]))",
+          "legendFormat": "Evictions",
           "range": true,
           "refId": "A"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
-          },
-          "editorMode": "code",
-          "expr": "sum(increase(results_cache_evictions{instance=~\"($instances)\", reason=\"expired\"}[$__rate_interval]))",
-          "legendFormat": "Expired (TTL)",
-          "range": true,
-          "refId": "B"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
-          },
-          "editorMode": "code",
-          "expr": "sum(increase(results_cache_evictions{instance=~\"($instances)\", reason=\"invalidated\"}[$__rate_interval]))",
-          "legendFormat": "Invalidated (refresh/DML)",
-          "range": true,
-          "refId": "C"
         }
       ],
-      "title": "Cache Evictions by Reason",
-      "type": "timeseries",
-      "description": "Entries removed from the results cache per interval. On an accelerated dataset with a periodic refresh, invalidation is usually the dominant reason; size and expiry are the ones that indicate cache pressure."
+      "title": "Cache Evictions",
+      "type": "timeseries"
     },
     {
       "datasource": {
