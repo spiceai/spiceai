@@ -1365,6 +1365,14 @@ mod tests {
     /// # Errors
     ///
     /// Returns an error if there are I/O errors while reading lines.
+    /// Drive `ArrayToNdjson` over a whole body and split the NDJSON it
+    /// produces into lines.
+    fn ndjson_lines(body: &[u8]) -> io::Result<Vec<String>> {
+        let mut out = String::new();
+        ArrayToNdjson::try_new(Cursor::new(body.to_vec()))?.read_to_string(&mut out)?;
+        Ok(out.lines().map(ToOwned::to_owned).collect())
+    }
+
     fn read_all_lines<R: BufRead>(mut reader: R) -> io::Result<Vec<String>> {
         let mut lines = Vec::new();
         let mut line = String::new();
@@ -4262,14 +4270,6 @@ mod tests {
     mod bare_scalar_elements {
         use super::*;
 
-        /// Drive `ArrayToNdjson` over a whole body and split the NDJSON it
-        /// produces into lines.
-        fn ndjson_lines(body: &[u8]) -> io::Result<Vec<String>> {
-            let mut out = String::new();
-            ArrayToNdjson::try_new(Cursor::new(body.to_vec()))?.read_to_string(&mut out)?;
-            Ok(out.lines().map(ToOwned::to_owned).collect())
-        }
-
         #[test]
         fn each_scalar_kind_reads_as_one_element() {
             for (body, want) in [
@@ -4494,14 +4494,6 @@ mod tests {
     /// the other rejects is a disagreement about what the file contains.
     mod pull_trailing_content {
         use super::*;
-
-        /// Drive `ArrayToNdjson` over a whole body and split what it produces
-        /// into lines.
-        fn ndjson_lines(body: &[u8]) -> io::Result<Vec<String>> {
-            let mut out = String::new();
-            ArrayToNdjson::try_new(Cursor::new(body.to_vec()))?.read_to_string(&mut out)?;
-            Ok(out.lines().map(ToOwned::to_owned).collect())
-        }
 
         #[test]
         fn trailing_content_after_the_closing_bracket_is_reported() {
