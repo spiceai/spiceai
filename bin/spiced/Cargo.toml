@@ -52,6 +52,7 @@ connector-spiceai = { path = "../../crates/data-connectors/connector-spiceai" }
 cpu-budget = { path = "../../crates/cpu-budget" }
 crash-handler.workspace = true
 event_stream = { path = "../../crates/event_stream" }
+podswatcher = { path = "../../crates/podswatcher" }
 repl = { path = "../../crates/repl" }
 futures.workspace = true
 libc = "0.2"

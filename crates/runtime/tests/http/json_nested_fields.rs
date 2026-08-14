@@ -36,7 +36,7 @@ use futures::TryStreamExt;
 use runtime::Runtime;
 use runtime::auth::EndpointAuth;
 use runtime::config::Config;
-use runtime::podswatcher::PodsWatcher;
+use podswatcher::PodsWatcher;
 use tokio::net::TcpListener;
 
 use crate::utils::{

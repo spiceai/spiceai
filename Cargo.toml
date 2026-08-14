@@ -34,6 +34,7 @@ members = [
     "crates/ns_lookup",
     "crates/object_store_occ",
     "crates/otel-arrow",
+    "crates/podswatcher",
     "crates/cayenne",
     "crates/runtime-object-store",
     "crates/package",

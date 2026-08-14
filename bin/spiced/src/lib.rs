@@ -107,7 +107,7 @@ use runtime::cluster::ResolvedClusterConfig;
 use runtime::config::ClusterRole;
 use runtime::config::Config as RuntimeConfig;
 use runtime::datafusion::DataFusion;
-use runtime::podswatcher::PodsWatcher;
+use podswatcher::PodsWatcher;
 use runtime::spice_metrics;
 use runtime::{Runtime, auth::EndpointAuth, extension::ExtensionFactory};
 use runtime_async::ManagedTokioRuntime;

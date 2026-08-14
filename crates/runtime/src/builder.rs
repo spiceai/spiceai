@@ -38,7 +38,6 @@ use crate::{
     datasets_health_monitor::DatasetsHealthMonitor,
     extension::{Extension, ExtensionFactory},
     flight::RateLimits,
-    podswatcher,
     secrets::{self, Secrets},
     status, tracers,
 };

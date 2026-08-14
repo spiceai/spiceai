@@ -132,7 +132,6 @@ pub mod resource_monitor {
 // layering guard cannot see a path that hides inside a legal crate-level edge.
 pub(crate) use runtime_parameters as parameters;
 
-pub mod podswatcher;
 pub mod request;
 mod scheduling;
 pub(crate) use runtime_component::schema_evolution;
