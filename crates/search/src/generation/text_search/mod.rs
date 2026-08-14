@@ -11,7 +11,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 use std::{
-    cmp::min,
     collections::{HashMap, HashSet},
     sync::Arc,
 };
@@ -517,64 +516,57 @@ fn make_stream(
     limit: usize,
 ) -> impl Stream<Item = std::result::Result<RecordBatch, DataFusionError>> {
     stream! {
+        if limit == 0 {
+            return;
+        }
+
         // Share the searcher into the blocking task that runs the synchronous
         // tantivy search (mmap/disk reads + scoring + stored-field decode) off
         // the async runtime thread (which also serves `/health`, `/v1/search`).
         let fts = std::sync::Arc::new(fts);
-        let mut remaining_limit = limit;
-        let mut offset = 0;
-        while remaining_limit > 0 {
-            let page_size = min(remaining_limit, DEFAULT_BATCH_SIZE);
-            let hits = {
-                let fts = std::sync::Arc::clone(&fts);
-                let query = query.clone();
-                match tokio::task::spawn_blocking(move || {
-                    fts.search_query_literal(query.as_str(), page_size, offset)
-                })
-                .await
-                {
-                    Ok(Ok(h)) => h,
-                    Ok(Err(e)) => {
-                        yield Err(DataFusionError::Internal(e.to_string()));
-                        return;
-                    }
-                    Err(e) => {
-                        yield Err(DataFusionError::Internal(format!(
-                            "full text search task failed: {e}"
-                        )));
-                        return;
-                    }
+
+        // Collect the full result set (bounded by `limit`) in a single search.
+        // The searcher is a fixed snapshot, so paging with `TopDocs` offsets is
+        // both unnecessary and quadratic: an offset page still scores
+        // `offset + page` documents, re-scoring the whole prefix on every page.
+        let hits = {
+            let fts = std::sync::Arc::clone(&fts);
+            let query = query.clone();
+            match tokio::task::spawn_blocking(move || {
+                fts.search_query_literal(query.as_str(), limit, 0)
+            })
+            .await
+            {
+                Ok(Ok(h)) => h,
+                Ok(Err(e)) => {
+                    yield Err(DataFusionError::Internal(e.to_string()));
+                    return;
                 }
-            };
-
-            // Decrement by *actual* hits returned (not the requested page size) so
-            // we stop once the index is exhausted instead of issuing further empty
-            // queries.
-            let returned = hits.len();
-            offset += returned;
-            remaining_limit = remaining_limit.saturating_sub(returned);
-
-            if !hits.is_empty() {
-                let mut decoder = match fts.tantivy_json_to_arrow_decoder(hits.as_slice())
-                    .map_err(DataFusionError::from) {
-                        Ok(h) => h,
-                        Err(e) => {
-                            yield Err(e);
-                            return
-                        }
-                    };
-
-                match decoder.flush() {
-                    Ok(Some(rb)) => yield Ok(rb),
-                    Ok(None) => {},
-                    Err(e) => yield Err(DataFusionError::from(e))
+                Err(e) => {
+                    yield Err(DataFusionError::Internal(format!(
+                        "full text search task failed: {e}"
+                    )));
+                    return;
                 }
             }
+        };
 
-            // Index is exhausted: a partial page (or empty page) means there are
-            // no more matching documents.
-            if returned < page_size {
-                return;
+        // Emit the hits as bounded record batches so downstream consumers still
+        // receive a stream rather than one large batch.
+        for chunk in hits.chunks(DEFAULT_BATCH_SIZE) {
+            let mut decoder = match fts.tantivy_json_to_arrow_decoder(chunk)
+                .map_err(DataFusionError::from) {
+                    Ok(h) => h,
+                    Err(e) => {
+                        yield Err(e);
+                        return
+                    }
+                };
+
+            match decoder.flush() {
+                Ok(Some(rb)) => yield Ok(rb),
+                Ok(None) => {},
+                Err(e) => yield Err(DataFusionError::from(e))
             }
         }
     }
