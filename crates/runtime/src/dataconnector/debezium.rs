@@ -17,13 +17,10 @@ limitations under the License.
 use super::{ConnectorParams, DataConnector, DataConnectorFactory, ParameterSpec, Parameters};
 use crate::accelerated::refresh_task::changes::{CdcSchemaEvolution, install_cdc_schema_evolution};
 use crate::component::dataset::acceleration::{Engine, RefreshMode};
-use crate::component::dataset::{Dataset, OnSchemaChange};
-use crate::dataaccelerator::spice_sys::{self, OpenOption, debezium_kafka::DebeziumKafkaSys};
+use crate::component::dataset::{Dataset, DatasetSpec, OnSchemaChange};
+use crate::dataconnector::parameters::ConnectorContext;
 use crate::dataconnector::schema_projection::{ProjectionPolicy, parse_schema_projection};
-use crate::dataconnector::{
-    ConnectorComponent,
-    kafka::{SidecarOffsetCommitHook, SidecarOffsetStore},
-};
+use crate::dataconnector::{ConnectorComponent, kafka::SidecarOffsetCommitHook};
 use crate::datafusion::refresh_sql;
 use crate::schema_evolution::{
     SCHEMA_EVOLUTION_APPLIED, SCHEMA_EVOLUTION_DETECTED, SCHEMA_EVOLUTION_FAILED,
@@ -42,6 +39,8 @@ use data_components::schema_discovery::merge_inferred_and_declared_schemas;
 use data_connector_api::federated::FederatedTableProvider;
 use datafusion::datasource::TableProvider;
 use futures::StreamExt;
+use runtime_checkpoint_api::CheckpointError;
+use runtime_checkpoint_api::debezium::{DebeziumCheckpoint, DebeziumCheckpointStore};
 use runtime_metrics::component::MetricsProvider;
 use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
@@ -76,11 +75,25 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-#[derive(Debug)]
 pub struct Debezium {
     kafka_config: KafkaConfig,
     batching: (usize, Duration),
     schema_evolution: bool,
+    /// Retained so `read_provider` can resolve the checkpoint store over the dataset's
+    /// accelerator. `None` only in unit tests, which build params without a runtime
+    /// attached.
+    context: Option<Arc<dyn ConnectorContext>>,
+}
+
+// Hand-written because the retained `ConnectorContext` handle is not `Debug`.
+impl std::fmt::Debug for Debezium {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Debezium")
+            .field("kafka_config", &self.kafka_config)
+            .field("batching", &self.batching)
+            .field("schema_evolution", &self.schema_evolution)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Debezium {
@@ -206,7 +219,32 @@ impl Debezium {
             kafka_config,
             batching: (batch_max_size, batch_max_duration),
             schema_evolution,
+            context: None,
         })
+    }
+
+    /// Attach the runtime context the checkpoint store is resolved through.
+    ///
+    /// Separate from [`Self::new`] so unit tests can build a connector from parameters
+    /// alone, which is how they already construct one.
+    #[must_use]
+    fn with_context(mut self, context: Option<Arc<dyn ConnectorContext>>) -> Self {
+        self.context = context;
+        self
+    }
+
+    /// Resolve the checkpoint store over this dataset's accelerator.
+    async fn checkpoint_store(
+        &self,
+        dataset: &DatasetSpec,
+    ) -> Result<Arc<dyn DebeziumCheckpointStore>, CheckpointError> {
+        let context = self
+            .context
+            .as_ref()
+            .ok_or_else(|| CheckpointError::Store {
+                source: "no runtime is attached to the Debezium connector".into(),
+            })?;
+        context.debezium_checkpoint_store(dataset).await
     }
 }
 
@@ -292,7 +330,8 @@ impl DataConnectorFactory for DebeziumFactory {
         params: ConnectorParams,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
-            let debezium = Debezium::new(params.parameters)?;
+            let context = params.context.clone();
+            let debezium = Debezium::new(params.parameters)?.with_context(context);
             Ok(Arc::new(debezium) as Arc<dyn DataConnector>)
         })
     }
@@ -347,15 +386,12 @@ impl DataConnector for Debezium {
         let dataset_name = dataset.name.to_string();
 
         let debezium_kafka_sys = if dataset.is_file_accelerated() {
-            Some(Arc::new(
-                DebeziumKafkaSys::try_new(dataset, OpenOption::CreateIfNotExists)
-                    .await
-                    .boxed()
-                    .context(super::UnableToGetReadProviderSnafu {
-                        dataconnector: "debezium",
-                        connector_component: ConnectorComponent::from(dataset),
-                    })?,
-            ))
+            Some(self.checkpoint_store(dataset).await.boxed().context(
+                super::UnableToGetReadProviderSnafu {
+                    dataconnector: "debezium",
+                    connector_component: ConnectorComponent::from(dataset),
+                },
+            )?)
         } else {
             tracing::warn!(
                 dataset = %dataset_name,
@@ -602,31 +638,55 @@ pub(crate) struct DebeziumKafkaMetadata {
     pub(crate) offsets: Vec<KafkaOffset>,
 }
 
+/// The stored checkpoint, as the connector speaks it.
+///
+/// The durable form carries the change-event field descriptors as JSON; the connector
+/// wants them typed, so the two differ by exactly that conversion.
 async fn get_metadata_from_accelerator(
-    debezium_kafka_sys: &DebeziumKafkaSys,
-) -> Result<Option<DebeziumKafkaMetadata>, spice_sys::Error> {
-    debezium_kafka_sys.get().await
+    debezium_kafka_sys: &dyn DebeziumCheckpointStore,
+) -> Result<Option<DebeziumKafkaMetadata>, CheckpointError> {
+    let Some(checkpoint) = debezium_kafka_sys.get().await? else {
+        return Ok(None);
+    };
+    let schema_fields = serde_json::from_str(&checkpoint.schema_fields_json).map_err(|source| {
+        CheckpointError::Store {
+            source: Box::new(source),
+        }
+    })?;
+    Ok(Some(DebeziumKafkaMetadata {
+        consumer_group_id: checkpoint.consumer_group_id,
+        topic: checkpoint.topic,
+        primary_keys: checkpoint.primary_keys,
+        schema_fields,
+        offsets: checkpoint.offsets,
+    }))
 }
 
 async fn set_metadata_to_accelerator(
-    debezium_kafka_sys: &DebeziumKafkaSys,
+    debezium_kafka_sys: &dyn DebeziumCheckpointStore,
     metadata: &DebeziumKafkaMetadata,
-) -> Result<(), spice_sys::Error> {
-    debezium_kafka_sys.upsert(metadata).await
-}
-
-#[async_trait]
-impl SidecarOffsetStore for DebeziumKafkaSys {
-    async fn upsert_offsets(&self, offsets: &[KafkaOffset]) -> spice_sys::Result<()> {
-        DebeziumKafkaSys::upsert_offsets(self, offsets).await
-    }
+) -> Result<(), CheckpointError> {
+    let schema_fields_json = serde_json::to_string(&metadata.schema_fields).map_err(|source| {
+        CheckpointError::Store {
+            source: Box::new(source),
+        }
+    })?;
+    debezium_kafka_sys
+        .upsert(&DebeziumCheckpoint {
+            consumer_group_id: metadata.consumer_group_id.clone(),
+            topic: metadata.topic.clone(),
+            primary_keys: metadata.primary_keys.clone(),
+            schema_fields_json,
+            offsets: metadata.offsets.clone(),
+        })
+        .await
 }
 
 async fn get_metadata_from_kafka(
     dataset: &Dataset,
     topic: &str,
     kafka_config: &KafkaConfig,
-    debezium_kafka_sys: Option<&DebeziumKafkaSys>,
+    debezium_kafka_sys: Option<&dyn DebeziumCheckpointStore>,
     declared_schema: Option<&SchemaRef>,
     schema_evolution: bool,
 ) -> super::DataConnectorResult<(KafkaConsumer, DebeziumKafkaMetadata, SchemaRef)> {
@@ -863,7 +923,7 @@ async fn refresh_schema_if_evolved(
     dataset: &Dataset,
     topic: &str,
     kafka_config: &KafkaConfig,
-    debezium_kafka_sys: Option<&DebeziumKafkaSys>,
+    debezium_kafka_sys: Option<&dyn DebeziumCheckpointStore>,
     declared_schema: Option<&SchemaRef>,
     on_schema_change: OnSchemaChange,
 ) -> super::DataConnectorResult<(DebeziumKafkaMetadata, SchemaRef)> {

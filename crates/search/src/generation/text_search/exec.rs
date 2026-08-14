@@ -80,7 +80,21 @@ impl std::fmt::Debug for FullTextSearchExec {
 }
 impl DisplayAs for FullTextSearchExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut Formatter) -> std::fmt::Result {
-        write!(f, "FullTextSearchTableExec q={}", self.query)
+        write!(
+            f,
+            "FullTextSearchTableExec q={}, limit={}",
+            self.query, self.limit
+        )?;
+        if !self.filters.is_empty() {
+            let filters = self
+                .filters
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            write!(f, ", filters=[{filters}]")?;
+        }
+        Ok(())
     }
 }
 
@@ -114,10 +128,22 @@ impl ExecutionPlan for FullTextSearchExec {
         let limit = self.limit;
         let query = self.query.clone();
 
+        // Translate the pushed-down SQL filters into tantivy queries up front (cheap, sync). Any
+        // filter that fails to translate was advertised as pushable by `supports_filters_pushdown`
+        // but cannot be built — a lockstep bug — so fail the scan rather than silently drop it.
+        let filter_queries = match idx.translate_filters(&self.filters) {
+            Ok(queries) => queries,
+            Err(e) => {
+                return Ok(Box::pin(RecordBatchStreamAdapter::new(
+                    self.schema(),
+                    futures::stream::once(async move { Err(e) }),
+                )));
+            }
+        };
+
         let s = stream! {
-          // TODO: Support filters.
             match idx
-                .search(query, &[], limit)
+                .search(query, filter_queries, limit)
                 .map_err(|e| DataFusionError::Plan(format!("Failed to prepare full text search: {e}"))) {
                 Ok(mut stream) => {
                     while let Some(item) = stream.next().await {

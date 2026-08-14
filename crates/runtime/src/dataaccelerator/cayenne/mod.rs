@@ -347,6 +347,12 @@ pub fn register_cayenne_telemetry() {
     use opentelemetry::global;
     let meter = global::meter("cayenne");
 
+    // Process-wide Vortex segment cache: fill vs capacity, entries, and the
+    // access/hit counters. Registered here rather than where the cache is
+    // installed, because the cache must exist before any table is registered —
+    // well before the real meter provider replaces the startup noop one.
+    vortex_datafusion::register_segment_cache_metrics();
+
     // --- Process-global encode-concurrency budget ---
     let _ = meter
         .u64_observable_gauge("cayenne_encode_permits_available")
@@ -1331,13 +1337,20 @@ impl CayenneAccelerator {
                 config.cdc_mem_tier_min_flush_bytes = tier_caps.min_flush_bytes;
             }
 
-            // Vortex segment cache: memory-aware `auto` default (scales up on
-            // memory-rich hosts, never below the historical 256 MiB), overridable.
-            config.segment_cache_mb = autotune::auto_or_usize(
-                acceleration,
-                &["cayenne_segment_cache_mb"],
-                hw.segment_cache_mb(),
-            );
+            // Vortex segment cache: one cache serves every table, so its budget is
+            // set once at the runtime level and a per-table value has nothing to
+            // size. This memory-aware default only reaches a process with no
+            // installed cache (an embedded host that skips the runtime builder).
+            config.segment_cache_mb = hw.segment_cache_mb();
+            // Report on the key being *present*, not on it parsing: `read_knob`
+            // folds `auto` and malformed values alike into `Knob::Auto`, so
+            // matching on `Set` would leave those operators unaware their setting
+            // no longer does anything.
+            if let Some(requested_mb) = acceleration.params.get("cayenne_segment_cache_mb") {
+                tracing::warn!(
+                    "Dataset {table_name}: acceleration.params.cayenne_segment_cache_mb={requested_mb} is ignored. The Vortex segment cache is now a single budget shared by every table instead of one cache per table, so a per-table size has nothing to size. To control it, set runtime.params.cayenne_segment_cache_mb (in MB; 0 disables caching). See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+                );
+            }
 
             // PK keyset cache: `auto`/unset → memory-derived default; 0 → warn +
             // minimum 1 MiB (mirroring upload_concurrency); else the operator value.
@@ -2028,8 +2041,7 @@ impl CayenneAccelerator {
                     inferred_schema_present = workload.inferred_metadata.is_present(),
                     has_primary_key = workload.has_primary_key,
                     is_upsert = workload.is_upsert,
-                    "Cayenne auto-tuned config: segment_cache={}MB, pk_keyset_cache={:?}MB, target_file_size={}MB, upload_concurrency={}, write_concurrency_override={:?}, sort_columns={:?}, compression_strategy={:?}, delta_encoding={}, pk_conflict_detection={}, deletion_mode={:?}, compaction_trigger_files={}, compaction_trigger_protected_snapshots={}, compaction_trigger_snapshot_age_ms={}, compaction_max_levels={}, compaction_max_files_per_pick={}, compaction_background_interval_ms={}, inline_max_rows={}, inline_max_bytes={}, inline_max_buffer_bytes={}, inline_flush_max_rows={}, inline_flush_max_segments={}, inline_flush_max_bytes={}, cdc_durability={}, cdc_mem_tier_max_bytes={}, cdc_mem_tier_min_flush_bytes={}",
-                    config.segment_cache_mb,
+                    "Cayenne auto-tuned config: pk_keyset_cache={:?}MB, target_file_size={}MB, upload_concurrency={}, write_concurrency_override={:?}, sort_columns={:?}, compression_strategy={:?}, delta_encoding={}, pk_conflict_detection={}, deletion_mode={:?}, compaction_trigger_files={}, compaction_trigger_protected_snapshots={}, compaction_trigger_snapshot_age_ms={}, compaction_max_levels={}, compaction_max_files_per_pick={}, compaction_background_interval_ms={}, inline_max_rows={}, inline_max_bytes={}, inline_max_buffer_bytes={}, inline_flush_max_rows={}, inline_flush_max_segments={}, inline_flush_max_bytes={}, cdc_durability={}, cdc_mem_tier_max_bytes={}, cdc_mem_tier_min_flush_bytes={}",
                     config.pk_keyset_cache_mb,
                     config.target_vortex_file_size_mb,
                     config.upload_concurrency,
@@ -2690,8 +2702,7 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
             .one_of(&["string", "error", "ignore", "warn"])
             .default("string"),
         ParameterSpec::component("segment_cache_mb")
-            .description("Size of the in-memory Vortex decompressed-segment cache in MB. 'auto' (default, or when unset) scales with machine memory (~1/128 of RAM) but never below 256 MB and never above 1024 MB. Set an explicit MB value to override.")
-            .default("auto"),
+            .description("Ignored: the in-memory Vortex segment cache is now one budget shared by every Cayenne table rather than a cache per table, so a per-table size no longer has anything to size. Set runtime.params.cayenne_segment_cache_mb instead (unset: ~1/64 of the available memory, clamped to [256 MB, 2048 MB]; 0 disables caching). A value set here is reported at startup and otherwise has no effect."),
         ParameterSpec::component("scan_concurrency")
             .description("How many splits a single Vortex file scan decodes concurrently. 'auto' (default) derives it from the query fan-out and the number of files a scan plans, so a table held in few files still decodes in parallel. 'off' decodes each file serially. An explicit count pins it. Each concurrent split holds a decoded batch, and all of them are charged to 'runtime.query.memory_limit', so lowering this cuts a scan's resident decode memory without shrinking query parallelism everywhere the way 'runtime.query.target_partitions' does.")
             .default("auto"),
@@ -2849,6 +2860,10 @@ impl DataAccelerator for CayenneAccelerator {
 
     fn name(&self) -> &'static str {
         "cayenne"
+    }
+
+    fn type_rewrite_rules(&self) -> arrow_tools::type_rewrite::TypeRewriteRules {
+        cayenne::CAYENNE_TYPE_REWRITE_RULES
     }
 
     fn valid_file_extensions(&self) -> Vec<&'static str> {
