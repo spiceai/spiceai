@@ -1715,13 +1715,19 @@ fn produced_artifact<'a>(entry_name: &'a str, prefix: &str) -> Option<(&'a str, 
         .and_then(|rest| rest.rsplit_once('.'))?;
     let produced = if extension.eq_ignore_ascii_case("tmp") || extension.eq_ignore_ascii_case("bak")
     {
-        // `atomic_write_owner_only` and `promote_temp` name theirs with a v4 UUID.
-        uuid::Uuid::parse_str(token).is_ok()
+        // `atomic_write_owner_only` and `promote_temp` write `Uuid::new_v4()`,
+        // whose `Display` is lowercase hyphenated. Round-tripping rejects the
+        // spellings `parse_str` also accepts — braced, URN, unhyphenated — and the
+        // version check rejects a UUID this code could not have generated.
+        uuid::Uuid::parse_str(token)
+            .is_ok_and(|id| id.get_version_num() == 4 && id.hyphenated().to_string() == token)
     } else if extension.eq_ignore_ascii_case("candidate") {
-        // `spice connect`'s writer uses a decimal u64.
-        !token.is_empty()
-            && token.bytes().all(|byte| byte.is_ascii_digit())
-            && token.parse::<u64>().is_ok()
+        // `spice connect`'s writer formats `rand::random::<u64>()`, so the digits
+        // have to be exactly what `u64::to_string` produces: no sign, no leading
+        // zeros, `0` itself allowed.
+        token
+            .parse::<u64>()
+            .is_ok_and(|number| number.to_string() == token)
     } else {
         false
     };

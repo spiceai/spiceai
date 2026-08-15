@@ -48,7 +48,7 @@ limitations under the License.
 //! driver stays connected with the still-valid identity rather than
 //! falsely reporting the instance as released.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -61,6 +61,8 @@ use tonic::Streaming;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint};
 
 use crate::config::CloudConnectConfig;
+use snafu::Snafu;
+
 use crate::draft::{EnrollmentDraft, EnrollmentTransactionLock};
 use crate::enroll::EnrollClient;
 use crate::handlers::{
@@ -1421,13 +1423,19 @@ impl ClientDriver {
     /// that did not finish, or a `.candidate` from a `spice connect` that did
     /// not — because each holds what the canonical file held.
     ///
-    /// Only the identity is fatal. The cache, the draft, the journals, the
-    /// endpoint override and any write debris are each named in `retained` and
-    /// logged but do not stop the removal, because the alternative — aborting
-    /// with the identity intact — leaves a live credential on an instance the
-    /// control plane has already released, which is worse than leaving a file
-    /// behind. This is the one place the ordering differs from the local command,
+    /// A canonical file that cannot be removed does not stop the release: it is
+    /// named in `retained` and logged, because aborting with the identity intact
+    /// leaves a live credential on an instance the control plane has already
+    /// released, which is worse than leaving a file behind. So does a `.bak` or
+    /// `.candidate` that survives, since nothing renames one into place on its
+    /// own. This is the one place the ordering differs from the local command,
     /// which can abort and let the operator retry.
+    ///
+    /// Three things do stop it, all before the identity is cleared, so the
+    /// instance stays connected and the control plane can dispatch `Remove`
+    /// again: a lock it cannot take, a `.tmp` whose writer could still promote it
+    /// over the release, and a scan that could not finish — which cannot be told
+    /// apart from finding nothing. They are the [`ReleaseError`] variants.
     async fn handle_remove(
         &mut self,
         tx: &mpsc::Sender<proto::ClientMessage>,
@@ -1437,7 +1445,7 @@ impl ClientDriver {
         let retained = match release_local_state(&self.config, ReleasePolicy::DISPATCHED).await {
             Ok(retained) => retained,
             Err(message) => {
-                send_failed(tx, command_id, &message).await;
+                send_failed(tx, command_id, &message.to_string()).await;
                 return false;
             }
         };
@@ -1455,6 +1463,58 @@ impl ClientDriver {
         send_ok_json(tx, command_id, &result).await;
         true
     }
+}
+
+/// Why a release could not complete.
+///
+/// Every variant stops the removal with the identity still on disk, so the
+/// instance stays connected and the control plane can dispatch `Remove` again.
+/// What a release survives instead — a canonical file or an inert artifact it
+/// could not remove — is reported in `retained`, never here.
+#[derive(Snafu, Debug)]
+pub(crate) enum ReleaseError {
+    #[snafu(display("failed to take the connect mutation lock for {}: {source}", config_dir.display()))]
+    MutationLock {
+        config_dir: PathBuf,
+        source: crate::mutation_lock::Error,
+    },
+
+    #[snafu(display("failed to acquire the enrollment transaction for {}: {source}", config_dir.display()))]
+    EnrollmentTransaction {
+        config_dir: PathBuf,
+        source: crate::draft::Error,
+    },
+
+    #[snafu(display("failed to clear identity at {}: {source}", path.display()))]
+    ClearIdentity {
+        path: PathBuf,
+        source: crate::identity::Error,
+    },
+
+    /// The scan stops at its first error, so it cannot distinguish "no writer
+    /// holds a temp here" from "I could not finish looking" — and the release
+    /// treats the first as permission to delete the canonical file.
+    #[snafu(display("failed to check for interrupted writes beside {}: {source}", released.display()))]
+    ArtifactScan {
+        released: PathBuf,
+        source: std::io::Error,
+    },
+
+    /// Its writer can still rename it onto the canonical path once this release
+    /// drops its locks, undoing the removal after the control plane was told the
+    /// instance was gone.
+    #[snafu(display(
+        "an interrupted write at {} could still be published as {}",
+        artifact.display(),
+        released.display()
+    ))]
+    PromotableArtifact {
+        artifact: PathBuf,
+        released: PathBuf,
+    },
+
+    #[snafu(display("the release task stopped unexpectedly: {source}"))]
+    ReleaseTask { source: tokio::task::JoinError },
 }
 
 /// How long a cloud-dispatched `Remove` waits for the connect mutation lock:
@@ -1504,7 +1564,7 @@ impl ReleasePolicy {
 async fn release_local_state(
     config: &CloudConnectConfig,
     policy: ReleasePolicy,
-) -> std::result::Result<Vec<String>, String> {
+) -> std::result::Result<Vec<String>, ReleaseError> {
     // The OUTER lock, taken first. This is the same `connect.lock` a local
     // `spice connect` holds for its whole transaction, so it is what actually
     // excludes one: the enrollment transaction alone does not, because the
@@ -1515,15 +1575,14 @@ async fn release_local_state(
     // transaction — never the reverse.
     let mutation = MutationLock::acquire_with_timeout(&config.config_dir, "remove", policy.lock_timeout)
         .await
-        .map_err(|err| {
+        .inspect_err(|err| {
             tracing::warn!(
                 "Cloud Connect: failed to take the connect mutation lock for {} before removal: {err}; reporting Remove as failed and staying connected",
                 config.config_dir.display()
             );
-            format!(
-                "failed to take the connect mutation lock for {}: {err}",
-                config.config_dir.display()
-            )
+        })
+        .context(MutationLockSnafu {
+            config_dir: config.config_dir.clone(),
         })?;
 
     // Then the inner one: it is what a draft publication takes, so holding it
@@ -1534,15 +1593,14 @@ async fn release_local_state(
     let transaction = Arc::new(
         EnrollmentTransactionLock::try_acquire_async(&config.config_dir)
             .await
-            .map_err(|err| {
+            .inspect_err(|err| {
                 tracing::warn!(
                     "Cloud Connect: failed to acquire the enrollment transaction for {} before removal: {err}; reporting Remove as failed and staying connected",
                     config.config_dir.display()
                 );
-                format!(
-                    "failed to acquire the enrollment transaction for {}: {err}",
-                    config.config_dir.display()
-                )
+            })
+            .context(EnrollmentTransactionSnafu {
+                config_dir: config.config_dir.clone(),
             })?,
     );
     // The cache writer is excluded by the outer lock above: the only caller of
@@ -1564,7 +1622,7 @@ async fn release_local_state(
         release_local_state_locked(&config_dir, &identity_path, policy, &transaction)
     })
     .await
-    .map_err(|source| format!("the release task stopped unexpectedly: {source}"))?
+    .context(ReleaseTaskSnafu)?
 }
 
 /// The destructive half of a release, under guards its caller holds for the
@@ -1575,7 +1633,7 @@ fn release_local_state_locked(
     identity_path: &Path,
     policy: ReleasePolicy,
     transaction: &Arc<EnrollmentTransactionLock>,
-) -> std::result::Result<Vec<String>, String> {
+) -> std::result::Result<Vec<String>, ReleaseError> {
     // The identity is guarded by whichever transaction protects ITS directory.
     // `clear_with_transaction` refuses a guard whose draft path has a different
     // parent, and `identity_path` is a public field documented as only
@@ -1587,19 +1645,16 @@ fn release_local_state_locked(
     // Taken here, before anything is deleted and inside this task, because
     // deciding which guard applies resolves both directories on disk — work that
     // has no business on the driver thread.
-    let identity_transaction = match identity_transaction(identity_path, config_dir, transaction) {
-        Ok(held) => held,
-        Err(err) => {
+    let identity_transaction = identity_transaction(identity_path, config_dir, transaction)
+        .inspect_err(|err| {
             tracing::warn!(
                 "Cloud Connect: failed to acquire the enrollment transaction for the identity directory of {}: {err}; reporting Remove as failed and staying connected",
                 identity_path.display()
             );
-            return Err(format!(
-                "failed to acquire the enrollment transaction for {}: {err}",
-                identity_path.display()
-            ));
-        }
-    };
+        })
+        .context(EnrollmentTransactionSnafu {
+            config_dir: identity_path.to_path_buf(),
+        })?;
 
     // Named in the command result so the control plane and the portal learn that
     // a released host still holds something, rather than the operator
@@ -1697,10 +1752,9 @@ fn release_local_state_locked(
              identity would otherwise reconnect on restart)",
             identity_path.display()
         );
-        return Err(format!(
-            "failed to clear identity at {}: {err}",
-            identity_path.display()
-        ));
+        return Err(err).context(ClearIdentitySnafu {
+            path: identity_path.to_path_buf(),
+        });
     }
 
     Ok(retained)
@@ -1757,16 +1811,23 @@ fn remove_file_if_present(path: &Path) -> std::result::Result<(), String> {
     }
 }
 
-/// Reclaim the temp and backup files an interrupted atomic write can leave beside
-/// a released file, and name whatever is still there.
+/// Reclaim the artifacts an interrupted atomic write can leave beside a released
+/// file, and name whatever is still there.
 ///
-/// Non-fatal for the same reason the cache is: the instance is released either
-/// way, and an operator who is told a credential copy remains can remove it,
-/// where a removal that aborted over it would leave the live identity behind.
+/// Split by whether the release can still be undone, which is what decides fatal
+/// from merely reported:
+///
+/// - **Fatal**: a temp its writer may still promote onto the canonical path, and
+///   a scan that could not finish — which cannot tell that case from its absence.
+///   Both stop the removal while the identity is live, so the control plane can
+///   retry.
+/// - **Reported**: a backup or candidate that could not be removed. Nothing
+///   renames one into place on its own, so the release stands and the operator is
+///   told what remains.
 fn release_atomic_write_artifacts(
     path: &Path,
     minimum_age: Duration,
-) -> std::result::Result<Vec<String>, String> {
+) -> std::result::Result<Vec<String>, ReleaseError> {
     let released = path.display().to_string();
     let remaining = match crate::identity::release_atomic_write_artifacts(path, minimum_age) {
         Ok(remaining) => remaining,
@@ -1779,9 +1840,9 @@ fn release_atomic_write_artifacts(
             tracing::warn!(
                 "Cloud Connect: failed to reclaim interrupted-write artifacts beside {released}: {err}; reporting Remove as failed and staying connected, because an unfinished scan cannot rule out a writer that would publish over the release"
             );
-            return Err(format!(
-                "failed to check for interrupted writes beside {released}: {err}"
-            ));
+            return Err(err).context(ArtifactScanSnafu {
+                released: path.to_path_buf(),
+            });
         }
     };
 
@@ -1791,13 +1852,15 @@ fn release_atomic_write_artifacts(
     // plane has been told the instance is gone. Fail instead, while the identity
     // is still live and the dispatch can be retried.
     if let Some(promotable) = remaining.promotable.first() {
-        let promotable = promotable.display().to_string();
         tracing::warn!(
-            "Cloud Connect: {promotable} is still owned by a writer that could publish it as {released}; reporting Remove as failed and staying connected so the control plane can retry"
+            "Cloud Connect: {} is still owned by a writer that could publish it as {released}; reporting Remove as failed and staying connected so the control plane can retry",
+            promotable.display()
         );
-        return Err(format!(
-            "an interrupted write at {promotable} could still be published as {released}"
-        ));
+        return PromotableArtifactSnafu {
+            artifact: promotable.clone(),
+            released: path.to_path_buf(),
+        }
+        .fail();
     }
 
     Ok(remaining
@@ -2500,7 +2563,8 @@ mod tests {
     /// behind, and in particular no secrets whose key it just destroyed.
     mod removal {
         use super::super::{
-            EnrollmentTransactionLock, MutationLock, ReleasePolicy, release_local_state,
+            EnrollmentTransactionLock, MutationLock, ReleaseError, ReleasePolicy,
+            release_local_state,
         };
         use crate::config::CloudConnectConfig;
         use crate::draft::EnrollmentDraft;
@@ -2555,7 +2619,7 @@ mod tests {
                 self.config.config_dir.join(file)
             }
 
-            async fn release(&self) -> std::result::Result<Vec<String>, String> {
+            async fn release(&self) -> std::result::Result<Vec<String>, ReleaseError> {
                 release_local_state(&self.config, Self::policy()).await
             }
 
@@ -2646,8 +2710,9 @@ mod tests {
                 },
             )
             .await;
-            let message =
-                contended.expect_err("a release must not run while a local connect holds it");
+            let message = contended
+                .expect_err("a release must not run while a local connect holds it")
+                .to_string();
             assert!(
                 message.contains("connect mutation lock"),
                 "the failure must name the lock it could not take, got {message}"
@@ -2690,7 +2755,8 @@ mod tests {
 
             let message = release_local_state(&config, Host::policy())
                 .await
-                .expect_err("a removal that cannot lock the identity must fail");
+                .expect_err("a removal that cannot lock the identity must fail")
+                .to_string();
 
             assert!(
                 message.contains(&config.identity_path.display().to_string()),
@@ -2754,7 +2820,8 @@ mod tests {
             let message = host
                 .release()
                 .await
-                .expect_err("a temp that could still be published must fail the removal");
+                .expect_err("a temp that could still be published must fail the removal")
+                .to_string();
 
             assert!(
                 message.contains("66666666-7777-4888-8999-aaaaaaaaaaaa"),
@@ -2793,7 +2860,8 @@ mod tests {
             let message = host
                 .release()
                 .await
-                .expect_err("an unfinished scan must fail the removal");
+                .expect_err("an unfinished scan must fail the removal")
+                .to_string();
 
             assert!(
                 message.contains("failed to check for interrupted writes"),
@@ -2863,6 +2931,42 @@ mod tests {
                 "and the canonical identity is gone, which is what makes the backup an orphan"
             );
             assert!(retained.is_empty(), "nothing should be left: {retained:?}");
+        }
+
+        /// The spellings `Uuid::parse_str` and `u64::from_str` accept but these
+        /// writers never produce. A file named with a v1 UUID, a braced one, or a
+        /// zero-padded number came from somewhere else.
+        #[tokio::test]
+        async fn it_leaves_alone_names_its_writers_would_not_produce() {
+            let host = Host::enrolled();
+            let strays = [
+                // v1, not v4.
+                format!(".{SECRET_CACHE_FILE}.11111111-2222-1333-8444-555555555555.bak"),
+                // v4, but braced rather than plain hyphenated.
+                format!(".{SECRET_CACHE_FILE}.{{11111111-2222-4333-8444-555555555555}}.bak"),
+                // A number, but not one `u64::to_string` would write.
+                format!(
+                    ".{}.007.candidate",
+                    CloudConnectConfig::ENDPOINT_OVERRIDE_FILE
+                ),
+            ];
+            for stray in &strays {
+                std::fs::write(host.config.config_dir.join(stray), "someone's own file")
+                    .expect("write the stray");
+            }
+
+            let retained = host
+                .release()
+                .await
+                .expect("a stray must not fail the removal");
+
+            for stray in &strays {
+                assert!(
+                    host.config.config_dir.join(stray).exists(),
+                    "{stray} is not a name this code writes and must survive the release"
+                );
+            }
+            assert!(retained.is_empty(), "{retained:?}");
         }
 
         /// A sibling somebody named themselves is not this code's to touch, even
@@ -3071,7 +3175,8 @@ mod tests {
             let message = host
                 .release()
                 .await
-                .expect_err("an identity left on disk must fail the removal");
+                .expect_err("an identity left on disk must fail the removal")
+                .to_string();
 
             assert!(message.contains("failed to clear identity"), "{message}");
             for (label, path) in [
