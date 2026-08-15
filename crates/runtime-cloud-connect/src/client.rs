@@ -1572,12 +1572,10 @@ async fn release_local_state(
         }
     };
 
-    // Nothing here excludes the cache writer, and nothing needs to: the only
-    // caller of `secret_cache::write` is the deployment handler, and the control
-    // stream awaits each command inline, so a delivery and this release are
-    // dispatched one after the other and never overlap. A handler that were ever
-    // spawned instead would break that, and would need the writer to take the
-    // mutation lock this release already holds.
+    // The cache writer is excluded by the outer lock above: the only caller of
+    // `secret_cache::write` takes that same lock and reads the cache key under
+    // it, so it cannot be mid-write here and cannot publish a cache afterwards
+    // with a key this release destroyed.
     let cache_path = config
         .config_dir
         .join(crate::secret_cache::SECRET_CACHE_FILE);
@@ -1747,21 +1745,26 @@ async fn release_atomic_write_artifacts(
 
     let remaining = match outcome {
         Ok(Ok(remaining)) => remaining,
+        // Fatal for the same reason a promotable temp is. The scan stops at the
+        // first error, so it may have given up before reaching a temp a writer
+        // still owns — and this cannot tell the difference between "there is
+        // none" and "I could not finish looking". Releasing on the strength of an
+        // incomplete scan is what would let that writer publish afterwards.
         Ok(Err(err)) => {
             tracing::warn!(
-                "Cloud Connect: failed to reclaim interrupted-write artifacts beside {released}: {err}; the instance is still being released, but this host may retain a copy of what was removed"
+                "Cloud Connect: failed to reclaim interrupted-write artifacts beside {released}: {err}; reporting Remove as failed and staying connected, because an unfinished scan cannot rule out a writer that would publish over the release"
             );
-            return Ok(vec![format!(
-                "interrupted-write artifacts beside {released}"
-            )]);
+            return Err(format!(
+                "failed to check for interrupted writes beside {released}: {err}"
+            ));
         }
         Err(source) => {
             tracing::warn!(
-                "Cloud Connect: the task reclaiming interrupted-write artifacts beside {released} stopped unexpectedly: {source}; the instance is still being released, but this host may retain a copy of what was removed"
+                "Cloud Connect: the task reclaiming interrupted-write artifacts beside {released} stopped unexpectedly: {source}; reporting Remove as failed and staying connected, because an unfinished scan cannot rule out a writer that would publish over the release"
             );
-            return Ok(vec![format!(
-                "interrupted-write artifacts beside {released}"
-            )]);
+            return Err(format!(
+                "failed to check for interrupted writes beside {released}: {source}"
+            ));
         }
     };
 
@@ -2763,6 +2766,41 @@ mod tests {
                 "and the identity stays, so the instance is still reachable for a retry"
             );
             drop(writer);
+        }
+
+        /// A scan that cannot finish cannot prove no writer is holding a temp,
+        /// and the release treats a known one as fatal, so it must treat "I could
+        /// not tell" the same way. The alternative is releasing on an incomplete
+        /// answer and letting that writer publish afterwards.
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn a_reclaim_that_cannot_finish_fails_the_release() {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            let host = Host::enrolled();
+            // A temp the reclaim cannot open: it decides liveness by taking the
+            // file's lock, so a file it cannot open is one it cannot judge.
+            let unreadable = host
+                .config
+                .config_dir
+                .join(format!(".{SECRET_CACHE_FILE}.unreadable.tmp"));
+            std::fs::write(&unreadable, "an interrupted write").expect("write the temp");
+            std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000))
+                .expect("make the temp unopenable");
+
+            let message = host
+                .release()
+                .await
+                .expect_err("an unfinished scan must fail the removal");
+
+            assert!(
+                message.contains("failed to check for interrupted writes"),
+                "the failure must say what it could not establish, got {message}"
+            );
+            assert!(
+                host.config.identity_path.exists(),
+                "the identity stays, so the instance is still reachable for a retry"
+            );
         }
 
         /// The draft carries the provisional private key of an enrollment in

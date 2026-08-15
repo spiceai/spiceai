@@ -1847,9 +1847,15 @@ pub(crate) fn release_atomic_write_artifacts(
     cleanup_abandoned_atomic_temps(path, minimum_age)?;
 
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
-        return Ok(RemainingArtifacts::default());
-    };
+    // The same fallback the writer uses, so a non-UTF-8 canonical name still
+    // scans for the temps `atomic_write_owner_only` would have named. Skipping
+    // the scan would report no promotable temp and let the release proceed to
+    // delete the canonical file, which is the one outcome that must not happen
+    // on a name we cannot read.
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("identity.json");
     let prefix = format!(".{file_name}.");
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
