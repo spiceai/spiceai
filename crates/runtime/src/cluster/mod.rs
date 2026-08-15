@@ -2392,7 +2392,6 @@ async fn executor_bind_app(
     // app asks for, which emission state cannot stand in for — a concurrent
     // `load_components` reaching task-history initialization before this bind
     // installs the app finds no configuration and turns emission off.
-    let app_enables_task_history = app_def.runtime.task_history.enabled;
     *rt.app.write().await = Some(app_def);
 
     // Create a cluster client for secrets. This channel outlives every secret
@@ -2404,36 +2403,26 @@ async fn executor_bind_app(
     let expander = Box::new(ClusterSecretExpanderImpl::new(secrets_cluster_client));
     *rt.secrets.write().await = Secrets::new_for_cluster_executor(expander, executor_id);
 
-    // Task history is created by `load_components` on a normal bring-up, but
-    // Fix B Ready/slots gate on this bind path — and the test harness skips
-    // concurrent `load_components` to avoid racing dataset load. Ensure the
-    // table exists here so federated `runtime.task_history` queries from the
-    // scheduler don't fail with "table not found" on the executor.
+    // Task history is created by `load_components` on a normal bring-up, but the
+    // readiness and slot gates depend on it on this bind path — and the test
+    // harness skips a concurrent `load_components` to avoid racing dataset load.
+    // So it is brought up here, from the app installed just above.
     //
-    // Concurrent with `load_components` is fine: if we lose the race,
-    // `init_task_history` fails with "table already exists" and we re-check.
-    // Fail closed if init fails and the table is still absent — otherwise the
-    // executor can report Ready while scheduler federated queries break.
-    if app_enables_task_history {
-        let task_history_ref = ::datafusion::sql::TableReference::partial(
-            crate::datafusion::SPICE_RUNTIME_SCHEMA,
-            crate::task_history::DEFAULT_TASK_HISTORY_TABLE,
-        );
-        if rt.df.get_table(&task_history_ref).await.is_none() {
-            match Arc::clone(rt).init_task_history().await {
-                Ok(()) => {}
-                Err(err) if rt.df.get_table(&task_history_ref).await.is_some() => {
-                    tracing::debug!(
-                        "task_history already initialized by concurrent load_components: {err}"
-                    );
-                }
-                Err(err) => {
-                    return Err(FailedToStartClusterExecutor {
-                        source: Box::new(err),
-                    });
-                }
-            }
-        }
+    // The initializer decides everything: whether the app asks for task history,
+    // whether this runtime already registered the table, and whether the name is
+    // free. Racing `load_components` is fine because it is idempotent — a caller
+    // that lost the race finds the table recorded as this runtime's and returns
+    // Ok. Nothing here reads whether the table *exists*: a dataset can occupy the
+    // name, and a table that exists is not evidence this runtime registered it.
+    // Treating existence as success is how a scheduler's federated task-history
+    // query ends up reading a user's table.
+    //
+    // Fail closed, because the alternative is an executor reporting Ready while
+    // the scheduler's queries either break or read the wrong table.
+    if let Err(err) = Arc::clone(rt).init_task_history().await {
+        return Err(FailedToStartClusterExecutor {
+            source: Box::new(err),
+        });
     }
 
     Arc::clone(rt).load_catalogs().await;
