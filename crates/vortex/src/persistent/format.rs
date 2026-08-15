@@ -1326,26 +1326,31 @@ mod tests {
             "this test's whole point is a format with no segment cache of its own"
         );
 
-        // A path that was never cached stands in for a retirement reporting a
-        // file whose footer no scan ever read: it must not be counted as evicted.
-        let mut paths = retired.clone();
-        paths.insert(Path::from("retired/never-opened.vortex"));
-        let evicted = VortexFormat::invalidate_footer_cache_paths(&runtime_env, &paths);
-        assert_eq!(
-            evicted,
-            retired.len(),
-            "every resident footer of the retired paths is evicted, and only those"
-        );
-
-        format.invalidate_cached_paths(&runtime_env, paths).await;
+        // Retire through the entry point production uses, so a footer eviction
+        // reached only when a segment cache happens to exist fails here.
+        format
+            .invalidate_cached_paths(&runtime_env, retired.clone())
+            .await;
         assert!(
             cached("retired").is_empty(),
-            "a retired file's footer must not survive its file"
+            "a retired file's footer must not survive its file, segment cache or not"
         );
         assert_eq!(
             cached("live"),
             live_before,
             "a table nothing retired must keep every footer it had"
+        );
+
+        // A path that was never cached stands in for a retirement reporting a
+        // file whose footer no scan ever read: it is evicted for free and must
+        // not be counted as resident. Asserted against the second table, whose
+        // footers are still cached at this point.
+        let mut with_absent = live_before.clone();
+        with_absent.insert(Path::from("live/never-opened.vortex"));
+        assert_eq!(
+            VortexFormat::invalidate_footer_cache_paths(&runtime_env, &with_absent),
+            live_before.len(),
+            "the count reports footers that were resident, not paths that were asked for"
         );
 
         Ok(())
