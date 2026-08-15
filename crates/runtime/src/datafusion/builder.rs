@@ -1181,7 +1181,8 @@ impl DataFusionBuilder {
             // How we handle Cayenne DDL depends if its single node vs distributed.
             if let Some(executor_registry) = &self.executor_registry {
                 use crate::cluster::{AcceleratedPartitionProvider, FederatedPartitionProvider};
-                use crate::cluster::datafusion::distributed_search_rewrite::DistributedSearchRewrite;
+                use crate::cluster::accelerated_partition_provider::is_accelerated_table_provider;
+                use runtime_cluster_search::rewrite::DistributedSearchRewrite;
 
 
                 // Rules only for distributed query
@@ -1190,9 +1191,12 @@ impl DataFusionBuilder {
                 // an accelerated table into a global-statistics gather plus a
                 // per-executor scored search. Runs before the partition rewrites
                 // and federation, which do not match the `SearchQueryProvider` scan.
-                ctx.add_analyzer_rule(Arc::new(DistributedSearchRewrite::new(Arc::clone(
-                    executor_registry,
-                ))));
+                // The accelerated-table check is injected here because its type
+                // (`AcceleratedTable`) lives in this crate, above the rule's crate.
+                ctx.add_analyzer_rule(Arc::new(DistributedSearchRewrite::new(
+                    Arc::clone(executor_registry),
+                    Arc::new(is_accelerated_table_provider),
+                )));
 
                 // Accelerated tables
                 ctx.add_analyzer_rule(Arc::new(PartitionedTableScanRewrite::new(
@@ -1947,9 +1951,7 @@ pub(crate) fn default_extension_planners(
         Arc::new(IndexTableScanExtensionPlanner::new()),
         // Plans the DistributedSearch extension node the scheduler's
         // `DistributedSearchRewrite` produces; a no-op when no such node exists.
-        Arc::new(
-            crate::cluster::datafusion::distributed_search::DistributedSearchExtensionPlanner::default(),
-        ),
+        Arc::new(runtime_cluster_search::DistributedSearchExtensionPlanner::default()),
         Arc::new(FederatedPlanner::new()),
         Arc::new(CacheInvalidationExtensionPlanner::new()),
         // One stateless DDL planner handles all DdlExtensionNodes from any handler.

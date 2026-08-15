@@ -16969,6 +16969,7 @@ dependencies = [
  "runtime-checkpoint-sqlite",
  "runtime-checkpoint-turso",
  "runtime-cluster",
+ "runtime-cluster-search",
  "runtime-component",
  "runtime-datafusion",
  "runtime-datafusion-index",
@@ -17256,6 +17257,20 @@ dependencies = [
  "tracing",
  "util",
  "uuid 1.23.2",
+]
+
+[[package]]
+name = "runtime-cluster-search"
+version = "2.2.0-unstable"
+dependencies = [
+ "arrow",
+ "async-trait",
+ "data_components",
+ "datafusion",
+ "flight_client",
+ "futures",
+ "runtime-cluster",
+ "search",
 ]
 
 [[package]]

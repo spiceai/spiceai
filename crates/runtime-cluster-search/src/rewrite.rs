@@ -34,7 +34,7 @@ limitations under the License.
 //!
 //! The `Aggregate` over `text_search_stats` legs gathers the global statistics (a
 //! distributed sum of the additive per-partition statistics). The
-//! [`DistributedSearchExec`](super::distributed_search::DistributedSearchExec)
+//! [`DistributedSearchExec`](crate::exec::DistributedSearchExec)
 //! drains that child, then scores each executor's partition with the global
 //! statistics and merges the comparable results.
 
@@ -66,23 +66,38 @@ use search::generation::text_search::bm25_stats::{
 };
 use search::provider::{SearchQueryProvider, UdtfSource};
 
-use crate::cluster::accelerated_partition_provider::is_accelerated_table_provider;
-use crate::cluster::datafusion::distributed_search::{
-    DistributedExecutor, DistributedSearchNode, DistributedSearchParams,
-};
+use crate::exec::{DistributedExecutor, DistributedSearchNode, DistributedSearchParams};
+
+/// Decides whether a searched table should be distributed across executors.
+///
+/// The condition — the table is a multi-node accelerated table — is tested with
+/// a type that lives in the runtime crate (`AcceleratedTable`), above this crate.
+/// The runtime injects the check as this closure so the rule can live here
+/// without depending upward. Returns `true` to distribute the search.
+pub type SearchDistributionGate = Arc<dyn Fn(&Arc<dyn TableProvider>) -> bool + Send + Sync>;
 
 /// Rewrites `text_search` scans over multi-node accelerated tables into a
 /// distributed-search plan. Registered on the scheduler only (it needs the
 /// executor registry).
-#[derive(Debug)]
 pub struct DistributedSearchRewrite {
     registry: Arc<ExecutorRegistry>,
+    should_distribute: SearchDistributionGate,
+}
+
+impl std::fmt::Debug for DistributedSearchRewrite {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DistributedSearchRewrite")
+            .finish_non_exhaustive()
+    }
 }
 
 impl DistributedSearchRewrite {
     #[must_use]
-    pub fn new(registry: Arc<ExecutorRegistry>) -> Self {
-        Self { registry }
+    pub fn new(registry: Arc<ExecutorRegistry>, should_distribute: SearchDistributionGate) -> Self {
+        Self {
+            registry,
+            should_distribute,
+        }
     }
 
     /// The distributed rewrite of one `text_search` table scan, or `None` when
@@ -113,7 +128,7 @@ impl DistributedSearchRewrite {
 
         // Only distribute when the searched table is an accelerated (multi-node)
         // table. A non-accelerated search runs locally, unchanged.
-        if !is_accelerated_table_provider(&search_provider.table_provider) {
+        if !(self.should_distribute)(&search_provider.table_provider) {
             return Ok(None);
         }
 

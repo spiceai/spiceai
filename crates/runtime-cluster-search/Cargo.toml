@@ -1,0 +1,23 @@
+[package]
+description = "Distributed full-text search: rewrite and operator that fan a text_search out across executor partitions"
+edition.workspace = true
+exclude.workspace = true
+homepage.workspace = true
+license-file.workspace = true
+name = "runtime-cluster-search"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+arrow = { workspace = true }
+async-trait.workspace = true
+data_components = { path = "../data_components", features = ["flightsql"] }
+datafusion.workspace = true
+flight_client = { path = "../flight_client" }
+futures.workspace = true
+runtime-cluster = { path = "../runtime-cluster" }
+search = { path = "../search" }
+
+[lints]
+workspace = true

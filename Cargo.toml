@@ -49,6 +49,7 @@ members = [
     "crates/runtime-async",
     "crates/runtime-cloud-connect",
     "crates/runtime-cluster",
+    "crates/runtime-cluster-search",
     "crates/datafusion-flightsql",
     "crates/runtime-datafusion",
     "crates/runtime-query-engine",

@@ -147,6 +147,7 @@ runtime-component = { path = "../runtime-component" }
 runtime-metrics = { path = "../runtime-metrics" }
 runtime-auth = { path = "../runtime-auth" }
 runtime-cluster = { path = "../runtime-cluster" }
+runtime-cluster-search = { path = "../runtime-cluster-search" }
 runtime-datafusion = { path = "../runtime-datafusion" }
 runtime-query-engine = { path = "../runtime-query-engine" }
 runtime-search = { path = "../runtime-search" }
