@@ -18,6 +18,24 @@ pub mod embeddings;
 pub mod query;
 pub mod search;
 
+use arrow::array::RecordBatch;
+
+/// Compacts batches that retain more memory than their own rows need, so a
+/// cache entry holds — and is billed — what it stores.
+///
+/// Every store of raw batches funnels through here rather than through its
+/// call sites: `LIMIT`/`OFFSET` and top-k plans emit zero-copy slices of the
+/// scan batches they came from, and an entry built from one of those pins the
+/// whole scan batch for the lifetime of the entry. Encoded entries need no
+/// equivalent, because serialization already writes only the rows a batch
+/// holds.
+pub(crate) fn compact_for_storage(mut batches: Vec<RecordBatch>) -> Vec<RecordBatch> {
+    for batch in &mut batches {
+        *batch = arrow_tools::record_batch::compact_retained_buffers(batch);
+    }
+    batches
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CacheStatus {
     // The request was not eligible for caching, and thus the cache was not checked.

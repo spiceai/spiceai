@@ -20,8 +20,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use app::spicepod::component::runtime::TlsConfig as SpicepodTlsConfig;
-use runtime::secrets::{ExposeSecret, ParamStr, Secrets};
 use runtime::tls::{TlsConfig, TlsControl};
+use runtime_secrets::{ExposeSecret, ParamStr, Secrets};
 use tokio::sync::RwLock;
 
 use crate::{Args, ClientAuthMode};

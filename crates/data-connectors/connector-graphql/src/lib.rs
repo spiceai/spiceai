@@ -24,17 +24,18 @@ use crate::graphql::{
 };
 use async_trait::async_trait;
 use data_components::rate_limit::RateLimiter;
-use datafusion::datasource::TableProvider;
-use runtime::component::dataset::Dataset;
-use runtime::dataconnector::http_rate_control::{
+use data_http_rate_control as http_rate_control;
+use data_http_rate_control::{
     HttpRateControlMetricSource, HttpRateControlMetrics, HttpRateControlMetricsProvider,
 };
+use datafusion::datasource::TableProvider;
+use runtime::component::dataset::Dataset;
 use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
-    DataConnectorResult, NewDataConnectorResult, default_spice_client, http_rate_control,
+    DataConnectorResult, NewDataConnectorResult, default_spice_client,
 };
-use runtime::parameters::{ParameterSpec, Parameters};
 use runtime_metrics::component::MetricsProvider;
+use runtime_parameters::{ParameterSpec, Parameters};
 use snafu::prelude::*;
 use std::{
     any::Any,
@@ -112,10 +113,8 @@ impl DataConnectorFactory for GraphQLFactory {
         Box::pin(async move {
             let runtime_rate_control_params = params.app().map(|app| app.runtime.params.clone());
             let rate_control_registry = params
-                .runtime()
-                .map_or_else(http_rate_control::global_registry, |runtime| {
-                    runtime.http_rate_control_registry()
-                });
+                .http_rate_control_registry()
+                .unwrap_or_else(http_rate_control::global_registry);
             let (metrics, emit_rate_control_metrics, rate_control_metric_source) =
                 if let ConnectorComponent::Dataset(dataset) = &params.component {
                     Url::parse(dataset.path()).map_or_else(
@@ -243,10 +242,10 @@ impl GraphQL {
                 source,
             })?;
 
-        let rate_control = http_rate_control::resolve_config(
+        let rate_control = http_rate_control::resolve_config_for_component(
             &self.params,
             self.runtime_rate_control_params.as_ref(),
-            dataset,
+            &ConnectorComponent::from(dataset),
             "graphql",
         )?;
         let rate_limiter = self
@@ -256,7 +255,13 @@ impl GraphQL {
         self.metrics.set_rate_limiter(&rate_limiter);
         let rate_limiter: Arc<dyn RateLimiter> = rate_limiter;
         let rate_controller = Arc::clone(&self.rate_control_registry)
-            .reserve_shared_rate_controller(&endpoint, &rate_control, dataset, "graphql")
+            .reserve_shared_rate_controller_for_component(
+                &endpoint,
+                &rate_control,
+                dataset.app.name.as_str(),
+                &ConnectorComponent::from(dataset),
+                "graphql",
+            )
             .await?;
         self.metrics.set_config(&rate_controller.shared().config);
         self.metrics
@@ -366,7 +371,7 @@ mod tests {
     use super::*;
     use runtime::Runtime;
     use runtime::component::dataset::builder::DatasetBuilder;
-    use runtime::secrets::Secrets;
+    use runtime_secrets::Secrets;
     use std::collections::HashMap;
     use tokio::sync::RwLock;
 

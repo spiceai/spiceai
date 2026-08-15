@@ -30,6 +30,7 @@ use data_components::databricks::DatabricksSparkConnect;
 use data_components::databricks::sql_warehouse::DatabricksMetrics;
 use data_components::databricks::{DatabricksDelta, DatabricksSqlWarehouse, sql_warehouse};
 use data_components::unity_catalog::{Endpoint, UnityCatalog as UnityCatalogClient};
+use data_http_rate_control as http_rate_control;
 use datafusion::datasource::TableProvider;
 use datafusion::datasource::listing::ListingTableUrl;
 use datafusion::execution::runtime_env::RuntimeEnv;
@@ -39,15 +40,15 @@ use runtime::component::ComponentInitialization;
 use runtime::component::dataset::Dataset;
 use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
-    DataConnectorResult, NewDataConnectorResult, http_rate_control,
+    DataConnectorResult, NewDataConnectorResult,
 };
-use runtime::parameters::{ParameterSpec, Parameters};
 use runtime::token_providers::databricks::{
     AUTH_MODE_DESCRIPTION, AUTH_MODES, AuthConfigError, AuthCredentials,
     DatabricksM2MTokenProvider, DatabricksU2MTokenProvider,
 };
 use runtime_api_types::v1::ComponentType;
 use runtime_metrics::component::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback};
+use runtime_parameters::{ParameterSpec, Parameters};
 use runtime_rate_control::RateController;
 use secrecy::ExposeSecret;
 use secrecy::SecretString;
@@ -866,7 +867,6 @@ impl DataConnectorFactory for DatabricksFactory {
 
             Box::pin(async move {
                 let app = context.app();
-                let runtime = context.runtime();
 
                 // Initialize AWS SDK credentials if not using explicit credentials
                 if !aws_sdk_credential_bridge::has_explicit_credentials(
@@ -909,10 +909,26 @@ impl DataConnectorFactory for DatabricksFactory {
                     None
                 };
 
+                // The runtime is constructing this connector, so it is necessarily alive
+                // here; a missing registry would mean it went away mid-construction.
+                // Report that rather than silently building a connector with no rate
+                // control or no way to authenticate.
+                let runtime_gone = |capability: &str| {
+                    DataConnectorError::InvalidConfigurationNoSource {
+                        dataconnector: CONNECTOR_NAME.to_string(),
+                        connector_component: params.component.clone(),
+                        message: format!(
+                            "The runtime shut down while the connector was being created, so its {capability} could not be reached"
+                        ),
+                    }
+                };
+
                 let rate_control_reservation = reserve_databricks_rate_controller(
                     &params.parameters,
                     Some(&app.runtime.params),
-                    runtime.http_rate_control_registry(),
+                    context
+                        .http_rate_control_registry()
+                        .ok_or_else(|| runtime_gone("HTTP rate-control registry"))?,
                     &params.component,
                     app.name.as_str(),
                 )
@@ -924,7 +940,9 @@ impl DataConnectorFactory for DatabricksFactory {
                 let databricks_result = Databricks::new(
                     params.parameters,
                     params.io_runtime,
-                    runtime.token_provider_registry(),
+                    context
+                        .token_provider_registry()
+                        .ok_or_else(|| runtime_gone("token-provider registry"))?,
                     shared_semaphore,
                     rate_controller,
                 )
@@ -1405,7 +1423,7 @@ mod tests {
                 ),
             ],
             "databricks",
-            Arc::new(tokio::sync::RwLock::new(runtime::secrets::Secrets::new())),
+            Arc::new(tokio::sync::RwLock::new(runtime_secrets::Secrets::new())),
             PARAMETERS,
         )
         .await

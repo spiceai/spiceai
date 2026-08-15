@@ -31,12 +31,12 @@ use opentelemetry::KeyValue;
 use runtime::component::dataset::Dataset;
 use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
-    DataConnectorResult, NewDataConnectorResult,
+    DataConnectorResult, NewDataConnectorResult, parameters::ConnectorContext,
 };
-use runtime::datafusion::udf::deny_spice_functions_for_table_providers;
-use runtime::parameters::{ParameterSpec, Parameters};
 use runtime_api_types::v1::ComponentType;
 use runtime_metrics::component::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback};
+use runtime_parameters::{ParameterSpec, Parameters};
+use runtime_udfs_api::deny_spice_functions_for_table_providers;
 use secrecy::{ExposeSecret, SecretBox};
 use snafu::prelude::*;
 use std::any::Any;
@@ -69,6 +69,10 @@ pub struct MySQL {
     /// Connector params retained for the replication path, which opens its
     /// own dedicated connections outside the pool.
     params: Parameters,
+    /// Retained so the replication path can resolve the binlog-position store over
+    /// the dataset's accelerator. `None` only in unit tests, which build params
+    /// without a runtime attached.
+    context: Option<Arc<dyn ConnectorContext>>,
     replication_metrics: Arc<ReplicationMetricsCollector>,
 }
 
@@ -365,6 +369,7 @@ impl DataConnectorFactory for MySQLFactory {
                 mysql_factory,
                 pool,
                 params: params_for_replication,
+                context: params.context.clone(),
                 replication_metrics: ReplicationMetricsCollector::new(),
             }) as Arc<dyn DataConnector>)
         })
@@ -612,12 +617,13 @@ impl DataConnector for MySQL {
 
     fn changes_stream(
         &self,
-        federated_table: Arc<runtime::federated::FederatedTable>,
+        federated_table: Arc<dyn data_connector_api::federated::FederatedTableProvider>,
         dataset: &Dataset,
     ) -> Option<data_components::cdc::ChangesStream> {
         Some(replication::build_changes_stream(
             &self.params,
             dataset,
+            self.context.clone(),
             federated_table,
             Arc::clone(&self.replication_metrics),
         ))

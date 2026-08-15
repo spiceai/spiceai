@@ -54,7 +54,9 @@ limitations under the License.
 //! It is timing-dependent (it provokes a real race), so it makes several
 //! attempts and uses a wide rewrite window to keep reproduction reliable; it is
 //! a *reproducer*, complemented by the broader randomized harness in
-//! `mutation_property_test.rs`.
+//! `mutation_property_test.rs`. The attempt count is scalable via
+//! `CAYENNE_PROPTEST_SCALE` (see `common::env_scale`), so CI can dial
+//! reproduction depth up or down without code changes.
 
 #![allow(clippy::expect_used)]
 #![allow(clippy::clone_on_ref_ptr)]
@@ -248,11 +250,24 @@ async fn run_once(fixture: &TestFixture, table_name: &str) -> TestResult<()> {
 
 async fn delete_during_full_rewrite_is_not_lost_impl(fixture: TestFixture) -> TestResult<()> {
     // A few independent attempts; a real timing race need only surface once to
-    // prove the hazard is reachable.
-    for attempt in 0..4 {
+    // prove the hazard is reachable. Scalable via `CAYENNE_PROPTEST_SCALE` for a
+    // lighter per-PR pass or a deeper nightly run; floored at 1 so the race is
+    // still exercised at least once.
+    for attempt in 0..attempt_count() {
         run_once(&fixture, &format!("race_{attempt}")).await?;
     }
     Ok(())
+}
+
+#[expect(
+    clippy::cast_sign_loss,
+    clippy::cast_possible_truncation,
+    reason = "common::env_scale() is always positive and the result is floored at 1.0 before casting"
+)]
+fn attempt_count() -> u64 {
+    (4.0 * common::env_scale("CAYENNE_PROPTEST_SCALE"))
+        .round()
+        .max(1.0) as u64
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -378,7 +393,7 @@ async fn run_once_position(fixture: &TestFixture, table_name: &str) -> TestResul
 async fn position_delete_during_full_rewrite_is_not_lost_impl(
     fixture: TestFixture,
 ) -> TestResult<()> {
-    for attempt in 0..4 {
+    for attempt in 0..attempt_count() {
         run_once_position(&fixture, &format!("pos_race_{attempt}")).await?;
     }
     Ok(())

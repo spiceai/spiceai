@@ -38,6 +38,8 @@ linkme.workspace = true
 ns_lookup = { path = "../../ns_lookup" }
 paste.workspace = true
 runtime = { path = "../../runtime" }
+runtime-parameters = { path = "../../runtime-parameters" }
+runtime-udfs-api = { path = "../../runtime-udfs-api" }
 secrecy.workspace = true
 snafu.workspace = true
 url.workspace = true

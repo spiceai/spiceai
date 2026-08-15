@@ -82,7 +82,7 @@ impl CachedQueryResult {
         read_started_at: Instant,
     ) -> Self {
         Self {
-            data: CachedData::Raw(Arc::new(batches)),
+            data: CachedData::Raw(Arc::new(super::compact_for_storage(batches))),
             schema,
             input_tables,
             cached_at,
@@ -133,7 +133,7 @@ impl CachedQueryResult {
             let encoded_data = encoder.encode(&records).await?;
             CachedData::Encoded(Bytes::from(encoded_data))
         } else {
-            CachedData::Raw(Arc::new(records))
+            CachedData::Raw(Arc::new(super::compact_for_storage(records)))
         };
 
         Ok(Self {
@@ -442,6 +442,80 @@ mod tests {
         assert_eq!(
             sizeable_size as u64, memory_size,
             "Sizeable trait should delegate to memory_size()"
+        );
+    }
+
+    use crate::utils::tests::wide_string_batch;
+
+    fn only_payload(batch: &RecordBatch) -> String {
+        batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("payload is a StringArray")
+            .value(0)
+            .to_string()
+    }
+
+    /// Regression test for <https://github.com/spiceai/spiceai/issues/12921>.
+    /// An entry built from a slice must not hold — or be billed — the batch the
+    /// slice was carved out of.
+    #[test]
+    fn a_sliced_entry_is_billed_its_own_rows_new_raw() {
+        let scan_batch = wide_string_batch(2_000);
+        let sliced = scan_batch.slice(1_000, 1);
+        let cached_at = Instant::now();
+
+        let cached_result = CachedQueryResult::new_raw(
+            vec![sliced.clone()],
+            sliced.schema(),
+            Arc::new(HashSet::new()),
+            cached_at,
+            cached_at,
+        );
+
+        assert!(
+            cached_result.memory_size() * 100 < scan_batch.get_array_memory_size() as u64,
+            "a one-row entry sliced from a 2000-row batch should be billed a small fraction of it, got {} of {}",
+            cached_result.memory_size(),
+            scan_batch.get_array_memory_size()
+        );
+    }
+
+    /// The same store path, exercised through `from_batches` — what background
+    /// revalidation uses — and asserting the row itself survives compaction.
+    #[tokio::test]
+    async fn a_sliced_entry_is_billed_its_own_rows_from_batches() {
+        let scan_batch = wide_string_batch(2_000);
+        let sliced = scan_batch.slice(1_000, 1);
+        let expected_payload = only_payload(&sliced);
+        let cached_at = Instant::now();
+
+        let cached_result = CachedQueryResult::from_batches(
+            vec![sliced.clone()],
+            sliced.schema(),
+            Arc::new(HashSet::new()),
+            cached_at,
+            cached_at,
+            None,
+        )
+        .await
+        .expect("should create cached result");
+
+        assert!(
+            cached_result.memory_size() * 100 < scan_batch.get_array_memory_size() as u64,
+            "a one-row entry should be billed a small fraction of its parent, got {} of {}",
+            cached_result.memory_size(),
+            scan_batch.get_array_memory_size()
+        );
+
+        let records = cached_result.records().await.expect("should decode");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].num_rows(), 1);
+        assert_eq!(
+            only_payload(&records[0]),
+            expected_payload,
+            "compacting the entry must not change the row it holds"
         );
     }
 

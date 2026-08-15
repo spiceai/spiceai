@@ -172,7 +172,7 @@ impl<
     H: Hasher + Send + Sync + 'static,
 > TabledCacheProvider<V> for SimpleCache<V, T, H>
 {
-    fn invalidate_for_table(&self, table_ref: TableReference) -> Result<()> {
+    async fn invalidate_for_table(&self, table_ref: TableReference) -> Result<()> {
         let table_name = match &table_ref {
             TableReference::Bare { table }
             | TableReference::Partial { table, .. }

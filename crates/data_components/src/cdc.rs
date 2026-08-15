@@ -444,6 +444,7 @@ pub struct ChangeEnvelope {
     change_committer: Box<dyn CommitChange + Send + Sync>,
     change_batch: LazyChangeBatch,
     is_dataset_ready: bool,
+    history_unavailable: bool,
 }
 
 impl ChangeEnvelope {
@@ -457,6 +458,7 @@ impl ChangeEnvelope {
             change_committer,
             change_batch: LazyChangeBatch::ready(change_batch),
             is_dataset_ready,
+            history_unavailable: false,
         }
     }
 
@@ -478,6 +480,7 @@ impl ChangeEnvelope {
             change_committer,
             change_batch: LazyChangeBatch::from_rows(rows),
             is_dataset_ready,
+            history_unavailable: false,
         }
     }
 
@@ -554,7 +557,12 @@ impl ChangeEnvelope {
     /// this for synchronous contexts or already-materialized envelopes.
     pub fn into_parts(self) -> Result<ChangeEnvelopeParts, ChangeBatchError> {
         let batch = self.change_batch.into_built()?;
-        Ok((self.change_committer, batch, self.is_dataset_ready))
+        Ok((
+            self.change_committer,
+            batch,
+            self.is_dataset_ready,
+            self.history_unavailable,
+        ))
     }
 
     /// [`Self::into_parts`] for async callers: a *deferred* envelope's
@@ -580,12 +588,38 @@ impl ChangeEnvelope {
         change_committer: Box<dyn CommitChange + Send + Sync>,
         change_batch: ChangeBatch,
         is_dataset_ready: bool,
+        history_unavailable: bool,
     ) -> Self {
         Self {
             change_committer,
             change_batch: LazyChangeBatch::ready(change_batch),
             is_dataset_ready,
+            history_unavailable,
         }
+    }
+
+    /// Whether the accelerator must be rebuilt from the source before this
+    /// envelope's changes — and everything after it — can be applied.
+    ///
+    /// Set by a source that has lost the incremental history it was resuming
+    /// from, and therefore cannot describe what changed while it was away: a
+    /// `PostgreSQL` replication slot that was dropped or invalidated, and by
+    /// extension any equivalent (a purged binlog, an expired stream shard). The
+    /// changes that were missed are gone from the source's log, so no sequence
+    /// of change rows can reconstruct them — only re-reading the table can.
+    ///
+    /// The consumer answers this by re-reading the source into the accelerator
+    /// as a single atomic replacement (the `refresh_mode: full` write path)
+    /// before resuming the stream. It must not be answered by clearing the
+    /// table and letting the stream refill it: that is observable to queries as
+    /// an empty, then partially-filled, table.
+    ///
+    /// Carried as its own zero-row envelope (see
+    /// [`build_history_unavailable_envelope`]) so it is ordered in the stream
+    /// rather than racing it.
+    #[must_use]
+    pub fn history_unavailable(&self) -> bool {
+        self.history_unavailable
     }
 
     /// Returns `true` if processing this envelope means the dataset can be
@@ -600,8 +634,14 @@ impl ChangeEnvelope {
 }
 
 /// The parts of a consumed [`ChangeEnvelope`]: committer, built change batch,
-/// and dataset-ready flag.
-pub type ChangeEnvelopeParts = (Box<dyn CommitChange + Send + Sync>, ChangeBatch, bool);
+/// dataset-ready flag, and rebuild-required flag.
+///
+/// Every field is carried explicitly rather than defaulted on reconstruction:
+/// a consumer that decomposes an envelope and rebuilds it (indexing, embedding,
+/// full-text wrapping) must forward the flags, and dropping one is a silent
+/// correctness bug rather than a compile error if the tuple hides it. See
+/// [`ChangeEnvelope::history_unavailable`].
+pub type ChangeEnvelopeParts = (Box<dyn CommitChange + Send + Sync>, ChangeBatch, bool, bool);
 
 /// Run a CDC batch build off the async worker, but only when it would actually
 /// block: an already-materialized build is a no-op, and `spawn_blocking`
@@ -796,6 +836,28 @@ pub fn build_heartbeat_envelope(
 /// the readiness contract.
 pub fn build_ready_signal_envelope(schema: &SchemaRef) -> Result<ChangeEnvelope, ChangeBatchError> {
     build_heartbeat_envelope(schema, None, true)
+}
+
+/// Construct a zero-row [`ChangeEnvelope`] that asks the consumer to rebuild the
+/// accelerator from the source before applying anything further — see
+/// [`ChangeEnvelope::history_unavailable`] for when a source must emit one.
+///
+/// Zero rows and a no-op committer, like the readiness and heartbeat signals:
+/// it carries no data and acknowledges no source position. It is emitted
+/// *before* the changes it precedes, so the rebuild is ordered ahead of them
+/// rather than racing them, and `is_dataset_ready` is false because a dataset
+/// whose accelerator is about to be replaced is not ready to serve.
+pub fn build_history_unavailable_envelope(
+    schema: &SchemaRef,
+) -> Result<ChangeEnvelope, ChangeBatchError> {
+    let (committer, batch, is_dataset_ready, _) =
+        build_heartbeat_envelope(schema, None, false)?.into_parts()?;
+    Ok(ChangeEnvelope::from_parts(
+        committer,
+        batch,
+        is_dataset_ready,
+        true,
+    ))
 }
 
 /// Lag-based readiness predicate shared by CDC connectors: returns `true` when
@@ -1813,7 +1875,7 @@ mod deferred_tests {
             },
             true,
         );
-        let (_committer, batch, ready) = env.into_parts().expect("into_parts builds ok");
+        let (_committer, batch, ready, _) = env.into_parts().expect("into_parts builds ok");
         assert_eq!(batch.record.num_rows(), 1);
         assert!(ready);
         assert_eq!(builds.load(Ordering::SeqCst), 1);
@@ -1886,7 +1948,7 @@ mod deferred_tests {
         assert_eq!(
             parts
                 .iter()
-                .map(|(_, batch, _)| batch.record.num_rows())
+                .map(|(_, batch, _, _)| batch.record.num_rows())
                 .collect::<Vec<_>>(),
             vec![1, 2, 3],
             "burst order must be preserved — committers pair with their batches"
@@ -1911,7 +1973,7 @@ mod deferred_tests {
         assert_eq!(
             parts
                 .iter()
-                .map(|(_, batch, ready)| (batch.record.num_rows(), *ready))
+                .map(|(_, batch, ready, _)| (batch.record.num_rows(), *ready))
                 .collect::<Vec<_>>(),
             vec![(2, false), (4, true)]
         );
@@ -2063,11 +2125,33 @@ mod deferred_tests {
         let ready = build_ready_signal_envelope(&schema).expect("ready envelope builds");
         assert!(ready.is_no_op_heartbeat());
 
+        // The history-unavailable signal is ALSO a droppable heartbeat by this
+        // predicate — zero rows, no-op committer — which is why a consumer must
+        // read `history_unavailable` BEFORE stripping heartbeats from the write
+        // path. Asserted here so the overlap stays visible: silently stripping it
+        // would skip the rebuild and resume streaming onto stale rows.
+        let reload = build_history_unavailable_envelope(&schema)
+            .expect("history-unavailable envelope builds");
+        assert!(
+            reload.is_no_op_heartbeat(),
+            "the signal carries no rows and no committer, so heartbeat stripping would drop it"
+        );
+        assert!(reload.history_unavailable());
+        assert!(
+            !reload.is_dataset_ready(),
+            "a dataset whose accelerator is about to be replaced is not ready to serve"
+        );
+
+        // Every other envelope must leave the flag clear, so only a source that
+        // actually lost its history can trigger a full re-read.
+        assert!(!heartbeat.history_unavailable());
+        assert!(!ready.history_unavailable());
+
         // A zero-row envelope re-wrapped with a REAL committer (the MySQL
         // snapshot-boundary pattern) must NOT be treated as a heartbeat: its
         // commit persists source progress and needs durability-then-commit
         // ordering.
-        let (_, boundary_batch, _) = build_heartbeat_envelope(&schema, None, false)
+        let (_, boundary_batch, _, _) = build_heartbeat_envelope(&schema, None, false)
             .expect("boundary batch builds")
             .into_parts()
             .expect("already built");

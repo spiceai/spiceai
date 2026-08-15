@@ -27,7 +27,7 @@ use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult, NewDataConnectorResult,
 };
-use runtime::parameters::{ParameterSpec, Parameters};
+use runtime_parameters::{ParameterSpec, Parameters};
 use secrecy::ExposeSecret;
 use std::any::Any;
 use std::future::Future;
@@ -154,8 +154,7 @@ impl DataConnectorFactory for DeltaLakeFactory {
                 );
             }
 
-            let runtime = params.runtime();
-            let parquet_opts = build_table_parquet_options(runtime.as_deref()).await?;
+            let parquet_opts = build_table_parquet_options(params.app().as_ref())?;
 
             tracing::debug!(
                 ?parquet_opts,
@@ -303,7 +302,7 @@ pub fn factory() -> Arc<dyn DataConnectorFactory> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use runtime::secrets::Secrets;
+    use runtime_secrets::Secrets;
     use secrecy::SecretString;
     use tokio::sync::RwLock;
 

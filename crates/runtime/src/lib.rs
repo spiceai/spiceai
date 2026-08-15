@@ -127,14 +127,20 @@ pub mod resource_monitor {
     pub use runtime_resources::*;
 }
 
-pub use runtime_parameters as parameters;
+// Connector parameters live in `runtime-parameters`; the runtime names them
+// through this alias. Crate-visible so that a crate outside the runtime has to
+// depend on `runtime-parameters` directly rather than route through here — the
+// layering guard cannot see a path that hides inside a legal crate-level edge.
+pub(crate) use runtime_parameters as parameters;
 
 pub mod podswatcher;
 pub mod request;
 mod scheduling;
 pub(crate) use runtime_component::schema_evolution;
 pub mod search;
-pub mod secrets {
+// Secrets live in `runtime-secrets`. Crate-visible for the same reason as
+// `parameters` above: reach for `runtime-secrets` instead.
+pub(crate) mod secrets {
     pub use runtime_secrets::*;
 }
 pub mod cluster;
@@ -386,6 +392,17 @@ pub enum Error {
 
     #[snafu(display("Unable to receive accelerated table status: {source}"))]
     UnableToReceiveAcceleratedTableStatus { source: RecvError },
+
+    #[snafu(display(
+        "Failed to reload dataset {dataset}: its acceleration did not complete a refresh within {timeout_secs}s of being recreated. \
+        Reloading the dataset from scratch instead. \
+        Check that the dataset's source is reachable, and for 'refresh_mode: changes' that its change stream is producing data. \
+        See: https://spiceai.org/docs/components/data-accelerators"
+    ))]
+    HotReloadRefreshTimedOut {
+        dataset: TableReference,
+        timeout_secs: u64,
+    },
 
     #[snafu(display("Unable to start local metrics: {source}"))]
     UnableToStartLocalMetrics { source: spice_metrics::Error },
@@ -1729,11 +1746,9 @@ impl Runtime {
 
         Arc::clone(&self).start_extensions().await;
 
-        // Must be loaded before datasets
-        self.load_embeddings().await;
-        self.load_rerankers().await;
-
-        // Spawn each component load in its own task to run in parallel
+        // Spawned before `load_embeddings`/`load_rerankers` so the table is registered as early as
+        // possible: it depends only on the app config, not on embeddings/rerankers being loaded, and
+        // other startup paths (tracing, `datasets_health_monitor`) start querying it immediately.
         let task_history = tokio::spawn({
             let self_clone = Arc::clone(&self);
             async move {
@@ -1743,6 +1758,11 @@ impl Runtime {
             }
         });
 
+        // Must be loaded before datasets
+        self.load_embeddings().await;
+        self.load_rerankers().await;
+
+        // Spawn each remaining component load in its own task to run in parallel
         let datasets = tokio::spawn({
             let self_clone = Arc::clone(&self);
             async move {

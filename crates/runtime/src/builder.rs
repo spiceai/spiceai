@@ -59,6 +59,7 @@ use util::{in_tracing_context, in_tracing_context_async};
 type DatafusionConfigurationCallback = fn(&mut DataFusion);
 
 const CAYENNE_FOOTER_CACHE_MB_PARAM: &str = "cayenne_footer_cache_mb";
+const CAYENNE_SEGMENT_CACHE_MB_PARAM: &str = "cayenne_segment_cache_mb";
 const CAYENNE_SORT_MERGE_MIN_ROWS_PARAM: &str = "cayenne_sort_merge_min_rows";
 const CAYENNE_SORT_MERGE_MEMORY_POOL_FRACTION_PARAM: &str =
     "cayenne_sort_merge_memory_pool_fraction";
@@ -108,6 +109,7 @@ const MAX_COMPACTION_MEMORY_FRACTION: f64 = 0.9;
 /// `runtime.params` keys with a `cayenne_` prefix that the runtime recognizes.
 const KNOWN_CAYENNE_RUNTIME_PARAMS: &[&str] = &[
     CAYENNE_FOOTER_CACHE_MB_PARAM,
+    CAYENNE_SEGMENT_CACHE_MB_PARAM,
     CAYENNE_SORT_MERGE_MIN_ROWS_PARAM,
     CAYENNE_SORT_MERGE_MEMORY_POOL_FRACTION_PARAM,
     CAYENNE_FILTER_PROPAGATION_PARAM,
@@ -397,6 +399,10 @@ impl RuntimeBuilder {
         let cayenne_footer_cache_mb =
             parse_usize_runtime_param(&spicepod_rt.params, CAYENNE_FOOTER_CACHE_MB_PARAM);
         log_applied_cayenne_param(CAYENNE_FOOTER_CACHE_MB_PARAM, cayenne_footer_cache_mb);
+        let cayenne_segment_cache_mb =
+            parse_usize_runtime_param(&spicepod_rt.params, CAYENNE_SEGMENT_CACHE_MB_PARAM);
+        log_applied_cayenne_param(CAYENNE_SEGMENT_CACHE_MB_PARAM, cayenne_segment_cache_mb);
+        install_segment_cache(cayenne_segment_cache_mb);
         let cayenne_filter_propagation = parse_cayenne_filter_propagation(&spicepod_rt.params);
 
         // Process-global SQLite metastore pragma tuning (cache, mmap, busy
@@ -1031,6 +1037,84 @@ fn parse_memory_limit(memory_limit: Option<String>) -> Option<u64> {
 /// operators see at startup which override actually took effect. Only logs
 /// when `value` is `Some` (the parser already emits a warning for malformed
 /// values). See spiceai/spiceai#10970.
+/// Total byte budget for the process-wide Vortex segment cache.
+///
+/// One cache serves every Cayenne table, so this is a whole-process budget:
+/// adding a table divides this pool instead of reserving another cache of its own
+/// (spiceai/spiceai#12937). Unset derives ~1/64 of the process's memory
+/// entitlement, clamped to [256 MiB, 2 GiB] — a single-table deployment gets
+/// somewhat more than the old per-table share, while a fleet of tables can no
+/// longer multiply it. `0` disables segment caching.
+///
+/// The floor matches the old per-table floor on purpose, and is not a regression
+/// against it: the old default floored at 256 MiB *per table*, so below 16 GiB —
+/// where `RAM/64` is still under the floor — this whole-process budget is at most
+/// what a single table used to take, and strictly less for any pod with two or
+/// more. A deployment that set an explicit per-table value smaller than the floor
+/// is the one case this does not cover, and no floor would: the fix there is to
+/// set `runtime.params.cayenne_segment_cache_mb`.
+///
+/// Note `get_total_memory()` prefers the cgroup limit but falls back to host RAM,
+/// so a pod with `requests.memory` and no `limits.memory` still derives from the
+/// node's memory; that entitlement gap is tracked separately.
+fn segment_cache_budget_bytes(configured_mb: Option<usize>) -> u64 {
+    const MIB: u64 = 1024 * 1024;
+    const FLOOR_BYTES: u64 = 256 * MIB;
+    const CEIL_BYTES: u64 = 2048 * MIB;
+    const HOST_FRACTION: u64 = 64;
+
+    match configured_mb {
+        Some(mb) => u64::try_from(mb).unwrap_or(u64::MAX).saturating_mul(MIB),
+        // Derive in whole MiB: `get_total_memory()` is not page-aligned on every
+        // host, so dividing the byte count would give a budget whose value
+        // depends on the machine.
+        None => (crate::resource_monitor::get_total_memory() / HOST_FRACTION / MIB)
+            .clamp(FLOOR_BYTES / MIB, CEIL_BYTES / MIB)
+            .saturating_mul(MIB),
+    }
+}
+
+/// Install the process-wide Vortex segment cache, before any Cayenne table is
+/// registered so every format shares one budget.
+///
+/// Always installs a decision, even for a pod with no Cayenne table today.
+/// Datasets can be added after startup through `apply_app`/`apply_dataset_diff`,
+/// and a format that finds no decision falls back to a cache of its own — which
+/// would rebuild the per-table allocation this replaced, and would ignore a
+/// configured `0`. What *is* gated on a Cayenne table is the memory reservation
+/// (see `estimate_cayenne_reservation_bytes`): an empty Moka cache allocates
+/// nothing until something inserts into it, so installing costs nothing, while
+/// reserving against the query pool for a cache no table can read would shrink
+/// every other query's budget for nothing.
+fn install_segment_cache(configured_mb: Option<usize>) {
+    // `runtime.params.cayenne_segment_cache_mb` is the only input. Per-table values
+    // sized a per-table cache; there is no conversion from them to a shared budget
+    // that is not invented, and a single dataset's setting must not decide the
+    // budget every other table reads from. They are reported as ignored where they
+    // are read, against the dataset that set them.
+    let bytes = segment_cache_budget_bytes(configured_mb);
+
+    if bytes == 0 {
+        // Install the decision, not just the absence of one: a format must not
+        // substitute a private cache for one the operator switched off.
+        vortex_datafusion::install_process_segment_cache(0);
+        return;
+    }
+    if vortex_datafusion::install_process_segment_cache(bytes) {
+        tracing::info!(
+            "Vortex segment cache installed: {} MB shared across all Cayenne tables",
+            bytes / (1024 * 1024)
+        );
+    } else {
+        // A second runtime in one process (tests, embedded hosts) keeps the cache
+        // the first one installed; the budget is process-wide by construction.
+        tracing::debug!(
+            "Vortex segment cache already installed; keeping the existing budget and ignoring {} MB",
+            bytes / (1024 * 1024)
+        );
+    }
+}
+
 fn log_applied_cayenne_param<V: std::fmt::Display>(key: &str, value: Option<V>) {
     if let Some(value) = value {
         tracing::info!("Cayenne runtime tunable applied: runtime.params.{key}={value}");
@@ -1208,8 +1292,11 @@ fn resolved_refresh_mode(
 /// falls back to the refresh runtime (and then the CPU runtime), so skipping it is
 /// a resource decision, not a behavioral one.
 ///
-/// Datasets only: `ViewBuilder::try_from` rejects every view refresh mode except
-/// `full`, so no view can stream changes.
+/// Datasets and catalogs. A view cannot stream changes — `ViewBuilder::try_from`
+/// rejects every view refresh mode except `full` — but an accelerated catalog runs
+/// the apply loop for every table it discovers, and `changes` is the only refresh
+/// mode its schema admits, so a catalog-accelerated pod needs the runtime as much
+/// as an equivalent set of datasets does.
 #[must_use]
 pub fn streams_cdc_changes(app: Option<&Arc<app::App>>) -> bool {
     app.is_some_and(|app| {
@@ -1219,18 +1306,28 @@ pub fn streams_cdc_changes(app: Option<&Arc<app::App>>) -> bool {
                     && resolved_refresh_mode(&dataset.from, accel.refresh_mode.as_ref())
                         == RefreshMode::Changes
             })
+        }) || app.catalogs.iter().any(|catalog| {
+            catalog.acceleration.as_ref().is_some_and(|accel| {
+                matches!(
+                    accel.refresh_mode,
+                    spicepod::component::catalog::CatalogRefreshMode::Changes
+                )
+            })
         })
     })
 }
 
 /// Classify the Cayenne accelerations `app` configures (see [`CayenneWorkload`]).
 ///
-/// Covers both `app.datasets` and `app.views`: a view carries its own
-/// `acceleration` block and is initialized through the same `DataAccelerator::init`
-/// path as a dataset (`init::view::initialize_views_accelerators`, which resolves
-/// any engine in the registry), so a pod whose Cayenne acceleration lives only on
-/// views runs a Cayenne tier the memory budget cannot see. Catalogs are excluded
-/// deliberately: they carry `CatalogAcceleration`, a separate type.
+/// Covers every component kind that creates a Cayenne table — `app.datasets`,
+/// `app.views` and `app.catalogs` — because a kind the classification cannot see
+/// runs a Cayenne tier the memory budget does not account for. A view carries its
+/// own `acceleration` block and is initialized through the same
+/// `DataAccelerator::init` path as a dataset
+/// (`init::view::initialize_views_accelerators`, which resolves any engine in the
+/// registry); a catalog carries `CatalogAcceleration`, which is converted into the
+/// dataset acceleration its tables are configured with (see
+/// [`cayenne_accelerations`]).
 ///
 /// Each acceleration is classified by `RefreshWriteProfile::from_spicepod` — the
 /// same mapping `dataaccelerator::cayenne` uses to configure the table — so the
@@ -1249,7 +1346,7 @@ fn cayenne_workload(app: Option<&Arc<app::App>>) -> CayenneWorkload {
             configured: true,
             uses_cdc_tier: workload.uses_cdc_tier || profile.uses_cdc_tier(),
             needs_compaction: workload.needs_compaction
-                || compacts_into_carved_pool(accel, profile),
+                || compacts_into_carved_pool(&accel, profile),
         }
     })
 }
@@ -1286,6 +1383,10 @@ fn compacts_into_carved_pool(
 /// How many enabled Cayenne accelerations can compact into the carved pool, for the
 /// operator log. [`CayenneWorkload::needs_compaction`] is exactly `count > 0`, so
 /// the counted set is structurally the same one the gate keys off.
+///
+/// An accelerated catalog counts once, not once per table: how many tables it
+/// discovers is unknowable before the connector connects. The count is a log line
+/// about which configuration earned the carve, not a table census.
 #[cfg(not(windows))]
 fn count_compaction_eligible_accelerations(app: Option<&Arc<app::App>>) -> usize {
     app.map_or(0, |app| {
@@ -1368,6 +1469,23 @@ fn plan_cayenne_memory_budgets(
     }
 }
 
+/// Whether the pod reads from a `from: cayenne` catalog.
+///
+/// Such a catalog reads an existing Cayenne store, so it declares no acceleration
+/// at all — [`cayenne_accelerations`] converts a catalog's `CatalogAcceleration`
+/// and drops the catalogs that have none, which is every catalog of this shape.
+/// It is the one way a pod hosts Cayenne tables that no acceleration block names.
+#[cfg(not(windows))]
+fn reads_from_cayenne_catalog(app: &Arc<app::App>) -> bool {
+    app.catalogs.iter().any(|catalog| {
+        catalog
+            .from
+            .split(':')
+            .next()
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("cayenne"))
+    })
+}
+
 /// Every enabled Cayenne acceleration in `app`, paired with its RESOLVED write
 /// profile — the connector default is already applied for an unset `refresh_mode`
 /// (see [`connector_unset_refresh_mode`]), so a consumer cannot read the fallback
@@ -1375,30 +1493,59 @@ fn plan_cayenne_memory_budgets(
 ///
 /// A view has no `from:` and `ViewBuilder::try_from` rejects every refresh mode
 /// except `full`, so its unset default is the whole-table replace.
+///
+/// A catalog carries `CatalogAcceleration` rather than a dataset's `Acceleration`,
+/// so it is CONVERTED into one — through
+/// [`runtime_component::catalog::CatalogAcceleration::to_dataset_acceleration`],
+/// the same conversion the catalog connector configures every table it accelerates
+/// from — and then classified like any other. That is a config-shape conversion
+/// only: it reads the Spicepod, discovers nothing, and yields one item per catalog
+/// rather than one per table (see `count_compaction_eligible_accelerations` and
+/// `estimate_cayenne_reservation_bytes` for what that means for each consumer).
+/// Converting rather than classifying `CatalogAcceleration` in place is what keeps
+/// `RefreshWriteProfile` the single classifier; the eventual home for this is a
+/// trait both acceleration types implement, the pre-init counterpart of
+/// `AccelerationSource`.
+///
+/// The yielded acceleration is therefore owned for a catalog and borrowed for the
+/// two component kinds that declare one directly.
 #[cfg(not(windows))]
 fn cayenne_accelerations(
     app: &Arc<app::App>,
 ) -> impl Iterator<
     Item = (
-        &spicepod::acceleration::Acceleration,
+        std::borrow::Cow<'_, spicepod::acceleration::Acceleration>,
         crate::dataaccelerator::cayenne::RefreshWriteProfile,
     ),
 > {
     use crate::dataaccelerator::cayenne::RefreshWriteProfile;
+    use std::borrow::Cow;
 
     app.datasets
         .iter()
         .map(|dataset| {
             (
-                dataset.acceleration.as_ref(),
+                dataset.acceleration.as_ref().map(Cow::Borrowed),
                 connector_unset_refresh_mode(&dataset.from),
             )
         })
-        .chain(
-            app.views
-                .iter()
-                .map(|view| (view.acceleration.as_ref(), RefreshMode::Full)),
-        )
+        .chain(app.views.iter().map(|view| {
+            (
+                view.acceleration.as_ref().map(Cow::Borrowed),
+                RefreshMode::Full,
+            )
+        }))
+        .chain(app.catalogs.iter().map(|catalog| {
+            let converted = catalog.acceleration.clone().map(|acceleration| {
+                Cow::Owned(
+                    runtime_component::catalog::CatalogAcceleration::from(acceleration)
+                        .to_dataset_acceleration(),
+                )
+            });
+            // The expansion always names a `refresh_mode` (catalog acceleration
+            // requires one), so this fallback is never consulted.
+            (converted, RefreshMode::Changes)
+        }))
         .filter_map(|(accel, unset)| accel.map(|accel| (accel, unset)))
         .filter(|(accel, _)| {
             accel.enabled
@@ -1407,7 +1554,10 @@ fn cayenne_accelerations(
                     .as_deref()
                     .is_some_and(|engine| engine.eq_ignore_ascii_case("cayenne"))
         })
-        .map(|(accel, unset)| (accel, RefreshWriteProfile::from_spicepod(accel, unset)))
+        .map(|(accel, unset)| {
+            let profile = RefreshWriteProfile::from_spicepod(&accel, unset);
+            (accel, profile)
+        })
 }
 
 /// Estimate the aggregate bytes that enabled Cayenne tables reserve OUTSIDE the
@@ -1417,14 +1567,13 @@ fn cayenne_accelerations(
 /// `dataaccelerator::cayenne::autotune::HardwareProfile` — keep the fractions in
 /// sync).
 ///
-/// Two tiers of consumer, because they attach to different tables:
+/// Two tiers of consumer, because they scale differently:
 ///
-/// * The **Vortex segment cache** is a SCAN-path cache. `CayenneContext` builds one
-///   `SharedSegmentCache` the moment a table is registered, whatever its refresh
-///   mode, and it fills to its cap under query load. It is counted for EVERY enabled
-///   Cayenne acceleration. One per acceleration is exact: a partitioned dataset's
-///   children all share the parent's context, and therefore its one cache
-///   (`CayennePartitionCreator::new`).
+/// * The **Vortex segment cache** is a SCAN-path cache, and there is exactly one for
+///   the process however many tables read through it. It is counted ONCE, outside the
+///   per-acceleration fold, at whatever capacity was installed — so adding a table
+///   divides that pool rather than reserving another cache. Its presence in this
+///   estimate is gated on the pod having something to read through it at all.
 /// * The **PK keyset, CDC coalesce buffer, and inline memtable** are write-path
 ///   state that only a small-write (CDC-profile) table populates, so they are
 ///   counted only for those.
@@ -1440,10 +1589,16 @@ fn cayenne_accelerations(
 /// mmap are intentionally excluded: the tier is already capped at host/5 and the
 /// mmap is page-cache-backed.
 ///
-/// Datasets AND views: a view registers a Cayenne table with its own segment cache
-/// exactly as a dataset does. `ViewBuilder::try_from` rejects every view refresh mode
-/// except `full`, so a view never contributes the write-path tier, but it is
-/// classified through the same predicate rather than assumed.
+/// Datasets, views AND catalogs: a view registers a Cayenne table exactly as a
+/// dataset does. `ViewBuilder::try_from` rejects every view refresh mode except
+/// `full`, so a view never contributes the write-path tier, but it is classified
+/// through the same predicate rather than assumed.
+///
+/// A catalog contributes ONE table's worth, which is a floor rather than an
+/// estimate: it accelerates every table it discovers, and that count is unknowable
+/// before the connector connects. Under-counting a catalog leaves the query pool
+/// larger than the tables warrant, but counting it as zero — which is what excluding
+/// catalogs did — reserves nothing at all for a pod built entirely on one.
 #[cfg(not(windows))]
 fn estimate_cayenne_reservation_bytes(
     app: Option<&Arc<app::App>>,
@@ -1453,7 +1608,6 @@ fn estimate_cayenne_reservation_bytes(
     const GIB: u64 = 1024 * MIB;
     // Auto-derived per-table cap fractions (mirror of the accelerator's autotune).
     const KEYSET_CACHE_HOST_FRACTION: u64 = 32; // ~1/32 host, clamped [256 MiB, 8 GiB]
-    const SEGMENT_CACHE_HOST_FRACTION: u64 = 128; // ~1/128 host, clamped [256 MiB, 1 GiB]
     const DEFAULT_COALESCE_BYTES: u64 = 128 * MIB;
     const DEFAULT_INLINE_BYTES: u64 = 8 * MIB;
 
@@ -1475,21 +1629,14 @@ fn estimate_cayenne_reservation_bytes(
         parse_u64(runtime_params, &["cdc_max_coalesced_bytes"]).unwrap_or(DEFAULT_COALESCE_BYTES);
 
     let mut total: u64 = 0;
+    let mut has_cayenne_acceleration = false;
     for (accel, profile) in cayenne_accelerations(app) {
+        has_cayenne_acceleration = true;
         let params = accel
             .params
             .as_ref()
             .map(spicepod::param::Params::as_string_map)
             .unwrap_or_default();
-        // Scan-path cache: allocated per registered Cayenne acceleration regardless
-        // of refresh mode.
-        let segment = parse_u64(&params, &["cayenne_segment_cache_mb", "segment_cache_mb"])
-            .map_or_else(
-                || (total_memory / SEGMENT_CACHE_HOST_FRACTION).clamp(256 * MIB, GIB),
-                |mb| mb.saturating_mul(MIB),
-            );
-        total = total.saturating_add(segment);
-
         // Inline-admission state: the bounded Arrow buffer a write is admitted
         // through, plus the Arrow IPC entry it serializes into. Byte-valued
         // params, so no MB conversion; the accelerator's key lists (with the
@@ -1547,6 +1694,22 @@ fn estimate_cayenne_reservation_bytes(
             .saturating_add(coalesce)
             .saturating_add(inline);
     }
+
+    // Scan-path cache: one process-wide cache shared by every table, so it is
+    // counted once rather than per acceleration — and only when something exists
+    // to use it, since reserving against the query pool for a cache no table can
+    // read would shrink every other query's budget for nothing. Reading the
+    // installed capacity rather than recomputing the budget also reports zero
+    // when caching is switched off.
+    //
+    // Catalogs count as much as datasets here: a `from: cayenne` catalog builds
+    // its tables through `CayenneTableProviderBuilder` and `CayenneContext`, which
+    // read from the same shared cache. A catalog-only pod would otherwise keep the
+    // full query pool while the cache filled beside it.
+    if has_cayenne_acceleration || reads_from_cayenne_catalog(app) {
+        total = total
+            .saturating_add(vortex_datafusion::process_segment_cache_capacity_bytes().unwrap_or(0));
+    }
     total
 }
 
@@ -1572,8 +1735,11 @@ fn estimate_cayenne_reservation_bytes(
 /// Covers both `app.datasets` and `app.views`: a view carries its own `acceleration`
 /// block and creates a `DuckDB` instance exactly as a dataset does, so an instance
 /// the budget cannot see is an instance left at `DuckDB`'s own ~80%-of-RAM default —
-/// the over-commit this budget exists to prevent. Catalogs are excluded deliberately:
-/// they carry `CatalogAcceleration`, whose engine enum admits only Cayenne.
+/// the over-commit this budget exists to prevent. Catalogs are excluded because they
+/// cannot create a `DuckDB` instance at all: `CatalogAcceleration`'s engine enum
+/// admits only Cayenne. That is a statement about this engine, not about whether a
+/// catalog demands memory — the Cayenne classification counts catalogs (see
+/// `cayenne_accelerations`).
 ///
 /// This enumerates component kinds by hand because it runs *before* initialization,
 /// against the Spicepod. It is the pre-init mirror of the `AccelerationSource` trait,
@@ -1933,6 +2099,116 @@ fn parse_cayenne_optimizer_rules(
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[cfg(not(windows))]
+    fn dataset_with_cayenne(
+        name: &str,
+        segment_cache_mb: Option<&str>,
+    ) -> spicepod::component::dataset::Dataset {
+        let mut dataset = spicepod::component::dataset::Dataset::new("postgres:public.t", name);
+        let mut acceleration = spicepod::acceleration::Acceleration {
+            enabled: true,
+            engine: Some("cayenne".to_string()),
+            ..Default::default()
+        };
+        if let Some(mb) = segment_cache_mb {
+            acceleration.params = Some(spicepod::param::Params::from_string_map(
+                [("cayenne_segment_cache_mb".to_string(), mb.to_string())]
+                    .into_iter()
+                    .collect(),
+            ));
+        }
+        dataset.acceleration = Some(acceleration);
+        dataset
+    }
+
+    /// A pod with no Cayenne acceleration must reserve nothing. The reservation is
+    /// subtracted from the query memory limit, so counting a cache that is never
+    /// installed would shrink every query's budget for memory nothing allocates.
+    #[cfg(not(windows))]
+    #[test]
+    fn no_cayenne_acceleration_reserves_nothing() {
+        let app = Arc::new(
+            app::AppBuilder::new("test")
+                .with_dataset(spicepod::component::dataset::Dataset::new(
+                    "postgres:public.t",
+                    "plain",
+                ))
+                .build(),
+        );
+        assert_eq!(
+            estimate_cayenne_reservation_bytes(Some(&app), &HashMap::new()),
+            0,
+            "a pod with no Cayenne table reserves nothing, segment cache included"
+        );
+    }
+
+    /// The counterpart to the no-Cayenne case: a pod that does have a Cayenne
+    /// table reserves its write-path state, so the gate above is what decides,
+    /// not an empty estimator.
+    #[cfg(not(windows))]
+    #[test]
+    fn a_cayenne_acceleration_reserves_its_write_path_state() {
+        let app = Arc::new(
+            app::AppBuilder::new("test")
+                .with_dataset(dataset_with_cayenne("accelerated", None))
+                .build(),
+        );
+        assert!(
+            estimate_cayenne_reservation_bytes(Some(&app), &HashMap::new()) > 0,
+            "a Cayenne table reserves against the query pool"
+        );
+    }
+
+    /// A catalog-only pod hosts Cayenne tables with no dataset acceleration block,
+    /// so the reservation has to see it or the shared cache grows beside a query
+    /// pool that never accounted for it.
+    #[cfg(not(windows))]
+    #[test]
+    fn a_cayenne_catalog_reserves_even_without_a_dataset_acceleration() {
+        let catalog =
+            spicepod::component::catalog::Catalog::new("cayenne".to_string(), "cat".to_string());
+        let app = Arc::new(app::AppBuilder::new("test").with_catalog(catalog).build());
+        assert!(
+            reads_from_cayenne_catalog(&app),
+            "a `from: cayenne` catalog must be recognized"
+        );
+        assert!(
+            estimate_cayenne_reservation_bytes(Some(&app), &HashMap::new()) > 0
+                || vortex_datafusion::process_segment_cache_capacity_bytes().is_none(),
+            "a catalog-only pod reserves the shared cache when one is installed"
+        );
+    }
+
+    #[test]
+    fn segment_cache_budget_honours_an_explicit_value() {
+        const MIB: u64 = 1024 * 1024;
+        assert_eq!(segment_cache_budget_bytes(Some(512)), 512 * MIB);
+        // Below the derived floor on purpose: an explicit value is the operator's
+        // call, not a hint to clamp.
+        assert_eq!(segment_cache_budget_bytes(Some(16)), 16 * MIB);
+        assert_eq!(
+            segment_cache_budget_bytes(Some(0)),
+            0,
+            "zero disables segment caching"
+        );
+    }
+
+    #[test]
+    fn segment_cache_budget_default_stays_within_its_bounds() {
+        const MIB: u64 = 1024 * 1024;
+        // Derived from the host, so assert the contract rather than a figure: one
+        // shared budget between 256 MiB and 2 GiB, whatever the machine.
+        let derived = segment_cache_budget_bytes(None);
+        assert!(
+            (256 * MIB..=2048 * MIB).contains(&derived),
+            "derived budget {derived} out of bounds"
+        );
+        assert!(
+            derived.is_multiple_of(MIB),
+            "the budget is a whole number of MiB"
+        );
+    }
 
     #[test]
     fn test_parse_memory_limit() {
@@ -2449,6 +2725,15 @@ mod test {
             )]),
             "an explicit refresh_mode overrides the connector default"
         );
+
+        // An accelerated catalog runs the same apply loop for every table it
+        // discovers, so a catalog-only pod needs the dedicated runtime too.
+        assert!(streams_cdc_changes(Some(&catalog_test_app(test_catalog(
+            Some((spicepod::acceleration::Mode::Memory, &[]))
+        )))));
+        assert!(!streams_cdc_changes(Some(&catalog_test_app(test_catalog(
+            None
+        )))));
     }
 
     /// One accelerated dataset for [`cayenne_budget_app`], as
@@ -2717,6 +3002,149 @@ mod test {
         assert_eq!(count_compaction_eligible_accelerations(Some(&view_only)), 0);
 
         assert_eq!(count_compaction_eligible_accelerations(None), 0);
+    }
+
+    /// A Spicepod catalog, accelerated into Cayenne or (with no `acceleration`
+    /// block) not accelerated at all. `refresh_mode` has no catalog-level default
+    /// because `changes` is the only value the schema admits.
+    fn test_catalog(
+        acceleration: Option<(spicepod::acceleration::Mode, &[(&str, &str)])>,
+    ) -> spicepod::component::catalog::Catalog {
+        use spicepod::component::catalog::{
+            Catalog, CatalogAcceleration, CatalogAccelerationEngine, CatalogRefreshMode,
+        };
+
+        let mut catalog = Catalog::new("postgres:my_catalog".to_string(), "pg".to_string());
+        let Some((mode, params)) = acceleration else {
+            return catalog;
+        };
+        catalog.acceleration = Some(CatalogAcceleration {
+            engine: CatalogAccelerationEngine::Cayenne,
+            refresh_mode: CatalogRefreshMode::Changes,
+            mode,
+            params: (!params.is_empty()).then(|| {
+                spicepod::param::Params::from_string_map(
+                    params
+                        .iter()
+                        .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                        .collect(),
+                )
+            }),
+        });
+        catalog
+    }
+
+    fn catalog_test_app(catalog: spicepod::component::catalog::Catalog) -> Arc<app::App> {
+        Arc::new(
+            app::AppBuilder::new("catalog-gate-test")
+                .with_catalog(catalog)
+                .build(),
+        )
+    }
+
+    /// Regression for #13013: a pod whose only Cayenne acceleration is a catalog must
+    /// be budgeted on the same terms as the equivalent set of datasets. Every table a
+    /// catalog accelerates is a CDC-accelerated Cayenne table, so the catalog reaches
+    /// the in-memory CDC tier (the query-pool reduction that leaves room for that
+    /// tier is gated on it) and takes the compaction carve whenever its storage mode
+    /// accumulates Vortex files.
+    ///
+    /// Asserted against an equivalent dataset rather than against literals, so the
+    /// two component kinds cannot drift apart as the classification evolves.
+    #[cfg(not(windows))]
+    #[test]
+    fn cayenne_workload_counts_accelerated_catalogs() {
+        use spicepod::acceleration::{Acceleration, Mode, RefreshMode};
+
+        let catalog_app = |mode: Mode, params: &[(&str, &str)]| {
+            catalog_test_app(test_catalog(Some((mode, params))))
+        };
+        // The per-table dataset the catalog connector synthesizes for each table it
+        // discovers, minus the per-table key.
+        let dataset_app = |mode: Mode, params: &[(&str, &str)]| {
+            let accel = Acceleration {
+                enabled: true,
+                engine: Some("cayenne".to_string()),
+                refresh_mode: Some(RefreshMode::Changes),
+                mode,
+                params: (!params.is_empty()).then(|| {
+                    spicepod::param::Params::from_string_map(
+                        params
+                            .iter()
+                            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                            .collect(),
+                    )
+                }),
+                ..Acceleration::default()
+            };
+            cayenne_test_app(
+                vec![cayenne_test_dataset_from(
+                    "postgres:my_catalog.public.orders",
+                    "orders",
+                    accel,
+                )],
+                vec![],
+            )
+        };
+
+        let params = [("cayenne_file_path", "/data")];
+        for mode in [Mode::Memory, Mode::File, Mode::FileCreate, Mode::FileUpdate] {
+            let catalog = catalog_app(mode.clone(), &params);
+            let dataset = dataset_app(mode.clone(), &params);
+            assert_eq!(
+                cayenne_workload(Some(&catalog)),
+                cayenne_workload(Some(&dataset)),
+                "an accelerated catalog must be classified exactly as the tables it creates ({mode:?})"
+            );
+            assert_eq!(
+                count_compaction_eligible_accelerations(Some(&catalog)),
+                count_compaction_eligible_accelerations(Some(&dataset)),
+                "{mode:?}"
+            );
+            // The catalog's own accelerator params reach the budget, so a per-table
+            // cap the catalog sets is the cap the reservation is sized against.
+            assert_eq!(
+                estimate_cayenne_reservation_bytes(Some(&catalog), &HashMap::new()),
+                estimate_cayenne_reservation_bytes(Some(&dataset), &HashMap::new()),
+                "{mode:?}"
+            );
+        }
+
+        // Spelled out, so the equivalence above can't hold by both sides being wrong:
+        // a catalog always streams changes, so it always reaches the CDC tier, and it
+        // earns the carve exactly when its storage mode produces files.
+        let memory = catalog_app(Mode::Memory, &[]);
+        let memory_workload = cayenne_workload(Some(&memory));
+        assert!(memory_workload.is_configured());
+        assert!(
+            memory_workload.uses_cdc_tier(),
+            "a catalog's only refresh mode is `changes`, whose tables hold rows in the in-memory CDC tier"
+        );
+        assert!(
+            !memory_workload.needs_compaction(),
+            "mode: memory never writes a Vortex file for compaction to consolidate"
+        );
+        assert!(
+            estimate_cayenne_reservation_bytes(Some(&memory), &HashMap::new()) > 0,
+            "a catalog-only pod holds off-pool Cayenne caches, so the query pool must be reduced for them"
+        );
+
+        let file = catalog_app(Mode::File, &[]);
+        assert!(cayenne_workload(Some(&file)).needs_compaction());
+        assert_eq!(count_compaction_eligible_accelerations(Some(&file)), 1);
+        assert_eq!(
+            plan_cayenne_memory_budgets(Some(&file), &HashMap::new()).compaction_memory_fraction,
+            Some(DEFAULT_COMPACTION_MEMORY_FRACTION),
+            "a file-mode catalog compacts, so it carves the compaction pool"
+        );
+
+        // A catalog without an `acceleration` block configures no Cayenne at all.
+        let plain = catalog_test_app(test_catalog(None));
+        assert!(!cayenne_workload(Some(&plain)).is_configured());
+        assert_eq!(
+            estimate_cayenne_reservation_bytes(Some(&plain), &HashMap::new()),
+            0
+        );
     }
 
     /// Regression for #12320: a Cayenne deployment with no dataset that can compact

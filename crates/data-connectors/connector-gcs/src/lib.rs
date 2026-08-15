@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use runtime::Runtime;
+use app::App;
 use runtime::component::dataset::Dataset;
 use runtime::dataconnector::listing::{
     LISTING_TABLE_PARAMETERS, ListingTableConnector, ObjectVersionType, build_fragments,
@@ -23,8 +23,9 @@ use runtime::dataconnector::listing::{
 use runtime::dataconnector::parameters::{Validator, gcs::GcsAuthValidator};
 use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
-    DataConnectorResult, ParameterSpec, Parameters,
+    DataConnectorResult,
 };
+use runtime_parameters::{ParameterSpec, Parameters};
 use snafu::prelude::*;
 use std::any::Any;
 use std::clone::Clone;
@@ -77,7 +78,7 @@ pub enum Error {
 
 pub struct GoogleCloudStorage {
     params: Parameters,
-    runtime: Option<Runtime>,
+    app: Option<Arc<App>>,
     tokio_io_runtime: Handle,
 }
 
@@ -155,10 +156,10 @@ impl DataConnectorFactory for GoogleCloudStorageFactory {
                 validator.validate(&mut params).await?;
             }
 
-            let runtime = params.runtime().map(Arc::unwrap_or_clone);
+            let app = params.app();
             let gcs = GoogleCloudStorage {
                 params: params.parameters,
-                runtime,
+                app,
                 tokio_io_runtime: params.io_runtime,
             };
             Ok(Arc::new(gcs) as Arc<dyn DataConnector>)
@@ -234,8 +235,8 @@ impl ListingTableConnector for GoogleCloudStorage {
         Ok(gcs_url)
     }
 
-    fn get_runtime(&self) -> Option<Runtime> {
-        self.runtime.clone()
+    fn get_app(&self) -> Option<Arc<App>> {
+        self.app.clone()
     }
 
     fn handle_object_store_error(
@@ -346,7 +347,7 @@ mod tests {
     fn create_test_connector(params: Parameters) -> GoogleCloudStorage {
         GoogleCloudStorage {
             params,
-            runtime: None,
+            app: None,
             tokio_io_runtime: Handle::current(),
         }
     }

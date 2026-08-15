@@ -50,12 +50,13 @@ use super::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     ParameterSpec,
 };
-use crate::{component::dataset::Dataset, federated::FederatedTable};
+use crate::component::dataset::Dataset;
 use data_components::cdc::{
     self, ChangeBatch, ChangeEnvelope, ChangesStream, CommitChange, CommitError,
 };
 use data_components::flight::{FlightFactory, FlightTable};
 use data_components::{Read, ReadWrite};
+use data_connector_api::federated::FederatedTableProvider;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -568,13 +569,16 @@ impl DataConnector for SpiceAI {
 
     fn changes_stream(
         &self,
-        federated_table: Arc<FederatedTable>,
+        federated_table: Arc<dyn FederatedTableProvider>,
         _dataset: &Dataset,
     ) -> Option<ChangesStream> {
         self.append_stream(federated_table)
     }
 
-    fn append_stream(&self, federated_table: Arc<FederatedTable>) -> Option<ChangesStream> {
+    fn append_stream(
+        &self,
+        federated_table: Arc<dyn FederatedTableProvider>,
+    ) -> Option<ChangesStream> {
         Some(Box::pin(stream! {
             let table_provider = federated_table.table_provider().await;
             let Some(federated_table_provider_adaptor) = table_provider

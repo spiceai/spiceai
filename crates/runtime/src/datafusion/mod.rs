@@ -57,6 +57,7 @@ use crate::secrets::Secrets;
 use crate::tracing_util::view_registered_trace;
 use crate::view::prepare_view;
 use crate::{status, view};
+use data_connector_api::federated::FederatedTableProvider;
 use runtime_search::udtf::TEXT_SEARCH_UDTF_NAME;
 
 use snafu::ResultExt;
@@ -133,8 +134,12 @@ pub mod builder;
 #[cfg(not(windows))]
 pub mod cayenne_ddl;
 pub use runtime_datafusion::composed_catalog;
-pub use runtime_datafusion::dialect;
-pub use runtime_datafusion::error;
+// `dialect`, `error` and `refresh_sql` below are named throughout the runtime
+// through these aliases, but they belong to `runtime-datafusion`. Crate-visible
+// so a crate outside the runtime has to depend on `runtime-datafusion` directly
+// rather than route through here.
+pub(crate) use runtime_datafusion::dialect;
+pub(crate) use runtime_datafusion::error;
 pub use runtime_table::filter_converter;
 pub mod flight_session_extension;
 pub mod iceberg_ddl;
@@ -144,7 +149,7 @@ pub use runtime_datafusion::param_utils;
 pub use runtime_datafusion::pg_catalog;
 #[cfg(not(windows))]
 pub mod planner;
-pub use runtime_datafusion::refresh_sql;
+pub(crate) use runtime_datafusion::refresh_sql;
 pub mod request_context_extension;
 pub use runtime_datafusion::retention_sql;
 pub use runtime_table::table_provider_with_spicepod_metadata;
@@ -2298,7 +2303,11 @@ impl DataFusion {
         // - plans cache may hold stale `Arc<dyn TableProvider>` references
         //   whose in-memory state (e.g. Cayenne protected snapshots / deletion
         //   caches) no longer reflects the latest write.
-        if let Err(e) = self.caching().invalidate_for_table(table_reference.clone()) {
+        if let Err(e) = self
+            .caching()
+            .invalidate_for_table(table_reference.clone())
+            .await
+        {
             tracing::warn!(
                 "Failed to invalidate caches for table {table_reference} after write: {e}"
             );
@@ -2417,7 +2426,11 @@ impl DataFusion {
         // - plans cache may hold stale `Arc<dyn TableProvider>` references
         //   whose in-memory state (e.g. Cayenne protected snapshots / deletion
         //   caches) no longer reflects the latest write.
-        if let Err(e) = self.caching().invalidate_for_table(table_reference.clone()) {
+        if let Err(e) = self
+            .caching()
+            .invalidate_for_table(table_reference.clone())
+            .await
+        {
             tracing::warn!(
                 "Failed to invalidate caches for table {table_reference} after streaming write: {e}"
             );
@@ -3083,7 +3096,10 @@ impl DataFusion {
                 },
             );
 
-            let changes_stream = source.changes_stream(Arc::clone(&source_table_provider), dataset);
+            let changes_stream = source.changes_stream(
+                Arc::clone(&source_table_provider) as Arc<dyn FederatedTableProvider>,
+                dataset,
+            );
 
             if let Some(changes_stream) = changes_stream {
                 accelerated_table_builder.changes_stream(changes_stream);
@@ -3156,6 +3172,20 @@ impl DataFusion {
         #[cfg(windows)]
         let is_s3_express_acceleration = false;
         accelerated_table_builder.s3_express_acceleration(is_s3_express_acceleration);
+
+        // The engine rewrites some incoming types at table creation because its storage
+        // format cannot hold them (Cayenne/Vortex keeps every timestamp at microsecond
+        // precision, DuckDB does the same for TIMESTAMPTZ). The refresh sink compares the
+        // incoming schema against the accelerated one, so without these rules it reports
+        // the engine's own type as the acceleration lagging the source.
+        let engine_type_rewrites = self
+            .accelerator_engine_registry
+            .get_accelerator_engine(acceleration_settings.engine)
+            .await
+            .map_or::<arrow_tools::type_rewrite::TypeRewriteRules, _>(&[], |accel| {
+                accel.type_rewrite_rules()
+            });
+        accelerated_table_builder.engine_type_rewrites(engine_type_rewrites);
 
         source
             .on_accelerator_setup(dataset, &mut accelerated_table_builder)

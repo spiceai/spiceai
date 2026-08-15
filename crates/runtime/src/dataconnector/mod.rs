@@ -14,17 +14,20 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::accelerated::{self, AcceleratedTable};
 use crate::component::ComponentInitialization;
 use crate::component::catalog::Catalog;
 use crate::component::dataset::Dataset;
 use crate::component::dataset::acceleration::RefreshMode;
-use crate::federated::FederatedTable;
-pub use crate::parameters::ParameterSpec;
-pub use crate::parameters::Parameters;
+// A second alias for the `runtime-parameters` types, kept crate-visible for the
+// same reason as the `parameters` alias itself: it would otherwise be a way for
+// a connector to name them without depending on the crate that owns them.
+pub(crate) use crate::parameters::ParameterSpec;
+pub(crate) use crate::parameters::Parameters;
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use data_components::cdc::ChangesStream;
+use data_connector_api::accelerated::{AcceleratorSetup, RegisteredAcceleratedTable};
+use data_connector_api::federated::FederatedTableProvider;
 use datafusion::datasource::TableProvider;
 use linkme::distributed_slice;
 pub use parameters::ConnectorParams;
@@ -40,7 +43,9 @@ use std::future::Future;
 use std::time::Duration;
 
 pub mod client_identity;
-pub mod http_rate_control;
+// Re-exports `data-http-rate-control`; crate-visible so a connector outside the
+// runtime depends on that crate directly instead of routing through here.
+pub(crate) mod http_rate_control;
 pub mod listing;
 
 /// Creates a default reqwest client with standard Spice settings.
@@ -174,7 +179,16 @@ pub mod iceberg_cluster;
 pub mod parameters;
 pub mod refresh_source;
 pub mod s3;
-pub mod schema_projection;
+// Re-exports `data-connector-api`'s projection parser; crate-visible so a
+// connector outside the runtime depends on that crate directly. Shadowing the
+// same-named module the `data_connector_api::*` glob below would otherwise
+// re-export is the point: it is what withdraws `runtime::dataconnector::
+// schema_projection` from the public API, and a glob cannot exclude a name.
+#[expect(
+    hidden_glob_reexports,
+    reason = "deliberately withdraws the path so connectors name `data-connector-api` directly"
+)]
+pub(crate) mod schema_projection;
 pub mod sink;
 // spiceai: registration moved to crates/data-connectors/connector-spiceai; module kept for catalog connector
 pub mod spiceai;
@@ -369,7 +383,7 @@ pub trait DataConnector: Debug + Send + Sync + 'static {
 
     fn changes_stream(
         &self,
-        _federated_table: Arc<FederatedTable>,
+        _federated_table: Arc<dyn FederatedTableProvider>,
         _dataset: &Dataset,
     ) -> Option<ChangesStream> {
         None
@@ -379,7 +393,10 @@ pub trait DataConnector: Debug + Send + Sync + 'static {
         false
     }
 
-    fn append_stream(&self, _federated_table: Arc<FederatedTable>) -> Option<ChangesStream> {
+    fn append_stream(
+        &self,
+        _federated_table: Arc<dyn FederatedTableProvider>,
+    ) -> Option<ChangesStream> {
         None
     }
 
@@ -439,18 +456,17 @@ pub trait DataConnector: Debug + Send + Sync + 'static {
     }
 
     /// A hook called **before** the accelerated table is built, giving the
-    /// connector a chance to wrap or replace the accelerator provider on the
-    /// [`Builder`](crate::accelerated::Builder).
+    /// connector a chance to wrap or replace the accelerator's provider.
     ///
-    /// Any provider set here will be shared with the [`Refresher`] that is
-    /// created during [`Builder::build`]. Use this hook instead of
+    /// Any provider set here will be shared with the [`Refresher`] created when
+    /// the table is built. Use this hook instead of
     /// [`on_accelerated_table_registration`](Self::on_accelerated_table_registration)
     /// when the wrapped provider must be visible to the refresh pipeline
     /// (e.g. to recreate indexes after a data refresh).
     async fn on_accelerator_setup(
         &self,
         _dataset: &Dataset,
-        _builder: &mut accelerated::Builder,
+        _accelerator: &mut dyn AcceleratorSetup,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Ok(())
     }
@@ -464,7 +480,7 @@ pub trait DataConnector: Debug + Send + Sync + 'static {
     async fn on_accelerated_table_registration(
         &self,
         _dataset: &Dataset,
-        _accelerated_table: &mut AcceleratedTable,
+        _accelerated_table: &mut dyn RegisteredAcceleratedTable,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Ok(())
     }

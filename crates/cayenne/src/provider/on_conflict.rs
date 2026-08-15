@@ -22,7 +22,9 @@ limitations under the License.
 //! scan/update plumbing. The provider drives these from its insert/delete path.
 
 use super::delete::CayenneDeletionSink;
-use super::pk_index::{CachedPkIndex, PkDigestSet, PkExistenceRef, ShardedPkIndex};
+use super::pk_index::{
+    CachedPkIndex, PendingPkExistence, PkDigestSet, PkExistenceRef, ShardedPkIndex,
+};
 use crate::metadata::InlinedData;
 
 use arrow::record_batch::RecordBatch;
@@ -394,6 +396,52 @@ pub(crate) fn is_delete_all(filters: &[Expr]) -> bool {
             Expr::Literal(datafusion_common::ScalarValue::Boolean(Some(true)), _)
         )
     })
+}
+
+/// Taints the maintained live row count's exactness around a user `DELETE`.
+///
+/// A delete tombstones rows the persisted `num_rows` still counts, and nothing
+/// re-derives that count — `cached_table_statistics_for_optimizer` only *masks*
+/// the drift while `has_pending_deletions()` holds. Any path that folds the
+/// tombstone (compaction, overwrite, datalake promotion, the seq-prefix bake)
+/// drops that mask, and one that does not also re-baseline the count with
+/// [`RowCountUpdate::Set`] leaves it served `Exact` over a stale value — which a
+/// distributed `COUNT(*)` can substitute into its result. Tainting exactness at
+/// delete time makes the mask no longer the only thing standing between a stale
+/// count and an `Exact` answer, for every fold path at once.
+///
+/// The count itself is deliberately left alone rather than decremented: the
+/// deleted total spans tiers the persisted count does not uniformly include (a
+/// delete-all also purges the mem tier), so subtracting it can under-count. An
+/// over-count served `Inexact` is a planner estimate; an under-count that a later
+/// `Set` has not yet corrected would be a wrong answer.
+///
+/// [`RowCountUpdate::Set`]: super::column_stats::RowCountUpdate::Set
+pub(crate) struct RowCountExactnessTaintingDeletionSink {
+    pub(crate) table: CayenneTableProvider,
+    pub(crate) inner: Arc<dyn DeletionSink>,
+}
+
+#[async_trait]
+impl DeletionSink for RowCountExactnessTaintingDeletionSink {
+    async fn delete_from(
+        &self,
+        context: Arc<TaskContext>,
+    ) -> std::result::Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+        // Taint BEFORE the inner delete, which publishes durably and cannot be
+        // undone. Taint-then-delete can only leave the count conservative (a
+        // delete that removes nothing, errors, or is cancelled costs the metadata
+        // `COUNT(*)` fast path until the next full rewrite); delete-then-taint
+        // leaves the *unsafe* residue — a cancellation, crash, or failed
+        // statistics write between the two, after which the tombstone is durable
+        // while `num_rows_exact` still claims the stale count is the live one, and
+        // a later fold un-masks it as `Exact`. This mirrors
+        // `PkKeysetInvalidatingDeletionSink`'s unconditional pre-delete
+        // `mark_pk_keyset_occ_degraded`, and for the same reason: on this path the
+        // conservative direction is free and the optimistic one is a wrong answer.
+        self.table.taint_persisted_row_count_exactness().await;
+        self.inner.delete_from(context).await
+    }
 }
 
 pub(crate) struct PkKeysetInvalidatingDeletionSink {
@@ -1081,6 +1129,13 @@ pub(crate) struct OnConflictContext<'a> {
     pub(crate) on_conflict: &'a OnConflict,
     pub(crate) upsert_options: &'a UpsertOptions,
     pub(crate) existing: PkExistenceRef<'a>,
+    /// Keys committed by other writers since `existing` was checked out of its
+    /// cache, which `existing` therefore cannot know about (see
+    /// [`PendingPkKeys`](super::pk_index::PendingPkKeys)).
+    /// Consulted on an `existing` miss so a key committed mid-validation is not
+    /// classified as a new primary key. `None` when nothing was committed during
+    /// this checkout — the common case.
+    pub(crate) pending: Option<&'a PendingPkExistence>,
     pub(crate) incoming_keys: &'a PkDigestSet,
 }
 
@@ -1171,12 +1226,24 @@ impl OnConflictValidationStream {
             CachedPkIndex::Bloom(bloom) => PkExistenceRef::Bloom(bloom),
         };
 
+        // Snapshot per batch, not per stream: `existing` was checked out before the
+        // first batch, and this stream is consumed lazily as the encode runs, so a
+        // concurrent writer can commit a key between two batches of it.
+        let pending = if self.store_back {
+            self.table.pending_pk_existence()
+        } else {
+            // Off-lock staging validates against a private keyset it just built —
+            // it holds no checkout, so the log is another writer's business.
+            None
+        };
+
         let mut ctx = OnConflictContext {
             pk_indices: &self.pk_indices,
             converter: &self.converter,
             on_conflict: &self.on_conflict,
             upsert_options: &self.upsert_options,
             existing,
+            pending: pending.as_ref(),
             incoming_keys: &self.incoming_keys,
         };
 

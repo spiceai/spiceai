@@ -38,10 +38,10 @@ use runtime::{
     dataconnector::{DataConnectorError, create_new_connector, parameters::ConnectorParamsBuilder},
     extension::{Error as ExtensionError, Extension, ExtensionFactory, ExtensionManifest, Result},
     federated::FederatedTable,
-    secrets::{ExposeSecret, Secrets},
     spice_metrics::get_metrics_table_reference,
     status,
 };
+use runtime_secrets::{ExposeSecret, Secrets};
 use tokio::sync::RwLock;
 
 #[derive(Debug, Snafu)]
