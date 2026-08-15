@@ -1264,6 +1264,93 @@ mod tests {
         Ok(())
     }
 
+    /// Footer eviction must not be conditional on this format owning a segment
+    /// cache. The two caches are independent — a format with no segment cache
+    /// still `put`s every footer it reads into the shared, process-wide
+    /// `FileMetadataCache` — so gating the eviction on the segment cache would
+    /// leave exactly those deployments unable to release anything.
+    ///
+    /// Also pins the blast radius: only the named paths are evicted.
+    #[tokio::test]
+    async fn invalidating_retired_paths_evicts_their_footers_with_no_segment_cache()
+    -> anyhow::Result<()> {
+        let ctx = TestSessionContext::default();
+        for table in ["retired", "live"] {
+            ctx.session
+                .sql(&format!(
+                    "CREATE EXTERNAL TABLE {table} (id INT NOT NULL) \
+                     STORED AS vortex LOCATION '{table}/'"
+                ))
+                .await?
+                .collect()
+                .await?;
+            ctx.session
+                .sql(&format!("INSERT INTO {table} VALUES (1), (2), (3)"))
+                .await?
+                .collect()
+                .await?;
+            // Reading is what caches the footers (`infer_schema` / `infer_stats`).
+            ctx.session
+                .sql(&format!("SELECT * FROM {table}"))
+                .await?
+                .collect()
+                .await?;
+        }
+
+        let runtime_env = ctx.session.runtime_env();
+        // `LOCATION 'retired/'` resolves against the process working directory,
+        // so match the table's own directory rather than a leading prefix.
+        let cached = |table: &str| {
+            let dir = format!("/{table}/");
+            runtime_env
+                .cache_manager
+                .get_file_metadata_cache()
+                .list_entries()
+                .into_keys()
+                .filter(|path| path.as_ref().contains(&dir))
+                .collect::<HashSet<Path>>()
+        };
+
+        let retired = cached("retired");
+        let live_before = cached("live");
+        assert!(
+            !retired.is_empty() && !live_before.is_empty(),
+            "reading both tables must cache both tables' footers"
+        );
+
+        let format =
+            VortexFormat::new_with_options(VortexSession::default(), VortexTableOptions::default());
+        assert_eq!(
+            format.segment_cache_capacity_bytes(),
+            None,
+            "this test's whole point is a format with no segment cache of its own"
+        );
+
+        // A path that was never cached stands in for a retirement reporting a
+        // file whose footer no scan ever read: it must not be counted as evicted.
+        let mut paths = retired.clone();
+        paths.insert(Path::from("retired/never-opened.vortex"));
+        let evicted = VortexFormat::invalidate_footer_cache_paths(&runtime_env, &paths);
+        assert_eq!(
+            evicted,
+            retired.len(),
+            "every resident footer of the retired paths is evicted, and only those"
+        );
+
+        format.invalidate_cached_paths(&runtime_env, paths).await;
+        assert!(
+            cached("retired").is_empty(),
+            "a retired file's footer must not survive its file"
+        );
+        assert_eq!(
+            cached("live"),
+            live_before,
+            "a table nothing retired must keep every footer it had"
+        );
+
+        Ok(())
+    }
+
     #[test]
     fn format_plumbs_footer_initial_read_size() {
         let mut opts = VortexTableOptions::default();
