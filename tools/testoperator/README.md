@@ -44,9 +44,9 @@ Run standard benchmarks using the `testoperator run bench [OPTIONS]` command. In
 - `--scale-factor <SCALE_FACTOR>`: The expected scale factor for the test, used in metrics calculation.
 - `--validate`: A boolean flag to specify whether results should be validated against their expected results. Supported for `tpch`, `tpch[parameterized]` (scale factor 1 only), and `scenario` query sets (when expected results are defined in the scenario file).
 - `--metrics`: Whether to upload metrics to the Spice OSS benchmarks dashboards. By default, submits to the Production metrics endpoint using the API key specified in the `SPICEAI_BENCHMARK_METRICS_KEY` environment variable. If specified, the metrics delivery endpoint can be overridden with the `SPICEAI_TELEMETRY_ENDPOINT` environment variable.
-- `--disable-caching`: Whether to disable results cache by supplying a `Cache-Control: no-cache` header over the Flight request. Allows disabling results cache separately from spicepod configuration.
+- `--disable-caching`: Whether to disable results cache by supplying a `Cache-Control: no-cache` header over the Flight request. Allows disabling results cache separately from spicepod configuration. A benchmark should almost always pass this: `runtime.caching.sql_results` is on by default with a one-second `item_ttl`, and a benchmark runs one warmup query followed by its timed iterations of the same SQL back-to-back, so without it the timed iterations read the cache the warmup filled. The `bench` workflow passes it by default; turn it off only for a spicepod that is benchmarking the cache itself, such as those under `test/spicepods/tpch/sf5/cache`.
 
-Running a benchmark test will always generate snapshots for the query explain plan and results for `tpch` and `tpcds` queries. Only explain plans will be generated for `clickbench` queries.
+Running a benchmark test will always generate snapshots for the query explain plan, and result snapshots for the `tpch` and `tpcds` queries. `clickbench` records result snapshots for the subset of its queries whose rows do not depend on how the engine breaks ties — see `SNAPSHOTTED_CLICKBENCH_QUERIES` in `src/commands/bench/mod.rs` — and explain plans for all of them.
 
 Snapshots can be automatically re-generated using the [`INSTA_UPDATE`](https://docs.rs/insta/latest/insta/#updating-snapshots) environment variable.
 
