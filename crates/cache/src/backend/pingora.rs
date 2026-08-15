@@ -80,7 +80,8 @@ struct KeyedValue<V> {
 ///
 /// Trade-offs:
 /// - pingora-lru requires remove + re-admit to read values (no `peek_value` API)
-/// - Brief race window during value retrieval under heavy concurrent load
+/// - A hit therefore holds its key's metadata shard exclusively, so it excludes that shard's
+///   metadata-only readers (a miss, `len()`, `iter_keys()`) for the length of the read
 /// - More complex implementation than Moka
 pub struct PingoraBackend<V>
 where
@@ -279,40 +280,40 @@ where
             }
         }
 
-        // NOTE: pingora-lru doesn't have a peek_value() API, only peek() which returns bool.
-        // We must use remove() to get the value, then re-admit it to maintain LRU ordering.
-        // There's a brief race window here where concurrent requests may see a cache miss.
-        // This is acceptable because:
-        // 1. The window is extremely small (single-digit microseconds)
-        // 2. We already verified the item isn't expired (no unnecessary re-admission)
-        // 3. Cache misses are handled gracefully by upstream code
+        // NOTE: pingora-lru exposes no by-key value read — `peek` returns a bool and discards
+        // the value its private `LruUnit::peek` already holds — so a hit is served by removing
+        // the entry and re-admitting it, which also maintains LRU ordering. Whether that
+        // destructive read can be avoided at all is #12985.
         //
-        // What is *not* acceptable is another request writing this key inside that window.
-        // The pair below is a read expressed as a mutation, so an `insert` that completes
-        // between the remove and the re-admit is undone by the re-admit: the old value goes
-        // back over the new one, while the insert's metadata — and so the new entry's
-        // expiry — stays. The cache then serves a value the writer replaced, for the TTL of
-        // the replacement (#12838).
+        // Expressing a read as a mutation makes two other operations on this key unsafe while
+        // the value is out, and one exclusive hold of the key's metadata shard excludes both:
         //
-        // So the pair goes under one hold of the key's shard, the lock every writer of an
-        // entry — `insert`, `remove`, `remove_if_expired`, `evict_to_weight_limit`, `clear` —
-        // takes for writing. An `insert` that lands before the hold is what `remove` returns
-        // and what the re-admit puts back; one that arrives during it waits and then wins
-        // outright.
+        // 1. An `insert` that completes between the remove and the re-admit is undone by the
+        //    re-admit: the old value goes back over the new one, while the insert's metadata —
+        //    and so the new entry's expiry — stays. The cache then serves a value the writer
+        //    replaced, for the TTL of the replacement (#12838). Every writer of an entry —
+        //    `insert`, `remove`, `remove_if_expired`, `evict_to_weight_limit`, `clear` — takes
+        //    this shard for writing, so one that lands before the hold is what `remove`
+        //    returns and what the re-admit puts back, and one that arrives during the hold
+        //    waits and then wins outright.
         //
-        // A *read* hold is what that needs, and all it needs: this path reads the shard's
-        // metadata and never changes it, so excluding the writers is the whole requirement,
-        // and holding it shared leaves concurrent hits — and `len()`/`iter_keys()` — running
-        // in parallel as they did before. Two hits on one key can still each `remove` and
-        // have one of them come back empty; that is the transient miss noted above, which
-        // costs a re-fetch and cannot lose a write.
+        // 2. A second `get` of the same key finds the entry removed and reports a miss for a
+        //    value the cache is holding, costing a re-fetch and understating the hit rate
+        //    (#12987). Excluding readers as well as writers is why this hold is exclusive.
+        //
+        // Excluding readers costs no parallelism the destructive read had, because the two
+        // shardings coincide: `get_shard_index` is `key % NUM_KEY_SHARDS` and pingora-lru's
+        // own `get_shard` is `key % N` over the same 16 units, so any two `get`s serialised
+        // here already serialise on the pingora shard under `remove` and again under `admit`.
+        // What the hold does newly exclude is this shard's metadata-only readers — a miss,
+        // `len()`, `iter_keys()` — for the length of one remove/clone/re-admit.
         //
         // The lock is taken in the order `insert` already takes it — shard, then the
         // pingora-lru shard underneath `remove`/`admit` — so it adds no new ordering against
         // eviction, which materialises its victims (`evict_to_limit` returns an owned `Vec`)
         // before it takes any shard.
         let shard_idx = Self::get_shard_index(*key);
-        let _shard = self.metadata_shards[shard_idx].read();
+        let _shard = self.metadata_shards[shard_idx].write();
 
         let (entry, weight) = self.cache.remove(*key)?;
 
@@ -1254,6 +1255,74 @@ mod tests {
             served.data, "new",
             "the reader's re-admit undid the concurrent insert"
         );
+    }
+
+    /// A hit is served by removing the entry, so a second reader that reaches the cache while
+    /// the value is out finds nothing and reports a miss for a key the cache is holding —
+    /// re-executing the query behind it and understating the hit rate (#12987). The reader
+    /// must wait for the value to come back instead.
+    ///
+    /// Driven through the same gate as the test above rather than by racing two readers: the
+    /// window is a few microseconds wide, so a stress test reports the bug only occasionally.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_hit_cannot_be_missed_by_a_concurrent_hit() {
+        let backend = Arc::new(PingoraBackend::<GatedValue>::with_params(
+            4096,
+            Duration::from_mins(1),
+        ));
+        let key = 12u64;
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel::<()>(1);
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        backend
+            .insert(
+                key,
+                GatedValue {
+                    data: "cached".to_string(),
+                    gate: Some(Arc::new(Gate {
+                        entered: entered_tx,
+                        release: std::sync::Mutex::new(release_rx),
+                    })),
+                },
+            )
+            .await;
+
+        let parked_reader = Arc::clone(&backend);
+        let parked = tokio::spawn(async move { parked_reader.get(&key).await });
+        entered_rx
+            .recv()
+            .expect("the first reader reaches the re-admit window");
+
+        // The first reader is now holding the value out of the cache, mid-read.
+        let second_reader = Arc::clone(&backend);
+        let mut concurrent = tokio::spawn(async move { second_reader.get(&key).await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(250), &mut concurrent)
+                .await
+                .is_err(),
+            "a concurrent hit resolved while the value was held out of the cache — on a read \
+             served by removing the entry, that resolution is a miss reported for a key the \
+             cache is holding"
+        );
+
+        // One release per reader: the value the first reader re-admits is the gated copy the
+        // cache was given, so the second reader's clone parks in the same window.
+        release_tx.send(()).expect("the first reader waits on this");
+        release_tx
+            .send(())
+            .expect("the second reader waits on this");
+
+        let first_served = parked
+            .await
+            .expect("the first read task does not panic")
+            .expect("the first reader is served the cached value");
+        assert_eq!(first_served.data, "cached");
+
+        let second_served = concurrent
+            .await
+            .expect("the second read task does not panic")
+            .expect("a concurrent hit reported a miss for a key the cache is holding");
+        assert_eq!(second_served.data, "cached");
     }
 
     // ===================
