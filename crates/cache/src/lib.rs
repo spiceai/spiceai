@@ -113,15 +113,23 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 ///
 /// This is what `max_size` is enforced against, so an implementation must
 /// account for everything the value reaches through a pointer — the weigher is
-/// handed the value and nothing else. [`crate::sizing`] holds the deep-size
+/// handed the value and nothing else — **and** add
+/// `sizing::ENTRY_OVERHEAD_BYTES` for the store's own per-entry bookkeeping,
+/// which no implementation can see. The `sizing` module holds the deep-size
 /// helpers and states which imprecisions are deliberate.
+///
+/// Omitting any of it does not fail to compile; it silently makes `max_size`
+/// unable to bound a stream of that value, which is the defect
+/// <https://github.com/spiceai/spiceai/issues/12931> reported.
 pub trait Sizeable {
     fn get_memory_size(&self) -> usize;
 }
 
 impl Sizeable for Vec<Vec<f32>> {
     fn get_memory_size(&self) -> usize {
-        std::mem::size_of::<Self>() + sizing::f32_vectors_heap_size(self)
+        std::mem::size_of::<Self>()
+            + sizing::f32_vectors_heap_size(self)
+            + sizing::ENTRY_OVERHEAD_BYTES
     }
 }
 

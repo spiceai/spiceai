@@ -57,21 +57,7 @@ impl CachedAggregationResult {
             schema,
         }
     }
-}
 
-#[derive(Clone)]
-pub struct CachedSearchResult {
-    pub results: Arc<HashMap<TableReference, CachedAggregationResult>>,
-    pub input_tables: Arc<HashSet<TableReference>>,
-}
-
-impl AsTableRefs for CachedSearchResult {
-    fn as_table_refs(&self) -> Arc<HashSet<TableReference>> {
-        Arc::clone(&self.input_tables)
-    }
-}
-
-impl CachedAggregationResult {
     /// The memory one table's aggregated results hold, excluding the struct
     /// itself — the caller charges that through the map slot holding it.
     fn heap_size(&self) -> usize {
@@ -92,6 +78,18 @@ impl CachedAggregationResult {
                 .sum::<usize>()
             + ARC_HEADER_BYTES
             + schema_size(&self.schema)
+    }
+}
+
+#[derive(Clone)]
+pub struct CachedSearchResult {
+    pub results: Arc<HashMap<TableReference, CachedAggregationResult>>,
+    pub input_tables: Arc<HashSet<TableReference>>,
+}
+
+impl AsTableRefs for CachedSearchResult {
+    fn as_table_refs(&self) -> Arc<HashSet<TableReference>> {
+        Arc::clone(&self.input_tables)
     }
 }
 
