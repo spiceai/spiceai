@@ -7,12 +7,12 @@ description: "Query: tpcds_q65"
 +--------------+-------------+---------+-----------------+------------------+--------------------+
 | able         | A           | 1.42    | 3.42            | 1.19             | importoedu pack #1 |
 | able         | A           | 1.74    | 3.42            | 1.19             | importoedu pack #1 |
+| able         | A           | 6.96    | 6.64            | 2.19             | maxinameless #7    |
 | able         | A           | 4.23    | 6.64            | 2.19             | maxinameless #7    |
 | able         | A           | 9.69    | 6.64            | 2.19             | maxinameless #7    |
-| able         | A           | 6.96    | 6.64            | 2.19             | maxinameless #7    |
+| able         | A           | 3.21    | 3.29            | 2.79             | amalgamalg #2      |
 | able         | A           | 6.77    | 4.86            | 2.72             | importoedu pack #2 |
 | able         | A           | 10.27   | 7.97            | 3.74             | exportimaxi #6     |
-| able         | A           | 3.21    | 3.29            | 2.79             | amalgamalg #2      |
+| able         | A           | 8.85    | 3.97            | 1.66             | amalgexporti #2    |
 | able         | A           | 10.53   | 3.54            | 1.23             | edu packscholar #1 |
-| able         | A           | 3.64    | 3.54            | 1.23             | edu packscholar #1 |
 +--------------+-------------+---------+-----------------+------------------+--------------------+
