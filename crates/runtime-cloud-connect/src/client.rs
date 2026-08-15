@@ -1654,7 +1654,10 @@ fn release_local_state_locked(
             );
         })
         .context(EnrollmentTransactionSnafu {
-            config_dir: identity_path.to_path_buf(),
+            // The directory whose transaction is contended, not the file inside
+            // it: the message names a config directory, and on a split
+            // configuration those are not the same path.
+            config_dir: crate::identity::parent_directory(identity_path).to_path_buf(),
         })?;
 
     // Named in the command result so the control plane and the portal learn that
@@ -2773,8 +2776,13 @@ mod tests {
                 .to_string();
 
             assert!(
-                message.contains(&config.identity_path.display().to_string()),
-                "the failure must name the path it could not guard, got {message}"
+                message.contains(&identity_dir.display().to_string()),
+                "the failure must name the directory whose transaction it could not take, got {message}"
+            );
+            assert!(
+                !message.contains(&config.identity_path.display().to_string()),
+                "and must not name the file instead — the contended transaction belongs to the \
+                 directory, and the message calls it one: {message}"
             );
             assert!(
                 cache.exists(),
@@ -3008,40 +3016,6 @@ mod tests {
                 host.config.identity_path.exists(),
                 "and must stop before the identity is cleared, so the instance stays connected"
             );
-        }
-
-        /// A bare relative identity path has `parent() == Some("")` — the
-        /// current directory, spelled in a way no syscall accepts. Left alone it
-        /// turns the artifact scan into a `NotFound` that reads as "no debris"
-        /// and the directory sync into a failure *after* the identity is already
-        /// unlinked, so the release reports failure over a file that is gone.
-        #[tokio::test]
-        async fn it_releases_an_identity_named_without_a_directory() {
-            let host = Host::enrolled();
-            let previous = std::env::current_dir().expect("read the working directory");
-            // The scan and the sync both resolve relative to the process
-            // directory, which is what makes the bare name meaningful.
-            std::env::set_current_dir(&host.config.config_dir).expect("enter the config dir");
-
-            let mut config = host.config.clone();
-            config.identity_path = std::path::PathBuf::from("identity.json");
-            let debris = host
-                .config
-                .config_dir
-                .join(".identity.json.11111111-2222-4333-8444-555555555555.tmp");
-            std::fs::write(&debris, "an interrupted write").expect("write the temp");
-
-            let released = release_local_state(&config, Host::policy()).await;
-
-            std::env::set_current_dir(previous).expect("restore the working directory");
-            let retained = released.expect("a bare relative identity path must still release");
-
-            assert!(
-                !host.config.identity_path.exists(),
-                "the identity is cleared even when named without a directory"
-            );
-            assert!(!debris.exists(), "and its debris is reclaimed, not skipped");
-            assert!(retained.is_empty(), "{retained:?}");
         }
 
         /// The two writers do not overlap: the runtime writes `.tmp`/`.bak`

@@ -1708,7 +1708,7 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
 /// Left as-is it turns `read_dir` into a `NotFound` that reads as "no debris
 /// here" and turns the directory sync into a failure after the file is already
 /// unlinked.
-fn parent_directory(path: &Path) -> &Path {
+pub(crate) fn parent_directory(path: &Path) -> &Path {
     match path.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent,
         _ => Path::new("."),
@@ -2456,6 +2456,30 @@ mod tests {
         assert!(
             !active_temp.exists(),
             "a writer temp becomes reclaimable after its process releases the lock"
+        );
+    }
+
+    /// A bare relative name has `parent() == Some("")`, the current directory
+    /// spelled in a way no syscall accepts. Every scan and directory sync in the
+    /// release resolves through this, so leaving it unnormalized turns `read_dir`
+    /// into a `NotFound` read as "no debris here" and turns the sync into a
+    /// failure after the canonical file is already unlinked.
+    #[test]
+    fn a_name_without_a_directory_resolves_to_the_current_one() {
+        assert_eq!(
+            super::parent_directory(Path::new("identity.json")),
+            Path::new("."),
+            "an empty parent is the current directory"
+        );
+        assert_eq!(
+            super::parent_directory(Path::new("/")),
+            Path::new("."),
+            "and so is no parent at all"
+        );
+        assert_eq!(
+            super::parent_directory(Path::new("/etc/spice/identity.json")),
+            Path::new("/etc/spice"),
+            "while a real parent is left alone"
         );
     }
 
