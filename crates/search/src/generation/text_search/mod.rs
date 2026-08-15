@@ -29,8 +29,11 @@ use arrow_json::reader::Decoder;
 use async_stream::stream;
 use async_trait::async_trait;
 use datafusion::{
-    catalog::TableProvider, error::DataFusionError, execution::SendableRecordBatchStream,
-    logical_expr::sqlparser::ast::Expr, physical_plan::stream::RecordBatchStreamAdapter,
+    catalog::TableProvider,
+    error::DataFusionError,
+    execution::SendableRecordBatchStream,
+    logical_expr::{Expr, TableProviderFilterPushDown},
+    physical_plan::stream::RecordBatchStreamAdapter,
 };
 
 use ::util::format_datafusion_error;
@@ -40,15 +43,16 @@ use snafu::{ResultExt, Snafu};
 use tantivy::{
     Searcher, TantivyError, Term,
     collector::TopDocs,
-    query::{Bm25StatisticsProvider, Occur, QueryParser, QueryParserError},
+    query::{
+        Bm25StatisticsProvider, BooleanQuery, ConstScoreQuery, Occur, Query, QueryParser,
+        QueryParserError,
+    },
     query_grammar::{Delimiter, UserInputAst, UserInputLeaf, UserInputLiteral},
     schema::{FieldType, OwnedValue},
     tokenizer::{LowerCaser, SimpleTokenizer, TextAnalyzer},
 };
 
-use super::{
-    CandidateGeneration, Result as GenerationResult, TextSearchSnafu as GenerationTextSearchSnafu,
-};
+use super::{CandidateGeneration, Result as GenerationResult};
 
 /// Maximum number of results in a single full-text search request, before any pagination.
 /// This size is designated for latency performance on the underlying index.
@@ -445,16 +449,49 @@ impl FullTextSearchFieldIndex {
         })
     }
 
+    /// Classify each pushed-down filter for [`TableProvider::supports_filters_pushdown`].
+    ///
+    /// Every column is classified against the underlying tantivy schema and field types, so the
+    /// classification stays in lockstep with what [`Self::translate_filters`] can actually build.
+    #[must_use]
+    pub fn classify_filters(&self, filters: &[&Expr]) -> Vec<TableProviderFilterPushDown> {
+        let schema = self.reader.schema();
+        filters
+            .iter()
+            .map(|f| tantivy_datafusion_filter::classify_filter(schema, f))
+            .collect()
+    }
+
+    /// Translate the filters DataFusion pushed into this scan into tantivy queries.
+    ///
+    /// A filter DataFusion pushes was previously advertised as `Exact`/`Inexact` by
+    /// [`Self::classify_filters`], so it must translate; a filter that cannot be translated is a
+    /// lockstep violation and is surfaced as an error rather than silently dropped (which would
+    /// return wrong results for a filter DataFusion believes was applied).
+    pub fn translate_filters(
+        &self,
+        filters: &[Expr],
+    ) -> Result<Vec<Box<dyn Query>>, DataFusionError> {
+        let schema = self.reader.schema();
+        filters
+            .iter()
+            .map(|f| {
+                tantivy_datafusion_filter::translate_filter(schema, f).ok_or_else(|| {
+                    DataFusionError::Internal(format!(
+                        "Full text search received a filter it advertised as pushable but cannot translate: {f}"
+                    ))
+                })
+            })
+            .collect()
+    }
+
     pub fn search(
         &self,
         query: String,
-        opt_filters: &[&Expr],
+        filters: Vec<Box<dyn Query>>,
         limit: usize,
     ) -> GenerationResult<SendableRecordBatchStream> {
-        if !opt_filters.is_empty() {
-            return Err(Error::UnsupportedFiltersError).context(GenerationTextSearchSnafu)?;
-        }
-        let strm = make_stream(self.clone(), query, limit);
+        let strm = make_stream(self.clone(), query, filters, limit);
         let schema = self.result_schema();
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, strm)) as SendableRecordBatchStream)
@@ -463,6 +500,7 @@ impl FullTextSearchFieldIndex {
     fn search_query_literal(
         &self,
         literal: &str,
+        filters: &[Box<dyn Query>],
         limit: usize,
         offset: usize,
     ) -> Result<Vec<Value>> {
@@ -472,13 +510,30 @@ impl FullTextSearchFieldIndex {
         // parser rejects (e.g. unbalanced quotes, lone special characters in
         // conversational queries).
         let parser = self.query_parser();
-        let q = match parser.parse_query(literal) {
+        let text_query = match parser.parse_query(literal) {
             Ok(parsed) => parsed,
             Err(_) => parser
                 .build_query_from_user_input_ast(parse_query_literal(literal))
                 .context(InvalidTextSearchQuerySnafu {
                     query: literal.to_string(),
                 })?,
+        };
+
+        // `Must`-combine each pushed-down SQL filter with the full-text clause so the top-K is
+        // computed over the filtered document set (the filter is applied inside the index, not
+        // above the candidate cap).
+        let q: Box<dyn Query> = if filters.is_empty() {
+            text_query
+        } else {
+            let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::with_capacity(filters.len() + 1);
+            clauses.push((Occur::Must, text_query));
+            for f in filters {
+                clauses.push((
+                    Occur::Must,
+                    Box::new(ConstScoreQuery::new(f.box_clone(), 0.0)),
+                ));
+            }
+            Box::new(BooleanQuery::new(clauses))
         };
 
         let collector = TopDocs::with_limit(limit)
@@ -626,6 +681,7 @@ impl CandidateGeneration for FullTextSearchCandidate {
 fn make_stream(
     fts: FullTextSearchFieldIndex,
     query: String,
+    filters: Vec<Box<dyn Query>>,
     limit: usize,
 ) -> impl Stream<Item = std::result::Result<RecordBatch, DataFusionError>> {
     stream! {
@@ -633,15 +689,18 @@ fn make_stream(
         // tantivy search (mmap/disk reads + scoring + stored-field decode) off
         // the async runtime thread (which also serves `/health`, `/v1/search`).
         let fts = std::sync::Arc::new(fts);
+        // Shared across pages; each page `box_clone`s the queries into its own BooleanQuery.
+        let filters = std::sync::Arc::new(filters);
         let mut remaining_limit = limit;
         let mut offset = 0;
         while remaining_limit > 0 {
             let page_size = min(remaining_limit, DEFAULT_BATCH_SIZE);
             let hits = {
                 let fts = std::sync::Arc::clone(&fts);
+                let filters = std::sync::Arc::clone(&filters);
                 let query = query.clone();
                 match tokio::task::spawn_blocking(move || {
-                    fts.search_query_literal(query.as_str(), page_size, offset)
+                    fts.search_query_literal(query.as_str(), filters.as_slice(), page_size, offset)
                 })
                 .await
                 {
