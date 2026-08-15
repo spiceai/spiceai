@@ -1517,7 +1517,19 @@ mod tests {
         );
 
         // Exactly the opener the retirement snapshot could not have seen.
+        //
+        // Pin down *where* it is parked. `is_pending` alone cannot tell the drain
+        // apart from the key scan, and the assertion below is only the one this
+        // test claims to make while the scan is still ahead of the retirement.
         let opened_mid_retirement = shared.for_path(test_store(), retiring.clone());
+        assert!(
+            opened_mid_retirement
+                .get(resident)
+                .await
+                .expect("get for the resident segment should not error")
+                .is_some(),
+            "the retirement must still be parked short of its key scan, or this is not the interleaving under test"
+        );
         opened_mid_retirement
             .put(late, ByteBuffer::from(vec![5u8, 6, 7, 8]))
             .await
