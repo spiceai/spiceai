@@ -70,6 +70,7 @@ use crate::handlers::{
     SpicepodDeployment, advertised_capabilities, effective_max_rows,
 };
 use crate::heartbeat::{build_heartbeat, build_telemetry, now_unix};
+use crate::identity::ArtifactKinds;
 use crate::identity::{AppAttachment, Identity, IdentityStore};
 use crate::mutation_lock::MutationLock;
 use crate::proto;
@@ -1675,6 +1676,7 @@ fn release_local_state_locked(
     retained.extend(release_atomic_write_artifacts(
         &cache_path,
         policy.temp_min_age,
+        ArtifactKinds::Runtime,
     )?);
 
     if let Err(err) = transaction.delete() {
@@ -1690,6 +1692,7 @@ fn release_local_state_locked(
     retained.extend(release_atomic_write_artifacts(
         &EnrollmentDraft::path_in(config_dir),
         policy.temp_min_age,
+        ArtifactKinds::Runtime,
     )?);
 
     // The journals go with the draft, for the same reason: `spice connect` writes
@@ -1715,7 +1718,11 @@ fn release_local_state_locked(
             );
             retained.push(format!("{label} at {}", path.display()));
         }
-        retained.extend(release_atomic_write_artifacts(&path, policy.temp_min_age)?);
+        retained.extend(release_atomic_write_artifacts(
+            &path,
+            policy.temp_min_age,
+            ArtifactKinds::Connect,
+        )?);
     }
 
     let endpoint_path = config_dir.join(CloudConnectConfig::ENDPOINT_OVERRIDE_FILE);
@@ -1729,6 +1736,7 @@ fn release_local_state_locked(
     retained.extend(release_atomic_write_artifacts(
         &endpoint_path,
         policy.temp_min_age,
+        ArtifactKinds::Connect,
     )?);
 
     // The identity goes LAST, and it is the only step that is not retryable:
@@ -1743,6 +1751,7 @@ fn release_local_state_locked(
     retained.extend(release_atomic_write_artifacts(
         identity_path,
         policy.temp_min_age,
+        ArtifactKinds::Runtime,
     )?);
 
     if let Err(err) = IdentityStore::clear_with_transaction(identity_path, &identity_transaction) {
@@ -1801,11 +1810,14 @@ fn identity_transaction(
 /// `std::fs` on the blocking pool rather than `tokio::fs`, to match the other
 /// removals here and keep one failure vocabulary across them.
 fn remove_file_if_present(path: &Path) -> std::result::Result<(), String> {
+    // Only the unlink is reported. Making it durable is the job of the artifact
+    // reclaim that follows every one of these, which syncs this same parent
+    // directory unconditionally and fails the release if it cannot — one sync
+    // covers every unlink pending in the directory. Reporting a sync failure here
+    // would name a file as retained that is in fact gone, and gone durably once
+    // that reclaim succeeds.
     match std::fs::remove_file(path) {
-        // Sync the directory, as the identity and draft removals do: without it
-        // the unlink is acknowledged while the entry can still come back after a
-        // crash, and a released host would silently hold cloud state again.
-        Ok(()) => crate::identity::sync_parent_directory(path).map_err(|err| err.to_string()),
+        Ok(()) => Ok(()),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(err) => Err(err.to_string()),
     }
@@ -1827,9 +1839,11 @@ fn remove_file_if_present(path: &Path) -> std::result::Result<(), String> {
 fn release_atomic_write_artifacts(
     path: &Path,
     minimum_age: Duration,
+    kinds: ArtifactKinds,
 ) -> std::result::Result<Vec<String>, ReleaseError> {
     let released = path.display().to_string();
-    let remaining = match crate::identity::release_atomic_write_artifacts(path, minimum_age) {
+    let remaining = match crate::identity::release_atomic_write_artifacts(path, minimum_age, kinds)
+    {
         Ok(remaining) => remaining,
         // Fatal for the same reason a promotable temp is. The scan stops at the
         // first error, so it may have given up before reaching a temp a writer
@@ -2933,6 +2947,96 @@ mod tests {
             assert!(retained.is_empty(), "nothing should be left: {retained:?}");
         }
 
+        /// A file that was unlinked is gone, whatever happens to the directory
+        /// sync afterwards, so it must not be named as retained. The reclaim that
+        /// follows every removal syncs this same parent and fails the release if
+        /// it cannot, which is what makes the unlink durable — reporting the file
+        /// here would tell the operator to go remove something that is not there.
+        #[tokio::test]
+        async fn a_file_it_unlinked_is_never_reported_as_retained() {
+            let host = Host::enrolled();
+            std::fs::write(host.endpoint_path(), "https://control.example\n")
+                .expect("write the endpoint override");
+
+            let retained = host.release().await.expect("the removal succeeds");
+
+            for (label, path) in [
+                (
+                    "enrollment journal",
+                    host.journal_path(CloudConnectConfig::CONNECT_OPERATION_FILE),
+                ),
+                ("endpoint override", host.endpoint_path()),
+            ] {
+                assert!(!path.exists(), "the {label} is gone");
+                assert!(
+                    !retained.iter().any(|item| item.contains(label)),
+                    "and must not be reported as retained: {retained:?}"
+                );
+            }
+        }
+
+        /// The two writers do not overlap: the runtime writes `.tmp`/`.bak`
+        /// beside the cache, draft and identity, `spice connect` writes
+        /// `.candidate` beside the journals and endpoint override. A shape the
+        /// writer for a given file cannot produce is somebody else's — and for a
+        /// `.tmp` it is worse than deleted, since an unreclaimable temp fails
+        /// every release.
+        #[tokio::test]
+        async fn it_matches_each_file_against_only_its_own_writer() {
+            let host = Host::enrolled();
+            let strays = [
+                // The runtime never writes a `.candidate` beside the identity.
+                ".identity.json.7.candidate".to_string(),
+                // `spice connect` never writes a `.tmp` beside the endpoint.
+                format!(
+                    ".{}.11111111-2222-4333-8444-555555555555.tmp",
+                    CloudConnectConfig::ENDPOINT_OVERRIDE_FILE
+                ),
+            ];
+            for stray in &strays {
+                std::fs::write(host.config.config_dir.join(stray), "someone's own file")
+                    .expect("write the stray");
+            }
+
+            let retained = host
+                .release()
+                .await
+                .expect("a shape the writer cannot produce must not fail the removal");
+
+            for stray in &strays {
+                assert!(
+                    host.config.config_dir.join(stray).exists(),
+                    "{stray} is not a shape that file's writer produces and must survive"
+                );
+            }
+            assert!(retained.is_empty(), "{retained:?}");
+        }
+
+        /// None of these writers creates a directory or a symlink, so something
+        /// wearing an artifact name that is not a regular file came from
+        /// elsewhere: not ours to delete, and not evidence of a live writer.
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn it_classifies_only_regular_files_as_artifacts() {
+            let host = Host::enrolled();
+            let link = host.config.config_dir.join(format!(
+                ".{SECRET_CACHE_FILE}.11111111-2222-4333-8444-555555555555.tmp"
+            ));
+            std::os::unix::fs::symlink(host.config.config_dir.join("nothing-here"), &link)
+                .expect("create the symlink");
+
+            let retained = host
+                .release()
+                .await
+                .expect("a non-regular file must not fail the removal");
+
+            assert!(
+                link.symlink_metadata().is_ok(),
+                "a symlink is not an artifact this code wrote and must survive"
+            );
+            assert!(retained.is_empty(), "{retained:?}");
+        }
+
         /// The spellings `Uuid::parse_str` and `u64::from_str` accept but these
         /// writers never produce. A file named with a v1 UUID, a braced one, or a
         /// zero-padded number came from somewhere else.
@@ -2944,6 +3048,11 @@ mod tests {
                 format!(".{SECRET_CACHE_FILE}.11111111-2222-1333-8444-555555555555.bak"),
                 // v4, but braced rather than plain hyphenated.
                 format!(".{SECRET_CACHE_FILE}.{{11111111-2222-4333-8444-555555555555}}.bak"),
+                // Version 4, but the variant nibble is `c` — not RFC 4122, so not
+                // something `Uuid::new_v4` produces.
+                format!(".{SECRET_CACHE_FILE}.11111111-2222-4333-c444-555555555555.bak"),
+                // Uppercase suffix; every emitted one is lowercase.
+                format!(".{SECRET_CACHE_FILE}.11111111-2222-4333-8444-555555555555.BAK"),
                 // A number, but not one `u64::to_string` would write.
                 format!(
                     ".{}.007.candidate",

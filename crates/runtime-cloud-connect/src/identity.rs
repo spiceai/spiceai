@@ -1701,7 +1701,23 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     })
 }
 
-/// The `(token, extension)` of a sibling this codebase could have written beside
+/// Which writer's artifacts may appear beside a file.
+///
+/// Two writers, two shapes, and they do not overlap: the runtime writes the
+/// cache, the draft and the identity through [`atomic_write_owner_only`], while
+/// `spice connect` writes the operation journals and the endpoint override
+/// through its own. Accepting both everywhere would delete a
+/// `.identity.json.7.candidate` nothing here can create, and let a
+/// `.cloud-endpoint.<uuid>.tmp` — equally impossible — fail every release.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ArtifactKinds {
+    /// `.tmp` from [`atomic_write_owner_only`], `.bak` from `promote_temp`.
+    Runtime,
+    /// `.candidate` from `spice connect`'s writer.
+    Connect,
+}
+
+/// The `(token, extension)` of a sibling `kinds` could have written beside
 /// `file_name`, or `None` for anything else in the directory.
 ///
 /// Prefix and extension alone are not enough. A sibling somebody named
@@ -1709,27 +1725,28 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
 /// is not ours to delete, and a stray `.tmp` would be worse than deleted: the
 /// release reads an unreclaimable temp as a writer's in-flight file and fails, so
 /// one sitting in the directory would fail every `Remove` for good.
-fn produced_artifact<'a>(entry_name: &'a str, prefix: &str) -> Option<(&'a str, &'a str)> {
+///
+/// Every comparison is exact, because every emitted name is: the extensions are
+/// written lowercase, the UUID is `Uuid::new_v4`'s lowercase hyphenated
+/// `Display`, and the candidate token is `u64::to_string`.
+fn produced_artifact<'a>(
+    entry_name: &'a str,
+    prefix: &str,
+    kinds: ArtifactKinds,
+) -> Option<(&'a str, &'a str)> {
     let (token, extension) = entry_name
         .strip_prefix(prefix)
         .and_then(|rest| rest.rsplit_once('.'))?;
-    let produced = if extension.eq_ignore_ascii_case("tmp") || extension.eq_ignore_ascii_case("bak")
-    {
-        // `atomic_write_owner_only` and `promote_temp` write `Uuid::new_v4()`,
-        // whose `Display` is lowercase hyphenated. Round-tripping rejects the
-        // spellings `parse_str` also accepts — braced, URN, unhyphenated — and the
-        // version check rejects a UUID this code could not have generated.
-        uuid::Uuid::parse_str(token)
-            .is_ok_and(|id| id.get_version_num() == 4 && id.hyphenated().to_string() == token)
-    } else if extension.eq_ignore_ascii_case("candidate") {
-        // `spice connect`'s writer formats `rand::random::<u64>()`, so the digits
-        // have to be exactly what `u64::to_string` produces: no sign, no leading
-        // zeros, `0` itself allowed.
-        token
+    let produced = match (kinds, extension) {
+        (ArtifactKinds::Runtime, "tmp" | "bak") => uuid::Uuid::parse_str(token).is_ok_and(|id| {
+            id.get_version_num() == 4
+                && id.get_variant() == uuid::Variant::RFC4122
+                && id.hyphenated().to_string() == token
+        }),
+        (ArtifactKinds::Connect, "candidate") => token
             .parse::<u64>()
-            .is_ok_and(|number| number.to_string() == token)
-    } else {
-        false
+            .is_ok_and(|number| number.to_string() == token),
+        _ => false,
     };
     produced.then_some((token, extension))
 }
@@ -1751,12 +1768,13 @@ fn cleanup_abandoned_atomic_temps(
     path: &Path,
     minimum_age: std::time::Duration,
 ) -> std::io::Result<()> {
-    cleanup_abandoned_atomic_temps_with(path, minimum_age, |_, _| Ok(()))
+    cleanup_abandoned_atomic_temps_with(path, minimum_age, ArtifactKinds::Runtime, |_, _| Ok(()))
 }
 
 fn cleanup_abandoned_atomic_temps_with<F>(
     path: &Path,
     minimum_age: std::time::Duration,
+    kinds: ArtifactKinds,
     before_remove: F,
 ) -> std::io::Result<()>
 where
@@ -1780,8 +1798,8 @@ where
         let Some(entry_name) = entry_name.to_str() else {
             continue;
         };
-        let is_temp = produced_artifact(entry_name, &prefix)
-            .is_some_and(|(_, extension)| extension.eq_ignore_ascii_case("tmp"));
+        let is_temp = produced_artifact(entry_name, &prefix, kinds)
+            .is_some_and(|(_, extension)| extension == "tmp");
         if !is_temp || !entry.file_type()?.is_file() {
             continue;
         }
@@ -1871,8 +1889,9 @@ pub(crate) struct RemainingArtifacts {
 pub(crate) fn release_atomic_write_artifacts(
     path: &Path,
     minimum_age: std::time::Duration,
+    kinds: ArtifactKinds,
 ) -> std::io::Result<RemainingArtifacts> {
-    cleanup_abandoned_atomic_temps(path, minimum_age)?;
+    cleanup_abandoned_atomic_temps_with(path, minimum_age, kinds, |_, _| Ok(()))?;
 
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     // The same fallback the writer uses, so a non-UTF-8 canonical name still
@@ -1900,10 +1919,17 @@ pub(crate) fn release_atomic_write_artifacts(
         let Some(entry_name) = entry_name.to_str() else {
             continue;
         };
-        let Some((_, extension)) = produced_artifact(entry_name, &prefix) else {
+        let Some((_, extension)) = produced_artifact(entry_name, &prefix, kinds) else {
             continue;
         };
-        let is_temp = extension.eq_ignore_ascii_case("tmp");
+        // Only regular files, as the temp cleanup requires: none of these writers
+        // creates a directory or a symlink, so anything else wearing the name came
+        // from somewhere else and is neither ours to delete nor evidence of a
+        // writer.
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let is_temp = extension == "tmp";
         let is_abandoned = !is_temp;
         if is_abandoned {
             match std::fs::remove_file(entry.path()) {
@@ -2374,18 +2400,23 @@ mod tests {
         std::fs::write(&unrelated, "unrelated").expect("write unrelated temp");
 
         let observed_locked_removal = std::cell::Cell::new(false);
-        cleanup_abandoned_atomic_temps_with(&path, std::time::Duration::ZERO, |_, candidate| {
-            let contender = std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(candidate)?;
-            assert!(
-                !fs4::fs_std::FileExt::try_lock_exclusive(&contender)?,
-                "the cleanup lock must remain held through removal"
-            );
-            observed_locked_removal.set(true);
-            Ok(())
-        })
+        cleanup_abandoned_atomic_temps_with(
+            &path,
+            std::time::Duration::ZERO,
+            ArtifactKinds::Runtime,
+            |_, candidate| {
+                let contender = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(candidate)?;
+                assert!(
+                    !fs4::fs_std::FileExt::try_lock_exclusive(&contender)?,
+                    "the cleanup lock must remain held through removal"
+                );
+                observed_locked_removal.set(true);
+                Ok(())
+            },
+        )
         .expect("clean abandoned temps");
 
         assert!(active_temp.exists(), "a live writer must not be deleted");

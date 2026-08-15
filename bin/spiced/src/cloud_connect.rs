@@ -1071,14 +1071,15 @@ mod cache_lock_seam {
     /// descriptor conflicts with the guard the writer is carrying.
     fn still_locked(config_dir: &Path) -> bool {
         let path = config_dir.join(runtime_cloud_connect::MUTATION_LOCK_FILE);
-        let Ok(probe) = std::fs::OpenOptions::new()
+        let probe = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .open(&path)
-        else {
-            return false;
-        };
-        !fs4::fs_std::FileExt::try_lock_exclusive(&probe).unwrap_or(false)
+            .expect("open the connect mutation lock to probe it");
+        // Not `unwrap_or(false)`: that turns a filesystem without working advisory
+        // locks into a report of "held", which is exactly the answer that makes
+        // the assertion pass without proving anything.
+        !fs4::fs_std::FileExt::try_lock_exclusive(&probe).expect("probe the connect mutation lock")
     }
 }
 
