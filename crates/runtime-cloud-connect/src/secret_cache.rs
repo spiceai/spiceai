@@ -418,7 +418,12 @@ pub fn read(path: &Path, key: &[u8]) -> Result<Option<CachedSecrets>> {
 /// meant to be released.
 pub fn remove(path: &Path) -> Result<()> {
     match std::fs::remove_file(path) {
-        Ok(()) => Ok(()),
+        // Sync the directory, as the identity removal does. A release deletes
+        // this cache before the identity holding its key, so an unlink that is
+        // acknowledged but not durable lets the entry come back after a crash —
+        // beside a durably-deleted identity, which is exactly the stranded cache
+        // this function exists to prevent.
+        Ok(()) => crate::identity::sync_parent_directory(path).context(WriteSnafu { path }),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(source) => Err(Error::Write {
             path: path.to_path_buf(),

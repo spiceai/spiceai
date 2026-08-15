@@ -30,10 +30,15 @@ use runtime_cloud_connect::identity::Identity;
 use serde::{Deserialize, Serialize};
 use snafu::{ResultExt as _, Snafu};
 
+use runtime_cloud_connect::config::CloudConnectConfig;
+
 use super::project::ProjectMutation;
 
-pub(super) const CONNECT_OPERATION_FILE: &str = "connect-operation.json";
-pub(super) const PROJECT_OPERATION_FILE: &str = "connect-project-operation.json";
+// Shared with the runtime, which removes these journals when the control plane
+// releases the instance. A name defined on each side independently would let a
+// rename here leave that removal silently reading a path nothing writes.
+pub(super) const CONNECT_OPERATION_FILE: &str = CloudConnectConfig::CONNECT_OPERATION_FILE;
+pub(super) const PROJECT_OPERATION_FILE: &str = CloudConnectConfig::PROJECT_OPERATION_FILE;
 
 const CONNECT_OPERATION_SCHEMA_VERSION: u32 = 3;
 const PROJECT_OPERATION_SCHEMA_VERSION: u32 = 3;
