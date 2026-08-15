@@ -24,20 +24,27 @@ limitations under the License.
 //! holds: a 0-row query result contributes no array bytes at all, so 100% of
 //! its real cost went unbilled and the byte budget could never evict it.
 //!
-//! Three deliberate imprecisions, all in the over-counting direction, which is
-//! the safe one for a bound:
+//! What this produces is an estimate, not an exact figure. Three deliberate
+//! imprecisions:
 //!
 //! * An allocation reached through an `Arc` from two entries is charged to
-//!   both. Sharing is not observable from a weigher.
-//! * Collection capacity is charged as `capacity * size_of::<Entry>()`, which
-//!   omits a hash table's control bytes and rounding. This matches how
-//!   `arrow_schema::Field::size` charges its own metadata map, so a schema is
-//!   sized the same way whoever asks.
+//!   both. Sharing is not observable from a weigher, and over-charging evicts
+//!   sooner, which is the safe direction for a budget.
+//! * Collection slots are charged as `len`- or `capacity`-times-entry-size,
+//!   which omits a hash table's control bytes and a `Vec`'s spare capacity.
+//!   This matches how `arrow_schema::Field::size` charges its own metadata map,
+//!   so a schema is sized the same way whoever asks.
 //! * [`ENTRY_OVERHEAD_BYTES`] is a flat allowance, not a measurement.
+//!
+//! Exactness is not what `max_size` needs. What it needs — and what the
+//! pre-fix accounting did not give it — is a figure *proportional to what the
+//! entry holds*, so that a budget expressed in bytes constrains how many
+//! entries fit under it.
 
 use std::collections::{HashMap, HashSet};
 use std::hash::BuildHasher;
 use std::mem::size_of;
+use std::sync::Arc;
 
 use arrow::datatypes::Schema;
 use datafusion::sql::TableReference;
@@ -88,16 +95,21 @@ pub(crate) fn string_map_size<S: BuildHasher>(map: &HashMap<String, String, S>) 
 
 /// The bytes a [`TableReference`]'s name parts own on the heap, excluding the
 /// enum itself — the caller charges that through its containing collection.
+///
+/// Each part is its own `Arc<str>` allocation, so each carries a header as well
+/// as its characters.
 pub(crate) fn table_reference_heap_size(table_ref: &TableReference) -> usize {
-    match table_ref {
-        TableReference::Bare { table } => table.len(),
-        TableReference::Partial { schema, table } => schema.len() + table.len(),
+    let parts: &[&Arc<str>] = match table_ref {
+        TableReference::Bare { table } => &[table],
+        TableReference::Partial { schema, table } => &[schema, table],
         TableReference::Full {
             catalog,
             schema,
             table,
-        } => catalog.len() + schema.len() + table.len(),
-    }
+        } => &[catalog, schema, table],
+    };
+
+    parts.iter().map(|part| ARC_HEADER_BYTES + part.len()).sum()
 }
 
 /// Deep size of the input-table set every cached result carries for invalidation.
@@ -111,10 +123,10 @@ pub(crate) fn table_refs_size<S: BuildHasher>(tables: &HashSet<TableReference, S
         + tables.iter().map(table_reference_heap_size).sum::<usize>()
 }
 
-/// Deep size of a `Vec<String>`: its slots plus the bytes each string owns.
-pub(crate) fn string_vec_size(strings: &[String]) -> usize {
-    size_of::<Vec<String>>()
-        + std::mem::size_of_val(strings)
+/// The heap a `Vec<String>` owns — its slots plus the bytes each string owns —
+/// excluding the outer `Vec` struct, which its container already charges.
+pub(crate) fn string_vec_heap_size(strings: &[String]) -> usize {
+    std::mem::size_of_val(strings)
         + strings
             .iter()
             .map(std::string::String::capacity)

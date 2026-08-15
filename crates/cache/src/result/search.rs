@@ -22,7 +22,7 @@ use arrow::datatypes::SchemaRef;
 use datafusion::sql::TableReference;
 
 use crate::sizing::{
-    ARC_HEADER_BYTES, ENTRY_OVERHEAD_BYTES, arc_heap_size, schema_size, string_vec_size,
+    ARC_HEADER_BYTES, ENTRY_OVERHEAD_BYTES, arc_heap_size, schema_size, string_vec_heap_size,
     table_reference_heap_size, table_refs_size,
 };
 use crate::{AsTableRefs, Sizeable};
@@ -82,13 +82,13 @@ impl CachedAggregationResult {
                 .iter()
                 .map(RecordBatch::get_array_memory_size)
                 .sum::<usize>()
-            + string_vec_size(&self.primary_keys)
-            + string_vec_size(&self.data_columns)
+            + string_vec_heap_size(&self.primary_keys)
+            + string_vec_heap_size(&self.data_columns)
             + self.matches.capacity() * std::mem::size_of::<(String, Vec<String>)>()
             + self
                 .matches
                 .iter()
-                .map(|(key, values)| key.capacity() + string_vec_size(values))
+                .map(|(key, values)| key.capacity() + string_vec_heap_size(values))
                 .sum::<usize>()
             + ARC_HEADER_BYTES
             + schema_size(&self.schema)
