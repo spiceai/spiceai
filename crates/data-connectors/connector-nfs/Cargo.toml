@@ -17,6 +17,3 @@ runtime-parameters = { path = "../../runtime-parameters" }
 snafu = "0.8.6"
 tokio = { version = "1", features = ["rt-multi-thread", "signal", "macros", "test-util", "time"] }
 url = "2.5"
-
-[dev-dependencies]
-runtime = { path = "../../runtime" }

@@ -20,7 +20,6 @@ use data_connector_api::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorFactory, DataConnectorResult,
     NewDataConnectorResult,
 };
-use runtime::component::dataset::Dataset;
 use runtime_component::dataset::DatasetSpec;
 use runtime_parameters::{ParameterSpec, Parameters};
 use snafu::prelude::*;
