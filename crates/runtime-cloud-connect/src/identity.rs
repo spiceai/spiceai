@@ -677,7 +677,7 @@ fn write_lock() -> std::sync::MutexGuard<'static, ()> {
 }
 
 fn acquire_update_transaction(path: &Path) -> Result<crate::draft::EnrollmentTransactionLock> {
-    let config_dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let config_dir = parent_directory(path);
     crate::draft::EnrollmentTransactionLock::acquire(config_dir).map_err(|source| {
         Error::UpdateTransaction {
             path: path.to_path_buf(),
@@ -687,7 +687,7 @@ fn acquire_update_transaction(path: &Path) -> Result<crate::draft::EnrollmentTra
 }
 
 fn acquire_removal_transaction(path: &Path) -> Result<crate::draft::EnrollmentTransactionLock> {
-    let config_dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let config_dir = parent_directory(path);
     crate::draft::EnrollmentTransactionLock::acquire_for_removal(config_dir).map_err(|source| {
         Error::UpdateTransaction {
             path: path.to_path_buf(),
@@ -1701,6 +1701,20 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     })
 }
 
+/// The directory a file lives in, as a path that can actually be opened.
+///
+/// `Path::parent` answers `Some("")` for a bare relative name like
+/// `identity.json` — the current directory, spelled in a way no syscall accepts.
+/// Left as-is it turns `read_dir` into a `NotFound` that reads as "no debris
+/// here" and turns the directory sync into a failure after the file is already
+/// unlinked.
+fn parent_directory(path: &Path) -> &Path {
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    }
+}
+
 /// Which writer's artifacts may appear beside a file.
 ///
 /// Two writers, two shapes, and they do not overlap: the runtime writes the
@@ -1780,7 +1794,7 @@ fn cleanup_abandoned_atomic_temps_with<F>(
 where
     F: Fn(&std::fs::File, &Path) -> std::io::Result<()>,
 {
-    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let dir = parent_directory(path);
     let file_name = path
         .file_name()
         .and_then(|name| name.to_str())
@@ -1891,18 +1905,24 @@ pub(crate) fn release_atomic_write_artifacts(
     minimum_age: std::time::Duration,
     kinds: ArtifactKinds,
 ) -> std::io::Result<RemainingArtifacts> {
+    // Fail closed on a name this cannot read, rather than scanning under the
+    // fallback prefix the writer uses. That fallback is `identity.json`, so the
+    // artifacts of an unreadable name are spelled exactly like a real
+    // `identity.json`'s and the two are indistinguishable from the outside:
+    // reclaiming them would delete the other file's debris, and finding one held
+    // would fail this release over the other file's writer. Neither is a
+    // judgement worth making blind. It stops the release before the identity is
+    // cleared — the only step that cannot be retried — so the instance stays
+    // connected and can be released once the path is one both sides can name.
+    let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+        return Err(std::io::Error::other(format!(
+            "cannot identify interrupted writes beside {}: its file name is not valid UTF-8, so they cannot be told apart from another file's",
+            path.display()
+        )));
+    };
     cleanup_abandoned_atomic_temps_with(path, minimum_age, kinds, |_, _| Ok(()))?;
 
-    let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    // The same fallback the writer uses, so a non-UTF-8 canonical name still
-    // scans for the temps `atomic_write_owner_only` would have named. Skipping
-    // the scan would report no promotable temp and let the release proceed to
-    // delete the canonical file, which is the one outcome that must not happen
-    // on a name we cannot read.
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("identity.json");
+    let dir = parent_directory(path);
     let prefix = format!(".{file_name}.");
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
@@ -1967,7 +1987,7 @@ pub(crate) fn atomic_write_owner_only(path: &Path, bytes: &[u8]) -> std::io::Res
     use std::os::unix::fs::PermissionsExt as _;
 
     cleanup_abandoned_atomic_temps(path, ABANDONED_TEMP_MIN_AGE)?;
-    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let dir = parent_directory(path);
     let file_name = path
         .file_name()
         .and_then(|s| s.to_str())
@@ -2011,7 +2031,7 @@ pub(crate) fn atomic_write_owner_only(path: &Path, bytes: &[u8]) -> std::io::Res
     use std::io::Write as _;
     cleanup_stale_identity_backups(path)?;
     cleanup_abandoned_atomic_temps(path, ABANDONED_TEMP_MIN_AGE)?;
-    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let dir = parent_directory(path);
     let file_name = path
         .file_name()
         .and_then(|s| s.to_str())
@@ -2041,7 +2061,7 @@ pub(crate) fn atomic_write_owner_only(path: &Path, bytes: &[u8]) -> std::io::Res
 /// directory metadata durable across power loss.
 #[cfg(unix)]
 pub(crate) fn sync_parent_directory(path: &Path) -> std::io::Result<()> {
-    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let dir = parent_directory(path);
     std::fs::File::open(dir)?.sync_all()
 }
 
@@ -2059,7 +2079,7 @@ pub(crate) fn sync_parent_directory(_path: &Path) -> std::io::Result<()> {
 /// may be the only recoverable identity after an interrupted rollback.
 #[cfg(any(not(unix), test))]
 fn cleanup_stale_identity_backups(path: &Path) -> std::io::Result<()> {
-    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let dir = parent_directory(path);
     let file_name = path
         .file_name()
         .and_then(|s| s.to_str())
@@ -2113,7 +2133,7 @@ fn promote_temp(tmp_path: &Path, path: &Path) -> std::io::Result<()> {
             return Err(err);
         }
 
-        let dir = path.parent().unwrap_or_else(|| Path::new("."));
+        let dir = parent_directory(path);
         let file_name = path
             .file_name()
             .and_then(|s| s.to_str())
