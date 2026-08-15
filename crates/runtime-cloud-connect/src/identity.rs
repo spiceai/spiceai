@@ -1804,11 +1804,12 @@ where
 /// release that removed only the canonical file would report a host clean while
 /// leaving a complete copy of what it was supposed to destroy.
 ///
-/// Temps are reclaimed on the same terms as anywhere else: an exclusive advisory
-/// lock is the liveness signal, and one held on a temp older than `minimum_age`
-/// is the only thing that authorizes removal. A release does not relax that — a
-/// temp too new to judge is reported instead, because deleting a live writer's
-/// file to tidy up would be the worse outcome.
+/// Temps are reclaimed on the same terms as anywhere else: a live writer holds an
+/// exclusive advisory lock on its own temp, so *acquiring* that lock is what
+/// establishes no writer owns the file, and only a temp older than `minimum_age`
+/// whose lock the reclaim takes may be removed. A release does not relax that — a
+/// temp still held, or too new to judge, is reported instead, because deleting a
+/// live writer's file to tidy up would be the worse outcome.
 ///
 /// Backups are removed outright, which is where a release differs from
 /// [`cleanup_stale_identity_backups`]: that one preserves an orphan as possibly
