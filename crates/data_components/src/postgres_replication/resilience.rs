@@ -118,13 +118,15 @@ fn jitter(d: Duration) -> Duration {
 /// Classify a `pgwire_replication::PgWireError` as transient (worth
 /// reconnecting) or fatal (propagate to the user).
 ///
-/// We look at the *error path* rather than specific variants, since
-/// pgwire-replication may add variants over time. The heuristic: anything
-/// that looks like an IO / connection / EOF error is transient; authentication,
+/// Anything that looks like an IO / connection / EOF error, worker task termination,
+/// or a connection-lifecycle / server-shutdown SQLSTATE is transient; authentication,
 /// protocol, slot-not-found, or decoding errors are fatal.
 #[must_use]
 pub fn is_transient_pgwire(err: &pgwire_replication::PgWireError) -> bool {
-    is_transient_by_display(&err.to_string())
+    match err {
+        pgwire_replication::PgWireError::Io(_) | pgwire_replication::PgWireError::Task(_) => true,
+        _ => is_transient_by_display(&err.to_string()),
+    }
 }
 
 /// Same classifier for tokio-postgres (used by setup + bootstrap).
@@ -158,6 +160,8 @@ fn is_transient_by_display(msg: &str) -> bool {
         "unexpected eof",
         "unexpected end of file",
         "early eof",
+        "eof while reading",
+        "end of file",
         "temporarily unavailable",
         "timed out",
         "timeout",
@@ -182,6 +186,17 @@ fn is_transient_by_display(msg: &str) -> bool {
         "sqlstate 53300",
         "max_wal_senders",
         "too many connections",
+        // SQLSTATE 57P0x (operator_intervention): admin shutdown, crash shutdown,
+        // cannot connect now.
+        "sqlstate 57p",
+        "admin shutdown",
+        "administrator command",
+        "terminating connection",
+        "crash shutdown",
+        "cannot connect now",
+        // SQLSTATE 08xxx (connection_exception): connection does not exist,
+        // connection failure, sqlclient unable to establish sqlconnection, etc.
+        "sqlstate 08",
     ];
     let lower = msg.to_ascii_lowercase();
     TRANSIENT_MARKERS.iter().any(|m| lower.contains(m))
@@ -310,6 +325,51 @@ mod tests {
         .await;
         assert_eq!(result, Ok("success"));
         assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn io_and_eof_errors_are_transient() {
+        // All pgwire IO errors are transient regardless of description
+        let eof_header = pgwire_replication::PgWireError::Io(std::sync::Arc::new(
+            std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "EOF while reading backend message header",
+            ),
+        ));
+        assert!(is_transient_pgwire(&eof_header));
+
+        let eof_payload = pgwire_replication::PgWireError::Io(std::sync::Arc::new(
+            std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "EOF while reading backend message payload",
+            ),
+        ));
+        assert!(is_transient_pgwire(&eof_payload));
+
+        let eof_message = pgwire_replication::PgWireError::Io(std::sync::Arc::new(
+            std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "EOF while reading backend message",
+            ),
+        ));
+        assert!(is_transient_pgwire(&eof_message));
+
+        let reset = pgwire_replication::PgWireError::Io(std::sync::Arc::new(
+            std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "Connection reset by peer",
+            ),
+        ));
+        assert!(is_transient_pgwire(&reset));
+
+        let task_err = pgwire_replication::PgWireError::Task("worker task dropped".to_string());
+        assert!(is_transient_pgwire(&task_err));
+
+        let auth_err = pgwire_replication::PgWireError::Auth("password authentication failed".to_string());
+        assert!(!is_transient_pgwire(&auth_err));
+
+        let proto_err = pgwire_replication::PgWireError::Protocol("malformed pgoutput tuple".to_string());
+        assert!(!is_transient_pgwire(&proto_err));
     }
 
     #[tokio::test]
