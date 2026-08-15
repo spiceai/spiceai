@@ -1384,9 +1384,7 @@ impl ClientDriver {
     ///    status` list a cache with no key at all). A released host would keep an
     ///    inventory of the app's secret names beside ciphertext nobody can open —
     ///    the hazard [`crate::secret_cache::remove`] exists to prevent.
-    /// 2. The **identity**, which is what actually releases the instance and
-    ///    stops it reconnecting.
-    /// 3. The **enrollment draft**, so the next enrollment in this directory
+    /// 2. The **enrollment draft**, so the next enrollment in this directory
     ///    starts clean. A draft is reused verbatim by
     ///    `EnrollmentTransactionLock::load_or_create`, replay key and all, so one
     ///    left behind sends the next `spiced --token` either into a replay of the
@@ -1394,14 +1392,14 @@ impl ClientDriver {
     ///    idempotency mismatch whose guidance is to preserve the file and contact
     ///    support.
     ///
-    /// 4. The **operation journals**, the enrollment one and the
+    /// 3. The **operation journals**, the enrollment one and the
     ///    project-assignment one, which go with the draft for the same reason:
     ///    `spice connect` writes them to resume an interrupted operation, and
     ///    either one left beside a removed identity stops the next enrollment
     ///    rather than helping it — the enrollment journal is quarantined, the
     ///    project journal fails as a pending mismatch.
     ///
-    /// 5. The **`cloud-endpoint` override**. `spice connect` persists it both for
+    /// 4. The **`cloud-endpoint` override**. `spice connect` persists it both for
     ///    an explicit `--endpoint` and for a binding taken from the durable
     ///    identity or a pending draft (`EndpointSource::Bound`), so it can hold a
     ///    value derived from the very enrollment being released. Left behind, the
@@ -1410,13 +1408,26 @@ impl ClientDriver {
     ///    the endpoint themselves re-supplies it, which is what the local command
     ///    already makes them do.
     ///
-    /// Only the identity is fatal. The cache, the draft, the journals and the
-    /// endpoint override are each named in `retained` and logged but do not stop
-    /// the removal, because the
-    /// alternative — aborting with the identity intact — leaves a live credential
-    /// on an instance the control plane has already released, which is worse than
-    /// leaving a file behind. This is the one place the ordering differs from the
-    /// local command, which can abort and let the operator retry.
+    /// 5. The **identity**, which is what actually releases the instance and
+    ///    stops it reconnecting — last, because it is the one step that cannot be
+    ///    retried. Up to here the instance is still connected and still holds a
+    ///    live credential, so a crash leaves the control plane free to dispatch
+    ///    `Remove` again; afterwards there is nothing left to retry into. Doing it
+    ///    last means a crash cannot strand the stale enrollment state above on a
+    ///    host that has already been released.
+    ///
+    /// Each file is preceded by the debris an interrupted atomic write can leave
+    /// beside it — a `.tmp` no live writer holds, or a `.bak` from a replacement
+    /// that did not finish — because either holds the same credential the
+    /// canonical file did.
+    ///
+    /// Only the identity is fatal. The cache, the draft, the journals, the
+    /// endpoint override and any write debris are each named in `retained` and
+    /// logged but do not stop the removal, because the alternative — aborting
+    /// with the identity intact — leaves a live credential on an instance the
+    /// control plane has already released, which is worse than leaving a file
+    /// behind. This is the one place the ordering differs from the local command,
+    /// which can abort and let the operator retry.
     async fn handle_remove(
         &mut self,
         tx: &mpsc::Sender<proto::ClientMessage>,
@@ -1582,27 +1593,6 @@ async fn release_local_state(
     }
     retained.extend(release_atomic_write_artifacts(cache_path.clone(), policy.temp_min_age).await);
 
-    if let Err(err) = IdentityStore::clear_with_transaction_async(
-        config.identity_path.clone(),
-        Arc::clone(&identity_transaction),
-    )
-    .await
-    {
-        tracing::warn!(
-            "Cloud Connect: failed to clear identity at {}: {err}; \
-             reporting Remove as failed and staying connected (the unchanged \
-             identity would otherwise reconnect on restart)",
-            config.identity_path.display()
-        );
-        return Err(format!(
-            "failed to clear identity at {}: {err}",
-            config.identity_path.display()
-        ));
-    }
-    retained.extend(
-        release_atomic_write_artifacts(config.identity_path.clone(), policy.temp_min_age).await,
-    );
-
     if let Err(err) = transaction.delete_draft_async().await {
         tracing::warn!(
             "Cloud Connect: failed to remove the enrollment draft in {}: {err}; the instance is released, but the next enrollment in this directory will need it removed first",
@@ -1655,6 +1645,37 @@ async fn release_local_state(
             endpoint_path.display()
         );
         retained.push(format!("endpoint override at {}", endpoint_path.display()));
+    }
+
+    // The identity goes LAST, and it is the only step that is not retryable:
+    // once it is gone this instance is released and stops connecting, so a
+    // crash immediately after it cannot be handed a retry. Everything above
+    // therefore runs first — a crash before this point leaves an instance that
+    // is still connected, still holding a live credential, and still reachable
+    // for the control plane to dispatch `Remove` again. Reclaiming the
+    // identity's own write debris belongs on this side of the line for the same
+    // reason: after the canonical file is gone, a crash would strand a complete
+    // copy of the credential that nothing is left to come back and remove.
+    retained.extend(
+        release_atomic_write_artifacts(config.identity_path.clone(), policy.temp_min_age).await,
+    );
+
+    if let Err(err) = IdentityStore::clear_with_transaction_async(
+        config.identity_path.clone(),
+        Arc::clone(&identity_transaction),
+    )
+    .await
+    {
+        tracing::warn!(
+            "Cloud Connect: failed to clear identity at {}: {err}; \
+             reporting Remove as failed and staying connected (the unchanged \
+             identity would otherwise reconnect on restart)",
+            config.identity_path.display()
+        );
+        return Err(format!(
+            "failed to clear identity at {}: {err}",
+            config.identity_path.display()
+        ));
     }
 
     Ok(retained)
@@ -2880,11 +2901,18 @@ mod tests {
 
         /// The identity is the only fatal part: if it survives, the instance
         /// reconnects on the next start, so reporting success would lie to the
-        /// control plane. The secrets are already gone by then — which is the
-        /// point of removing them first.
+        /// control plane.
+        ///
+        /// It is also the last thing removed, so reaching it proves everything
+        /// else is already gone. That is what makes the step safe to be the
+        /// unretryable one — a crash anywhere before it leaves a live credential
+        /// on a connected instance the control plane can dispatch `Remove` to
+        /// again, rather than stale enrollment state on a released host.
         #[tokio::test]
-        async fn an_unremovable_identity_fails_the_removal_after_the_secrets_are_gone() {
+        async fn an_unremovable_identity_fails_the_removal_after_everything_else_is_gone() {
             let host = Host::enrolled();
+            std::fs::write(host.endpoint_path(), "https://control.example\n")
+                .expect("write the endpoint override");
             std::fs::remove_file(&host.config.identity_path)
                 .expect("replace the identity with a directory");
             std::fs::create_dir(&host.config.identity_path).expect("create the identity directory");
@@ -2896,10 +2924,24 @@ mod tests {
                 .expect_err("an identity left on disk must fail the removal");
 
             assert!(message.contains("failed to clear identity"), "{message}");
-            assert!(
-                !host.cache_path().exists(),
-                "the secrets go first, so they are gone even when the identity cannot be cleared"
-            );
+            for (label, path) in [
+                ("delivered-secrets cache", host.cache_path()),
+                ("enrollment draft", host.draft_path()),
+                (
+                    "enrollment journal",
+                    host.journal_path(CloudConnectConfig::CONNECT_OPERATION_FILE),
+                ),
+                (
+                    "project journal",
+                    host.journal_path(CloudConnectConfig::PROJECT_OPERATION_FILE),
+                ),
+                ("endpoint override", host.endpoint_path()),
+            ] {
+                assert!(
+                    !path.exists(),
+                    "the {label} is removed before the identity, so it is gone even when the identity cannot be cleared"
+                );
+            }
         }
     }
 }
