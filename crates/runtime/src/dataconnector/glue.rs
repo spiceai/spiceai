@@ -303,6 +303,11 @@ pub enum InputFormat {
     Iceberg,
 }
 
+/// The formats above, for the user-facing message naming what Spice can read.
+/// It lives beside the variants so enabling one of the commented-out formats
+/// does not leave a diagnostic claiming Spice cannot read it.
+pub(crate) const SUPPORTED_INPUT_FORMATS: &str = "parquet, csv, iceberg";
+
 impl InputFormat {
     /// Return the file format of the [`InputFormat`]. For
     /// [`InputFormat::Iceberg`], it's not a file format but we return a value
