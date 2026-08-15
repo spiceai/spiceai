@@ -477,43 +477,59 @@ impl VortexFormat {
         &self.opts
     }
 
-    /// Invalidates every cached artifact this format holds for the exact
-    /// object-store paths — the file footers in the shared
+    /// Invalidates every cached artifact Vortex holds for the exact object-store
+    /// paths — this format's decoded segments and the file footers in
+    /// `DataFusion`'s shared
     /// [`FileMetadataCache`](datafusion_execution::cache::cache_manager::FileMetadataCache)
-    /// and the decoded segments — and physically evicts them before returning.
+    /// — and physically evicts them before returning.
     ///
     /// Callers pass the paths of objects a retirement has confirmed absent.
-    /// Both caches are keyed by [`ObjectMeta::location`], so the same set
-    /// addresses both, and taking them together is what keeps a caller from
-    /// releasing one and silently retaining the other.
+    /// Neither cache has a TTL or any invalidation of its own — an entry leaves
+    /// only when another `put` pushes it out under capacity pressure — and a
+    /// caller whose paths are immutable never writes one again, so an artifact
+    /// whose file has been retired can never be looked up while still holding a
+    /// share of a budget every other table draws on. Retirement is the only
+    /// thing that hands it back.
+    ///
+    /// Both caches key on the object-store location, so one path set addresses
+    /// both; taking them together is what stops a caller releasing one and
+    /// silently retaining the other. Evicting a path that turns out to still be
+    /// live costs a re-read, not correctness: a stale footer was never servable,
+    /// because every read site checks
+    /// [`CachedFileMetadataEntry::is_valid_for`] against the current object.
     pub async fn invalidate_cached_paths(&self, runtime_env: &RuntimeEnv, paths: HashSet<Path>) {
-        Self::invalidate_footer_cache_paths(runtime_env, &paths);
+        if paths.is_empty() {
+            return;
+        }
+
+        // One set clone so the footer sweep below still has the paths after the
+        // segment cache consumes them; that ordering is what keeps a failed join
+        // from also costing the segment invalidation.
+        let footer_paths = paths.clone();
         if let Some(cache) = self.segment_cache.as_ref() {
             cache.invalidate_paths(paths).await;
         }
-    }
 
-    /// Evicts the cached footers of the exact object-store paths, returning how
-    /// many were resident.
-    ///
-    /// The footer cache is process-wide, shared with every other format, and has
-    /// neither a TTL nor any invalidation of its own: entries leave it only when
-    /// another `put` pushes them out under capacity pressure. A footer read for a
-    /// file that has since been retired is therefore unreachable — every path is
-    /// written once under a fresh directory, so it can never be looked up again —
-    /// yet stays resident, holding a share of a budget that live metadata for
-    /// other tables competes for. Evicting on retirement is what gives it back.
-    ///
-    /// Serving a stale footer was never possible (a reader checks
-    /// [`CachedFileMetadataEntry::is_valid_for`] against the current object), so
-    /// evicting a path that turns out to still be live costs one re-read, not
-    /// correctness.
-    pub fn invalidate_footer_cache_paths(runtime_env: &RuntimeEnv, paths: &HashSet<Path>) -> usize {
-        let cache = runtime_env.cache_manager.get_file_metadata_cache();
-        paths
-            .iter()
-            .filter(|path| cache.remove(path).is_some())
-            .count()
+        // The footer cache is process-wide, its lock is taken by every format's
+        // `get`/`put`, and dropping an entry deallocates a parsed footer — so a
+        // retirement spanning thousands of files would hold a runtime worker for
+        // milliseconds against a lock every other table's scans need. Same
+        // reasoning as the segment key scan, which is on the blocking pool for
+        // it.
+        let footer_cache = runtime_env.cache_manager.get_file_metadata_cache();
+        if let Err(error) = tokio::task::spawn_blocking(move || {
+            for path in &footer_paths {
+                footer_cache.remove(path);
+            }
+        })
+        .await
+        {
+            tracing::error!(
+                target: "vortex::footer_cache",
+                %error,
+                "Footer-cache invalidation failed to run; retired footers stay cached until capacity evicts them"
+            );
+        }
     }
 
     /// Returns the current number of cached Vortex segments, or `None` when the
@@ -1327,9 +1343,13 @@ mod tests {
         );
 
         // Retire through the entry point production uses, so a footer eviction
-        // reached only when a segment cache happens to exist fails here.
+        // reached only when a segment cache happens to exist fails here. The
+        // extra path was never cached — it stands in for a retirement reporting
+        // a file whose footer no scan ever read, which must pass harmlessly.
+        let mut to_retire = retired.clone();
+        to_retire.insert(Path::from("retired/never-opened.vortex"));
         format
-            .invalidate_cached_paths(&runtime_env, retired.clone())
+            .invalidate_cached_paths(&runtime_env, to_retire)
             .await;
         assert!(
             cached("retired").is_empty(),
@@ -1339,18 +1359,6 @@ mod tests {
             cached("live"),
             live_before,
             "a table nothing retired must keep every footer it had"
-        );
-
-        // A path that was never cached stands in for a retirement reporting a
-        // file whose footer no scan ever read: it is evicted for free and must
-        // not be counted as resident. Asserted against the second table, whose
-        // footers are still cached at this point.
-        let mut with_absent = live_before.clone();
-        with_absent.insert(Path::from("live/never-opened.vortex"));
-        assert_eq!(
-            VortexFormat::invalidate_footer_cache_paths(&runtime_env, &with_absent),
-            live_before.len(),
-            "the count reports footers that were resident, not paths that were asked for"
         );
 
         Ok(())
