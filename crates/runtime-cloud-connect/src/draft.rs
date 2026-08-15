@@ -214,7 +214,10 @@ impl EnrollmentTransactionLock {
     }
 
     pub(crate) fn protects(&self, path: &Path) -> bool {
-        self.draft_path.parent() == path.parent()
+        match (self.draft_path.parent(), path.parent()) {
+            (Some(held), Some(wanted)) => same_directory(held, wanted),
+            (held, wanted) => held == wanted,
+        }
     }
 
     /// Acquire exclusive ownership of a config directory's enrollment
@@ -285,6 +288,20 @@ impl EnrollmentTransactionLock {
         tokio::task::spawn_blocking(move || transaction.delete())
             .await
             .map_err(|source| Error::DeleteTaskPanicked { source })?
+    }
+}
+
+/// Whether two paths name the same directory, rather than the same spelling.
+///
+/// A config directory reached through a relative path, an absolute one, or an
+/// ancestor symlink is still that directory, and treating those as different is
+/// what makes a transaction refuse the very file it protects. Resolution needs
+/// both to exist; when either cannot be resolved there is nothing better than
+/// the spelling to go on.
+pub(crate) fn same_directory(one: &Path, other: &Path) -> bool {
+    match (std::fs::canonicalize(one), std::fs::canonicalize(other)) {
+        (Ok(one), Ok(other)) => one == other,
+        _ => one == other,
     }
 }
 

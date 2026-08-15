@@ -48,7 +48,7 @@ limitations under the License.
 //! driver stays connected with the still-valid identity rather than
 //! falsely reporting the instance as released.
 
-use std::path::PathBuf;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -1513,7 +1513,7 @@ async fn release_local_state(
     // this removal had already deleted while still reporting success. Ordering is
     // fixed by `mutation_lock`: MutationLock outer, then the enrollment
     // transaction — never the reverse.
-    let _mutation = MutationLock::acquire_with_timeout(&config.config_dir, "remove", policy.lock_timeout)
+    let mutation = MutationLock::acquire_with_timeout(&config.config_dir, "remove", policy.lock_timeout)
         .await
         .map_err(|err| {
             tracing::warn!(
@@ -1545,12 +1545,6 @@ async fn release_local_state(
                 )
             })?,
     );
-    let transaction = &transaction;
-    // Named in the command result so the control plane and the portal learn that
-    // a released host still holds something, rather than the operator
-    // discovering it later.
-    let mut retained: Vec<String> = Vec::new();
-
     // The identity is guarded by whichever transaction protects ITS directory.
     // `clear_with_transaction_async` refuses a guard whose draft path has a
     // different parent, and `identity_path` is a public field documented as only
@@ -1558,7 +1552,7 @@ async fn release_local_state(
     // config-dir transaction is the wrong guard, and passing it would fail every
     // Remove rather than protect anything. Acquiring the identity directory's own
     // transaction keeps the split shape working without tightening the field.
-    let identity_transaction = match identity_transaction(config, transaction).await {
+    let identity_transaction = match identity_transaction(config, &transaction).await {
         Ok(held) => held,
         Err(err) => {
             tracing::warn!(
@@ -1576,10 +1570,47 @@ async fn release_local_state(
     // `secret_cache::write` takes that same lock and reads the cache key under
     // it, so it cannot be mid-write here and cannot publish a cache afterwards
     // with a key this release destroyed.
-    let cache_path = config
-        .config_dir
-        .join(crate::secret_cache::SECRET_CACHE_FILE);
-    if let Err(err) = remove_secret_cache(cache_path.clone()).await {
+
+    // Everything destructive runs in ONE blocking task, and the guards move into
+    // it. `CloudConnect::shutdown` aborts the driver when it overruns its drain
+    // budget, which drops this future — but an in-flight `spawn_blocking` is not
+    // cancelled, so a per-step task would keep unlinking files after the guards
+    // its caller held had been dropped, racing a `spice connect` that could by
+    // then have taken the directory. Holding the guards here means the exclusion
+    // ends when the work does, not when the future does.
+    let identity_path = config.identity_path.clone();
+    let config_dir = config.config_dir.clone();
+    tokio::task::spawn_blocking(move || {
+        let _mutation = mutation;
+        release_local_state_locked(
+            &config_dir,
+            &identity_path,
+            policy,
+            &transaction,
+            &identity_transaction,
+        )
+    })
+    .await
+    .map_err(|source| format!("the release task stopped unexpectedly: {source}"))?
+}
+
+/// The destructive half of a release, under guards its caller holds for the
+/// whole call. Synchronous throughout: it is all file work, and splitting it
+/// across tasks is what would let a cancelled release outlive its exclusion.
+fn release_local_state_locked(
+    config_dir: &Path,
+    identity_path: &Path,
+    policy: ReleasePolicy,
+    transaction: &Arc<EnrollmentTransactionLock>,
+    identity_transaction: &Arc<EnrollmentTransactionLock>,
+) -> std::result::Result<Vec<String>, String> {
+    // Named in the command result so the control plane and the portal learn that
+    // a released host still holds something, rather than the operator
+    // discovering it later.
+    let mut retained: Vec<String> = Vec::new();
+
+    let cache_path = config_dir.join(crate::secret_cache::SECRET_CACHE_FILE);
+    if let Err(err) = crate::secret_cache::remove(&cache_path) {
         tracing::warn!(
             "Cloud Connect: failed to remove the delivered-secrets cache at {}: {err}; the instance is still being released, but this host retains secrets it can no longer open",
             cache_path.display()
@@ -1589,25 +1620,25 @@ async fn release_local_state(
             cache_path.display()
         ));
     }
-    retained.extend(release_atomic_write_artifacts(cache_path.clone(), policy.temp_min_age).await?);
+    retained.extend(release_atomic_write_artifacts(
+        &cache_path,
+        policy.temp_min_age,
+    )?);
 
-    if let Err(err) = transaction.delete_draft_async().await {
+    if let Err(err) = transaction.delete() {
         tracing::warn!(
             "Cloud Connect: failed to remove the enrollment draft in {}: {err}; the instance is released, but the next enrollment in this directory will need it removed first",
-            config.config_dir.display()
+            config_dir.display()
         );
         retained.push("enrollment draft".to_string());
     }
     // The draft holds the provisional private key of an enrollment in progress,
     // and it is published through the same atomic write, so it strands the same
     // credential debris the identity and the cache do.
-    retained.extend(
-        release_atomic_write_artifacts(
-            EnrollmentDraft::path_in(&config.config_dir),
-            policy.temp_min_age,
-        )
-        .await?,
-    );
+    retained.extend(release_atomic_write_artifacts(
+        &EnrollmentDraft::path_in(config_dir),
+        policy.temp_min_age,
+    )?);
 
     // The journals go with the draft, for the same reason: `spice connect` writes
     // them to resume an interrupted operation, and either one left beside a
@@ -1624,28 +1655,29 @@ async fn release_local_state(
             CloudConnectConfig::PROJECT_OPERATION_FILE,
         ),
     ] {
-        let path = config.config_dir.join(file);
-        if let Err(err) = remove_file_if_present(path.clone()).await {
+        let path = config_dir.join(file);
+        if let Err(err) = remove_file_if_present(&path) {
             tracing::warn!(
                 "Cloud Connect: failed to remove the {label} at {}: {err}; the instance is released, but the next enrollment in this directory will stop on it",
                 path.display()
             );
             retained.push(format!("{label} at {}", path.display()));
         }
-        retained.extend(release_atomic_write_artifacts(path, policy.temp_min_age).await?);
+        retained.extend(release_atomic_write_artifacts(&path, policy.temp_min_age)?);
     }
 
-    let endpoint_path = config
-        .config_dir
-        .join(CloudConnectConfig::ENDPOINT_OVERRIDE_FILE);
-    if let Err(err) = remove_file_if_present(endpoint_path.clone()).await {
+    let endpoint_path = config_dir.join(CloudConnectConfig::ENDPOINT_OVERRIDE_FILE);
+    if let Err(err) = remove_file_if_present(&endpoint_path) {
         tracing::warn!(
             "Cloud Connect: failed to remove the endpoint override at {}: {err}; the instance is released, but a later enrollment in this directory would still reach the control plane it names",
             endpoint_path.display()
         );
         retained.push(format!("endpoint override at {}", endpoint_path.display()));
     }
-    retained.extend(release_atomic_write_artifacts(endpoint_path, policy.temp_min_age).await?);
+    retained.extend(release_atomic_write_artifacts(
+        &endpoint_path,
+        policy.temp_min_age,
+    )?);
 
     // The identity goes LAST, and it is the only step that is not retryable:
     // once it is gone this instance is released and stops connecting, so a
@@ -1656,25 +1688,21 @@ async fn release_local_state(
     // identity's own write debris belongs on this side of the line for the same
     // reason: after the canonical file is gone, a crash would strand a complete
     // copy of the credential that nothing is left to come back and remove.
-    retained.extend(
-        release_atomic_write_artifacts(config.identity_path.clone(), policy.temp_min_age).await?,
-    );
+    retained.extend(release_atomic_write_artifacts(
+        identity_path,
+        policy.temp_min_age,
+    )?);
 
-    if let Err(err) = IdentityStore::clear_with_transaction_async(
-        config.identity_path.clone(),
-        Arc::clone(&identity_transaction),
-    )
-    .await
-    {
+    if let Err(err) = IdentityStore::clear_with_transaction(identity_path, identity_transaction) {
         tracing::warn!(
             "Cloud Connect: failed to clear identity at {}: {err}; \
              reporting Remove as failed and staying connected (the unchanged \
              identity would otherwise reconnect on restart)",
-            config.identity_path.display()
+            identity_path.display()
         );
         return Err(format!(
             "failed to clear identity at {}: {err}",
-            config.identity_path.display()
+            identity_path.display()
         ));
     }
 
@@ -1702,7 +1730,13 @@ async fn identity_transaction(
     let Some(identity_dir) = config.identity_path.parent() else {
         return Ok(Arc::clone(config_dir_transaction));
     };
-    if identity_dir == config.config_dir {
+    // Directory identity, not spelling: an identity path reached through a
+    // relative path or an ancestor symlink is still inside the config directory,
+    // and taking a second transaction for it would contend with the one already
+    // held — one non-blocking attempt, so `Remove` would fail every time on a
+    // path the split-config support is meant to allow. `protects` resolves the
+    // same way, so the guard chosen here is the guard the clear accepts.
+    if crate::draft::same_directory(identity_dir, &config.config_dir) {
         return Ok(Arc::clone(config_dir_transaction));
     }
     Ok(Arc::new(
@@ -1714,17 +1748,15 @@ async fn identity_transaction(
 ///
 /// `std::fs` on the blocking pool rather than `tokio::fs`, to match the other
 /// removals here and keep one failure vocabulary across them.
-async fn remove_file_if_present(path: PathBuf) -> std::result::Result<(), String> {
-    tokio::task::spawn_blocking(move || match std::fs::remove_file(&path) {
+fn remove_file_if_present(path: &Path) -> std::result::Result<(), String> {
+    match std::fs::remove_file(path) {
         // Sync the directory, as the identity and draft removals do: without it
         // the unlink is acknowledged while the entry can still come back after a
         // crash, and a released host would silently hold cloud state again.
-        Ok(()) => crate::identity::sync_parent_directory(&path).map_err(|err| err.to_string()),
+        Ok(()) => crate::identity::sync_parent_directory(path).map_err(|err| err.to_string()),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(err) => Err(err.to_string()),
-    })
-    .await
-    .map_err(|source| format!("the removal task stopped unexpectedly: {source}"))?
+    }
 }
 
 /// Reclaim the temp and backup files an interrupted atomic write can leave beside
@@ -1733,37 +1765,24 @@ async fn remove_file_if_present(path: PathBuf) -> std::result::Result<(), String
 /// Non-fatal for the same reason the cache is: the instance is released either
 /// way, and an operator who is told a credential copy remains can remove it,
 /// where a removal that aborted over it would leave the live identity behind.
-async fn release_atomic_write_artifacts(
-    path: PathBuf,
+fn release_atomic_write_artifacts(
+    path: &Path,
     minimum_age: Duration,
 ) -> std::result::Result<Vec<String>, String> {
     let released = path.display().to_string();
-    let outcome = tokio::task::spawn_blocking(move || {
-        crate::identity::release_atomic_write_artifacts(&path, minimum_age)
-    })
-    .await;
-
-    let remaining = match outcome {
-        Ok(Ok(remaining)) => remaining,
+    let remaining = match crate::identity::release_atomic_write_artifacts(path, minimum_age) {
+        Ok(remaining) => remaining,
         // Fatal for the same reason a promotable temp is. The scan stops at the
         // first error, so it may have given up before reaching a temp a writer
         // still owns — and this cannot tell the difference between "there is
         // none" and "I could not finish looking". Releasing on the strength of an
         // incomplete scan is what would let that writer publish afterwards.
-        Ok(Err(err)) => {
+        Err(err) => {
             tracing::warn!(
                 "Cloud Connect: failed to reclaim interrupted-write artifacts beside {released}: {err}; reporting Remove as failed and staying connected, because an unfinished scan cannot rule out a writer that would publish over the release"
             );
             return Err(format!(
                 "failed to check for interrupted writes beside {released}: {err}"
-            ));
-        }
-        Err(source) => {
-            tracing::warn!(
-                "Cloud Connect: the task reclaiming interrupted-write artifacts beside {released} stopped unexpectedly: {source}; reporting Remove as failed and staying connected, because an unfinished scan cannot rule out a writer that would publish over the release"
-            );
-            return Err(format!(
-                "failed to check for interrupted writes beside {released}: {source}"
             ));
         }
     };
@@ -1794,18 +1813,6 @@ async fn release_atomic_write_artifacts(
             format!("interrupted-write artifact at {left}")
         })
         .collect())
-}
-
-/// Delete the delivered-secrets cache off the Tokio driver task.
-///
-/// [`crate::secret_cache::remove`] is synchronous `std::fs`, and this runs while
-/// the Cloud Connect stream is live, so it goes to the blocking pool rather than
-/// stalling a worker.
-async fn remove_secret_cache(path: PathBuf) -> std::result::Result<(), String> {
-    tokio::task::spawn_blocking(move || crate::secret_cache::remove(&path))
-        .await
-        .map_err(|source| format!("the removal task stopped unexpectedly: {source}"))?
-        .map_err(|source| source.to_string())
 }
 
 /// Outcome of the pre-connect credential phase
