@@ -1002,6 +1002,42 @@ struct SpicedRuntimeHandleParts {
     initial_load_budget: Duration,
 }
 
+/// A test-only signal fired at the point the cache key must not yet have been
+/// read: immediately before [`SpicedRuntimeHandle::cache_delivered_secrets`]
+/// takes the connect mutation lock.
+///
+/// That ordering is what prevents a release from being undone — a key read
+/// before the lock stays usable across the release, so the write would republish
+/// a cache whose key is gone. Without a signal here a test cannot tell whether a
+/// writer had reached the key read before the release ran, so a key load that
+/// moved ahead of the lock would go unnoticed. Arming is keyed on the config
+/// directory so concurrent tests never observe one another.
+#[cfg(test)]
+mod cache_lock_seam {
+    use std::path::{Path, PathBuf};
+
+    use parking_lot::Mutex;
+    use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
+
+    static ARMED: Mutex<Vec<(PathBuf, UnboundedSender<()>)>> = Mutex::new(Vec::new());
+
+    /// Watch for a writer in `config_dir` reaching the lock.
+    pub(super) fn arm(config_dir: &Path) -> UnboundedReceiver<()> {
+        let (tx, rx) = unbounded_channel();
+        ARMED.lock().push((config_dir.to_path_buf(), tx));
+        rx
+    }
+
+    /// Announce that a writer in `config_dir` is about to take the lock.
+    pub(super) fn reached(config_dir: &Path) {
+        for (dir, tx) in ARMED.lock().iter() {
+            if dir == config_dir {
+                let _ = tx.send(());
+            }
+        }
+    }
+}
+
 impl SpicedRuntimeHandle {
     fn new(parts: SpicedRuntimeHandleParts) -> Self {
         let SpicedRuntimeHandleParts {
@@ -1131,6 +1167,11 @@ impl SpicedRuntimeHandle {
         // after a release had deleted the cache, recreating it with a key that no
         // longer exists. Reading it here means a release that has already run
         // leaves no key to find, and this write is skipped.
+        // The seam sits here, not after the lock: this is the point the key must
+        // not have been read yet.
+        #[cfg(test)]
+        cache_lock_seam::reached(config_dir);
+
         let _mutation = match runtime_cloud_connect::MutationLock::acquire_with_timeout(
             config_dir,
             "cache-secrets",
@@ -3002,12 +3043,12 @@ views:
     /// The interleaving the lock exists to prevent: a writer that starts while a
     /// release is running must not publish a cache after it.
     ///
-    /// Deterministic without any waiting — the release holds the lock for the
-    /// whole window, so the writer cannot pass it until the identity and cache
-    /// are already gone. Reading the key inside the critical section is what
-    /// makes that decisive: a key read before the lock would still be usable
-    /// here, and the write would recreate a cache nothing can open.
-    #[tokio::test]
+    /// The seam gives this a happens-before instead of a sleep. The writer is
+    /// known to have reached the lock before the release deletes anything, so in
+    /// a build where the key load moved ahead of the lock it holds a usable key
+    /// across the release and republishes the cache — which is the regression
+    /// this asserts against, not merely the exclusion.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_cache_write_started_during_a_release_does_not_republish_it() {
         let dir = scratch_dir("cache-write-interleaved");
         let handle = handle_serving(&dir, SERVING).await;
@@ -3023,12 +3064,14 @@ views:
         );
         assert!(cache.exists(), "the cache is what the next start reads");
 
+        let mut at_the_lock = cache_lock_seam::arm(&dir);
+
         // A release in another process takes the directory and starts working.
         let held = runtime_cloud_connect::MutationLock::acquire(&dir, "remove")
             .await
             .expect("a release takes the directory");
 
-        // A deployment lands mid-release. It cannot get past the lock.
+        // A deployment lands mid-release.
         let writer = tokio::spawn({
             let handle = Arc::clone(&handle);
             let dir = dir.clone();
@@ -3038,6 +3081,11 @@ views:
                     .await
             }
         });
+
+        at_the_lock
+            .recv()
+            .await
+            .expect("the writer reaches the connect mutation lock");
 
         // The release finishes: identity and cache gone, then the lock freed.
         std::fs::remove_file(dir.join(IDENTITY_FILE)).expect("release clears the identity");
