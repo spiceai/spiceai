@@ -21,7 +21,7 @@ limitations under the License.
 //! [`RowLocation`].
 
 use crate::row_converter::OwnedRow;
-use hash_index::{PrehashedBuildHasher, hash_key_128};
+use hash_index::{PrehashedBuildHasher, hash_key_128, hash_key_bytes};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock};
 
@@ -443,9 +443,8 @@ const PK_BLOOM_FRAME_MAGIC: u32 = 0x4350_4b46;
 /// the caller's conservative fallback), so a rollback across a future bump
 /// degrades to extra work, never to wrong answers.
 const PK_BLOOM_FRAME_VERSION: u32 = 1;
-/// Independent seed for [`PK_BLOOM_PROBE_FINGERPRINT`], so folding the sample
-/// bloom is not the same computation as filling it.
-const PK_BLOOM_FINGERPRINT_SEED: u64 = 0xa076_1d64_78bd_642f;
+/// Bytes the frame prepends to the bloom body: magic, version, fingerprint.
+const PK_BLOOM_FRAME_HEADER_LEN: usize = 16;
 
 /// Identity of everything that decides WHERE a key's bits land: the hash
 /// function and its seeds, the double-hashing scheme, the probe count
@@ -457,13 +456,16 @@ const PK_BLOOM_FINGERPRINT_SEED: u64 = 0xa076_1d64_78bd_642f;
 /// can probe as absent. On the cold-tier path that false negative means no
 /// supersede tombstone, and so a duplicate live row.
 ///
-/// Rather than declare a version that someone must remember to bump, this
-/// MEASURES the probe function: it fills a fixed-size bloom with fixed keys and
-/// folds the resulting bits. Any change to a leg above moves those bits (the
-/// probe count is folded in as well, so it is caught even where an extra probe
-/// happens to collide on every sample key), which moves the fingerprint, which
-/// makes every blob written by the old code fail validation and route to the
-/// exact-scan fallback.
+/// It is derived rather than declared, so that it cannot be forgotten the way a
+/// hand-bumped version can: it folds [`PK_BLOOM_NUM_HASHES`] together with the
+/// bits a fixed sample fills, which covers the seeds, the double-hashing
+/// scheme, the layout, and the body of [`pk_bloom_hash`] itself — legs no
+/// declared constant would catch, since none of them is a constant. What it
+/// does not offer is a proof: the sample is four keys wide, so a change that
+/// leaves all four keys' bits identical would go unnoticed (the probe count is
+/// folded in on its own for exactly that reason, being the leg most likely to
+/// collide). Nor does it decompose — a mismatch reports two `u64`s, not which
+/// leg moved.
 static PK_BLOOM_PROBE_FINGERPRINT: LazyLock<u64> = LazyLock::new(|| {
     let mut sample = PkBloom::with_num_bits_pow2(512);
     for key in [
@@ -480,7 +482,11 @@ static PK_BLOOM_PROBE_FINGERPRINT: LazyLock<u64> = LazyLock::new(|| {
     for word in &sample.bits {
         folded.extend_from_slice(&word.to_le_bytes());
     }
-    pk_bloom_hash(&folded, PK_BLOOM_FINGERPRINT_SEED)
+    // The crate's byte-fingerprint primitive (as used by the WAL checksum and
+    // the file digest), not `pk_bloom_hash` — folding the sample with the same
+    // function that filled it would let a change to that function move the bits
+    // and the fold in step.
+    hash_key_bytes(&[&folded])
 });
 
 /// The [`PK_BLOOM_PROBE_FINGERPRINT`] of the probe function that wrote the
@@ -491,7 +497,16 @@ static PK_BLOOM_PROBE_FINGERPRINT: LazyLock<u64> = LazyLock::new(|| {
 /// exactly what stops the new reader from trusting bits the old probes placed.
 /// Once the two differ, unframed blobs are rejected (→ exact-scan fallback) and
 /// this constant is inert.
-const LEGACY_PK_BLOOM_PROBE_FINGERPRINT: u64 = 0x7b2f_c687_db27_c7d9;
+///
+/// It grandfathers ONE transition — the blooms already on disk — rather than
+/// establishing that old formats are read forever. A future
+/// [`PK_BLOOM_FRAME_VERSION`] bump rejects its predecessor outright, the same
+/// way [`PK_INDEX_SIDECAR_VERSION`] already treats its own. The asymmetry is
+/// deliberate: rejecting a cold-file bloom costs an exact scan of a table's
+/// whole cold tier on every keyset rebuild until those files are re-promoted,
+/// which is worth a one-off compatibility branch in a way rebuilding one
+/// sidecar checkpoint is not.
+const LEGACY_PK_BLOOM_PROBE_FINGERPRINT: u64 = 0x05af_06a0_1263_09d6;
 
 /// Bounded Bloom filter of live primary keys.
 ///
@@ -573,15 +588,20 @@ impl PkBloom {
     }
 
     /// [`Self::deserialize_from_prefix`] against an explicit probe fingerprint.
-    /// Production passes the compiled-in [`PK_BLOOM_PROBE_FINGERPRINT`]; tests
-    /// pass a different value to exercise the "the probe function moved"
-    /// rejection without having to change the probe function.
+    /// Production passes the compiled-in [`PK_BLOOM_PROBE_FINGERPRINT`].
+    ///
+    /// The parameter exists for the UNFRAMED arm, which no serialized-byte
+    /// mutation can reach: an unframed bloom records no fingerprint, so its
+    /// rejection turns on this binary's own value having moved away from
+    /// [`LEGACY_PK_BLOOM_PROBE_FINGERPRINT`] — not on anything in the blob. The
+    /// framed arm needs no such seam; a test mutates the recorded fingerprint
+    /// in the bytes and goes through [`Self::from_bytes`].
     fn deserialize_from_prefix_probed_by(
         bytes: &[u8],
         probe_fingerprint: u64,
     ) -> Option<(Self, usize)> {
         let magic = u32::from_le_bytes(bytes.get(0..4)?.try_into().ok()?);
-        let body = if magic == PK_BLOOM_FRAME_MAGIC {
+        let header_len = if magic == PK_BLOOM_FRAME_MAGIC {
             let version = u32::from_le_bytes(bytes.get(4..8)?.try_into().ok()?);
             let written_by = u64::from_le_bytes(bytes.get(8..16)?.try_into().ok()?);
             // An unknown version or a bloom filled by a different probe function
@@ -590,7 +610,7 @@ impl PkBloom {
             if version != PK_BLOOM_FRAME_VERSION || written_by != probe_fingerprint {
                 return None;
             }
-            16usize
+            PK_BLOOM_FRAME_HEADER_LEN
         } else {
             // Unframed: persisted before the header existed, so it records
             // nothing about what filled it. Its bits are probeable only while
@@ -598,25 +618,18 @@ impl PkBloom {
             if probe_fingerprint != LEGACY_PK_BLOOM_PROBE_FINGERPRINT {
                 return None;
             }
-            0usize
+            0
         };
-        let bit_mask = u64::from_le_bytes(bytes.get(body..body.checked_add(8)?)?.try_into().ok()?);
-        let inserted_keys = u64::from_le_bytes(
-            bytes
-                .get(body.checked_add(8)?..body.checked_add(16)?)?
-                .try_into()
-                .ok()?,
-        );
-        let words_at = body.checked_add(24)?;
-        let num_words = usize::try_from(u64::from_le_bytes(
-            bytes
-                .get(body.checked_add(16)?..words_at)?
-                .try_into()
-                .ok()?,
-        ))
-        .ok()?;
+        // Past the header the two shapes are identical, so the body parses at
+        // fixed offsets off `body` rather than threading the header length
+        // through every field read.
+        let body = bytes.get(header_len..)?;
+        let bit_mask = u64::from_le_bytes(body.get(0..8)?.try_into().ok()?);
+        let inserted_keys = u64::from_le_bytes(body.get(8..16)?.try_into().ok()?);
+        let num_words =
+            usize::try_from(u64::from_le_bytes(body.get(16..24)?.try_into().ok()?)).ok()?;
         // Reject impossible word counts before allocating.
-        if num_words == 0 || num_words > bytes.len().saturating_sub(words_at) / 8 {
+        if num_words == 0 || num_words > body.len().saturating_sub(24) / 8 {
             return None;
         }
         // `num_bits` must be a power of two and consistent with `bit_mask`.
@@ -625,10 +638,10 @@ impl PkBloom {
             return None;
         }
         let mut bits = Vec::with_capacity(num_words);
-        let mut offset = words_at;
+        let mut offset = 24usize;
         for _ in 0..num_words {
             let end = offset.checked_add(8)?;
-            bits.push(u64::from_le_bytes(bytes.get(offset..end)?.try_into().ok()?));
+            bits.push(u64::from_le_bytes(body.get(offset..end)?.try_into().ok()?));
             offset = end;
         }
         Some((
@@ -637,7 +650,7 @@ impl PkBloom {
                 bit_mask,
                 inserted_keys: usize::try_from(inserted_keys).unwrap_or(0),
             },
-            offset,
+            header_len.checked_add(offset)?,
         ))
     }
 
@@ -1980,17 +1993,24 @@ mod tests {
     #[test]
     fn pk_bloom_rejects_bits_a_different_probe_function_placed() {
         let bloom = sample_bloom();
-        let moved = PK_BLOOM_PROBE_FINGERPRINT.wrapping_add(1);
 
-        // Framed: the fingerprint the writer recorded is not this binary's.
+        // Framed: the writer recorded a fingerprint that is not this binary's.
+        // Through the production reader — the recorded value lives in the bytes,
+        // so the rejection needs no seam.
+        let mut framed = bloom.to_bytes();
+        framed[8..16].copy_from_slice(&PK_BLOOM_PROBE_FINGERPRINT.wrapping_add(1).to_le_bytes());
         assert!(
-            PkBloom::deserialize_from_prefix_probed_by(&bloom.to_bytes(), moved).is_none(),
+            PkBloom::from_bytes(&framed).is_none(),
             "a framed blob written by another probe function must be rejected"
         );
-        // Unframed: nothing recorded, so it is readable only while this binary
-        // still probes the way the pre-frame code did.
+        // Unframed: nothing is recorded, so the rejection turns on this binary's
+        // own fingerprint having moved — which only the seam can simulate.
         assert!(
-            PkBloom::deserialize_from_prefix_probed_by(&unframed_bytes(&bloom), moved).is_none(),
+            PkBloom::deserialize_from_prefix_probed_by(
+                &unframed_bytes(&bloom),
+                PK_BLOOM_PROBE_FINGERPRINT.wrapping_add(1)
+            )
+            .is_none(),
             "an unframed blob must be rejected once the probe function has moved"
         );
     }
@@ -2012,16 +2032,17 @@ mod tests {
     #[test]
     fn a_pre_frame_reader_rejects_a_framed_blob() {
         let bloom = sample_bloom();
+        let framed = bloom.to_bytes();
         assert!(
             pre_frame_reader_accepts(&unframed_bytes(&bloom)),
             "control: the pre-frame reader accepts the shape it wrote"
         );
         assert!(
-            !pre_frame_reader_accepts(&bloom.to_bytes()),
+            !pre_frame_reader_accepts(&framed),
             "a pre-frame reader must reject a framed blob"
         );
         let leading = u64::from_le_bytes(
-            bloom.to_bytes()[0..8]
+            framed[0..8]
                 .try_into()
                 .expect("frame is longer than 8 bytes"),
         );
