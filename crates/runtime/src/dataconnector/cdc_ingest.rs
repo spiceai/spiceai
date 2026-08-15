@@ -20,6 +20,7 @@ limitations under the License.
 //! Spice via `POST /v1/datasets/{name}/cdc`. Events are decoded (JSON or Avro)
 //! and applied through the shared `refresh_mode: changes` path — no Kafka.
 
+use crate::dataconnector::ConnectorContext;
 use std::{any::Any, pin::Pin, sync::Arc, time::Duration};
 
 use arrow::datatypes::SchemaRef;
@@ -335,10 +336,11 @@ impl DataConnectorFactory for CdcIngestFactory {
         self
     }
 
-    fn create(
-        &self,
+    fn create<'a>(
+        &'a self,
         params: ConnectorParams,
-    ) -> Pin<Box<dyn std::future::Future<Output = super::NewDataConnectorResult> + Send>> {
+        _context: &'a dyn ConnectorContext,
+    ) -> Pin<Box<dyn std::future::Future<Output = super::NewDataConnectorResult> + Send + 'a>> {
         Box::pin(async move {
             Ok(Arc::new(CdcIngest::new(&params.parameters)) as Arc<dyn DataConnector>)
         })
@@ -367,6 +369,7 @@ impl DataConnector for CdcIngest {
 
     async fn read_provider(
         &self,
+        _context: &dyn ConnectorContext,
         dataset: &DatasetSpec,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
         let Some(acceleration) = dataset
@@ -431,8 +434,9 @@ impl DataConnector for CdcIngest {
         true
     }
 
-    fn changes_stream(
+    async fn changes_stream(
         &self,
+        _context: &dyn ConnectorContext,
         federated_table: Arc<dyn FederatedTableProvider>,
         dataset: &DatasetSpec,
     ) -> Option<ChangesStream> {

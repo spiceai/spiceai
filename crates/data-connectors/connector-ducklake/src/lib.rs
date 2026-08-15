@@ -24,6 +24,7 @@ use data_components::ducklake::writer::DuckDbFederatedTableWriter;
 use data_components::ducklake::{
     DuckLakeS3Params, build_ducklake_attach_sql, configure_duckdb_httpfs,
 };
+use data_connector_api::ConnectorContext;
 use data_connector_api::{
     AnyErrorResult, ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError,
     DataConnectorFactory,
@@ -266,10 +267,11 @@ impl DataConnectorFactory for DuckLakeFactory {
         self
     }
 
-    fn create(
-        &self,
+    fn create<'a>(
+        &'a self,
         params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = data_connector_api::NewDataConnectorResult> + Send>> {
+        _context: &'a dyn ConnectorContext,
+    ) -> Pin<Box<dyn Future<Output = data_connector_api::NewDataConnectorResult> + Send + 'a>> {
         Box::pin(async move {
             let connection_string: String = params
                 .parameters
@@ -362,6 +364,7 @@ impl DataConnector for DuckLake {
 
     async fn read_provider(
         &self,
+        _context: &dyn ConnectorContext,
         dataset: &DatasetSpec,
     ) -> data_connector_api::DataConnectorResult<Arc<dyn TableProvider>> {
         let table_ref = self.resolve_table_reference(dataset);
@@ -376,6 +379,7 @@ impl DataConnector for DuckLake {
 
     async fn read_write_provider(
         &self,
+        _context: &dyn ConnectorContext,
         dataset: &DatasetSpec,
     ) -> Option<data_connector_api::DataConnectorResult<Arc<dyn TableProvider>>> {
         let table_ref = self.resolve_table_reference(dataset);

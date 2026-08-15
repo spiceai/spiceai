@@ -25,6 +25,7 @@ use crate::git::{
 };
 use async_trait::async_trait;
 use data_components::rate_limit::RateLimiter;
+use data_connector_api::ConnectorContext;
 use data_connector_api::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult,
@@ -353,6 +354,7 @@ impl DataConnector for Git {
 
     async fn read_provider(
         &self,
+        _context: &dyn ConnectorContext,
         dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         self.create_table_provider(dataset).await
@@ -454,10 +456,11 @@ impl DataConnectorFactory for GitFactory {
         self
     }
 
-    fn create(
-        &self,
+    fn create<'a>(
+        &'a self,
         params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = data_connector_api::NewDataConnectorResult> + Send>> {
+        _context: &'a dyn ConnectorContext,
+    ) -> Pin<Box<dyn Future<Output = data_connector_api::NewDataConnectorResult> + Send + 'a>> {
         Box::pin(async move { Ok(Arc::new(Git::new(params.parameters)) as Arc<dyn DataConnector>) })
     }
 

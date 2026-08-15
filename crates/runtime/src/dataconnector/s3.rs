@@ -23,6 +23,7 @@ use super::{
         aws::{AuthValidator, RegionValidator, S3EndpointValidator},
     },
 };
+use crate::dataconnector::ConnectorContext;
 
 use app::App;
 
@@ -208,10 +209,11 @@ impl DataConnectorFactory for S3Factory {
         self
     }
 
-    fn create(
-        &self,
+    fn create<'a>(
+        &'a self,
         mut params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
+        context: &'a dyn ConnectorContext,
+    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send + 'a>> {
         if let Some(endpoint) = params.parameters.get("endpoint").expose().ok()
             && endpoint.ends_with('/')
         {
@@ -282,7 +284,7 @@ impl DataConnectorFactory for S3Factory {
                 }
             }
 
-            let app = params.app();
+            let app = Some(context.app());
             let s3 = S3 {
                 params: params.parameters,
                 app,

@@ -127,7 +127,6 @@ mod tests {
             ),
             unsupported_type_action: None,
             component: create_mock_connector_component().await,
-            context: None,
             io_runtime: Handle::current(),
         }
     }

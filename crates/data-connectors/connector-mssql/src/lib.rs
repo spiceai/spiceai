@@ -28,6 +28,7 @@ use data_components::mssql::connection_manager::SqlServerConnectionManager;
 use data_components::mssql::{
     self, SqlServerTableProvider, connection_manager::SqlServerConnectionPool,
 };
+use data_connector_api::ConnectorContext;
 use data_connector_api::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult, NewDataConnectorResult,
@@ -195,10 +196,11 @@ impl DataConnectorFactory for SqlServerFactory {
         self
     }
 
-    fn create(
-        &self,
+    fn create<'a>(
+        &'a self,
         params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>> {
+        _context: &'a dyn ConnectorContext,
+    ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send + 'a>> {
         Box::pin(async move {
             Ok(Arc::new(SqlServer::new(&params.parameters).await?) as Arc<dyn DataConnector>)
         })
@@ -260,6 +262,7 @@ impl DataConnector for SqlServer {
 
     async fn read_provider(
         &self,
+        _context: &dyn ConnectorContext,
         dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         let provider = SqlServerTableProvider::new(Arc::clone(&self.conn), &dataset.path().into())

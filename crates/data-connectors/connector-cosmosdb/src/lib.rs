@@ -19,6 +19,7 @@ limitations under the License.
 
 pub mod cosmosdb;
 
+use data_connector_api::ConnectorContext;
 use std::any::Any;
 use std::collections::HashMap;
 use std::future::Future;
@@ -192,10 +193,11 @@ impl DataConnectorFactory for CosmosDBFactory {
         self
     }
 
-    fn create(
-        &self,
+    fn create<'a>(
+        &'a self,
         params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = data_connector_api::NewDataConnectorResult> + Send>> {
+        _context: &'a dyn ConnectorContext,
+    ) -> Pin<Box<dyn Future<Output = data_connector_api::NewDataConnectorResult> + Send + 'a>> {
         let unsupported_type_action = params.unsupported_type_action;
         Box::pin(async move {
             let conn = CosmosDB {
@@ -354,6 +356,7 @@ impl DataConnector for CosmosDB {
 
     async fn read_provider(
         &self,
+        _context: &dyn ConnectorContext,
         dataset: &DatasetSpec,
     ) -> Result<Arc<dyn TableProvider>, DataConnectorError> {
         let credential = self.build_credential(dataset)?;

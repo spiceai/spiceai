@@ -72,10 +72,6 @@ pub struct Kafka {
     config: KafkaConfig,
     json_options: Arc<SpiceJsonOptions>,
     batching: (usize, Duration),
-    /// Retained so `read_provider` can resolve the offset store over the dataset's
-    /// accelerator. `None` only in unit tests, which build params without a runtime
-    /// attached.
-    context: Option<Arc<dyn ConnectorContext>>,
 }
 
 impl Kafka {
@@ -175,32 +171,7 @@ impl Kafka {
             config: kafka_config,
             json_options: get_json_format(&params)?,
             batching: (batch_max_size, batch_max_duration),
-            context: None,
         })
-    }
-
-    /// Attach the runtime context the offset store is resolved through.
-    ///
-    /// Separate from [`Self::new`] so unit tests can build a connector from parameters
-    /// alone, which is how they already construct one.
-    #[must_use]
-    fn with_context(mut self, context: Option<Arc<dyn ConnectorContext>>) -> Self {
-        self.context = context;
-        self
-    }
-
-    /// Resolve the offset store over this dataset's accelerator.
-    async fn offset_store(
-        &self,
-        dataset: &DatasetSpec,
-    ) -> Result<Arc<dyn KafkaCheckpointStore>, CheckpointError> {
-        let context = self
-            .context
-            .as_ref()
-            .ok_or_else(|| CheckpointError::Store {
-                source: "no runtime is attached to the Kafka connector".into(),
-            })?;
-        context.kafka_checkpoint_store(dataset).await
     }
 }
 
@@ -334,13 +305,13 @@ impl DataConnectorFactory for KafkaFactory {
         self
     }
 
-    fn create(
-        &self,
+    fn create<'a>(
+        &'a self,
         params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>> {
+        _context: &'a dyn ConnectorContext,
+    ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send + 'a>> {
         Box::pin(async move {
-            let context = params.context.clone();
-            let kafka = Kafka::new(params.parameters)?.with_context(context);
+            let kafka = Kafka::new(params.parameters)?;
             Ok(Arc::new(kafka) as Arc<dyn DataConnector>)
         })
     }
@@ -370,6 +341,7 @@ impl DataConnector for Kafka {
 
     async fn read_provider(
         &self,
+        context: &dyn ConnectorContext,
         dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         let Some(acceleration) = dataset
@@ -398,12 +370,16 @@ impl DataConnector for Kafka {
             // A dataset whose offsets cannot be persisted is refused rather than run
             // ephemerally: replaying the topic from the beginning into an append
             // accelerator duplicates every row already there.
-            Some(self.offset_store(dataset).await.boxed().context(
-                UnableToGetReadProviderSnafu {
-                    dataconnector: "kafka",
-                    connector_component: ConnectorComponent::from(dataset),
-                },
-            )?)
+            Some(
+                context
+                    .kafka_checkpoint_store(dataset)
+                    .await
+                    .boxed()
+                    .context(UnableToGetReadProviderSnafu {
+                        dataconnector: "kafka",
+                        connector_component: ConnectorComponent::from(dataset),
+                    })?,
+            )
         } else {
             tracing::warn!(
                 dataset = %dataset.name,

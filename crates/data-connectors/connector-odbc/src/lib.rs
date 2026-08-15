@@ -28,6 +28,7 @@ use crate::odbcconn::ODBCDbConnectionPool;
 use crate::odbcpool::ODBCPool;
 use async_trait::async_trait;
 use data_components::Read;
+use data_connector_api::ConnectorContext;
 use data_connector_api::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorFactory, DataConnectorResult,
     NewDataConnectorResult,
@@ -233,10 +234,11 @@ impl DataConnectorFactory for ODBCFactory {
         self
     }
 
-    fn create(
-        &self,
+    fn create<'a>(
+        &'a self,
         params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>> {
+        _context: &'a dyn ConnectorContext,
+    ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send + 'a>> {
         Box::pin(async move {
             parameter_is_integer(&params.parameters, "max_binary_size")?;
             parameter_is_integer(&params.parameters, "max_text_size")?;
@@ -312,6 +314,7 @@ where
 
     async fn read_provider(
         &self,
+        _context: &dyn ConnectorContext,
         dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         Ok(

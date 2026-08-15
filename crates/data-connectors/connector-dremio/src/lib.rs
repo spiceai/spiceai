@@ -17,6 +17,7 @@ limitations under the License.
 use async_trait::async_trait;
 use data_components::ReadWrite;
 use data_components::flight::FlightFactory;
+use data_connector_api::ConnectorContext;
 use data_connector_api::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult, NewDataConnectorResult,
@@ -132,10 +133,11 @@ impl DataConnectorFactory for DremioFactory {
         self
     }
 
-    fn create(
-        &self,
+    fn create<'a>(
+        &'a self,
         params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>> {
+        _context: &'a dyn ConnectorContext,
+    ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send + 'a>> {
         Box::pin(async move {
             let endpoint: Arc<str> = params
                 .parameters
@@ -193,6 +195,7 @@ impl DataConnector for Dremio {
 
     async fn read_provider(
         &self,
+        _context: &dyn ConnectorContext,
         dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         let table_reference = match RemoteTableRef::parse_with_default_dialect(dataset.path()) {
@@ -232,6 +235,7 @@ impl DataConnector for Dremio {
 
     async fn read_write_provider(
         &self,
+        _context: &dyn ConnectorContext,
         dataset: &DatasetSpec,
     ) -> Option<DataConnectorResult<Arc<dyn TableProvider>>> {
         let read_write_result =

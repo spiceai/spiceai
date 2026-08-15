@@ -55,10 +55,6 @@ pub struct MongoDB {
     mongodb_factory: MongoDBTableFactory,
     pool: Arc<MongoDBConnectionPool>,
     params: Parameters,
-    /// Retained so the change stream can resolve the resume-token store over the
-    /// dataset's accelerator. `None` only in unit tests, which build params without a
-    /// runtime attached.
-    context: Option<Arc<dyn ConnectorContext>>,
 }
 
 impl std::fmt::Debug for MongoDB {
@@ -179,10 +175,11 @@ impl DataConnectorFactory for MongoDBFactory {
         self
     }
 
-    fn create(
-        &self,
+    fn create<'a>(
+        &'a self,
         mut params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = data_connector_api::NewDataConnectorResult> + Send>> {
+        _context: &'a dyn ConnectorContext,
+    ) -> Pin<Box<dyn Future<Output = data_connector_api::NewDataConnectorResult> + Send + 'a>> {
         Box::pin(async move {
             // If a full connection_string is provided, warn about ignored connection details.
             if params.parameters.get("connection_string").ok().is_some() {
@@ -321,7 +318,6 @@ impl DataConnectorFactory for MongoDBFactory {
             Ok(Arc::new(MongoDB {
                 mongodb_factory,
                 pool,
-                context: params.context.clone(),
                 params: params.parameters,
             }) as Arc<dyn DataConnector>)
         })
@@ -778,6 +774,7 @@ impl DataConnector for MongoDB {
 
     async fn read_provider(
         &self,
+        _context: &dyn ConnectorContext,
         dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         // JSON-nesting / declared-schema projection. `_id` is MongoDB's only
@@ -801,16 +798,18 @@ impl DataConnector for MongoDB {
         true
     }
 
-    fn changes_stream(
+    async fn changes_stream(
         &self,
+        context: &dyn ConnectorContext,
         federated_table: Arc<dyn FederatedTableProvider>,
         dataset: &DatasetSpec,
     ) -> Option<data_components::cdc::ChangesStream> {
+        let mongo_sys = changes::resolve_checkpoint_store(context, dataset).await;
         Some(changes::build_changes_stream(
             Arc::clone(&self.pool),
             self.params.clone(),
             dataset.clone(),
-            self.context.clone(),
+            mongo_sys,
             federated_table,
         ))
     }

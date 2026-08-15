@@ -36,7 +36,7 @@ use runtime_parameters::ParameterSpec;
 
 use crate::accelerated::{AcceleratorSetup, RegisteredAcceleratedTable};
 use crate::federated::FederatedTableProvider;
-use crate::parameters::ConnectorParams;
+use crate::parameters::{ConnectorContext, ConnectorParams};
 use crate::{AnyErrorResult, DataConnectorResult};
 
 pub type NewDataConnectorResult = AnyErrorResult<Arc<dyn DataConnector>>;
@@ -130,10 +130,16 @@ macro_rules! register_data_connector {
 pub trait DataConnectorFactory: Send + Sync {
     fn as_any(&self) -> &dyn Any;
 
-    fn create(
-        &self,
+    /// Builds the connector.
+    ///
+    /// `context` is borrowed for the duration of the call, so a connector may
+    /// resolve a capability from it but must not keep the context itself — see
+    /// [`ConnectorContext`].
+    fn create<'a>(
+        &'a self,
         params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>>;
+        context: &'a dyn ConnectorContext,
+    ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send + 'a>>;
 
     fn supports_unsupported_type_action(&self) -> bool {
         false
@@ -212,11 +218,13 @@ pub trait DataConnector: Debug + Send + Sync + 'static {
 
     async fn read_provider(
         &self,
+        context: &dyn ConnectorContext,
         dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>>;
 
     async fn read_write_provider(
         &self,
+        _context: &dyn ConnectorContext,
         _dataset: &DatasetSpec,
     ) -> Option<DataConnectorResult<Arc<dyn TableProvider>>> {
         None
@@ -226,8 +234,17 @@ pub trait DataConnector: Debug + Send + Sync + 'static {
         false
     }
 
-    fn changes_stream(
+    /// The CDC stream for `dataset`, if this connector produces one.
+    ///
+    /// `async` so that anything the stream needs from `context` — a checkpoint
+    /// store, a session — is resolved **here**, before the stream is built. The
+    /// generator then holds only the resolved capability. That is what keeps a
+    /// long-lived stream from pinning the runtime: a checkpoint store holds a
+    /// connection pool and no runtime, so a stream holding one cannot close the
+    /// loop.
+    async fn changes_stream(
         &self,
+        _context: &dyn ConnectorContext,
         _federated_table: Arc<dyn FederatedTableProvider>,
         _dataset: &DatasetSpec,
     ) -> Option<ChangesStream> {

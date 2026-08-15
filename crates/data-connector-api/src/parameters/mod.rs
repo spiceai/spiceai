@@ -55,14 +55,24 @@ pub trait Validator {
     async fn validate(&self, params: &mut ConnectorParams) -> Result<(), Self::Error>;
 }
 
-/// The runtime capabilities a data connector may reach for while it is being
-/// built, behind a handle so [`ConnectorParams`] does not name them directly.
-/// A connector's *configuration* travels separately, as the
+/// The runtime capabilities a data connector may reach for, behind a handle so
+/// the connector contract does not name the orchestrator directly. A
+/// connector's *configuration* travels separately, as the
 /// [`ConnectorComponent`] spec.
 ///
 /// Each method is a single capability rather than a handle to the orchestrator,
 /// so the contract names only types that live below `runtime`: a registry, a
 /// session, the loaded app, or an already-resolved answer.
+///
+/// **Always borrowed, never held.** A context is passed as `&dyn
+/// ConnectorContext` to each call that needs one and is valid only for that
+/// call. A connector therefore *cannot* retain it, which is what makes the
+/// `Runtime -> … -> Arc<dyn DataConnector> -> context -> Runtime` cycle
+/// impossible rather than merely discouraged — and the cycle matters: an
+/// accelerated table aborts its refresh handlers in `Drop`, so a retained cycle
+/// does not just leak, it stops shutdown from ever aborting them. A connector
+/// that needs a capability after the call must keep the *resolved* capability
+/// (a store, a registry, a session), never the context that produced it.
 #[async_trait]
 pub trait ConnectorContext: Send + Sync {
     /// The loaded app, for the runtime-level configuration a connector consults
@@ -71,19 +81,15 @@ pub trait ConnectorContext: Send + Sync {
 
     /// The process-wide per-origin HTTP rate-control registry, so connectors
     /// sharing an origin share one limiter.
-    ///
-    /// `None` once the runtime has shut down. These three accessors are fallible
-    /// because the context holds the runtime weakly — see `RuntimeConnectorContext`.
-    fn http_rate_control_registry(&self) -> Option<Arc<HttpRateControlRegistry>>;
+    fn http_rate_control_registry(&self) -> Arc<HttpRateControlRegistry>;
 
-    /// The registry of token providers a connector authenticates through. `None` once
-    /// the runtime has shut down.
-    fn token_provider_registry(&self) -> Option<Arc<TokenProviderRegistry>>;
+    /// The registry of token providers a connector authenticates through.
+    fn token_provider_registry(&self) -> Arc<TokenProviderRegistry>;
 
     /// The runtime's own `DataFusion` session, for a connector that registers an
-    /// object store the main session must resolve at scan time. `None` once the runtime
-    /// has shut down.
-    fn datafusion_session_context(&self) -> Option<Arc<SessionContext>>;
+    /// object store the main session must resolve at scan time, or that builds a
+    /// vector index against the session's catalog.
+    fn datafusion_session_context(&self) -> Arc<SessionContext>;
 
     /// The accelerated schema recorded in this dataset's acceleration
     /// checkpoint, so a connector can re-advertise the schema a previous run
@@ -143,122 +149,18 @@ pub trait ConnectorContext: Send + Sync {
     ) -> Result<Arc<dyn MongoCheckpointStore>, CheckpointError>;
 }
 
+/// Everything a data connector is built from: the component's spicepod
+/// parameters with secrets already expanded, and the tokio handle its blocking
+/// I/O belongs on.
+///
+/// Deliberately *not* a place to keep a [`ConnectorContext`]. The context is
+/// borrowed for the duration of each call that needs it, so a connector cannot
+/// retain one — which is what makes the connector-to-runtime cycle impossible
+/// rather than merely discouraged.
 #[derive(Clone)]
 pub struct ConnectorParams {
     pub parameters: Parameters,
     pub unsupported_type_action: Option<UnsupportedTypeAction>,
     pub component: ConnectorComponent,
-    /// `None` only where no runtime is attached — connector unit tests that
-    /// build params directly.
-    pub context: Option<Arc<dyn ConnectorContext>>,
     pub io_runtime: Handle,
-}
-
-impl ConnectorParams {
-    /// The loaded app, if a runtime is attached.
-    #[must_use]
-    pub fn app(&self) -> Option<Arc<App>> {
-        self.context.as_ref().map(|ctx| ctx.app())
-    }
-
-    /// The HTTP rate-control registry, if a runtime is attached.
-    #[must_use]
-    pub fn http_rate_control_registry(&self) -> Option<Arc<HttpRateControlRegistry>> {
-        self.context
-            .as_ref()
-            .and_then(|ctx| ctx.http_rate_control_registry())
-    }
-
-    /// The token-provider registry, if a runtime is attached.
-    #[must_use]
-    pub fn token_provider_registry(&self) -> Option<Arc<TokenProviderRegistry>> {
-        self.context
-            .as_ref()
-            .and_then(|ctx| ctx.token_provider_registry())
-    }
-
-    /// The runtime's own `DataFusion` session, if a runtime is attached.
-    #[must_use]
-    pub fn datafusion_session_context(&self) -> Option<Arc<SessionContext>> {
-        self.context
-            .as_ref()
-            .and_then(|ctx| ctx.datafusion_session_context())
-    }
-
-    /// The accelerated schema stored for `dataset`, if a runtime is attached and
-    /// a checkpoint holds one.
-    pub async fn accelerated_checkpoint_schema(&self, dataset: &DatasetSpec) -> Option<SchemaRef> {
-        self.context
-            .as_ref()?
-            .accelerated_checkpoint_schema(dataset)
-            .await
-    }
-
-    /// The blob checkpoint store over `dataset`'s accelerator, writing into the sidecar
-    /// `table_name`. `None` if no runtime is attached or the dataset has no usable
-    /// accelerator connection.
-    pub async fn blob_checkpoint_store(
-        &self,
-        dataset: &DatasetSpec,
-        table_name: &'static str,
-    ) -> Option<Arc<dyn BlobCheckpointStore>> {
-        self.context
-            .as_ref()?
-            .blob_checkpoint_store(dataset, table_name)
-            .await
-    }
-
-    /// The Kafka checkpoint store over `dataset`'s accelerator.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if no runtime is attached, or if the dataset's accelerator
-    /// cannot be resolved into a store.
-    pub async fn kafka_checkpoint_store(
-        &self,
-        dataset: &DatasetSpec,
-    ) -> Result<Arc<dyn KafkaCheckpointStore>, CheckpointError> {
-        self.checkpoint_context()?
-            .kafka_checkpoint_store(dataset)
-            .await
-    }
-
-    /// The `MySQL` binlog position store over `dataset`'s accelerator.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if no runtime is attached, or if the dataset's accelerator
-    /// cannot be resolved into a store.
-    pub async fn mysql_binlog_store(
-        &self,
-        dataset: &DatasetSpec,
-    ) -> Result<Arc<dyn MySqlBinlogStore>, CheckpointError> {
-        self.checkpoint_context()?.mysql_binlog_store(dataset).await
-    }
-
-    /// The `MongoDB` resume-token store over `dataset`'s accelerator.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if no runtime is attached, or if the dataset's accelerator
-    /// cannot be resolved into a store.
-    pub async fn mongo_checkpoint_store(
-        &self,
-        dataset: &DatasetSpec,
-    ) -> Result<Arc<dyn MongoCheckpointStore>, CheckpointError> {
-        self.checkpoint_context()?
-            .mongo_checkpoint_store(dataset)
-            .await
-    }
-
-    /// The attached context, as a checkpoint-store error when there is none.
-    ///
-    /// Only connector unit tests build params without a runtime, so this reports the
-    /// same "nothing can persist a checkpoint" outcome as an unresolvable accelerator
-    /// rather than a distinct case each caller has to handle.
-    fn checkpoint_context(&self) -> Result<&Arc<dyn ConnectorContext>, CheckpointError> {
-        self.context.as_ref().ok_or_else(|| CheckpointError::Store {
-            source: "No runtime is attached to these connector parameters".into(),
-        })
-    }
 }

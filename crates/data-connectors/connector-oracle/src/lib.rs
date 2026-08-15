@@ -30,6 +30,7 @@ use data_components::oracle::OracleTableProvider;
 use data_components::oracle::connection::{
     OracleConnectionParams, OracleConnectionPool, OracleDirectConnectionParamsBuilder,
 };
+use data_connector_api::ConnectorContext;
 use data_connector_api::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorFactory, DataConnectorResult,
 };
@@ -272,10 +273,11 @@ impl DataConnectorFactory for OracleFactory {
         self
     }
 
-    fn create(
-        &self,
+    fn create<'a>(
+        &'a self,
         params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = data_connector_api::NewDataConnectorResult> + Send>> {
+        _context: &'a dyn ConnectorContext,
+    ) -> Pin<Box<dyn Future<Output = data_connector_api::NewDataConnectorResult> + Send + 'a>> {
         Box::pin(async move {
             Ok(Arc::new(Oracle::new(&params.parameters).await?) as Arc<dyn DataConnector>)
         })
@@ -333,6 +335,7 @@ impl DataConnector for Oracle {
 
     async fn read_provider(
         &self,
+        _context: &dyn ConnectorContext,
         dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         let provider = OracleTableProvider::new(Arc::clone(&self.conn), &dataset.path().into())

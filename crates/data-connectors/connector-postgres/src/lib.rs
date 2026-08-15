@@ -67,10 +67,6 @@ pub struct Postgres {
     factory: PostgresTableFactory,
     pool: Arc<PostgresConnectionPool>,
     params: Parameters,
-    /// Retained so the replication stream can resolve the applied-LSN watermark store
-    /// over the dataset's accelerator. `None` only in unit tests, which build params
-    /// without a runtime attached.
-    context: Option<Arc<dyn ConnectorContext>>,
     replication_metrics:
         std::sync::Arc<data_components::postgres_replication::ReplicationMetricsCollector>,
 }
@@ -239,10 +235,11 @@ impl DataConnectorFactory for PostgresFactory {
         self
     }
 
-    fn create(
-        &self,
+    fn create<'a>(
+        &'a self,
         params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>> {
+        _context: &'a dyn ConnectorContext,
+    ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send + 'a>> {
         Box::pin(async move {
             let mut param_map = params.parameters.to_secret_map();
 
@@ -297,7 +294,6 @@ impl DataConnectorFactory for PostgresFactory {
                         factory,
                         pool,
                         params: params_for_replication,
-                        context: params.context.clone(),
                         replication_metrics:
                             data_components::postgres_replication::ReplicationMetricsCollector::new(
                             ),
@@ -985,6 +981,7 @@ impl DataConnector for Postgres {
 
     async fn read_write_provider(
         &self,
+        _context: &dyn ConnectorContext,
         dataset: &DatasetSpec,
     ) -> Option<DataConnectorResult<Arc<dyn TableProvider>>> {
         match self
@@ -1035,6 +1032,7 @@ impl DataConnector for Postgres {
 
     async fn read_provider(
         &self,
+        _context: &dyn ConnectorContext,
         dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         match federated_postgres_table_provider(Arc::clone(&self.pool), dataset.path().into()).await
@@ -1081,18 +1079,22 @@ impl DataConnector for Postgres {
         true
     }
 
-    fn changes_stream(
+    async fn changes_stream(
         &self,
+        context: &dyn ConnectorContext,
         federated_table: Arc<dyn data_connector_api::federated::FederatedTableProvider>,
         dataset: &DatasetSpec,
     ) -> Option<data_components::cdc::ChangesStream> {
-        Some(replication::build_changes_stream(
-            &self.params,
-            dataset,
-            self.context.clone(),
-            federated_table,
-            Arc::clone(&self.replication_metrics),
-        ))
+        Some(
+            replication::build_changes_stream(
+                &self.params,
+                dataset,
+                context,
+                federated_table,
+                Arc::clone(&self.replication_metrics),
+            )
+            .await,
+        )
     }
 
     fn metrics_provider(&self) -> Option<Arc<dyn MetricsProvider>> {

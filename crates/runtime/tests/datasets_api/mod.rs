@@ -16,6 +16,7 @@ limitations under the License.
 
 //! Tests for the `/v1/datasets` HTTP API endpoint.
 
+use data_connector_api::ConnectorContext;
 use std::{
     any::Any,
     future::Future,
@@ -90,6 +91,7 @@ impl DataConnector for PermissionStatusConnector {
 
     async fn read_provider(
         &self,
+        _context: &dyn data_connector_api::ConnectorContext,
         dataset: &RuntimeDataset,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         if dataset.name.table() == "permission_denied" {
@@ -124,10 +126,11 @@ impl DataConnectorFactory for PermissionStatusConnectorFactory {
         self
     }
 
-    fn create(
-        &self,
+    fn create<'a>(
+        &'a self,
         _params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>> {
+        _context: &'a dyn ConnectorContext,
+    ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send + 'a>> {
         Box::pin(async move { Ok(Arc::new(PermissionStatusConnector) as Arc<dyn DataConnector>) })
     }
 

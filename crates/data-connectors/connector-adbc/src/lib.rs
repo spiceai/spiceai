@@ -20,6 +20,7 @@ use adbc_driver_manager::ManagedDriver;
 use arrow::array::{Array, ArrayRef, LargeStringArray, StringArray};
 use async_trait::async_trait;
 use data_components::{FieldMetadata, metadata_enriched_table_provider};
+use data_connector_api::ConnectorContext;
 use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
 use datafusion::sql::unparser::dialect::{BigQueryDialect, Dialect};
@@ -750,10 +751,11 @@ impl DataConnectorFactory for AdbcFactory {
         self
     }
 
-    fn create(
-        &self,
+    fn create<'a>(
+        &'a self,
         params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>> {
+        _context: &'a dyn ConnectorContext,
+    ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send + 'a>> {
         let cache_key = compute_adbc_cache_key(&params);
 
         let entry = {
@@ -1165,6 +1167,7 @@ impl DataConnector for Adbc {
 
     async fn read_provider(
         &self,
+        _context: &dyn ConnectorContext,
         dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         let adbc_factory =
@@ -1201,6 +1204,7 @@ impl DataConnector for Adbc {
 
     async fn read_write_provider(
         &self,
+        _context: &dyn ConnectorContext,
         dataset: &DatasetSpec,
     ) -> Option<DataConnectorResult<Arc<dyn TableProvider>>> {
         let adbc_factory =
@@ -1606,7 +1610,6 @@ mod tests {
                 parameters,
                 unsupported_type_action: None,
                 component: ConnectorComponent::from(dataset),
-                context: None,
                 io_runtime: tokio::runtime::Handle::current(),
             }
         };
@@ -1639,7 +1642,6 @@ mod tests {
                 parameters,
                 unsupported_type_action: None,
                 component: ConnectorComponent::from(&dataset),
-                context: None,
                 io_runtime: tokio::runtime::Handle::current(),
             }
         };
@@ -1768,7 +1770,6 @@ mod tests {
                 parameters,
                 unsupported_type_action: None,
                 component: ConnectorComponent::from(dataset),
-                context: None,
                 io_runtime: tokio::runtime::Handle::current(),
             }
         };
@@ -1811,6 +1812,7 @@ mod tests {
 
         async fn read_provider(
             &self,
+            _context: &dyn ConnectorContext,
             _dataset: &DatasetSpec,
         ) -> DataConnectorResult<Arc<dyn TableProvider>> {
             unreachable!("test connector is not used to read data")

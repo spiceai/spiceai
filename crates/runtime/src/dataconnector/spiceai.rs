@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::dataconnector::ConnectorContext;
+use app::App;
 use std::any::Any;
 use std::borrow::Borrow;
 use std::future::Future;
@@ -381,10 +383,11 @@ impl DataConnectorFactory for SpiceAIFactory {
         self
     }
 
-    fn create(
-        &self,
+    fn create<'a>(
+        &'a self,
         params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
+        context: &'a dyn ConnectorContext,
+    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send + 'a>> {
         Box::pin(async move {
             let url = get_endpoint(&params)?;
             tracing::trace!("Connecting to SpiceAI with flight url: {url}");
@@ -444,7 +447,7 @@ impl DataConnectorFactory for SpiceAIFactory {
                     .await
                     .context(UnableToCreateFlightClientSnafu)?;
 
-            flight_client = configure_max_message_size(flight_client, &params)?;
+            flight_client = configure_max_message_size(flight_client, &context.app())?;
 
             let flight_factory = FlightFactory::new(
                 "spice.ai",
@@ -466,12 +469,8 @@ impl DataConnectorFactory for SpiceAIFactory {
 }
 
 /// Configures flight client's message size based on app parameters
-fn configure_max_message_size(
-    mut flight_client: FlightClient,
-    params: &ConnectorParams,
-) -> Result<FlightClient> {
-    if let Some(app) = params.app()
-        && let Some(flight) = app.runtime.flight.as_ref()
+fn configure_max_message_size(mut flight_client: FlightClient, app: &App) -> Result<FlightClient> {
+    if let Some(flight) = app.runtime.flight.as_ref()
         && let Some(max_message_size) =
             flight
                 .max_message_size_bytes()
@@ -493,6 +492,7 @@ impl DataConnector for SpiceAI {
 
     async fn read_provider(
         &self,
+        _context: &dyn ConnectorContext,
         dataset: &DatasetSpec,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
         let dataset_path = match SpiceAI::spice_dataset_path(dataset) {
@@ -535,6 +535,7 @@ impl DataConnector for SpiceAI {
 
     async fn read_write_provider(
         &self,
+        _context: &dyn ConnectorContext,
         dataset: &DatasetSpec,
     ) -> Option<super::DataConnectorResult<Arc<dyn TableProvider>>> {
         let dataset_path = match SpiceAI::spice_dataset_path(dataset) {
@@ -567,8 +568,9 @@ impl DataConnector for SpiceAI {
         false
     }
 
-    fn changes_stream(
+    async fn changes_stream(
         &self,
+        _context: &dyn ConnectorContext,
         federated_table: Arc<dyn FederatedTableProvider>,
         _dataset: &DatasetSpec,
     ) -> Option<ChangesStream> {
@@ -738,7 +740,6 @@ mod tests {
             parameters,
             unsupported_type_action: None,
             component: ConnectorComponent::from(&dataset),
-            context: None,
             io_runtime: Handle::current(),
         }
     }

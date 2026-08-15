@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use app::App;
+use data_connector_api::ConnectorContext;
 use data_connector_api::listing::{
     LISTING_TABLE_PARAMETERS, ListingTableConnector, ObjectVersionType, build_fragments,
     object_store_timeout_message,
@@ -213,10 +214,11 @@ impl DataConnectorFactory for AzureBlobFSFactory {
         self
     }
 
-    fn create(
-        &self,
+    fn create<'a>(
+        &'a self,
         mut params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = data_connector_api::NewDataConnectorResult> + Send>> {
+        context: &'a dyn ConnectorContext,
+    ) -> Pin<Box<dyn Future<Output = data_connector_api::NewDataConnectorResult> + Send + 'a>> {
         // Validate versioning parameter early
         if let Some(versioning) = params.parameters.get("versioning").expose().ok()
             && !matches!(versioning, "enabled" | "disabled")
@@ -235,7 +237,7 @@ impl DataConnectorFactory for AzureBlobFSFactory {
                 validator.validate(&mut params).await?;
             }
 
-            let app = params.app();
+            let app = Some(context.app());
             let azure = AzureBlobFS {
                 params: params.parameters,
                 app,

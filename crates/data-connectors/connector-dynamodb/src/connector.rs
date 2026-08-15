@@ -56,14 +56,10 @@ const CHECKPOINT_TABLE: &str = "spice_sys_dynamodb_streams";
 
 pub struct DynamoDB {
     params: Parameters,
-    /// Retained so the change stream can resolve the checkpoint store over the
-    /// dataset's accelerator. `None` only in unit tests, which build params without a
-    /// runtime attached.
-    context: Option<Arc<dyn ConnectorContext>>,
     metrics_collector: Arc<MetricsCollector>,
 }
 
-// Hand-written because the retained `ConnectorContext` handle is not `Debug`.
+// Hand-written because `MetricsCollector` is not `Debug`.
 impl std::fmt::Debug for DynamoDB {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DynamoDB")
@@ -236,13 +232,13 @@ impl DataConnectorFactory for DynamoDBFactory {
         self
     }
 
-    fn create(
-        &self,
+    fn create<'a>(
+        &'a self,
         params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = data_connector_api::NewDataConnectorResult> + Send>> {
+        _context: &'a dyn ConnectorContext,
+    ) -> Pin<Box<dyn Future<Output = data_connector_api::NewDataConnectorResult> + Send + 'a>> {
         Box::pin(async move {
             let dynamodb = DynamoDB {
-                context: params.context.clone(),
                 params: params.parameters,
                 metrics_collector: Arc::new(MetricsCollector::default()),
             };
@@ -267,13 +263,15 @@ impl DataConnector for DynamoDB {
 
     async fn read_write_provider(
         &self,
+        context: &dyn ConnectorContext,
         dataset: &DatasetSpec,
     ) -> Option<Result<Arc<dyn TableProvider>, DataConnectorError>> {
-        Some(self.read_provider(dataset).await)
+        Some(self.read_provider(context, dataset).await)
     }
 
     async fn read_provider(
         &self,
+        _context: &dyn ConnectorContext,
         dataset: &DatasetSpec,
     ) -> Result<Arc<dyn TableProvider>, DataConnectorError> {
         if let Some(acceleration) = &dataset.acceleration
@@ -469,8 +467,9 @@ impl DataConnector for DynamoDB {
         ))))
     }
 
-    fn changes_stream(
+    async fn changes_stream(
         &self,
+        context: &dyn ConnectorContext,
         federated_table: Arc<dyn FederatedTableProvider>,
         dataset: &DatasetSpec,
     ) -> Option<ChangesStream> {
@@ -481,38 +480,33 @@ impl DataConnector for DynamoDB {
         let snapshot_mode = parse_snapshot_mode(&self.params, &dataset.name);
 
         let metrics_collector = Arc::clone(&self.metrics_collector);
-        let context = self.context.clone();
+
+        // Resolved here rather than inside the stream: the stream outlives this call,
+        // and a store holds only a connection to the accelerator, so handing the
+        // generator the resolved store keeps it from pinning the runtime.
+        let dynamodb_sys: Option<Arc<dyn BlobCheckpointStore>> = if dataset.is_file_accelerated() {
+            // `None` here is a graceful "checkpointing unavailable" degradation, and the
+            // accessor already logs why, so it is not logged again.
+            context
+                .blob_checkpoint_store(&dataset, CHECKPOINT_TABLE)
+                .await
+        } else {
+            tracing::warn!(
+                dataset = %dataset.name,
+                "DynamoDB Streams dataset is not file-accelerated. Connector state is ephemeral and the stream will restart on every runtime restart"
+            );
+            None
+        };
 
         Some(Box::pin(
             stream::once(async move {
                 let table_provider = federated_table.table_provider().await;
 
-                let dynamodb_ref = table_provider
-                    .downcast_ref::<DynamoDBTableProvider>()?;
+                let dynamodb_ref = table_provider.downcast_ref::<DynamoDBTableProvider>()?;
 
                 let acceptable_lag = dynamodb_ref.ready_lag;
                 let dataset_name = dataset.name.clone();
                 let dynamodb = Arc::new(dynamodb_ref.clone());
-                let dynamodb_sys: Option<Arc<dyn BlobCheckpointStore>> =
-                    if dataset.is_file_accelerated() {
-                        // `None` here is a graceful "checkpointing unavailable"
-                        // degradation, and the accessor already logs why, so it is not
-                        // logged again.
-                        match context.as_ref() {
-                            Some(context) => {
-                                context
-                                    .blob_checkpoint_store(&dataset, CHECKPOINT_TABLE)
-                                    .await
-                            }
-                            None => None,
-                        }
-                    } else {
-                        tracing::warn!(
-                            dataset = %dataset_name,
-                            "DynamoDB Streams dataset is not file-accelerated. Connector state is ephemeral and the stream will restart on every runtime restart"
-                        );
-                        None
-                    };
 
                 let (should_bootstrap, checkpoint, checkpoint_updated_at) = match snapshot_mode {
                     // `always`: scan on every start from a fresh stream tip,
@@ -534,8 +528,12 @@ impl DataConnector for DynamoDB {
                         (false, checkpoint, updated_at)
                     }
                     InitialSnapshotMode::Auto => {
-                        load_or_initialize_checkpoint(&dynamodb, dynamodb_sys.as_ref(), &dataset_name)
-                            .await?
+                        load_or_initialize_checkpoint(
+                            &dynamodb,
+                            dynamodb_sys.as_ref(),
+                            &dataset_name,
+                        )
+                        .await?
                     }
                 };
 

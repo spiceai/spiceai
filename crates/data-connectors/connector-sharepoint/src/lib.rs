@@ -49,6 +49,7 @@ use crate::sharepoint::table::SharepointTableProvider;
 use crate::sharepoint::url::DriveRef;
 use app::App;
 use async_trait::async_trait;
+use data_connector_api::ConnectorContext;
 use data_connector_api::listing::{
     LISTING_TABLE_PARAMETERS, ListingTableConnector, ObjectVersionType,
 };
@@ -711,14 +712,15 @@ impl DataConnectorFactory for SharepointFactory {
         self
     }
 
-    fn create(
-        &self,
+    fn create<'a>(
+        &'a self,
         params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>> {
+        context: &'a dyn ConnectorContext,
+    ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send + 'a>> {
         Box::pin(async move {
             let io_runtime = params.io_runtime.clone();
-            let app = params.app();
-            let session_context = params.datafusion_session_context();
+            let app = Some(context.app());
+            let session_context = Some(context.datafusion_session_context());
             let connector =
                 Sharepoint::new(params.parameters, io_runtime, app, session_context).await?;
             Ok(Arc::new(connector) as Arc<dyn DataConnector>)
@@ -742,12 +744,13 @@ impl DataConnector for Sharepoint {
 
     async fn read_provider(
         &self,
+        context: &dyn ConnectorContext,
         dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         if Self::uses_object_store(dataset) {
             return self
                 .listing_connector(dataset)?
-                .read_provider(dataset)
+                .read_provider(context, dataset)
                 .await;
         }
         // Legacy path — metadata-listing table provider.
@@ -768,6 +771,7 @@ impl DataConnector for Sharepoint {
 
     async fn read_write_provider(
         &self,
+        context: &dyn ConnectorContext,
         dataset: &DatasetSpec,
     ) -> Option<DataConnectorResult<Arc<dyn TableProvider>>> {
         if !Self::uses_object_store(dataset) {
@@ -777,7 +781,7 @@ impl DataConnector for Sharepoint {
             Ok(c) => c,
             Err(e) => return Some(Err(e)),
         };
-        Some(connector.read_provider(dataset).await)
+        Some(connector.read_provider(context, dataset).await)
     }
 
     async fn metadata_provider(

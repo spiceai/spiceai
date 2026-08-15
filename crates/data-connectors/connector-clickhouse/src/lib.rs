@@ -31,6 +31,7 @@ mod pool;
 use async_trait::async_trait;
 use clickhouse_rs::Options;
 use data_components::Read;
+use data_connector_api::ConnectorContext;
 use data_connector_api::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult, NewDataConnectorResult,
@@ -174,10 +175,11 @@ impl DataConnectorFactory for ClickhouseFactory {
         self
     }
 
-    fn create(
-        &self,
+    fn create<'a>(
+        &'a self,
         params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>> {
+        _context: &'a dyn ConnectorContext,
+    ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send + 'a>> {
         Box::pin(async move {
             match get_config_from_params(params.parameters).await {
                 Ok(config) => {
@@ -261,6 +263,7 @@ impl DataConnector for Clickhouse {
 
     async fn read_provider(
         &self,
+        _context: &dyn ConnectorContext,
         dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         Ok(

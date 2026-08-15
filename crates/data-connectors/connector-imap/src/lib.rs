@@ -26,6 +26,7 @@ use crate::imap::{
     session::{ImapAuthMode, ImapAuthModeParameter, ImapSSLMode, ImapSession},
 };
 use async_trait::async_trait;
+use data_connector_api::ConnectorContext;
 use data_connector_api::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult, NewDataConnectorResult,
@@ -209,10 +210,11 @@ impl DataConnectorFactory for ImapFactory {
         self
     }
 
-    fn create(
-        &self,
+    fn create<'a>(
+        &'a self,
         mut params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>> {
+        _context: &'a dyn ConnectorContext,
+    ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send + 'a>> {
         Box::pin(async move {
             let host = Self::parse_host(&mut params)?;
 
@@ -293,6 +295,7 @@ impl DataConnector for Imap {
 
     async fn read_provider(
         &self,
+        _context: &dyn ConnectorContext,
         dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         Ok(Arc::new(ImapTableProvider::new(

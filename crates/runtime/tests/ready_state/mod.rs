@@ -15,6 +15,7 @@ limitations under the License.
 */
 #![expect(clippy::expect_used, reason = "integration-test helper")]
 
+use data_connector_api::ConnectorContext;
 use std::{
     any::Any,
     fmt,
@@ -133,6 +134,7 @@ impl DataConnector for SlowNativeDataConnector {
 
     async fn read_provider(
         &self,
+        _context: &dyn ConnectorContext,
         _dataset: &DatasetSpec,
     ) -> Result<Arc<dyn TableProvider>, DataConnectorError> {
         // Create wrapper table provider that delays the stream
@@ -168,6 +170,7 @@ impl DataConnector for SlowFederatedDataConnector {
 
     async fn read_provider(
         &self,
+        _context: &dyn ConnectorContext,
         dataset: &DatasetSpec,
     ) -> Result<Arc<dyn TableProvider>, DataConnectorError> {
         // Create SQLExecutor implementation
@@ -389,10 +392,11 @@ impl DataConnectorFactory for SlowNativeDataConnectorProvider {
         self
     }
 
-    fn create(
-        &self,
+    fn create<'a>(
+        &'a self,
         _params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>> {
+        _context: &'a dyn ConnectorContext,
+    ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send + 'a>> {
         Box::pin(
             async move { Ok(Arc::new(SlowNativeDataConnector::new()) as Arc<dyn DataConnector>) },
         )
@@ -422,10 +426,11 @@ impl DataConnectorFactory for SlowFederatedDataConnectorProvider {
         self
     }
 
-    fn create(
-        &self,
+    fn create<'a>(
+        &'a self,
         _params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>> {
+        _context: &'a dyn ConnectorContext,
+    ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send + 'a>> {
         Box::pin(async move {
             Ok(Arc::new(SlowFederatedDataConnector::new()) as Arc<dyn DataConnector>)
         })
@@ -451,6 +456,7 @@ impl DataConnector for AuthErrorDataConnector {
 
     async fn read_provider(
         &self,
+        _context: &dyn ConnectorContext,
         dataset: &DatasetSpec,
     ) -> Result<Arc<dyn TableProvider>, DataConnectorError> {
         Err(
@@ -476,10 +482,11 @@ impl DataConnectorFactory for AuthErrorDataConnectorProvider {
         self
     }
 
-    fn create(
-        &self,
+    fn create<'a>(
+        &'a self,
         _params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>> {
+        _context: &'a dyn ConnectorContext,
+    ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send + 'a>> {
         Box::pin(async move { Ok(Arc::new(AuthErrorDataConnector) as Arc<dyn DataConnector>) })
     }
 

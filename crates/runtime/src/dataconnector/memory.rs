@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::dataconnector::ConnectorContext;
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use data_components::arrow::write::MemTable;
@@ -65,10 +66,11 @@ impl DataConnectorFactory for MemoryConnectorFactory {
         self
     }
 
-    fn create(
-        &self,
+    fn create<'a>(
+        &'a self,
         _params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
+        _context: &'a dyn ConnectorContext,
+    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send + 'a>> {
         Box::pin(async move { Ok(Arc::new(MemoryConnector::default()) as Arc<dyn DataConnector>) })
     }
 
@@ -89,6 +91,7 @@ impl DataConnector for MemoryConnector {
 
     async fn read_provider(
         &self,
+        _context: &dyn ConnectorContext,
         dataset: &DatasetSpec,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
         let path = dataset.path();
@@ -114,6 +117,7 @@ impl DataConnector for MemoryConnector {
 
     async fn read_write_provider(
         &self,
+        _context: &dyn ConnectorContext,
         dataset: &DatasetSpec,
     ) -> Option<super::DataConnectorResult<Arc<dyn TableProvider>>> {
         let path = dataset.path();

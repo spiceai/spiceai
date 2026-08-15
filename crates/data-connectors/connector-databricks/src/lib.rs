@@ -30,6 +30,7 @@ use data_components::databricks::DatabricksSparkConnect;
 use data_components::databricks::sql_warehouse::DatabricksMetrics;
 use data_components::databricks::{DatabricksDelta, DatabricksSqlWarehouse, sql_warehouse};
 use data_components::unity_catalog::{Endpoint, UnityCatalog as UnityCatalogClient};
+use data_connector_api::ConnectorContext;
 use data_connector_api::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult, NewDataConnectorResult,
@@ -852,11 +853,12 @@ impl DataConnectorFactory for DatabricksFactory {
         self
     }
 
-    fn create(
-        &self,
+    fn create<'a>(
+        &'a self,
         params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>> {
-        if let Some(context) = params.context.clone() {
+        context: &'a dyn ConnectorContext,
+    ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send + 'a>> {
+        {
             let aws_region = params
                 .parameters
                 .get("aws_region")
@@ -909,26 +911,10 @@ impl DataConnectorFactory for DatabricksFactory {
                     None
                 };
 
-                // The runtime is constructing this connector, so it is necessarily alive
-                // here; a missing registry would mean it went away mid-construction.
-                // Report that rather than silently building a connector with no rate
-                // control or no way to authenticate.
-                let runtime_gone = |capability: &str| {
-                    DataConnectorError::InvalidConfigurationNoSource {
-                        dataconnector: CONNECTOR_NAME.to_string(),
-                        connector_component: params.component.clone(),
-                        message: format!(
-                            "The runtime shut down while the connector was being created, so its {capability} could not be reached"
-                        ),
-                    }
-                };
-
                 let rate_control_reservation = reserve_databricks_rate_controller(
                     &params.parameters,
                     Some(&app.runtime.params),
-                    context
-                        .http_rate_control_registry()
-                        .ok_or_else(|| runtime_gone("HTTP rate-control registry"))?,
+                    context.http_rate_control_registry(),
                     &params.component,
                     app.name.as_str(),
                 )
@@ -940,9 +926,7 @@ impl DataConnectorFactory for DatabricksFactory {
                 let databricks_result = Databricks::new(
                     params.parameters,
                     params.io_runtime,
-                    context
-                        .token_provider_registry()
-                        .ok_or_else(|| runtime_gone("token-provider registry"))?,
+                    context.token_provider_registry(),
                     shared_semaphore,
                     rate_controller,
                 )
@@ -962,13 +946,6 @@ impl DataConnectorFactory for DatabricksFactory {
                         Err(error.into())
                     }
                 }
-            })
-        } else {
-            Box::pin(async move {
-                Err(Box::new(Error::UnableToBuild {
-                    missing_component: "runtime".to_string(),
-                })
-                    as Box<dyn std::error::Error + Send + Sync>)
             })
         }
     }
@@ -990,6 +967,7 @@ impl DataConnector for Databricks {
 
     async fn read_provider(
         &self,
+        _context: &dyn ConnectorContext,
         dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         let table_reference = TableReference::from(dataset.path());
@@ -1648,7 +1626,9 @@ mod tests {
         };
         let dataset = make_dataset(dataset_from, "tpch_sf400_part").await;
 
-        let result = DataConnector::read_provider(&connector, &dataset)
+        let context =
+            runtime::dataconnector::parameters::RuntimeConnectorContext::for_dataset(&dataset);
+        let result = DataConnector::read_provider(&connector, &context, &dataset)
             .await
             .map(|_| ());
         let captured_requests = captured_requests.lock().await.clone();

@@ -21,9 +21,8 @@ use crate::component::dataset::DatasetSpec;
 use crate::component::dataset::acceleration::Engine;
 #[cfg(feature = "duckdb")]
 use crate::component::view::View;
-use crate::dataconnector::ConnectorComponent;
+use crate::dataconnector::ConnectorContext;
 use crate::dataconnector::{DataConnector, DataConnectorError, DataConnectorResult};
-use crate::datafusion::DataFusion;
 use crate::embeddings::execution_plan::{
     compute_additional_embedding_columns, construct_record_batch,
 };
@@ -51,7 +50,7 @@ use spicepod::semantic::Column;
 use spicepod::semantic::ColumnLevelEmbeddingConfig;
 use spicepod::vector::VectorStore;
 use std::any::Any;
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use runtime_search::embeddings::table::EmbeddingTable;
@@ -61,11 +60,6 @@ pub struct EmbeddingConnector {
     inner_connector: Arc<dyn DataConnector>,
     embedding_models: Arc<RwLock<EmbeddingModelStore>>,
     secrets: Arc<RwLock<Secrets>>,
-    /// The runtime's `DataFusion`, held **weakly** for the same reason
-    /// `RuntimeConnectorContext` holds the runtime weakly: this connector is reachable
-    /// from the session's own catalog, so a strong handle would close a cycle and stop
-    /// `AcceleratedTable::drop` from aborting its refresh handlers.
-    datafusion: Weak<DataFusion>,
 }
 
 impl std::fmt::Debug for EmbeddingConnector {
@@ -82,13 +76,11 @@ impl EmbeddingConnector {
         inner_connector: Arc<dyn DataConnector>,
         embedding_models: Arc<RwLock<EmbeddingModelStore>>,
         secrets: Arc<RwLock<Secrets>>,
-        datafusion: Weak<DataFusion>,
     ) -> Self {
         Self {
             inner_connector,
             embedding_models,
             secrets,
-            datafusion,
         }
     }
 
@@ -96,6 +88,7 @@ impl EmbeddingConnector {
     /// are needed for the [`Dataset`], it is not unnecessarily nested.
     pub(crate) async fn wrap_table(
         &self,
+        context: &dyn ConnectorContext,
         inner_table_provider: Arc<dyn TableProvider>,
         dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
@@ -131,21 +124,11 @@ impl EmbeddingConnector {
 
             let on_zero_results = warm_index_on_zero_results(dataset.acceleration.as_ref());
 
+            let session_context = context.datafusion_session_context();
             let mut provider = Arc::clone(&inner_table_provider);
             for (effective_vector_store, columns) in vector_index_groups(vector_engine, dataset) {
-                let Some(datafusion) = self.datafusion.upgrade() else {
-                    // The runtime is shutting down under this load; there is no session to
-                    // register an index against.
-                    return Err(DataConnectorError::InvalidConfigurationNoSource {
-                        dataconnector: "embeddings".to_string(),
-                        connector_component: ConnectorComponent::from(dataset),
-                        message:
-                            "The runtime shut down while the dataset's vector index was being built"
-                                .to_string(),
-                    });
-                };
                 provider = wrap_table_as_index(
-                    &datafusion.ctx,
+                    &session_context,
                     &self.embedding_models,
                     &self.secrets,
                     &dataset.name,
@@ -265,18 +248,28 @@ impl DataConnector for EmbeddingConnector {
 
     async fn read_provider(
         &self,
+        context: &dyn ConnectorContext,
         dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
-        self.wrap_table(self.inner_connector.read_provider(dataset).await?, dataset)
-            .await
+        self.wrap_table(
+            context,
+            self.inner_connector.read_provider(context, dataset).await?,
+            dataset,
+        )
+        .await
     }
 
     async fn read_write_provider(
         &self,
+        context: &dyn ConnectorContext,
         dataset: &DatasetSpec,
     ) -> Option<DataConnectorResult<Arc<dyn TableProvider>>> {
-        match self.inner_connector.read_write_provider(dataset).await {
-            Some(Ok(inner)) => Some(self.wrap_table(inner, dataset).await),
+        match self
+            .inner_connector
+            .read_write_provider(context, dataset)
+            .await
+        {
+            Some(Ok(inner)) => Some(self.wrap_table(context, inner, dataset).await),
             Some(Err(e)) => Some(Err(e)),
             None => None,
         }
@@ -364,8 +357,9 @@ impl DataConnector for EmbeddingConnector {
         self.inner_connector.supports_durable_write_back_delivery()
     }
 
-    fn changes_stream(
+    async fn changes_stream(
         &self,
+        context: &dyn ConnectorContext,
         federated_table: Arc<dyn FederatedTableProvider>,
         dataset: &DatasetSpec,
     ) -> Option<ChangesStream> {
@@ -403,7 +397,8 @@ impl DataConnector for EmbeddingConnector {
 
             let stream = self
                 .inner_connector
-                .changes_stream(underlying_federated_table, dataset)?
+                .changes_stream(context, underlying_federated_table, dataset)
+                .await?
                 .then(move |item| index_change_envelope(item, Arc::clone(&indexes)))
                 .boxed();
 
@@ -413,12 +408,15 @@ impl DataConnector for EmbeddingConnector {
         } else if let Some(vector_scan) =
             find_layer::<VectorScanTableProvider>(table_provider.as_ref(), LayerWalk::CdcDetection)
         {
-            self.inner_connector.changes_stream(
-                Arc::new(FederatedTable::Immediate(Arc::clone(
-                    &vector_scan.table_provider,
-                ))),
-                dataset,
-            )
+            self.inner_connector
+                .changes_stream(
+                    context,
+                    Arc::new(FederatedTable::Immediate(Arc::clone(
+                        &vector_scan.table_provider,
+                    ))),
+                    dataset,
+                )
+                .await
         } else if let Some(embedding_table) =
             find_layer::<EmbeddingTable>(table_provider.as_ref(), LayerWalk::CdcDetection)
         {
@@ -428,7 +426,8 @@ impl DataConnector for EmbeddingConnector {
 
             Some(
                 self.inner_connector
-                    .changes_stream(underlying_federated_table, dataset)?
+                    .changes_stream(context, underlying_federated_table, dataset)
+                    .await?
                     .then(move |item| {
                         Self::embed_change_envelope(item, Arc::clone(&embedding_table))
                     })
@@ -776,6 +775,7 @@ mod tests {
 
         async fn read_provider(
             &self,
+            _context: &dyn ConnectorContext,
             _dataset: &DatasetSpec,
         ) -> DataConnectorResult<Arc<dyn TableProvider>> {
             Ok(memtable())
@@ -785,8 +785,9 @@ mod tests {
             true
         }
 
-        fn changes_stream(
+        async fn changes_stream(
             &self,
+            _context: &dyn ConnectorContext,
             _federated_table: Arc<dyn FederatedTableProvider>,
             _dataset: &DatasetSpec,
         ) -> Option<ChangesStream> {
@@ -836,7 +837,6 @@ mod tests {
             Arc::new(StreamingSource),
             Arc::new(RwLock::new(EmbeddingModelStore::default())),
             Arc::new(RwLock::new(Secrets::default())),
-            std::sync::Weak::new(),
         )
     }
 
@@ -897,9 +897,12 @@ mod tests {
                 .build()
                 .expect("valid dataset");
 
+        let context =
+            crate::dataconnector::parameters::RuntimeConnectorContext::for_dataset(&dataset);
         assert!(
             embedding_connector()
-                .changes_stream(vector_scan_over_memtable(), &dataset)
+                .changes_stream(&context, vector_scan_over_memtable(), &dataset)
+                .await
                 .is_some(),
             "a vector scan must resolve to the source's changes stream"
         );

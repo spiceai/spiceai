@@ -69,10 +69,6 @@ pub struct MySQL {
     /// Connector params retained for the replication path, which opens its
     /// own dedicated connections outside the pool.
     params: Parameters,
-    /// Retained so the replication path can resolve the binlog-position store over
-    /// the dataset's accelerator. `None` only in unit tests, which build params
-    /// without a runtime attached.
-    context: Option<Arc<dyn ConnectorContext>>,
     replication_metrics: Arc<ReplicationMetricsCollector>,
 }
 
@@ -213,10 +209,11 @@ impl DataConnectorFactory for MySQLFactory {
         self
     }
 
-    fn create(
-        &self,
+    fn create<'a>(
+        &'a self,
         mut params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>> {
+        _context: &'a dyn ConnectorContext,
+    ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send + 'a>> {
         Box::pin(async move {
             let pool_min = params
                 .parameters
@@ -369,7 +366,6 @@ impl DataConnectorFactory for MySQLFactory {
                 mysql_factory,
                 pool,
                 params: params_for_replication,
-                context: params.context.clone(),
                 replication_metrics: ReplicationMetricsCollector::new(),
             }) as Arc<dyn DataConnector>)
         })
@@ -566,6 +562,7 @@ impl DataConnector for MySQL {
 
     async fn read_provider(
         &self,
+        _context: &dyn ConnectorContext,
         dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         let tbl = dataset
@@ -615,15 +612,17 @@ impl DataConnector for MySQL {
         true
     }
 
-    fn changes_stream(
+    async fn changes_stream(
         &self,
+        context: &dyn ConnectorContext,
         federated_table: Arc<dyn data_connector_api::federated::FederatedTableProvider>,
         dataset: &DatasetSpec,
     ) -> Option<data_components::cdc::ChangesStream> {
+        let position_store = replication::resolve_position_store(context, dataset).await;
         Some(replication::build_changes_stream(
             &self.params,
             dataset,
-            self.context.clone(),
+            position_store,
             federated_table,
             Arc::clone(&self.replication_metrics),
         ))

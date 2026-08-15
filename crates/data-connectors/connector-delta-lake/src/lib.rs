@@ -17,6 +17,7 @@ limitations under the License.
 use async_trait::async_trait;
 use data_components::Read;
 use data_components::delta_lake::DeltaTableFactory;
+use data_connector_api::ConnectorContext;
 use data_connector_api::listing::build_table_parquet_options;
 use data_connector_api::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
@@ -128,10 +129,11 @@ impl DataConnectorFactory for DeltaLakeFactory {
         self
     }
 
-    fn create(
-        &self,
+    fn create<'a>(
+        &'a self,
         params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>> {
+        context: &'a dyn ConnectorContext,
+    ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send + 'a>> {
         let aws_region = params
             .parameters
             .get("aws_region")
@@ -154,7 +156,8 @@ impl DataConnectorFactory for DeltaLakeFactory {
                 );
             }
 
-            let parquet_opts = build_table_parquet_options(params.app().as_ref())?;
+            let app = context.app();
+            let parquet_opts = build_table_parquet_options(Some(&app))?;
 
             tracing::debug!(
                 ?parquet_opts,
@@ -182,6 +185,7 @@ impl DataConnector for DeltaLake {
 
     async fn read_provider(
         &self,
+        _context: &dyn ConnectorContext,
         dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         match Read::table_provider(&self.delta_table_factory, dataset.path().into()).await {

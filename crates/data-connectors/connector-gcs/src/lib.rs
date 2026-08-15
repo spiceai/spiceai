@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use app::App;
+use data_connector_api::ConnectorContext;
 use data_connector_api::listing::{
     LISTING_TABLE_PARAMETERS, ListingTableConnector, ObjectVersionType, build_fragments,
     object_store_timeout_message,
@@ -146,17 +147,18 @@ impl DataConnectorFactory for GoogleCloudStorageFactory {
         self
     }
 
-    fn create(
-        &self,
+    fn create<'a>(
+        &'a self,
         mut params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = data_connector_api::NewDataConnectorResult> + Send>> {
+        context: &'a dyn ConnectorContext,
+    ) -> Pin<Box<dyn Future<Output = data_connector_api::NewDataConnectorResult> + Send + 'a>> {
         Box::pin(async move {
             // Run all validators
             for validator in VALIDATORS.iter() {
                 validator.validate(&mut params).await?;
             }
 
-            let app = params.app();
+            let app = Some(context.app());
             let gcs = GoogleCloudStorage {
                 params: params.parameters,
                 app,

@@ -63,15 +63,15 @@ const WATERMARK_TABLE: &str = "spice_sys_postgres_replication";
 
 /// Resolve the applied-LSN watermark store over the dataset's own accelerator.
 ///
-/// `None` means nothing durable can record a position — no runtime attached, or no
-/// usable accelerator connection. The caller treats that as "never loaded", which is
-/// correct: an acceleration that cannot persist a watermark cannot have persisted rows
-/// for one to describe.
+/// `None` means nothing durable can record a position — there is no usable accelerator
+/// connection. The caller treats that as "never loaded", which is correct: an
+/// acceleration that cannot persist a watermark cannot have persisted rows for one to
+/// describe.
 async fn resolve_watermark_store(
-    context: Option<&Arc<dyn ConnectorContext>>,
+    context: &dyn ConnectorContext,
     dataset: &DatasetSpec,
 ) -> Option<Arc<dyn BlobCheckpointStore>> {
-    context?
+    context
         .blob_checkpoint_store(dataset, WATERMARK_TABLE)
         .await
 }
@@ -166,10 +166,13 @@ impl AppliedLsnStore for SidecarAppliedLsnStore {
     }
 }
 
-pub fn build_changes_stream(
+/// `async` so the watermark store is resolved here, before the stream is built: the
+/// generator then holds only the resolved store, which owns a connection pool and no
+/// runtime and so cannot pin the runtime for as long as the stream lives.
+pub async fn build_changes_stream(
     params: &Parameters,
     dataset: &DatasetSpec,
-    context: Option<Arc<dyn ConnectorContext>>,
+    context: &dyn ConnectorContext,
     federated_table: Arc<dyn FederatedTableProvider>,
     metrics: Arc<ReplicationMetricsCollector>,
 ) -> ChangesStream {
@@ -211,10 +214,25 @@ pub fn build_changes_stream(
         );
     }
 
-    // Resolving the watermark store needs to await, so it happens inside the
-    // stream below; clone the dataset handle it needs (cheap — `Dataset` is an
-    // `Arc`-bound wrapper over its spec).
-    let dataset_for_watermark = dataset.clone();
+    // Where this dataset's applied-LSN watermark lives. An ephemeral acceleration
+    // gets the no-op store: it boots empty and re-snapshots every start, so a
+    // recorded position would describe rows the restart already threw away, and
+    // resuming on it would skip everything before it.
+    //
+    // A durable acceleration with no reachable store also records nothing, which
+    // reads as "never loaded" — correct, since an acceleration that cannot persist a
+    // watermark cannot have persisted the rows one would describe.
+    let applied_lsn_store: Arc<dyn AppliedLsnStore> = if ephemeral {
+        Arc::new(NoopAppliedLsnStore)
+    } else {
+        match resolve_watermark_store(context, dataset).await {
+            Some(blobs) => Arc::new(SidecarAppliedLsnStore {
+                blobs,
+                identity: source_identity(&params_for_stream, &schema_name, &table_name),
+            }),
+            None => Arc::new(NoopAppliedLsnStore),
+        }
+    };
 
     // Prefer the dataset's explicitly-declared acceleration `primary_key` —
     // that's what the accelerator write path uses for upsert/delete, and it's
@@ -344,31 +362,6 @@ pub fn build_changes_stream(
             };
             Err(StreamError::External(msg))?;
         }
-
-        // Where this dataset's applied-LSN watermark lives. An ephemeral
-        // acceleration gets the no-op store: it boots empty and re-snapshots
-        // every start, so a recorded position would describe rows the restart
-        // already threw away, and resuming on it would skip everything before it.
-        //
-        // A durable acceleration with no reachable store also records nothing,
-        // which reads as "never loaded" — correct, since an acceleration that
-        // cannot persist a watermark cannot have persisted the rows one would
-        // describe.
-        let applied_lsn_store: Arc<dyn AppliedLsnStore> = if ephemeral {
-            Arc::new(NoopAppliedLsnStore)
-        } else {
-            match resolve_watermark_store(context.as_ref(), &dataset_for_watermark).await {
-                Some(blobs) => Arc::new(SidecarAppliedLsnStore {
-                    blobs,
-                    identity: source_identity(&params_for_stream, &schema_name, &table_name),
-                }),
-                None => Arc::new(NoopAppliedLsnStore),
-            }
-        };
-
-        // See the note in the MySQL connector: the store is what the stream needs, and
-        // the context has served its purpose once the store is resolved.
-        drop(context);
 
         let input = ReplicationStreamInput {
             dataset_name: dataset_name.clone(),

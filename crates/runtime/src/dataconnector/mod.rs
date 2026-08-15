@@ -131,6 +131,7 @@ pub async fn get_connector_factory(name: &str) -> Option<Arc<dyn DataConnectorFa
 pub async fn create_new_connector(
     name: &str,
     params: ConnectorParams,
+    context: &dyn ConnectorContext,
 ) -> Option<AnyErrorResult<Arc<dyn DataConnector>>> {
     let factory = {
         let guard = DATA_CONNECTOR_FACTORY_REGISTRY.lock().await;
@@ -160,7 +161,7 @@ pub async fn create_new_connector(
         .into()));
     }
 
-    let result = factory.create(params).await;
+    let result = factory.create(params, context).await;
     Some(result)
 }
 
@@ -261,10 +262,11 @@ mod tests {
             fn as_any(&self) -> &dyn Any {
                 self
             }
-            fn create(
-                &self,
+            fn create<'a>(
+                &'a self,
                 _params: ConnectorParams,
-            ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>> {
+                _context: &'a dyn ConnectorContext,
+            ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send + 'a>> {
                 unimplemented!("static_schema must not require create()")
             }
             fn prefix(&self) -> &'static str {
@@ -305,10 +307,11 @@ mod tests {
                 self
             }
 
-            fn create(
-                &self,
+            fn create<'a>(
+                &'a self,
                 _params: ConnectorParams,
-            ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>> {
+                _context: &'a dyn ConnectorContext,
+            ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send + 'a>> {
                 Box::pin(async {
                     let connector: Arc<dyn DataConnector> = Arc::new(TestConnector);
                     Ok(connector)
@@ -339,6 +342,7 @@ mod tests {
 
             async fn read_provider(
                 &self,
+                _context: &dyn ConnectorContext,
                 _dataset: &DatasetSpec,
             ) -> DataConnectorResult<Arc<dyn TableProvider>> {
                 unimplemented!()
@@ -384,10 +388,11 @@ mod tests {
                 self
             }
 
-            fn create(
-                &self,
+            fn create<'a>(
+                &'a self,
                 _params: ConnectorParams,
-            ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>> {
+                _context: &'a dyn ConnectorContext,
+            ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send + 'a>> {
                 let barrier = Arc::clone(&self.barrier);
 
                 Box::pin(async move {
@@ -418,6 +423,7 @@ mod tests {
 
             async fn read_provider(
                 &self,
+                _context: &dyn ConnectorContext,
                 _dataset: &DatasetSpec,
             ) -> DataConnectorResult<Arc<dyn TableProvider>> {
                 unimplemented!()
@@ -444,13 +450,20 @@ mod tests {
             Arc::clone(&secrets),
         )
         .await;
-        let params_two =
-            build_test_connector_params("test_concurrent", "second", app, runtime, secrets).await;
+        let params_two = build_test_connector_params(
+            "test_concurrent",
+            "second",
+            Arc::clone(&app),
+            Arc::clone(&runtime),
+            secrets,
+        )
+        .await;
+        let context = parameters::RuntimeConnectorContext::new(app, runtime);
 
-        let (result_one, result_two) = timeout(Duration::from_secs(5), async move {
+        let (result_one, result_two) = timeout(Duration::from_secs(5), async {
             tokio::join!(
-                create_new_connector("test_concurrent", params_one),
-                create_new_connector("test_concurrent", params_two),
+                create_new_connector("test_concurrent", params_one, &context),
+                create_new_connector("test_concurrent", params_two, &context),
             )
         })
         .await
@@ -481,6 +494,7 @@ mod tests {
 
         async fn read_provider(
             &self,
+            _context: &dyn ConnectorContext,
             _dataset: &DatasetSpec,
         ) -> DataConnectorResult<Arc<dyn TableProvider>> {
             unimplemented!("capability-forwarding test never reads")
@@ -525,7 +539,6 @@ mod tests {
             Arc::clone(&inner),
             Arc::new(RwLock::new(std::collections::HashMap::new())),
             Arc::new(RwLock::new(Secrets::default())),
-            std::sync::Weak::new(),
         );
         assert!(
             embedding.supports_durable_write_back_delivery(),

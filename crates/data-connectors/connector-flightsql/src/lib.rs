@@ -20,6 +20,7 @@ use arrow_flight::sql::client::FlightSqlServiceClient;
 use async_trait::async_trait;
 use data_components::Read;
 use data_components::flightsql::FlightSQLFactory as DataComponentFlightSQLFactory;
+use data_connector_api::ConnectorContext;
 use data_connector_api::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult, NewDataConnectorResult,
@@ -171,10 +172,11 @@ impl DataConnectorFactory for FlightSQLFactory {
         self
     }
 
-    fn create(
-        &self,
+    fn create<'a>(
+        &'a self,
         params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>> {
+        context: &'a dyn ConnectorContext,
+    ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send + 'a>> {
         Box::pin(async move {
             let endpoint: String = params
                 .parameters
@@ -235,7 +237,7 @@ impl DataConnectorFactory for FlightSQLFactory {
                 .context(UnableToConstructTlsChannelSnafu)?;
             let flight_channel = CookieService::new(flight_channel, Arc::clone(&cookie_store));
 
-            let app = params.app();
+            let app = Some(context.app());
             let max_message_size =
                 match app.as_ref().and_then(|app| app.runtime.flight.as_ref()) {
                     Some(flight) => flight.max_message_size_bytes().map_err(|err| {
@@ -292,6 +294,7 @@ impl DataConnector for FlightSQL {
 
     async fn read_provider(
         &self,
+        _context: &dyn ConnectorContext,
         dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         match Read::table_provider(&self.flightsql_factory, dataset.path().into()).await {

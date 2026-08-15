@@ -50,11 +50,44 @@ const DEFAULT_CHANGE_STREAM_BATCH_SIZE: u32 = 1_000;
 const DEFAULT_CHANGE_STREAM_BATCH_MAX_DURATION: Duration = Duration::from_secs(1);
 const DEFAULT_CHANGE_STREAM_MAX_AWAIT_TIME: Duration = Duration::from_secs(1);
 
+/// The resume-token store for `dataset`, or `None` when the resume token cannot be
+/// persisted — the dataset is not file-accelerated, or the sidecar cannot be opened.
+/// Either way the stream runs, restarting from the beginning after a restart.
+///
+/// Resolved *before* the stream is built, so the generator holds only the store. A
+/// store holds a connection pool and no runtime, so a long-lived stream that holds
+/// one cannot pin the runtime.
+pub async fn resolve_checkpoint_store(
+    context: &dyn ConnectorContext,
+    dataset: &DatasetSpec,
+) -> Option<Arc<dyn MongoCheckpointStore>> {
+    if !dataset.is_file_accelerated() {
+        tracing::info!(
+            dataset = %dataset.name,
+            collection = %dataset.path(),
+            "MongoDB Change Stream dataset is not file-accelerated; resume token will not be persisted across restarts"
+        );
+        return None;
+    }
+
+    match context.mongo_checkpoint_store(dataset).await {
+        Ok(sys) => Some(sys),
+        Err(error) => {
+            tracing::error!(
+                dataset = %dataset.name,
+                error = %error,
+                "Failed to initialize MongoDB resume-token sidecar; resume token will not be persisted across restarts"
+            );
+            None
+        }
+    }
+}
+
 pub fn build_changes_stream(
     pool: Arc<MongoDBConnectionPool>,
     params: Parameters,
     dataset: DatasetSpec,
-    context: Option<Arc<dyn ConnectorContext>>,
+    mongo_sys: Option<Arc<dyn MongoCheckpointStore>>,
     federated_table: Arc<dyn FederatedTableProvider>,
 ) -> ChangesStream {
     // `try_stream!` keeps MongoDB cursor polling, snapshot reads, and commit-aware
@@ -87,21 +120,6 @@ pub fn build_changes_stream(
             .client
             .database(&connection.db_name)
             .collection::<Document>(&collection_name);
-
-        let mongo_sys = if dataset.is_file_accelerated() {
-            initialize_mongo_sys(context.as_ref(), &dataset).await
-        } else {
-            tracing::info!(
-                dataset = %dataset.name,
-                collection = %collection_name,
-                "MongoDB Change Stream dataset is not file-accelerated; resume token will not be persisted across restarts"
-            );
-            None
-        };
-
-        // See the note in the MySQL connector: the store is what the stream needs, and
-        // the context has served its purpose once the store is resolved.
-        drop(context);
 
         let current_schema_json = serialize_current_schema(&schema, &dataset.name);
         let persisted =
@@ -289,25 +307,6 @@ pub fn build_changes_stream(
             }
         }
     })
-}
-
-async fn initialize_mongo_sys(
-    context: Option<&Arc<dyn ConnectorContext>>,
-    dataset: &DatasetSpec,
-) -> Option<Arc<dyn MongoCheckpointStore>> {
-    // No context means no runtime is attached, which only happens in unit tests.
-    let context = context?;
-    match context.mongo_checkpoint_store(dataset).await {
-        Ok(sys) => Some(sys),
-        Err(error) => {
-            tracing::error!(
-                dataset = %dataset.name,
-                error = %error,
-                "Failed to initialize MongoDB resume-token sidecar; resume token will not be persisted across restarts"
-            );
-            None
-        }
-    }
 }
 
 async fn persisted_checkpoint(

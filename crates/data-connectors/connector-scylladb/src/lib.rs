@@ -35,6 +35,7 @@ use crate::scylladb::ScyllaDbTableFactory;
 use crate::scylladb::pool::ScyllaDbConnectionPool;
 use async_trait::async_trait;
 use data_components::Read;
+use data_connector_api::ConnectorContext;
 use data_connector_api::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult,
@@ -210,10 +211,11 @@ impl DataConnectorFactory for ScyllaDbFactory {
         self
     }
 
-    fn create(
-        &self,
+    fn create<'a>(
+        &'a self,
         params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = data_connector_api::NewDataConnectorResult> + Send>> {
+        _context: &'a dyn ConnectorContext,
+    ) -> Pin<Box<dyn Future<Output = data_connector_api::NewDataConnectorResult> + Send + 'a>> {
         Box::pin(async move {
             match create_scylladb_connector(params.parameters).await {
                 Ok((session, keyspace, compute_context)) => {
@@ -312,6 +314,7 @@ impl DataConnector for ScyllaDb {
 
     async fn read_provider(
         &self,
+        _context: &dyn ConnectorContext,
         dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         Ok(

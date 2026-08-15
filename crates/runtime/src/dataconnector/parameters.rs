@@ -20,7 +20,7 @@ limitations under the License.
 //! [`ConnectorParams`]. The contract itself lives in `data-connector-api`,
 //! below `runtime`, so a connector can name it without the orchestrator.
 
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
 
 use app::App;
 use arrow_schema::SchemaRef;
@@ -56,40 +56,31 @@ pub(crate) use data_connector_api::parameters::aws;
 
 /// [`ConnectorContext`] over the app + runtime handles a component carries.
 ///
-/// The runtime is held **weakly**. A connector, and any change stream it builds, is
-/// owned by the runtime — a dataset's accelerated table owns the stream, and the runtime
-/// owns the table. A strong handle here would close that loop, and because
-/// [`AcceleratedTable`](runtime_table::accelerated::AcceleratedTable) aborts its refresh
-/// handlers in `Drop`, a loop does not merely leak: it stops shutdown from ever aborting
-/// them.
-///
-/// Failing to upgrade means the runtime is gone, which is reported as a store error
-/// rather than papered over — a checkpoint genuinely cannot be resolved during teardown.
+/// Built at each call site that hands a connector a context, and dropped when
+/// that call returns. The runtime is therefore held **strongly** with no cycle
+/// risk: a connector only ever sees `&dyn ConnectorContext`, so nothing it owns
+/// can outlive the call and point back at the runtime.
 pub struct RuntimeConnectorContext {
     app: Arc<App>,
-    runtime: Weak<Runtime>,
+    runtime: Arc<Runtime>,
 }
 
 impl RuntimeConnectorContext {
     #[must_use]
-    pub fn new(app: Arc<App>, runtime: &Arc<Runtime>) -> Self {
-        Self {
-            app,
-            runtime: Arc::downgrade(runtime),
-        }
+    pub fn new(app: Arc<App>, runtime: Arc<Runtime>) -> Self {
+        Self { app, runtime }
     }
 
-    /// The runtime, if it is still alive.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error once the runtime has been dropped, i.e. during or after shutdown.
-    fn runtime(&self) -> Result<Arc<Runtime>, CheckpointError> {
-        self.runtime
-            .upgrade()
-            .ok_or_else(|| CheckpointError::Store {
-                source: "the runtime has shut down, so its accelerator cannot be reached".into(),
-            })
+    /// The context for a connector serving `dataset`.
+    #[must_use]
+    pub fn for_dataset(dataset: &Dataset) -> Self {
+        Self::new(dataset.app(), dataset.runtime())
+    }
+
+    /// The context for a catalog connector serving `catalog`.
+    #[must_use]
+    pub fn for_catalog(catalog: &Catalog) -> Self {
+        Self::new(catalog.app(), catalog.runtime())
     }
 
     /// Rebind a configuration spec to the app + runtime handles held here.
@@ -98,12 +89,12 @@ impl RuntimeConnectorContext {
     /// which hang off the runtime. Rebinding keeps those on this side of the connector
     /// boundary, so the contract can name a spec while the resolution still has
     /// everything it needs.
-    fn bind(&self, dataset: &DatasetSpec) -> Result<Dataset, CheckpointError> {
-        Ok(Dataset {
+    fn bind(&self, dataset: &DatasetSpec) -> Dataset {
+        Dataset {
             spec: dataset.clone(),
             app: Arc::clone(&self.app),
-            runtime: self.runtime()?,
-        })
+            runtime: Arc::clone(&self.runtime),
+        }
     }
 }
 
@@ -113,20 +104,20 @@ impl ConnectorContext for RuntimeConnectorContext {
         Arc::clone(&self.app)
     }
 
-    fn http_rate_control_registry(&self) -> Option<Arc<HttpRateControlRegistry>> {
-        Some(self.runtime.upgrade()?.http_rate_control_registry())
+    fn http_rate_control_registry(&self) -> Arc<HttpRateControlRegistry> {
+        self.runtime.http_rate_control_registry()
     }
 
-    fn token_provider_registry(&self) -> Option<Arc<TokenProviderRegistry>> {
-        Some(self.runtime.upgrade()?.token_provider_registry())
+    fn token_provider_registry(&self) -> Arc<TokenProviderRegistry> {
+        self.runtime.token_provider_registry()
     }
 
-    fn datafusion_session_context(&self) -> Option<Arc<SessionContext>> {
-        Some(Arc::clone(&self.runtime.upgrade()?.datafusion().ctx))
+    fn datafusion_session_context(&self) -> Arc<SessionContext> {
+        Arc::clone(&self.runtime.datafusion().ctx)
     }
 
     async fn accelerated_checkpoint_schema(&self, dataset: &DatasetSpec) -> Option<SchemaRef> {
-        super::sink::accelerated_checkpoint_schema(&self.bind(dataset).ok()?).await
+        super::sink::accelerated_checkpoint_schema(&self.bind(dataset)).await
     }
 
     async fn blob_checkpoint_store(
@@ -134,42 +125,41 @@ impl ConnectorContext for RuntimeConnectorContext {
         dataset: &DatasetSpec,
         table_name: &'static str,
     ) -> Option<Arc<dyn BlobCheckpointStore>> {
-        spice_sys::checkpoint_store(&self.bind(dataset).ok()?, table_name).await
+        spice_sys::checkpoint_store(&self.bind(dataset), table_name).await
     }
 
     async fn kafka_checkpoint_store(
         &self,
         dataset: &DatasetSpec,
     ) -> Result<Arc<dyn KafkaCheckpointStore>, CheckpointError> {
-        spice_sys::kafka_checkpoint_store(&self.bind(dataset)?).await
+        spice_sys::kafka_checkpoint_store(&self.bind(dataset)).await
     }
 
     async fn debezium_checkpoint_store(
         &self,
         dataset: &DatasetSpec,
     ) -> Result<Arc<dyn DebeziumCheckpointStore>, CheckpointError> {
-        spice_sys::debezium_checkpoint_store(&self.bind(dataset)?).await
+        spice_sys::debezium_checkpoint_store(&self.bind(dataset)).await
     }
 
     async fn mysql_binlog_store(
         &self,
         dataset: &DatasetSpec,
     ) -> Result<Arc<dyn MySqlBinlogStore>, CheckpointError> {
-        spice_sys::mysql_binlog_store(&self.bind(dataset)?).await
+        spice_sys::mysql_binlog_store(&self.bind(dataset)).await
     }
 
     async fn mongo_checkpoint_store(
         &self,
         dataset: &DatasetSpec,
     ) -> Result<Arc<dyn MongoCheckpointStore>, CheckpointError> {
-        spice_sys::mongo_checkpoint_store(&self.bind(dataset)?).await
+        spice_sys::mongo_checkpoint_store(&self.bind(dataset)).await
     }
 }
 
 pub struct ConnectorParamsBuilder {
     connector: Arc<str>,
     component: ConnectorComponent,
-    context: Option<Arc<dyn ConnectorContext>>,
 }
 
 impl ConnectorParamsBuilder {
@@ -179,10 +169,6 @@ impl ConnectorParamsBuilder {
         Self {
             connector,
             component: ConnectorComponent::from(dataset),
-            context: Some(Arc::new(RuntimeConnectorContext::new(
-                dataset.app(),
-                &dataset.runtime(),
-            ))),
         }
     }
 
@@ -192,10 +178,6 @@ impl ConnectorParamsBuilder {
         Self {
             connector,
             component: ConnectorComponent::from(catalog),
-            context: Some(Arc::new(RuntimeConnectorContext::new(
-                catalog.app(),
-                &catalog.runtime(),
-            ))),
         }
     }
 
@@ -270,7 +252,6 @@ impl ConnectorParamsBuilder {
             parameters,
             unsupported_type_action: unsupported_type_action.map(UnsupportedTypeAction::from),
             component: self.component,
-            context: self.context,
             io_runtime,
         })
     }

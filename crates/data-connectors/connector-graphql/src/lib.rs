@@ -24,6 +24,7 @@ use crate::graphql::{
 };
 use async_trait::async_trait;
 use data_components::rate_limit::RateLimiter;
+use data_connector_api::ConnectorContext;
 use data_connector_api::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult, NewDataConnectorResult,
@@ -110,18 +111,16 @@ impl DataConnectorFactory for GraphQLFactory {
         self
     }
 
-    fn create(
-        &self,
+    fn create<'a>(
+        &'a self,
         params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>> {
+        context: &'a dyn ConnectorContext,
+    ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send + 'a>> {
         Box::pin(async move {
-            let runtime_rate_control_params = params.app().map(|app| app.runtime.params.clone());
-            let app_name: Arc<str> = params
-                .app()
-                .map_or_else(|| Arc::from(""), |app| Arc::from(app.name.as_str()));
-            let rate_control_registry = params
-                .http_rate_control_registry()
-                .unwrap_or_else(http_rate_control::global_registry);
+            let app = context.app();
+            let runtime_rate_control_params = Some(app.runtime.params.clone());
+            let app_name: Arc<str> = Arc::from(app.name.as_str());
+            let rate_control_registry = context.http_rate_control_registry();
             let (metrics, emit_rate_control_metrics, rate_control_metric_source) =
                 if let ConnectorComponent::Dataset(dataset) = &params.component {
                     Url::parse(dataset.path()).map_or_else(
@@ -311,6 +310,7 @@ impl DataConnector for GraphQL {
 
     async fn read_provider(
         &self,
+        _context: &dyn ConnectorContext,
         dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         let query = self.params.get("query").expose().ok_or_else(|p| {

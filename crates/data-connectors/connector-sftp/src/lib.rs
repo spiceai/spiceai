@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use data_connector_api::ConnectorContext;
 use data_connector_api::listing::{self, LISTING_TABLE_PARAMETERS, ListingTableConnector};
 use data_connector_api::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorFactory, DataConnectorResult,
@@ -72,10 +73,11 @@ impl DataConnectorFactory for SFTPFactory {
         self
     }
 
-    fn create(
-        &self,
+    fn create<'a>(
+        &'a self,
         params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>> {
+        _context: &'a dyn ConnectorContext,
+    ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send + 'a>> {
         Box::pin(async move {
             let sftp = SFTP {
                 params: params.parameters,

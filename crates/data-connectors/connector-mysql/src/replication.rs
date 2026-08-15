@@ -53,10 +53,46 @@ const DEFAULT_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(10);
 const DEFAULT_BOOTSTRAP_BATCH_SIZE: usize = 8192;
 const MAX_BOOTSTRAP_BATCH_SIZE: usize = 1_048_576;
 
+/// The binlog-position store for `dataset`.
+///
+/// File-accelerated datasets persist their position in the accelerator sidecar;
+/// everything else re-bootstraps on each start, as does a dataset whose sidecar
+/// cannot be opened.
+///
+/// Resolved *before* the stream is built, so the generator holds only the store. A
+/// store holds a connection pool and no runtime, so a long-lived stream that holds
+/// one cannot pin the runtime.
+pub async fn resolve_position_store(
+    context: &dyn ConnectorContext,
+    dataset: &DatasetSpec,
+) -> Arc<dyn PositionStore> {
+    if !dataset.is_file_accelerated() {
+        tracing::info!(
+            dataset = %dataset.name,
+            "dataset is not file-accelerated; the binlog position will not be persisted \
+             across restarts and the stream will re-bootstrap on every start"
+        );
+        return Arc::new(NoopPositionStore);
+    }
+
+    match context.mysql_binlog_store(dataset).await {
+        Ok(sys) => Arc::new(SidecarPositionStore { sys }),
+        Err(e) => {
+            tracing::error!(
+                dataset = %dataset.name,
+                error = %e,
+                "failed to initialize the binlog-position sidecar; the position will \
+                 not be persisted and the stream will re-bootstrap on every restart"
+            );
+            Arc::new(NoopPositionStore)
+        }
+    }
+}
+
 pub fn build_changes_stream(
     params: &Parameters,
     dataset: &DatasetSpec,
-    context: Option<Arc<dyn ConnectorContext>>,
+    position_store: Arc<dyn PositionStore>,
     federated_table: Arc<dyn FederatedTableProvider>,
     metrics: Arc<ReplicationMetricsCollector>,
 ) -> ChangesStream {
@@ -141,8 +177,6 @@ pub fn build_changes_stream(
         })
     });
 
-    let dataset = dataset.clone();
-
     Box::pin(try_stream! {
         let table_provider = federated_table.table_provider().await;
         let schema = table_provider.schema();
@@ -197,35 +231,6 @@ pub fn build_changes_stream(
             Err(StreamError::External(msg))?;
         }
 
-        // File-accelerated datasets persist their binlog position in the
-        // accelerator sidecar; everything else re-bootstraps on each start.
-        let position_store: Arc<dyn PositionStore> = if dataset.is_file_accelerated() {
-            match resolve_binlog_store(context.as_ref(), &dataset).await {
-                Ok(sys) => Arc::new(SidecarPositionStore { sys }),
-                Err(e) => {
-                    tracing::error!(
-                        dataset = %dataset_name,
-                        error = %e,
-                        "failed to initialize the binlog-position sidecar; the position will \
-                         not be persisted and the stream will re-bootstrap on every restart"
-                    );
-                    Arc::new(NoopPositionStore)
-                }
-            }
-        } else {
-            tracing::info!(
-                dataset = %dataset_name,
-                "dataset is not file-accelerated; the binlog position will not be persisted \
-                 across restarts and the stream will re-bootstrap on every start"
-            );
-            Arc::new(NoopPositionStore)
-        };
-
-        // The store is all this stream needs; the context is only the route to it. The
-        // context is weak, so retaining it would not pin the runtime, but a long-lived
-        // change stream should not hold a handle it has finished with.
-        drop(context);
-
         let schema_json = match arrow_tools::schema::schema_to_json(&schema) {
             Ok(json) => Some(json),
             Err(e) => {
@@ -255,24 +260,6 @@ pub fn build_changes_stream(
             yield item?;
         }
     })
-}
-
-/// Resolve the binlog-position store over the dataset's own accelerator.
-///
-/// A missing context means no runtime is attached, which only happens in unit tests;
-/// it is reported the same way as an unresolvable accelerator so the caller has one
-/// fallback path.
-async fn resolve_binlog_store(
-    context: Option<&Arc<dyn ConnectorContext>>,
-    dataset: &DatasetSpec,
-) -> Result<Arc<dyn MySqlBinlogStore>, StoreError> {
-    let context = context.ok_or_else(|| -> StoreError {
-        "no runtime is attached to the connector, so the binlog position cannot be persisted".into()
-    })?;
-    context
-        .mysql_binlog_store(dataset)
-        .await
-        .map_err(|e| Box::new(e) as StoreError)
 }
 
 /// [`PositionStore`] over the accelerator's `spice_sys_mysql_binlog` sidecar.

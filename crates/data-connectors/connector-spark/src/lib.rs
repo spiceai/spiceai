@@ -26,6 +26,7 @@ limitations under the License.
 use async_trait::async_trait;
 use data_components::Read;
 use data_components::spark_connect::SparkConnect;
+use data_connector_api::ConnectorContext;
 use data_connector_api::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult,
@@ -112,10 +113,11 @@ impl DataConnectorFactory for SparkFactory {
         self
     }
 
-    fn create(
-        &self,
+    fn create<'a>(
+        &'a self,
         params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = data_connector_api::NewDataConnectorResult> + Send>> {
+        _context: &'a dyn ConnectorContext,
+    ) -> Pin<Box<dyn Future<Output = data_connector_api::NewDataConnectorResult> + Send + 'a>> {
         Box::pin(async move {
             match Spark::new(params.parameters).await {
                 Ok(spark_connector) => Ok(Arc::new(spark_connector) as Arc<dyn DataConnector>),
@@ -196,6 +198,7 @@ impl DataConnector for Spark {
 
     async fn read_provider(
         &self,
+        _context: &dyn ConnectorContext,
         dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         let table_reference = TableReference::from(dataset.path());

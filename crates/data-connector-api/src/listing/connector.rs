@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::parameters::ConnectorContext;
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
@@ -1389,6 +1390,7 @@ impl<T: ListingTableConnector + Display> DataConnector for T {
 
     async fn read_provider(
         &self,
+        _context: &dyn ConnectorContext,
         dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         let url = self.get_object_store_url(dataset, None)?;
@@ -1937,10 +1939,11 @@ mod tests {
             self
         }
 
-        fn create(
-            &self,
+        fn create<'a>(
+            &'a self,
             params: ConnectorParams,
-        ) -> Pin<Box<dyn Future<Output = crate::NewDataConnectorResult> + Send>> {
+            _context: &'a dyn ConnectorContext,
+        ) -> Pin<Box<dyn Future<Output = crate::NewDataConnectorResult> + Send + 'a>> {
             Box::pin(async move {
                 let connector = Self {
                     params: params.parameters,
