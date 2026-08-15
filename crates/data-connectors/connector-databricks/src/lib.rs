@@ -909,10 +909,26 @@ impl DataConnectorFactory for DatabricksFactory {
                     None
                 };
 
+                // The runtime is constructing this connector, so it is necessarily alive
+                // here; a missing registry would mean it went away mid-construction.
+                // Report that rather than silently building a connector with no rate
+                // control or no way to authenticate.
+                let runtime_gone = |capability: &str| {
+                    DataConnectorError::InvalidConfigurationNoSource {
+                        dataconnector: CONNECTOR_NAME.to_string(),
+                        connector_component: params.component.clone(),
+                        message: format!(
+                            "The runtime shut down while the connector was being created, so its {capability} could not be reached"
+                        ),
+                    }
+                };
+
                 let rate_control_reservation = reserve_databricks_rate_controller(
                     &params.parameters,
                     Some(&app.runtime.params),
-                    context.http_rate_control_registry(),
+                    context
+                        .http_rate_control_registry()
+                        .ok_or_else(|| runtime_gone("HTTP rate-control registry"))?,
                     &params.component,
                     app.name.as_str(),
                 )
@@ -924,7 +940,9 @@ impl DataConnectorFactory for DatabricksFactory {
                 let databricks_result = Databricks::new(
                     params.parameters,
                     params.io_runtime,
-                    context.token_provider_registry(),
+                    context
+                        .token_provider_registry()
+                        .ok_or_else(|| runtime_gone("token-provider registry"))?,
                     shared_semaphore,
                     rate_controller,
                 )

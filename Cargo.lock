@@ -3283,6 +3283,7 @@ version = "2.2.0-unstable"
 dependencies = [
  "ahash 0.8.12",
  "arrow",
+ "arrow_tools",
  "async-compression",
  "async-openai",
  "async-stream",
@@ -4638,6 +4639,7 @@ name = "connector-kafka"
 version = "2.2.0-unstable"
 dependencies = [
  "arrow-schema",
+ "arrow_tools",
  "async-stream",
  "async-trait",
  "data-connector-api",
@@ -4650,6 +4652,7 @@ dependencies = [
  "opentelemetry",
  "runtime",
  "runtime-api-types",
+ "runtime-checkpoint-api",
  "runtime-datafusion",
  "runtime-metrics",
  "runtime-parameters",
@@ -4668,6 +4671,7 @@ version = "2.2.0-unstable"
 dependencies = [
  "arrow",
  "arrow-buffer",
+ "arrow_tools",
  "async-stream",
  "async-trait",
  "criterion 0.7.0",
@@ -4681,6 +4685,7 @@ dependencies = [
  "mongodb",
  "paste",
  "runtime",
+ "runtime-checkpoint-api",
  "runtime-parameters",
  "secrecy",
  "serde_json",
@@ -4709,6 +4714,7 @@ dependencies = [
 name = "connector-mysql"
 version = "2.2.0-unstable"
 dependencies = [
+ "arrow_tools",
  "async-stream",
  "async-trait",
  "chrono",
@@ -4724,6 +4730,7 @@ dependencies = [
  "paste",
  "runtime",
  "runtime-api-types",
+ "runtime-checkpoint-api",
  "runtime-metrics",
  "runtime-parameters",
  "runtime-udfs-api",
@@ -4806,6 +4813,7 @@ dependencies = [
  "opentelemetry",
  "runtime",
  "runtime-api-types",
+ "runtime-checkpoint-api",
  "runtime-datafusion",
  "runtime-metrics",
  "runtime-parameters",
@@ -6121,6 +6129,7 @@ dependencies = [
  "rdkafka",
  "regex",
  "reqwest 0.13.4",
+ "runtime-checkpoint-api",
  "runtime-rate-control",
  "runtime-request-context",
  "rusqlite",
@@ -14763,9 +14772,9 @@ checksum = "8b870d8c151b6f2fb93e84a13146138f05d02ed11c7e7c54f8826aaaf7c9f184"
 
 [[package]]
 name = "pingora-lru"
-version = "0.7.0"
+version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3aa964c4e12e6328388b7059c93aac37b052be7962bbb70dd239b515532be4bf"
+checksum = "6705a26ad89d241a989a5395641931ba37076f5ab5fbd19ee92402414a43af32"
 dependencies = [
  "arrayvec",
  "hashbrown 0.17.1",
@@ -17166,6 +17175,7 @@ name = "runtime-checkpoint-api"
 version = "2.2.0-unstable"
 dependencies = [
  "async-trait",
+ "serde",
  "snafu",
 ]
 
@@ -19547,7 +19557,6 @@ dependencies = [
  "mimalloc",
  "opentelemetry",
  "opentelemetry-http",
- "opentelemetry-prometheus",
  "opentelemetry-zipkin",
  "opentelemetry_sdk",
  "otel-arrow",
@@ -22551,7 +22560,6 @@ dependencies = [
  "ctrlc",
  "datafusion",
  "futures",
- "globset",
  "http-body 1.0.1",
  "humantime",
  "parking_lot",

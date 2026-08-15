@@ -30,7 +30,7 @@ use arrow::array::Int64Array;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use cayenne::metadata::{CreateTableOptions, DeletionMode, VortexConfig};
-use cayenne::{CayenneTableProvider, MetadataCatalog};
+use cayenne::{CayenneCatalog, CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog};
 use datafusion::datasource::TableProvider;
 use datafusion::prelude::*;
 use datafusion_common::stats::Precision;
@@ -214,25 +214,16 @@ async fn test_cold_tier_statistics_survive_promotion_impl(
     Ok(())
 }
 
+test_with_backends!(test_cold_tier_statistics_follow_a_folded_delete_impl);
+
 /// Deleting a datalake-resident row must decrement the maintained count once the
 /// promotion that folds the tombstone has run.
 ///
-/// Ignored as a defect marker for #12846, not a flaky test: the table reports
-/// `Exact(110)` while the cold manifest correctly holds 109 rows. Un-ignore it
-/// with the fix; do not weaken the assertions to make it pass.
-///
-/// Registered by hand on `SQLite` rather than through `test_with_backends!`,
-/// which emits its own `#[test]` attributes and has no hook for `#[ignore]`.
-/// Convert it to `test_with_backends!` when un-ignoring, so Turso is covered too.
-#[test]
-#[ignore = "https://github.com/spiceai/spiceai/issues/12846 — a folded delete tombstone leaves the maintained row count stale and Exact"]
-fn test_cold_tier_statistics_follow_a_folded_delete_sqlite() -> Result<(), String> {
-    common::run_with_backend_blocking(
-        common::BackendType::Sqlite,
-        test_cold_tier_statistics_follow_a_folded_delete_impl,
-    )
-}
-
+/// Regression test for #12846: promotion applied every tombstone physically and
+/// cleared the deletion index — dropping the `has_pending_deletions()` mask that
+/// was the only thing keeping the stale count off the `Exact` path — without
+/// re-baselining the count, so the table reported `Exact(110)` while the cold
+/// manifest correctly held 109 rows.
 async fn test_cold_tier_statistics_follow_a_folded_delete_impl(
     fixture: common::TestFixture,
 ) -> TestResult<()> {
@@ -274,6 +265,183 @@ async fn test_cold_tier_statistics_follow_a_folded_delete_impl(
         "the cold manifest drops the physically-removed row"
     );
     assert_count_agrees(&table, &ctx, 109, "after the tombstone was folded").await?;
+
+    Ok(())
+}
+
+test_with_backends!(test_a_delete_taints_the_maintained_count_exactness_impl);
+
+/// A standalone `DELETE` must taint the maintained count's exactness durably.
+///
+/// The second half of #12846: nothing re-derives the count on the delete path, so
+/// `has_pending_deletions()` masking it to `Inexact` is the *only* thing keeping
+/// the stale value off the `Exact` path — and every tombstone fold drops that
+/// mask. Persisting the taint means a fold that does not re-baseline (and a
+/// restart, which reloads the flag) cannot serve the stale count `Exact`; a full
+/// rewrite still restores exactness with its own authoritative count.
+async fn test_a_delete_taints_the_maintained_count_exactness_impl(
+    fixture: common::TestFixture,
+) -> TestResult<()> {
+    let ctx = SessionContext::new();
+    let table = create_table(&fixture, &ctx).await?;
+
+    insert_range(&table, 0..200).await?;
+    settle(&table).await?;
+    assert_count_agrees(&table, &ctx, 200, "before the delete").await?;
+
+    delete_id(&table, 42).await?;
+    settle(&table).await?;
+    assert_eq!(
+        scan_row_count(&ctx).await?,
+        199,
+        "the delete hides the row immediately"
+    );
+    assert!(
+        !table
+            .statistics()
+            .unwrap_or_else(|| panic!("maintained statistics must be populated after a delete"))
+            .num_rows
+            .is_exact()
+            .unwrap_or(false),
+        "the maintained count still counts the deleted row, so it must not be served Exact"
+    );
+
+    // Durable, not just cached: the flag is what a reopen reloads, and an
+    // `Exact` flag over a stale count is the wrong answer this guards.
+    let persisted = fixture
+        .catalog
+        .get_table_statistics(table.table_id())
+        .await?
+        .unwrap_or_else(|| panic!("statistics row must be persisted"));
+    assert!(
+        !persisted.num_rows_exact,
+        "the persisted exactness flag must be tainted, got num_rows={} num_rows_exact=true",
+        persisted.num_rows
+    );
+
+    // A full rewrite still re-establishes exactness from its own authoritative
+    // count, so the taint is a hold on the fast path, not a permanent loss of it.
+    insert_range(&table, 200..210).await?;
+    settle(&table).await?;
+    assert!(
+        table.promote_warm_to_cold().await?,
+        "the promotion folding the tombstone should fire"
+    );
+    table.flush_pending_maintenance().await?;
+    assert_count_agrees(&table, &ctx, 209, "after a full rewrite re-baselined it").await?;
+
+    Ok(())
+}
+
+test_with_backends!(test_a_promotion_after_a_reopen_rebaselines_the_count_impl);
+
+/// A promotion whose statistics cache is cold must still re-baseline the count.
+///
+/// `commit_overwrite_to_cold` deletes the table's `cayenne_table_statistics` row,
+/// so a re-baseline that reads the record *after* the commit finds nothing and
+/// silently no-ops — while the in-memory cache goes on serving the count loaded at
+/// open. That is the #12846 failure again, reached through a reopen rather than a
+/// single session: the promotion must capture its baseline before committing.
+async fn test_a_promotion_after_a_reopen_rebaselines_the_count_impl(
+    fixture: common::TestFixture,
+) -> TestResult<()> {
+    let table_id = {
+        let ctx = SessionContext::new();
+        let table = create_table(&fixture, &ctx).await?;
+
+        insert_range(&table, 0..100).await?;
+        settle(&table).await?;
+        assert!(table.promote_warm_to_cold().await?, "promotion should fire");
+        table.flush_pending_maintenance().await?;
+        assert_count_agrees(&table, &ctx, 100, "before the reopen").await?;
+
+        // The tombstone this session leaves is what the next session's promotion
+        // folds — and what its count must stop including.
+        delete_id(&table, 42).await?;
+        insert_range(&table, 100..110).await?;
+        settle(&table).await?;
+        table.table_id().to_string()
+        // Session 1's provider and its background tasks drop here.
+    };
+
+    // Session 2: a fresh catalog connection over the same metastore, so the
+    // provider rebuilds its statistics cache from persisted state.
+    let catalog = Arc::new(CayenneCatalog::new(fixture.connection_string())?);
+    catalog.init().await?;
+    let ctx = SessionContext::new();
+    let reopened = Arc::new(
+        CayenneTableProviderBuilder::new(
+            Arc::clone(&catalog) as Arc<dyn MetadataCatalog>,
+            ctx.runtime_env(),
+        )
+        .open(TABLE)
+        .await?,
+    );
+    assert_eq!(reopened.table_id(), table_id, "reopen resolves same table");
+    ctx.register_table(TABLE, Arc::clone(&reopened) as Arc<dyn TableProvider>)?;
+
+    assert!(
+        reopened.promote_warm_to_cold().await?,
+        "the promotion folding the tombstone should fire after the reopen"
+    );
+    reopened.flush_pending_maintenance().await?;
+    assert_count_agrees(&reopened, &ctx, 109, "after a promotion post-reopen").await?;
+
+    Ok(())
+}
+
+test_with_backends!(test_a_promotion_does_not_fold_a_stale_extremum_impl);
+
+/// A metadata-folded `MAX` must reflect deletes a promotion just folded.
+///
+/// Re-baselining the count restores `num_rows_exact`, which re-opens the
+/// metadata-only `MIN`/`MAX`/`SUM` fold ([`cayenne::stats_aggregate`]) — while the
+/// table-level column aggregate carried across the promotion is a superset whose
+/// min/max only ever widened, so it still names the deleted extremum. This pins
+/// that the fold answers from the live files' footer statistics rather than that
+/// superset: the plan folds to a constant (`ProjectionExec: expr=[108 as m]`) and
+/// the constant is right.
+async fn test_a_promotion_does_not_fold_a_stale_extremum_impl(
+    fixture: common::TestFixture,
+) -> TestResult<()> {
+    let ctx = SessionContext::new();
+    let table = create_table(&fixture, &ctx).await?;
+
+    insert_range(&table, 0..100).await?;
+    settle(&table).await?;
+    assert!(table.promote_warm_to_cold().await?, "promotion should fire");
+    table.flush_pending_maintenance().await?;
+
+    // id=99 is the table's maximum and lives only in the datalake, so the carried
+    // aggregate's max still names it after the delete.
+    delete_id(&table, 99).await?;
+    insert_range(&table, 100..110).await?;
+    delete_id(&table, 109).await?;
+    settle(&table).await?;
+    assert!(
+        table.promote_warm_to_cold().await?,
+        "the promotion folding the tombstones should fire"
+    );
+    table.flush_pending_maintenance().await?;
+
+    // 100 - 1 + 10 - 1 = 108 live rows, with 99 and 109 both gone.
+    assert_count_agrees(&table, &ctx, 108, "after the tombstones were folded").await?;
+
+    let batches = ctx
+        .sql(&format!("SELECT MAX(id) AS m FROM {TABLE}"))
+        .await?
+        .collect()
+        .await?;
+    let max = batches
+        .first()
+        .and_then(|b| b.column(0).as_any().downcast_ref::<Int64Array>())
+        .and_then(|a| a.values().first())
+        .copied();
+    assert_eq!(
+        max,
+        Some(108),
+        "MAX(id) must reflect the deletes, not the carried aggregate's stale extremum"
+    );
 
     Ok(())
 }

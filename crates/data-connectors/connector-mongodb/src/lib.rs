@@ -39,7 +39,7 @@ use runtime::component::dataset::Dataset;
 use runtime::component::dataset::acceleration::RefreshMode;
 use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
-    DataConnectorResult,
+    DataConnectorResult, parameters::ConnectorContext,
 };
 use runtime_parameters::{ParameterSpec, Parameters};
 use secrecy::ExposeSecret;
@@ -55,6 +55,10 @@ pub struct MongoDB {
     mongodb_factory: MongoDBTableFactory,
     pool: Arc<MongoDBConnectionPool>,
     params: Parameters,
+    /// Retained so the change stream can resolve the resume-token store over the
+    /// dataset's accelerator. `None` only in unit tests, which build params without a
+    /// runtime attached.
+    context: Option<Arc<dyn ConnectorContext>>,
 }
 
 impl std::fmt::Debug for MongoDB {
@@ -317,6 +321,7 @@ impl DataConnectorFactory for MongoDBFactory {
             Ok(Arc::new(MongoDB {
                 mongodb_factory,
                 pool,
+                context: params.context.clone(),
                 params: params.parameters,
             }) as Arc<dyn DataConnector>)
         })
@@ -805,6 +810,7 @@ impl DataConnector for MongoDB {
             Arc::clone(&self.pool),
             self.params.clone(),
             dataset.clone(),
+            self.context.clone(),
             federated_table,
         ))
     }
