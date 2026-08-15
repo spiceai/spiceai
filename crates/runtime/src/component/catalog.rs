@@ -295,7 +295,12 @@ impl CatalogBuilder {
 
     /// The configuration half of the catalog, without the `app`/`runtime` a
     /// fully built [`Catalog`] also carries.
-    fn into_spec(self) -> CatalogSpec {
+    ///
+    /// `pub(crate)` so a connector's own tests can drive [`table_selector`] from
+    /// a spicepod catalog through the real [`compile_globset`], rather than
+    /// hand-populating a [`CatalogSpec`] and skipping the compile step the
+    /// user's `include:`/`exclude:` actually travel.
+    pub(crate) fn into_spec(self) -> CatalogSpec {
         CatalogSpec {
             provider: self.provider,
             catalog_id: self.catalog_id,

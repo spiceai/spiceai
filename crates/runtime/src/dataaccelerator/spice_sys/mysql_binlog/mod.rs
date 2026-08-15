@@ -77,29 +77,10 @@ mod sqlite;
 #[cfg(feature = "turso")]
 mod turso;
 
-#[derive(Clone, Debug, Default)]
-pub struct MySqlBinlogCheckpoint {
-    /// Binlog file name to resume from, e.g. `binlog.000042`.
-    pub binlog_file: String,
-    /// Byte offset of the next event to read within `binlog_file`.
-    pub binlog_pos: u64,
-    /// Optional serialized Arrow schema snapshot for detecting drift between
-    /// runs.
-    pub schema_json: Option<String>,
-    /// Optional executed GTID set (`uuid:range` text) for failover-safe resume
-    /// via `COM_BINLOG_DUMP_GTID`. `None` for file+offset positioning; may be an
-    /// empty string when `gtid_mode = ON` but no transactions have committed.
-    pub gtid_executed: Option<String>,
-    /// The checkpoint's positioning type (`file`|`gtid`), stored explicitly so
-    /// resume doesn't need to infer it from `gtid_executed`. `Option` only
-    /// because the column is nullable; this connector always writes it (the
-    /// feature has never shipped, so there are no legacy typeless checkpoints),
-    /// and the sidecar loader defensively resolves any `None` read by inferring
-    /// the type from `gtid_executed`.
-    pub cursor_type: Option<String>,
-    /// When the row was last updated. Populated by the database layer on read.
-    pub updated_at: Option<std::time::SystemTime>,
-}
+// The checkpoint's shape is the connector-facing contract, so it lives in
+// `runtime-checkpoint-api` below both sides. The engine modules here name it through
+// this path.
+pub use runtime_checkpoint_api::mysql_binlog::MySqlBinlogCheckpoint;
 
 pub struct MySqlBinlogSys {
     pub dataset_name: String,
@@ -283,11 +264,6 @@ impl MySqlBinlogSys {
         }
     }
 
-    /// Serialize an Arrow schema to a JSON string for `schema_json` storage.
-    pub fn serialize_schema(schema: &datafusion::arrow::datatypes::SchemaRef) -> Result<String> {
-        serde_json::to_string(schema).map_err(Error::external)
-    }
-
     /// Convert a stored position (`BIGINT`) back to the u64 the replication
     /// layer speaks. Negative stored values (impossible via [`Self::upsert`])
     /// clamp to 0.
@@ -318,5 +294,25 @@ impl MySqlBinlogSys {
     )]
     fn position_to_i64(pos: u64) -> i64 {
         i64::try_from(pos).unwrap_or(i64::MAX)
+    }
+}
+
+#[async_trait::async_trait]
+impl runtime_checkpoint_api::mysql_binlog::MySqlBinlogStore for MySqlBinlogSys {
+    async fn get(&self) -> Option<MySqlBinlogCheckpoint> {
+        MySqlBinlogSys::get(self).await
+    }
+
+    async fn upsert(
+        &self,
+        checkpoint: &MySqlBinlogCheckpoint,
+    ) -> std::result::Result<(), runtime_checkpoint_api::CheckpointError> {
+        MySqlBinlogSys::upsert(self, checkpoint)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn delete(&self) -> std::result::Result<(), runtime_checkpoint_api::CheckpointError> {
+        MySqlBinlogSys::delete(self).await.map_err(Into::into)
     }
 }
