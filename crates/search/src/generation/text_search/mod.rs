@@ -417,7 +417,10 @@ impl FullTextSearchFieldIndex {
             if Some(term.field()) != search_field {
                 continue;
             }
-            let Some(text) = term.value().as_str() else {
+            // Bind the term value: `as_str` borrows from it, so it must outlive
+            // the lookup below (a temporary would be dropped too early).
+            let value = term.value();
+            let Some(text) = value.as_str() else {
                 continue;
             };
             if doc_freq.contains_key(text) {

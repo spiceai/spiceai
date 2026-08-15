@@ -89,23 +89,24 @@ impl DistributedSearchRewrite {
     /// the scan is not a distributable search (not a `SearchQueryProvider`, not
     /// a text search, or not over an accelerated table).
     fn rewrite_scan(&self, scan: &TableScan) -> Result<Option<LogicalPlan>> {
-        let Some(default_source) = scan.source.as_any().downcast_ref::<DefaultTableSource>() else {
+        let Some(default_source) = scan.source.downcast_ref::<DefaultTableSource>() else {
             return Ok(None);
         };
         let Some(search_provider) = default_source
             .table_provider
-            .as_any()
             .downcast_ref::<SearchQueryProvider>()
         else {
             return Ok(None);
         };
+        // Clone the source so the fields are owned (edition-2024 match ergonomics
+        // binds them by value here); they are small strings and options.
         let Some(UdtfSource::TextSearch {
             table,
             query,
             column,
             limit,
             ..
-        }) = &search_provider.udtf_source
+        }) = search_provider.udtf_source.clone()
         else {
             return Ok(None);
         };
@@ -116,7 +117,7 @@ impl DistributedSearchRewrite {
             return Ok(None);
         }
 
-        let base_ref = TableReference::parse_str(table);
+        let base_ref = TableReference::parse_str(&table);
         let executors = self.registry.resolve_search_executors(&base_ref);
         if executors.is_empty() {
             // No live executor covers the table's partitions; produce no rows
@@ -139,17 +140,17 @@ impl DistributedSearchRewrite {
         let stats_plan = self.build_stats_plan(
             &base_ref,
             &from_table_sql,
-            query,
+            &query,
             column.as_deref(),
             &executors,
         )?;
 
         let params = DistributedSearchParams {
             from_table_sql,
-            query: query.clone(),
-            column: column.clone(),
+            query,
+            column,
             primary_key: search_provider.primary_key.clone(),
-            fetch: *limit,
+            fetch: limit,
             skip: 0,
         };
 

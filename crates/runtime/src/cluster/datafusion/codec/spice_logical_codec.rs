@@ -168,6 +168,9 @@ impl SpiceLogicalCodec {
                         column: args.column.clone(),
                         limit: args.limit.map(Self::limit_from_u64).transpose()?,
                         include_score: args.include_score,
+                        // RRF nests independent per-node searches; global BM25
+                        // statistics do not apply to its fused ranking.
+                        global_stats: None,
                     }
                     .to_expr();
                     (text_exprs, ts.rank_weight)

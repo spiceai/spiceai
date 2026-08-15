@@ -244,10 +244,13 @@ impl Bm25StatisticsProvider for GlobalBm25Provider<'_> {
     }
 
     fn doc_freq(&self, term: &Term) -> tantivy::Result<u64> {
-        if term.field() == self.field
-            && let Some(text) = term.value().as_str()
-        {
-            return Ok(self.stats.doc_freq.get(text).copied().unwrap_or(0));
+        if term.field() == self.field {
+            // Bind the term value: `as_str` borrows from it, so it must outlive
+            // the map lookup (a temporary would be dropped too early).
+            let value = term.value();
+            if let Some(text) = value.as_str() {
+                return Ok(self.stats.doc_freq.get(text).copied().unwrap_or(0));
+            }
         }
         self.searcher.doc_freq(term)
     }
