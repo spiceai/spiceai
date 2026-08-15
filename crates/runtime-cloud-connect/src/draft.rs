@@ -299,6 +299,20 @@ impl EnrollmentTransactionLock {
 /// both to exist; when either cannot be resolved there is nothing better than
 /// the spelling to go on.
 pub(crate) fn same_directory(one: &Path, other: &Path) -> bool {
+    // `Path::new("identity.json").parent()` is `Some("")`, the current
+    // directory said a different way. Canonicalizing the empty path fails while
+    // canonicalizing `.` succeeds, so without this the two spellings of one
+    // directory compare as different.
+    let one = if one.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        one
+    };
+    let other = if other.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        other
+    };
     match (std::fs::canonicalize(one), std::fs::canonicalize(other)) {
         (Ok(one), Ok(other)) => one == other,
         _ => one == other,
@@ -721,6 +735,43 @@ fn read_bounded_regular_file(path: &Path, max_bytes: u64) -> std::io::Result<Vec
 
 #[cfg(test)]
 mod tests {
+
+    /// A bare relative identity path has an empty parent, which is the current
+    /// directory written a different way. Canonicalizing `""` fails while `"."`
+    /// succeeds, so comparing the two spellings would make one directory look
+    /// like two — and the release would then try to take a second transaction on
+    /// a directory it already holds, which is a single non-blocking attempt, so
+    /// every `Remove` would fail.
+    #[test]
+    fn an_empty_directory_path_is_the_current_directory() {
+        assert!(
+            super::same_directory(std::path::Path::new(""), std::path::Path::new(".")),
+            "an empty path and `.` name the same directory"
+        );
+        assert_eq!(
+            std::path::Path::new("identity.json").parent(),
+            Some(std::path::Path::new("")),
+            "which is the parent a bare relative identity path has"
+        );
+    }
+
+    /// Directory identity, not spelling: the same directory reached through a
+    /// different route is still that directory.
+    #[test]
+    fn a_directory_reached_another_way_is_the_same_directory() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let nested = dir.path().join("config");
+        std::fs::create_dir(&nested).expect("create the config dir");
+
+        assert!(
+            super::same_directory(&nested, &nested.join(".")),
+            "a trailing `.` does not make a different directory"
+        );
+        assert!(
+            !super::same_directory(&nested, dir.path()),
+            "but genuinely different directories still differ"
+        );
+    }
     use super::*;
 
     fn test_binding() -> EnrollmentRequestBinding {

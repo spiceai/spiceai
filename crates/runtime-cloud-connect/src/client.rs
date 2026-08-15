@@ -1545,27 +1545,6 @@ async fn release_local_state(
                 )
             })?,
     );
-    // The identity is guarded by whichever transaction protects ITS directory.
-    // `clear_with_transaction_async` refuses a guard whose draft path has a
-    // different parent, and `identity_path` is a public field documented as only
-    // "typically" inside the config dir — so for a split configuration the
-    // config-dir transaction is the wrong guard, and passing it would fail every
-    // Remove rather than protect anything. Acquiring the identity directory's own
-    // transaction keeps the split shape working without tightening the field.
-    let identity_transaction = match identity_transaction(config, &transaction).await {
-        Ok(held) => held,
-        Err(err) => {
-            tracing::warn!(
-                "Cloud Connect: failed to acquire the enrollment transaction for the identity directory of {}: {err}; reporting Remove as failed and staying connected",
-                config.identity_path.display()
-            );
-            return Err(format!(
-                "failed to acquire the enrollment transaction for {}: {err}",
-                config.identity_path.display()
-            ));
-        }
-    };
-
     // The cache writer is excluded by the outer lock above: the only caller of
     // `secret_cache::write` takes that same lock and reads the cache key under
     // it, so it cannot be mid-write here and cannot publish a cache afterwards
@@ -1582,13 +1561,7 @@ async fn release_local_state(
     let config_dir = config.config_dir.clone();
     tokio::task::spawn_blocking(move || {
         let _mutation = mutation;
-        release_local_state_locked(
-            &config_dir,
-            &identity_path,
-            policy,
-            &transaction,
-            &identity_transaction,
-        )
+        release_local_state_locked(&config_dir, &identity_path, policy, &transaction)
     })
     .await
     .map_err(|source| format!("the release task stopped unexpectedly: {source}"))?
@@ -1602,8 +1575,32 @@ fn release_local_state_locked(
     identity_path: &Path,
     policy: ReleasePolicy,
     transaction: &Arc<EnrollmentTransactionLock>,
-    identity_transaction: &Arc<EnrollmentTransactionLock>,
 ) -> std::result::Result<Vec<String>, String> {
+    // The identity is guarded by whichever transaction protects ITS directory.
+    // `clear_with_transaction` refuses a guard whose draft path has a different
+    // parent, and `identity_path` is a public field documented as only
+    // "typically" inside the config dir — so for a split configuration the
+    // config-dir transaction is the wrong guard, and passing it would fail every
+    // Remove rather than protect anything. Acquiring the identity directory's own
+    // transaction keeps the split shape working without tightening the field.
+    //
+    // Taken here, before anything is deleted and inside this task, because
+    // deciding which guard applies resolves both directories on disk — work that
+    // has no business on the driver thread.
+    let identity_transaction = match identity_transaction(identity_path, config_dir, transaction) {
+        Ok(held) => held,
+        Err(err) => {
+            tracing::warn!(
+                "Cloud Connect: failed to acquire the enrollment transaction for the identity directory of {}: {err}; reporting Remove as failed and staying connected",
+                identity_path.display()
+            );
+            return Err(format!(
+                "failed to acquire the enrollment transaction for {}: {err}",
+                identity_path.display()
+            ));
+        }
+    };
+
     // Named in the command result so the control plane and the portal learn that
     // a released host still holds something, rather than the operator
     // discovering it later.
@@ -1693,7 +1690,7 @@ fn release_local_state_locked(
         policy.temp_min_age,
     )?);
 
-    if let Err(err) = IdentityStore::clear_with_transaction(identity_path, identity_transaction) {
+    if let Err(err) = IdentityStore::clear_with_transaction(identity_path, &identity_transaction) {
         tracing::warn!(
             "Cloud Connect: failed to clear identity at {}: {err}; \
              reporting Remove as failed and staying connected (the unchanged \
@@ -1723,11 +1720,12 @@ fn release_local_state_locked(
 /// Returns the acquisition failure when the identity directory's transaction is
 /// held elsewhere, which is a reason to fail the removal rather than clear the
 /// identity unguarded.
-async fn identity_transaction(
-    config: &CloudConnectConfig,
+fn identity_transaction(
+    identity_path: &Path,
+    config_dir: &Path,
     config_dir_transaction: &Arc<EnrollmentTransactionLock>,
 ) -> std::result::Result<Arc<EnrollmentTransactionLock>, crate::draft::Error> {
-    let Some(identity_dir) = config.identity_path.parent() else {
+    let Some(identity_dir) = identity_path.parent() else {
         return Ok(Arc::clone(config_dir_transaction));
     };
     // Directory identity, not spelling: an identity path reached through a
@@ -1736,12 +1734,12 @@ async fn identity_transaction(
     // held — one non-blocking attempt, so `Remove` would fail every time on a
     // path the split-config support is meant to allow. `protects` resolves the
     // same way, so the guard chosen here is the guard the clear accepts.
-    if crate::draft::same_directory(identity_dir, &config.config_dir) {
+    if crate::draft::same_directory(identity_dir, config_dir) {
         return Ok(Arc::clone(config_dir_transaction));
     }
-    Ok(Arc::new(
-        EnrollmentTransactionLock::try_acquire_async(identity_dir).await?,
-    ))
+    Ok(Arc::new(EnrollmentTransactionLock::try_acquire(
+        identity_dir,
+    )?))
 }
 
 /// Delete `path` off the Tokio driver task, treating a missing file as success.
