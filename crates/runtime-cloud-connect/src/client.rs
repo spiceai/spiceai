@@ -1812,7 +1812,7 @@ fn identity_transaction(
 ///
 /// `std::fs` on the blocking pool rather than `tokio::fs`, to match the other
 /// removals here and keep one failure vocabulary across them.
-fn remove_file_if_present(path: &Path) -> std::result::Result<(), String> {
+fn remove_file_if_present(path: &Path) -> std::io::Result<()> {
     // Only the unlink is reported. Making it durable is the job of the artifact
     // reclaim that follows every one of these, which syncs this same parent
     // directory unconditionally and fails the release if it cannot — one sync
@@ -1822,7 +1822,7 @@ fn remove_file_if_present(path: &Path) -> std::result::Result<(), String> {
     match std::fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(err.to_string()),
+        Err(err) => Err(err),
     }
 }
 
