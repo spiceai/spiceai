@@ -45,6 +45,10 @@ use tokio::sync::Semaphore;
 static CONTAINER_SEMAPHORE: LazyLock<Arc<Semaphore>> =
     LazyLock::new(|| Arc::new(Semaphore::new(3)));
 
+/// How long a dropped container waits on the Docker daemon before giving up.
+/// Cleanup is best-effort, and a test process must never hang in it.
+const CLEANUP_TIMEOUT: Duration = Duration::from_secs(30);
+
 pub struct RunningContainer<'a> {
     name: &'a str,
     docker: Docker,
@@ -125,6 +129,14 @@ impl RunningContainer<'_> {
 /// the task. So the removal gets a runtime of its own, on a thread joined
 /// before the drop returns. Best-effort by construction: a failure here must
 /// not mask the test result that is already on its way out.
+///
+/// Two cases this cannot reach, both because `Drop` never runs:
+///
+/// - A container parked in a `static` for the life of the process, as
+///   `tpcds_postgres` does to share one database across its queries. Such a
+///   suite has to remove its container itself.
+/// - A process killed outright rather than unwound (`SIGKILL`, a hard CI
+///   timeout).
 impl Drop for RunningContainer<'_> {
     fn drop(&mut self) {
         if *self.removed.get_mut() {
@@ -133,23 +145,43 @@ impl Drop for RunningContainer<'_> {
 
         let docker = self.docker.clone();
         let name = self.name.to_string();
-        let removal = std::thread::spawn(move || {
-            let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            else {
-                return Err(anyhow::anyhow!("could not build a runtime for cleanup"));
-            };
-            runtime.block_on(remove(&docker, &name))
-        });
+        let removal = std::thread::Builder::new()
+            .name(format!("cleanup-{name}"))
+            .spawn(move || {
+                let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                else {
+                    return Err(anyhow::anyhow!("could not build a runtime for cleanup"));
+                };
+                runtime.block_on(async {
+                    // Bounded: a daemon that accepts the connection and then
+                    // stops answering would otherwise hang the test process
+                    // here, turning a readable failure into a CI timeout.
+                    tokio::time::timeout(CLEANUP_TIMEOUT, remove(&docker, &name))
+                        .await
+                        .unwrap_or_else(|_| {
+                            Err(anyhow::anyhow!(
+                                "timed out after {CLEANUP_TIMEOUT:?} waiting for Docker"
+                            ))
+                        })
+                })
+            });
 
         // Report rather than panic: a panicking `Drop` during an unwind aborts
         // the process, which would replace a readable test failure with none.
-        match removal.join() {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => eprintln!("failed to remove test container {}: {e}", self.name),
-            Err(_) => eprintln!(
+        // `Builder::spawn` is used over `thread::spawn` for the same reason --
+        // it reports a thread that cannot be created instead of panicking, and
+        // exhaustion is the very condition this cleanup exists to relieve.
+        match removal.map(std::thread::JoinHandle::join) {
+            Ok(Ok(Ok(()))) => {}
+            Ok(Ok(Err(e))) => eprintln!("failed to remove test container {}: {e}", self.name),
+            Ok(Err(_)) => eprintln!(
                 "the cleanup thread for test container {} panicked",
+                self.name
+            ),
+            Err(e) => eprintln!(
+                "could not start a cleanup thread for test container {}: {e}",
                 self.name
             ),
         }
@@ -340,6 +372,17 @@ impl<'a> ContainerRunner<'a> {
 
         let _ = self.docker.create_container(Some(options), config).await?;
 
+        // The container exists from here on, so hold it in the guard before
+        // anything else can fail. Starting it, inspecting it, or waiting for it
+        // to report healthy can all return early, and each of those paths would
+        // otherwise leave behind a container no test ever saw.
+        let container = RunningContainer::<'a> {
+            name: self.name,
+            docker: self.docker.clone(),
+            removed: AtomicBool::new(false),
+            _permit: permit,
+        };
+
         self.docker
             .start_container(self.name, None::<StartContainerOptions<String>>)
             .await?;
@@ -373,12 +416,7 @@ impl<'a> ContainerRunner<'a> {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
 
-        Ok(RunningContainer::<'a> {
-            name: self.name,
-            docker: self.docker,
-            removed: AtomicBool::new(false),
-            _permit: permit,
-        })
+        Ok(container)
     }
 
     async fn pull_image(&self) -> Result<(), anyhow::Error> {
