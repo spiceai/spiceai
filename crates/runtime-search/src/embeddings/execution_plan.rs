@@ -321,7 +321,7 @@ pub async fn compute_additional_embedding_columns<S: std::hash::BuildHasher>(
                 })
                 .await??
             } else {
-                get_vectors_per_list_element(rows, &**model, cfg.vector_size).await?
+                get_vectors_per_list_element(rows, &*model, cfg.vector_size).await?
             };
 
             tracing::trace!("Successfully embedded column '{col}' in multi-vector mode");
@@ -356,7 +356,7 @@ pub async fn compute_additional_embedding_columns<S: std::hash::BuildHasher>(
                 })
                 .await??
             } else {
-                get_vectors(arr_iter, &**model, cfg.vector_size).await?
+                get_vectors(arr_iter, &*model, cfg.vector_size).await?
             };
 
             tracing::trace!("Successfully embedded column '{col}'");
