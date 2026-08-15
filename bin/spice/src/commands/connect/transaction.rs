@@ -40,7 +40,7 @@ use crate::error::{CloudErrorCode, Error, Result};
 
 use super::naming::{collision_suggestion, initial_suggestion, validate_project_name};
 use super::project::{ProjectAttachment, ProjectClient, ProjectMutation};
-use super::state::{ConnectLock, ConnectOperation, IdentityFacts, ProjectOperation};
+use super::state::{ConnectOperation, IdentityFacts, OrganizationBinding, ProjectOperation};
 
 pub(super) struct ConnectRequest {
     pub org: Option<String>,
@@ -305,22 +305,25 @@ async fn execute_with<P: Prompter>(
     // fresh-enrollment guidance. Deferring instead reaches the draft loader under
     // the lock, which is the layer that reports the real I/O failure.
     let draft_pending = !matches!(
-        runtime_cloud_connect::EnrollmentDraft::path_in(&config_dir).try_exists(),
+        tokio::fs::try_exists(runtime_cloud_connect::EnrollmentDraft::path_in(&config_dir)).await,
         Ok(false)
     );
+    let identity_present = tokio::fs::try_exists(&identity_path).await.unwrap_or(true);
     if !prompter.interactive()
         && request.token.is_none()
         && (request.org.is_none() || request.project.is_none())
-        && !identity_path.exists()
+        && !identity_present
         && !draft_pending
     {
         return Err(invalid_usage(
             "non-interactive Cloud Connect requires either a login with --org <org> --project <name>, or --token <enrollment-key>.",
         ));
     }
-    let _lock = ConnectLock::acquire(&config_dir, "connect")
+    let _lock = runtime_cloud_connect::MutationLock::acquire(&config_dir, "connect")
         .await
-        .map_err(|error| state_error(&error))?;
+        .map_err(|source| Error::CloudConnectIo {
+            message: source.to_string(),
+        })?;
     let identity = load_identity(&identity_path).await?;
     if let Some(identity) = identity.as_ref() {
         validate_existing_identity(&identity_path, identity)?;
@@ -377,16 +380,44 @@ async fn execute_with<P: Prompter>(
         .as_ref()
         .map(|draft| resumable_authority(draft, &request, prompter.interactive()))
         .transpose()?;
+    // The operation the decision above was made for. Carried so the enrollment
+    // transaction can refuse an operation this run never routed on.
+    let resumed_operation = resumable
+        .as_ref()
+        .and(draft.as_ref())
+        .map(|draft| draft.enrollment_operation_id.clone());
+    // A resumed operation replays the location recorded when it was published:
+    // the enrollment request is built from the draft, and the draft deliberately
+    // keeps its region so a differing `--region` on a retry cannot invalidate
+    // exact-replay state. The journal has to record that same value or it
+    // describes a request that was never sent — and then rejects the retry that
+    // names the region the operation actually carries.
+    let region = match resumable.as_ref().and(draft.as_ref()) {
+        Some(pending) => {
+            if let Some(requested) = request.region.as_deref()
+                && pending.region.as_deref() != Some(requested)
+            {
+                println!(
+                    "The pending enrollment declares location {}, which is what it replays; --region {requested} applies to a new enrollment.",
+                    pending.region.as_deref().unwrap_or("(none)")
+                );
+            }
+            pending.region.clone()
+        }
+        None => request.region.clone(),
+    };
     let token = request.token.take();
 
-    let key_enrollment = |expected_org: Option<String>| KeyEnrollment {
-        ctx,
-        config_dir: &config_dir,
-        directory: &directory,
-        endpoint: &resolved_endpoint,
-        region: request.region.clone(),
-        expected_org,
-    };
+    let key_enrollment =
+        |expected_org: Option<String>, resumed_operation: Option<String>| KeyEnrollment {
+            ctx,
+            config_dir: &config_dir,
+            directory: &directory,
+            endpoint: &resolved_endpoint,
+            region: region.clone(),
+            expected_org,
+            resumed_operation,
+        };
 
     match resumable {
         Some(ResumableAuthority::EnrollmentKey { expected_org }) => {
@@ -409,7 +440,12 @@ async fn execute_with<P: Prompter>(
                     message: source.to_string(),
                 })?
             };
-            return enroll_with_key(key_enrollment(expected_org), key, &telemetry).await;
+            return enroll_with_key(
+                key_enrollment(expected_org, resumed_operation),
+                key,
+                &telemetry,
+            )
+            .await;
         }
         Some(ResumableAuthority::Login { organization }) => {
             return resume_pending_login(
@@ -418,7 +454,9 @@ async fn execute_with<P: Prompter>(
                     config_dir: &config_dir,
                     directory: &directory,
                     endpoint: &resolved_endpoint,
+                    region,
                     organization,
+                    resumed_operation,
                 },
                 &request,
                 prompter,
@@ -430,7 +468,17 @@ async fn execute_with<P: Prompter>(
     }
 
     if let Some(key) = token {
-        return enroll_with_key(key_enrollment(request.org.clone()), key, &telemetry).await;
+        // A key cannot create a project, in any mode. This sits below the draft
+        // decision so that a pending operation answers first: a login-mode
+        // operation asked to finish with a key names the command that finishes it
+        // and the one that abandons it, which is more use than a rule about two
+        // flags.
+        if request.project.is_some() {
+            return Err(invalid_usage(
+                "--project cannot be used with --token; an enrollment key can enroll an instance but cannot create a project.",
+            ));
+        }
+        return enroll_with_key(key_enrollment(request.org.clone(), None), key, &telemetry).await;
     }
 
     if !prompter.interactive() && (request.org.is_none() || request.project.is_none()) {
@@ -479,7 +527,8 @@ async fn execute_with<P: Prompter>(
                 let key = EnrollmentKey::parse(&raw).map_err(|source| Error::InvalidUsage {
                     message: source.to_string(),
                 })?;
-                return enroll_with_key(key_enrollment(request.org.clone()), key, &telemetry).await;
+                return enroll_with_key(key_enrollment(request.org.clone(), None), key, &telemetry)
+                    .await;
             }
             None => {
                 telemetry.complete("cancelled");
@@ -525,7 +574,8 @@ async fn execute_with<P: Prompter>(
             let key = EnrollmentKey::parse(&raw).map_err(|source| Error::InvalidUsage {
                 message: source.to_string(),
             })?;
-            return enroll_with_key(key_enrollment(request.org.clone()), key, &telemetry).await;
+            return enroll_with_key(key_enrollment(request.org.clone(), None), key, &telemetry)
+                .await;
         }
         Err(error) => return Err(error),
     };
@@ -536,8 +586,10 @@ async fn execute_with<P: Prompter>(
             config_dir: &config_dir,
             directory: &directory,
             endpoint: &resolved_endpoint,
+            region,
             organization: selected.name,
             login,
+            resumed_operation: None,
         },
         &request,
         prompter,
@@ -574,20 +626,6 @@ fn resumable_authority(
 ) -> Result<ResumableAuthority> {
     match &draft.binding.authority {
         runtime_cloud_connect::EnrollmentAuthorityBinding::Token { expected_org } => {
-            if let Some(requested) = request.org.as_deref()
-                && !expected_org
-                    .as_deref()
-                    .is_some_and(|pending| pending.eq_ignore_ascii_case(requested))
-            {
-                return Err(pending_operation_conflict(
-                    &format!(
-                        "asserts organization {}",
-                        expected_org.as_deref().unwrap_or("(none)")
-                    ),
-                    &format!("--org {requested}"),
-                    "re-run without --org, or with the organization the pending operation asserts",
-                ));
-            }
             if request.project.is_some() {
                 return Err(pending_operation_conflict(
                     "was authorized by an enrollment key, which cannot create a project",
@@ -600,9 +638,21 @@ fn resumable_authority(
                     "this directory has a pending enrollment that was authorized by an enrollment key. Enrollment keys are never stored, so finishing it non-interactively requires --token <enrollment-key>.",
                 ));
             }
-            Ok(ResumableAuthority::EnrollmentKey {
-                expected_org: expected_org.clone(),
-            })
+            // `--org` on a resume corrects the assertion rather than
+            // contradicting it. Spice Cloud checks the assertion before it
+            // consumes the key, so an operation that failed on a mistyped one is
+            // still replayable — and refusing the correction here would strand the
+            // draft with no way to finish it but abandoning it. A flag naming the
+            // organization the draft already asserts is not a correction, and
+            // replays the draft's own value.
+            let expected_org = match (request.org.as_deref(), expected_org.as_deref()) {
+                (Some(requested), Some(pending)) if requested.eq_ignore_ascii_case(pending) => {
+                    expected_org.clone()
+                }
+                (Some(requested), _) => Some(requested.to_string()),
+                (None, _) => expected_org.clone(),
+            };
+            Ok(ResumableAuthority::EnrollmentKey { expected_org })
         }
         runtime_cloud_connect::EnrollmentAuthorityBinding::AuthenticatedSession {
             organization,
@@ -659,6 +709,10 @@ struct KeyEnrollment<'a> {
     directory: &'a Path,
     endpoint: &'a TransactionEndpoint,
     region: Option<String>,
+    /// The operation a resumed run routed on, verified under the enrollment
+    /// transaction before the key is spent. `None` for a fresh enrollment,
+    /// which has no operation to hold to.
+    resumed_operation: Option<String>,
     /// The organization this attempt asserts the key belongs to, checked
     /// against the enrollment response. `None` asserts nothing.
     expected_org: Option<String>,
@@ -673,15 +727,16 @@ async fn enroll_with_key(
     telemetry.auth("token");
     telemetry.stage("enrollment");
     let expected_org = context.expected_org;
-    let enrolled = enroll(
-        context.ctx,
-        context.config_dir,
-        context.directory,
-        context.endpoint,
-        context.region,
-        expected_org.clone().unwrap_or_default(),
-        EnrollmentAuthority::Token { key, expected_org },
-    )
+    let enrolled = enroll(EnrollAttempt {
+        ctx: context.ctx,
+        config_dir: context.config_dir,
+        directory: context.directory,
+        endpoint: context.endpoint,
+        region: context.region,
+        journal_org: expected_org.clone().unwrap_or_default(),
+        authority: EnrollmentAuthority::Token { key, expected_org },
+        resumed_operation: context.resumed_operation,
+    })
     .await?;
     print_enrollment_result(&enrolled);
     telemetry.complete(if enrolled.identity.app_id.is_some() {
@@ -698,8 +753,13 @@ struct LoginEnrollment<'a> {
     config_dir: &'a Path,
     directory: &'a Path,
     endpoint: &'a TransactionEndpoint,
+    /// The location this enrollment declares. A resumed operation carries the
+    /// one its draft recorded, not this invocation's flag.
+    region: Option<String>,
     organization: String,
     login: LoginCredential,
+    /// As [`KeyEnrollment::resumed_operation`].
+    resumed_operation: Option<String>,
 }
 
 /// Enroll under a login session, then attach a project when one is named.
@@ -710,18 +770,19 @@ async fn enroll_with_login<P: Prompter>(
     telemetry: &FlowTelemetry,
 ) -> Result<()> {
     telemetry.stage("enrollment");
-    let enrolled = enroll(
-        context.ctx,
-        context.config_dir,
-        context.directory,
-        context.endpoint,
-        request.region.clone(),
-        context.organization.clone(),
-        EnrollmentAuthority::AuthenticatedSession {
+    let enrolled = enroll(EnrollAttempt {
+        ctx: context.ctx,
+        config_dir: context.config_dir,
+        directory: context.directory,
+        endpoint: context.endpoint,
+        region: context.region,
+        journal_org: context.organization.clone(),
+        authority: EnrollmentAuthority::AuthenticatedSession {
             access_token: context.login.token.clone(),
             org: context.organization.clone(),
         },
-    )
+        resumed_operation: context.resumed_operation,
+    })
     .await?;
 
     if enrolled.already_enrolled && enrolled.identity.app_id.is_some() {
@@ -766,7 +827,11 @@ struct PendingLogin<'a> {
     config_dir: &'a Path,
     directory: &'a Path,
     endpoint: &'a TransactionEndpoint,
+    /// As [`LoginEnrollment::region`].
+    region: Option<String>,
     organization: String,
+    /// As [`KeyEnrollment::resumed_operation`].
+    resumed_operation: Option<String>,
 }
 
 /// The credential a resumed login operation presents.
@@ -841,8 +906,10 @@ async fn resume_pending_login<P: Prompter>(
             config_dir: context.config_dir,
             directory: context.directory,
             endpoint: context.endpoint,
+            region: context.region,
             organization: context.organization,
             login,
+            resumed_operation: context.resumed_operation,
         },
         request,
         prompter,
@@ -868,6 +935,17 @@ async fn existing_identity_flow<P: Prompter>(
     context: ExistingIdentityContext<'_>,
     telemetry: &FlowTelemetry,
 ) -> Result<()> {
+    // An enrolled instance ignores an enrollment key — the identity wins — so
+    // accepting one here would take a secret from the operator, drop it, and then
+    // attach the project with a stored login credential instead. Moving the flag
+    // rule below the draft decision left this path unguarded; it is invalid in
+    // every mode, so it is refused wherever it is reachable.
+    if request.token.is_some() && request.project.is_some() {
+        return Err(invalid_usage(
+            "--project cannot be used with --token; an enrollment key can enroll an instance but cannot create a project.",
+        ));
+    }
+
     let ExistingIdentityContext {
         config_dir,
         directory,
@@ -1109,15 +1187,42 @@ fn legacy_endpoint_requires_explicit_authority(endpoint: &str) -> Error {
     ))
 }
 
-async fn enroll(
-    ctx: &RuntimeContext,
-    config_dir: &Path,
-    directory: &Path,
-    endpoint: &TransactionEndpoint,
+/// One enrollment attempt: where it goes, what authorizes it, and what it has to
+/// stay faithful to.
+struct EnrollAttempt<'a> {
+    ctx: &'a RuntimeContext,
+    config_dir: &'a Path,
+    directory: &'a Path,
+    endpoint: &'a TransactionEndpoint,
     region: Option<String>,
+    /// The organization recorded in the enrollment journal, which is compared
+    /// case-insensitively on every replay.
     journal_org: String,
     authority: EnrollmentAuthority,
-) -> Result<EnrollmentResult> {
+    /// The operation a resumed run routed on, verified under the enrollment
+    /// transaction before the credential is spent. `None` for a fresh
+    /// enrollment, which has no operation to hold to.
+    resumed_operation: Option<String>,
+}
+
+async fn enroll(attempt: EnrollAttempt<'_>) -> Result<EnrollmentResult> {
+    let EnrollAttempt {
+        ctx,
+        config_dir,
+        directory,
+        endpoint,
+        region,
+        journal_org,
+        authority,
+        resumed_operation,
+    } = attempt;
+    // Which authority is enrolling decides whether the organization recorded for
+    // this operation can still be corrected: an enrollment key asserts one and is
+    // checked before it is spent, a session is issued for one.
+    let organization_binding = match &authority {
+        EnrollmentAuthority::Token { .. } => OrganizationBinding::Assertion,
+        EnrollmentAuthority::AuthenticatedSession { .. } => OrganizationBinding::Fixed,
+    };
     let runtime_version = ctx
         .runtime_version()
         .unwrap_or_else(|_| crate::commands::version::cli_version());
@@ -1155,6 +1260,44 @@ async fn enroll(
     };
     let (enrollment_transaction, mut operation) = tokio::task::spawn_blocking(move || {
         let facts = InstanceFacts::gather(&runtime_version);
+        // A resumed run exists to finish one operation, so it settles that
+        // question before anything can publish a new one. `load_or_create`
+        // creates when the draft is absent, and creating here would answer a
+        // vanished operation by leaving a phantom one on disk for the next run to
+        // resume — so the resumed case is decided first, from what the
+        // transaction can now see, and refuses instead.
+        //
+        // The binding check inside `load_or_create` cannot stand in for this: it
+        // admits a corrected organization assertion, which is what lets a
+        // mistyped `--org` recover, and therefore cannot tell a replay from a
+        // different operation published under the same binding.
+        if let Some(resumed) = resumed_operation.as_deref() {
+            match runtime_cloud_connect::EnrollmentDraft::load_optional(&prepare_dir)
+                .map_err(|source| Error::CloudConnectIo {
+                    message: format!("read the pending enrollment: {source}"),
+                })?
+            {
+                Some(pending) if pending.enrollment_operation_id == resumed => {}
+                Some(_) => {
+                    return Err(invalid_usage(
+                        "the pending enrollment for this directory changed while this run was preparing: it now holds a different operation. Nothing was sent. Re-run `spice connect` to continue the operation that is pending now, or run `spice connect remove --yes` to abandon it explicitly.",
+                    ));
+                }
+                None if prepare_dir
+                    .join(runtime_cloud_connect::config::IDENTITY_FILE)
+                    .exists() =>
+                {
+                    return Err(invalid_usage(
+                        "this directory finished enrolling while this run was preparing, so the pending operation is gone. Nothing was sent, and the enrollment key was not redeemed. Re-run `spice connect` to start the instance.",
+                    ));
+                }
+                None => {
+                    return Err(invalid_usage(
+                        "the pending enrollment for this directory was removed while this run was preparing. Nothing was sent, and the enrollment key was not redeemed. Re-run `spice connect` to enroll this directory again.",
+                    ));
+                }
+            }
+        }
         let draft = enrollment_transaction
             .load_or_create(&facts, region.as_deref(), &draft_binding)
             .map_err(|source| Error::CloudConnectIo {
@@ -1165,6 +1308,7 @@ async fn enroll(
             &canonical_dir,
             &draft.enrollment_operation_id,
             &journal_org,
+            organization_binding,
             &journal_endpoint,
             region.as_deref(),
         )
@@ -1669,20 +1813,13 @@ fn safe_recovery_url(candidate: &str) -> Option<String> {
 /// Validate what this invocation asks for on its own terms, before any state is
 /// read or any lock is taken.
 ///
-/// This runs ahead of the pending-draft rules deliberately. Everything it rejects
-/// is invalid whatever is on disk — an enrollment key cannot create a project in
-/// any mode — so rejecting it here costs no I/O and touches nothing. The trade is
-/// that one combination (`--token` with `--project`, over a pending login-mode
-/// operation) is answered by the flag rule rather than by the draft-aware
-/// finish/abandon guidance: dropping the flag that can never apply then reaches
-/// that guidance. Deferring these checks to make one message richer would make
-/// every invalid pair depend on state it cannot change.
+/// Everything here is wrong whatever is on disk — a malformed project name, an
+/// impossible region, an unusable endpoint — so rejecting it costs no I/O and
+/// touches nothing. Rules that a pending operation can answer better are not
+/// here: those wait until the draft has been read, so an operator with an
+/// operation in flight is always told about *that* operation rather than about
+/// the flags in the abstract.
 fn preflight_request(request: &ConnectRequest) -> Result<()> {
-    if request.token.is_some() && request.project.is_some() {
-        return Err(invalid_usage(
-            "--project cannot be used with --token; an enrollment key can enroll an instance but cannot create a project.",
-        ));
-    }
     if let Some(project) = request.project.as_deref() {
         validate_project_name(project)
             .map_err(|reason| invalid_usage(format!("invalid --project value: {reason}.")))?;
@@ -1958,6 +2095,9 @@ mod tests {
         key: Option<String>,
         config_dir: std::path::PathBuf,
         replacement: Option<EnrollmentRequestBinding>,
+        /// Remove the pending draft without publishing another, the way a
+        /// release does.
+        remove: bool,
     }
 
     impl Prompter for RacingPrompter {
@@ -1970,12 +2110,14 @@ mod tests {
         }
 
         async fn read_enrollment_key(&mut self, _portal_url: &str) -> Result<Option<String>> {
-            if let Some(binding) = self.replacement.take() {
-                // What another process does when it takes the transaction: the
-                // operation this run routed on is gone, and a different one is
-                // pending in its place.
+            // What another process does when it takes the transaction: the
+            // operation this run routed on is gone, and either a different one is
+            // pending in its place or nothing is.
+            if self.remove || self.replacement.is_some() {
                 std::fs::remove_file(EnrollmentDraft::path_in(&self.config_dir))
                     .expect("remove the pending draft");
+            }
+            if let Some(binding) = self.replacement.take() {
                 EnrollmentDraft::load_or_create(
                     &self.config_dir,
                     &InstanceFacts::gather("v0.0.0-racing-test"),
@@ -2071,28 +2213,13 @@ mod tests {
         }
     }
 
-    /// An explicit input that would move the pending operation to another
-    /// organization, or ask an enrollment key to create a project, fails before
-    /// anything is prompted for or sent — and says what finishes it instead.
+    /// An explicit input an enrollment-key operation cannot replay — a project it
+    /// has no authority to create, a key it cannot be given — fails before
+    /// anything is prompted for or sent, and says what finishes it instead.
     #[test]
     fn a_token_draft_rejects_inputs_it_cannot_replay() {
         let dir = tempfile::tempdir().expect("create tempdir");
         let draft = token_draft(dir.path(), Some("acme"));
-
-        let another_org = resumable_authority(
-            &draft,
-            &ConnectRequest {
-                org: Some("globex".to_string()),
-                ..connect_request()
-            },
-            true,
-        )
-        .expect_err("another organization must not be applied to the pending operation");
-        assert!(
-            another_org.to_string().contains("acme")
-                && another_org.to_string().contains("--org globex"),
-            "{another_org}"
-        );
 
         let with_project = resumable_authority(
             &draft,
@@ -2120,6 +2247,53 @@ mod tests {
         assert_eq!(
             resumable_authority(&unasserted, &connect_request(), true).expect("resume token mode"),
             ResumableAuthority::EnrollmentKey { expected_org: None }
+        );
+    }
+
+    /// `--org` on a pending token operation corrects the assertion rather than
+    /// contradicting it.
+    ///
+    /// Spice Cloud checks `expected_org` before it consumes the key, so an
+    /// operation that failed on a mistyped organization still holds an unspent
+    /// key and is replayable with the right one. Refusing the correction would
+    /// leave abandoning the draft as the only way forward.
+    #[test]
+    fn a_token_draft_takes_a_corrected_organization_assertion() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let draft = token_draft(dir.path(), Some("acme-typo"));
+
+        let corrected = resumable_authority(
+            &draft,
+            &ConnectRequest {
+                org: Some("acme".to_string()),
+                ..connect_request()
+            },
+            true,
+        )
+        .expect("a corrected assertion replays the pending operation");
+        assert_eq!(
+            corrected,
+            ResumableAuthority::EnrollmentKey {
+                expected_org: Some("acme".to_string())
+            },
+            "the corrected organization is what the replay asserts"
+        );
+
+        // And one is supplied where the draft asserted nothing at all.
+        let unasserted = token_draft(tempfile::tempdir().expect("create tempdir").path(), None);
+        assert_eq!(
+            resumable_authority(
+                &unasserted,
+                &ConnectRequest {
+                    org: Some("acme".to_string()),
+                    ..connect_request()
+                },
+                true,
+            )
+            .expect("resume token mode"),
+            ResumableAuthority::EnrollmentKey {
+                expected_org: Some("acme".to_string())
+            }
         );
     }
 
@@ -2306,11 +2480,165 @@ mod tests {
 
     /// The authority is routed from a draft read before the enrollment
     /// transaction is held, so another process can replace the operation while
-    /// the key prompt is open. The re-check under the transaction is what makes
-    /// that safe: the run fails closed, enrolls nothing, and leaves the operation
-    /// the other process published exactly as it wrote it.
+    /// the key prompt is open — the one place a resumed run waits on a human.
+    ///
+    /// What refuses is the operation's identity, whatever else the replacement
+    /// changed. The binding cannot stand in for it: every token binding matches
+    /// every other so a corrected organization assertion can still recover its
+    /// operation, which leaves a *different* operation under the same binding
+    /// indistinguishable. Both replacements below are therefore refused the same
+    /// way, with nothing sent, nothing enrolled, and the operation the other
+    /// process published left exactly as it wrote it.
     #[tokio::test(start_paused = true)]
-    async fn a_draft_replaced_while_prompting_fails_closed() {
+    async fn an_operation_replaced_while_prompting_fails_closed() {
+        let endpoint = closed_endpoint();
+        let routed_binding = EnrollmentRequestBinding {
+            endpoint: endpoint.clone(),
+            authority: EnrollmentAuthorityBinding::Token {
+                expected_org: Some("acme".to_string()),
+            },
+        };
+        let replacements = [
+            // Indistinguishable by binding: only the operation ID differs.
+            routed_binding.clone(),
+            // A different authority entirely.
+            EnrollmentRequestBinding {
+                endpoint: endpoint.clone(),
+                authority: EnrollmentAuthorityBinding::AuthenticatedSession {
+                    organization: "globex".to_string(),
+                },
+            },
+        ];
+
+        for replacement in replacements {
+            let instance = tempfile::tempdir().expect("create instance directory");
+            let directory = instance.path().canonicalize().expect("canonical tempdir");
+            let config_dir = CloudConnectConfig::resolve_config_dir(Some(&directory));
+            let routed = EnrollmentDraft::load_or_create(
+                &config_dir,
+                &InstanceFacts::gather("v0.0.0-racing-test"),
+                Some("lab-seoul"),
+                &routed_binding,
+            )
+            .expect("publish a pending enrollment draft");
+
+            let mut prompter = RacingPrompter {
+                key: Some("spice-enroll-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string()),
+                config_dir: config_dir.clone(),
+                replacement: Some(replacement.clone()),
+                remove: false,
+            };
+            let error = execute_with(
+                &RuntimeContext::new().expect("runtime context"),
+                ConnectRequest {
+                    dir: Some(directory.clone()),
+                    endpoint: Some(endpoint.clone()),
+                    ..connect_request()
+                },
+                &mut prompter,
+            )
+            .await
+            .expect_err("an operation this run never routed on must not be enrolled");
+            let rendered = error.to_string();
+            assert!(
+                rendered.contains("changed while this run was preparing")
+                    && rendered.contains("Nothing was sent"),
+                "the transaction must refuse the replaced operation: {rendered}"
+            );
+
+            let surviving = EnrollmentDraft::load_optional(&config_dir)
+                .expect("read the draft state")
+                .expect("the replacement is still pending");
+            assert_eq!(
+                surviving.binding, replacement,
+                "the operation the other process published must be left exactly as written"
+            );
+            assert_ne!(
+                surviving.enrollment_operation_id, routed.enrollment_operation_id,
+                "the replacement is a different operation, which is what refuses"
+            );
+            assert!(
+                !config_dir
+                    .join(runtime_cloud_connect::config::IDENTITY_FILE)
+                    .exists(),
+                "a refused resume must enroll nothing"
+            );
+        }
+    }
+
+    /// The conflict rules are asserted through the command, not only through the
+    /// decision function, because their value is which message an operator
+    /// actually gets — and that depends on the order the command applies them in.
+    ///
+    /// `--token` with `--project` is invalid in every mode, but over a pending
+    /// login-mode operation the useful answer is the one about that operation, so
+    /// the flag rule must not pre-empt it.
+    #[tokio::test(start_paused = true)]
+    async fn a_pending_login_draft_answers_before_the_flag_rules_do() {
+        let instance = tempfile::tempdir().expect("create instance directory");
+        let directory = instance.path().canonicalize().expect("canonical tempdir");
+        let config_dir = CloudConnectConfig::resolve_config_dir(Some(&directory));
+        let endpoint = closed_endpoint();
+        let published = EnrollmentDraft::load_or_create(
+            &config_dir,
+            &InstanceFacts::gather("v0.0.0-ordering-test"),
+            Some("lab-seoul"),
+            &EnrollmentRequestBinding {
+                endpoint: endpoint.clone(),
+                authority: EnrollmentAuthorityBinding::AuthenticatedSession {
+                    organization: "acme".to_string(),
+                },
+            },
+        )
+        .expect("publish a pending enrollment draft");
+
+        let mut prompter = ResumePrompter {
+            interactive: true,
+            key: None,
+            key_prompts: 0,
+        };
+        let error = execute_with(
+            &RuntimeContext::new().expect("runtime context"),
+            ConnectRequest {
+                token: Some(
+                    EnrollmentKey::parse("spice-enroll-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+                        .expect("fixture enrollment key"),
+                ),
+                project: Some("retail".to_string()),
+                dir: Some(directory.clone()),
+                endpoint: Some(endpoint.clone()),
+                ..connect_request()
+            },
+            &mut prompter,
+        )
+        .await
+        .expect_err("a key cannot finish a pending login-mode operation");
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("spice connect --project <name>")
+                && rendered.contains("spice connect remove --yes"),
+            "the pending operation must answer, naming what finishes and what abandons it: {rendered}"
+        );
+        assert_eq!(
+            prompter.key_prompts, 0,
+            "a refusal must not ask for anything first"
+        );
+        assert_eq!(
+            EnrollmentDraft::load_optional(&config_dir)
+                .expect("read the draft state")
+                .expect("the operation is still pending")
+                .enrollment_operation_id,
+            published.enrollment_operation_id,
+            "a refused invocation leaves the pending operation exactly as it was"
+        );
+    }
+
+    /// A resumed run whose operation is gone refuses and publishes nothing. The
+    /// prepare step creates a draft when none exists, and creating one here would
+    /// answer a vanished operation by leaving a phantom for the next run to
+    /// resume — so it is decided before anything can create.
+    #[tokio::test(start_paused = true)]
+    async fn a_resumed_operation_that_vanished_publishes_nothing() {
         let instance = tempfile::tempdir().expect("create instance directory");
         let directory = instance.path().canonicalize().expect("canonical tempdir");
         let config_dir = CloudConnectConfig::resolve_config_dir(Some(&directory));
@@ -2328,18 +2656,13 @@ mod tests {
         )
         .expect("publish a pending enrollment draft");
 
-        let replacement = EnrollmentRequestBinding {
-            endpoint: endpoint.clone(),
-            authority: EnrollmentAuthorityBinding::AuthenticatedSession {
-                organization: "globex".to_string(),
-            },
-        };
         let mut prompter = RacingPrompter {
             key: Some("spice-enroll-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string()),
             config_dir: config_dir.clone(),
-            replacement: Some(replacement.clone()),
+            // No replacement: the operation is simply removed, as a release does.
+            replacement: None,
+            remove: true,
         };
-
         let error = execute_with(
             &RuntimeContext::new().expect("runtime context"),
             ConnectRequest {
@@ -2350,20 +2673,18 @@ mod tests {
             &mut prompter,
         )
         .await
-        .expect_err("a replaced operation must not be enrolled under the routed authority");
+        .expect_err("a vanished operation must not be replaced by a new one");
+        let rendered = error.to_string();
         assert!(
-            error
-                .to_string()
-                .contains("different control plane or authority"),
-            "the transaction must refuse the replaced operation: {error}"
+            rendered.contains("was removed while this run was preparing")
+                && rendered.contains("was not redeemed"),
+            "the failure must say the operation is gone and the key unspent: {rendered}"
         );
-
-        let surviving = EnrollmentDraft::load_optional(&config_dir)
-            .expect("read the draft state")
-            .expect("the replacement is still pending");
-        assert_eq!(
-            surviving.binding, replacement,
-            "the operation the other process published must be left exactly as written"
+        assert!(
+            EnrollmentDraft::load_optional(&config_dir)
+                .expect("read the draft state")
+                .is_none(),
+            "a refused resume must not publish a phantom operation"
         );
         assert!(
             !config_dir

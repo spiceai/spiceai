@@ -16,10 +16,14 @@ limitations under the License.
 
 //! Per-directory serialization and the non-secret enrollment journal.
 
-use std::fs::{File, OpenOptions, TryLockError};
-use std::io::{Read as _, Seek as _, Write as _};
+use std::fs::OpenOptions;
+// Only the Windows reader below needs `File`, so an unconditional import would
+// be unused everywhere else.
+#[cfg(windows)]
+use std::fs::File;
+use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use runtime_cloud_connect::EnrollmentDraft;
 use runtime_cloud_connect::identity::Identity;
@@ -30,12 +34,9 @@ use super::project::ProjectMutation;
 
 pub(super) const CONNECT_OPERATION_FILE: &str = "connect-operation.json";
 pub(super) const PROJECT_OPERATION_FILE: &str = "connect-project-operation.json";
-pub(super) const CONNECT_LOCK_FILE: &str = "connect.lock";
-pub(super) const CONNECT_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 
 const CONNECT_OPERATION_SCHEMA_VERSION: u32 = 3;
 const PROJECT_OPERATION_SCHEMA_VERSION: u32 = 3;
-const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 const MAX_JOURNAL_BYTES: u64 = 256 * 1024;
 
 #[derive(Debug, Snafu)]
@@ -107,356 +108,6 @@ impl From<&Identity> for IdentityFacts {
     }
 }
 
-/// Held for the complete enrollment/project mutation boundary.
-#[derive(Debug)]
-pub(super) struct ConnectLock {
-    _file: File,
-}
-
-impl ConnectLock {
-    pub(super) async fn acquire(config_dir: &Path, action: &'static str) -> Result<Self> {
-        Self::acquire_with_timeout(config_dir, action, CONNECT_LOCK_TIMEOUT).await
-    }
-
-    pub(super) async fn acquire_with_timeout(
-        config_dir: &Path,
-        action: &'static str,
-        timeout: Duration,
-    ) -> Result<Self> {
-        let config_dir = config_dir.to_path_buf();
-        let lock_path = config_dir.join(CONNECT_LOCK_FILE);
-        tokio::task::spawn_blocking(move || acquire_lock(&config_dir, action, timeout))
-            .await
-            .map_err(|source| Error::Io {
-                path: lock_path,
-                source: std::io::Error::other(format!("lock task panicked: {source}")),
-            })?
-    }
-}
-
-fn acquire_lock(config_dir: &Path, action: &str, timeout: Duration) -> Result<ConnectLock> {
-    let config_dir = canonical_config_directory(config_dir)?;
-    validate_existing_directory_chain(&config_dir)?;
-    std::fs::create_dir_all(&config_dir).context(IoSnafu {
-        path: config_dir.clone(),
-    })?;
-    validate_existing_directory_chain(&config_dir)?;
-    let path = config_dir.join(CONNECT_LOCK_FILE);
-    #[cfg(not(windows))]
-    let mut options = OpenOptions::new();
-    #[cfg(not(windows))]
-    options.create(true).read(true).write(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options
-            .mode(0o600)
-            // Never follow an attacker-controlled repository symlink or block
-            // on a FIFO/device before checking the descriptor below.
-            .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK);
-    }
-    #[cfg(not(windows))]
-    let mut file = options
-        .open(&path)
-        .context(IoSnafu { path: path.clone() })?;
-    #[cfg(windows)]
-    let mut file = open_windows_owner_only_lock(&path).context(IoSnafu { path: path.clone() })?;
-    let metadata = file.metadata().context(IoSnafu { path: path.clone() })?;
-    if !metadata.is_file() {
-        return Err(Error::Io {
-            path,
-            source: std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "the Cloud Connect mutation lock must be a regular file",
-            ),
-        });
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt as _;
-        use std::os::unix::fs::PermissionsExt as _;
-        if metadata.nlink() != 1 {
-            return Err(Error::Io {
-                path,
-                source: std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "the Cloud Connect mutation lock must not be hard-linked",
-                ),
-            });
-        }
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))
-            .context(IoSnafu { path: path.clone() })?;
-    }
-    #[cfg(windows)]
-    validate_windows_lock(&file).context(IoSnafu { path: path.clone() })?;
-    let started = Instant::now();
-
-    loop {
-        match file.try_lock() {
-            Ok(()) => break,
-            Err(TryLockError::WouldBlock) if started.elapsed() < timeout => {
-                std::thread::sleep(
-                    LOCK_RETRY_INTERVAL.min(timeout.saturating_sub(started.elapsed())),
-                );
-            }
-            Err(TryLockError::WouldBlock) => {
-                let owner = lock_owner_suffix(&mut file);
-                return Err(Error::LockTimeout { owner });
-            }
-            Err(TryLockError::Error(source)) => {
-                return Err(Error::Io { path, source });
-            }
-        }
-    }
-
-    file.set_len(0).context(IoSnafu { path: path.clone() })?;
-    file.rewind().context(IoSnafu { path: path.clone() })?;
-    writeln!(file, "pid={} action={action}", std::process::id())
-        .context(IoSnafu { path: path.clone() })?;
-    file.sync_data().context(IoSnafu { path: path.clone() })?;
-    sync_parent_directory(&path).context(IoSnafu { path })?;
-    Ok(ConnectLock { _file: file })
-}
-
-/// Resolve every existing component of a config path before creating or
-/// opening its mutation lock.
-///
-/// This deliberately accepts a symlink supplied as the instance directory or
-/// by `SPICE_CONFIG_DIR`, but reduces it to the same physical directory as its
-/// target. Missing tail components are appended only after the nearest
-/// existing ancestor has been canonicalized, so the directory-chain checks
-/// below never reject a legitimate symlinked ancestor or create a second lock
-/// through a path alias.
-fn canonical_config_directory(path: &Path) -> Result<PathBuf> {
-    let absolute = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .map(|cwd| cwd.join(path))
-            .context(IoSnafu {
-                path: path.to_path_buf(),
-            })?
-    };
-    let mut cursor = absolute.as_path();
-    let mut missing = Vec::new();
-    loop {
-        match std::fs::symlink_metadata(cursor) {
-            Ok(_) => {
-                let mut resolved = std::fs::canonicalize(cursor).context(IoSnafu {
-                    path: cursor.to_path_buf(),
-                })?;
-                if !resolved.is_dir() {
-                    return Err(Error::Io {
-                        path: cursor.to_path_buf(),
-                        source: std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            "the Cloud Connect config path must resolve to a directory",
-                        ),
-                    });
-                }
-                for component in missing.iter().rev() {
-                    resolved.push(component);
-                }
-                return Ok(resolved);
-            }
-            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
-                let Some(name) = cursor.file_name() else {
-                    return Err(Error::Io {
-                        path: absolute,
-                        source,
-                    });
-                };
-                missing.push(name.to_os_string());
-                let Some(parent) = cursor.parent() else {
-                    return Err(Error::Io {
-                        path: absolute,
-                        source,
-                    });
-                };
-                cursor = parent;
-            }
-            Err(source) => {
-                return Err(Error::Io {
-                    path: cursor.to_path_buf(),
-                    source,
-                });
-            }
-        }
-    }
-}
-
-fn validate_existing_directory_chain(path: &Path) -> Result<()> {
-    let mut ancestors = path.ancestors().collect::<Vec<_>>();
-    ancestors.reverse();
-    for ancestor in ancestors {
-        let metadata = match std::fs::symlink_metadata(ancestor) {
-            Ok(metadata) => metadata,
-            Err(source) if source.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(source) => {
-                return Err(Error::Io {
-                    path: ancestor.to_path_buf(),
-                    source,
-                });
-            }
-        };
-        if metadata.file_type().is_symlink() || !metadata.is_dir() {
-            return Err(Error::Io {
-                path: ancestor.to_path_buf(),
-                source: std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "the Cloud Connect config path must contain only real directories",
-                ),
-            });
-        }
-    }
-    Ok(())
-}
-
-#[cfg(windows)]
-fn open_windows_owner_only_lock(path: &Path) -> std::io::Result<File> {
-    use std::os::windows::ffi::OsStrExt as _;
-    use std::os::windows::io::{FromRawHandle as _, RawHandle};
-    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE, LocalFree};
-    use windows_sys::Win32::Security::Authorization::{
-        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1, SE_FILE_OBJECT,
-        SetSecurityInfo,
-    };
-    use windows_sys::Win32::Security::{
-        DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl, PROTECTED_DACL_SECURITY_INFORMATION,
-        SECURITY_ATTRIBUTES,
-    };
-    use windows_sys::Win32::Storage::FileSystem::{
-        CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ,
-        FILE_GENERIC_WRITE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_ALWAYS,
-    };
-
-    let path = path
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect::<Vec<_>>();
-    // Protected DACL granting generic-all only to the file owner. Passing it
-    // at creation avoids a window in which a newly-created repository-local
-    // lock inherits broader directory permissions.
-    let sddl = "D:P(A;;GA;;;OW)"
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect::<Vec<_>>();
-    let mut descriptor = std::ptr::null_mut();
-    let converted = unsafe {
-        ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            sddl.as_ptr(),
-            SDDL_REVISION_1,
-            &mut descriptor,
-            std::ptr::null_mut(),
-        )
-    };
-    if converted == 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    let mut security = SECURITY_ATTRIBUTES {
-        nLength: u32::try_from(std::mem::size_of::<SECURITY_ATTRIBUTES>()).unwrap_or(u32::MAX),
-        lpSecurityDescriptor: descriptor,
-        bInheritHandle: 0,
-    };
-    let handle = unsafe {
-        CreateFileW(
-            path.as_ptr(),
-            FILE_GENERIC_READ | FILE_GENERIC_WRITE,
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
-            &mut security,
-            OPEN_ALWAYS,
-            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
-            std::ptr::null_mut(),
-        )
-    };
-    if handle == INVALID_HANDLE_VALUE {
-        unsafe {
-            let _ = LocalFree(descriptor.cast());
-        }
-        return Err(std::io::Error::last_os_error());
-    }
-    let mut dacl_present = 0;
-    let mut dacl = std::ptr::null_mut();
-    let mut dacl_defaulted = 0;
-    let got_dacl = unsafe {
-        GetSecurityDescriptorDacl(
-            descriptor,
-            &mut dacl_present,
-            &mut dacl,
-            &mut dacl_defaulted,
-        )
-    };
-    if got_dacl == 0 || dacl_present == 0 {
-        let source = if got_dacl == 0 {
-            std::io::Error::last_os_error()
-        } else {
-            std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "owner-only lock descriptor did not contain a DACL",
-            )
-        };
-        unsafe {
-            let _ = LocalFree(descriptor.cast());
-            let _ = CloseHandle(handle);
-        }
-        return Err(source);
-    }
-    let acl_result = unsafe {
-        SetSecurityInfo(
-            handle,
-            SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            dacl,
-            std::ptr::null_mut(),
-        )
-    };
-    unsafe {
-        let _ = LocalFree(descriptor.cast());
-    }
-    if acl_result != 0 {
-        unsafe {
-            let _ = CloseHandle(handle);
-        }
-        return Err(std::io::Error::from_raw_os_error(
-            i32::try_from(acl_result).unwrap_or(i32::MAX),
-        ));
-    }
-    Ok(unsafe { File::from_raw_handle(handle as RawHandle) })
-}
-
-#[cfg(windows)]
-fn validate_windows_lock(file: &File) -> std::io::Result<()> {
-    use std::os::windows::io::AsRawHandle as _;
-    use windows_sys::Win32::Storage::FileSystem::{
-        BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
-        GetFileInformationByHandle,
-    };
-
-    let mut information = BY_HANDLE_FILE_INFORMATION::default();
-    let result =
-        unsafe { GetFileInformationByHandle(file.as_raw_handle().cast(), &mut information) };
-    if result == 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    if information.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT) != 0
-    {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "the Cloud Connect state path must be a regular file, not a directory or reparse point",
-        ));
-    }
-    if information.nNumberOfLinks != 1 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "the Cloud Connect state path must not be hard-linked",
-        ));
-    }
-    Ok(())
-}
-
 #[cfg(windows)]
 fn open_windows_regular_file_for_read(path: &Path) -> std::io::Result<File> {
     use std::os::windows::ffi::OsStrExt as _;
@@ -487,27 +138,8 @@ fn open_windows_regular_file_for_read(path: &Path) -> std::io::Result<File> {
         return Err(std::io::Error::last_os_error());
     }
     let file = unsafe { File::from_raw_handle(handle as RawHandle) };
-    validate_windows_lock(&file)?;
+    runtime_cloud_connect::identity::validate_windows_regular_single_link(&file)?;
     Ok(file)
-}
-
-fn lock_owner_suffix(file: &mut File) -> String {
-    file.rewind()
-        .and_then(|()| {
-            let mut value = String::new();
-            file.read_to_string(&mut value).map(|_| value)
-        })
-        .ok()
-        .map(|value| {
-            value
-                .chars()
-                .filter(|character| !character.is_control())
-                .take(160)
-                .collect::<String>()
-        })
-        .filter(|value| !value.is_empty())
-        .map(|value| format!(" ({value})"))
-        .unwrap_or_default()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -530,24 +162,49 @@ pub(super) struct ConnectOperation {
     pub instance_id: Option<String>,
 }
 
+/// How firmly an operation is tied to the organization recorded for it.
+///
+/// The two enrollment authorities differ here, and the journal has to match them
+/// or it refuses a retry the enrollment itself would accept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum OrganizationBinding {
+    /// A login-session operation is bound to one organization for its lifetime:
+    /// the session was issued for it, and another organization is another
+    /// operation.
+    Fixed,
+    /// An enrollment key asserts the organization it expects, and Spice Cloud
+    /// checks the assertion *before* consuming the key — so a mismatch leaves the
+    /// key unspent and the operation replayable with the assertion corrected.
+    Assertion,
+}
+
 impl ConnectOperation {
     pub(super) fn prepare(
         config_dir: &Path,
         directory: &Path,
         enrollment_operation_id: &str,
         organization: &str,
+        binding: OrganizationBinding,
         endpoint: &str,
         region: Option<&str>,
     ) -> Result<Self> {
-        if let Some(existing) = Self::load_optional(config_dir)? {
+        if let Some(mut existing) = Self::load_optional(config_dir)? {
+            let same_organization = existing.organization.eq_ignore_ascii_case(organization);
             if existing.schema_version == CONNECT_OPERATION_SCHEMA_VERSION
                 && existing.directory == directory
                 && existing.enrollment_operation_id == enrollment_operation_id
-                && existing.organization.eq_ignore_ascii_case(organization)
+                && (same_organization || binding == OrganizationBinding::Assertion)
                 && existing.endpoint == endpoint
                 && region.is_none_or(|region| existing.region.as_deref() == Some(region))
                 && existing.phase == EnrollmentPhase::Prepared
             {
+                if !same_organization {
+                    // The corrected assertion, replaying the same operation. It is
+                    // recorded now so that the identity this run enrolls is checked
+                    // against what was asked for, not against what was mistyped.
+                    existing.organization = organization.to_string();
+                    existing.store(config_dir)?;
+                }
                 return Ok(existing);
             }
             return Err(Error::PendingRequestMismatch {
@@ -1058,6 +715,7 @@ mod tests {
             dir.path(),
             "operation-1",
             "acme",
+            OrganizationBinding::Fixed,
             "https://api.spice.ai",
             None,
         )
@@ -1083,6 +741,7 @@ mod tests {
             dir.path(),
             "operation-1",
             "acme",
+            OrganizationBinding::Fixed,
             "https://api.spice.ai",
             None,
         )
@@ -1107,6 +766,64 @@ mod tests {
         );
     }
 
+    /// An enrollment key asserts the organization it expects and Spice Cloud
+    /// checks the assertion before consuming the key, so a mismatch leaves the
+    /// operation replayable with the assertion corrected. The journal has to
+    /// accept that correction, or the draft it preserved can never be finished.
+    #[test]
+    fn a_corrected_assertion_replays_the_same_token_operation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        ConnectOperation::prepare(
+            dir.path(),
+            dir.path(),
+            "operation-1",
+            "acme-typo",
+            OrganizationBinding::Assertion,
+            "https://api.spice.ai",
+            None,
+        )
+        .expect("prepare the operation that asserted the wrong organization");
+
+        let corrected = ConnectOperation::prepare(
+            dir.path(),
+            dir.path(),
+            "operation-1",
+            "acme",
+            OrganizationBinding::Assertion,
+            "https://api.spice.ai",
+            None,
+        )
+        .expect("the corrected assertion replays the same operation");
+        assert_eq!(
+            corrected.enrollment_operation_id, "operation-1",
+            "the operation is replayed, not replaced"
+        );
+        assert_eq!(
+            corrected.organization, "acme",
+            "and the journal records what was asked for"
+        );
+
+        // Persisted, so the identity this run enrolls is checked against the
+        // corrected organization rather than the mistyped one.
+        let reloaded = ConnectOperation::load_optional(dir.path())
+            .expect("load")
+            .expect("the journal is still there");
+        assert_eq!(reloaded.organization, "acme");
+
+        // A login-bound operation is not an assertion and does not move.
+        let fixed = ConnectOperation::prepare(
+            dir.path(),
+            dir.path(),
+            "operation-1",
+            "globex",
+            OrganizationBinding::Fixed,
+            "https://api.spice.ai",
+            None,
+        )
+        .expect_err("a session is issued for one organization");
+        assert!(matches!(fixed, Error::PendingRequestMismatch { .. }));
+    }
+
     #[test]
     fn changed_pending_request_preserves_exact_replay_state() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1117,6 +834,7 @@ mod tests {
             dir.path(),
             "operation-1",
             "acme",
+            OrganizationBinding::Fixed,
             "https://control-a.example",
             None,
         )
@@ -1134,6 +852,7 @@ mod tests {
             dir.path(),
             "operation-1",
             "globex",
+            OrganizationBinding::Fixed,
             "https://control-a.example",
             None,
         )
@@ -1159,6 +878,7 @@ mod tests {
             dir.path(),
             "operation-1",
             "acme",
+            OrganizationBinding::Fixed,
             "https://api.spice.ai",
             Some("us-east-1"),
         )
@@ -1168,6 +888,7 @@ mod tests {
             dir.path(),
             "operation-1",
             "acme",
+            OrganizationBinding::Fixed,
             "https://api.spice.ai",
             Some("eu-west-1"),
         )
@@ -1187,6 +908,7 @@ mod tests {
             dir.path(),
             "operation-1",
             "acme",
+            OrganizationBinding::Fixed,
             "https://api.spice.ai",
             None,
         )
@@ -1226,93 +948,6 @@ mod tests {
         assert_eq!(recovered, operation);
     }
 
-    #[tokio::test]
-    async fn lock_wait_is_bounded_and_reports_only_owner_metadata() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let config_dir = dir.path().canonicalize().expect("canonical tempdir");
-        let first = ConnectLock::acquire_with_timeout(
-            &config_dir,
-            "first-action",
-            Duration::from_millis(100),
-        )
-        .await
-        .expect("first lock");
-        let err = ConnectLock::acquire_with_timeout(
-            &config_dir,
-            "second-action",
-            Duration::from_millis(120),
-        )
-        .await
-        .expect_err("second lock must time out");
-        let rendered = err.to_string();
-        assert!(rendered.contains("pid="));
-        assert!(rendered.contains("first-action"));
-        drop(first);
-        ConnectLock::acquire_with_timeout(&config_dir, "third-action", Duration::from_millis(100))
-            .await
-            .expect("lock released");
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn mutation_lock_rejects_symlinks_without_touching_the_target() {
-        use std::os::unix::fs::symlink;
-
-        let dir = tempfile::tempdir().expect("tempdir");
-        let target = dir.path().join("important.txt");
-        std::fs::write(&target, "must remain unchanged").expect("write target");
-        let config = dir.path().join("config");
-        std::fs::create_dir_all(&config).expect("create config");
-        symlink(&target, config.join(CONNECT_LOCK_FILE)).expect("create lock symlink");
-
-        ConnectLock::acquire_with_timeout(&config, "connect", Duration::from_millis(50))
-            .await
-            .expect_err("a symlink must not become the mutation lock");
-        assert_eq!(
-            std::fs::read_to_string(target).expect("read target"),
-            "must remain unchanged"
-        );
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn mutation_lock_canonicalizes_a_symlinked_config_ancestor() {
-        use std::os::unix::fs::symlink;
-
-        let dir = tempfile::tempdir().expect("tempdir");
-        let real_root = dir.path().join("real");
-        let real_config = real_root.join("instance/.spice");
-        std::fs::create_dir_all(&real_config).expect("create real config directory");
-        let alias_root = dir.path().join("current");
-        symlink(&real_root, &alias_root).expect("create config ancestor symlink");
-        let alias_config = alias_root.join("instance/.spice");
-
-        let first = ConnectLock::acquire_with_timeout(
-            &real_config,
-            "canonical-owner",
-            Duration::from_millis(100),
-        )
-        .await
-        .expect("acquire through canonical path");
-        let error = ConnectLock::acquire_with_timeout(
-            &alias_config,
-            "alias-owner",
-            Duration::from_millis(100),
-        )
-        .await
-        .expect_err("the alias must contend on the canonical lock");
-        assert!(matches!(error, Error::LockTimeout { .. }));
-        drop(first);
-
-        ConnectLock::acquire_with_timeout(
-            &alias_config,
-            "alias-after-release",
-            Duration::from_millis(100),
-        )
-        .await
-        .expect("acquire through symlinked config ancestor");
-    }
-
     #[test]
     fn non_replacing_promotion_replaces_an_existing_journal() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1345,6 +980,7 @@ mod tests {
             dir.path(),
             "operation-1",
             "acme",
+            OrganizationBinding::Fixed,
             "https://api.spice.ai",
             None,
         )

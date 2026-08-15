@@ -341,22 +341,14 @@ fn validate_response(
             reason: "project metadata contained control characters",
         });
     }
-    let monitor_url =
-        reqwest::Url::parse(&response.monitor_url).map_err(|_| Error::InvalidResponse {
-            reason: "monitor_url was not an absolute URL",
-        })?;
-    let local_http =
-        monitor_url.scheme() == "http" && monitor_url.host_str().is_some_and(is_loopback_host);
-    if (monitor_url.scheme() != "https" && !local_http)
-        || monitor_url.host_str().is_none()
-        || !monitor_url.username().is_empty()
-        || monitor_url.password().is_some()
-    {
-        return Err(Error::InvalidResponse {
+    // The same rule every Cloud-delivered link is held to, applied in one place:
+    // a second copy of it here is a second thing to keep in step, and the two
+    // would sooner or later accept different links.
+    runtime_cloud_connect::config::safe_portal_url(&response.monitor_url).ok_or(
+        Error::InvalidResponse {
             reason: "monitor_url was not a safe HTTP URL",
-        });
-    }
-    Ok(monitor_url.to_string())
+        },
+    )
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

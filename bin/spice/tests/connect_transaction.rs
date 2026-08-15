@@ -1455,3 +1455,37 @@ fn a_pending_login_draft_resumes_without_a_portal_or_discovery_request() {
     assert_eq!(identity.org_name.as_deref(), Some("acme"));
     assert_eq!(identity.app_name.as_deref(), Some(PROJECT_NAME));
 }
+
+/// An enrolled instance ignores an enrollment key — the identity wins — so
+/// accepting one beside `--project` would take the operator's secret, drop it,
+/// and attach the project with a stored login credential instead. The rule has to
+/// hold on this path too, not only on a fresh enrollment.
+#[test]
+fn an_enrolled_directory_refuses_a_key_with_a_project() {
+    let instance = TempDir::new().expect("create instance directory");
+    let home = TempDir::new().expect("create isolated home");
+    let config_dir = instance.path().join(".spice");
+    runtime_cloud_connect::IdentityStore::store(
+        &config_dir.join("identity.json"),
+        &unattached_identity(),
+    )
+    .expect("store an enrolled identity");
+
+    let (success, output) = output_of(
+        connect_at(&instance, &home, &closed_endpoint())
+            .env("SPICE_SPICEAI_TOKEN", LOGIN_TOKEN)
+            .arg("--token")
+            .arg("spice-enroll-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+            .arg("--project")
+            .arg(PROJECT_NAME),
+    );
+    assert!(!success, "a key with a project must be refused");
+    assert!(
+        output.contains("--project cannot be used with --token"),
+        "the pair must be named as the problem: {output}"
+    );
+    assert!(
+        !output.contains("spice-enroll-"),
+        "the key must never be echoed: {output}"
+    );
+}

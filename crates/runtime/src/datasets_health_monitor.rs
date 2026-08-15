@@ -132,7 +132,6 @@ enum AvailabilityVerificationResult {
 pub struct DatasetsHealthMonitor {
     df: Arc<DataFusion>,
     pub monitored_datasets: Arc<Mutex<HashMap<String, Arc<DatasetAvailabilityInfo>>>>,
-    is_task_history_enabled: bool,
 }
 
 impl DatasetsHealthMonitor {
@@ -141,14 +140,7 @@ impl DatasetsHealthMonitor {
         Self {
             df,
             monitored_datasets: Arc::new(Mutex::new(HashMap::new())),
-            is_task_history_enabled: false,
         }
-    }
-
-    #[must_use]
-    pub fn with_task_history_enabled(mut self, is_enabled: bool) -> Self {
-        self.is_task_history_enabled = is_enabled;
-        self
     }
 
     pub async fn register_dataset(&self, dataset: &Dataset) -> Result<()> {
@@ -312,7 +304,6 @@ AND labels.error_code IS NULL"
         let monitored_datasets = Arc::clone(&self.monitored_datasets);
         let df = Arc::clone(&self.df);
         let runtime_status = df.runtime_status();
-        let is_task_history_enabled = self.is_task_history_enabled;
         tokio::spawn(async move {
             loop {
                 // Wake at the shortest configured interval so each dataset is
@@ -330,7 +321,11 @@ AND labels.error_code IS NULL"
                 // A recent successful query proves the source is reachable, so
                 // fold it in to avoid redundantly probing actively-queried
                 // datasets (and to clear a stale Error for them).
-                let recent = if is_task_history_enabled {
+                // Read per pass rather than captured: the app that decides
+                // whether task history exists can arrive after this loop starts,
+                // and querying a table that setting told the runtime not to
+                // create would warn on every pass.
+                let recent = if df.task_history_emission_enabled() {
                     let lookback = max_interval.min(MAX_RECENT_QUERY_LOOKBACK);
                     match Self::recent_success_times(Arc::clone(&df), lookback).await {
                         Ok(map) => map,

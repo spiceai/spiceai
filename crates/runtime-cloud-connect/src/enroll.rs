@@ -914,6 +914,36 @@ where
     }
 }
 
+/// The caller's authority with a token assertion restored from `draft`, or
+/// `None` when there is nothing to restore.
+///
+/// This only ever fills in what the draft recorded. A caller that names an
+/// organization keeps it: that is how a first attempt naming the wrong one is
+/// corrected on a later attempt, which the draft's token binding deliberately
+/// permits.
+fn restored_token_assertion(
+    caller: &EnrollmentAuthority,
+    draft: &EnrollmentDraft,
+) -> Option<EnrollmentAuthority> {
+    let EnrollmentAuthority::Token {
+        key,
+        expected_org: None,
+    } = caller
+    else {
+        return None;
+    };
+    let EnrollmentAuthorityBinding::Token {
+        expected_org: Some(persisted),
+    } = &draft.binding.authority
+    else {
+        return None;
+    };
+    Some(EnrollmentAuthority::Token {
+        key: key.clone(),
+        expected_org: Some(persisted.clone()),
+    })
+}
+
 /// Errors from the one-shot [`enroll_now`] flow.
 #[derive(Debug, Snafu)]
 pub enum EnrollNowError {
@@ -1199,6 +1229,16 @@ pub async fn enroll_now_with_transaction(
     })
     .context(DraftSnafu)?;
 
+    // The organization the operation was published with rides every replay of
+    // it, including one from a caller that names none. `spiced --token` is that
+    // caller: it enrolls with a key and no assertion, and a draft's token binding
+    // matches any token request, so without this a resumed operation would be
+    // replayed with its assertion dropped and the response checked against
+    // nothing — the defect the CLI's resume closes, reopened by the other caller
+    // of the same operation.
+    let restored = restored_token_assertion(authority, &draft);
+    let authority = restored.as_ref().unwrap_or(authority);
+
     let client = EnrollClient::new(config).context(ClientSnafu)?;
     let material = draft.material();
 
@@ -1258,6 +1298,11 @@ pub async fn enroll_now_with_transaction(
         .map(str::trim)
         .filter(|url| !url.is_empty())
         .and_then(crate::config::safe_portal_url);
+    // Sanitized at the boundary, not per consumer: this outcome is returned to
+    // the caller, and `spiced --token` logs the page it names straight from it.
+    // Replacing the field here means no consumer can print a link the rule
+    // rejected.
+    outcome.metadata.new_project_url = new_project_url.clone();
 
     // Atomic promotion: the draft's provisional key material becomes the
     // identity, written owner-only via atomic rename; the draft is deleted
@@ -2483,6 +2528,69 @@ mod tests {
             "the enrollment authority crossed origins: {leaked_request:?}"
         );
         assert!(matches!(error, Error::Denied { status, .. } if status == expected_status));
+    }
+
+    /// A caller that names no organization inherits the one the operation was
+    /// published with; a caller that names one keeps it, which is what lets a
+    /// wrong first assertion be corrected on a later attempt.
+    #[test]
+    fn a_token_assertion_is_restored_from_the_draft_but_never_replaced() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let published = EnrollmentDraft::load_or_create(
+            dir.path(),
+            &InstanceFacts::gather("v0.0.0-assertion-test"),
+            None,
+            &EnrollmentRequestBinding {
+                endpoint: "https://api.spice.ai".to_string(),
+                authority: EnrollmentAuthorityBinding::Token {
+                    expected_org: Some("acme".to_string()),
+                },
+            },
+        )
+        .expect("publish a pending draft");
+        let key = EnrollmentKey::parse("spice-enroll-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+            .expect("fixture enrollment key");
+
+        let restored = restored_token_assertion(
+            &EnrollmentAuthority::Token {
+                key: key.clone(),
+                expected_org: None,
+            },
+            &published,
+        )
+        .expect("an unasserted caller inherits the operation's organization");
+        match restored {
+            EnrollmentAuthority::Token { expected_org, .. } => {
+                assert_eq!(expected_org.as_deref(), Some("acme"));
+            }
+            other @ EnrollmentAuthority::AuthenticatedSession { .. } => {
+                panic!("unexpected authority: {other:?}")
+            }
+        }
+
+        assert!(
+            restored_token_assertion(
+                &EnrollmentAuthority::Token {
+                    key,
+                    expected_org: Some("globex".to_string()),
+                },
+                &published,
+            )
+            .is_none(),
+            "an explicit assertion must not be replaced by the persisted one"
+        );
+
+        assert!(
+            restored_token_assertion(
+                &EnrollmentAuthority::AuthenticatedSession {
+                    access_token: SessionToken::new("t".to_string()),
+                    org: "acme".to_string(),
+                },
+                &published,
+            )
+            .is_none(),
+            "a login authority has no token assertion to restore"
+        );
     }
 
     #[tokio::test]

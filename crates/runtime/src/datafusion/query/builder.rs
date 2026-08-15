@@ -158,7 +158,10 @@ impl QueryBuilder {
         // The tracker is the only emitter of the query metrics, so it is always
         // built — `runtime.task_history.enabled` only controls what it reports.
         let tracker = Some(QueryTracker {
-            task_history_enabled: self.df.task_history_enabled,
+            task_history_enabled: self
+                .df
+                .task_history_enabled
+                .load(std::sync::atomic::Ordering::Relaxed),
             schema: None,
             query_duration_secs: None,
             query_execution_duration_secs: None,
