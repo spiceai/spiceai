@@ -1217,14 +1217,27 @@ impl DataFusion {
     /// names it did claim are released rather than left holding tables nothing
     /// exposes.
     pub fn release_internal_table(&self, table_name: &TableReference) {
+        {
+            // The writer marker goes first, while the name is still reserved and
+            // nothing else can be registered under it — so the marker removed here
+            // is certainly the one this reservation added. Releasing the name
+            // first would let a dataset claim it and mark itself writable in
+            // between, and this cleanup would then strip *that* dataset's marker,
+            // leaving a read-write dataset registered and treated as read-only.
+            let Ok(mut writers) = self.data_writers.write() else {
+                // Nothing is released at all rather than handing the name over
+                // with a stale marker behind it: a name left reserved is a
+                // recoverable state, a dataset silently made read-only is not.
+                return;
+            };
+            writers.remove(table_name);
+        }
+
         if let Some(schema_name) = table_name.schema()
             && let Some(registered_schema) = self.schema(schema_name)
             && let Some(spice_schema) = registered_schema.downcast_ref::<SpiceSchemaProvider>()
         {
             spice_schema.release_reserved_table(table_name.table());
-        }
-        if let Ok(mut writers) = self.data_writers.write() {
-            writers.remove(table_name);
         }
     }
 
@@ -6804,6 +6817,41 @@ mod tests {
                 .expect("and nothing reserved: the name is free for the next claim");
         }
 
+        /// A release that cannot finish keeps the name rather than exposing it.
+        ///
+        /// The writer marker is removed while the name is still reserved, so it is
+        /// certainly this reservation's own. If that cannot be done, handing the
+        /// name over anyway would leave the marker behind for whatever claims it
+        /// next — a dataset registered read-write and then stripped to read-only.
+        /// A name left reserved is recoverable; that is not.
+        #[tokio::test]
+        async fn a_release_that_cannot_finish_keeps_the_name() {
+            let df = DataFusionBuilder::new(
+                RuntimeStatus::new(),
+                Arc::new(AcceleratorEngineRegistry::new()),
+                Handle::current(),
+            )
+            .build();
+            let name = TableReference::partial(SPICE_RUNTIME_SCHEMA, "held");
+            df.reserve_internal_table(name.clone(), table("internal"))
+                .expect("reserve the name");
+
+            let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _guard = df.data_writers.write().expect("take the writer registry");
+                panic!("poison the writer registry");
+            }));
+            assert!(poisoned.is_err(), "the panic was caught, not swallowed");
+
+            df.release_internal_table(&name);
+
+            assert!(df.table_exists(&name), "the reservation is kept");
+            let error = df
+                .ctx
+                .register_table(name.clone(), table("dataset"))
+                .expect_err("and the name is not exposed to anything else");
+            assert!(error.to_string().contains("reserved"), "{error}");
+        }
+
         /// Task history claims two names in scheduler mode and the pair is not
         /// atomic, so the first has to be releasable when the second is lost.
         #[tokio::test]
@@ -6822,11 +6870,19 @@ mod tests {
             df.reserve_internal_table(second.clone(), table("federated"))
                 .expect("reserve the second name");
 
+            assert!(
+                df.is_writable(&first),
+                "a reserved internal table is writable"
+            );
             df.release_internal_table(&first);
 
             assert!(
                 !df.table_exists(&first),
                 "the released name holds nothing and is free again"
+            );
+            assert!(
+                !df.is_writable(&first),
+                "and the writer marker went with it"
             );
             df.ctx
                 .register_table(first.clone(), table("dataset"))
