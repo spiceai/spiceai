@@ -9131,18 +9131,25 @@ impl CayenneTableProvider {
             if let Some(bloom) = f.pk_bloom.as_deref().and_then(PkBloom::from_bytes) {
                 blooms.push(bloom);
             } else {
-                // A live cold file without a usable bloom (legacy row, over
-                // the per-file cap, or corrupt) means the union would omit
-                // that file's keys. Missing a cold key would let an upsert
+                // A live cold file without a usable bloom (no bloom row, over
+                // the per-file cap, corrupt, or bits this binary's probe
+                // function did not place) means the union would omit that
+                // file's keys. Missing a cold key would let an upsert
                 // false-negative and double-count, so fall back to the exact
                 // cold scan for the whole table. Nothing to publish and nothing
                 // to pair: the exact fold reads the manifest under the rebuild's
                 // own fence.
+                //
+                // `unreadable` separates the two: a file that HAS bloom bytes
+                // this build declines to probe is the only signal that a bloom
+                // format or probe-function change is in play, and it is
+                // otherwise indistinguishable from a file that never had one.
                 tracing::debug!(
                     target: "cayenne::compaction",
                     table = self.table_metadata.table_name.as_str(),
                     file = f.file_url.as_str(),
-                    "Cold-tier file has no PK bloom; keyset rebuild falls back to the exact cold scan"
+                    unreadable = f.pk_bloom.is_some(),
+                    "Cold-tier file has no usable PK bloom; keyset rebuild falls back to the exact cold scan"
                 );
                 self.store_cold_pk_existence(None);
                 return Ok(ColdKeysetPlan {
