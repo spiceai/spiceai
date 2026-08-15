@@ -37,6 +37,7 @@ use datafusion_datasource::file_sink_config::FileSinkConfig;
 use datafusion_datasource::sink::DataSinkExec;
 use datafusion_datasource::source::DataSourceExec;
 use datafusion_execution::cache::cache_manager::CachedFileMetadataEntry;
+use datafusion_execution::runtime_env::RuntimeEnv;
 use datafusion_expr::dml::InsertOp;
 use datafusion_physical_expr::LexRequirement;
 use datafusion_physical_expr::PhysicalExprRef;
@@ -476,12 +477,43 @@ impl VortexFormat {
         &self.opts
     }
 
-    /// Invalidates cached Vortex segments for the exact object-store paths and
-    /// physically evicts them before returning.
-    pub async fn invalidate_segment_cache_paths(&self, paths: HashSet<Path>) {
+    /// Invalidates every cached artifact this format holds for the exact
+    /// object-store paths — the file footers in the shared
+    /// [`FileMetadataCache`](datafusion_execution::cache::cache_manager::FileMetadataCache)
+    /// and the decoded segments — and physically evicts them before returning.
+    ///
+    /// Callers pass the paths of objects a retirement has confirmed absent.
+    /// Both caches are keyed by [`ObjectMeta::location`], so the same set
+    /// addresses both, and taking them together is what keeps a caller from
+    /// releasing one and silently retaining the other.
+    pub async fn invalidate_cached_paths(&self, runtime_env: &RuntimeEnv, paths: HashSet<Path>) {
+        Self::invalidate_footer_cache_paths(runtime_env, &paths);
         if let Some(cache) = self.segment_cache.as_ref() {
             cache.invalidate_paths(paths).await;
         }
+    }
+
+    /// Evicts the cached footers of the exact object-store paths, returning how
+    /// many were resident.
+    ///
+    /// The footer cache is process-wide, shared with every other format, and has
+    /// neither a TTL nor any invalidation of its own: entries leave it only when
+    /// another `put` pushes them out under capacity pressure. A footer read for a
+    /// file that has since been retired is therefore unreachable — every path is
+    /// written once under a fresh directory, so it can never be looked up again —
+    /// yet stays resident, holding a share of a budget that live metadata for
+    /// other tables competes for. Evicting on retirement is what gives it back.
+    ///
+    /// Serving a stale footer was never possible (a reader checks
+    /// [`CachedFileMetadataEntry::is_valid_for`] against the current object), so
+    /// evicting a path that turns out to still be live costs one re-read, not
+    /// correctness.
+    pub fn invalidate_footer_cache_paths(runtime_env: &RuntimeEnv, paths: &HashSet<Path>) -> usize {
+        let cache = runtime_env.cache_manager.get_file_metadata_cache();
+        paths
+            .iter()
+            .filter(|path| cache.remove(path).is_some())
+            .count()
     }
 
     /// Returns the current number of cached Vortex segments, or `None` when the
