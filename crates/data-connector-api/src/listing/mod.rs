@@ -86,11 +86,13 @@ pub struct ParsedFileExtension {
     pub compression: Option<FileCompressionType>,
 }
 
+#[must_use]
 pub fn parse_file_extension_param(value: &str) -> Option<ParsedFileExtension> {
     let extension = value.trim().trim_start_matches('.');
     parse_extension_components(&extension.split('.').collect::<Vec<_>>(), false)
 }
 
+#[must_use]
 pub fn detect_file_extension_from_url_or_path(value: &str) -> Option<ParsedFileExtension> {
     Url::parse(value)
         .ok()
@@ -98,6 +100,7 @@ pub fn detect_file_extension_from_url_or_path(value: &str) -> Option<ParsedFileE
         .or_else(|| detect_file_extension_from_path(value))
 }
 
+#[must_use]
 pub fn detect_file_extension_from_path(path: &str) -> Option<ParsedFileExtension> {
     let path = path
         .split(['?', '#'])

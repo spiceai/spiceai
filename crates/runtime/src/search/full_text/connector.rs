@@ -54,7 +54,6 @@ impl FullTextConnector {
     /// while `append_stream` is not; both peel the same layer.
     #[expect(clippy::needless_pass_by_value)]
     fn indexed_stream_inputs(
-        &self,
         federated_table: Arc<dyn FederatedTableProvider>,
     ) -> Option<(Arc<Indexes>, Arc<dyn FederatedTableProvider>)> {
         let table_provider = federated_table.try_table_provider_sync()?;
@@ -219,7 +218,7 @@ impl DataConnector for FullTextConnector {
         federated_table: Arc<dyn FederatedTableProvider>,
         dataset: &DatasetSpec,
     ) -> Option<ChangesStream> {
-        let (indexes, below) = self.indexed_stream_inputs(federated_table)?;
+        let (indexes, below) = Self::indexed_stream_inputs(federated_table)?;
         let stream = self
             .inner_connector
             .changes_stream(context, below, dataset)
@@ -235,7 +234,7 @@ impl DataConnector for FullTextConnector {
         &self,
         federated_table: Arc<dyn FederatedTableProvider>,
     ) -> Option<ChangesStream> {
-        let (indexes, below) = self.indexed_stream_inputs(federated_table)?;
+        let (indexes, below) = Self::indexed_stream_inputs(federated_table)?;
         let stream = self.inner_connector.append_stream(below)?;
         Some(Self::maintaining(stream, indexes))
     }

@@ -498,7 +498,7 @@ pub trait ListingTableConnector: DataConnector {
     /// which skips a re-fetch when the object is unchanged.
     ///
     /// Only object stores that return a strong per-object version identifier on
-    /// `HEAD` qualify; a store whose ETag changes on re-upload of identical
+    /// `HEAD` qualify; a store whose `ETag` changes on re-upload of identical
     /// bytes, or which omits one, would serve stale data. Defaults to `false`,
     /// so a connector opts in only after its store has been checked.
     fn supports_single_file_version_cache(&self) -> bool {
@@ -521,6 +521,11 @@ pub trait ListingTableConnector: DataConnector {
     /// # Returns
     ///
     /// A [`DataConnectorResult`] containing the resolved [`Url`] of the object store.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the dataset's `from` (or the supplied `url`) is not a
+    /// URL this connector's object store can address.
     fn get_object_store_url(
         &self,
         dataset: &DatasetSpec,
@@ -540,6 +545,13 @@ pub trait ListingTableConnector: DataConnector {
         )
     }
 
+    /// The object store this connector reads `dataset` from.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the dataset's URL cannot be resolved or the store
+    /// cannot be constructed from the connector's parameters (bad credentials,
+    /// unreachable endpoint).
     fn get_object_store(&self, dataset: &DatasetSpec) -> DataConnectorResult<Arc<dyn ObjectStore>>
     where
         Self: Display,
@@ -863,6 +875,10 @@ pub trait ListingTableConnector: DataConnector {
     /// Returns a [`JsonFormat`] based on the provided [`Datasets`] parameters.
     ///
     /// If the [`Dataset`] has the relevant parameter, return an error if the value is invalid.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `schema_infer_max_records` is present but not a number.
     fn get_jsonl_format(
         &self,
         dataset: &DatasetSpec,
@@ -892,6 +908,11 @@ pub trait ListingTableConnector: DataConnector {
     /// Returns a [`SpiceJsonFormat`] based on the provided [`Datasets`] parameters.
     ///
     /// If the [`Dataset`] has the relevant parameter, return an error if the value is invalid.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `schema_infer_max_records` is not a number, or
+    /// `json_format` is not one of the supported formats.
     fn get_json_format(
         &self,
         dataset: &DatasetSpec,
@@ -963,6 +984,11 @@ pub trait ListingTableConnector: DataConnector {
     /// Returns a [`CsvFormat`] based on the provided [`Datasets`] parameters, and choice of delimiter.
     ///
     /// Uses the appropriate parameters based on the [`DelimitedFormat`] provided.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the quote or escape parameter is not a single
+    /// character, or `schema_infer_max_records` is not a number.
     fn delimiter_separated_format(
         &self,
         params: &Parameters,
@@ -1321,6 +1347,13 @@ pub trait ListingTableConnector: DataConnector {
         }
     }
 
+    /// Drops partition columns from `schema` that the files already carry, so a
+    /// hive-partitioned dataset does not expose the same column twice.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a partition column collides with a file column of a
+    /// different type, which cannot be reconciled into one schema.
     fn deduplicate_partition_columns_expressed_in_file(
         &self,
         dataset: &DatasetSpec,
@@ -1841,6 +1874,11 @@ impl SensitiveListingTableUrl {
 /// `runtime.params.parquet_page_index` (`required` | `auto` | `skip`) and
 /// sets `enable_page_index` accordingly. When no runtime is available,
 /// `enable_page_index` retains the `DataFusion` default (`true`).
+///
+/// # Errors
+///
+/// Returns an error if `runtime.params.parquet_page_index` is not one of the
+/// accepted values, or a resulting option is rejected by `DataFusion`.
 pub fn build_table_parquet_options(
     app: Option<&Arc<App>>,
 ) -> std::result::Result<TableParquetOptions, DataFusionError> {

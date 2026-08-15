@@ -224,6 +224,11 @@ impl Validator for AuthValidator {
 /// Initiate a [`ConfigLoader`] with AWS credentials as we'd expect them to be defined in [`Parameters`] (for a given `provider_name`).
 ///
 /// Return [`ConfigLoader`] to allow further customisation.
+///
+/// # Errors
+///
+/// Returns an error if the configured credentials are incomplete or inconsistent
+/// — a key without a secret, or an unusable IAM role source.
 pub async fn initiate_config_with_credentials(
     provider_name: &'static str,
     region_name: &'static str,
@@ -274,8 +279,14 @@ pub async fn initiate_config_with_credentials(
 /// Return [`ConfigLoader`] to allow further customisation.
 ///
 /// A generic AWS auth helper (parameterized by `provider_name`), used by AWS
-/// connector crates such as `connector-dynamodb`; kept in `runtime` alongside the
-/// other connector-support parameter helpers rather than gated to any one connector.
+/// connector crates such as `connector-dynamodb` as well as the runtime's own
+/// in-body S3/Glue/Iceberg connectors, so it lives with the connector contract
+/// rather than inside any one connector.
+///
+/// # Errors
+///
+/// Returns an error if the configured auth method is unsupported, or if its
+/// required parameters are missing or inconsistent.
 #[expect(clippy::too_many_arguments)]
 pub async fn initiate_config_with_auth_method(
     provider_name: &'static str,
