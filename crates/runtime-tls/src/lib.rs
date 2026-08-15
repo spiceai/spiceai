@@ -72,10 +72,10 @@ impl TlsControl {
         self.watcher.trigger_reload_all()
     }
 
-    /// Underlying watcher handle. Crate-private so the runtime
-    /// boundary stays opaque — binary callers go through the high-level
-    /// `reload_all` API.
-    pub(crate) fn watcher(&self) -> &Arc<CertWatcher> {
+    /// Underlying watcher handle, for subsystems (e.g. cluster mTLS) that
+    /// register their own reloadable material directly with the watcher.
+    #[must_use]
+    pub fn watcher(&self) -> &Arc<CertWatcher> {
         &self.watcher
     }
 }
