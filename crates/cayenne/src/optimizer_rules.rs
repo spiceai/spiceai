@@ -244,7 +244,10 @@ impl std::fmt::Debug for CayenneDynamicFilterSharing {
 /// is wired through config (the runtime always does this), any join type that
 /// sort-merge supports — inner, left/right/full outer, and semi/anti — whose
 /// estimated build side would not fit its share of the pool is rewritten to a
-/// `SortMergeJoinExec` with spillable `SortExec` inputs. Smaller joins, and
+/// `SortMergeJoinExec` with spillable `SortExec` inputs. A build side that
+/// exceeds only the per-join fair share, rather than the absolute pool
+/// fraction, must also clear `sort_merge_min_rows`, so a query holding many
+/// joins open does not push mid-size ones onto the slower plan. Smaller joins, and
 /// (when no pool is configured) everything but same-source semi/anti joins, are
 /// left as hash joins because that is usually the faster plan. Joins that carry
 /// an embedded output projection are also left alone — `HashJoinExec` exposes
@@ -253,10 +256,12 @@ impl std::fmt::Debug for CayenneDynamicFilterSharing {
 #[derive(Default)]
 pub struct CayenneAntiJoinSortMergeRewriter;
 
-/// Only rewrite same-source joins whose LEFT (build) input has
-/// `Precision::Exact` row count exceeding this threshold. Below it, the
-/// in-memory hash table is usually faster than two explicit sort buffers.
-const ANTI_JOIN_SORT_MERGE_MIN_EXACT_ROWS: usize = 10_000_000;
+/// Build-side row floor below which the in-memory hash table is usually faster
+/// than two explicit sort buffers. See `sort_merge_min_rows` for how each path
+/// applies it — the no-pool path additionally scopes itself to same-source
+/// semi/anti joins with a `Precision::Exact` count, so this is not the whole
+/// test there.
+const ANTI_JOIN_SORT_MERGE_MIN_ROWS: usize = 10_000_000;
 const ANTI_JOIN_SORT_MERGE_MEMORY_POOL_FRACTION: f64 = 0.125;
 const EXACT_JOIN_FILTER_MIN_PROBE_ROWS: usize = 100_000;
 const EXACT_JOIN_FILTER_MIN_PROBE_TO_BUILD_RATIO: usize = 10;
@@ -264,8 +269,8 @@ const EXACT_JOIN_FILTER_MIN_PROBE_TO_BUILD_RATIO: usize = 10;
 extensions_options! {
     /// Cayenne optimizer configuration.
     pub struct CayenneOptimizerConfig {
-        /// Minimum exact LEFT/build-side row count before considering the same-source hash-join to sort-merge rewrite.
-        pub sort_merge_min_rows: usize, default = ANTI_JOIN_SORT_MERGE_MIN_EXACT_ROWS
+        /// Minimum LEFT/build-side row count before rewriting a hash join to sort-merge. A build side estimated past `sort_merge_memory_pool_fraction` of the pool is rewritten whatever its row count; below that, a build side exceeding only its even share of the pool must also clear this floor.
+        pub sort_merge_min_rows: usize, default = ANTI_JOIN_SORT_MERGE_MIN_ROWS
 
         /// Fraction of the query memory pool that the estimated hash-join build side must exceed before rewriting to sort-merge. Set to 0 to disable the memory gate.
         pub sort_merge_memory_pool_fraction: f64, default = ANTI_JOIN_SORT_MERGE_MEMORY_POOL_FRACTION
@@ -795,7 +800,11 @@ fn try_rewrite_oversized_join(
         // is eligible when its estimated build side would not fit its share of
         // the pool. Build-side row counts may be inexact here: a build side that
         // is itself a join result rarely carries exact statistics, and an
-        // inexact estimate is enough to choose spilling over an OOM.
+        // inexact estimate is enough to choose spilling over an OOM. Note that
+        // inexactness now cuts both ways — the same count is weighed against
+        // `sort_merge_min_rows` below, so an underestimate can hold a join to the
+        // absolute gate instead of its fair share, where before it could only
+        // make the rule more eager.
         if !join_touches_cayenne(hash_join) {
             return Ok(None);
         }
@@ -817,7 +826,29 @@ fn try_rewrite_oversized_join(
             .sort_merge_memory_pool_bytes
             .map_or(gate_bytes, |pool_bytes| pool_bytes / hash_join_count.max(1));
         let effective_gate = gate_bytes.min(fair_share);
-        let fire = estimated_build_bytes > effective_gate;
+
+        // Which of the two terms a join is held to depends on its row count.
+        // Past `gate_bytes` a build side is oversized on the pool's own terms and
+        // spills whatever its rows say — a short-but-wide build can exhaust the
+        // non-spillable hash table well below any row floor. Only the fair-share
+        // term, which tightens as `hash_join_count` grows, can single out a
+        // mid-size join that would have finished comfortably in memory, so a
+        // build side is held to it only once it also clears `sort_merge_min_rows`.
+        //
+        // That is a deliberate loosening of the fair-share bound: a plan wide
+        // enough that `hash_join_count > 1 / sort_merge_memory_pool_fraction` can
+        // now admit builds summing past the pool (at the 0.125 default, above
+        // eight joins). Closing that back up belongs in the share itself, which
+        // charges a 1,000-row build the same slice as a billion-row one and so
+        // under-reports what is free: weighting it by estimated bytes is the fix
+        // (#13155), not holding large builds back from spilling.
+        let clears_row_floor = build_row_count > optimizer_config.sort_merge_min_rows;
+        let applicable_gate = if clears_row_floor {
+            effective_gate
+        } else {
+            gate_bytes
+        };
+        let fire = estimated_build_bytes > applicable_gate;
 
         tracing::debug!(
             join_type = ?hash_join.join_type(),
@@ -826,6 +857,9 @@ fn try_rewrite_oversized_join(
             gate_bytes,
             fair_share,
             effective_gate,
+            clears_row_floor,
+            applicable_gate,
+            sort_merge_min_rows = optimizer_config.sort_merge_min_rows,
             hash_join_count,
             fire,
             "Evaluated Cayenne oversized-join memory gate"
@@ -949,11 +983,21 @@ fn cayenne_optimizer_config(config: &ConfigOptions) -> CayenneOptimizerConfig {
         .unwrap_or_default()
 }
 
+/// The absolute byte gate: `sort_merge_memory_pool_fraction` of the pool.
+///
+/// This is the one place the fraction becomes bytes, so it is where the
+/// fraction's bounds are enforced. Nothing upstream constrains it to `<= 1.0` —
+/// `parse_f64_runtime_param` admits any finite value, and a direct `DataFusion`
+/// user can set the field outright — and a gate above the pool would describe a
+/// build side the pool cannot hold as fitting comfortably within it. Clamping
+/// here rather than at the callers keeps every consumer, present and future, on
+/// a gate that means what it says.
 fn sort_merge_memory_gate_bytes(config: &CayenneOptimizerConfig) -> Option<usize> {
     let fraction = config.sort_merge_memory_pool_fraction;
     if !fraction.is_finite() || fraction <= 0.0 {
         return None;
     }
+    let fraction = fraction.min(1.0);
 
     config
         .sort_merge_memory_pool_bytes
@@ -1597,11 +1641,11 @@ impl PhysicalOptimizerRule for CayenneJoinRewriter {
 #[cfg(test)]
 mod tests {
     use super::{
-        ANTI_JOIN_SORT_MERGE_MIN_EXACT_ROWS, CayenneAntiJoinSortMergeRewriter,
+        ANTI_JOIN_SORT_MERGE_MIN_ROWS, CayenneAntiJoinSortMergeRewriter,
         CayenneDynamicFilterSharing, CayenneMaintainedAggregateRewriter, CayenneOptimizerConfig,
         CayenneStatsAggregateRewriter, FilterAddition, HASH_JOIN_BUILD_SIDE_OVERHEAD_DEN,
         HASH_JOIN_BUILD_SIDE_OVERHEAD_NUM, apply_filter_additions, build_side_memory_estimate,
-        plan_schema_fields,
+        plan_schema_fields, sort_merge_memory_gate_bytes,
     };
     use crate::maintained_aggregate::{
         MaintainedAggregateExec, MaintainedAggregateExpr, MaintainedAggregateFunction,
@@ -2341,7 +2385,7 @@ mod tests {
         cayenne_file_exec_with_num_rows(
             schema,
             path,
-            Precision::Exact(ANTI_JOIN_SORT_MERGE_MIN_EXACT_ROWS + 1),
+            Precision::Exact(ANTI_JOIN_SORT_MERGE_MIN_ROWS + 1),
         )
     }
 
@@ -3021,7 +3065,7 @@ mod tests {
         let left = cayenne_file_exec_with_num_rows(
             &schema,
             "order_line.vortex",
-            Precision::Exact(ANTI_JOIN_SORT_MERGE_MIN_EXACT_ROWS),
+            Precision::Exact(ANTI_JOIN_SORT_MERGE_MIN_ROWS),
         );
         let right = large_exact_cayenne_file_exec(&schema, "order_line.vortex");
         let join = Arc::new(hash_join_with_join_type(
@@ -3076,11 +3120,8 @@ mod tests {
             JoinType::LeftAnti,
             NullEquality::NullEqualsNothing,
         ));
-        let config = config_with_cayenne_optimizer(
-            Some(ANTI_JOIN_SORT_MERGE_MIN_EXACT_ROWS + 2),
-            None,
-            None,
-        );
+        let config =
+            config_with_cayenne_optimizer(Some(ANTI_JOIN_SORT_MERGE_MIN_ROWS + 2), None, None);
 
         let optimized = optimize_anti_join_sort_merge_with_config(join, &config);
 
@@ -3149,6 +3190,154 @@ mod tests {
         );
     }
 
+    /// Plan holding `hash_join_count` `LeftAnti` joins over Cayenne scans, the
+    /// first with a `build_rows`-row build side and the rest tiny. Only the
+    /// count matters to the fair-share term, so the tiny joins just make the
+    /// pool divide further; a union keeps them siblings, matching how
+    /// `rewrites_concurrent_inner_hash_joins_exceeding_fair_share` builds its
+    /// multi-join fixture. The join under test is child 0.
+    fn plan_with_hash_joins(build_rows: usize, hash_join_count: usize) -> Arc<dyn ExecutionPlan> {
+        let schema = order_line_schema();
+        let anti_join = |rows: Precision<usize>| {
+            Arc::new(hash_join_with_join_type(
+                cayenne_file_exec_with_num_rows(&schema, "order_line.vortex", rows),
+                cayenne_file_exec_with_num_rows(&schema, "order_line.vortex", TINY_BUILD),
+                "order_id",
+                "order_id",
+                JoinType::LeftAnti,
+                NullEquality::NullEqualsNothing,
+            )) as Arc<dyn ExecutionPlan>
+        };
+
+        let mut children = vec![anti_join(Precision::Exact(build_rows))];
+        children.extend((1..hash_join_count).map(|_| anti_join(TINY_BUILD)));
+        UnionExec::try_new(children).expect("union of same-schema joins should be valid")
+    }
+
+    /// Assert the join under test (child 0 of [`plan_with_hash_joins`]) after the
+    /// rewriter has run.
+    fn assert_join_under_test(
+        plan: Arc<dyn ExecutionPlan>,
+        config: &ConfigOptions,
+        expect_sort_merge: bool,
+        why: &str,
+    ) {
+        let optimized = optimize_anti_join_sort_merge_with_config(plan, config);
+        let union = optimized
+            .downcast_ref::<UnionExec>()
+            .expect("top node should remain a union");
+        let children = union.children();
+        let join = children
+            .first()
+            .expect("union should keep the join under test");
+        assert_eq!(join.is::<SortMergeJoinExec>(), expect_sort_merge, "{why}");
+    }
+
+    const TINY_BUILD: Precision<usize> = Precision::Exact(1_000);
+
+    /// Shared arithmetic for the fair-share tests. `order_line_schema` is three
+    /// `Int64`s, so a row estimates 24 B and a build side estimates
+    /// `rows × 24 × 2.5` after the hash-table overhead factor. At a 144 MiB pool
+    /// and fraction 0.5 over three joins the absolute gate is 72 MiB and the fair
+    /// share is 48 MiB, so a 1M-row build (60 MB) falls between them — the band
+    /// where the rewrite used to fire on a join that fits memory comfortably.
+    const FAIR_SHARE_POOL_BYTES: usize = 144 * 1024 * 1024;
+    const FAIR_SHARE_POOL_FRACTION: f64 = 0.5;
+    const FAIR_SHARE_JOIN_COUNT: usize = 3;
+    const BETWEEN_GATES_BUILD_ROWS: usize = 1_000_000;
+
+    fn fair_share_config(min_rows: Option<usize>) -> ConfigOptions {
+        config_with_cayenne_optimizer(
+            min_rows,
+            Some(FAIR_SHARE_POOL_FRACTION),
+            Some(FAIR_SHARE_POOL_BYTES),
+        )
+    }
+
+    #[test]
+    fn leaves_mid_size_join_that_only_the_fair_share_gate_wants_rewritten() {
+        assert_join_under_test(
+            plan_with_hash_joins(BETWEEN_GATES_BUILD_ROWS, FAIR_SHARE_JOIN_COUNT),
+            &fair_share_config(None),
+            false,
+            "a build side under the absolute pool fraction and under sort_merge_min_rows should stay a hash join even when the fair-share term is exceeded",
+        );
+    }
+
+    /// Companion to the test above: same plan, same pool, only
+    /// `sort_merge_min_rows` differs. Two outcomes from one knob is what proves
+    /// it is read on the memory-gated path. Before this pair it was read only on
+    /// the no-pool arm, which a runtime reaches solely by setting
+    /// `cayenne_sort_merge_memory_pool_fraction` to 0 — never at the default.
+    #[test]
+    fn lowering_sort_merge_min_rows_rewrites_the_same_mid_size_join() {
+        assert_join_under_test(
+            plan_with_hash_joins(BETWEEN_GATES_BUILD_ROWS, FAIR_SHARE_JOIN_COUNT),
+            &fair_share_config(Some(BETWEEN_GATES_BUILD_ROWS / 2)),
+            true,
+            "a build side clearing a lowered sort_merge_min_rows should be rewritten, otherwise the knob is inert on the pooled path",
+        );
+    }
+
+    /// The row floor must never suppress the OOM safety net. A 2M-row build
+    /// estimates 120 MB, past the 72 MiB absolute gate, so it spills even though
+    /// 2M is far below the 10M default floor — the guarantee
+    /// `rewrites_low_row_count_wide_build_when_byte_estimate_exceeds_memory_gate`
+    /// makes for a lone join, held here with the fair-share term also active.
+    #[test]
+    fn rewrites_build_past_the_absolute_pool_fraction_below_the_row_floor() {
+        assert_join_under_test(
+            plan_with_hash_joins(2_000_000, FAIR_SHARE_JOIN_COUNT),
+            &fair_share_config(None),
+            true,
+            "a build side past the absolute pool fraction must spill regardless of row count",
+        );
+    }
+
+    /// A 2 GiB pool with twelve hash joins at the default 0.125 fraction: the
+    /// absolute gate is 256 MiB and the fair share 2 GiB / 12 ≈ 170.7 MiB. A
+    /// 3.5M-row build estimates 210 MB, between the two, and used to be rewritten
+    /// at roughly a third of the intended floor.
+    #[test]
+    fn keeps_mid_size_build_as_hash_join_across_twelve_concurrent_joins() {
+        assert_join_under_test(
+            plan_with_hash_joins(3_500_000, 12),
+            &config_with_cayenne_optimizer(None, Some(0.125), Some(2 * 1024 * 1024 * 1024)),
+            false,
+            "twelve joins dividing the pool should not drag a 3.5M-row build onto sort-merge",
+        );
+    }
+
+    /// `sort_merge_memory_pool_fraction` is never validated against 1.0 upstream,
+    /// so the gate clamps it: a gate above the pool would report a build side the
+    /// pool cannot hold as fitting inside it.
+    #[test]
+    fn memory_gate_clamps_a_fraction_above_one_to_the_whole_pool() {
+        let gate_for = |fraction: f64| {
+            sort_merge_memory_gate_bytes(&CayenneOptimizerConfig {
+                sort_merge_memory_pool_bytes: Some(1_024),
+                sort_merge_memory_pool_fraction: fraction,
+                ..CayenneOptimizerConfig::default()
+            })
+        };
+
+        assert_eq!(
+            gate_for(4.0),
+            Some(1_024),
+            "an over-1.0 fraction must not produce a gate larger than the pool"
+        );
+        assert_eq!(
+            gate_for(0.25),
+            Some(256),
+            "a fraction below 1.0 is unaffected by the clamp"
+        );
+        assert_eq!(
+            gate_for(0.0),
+            None,
+            "fraction 0 still disables the memory gate"
+        );
+    }
+
     #[test]
     fn leaves_same_source_left_anti_hash_join_when_build_estimate_fits_memory_gate() {
         let schema = order_line_schema();
@@ -3205,7 +3394,7 @@ mod tests {
         let left = cayenne_file_exec_with_num_rows(
             &schema,
             "order_line.vortex",
-            Precision::Inexact(ANTI_JOIN_SORT_MERGE_MIN_EXACT_ROWS + 1),
+            Precision::Inexact(ANTI_JOIN_SORT_MERGE_MIN_ROWS + 1),
         );
         let right = large_exact_cayenne_file_exec(&schema, "order_line.vortex");
         let join = Arc::new(hash_join_with_join_type(
@@ -3466,7 +3655,7 @@ mod tests {
         let left = cayenne_file_exec_with_num_rows(
             &schema,
             "order_line.vortex",
-            Precision::Inexact(ANTI_JOIN_SORT_MERGE_MIN_EXACT_ROWS + 1),
+            Precision::Inexact(ANTI_JOIN_SORT_MERGE_MIN_ROWS + 1),
         );
         let right = large_exact_cayenne_file_exec(&schema, "store_sales.vortex");
         let join = Arc::new(hash_join_with_join_type(
@@ -3523,7 +3712,7 @@ mod tests {
                 "external.parquet",
                 None,
                 Statistics::new_unknown(&schema)
-                    .with_num_rows(Precision::Exact(ANTI_JOIN_SORT_MERGE_MIN_EXACT_ROWS + 1)),
+                    .with_num_rows(Precision::Exact(ANTI_JOIN_SORT_MERGE_MIN_ROWS + 1)),
             )
         };
         let join = Arc::new(hash_join_with_join_type(
