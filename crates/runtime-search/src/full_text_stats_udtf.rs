@@ -93,8 +93,8 @@ impl<E: TableProviderExplorer> TextSearchStatsTableFunc<E> {
 
         let column = match args.next() {
             None => None,
-            Some(Expr::Column(Column { name, .. })) => Some(name.clone()),
-            Some(Expr::Literal(ScalarValue::Utf8(Some(name)), _)) => Some(name.clone()),
+            Some(Expr::Column(Column { name, .. }))
+            | Some(Expr::Literal(ScalarValue::Utf8(Some(name)), _)) => Some(name.clone()),
             Some(other) => {
                 return Err(DataFusionError::Plan(format!(
                     "text_search_stats: third argument must be a column name, but got {other:?}."

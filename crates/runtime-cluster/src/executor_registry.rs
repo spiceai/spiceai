@@ -818,10 +818,8 @@ fn covering_executor_ids(
         }
     }
 
-    match executor_selection::select_executors(&required_partitions, &executor_partition_map) {
-        Ok(selected) => selected,
-        Err(executor_selection::Error::MissingPartitions(_)) => Vec::new(),
-    }
+    executor_selection::select_executors(&required_partitions, &executor_partition_map)
+        .unwrap_or_default()
 }
 
 /// Returns executors that have both an active connection and a `FlightSQL` client.
