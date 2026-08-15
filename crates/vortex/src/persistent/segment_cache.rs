@@ -1471,6 +1471,11 @@ mod tests {
         let shared = SharedSegmentCache::new(1 << 20, true, "retirement");
         let retiring = Path::from("snapshot-a/retiring.vortex");
         let keeper = Path::from("snapshot-a/keeper.vortex");
+        // Retired without ever being opened, before or during. Nothing else can
+        // drop the state this retirement registers for it — the last-opener path
+        // needs an opener — so it is the one that proves the registration is
+        // temporary rather than a tombstone.
+        let never_opened = Path::from("snapshot-a/never-opened.vortex");
         let states = shared
             .path_states
             .as_ref()
@@ -1507,9 +1512,11 @@ mod tests {
             .expect("the open keeper file registers a state");
         keeper_state.active_puts.fetch_add(1, Ordering::SeqCst);
 
-        let mut retirement = std::pin::pin!(
-            shared.invalidate_paths(HashSet::from([retiring.clone(), keeper.clone()]))
-        );
+        let mut retirement = std::pin::pin!(shared.invalidate_paths(HashSet::from([
+            retiring.clone(),
+            keeper.clone(),
+            never_opened.clone(),
+        ])));
         let mut context = Context::from_waker(Waker::noop());
         assert!(
             std::future::Future::poll(retirement.as_mut(), &mut context).is_pending(),
@@ -1571,11 +1578,16 @@ mod tests {
             "no segment of a retired path may remain resident"
         );
 
+        assert!(
+            !states.contains_key(&never_opened),
+            "a retirement that registers a state for a path nothing opens must not leave it behind"
+        );
+
         drop(keeper_cache);
         drop(opened_mid_retirement);
         assert!(
             !states.contains_key(&retiring) && !states.contains_key(&keeper),
-            "a retirement that registers a state for an unopened path must not leave it behind"
+            "the states an opener took over must still go when that opener drops"
         );
     }
 }
