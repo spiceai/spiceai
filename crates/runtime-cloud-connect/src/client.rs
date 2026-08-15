@@ -69,6 +69,7 @@ use crate::handlers::{
 };
 use crate::heartbeat::{build_heartbeat, build_telemetry, now_unix};
 use crate::identity::{AppAttachment, Identity, IdentityStore};
+use crate::mutation_lock::{MUTATION_LOCK_TIMEOUT, MutationLock};
 use crate::proto;
 use crate::session::SessionAck;
 use crate::shutdown::Shutdown;
@@ -1375,11 +1376,14 @@ impl ClientDriver {
     ///
     /// What it removes, and in this order:
     ///
-    /// 1. The **delivered-secrets cache**, before the identity. The only key
-    ///    that opens it lives in `identity.json`, so clearing the identity first
-    ///    leaves the app's secrets behind on a released host as ciphertext
-    ///    nothing can open, audit, or even identify — the hazard
-    ///    [`crate::secret_cache::remove`] exists to prevent.
+    /// 1. The **delivered-secrets cache**, before the identity. The only key that
+    ///    opens it lives in `identity.json`, so clearing the identity first
+    ///    strands the file: its values become undecryptable, while its plaintext
+    ///    authenticated header keeps the secret NAMES and the deployment version
+    ///    readable to anyone on the box (that header is what lets `spice connect
+    ///    status` list a cache with no key at all). A released host would keep an
+    ///    inventory of the app's secret names beside ciphertext nobody can open —
+    ///    the hazard [`crate::secret_cache::remove`] exists to prevent.
     /// 2. The **identity**, which is what actually releases the instance and
     ///    stops it reconnecting.
     /// 3. The **enrollment draft**, so the next enrollment in this directory
@@ -1411,37 +1415,7 @@ impl ClientDriver {
         command_id: &str,
         live_identifier: &Arc<RwLock<String>>,
     ) -> bool {
-        // Own the whole state transition before touching a file, the same
-        // boundary the local command takes: without it a removal can clear old
-        // state while an enrollment is promoting a replacement identity under
-        // this directory's lock. One non-blocking attempt — a contended
-        // directory means an enrollment is in flight, and letting the control
-        // plane retry beats holding the control stream while we wait on it.
-        let transaction = match EnrollmentTransactionLock::try_acquire_async(
-            &self.config.config_dir,
-        )
-        .await
-        {
-            Ok(transaction) => Arc::new(transaction),
-            Err(err) => {
-                tracing::warn!(
-                    "Cloud Connect: failed to acquire the enrollment transaction for {} before removal: {err}; reporting Remove as failed and staying connected",
-                    self.config.config_dir.display()
-                );
-                send_failed(
-                    tx,
-                    command_id,
-                    &format!(
-                        "failed to acquire the enrollment transaction for {}: {err}",
-                        self.config.config_dir.display()
-                    ),
-                )
-                .await;
-                return false;
-            }
-        };
-
-        let retained = match release_local_state(&self.config, &transaction).await {
+        let retained = match release_local_state(&self.config, MUTATION_LOCK_TIMEOUT).await {
             Ok(retained) => retained,
             Err(message) => {
                 send_failed(tx, command_id, &message).await;
@@ -1464,17 +1438,59 @@ impl ClientDriver {
     }
 }
 
-/// Clear the cloud-issued state this instance holds on disk, under an enrollment
-/// transaction the caller already owns.
+/// Clear the cloud-issued state this instance holds on disk, under the same two
+/// locks a local `spice connect` takes.
 ///
 /// `Ok` names whatever could not be removed, for the command result; an `Err`
-/// carries the message for a failed `Remove`, and only the identity can produce
-/// one. See [`ClientDriver::handle_remove`] for what is removed, in which order,
-/// and why.
+/// carries the message for a failed `Remove`. Failing to take either lock is one
+/// such `Err`: a removal that cannot exclude a concurrent local mutation must not
+/// proceed. See [`ClientDriver::handle_remove`] for what is removed, in which
+/// order, and why.
 async fn release_local_state(
     config: &CloudConnectConfig,
-    transaction: &Arc<EnrollmentTransactionLock>,
+    lock_timeout: Duration,
 ) -> std::result::Result<Vec<String>, String> {
+    // The OUTER lock, taken first. This is the same `connect.lock` a local
+    // `spice connect` holds for its whole transaction, so it is what actually
+    // excludes one: the enrollment transaction alone does not, because the
+    // endpoint override and the operation journals are written outside it
+    // (`commands::connect::transaction`), and a local run could rewrite state
+    // this removal had already deleted while still reporting success. Ordering is
+    // fixed by `mutation_lock`: MutationLock outer, then the enrollment
+    // transaction — never the reverse.
+    let _mutation = MutationLock::acquire_with_timeout(&config.config_dir, "remove", lock_timeout)
+        .await
+        .map_err(|err| {
+            tracing::warn!(
+                "Cloud Connect: failed to take the connect mutation lock for {} before removal: {err}; reporting Remove as failed and staying connected",
+                config.config_dir.display()
+            );
+            format!(
+                "failed to take the connect mutation lock for {}: {err}",
+                config.config_dir.display()
+            )
+        })?;
+
+    // Then the inner one: it is what a draft publication takes, so holding it
+    // stops a removal interleaving with an enrollment promoting a replacement
+    // identity. One non-blocking attempt — a contended directory means an
+    // enrollment is in flight, and letting the control plane retry beats holding
+    // the control stream while we wait on it.
+    let transaction = Arc::new(
+        EnrollmentTransactionLock::try_acquire_async(&config.config_dir)
+            .await
+            .map_err(|err| {
+                tracing::warn!(
+                    "Cloud Connect: failed to acquire the enrollment transaction for {} before removal: {err}; reporting Remove as failed and staying connected",
+                    config.config_dir.display()
+                );
+                format!(
+                    "failed to acquire the enrollment transaction for {}: {err}",
+                    config.config_dir.display()
+                )
+            })?,
+    );
+    let transaction = &transaction;
     // Named in the command result so the control plane and the portal learn that
     // a released host still holds something, rather than the operator
     // discovering it later.
@@ -1494,9 +1510,30 @@ async fn release_local_state(
         ));
     }
 
+    // The identity is guarded by whichever transaction protects ITS directory.
+    // `clear_with_transaction_async` refuses a guard whose draft path has a
+    // different parent, and `identity_path` is a public field documented as only
+    // "typically" inside the config dir — so for a split configuration the
+    // config-dir transaction is the wrong guard, and passing it would fail every
+    // Remove rather than protect anything. Acquiring the identity directory's own
+    // transaction keeps the split shape working without tightening the field.
+    let identity_transaction = match identity_transaction(config, transaction).await {
+        Ok(held) => held,
+        Err(err) => {
+            tracing::warn!(
+                "Cloud Connect: failed to acquire the enrollment transaction for the identity directory of {}: {err}; reporting Remove as failed and staying connected",
+                config.identity_path.display()
+            );
+            return Err(format!(
+                "failed to acquire the enrollment transaction for {}: {err}",
+                config.identity_path.display()
+            ));
+        }
+    };
+
     if let Err(err) = IdentityStore::clear_with_transaction_async(
         config.identity_path.clone(),
-        Arc::clone(transaction),
+        Arc::clone(&identity_transaction),
     )
     .await
     {
@@ -1557,6 +1594,35 @@ async fn release_local_state(
     }
 
     Ok(retained)
+}
+
+/// The transaction guarding the identity file.
+///
+/// Usually the config directory's own — the identity lives inside it, and one
+/// transaction covers the draft, the journals and the identity together. When
+/// [`CloudConnectConfig::identity_path`] points somewhere else, that directory
+/// has its own enrollment transaction, and it is the one that excludes an
+/// enrollment racing this removal for that file; the config-dir guard protects
+/// nothing there and `clear_with_transaction_async` rightly refuses it.
+///
+/// # Errors
+///
+/// Returns the acquisition failure when the identity directory's transaction is
+/// held elsewhere, which is a reason to fail the removal rather than clear the
+/// identity unguarded.
+async fn identity_transaction(
+    config: &CloudConnectConfig,
+    config_dir_transaction: &Arc<EnrollmentTransactionLock>,
+) -> std::result::Result<Arc<EnrollmentTransactionLock>, crate::draft::Error> {
+    let Some(identity_dir) = config.identity_path.parent() else {
+        return Ok(Arc::clone(config_dir_transaction));
+    };
+    if identity_dir == config.config_dir {
+        return Ok(Arc::clone(config_dir_transaction));
+    }
+    Ok(Arc::new(
+        EnrollmentTransactionLock::try_acquire_async(identity_dir).await?,
+    ))
 }
 
 /// Delete `path` off the Tokio driver task, treating a missing file as success.
@@ -2274,11 +2340,10 @@ mod tests {
     /// `spice connect remove` leaves it in: none of the cloud-issued state
     /// behind, and in particular no secrets whose key it just destroyed.
     mod removal {
-        use super::super::{EnrollmentTransactionLock, release_local_state};
+        use super::super::{MutationLock, release_local_state};
         use crate::config::CloudConnectConfig;
         use crate::draft::EnrollmentDraft;
         use crate::secret_cache::SECRET_CACHE_FILE;
-        use std::sync::Arc;
 
         struct Host {
             _dir: tempfile::TempDir,
@@ -2330,12 +2395,7 @@ mod tests {
             }
 
             async fn release(&self) -> std::result::Result<Vec<String>, String> {
-                let transaction = Arc::new(
-                    EnrollmentTransactionLock::try_acquire_async(&self.config.config_dir)
-                        .await
-                        .expect("acquire the enrollment transaction"),
-                );
-                release_local_state(&self.config, &transaction).await
+                release_local_state(&self.config, std::time::Duration::from_secs(5)).await
             }
         }
 
@@ -2367,6 +2427,67 @@ mod tests {
                     "{journal} left beside a removed identity stops the next enrollment"
                 );
             }
+        }
+
+        /// The split configuration the public `identity_path` field allows: the
+        /// identity lives outside the config directory. The config-dir guard does
+        /// not protect it, so passing that guard would fail every Remove — the
+        /// release has to take the identity directory's own transaction instead.
+        #[tokio::test]
+        async fn it_releases_an_identity_kept_outside_the_config_directory() {
+            let dir = tempfile::tempdir().expect("create tempdir");
+            let config_dir = dir.path().join("config");
+            let identity_dir = dir.path().join("elsewhere");
+            std::fs::create_dir_all(&config_dir).expect("create config dir");
+            std::fs::create_dir_all(&identity_dir).expect("create identity dir");
+            let mut config = CloudConnectConfig::from_env_at("test-runtime", config_dir.clone());
+            config.identity_path = identity_dir.join("identity.json");
+            std::fs::write(&config.identity_path, "{}").expect("write identity");
+            std::fs::write(config_dir.join(SECRET_CACHE_FILE), "cached").expect("write cache");
+
+            let retained = release_local_state(&config, std::time::Duration::from_secs(5))
+                .await
+                .expect("a split identity path must still release");
+
+            assert!(
+                !config.identity_path.exists(),
+                "the identity outside the config dir must still be cleared"
+            );
+            assert!(retained.is_empty(), "{retained:?}");
+        }
+
+        /// The outer lock is the one a local `spice connect` holds, so a release
+        /// must not proceed while one is running. Deterministic: the lock is held
+        /// for the whole assertion, and released before the retry succeeds.
+        #[tokio::test]
+        async fn a_release_waits_for_a_local_connect_to_finish() {
+            let host = Host::enrolled();
+
+            let held = MutationLock::acquire(&host.config.config_dir, "connect")
+                .await
+                .expect("a local connect takes the directory");
+
+            let contended =
+                release_local_state(&host.config, std::time::Duration::from_millis(50)).await;
+            let message =
+                contended.expect_err("a release must not run while a local connect holds it");
+            assert!(
+                message.contains("connect mutation lock"),
+                "the failure must name the lock it could not take, got {message}"
+            );
+            assert!(
+                host.config.identity_path.exists(),
+                "and it must remove nothing before giving up, so the instance stays connected"
+            );
+
+            drop(held);
+            host.release()
+                .await
+                .expect("and it must proceed once that connect finishes");
+            assert!(
+                !host.config.identity_path.exists(),
+                "the release that took the lock still removes the identity"
+            );
         }
 
         /// The journals are non-fatal like the cache and the draft: the instance
@@ -2444,13 +2565,7 @@ mod tests {
         async fn it_succeeds_with_nothing_on_disk_to_remove() {
             let dir = tempfile::tempdir().expect("create tempdir");
             let config = CloudConnectConfig::from_env_at("test-runtime", dir.path().to_path_buf());
-            let transaction = Arc::new(
-                EnrollmentTransactionLock::try_acquire_async(&config.config_dir)
-                    .await
-                    .expect("acquire the enrollment transaction"),
-            );
-
-            let retained = release_local_state(&config, &transaction)
+            let retained = release_local_state(&config, std::time::Duration::from_secs(5))
                 .await
                 .expect("a removal with nothing to remove is not a failure");
 
