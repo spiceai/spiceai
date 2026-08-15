@@ -1705,7 +1705,7 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
 /// another process may consider its temp file abandoned. The lock remains the
 /// authoritative liveness signal after this age; time alone never authorizes
 /// deletion of an active writer.
-const ABANDONED_TEMP_MIN_AGE: std::time::Duration = std::time::Duration::from_hours(1);
+pub(crate) const ABANDONED_TEMP_MIN_AGE: std::time::Duration = std::time::Duration::from_hours(1);
 
 /// Reclaim secret-bearing temp files left by a process that exited before
 /// promotion.
@@ -1792,6 +1792,73 @@ where
         }
     }
     Ok(())
+}
+
+/// Reclaim the secret-bearing artifacts an interrupted atomic write leaves beside
+/// `path`, for a release that is deleting `path` itself.
+///
+/// [`atomic_write_owner_only`] writes through a uniquely-named temp and unlinks
+/// it best-effort on failure, and on non-Unix [`promote_temp`] parks the previous
+/// file in a `.bak` while it retries the rename. Either can outlive the process
+/// that made it, holding the same credential the canonical file did — so a
+/// release that removed only the canonical file would report a host clean while
+/// leaving a complete copy of what it was supposed to destroy.
+///
+/// Temps are reclaimed on the same terms as anywhere else: an exclusive advisory
+/// lock is the liveness signal, and one held on a temp older than `minimum_age`
+/// is the only thing that authorizes removal. A release does not relax that — a
+/// temp too new to judge is reported instead, because deleting a live writer's
+/// file to tidy up would be the worse outcome.
+///
+/// Backups are removed outright, which is where a release differs from
+/// [`cleanup_stale_identity_backups`]: that one preserves an orphan as possibly
+/// the last recoverable identity, and once the control plane has released the
+/// instance there is nothing left to recover it for.
+///
+/// Returns the artifacts still present afterwards, for the caller to report.
+pub(crate) fn release_atomic_write_artifacts(
+    path: &Path,
+    minimum_age: std::time::Duration,
+) -> std::io::Result<Vec<PathBuf>> {
+    cleanup_abandoned_atomic_temps(path, minimum_age)?;
+
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+        return Ok(Vec::new());
+    };
+    let prefix = format!(".{file_name}.");
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+
+    let mut remaining = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        let entry_name = entry.file_name();
+        let Some(entry_name) = entry_name.to_str() else {
+            continue;
+        };
+        if !entry_name.starts_with(&prefix) {
+            continue;
+        }
+        let extension = Path::new(entry_name).extension();
+        let is_temp = extension.is_some_and(|ext| ext.eq_ignore_ascii_case("tmp"));
+        let is_backup = extension.is_some_and(|ext| ext.eq_ignore_ascii_case("bak"));
+        if !is_temp && !is_backup {
+            continue;
+        }
+        if is_backup {
+            match std::fs::remove_file(entry.path()) {
+                Ok(()) => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(_) => {}
+            }
+        }
+        remaining.push(entry.path());
+    }
+    Ok(remaining)
 }
 
 /// Atomically write `bytes` to `path` with owner-only permissions.

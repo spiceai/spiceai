@@ -1423,7 +1423,7 @@ impl ClientDriver {
         command_id: &str,
         live_identifier: &Arc<RwLock<String>>,
     ) -> bool {
-        let retained = match release_local_state(&self.config, REMOVE_LOCK_ATTEMPT).await {
+        let retained = match release_local_state(&self.config, ReleasePolicy::DISPATCHED).await {
             Ok(retained) => retained,
             Err(message) => {
                 send_failed(tx, command_id, &message).await;
@@ -1457,6 +1457,29 @@ impl ClientDriver {
 /// the enrollment transaction is a single `try_acquire_async`.
 const REMOVE_LOCK_ATTEMPT: Duration = Duration::ZERO;
 
+/// The timing a release runs under.
+///
+/// Both values are liveness judgements about another process, and both are fixed
+/// in production. They are grouped and named so tests can drive contention and
+/// reclaim decisions deterministically without two bare `Duration` arguments that
+/// would silently swap.
+#[derive(Clone, Copy)]
+struct ReleasePolicy {
+    /// How long to wait for the connect mutation lock.
+    lock_timeout: Duration,
+    /// How old an interrupted write's temp must be before the advisory lock on it
+    /// is treated as an authoritative liveness signal.
+    temp_min_age: Duration,
+}
+
+impl ReleasePolicy {
+    /// What a cloud-dispatched `Remove` uses.
+    const DISPATCHED: Self = Self {
+        lock_timeout: REMOVE_LOCK_ATTEMPT,
+        temp_min_age: crate::identity::ABANDONED_TEMP_MIN_AGE,
+    };
+}
+
 /// Clear the cloud-issued state this instance holds on disk, under the same two
 /// locks a local `spice connect` takes.
 ///
@@ -1469,7 +1492,7 @@ const REMOVE_LOCK_ATTEMPT: Duration = Duration::ZERO;
 /// order, and why.
 async fn release_local_state(
     config: &CloudConnectConfig,
-    lock_timeout: Duration,
+    policy: ReleasePolicy,
 ) -> std::result::Result<Vec<String>, String> {
     // The OUTER lock, taken first. This is the same `connect.lock` a local
     // `spice connect` holds for its whole transaction, so it is what actually
@@ -1479,7 +1502,7 @@ async fn release_local_state(
     // this removal had already deleted while still reporting success. Ordering is
     // fixed by `mutation_lock`: MutationLock outer, then the enrollment
     // transaction — never the reverse.
-    let _mutation = MutationLock::acquire_with_timeout(&config.config_dir, "remove", lock_timeout)
+    let _mutation = MutationLock::acquire_with_timeout(&config.config_dir, "remove", policy.lock_timeout)
         .await
         .map_err(|err| {
             tracing::warn!(
@@ -1551,6 +1574,7 @@ async fn release_local_state(
             cache_path.display()
         ));
     }
+    retained.extend(release_atomic_write_artifacts(cache_path.clone(), policy.temp_min_age).await);
 
     if let Err(err) = IdentityStore::clear_with_transaction_async(
         config.identity_path.clone(),
@@ -1569,6 +1593,9 @@ async fn release_local_state(
             config.identity_path.display()
         ));
     }
+    retained.extend(
+        release_atomic_write_artifacts(config.identity_path.clone(), policy.temp_min_age).await,
+    );
 
     if let Err(err) = transaction.delete_draft_async().await {
         tracing::warn!(
@@ -1661,6 +1688,47 @@ async fn remove_file_if_present(path: PathBuf) -> std::result::Result<(), String
     })
     .await
     .map_err(|source| format!("the removal task stopped unexpectedly: {source}"))?
+}
+
+/// Reclaim the temp and backup files an interrupted atomic write can leave beside
+/// a released file, and name whatever is still there.
+///
+/// Non-fatal for the same reason the cache is: the instance is released either
+/// way, and an operator who is told a credential copy remains can remove it,
+/// where a removal that aborted over it would leave the live identity behind.
+async fn release_atomic_write_artifacts(path: PathBuf, minimum_age: Duration) -> Vec<String> {
+    let released = path.display().to_string();
+    let outcome = tokio::task::spawn_blocking(move || {
+        crate::identity::release_atomic_write_artifacts(&path, minimum_age)
+    })
+    .await;
+
+    let remaining = match outcome {
+        Ok(Ok(remaining)) => remaining,
+        Ok(Err(err)) => {
+            tracing::warn!(
+                "Cloud Connect: failed to reclaim interrupted-write artifacts beside {released}: {err}; the instance is released, but this host may retain a copy of what was removed"
+            );
+            return vec![format!("interrupted-write artifacts beside {released}")];
+        }
+        Err(source) => {
+            tracing::warn!(
+                "Cloud Connect: the task reclaiming interrupted-write artifacts beside {released} stopped unexpectedly: {source}; the instance is released, but this host may retain a copy of what was removed"
+            );
+            return vec![format!("interrupted-write artifacts beside {released}")];
+        }
+    };
+
+    remaining
+        .into_iter()
+        .map(|left| {
+            let left = left.display().to_string();
+            tracing::warn!(
+                "Cloud Connect: {left} is still held by a writer or too new to reclaim; the instance is released, but this host retains a copy of what was removed"
+            );
+            format!("interrupted-write artifact at {left}")
+        })
+        .collect()
 }
 
 /// Delete the delivered-secrets cache off the Tokio driver task.
@@ -2361,7 +2429,9 @@ mod tests {
     /// `spice connect remove` leaves it in: none of the cloud-issued state
     /// behind, and in particular no secrets whose key it just destroyed.
     mod removal {
-        use super::super::{EnrollmentTransactionLock, MutationLock, release_local_state};
+        use super::super::{
+            EnrollmentTransactionLock, MutationLock, ReleasePolicy, release_local_state,
+        };
         use crate::config::CloudConnectConfig;
         use crate::draft::EnrollmentDraft;
         use crate::secret_cache::SECRET_CACHE_FILE;
@@ -2416,7 +2486,17 @@ mod tests {
             }
 
             async fn release(&self) -> std::result::Result<Vec<String>, String> {
-                release_local_state(&self.config, std::time::Duration::from_secs(5)).await
+                release_local_state(&self.config, Self::policy()).await
+            }
+
+            /// The reclaim rule under test is the advisory lock, not the clock,
+            /// so the age margin is zero here and a held lock is what has to
+            /// save a live writer's temp.
+            fn policy() -> ReleasePolicy {
+                ReleasePolicy {
+                    lock_timeout: std::time::Duration::from_secs(5),
+                    temp_min_age: std::time::Duration::ZERO,
+                }
             }
         }
 
@@ -2466,7 +2546,7 @@ mod tests {
             std::fs::write(&config.identity_path, "{}").expect("write identity");
             std::fs::write(config_dir.join(SECRET_CACHE_FILE), "cached").expect("write cache");
 
-            let retained = release_local_state(&config, std::time::Duration::from_secs(5))
+            let retained = release_local_state(&config, Host::policy())
                 .await
                 .expect("a split identity path must still release");
 
@@ -2488,8 +2568,14 @@ mod tests {
                 .await
                 .expect("a local connect takes the directory");
 
-            let contended =
-                release_local_state(&host.config, std::time::Duration::from_millis(50)).await;
+            let contended = release_local_state(
+                &host.config,
+                ReleasePolicy {
+                    lock_timeout: std::time::Duration::from_millis(50),
+                    ..Host::policy()
+                },
+            )
+            .await;
             let message =
                 contended.expect_err("a release must not run while a local connect holds it");
             assert!(
@@ -2532,7 +2618,7 @@ mod tests {
                 .await
                 .expect("an enrollment holds the identity directory");
 
-            let message = release_local_state(&config, std::time::Duration::from_secs(5))
+            let message = release_local_state(&config, Host::policy())
                 .await
                 .expect_err("a removal that cannot lock the identity must fail");
 
@@ -2550,6 +2636,62 @@ mod tests {
                 "and the identity itself is untouched"
             );
             drop(contender);
+        }
+
+        /// An interrupted atomic write leaves a temp holding the same credential
+        /// the canonical file did. A release that removed only the canonical file
+        /// would report the host clean while a complete copy stayed behind.
+        #[tokio::test]
+        async fn it_reclaims_the_debris_of_an_interrupted_write() {
+            let host = Host::enrolled();
+            let abandoned = host
+                .config
+                .config_dir
+                .join(format!(".{SECRET_CACHE_FILE}.abandoned.tmp"));
+            std::fs::write(&abandoned, "ciphertext and secret names").expect("write the temp");
+
+            let retained = host.release().await.expect("the removal succeeds");
+
+            assert!(
+                !abandoned.exists(),
+                "a temp no live writer holds must not outlive the cache it copies"
+            );
+            assert!(retained.is_empty(), "nothing should be left: {retained:?}");
+        }
+
+        /// The lock is the liveness signal, so a temp a writer still holds is
+        /// reported rather than deleted: tidying up by destroying a live writer's
+        /// file would be the worse outcome.
+        #[tokio::test]
+        async fn a_live_writers_temp_is_reported_not_deleted() {
+            let host = Host::enrolled();
+            let in_flight = host
+                .config
+                .config_dir
+                .join(format!(".{SECRET_CACHE_FILE}.in-flight.tmp"));
+            let writer = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .read(true)
+                .write(true)
+                .open(&in_flight)
+                .expect("a writer creates its temp");
+            assert!(
+                fs4::fs_std::FileExt::try_lock_exclusive(&writer).expect("lock the temp"),
+                "the writer holds its own temp"
+            );
+
+            let retained = host.release().await.expect("the removal still succeeds");
+
+            assert!(
+                in_flight.exists(),
+                "a live writer's temp must survive the release"
+            );
+            assert!(
+                retained.iter().any(|item| item.contains("in-flight")),
+                "and the operator must be told it remains: {retained:?}"
+            );
+            drop(writer);
         }
 
         /// The journals are non-fatal like the cache and the draft: the instance
@@ -2627,7 +2769,7 @@ mod tests {
         async fn it_succeeds_with_nothing_on_disk_to_remove() {
             let dir = tempfile::tempdir().expect("create tempdir");
             let config = CloudConnectConfig::from_env_at("test-runtime", dir.path().to_path_buf());
-            let retained = release_local_state(&config, std::time::Duration::from_secs(5))
+            let retained = release_local_state(&config, Host::policy())
                 .await
                 .expect("a removal with nothing to remove is not a failure");
 
