@@ -1816,6 +1816,13 @@ where
 /// the last recoverable identity, and once the control plane has released the
 /// instance there is nothing left to recover it for.
 ///
+/// So are `.candidate` files, the artifact `spice connect` leaves for the state
+/// it writes — the operation journals and the endpoint override. Those get no
+/// per-file lock, so the temp rule cannot judge them; what authorizes removing
+/// them is that a release holds `connect.lock` for its whole run, which is the
+/// same lock their writer holds for its whole transaction. No `spice connect`
+/// can be mid-write, so any candidate present has been abandoned.
+///
 /// Returns the artifacts still present afterwards, for the caller to report.
 pub(crate) fn release_atomic_write_artifacts(
     path: &Path,
@@ -1846,11 +1853,13 @@ pub(crate) fn release_atomic_write_artifacts(
         }
         let extension = Path::new(entry_name).extension();
         let is_temp = extension.is_some_and(|ext| ext.eq_ignore_ascii_case("tmp"));
-        let is_backup = extension.is_some_and(|ext| ext.eq_ignore_ascii_case("bak"));
-        if !is_temp && !is_backup {
+        let is_abandoned = extension.is_some_and(|ext| {
+            ext.eq_ignore_ascii_case("bak") || ext.eq_ignore_ascii_case("candidate")
+        });
+        if !is_temp && !is_abandoned {
             continue;
         }
-        if is_backup {
+        if is_abandoned {
             match std::fs::remove_file(entry.path()) {
                 Ok(()) => continue,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,

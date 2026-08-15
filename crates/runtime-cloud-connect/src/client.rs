@@ -1416,10 +1416,10 @@ impl ClientDriver {
     ///    last means a crash cannot strand the stale enrollment state above on a
     ///    host that has already been released.
     ///
-    /// Each file is preceded by the debris an interrupted atomic write can leave
-    /// beside it — a `.tmp` no live writer holds, or a `.bak` from a replacement
-    /// that did not finish — because either holds the same credential the
-    /// canonical file did.
+    /// Each file is taken with the debris an interrupted atomic write can leave
+    /// beside it — a `.tmp` no live writer holds, a `.bak` from a replacement
+    /// that did not finish, or a `.candidate` from a `spice connect` that did
+    /// not — because each holds what the canonical file held.
     ///
     /// Only the identity is fatal. The cache, the draft, the journals, the
     /// endpoint override and any write debris are each named in `retained` and
@@ -1634,6 +1634,7 @@ async fn release_local_state(
             );
             retained.push(format!("{label} at {}", path.display()));
         }
+        retained.extend(release_atomic_write_artifacts(path, policy.temp_min_age).await);
     }
 
     let endpoint_path = config
@@ -1646,6 +1647,7 @@ async fn release_local_state(
         );
         retained.push(format!("endpoint override at {}", endpoint_path.display()));
     }
+    retained.extend(release_atomic_write_artifacts(endpoint_path, policy.temp_min_age).await);
 
     // The identity goes LAST, and it is the only step that is not retryable:
     // once it is gone this instance is released and stops connecting, so a
@@ -2790,6 +2792,47 @@ mod tests {
                 !host.config.identity_path.exists(),
                 "and the canonical identity is gone, which is what makes the backup an orphan"
             );
+            assert!(retained.is_empty(), "nothing should be left: {retained:?}");
+        }
+
+        /// `spice connect` writes the journals and the endpoint override through
+        /// its own atomic write, whose interrupted artifact is `.candidate` — a
+        /// different name from the runtime's `.tmp`, so a reclaim that knew only
+        /// the runtime's would report a clean release over a complete copy.
+        ///
+        /// Nothing holds a per-file lock on a candidate. What makes removing one
+        /// safe is that this release holds `connect.lock` for its whole run, the
+        /// same lock the writer holds for its whole transaction, so no writer can
+        /// be mid-write and any candidate present was abandoned.
+        #[tokio::test]
+        async fn it_reclaims_the_candidates_a_connect_left_behind() {
+            let host = Host::enrolled();
+            std::fs::write(host.endpoint_path(), "https://control.example\n")
+                .expect("write the endpoint override");
+
+            let candidates: Vec<std::path::PathBuf> = [
+                CloudConnectConfig::CONNECT_OPERATION_FILE,
+                CloudConnectConfig::PROJECT_OPERATION_FILE,
+                CloudConnectConfig::ENDPOINT_OVERRIDE_FILE,
+            ]
+            .into_iter()
+            .map(|file| {
+                let candidate = host.config.config_dir.join(format!(".{file}.7.candidate"));
+                std::fs::write(&candidate, "an interrupted connect wrote this")
+                    .expect("write the candidate");
+                candidate
+            })
+            .collect();
+
+            let retained = host.release().await.expect("the removal succeeds");
+
+            for candidate in &candidates {
+                assert!(
+                    !candidate.exists(),
+                    "a released host must not keep {}",
+                    candidate.display()
+                );
+            }
             assert!(retained.is_empty(), "nothing should be left: {retained:?}");
         }
 
