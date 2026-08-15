@@ -77,6 +77,7 @@ pub(super) fn responses_request_from_chat_completion_request(
             .map(|effort| Reasoning {
                 effort: Some(effort),
                 summary: None,
+                context: None,
             }),
         metadata: req
             .metadata
