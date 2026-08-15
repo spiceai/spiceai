@@ -1666,7 +1666,15 @@ fn release_local_state_locked(
     let mut retained: Vec<String> = Vec::new();
 
     let cache_path = config_dir.join(crate::secret_cache::SECRET_CACHE_FILE);
-    if let Err(err) = crate::secret_cache::remove(&cache_path) {
+    let removal = crate::secret_cache::remove(&cache_path);
+    retained.extend(release_atomic_write_artifacts(
+        &cache_path,
+        policy.temp_min_age,
+        ArtifactKinds::Runtime,
+    )?);
+    if let Err(err) = removal
+        && still_present(&cache_path)
+    {
         tracing::warn!(
             "Cloud Connect: failed to remove the delivered-secrets cache at {}: {err}; the instance is still being released, but this host retains secrets it can no longer open",
             cache_path.display()
@@ -1676,27 +1684,26 @@ fn release_local_state_locked(
             cache_path.display()
         ));
     }
+
+    let draft_path = EnrollmentDraft::path_in(config_dir);
+    let removal = transaction.delete();
+    // The draft holds the provisional private key of an enrollment in progress,
+    // and it is published through the same atomic write, so it strands the same
+    // credential debris the identity and the cache do.
     retained.extend(release_atomic_write_artifacts(
-        &cache_path,
+        &draft_path,
         policy.temp_min_age,
         ArtifactKinds::Runtime,
     )?);
-
-    if let Err(err) = transaction.delete() {
+    if let Err(err) = removal
+        && still_present(&draft_path)
+    {
         tracing::warn!(
             "Cloud Connect: failed to remove the enrollment draft in {}: {err}; the instance is released, but the next enrollment in this directory will need it removed first",
             config_dir.display()
         );
         retained.push("enrollment draft".to_string());
     }
-    // The draft holds the provisional private key of an enrollment in progress,
-    // and it is published through the same atomic write, so it strands the same
-    // credential debris the identity and the cache do.
-    retained.extend(release_atomic_write_artifacts(
-        &EnrollmentDraft::path_in(config_dir),
-        policy.temp_min_age,
-        ArtifactKinds::Runtime,
-    )?);
 
     // The journals go with the draft, for the same reason: `spice connect` writes
     // them to resume an interrupted operation, and either one left beside a
@@ -1714,33 +1721,39 @@ fn release_local_state_locked(
         ),
     ] {
         let path = config_dir.join(file);
-        if let Err(err) = remove_file_if_present(&path) {
+        let removal = remove_file_if_present(&path);
+        retained.extend(release_atomic_write_artifacts(
+            &path,
+            policy.temp_min_age,
+            ArtifactKinds::Connect,
+        )?);
+        if let Err(err) = removal
+            && still_present(&path)
+        {
             tracing::warn!(
                 "Cloud Connect: failed to remove the {label} at {}: {err}; the instance is released, but the next enrollment in this directory will stop on it",
                 path.display()
             );
             retained.push(format!("{label} at {}", path.display()));
         }
-        retained.extend(release_atomic_write_artifacts(
-            &path,
-            policy.temp_min_age,
-            ArtifactKinds::Connect,
-        )?);
     }
 
     let endpoint_path = config_dir.join(CloudConnectConfig::ENDPOINT_OVERRIDE_FILE);
-    if let Err(err) = remove_file_if_present(&endpoint_path) {
+    let removal = remove_file_if_present(&endpoint_path);
+    retained.extend(release_atomic_write_artifacts(
+        &endpoint_path,
+        policy.temp_min_age,
+        ArtifactKinds::Connect,
+    )?);
+    if let Err(err) = removal
+        && still_present(&endpoint_path)
+    {
         tracing::warn!(
             "Cloud Connect: failed to remove the endpoint override at {}: {err}; the instance is released, but a later enrollment in this directory would still reach the control plane it names",
             endpoint_path.display()
         );
         retained.push(format!("endpoint override at {}", endpoint_path.display()));
     }
-    retained.extend(release_atomic_write_artifacts(
-        &endpoint_path,
-        policy.temp_min_age,
-        ArtifactKinds::Connect,
-    )?);
 
     // The identity goes LAST, and it is the only step that is not retryable:
     // once it is gone this instance is released and stops connecting, so a
@@ -1806,6 +1819,22 @@ fn identity_transaction(
     Ok(Arc::new(EnrollmentTransactionLock::try_acquire(
         identity_dir,
     )?))
+}
+
+/// Whether a released file is still on disk.
+///
+/// Answers "yes" when it cannot tell, which is the conservative direction: a
+/// `retained` entry for a file that is gone sends an operator looking for
+/// nothing, but a missing entry for one that remains is the operator never
+/// learning their released host still holds it.
+///
+/// Asked *after* the artifact reclaim for the same path, never from the
+/// removal's own result. `secret_cache::remove` and the draft's delete report a
+/// parent-directory sync failure alongside a failed unlink, and the reclaim syncs
+/// that same directory afterwards — so a transient first sync would otherwise
+/// report a file that the release went on to make durably absent.
+fn still_present(path: &Path) -> bool {
+    path.try_exists().unwrap_or(true)
 }
 
 /// Delete `path` off the Tokio driver task, treating a missing file as success.
@@ -2969,9 +2998,15 @@ mod tests {
             let retained = host.release().await.expect("the removal succeeds");
 
             for (label, path) in [
+                ("delivered-secrets cache", host.cache_path()),
+                ("enrollment draft", host.draft_path()),
                 (
                     "enrollment journal",
                     host.journal_path(CloudConnectConfig::CONNECT_OPERATION_FILE),
+                ),
+                (
+                    "project assignment journal",
+                    host.journal_path(CloudConnectConfig::PROJECT_OPERATION_FILE),
                 ),
                 ("endpoint override", host.endpoint_path()),
             ] {
