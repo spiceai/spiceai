@@ -61,7 +61,7 @@ use tonic::Streaming;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint};
 
 use crate::config::CloudConnectConfig;
-use crate::draft::EnrollmentTransactionLock;
+use crate::draft::{EnrollmentDraft, EnrollmentTransactionLock};
 use crate::enroll::EnrollClient;
 use crate::handlers::{
     Capability, CommandError, MAX_QUERY_RESULT_BYTES, RestartMode, RuntimeHandle,
@@ -1561,6 +1561,12 @@ async fn release_local_state(
         }
     };
 
+    // Nothing here excludes the cache writer, and nothing needs to: the only
+    // caller of `secret_cache::write` is the deployment handler, and the control
+    // stream awaits each command inline, so a delivery and this release are
+    // dispatched one after the other and never overlap. A handler that were ever
+    // spawned instead would break that, and would need the writer to take the
+    // mutation lock this release already holds.
     let cache_path = config
         .config_dir
         .join(crate::secret_cache::SECRET_CACHE_FILE);
@@ -1604,6 +1610,16 @@ async fn release_local_state(
         );
         retained.push("enrollment draft".to_string());
     }
+    // The draft holds the provisional private key of an enrollment in progress,
+    // and it is published through the same atomic write, so it strands the same
+    // credential debris the identity and the cache do.
+    retained.extend(
+        release_atomic_write_artifacts(
+            EnrollmentDraft::path_in(&config.config_dir),
+            policy.temp_min_age,
+        )
+        .await,
+    );
 
     // The journals go with the draft, for the same reason: `spice connect` writes
     // them to resume an interrupted operation, and either one left beside a
@@ -2692,6 +2708,33 @@ mod tests {
                 "and the operator must be told it remains: {retained:?}"
             );
             drop(writer);
+        }
+
+        /// The draft carries the provisional private key of an enrollment in
+        /// progress, so an interrupted publication strands a credential exactly
+        /// as the identity and the cache do.
+        #[tokio::test]
+        async fn it_reclaims_the_debris_of_an_interrupted_draft_publication() {
+            let host = Host::enrolled();
+            let draft_name = host
+                .draft_path()
+                .file_name()
+                .and_then(|name| name.to_str())
+                .expect("the draft has a name")
+                .to_string();
+            let abandoned = host
+                .config
+                .config_dir
+                .join(format!(".{draft_name}.abandoned.tmp"));
+            std::fs::write(&abandoned, "provisional private key").expect("write the temp");
+
+            let retained = host.release().await.expect("the removal succeeds");
+
+            assert!(
+                !abandoned.exists(),
+                "a draft temp no live writer holds must not outlive the draft it copies"
+            );
+            assert!(retained.is_empty(), "nothing should be left: {retained:?}");
         }
 
         /// The journals are non-fatal like the cache and the draft: the instance

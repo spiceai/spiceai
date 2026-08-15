@@ -1858,6 +1858,12 @@ pub(crate) fn release_atomic_write_artifacts(
         }
         remaining.push(entry.path());
     }
+
+    // Durable, like the canonical removals: reporting that no credential copy
+    // remains is a claim about what survives a crash, and an unlink that is
+    // acknowledged but not synced can bring one back. One sync covers every
+    // unlink above, including the temps the reclaim removed.
+    sync_parent_directory(path)?;
     Ok(remaining)
 }
 
