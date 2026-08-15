@@ -50,6 +50,10 @@ pub struct TlsControl {
 impl TlsControl {
     /// Spawn a fresh process-wide TLS control plane. Spawns the
     /// underlying [`CertWatcher`] dispatcher thread.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the underlying [`CertWatcher`] fails to spawn.
     pub fn new() -> Result<Self, ReloadError> {
         Ok(Self {
             watcher: Arc::new(CertWatcher::spawn()?),
@@ -59,6 +63,11 @@ impl TlsControl {
     /// Force a synchronous reload of every TLS material currently being
     /// watched. Bypasses the filesystem-event debounce. Intended for
     /// SIGHUP-driven manual rotation pickup.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReloadError::WatcherClosed`] if the underlying watcher's
+    /// dispatcher loop has already exited.
     pub fn reload_all(&self) -> Result<(), ReloadError> {
         self.watcher.trigger_reload_all()
     }
@@ -163,6 +172,11 @@ impl TlsConfig {
     /// Build from in-memory PEM bytes. Used for inline `runtime.tls.certificate`
     /// and `${secrets:...}`-sourced material. The returned config will not
     /// hot-reload (no path is being watched).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `cert_bytes`/`key_bytes` cannot be parsed into
+    /// a valid certificate chain and private key.
     pub fn try_new(
         cert_bytes: &[u8],
         key_bytes: &[u8],
@@ -173,6 +187,12 @@ impl TlsConfig {
     /// Like [`Self::try_new`] but additionally builds a static client
     /// cert verifier from `client_ca_pem` when supplied. Inline
     /// material; no hot-reload.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `cert_bytes`/`key_bytes` cannot be parsed into
+    /// a valid certificate chain and private key, or if `client_ca_pem`
+    /// is supplied but cannot be parsed into a client cert verifier.
     pub fn try_new_with_client_auth(
         cert_bytes: &[u8],
         key_bytes: &[u8],
@@ -188,6 +208,12 @@ impl TlsConfig {
     /// from [`ClientAuthEnforcement::Required`] — both pass a CA
     /// bundle, only the per-listener verifier strictness and HTTP
     /// route gate differ.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `client_ca_pem`'s presence does not match
+    /// what `enforcement` requires, or if `cert_bytes`/`key_bytes`
+    /// (or `client_ca_pem`, when supplied) cannot be parsed.
     pub fn try_new_with_client_auth_mode(
         cert_bytes: &[u8],
         key_bytes: &[u8],
@@ -216,6 +242,11 @@ impl TlsConfig {
     /// `watcher`. When either path changes, both files are re-read and the
     /// rustls cert resolver is swapped atomically. In-flight TLS connections
     /// are unaffected; new handshakes pick up the new material.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the cert/key files cannot be read or parsed,
+    /// or if registering the watch with `control` fails.
     pub fn try_new_from_paths(
         cert_path: PathBuf,
         key_path: PathBuf,
@@ -230,6 +261,12 @@ impl TlsConfig {
     /// every change re-reads the whole bundle and the resulting
     /// `WebPkiClientVerifier` is atomically swapped under the live
     /// `ServerConfig` without rebuilding it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the cert/key (or, when supplied, client CA)
+    /// files cannot be read or parsed, or if registering the watch with
+    /// `control` fails.
     pub fn try_new_from_paths_with_client_auth(
         cert_path: PathBuf,
         key_path: PathBuf,
@@ -250,6 +287,13 @@ impl TlsConfig {
     /// an explicit [`ClientAuthEnforcement`] so callers can
     /// distinguish [`ClientAuthEnforcement::Requested`] from
     /// [`ClientAuthEnforcement::Required`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `client_ca_path`'s presence does not match
+    /// what `enforcement` requires, if the cert/key (or client CA) files
+    /// cannot be read or parsed, or if registering the watch with
+    /// `control` fails.
     pub fn try_new_from_paths_with_client_auth_mode(
         cert_path: PathBuf,
         key_path: PathBuf,

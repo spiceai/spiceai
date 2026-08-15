@@ -43,6 +43,12 @@ impl PodsWatcher {
         }
     }
 
+    /// Start watching for Spicepod changes under the configured root path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the underlying platform watcher fails to
+    /// register the root path (see [`watch_root`]).
     pub async fn watch(&mut self) -> notify::Result<Receiver<PathBuf>> {
         let root_path = self.root_path.clone();
         let runtime_handle = Handle::current();

@@ -14898,6 +14898,7 @@ dependencies = [
  "parking_lot",
  "spicepod",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -17777,6 +17778,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tokio-stream",
+ "tracing",
  "x509-certificate",
 ]
 

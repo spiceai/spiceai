@@ -140,6 +140,11 @@ pub struct ReloadableServerCerts {
 impl ReloadableServerCerts {
     /// Build from in-memory PEM. Used for inline / `${secrets:...}`-sourced
     /// material that cannot rotate at runtime.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `cert_pem`/`key_pem` cannot be parsed into a
+    /// valid certificate chain and private key.
     pub fn from_pem(
         cert_pem: &[u8],
         key_pem: &[u8],
@@ -153,6 +158,12 @@ impl ReloadableServerCerts {
     /// The verifier is held under the same `ArcSwap` machinery as the
     /// hot-reload path uses, but — since this constructor takes inline
     /// bytes — it never gets rebuilt for the lifetime of the process.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `cert_pem`/`key_pem` cannot be parsed into a
+    /// valid certificate chain and private key, or if `client_ca_pem` is
+    /// supplied but cannot be parsed into a client cert verifier.
     pub fn from_pem_with_client_auth(
         cert_pem: &[u8],
         key_pem: &[u8],
@@ -185,6 +196,11 @@ impl ReloadableServerCerts {
     /// Build from on-disk PEM and register reload via `watcher`. The watcher
     /// fires when either path changes; both files are then re-read together
     /// since cert + key must swap atomically.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the cert/key files cannot be read or parsed, or
+    /// if registering the watch with `watcher` fails.
     pub fn from_paths(
         cert_path: PathBuf,
         key_path: PathBuf,
@@ -202,6 +218,12 @@ impl ReloadableServerCerts {
     /// (separately) the new client verifier. Cert+key and verifier are
     /// independent swaps so reads on one cannot block reads on the
     /// other; the dispatcher thread is the only writer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the cert/key (or, when supplied, client CA)
+    /// files cannot be read or parsed, or if registering the watch with
+    /// `watcher` fails.
     pub fn from_paths_with_client_auth(
         cert_path: PathBuf,
         key_path: PathBuf,
@@ -541,6 +563,11 @@ enum WatchOp {
 impl CertWatcher {
     /// Spawn the watcher loop. The loop owns the OS-level watcher and a
     /// debounce table. Returns a handle that can be cloned cheaply via `Arc`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the underlying platform watcher or the
+    /// dispatcher thread fails to start.
     pub fn spawn() -> Result<Self, ReloadError> {
         type ReloadCallback = Box<dyn Fn(&Path) + Send + Sync>;
         let (tx, mut rx) = mpsc::unbounded_channel::<WatchOp>();
@@ -682,6 +709,12 @@ impl CertWatcher {
     /// directory, so misconfiguration (missing dir, no permissions) is
     /// surfaced as a `ReloadError::Watcher` at the call site rather than
     /// silently disabling rotation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any of `paths` cannot be watched (missing
+    /// parent directory, insufficient permissions), or if the dispatcher
+    /// loop has already exited.
     pub fn register<F>(&self, paths: Vec<PathBuf>, callback: F) -> Result<(), ReloadError>
     where
         F: Fn(&Path) + Send + Sync + 'static,
@@ -716,6 +749,11 @@ impl CertWatcher {
     /// the rotation has actually landed should observe the
     /// `tls_reload_total{result="ok"}` counter (or the
     /// `reload_count_for_tests` helper in tests).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReloadError::WatcherClosed`] if the dispatcher loop has
+    /// already exited.
     pub fn trigger_reload_all(&self) -> Result<(), ReloadError> {
         self.tx
             .send(WatchOp::TriggerReloadAll)
