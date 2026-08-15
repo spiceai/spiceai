@@ -32,6 +32,7 @@ use aws_sdk_glue::Client;
 use aws_sdk_glue::error::SdkError;
 use aws_sdk_glue::operation::get_databases::GetDatabasesError;
 use aws_sdk_glue::operation::get_tables::GetTablesError;
+use aws_sdk_glue::types::Table;
 use data_components::RefreshableCatalogProvider;
 use data_components::catalog_filter::TableSelector;
 use datafusion::{
@@ -159,6 +160,7 @@ impl GlueCatalogProvider {
         let mut paginator = tables_builder.into_paginator().send();
 
         let mut tables = HashMap::new();
+        let mut unreadable: Vec<String> = Vec::new();
 
         while let Some(maybe_get_tables_output) = paginator.next().await {
             let get_tables_output = maybe_get_tables_output.context(GetTablesSnafu {
@@ -169,8 +171,10 @@ impl GlueCatalogProvider {
                 .unwrap_or_default()
                 .into_iter()
                 .filter(|t| {
-                    InputFormat::try_from(t).is_ok()
-                        && is_selected(&self.selector, &database, t.name())
+                    // Selection first: a table the catalog's `exclude:` withholds
+                    // is not one to report as unreadable.
+                    is_selected(&self.selector, &database, t.name())
+                        && is_readable(&database, t, &mut unreadable)
                 })
                 .collect::<Vec<_>>();
 
@@ -203,6 +207,10 @@ impl GlueCatalogProvider {
                 )?;
                 tables.insert(table.name, table_provider);
             }
+        }
+
+        if let Some(summary) = unreadable_tables_summary(&database, &unreadable) {
+            tracing::warn!("{summary}");
         }
 
         let tables = RwLock::new(tables);
@@ -334,6 +342,60 @@ fn is_selected(selector: &TableSelector, database: &str, table: &str) -> bool {
         return false;
     }
     true
+}
+
+/// Whether Spice can read `table`'s storage format, recording its name in
+/// `unreadable` when it cannot.
+///
+/// [`InputFormat::try_from`] already names the table and the offending format in
+/// a structured error, and `is_ok()` discarded it: a table Spice cannot read was
+/// simply absent from the catalog, with no string anywhere in the log for an
+/// operator to search for. The reason goes to `debug!` per table, matching
+/// [`is_selected`]; [`unreadable_tables_summary`] is what an operator sees by
+/// default.
+fn is_readable(database: &str, table: &Table, unreadable: &mut Vec<String>) -> bool {
+    match InputFormat::try_from(table) {
+        Ok(_) => true,
+        Err(err) => {
+            tracing::debug!("skipping table {database}.{} ({err})", table.name());
+            unreadable.push(table.name().to_string());
+            false
+        }
+    }
+}
+
+/// The one line an operator sees for the tables a Glue database holds that Spice
+/// cannot read, or `None` when it can read all of them.
+///
+/// One line per database rather than one per table because
+/// `RefreshableCatalogProvider::refresh` rebuilds every schema provider on each
+/// cycle: a per-table warning would repeat for the life of the process, and a
+/// database of ORC tables would bury everything else. The names are sampled for
+/// the same reason, and the count names how many were left out rather than
+/// truncating silently.
+fn unreadable_tables_summary(database: &str, unreadable: &[String]) -> Option<String> {
+    /// How many table names the summary spells out before falling back to a count.
+    const SAMPLE: usize = 5;
+
+    if unreadable.is_empty() {
+        return None;
+    }
+
+    let total = unreadable.len();
+    let named: Vec<&str> = unreadable.iter().take(SAMPLE).map(String::as_str).collect();
+    let elided = total - named.len();
+    let elided_note = if elided > 0 {
+        format!(", and {elided} more")
+    } else {
+        String::new()
+    };
+    let named = named.join(", ");
+
+    Some(format!(
+        "Skipping {total} table(s) in Glue database '{database}' that Spice cannot read: {named}{elided_note}. \
+        Supported formats are Parquet, CSV and Iceberg; run with debug logging to see why each \
+        table was skipped. For help, visit: https://docs.spiceai.org/components/catalogs/glue"
+    ))
 }
 
 #[cfg(test)]
@@ -469,5 +531,111 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A Glue table as `GetTables` returns it: `input_format` is what the
+    /// connector reads to decide whether it can read the table at all.
+    fn glue_table(name: &str, input_format: Option<&str>) -> Table {
+        let mut table = Table::builder().name(name);
+        if let Some(input_format) = input_format {
+            table = table.storage_descriptor(
+                aws_sdk_glue::types::StorageDescriptor::builder()
+                    .input_format(input_format)
+                    .build(),
+            );
+        }
+        table.build().expect("a Glue table with a name")
+    }
+
+    /// An Iceberg table is identified by a table parameter rather than by a
+    /// storage descriptor, so it has neither of the fields the other formats use.
+    fn iceberg_table(name: &str) -> Table {
+        Table::builder()
+            .name(name)
+            .parameters("table_type", "ICEBERG")
+            .build()
+            .expect("a Glue table with a name")
+    }
+
+    const PARQUET: &str = "org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat";
+    const TEXT: &str = "org.apache.hadoop.mapred.TextInputFormat";
+    const ORC: &str = "org.apache.hadoop.hive.ql.io.orc.OrcInputFormat";
+
+    /// Regression test for #13102: `InputFormat::try_from(t).is_ok()` discarded a
+    /// structured error that already named the table and the format, so a table
+    /// Spice cannot read was absent from the catalog with nothing logged at all.
+    /// Every rejecting shape must now be recorded by name.
+    #[test]
+    fn a_table_glue_cannot_read_is_recorded_rather_than_dropped_silently() {
+        let mut unreadable = Vec::new();
+
+        assert!(is_readable(
+            "public",
+            &glue_table("orders", Some(PARQUET)),
+            &mut unreadable
+        ));
+        assert!(is_readable(
+            "public",
+            &glue_table("events", Some(TEXT)),
+            &mut unreadable
+        ));
+        assert!(is_readable(
+            "public",
+            &iceberg_table("ledger"),
+            &mut unreadable
+        ));
+        assert!(
+            unreadable.is_empty(),
+            "a readable table must not be reported: {unreadable:?}"
+        );
+
+        // Unsupported format, no input format, and no storage descriptor -- the
+        // three ways `InputFormat::try_from` refuses a table.
+        assert!(!is_readable(
+            "public",
+            &glue_table("archive", Some(ORC)),
+            &mut unreadable
+        ));
+        assert!(!is_readable(
+            "public",
+            &glue_table("legacy", None),
+            &mut unreadable
+        ));
+
+        assert_eq!(
+            unreadable,
+            vec!["archive".to_string(), "legacy".to_string()],
+            "every table the connector cannot read must be named"
+        );
+    }
+
+    /// The summary is what an operator sees by default, so it has to say how many
+    /// tables it did not name rather than truncating the list silently.
+    #[test]
+    fn the_unreadable_summary_names_a_sample_and_counts_the_rest() {
+        assert!(
+            unreadable_tables_summary("public", &[]).is_none(),
+            "a database Spice can read entirely must log nothing"
+        );
+
+        let one = unreadable_tables_summary("public", &["archive".to_string()])
+            .expect("one unreadable table must be reported");
+        assert!(
+            one.contains("Skipping 1 table(s) in Glue database 'public'"),
+            "{one}"
+        );
+        assert!(one.contains("archive"), "{one}");
+        assert!(!one.contains("more"), "nothing was elided: {one}");
+
+        let many: Vec<String> = (0..8).map(|i| format!("t{i}")).collect();
+        let many = unreadable_tables_summary("warehouse", &many)
+            .expect("eight unreadable tables must be reported");
+        assert!(many.contains("Skipping 8 table(s)"), "{many}");
+        assert!(many.contains("t0, t1, t2, t3, t4"), "{many}");
+        assert!(
+            many.contains("and 3 more"),
+            "the summary must count the names it left out: {many}"
+        );
+        assert!(!many.contains("t5"), "the sample must stop at five: {many}");
     }
 }
