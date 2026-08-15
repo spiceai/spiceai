@@ -1701,6 +1701,33 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     })
 }
 
+/// The `(token, extension)` of a sibling this codebase could have written beside
+/// `file_name`, or `None` for anything else in the directory.
+///
+/// Prefix and extension alone are not enough. A sibling somebody named
+/// themselves — `.cloud-endpoint.notes.candidate`, `.identity.json.manual.bak` —
+/// is not ours to delete, and a stray `.tmp` would be worse than deleted: the
+/// release reads an unreclaimable temp as a writer's in-flight file and fails, so
+/// one sitting in the directory would fail every `Remove` for good.
+fn produced_artifact<'a>(entry_name: &'a str, prefix: &str) -> Option<(&'a str, &'a str)> {
+    let (token, extension) = entry_name
+        .strip_prefix(prefix)
+        .and_then(|rest| rest.rsplit_once('.'))?;
+    let produced = if extension.eq_ignore_ascii_case("tmp") || extension.eq_ignore_ascii_case("bak")
+    {
+        // `atomic_write_owner_only` and `promote_temp` name theirs with a v4 UUID.
+        uuid::Uuid::parse_str(token).is_ok()
+    } else if extension.eq_ignore_ascii_case("candidate") {
+        // `spice connect`'s writer uses a decimal u64.
+        !token.is_empty()
+            && token.bytes().all(|byte| byte.is_ascii_digit())
+            && token.parse::<u64>().is_ok()
+    } else {
+        false
+    };
+    produced.then_some((token, extension))
+}
+
 /// A newly-created writer gets ample time to acquire its advisory lock before
 /// another process may consider its temp file abandoned. The lock remains the
 /// authoritative liveness signal after this age; time alone never authorizes
@@ -1747,14 +1774,9 @@ where
         let Some(entry_name) = entry_name.to_str() else {
             continue;
         };
-        let is_temp = Path::new(entry_name)
-            .extension()
-            .is_some_and(|extension| extension.eq_ignore_ascii_case("tmp"));
-        if !entry_name.starts_with(&prefix)
-            || !is_temp
-            || entry_name.len() <= prefix.len() + ".tmp".len()
-            || !entry.file_type()?.is_file()
-        {
+        let is_temp = produced_artifact(entry_name, &prefix)
+            .is_some_and(|(_, extension)| extension.eq_ignore_ascii_case("tmp"));
+        if !is_temp || !entry.file_type()?.is_file() {
             continue;
         }
 
@@ -1872,17 +1894,11 @@ pub(crate) fn release_atomic_write_artifacts(
         let Some(entry_name) = entry_name.to_str() else {
             continue;
         };
-        if !entry_name.starts_with(&prefix) {
+        let Some((_, extension)) = produced_artifact(entry_name, &prefix) else {
             continue;
-        }
-        let extension = Path::new(entry_name).extension();
-        let is_temp = extension.is_some_and(|ext| ext.eq_ignore_ascii_case("tmp"));
-        let is_abandoned = extension.is_some_and(|ext| {
-            ext.eq_ignore_ascii_case("bak") || ext.eq_ignore_ascii_case("candidate")
-        });
-        if !is_temp && !is_abandoned {
-            continue;
-        }
+        };
+        let is_temp = extension.eq_ignore_ascii_case("tmp");
+        let is_abandoned = !is_temp;
         if is_abandoned {
             match std::fs::remove_file(entry.path()) {
                 Ok(()) => continue,
@@ -2331,9 +2347,15 @@ mod tests {
     fn abandoned_atomic_temp_cleanup_preserves_a_locked_writer() {
         let dir = tempfile::tempdir().expect("create tempdir");
         let path = dir.path().join("identity.json");
-        let active_temp = dir.path().join(".identity.json.active.tmp");
-        let abandoned_temp = dir.path().join(".identity.json.abandoned.tmp");
-        let unrelated = dir.path().join(".different.json.abandoned.tmp");
+        let active_temp = dir
+            .path()
+            .join(".identity.json.aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee.tmp");
+        let abandoned_temp = dir
+            .path()
+            .join(".identity.json.11111111-2222-4333-8444-555555555555.tmp");
+        let unrelated = dir
+            .path()
+            .join(".different.json.66666666-7777-4888-8999-aaaaaaaaaaaa.tmp");
         let active = std::fs::OpenOptions::new()
             .create_new(true)
             .read(true)

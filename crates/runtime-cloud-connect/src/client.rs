@@ -2714,10 +2714,9 @@ mod tests {
         #[tokio::test]
         async fn it_reclaims_the_debris_of_an_interrupted_write() {
             let host = Host::enrolled();
-            let abandoned = host
-                .config
-                .config_dir
-                .join(format!(".{SECRET_CACHE_FILE}.abandoned.tmp"));
+            let abandoned = host.config.config_dir.join(format!(
+                ".{SECRET_CACHE_FILE}.11111111-2222-4333-8444-555555555555.tmp"
+            ));
             std::fs::write(&abandoned, "ciphertext and secret names").expect("write the temp");
 
             let retained = host.release().await.expect("the removal succeeds");
@@ -2737,10 +2736,9 @@ mod tests {
         #[tokio::test]
         async fn a_live_writers_temp_fails_the_release_rather_than_being_deleted() {
             let host = Host::enrolled();
-            let in_flight = host
-                .config
-                .config_dir
-                .join(format!(".{SECRET_CACHE_FILE}.in-flight.tmp"));
+            let in_flight = host.config.config_dir.join(format!(
+                ".{SECRET_CACHE_FILE}.66666666-7777-4888-8999-aaaaaaaaaaaa.tmp"
+            ));
             let writer = std::fs::OpenOptions::new()
                 .create(true)
                 .truncate(true)
@@ -2759,7 +2757,7 @@ mod tests {
                 .expect_err("a temp that could still be published must fail the removal");
 
             assert!(
-                message.contains("in-flight"),
+                message.contains("66666666-7777-4888-8999-aaaaaaaaaaaa"),
                 "the failure must name what could still be published, got {message}"
             );
             assert!(
@@ -2785,10 +2783,9 @@ mod tests {
             let host = Host::enrolled();
             // A temp the reclaim cannot open: it decides liveness by taking the
             // file's lock, so a file it cannot open is one it cannot judge.
-            let unreadable = host
-                .config
-                .config_dir
-                .join(format!(".{SECRET_CACHE_FILE}.unreadable.tmp"));
+            let unreadable = host.config.config_dir.join(format!(
+                ".{SECRET_CACHE_FILE}.11111111-2222-4333-8444-555555555555.tmp"
+            ));
             std::fs::write(&unreadable, "an interrupted write").expect("write the temp");
             std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000))
                 .expect("make the temp unopenable");
@@ -2820,10 +2817,9 @@ mod tests {
                 .and_then(|name| name.to_str())
                 .expect("the draft has a name")
                 .to_string();
-            let abandoned = host
-                .config
-                .config_dir
-                .join(format!(".{draft_name}.abandoned.tmp"));
+            let abandoned = host.config.config_dir.join(format!(
+                ".{draft_name}.bbbbbbbb-cccc-4ddd-8eee-ffffffffffff.tmp"
+            ));
             std::fs::write(&abandoned, "provisional private key").expect("write the temp");
 
             let retained = host.release().await.expect("the removal succeeds");
@@ -2851,10 +2847,9 @@ mod tests {
                 .and_then(|name| name.to_str())
                 .expect("the identity has a name")
                 .to_string();
-            let backup = host
-                .config
-                .config_dir
-                .join(format!(".{identity_name}.interrupted.bak"));
+            let backup = host.config.config_dir.join(format!(
+                ".{identity_name}.12341234-5678-49ab-8cde-f01234567890.bak"
+            ));
             std::fs::write(&backup, "the complete previous credential").expect("write the backup");
 
             let retained = host.release().await.expect("the removal succeeds");
@@ -2868,6 +2863,43 @@ mod tests {
                 "and the canonical identity is gone, which is what makes the backup an orphan"
             );
             assert!(retained.is_empty(), "nothing should be left: {retained:?}");
+        }
+
+        /// A sibling somebody named themselves is not this code's to touch, even
+        /// where it shares the prefix and extension. Deleting one would be a
+        /// release destroying an unrelated local file; worse, a stray `.tmp`
+        /// read as a writer's in-flight file would fail every `Remove` for good.
+        #[tokio::test]
+        async fn it_leaves_alone_files_it_did_not_write() {
+            let host = Host::enrolled();
+            let strays = [
+                format!(".{SECRET_CACHE_FILE}.notes.tmp"),
+                format!(".{SECRET_CACHE_FILE}.manual.bak"),
+                format!(
+                    ".{}.notes.candidate",
+                    CloudConnectConfig::ENDPOINT_OVERRIDE_FILE
+                ),
+            ];
+            for stray in &strays {
+                std::fs::write(host.config.config_dir.join(stray), "someone's own file")
+                    .expect("write the stray");
+            }
+
+            let retained = host
+                .release()
+                .await
+                .expect("a stray must not fail the removal");
+
+            for stray in &strays {
+                assert!(
+                    host.config.config_dir.join(stray).exists(),
+                    "{stray} was not written by this code and must survive the release"
+                );
+            }
+            assert!(
+                retained.is_empty(),
+                "and a stray is not something to report either: {retained:?}"
+            );
         }
 
         /// `spice connect` writes the journals and the endpoint override through
