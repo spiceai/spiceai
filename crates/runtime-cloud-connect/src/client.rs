@@ -1699,7 +1699,7 @@ fn release_local_state_locked(
         && still_present(&draft_path)
     {
         tracing::warn!(
-            "Cloud Connect: failed to remove the enrollment draft in {}: {err}; the instance is released, but the next enrollment in this directory will need it removed first",
+            "Cloud Connect: failed to remove the enrollment draft in {}: {err}; the removal is continuing, and if it completes the next enrollment in this directory will need it removed first",
             config_dir.display()
         );
         retained.push("enrollment draft".to_string());
@@ -1731,7 +1731,7 @@ fn release_local_state_locked(
             && still_present(&path)
         {
             tracing::warn!(
-                "Cloud Connect: failed to remove the {label} at {}: {err}; the instance is released, but the next enrollment in this directory will stop on it",
+                "Cloud Connect: failed to remove the {label} at {}: {err}; the removal is continuing, and if it completes the next enrollment in this directory will stop on it",
                 path.display()
             );
             retained.push(format!("{label} at {}", path.display()));
@@ -1749,7 +1749,7 @@ fn release_local_state_locked(
         && still_present(&endpoint_path)
     {
         tracing::warn!(
-            "Cloud Connect: failed to remove the endpoint override at {}: {err}; the instance is released, but a later enrollment in this directory would still reach the control plane it names",
+            "Cloud Connect: failed to remove the endpoint override at {}: {err}; the removal is continuing, and if it completes a later enrollment in this directory would still reach the control plane it names",
             endpoint_path.display()
         );
         retained.push(format!("endpoint override at {}", endpoint_path.display()));
@@ -1834,7 +1834,15 @@ fn identity_transaction(
 /// that same directory afterwards — so a transient first sync would otherwise
 /// report a file that the release went on to remove and synchronize.
 fn still_present(path: &Path) -> bool {
-    path.try_exists().unwrap_or(true)
+    // `symlink_metadata`, not `try_exists`: the latter follows the final link, so
+    // a dangling symlink reads as absent when the directory entry is very much
+    // still there — and an entry whose unlink failed is exactly what this is
+    // asked about.
+    // Anything but a definite "no entry here" counts as present, including an
+    // error that leaves it unknown.
+    std::fs::symlink_metadata(path)
+        .err()
+        .is_none_or(|err| err.kind() != std::io::ErrorKind::NotFound)
 }
 
 /// Delete `path` off the Tokio driver task, treating a missing file as success.
@@ -1915,7 +1923,7 @@ fn release_atomic_write_artifacts(
         .map(|left| {
             let left = left.display().to_string();
             tracing::warn!(
-                "Cloud Connect: {left} could not be removed; the instance is released, but this host retains a copy of what was removed"
+                "Cloud Connect: {left} could not be removed; the removal is continuing, and if it completes this host retains a copy of what was removed"
             );
             format!("interrupted-write artifact at {left}")
         })
@@ -2610,7 +2618,7 @@ mod tests {
     mod removal {
         use super::super::{
             EnrollmentTransactionLock, MutationLock, ReleaseError, ReleasePolicy,
-            release_local_state,
+            release_local_state, still_present,
         };
         use crate::config::CloudConnectConfig;
         use crate::draft::EnrollmentDraft;
@@ -3154,6 +3162,31 @@ mod tests {
                 );
             }
             assert!(retained.is_empty(), "{retained:?}");
+        }
+
+        /// What `retained` is decided from. A dangling symlink is a directory
+        /// entry that is still there — an unlink that failed leaves exactly that
+        /// — and following it would report the file gone and drop it from the
+        /// release's report.
+        #[cfg(unix)]
+        #[test]
+        fn a_directory_entry_counts_as_present_even_when_it_leads_nowhere() {
+            let dir = tempfile::tempdir().expect("create tempdir");
+            let dangling = dir.path().join("dangling");
+            std::os::unix::fs::symlink(dir.path().join("nothing-here"), &dangling)
+                .expect("create the dangling symlink");
+
+            assert!(
+                still_present(&dangling),
+                "the entry is still in the directory, whatever it points at"
+            );
+            assert!(
+                !still_present(&dir.path().join("never-existed")),
+                "and a name with no entry at all is gone"
+            );
+            let real = dir.path().join("real");
+            std::fs::write(&real, "x").expect("write the file");
+            assert!(still_present(&real), "as is an ordinary file");
         }
 
         /// A sibling somebody named themselves is not this code's to touch, even
