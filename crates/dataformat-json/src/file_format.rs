@@ -26,7 +26,7 @@ use std::sync::Arc;
 use crate::source::SpiceJsonSource;
 use crate::{
     ArrayToNdjson, ArrayToNdjsonPush, JsonPointerReader, ReadResult, SodaReader,
-    extract_flattened_from_nested, is_soda_response, peek_first_non_ws_byte, unnest_struct_schema,
+    body_opens_a_json_array, extract_flattened_from_nested, is_soda_response, unnest_struct_schema,
 };
 
 use arrow::array::RecordBatch;
@@ -654,7 +654,7 @@ fn infer_json_schema_for_format(
                     .to_string(),
             ));
         }
-        Format::Auto | Format::Json => peek_first_non_ws_byte(&mut reader).is_ok_and(|b| b == b'['),
+        Format::Auto | Format::Json => body_opens_a_json_array(&mut reader)?,
     };
 
     if is_array {
@@ -784,6 +784,49 @@ mod tests {
             .expect("field should exist in schema");
         schema
             .field_with_name("age")
+            .expect("field should exist in schema");
+    }
+
+    /// Format detection runs before the array reader and *consumes* the
+    /// prefix it skips, so whichever predicate it uses decides what the
+    /// reader's own guards ever get to see. With the wider
+    /// `is_ascii_whitespace`, a leading form feed — which `serde_json` rejects
+    /// — was eaten here and the body reached `ArrayToNdjson` already looking
+    /// well formed.
+    ///
+    /// This goes through `infer_json_schema_for_format`, the wiring the
+    /// default `Format::Auto` actually uses; a test that constructs the
+    /// adapter itself passes whether or not detection is correct.
+    #[test]
+    fn a_leading_form_feed_is_not_eaten_by_format_detection() {
+        for format in [Format::Auto, Format::Json, Format::Array] {
+            for body in [
+                &b"\x0c[{\"a\":1}]"[..],
+                &b"\x0b[{\"a\":1}]"[..],
+                // A prefix that starts like a BOM and is not one. Inference
+                // rejects these on its own — it re-parses the original buffer
+                // rather than the reader detection advanced — so these rows
+                // pin that, not the propagation fix. What the *scan* paths do
+                // with the same bodies is
+                // `array_detection_propagates_an_error_that_consumed_bytes`.
+                &b"\xEF{\"a\":1}"[..],
+                &b"\xEF\xBB{\"a\":1}"[..],
+            ] {
+                let mut take = || true;
+                assert!(
+                    infer_json_schema_for_format(body, format, &mut take).is_err(),
+                    "{format:?} accepted {:?}, which serde_json rejects",
+                    String::from_utf8_lossy(body)
+                );
+            }
+        }
+
+        // The four bytes JSON does admit still reach the array reader.
+        let mut take = || true;
+        let schema = infer_json_schema_for_format(b" \t\r\n[{\"a\":1}]", Format::Auto, &mut take)
+            .expect("JSON whitespace before the array must remain acceptable");
+        schema
+            .field_with_name("a")
             .expect("field should exist in schema");
     }
 
@@ -1464,6 +1507,32 @@ mod tests {
             assert!(
                 dec.flush().is_err(),
                 "streaming adapter accepted a truncated array the buffered reader rejects"
+            );
+        }
+
+        /// A body carrying more than the array it opens with is the other way
+        /// a file can be read short, and the two readers have to agree about
+        /// it as well: whichever one a dataset happens to be scanned through,
+        /// the same file has to reach the same verdict.
+        #[test]
+        fn both_readers_reject_the_same_trailing_content() {
+            let body = br#"[{"a":1}]{"a":2}"#;
+
+            let mut pulled = Vec::new();
+            let pull = ArrayToNdjson::try_new(std::io::Cursor::new(body.to_vec()))
+                .expect("array start is present")
+                .read_to_end(&mut pulled);
+            assert!(
+                pull.is_err(),
+                "buffered reader read a second array as part of the first"
+            );
+
+            let schema = schema();
+            let mut dec = decoder(&schema);
+            let decoded = dec.decode(body);
+            assert!(
+                decoded.is_err() || dec.flush().is_err(),
+                "streaming adapter accepted trailing content the buffered reader rejects"
             );
         }
     }

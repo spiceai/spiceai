@@ -168,6 +168,13 @@ impl<R: Read + Send> ArrayToNdjson<R> {
                     if matches!(self.peek_next_non_ws_byte(), Ok(b']')) {
                         // Empty array - consume the closing bracket and mark as EOF
                         self.consume_delimiter()?;
+                        // `eof` is set only once the tail is known to be clean:
+                        // it short-circuits `fill_pending`, so setting it first
+                        // would report a rejected body as a clean end of input
+                        // on every read after the one that failed.
+                        self.ensure_only_trailing_whitespace().inspect_err(|_| {
+                            self.malformed = true;
+                        })?;
                         self.eof = true;
                         return Ok(());
                     }
@@ -237,11 +244,57 @@ impl<R: Read + Send> ArrayToNdjson<R> {
             self.malformed = true;
         })?;
         if next == b']' {
+            // Checked before the element is published: a body that is not the
+            // single array it was read as is rejected whole, rather than
+            // handing back its first array's last row and then failing.
+            self.ensure_only_trailing_whitespace().inspect_err(|_| {
+                self.malformed = true;
+            })?;
             self.eof = true;
         }
 
         self.pending.append(&mut element_out);
         Ok(())
+    }
+
+    /// Verify that nothing but whitespace follows the array's closing `]`.
+    ///
+    /// The rule, and its wording, are [`trailing_content_error`]'s; the push
+    /// adapter applies the same one to the same bodies.
+    ///
+    /// Everything the source still holds is read here, because trailing content
+    /// can sit behind any amount of whitespace and only the end of the input
+    /// proves there is none. It is examined a chunk at a time and discarded, so
+    /// a long tail costs a fixed buffer rather than its own size. The inner
+    /// reader is therefore at EOF once this returns.
+    fn ensure_only_trailing_whitespace(&mut self) -> io::Result<()> {
+        let mut tee = match self.shared.lock() {
+            Ok(tee) => tee,
+            Err(e) => e.into_inner(),
+        };
+
+        // Whatever the delimiter scan read past `]` is still buffered, so it is
+        // the first thing the tail check has to account for.
+        if let Some(byte) = first_non_whitespace(&tee.buf) {
+            return Err(trailing_content_error(byte));
+        }
+        tee.buf.clear();
+
+        let mut chunk = [0u8; 4096];
+        loop {
+            let read = match tee.inner.read(&mut chunk) {
+                Ok(0) => return Ok(()),
+                Ok(read) => read,
+                // A read may be cut short by a signal without anything being
+                // wrong with the input; treating that as a verdict would fail a
+                // well-formed file.
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            };
+            if let Some(byte) = first_non_whitespace(&chunk[..read]) {
+                return Err(trailing_content_error(byte));
+            }
+        }
     }
 
     /// Consume the `,` or `]` that follows an element, and report which it was.
@@ -274,7 +327,7 @@ impl<R: Read + Send> ArrayToNdjson<R> {
             // The element's own bytes have already been drained, so whatever
             // is left in tee.buf starts just after it: serde's lookahead, plus
             // anything read here on an earlier pass.
-            if let Some(&b) = tee.buf.iter().find(|b| !b.is_ascii_whitespace()) {
+            if let Some(&b) = tee.buf.iter().find(|b| !is_json_whitespace(**b)) {
                 return Ok(b); // found it – return without consuming
             }
 
@@ -306,7 +359,7 @@ impl<R: Read + Send> ArrayToNdjson<R> {
 
         // 1️⃣  Drop leading whitespace that we may have read while peeking.
         while let Some(&b) = tee.buf.first() {
-            if !b.is_ascii_whitespace() {
+            if !is_json_whitespace(b) {
                 break;
             }
             tee.drain_front(1);
@@ -355,6 +408,53 @@ impl<R: Read + Send> BufRead for ArrayToNdjson<R> {
 // unsafe impl<R: Read + Send + Sync> Sync for ArrayToNdjson<R> {}
 
 /* ---------- shared utilities ---------- */
+
+/// Whether `byte` is whitespace as far as JSON is concerned.
+///
+/// RFC 8259 admits exactly four: space, horizontal tab, carriage return and
+/// line feed. `u8::is_ascii_whitespace` is a wider set — it follows the WHATWG
+/// Infra definition, which also counts form feed (`0x0C`) — so using it to
+/// decide what may follow a document accepts a byte `serde_json` itself
+/// reports as `trailing characters`. It excludes vertical tab (`0x0B`), so
+/// only form feed differs, but one byte is enough: a tail of form feeds is a
+/// body the guard is supposed to reject and would wave through.
+fn is_json_whitespace(byte: u8) -> bool {
+    matches!(byte, b' ' | b'\t' | b'\r' | b'\n')
+}
+
+/// The error for a body that opens with part of a UTF-8 byte-order mark and
+/// then something else, having read `seen` of its three bytes.
+fn incomplete_bom_error(seen: usize) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "Failed to read JSON: the body starts with {seen} of the 3 bytes of a UTF-8 byte-order mark and then something else, so it is neither a marked nor an unmarked JSON document. Check the file for a truncated or re-encoded header, or re-export it as UTF-8."
+        ),
+    )
+}
+
+/// The first byte of `bytes` that is not JSON whitespace, if there is one.
+fn first_non_whitespace(bytes: &[u8]) -> Option<u8> {
+    bytes.iter().find(|b| !is_json_whitespace(**b)).copied()
+}
+
+/// The error both readers report for content that follows the array's `]`.
+///
+/// Reaching `]` ends the array but not necessarily the input. A body holding
+/// more than the one array it was read as — a second concatenated array, or a
+/// larger document that merely starts with one — would otherwise yield that
+/// first array's rows and report success, which is the same silent short read
+/// as a truncated file. The pull and push readers are handed the same bodies,
+/// so they state the verdict in the same words.
+fn trailing_content_error(byte: u8) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "Failed to read JSON array: found '{byte}' after the closing ']'. The body holds more than the single JSON array it was read as, so the rows returned are only its first array. Check the file for concatenated or trailing content, or set the dataset's 'format' to match its contents.",
+            byte = byte.escape_ascii()
+        ),
+    )
+}
 
 /// Filter out newlines and carriage returns from JSON element bytes,
 /// also skip leading and trailing whitespace. Used by both pull and push implementations.
@@ -431,7 +531,7 @@ fn skip_ws_until<R: Read>(r: &mut R, expect: u8) -> io::Result<()> {
             }
         }
         match byte[0] {
-            b if b.is_ascii_whitespace() => {}
+            b if is_json_whitespace(b) => {}
             b if b == expect => return Ok(()),
             b => {
                 return Err(io::Error::new(
@@ -549,6 +649,63 @@ peek_first_non_ws_byte – auto-detect JSON format
 /// UTF-8 BOM prefix (`\xEF\xBB\xBF`).
 const UTF8_BOM: [u8; 3] = [0xEF, 0xBB, 0xBF];
 
+/// Whether the body `reader` holds opens a JSON array, for the formats that
+/// decide by looking at it.
+///
+/// Every caller that dispatches on the answer must go through this rather than
+/// testing [`peek_first_non_ws_byte`] with `is_ok_and`. Detection *consumes*
+/// what it inspects, so an error from it means the reader has already moved
+/// past bytes it could not accept; answering `false` there hands the
+/// non-array reader a body whose rejected prefix is gone, and it parses what
+/// is left as though it were the whole file. That is how `\xEF{"a":1}` was
+/// read as the clean row `{"a":1}`.
+///
+/// An empty or all-whitespace body is the one error that is safe to answer:
+/// nothing was skipped that could have mattered, and the reader chosen below
+/// reports the empty body in its own terms.
+///
+/// That exemption is keyed on the [`EmptyDetectionInput`] marker rather than on
+/// `ErrorKind::UnexpectedEof`, because the kind alone cannot tell the two apart:
+/// every `fill_buf` in the peek can surface an `UnexpectedEof` of its own from a
+/// truncated body, and matching on the kind would coerce that read failure to
+/// `false` after the peek had already consumed a BOM prefix — the exact
+/// discard-then-misparse this function exists to prevent.
+///
+/// # Errors
+///
+/// Returns the detection error for any body it could not classify without
+/// discarding part of.
+pub fn body_opens_a_json_array<R: BufRead>(reader: &mut R) -> io::Result<bool> {
+    match peek_first_non_ws_byte(reader) {
+        Ok(byte) => Ok(byte == b'['),
+        Err(e) if is_empty_detection_input(&e) => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// Marks the `UnexpectedEof` that [`peek_first_non_ws_byte`] raises itself when a
+/// body holds no non-whitespace byte, so it can be told apart from an
+/// `UnexpectedEof` propagated out of the reader.
+#[derive(Debug)]
+struct EmptyDetectionInput;
+
+impl std::fmt::Display for EmptyDetectionInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Empty input while detecting JSON format")
+    }
+}
+
+impl std::error::Error for EmptyDetectionInput {}
+
+fn empty_detection_input_error() -> io::Error {
+    io::Error::new(io::ErrorKind::UnexpectedEof, EmptyDetectionInput)
+}
+
+fn is_empty_detection_input(e: &io::Error) -> bool {
+    e.get_ref()
+        .is_some_and(<dyn std::error::Error + Send + Sync>::is::<EmptyDetectionInput>)
+}
+
 /// Peek at the first non-whitespace byte from a `BufRead` reader without
 /// consuming non-whitespace content.
 ///
@@ -556,9 +713,13 @@ const UTF8_BOM: [u8; 3] = [0xEF, 0xBB, 0xBF];
 /// Leading whitespace bytes are consumed from the buffer, but the first
 /// non-whitespace byte remains available for subsequent reads.
 ///
+/// Callers that dispatch on the answer want [`body_opens_a_json_array`]: this
+/// consumes what it inspects, so its errors cannot be coerced to a decision.
+///
 /// # Errors
 ///
-/// Returns an error if the reader is empty or contains only whitespace.
+/// Returns an error if the reader is empty, contains only whitespace, or
+/// opens with part of a UTF-8 BOM and then something else.
 pub fn peek_first_non_ws_byte<R: BufRead>(reader: &mut R) -> io::Result<u8> {
     // Skip UTF-8 BOM if present at the start of the stream.
     // Handle incrementally: the BOM bytes may arrive split across buffers.
@@ -567,27 +728,33 @@ pub fn peek_first_non_ws_byte<R: BufRead>(reader: &mut R) -> io::Result<u8> {
         if buf.len() >= 3 && buf[..3] == UTF8_BOM {
             reader.consume(3);
         } else if !buf.is_empty() && buf[0] == UTF8_BOM[0] {
-            // Potential partial BOM — read byte-by-byte to confirm.
-            let mut bom_buf = [0u8; 3];
-            bom_buf[0] = buf[0];
+            // Potential partial BOM — read byte-by-byte to confirm, because
+            // the BOM's bytes may straddle two buffers.
+            //
+            // Confirming costs consuming, and a `BufRead` cannot put the bytes
+            // back. So a prefix that starts like a BOM and turns out not to be
+            // one leaves the reader holding a body with its first bytes
+            // deleted. Reporting the `0xEF` and carrying on is what made
+            // `\xEF{"a":1}` load as the clean object `{"a":1}` — the corrupt
+            // prefix silently gone, and the caller handed a reader whose
+            // remaining bytes parse.
+            //
+            // Erroring refuses nothing valid: a JSON document begins with
+            // `{`, `[`, `"`, a digit, `-`, `t`, `f` or `n`, so `0xEF` can only
+            // ever be the start of a BOM.
             reader.consume(1);
             let b1 = reader.fill_buf()?;
             if !b1.is_empty() && b1[0] == UTF8_BOM[1] {
-                bom_buf[1] = b1[0];
                 reader.consume(1);
                 let b2 = reader.fill_buf()?;
                 if !b2.is_empty() && b2[0] == UTF8_BOM[2] {
                     // Full BOM consumed.
                     reader.consume(1);
                 } else {
-                    // Only 0xEF 0xBB seen — not a BOM, put back by returning 0xEF.
-                    // We can't un-consume, so treat what we read as content.
-                    // 0xEF is not ascii whitespace, so return it.
-                    return Ok(bom_buf[0]);
+                    return Err(incomplete_bom_error(2));
                 }
             } else {
-                // Only 0xEF seen — not a BOM. 0xEF is not whitespace.
-                return Ok(bom_buf[0]);
+                return Err(incomplete_bom_error(1));
             }
         }
     }
@@ -595,14 +762,16 @@ pub fn peek_first_non_ws_byte<R: BufRead>(reader: &mut R) -> io::Result<u8> {
     loop {
         let buf = reader.fill_buf()?;
         if buf.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "Empty input while detecting JSON format",
-            ));
+            return Err(empty_detection_input_error());
         }
         for (i, &byte) in buf.iter().enumerate() {
-            if !byte.is_ascii_whitespace() {
-                // Consume only the leading whitespace, leave the non-ws byte
+            if !is_json_whitespace(byte) {
+                // Consume only the leading whitespace, leave the non-ws byte.
+                // The predicate has to be JSON's, not `is_ascii_whitespace`'s:
+                // this consumes what it skips, so a wider one would eat a form
+                // feed here and hand `ArrayToNdjson` a body whose invalid
+                // prefix is already gone — the prologue guard would then never
+                // see the byte it exists to reject.
                 reader.consume(i);
                 return Ok(byte);
             }
@@ -1198,22 +1367,10 @@ impl ArrayToNdjsonPush {
     }
 
     fn ensure_only_trailing_whitespace(&self) -> io::Result<()> {
-        let Some(byte) = self
-            .buffer
-            .iter()
-            .find(|b| !b.is_ascii_whitespace())
-            .copied()
-        else {
-            return Ok(());
-        };
-
-        Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "Failed to read JSON array: found '{byte}' after the closing ']'. The body holds more than the single JSON array it was read as, so the rows returned are only its first array. Check the file for concatenated or trailing content, or set the dataset's 'format' to match its contents.",
-                byte = byte.escape_ascii()
-            ),
-        ))
+        match first_non_whitespace(&self.buffer) {
+            Some(byte) => Err(trailing_content_error(byte)),
+            None => Ok(()),
+        }
     }
 
     /// Whether the buffer ends part-way through a token, so that bytes still
@@ -1242,7 +1399,7 @@ impl ArrayToNdjsonPush {
                     "EOF while peeking next byte",
                 ));
             }
-            if !byte[0].is_ascii_whitespace() {
+            if !is_json_whitespace(byte[0]) {
                 return Ok(byte[0]);
             }
         }
@@ -1266,6 +1423,14 @@ mod tests {
     /// # Errors
     ///
     /// Returns an error if there are I/O errors while reading lines.
+    /// Drive `ArrayToNdjson` over a whole body and split the NDJSON it
+    /// produces into lines.
+    fn ndjson_lines(body: &[u8]) -> io::Result<Vec<String>> {
+        let mut out = String::new();
+        ArrayToNdjson::try_new(Cursor::new(body.to_vec()))?.read_to_string(&mut out)?;
+        Ok(out.lines().map(ToOwned::to_owned).collect())
+    }
+
     fn read_all_lines<R: BufRead>(mut reader: R) -> io::Result<Vec<String>> {
         let mut lines = Vec::new();
         let mut line = String::new();
@@ -1654,13 +1819,22 @@ mod tests {
         assert_eq!(lines, vec!["{}"]);
     }
 
+    /// A body that carries more than the array it opens with is reported, not
+    /// read as that array. Returning `{}` here and reporting success is the
+    /// same silent short read as a truncated file: the caller cannot tell the
+    /// rows it got apart from the whole of the input.
     #[test]
-    fn test_finish_method_recovers_reader() {
+    fn test_content_after_the_array_is_reported() {
         let input = "[{}]remaining data";
         let cursor = Cursor::new(input);
         let adapter = ArrayToNdjson::try_new(cursor).expect("Test should not fail");
-        let lines = read_all_lines(adapter).expect("Test should not fail");
-        assert_eq!(lines, vec!["{}"]);
+        let err = read_all_lines(adapter)
+            .expect_err("content after the closing ']' must not be dropped in silence");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("after the closing ']'"),
+            "expected the trailing-content verdict, got: {err}"
+        );
     }
 
     #[test]
@@ -2231,6 +2405,11 @@ mod tests {
                 &b"[1]]"[..],
                 &b"[1],"[..],
                 &b"[]x"[..],
+                // Not JSON whitespace, so a tail of these is content — see
+                // `is_json_whitespace`. Both readers have to agree on that.
+                &b"[1]\x0c"[..],
+                &b"[1]\x0b"[..],
+                &b"[]\x0c"[..],
             ] {
                 let mut adapter = ArrayToNdjsonPush::new();
                 let Err(err) = adapter.push_bytes(body) else {
@@ -2958,13 +3137,152 @@ mod tests {
             assert_eq!(byte, b'[');
         }
 
-        /// Partial BOM prefix (only 0xEF) — not a real BOM
+        /// A prefix that starts like a BOM and is not one has to be reported,
+        /// because confirming it costs consuming it and a `BufRead` cannot put
+        /// the bytes back. Returning `0xEF` and continuing hands the caller a
+        /// reader whose corrupt prefix has been deleted — so `\xEF{"a":1}`
+        /// reads as the clean object `{"a":1}`, which is the silent-acceptance
+        /// shape the array guards exist to remove.
+        ///
+        /// The bodies here differ in how far the prefix gets (one byte, then
+        /// two) and in whether what follows would parse on its own. The
+        /// `{"a":1}` rows are the ones that mattered: `[` alone fails later
+        /// anyway, so it cannot tell a fixed reader from a broken one.
         #[test]
-        fn test_auto_detect_partial_bom_single_byte() {
-            let input = vec![0xEF, b'['];
-            let mut reader = BufReader::with_capacity(1, Cursor::new(input));
-            let byte = peek_first_non_ws_byte(&mut reader).expect("should return 0xEF");
-            assert_eq!(byte, 0xEF);
+        fn a_partial_bom_is_reported_rather_than_swallowed() {
+            for input in [
+                vec![0xEF, b'['],
+                vec![0xEF, b'{', b'"', b'a', b'"', b':', b'1', b'}'],
+                vec![0xEF, 0xBB, b'{', b'"', b'a', b'"', b':', b'1', b'}'],
+            ] {
+                let mut reader = BufReader::with_capacity(1, Cursor::new(input.clone()));
+                let err = peek_first_non_ws_byte(&mut reader)
+                    .expect_err("an incomplete BOM must not be reported as content");
+                assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+                assert!(
+                    err.to_string().contains("byte-order mark"),
+                    "expected the incomplete-BOM verdict for {input:?}, got: {err}"
+                );
+            }
+        }
+
+        /// Every caller that dispatches on "is this an array" goes through
+        /// `body_opens_a_json_array`, so the decision to propagate rather than
+        /// answer `false` is made once. Testing it here is what covers the two
+        /// scan paths in `source.rs`, which have no unit-test harness of their
+        /// own: they are correct because they call this, not because each
+        /// spells the rule out again.
+        ///
+        /// An empty or all-whitespace body is the one error it may answer,
+        /// because detection skipped nothing that could have mattered.
+        #[test]
+        fn array_detection_propagates_an_error_that_consumed_bytes() {
+            for body in [
+                &b"\xEF{\"a\":1}"[..],
+                &b"\xEF\xBB{\"a\":1}"[..],
+                &b"\xEF["[..],
+            ] {
+                let mut reader = BufReader::with_capacity(1, Cursor::new(body.to_vec()));
+                let err = body_opens_a_json_array(&mut reader).expect_err(
+                    "a body whose prefix detection already consumed must not answer `false`",
+                );
+                assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+            }
+
+            for body in [&b""[..], &b"   \n\t"[..]] {
+                let mut reader = BufReader::new(Cursor::new(body.to_vec()));
+                assert!(
+                    !body_opens_a_json_array(&mut reader)
+                        .expect("an empty body is answerable, not an error to propagate"),
+                    "{:?} is not an array",
+                    String::from_utf8_lossy(body)
+                );
+            }
+
+            for (body, want) in [(&b"  [1]"[..], true), (&br#"{"a":1}"#[..], false)] {
+                let mut reader = BufReader::new(Cursor::new(body.to_vec()));
+                assert_eq!(
+                    body_opens_a_json_array(&mut reader).expect("a well-formed body classifies"),
+                    want,
+                    "for {}",
+                    String::from_utf8_lossy(body)
+                );
+            }
+        }
+
+        /// A `BufRead` that yields some bytes and then fails with
+        /// `UnexpectedEof` — a truncated body is the ordinary way to get one out
+        /// of an object-store or network reader.
+        struct TruncatingReader {
+            prefix: Vec<u8>,
+            pos: usize,
+        }
+
+        impl io::Read for TruncatingReader {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                let src = self.fill_buf()?;
+                let n = src.len().min(buf.len());
+                buf[..n].copy_from_slice(&src[..n]);
+                self.consume(n);
+                Ok(n)
+            }
+        }
+
+        impl BufRead for TruncatingReader {
+            fn fill_buf(&mut self) -> io::Result<&[u8]> {
+                if self.pos >= self.prefix.len() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "truncated body",
+                    ));
+                }
+                // One byte at a time, so the peek is forced back into `fill_buf`
+                // after each `consume` and meets the truncation mid-scan.
+                Ok(&self.prefix[self.pos..=self.pos])
+            }
+
+            fn consume(&mut self, amt: usize) {
+                self.pos += amt;
+            }
+        }
+
+        /// The empty-body exemption keys on the marker, not on the error *kind*.
+        /// `UnexpectedEof` is also what a truncated body raises out of
+        /// `fill_buf`, and by the time that surfaces the peek may already have
+        /// consumed a BOM prefix — so answering `false` on the kind alone would
+        /// hand the non-array reader a body with its first bytes deleted, which
+        /// is the discard-then-misparse this whole path exists to prevent.
+        #[test]
+        fn array_detection_propagates_a_truncated_read_it_did_not_raise() {
+            for prefix in [&b"\xEF"[..], &b"\xEF\xBB"[..], &b"   "[..]] {
+                let mut reader = TruncatingReader {
+                    prefix: prefix.to_vec(),
+                    pos: 0,
+                };
+                let err = body_opens_a_json_array(&mut reader)
+                    .expect_err("a read failure from the body must propagate, not answer `false`");
+                assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+                assert!(
+                    err.to_string().contains("truncated body"),
+                    "expected the reader's own error to survive, got: {err}"
+                );
+            }
+        }
+
+        /// The guard above must not touch a complete BOM, which is ordinary.
+        #[test]
+        fn a_complete_bom_is_still_skipped() {
+            for capacity in [1, 2, 8] {
+                let mut input = UTF8_BOM.to_vec();
+                input.extend(b"  [1]");
+                let mut reader = BufReader::with_capacity(capacity, Cursor::new(input));
+                assert_eq!(
+                    peek_first_non_ws_byte(&mut reader)
+                        .expect("a complete BOM must still be skipped"),
+                    b'[',
+                    "with a {capacity}-byte buffer"
+                );
+            }
         }
 
         /// Auto-detect: object
@@ -4113,14 +4431,6 @@ mod tests {
     mod bare_scalar_elements {
         use super::*;
 
-        /// Drive `ArrayToNdjson` over a whole body and split the NDJSON it
-        /// produces into lines.
-        fn ndjson_lines(body: &[u8]) -> io::Result<Vec<String>> {
-            let mut out = String::new();
-            ArrayToNdjson::try_new(Cursor::new(body.to_vec()))?.read_to_string(&mut out)?;
-            Ok(out.lines().map(ToOwned::to_owned).collect())
-        }
-
         #[test]
         fn each_scalar_kind_reads_as_one_element() {
             for (body, want) in [
@@ -4197,13 +4507,24 @@ mod tests {
             }
         }
 
-        /// An element is only ever the bytes serde committed to it. A body
-        /// with a stray byte after the array must still yield `1`, not `1]` —
-        /// a row that is not valid JSON and is not in the file.
+        /// An element is only ever the bytes serde committed to it, so the
+        /// stray `]` in `[1]]` is never folded into the row. It is not part of
+        /// the array either, which makes it trailing content: the body is
+        /// reported rather than read as the array it merely starts with.
+        ///
+        /// Asserting the error's own wording is what separates the two
+        /// failures. A row of `1]` would be reported too — as invalid JSON, by
+        /// a different message — and an assertion on `is_err` alone would pass
+        /// for that regression as readily as for the behaviour under test.
         #[test]
         fn a_trailing_byte_is_never_folded_into_the_element() {
-            let got = ndjson_lines(br"[1]]").expect("should read the closed array");
-            assert_eq!(got, vec!["1"]);
+            let err = ndjson_lines(br"[1]]")
+                .expect_err("a stray ']' after the array must not read clean");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+            assert!(
+                err.to_string().contains("after the closing ']'"),
+                "expected the trailing-content verdict, got: {err}"
+            );
         }
 
         /// An array cut short mid-scalar has no closing `]`, and must be
@@ -4230,7 +4551,7 @@ mod tests {
         /// and any failure breaks that: the element's bytes have already left
         /// the inner reader, so nothing can be re-read from the right place.
         /// Every read from there on has to keep saying so.
-        fn assert_stays_failed(body: &[u8], reads_before_failure: usize) {
+        pub(super) fn assert_stays_failed(body: &[u8], reads_before_failure: usize) {
             let mut reader =
                 ArrayToNdjson::try_new(Cursor::new(body.to_vec())).expect("array start");
             let mut buf = [0u8; 64];
@@ -4321,6 +4642,226 @@ mod tests {
                 lines.push(line.trim_end().to_owned());
             }
             assert_eq!(lines, vec!["1", "2", "3"]);
+        }
+    }
+
+    /// Reaching `]` ends the array but not the input. Whatever follows it is
+    /// not part of the array, so reading the array's rows and reporting
+    /// success would leave a caller unable to tell those rows from the whole
+    /// of the file — the same silent short read as a truncated body.
+    ///
+    /// The bodies below are the ones `push_tests` uses for the same rule. Both
+    /// readers are handed the same files, so a body either reader accepts and
+    /// the other rejects is a disagreement about what the file contains.
+    mod pull_trailing_content {
+        use super::*;
+
+        #[test]
+        fn trailing_content_after_the_closing_bracket_is_reported() {
+            for body in [
+                &b"[1]garbage"[..],
+                &b"[1][2]"[..],
+                &br#"[{"a":1}] {"b":2}"#[..],
+                &br#"[{"a":1}]garbage"#[..],
+                // A stray delimiter is trailing content too: the array is
+                // already closed, so neither can belong to it.
+                &b"[1]]"[..],
+                &b"[1],"[..],
+                &b"[]x"[..],
+                // Form feed and vertical tab are not JSON whitespace, so a
+                // tail of them is content. Rust's `is_ascii_whitespace` counts
+                // the form feed and would read this body clean.
+                &b"[1]\x0c"[..],
+                &b"[1]\x0b"[..],
+                &b"[]\x0c"[..],
+            ] {
+                let Err(err) = ndjson_lines(body) else {
+                    panic!(
+                        "{} must be reported, not silently truncated to its first array",
+                        String::from_utf8_lossy(body)
+                    )
+                };
+                assert_eq!(
+                    err.kind(),
+                    io::ErrorKind::InvalidData,
+                    "{} reported the wrong error kind",
+                    String::from_utf8_lossy(body)
+                );
+                assert!(
+                    err.to_string().contains("after the closing ']'"),
+                    "{} reported something other than the trailing-content verdict: {err}",
+                    String::from_utf8_lossy(body)
+                );
+            }
+        }
+
+        /// The guard must reject only what cannot belong to the file. A JSON
+        /// array ending in a newline is the ordinary case, and rejecting it
+        /// would turn every well-formed file into a read failure.
+        #[test]
+        fn whitespace_after_the_closing_bracket_is_accepted() {
+            for (body, expected) in [
+                (&b"[1]\n"[..], vec!["1"]),
+                (&b"[1] "[..], vec!["1"]),
+                (&br#"[{"a":1}]  "#[..], vec![r#"{"a":1}"#]),
+                (&b"[{\"a\":1}]\r\n\t "[..], vec![r#"{"a":1}"#]),
+                (&b"[]\n"[..], vec![]),
+            ] {
+                let got = ndjson_lines(body).unwrap_or_else(|e| {
+                    panic!(
+                        "{} is well formed and must not error: {e}",
+                        String::from_utf8_lossy(body)
+                    )
+                });
+                assert_eq!(
+                    got,
+                    expected,
+                    "{} produced the wrong rows",
+                    String::from_utf8_lossy(body)
+                );
+            }
+        }
+
+        /// The tail can be arbitrarily long, and it is only whitespace that
+        /// has to be read through before the content behind it is reached.
+        /// Reading it must not depend on it fitting anywhere.
+        #[test]
+        fn content_behind_a_long_whitespace_tail_is_still_found() {
+            let mut body = br#"[{"a":1}]"#.to_vec();
+            body.extend(std::iter::repeat_n(b' ', 64 * 1024));
+
+            let mut clean = body.clone();
+            clean.extend(b"\n\t  ");
+            assert_eq!(
+                ndjson_lines(&clean).expect("a whitespace tail must read cleanly"),
+                vec![r#"{"a":1}"#]
+            );
+
+            body.extend(br#"{"b":2}"#);
+            let err = ndjson_lines(&body)
+                .expect_err("content behind the whitespace must still be reported");
+            assert!(
+                err.to_string().contains("after the closing ']'"),
+                "expected the trailing-content verdict, got: {err}"
+            );
+        }
+
+        /// A consumer that logs the error and reads on must not then be handed
+        /// a clean end of input: `Ok(0)` there says the file ended where the
+        /// array did, which is the reading this fix exists to remove.
+        ///
+        /// `[1]]` fails on the read that closes the array, so no read succeeds
+        /// first; `[1,2]x` emits `1` before failing on the one that reaches
+        /// `]`, which is where the last element is withheld.
+        #[test]
+        fn a_reported_body_never_reads_clean_afterwards() {
+            bare_scalar_elements::assert_stays_failed(br"[1]]", 0);
+            bare_scalar_elements::assert_stays_failed(br"[1,2]x", 1);
+        }
+
+        /// Reads the body one byte at a time, returning `Interrupted` before
+        /// each. A `Cursor` never does this, so nothing else in these tests
+        /// reaches the retry the tail scan needs to survive.
+        struct InterruptsEveryRead {
+            body: Vec<u8>,
+            at: usize,
+            interrupt_next: bool,
+        }
+
+        impl Read for InterruptsEveryRead {
+            fn read(&mut self, dst: &mut [u8]) -> io::Result<usize> {
+                if self.interrupt_next {
+                    self.interrupt_next = false;
+                    return Err(io::Error::new(io::ErrorKind::Interrupted, "signal"));
+                }
+                self.interrupt_next = true;
+                if self.at >= self.body.len() || dst.is_empty() {
+                    return Ok(0);
+                }
+                dst[0] = self.body[self.at];
+                self.at += 1;
+                Ok(1)
+            }
+        }
+
+        /// A read cut short by a signal says nothing about the input, so the
+        /// tail scan has to resume rather than treat it as a verdict — in
+        /// either direction. Reporting it as an I/O failure would reject a
+        /// well-formed file; taking it for the end of the input would accept
+        /// the trailing content sitting behind it.
+        #[test]
+        fn an_interrupted_read_of_the_tail_is_resumed() {
+            let interrupted = |body: &[u8]| {
+                let mut out = String::new();
+                ArrayToNdjson::try_new(InterruptsEveryRead {
+                    body: body.to_vec(),
+                    at: 0,
+                    interrupt_next: false,
+                })?
+                .read_to_string(&mut out)?;
+                Ok::<_, io::Error>(out.lines().map(ToOwned::to_owned).collect::<Vec<_>>())
+            };
+
+            assert_eq!(
+                interrupted(b"[1]   \n  ").expect("a whitespace tail must still read cleanly"),
+                vec!["1"]
+            );
+
+            let err = interrupted(b"[1]   \n  x")
+                .expect_err("trailing content behind an interrupt must still be reported");
+            assert!(
+                err.to_string().contains("after the closing ']'"),
+                "expected the trailing-content verdict, got: {err}"
+            );
+        }
+
+        /// The tail is not the only place a document's validity turns on what
+        /// counts as whitespace. `serde_json` rejects a form feed between
+        /// tokens, so the scans this crate writes itself — the prologue before
+        /// `[`, and the one that decides an array is empty — have to reject it
+        /// too, or a body serde would refuse reads clean through them.
+        ///
+        /// Vertical tab is in the table because it is the byte the reported
+        /// version of this got wrong: `is_ascii_whitespace` already excludes
+        /// it, so it was rejected before this change and must stay rejected.
+        ///
+        /// Format detection is covered too, in `file_format`: it *consumes*
+        /// the prefix it skips, so a wider predicate there deletes the invalid
+        /// byte before any guard runs. Calling the adapters directly, as this
+        /// test does, cannot see that.
+        ///
+        /// Deliberately unchanged: `filter_element_bytes`, which trims a row
+        /// `serde_json` has already accepted. It formats output rather than
+        /// judging input, so JSON's whitespace rules do not govern it.
+        #[test]
+        fn a_form_feed_is_not_whitespace_to_either_reader() {
+            for body in [
+                &b"\x0c[1]"[..],
+                &b"\x0b[1]"[..],
+                &b"[\x0c]"[..],
+                &b"[\x0b]"[..],
+            ] {
+                assert!(
+                    ndjson_lines(body).is_err(),
+                    "pull reader accepted {:?}, which serde_json rejects",
+                    String::from_utf8_lossy(body)
+                );
+
+                let mut adapter = ArrayToNdjsonPush::new();
+                let accepted = adapter.push_bytes(body).is_ok() && adapter.finish().is_ok();
+                assert!(
+                    !accepted,
+                    "push reader accepted {:?}, which serde_json rejects",
+                    String::from_utf8_lossy(body)
+                );
+            }
+
+            // The four bytes JSON does admit stay admitted, in the same spots.
+            assert_eq!(
+                ndjson_lines(b" \t\r\n[ \t\r\n1 \t\r\n] \t\r\n")
+                    .expect("JSON whitespace must remain acceptable everywhere"),
+                vec!["1"]
+            );
         }
     }
 
