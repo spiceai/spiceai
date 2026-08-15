@@ -439,10 +439,22 @@ impl RequestContext {
         }
     }
 
+    /// Enters a query on this request, reporting whether it is the only one
+    /// running — the transition from no queries to some.
+    ///
+    /// Independent queries can share one request context and overlap, so this
+    /// means "the request went from idle to busy", not "this query encloses the
+    /// others". A caller pairing an acquire with a release must take the
+    /// release from [`Self::exited_top_level_query`] rather than remembering
+    /// this answer, because the query that opened the request is not
+    /// guaranteed to be the one that closes it.
     pub fn entered_top_level_query(&self) -> bool {
         self.nested_query_level.fetch_add(1, Ordering::Relaxed) == 0
     }
 
+    /// Leaves a query on this request, reporting whether it was the last one
+    /// running — the transition back to idle, and the release that pairs with
+    /// [`Self::entered_top_level_query`]'s acquire.
     pub fn exited_top_level_query(&self) -> bool {
         self.nested_query_level.fetch_add(-1, Ordering::Relaxed) == 1
     }

@@ -61,7 +61,6 @@ mimalloc = { version = "0.1.48", optional = true }
 opentelemetry.workspace = true
 opentelemetry-http.workspace = true
 parking_lot.workspace = true
-opentelemetry-prometheus.workspace = true
 opentelemetry-zipkin.workspace = true
 opentelemetry_sdk.workspace = true
 otel-arrow = { path = "../../crates/otel-arrow" }

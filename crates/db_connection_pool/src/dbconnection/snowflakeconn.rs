@@ -32,6 +32,7 @@ use arrow::temporal_conversions::NANOSECONDS;
 use async_trait::async_trait;
 use datafusion::error::DataFusionError;
 use datafusion::execution::SendableRecordBatchStream;
+use datafusion::physical_plan::EmptyRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::sql::TableReference;
 use datafusion_table_providers::sql::db_connection_pool::dbconnection::{
@@ -196,7 +197,7 @@ impl<'a> AsyncDbConnection<Arc<SnowflakeApi>, &'a dyn Sync> for SnowflakeConnect
         &self,
         sql: &str,
         _: &[&'a dyn Sync],
-        _projected_schema: Option<SchemaRef>,
+        projected_schema: Option<SchemaRef>,
     ) -> Result<SendableRecordBatchStream, Box<dyn std::error::Error + Send + Sync>> {
         let start = Instant::now();
         tracing::debug!("Snowflake: executing query");
@@ -218,10 +219,7 @@ impl<'a> AsyncDbConnection<Arc<SnowflakeApi>, &'a dyn Sync> for SnowflakeConnect
         });
 
         let Some(first_batch) = transformed_stream.next().await else {
-            return Ok(Box::pin(RecordBatchStreamAdapter::new(
-                Arc::new(Schema::empty()),
-                stream::empty(),
-            )));
+            return Ok(empty_result_stream(projected_schema));
         };
 
         let batch = first_batch?;
@@ -249,6 +247,17 @@ impl<'a> AsyncDbConnection<Arc<SnowflakeApi>, &'a dyn Sync> for SnowflakeConnect
     ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
         return NotImplementedSnafu.fail()?;
     }
+}
+
+/// The stream for a query Snowflake answered with no batches.
+///
+/// Every other schema on this path is read off the first batch, so when there is
+/// no batch the schema has to come from the projected schema the plan was built
+/// from. Falling back to [`Schema::empty`] would hand back a stream whose schema
+/// contradicts the columns the query selected.
+fn empty_result_stream(projected_schema: Option<SchemaRef>) -> SendableRecordBatchStream {
+    let schema = projected_schema.unwrap_or_else(|| Arc::new(Schema::empty()));
+    Box::pin(EmptyRecordBatchStream::new(schema))
 }
 
 fn to_execution_error(e: impl Into<Box<dyn std::error::Error>>) -> DataFusionError {
@@ -814,6 +823,40 @@ mod tests {
     use arrow::datatypes::{DataType, Field};
     use arrow::util::display;
     use std::sync::Arc;
+
+    /// Regression test for #13015: a query Snowflake answers with no batches
+    /// must still carry the projected schema, so an empty result is an empty
+    /// table with the columns the query selected rather than no columns at all.
+    #[test]
+    fn empty_result_stream_keeps_the_projected_schema() {
+        let projected: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+
+        let mut stream = empty_result_stream(Some(Arc::clone(&projected)));
+
+        assert_eq!(
+            stream.schema().as_ref(),
+            projected.as_ref(),
+            "an empty result must carry the projected schema"
+        );
+        assert!(
+            futures::executor::block_on(stream.next()).is_none(),
+            "an empty result must not yield a batch"
+        );
+    }
+
+    #[test]
+    fn empty_result_stream_without_a_projection_has_no_columns() {
+        let stream = empty_result_stream(None);
+
+        assert_eq!(
+            stream.schema().fields().len(),
+            0,
+            "with no projected schema there is nothing to preserve"
+        );
+    }
 
     #[test]
     fn test_cast_sf_timestamp_ntz_seconds_precision_to_arrow_timestamp() {
