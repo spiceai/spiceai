@@ -47,10 +47,10 @@ inputs:
         - 'go.mod'
         - 'go.sum'
         - 'Makefile'
-        # Dot-prefixed directories are spelled out literally rather than left to
-        # `**`, which only descends into them when picomatch runs with
-        # `dot: true` — `.ci/clippy.toml` is the config the lint gate actually
-        # reads, so it must match either way.
+        # Dot-prefixed directories are spelled out literally even though
+        # dorny/paths-filter runs picomatch with `dot: true`, so `**` would
+        # reach them: `.ci/clippy.toml` is the config the lint gate actually
+        # reads, and naming it keeps that explicit rather than incidental.
         - '.ci/**'
         - '.config/**'
         - '.cargo/**'

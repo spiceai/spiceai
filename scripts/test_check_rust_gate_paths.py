@@ -60,18 +60,25 @@ check(
     glob_matches("vendor/**", "vendored/lib.rs"),
     False,
 )
-# picomatch descends into a dot-prefixed segment only with `dot: true`, which
-# this filter does not set — so a wildcard must never be credited for one.
+# dorny/paths-filter builds its matchers with `{dot: true}`, so a wildcard does
+# reach a dot-prefixed segment. Modelling it as excluded would make this guard
+# stricter than the filter and report a covered path as ungated.
 check(
-    "a wildcard does not match a dot-prefixed segment",
+    "a wildcard reaches a dot-prefixed segment",
     glob_matches("**", ".ci/clippy.toml"),
-    False,
+    True,
 )
 check(
-    "a glob spelling the dot segment out does match",
+    "a glob spelling the dot segment out also matches",
     glob_matches(".ci/**", ".ci/clippy.toml"),
     True,
 )
+check(
+    "a leading `**/` reaches a dot-prefixed segment",
+    glob_matches("**/clippy.toml", ".ci/clippy.toml"),
+    True,
+)
+check("a wildcard still does not cross a segment boundary", glob_matches("*", "a/b"), False)
 check(
     "a leading `**/` may match nothing",
     glob_matches("**/clippy.toml", "clippy.toml"),
@@ -94,16 +101,22 @@ check(
     ({"scripts/signoff": []}, []),
 )
 
+# Built as named values rather than adjacent literals inside the list: two long
+# messages sitting side by side in a list is one missing comma away from
+# silently becoming a single element that still compares as "close enough".
+PATTERN_MISS = (
+    ".ci/clippy.toml changes what the Rust gate does, but the pattern in scripts/signoff "
+    + "does not match it — the branch would skip every Rust check."
+)
+GLOB_MISS = (
+    ".ci/clippy.toml changes what the Rust gate does, but no check-code-changes glob "
+    + "matches it — the merge queue would report `Rust Lint` and `Build and Test` green "
+    + "without running a step."
+)
 check(
     "a config path the globs miss names the merge-queue consequence",
     gate_config_errors([".ci/clippy.toml"], ["crates/**"], RS_PATTERN),
-    [
-        ".ci/clippy.toml changes what the Rust gate does, but the pattern in scripts/signoff "
-        "does not match it — the branch would skip every Rust check.",
-        ".ci/clippy.toml changes what the Rust gate does, but no check-code-changes glob "
-        "matches it — the merge queue would report `Rust Lint` and `Build and Test` green "
-        "without running a step.",
-    ],
+    [PATTERN_MISS, GLOB_MISS],
 )
 check(
     "a config path both lists cover is silent",

@@ -191,23 +191,24 @@ def rust_source_trees(tracked: list[str]) -> dict[str, list[str]]:
 def glob_matches(glob: str, path: str) -> bool:
     """Match one dorny/paths-filter (picomatch) glob against a path.
 
-    Equivalent to `glob.translate(glob, recursive=True, include_hidden=False)`,
+    Equivalent to `glob.translate(glob, recursive=True, include_hidden=True)`,
     hand-rolled only because that landed in Python 3.13 and this repo's guards
-    run on 3.11. `include_hidden=False` is the rule that matters: a wildcard
-    never matches a path segment starting with `.`, because picomatch descends
-    into dot-prefixed directories only with `dot: true`, which this filter does
-    not set. So a dot path (`.ci/clippy.toml`) must be covered by a glob that
-    spells the dot segment out (`.ci/**`) — which matches either way — rather
-    than relying on `**` to reach it.
+    run on 3.11. `include_hidden=True` is the rule that matters, and it is read
+    off the action rather than assumed: `dorny/paths-filter` builds every
+    matcher with `MatchOptions = {dot: true}` (`src/filter.ts`, at the SHA
+    pinned in `check-code-changes/action.yml`), so a wildcard *does* reach a
+    segment starting with `.` and `**` alone covers `.ci/clippy.toml`. Modelling
+    it the other way makes this guard stricter than the filter it stands in for,
+    which reports a covered path as ungated.
     """
     if glob.startswith("**/"):
         # picomatch lets a leading `**/` match nothing, so `**/x` matches `x`.
         return glob_matches(glob[3:], path) or glob_matches(f"*/{glob}", path)
     pattern = (
         re.escape(glob)
-        .replace(r"\*\*/", "(?:[^./][^/]*/)*")
-        .replace(r"\*\*", "[^./][^/]*(?:/[^./][^/]*)*")
-        .replace(r"\*", "[^./][^/]*")
+        .replace(r"\*\*/", "(?:[^/]+/)*")
+        .replace(r"\*\*", "[^/]+(?:/[^/]+)*")
+        .replace(r"\*", "[^/]+")
     )
     return re.fullmatch(pattern, path) is not None
 
