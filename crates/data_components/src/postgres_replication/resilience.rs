@@ -123,10 +123,12 @@ fn jitter(d: Duration) -> Duration {
 /// protocol, slot-not-found, or decoding errors are fatal.
 #[must_use]
 pub fn is_transient_pgwire(err: &pgwire_replication::PgWireError) -> bool {
-    match err {
+    let transient = match err {
         pgwire_replication::PgWireError::Io(_) | pgwire_replication::PgWireError::Task(_) => true,
         _ => is_transient_by_display(&err.to_string()),
-    }
+    };
+    tracing::info!(transient, %err, "classified pgwire error");
+    transient
 }
 
 /// Same classifier for tokio-postgres (used by setup + bootstrap).
@@ -186,9 +188,11 @@ fn is_transient_by_display(msg: &str) -> bool {
         "sqlstate 53300",
         "max_wal_senders",
         "too many connections",
-        // SQLSTATE 57P0x (operator_intervention): admin shutdown, crash shutdown,
-        // cannot connect now.
-        "sqlstate 57p",
+        // SQLSTATE 57P01/57P02/57P03 (operator_intervention): admin shutdown, crash shutdown,
+        // cannot connect now. Note that 57P04 (database_dropped) is fatal and not retryable.
+        "sqlstate 57p01",
+        "sqlstate 57p02",
+        "sqlstate 57p03",
         "admin shutdown",
         "administrator command",
         "terminating connection",
@@ -300,13 +304,22 @@ mod tests {
         assert!(is_transient_by_display("Connection reset by peer"));
         assert!(is_transient_by_display("broken pipe"));
         assert!(is_transient_by_display("unexpected EOF"));
+        assert!(is_transient_by_display("EOF while reading backend message header"));
+        assert!(is_transient_by_display("EOF while reading backend message"));
         assert!(is_transient_by_display("operation timed out"));
+        assert!(is_transient_by_display("server error: terminating connection due to administrator command (SQLSTATE 57P01)"));
+        assert!(is_transient_by_display("the database system is shutting down (SQLSTATE 57P01)"));
+        assert!(is_transient_by_display("the database system is in recovery mode (SQLSTATE 57P03)"));
+        assert!(is_transient_by_display("connection exception (SQLSTATE 08006)"));
         assert!(!is_transient_by_display("syntax error at or near"));
         assert!(!is_transient_by_display(
             "permission denied for table users"
         ));
         assert!(!is_transient_by_display(
             "replication slot \"foo\" does not exist"
+        ));
+        assert!(!is_transient_by_display(
+            "database \"db\" has been dropped (SQLSTATE 57P04)"
         ));
     }
 
@@ -364,6 +377,16 @@ mod tests {
 
         let task_err = pgwire_replication::PgWireError::Task("worker task dropped".to_string());
         assert!(is_transient_pgwire(&task_err));
+
+        let server_shutdown = pgwire_replication::PgWireError::Server(
+            "terminating connection due to administrator command (SQLSTATE 57P01)".to_string(),
+        );
+        assert!(is_transient_pgwire(&server_shutdown));
+
+        let server_dropped = pgwire_replication::PgWireError::Server(
+            "database \"test\" has been dropped (SQLSTATE 57P04)".to_string(),
+        );
+        assert!(!is_transient_pgwire(&server_dropped));
 
         let auth_err = pgwire_replication::PgWireError::Auth("password authentication failed".to_string());
         assert!(!is_transient_pgwire(&auth_err));
