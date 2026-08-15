@@ -38,10 +38,9 @@ pub mod turso;
 pub(crate) mod imds;
 pub(crate) mod snapshots;
 pub mod spice_sys;
-pub(crate) mod storage;
-
-pub(crate) use snapshots::validate_snapshot_paths;
-pub use snapshots::{CayenneSnapshotValidationError, validate_cayenne_snapshot_consistency};
+pub use data_accelerator_api::snapshots::CayenneSnapshotValidationError;
+pub(crate) use data_accelerator_api::snapshots::validate_snapshot_paths;
+pub use snapshots::validate_cayenne_snapshot_consistency;
 
 // The accelerator contract moved to `data-accelerator-api`; re-export for path
 // compatibility. (The `register_data_accelerator!` macro is invoked path-qualified

@@ -49,10 +49,11 @@ use super::{
     get_primary_keys_from_constraints, upsert_dedup,
 };
 use crate::component::dataset::acceleration::{Acceleration, Engine, Mode, RefreshMode};
+use crate::dataaccelerator::FilePathError;
 use crate::dataaccelerator::cayenne::s3::{S3_PARAMETERS, S3_PARAMS_LEN};
-use crate::dataaccelerator::{FilePathError, snapshots::download_snapshot_if_needed};
 use crate::parameters::ParameterSpec;
 use crate::spice_data_base_path;
+use data_accelerator_api::snapshots::download_snapshot_if_needed;
 use runtime_acceleration::snapshot::{AccelerationEngine, AccelerationLayout};
 use search::index::native_vector::NativeVectorIndex;
 use spice_table::{Index, IndexLayer};
@@ -3060,7 +3061,7 @@ impl DataAccelerator for CayenneAccelerator {
                     metadata_dir_for_snapshot,
                     path_buf.clone(),
                 );
-                super::snapshots::snapshot_before_recreate(
+                data_accelerator_api::snapshots::snapshot_before_recreate(
                     acceleration,
                     &source.name().to_string(),
                     snapshot_layout,
@@ -3166,7 +3167,6 @@ impl DataAccelerator for CayenneAccelerator {
             Ok(download_snapshot_if_needed(
                 acceleration,
                 source,
-                registry,
                 snapshot_adapter,
                 AccelerationEngine::Cayenne,
                 snapshot_engine,

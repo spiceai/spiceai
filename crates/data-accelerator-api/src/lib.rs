@@ -54,6 +54,8 @@ use std::path::PathBuf;
 use std::{any::Any, collections::HashMap, sync::Arc};
 use tokio::sync::RwLock;
 
+pub mod snapshots;
+pub mod storage;
 pub mod swappable;
 pub mod types;
 pub mod upsert_dedup;

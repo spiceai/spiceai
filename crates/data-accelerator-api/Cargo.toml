@@ -18,12 +18,15 @@ datafusion-table-providers = { workspace = true }
 futures.workspace = true
 linkme.workspace = true
 paste.workspace = true
+arrow-schema = { workspace = true, features = ["serde"] }
 runtime-acceleration = { path = "../runtime-acceleration" }
+runtime-component = { path = "../runtime-component" }
 runtime-secrets = { path = "../runtime-secrets", default-features = false }
 runtime-parameters = { path = "../runtime-parameters" }
 runtime-table-partition = { path = "../runtime-table-partition" }
 secrecy.workspace = true
 snafu.workspace = true
+sysinfo.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 

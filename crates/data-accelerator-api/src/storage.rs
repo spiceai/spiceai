@@ -16,10 +16,10 @@ limitations under the License.
 
 use std::{fmt::Display, path::Path};
 
-use crate::component::dataset::acceleration::StorageProfile;
+use runtime_component::dataset::acceleration::StorageProfile;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ResolvedAccelerationStorage {
+pub enum ResolvedAccelerationStorage {
     LocalSsd,
     Ebs,
     Tmpfs,
@@ -38,7 +38,7 @@ impl Display for ResolvedAccelerationStorage {
 }
 
 #[must_use]
-pub(crate) fn resolve_acceleration_storage(
+pub fn resolve_acceleration_storage(
     configured_storage: StorageProfile,
     path: &Path,
 ) -> ResolvedAccelerationStorage {
@@ -53,7 +53,7 @@ pub(crate) fn resolve_acceleration_storage(
 /// Resolve the storage profile from a path, off the async runtime when the
 /// profile is `Auto` (which performs blocking `/proc` and `/sys` reads on
 /// Linux). Explicit profiles short-circuit synchronously.
-pub(crate) async fn resolve_acceleration_storage_async(
+pub async fn resolve_acceleration_storage_async(
     configured_storage: StorageProfile,
     path: &str,
 ) -> ResolvedAccelerationStorage {
@@ -353,7 +353,7 @@ fn classify_block_devices(devices: &[BlockDevice]) -> ResolvedAccelerationStorag
 /// a non-existent path) or failed — the caller then falls back to class-based
 /// behavior, so the probe is strictly additive and fail-open.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
-pub(crate) struct StoragePerf {
+pub struct StoragePerf {
     /// Sequential write throughput in MiB/s (bulk write + final fsync), or `None`.
     pub write_mbps: Option<f64>,
 }
@@ -445,7 +445,7 @@ fn probe_storage_perf_blocking(path: &std::path::Path) -> StoragePerf {
 /// mount point is the longest prefix of the canonicalized path), or `None` when
 /// undetectable / remote / empty. Best-effort, for a low-disk startup warning: a
 /// full data or spill volume turns a memory-pressure spill into a crash.
-pub(crate) fn disk_space_bytes(path: &str) -> Option<(u64, u64)> {
+pub fn disk_space_bytes(path: &str) -> Option<(u64, u64)> {
     if path.is_empty() {
         return None;
     }
@@ -466,7 +466,7 @@ pub(crate) fn disk_space_bytes(path: &str) -> Option<(u64, u64)> {
 /// probe does blocking file I/O). Memoized per volume so repeated table
 /// registrations on the same mount probe once. Empty/remote paths and probe
 /// failures return `StoragePerf::default()` (all `None`).
-pub(crate) async fn probe_storage_perf_async(path: &str) -> StoragePerf {
+pub async fn probe_storage_perf_async(path: &str) -> StoragePerf {
     if path.is_empty() {
         return StoragePerf::default();
     }

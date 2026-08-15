@@ -232,6 +232,17 @@ impl AccelerationSource for Dataset {
             datasets
         })
     }
+
+    fn checkpointer_factory(
+        &self,
+        snapshot_behavior: runtime_acceleration::snapshot::SnapshotBehavior,
+    ) -> runtime_acceleration::dataset_checkpoint::DatasetCheckpointerFactory {
+        crate::dataaccelerator::spice_sys::dataset_checkpoint::checkpointer_factory(
+            self,
+            self.runtime.accelerator_engine_registry(),
+            snapshot_behavior,
+        )
+    }
 }
 
 #[cfg(test)]

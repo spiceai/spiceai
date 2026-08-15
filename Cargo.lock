@@ -6049,6 +6049,7 @@ name = "data-accelerator-api"
 version = "2.2.0-unstable"
 dependencies = [
  "arrow",
+ "arrow-schema",
  "arrow_tools",
  "async-trait",
  "datafusion",
@@ -6057,11 +6058,13 @@ dependencies = [
  "linkme",
  "paste",
  "runtime-acceleration",
+ "runtime-component",
  "runtime-parameters",
  "runtime-secrets",
  "runtime-table-partition",
  "secrecy",
  "snafu",
+ "sysinfo 0.38.4",
  "tokio",
  "tracing",
 ]

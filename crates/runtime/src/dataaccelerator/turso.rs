@@ -41,6 +41,11 @@ limitations under the License.
 //! connector** (for source datasets), where remote access patterns are the primary use case
 //! and local acceleration is not the goal.
 
+use data_accelerator_api::snapshots::{download_snapshot_if_needed, snapshot_before_recreate};
+use data_accelerator_api::storage::{
+    ResolvedAccelerationStorage, resolve_acceleration_storage_async,
+};
+
 use arrow::datatypes::{DataType, Field, Schema};
 use async_trait::async_trait;
 use data_components::poly::PolyTableProvider;
@@ -56,11 +61,7 @@ use tokio::sync::Mutex;
 
 use crate::{
     component::dataset::acceleration::{Engine, Mode},
-    dataaccelerator::{
-        AcceleratorEngineRegistry, FilePathError,
-        snapshots::{download_snapshot_if_needed, snapshot_before_recreate},
-        storage::{ResolvedAccelerationStorage, resolve_acceleration_storage_async},
-    },
+    dataaccelerator::{AcceleratorEngineRegistry, FilePathError},
     datafusion::udf::deny_spice_specific_functions,
     make_spice_data_directory,
     parameters::ParameterSpec,
@@ -670,7 +671,6 @@ impl DataAccelerator for TursoAccelerator {
             let bootstrap_status = download_snapshot_if_needed(
                 acceleration,
                 source,
-                registry,
                 runtime_acceleration::snapshot::AccelerationLayout::file(PathBuf::from(&path)),
                 AccelerationEngine::Turso,
                 None,

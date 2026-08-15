@@ -3509,7 +3509,7 @@ impl DataFusion {
                 && let Some(accel_engine) =
                     engine_to_acceleration_engine(acceleration_settings.engine)
             {
-                dataaccelerator::snapshots::snapshot_before_recreate(
+                data_accelerator_api::snapshots::snapshot_before_recreate(
                     acceleration_settings,
                     &dataset_name,
                     layout,

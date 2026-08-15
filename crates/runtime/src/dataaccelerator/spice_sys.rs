@@ -963,6 +963,15 @@ mod tests {
             fn as_any(&self) -> &dyn std::any::Any {
                 self
             }
+
+            fn checkpointer_factory(
+                &self,
+                _snapshot_behavior: runtime_acceleration::snapshot::SnapshotBehavior,
+            ) -> runtime_acceleration::dataset_checkpoint::DatasetCheckpointerFactory {
+                runtime_acceleration::dataset_checkpoint::make_checkpointer_factory(|| async {
+                    Err("test source has no checkpoint".into())
+                })
+            }
         }
 
         /// Both `spice_sys` sidecars of one Cayenne dataset — the dataset checkpoint

@@ -37,7 +37,12 @@ use async_trait::async_trait;
 ))]
 use datafusion::arrow::datatypes::Schema;
 use datafusion::arrow::datatypes::SchemaRef;
-use runtime_acceleration::{dataset_checkpoint::DatasetCheckpointer, snapshot::SnapshotBehavior};
+use runtime_acceleration::{
+    dataset_checkpoint::{
+        DatasetCheckpointer, DatasetCheckpointerFactory, make_checkpointer_factory,
+    },
+    snapshot::SnapshotBehavior,
+};
 #[cfg(any(
     feature = "sqlite",
     feature = "duckdb",
@@ -111,6 +116,39 @@ impl DatasetCheckpointer for DatasetCheckpoint {
     ) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
         self.get_refresh_sql().await.boxed()
     }
+}
+
+/// A [`DatasetCheckpointerFactory`] over `source`'s acceleration checkpoint, opened
+/// read-only.
+///
+/// This is what satisfies `AccelerationSource::checkpointer_factory` for every source
+/// the runtime owns. It exists so the snapshot bootstrap — which lives below `runtime`
+/// — can reconcile a downloaded snapshot against the stored checkpoint without naming
+/// [`DatasetCheckpoint`], whose per-engine sidecar SQL keeps it here.
+///
+/// A factory rather than the checkpointer itself because opening one touches the
+/// accelerator, and the caller decides whether it needs to.
+pub(crate) fn checkpointer_factory(
+    source: &dyn AccelerationSource,
+    registry: Arc<AcceleratorEngineRegistry>,
+    snapshot_behavior: SnapshotBehavior,
+) -> DatasetCheckpointerFactory {
+    let source = source.clone_arc();
+    make_checkpointer_factory(move || {
+        let source = Arc::clone(&source);
+        let registry = Arc::clone(&registry);
+        let snapshot_behavior = snapshot_behavior.clone();
+        async move {
+            DatasetCheckpoint::try_new(source.as_ref(), registry, OpenOption::OpenExisting)
+                .await
+                .boxed()
+                .map(|checkpoint| {
+                    checkpoint
+                        .with_snapshot_behavior(snapshot_behavior)
+                        .to_arc()
+                })
+        }
+    })
 }
 
 pub struct DatasetCheckpoint {

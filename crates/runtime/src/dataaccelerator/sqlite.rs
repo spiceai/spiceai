@@ -14,15 +14,16 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use data_accelerator_api::snapshots::{download_snapshot_if_needed, snapshot_before_recreate};
+use data_accelerator_api::storage::{
+    ResolvedAccelerationStorage, resolve_acceleration_storage_async,
+};
+
 use std::sync::Arc;
 
 use crate::{
     component::dataset::acceleration::{Engine, Mode},
-    dataaccelerator::{
-        AcceleratorEngineRegistry, FilePathError,
-        snapshots::{download_snapshot_if_needed, snapshot_before_recreate},
-        storage::{ResolvedAccelerationStorage, resolve_acceleration_storage_async},
-    },
+    dataaccelerator::{AcceleratorEngineRegistry, FilePathError},
     datafusion::udf::deny_spice_functions_for_table_providers,
     make_spice_data_directory,
     parameters::ParameterSpec,
@@ -439,7 +440,6 @@ impl DataAccelerator for SqliteAccelerator {
             let bootstrap_status = download_snapshot_if_needed(
                 acceleration,
                 source,
-                registry,
                 runtime_acceleration::snapshot::AccelerationLayout::file(PathBuf::from(path)),
                 AccelerationEngine::Sqlite,
                 None,

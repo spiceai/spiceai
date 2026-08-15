@@ -14,15 +14,16 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use data_accelerator_api::snapshots::{download_snapshot_if_needed, snapshot_before_recreate};
+use data_accelerator_api::storage::{
+    ResolvedAccelerationStorage, resolve_acceleration_storage_async,
+};
+
 use super::{AccelerationSource, AcceleratorEngineRegistry, BootstrapStatus, DataAccelerator};
 use crate::{
     App,
     component::dataset::acceleration::{Acceleration, Engine, Mode, RefreshMode},
-    dataaccelerator::{
-        FilePathError,
-        snapshots::{download_snapshot_if_needed, snapshot_before_recreate},
-        storage::{ResolvedAccelerationStorage, resolve_acceleration_storage_async},
-    },
+    dataaccelerator::FilePathError,
     datafusion::{
         dialect::new_duckdb_dialect,
         sort_columns::{SortColumn, parse_sort_columns},
@@ -761,7 +762,6 @@ impl DataAccelerator for DuckDBAccelerator {
             let bootstrap_status = download_snapshot_if_needed(
                 acceleration,
                 source,
-                registry,
                 runtime_acceleration::snapshot::AccelerationLayout::file(PathBuf::from(path)),
                 AccelerationEngine::DuckDB,
                 None,
