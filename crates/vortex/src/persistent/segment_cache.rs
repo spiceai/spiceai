@@ -685,6 +685,15 @@ mod tests {
 
     use super::*;
 
+    // Every cache built here takes a `name` unique to its test, and that is not
+    // cosmetic. `SharedSegmentCache::new` registers globally, so an observable
+    // callback fired by *any* test's reader observes every cache alive at that
+    // moment, and `name` is the sole label distinguishing the series. Two
+    // concurrent tests sharing a name therefore feed one series from two
+    // independent counters, which is not monotonic across them — enough to make
+    // a delta reader read a stale value, or to panic inside the SDK subtracting
+    // the previous sample from a smaller current one.
+
     struct MetricsHarness {
         registry: prometheus::Registry,
         provider: SdkMeterProvider,
@@ -914,7 +923,7 @@ mod tests {
     /// data, not just a wrong hit rate.
     #[tokio::test]
     async fn identical_paths_in_different_stores_do_not_collide() {
-        let shared = SharedSegmentCache::new(1 << 20, false, "test");
+        let shared = SharedSegmentCache::new(1 << 20, false, "roundtrip");
         let path = Path::from("narrow/019ff413/019ff41a/data.vortex");
         let id = SegmentId::from(1);
 
@@ -972,7 +981,7 @@ mod tests {
         let segment = block.slice(0..SEGMENT_BYTES);
         let segment_ptr = segment.as_slice().as_ptr();
 
-        let shared = SharedSegmentCache::new(8 * 1024 * 1024, false, "test");
+        let shared = SharedSegmentCache::new(8 * 1024 * 1024, false, "trim");
         let cache = shared.for_path(test_store(), Path::from("coalesced.vortex"));
         let id = SegmentId::from(1);
         cache
@@ -1011,7 +1020,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_put_roundtrip_and_path_isolation() {
-        let shared = SharedSegmentCache::new(1 << 20, false, "test");
+        let shared = SharedSegmentCache::new(1 << 20, false, "stores");
         let cache_a = shared.for_path(test_store(), Path::from("a.vortex"));
         let cache_b = shared.for_path(test_store(), Path::from("b.vortex"));
         let id = SegmentId::from(1);
@@ -1092,7 +1101,7 @@ mod tests {
 
     #[test]
     fn counter_callbacks_cannot_publish_hits_ahead_of_accesses() {
-        let counters = SharedSegmentCache::new(1_024, false, "test");
+        let counters = SharedSegmentCache::new(1_024, false, "counters");
         counters.accesses.store(1, Ordering::Relaxed);
         counters.hits.store(1, Ordering::Relaxed);
 
@@ -1310,7 +1319,7 @@ mod tests {
 
     #[tokio::test]
     async fn invalidates_exact_paths_only() {
-        let shared = SharedSegmentCache::new(1 << 20, true, "test");
+        let shared = SharedSegmentCache::new(1 << 20, true, "exact-paths");
         let path_a = Path::from("snapshot-a/a.vortex");
         let path_b = Path::from("snapshot-b/b.vortex");
         let cache_a = shared.for_path(test_store(), path_a.clone());
@@ -1362,7 +1371,7 @@ mod tests {
 
     #[tokio::test]
     async fn invalidation_physically_evicts_entries_without_later_cache_activity() {
-        let shared = SharedSegmentCache::new(1 << 20, true, "test");
+        let shared = SharedSegmentCache::new(1 << 20, true, "physical-eviction");
         let retired_path = Path::from("snapshot-a/retired.vortex");
         let live_path = Path::from("snapshot-b/live.vortex");
         let retired = shared.for_path(test_store(), retired_path.clone());
@@ -1404,7 +1413,7 @@ mod tests {
 
     #[tokio::test]
     async fn path_state_stays_registered_until_the_last_open_file_drops() {
-        let shared = SharedSegmentCache::new(1 << 20, true, "test");
+        let shared = SharedSegmentCache::new(1 << 20, true, "registration");
         let path = Path::from("snapshot/shared.vortex");
         let first = shared.for_path(test_store(), path.clone());
         let second = shared.for_path(test_store(), path.clone());
@@ -1459,7 +1468,7 @@ mod tests {
     /// makes it pass.
     #[tokio::test]
     async fn a_file_opened_during_retirement_cannot_repopulate_it() {
-        let shared = SharedSegmentCache::new(1 << 20, true, "test");
+        let shared = SharedSegmentCache::new(1 << 20, true, "retirement");
         let retiring = Path::from("snapshot-a/retiring.vortex");
         let keeper = Path::from("snapshot-a/keeper.vortex");
         let states = shared
