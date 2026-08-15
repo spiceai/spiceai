@@ -457,30 +457,56 @@ const PK_BLOOM_FRAME_HEADER_LEN: usize = 16;
 /// supersede tombstone, and so a duplicate live row.
 ///
 /// It is derived rather than declared, so that it cannot be forgotten the way a
-/// hand-bumped version can: it folds [`PK_BLOOM_NUM_HASHES`] together with the
-/// bits a fixed sample fills, which covers the seeds, the double-hashing
-/// scheme, the layout, and the body of [`pk_bloom_hash`] itself — legs no
-/// declared constant would catch, since none of them is a constant. What it
-/// does not offer is a proof: the sample is four keys wide, so a change that
-/// leaves all four keys' bits identical would go unnoticed (the probe count is
-/// folded in on its own for exactly that reason, being the leg most likely to
-/// collide). Nor does it decompose — a mismatch reports two `u64`s, not which
-/// leg moved.
+/// hand-bumped version can: it folds [`PK_BLOOM_NUM_HASHES`] together with what
+/// a fixed sample WRITES and what that same sample then READS BACK. That covers
+/// the seeds, the double-hashing scheme, the body of [`pk_bloom_hash`], and both
+/// copies of the bit/word arithmetic — legs no declared constant would catch,
+/// since none of them is a constant.
+///
+/// Reading back is not redundant with the bits. [`PkBloom::insert`] and
+/// [`PkBloom::maybe_contains`] each spell out the mask/word/bit mapping
+/// themselves rather than sharing one helper, so a change to the READ side alone
+/// leaves every written bit — and a write-only fingerprint — exactly where it
+/// was, while breaking the agreement between them. Folding the answers to a
+/// fixed set of present and absent probes is what closes that.
+///
+/// What it does not offer is a proof. The sample is a fixed set of keys, so a
+/// change that happens to leave all of their bits and answers identical — one
+/// conditioned on a key length or byte pattern the sample never takes — goes
+/// unnoticed. The probe count is folded in on its own for that reason, being the
+/// leg likeliest to collide. Nor does the value decompose: a mismatch reports
+/// two `u64`s, not which leg moved.
 static PK_BLOOM_PROBE_FINGERPRINT: LazyLock<u64> = LazyLock::new(|| {
+    // Fixed keys spanning empty, short, word-boundary, and long lengths, and
+    // both extremes of the byte range: a leg conditioned on one shape of key is
+    // only caught if the sample takes that shape.
+    const FILLED: [&[u8]; 8] = [
+        b"",
+        b"0",
+        b"\xff\x00",
+        b"\x7f\x80\x01",
+        b"cayenne\x00",
+        b"cayenne-pk-bloom",
+        b"cayenne-pk-bloom-probe-fingerprint-sample-key-0123456789abcdef",
+        &[0xff; 33],
+    ];
+    // Never inserted. Their answers are almost all `false`, and each one is a
+    // separate chance to notice a read side that no longer looks where the write
+    // side put the bits.
+    const ABSENT: [&[u8]; 4] = [b"\x01", b"absent", b"cayenne-pk-bloo", &[0x00; 17]];
+
     let mut sample = PkBloom::with_num_bits_pow2(512);
-    for key in [
-        b"".as_slice(),
-        b"0".as_slice(),
-        b"cayenne-pk-bloom".as_slice(),
-        &[0xff, 0x00, 0x7f, 0x80, 0x01],
-    ] {
+    for key in FILLED {
         sample.insert(key);
     }
-    let mut folded = Vec::with_capacity(12 + sample.bits.len() * 8);
+    let mut folded = Vec::with_capacity(12 + sample.bits.len() * 8 + FILLED.len() + ABSENT.len());
     folded.extend_from_slice(&PK_BLOOM_NUM_HASHES.to_le_bytes());
     folded.extend_from_slice(&sample.bit_mask.to_le_bytes());
     for word in &sample.bits {
         folded.extend_from_slice(&word.to_le_bytes());
+    }
+    for key in FILLED.iter().chain(ABSENT.iter()) {
+        folded.push(u8::from(sample.maybe_contains(key)));
     }
     // The crate's byte-fingerprint primitive (as used by the WAL checksum and
     // the file digest), not `pk_bloom_hash` — folding the sample with the same
@@ -506,7 +532,7 @@ static PK_BLOOM_PROBE_FINGERPRINT: LazyLock<u64> = LazyLock::new(|| {
 /// whole cold tier on every keyset rebuild until those files are re-promoted,
 /// which is worth a one-off compatibility branch in a way rebuilding one
 /// sidecar checkpoint is not.
-const LEGACY_PK_BLOOM_PROBE_FINGERPRINT: u64 = 0x05af_06a0_1263_09d6;
+const LEGACY_PK_BLOOM_PROBE_FINGERPRINT: u64 = 0x242b_5f72_35cc_ed37;
 
 /// Bounded Bloom filter of live primary keys.
 ///
