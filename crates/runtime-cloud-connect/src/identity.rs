@@ -1794,6 +1794,16 @@ where
     Ok(())
 }
 
+/// What a release could not reclaim, split by whether it can still be renamed
+/// onto the canonical path.
+#[derive(Debug, Default)]
+pub(crate) struct RemainingArtifacts {
+    /// Temps whose writer may still promote them, undoing the release.
+    pub(crate) promotable: Vec<PathBuf>,
+    /// Artifacts that remain on disk but cannot become the canonical file.
+    pub(crate) inert: Vec<PathBuf>,
+}
+
 /// Reclaim the secret-bearing artifacts an interrupted atomic write leaves beside
 /// `path`, for a release that is deleting `path` itself.
 ///
@@ -1807,9 +1817,14 @@ where
 /// Temps are reclaimed on the same terms as anywhere else: a live writer holds an
 /// exclusive advisory lock on its own temp, so *acquiring* that lock is what
 /// establishes no writer owns the file, and only a temp older than `minimum_age`
-/// whose lock the reclaim takes may be removed. A release does not relax that — a
-/// temp still held, or too new to judge, is reported instead, because deleting a
-/// live writer's file to tidy up would be the worse outcome.
+/// whose lock the reclaim takes may be removed. A release does not relax that —
+/// deleting a live writer's file to tidy up would be the worse outcome.
+///
+/// A temp that survives is therefore reported as **promotable**, not merely
+/// retained: whoever owns it can still rename it onto the canonical path, which
+/// would put back the very file the release is removing, after the release has
+/// reported success. A caller that cannot tolerate that must fail rather than
+/// acknowledge.
 ///
 /// Backups are removed outright, which is where a release differs from
 /// [`cleanup_stale_identity_backups`]: that one preserves an orphan as possibly
@@ -1823,25 +1838,28 @@ where
 /// same lock their writer holds for its whole transaction. No `spice connect`
 /// can be mid-write, so any candidate present has been abandoned.
 ///
-/// Returns the artifacts still present afterwards, for the caller to report.
+/// Returns what is still present afterwards, split by whether it can still
+/// become the canonical file.
 pub(crate) fn release_atomic_write_artifacts(
     path: &Path,
     minimum_age: std::time::Duration,
-) -> std::io::Result<Vec<PathBuf>> {
+) -> std::io::Result<RemainingArtifacts> {
     cleanup_abandoned_atomic_temps(path, minimum_age)?;
 
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
-        return Ok(Vec::new());
+        return Ok(RemainingArtifacts::default());
     };
     let prefix = format!(".{file_name}.");
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(RemainingArtifacts::default());
+        }
         Err(error) => return Err(error),
     };
 
-    let mut remaining = Vec::new();
+    let mut remaining = RemainingArtifacts::default();
     for entry in entries {
         let entry = entry?;
         let entry_name = entry.file_name();
@@ -1865,8 +1883,12 @@ pub(crate) fn release_atomic_write_artifacts(
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(_) => {}
             }
+            // It could not be removed, but nothing renames a backup or a
+            // candidate into place on its own, so it cannot undo the release.
+            remaining.inert.push(entry.path());
+            continue;
         }
-        remaining.push(entry.path());
+        remaining.promotable.push(entry.path());
     }
 
     // Durable, like the canonical removals: reporting that no credential copy

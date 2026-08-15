@@ -1591,7 +1591,7 @@ async fn release_local_state(
             cache_path.display()
         ));
     }
-    retained.extend(release_atomic_write_artifacts(cache_path.clone(), policy.temp_min_age).await);
+    retained.extend(release_atomic_write_artifacts(cache_path.clone(), policy.temp_min_age).await?);
 
     if let Err(err) = transaction.delete_draft_async().await {
         tracing::warn!(
@@ -1608,7 +1608,7 @@ async fn release_local_state(
             EnrollmentDraft::path_in(&config.config_dir),
             policy.temp_min_age,
         )
-        .await,
+        .await?,
     );
 
     // The journals go with the draft, for the same reason: `spice connect` writes
@@ -1634,7 +1634,7 @@ async fn release_local_state(
             );
             retained.push(format!("{label} at {}", path.display()));
         }
-        retained.extend(release_atomic_write_artifacts(path, policy.temp_min_age).await);
+        retained.extend(release_atomic_write_artifacts(path, policy.temp_min_age).await?);
     }
 
     let endpoint_path = config
@@ -1647,7 +1647,7 @@ async fn release_local_state(
         );
         retained.push(format!("endpoint override at {}", endpoint_path.display()));
     }
-    retained.extend(release_atomic_write_artifacts(endpoint_path, policy.temp_min_age).await);
+    retained.extend(release_atomic_write_artifacts(endpoint_path, policy.temp_min_age).await?);
 
     // The identity goes LAST, and it is the only step that is not retryable:
     // once it is gone this instance is released and stops connecting, so a
@@ -1659,7 +1659,7 @@ async fn release_local_state(
     // reason: after the canonical file is gone, a crash would strand a complete
     // copy of the credential that nothing is left to come back and remove.
     retained.extend(
-        release_atomic_write_artifacts(config.identity_path.clone(), policy.temp_min_age).await,
+        release_atomic_write_artifacts(config.identity_path.clone(), policy.temp_min_age).await?,
     );
 
     if let Err(err) = IdentityStore::clear_with_transaction_async(
@@ -1735,7 +1735,10 @@ async fn remove_file_if_present(path: PathBuf) -> std::result::Result<(), String
 /// Non-fatal for the same reason the cache is: the instance is released either
 /// way, and an operator who is told a credential copy remains can remove it,
 /// where a removal that aborted over it would leave the live identity behind.
-async fn release_atomic_write_artifacts(path: PathBuf, minimum_age: Duration) -> Vec<String> {
+async fn release_atomic_write_artifacts(
+    path: PathBuf,
+    minimum_age: Duration,
+) -> std::result::Result<Vec<String>, String> {
     let released = path.display().to_string();
     let outcome = tokio::task::spawn_blocking(move || {
         crate::identity::release_atomic_write_artifacts(&path, minimum_age)
@@ -1746,28 +1749,48 @@ async fn release_atomic_write_artifacts(path: PathBuf, minimum_age: Duration) ->
         Ok(Ok(remaining)) => remaining,
         Ok(Err(err)) => {
             tracing::warn!(
-                "Cloud Connect: failed to reclaim interrupted-write artifacts beside {released}: {err}; the instance is released, but this host may retain a copy of what was removed"
+                "Cloud Connect: failed to reclaim interrupted-write artifacts beside {released}: {err}; the instance is still being released, but this host may retain a copy of what was removed"
             );
-            return vec![format!("interrupted-write artifacts beside {released}")];
+            return Ok(vec![format!(
+                "interrupted-write artifacts beside {released}"
+            )]);
         }
         Err(source) => {
             tracing::warn!(
-                "Cloud Connect: the task reclaiming interrupted-write artifacts beside {released} stopped unexpectedly: {source}; the instance is released, but this host may retain a copy of what was removed"
+                "Cloud Connect: the task reclaiming interrupted-write artifacts beside {released} stopped unexpectedly: {source}; the instance is still being released, but this host may retain a copy of what was removed"
             );
-            return vec![format!("interrupted-write artifacts beside {released}")];
+            return Ok(vec![format!(
+                "interrupted-write artifacts beside {released}"
+            )]);
         }
     };
 
-    remaining
+    // A temp its writer still owns is not something to report and move on from:
+    // that writer can rename it onto the canonical path once this release drops
+    // its locks, putting back the file the release just removed after the control
+    // plane has been told the instance is gone. Fail instead, while the identity
+    // is still live and the dispatch can be retried.
+    if let Some(promotable) = remaining.promotable.first() {
+        let promotable = promotable.display().to_string();
+        tracing::warn!(
+            "Cloud Connect: {promotable} is still owned by a writer that could publish it as {released}; reporting Remove as failed and staying connected so the control plane can retry"
+        );
+        return Err(format!(
+            "an interrupted write at {promotable} could still be published as {released}"
+        ));
+    }
+
+    Ok(remaining
+        .inert
         .into_iter()
         .map(|left| {
             let left = left.display().to_string();
             tracing::warn!(
-                "Cloud Connect: {left} is still held by a writer or too new to reclaim; the instance is released, but this host retains a copy of what was removed"
+                "Cloud Connect: {left} could not be removed; the instance is released, but this host retains a copy of what was removed"
             );
             format!("interrupted-write artifact at {left}")
         })
-        .collect()
+        .collect())
 }
 
 /// Delete the delivered-secrets cache off the Tokio driver task.
@@ -2698,11 +2721,13 @@ mod tests {
             assert!(retained.is_empty(), "nothing should be left: {retained:?}");
         }
 
-        /// The lock is the liveness signal, so a temp a writer still holds is
-        /// reported rather than deleted: tidying up by destroying a live writer's
-        /// file would be the worse outcome.
+        /// A temp its writer still owns is not merely reported: that writer can
+        /// rename it onto the canonical path once the release drops its locks,
+        /// putting back the file the release removed after the control plane has
+        /// been told the instance is gone. So the release fails instead, while
+        /// the identity is still live and the dispatch can be retried.
         #[tokio::test]
-        async fn a_live_writers_temp_is_reported_not_deleted() {
+        async fn a_live_writers_temp_fails_the_release_rather_than_being_deleted() {
             let host = Host::enrolled();
             let in_flight = host
                 .config
@@ -2720,15 +2745,22 @@ mod tests {
                 "the writer holds its own temp"
             );
 
-            let retained = host.release().await.expect("the removal still succeeds");
+            let message = host
+                .release()
+                .await
+                .expect_err("a temp that could still be published must fail the removal");
 
             assert!(
-                in_flight.exists(),
-                "a live writer's temp must survive the release"
+                message.contains("in-flight"),
+                "the failure must name what could still be published, got {message}"
             );
             assert!(
-                retained.iter().any(|item| item.contains("in-flight")),
-                "and the operator must be told it remains: {retained:?}"
+                in_flight.exists(),
+                "a live writer's temp must survive: deleting it to tidy up is the worse outcome"
+            );
+            assert!(
+                host.config.identity_path.exists(),
+                "and the identity stays, so the instance is still reachable for a retry"
             );
             drop(writer);
         }
