@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use runtime::component::dataset::Dataset;
 use runtime::dataconnector::listing::{self, LISTING_TABLE_PARAMETERS, ListingTableConnector};
 use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorFactory, DataConnectorResult,

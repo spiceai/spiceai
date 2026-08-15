@@ -30,7 +30,7 @@ use datafusion_table_providers::sql::db_connection_pool::adbcpool::{
 };
 use datafusion_table_providers::sql::db_connection_pool::dbconnection::query_arrow;
 use futures::TryStreamExt;
-use runtime::component::dataset::DatasetSpec;
+use runtime_component::dataset::DatasetSpec;
 #[cfg(test)]
 use sha2::{Digest, Sha256};
 use snafu::prelude::*;
