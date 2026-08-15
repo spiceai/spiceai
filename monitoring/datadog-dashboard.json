@@ -945,11 +945,12 @@
               "title": "Cache Hit Rate",
               "title_size": "16",
               "title_align": "left",
-              "type": "query_value",
+              "type": "timeseries",
               "requests": [
                 {
                   "formulas": [
                     {
+                      "alias": "Hit %",
                       "formula": "(query1 / query2) * 100",
                       "number_format": {
                         "unit": {
@@ -957,77 +958,6 @@
                           "unit_name": "percent"
                         }
                       }
-                    }
-                  ],
-                  "queries": [
-                    {
-                      "data_source": "metrics",
-                      "name": "query1",
-                      "query": "sum:spiceai.results_cache_hits.count{$instance,$env,$kube_namespace,$kube_cluster_name,$pod_name}.as_count()",
-                      "aggregator": "sum"
-                    },
-                    {
-                      "data_source": "metrics",
-                      "name": "query2",
-                      "query": "sum:spiceai.results_cache_requests.count{$instance,$env,$kube_namespace,$kube_cluster_name,$pod_name}.as_count()",
-                      "aggregator": "sum"
-                    }
-                  ],
-                  "response_format": "scalar",
-                  "conditional_formats": [
-                    {
-                      "comparator": ">=",
-                      "value": 80,
-                      "palette": "white_on_green"
-                    },
-                    {
-                      "comparator": ">=",
-                      "value": 50,
-                      "palette": "white_on_yellow"
-                    },
-                    {
-                      "comparator": "<",
-                      "value": 50,
-                      "palette": "white_on_red"
-                    }
-                  ]
-                }
-              ],
-              "autoscale": true,
-              "precision": 2,
-              "timeseries_background": {
-                "type": "area"
-              }
-            },
-            "layout": {
-              "x": 0,
-              "y": 0,
-              "width": 4,
-              "height": 3
-            }
-          },
-          {
-            "id": 402,
-            "definition": {
-              "title": "Cache Hit/Miss Over Time",
-              "title_size": "16",
-              "title_align": "left",
-              "show_legend": true,
-              "legend_layout": "auto",
-              "legend_columns": [
-                "value"
-              ],
-              "type": "timeseries",
-              "requests": [
-                {
-                  "formulas": [
-                    {
-                      "alias": "Hit %",
-                      "formula": "(query1 / query2) * 100"
-                    },
-                    {
-                      "alias": "Miss %",
-                      "formula": "((query2 - query1) / query2) * 100"
                     }
                   ],
                   "queries": [
@@ -1048,13 +978,82 @@
                     "line_type": "solid",
                     "line_width": "normal"
                   },
+                  "display_type": "line"
+                }
+              ],
+              "show_legend": true,
+              "legend_layout": "vertical",
+              "legend_columns": [
+                "avg",
+                "min",
+                "value"
+              ],
+              "yaxis": {
+                "include_zero": true,
+                "scale": "linear",
+                "max": "100"
+              }
+            },
+            "layout": {
+              "x": 0,
+              "y": 0,
+              "width": 4,
+              "height": 3
+            }
+          },
+          {
+            "id": 402,
+            "definition": {
+              "title": "Cache Hits and Misses",
+              "title_size": "16",
+              "title_align": "left",
+              "show_legend": true,
+              "legend_layout": "auto",
+              "legend_columns": [
+                "value"
+              ],
+              "type": "timeseries",
+              "requests": [
+                {
+                  "formulas": [
+                    {
+                      "alias": "Hits",
+                      "formula": "query1"
+                    },
+                    {
+                      "alias": "Misses",
+                      "style": {
+                        "palette": "warm",
+                        "palette_index": 4
+                      },
+                      "formula": "query2"
+                    }
+                  ],
+                  "queries": [
+                    {
+                      "data_source": "metrics",
+                      "name": "query1",
+                      "query": "sum:spiceai.results_cache_hits.count{$instance,$env,$kube_namespace,$kube_cluster_name,$pod_name}.as_count()"
+                    },
+                    {
+                      "data_source": "metrics",
+                      "name": "query2",
+                      "query": "sum:spiceai.results_cache_misses.count{$instance,$env,$kube_namespace,$kube_cluster_name,$pod_name}.as_count()"
+                    }
+                  ],
+                  "response_format": "timeseries",
+                  "style": {
+                    "palette": "green",
+                    "line_type": "solid",
+                    "line_width": "normal"
+                  },
                   "display_type": "area"
                 }
               ],
               "yaxis": {
                 "include_zero": true,
                 "scale": "linear",
-                "max": "100"
+                "max": "auto"
               }
             },
             "layout": {
@@ -1081,7 +1080,13 @@
                   "formulas": [
                     {
                       "alias": "Used",
-                      "formula": "query1"
+                      "formula": "query1",
+                      "number_format": {
+                        "unit": {
+                          "type": "canonical_unit",
+                          "unit_name": "byte"
+                        }
+                      }
                     },
                     {
                       "alias": "Max Capacity",
@@ -1089,6 +1094,12 @@
                       "style": {
                         "palette": "gray",
                         "palette_index": 4
+                      },
+                      "number_format": {
+                        "unit": {
+                          "type": "canonical_unit",
+                          "unit_name": "byte"
+                        }
                       }
                     }
                   ],
@@ -1172,39 +1183,69 @@
           {
             "id": 405,
             "definition": {
-              "title": "Cache Evictions",
+              "title": "Cache Evictions by Reason",
               "title_size": "16",
               "title_align": "left",
-              "show_legend": false,
+              "show_legend": true,
               "type": "timeseries",
               "requests": [
                 {
                   "formulas": [
                     {
-                      "alias": "Evictions",
-                      "formula": "query1"
+                      "alias": "Over capacity (size)",
+                      "formula": "query1",
+                      "style": {
+                        "palette": "warm",
+                        "palette_index": 4
+                      }
+                    },
+                    {
+                      "alias": "Expired (TTL)",
+                      "formula": "query2",
+                      "style": {
+                        "palette": "gray",
+                        "palette_index": 2
+                      }
+                    },
+                    {
+                      "alias": "Invalidated (refresh/DML)",
+                      "formula": "query3",
+                      "style": {
+                        "palette": "cool",
+                        "palette_index": 1
+                      }
                     }
                   ],
                   "queries": [
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "sum:spiceai.results_cache_evictions.count{$instance,$env,$kube_namespace,$kube_cluster_name,$pod_name}.as_count()"
+                      "query": "sum:spiceai.results_cache_evictions.count{$instance,$env,$kube_namespace,$kube_cluster_name,$pod_name,reason:size}.as_count()"
+                    },
+                    {
+                      "data_source": "metrics",
+                      "name": "query2",
+                      "query": "sum:spiceai.results_cache_evictions.count{$instance,$env,$kube_namespace,$kube_cluster_name,$pod_name,reason:expired}.as_count()"
+                    },
+                    {
+                      "data_source": "metrics",
+                      "name": "query3",
+                      "query": "sum:spiceai.results_cache_evictions.count{$instance,$env,$kube_namespace,$kube_cluster_name,$pod_name,reason:invalidated}.as_count()"
                     }
                   ],
                   "response_format": "timeseries",
-                  "style": {
-                    "palette": "orange",
-                    "line_type": "solid",
-                    "line_width": "normal"
-                  },
                   "display_type": "bars"
                 }
               ],
               "yaxis": {
                 "include_zero": true,
                 "scale": "linear"
-              }
+              },
+              "legend_layout": "auto",
+              "legend_columns": [
+                "sum",
+                "value"
+              ]
             },
             "layout": {
               "x": 4,
@@ -2834,7 +2875,13 @@
                 {
                   "formulas": [
                     {
-                      "formula": "query1 - query2"
+                      "formula": "query1 - query2",
+                      "number_format": {
+                        "unit": {
+                          "type": "canonical_unit",
+                          "unit_name": "byte"
+                        }
+                      }
                     }
                   ],
                   "queries": [
