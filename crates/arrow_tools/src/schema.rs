@@ -52,6 +52,33 @@ pub enum Error {
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
+/// Serializes an Arrow schema to the JSON form used for durable storage.
+///
+/// The encoding is Arrow's own serde representation. It is a **persisted format** —
+/// CDC sidecar rows written by earlier runs must still parse — so it is pinned by
+/// `schema_json_encoding_is_stable`, not free to change with a dependency bump.
+///
+/// This is the single implementation of that encoding: a CDC connector's sidecar
+/// checkpoint records the schema it last read as JSON, and the connector and the
+/// accelerator-side store must agree on the bytes or a restart reads a schema it
+/// cannot parse. Callers wrap the error in their own type.
+///
+/// # Errors
+///
+/// Returns an error if the schema cannot be serialized to JSON.
+pub fn schema_to_json(schema: &Schema) -> serde_json::Result<String> {
+    serde_json::to_string(schema)
+}
+
+/// Parses a schema serialized by [`schema_to_json`].
+///
+/// # Errors
+///
+/// Returns an error if `json` is not a valid serialized Arrow schema.
+pub fn schema_from_json(json: &str) -> serde_json::Result<Arc<Schema>> {
+    serde_json::from_str(json).map(Arc::new)
+}
+
 /// Validates the fields between two Arrow schemas match, with a specific error about which field is mismatched.
 ///
 /// # Errors
@@ -367,6 +394,37 @@ pub fn to_source_native_type_name(data_type: &DataType) -> &'static str {
 mod tests {
     use super::*;
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
+
+    /// The schema JSON encoding is a persisted format: CDC connectors record the schema
+    /// they last read into an accelerator sidecar row, and a later run has to parse what
+    /// an earlier one wrote. Pin the exact bytes so an Arrow upgrade that changes the
+    /// representation fails here rather than at a customer's restart.
+    #[test]
+    fn schema_json_encoding_is_stable() {
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, true),
+        ]);
+
+        assert_eq!(
+            schema_to_json(&schema).expect("a plain schema serializes"),
+            r#"{"fields":[{"name":"id","data_type":"Int32","nullable":false,"dict_id":0,"dict_is_ordered":false,"metadata":{}},{"name":"name","data_type":"Utf8","nullable":true,"dict_id":0,"dict_is_ordered":false,"metadata":{}}],"metadata":{}}"#
+        );
+    }
+
+    #[test]
+    fn schema_json_round_trips() {
+        let schema = create_test_schema_with_embeddings();
+        let json = schema_to_json(&schema).expect("schema serializes");
+        let parsed = schema_from_json(&json).expect("its own output parses back");
+        assert_eq!(*parsed, schema);
+    }
+
+    #[test]
+    fn schema_from_json_rejects_a_non_schema() {
+        schema_from_json(r#"{"not":"a schema"}"#)
+            .expect_err("an object that is not a serialized schema must not parse as one");
+    }
 
     fn create_test_schema_with_embeddings() -> Schema {
         Schema::new(vec![

@@ -246,6 +246,7 @@ mod tests {
         dataaccelerator::spice_sys::OpenOption,
     };
     use arrow::datatypes::{DataType, Field, Schema};
+    use runtime_checkpoint_api::kafka::{KafkaCheckpoint, KafkaCheckpointStore};
     use std::sync::Arc;
     use tempfile::TempDir;
 
@@ -459,5 +460,88 @@ mod tests {
             .find(|o| o.partition == 0 && o.topic == "test-topic")
             .expect("partition 0 present");
         assert_eq!(p0.offset, 100);
+    }
+
+    /// The connector reaches this store as `dyn KafkaCheckpointStore`, whose checkpoint
+    /// carries the schema as JSON rather than as an Arrow schema. Everything the
+    /// connector persists therefore crosses one extra conversion, so round-trip it
+    /// through the trait and not just through `KafkaSys`.
+    #[tokio::test]
+    async fn trait_roundtrip_preserves_the_schema_and_offsets() {
+        let (ds, _temp_dir) = create_test_dataset("test_duckdb_trait_roundtrip").await;
+        let store = trait_store(&ds).await;
+
+        let metadata = create_test_metadata();
+        let written = durable_form(&metadata);
+        store.upsert(&written).await.expect("to upsert checkpoint");
+
+        let read = store
+            .get()
+            .await
+            .expect("to read the checkpoint back")
+            .expect("a checkpoint to exist");
+
+        assert_eq!(read.consumer_group_id, written.consumer_group_id);
+        assert_eq!(read.topic, written.topic);
+        assert_eq!(read.offsets, written.offsets);
+        // The engine layer parses the stored JSON and the seam re-encodes it, so this
+        // asserts that round trip is byte-lossless and not merely semantically equal.
+        assert_eq!(read.schema_json, written.schema_json);
+    }
+
+    /// `upsert_offsets` is the hot path and must never move a partition backwards, which
+    /// is the whole reason offsets are rows rather than a field of the metadata blob.
+    #[tokio::test]
+    async fn trait_offset_upsert_keeps_the_higher_offset() {
+        let (ds, _temp_dir) = create_test_dataset("test_duckdb_trait_offsets").await;
+        let store = trait_store(&ds).await;
+        store
+            .upsert(&durable_form(&create_test_metadata()))
+            .await
+            .expect("seed");
+
+        let at = |offset: i64| {
+            vec![KafkaOffset {
+                topic: "test-topic".to_string(),
+                partition: 0,
+                offset,
+            }]
+        };
+        store.upsert_offsets(&at(80)).await.expect("advance");
+        store
+            .upsert_offsets(&at(20))
+            .await
+            .expect("a late, lower commit is accepted rather than rejected");
+
+        let read = store.get().await.expect("read").expect("exist");
+        let p0 = read
+            .offsets
+            .iter()
+            .find(|o| o.partition == 0 && o.topic == "test-topic")
+            .expect("partition 0 present");
+        assert_eq!(
+            p0.offset, 80,
+            "a lower offset must not overwrite a higher one"
+        );
+    }
+
+    /// The sidecar as a connector sees it: behind the checkpoint-store trait.
+    async fn trait_store(ds: &Dataset) -> Arc<dyn KafkaCheckpointStore> {
+        Arc::new(
+            KafkaSys::try_new(ds, OpenOption::CreateIfNotExists)
+                .await
+                .expect("to create KafkaSys"),
+        )
+    }
+
+    /// The durable checkpoint form of what the consumer holds in memory.
+    fn durable_form(metadata: &KafkaMetadata) -> KafkaCheckpoint {
+        KafkaCheckpoint {
+            consumer_group_id: metadata.consumer_group_id.clone(),
+            topic: metadata.topic.clone(),
+            schema_json: arrow_tools::schema::schema_to_json(&metadata.schema)
+                .expect("schema serializes"),
+            offsets: metadata.offsets.clone(),
+        }
     }
 }
