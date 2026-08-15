@@ -259,14 +259,18 @@ impl Runtime {
         // wrongly means either displacing a dataset or aiming internal task rows
         // at one. The exporter resolves this table by name at write time, so a
         // name this runtime does not hold leaves emission off (it already is).
-        if let Some(_taken) = self
+        let claimed = self
             .df
             .reserve_internal_table(table.clone(), table_to_register)
-            .context(UnableToCreateBackendSnafu)?
-        {
-            if reserved_local {
-                self.df.release_internal_table(&local);
-            }
+            .context(UnableToCreateBackendSnafu);
+        // Whatever ends this attempt — the name being taken, or the reservation
+        // failing outright — ends it for the local name claimed in scheduler mode
+        // too. An initialization that did not finish must leave no internal name
+        // occupied, and only the component that reserved one can hand it back.
+        if reserved_local && !matches!(claimed, Ok(None)) {
+            self.df.release_internal_table(&local);
+        }
+        if claimed?.is_some() {
             return Err(Error::UnableToTrackTaskHistory {
                 source: task_history::Error::TableNameTaken {
                     table: table.to_string(),
