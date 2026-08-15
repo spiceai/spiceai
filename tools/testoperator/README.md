@@ -48,6 +48,8 @@ Run standard benchmarks using the `testoperator run bench [OPTIONS]` command. In
 
 Running a benchmark test will always generate snapshots for the query explain plan, and result snapshots for the `tpch` and `tpcds` queries. `clickbench` records result snapshots for the subset of its queries whose rows do not depend on how the engine breaks ties — see `SNAPSHOTTED_CLICKBENCH_QUERIES` in `src/commands/bench/mod.rs` — and explain plans for all of them.
 
+A snapshot that does not match, or that does not exist yet, fails the benchmark. Result snapshots are asserted on the warmup run — the only run that takes them — so that verdict comes from the warmup rather than from a timed iteration.
+
 Snapshots can be automatically re-generated using the [`INSTA_UPDATE`](https://docs.rs/insta/latest/insta/#updating-snapshots) environment variable.
 
 `testoperator run bench [OPTIONS]`
