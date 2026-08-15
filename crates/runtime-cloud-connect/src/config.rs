@@ -292,10 +292,11 @@ impl CloudConnectConfig {
     /// The `spice connect` operation journals, relative to the config directory:
     /// the enrollment journal and the project-assignment journal.
     ///
-    /// Named here because a release deletes them. `spice connect` owns the
-    /// writers (`commands::connect::state`), where these same names are declared
-    /// `pub(super)`; a later consolidation should have that module read them from
-    /// here rather than keep its own copy.
+    /// The single source of truth for these names. A release deletes the
+    /// journals and `spice connect` writes them, so `commands::connect::state`
+    /// aliases these constants rather than declaring its own: a name defined
+    /// independently on each side would let a rename leave the removal reading a
+    /// path nothing writes.
     ///
     /// They cannot outlive the identity: a journal left in the enrolled phase
     /// with no identity beside it makes the next `spice connect` quarantine it
@@ -308,7 +309,8 @@ impl CloudConnectConfig {
     /// The instance-local control-plane endpoint override, relative to the
     /// config directory.
     ///
-    /// Named here because resolution reads it and a release deletes it: `spice
+    /// The single source of truth for this name, aliased by the writer in
+    /// `commands::connect`. Resolution reads it and a release deletes it: `spice
     /// connect` persists it for an explicit `--endpoint` and for a binding taken
     /// from the durable identity or a pending draft, so it can carry cloud-issued
     /// state that must not outlive the enrollment.

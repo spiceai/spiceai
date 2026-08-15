@@ -69,7 +69,7 @@ use crate::handlers::{
 };
 use crate::heartbeat::{build_heartbeat, build_telemetry, now_unix};
 use crate::identity::{AppAttachment, Identity, IdentityStore};
-use crate::mutation_lock::{MUTATION_LOCK_TIMEOUT, MutationLock};
+use crate::mutation_lock::MutationLock;
 use crate::proto;
 use crate::session::SessionAck;
 use crate::shutdown::Shutdown;
@@ -1394,7 +1394,14 @@ impl ClientDriver {
     ///    idempotency mismatch whose guidance is to preserve the file and contact
     ///    support.
     ///
-    /// 4. The **`cloud-endpoint` override**. `spice connect` persists it both for
+    /// 4. The **operation journals**, the enrollment one and the
+    ///    project-assignment one, which go with the draft for the same reason:
+    ///    `spice connect` writes them to resume an interrupted operation, and
+    ///    either one left beside a removed identity stops the next enrollment
+    ///    rather than helping it — the enrollment journal is quarantined, the
+    ///    project journal fails as a pending mismatch.
+    ///
+    /// 5. The **`cloud-endpoint` override**. `spice connect` persists it both for
     ///    an explicit `--endpoint` and for a binding taken from the durable
     ///    identity or a pending draft (`EndpointSource::Bound`), so it can hold a
     ///    value derived from the very enrollment being released. Left behind, the
@@ -1403,8 +1410,9 @@ impl ClientDriver {
     ///    the endpoint themselves re-supplies it, which is what the local command
     ///    already makes them do.
     ///
-    /// Only the identity is fatal. The cache, the draft, and the endpoint
-    /// override are reported and logged but do not stop the removal, because the
+    /// Only the identity is fatal. The cache, the draft, the journals and the
+    /// endpoint override are each named in `retained` and logged but do not stop
+    /// the removal, because the
     /// alternative — aborting with the identity intact — leaves a live credential
     /// on an instance the control plane has already released, which is worse than
     /// leaving a file behind. This is the one place the ordering differs from the
@@ -1415,7 +1423,7 @@ impl ClientDriver {
         command_id: &str,
         live_identifier: &Arc<RwLock<String>>,
     ) -> bool {
-        let retained = match release_local_state(&self.config, MUTATION_LOCK_TIMEOUT).await {
+        let retained = match release_local_state(&self.config, REMOVE_LOCK_ATTEMPT).await {
             Ok(retained) => retained,
             Err(message) => {
                 send_failed(tx, command_id, &message).await;
@@ -1438,13 +1446,26 @@ impl ClientDriver {
     }
 }
 
+/// How long a cloud-dispatched `Remove` waits for the connect mutation lock:
+/// one attempt.
+///
+/// Contention means a local `spice connect` is mid-transaction, and those last as
+/// long as the operator takes. Waiting out
+/// [`crate::mutation_lock::MUTATION_LOCK_TIMEOUT`] would hold the control stream
+/// until the gateway's own command timeout had passed, so the control plane would
+/// see the dispatch expire instead of a failure it can retry — the same reason
+/// the enrollment transaction is a single `try_acquire_async`.
+const REMOVE_LOCK_ATTEMPT: Duration = Duration::ZERO;
+
 /// Clear the cloud-issued state this instance holds on disk, under the same two
 /// locks a local `spice connect` takes.
 ///
 /// `Ok` names whatever could not be removed, for the command result; an `Err`
-/// carries the message for a failed `Remove`. Failing to take either lock is one
-/// such `Err`: a removal that cannot exclude a concurrent local mutation must not
-/// proceed. See [`ClientDriver::handle_remove`] for what is removed, in which
+/// carries the message for a failed `Remove`. Failing to take any of the locks is
+/// one such `Err`, and all of them are taken before anything is deleted: a
+/// removal that cannot exclude a concurrent local mutation must not proceed, and
+/// one that gives up partway through would leave an instance that is still
+/// connected — because its identity is still live — missing state it needs. See [`ClientDriver::handle_remove`] for what is removed, in which
 /// order, and why.
 async fn release_local_state(
     config: &CloudConnectConfig,
@@ -1496,20 +1517,6 @@ async fn release_local_state(
     // discovering it later.
     let mut retained: Vec<String> = Vec::new();
 
-    let cache_path = config
-        .config_dir
-        .join(crate::secret_cache::SECRET_CACHE_FILE);
-    if let Err(err) = remove_secret_cache(cache_path.clone()).await {
-        tracing::warn!(
-            "Cloud Connect: failed to remove the delivered-secrets cache at {}: {err}; the instance is still being released, but this host retains secrets it can no longer open",
-            cache_path.display()
-        );
-        retained.push(format!(
-            "delivered-secrets cache at {}",
-            cache_path.display()
-        ));
-    }
-
     // The identity is guarded by whichever transaction protects ITS directory.
     // `clear_with_transaction_async` refuses a guard whose draft path has a
     // different parent, and `identity_path` is a public field documented as only
@@ -1530,6 +1537,20 @@ async fn release_local_state(
             ));
         }
     };
+
+    let cache_path = config
+        .config_dir
+        .join(crate::secret_cache::SECRET_CACHE_FILE);
+    if let Err(err) = remove_secret_cache(cache_path.clone()).await {
+        tracing::warn!(
+            "Cloud Connect: failed to remove the delivered-secrets cache at {}: {err}; the instance is still being released, but this host retains secrets it can no longer open",
+            cache_path.display()
+        );
+        retained.push(format!(
+            "delivered-secrets cache at {}",
+            cache_path.display()
+        ));
+    }
 
     if let Err(err) = IdentityStore::clear_with_transaction_async(
         config.identity_path.clone(),
@@ -2340,7 +2361,7 @@ mod tests {
     /// `spice connect remove` leaves it in: none of the cloud-issued state
     /// behind, and in particular no secrets whose key it just destroyed.
     mod removal {
-        use super::super::{MutationLock, release_local_state};
+        use super::super::{EnrollmentTransactionLock, MutationLock, release_local_state};
         use crate::config::CloudConnectConfig;
         use crate::draft::EnrollmentDraft;
         use crate::secret_cache::SECRET_CACHE_FILE;
@@ -2488,6 +2509,47 @@ mod tests {
                 !host.config.identity_path.exists(),
                 "the release that took the lock still removes the identity"
             );
+        }
+
+        /// Every lock is taken before anything is deleted. A split identity
+        /// path needs a second transaction, and failing to take it must leave the
+        /// host exactly as it was — the identity is still live, so the instance
+        /// stays connected and still needs its delivered secrets.
+        #[tokio::test]
+        async fn a_removal_that_cannot_lock_the_identity_deletes_nothing() {
+            let dir = tempfile::tempdir().expect("create tempdir");
+            let config_dir = dir.path().join("config");
+            let identity_dir = dir.path().join("elsewhere");
+            std::fs::create_dir_all(&config_dir).expect("create config dir");
+            std::fs::create_dir_all(&identity_dir).expect("create identity dir");
+            let mut config = CloudConnectConfig::from_env_at("test-runtime", config_dir.clone());
+            config.identity_path = identity_dir.join("identity.json");
+            std::fs::write(&config.identity_path, "{}").expect("write identity");
+            let cache = config_dir.join(SECRET_CACHE_FILE);
+            std::fs::write(&cache, "cached").expect("write cache");
+
+            let contender = EnrollmentTransactionLock::try_acquire_async(&identity_dir)
+                .await
+                .expect("an enrollment holds the identity directory");
+
+            let message = release_local_state(&config, std::time::Duration::from_secs(5))
+                .await
+                .expect_err("a removal that cannot lock the identity must fail");
+
+            assert!(
+                message.contains(&config.identity_path.display().to_string()),
+                "the failure must name the path it could not guard, got {message}"
+            );
+            assert!(
+                cache.exists(),
+                "the secrets cache must survive: the identity is still live, so the \
+                 instance stays connected and still needs it"
+            );
+            assert!(
+                config.identity_path.exists(),
+                "and the identity itself is untouched"
+            );
+            drop(contender);
         }
 
         /// The journals are non-fatal like the cache and the draft: the instance
