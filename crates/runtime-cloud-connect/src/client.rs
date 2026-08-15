@@ -2737,6 +2737,41 @@ mod tests {
             assert!(retained.is_empty(), "nothing should be left: {retained:?}");
         }
 
+        /// A release deletes an interrupted replacement's backup, which is the
+        /// deliberate opposite of `cleanup_stale_identity_backups`: that one
+        /// preserves an orphaned backup as possibly the last recoverable
+        /// identity, and once the control plane has released the instance there
+        /// is nothing left to recover it for. Left behind it is a complete copy
+        /// of the credential the release just destroyed.
+        #[tokio::test]
+        async fn it_deletes_the_backup_of_an_interrupted_identity_replacement() {
+            let host = Host::enrolled();
+            let identity_name = host
+                .config
+                .identity_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .expect("the identity has a name")
+                .to_string();
+            let backup = host
+                .config
+                .config_dir
+                .join(format!(".{identity_name}.interrupted.bak"));
+            std::fs::write(&backup, "the complete previous credential").expect("write the backup");
+
+            let retained = host.release().await.expect("the removal succeeds");
+
+            assert!(
+                !backup.exists(),
+                "a released host must not keep a copy of the identity it just gave up"
+            );
+            assert!(
+                !host.config.identity_path.exists(),
+                "and the canonical identity is gone, which is what makes the backup an orphan"
+            );
+            assert!(retained.is_empty(), "nothing should be left: {retained:?}");
+        }
+
         /// The journals are non-fatal like the cache and the draft: the instance
         /// is released either way, and what could not be taken is named.
         #[tokio::test]
