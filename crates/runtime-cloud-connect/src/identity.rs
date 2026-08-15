@@ -2066,7 +2066,12 @@ pub(crate) fn sync_parent_directory(path: &Path) -> std::io::Result<()> {
 }
 
 /// Windows does not expose a portable directory handle through `std::fs` that
-/// can be synchronized. File contents are still flushed before promotion.
+/// can be synchronized. File contents are still flushed before promotion, but a
+/// directory entry — a creation or an unlink — is not, so callers that report
+/// durable absence get only what the filesystem's own metadata ordering gives
+/// them here. Closing that would mean a directory handle from `CreateFileW` with
+/// `FILE_FLAG_BACKUP_SEMANTICS` and `FlushFileBuffers`, which is a platform
+/// dependency this crate does not carry today.
 #[cfg(not(unix))]
 pub(crate) fn sync_parent_directory(_path: &Path) -> std::io::Result<()> {
     Ok(())

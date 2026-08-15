@@ -1832,7 +1832,7 @@ fn identity_transaction(
 /// removal's own result. `secret_cache::remove` and the draft's delete report a
 /// parent-directory sync failure alongside a failed unlink, and the reclaim syncs
 /// that same directory afterwards — so a transient first sync would otherwise
-/// report a file that the release went on to make durably absent.
+/// report a file that the release went on to remove and synchronize.
 fn still_present(path: &Path) -> bool {
     path.try_exists().unwrap_or(true)
 }

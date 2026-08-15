@@ -411,16 +411,23 @@ pub fn read(path: &Path, key: &[u8]) -> Result<Option<CachedSecrets>> {
 
 /// Delete the cache file. A missing file is success.
 ///
-/// Success means the file is durably absent, not merely absent: the directory
-/// entry is synchronized before returning. A release deletes this cache before
-/// the identity holding its key, so an unlink that is acknowledged but not
-/// durable lets the entry come back after a crash, beside a durably-deleted
+/// Success means the file is absent and its directory entry has been
+/// synchronized as far as the platform allows. A release deletes this cache
+/// before the identity holding its key, so an unlink that is acknowledged but
+/// not durable lets the entry come back after a crash, beside a durably-deleted
 /// identity — exactly the stranded cache this function exists to prevent.
 ///
 /// That includes the already-missing case, which is what a retry sees. Returning
 /// success there without synchronizing would let a caller whose earlier unlink
 /// went unsynced go on to clear the identity, and a crash could then roll the
 /// cache back with no key left to open it.
+///
+/// **Unix only.** [`crate::identity::sync_parent_directory`] cannot flush a
+/// directory entry through `std::fs` on other platforms and is a no-op there, so
+/// on those the absence is only as durable as the filesystem's own metadata
+/// ordering. Every removal in this crate shares that limit; it is stated here
+/// because this is the one whose result a caller uses to decide it may clear the
+/// identity.
 ///
 /// # Errors
 ///
@@ -438,9 +445,9 @@ pub fn remove(path: &Path) -> Result<()> {
     }
 }
 
-/// Make the absence of `path` durable by synchronizing the directory that held
-/// it. A directory that is itself gone needs nothing: the entry cannot come
-/// back.
+/// Synchronize the directory that held `path`, so far as the platform allows, so
+/// its absence survives a crash. A directory that is itself gone needs nothing:
+/// the entry cannot come back.
 fn sync_absence(path: &Path) -> Result<()> {
     match crate::identity::sync_parent_directory(path) {
         Ok(()) => Ok(()),
