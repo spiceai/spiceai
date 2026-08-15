@@ -259,8 +259,8 @@ pub async fn build_changes_stream(
         .unwrap_or_default();
     let engine_supports_upsert = !matches!(
         engine,
-        runtime::component::dataset::acceleration::Engine::Arrow
-            | runtime::component::dataset::acceleration::Engine::PartitionedArrow
+        runtime_component::dataset::acceleration::Engine::Arrow
+            | runtime_component::dataset::acceleration::Engine::PartitionedArrow
     );
     // The on_conflict map is keyed on a ColumnReference (same type as
     // primary_key), so checking whether the PK has an Upsert entry is a
@@ -271,7 +271,7 @@ pub async fn build_changes_stream(
         a.primary_key.as_ref().is_some_and(|pk| {
             matches!(
                 a.on_conflict.get(pk),
-                Some(runtime::component::dataset::acceleration::OnConflictBehavior::Upsert(_))
+                Some(runtime_component::dataset::acceleration::OnConflictBehavior::Upsert(_))
             )
         })
     });
@@ -282,17 +282,17 @@ pub async fn build_changes_stream(
     // mid-stream (the runtime apply loop still enforces the per-policy
     // evolution set). `OnSchemaChange` is `Copy`, so capture it by value.
     let schema_evolution_policy = match dataset.on_schema_change {
-        runtime::component::dataset::OnSchemaChange::Block => SchemaEvolutionPolicy::Block,
-        runtime::component::dataset::OnSchemaChange::Fail => SchemaEvolutionPolicy::Fail,
-        runtime::component::dataset::OnSchemaChange::AppendNewColumns => {
+        runtime_component::dataset::OnSchemaChange::Block => SchemaEvolutionPolicy::Block,
+        runtime_component::dataset::OnSchemaChange::Fail => SchemaEvolutionPolicy::Fail,
+        runtime_component::dataset::OnSchemaChange::AppendNewColumns => {
             SchemaEvolutionPolicy::AppendNewColumns
         }
         // A CDC stream cannot drop-and-recreate without losing un-replayable history, so
         // `drop_and_recreate` adopts widening changes like `sync_all_columns` and rejects
         // incompatible changes mid-stream. The accelerated table is recreated only on a
         // `refresh_mode: full` registration, not from the replication stream.
-        runtime::component::dataset::OnSchemaChange::SyncAllColumns
-        | runtime::component::dataset::OnSchemaChange::DropAndRecreate => {
+        runtime_component::dataset::OnSchemaChange::SyncAllColumns
+        | runtime_component::dataset::OnSchemaChange::DropAndRecreate => {
             SchemaEvolutionPolicy::SyncAllColumns
         }
     };
@@ -824,9 +824,9 @@ impl MetricsProvider for PostgresMetricsProvider {
 /// accelerators must re-snapshot on every start — WAL replay from the slot's
 /// checkpoint can never reconstruct an accelerator that booted empty.
 fn accelerator_is_ephemeral(
-    acceleration: &runtime::component::dataset::acceleration::Acceleration,
+    acceleration: &runtime_component::dataset::acceleration::Acceleration,
 ) -> bool {
-    use runtime::component::dataset::acceleration::{Engine, Mode};
+    use runtime_component::dataset::acceleration::{Engine, Mode};
     // Matched exhaustively (no `_` arm) so a newly added engine has to make an
     // explicit durability claim here: defaulting a non-persistent engine to
     // "persistent" silently skips its resume snapshot and leaves the accelerator
@@ -1235,7 +1235,7 @@ TXTE85+Or9IUwDI9543jsyCvuQ8=
     /// than in production.
     #[test]
     fn accelerator_ephemerality_is_classified_per_engine_and_mode() {
-        use runtime::component::dataset::acceleration::{Acceleration, Engine, Mode};
+        use runtime_component::dataset::acceleration::{Acceleration, Engine, Mode};
 
         let ephemeral = |engine: Engine, mode: Mode| {
             accelerator_is_ephemeral(&Acceleration {

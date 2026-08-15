@@ -38,7 +38,6 @@ futures.workspace = true
 linkme.workspace = true
 ns_lookup = { path = "../../ns_lookup" }
 paste.workspace = true
-runtime = { path = "../../runtime" }
 runtime-component = { path = "../../runtime-component" }
 runtime-parameters = { path = "../../runtime-parameters" }
 runtime-udfs-api = { path = "../../runtime-udfs-api" }
@@ -49,6 +48,9 @@ uuid.workspace = true
 
 [features]
 default = []
+
+[dev-dependencies]
+runtime = { path = "../../runtime" }
 
 [lints]
 workspace = true

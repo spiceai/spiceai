@@ -259,7 +259,7 @@ impl DataConnectorFactory for PostgresFactory {
             if let ConnectorComponent::Dataset(dataset) = &params.component {
                 let is_changes_mode = dataset.acceleration.as_ref().is_some_and(|acceleration| {
                     acceleration.refresh_mode
-                        == Some(runtime::component::dataset::acceleration::RefreshMode::Changes)
+                        == Some(runtime_component::dataset::acceleration::RefreshMode::Changes)
                 });
                 if is_changes_mode {
                     // The injected spec defaults are indistinguishable from

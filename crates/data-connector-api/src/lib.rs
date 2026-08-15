@@ -38,7 +38,7 @@ pub mod schema_projection;
 
 pub use connector::{
     DATA_CONNECTOR_REGISTRATIONS, DataConnector, DataConnectorFactory, DataConnectorRegistration,
-    MetricsProviderComponent, NewDataConnectorResult,
+    MetricsProviderComponent, NewDataConnectorResult, default_spice_client,
 };
 /// Re-exported so a crate invoking [`register_data_connector!`] can bring
 /// `linkme` into scope with `use data_connector_api::linkme;` instead of taking

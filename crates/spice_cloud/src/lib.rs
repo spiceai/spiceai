@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use data_connector_api::DataConnectorError;
 use runtime::dataconnector::parameters::RuntimeConnectorContext;
 use std::{sync::Arc, time::Duration};
 
@@ -36,7 +37,7 @@ use runtime::{
         },
     },
     dataaccelerator::{self, AcceleratorEngineRegistry},
-    dataconnector::{DataConnectorError, create_new_connector, parameters::ConnectorParamsBuilder},
+    dataconnector::{create_new_connector, parameters::ConnectorParamsBuilder},
     extension::{Error as ExtensionError, Extension, ExtensionFactory, ExtensionManifest, Result},
     federated::FederatedTable,
     spice_metrics::get_metrics_table_reference,

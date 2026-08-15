@@ -30,7 +30,6 @@ datafusion.workspace = true
 elasticsearch = { path = "../../elasticsearch" }
 linkme.workspace = true
 paste.workspace = true
-runtime = { path = "../../runtime" }
 runtime-component = { path = "../../runtime-component" }
 runtime-parameters = { path = "../../runtime-parameters" }
 secrecy.workspace = true
@@ -39,6 +38,9 @@ tracing.workspace = true
 
 [features]
 default = []
+
+[dev-dependencies]
+runtime = { path = "../../runtime" }
 
 [lints]
 workspace = true

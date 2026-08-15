@@ -26,7 +26,6 @@ object_store = { workspace = true }
 paste.workspace = true
 percent-encoding.workspace = true
 reqwest.workspace = true
-runtime = { path = "../../runtime" }
 runtime-component = { path = "../../runtime-component" }
 runtime-datafusion = { path = "../../runtime-datafusion" }
 runtime-object-store = { path = "../../runtime-object-store" }
@@ -43,6 +42,9 @@ url.workspace = true
 # Enables graph-rs-sdk's `test-util` feature so `GraphClient::use_test_endpoint`
 # accepts non-Microsoft hosts (e.g. localhost mocks). Intended for tests only.
 sharepoint-mock-host = ["graph-rs-sdk/test-util"]
+
+[dev-dependencies]
+runtime = { path = "../../runtime" }
 
 [lints]
 workspace = true

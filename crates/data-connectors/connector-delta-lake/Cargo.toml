@@ -14,7 +14,6 @@ data_components = { path = "../../data_components", features = ["delta_lake"] }
 datafusion.workspace = true
 linkme.workspace = true
 paste.workspace = true
-runtime = { path = "../../runtime" }
 runtime-component = { path = "../../runtime-component" }
 runtime-parameters = { path = "../../runtime-parameters" }
 secrecy.workspace = true
@@ -24,6 +23,7 @@ tracing.workspace = true
 url.workspace = true
 
 [dev-dependencies]
+runtime = { path = "../../runtime" }
 runtime-secrets = { path = "../../runtime-secrets", default-features = false }
 
 [lints]

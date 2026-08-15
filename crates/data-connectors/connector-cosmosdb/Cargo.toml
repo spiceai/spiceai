@@ -20,7 +20,6 @@ datafusion.workspace = true
 datafusion-table-providers = { workspace = true }
 futures.workspace = true
 opentelemetry.workspace = true
-runtime = { path = "../../runtime" }
 runtime-component = { path = "../../runtime-component" }
 runtime-api-types = { path = "../../runtime-api-types" }
 runtime-metrics = { path = "../../runtime-metrics" }
@@ -29,6 +28,9 @@ serde_json.workspace = true
 snafu.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+runtime = { path = "../../runtime" }
 
 [lints]
 workspace = true

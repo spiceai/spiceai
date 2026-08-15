@@ -36,7 +36,6 @@ linkme.workspace = true
 paste.workspace = true
 regex.workspace = true
 reqwest.workspace = true
-runtime = { path = "../../runtime" }
 runtime-component = { path = "../../runtime-component" }
 runtime-metrics = { path = "../../runtime-metrics" }
 runtime-parameters = { path = "../../runtime-parameters" }
@@ -52,6 +51,7 @@ url.workspace = true
 util = { path = "../../util", features = ["datafusion"] }
 
 [dev-dependencies]
+runtime = { path = "../../runtime" }
 app = { path = "../../app" }
 runtime-secrets = { path = "../../runtime-secrets", default-features = false }
 tokio.workspace = true

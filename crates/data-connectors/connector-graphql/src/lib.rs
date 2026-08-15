@@ -27,14 +27,13 @@ use data_components::rate_limit::RateLimiter;
 use data_connector_api::ConnectorContext;
 use data_connector_api::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
-    DataConnectorResult, NewDataConnectorResult,
+    DataConnectorResult, NewDataConnectorResult, default_spice_client,
 };
 use data_http_rate_control as http_rate_control;
 use data_http_rate_control::{
     HttpRateControlMetricSource, HttpRateControlMetrics, HttpRateControlMetricsProvider,
 };
 use datafusion::datasource::TableProvider;
-use runtime::dataconnector::default_spice_client;
 use runtime_component::dataset::DatasetSpec;
 use runtime_metrics::component::MetricsProvider;
 use runtime_parameters::{ParameterSpec, Parameters};

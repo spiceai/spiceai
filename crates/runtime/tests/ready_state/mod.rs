@@ -51,14 +51,11 @@ use datafusion_federation::{FederatedTableProviderAdaptor, sql::RemoteTableRef};
 use futures::{Stream, TryStreamExt};
 
 use data_connector_api::ConnectorParams;
-use runtime::{
-    Runtime,
-    component::dataset::DatasetSpec,
-    dataconnector::{
-        self, ConnectorComponent, DataConnector, DataConnectorError, DataConnectorFactory,
-        NewDataConnectorResult,
-    },
+use data_connector_api::{
+    ConnectorComponent, DataConnector, DataConnectorError, DataConnectorFactory,
+    NewDataConnectorResult,
 };
+use runtime::{Runtime, component::dataset::DatasetSpec, dataconnector};
 use runtime_parameters::ParameterSpec;
 use runtime_request_context::{AsyncMarker, Protocol, RequestContext};
 use spicepod::{

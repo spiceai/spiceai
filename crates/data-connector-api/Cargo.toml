@@ -31,6 +31,7 @@ globset = { workspace = true }
 itertools.workspace = true
 linkme.workspace = true
 object_store = { workspace = true, features = ["aws", "http", "azure", "gcp"] }
+reqwest = { workspace = true }
 runtime-checkpoint-api = { path = "../runtime-checkpoint-api" }
 runtime-component = { path = "../runtime-component" }
 runtime-datafusion = { path = "../runtime-datafusion" }

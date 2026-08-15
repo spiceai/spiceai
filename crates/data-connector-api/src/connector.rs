@@ -22,6 +22,7 @@ use std::fmt::Debug;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
@@ -40,6 +41,25 @@ use crate::parameters::{ConnectorContext, ConnectorParams};
 use crate::{AnyErrorResult, DataConnectorResult};
 
 pub type NewDataConnectorResult = AnyErrorResult<Arc<dyn DataConnector>>;
+
+/// Creates a default reqwest client with standard Spice settings.
+///
+/// # Errors
+///
+/// Returns an error if the client cannot be built.
+pub fn default_spice_client(content_type: &'static str) -> reqwest::Result<reqwest::Client> {
+    use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
+
+    let mut headers = HeaderMap::new();
+    headers.append(CONTENT_TYPE, HeaderValue::from_static(content_type));
+
+    reqwest::Client::builder()
+        .user_agent(util::spiceai_user_agent())
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(30))
+        .default_headers(headers)
+        .build()
+}
 
 #[derive(Clone, Copy)]
 pub struct DataConnectorRegistration {

@@ -25,31 +25,10 @@ use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 use tokio::sync::Mutex;
 
-use std::time::Duration;
-
 pub mod client_identity;
 // Re-exports `data-http-rate-control`; crate-visible so a connector outside the
 // runtime depends on that crate directly instead of routing through here.
 pub(crate) mod http_rate_control;
-
-/// Creates a default reqwest client with standard Spice settings.
-///
-/// # Errors
-///
-/// Returns an error if the client cannot be built.
-pub fn default_spice_client(content_type: &'static str) -> reqwest::Result<reqwest::Client> {
-    use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
-
-    let mut headers = HeaderMap::new();
-    headers.append(CONTENT_TYPE, HeaderValue::from_static(content_type));
-
-    reqwest::Client::builder()
-        .user_agent(util::spiceai_user_agent())
-        .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(30))
-        .default_headers(headers)
-        .build()
-}
 
 // abfs: moved to crates/data-connectors/connector-abfs
 // #[deprecated] pub mod abfs;
@@ -84,25 +63,19 @@ pub mod parameters;
 pub mod refresh_source;
 pub mod s3;
 // Re-exports `data-connector-api`'s projection parser; crate-visible so a
-// connector outside the runtime depends on that crate directly. Shadowing the
-// same-named module the `data_connector_api::*` glob below would otherwise
-// re-export is the point: it is what withdraws `runtime::dataconnector::
-// schema_projection` from the public API, and a glob cannot exclude a name.
-#[expect(
-    hidden_glob_reexports,
-    reason = "deliberately withdraws the path so connectors name `data-connector-api` directly"
-)]
+// connector outside the runtime depends on that crate directly.
 pub(crate) mod schema_projection;
 pub mod sink;
 // spiceai: registration moved to crates/data-connectors/connector-spiceai; module kept for catalog connector
 pub mod spiceai;
 
-// The connector contract — the `DataConnector` trait and its factory, the
-// link-time registration, the component configuration a connector is built for
-// and the errors it reports — lives in `data-connector-api`, below `runtime`, so
-// connector crates can name it without depending on the orchestrator. Re-exported
-// here so existing `crate::dataconnector::…` paths keep resolving.
-pub use data_connector_api::*;
+// The connector contract lives in `data-connector-api`, below `runtime`.
+// Crate-visible, not public: a public re-export would be a second path to every
+// contract item, and anything reached through `runtime` re-acquires the
+// dependency on the orchestrator that the inversion just removed — invisibly to
+// the layering guard, which only sees the `runtime` edge. Everything outside
+// this crate names `data-connector-api` directly.
+pub(crate) use data_connector_api::*;
 
 static DATA_CONNECTOR_FACTORY_REGISTRY: LazyLock<
     Mutex<HashMap<String, Arc<dyn DataConnectorFactory>>>,

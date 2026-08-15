@@ -34,13 +34,13 @@ use data_connector_api::{
 use dataformat_json::{SpiceJsonOptions, unnest_struct_schema};
 use datafusion::catalog::TableProvider;
 use futures::StreamExt;
-use runtime::component::dataset::acceleration::RefreshMode;
 use runtime_api_types::v1::ComponentType;
 use runtime_checkpoint_api::{
     CheckpointError,
     kafka::{KafkaCheckpoint, KafkaCheckpointStore},
 };
 use runtime_component::dataset::DatasetSpec;
+use runtime_component::dataset::acceleration::RefreshMode;
 use runtime_datafusion::refresh_sql;
 use runtime_metrics::component::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback};
 use runtime_parameters::{ExposedParamLookup, ParameterSpec, Parameters};

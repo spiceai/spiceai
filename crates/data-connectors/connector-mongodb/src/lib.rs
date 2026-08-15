@@ -39,8 +39,8 @@ use datafusion_table_providers::mongodb::{
     Error as MongoDBError, MongoDBTableFactory, connection_pool::MongoDBConnectionPool,
 };
 use mongodb::bson::{Bson, Document, doc};
-use runtime::component::dataset::acceleration::RefreshMode;
 use runtime_component::dataset::DatasetSpec;
+use runtime_component::dataset::acceleration::RefreshMode;
 use runtime_parameters::{ParameterSpec, Parameters};
 use secrecy::ExposeSecret;
 use snafu::prelude::*;

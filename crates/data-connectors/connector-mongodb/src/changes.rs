@@ -38,9 +38,9 @@ use mongodb::{
     change_stream::{ChangeStream, event::ChangeStreamEvent, event::ResumeToken},
     options::FullDocumentType,
 };
-use runtime::component::dataset::acceleration::{Acceleration, Engine, OnConflictBehavior};
 use runtime_checkpoint_api::mongodb::{MongoCheckpointMetadata, MongoCheckpointStore};
 use runtime_component::dataset::DatasetSpec;
+use runtime_component::dataset::acceleration::{Acceleration, Engine, OnConflictBehavior};
 use runtime_parameters::{ExposedParamLookup, Parameters};
 use std::{sync::Arc, time::Duration};
 use tokio_stream::StreamExt as TokioStreamExt;
@@ -766,7 +766,7 @@ mod tests {
     use datafusion_table_providers::util::{
         column_reference::ColumnReference, constraints::UpsertOptions,
     };
-    use runtime::component::dataset::acceleration::{Acceleration, RefreshMode};
+    use runtime_component::dataset::acceleration::{Acceleration, RefreshMode};
     use secrecy::SecretString;
     use std::collections::HashMap;
 
