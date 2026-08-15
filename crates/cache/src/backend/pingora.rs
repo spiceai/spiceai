@@ -31,6 +31,13 @@ use std::time::{Duration, Instant};
 // 1. Reduced lock contention (16x reduction vs single lock)
 // 2. Better cache line alignment with pingora-lru's internal data structures
 // 3. Improved throughput for concurrent operations (2-3x faster than single-threaded caches)
+//
+// The `Lru` below is instantiated with this same count, and — as of pingora-lru 0.8 — both
+// partition the key space by `key % shards`, so a metadata shard and an LRU unit cover
+// exactly the same keys. `get` leans on that to argue its exclusive hold is nearly free.
+// Only this half of the assumption is pinned here: the other half is a private free function
+// inside the dependency, so a release that hash-mixes the key would falsify the argument
+// silently, costing throughput rather than correctness.
 const NUM_KEY_SHARDS: usize = 16;
 
 /// Entries to reserve per shard when the cache is created.
@@ -80,16 +87,18 @@ struct KeyedValue<V> {
 ///
 /// Trade-offs:
 /// - pingora-lru requires remove + re-admit to read values (no `peek_value` API)
-/// - A hit therefore holds its key's metadata shard exclusively, so it excludes that shard's
-///   metadata-only readers (a miss, `len()`, `iter_keys()`) for the length of the read
+/// - A hit therefore holds its key's metadata shard exclusively for the length of one read,
+///   which excludes that shard's other hits and its metadata-only readers. `len()` and
+///   `iter_keys()` read every shard, so any in-flight hit can hold them up; a caller that
+///   walks the keyset calling `get` pays the hold once per key
 /// - More complex implementation than Moka
 pub struct PingoraBackend<V>
 where
     V: Clone + Send + Sync + 'static,
 {
-    cache: Arc<Lru<KeyedValue<V>, 16>>,
-    // 16-shard metadata tracking for TTL checks and key iteration
-    // Each shard covers 1/16th of the key space (key % 16)
+    cache: Arc<Lru<KeyedValue<V>, NUM_KEY_SHARDS>>,
+    // Sharded metadata tracking for TTL checks and key iteration
+    // Each shard covers one `NUM_KEY_SHARDS`th of the key space (key % NUM_KEY_SHARDS)
     // Stores expiry time and weight for each key
     metadata_shards: Arc<[RwLock<HashMap<u64, KeyMetadata>>; NUM_KEY_SHARDS]>,
     ttl: Duration,
@@ -301,12 +310,13 @@ where
         //    value the cache is holding, costing a re-fetch and understating the hit rate
         //    (#12987). Excluding readers as well as writers is why this hold is exclusive.
         //
-        // Excluding readers costs no parallelism the destructive read had, because the two
-        // shardings coincide: `get_shard_index` is `key % NUM_KEY_SHARDS` and pingora-lru's
-        // own `get_shard` is `key % N` over the same 16 units, so any two `get`s serialised
-        // here already serialise on the pingora shard under `remove` and again under `admit`.
-        // What the hold does newly exclude is this shard's metadata-only readers — a miss,
-        // `len()`, `iter_keys()` — for the length of one remove/clone/re-admit.
+        // For two hits on the *same* key that costs no parallelism, because the shardings
+        // coincide (see `NUM_KEY_SHARDS`) and the loser of that race was doing no useful work
+        // — it was reporting the miss this fixes. It does serialise work between hits on
+        // *different* keys of one shard: pingora-lru drops its unit lock at the end of each of
+        // `remove` and `admit`, so the `clone` between them was never covered by it and now
+        // runs under this hold. Cheap while cached values are `Arc`-shaped, as the query and
+        // search results are; a value whose clone is a deep copy would pay for it.
         //
         // The lock is taken in the order `insert` already takes it — shard, then the
         // pingora-lru shard underneath `remove`/`admit` — so it adds no new ordering against
@@ -1183,6 +1193,60 @@ mod tests {
         fn publish_counters_at_zero() {}
     }
 
+    /// A reader parked inside `get`'s remove → re-admit window, with the handles needed to
+    /// aim a second operation at exactly the gap the bug lives in.
+    struct ParkedRead {
+        backend: Arc<PingoraBackend<GatedValue>>,
+        reader: tokio::task::JoinHandle<Option<GatedValue>>,
+        release: std::sync::mpsc::Sender<()>,
+        /// Handed back rather than dropped: the value the reader re-admits is the gated copy,
+        /// so the *next* read of this key parks too and signals on this channel. Dropping the
+        /// receiver would make that signal fail, panicking the reader inside `Clone`.
+        entered: std::sync::mpsc::Receiver<()>,
+    }
+
+    /// Caches `data` under `key` and parks a reader in the window, returning once the reader
+    /// is provably inside it.
+    ///
+    /// The protocol has three parts that are easy to get subtly wrong — the gate belongs only
+    /// on the copy the cache holds, the `entered` channel must be able to buffer a signal, and
+    /// the caller must not start its second actor until the reader has signalled — so both
+    /// tests that aim something at the window share one transcription of it.
+    async fn park_a_reader_mid_read(key: u64, data: &str) -> ParkedRead {
+        let backend = Arc::new(PingoraBackend::<GatedValue>::with_params(
+            4096,
+            Duration::from_mins(1),
+        ));
+
+        let (entered_tx, entered) = std::sync::mpsc::sync_channel::<()>(1);
+        let (release, release_rx) = std::sync::mpsc::channel::<()>();
+        backend
+            .insert(
+                key,
+                GatedValue {
+                    data: data.to_string(),
+                    gate: Some(Arc::new(Gate {
+                        entered: entered_tx,
+                        release: std::sync::Mutex::new(release_rx),
+                    })),
+                },
+            )
+            .await;
+
+        let reader_backend = Arc::clone(&backend);
+        let reader = tokio::spawn(async move { reader_backend.get(&key).await });
+        entered
+            .recv()
+            .expect("the reader reaches the re-admit window");
+
+        ParkedRead {
+            backend,
+            reader,
+            release,
+            entered,
+        }
+    }
+
     /// The hit path reads by removing the value and re-admitting it. An `insert` that
     /// completes between the two is then undone by the re-admit: the old value goes back
     /// over the new one, and the new one's metadata stays, so the cache serves the replaced
@@ -1193,32 +1257,13 @@ mod tests {
     /// passes on the broken code most runs.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_hit_cannot_re_admit_over_a_concurrent_insert() {
-        let backend = Arc::new(PingoraBackend::<GatedValue>::with_params(
-            4096,
-            Duration::from_mins(1),
-        ));
         let key = 11u64;
-
-        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel::<()>(1);
-        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
-        backend
-            .insert(
-                key,
-                GatedValue {
-                    data: "old".to_string(),
-                    gate: Some(Arc::new(Gate {
-                        entered: entered_tx,
-                        release: std::sync::Mutex::new(release_rx),
-                    })),
-                },
-            )
-            .await;
-
-        let reader = Arc::clone(&backend);
-        let hit = tokio::spawn(async move { reader.get(&key).await });
-        entered_rx
-            .recv()
-            .expect("the reader reaches the re-admit window");
+        let ParkedRead {
+            backend,
+            reader: hit,
+            release: release_tx,
+            entered: _entered,
+        } = park_a_reader_mid_read(key, "old").await;
 
         // The reader is now holding the value out of the cache, mid-read.
         let writer = Arc::clone(&backend);
@@ -1266,32 +1311,13 @@ mod tests {
     /// window is a few microseconds wide, so a stress test reports the bug only occasionally.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_hit_cannot_be_missed_by_a_concurrent_hit() {
-        let backend = Arc::new(PingoraBackend::<GatedValue>::with_params(
-            4096,
-            Duration::from_mins(1),
-        ));
         let key = 12u64;
-
-        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel::<()>(1);
-        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
-        backend
-            .insert(
-                key,
-                GatedValue {
-                    data: "cached".to_string(),
-                    gate: Some(Arc::new(Gate {
-                        entered: entered_tx,
-                        release: std::sync::Mutex::new(release_rx),
-                    })),
-                },
-            )
-            .await;
-
-        let parked_reader = Arc::clone(&backend);
-        let parked = tokio::spawn(async move { parked_reader.get(&key).await });
-        entered_rx
-            .recv()
-            .expect("the first reader reaches the re-admit window");
+        let ParkedRead {
+            backend,
+            reader: parked,
+            release: release_tx,
+            entered: _entered,
+        } = park_a_reader_mid_read(key, "cached").await;
 
         // The first reader is now holding the value out of the cache, mid-read.
         let second_reader = Arc::clone(&backend);
