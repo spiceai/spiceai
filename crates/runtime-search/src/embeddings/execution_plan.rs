@@ -281,14 +281,13 @@ pub async fn compute_additional_embedding_columns<S: std::hash::BuildHasher>(
         // bound embed call does not hold the lock and stall model reloads.
         let model = {
             let read_guard = embedding_models.read().await;
-            match read_guard.get(model_name) {
-                Some(model) => Arc::clone(model),
-                None => {
-                    tracing::debug!(
-                        "When embedding col='{col}', model {model_name} expected, but not found"
-                    );
-                    continue;
-                }
+            if let Some(model) = read_guard.get(model_name) {
+                Arc::clone(model)
+            } else {
+                tracing::debug!(
+                    "When embedding col='{col}', model {model_name} expected, but not found"
+                );
+                continue;
             }
         };
 
