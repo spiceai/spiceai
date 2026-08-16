@@ -2061,6 +2061,12 @@ async fn snapshot_int_test13_refresh_based_snapshots() -> Result<()> {
         .await
 }
 
+/// Rows appended to the source between the two arms of
+/// `snapshot_int_test14_file_create_skips_snapshot_bootstrap`, which is what makes a
+/// bootstrap and a rebuild-from-source land on different row counts.
+#[cfg(feature = "duckdb")]
+const FILE_CREATE_EXTRA_ROWS: usize = 5;
+
 /// `mode: file_create` must not bootstrap the snapshot it just discarded.
 ///
 /// `file_create` snapshots the outgoing acceleration and deletes it so the next
@@ -2125,8 +2131,7 @@ async fn snapshot_int_test14_file_create_skips_snapshot_bootstrap() -> Result<()
 
             // Grow the source so restoring the snapshot and rebuilding from the
             // source no longer agree on the row count.
-            const EXTRA_ROWS: usize = 5;
-            grow_csv_source(&source_path, EXTRA_ROWS)
+            grow_csv_source(&source_path, FILE_CREATE_EXTRA_ROWS)
                 .await
                 .context("Growing the dataset source before the file_create restart")?;
 
@@ -2158,7 +2163,7 @@ async fn snapshot_int_test14_file_create_skips_snapshot_bootstrap() -> Result<()
 
             assert_eq!(
                 rebuilt_rows,
-                snapshot_rows + i64::try_from(EXTRA_ROWS)?,
+                snapshot_rows + i64::try_from(FILE_CREATE_EXTRA_ROWS)?,
                 "file_create should have rebuilt the acceleration from the grown source; \
                  {snapshot_rows} rows means the snapshot it deleted was bootstrapped back"
             );
