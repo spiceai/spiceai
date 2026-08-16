@@ -17,7 +17,10 @@ limitations under the License.
 
 use std::{
     collections::HashMap,
-    sync::{Arc, LazyLock},
+    sync::{
+        Arc, LazyLock,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -42,16 +45,27 @@ use tokio::sync::Semaphore;
 static CONTAINER_SEMAPHORE: LazyLock<Arc<Semaphore>> =
     LazyLock::new(|| Arc::new(Semaphore::new(3)));
 
+/// How long a dropped container waits on the Docker daemon before giving up.
+/// Cleanup is best-effort, and a test process must never hang in it.
+const CLEANUP_TIMEOUT: Duration = Duration::from_secs(30);
+
 pub struct RunningContainer<'a> {
     name: &'a str,
     docker: Docker,
+    /// Whether the container has already been removed, so dropping one a test
+    /// cleaned up explicitly does not attempt it a second time.
+    removed: AtomicBool,
     // Store the permit to release it when the container is dropped
     _permit: tokio::sync::OwnedSemaphorePermit,
 }
 
 impl RunningContainer<'_> {
     pub async fn remove(&self) -> Result<(), anyhow::Error> {
-        remove(&self.docker, self.name).await
+        let result = remove(&self.docker, self.name).await;
+        if result.is_ok() {
+            self.removed.store(true, Ordering::Relaxed);
+        }
+        result
     }
 
     pub async fn stop(&self) -> Result<(), anyhow::Error> {
@@ -102,12 +116,94 @@ impl RunningContainer<'_> {
     }
 }
 
+/// Removes the container when the test that started it is finished with it,
+/// including when that test panicked partway through.
+///
+/// Explicit cleanup cannot cover this on its own: a `.remove()` call at the end
+/// of a test is skipped by the `?` or the failed assertion that ends the test
+/// early, which is exactly when a suite is being run repeatedly.
+///
+/// `Drop` cannot await, and the removal must work whether or not the test's
+/// runtime is still running -- a `#[tokio::test]` drops its runtime while
+/// unwinding, and spawning onto a runtime that is shutting down silently drops
+/// the task. So the removal gets a runtime of its own, on a thread joined
+/// before the drop returns. Best-effort by construction: a failure here must
+/// not mask the test result that is already on its way out.
+///
+/// Two cases this cannot reach, both because `Drop` never runs:
+///
+/// - A container parked in a `static` for the life of the process, as
+///   `tpcds_postgres` does to share one database across its queries. Such a
+///   suite has to remove its container itself.
+/// - A process killed outright rather than unwound (`SIGKILL`, a hard CI
+///   timeout).
+impl Drop for RunningContainer<'_> {
+    fn drop(&mut self) {
+        if *self.removed.get_mut() {
+            return;
+        }
+
+        let docker = self.docker.clone();
+        let name = self.name.to_string();
+        let removal = std::thread::Builder::new()
+            .name(format!("cleanup-{name}"))
+            .spawn(move || {
+                let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                else {
+                    return Err(anyhow::anyhow!("could not build a runtime for cleanup"));
+                };
+                runtime.block_on(async {
+                    // Bounded: a daemon that accepts the connection and then
+                    // stops answering would otherwise hang the test process
+                    // here, turning a readable failure into a CI timeout.
+                    tokio::time::timeout(CLEANUP_TIMEOUT, remove(&docker, &name))
+                        .await
+                        .unwrap_or_else(|_| {
+                            Err(anyhow::anyhow!(
+                                "timed out after {CLEANUP_TIMEOUT:?} waiting for Docker"
+                            ))
+                        })
+                })
+            });
+
+        // Report rather than panic: a panicking `Drop` during an unwind aborts
+        // the process, which would replace a readable test failure with none.
+        // `Builder::spawn` is used over `thread::spawn` for the same reason --
+        // it reports a thread that cannot be created instead of panicking, and
+        // exhaustion is the very condition this cleanup exists to relieve.
+        match removal.map(std::thread::JoinHandle::join) {
+            Ok(Ok(Ok(()))) => {}
+            Ok(Ok(Err(e))) => eprintln!("failed to remove test container {}: {e}", self.name),
+            Ok(Err(_)) => eprintln!(
+                "the cleanup thread for test container {} panicked",
+                self.name
+            ),
+            Err(e) => eprintln!(
+                "could not start a cleanup thread for test container {}: {e}",
+                self.name
+            ),
+        }
+    }
+}
+
+/// Removes a container that a test has finished with, and every test *must*
+/// reach this -- directly or by dropping its [`RunningContainer`].
+///
+/// A leaked container is not merely untidy: each one holds a running database
+/// and an anonymous volume carrying its data directory, so a few runs of the
+/// suite are enough to exhaust memory (a concurrent build gets OOM-killed) and
+/// tens of gigabytes of disk that nothing reclaims.
 pub async fn remove(docker: &Docker, name: &str) -> Result<(), anyhow::Error> {
     Ok(docker
         .remove_container(
             name,
             Some(RemoveContainerOptions {
                 force: true,
+                // The data directory is an anonymous volume, which outlives the
+                // container unless it is removed with it.
+                v: true,
                 ..Default::default()
             }),
         )
@@ -276,6 +372,17 @@ impl<'a> ContainerRunner<'a> {
 
         let _ = self.docker.create_container(Some(options), config).await?;
 
+        // The container exists from here on, so hold it in the guard before
+        // anything else can fail. Starting it, inspecting it, or waiting for it
+        // to report healthy can all return early, and each of those paths would
+        // otherwise leave behind a container no test ever saw.
+        let container = RunningContainer::<'a> {
+            name: self.name,
+            docker: self.docker.clone(),
+            removed: AtomicBool::new(false),
+            _permit: permit,
+        };
+
         self.docker
             .start_container(self.name, None::<StartContainerOptions<String>>)
             .await?;
@@ -309,11 +416,7 @@ impl<'a> ContainerRunner<'a> {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
 
-        Ok(RunningContainer::<'a> {
-            name: self.name,
-            docker: self.docker,
-            _permit: permit,
-        })
+        Ok(container)
     }
 
     async fn pull_image(&self) -> Result<(), anyhow::Error> {
