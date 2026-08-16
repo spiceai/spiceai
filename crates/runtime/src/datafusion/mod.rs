@@ -813,6 +813,12 @@ pub struct DataFusion {
     /// plan instead of re-running `EXPLAIN ANALYZE`. Default (unset) behaves
     /// as `TaskHistoryCapturedPlan::None`.
     plan_capture: OnceLock<query::plan_capture::PlanCaptureConfig>,
+    /// Drasi forwarders for the runtime's own tables, from `runtime.drasi`.
+    /// Installed before anything can write, ahead of the tables themselves —
+    /// the forwarders resolve a table's key lazily from the constraints handed
+    /// to them at write time, so the tables need not exist yet. Absent when
+    /// unconfigured.
+    pub(crate) drasi_forwarders: OnceLock<Arc<crate::drasi::internal::InternalForwarders>>,
 
     /// Signalled after each completed streaming write; the cluster executor
     /// statistics reporter listens so scheduler-side stats (and the COUNT(*)
@@ -1073,6 +1079,19 @@ impl DataFusion {
     #[must_use]
     pub(crate) fn plan_capture_config(&self) -> Option<&query::plan_capture::PlanCaptureConfig> {
         self.plan_capture.get()
+    }
+
+    /// Install the Drasi forwarders for the runtime's own tables. Idempotent-
+    /// tolerant: a second call is ignored with a warning.
+    pub(crate) fn set_drasi_forwarders(
+        &self,
+        forwarders: Arc<crate::drasi::internal::InternalForwarders>,
+    ) {
+        if self.drasi_forwarders.set(forwarders).is_err() {
+            tracing::warn!(
+                "Drasi forwarders already set on DataFusion; ignoring duplicate set_drasi_forwarders"
+            );
+        }
     }
 
     pub async fn get_table(
@@ -2295,6 +2314,22 @@ impl DataFusion {
                 .context(UnableToExecuteTableInsertSnafu {
                     table_name: table_reference.to_string(),
                 })?;
+        }
+
+        // Queue the committed write for Drasi, when `runtime.drasi` names this
+        // table. After the write, so Drasi only sees rows the runtime kept; and
+        // a queue rather than an await, so a Drasi outage cannot stall the
+        // writer or fail a write a caller would then retry and duplicate.
+        if let Some(forwarders) = self.drasi_forwarders.get() {
+            forwarders
+                .forward(
+                    table_reference,
+                    &update_type,
+                    table_provider.constraints(),
+                    &update_schema,
+                    &update_data,
+                )
+                .await;
         }
 
         // Invalidate cached query state for this table.
@@ -5836,6 +5871,7 @@ mod tests {
                     check_availability: crate::component::dataset::CheckAvailability::Disabled,
                     check_availability_interval: None,
                     on_schema_change: crate::component::dataset::OnSchemaChange::default(),
+                    drasi: None,
                 },
                 app: Arc::new(app::App::default()),
                 runtime: Arc::new(runtime),
