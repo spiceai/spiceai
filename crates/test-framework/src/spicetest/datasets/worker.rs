@@ -372,7 +372,8 @@ impl SpiceTestQueryWorker {
                         let warmup_start = std::time::Instant::now();
 
                         let QueryRunResult {
-                            connection_failed, ..
+                            connection_failed,
+                            query_failure,
                         } = self
                             .run_single_query(
                                 query,
@@ -382,6 +383,13 @@ impl SpiceTestQueryWorker {
                                 false,
                             )
                             .await?;
+
+                        // The warmup's timing is thrown away; its verdict is not. This is the
+                        // only run of the query that compares results against their snapshot —
+                        // the timed iterations below pass `false` for `results_snapshot` so they
+                        // do not re-assert it — so dropping this failure is what would let a
+                        // wrong answer, or a missing baseline, finish the benchmark green.
+                        query_status = status_after_run(query_status, query_failure);
 
                         println!(
                             "Worker {} - Query '{}' - Warmup query completed in {:?}",
@@ -438,9 +446,7 @@ impl SpiceTestQueryWorker {
                                 ));
                             }
 
-                            if let Some(query_failure) = query_failure {
-                                query_status = QueryStatus::Failed(Some(query_failure.into()));
-                            }
+                            query_status = status_after_run(query_status, query_failure);
 
                             current_query_count += 1;
                         }
@@ -850,6 +856,25 @@ impl SpiceTestQueryWorker {
     }
 }
 
+/// Fold one run of a query into the status the benchmark reports for it.
+///
+/// Every run funnels through here — the warmup and each timed iteration alike — so
+/// the two cannot drift about what a failure is worth. A failure is sticky: once a
+/// run has failed, a later one that succeeds does not clear it.
+///
+/// The warmup is the reason this is a named function rather than an `if` at each
+/// site. Its *timing* is discarded by design, which makes it tempting to discard
+/// its verdict too, but it is the only run that asserts the result snapshot — the
+/// timed iterations pass `false` for `results_snapshot` so they never re-assert it.
+/// A status that skipped the warmup would let a wrong answer, or a missing
+/// baseline, finish the benchmark green.
+fn status_after_run(current: QueryStatus, query_failure: Option<String>) -> QueryStatus {
+    match query_failure {
+        Some(failure) => QueryStatus::Failed(Some(failure.into())),
+        None => current,
+    }
+}
+
 fn validation_result_after_reference_validation(
     validation_result: QueryValidationResult,
     reference_validation_passed: bool,
@@ -934,6 +959,36 @@ mod tests {
 
     use super::*;
     use std::sync::Arc;
+
+    /// The warmup is the only run that asserts a result snapshot, so its failure has
+    /// to reach the reported status. Regression test for a benchmark that logged
+    /// `FAIL` for a mismatched or missing snapshot and still finished green.
+    #[test]
+    fn a_failed_run_fails_the_query() {
+        let status = status_after_run(
+            QueryStatus::Passed,
+            Some(
+                "Query `s3[parquet]-cayenne[file]` `clickbench_q1` snapshot assertion failed"
+                    .to_string(),
+            ),
+        );
+
+        assert!(matches!(status, QueryStatus::Failed(Some(_))));
+    }
+
+    #[test]
+    fn a_successful_run_leaves_the_status_alone() {
+        assert!(status_after_run(QueryStatus::Passed, None) == QueryStatus::Passed);
+    }
+
+    /// A failure is sticky: the timed iterations run after the warmup, and a passing
+    /// one must not clear a warmup that already failed its snapshot.
+    #[test]
+    fn a_successful_run_does_not_clear_an_earlier_failure() {
+        let failed = QueryStatus::Failed(Some("snapshot assertion failed".into()));
+
+        assert!(status_after_run(failed.clone(), None) == failed);
+    }
 
     #[test]
     fn test_reference_validation_does_not_skip_static_validation_failures() {
