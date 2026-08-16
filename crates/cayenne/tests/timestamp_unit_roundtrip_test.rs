@@ -18,12 +18,11 @@ limitations under the License.
 
 //! A Cayenne table stores the timestamp unit its source reports.
 //!
-//! Vortex represents second, millisecond, microsecond and nanosecond timestamps,
-//! but Cayenne used to rewrite every non-microsecond unit to microseconds when it
-//! created a table. A Postgres `timestamptz` column — inferred as
-//! `Timestamp(ns, "UTC")` — could therefore never match its own accelerated
-//! schema, so every refresh cast ns to µs and reported the acceleration as behind
-//! the source.
+//! Vortex represents second, millisecond, microsecond and nanosecond timestamps, so
+//! a table created for a `Timestamp(ns, "UTC")` column — what every `PostgreSQL`
+//! `timestamptz` infers as — stores nanoseconds, and a value carrying a
+//! sub-microsecond remainder survives a write and read back unchanged. Units may
+//! also be mixed within one table.
 //!
 //! Regression test for <https://github.com/spiceai/spiceai/issues/13018>.
 
@@ -239,8 +238,8 @@ async fn assert_timestamp_units_round_trip(vortex_config: VortexConfig, require_
     let table_name = "timestamp_units";
     let table = create_table(&fixture, table_name, vortex_config).await;
 
-    // The table's own schema, before any data moves: down-converting on create is
-    // the bug, so this alone fails if it comes back.
+    // The table's own schema, before any data moves: creation must carry the
+    // source's unit through on its own, independently of the write path.
     assert_timestamp_fields_match(&table.schema(), "the created table");
 
     let written = insert_batch(&table, timestamp_batch(ROW_COUNT))

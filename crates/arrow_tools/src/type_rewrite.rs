@@ -116,6 +116,32 @@ impl TypeRewriteRule for Float16ToFloat32 {
     }
 }
 
+/// Rewrites any non-microsecond `DataType::Timestamp(unit, tz)` →
+/// `DataType::Timestamp(Microsecond, tz)`, preserving the timezone (including its
+/// absence).
+///
+/// Cayenne applied this at table creation before it stored the source's own unit, so
+/// a table created by one of those builds holds microseconds for the life of that
+/// table. The rule is retained for the acceleration write path, which must recognize
+/// that stored type as one the engine produced rather than as the acceleration having
+/// fallen behind its source — see `cayenne::CAYENNE_TYPE_REWRITE_RULES`. It is not a
+/// creation rewrite: a table created now keeps the unit its source reports.
+///
+/// This differs from [`TimestampTzToMicrosecond`] in covering timezone-naive
+/// timestamps too, because the rewrite it describes did.
+#[derive(Debug)]
+pub struct TimestampToMicrosecond;
+impl TypeRewriteRule for TimestampToMicrosecond {
+    fn rewrite(&self, dt: &DataType) -> Option<DataType> {
+        match dt {
+            DataType::Timestamp(unit, tz) if *unit != TimeUnit::Microsecond => {
+                Some(DataType::Timestamp(TimeUnit::Microsecond, tz.clone()))
+            }
+            _ => None,
+        }
+    }
+}
+
 /// A rule list an acceleration engine declares once and hands out by reference.
 pub type TypeRewriteRules = &'static [&'static dyn TypeRewriteRule];
 
@@ -254,6 +280,60 @@ mod tests {
         assert_eq!(
             result.field(2).data_type(),
             &DataType::List(Arc::new(Field::new("item", DataType::Float32, true)))
+        );
+    }
+
+    #[test]
+    fn timestamp_to_microsecond_covers_naive_and_zoned() {
+        let schema = Schema::new(vec![
+            Field::new(
+                "zoned",
+                DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+                true,
+            ),
+            Field::new("naive", DataType::Timestamp(TimeUnit::Second, None), true),
+            Field::new(
+                "already",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("+02:00".into())),
+                true,
+            ),
+        ]);
+        let result = apply_rules(&schema, &[&TimestampToMicrosecond]);
+        assert_eq!(
+            result.field(0).data_type(),
+            &DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
+        );
+        assert_eq!(
+            result.field(1).data_type(),
+            &DataType::Timestamp(TimeUnit::Microsecond, None)
+        );
+        assert_eq!(
+            result.field(2).data_type(),
+            &DataType::Timestamp(TimeUnit::Microsecond, Some("+02:00".into()))
+        );
+    }
+
+    /// The distinguishing case against [`TimestampTzToMicrosecond`], which leaves a
+    /// timezone-naive timestamp alone because `DuckDB` stores it at nanosecond
+    /// precision.
+    #[test]
+    fn timestamp_tz_rule_leaves_naive_timestamps_where_the_all_rule_rewrites_them() {
+        let schema = Schema::new(vec![Field::new(
+            "naive",
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            true,
+        )]);
+        assert_eq!(
+            apply_rules(&schema, &[&TimestampTzToMicrosecond])
+                .field(0)
+                .data_type(),
+            &DataType::Timestamp(TimeUnit::Nanosecond, None)
+        );
+        assert_eq!(
+            apply_rules(&schema, &[&TimestampToMicrosecond])
+                .field(0)
+                .data_type(),
+            &DataType::Timestamp(TimeUnit::Microsecond, None)
         );
     }
 

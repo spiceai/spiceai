@@ -564,13 +564,14 @@ mod tests {
         assert!(changes.engine_normalized.is_empty());
     }
 
-    /// Cayenne stores whatever timestamp unit its source reports, so a µs accelerated
-    /// column under a ns source is a table created before that was true - a genuine
-    /// narrowing the operator can clear by recreating the table, not something the
-    /// engine imposes. Regression test for
+    /// A Cayenne table created before the engine preserved timestamp units still
+    /// stores microseconds. Its rules must keep explaining that stored type after
+    /// upgrade, or the first write against an unchanged `PostgreSQL` `timestamptz`
+    /// source reports the acceleration as stale — and on the CDC path stops
+    /// replication outright. Regression test for
     /// <https://github.com/spiceai/spiceai/issues/13018>.
     #[test]
-    fn cayenne_does_not_excuse_a_timestamp_narrowing() {
+    fn cayenne_still_explains_a_pre_existing_microsecond_table() {
         let ts = |unit: TimeUnit| DataType::Timestamp(unit, Some("UTC".into()));
         let input = schema(vec![Field::new("created_at", ts(TimeUnit::Nanosecond), true)]);
         let target = schema(vec![Field::new(
@@ -580,14 +581,25 @@ mod tests {
         )]);
 
         let changes = narrowing_schema_cast_changes(&input, &target, CAYENNE_TYPE_REWRITE_RULES);
+        assert!(changes.narrowed.is_empty(), "{:?}", changes.narrowed);
         assert_eq!(
-            changes.narrowed,
+            changes.engine_normalized,
             [r#"created_at: Timestamp(ns, "UTC") -> Timestamp(µs, "UTC")"#.to_string()]
         );
-        assert!(
-            changes.engine_normalized.is_empty(),
-            "{:?}",
-            changes.engine_normalized
-        );
+    }
+
+    /// The compatibility rule above must not reach a table created now, which stores
+    /// the source's own unit: identical schemas cast nothing, so there is nothing to
+    /// excuse and no warning to emit.
+    #[test]
+    fn a_nanosecond_cayenne_table_casts_nothing_at_all() {
+        let ns = schema(vec![Field::new(
+            "created_at",
+            DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+            true,
+        )]);
+
+        let changes = narrowing_schema_cast_changes(&ns, &ns, CAYENNE_TYPE_REWRITE_RULES);
+        assert!(changes.is_empty(), "{changes:?}");
     }
 }

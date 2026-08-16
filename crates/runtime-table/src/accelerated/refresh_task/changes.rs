@@ -4824,6 +4824,7 @@ mod tests {
         use crate::accelerated::refresh_task::RefreshTaskBuilder;
         use crate::federated::FederatedTable;
         use arrow::datatypes::TimeUnit;
+        use cayenne::CAYENNE_TYPE_REWRITE_RULES;
 
         /// `DuckDB`'s normalization of a timezone-aware timestamp to microseconds.
         /// Spelled out rather than imported because the `DuckDB` accelerator sits
@@ -4879,6 +4880,18 @@ mod tests {
         task.maybe_evolve_schema_for_cdc(&incoming).await.expect(
             "an engine-required rewrite is not a schema change and must not fail the write",
         );
+
+        // The upgrade case for #13018. A Cayenne table created before the engine
+        // preserved timestamp units stores microseconds; Cayenne now creates such a
+        // column as nanoseconds, but this table's stored type does not change. Its
+        // rules must still explain that, or upgrading stops replication on the first
+        // batch of an unchanged Postgres `timestamptz` stream. `classify` cannot save
+        // it: nanosecond is excluded as a widening target because rescaling to ns
+        // overflows i64 past ~2262, so us -> ns is `Incompatible`, not `Widening`.
+        let task = build("cdc_legacy_microsecond_table", CAYENNE_TYPE_REWRITE_RULES);
+        task.maybe_evolve_schema_for_cdc(&incoming)
+            .await
+            .expect("a pre-existing microsecond Cayenne table must keep replicating after upgrade");
 
         // Neuter: with no engine rules the same pair is classified as incompatible and
         // `on_schema_change: fail` rejects it - so the pass above is the rules working,
