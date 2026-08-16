@@ -16,7 +16,6 @@ limitations under the License.
 
 use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Instant};
 
-use crate::component::dataset::Dataset;
 use crate::component::dataset::acceleration::{Engine, Mode, RefreshMode};
 use crate::dataaccelerator::BootstrapStatus;
 #[cfg(not(windows))]
@@ -51,16 +50,35 @@ use snafu::{ResultExt, Snafu};
 /// but nothing is bootstrapped back in and the next refresh reloads from the
 /// source with the source's current schema.
 ///
-/// That only holds while something other than the snapshot store can repopulate the
-/// acceleration. Where nothing can, the snapshot is the only remaining copy of the
-/// data and skipping the bootstrap would discard it for good, so these keep
-/// bootstrapping:
+/// That only holds while the next refresh really does reload everything. Where it does
+/// not, the snapshot is the last copy of whatever the acceleration held and skipping
+/// the bootstrap destroys it, so the skip is limited to the two refresh modes that
+/// rebuild the whole acceleration from the source *by definition*:
 ///
-/// * a connector that cannot replay what the acceleration held
-///   ([`connector_can_replay_after_wipe`]).
-/// * `refresh_mode: snapshot`, which reads the snapshot store itself and never
-///   queries the source.
-/// * a resolved `refresh_mode` of `disabled`, which never refreshes at all.
+/// * `full` reloads the dataset outright on every refresh.
+/// * `caching` holds query results it re-fetches from the source on demand, so an
+///   empty accelerator costs cache misses rather than data.
+///
+/// Every other mode keeps bootstrapping, because whether it can reproduce what the
+/// acceleration held is a property of the connector and its configuration rather than
+/// of the mode, and this gate sees neither:
+///
+/// * `snapshot` reads the snapshot store itself and never queries the source.
+/// * `disabled` — what a `sink:` dataset resolves an unset `refresh_mode` to — never
+///   refreshes at all, because its rows arrive by `INSERT INTO`.
+/// * `append` reloads its window, not the history behind it.
+/// * `changes` backfills only when the connector runs an initial snapshot, and that is
+///   per-connector configuration: `pg_replication_initial_snapshot: disabled` and
+///   `dynamodb_replication_initial_snapshot: disabled` begin at the stream tip, a
+///   `cdc:` dataset is fed only by `POST /v1/datasets/{name}/cdc`, and a `debezium:`
+///   dataset with a pinned `kafka_consumer_group_id` resumes past the rows it already
+///   consumed instead of replaying the topic.
+///
+/// Erring this way costs `file_create` some of its effect on a CDC dataset that would
+/// in fact have re-snapshotted; erring the other way destroys rows nothing can re-send.
+/// Widening it safely needs a `DataConnector` capability reporting whether a refresh
+/// replays from the beginning — this gate only has an `AccelerationSource`, so it
+/// cannot ask.
 fn mode_allows_snapshot_bootstrap(
     source: &dyn AccelerationSource,
     acceleration: &Acceleration,
@@ -69,51 +87,10 @@ fn mode_allows_snapshot_bootstrap(
         return true;
     }
 
-    if !connector_can_replay_after_wipe(
-        source.connector_name(),
-        has_stable_kafka_consumer_group(source),
-    ) {
-        return true;
-    }
-
-    matches!(
+    !matches!(
         resolved_refresh_mode(source, acceleration),
-        RefreshMode::Snapshot | RefreshMode::Disabled
+        RefreshMode::Full | RefreshMode::Caching
     )
-}
-
-/// Whether the connector can re-deliver the rows the acceleration held, once
-/// `file_create` has deleted it.
-///
-/// `sink:` takes rows by `INSERT INTO` and `cdc:` by `POST /v1/datasets/{name}/cdc`.
-/// Both hand Spice a change and move on, the sender having committed its own offset
-/// once Spice acknowledged, so there is nothing left to ask.
-///
-/// `debezium:` resolves to the same `refresh_mode: changes` but normally *can* replay:
-/// its consumer group defaults to `spice.ai-{dataset}-{uuid}`, a fresh group per start
-/// whose offsets the broker has never seen, so the topic is read from the beginning.
-/// A configured `kafka_consumer_group_id` breaks that — the group is stable across
-/// restarts and committed batches have already advanced its broker-side offsets, which
-/// deleting the local acceleration does not touch, so the consumer resumes past those
-/// rows rather than replaying them.
-fn connector_can_replay_after_wipe(connector: Option<&str>, has_stable_kafka_group: bool) -> bool {
-    match connector {
-        Some("sink" | "cdc") => false,
-        Some("debezium") => !has_stable_kafka_group,
-        _ => true,
-    }
-}
-
-/// Whether this source pins a Kafka consumer group that outlives the acceleration.
-///
-/// Conservative when the source is not a [`Dataset`] and its params cannot be read:
-/// reports a stable group, so the caller keeps the bootstrap rather than risk
-/// discarding rows nothing will re-send.
-fn has_stable_kafka_consumer_group(source: &dyn AccelerationSource) -> bool {
-    source
-        .as_any()
-        .downcast_ref::<Dataset>()
-        .is_none_or(|dataset| dataset.params.contains_key("kafka_consumer_group_id"))
 }
 
 /// Downloads a snapshot if needed for bootstrapping.
@@ -483,7 +460,7 @@ pub fn validate_cayenne_snapshot_consistency(
 
 #[cfg(test)]
 mod bootstrap_gate_tests {
-    use super::{connector_can_replay_after_wipe, mode_allows_snapshot_bootstrap};
+    use super::mode_allows_snapshot_bootstrap;
     use crate::component::dataset::acceleration::{Acceleration, Mode, RefreshMode};
     use crate::dataaccelerator::AccelerationSource;
     use datafusion::sql::TableReference;
@@ -564,15 +541,16 @@ mod bootstrap_gate_tests {
 
     /// Every `RefreshMode`, so that adding a variant has to make a deliberate choice
     /// here rather than inheriting whichever side of the gate it happens to land on.
-    /// A mode bootstraps exactly when it never reads the federated source, because
-    /// then the snapshot is the only remaining copy of the data.
+    /// Only the modes that rebuild the whole acceleration from the source by
+    /// definition may skip; anything whose backfill depends on connector
+    /// configuration keeps the snapshot.
     #[test]
-    fn file_create_bootstraps_only_when_no_refresh_reads_the_source() {
+    fn file_create_skips_only_the_modes_that_reload_everything() {
         for (refresh_mode, bootstraps) in [
             (RefreshMode::Full, false),
-            (RefreshMode::Append, false),
-            (RefreshMode::Changes, false),
             (RefreshMode::Caching, false),
+            (RefreshMode::Append, true),
+            (RefreshMode::Changes, true),
             (RefreshMode::Snapshot, true),
             (RefreshMode::Disabled, true),
         ] {
@@ -588,45 +566,21 @@ mod bootstrap_gate_tests {
         }
     }
 
-    /// Whether the connector's rows can be read again at all, which the refresh mode
-    /// alone does not answer: `cdc:` and `debezium:` both resolve to `changes`, but
-    /// only one of them always has a source left to replay.
+    /// The connectors whose CDC cannot be assumed to backfill reach the safe side
+    /// through the `refresh_mode` their connector fills in, with no special-casing:
+    /// a `sink:` dataset resolves to `disabled`, and `cdc:`/`debezium:` to `changes`.
+    /// A push-ingest dataset has nothing to rebuild from, and a CDC dataset may be
+    /// configured to start at the stream tip
+    /// (`pg_replication_initial_snapshot: disabled`, a pinned
+    /// `kafka_consumer_group_id`), so none of them may lose their snapshot.
     #[test]
-    fn only_replayable_connectors_may_skip_the_bootstrap() {
-        for (connector, stable_kafka_group, can_replay) in [
-            // Pushed to Spice by `INSERT INTO` / `POST /v1/datasets/{name}/cdc`. The
-            // sender committed its offset once Spice acknowledged, so the rows the
-            // acceleration held cannot be re-sent — the group ID is irrelevant.
-            (Some("sink"), false, false),
-            (Some("sink"), true, false),
-            (Some("cdc"), false, false),
-            (Some("cdc"), true, false),
-            // Debezium reads the topic from the beginning under its default
-            // per-start group, but resumes past those rows under a pinned one.
-            (Some("debezium"), false, true),
-            (Some("debezium"), true, false),
-            // Pulled from a source table, which is still there to re-read.
-            (Some("postgres"), false, true),
-            (Some("postgres"), true, true),
-            // No connector at all (a view, an Iceberg DDL table).
-            (None, false, true),
-        ] {
-            assert_eq!(
-                connector_can_replay_after_wipe(connector, stable_kafka_group),
-                can_replay,
-                "{connector:?} (stable kafka group: {stable_kafka_group})"
+    fn file_create_keeps_the_snapshot_for_connectors_that_may_not_backfill() {
+        for connector in ["sink", "cdc", "debezium"] {
+            assert!(
+                allows(&source(Some(connector), Mode::FileCreate, None)),
+                "{connector}: cannot be assumed to replay what the acceleration held"
             );
         }
-    }
-
-    /// A `sink:` dataset is the end-to-end case: `refresh_mode` is unset, so the gate
-    /// has to reach the verdict through the connector rather than the field.
-    #[test]
-    fn file_create_still_bootstraps_a_push_ingest_dataset() {
-        assert!(
-            allows(&source(Some("sink"), Mode::FileCreate, None)),
-            "a sink dataset has no source to rebuild from, so the snapshot is its only copy"
-        );
     }
 
     #[test]
