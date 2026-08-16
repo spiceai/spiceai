@@ -130,6 +130,10 @@ pub enum Mode {
     File,
     /// Always create a new file, truncating/overwriting any existing file on startup.
     /// Use this when you want a fresh acceleration on each startup.
+    /// With `snapshots: enabled` the outgoing file is still snapshotted, but no
+    /// snapshot is bootstrapped back in — the next refresh rebuilds from the
+    /// source. `refresh_mode: snapshot` is the exception, since there the
+    /// snapshot store is the dataset's source.
     FileCreate,
     /// Open an existing file if it exists, then check schema compatibility on refresh.
     /// If the source schema is incompatible (non-additive change), snapshot (if enabled)

@@ -16,7 +16,7 @@ limitations under the License.
 
 use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Instant};
 
-use crate::component::dataset::acceleration::Engine;
+use crate::component::dataset::acceleration::{Engine, Mode, RefreshMode};
 use crate::dataaccelerator::BootstrapStatus;
 #[cfg(not(windows))]
 use crate::dataaccelerator::cayenne::CayenneAccelerator;
@@ -37,6 +37,26 @@ use runtime_acceleration::{
 };
 use snafu::{ResultExt, Snafu};
 
+/// Whether the acceleration mode leaves anything for a snapshot bootstrap to do.
+///
+/// `mode: file_create` recreates the acceleration on every startup, so by the
+/// time the bootstrap runs the accelerator has just deleted the file the
+/// operator asked to discard. Downloading the snapshot of that file restores its
+/// rows *and its stored schema*, which is what `file_create` was used to get rid
+/// of — the mode would have no effect. `file_create` therefore behaves like
+/// `snapshots: create_only`: the outgoing acceleration is still snapshotted by
+/// [`snapshot_before_recreate`] and remains available for an explicit restore,
+/// but nothing is bootstrapped back in and the next refresh reloads from the
+/// source with the source's current schema.
+///
+/// `refresh_mode: snapshot` is exempt because there the snapshot store is the
+/// dataset's data source rather than a bootstrap accelerant; skipping the
+/// download would leave the dataset with no way to load anything at all.
+fn mode_allows_snapshot_bootstrap(acceleration: &Acceleration) -> bool {
+    acceleration.mode != Mode::FileCreate
+        || acceleration.refresh_mode == Some(RefreshMode::Snapshot)
+}
+
 /// Downloads a snapshot if needed for bootstrapping.
 /// Returns `BootstrapStatus`::`Bootstrapped` if a snapshot was successfully downloaded.
 ///
@@ -54,6 +74,14 @@ pub(super) async fn download_snapshot_if_needed(
     engine_override: Option<Arc<dyn SnapshotEngine>>,
 ) -> BootstrapStatus {
     if !acceleration.snapshot_behavior.bootstrap_enabled() {
+        return BootstrapStatus::none();
+    }
+
+    if !mode_allows_snapshot_bootstrap(acceleration) {
+        tracing::info!(
+            "Acceleration mode is 'file_create' for dataset {}, skipping snapshot bootstrap so the next refresh rebuilds the acceleration from the source",
+            source.name()
+        );
         return BootstrapStatus::none();
     }
 
@@ -361,6 +389,56 @@ pub fn validate_cayenne_snapshot_consistency(
     _sources: &[Arc<dyn AccelerationSource>],
 ) -> Result<(), CayenneSnapshotValidationError> {
     Ok(())
+}
+
+#[cfg(test)]
+mod bootstrap_gate_tests {
+    use super::mode_allows_snapshot_bootstrap;
+    use crate::component::dataset::acceleration::{Acceleration, Mode, RefreshMode};
+
+    fn acceleration(mode: Mode, refresh_mode: Option<RefreshMode>) -> Acceleration {
+        Acceleration {
+            mode,
+            refresh_mode,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn file_create_does_not_bootstrap_the_snapshot_it_just_discarded() {
+        for refresh_mode in [
+            None,
+            Some(RefreshMode::Full),
+            Some(RefreshMode::Append),
+            Some(RefreshMode::Changes),
+        ] {
+            assert!(
+                !mode_allows_snapshot_bootstrap(&acceleration(Mode::FileCreate, refresh_mode)),
+                "file_create must not restore the acceleration it deleted ({refresh_mode:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn file_create_still_bootstraps_when_snapshots_are_the_data_source() {
+        assert!(
+            mode_allows_snapshot_bootstrap(&acceleration(
+                Mode::FileCreate,
+                Some(RefreshMode::Snapshot),
+            )),
+            "refresh_mode: snapshot has no source other than the snapshot store to load from"
+        );
+    }
+
+    #[test]
+    fn modes_that_keep_their_acceleration_still_bootstrap() {
+        for mode in [Mode::File, Mode::FileUpdate, Mode::Memory] {
+            assert!(
+                mode_allows_snapshot_bootstrap(&acceleration(mode, None)),
+                "{mode:?} does not discard the acceleration, so bootstrapping still applies"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
