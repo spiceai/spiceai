@@ -2447,10 +2447,11 @@ mod tests {
             self
         }
 
-        fn create(
-            &self,
+        fn create<'a>(
+            &'a self,
             _params: ConnectorParams,
-        ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>> {
+            _context: &'a dyn crate::dataconnector::ConnectorContext,
+        ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send + 'a>> {
             Box::pin(std::future::pending())
         }
 

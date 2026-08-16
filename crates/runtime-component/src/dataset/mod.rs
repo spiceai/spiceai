@@ -482,6 +482,7 @@ impl DatasetSpec {
             metrics: Metrics::default(),
             vectors: None,
             full_text_search: None,
+            drasi: None,
             check_availability: CheckAvailability::default(),
             check_availability_interval: None,
         }
