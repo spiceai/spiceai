@@ -1327,6 +1327,85 @@ async fn an_empty_acceleration_bootstraps_rather_than_rebuilding() -> Result<(),
     Ok(())
 }
 
+/// An empty acceleration must still be **loaded** when no snapshot is going to
+/// run, which means rebuilding it.
+///
+/// Emptiness says only that there is nothing stale to repair. It does not load
+/// the table. When the slot already exists and its publication already carries
+/// this table, none of `need_snapshot`'s conditions hold, so no snapshot runs —
+/// and if the rebuild is skipped too, the member resumes from the slot's
+/// position and every row committed before it is missing from the acceleration
+/// permanently. That is silent, unrecoverable data loss: no change event for
+/// those rows will ever be replayed.
+///
+/// Reached by starting a stream (creating the slot and publication), dropping
+/// it, and rejoining against a *fresh* acceleration — the shape of a deleted or
+/// relocated accelerator directory under a slot that outlived it.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_empty_acceleration_is_still_loaded_when_no_snapshot_runs() -> Result<(), anyhow::Error>
+{
+    let _tracing = init_tracing(Some("data_components::postgres_replication=debug,info"));
+
+    let port = common::get_random_port()?;
+    let _container = common::start_postgres_docker_container_with_logical_wal(port).await?;
+    let port = u16::try_from(port).expect("port fits in u16");
+    let source = pg_client(port).await?;
+
+    create_table(&source, "slot_outlived", &[(1, "alice"), (2, "bob")]).await?;
+
+    // First start: creates the slot and puts the table in the publication, and
+    // commits so the slot holds a real position.
+    let first_store = InMemoryAppliedLsnStore::shared();
+    let mut first = start_replication_stream(input_with_contents(
+        port,
+        "slot_outlived",
+        &first_store,
+        AccelerationContents::Empty,
+    ));
+    next_envelope(&mut first, "first-start bootstrap")
+        .await?
+        .commit()
+        .await?;
+    drop(first);
+    wait_for_walsender_count(&source, 0).await?;
+
+    // Rows committed while nothing is streaming. A resume from the slot position
+    // would carry these, but never the two rows that predate the slot.
+    source
+        .execute(
+            "INSERT INTO public.slot_outlived (id, name) VALUES ($1, 'carol')",
+            &[&3_i32],
+        )
+        .await?;
+
+    // Rejoin with a brand-new acceleration: empty, nothing recorded, against the
+    // surviving slot and publication. No snapshot can run in this state.
+    let store = InMemoryAppliedLsnStore::shared();
+    let input = input_with_contents(port, "slot_outlived", &store, AccelerationContents::Empty);
+    let metrics = ReplicationMetrics::new(Arc::clone(&input.metrics));
+    let mut rejoined = start_replication_stream(input);
+
+    let envelope =
+        next_envelope(&mut rejoined, "first envelope after the slot outlived it").await?;
+    let loaded = envelope.history_unavailable() || metrics.bootstrap_rows_total() > 0;
+    anyhow::ensure!(
+        loaded,
+        "an empty acceleration was neither rebuilt nor snapshotted when it rejoined a slot that \
+         outlived it, so it resumed from the slot position and the rows committed before that \
+         position are gone for good. Emptiness means there is nothing stale to repair — it does \
+         not mean something else will load the table"
+    );
+    envelope.commit().await?;
+
+    drop(rejoined);
+    wait_for_walsender_count(&source, 0).await?;
+    drop_replication_slot_when_inactive(&source, SLOT).await?;
+    source
+        .simple_query(&format!("DROP PUBLICATION IF EXISTS {PUBLICATION}"))
+        .await?;
+    Ok(())
+}
+
 /// The other side of [`an_empty_acceleration_bootstraps_rather_than_rebuilding`]:
 /// an acceleration that holds rows it cannot place must still be rebuilt.
 ///

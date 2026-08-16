@@ -2117,13 +2117,20 @@ async fn attach_member(
     // missing watermark cannot be told apart from one whose write failed — except
     // when the acceleration is observed to hold no rows at all, which is proof
     // enough on its own: nothing is present that could be stale, and no deletion
-    // can be missing. Such a load is a first load, and takes the ordinary
-    // snapshot bootstrap.
-    let acceleration_is_empty = params.acceleration.is_provably_empty();
+    // can be missing.
+    //
+    // Gated on `snapshotting`, because emptiness only licenses skipping the
+    // rebuild when something *else* is going to load the table. When no snapshot
+    // runs — a pre-existing slot whose publication already carries this table, so
+    // none of `need_snapshot`'s conditions hold, or snapshots disabled outright —
+    // the rebuild is the only thing that would populate the acceleration, and
+    // skipping it would resume from the slot's position and leave every row that
+    // predates it missing for good.
+    let load_runs_without_rebuild = params.acceleration.is_provably_empty() && snapshotting;
     let rebuild_via_consumer = super::needs_rebuild(
         &watermark,
         earliest_streamable_lsn,
-        !params.ephemeral_accelerator && tracks_positions && !acceleration_is_empty,
+        !params.ephemeral_accelerator && tracks_positions && !load_runs_without_rebuild,
     );
 
     // Why the rebuild, in the terms the operator can act on. The four causes are

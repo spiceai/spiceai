@@ -230,10 +230,16 @@ pub struct AppliedLsn {
 /// What settles that question is the acceleration's *contents*, not its record.
 /// An acceleration observed to hold no rows has nothing that could be stale and
 /// no deletion it could be missing, so absence of a watermark tells against
-/// nothing and the load proceeds through the ordinary snapshot bootstrap. Only a
-/// positive observation of emptiness counts
+/// nothing and the load can proceed through the ordinary snapshot bootstrap.
+/// Only a positive observation of emptiness counts
 /// ([`crate::cdc::AccelerationContents::is_provably_empty`]); a probe that could
 /// not answer leaves the rebuild in place.
+///
+/// Emptiness alone is not enough, and callers must not pass it through on its
+/// own: it licenses skipping the rebuild only when a snapshot is actually going
+/// to run. If nothing else loads the table, the rebuild is the only thing that
+/// would, and skipping it resumes from the slot's position with every earlier
+/// row missing for good.
 #[must_use]
 pub fn needs_rebuild(
     position: &RecordedPosition,

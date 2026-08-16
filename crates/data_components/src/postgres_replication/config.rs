@@ -106,6 +106,9 @@ pub struct ReplicationParams {
     /// Anything else — including a probe that could not answer — leaves the
     /// rebuild in place.
     ///
+    /// Even then it only applies when an initial snapshot is going to run, since
+    /// otherwise the rebuild is the only thing that would load the table at all.
+    ///
     /// Per-dataset, so it is deliberately not part of the shared-slot params
     /// compatibility check: two datasets legitimately share a slot while one is
     /// empty and the other is populated.
