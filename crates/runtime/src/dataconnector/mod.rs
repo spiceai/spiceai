@@ -857,5 +857,30 @@ mod tests {
             embedding.supports_durable_write_back_delivery(),
             "EmbeddingConnector must forward the source's delivery capability"
         );
+
+        let drasi = crate::drasi::connector::DrasiConnector::new(
+            Arc::clone(&inner),
+            crate::drasi::DeliveryMode::Acknowledged(Arc::new(
+                runtime_drasi::DrasiSink::try_new(runtime_drasi::DrasiSinkConfig {
+                    dataset: "test".to_string(),
+                    source_id: "test".to_string(),
+                    mapping: runtime_drasi::ElementMapping::new(
+                        "test".to_string(),
+                        vec!["test".to_string()],
+                    ),
+                    // Never connected to: building the sink only builds a client.
+                    transport: runtime_drasi::TransportConfig::Http {
+                        endpoint: url::Url::parse("http://127.0.0.1:1").expect("valid url"),
+                        request_timeout: Duration::from_secs(1),
+                    },
+                    on_delivery_error: runtime_drasi::OnDeliveryError::Block,
+                })
+                .expect("builds a sink"),
+            )),
+        );
+        assert!(
+            drasi.supports_durable_write_back_delivery(),
+            "DrasiConnector must forward the source's delivery capability"
+        );
     }
 }
