@@ -316,17 +316,18 @@ impl PhysicalOptimizerRule for CayenneAntiJoinSortMergeRewriter {
         plan: Arc<dyn ExecutionPlan>,
         config: &ConfigOptions,
     ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
-        // The fair-share memory gate divides the pool across every hash join in
-        // the plan, so count them once up front (the original plan's join count
-        // is the concurrency pressure we are budgeting against).
-        let hash_join_count = count_hash_joins(&plan);
+        // The fair-share memory gate charges each hash join for the build side
+        // it will actually allocate, so collect every join's build-side
+        // estimate once up front (the original plan's build sides are the
+        // concurrency pressure we are budgeting against).
+        let build_estimates = collect_hash_join_build_estimates(&plan);
         plan.transform_down(|node| {
             let Some(hash_join) = node.downcast_ref::<HashJoinExec>() else {
                 return Ok(Transformed::no(node));
             };
 
             let Some(sort_merge_join) =
-                try_rewrite_oversized_join(hash_join, config, hash_join_count)?
+                try_rewrite_oversized_join(hash_join, config, &build_estimates)?
             else {
                 return Ok(Transformed::no(node));
             };
@@ -751,7 +752,7 @@ fn filter_additions_for_join(
 fn try_rewrite_oversized_join(
     hash_join: &HashJoinExec,
     config: &ConfigOptions,
-    hash_join_count: usize,
+    build_estimates: &BuildEstimates,
 ) -> Result<Option<Arc<dyn ExecutionPlan>>, DataFusionError> {
     // `SortMergeJoinExec` supports these join types with spillable, explicitly
     // sorted inputs. Inner and outer joins are included here (unlike the legacy
@@ -808,14 +809,16 @@ fn try_rewrite_oversized_join(
             return Ok(None);
         };
 
-        // Per-join budget: the smaller of the absolute pool fraction and an even
-        // share of the pool across every hash join in the plan. A wide query
-        // such as TPC-DS q78 keeps many build sides alive at once, each below
-        // the absolute fraction yet summing past the pool; the fair-share term
+        // Per-join budget: the smaller of the absolute pool fraction and this
+        // join's build-size-weighted share of the pool. A wide query such as
+        // TPC-DS q78 keeps many build sides alive at once, each below the
+        // absolute fraction yet summing past the pool; the fair-share term
         // catches that, while a lone large join still gets the full fraction.
-        let fair_share = optimizer_config
-            .sort_merge_memory_pool_bytes
-            .map_or(gate_bytes, |pool_bytes| pool_bytes / hash_join_count.max(1));
+        let fair_share = build_estimates.weighted_share(
+            estimated_build_bytes,
+            optimizer_config.sort_merge_memory_pool_bytes,
+            gate_bytes,
+        );
         let effective_gate = gate_bytes.min(fair_share);
         let fire = estimated_build_bytes > effective_gate;
 
@@ -826,7 +829,7 @@ fn try_rewrite_oversized_join(
             gate_bytes,
             fair_share,
             effective_gate,
-            hash_join_count,
+            hash_join_count = build_estimates.join_count(),
             fire,
             "Evaluated Cayenne oversized-join memory gate"
         );
@@ -923,21 +926,98 @@ fn join_touches_cayenne(hash_join: &HashJoinExec) -> bool {
         || !collect_cayenne_scans(hash_join.right()).is_empty()
 }
 
-/// Count the `HashJoinExec` nodes in a plan. Used to size each join's fair
-/// share of the query memory pool: many concurrent build sides, each within the
-/// absolute fraction, can still sum past the pool.
-fn count_hash_joins(plan: &Arc<dyn ExecutionPlan>) -> usize {
-    let mut count = 0;
-    count_hash_joins_inner(plan, &mut count);
-    count
+/// The per-join estimated build-side bytes collected from the plan as it was
+/// received, used to weight each hash join's fair share of the query memory
+/// pool. Weighting by what each join is estimated to allocate keeps a fleet of
+/// trivial build sides from reserving budget a genuinely large join needs (and
+/// keeps a fleet of large joins from each claiming an equal slice of a pool
+/// they jointly exhaust).
+#[derive(Debug, Default)]
+struct BuildEstimates {
+    /// Number of `HashJoinExec` nodes seen in the plan.
+    join_count: usize,
+    /// Sum of every build-side estimate that could be computed. Held in
+    /// `u128` so a plan of extreme builds cannot saturate the total: a
+    /// saturated total would collapse every join's share to the whole pool
+    /// and silently drop the pool-wide bound the fair-share term enforces.
+    known_total: u128,
+    /// Joins whose build-side estimate could not be computed (absent row
+    /// statistics or an unestimatable schema). Their pressure cannot be
+    /// zeroed without losing the pool-exhaustion protection the fair-share
+    /// term exists for, so each keeps an equal-share charge.
+    unknown_count: usize,
 }
 
-fn count_hash_joins_inner(plan: &Arc<dyn ExecutionPlan>, count: &mut usize) {
-    if plan.is::<HashJoinExec>() {
-        *count += 1;
+impl BuildEstimates {
+    /// This join's fair share of the pool: its fraction of the plan's total
+    /// estimated build bytes, times the pool. Joins without an estimate
+    /// contribute `pool / join_count` each to the denominator so their
+    /// pressure is charged, not dropped. With no pool wired this is the
+    /// absolute gate itself, matching the single-term gate that preceded it.
+    ///
+    /// Fails closed under demand past the pool: when the plan's estimated
+    /// builds sum to more than the pool, every join's share sits below its
+    /// own estimate, so the rewrite fires rather than admitting build sides
+    /// that jointly exhaust the pool.
+    fn weighted_share(
+        &self,
+        estimated_build_bytes: usize,
+        pool_bytes: Option<usize>,
+        gate_bytes: usize,
+    ) -> usize {
+        let Some(pool_bytes) = pool_bytes else {
+            return gate_bytes;
+        };
+        if self.join_count == 0 || pool_bytes == 0 {
+            return 0;
+        }
+        let pool = pool_bytes as u128;
+        let unknown_total = pool / self.join_count as u128 * self.unknown_count as u128;
+        let total = self.known_total.saturating_add(unknown_total);
+        if total == 0 {
+            // Every build side is estimated at zero bytes: no join allocates
+            // enough to charge any other for, so the pool is not divided.
+            return pool_bytes;
+        }
+        // (pool × estimate) / total, in u128 so neither the plan-wide total
+        // nor the numerator can overflow back into overstating a share.
+        let share = pool.saturating_mul(estimated_build_bytes as u128) / total;
+        usize::try_from(share).unwrap_or(pool_bytes)
+    }
+
+    fn join_count(&self) -> usize {
+        self.join_count
+    }
+}
+
+/// Collect every `HashJoinExec` in the plan and estimate its build side. A
+/// join is counted even when its estimate cannot be computed: the gate fires
+/// per join, so the pressure of every join that could consume pool budget —
+/// not only the rewriteable ones — belongs in the denominator.
+fn collect_hash_join_build_estimates(plan: &Arc<dyn ExecutionPlan>) -> BuildEstimates {
+    let mut estimates = BuildEstimates::default();
+    collect_hash_join_build_estimates_inner(plan, &mut estimates);
+    estimates
+}
+
+fn collect_hash_join_build_estimates_inner(
+    plan: &Arc<dyn ExecutionPlan>,
+    estimates: &mut BuildEstimates,
+) {
+    if let Some(hash_join) = plan.downcast_ref::<HashJoinExec>() {
+        estimates.join_count += 1;
+        let estimate = build_input_row_estimate(hash_join).and_then(|build_rows| {
+            build_side_memory_estimate(hash_join.left().as_ref(), build_rows)
+        });
+        match estimate {
+            Some(bytes) => {
+                estimates.known_total = estimates.known_total.saturating_add(bytes as u128);
+            }
+            None => estimates.unknown_count += 1,
+        }
     }
     for child in plan.children() {
-        count_hash_joins_inner(child, count);
+        collect_hash_join_build_estimates_inner(child, estimates);
     }
 }
 
@@ -1597,7 +1677,7 @@ impl PhysicalOptimizerRule for CayenneJoinRewriter {
 #[cfg(test)]
 mod tests {
     use super::{
-        ANTI_JOIN_SORT_MERGE_MIN_EXACT_ROWS, CayenneAntiJoinSortMergeRewriter,
+        ANTI_JOIN_SORT_MERGE_MIN_EXACT_ROWS, BuildEstimates, CayenneAntiJoinSortMergeRewriter,
         CayenneDynamicFilterSharing, CayenneMaintainedAggregateRewriter, CayenneOptimizerConfig,
         CayenneStatsAggregateRewriter, FilterAddition, HASH_JOIN_BUILD_SIDE_OVERHEAD_DEN,
         HASH_JOIN_BUILD_SIDE_OVERHEAD_NUM, apply_filter_additions, build_side_memory_estimate,
@@ -3592,8 +3672,9 @@ mod tests {
         ])
         .expect("union of two same-schema joins should be valid");
         // Same 0.9 × 1 GiB config: each ~600 MB build (240 MB × 2.5 HT overhead)
-        // is under the ~921 MiB absolute gate but over its 512 MiB fair share
-        // (pool / 2 joins), so only the fair-share term fires.
+        // is under the ~921 MiB absolute gate but over its 512 MiB weighted
+        // fair share — the two builds are equal, so each is entitled to half
+        // the pool — and only the fair-share term fires.
         let config = config_with_cayenne_optimizer(None, Some(0.9), Some(1024 * 1024 * 1024));
 
         let optimized = optimize_anti_join_sort_merge_with_config(plan, &config);
@@ -3608,5 +3689,266 @@ mod tests {
                 "each concurrent inner join should be rewritten to sort-merge under fair-share"
             );
         }
+    }
+
+    /// Regression test for #13155: joins whose build sides will never allocate
+    /// anything meaningful must not reserve pool budget a genuinely large
+    /// build needs. Three joins over a 144 MiB pool used to split it into
+    /// three equal 48 MiB slices; under build-size weighting the two
+    /// 1,000-row builds (60 KB estimated each) stop reserving budget and the
+    /// 1,500,000-row join's share rises from ~48 MiB to ~144 MiB, so a build
+    /// between the two marks keeps its hash join.
+    #[test]
+    fn leaves_large_build_beside_trivial_joins_that_count_sharing_would_rewrite() {
+        let schema = order_line_schema();
+        let trivial_rows = Precision::Exact(1_000);
+        let mid_join = Arc::new(hash_join_with_join_type(
+            cayenne_file_exec_with_num_rows(&schema, "a.vortex", Precision::Exact(1_500_000)),
+            cayenne_file_exec_with_num_rows(&schema, "b.vortex", Precision::Exact(1_000)),
+            "order_id",
+            "order_id",
+            JoinType::Inner,
+            NullEquality::NullEqualsNothing,
+        )) as Arc<dyn ExecutionPlan>;
+        let trivial_join = |a: &str, b: &str| {
+            Arc::new(hash_join_with_join_type(
+                cayenne_file_exec_with_num_rows(&schema, a, trivial_rows),
+                cayenne_file_exec_with_num_rows(&schema, b, trivial_rows),
+                "order_id",
+                "order_id",
+                JoinType::Inner,
+                NullEquality::NullEqualsNothing,
+            )) as Arc<dyn ExecutionPlan>
+        };
+        let plan = UnionExec::try_new(vec![
+            mid_join,
+            trivial_join("c.vortex", "d.vortex"),
+            trivial_join("e.vortex", "f.vortex"),
+        ])
+        .expect("union of three same-schema joins should be valid");
+        // 144 MiB pool, fraction 0.9 → ~135.9 MiB absolute gate. The mid
+        // join's build estimate is 1.5M × 24 × 2.5 = 90 MB. Count-based
+        // sharing gave it a ~48 MiB fair share (rewrite); weighted sharing
+        // gives it ~143.8 MiB of the 144 MiB pool (capped by the ~135.9 MiB
+        // absolute gate), so it stays a hash join.
+        let config = config_with_cayenne_optimizer(None, Some(0.9), Some(144 * 1024 * 1024));
+
+        let optimized = optimize_anti_join_sort_merge_with_config(plan, &config);
+
+        let union = optimized
+            .downcast_ref::<UnionExec>()
+            .expect("top node should remain a union");
+        assert_eq!(union.children().len(), 3, "union should keep all joins");
+        let mut rewritten = 0;
+        for child in union.children() {
+            if child.is::<SortMergeJoinExec>() {
+                rewritten += 1;
+            }
+        }
+        assert_eq!(
+            rewritten, 0,
+            "a build within its weighted share must stay a hash join even when many trivial joins \
+             share the plan"
+        );
+    }
+
+    /// Weighting cuts both ways: two joins whose build sides sum past the pool
+    /// (60 MB + 120 MB over a 144 MiB pool) must both be rewritten. Under
+    /// count-based sharing they got 72 MiB each; under weighting they are
+    /// entitled to 48 MiB and 96 MiB — both below their own estimates.
+    #[test]
+    fn rewrites_unequal_builds_whose_sum_exceeds_the_pool() {
+        let schema = order_line_schema();
+        let join_with_build_rows = |build_rows: usize, a: &str, b: &str| {
+            Arc::new(hash_join_with_join_type(
+                cayenne_file_exec_with_num_rows(&schema, a, Precision::Exact(build_rows)),
+                cayenne_file_exec_with_num_rows(&schema, b, Precision::Exact(1)),
+                "order_id",
+                "order_id",
+                JoinType::Inner,
+                NullEquality::NullEqualsNothing,
+            )) as Arc<dyn ExecutionPlan>
+        };
+        // 1,000,000 rows × 24 B × 2.5 = 60 MB; 2,000,000 rows → 120 MB.
+        let plan = UnionExec::try_new(vec![
+            join_with_build_rows(1_000_000, "a.vortex", "b.vortex"),
+            join_with_build_rows(2_000_000, "c.vortex", "d.vortex"),
+        ])
+        .expect("union of two same-schema joins should be valid");
+        // 144 MiB pool, fraction 0.9 → ~135.9 MiB absolute gate. Both builds
+        // clear it individually (60 MB, 120 MB), so only the fair-share term
+        // can rewrite them: their sum (180 MB) exceeds the pool.
+        let config = config_with_cayenne_optimizer(None, Some(0.9), Some(144 * 1024 * 1024));
+
+        let optimized = optimize_anti_join_sort_merge_with_config(plan, &config);
+
+        let union = optimized
+            .downcast_ref::<UnionExec>()
+            .expect("top node should remain a union");
+        assert_eq!(union.children().len(), 2, "union should keep both joins");
+        for child in union.children() {
+            assert!(
+                child.is::<SortMergeJoinExec>(),
+                "unequal builds summing past the pool must both be rewritten"
+            );
+        }
+    }
+
+    /// A join with unknown build statistics must still count toward the pool's
+    /// pressure: the equal-share charge for an unknown build is `pool / n` per
+    /// join, and zeroing it would hand the known 96 MB build a full-pool share
+    /// it is not entitled to. Here the unknown join and the known build
+    /// jointly exceed the pool, so the known join is rewritten.
+    #[test]
+    fn charges_joins_with_unknown_build_estimates_for_their_pressure() {
+        let schema = order_line_schema();
+        // `file_exec` without statistics leaves num_rows `Absent`, so this
+        // join contributes an unknown — not a known zero — to the totals.
+        let unknown_join = Arc::new(hash_join_with_join_type(
+            cayenne_file_exec(&schema, "a.vortex", None),
+            cayenne_file_exec(&schema, "b.vortex", None),
+            "order_id",
+            "order_id",
+            JoinType::Inner,
+            NullEquality::NullEqualsNothing,
+        )) as Arc<dyn ExecutionPlan>;
+        let known_join = Arc::new(hash_join_with_join_type(
+            cayenne_file_exec_with_num_rows(&schema, "c.vortex", Precision::Exact(1_600_000)),
+            cayenne_file_exec_with_num_rows(&schema, "d.vortex", Precision::Exact(1)),
+            "order_id",
+            "order_id",
+            JoinType::Inner,
+            NullEquality::NullEqualsNothing,
+        )) as Arc<dyn ExecutionPlan>;
+        let plan = UnionExec::try_new(vec![unknown_join, known_join])
+            .expect("union of two same-schema joins should be valid");
+        // 1.6M rows × 24 B × 2.5 = 96 MB build. 144 MiB pool, fraction 0.9 →
+        // ~135.9 MiB gate. The unknown join charges pool / 2 = 72 MiB, so the
+        // known build's share is 144 MiB × 96 MB / (96 MB + 72 MiB) ≈ 81 MiB —
+        // below its 96 MB estimate, so it rewrites even though it is within
+        // the absolute gate.
+        let config = config_with_cayenne_optimizer(None, Some(0.9), Some(144 * 1024 * 1024));
+
+        let optimized = optimize_anti_join_sort_merge_with_config(plan, &config);
+
+        let union = optimized
+            .downcast_ref::<UnionExec>()
+            .expect("top node should remain a union");
+        assert_eq!(union.children().len(), 2, "union should keep both joins");
+        let known_child = &union.children()[1];
+        assert!(
+            known_child.is::<SortMergeJoinExec>(),
+            "a known build must be charged for the unknown sibling's pressure"
+        );
+        let unknown_child = &union.children()[0];
+        assert!(
+            unknown_child.is::<HashJoinExec>(),
+            "the unknown join itself has no estimate to compare and must stay a hash join"
+        );
+    }
+
+    #[test]
+    fn build_estimates_weighted_share_reduces_to_equal_shares_for_equal_builds() {
+        let estimates = BuildEstimates {
+            join_count: 4,
+            known_total: 400,
+            unknown_count: 0,
+        };
+        // Four equal 100-byte builds over a 1,000-byte pool: each join's share
+        // is exactly pool / 4, the count-based fair share.
+        assert_eq!(estimates.weighted_share(100, Some(1_000), 900), 250);
+        // With no pool wired the absolute gate stands in.
+        assert_eq!(estimates.weighted_share(100, None, 900), 900);
+    }
+
+    /// Plan-level form of the unrepresentable-aggregate case: nine builds
+    /// whose estimates each fit `usize` but whose aggregate (~1.9e19 bytes)
+    /// exceeds `usize::MAX`, over a `usize::MAX` pool. The total must stay
+    /// exact, so each join's share sits below its own estimate and every
+    /// join rewrites; a saturated total would hand each the whole pool and
+    /// admit nine non-spillable hash tables the pool cannot hold.
+    #[test]
+    fn rewrites_builds_whose_aggregate_estimate_exceeds_usize() {
+        let schema = order_line_schema();
+        // 2.1e18 estimated bytes per build: 35e15 rows × 60 bytes/row.
+        let extreme_rows = 35_000_000_000_000_000;
+        let make_join = |a: &str, b: &str| {
+            Arc::new(hash_join_with_join_type(
+                cayenne_file_exec_with_num_rows(&schema, a, Precision::Exact(extreme_rows)),
+                cayenne_file_exec_with_num_rows(&schema, b, Precision::Exact(1)),
+                "order_id",
+                "order_id",
+                JoinType::Inner,
+                NullEquality::NullEqualsNothing,
+            )) as Arc<dyn ExecutionPlan>
+        };
+        let joins: Vec<Arc<dyn ExecutionPlan>> = ["a", "b", "c", "d", "e", "f", "g", "h", "i"]
+            .iter()
+            .map(|p| make_join(&format!("{p}.vortex"), "z.vortex"))
+            .collect();
+        let plan =
+            UnionExec::try_new(joins).expect("union of nine same-schema joins should be valid");
+        // usize::MAX pool at fraction 1.0 makes the absolute gate the whole
+        // pool, so only the fair-share term can fire.
+        let config = config_with_cayenne_optimizer(None, Some(1.0), Some(usize::MAX));
+
+        let optimized = optimize_anti_join_sort_merge_with_config(plan, &config);
+
+        let union = optimized
+            .downcast_ref::<UnionExec>()
+            .expect("top node should remain a union");
+        assert_eq!(union.children().len(), 9, "union should keep all joins");
+        for child in union.children() {
+            assert!(
+                child.is::<SortMergeJoinExec>(),
+                "builds whose aggregate estimate exceeds usize must each see a share below their \
+                 own estimate and be rewritten"
+            );
+        }
+    }
+
+    #[test]
+    fn build_estimates_weighted_share_zero_and_unrepresentable_totals() {
+        // All-zero estimates do not divide the pool.
+        let all_zero = BuildEstimates {
+            join_count: 3,
+            known_total: 0,
+            unknown_count: 0,
+        };
+        assert_eq!(all_zero.weighted_share(0, Some(900), 800), 900);
+        // A plan-wide total past `usize::MAX` is held exactly in u128, so the
+        // share still fails closed instead of collapsing to the whole pool:
+        // nine 2.1e18-byte builds over a `usize::MAX` pool (aggregate ≈
+        // 1.9e19 > usize::MAX) each get roughly a ninth of the pool, below
+        // their own estimate.
+        let extreme = BuildEstimates {
+            join_count: 9,
+            known_total: 9 * 2_100_000_000_000_000_000,
+            unknown_count: 0,
+        };
+        let e = 2_100_000_000_000_000_000_usize;
+        let share = extreme.weighted_share(e, Some(usize::MAX), usize::MAX);
+        assert!(
+            share < e,
+            "an aggregate past usize::MAX must not collapse shares to the whole pool"
+        );
+        assert_eq!(
+            share as u128,
+            usize::MAX as u128 * e as u128 / (9 * 2_100_000_000_000_000_000)
+        );
+        // Unknown builds charge pool / join_count each; two unknowns over a
+        // 1,000-byte pool reserve 2 × 333 = 666 bytes, leaving the lone
+        // 100-byte build just over an eighth of the pool.
+        let with_unknowns = BuildEstimates {
+            join_count: 3,
+            known_total: 100,
+            unknown_count: 2,
+        };
+        assert_eq!(with_unknowns.weighted_share(100, Some(1_000), 900), 130);
+        // An empty estimate set cannot grant a share at all.
+        assert_eq!(
+            BuildEstimates::default().weighted_share(100, Some(900), 800),
+            0
+        );
     }
 }
