@@ -18,6 +18,7 @@ limitations under the License.
 
 use std::time::Duration;
 
+use futures::StreamExt as _;
 use reqwest::{Client, RequestBuilder};
 use snafu::ResultExt;
 
@@ -26,14 +27,15 @@ use crate::redirect::same_origin_redirect_policy;
 use crate::types::{
     ApiKeysResponse, AuthContext, AuthContextRaw, AuthExchangeRequest, AuthExchangeResponse,
     ContainerImagesResponse, CreateDeploymentRequest, CreateProjectRequest, Deployment,
-    DeploymentsResponse, LogsResponse, MetricsResponse, MintAdoptionCodeRequest,
-    MintAdoptionCodeResponse, OAuthTokenRequest, OAuthTokenResponse, Org, OrgsResponse, Project,
-    ProjectsResponse, RegenerateApiKeyRequest, RegenerateApiKeyResponse, RegionsResponse, Secret,
-    SecretsResponse, SetSecretRequest, UpdateProjectRequest,
+    DeploymentsResponse, LogsResponse, MetricsResponse, OAuthTokenRequest, OAuthTokenResponse, Org,
+    OrgsResponse, Project, ProjectsResponse, RegenerateApiKeyRequest, RegenerateApiKeyResponse,
+    RegionsResponse, Secret, SecretsResponse, SetSecretRequest, UpdateProjectRequest,
 };
 
 const DEFAULT_BASE_URL: &str = "https://api.spice.ai";
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_RESPONSE_BYTES: usize = 64 * 1024;
+const MAX_SUCCESS_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 
 /// Header carrying the organization a management request should act on. Tokens
 /// minted for a single org ignore it; the server is the authority on membership.
@@ -44,7 +46,7 @@ const ORG_HEADER: &str = "X-Org-Name";
 /// Both constructors go through here so the settings cannot drift apart — in particular the
 /// same-origin redirect policy, which is what keeps a bearer token, and the auth code that
 /// `exchange_code` puts in a request body, from following a `Location` off origin.
-fn build_http_client(timeout: Duration) -> Result<Client> {
+fn build_http_client(_base_url: &str, timeout: Duration) -> Result<Client> {
     Client::builder()
         .connect_timeout(Duration::from_secs(10))
         .timeout(timeout)
@@ -73,7 +75,24 @@ impl CloudClient {
     /// Use [`Self::with_token`] to set an authentication token, and
     /// [`Self::with_timeout`] to override the default 30-second timeout.
     pub fn new(base_url: &str) -> Result<Self> {
-        let client = build_http_client(DEFAULT_TIMEOUT)?;
+        let client = build_http_client(base_url, DEFAULT_TIMEOUT)?;
+
+        Ok(Self {
+            base_url: base_url.trim_end_matches('/').to_string(),
+            client,
+            token: None,
+            org: None,
+        })
+    }
+
+    #[cfg(test)]
+    fn new_allowing_http_for_test(base_url: &str) -> Result<Self> {
+        let client = Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(DEFAULT_TIMEOUT)
+            .redirect(same_origin_redirect_policy())
+            .build()
+            .context(HttpRequestSnafu)?;
 
         Ok(Self {
             base_url: base_url.trim_end_matches('/').to_string(),
@@ -111,7 +130,7 @@ impl CloudClient {
     ///
     /// Returns an error if the HTTP client cannot be rebuilt with the given timeout.
     pub fn with_timeout(mut self, timeout: Duration) -> Result<Self> {
-        self.client = build_http_client(timeout)?;
+        self.client = build_http_client(&self.base_url, timeout)?;
         Ok(self)
     }
 
@@ -154,14 +173,17 @@ impl CloudClient {
         }
 
         if !status.is_success() {
-            self.handle_empty_response(response).await?;
+            self.handle_empty_response_with_sensitive(response, &[auth_code])
+                .await?;
             return Err(error::Error::Api {
                 status: status.as_u16(),
                 message: "Unexpected non-success status while exchanging auth code".to_string(),
             });
         }
 
-        let body: AuthExchangeResponse = response.json().await.context(HttpRequestSnafu)?;
+        let body: AuthExchangeResponse = self
+            .handle_response_with_sensitive(response, &[auth_code])
+            .await?;
         auth_exchange_result(body)
     }
 
@@ -209,7 +231,8 @@ impl CloudClient {
             .await
             .context(HttpRequestSnafu)?;
 
-        self.handle_response(response).await
+        self.handle_response_with_sensitive(response, &[client_secret])
+            .await
     }
 
     /// Get the authentication context for the current token — the identity and
@@ -503,7 +526,8 @@ impl CloudClient {
             .await
             .context(HttpRequestSnafu)?;
 
-        self.handle_response(response).await
+        self.handle_response_with_sensitive(response, &[value])
+            .await
     }
 
     /// Delete a secret.
@@ -554,37 +578,6 @@ impl CloudClient {
     }
 
     // ========================================================================
-    // Standalone instance adoption codes
-    // ========================================================================
-
-    /// Mint a single-use standalone-instance adoption code.
-    ///
-    /// This is the codeless-connect path: a host already authenticated with
-    /// `spice login` can mint its own code and redeem it in the same command
-    /// rather than sending the customer to the portal.
-    ///
-    /// The code is minted in the client's org context, so a credential that
-    /// spans several orgs adopts the instance into the requested one rather
-    /// than the token's default.
-    ///
-    /// Requires org admin/owner. The plaintext code is returned once and must
-    /// never be printed or persisted — the caller consumes it immediately.
-    pub async fn mint_instance_adoption_code(
-        &self,
-        request: &MintAdoptionCodeRequest,
-    ) -> Result<MintAdoptionCodeResponse> {
-        let url = format!("{}/v1/instance-adoption-codes", self.base_url);
-        let response = self
-            .authed(self.client.post(&url))
-            .json(request)
-            .send()
-            .await
-            .context(HttpRequestSnafu)?;
-
-        self.handle_response(response).await
-    }
-
-    // ========================================================================
     // Metrics
     // ========================================================================
 
@@ -612,12 +605,22 @@ impl CloudClient {
         &self,
         response: reqwest::Response,
     ) -> Result<T> {
+        self.handle_response_with_sensitive(response, &[]).await
+    }
+
+    async fn handle_response_with_sensitive<T: serde::de::DeserializeOwned>(
+        &self,
+        response: reqwest::Response,
+        sensitive: &[&str],
+    ) -> Result<T> {
         let status = response.status();
-        let body = response.text().await.context(HttpRequestSnafu)?;
+        if matches!(status.as_u16(), 200..=202) {
+            let body = bounded_response_body(response, MAX_SUCCESS_RESPONSE_BYTES).await?;
+            return serde_json::from_slice(&body)
+                .map_err(|source| error::Error::JsonParse { source });
+        }
+        let body = self.sanitized_error_body(response, sensitive).await?;
         match status.as_u16() {
-            200..=202 => {
-                serde_json::from_str(&body).map_err(|source| error::Error::JsonParse { source })
-            }
             401 => error::UnauthorizedSnafu {
                 message: body_or("invalid or expired token", &body),
             }
@@ -643,11 +646,23 @@ impl CloudClient {
     }
 
     async fn handle_empty_response(&self, response: reqwest::Response) -> Result<()> {
+        self.handle_empty_response_with_sensitive(response, &[])
+            .await
+    }
+
+    async fn handle_empty_response_with_sensitive(
+        &self,
+        response: reqwest::Response,
+        sensitive: &[&str],
+    ) -> Result<()> {
         let status = response.status();
-        let body = response.text().await.context(HttpRequestSnafu)?;
+        if matches!(status.as_u16(), 200..=204) {
+            let _ = bounded_response_body(response, MAX_SUCCESS_RESPONSE_BYTES).await?;
+            return Ok(());
+        }
+        let body = self.sanitized_error_body(response, sensitive).await?;
 
         match status.as_u16() {
-            200..=204 => Ok(()),
             401 => error::UnauthorizedSnafu {
                 message: body_or("invalid or expired token", &body),
             }
@@ -676,6 +691,27 @@ impl CloudClient {
         self.token.as_deref().unwrap_or("")
     }
 
+    async fn sanitized_error_body(
+        &self,
+        response: reqwest::Response,
+        sensitive: &[&str],
+    ) -> Result<String> {
+        let bytes = match bounded_response_body(response, MAX_RESPONSE_BYTES).await {
+            Ok(bytes) => bytes,
+            // The status is already authoritative. An oversized diagnostic is
+            // equivalent to no diagnostic, not a reason to erase a known
+            // Unauthorized/Forbidden/NotFound/Conflict classification.
+            Err(error::Error::ResponseTooLarge { .. }) => return Ok(String::new()),
+            Err(error) => return Err(error),
+        };
+        let raw = String::from_utf8_lossy(&bytes);
+        let mut redacted = redact_response_body(&raw, self.token.as_deref());
+        for value in sensitive {
+            redacted = redact_response_body(&redacted, Some(value));
+        }
+        Ok(redacted)
+    }
+
     /// Apply the bearer token and, when set, the org context header.
     ///
     /// An org name that cannot be encoded as a header value surfaces as a
@@ -687,6 +723,59 @@ impl CloudClient {
             Some(org) => request.header(ORG_HEADER, org),
             None => request,
         }
+    }
+}
+
+async fn bounded_response_body(response: reqwest::Response, limit: usize) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.context(HttpRequestSnafu)?;
+        if bytes.len().saturating_add(chunk.len()) > limit {
+            return error::ResponseTooLargeSnafu { limit }.fail();
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
+fn redact_response_body(body: &str, sensitive: Option<&str>) -> String {
+    let Some(sensitive) = sensitive.filter(|value| !value.is_empty()) else {
+        return body.to_string();
+    };
+    let redacted = body.replace(sensitive, "[REDACTED]");
+    let Ok(mut json) = serde_json::from_str::<serde_json::Value>(&redacted) else {
+        // A malformed document can still carry the credential through JSON
+        // escapes that raw replacement cannot recognize. Without a complete
+        // parse there is no sound decoding boundary, so discard the peer's
+        // diagnostic rather than risk returning recoverable authority bytes.
+        return String::new();
+    };
+    redact_json_strings(&mut json, sensitive);
+    serde_json::to_string(&json).unwrap_or(redacted)
+}
+
+fn redact_json_strings(value: &mut serde_json::Value, sensitive: &str) {
+    match value {
+        serde_json::Value::String(value) => *value = value.replace(sensitive, "[REDACTED]"),
+        serde_json::Value::Array(values) => {
+            for value in values {
+                redact_json_strings(value, sensitive);
+            }
+        }
+        serde_json::Value::Object(values) => {
+            // Keys carry the credential just as easily as values, and parsing
+            // decodes an escaped key back to its literal bytes — so a key the
+            // raw replacement above could not match is reconstructed here and
+            // would be re-emitted by the serialization that follows.
+            let mut redacted = serde_json::Map::with_capacity(values.len());
+            for (key, mut value) in std::mem::take(values) {
+                redact_json_strings(&mut value, sensitive);
+                redacted.insert(key.replace(sensitive, "[REDACTED]"), value);
+            }
+            *values = redacted;
+        }
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
     }
 }
 
@@ -744,10 +833,88 @@ fn oauth_host(host: &str) -> Option<String> {
 mod tests {
     use super::{
         CloudClient, DEFAULT_TIMEOUT, auth_exchange_result, auth_exchange_status_is_pending,
-        same_origin_redirect_policy,
+        redact_response_body, same_origin_redirect_policy,
     };
     use crate::types::{AuthContext, AuthContextApp, AuthContextOrg, AuthContextRaw};
     use crate::{error, types::AuthExchangeResponse};
+
+    #[tokio::test]
+    async fn an_oversized_error_body_preserves_the_authoritative_status() {
+        let body = "x".repeat(super::MAX_RESPONSE_BYTES + 1);
+        let stub = crate::test_support::Stub::serve(move |_| {
+            format!(
+                "HTTP/1.1 401 Unauthorized\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+        });
+        let client = CloudClient::new_allowing_http_for_test(&stub.url(""))
+            .expect("construct a loopback client")
+            .with_token("secret-token");
+        let response = client
+            .client
+            .get(stub.url("/oversized"))
+            .send()
+            .await
+            .expect("the stub answers");
+
+        let error = client
+            .handle_empty_response(response)
+            .await
+            .expect_err("HTTP 401 is not success");
+        assert!(
+            matches!(error, error::Error::Unauthorized { .. }),
+            "the known status must win over its oversized diagnostic: {error}"
+        );
+    }
+
+    #[test]
+    fn management_error_bodies_redact_raw_and_json_escaped_bearers() {
+        let token = "secret-token";
+        let raw = redact_response_body("proxy echoed secret-token", Some(token));
+        assert!(!raw.contains(token));
+        let escaped =
+            redact_response_body(r#"{"error":"secret\u002dtoken was rejected"}"#, Some(token));
+        assert!(!escaped.contains(token));
+        assert!(escaped.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn malformed_management_errors_with_authority_are_discarded() {
+        let token = "secret-token";
+        for malformed in [
+            r#"{"error":"secret\u002dtoken was rejected""#,
+            "proxy echoed secret-token but never returned JSON",
+        ] {
+            assert_eq!(
+                redact_response_body(malformed, Some(token)),
+                "",
+                "a malformed peer diagnostic cannot be proven free of escaped authority"
+            );
+        }
+    }
+
+    /// An escaped credential in an object *key* survives the raw replacement,
+    /// and parsing decodes it back to the literal token, so serializing the
+    /// tree again would publish it.
+    #[test]
+    fn management_error_bodies_redact_bearers_hidden_in_object_keys() {
+        let token = "secret-token";
+        for body in [
+            // Escaped in the key, so the raw replacement cannot match it.
+            r#"{"secret\u002dtoken":"rejected"}"#,
+            r#"{"outer":{"secret\u002dtoken":["rejected"]}}"#,
+            // Literal in the key, for the path the raw replacement does cover.
+            r#"{"secret-token":"rejected"}"#,
+        ] {
+            let redacted = redact_response_body(body, Some(token));
+            assert!(
+                !redacted.contains(token),
+                "object key leaked the bearer: {redacted}"
+            );
+            assert!(redacted.contains("[REDACTED]"), "{redacted}");
+        }
+    }
 
     /// Both constructors must install the same-origin redirect policy, or a bearer token —
     /// and the auth code `exchange_code` puts in a request body — could follow a `Location`

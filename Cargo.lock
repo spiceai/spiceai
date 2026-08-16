@@ -19437,7 +19437,6 @@ dependencies = [
  "flate2",
  "fundu",
  "futures",
- "gethostname",
  "http 1.4.1",
  "humantime",
  "insta",
@@ -19475,6 +19474,7 @@ dependencies = [
  "uuid 1.23.2",
  "wiremock",
  "yaml",
+ "zeroize",
  "zip 7.2.0",
 ]
 
@@ -19498,6 +19498,7 @@ dependencies = [
 name = "spice-cloud-client"
 version = "2.2.0-unstable"
 dependencies = [
+ "futures",
  "reqwest 0.13.4",
  "serde",
  "serde_json",

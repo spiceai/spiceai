@@ -27,10 +27,9 @@ use crate::error::{CloudErrorCode, Error, InvalidResponseSnafu, Result};
 pub use spice_cloud_client::CloudClient as InnerCloudClient;
 use spice_cloud_client::types::{
     ApiKeysResponse, AuthContext, AuthExchangeResponse, ContainerImagesResponse,
-    CreateDeploymentRequest, CreateProjectRequest, Deployment, LogsResponse, MetricsResponse,
-    MintAdoptionCodeRequest, MintAdoptionCodeResponse, Org, Project, ProjectExecutor, ProjectKind,
-    ProjectResourceLimits, ProjectResources, RegenerateApiKeyResponse, RegionsResponse, Secret,
-    UpdateChannel, UpdateProjectRequest,
+    CreateDeploymentRequest, CreateProjectRequest, Deployment, LogsResponse, MetricsResponse, Org,
+    Project, ProjectExecutor, ProjectKind, ProjectResourceLimits, ProjectResources,
+    RegenerateApiKeyResponse, RegionsResponse, Secret, UpdateChannel, UpdateProjectRequest,
 };
 
 use super::org;
@@ -157,7 +156,19 @@ impl CloudClient {
     /// Create a new authenticated cloud client with an explicit bearer token,
     /// acting on `org`.
     pub fn with_token_for_org(token: impl Into<String>, org: Option<&str>) -> Result<Self> {
-        let mut inner = InnerCloudClient::new(&get_base_url())
+        Self::with_token_for_org_at(token, org, &get_base_url())
+    }
+
+    /// Create an authenticated client against an explicit Cloud API base URL.
+    ///
+    /// Cloud Connect uses this for `--endpoint` and local HTTP fixtures; every
+    /// other Cloud command continues to use [`Self::with_token_for_org`].
+    pub fn with_token_for_org_at(
+        token: impl Into<String>,
+        org: Option<&str>,
+        base_url: &str,
+    ) -> Result<Self> {
+        let mut inner = InnerCloudClient::new(base_url)
             .map_err(map_cloud_error(None))?
             .with_token(token);
         if let Some(org) = org {
@@ -221,31 +232,6 @@ impl CloudClient {
             }
             .fail()
         }
-    }
-
-    /// Mint a single-use standalone-instance adoption code for
-    /// `spice connect`'s codeless path.
-    pub async fn mint_instance_adoption_code(
-        &self,
-        request: &MintAdoptionCodeRequest,
-    ) -> Result<MintAdoptionCodeResponse> {
-        self.inner
-            .mint_instance_adoption_code(request)
-            .await
-            .map_err(|error| self.err(error))
-    }
-
-    /// `true` when a `spice login` credential [`Self::connect`] would accept for
-    /// `org` is available in this environment.
-    ///
-    /// Lets `spice connect` tell "no code and no login" (which must name both
-    /// fixes) apart from "logged in, so mint a code" — without making a
-    /// network request to find out. It resolves credentials the same way
-    /// [`Self::connect`] does, so an operator with a credential for the named
-    /// org alone is never told to log in again.
-    #[must_use]
-    pub fn is_authenticated(org: Option<&str>) -> bool {
-        org.is_some_and(org::has_org_token) || org::default_token().is_some()
     }
 
     /// Get the auth context for the current user.
@@ -875,6 +861,9 @@ fn map_cloud_error(org: Option<&str>) -> impl Fn(spice_cloud_client::error::Erro
                 format!("Spice Cloud request failed with status {status}: {message}"),
             ),
             CloudError::HttpRequest { source } => Error::HttpRequestFailed { source },
+            CloudError::ResponseTooLarge { limit } => Error::InvalidResponse {
+                message: format!("Spice Cloud response exceeded the {limit} byte limit"),
+            },
             CloudError::JsonParse { source } => Error::InvalidResponse {
                 message: format!("Failed to parse response: {source}"),
             },

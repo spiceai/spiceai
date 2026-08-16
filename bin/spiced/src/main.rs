@@ -121,7 +121,6 @@ fn main() {
         println!("{}", get_version_string());
         return;
     }
-
     // Install the default AWS LC RS crypto provider for rusttls
     let _ = CryptoProvider::install_default(crypto::aws_lc_rs::default_provider());
 
@@ -155,15 +154,26 @@ fn main() {
         }
     });
 
-    if let Err(err) = load_and_run(args) {
-        in_tracing_context(|| {
-            tracing::error!("{err}");
-        });
-    }
+    let runtime_failed = match load_and_run(args) {
+        Ok(()) => false,
+        Err(err) => {
+            in_tracing_context(|| {
+                tracing::error!("{err}");
+            });
+            true
+        }
+    };
 
     // There is no global::shutdown_meter_provider, so we replace currently used meter provider with a noop one to clean up resources
     global::set_meter_provider(NoopMeterProvider::new());
     tracing::info!("Goodbye!");
+    if runtime_failed {
+        // The foreground launcher has already seen the instance-claim ack at
+        // this point. Preserve every later startup/runtime failure in the
+        // process status so it cannot mistake "claimed, then failed" for a
+        // successfully running instance.
+        std::process::exit(1);
+    }
 }
 
 /// Load the spicepod, resolve the CPU budget it configures, and only then build
@@ -192,7 +202,6 @@ fn load_and_run(mut args: spiced::Args) -> Result<(), Box<dyn std::error::Error>
             std::process::exit(1);
         }
     };
-
     // One temporary subscriber for the whole window before `spiced::run` installs the
     // global one, so every line the spicepod load and the CPU budget emit — including
     // any added later — has somewhere to go. Both the bootstrap runtime and

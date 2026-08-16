@@ -81,9 +81,11 @@ use runtime::Runtime;
 use runtime::datafusion::query::Error as QueryError;
 use runtime::metrics_reader::MetricsReader;
 use runtime::status::ComponentStatus;
+#[cfg(test)]
+use runtime_cloud_connect::config::IDENTITY_FILE;
 use runtime_cloud_connect::config::{
     CLOUD_MANAGED_SPICEPOD_FILE, CloudConnectConfig, DEPLOYMENT_TRANSACTION_FILE,
-    DEPLOYMENT_TRANSACTION_INCOMING_FILE, IDENTITY_FILE, INCOMING_SECRET_CACHE_FILE,
+    DEPLOYMENT_TRANSACTION_INCOMING_FILE, INCOMING_SECRET_CACHE_FILE,
     PREVIOUS_CLOUD_MANAGED_SPICEPOD_FILE, PREVIOUS_SECRET_CACHE_FILE,
 };
 use runtime_cloud_connect::handlers::{
@@ -105,15 +107,6 @@ use crate::log_capture::LogRingBuffer;
 const DEFAULT_LOG_TAIL_LINES: usize = 500;
 
 const DEPLOYMENT_TRANSACTION_FORMAT: u8 = 1;
-
-/// Cheap probe used during tracing initialization, before startup state has
-/// been loaded. Full identity validation still happens during bootstrap.
-pub(crate) fn is_configured(token_supplied: bool) -> bool {
-    token_supplied
-        || CloudConnectConfig::default_config_dir()
-            .join(IDENTITY_FILE)
-            .exists()
-}
 
 /// The one durable-state decision made before the runtime is built.
 ///

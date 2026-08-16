@@ -245,6 +245,25 @@ impl RuntimeContext {
         }
     }
 
+    /// Create a context whose runtime binary is `<spice_bin_dir>/spiced`.
+    ///
+    /// This is how a test drives the parts of the CLI that *run* the runtime —
+    /// the launcher's working directory, exit status, and signal handling —
+    /// against a stub executable, without an installed Spice runtime and
+    /// without mutating this process's environment.
+    #[cfg(test)]
+    pub(crate) fn with_bin_dir_for_test(spice_bin_dir: PathBuf) -> Self {
+        Self {
+            spice_runtime_dir: spice_bin_dir.clone(),
+            spice_bin_dir,
+            ..Self::with_deadlines_for_test(
+                DEFAULT_HTTP_ENDPOINT,
+                CONTROL_PLANE_DEADLINE,
+                INFERENCE_DEADLINE,
+            )
+        }
+    }
+
     /// Create a runtime context from CLI arguments.
     ///
     /// `cloud` is `None` when cloud mode is not enabled, or `Some("region")` with
@@ -584,6 +603,17 @@ impl RuntimeContext {
 
         // Add TLS root certificate file if present
         if let Some(tls_cert) = &self.tls_root_certificate_file {
+            let tls_cert = PathBuf::from(tls_cert);
+            let tls_cert = if tls_cert.is_absolute() {
+                tls_cert
+            } else {
+                // Preserve the CLI caller's path semantics even when a command
+                // such as `spice connect --dir` later changes the child's
+                // working directory before spawn.
+                std::env::current_dir()
+                    .context(RuntimeExecutionSnafu)?
+                    .join(tls_cert)
+            };
             cmd.arg("--tls-root-certificate-file");
             cmd.arg(tls_cert);
         }
