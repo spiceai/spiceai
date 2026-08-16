@@ -88,9 +88,9 @@ Do **not** merge `trunk` into the child at this stage. `BEHIND` does not block t
 merge queue, so the merge buys nothing — and it is churn a reviewer has to read past.
 
 It does not necessarily cost a re-signoff, though: **Attestation** inherits a sign-off
-across a *conflict-free* base merge (see [Sign-off after a restack](#sign-off-after-a-restack)).
-What forfeits the attestation is resolving a conflict, which is why the restack below
-needs a fresh one and this merge might not.
+across a base merge whose tree is Git's own conflict-free result (see [Sign-off after a
+restack](#sign-off-after-a-restack)). That is why the restack below usually needs a fresh
+sign-off — it resolves and corrects the merge — while this one might not.
 
 ---
 
@@ -311,17 +311,20 @@ other. `--cached` for the same reason as above — it compares `trunk` against t
 which is what the merge commit will record; without it an unstaged correction makes the
 stats look right while the commit still carries the wrong content.
 
-**5. Commit, push, then re-run `make signoff`.** A restack forfeits the previous
-attestation — not merely because the merge is a new commit, but because it **resolved
-conflicts**. See [Sign-off after a restack](#sign-off-after-a-restack) for when a base
-merge inherits instead:
+**5. Commit, push, then sign off if the merge needs it.** Sign-off attests the *pushed*
+HEAD from a clean checkout (`docs/dev/ci_signoff.md`). A restack usually forfeits the
+previous attestation — not because the merge is a new commit, but because the tree it
+records differs from Git's automatic merge result, which is what a conflict resolution or
+an audit correction makes it do. A restack that needed neither still inherits. [Sign-off
+after a restack](#sign-off-after-a-restack) has the two commands that tell you which case
+you are in:
 
 ```bash
 git commit                                # completes the --no-commit merge
 git rev-list --parents -n1 HEAD | wc -w   # 3 = a real merge, 2 = no merge happened
 git status --short                        # must be clean before signing off
 git push
-make signoff
+make signoff                              # skip only if the merge tree checks out below
 ```
 
 Count the parents *of the commit you just made*, rather than trusting it to have merged
@@ -332,31 +335,48 @@ happened. `git status` cannot tell you that — it is clean either way.
 
 ## Sign-off after a restack
 
-A restack almost always needs a fresh `make signoff`, but not for the reason it looks
-like, and the exception is worth knowing because the gate takes hours.
+A restack usually needs a fresh `make signoff`, but not for the reason it looks like, and
+the exception is worth knowing because the gate takes hours.
 
 **Attestation binds to a commit, and inherits across clean base merges.**
 `docs/dev/ci_signoff.md` is authoritative: **Attestation** walks up to 100 successive
 merge commits on the first-parent chain looking for a sign-off. `HEAD` must merge the
 current base commit, each older merged base must appear in order on the base branch's
 first-parent history, and **every merge tree must exactly match Git's conflict-free
-automatic result**. A plain `git merge origin/trunk` that Git resolves on its own
-therefore costs nothing — the existing attestation carries forward.
+automatic result** — the workflow re-runs the merge with `git merge-tree` on each merge's
+two parents and compares the tree that produces against the tree the commit recorded. A
+plain `git merge origin/trunk` that Git resolves on its own therefore costs nothing: the
+existing attestation carries forward.
 
-**Resolving a conflict forfeits it, by design.** So do an amended merge, an octopus
-merge, and a merge from any branch other than the base. A resolution is code that has
-never been compiled: the merge can be textually clean and still semantically broken, and
-a sign-off against the merge commit is exactly what finds that out.
+**What forfeits it is a recorded tree that differs from that automatic result** — the
+test is the tree, not the procedure that produced it. Resolving a conflict does it, and
+unavoidably: CI's own re-run conflicts on the same paths, so no resolution inherits,
+however careful. Correcting the merge afterwards does it too, which is the whole point of
+the audit in step 4 — the stacked-restack failure mode is a *clean* merge whose result is
+wrong, and the `git rm` that fixes it is a departure from what Git produced. An amended
+merge, an octopus merge, a merge from a branch other than the base, and any further commit
+on top all forfeit it as well.
 
-**For a Rust branch, a restack forfeits it in practice.** The checklist above requires
-`Cargo.lock` to be taken from `trunk` and re-resolved by cargo — a resolution, so
-inheritance is lost on that file alone, before any source conflict. Assume you will re-run
-sign-off after a restack.
+**Check rather than guess**, on the merge commit before you decide to spend hours:
 
-**Where the exception pays off** is the ordinary case this document tells you to avoid
-anyway: merging the base into a branch that has no conflicts with it. If you do that and
-Git resolves it silently, do not reflexively re-run the gate — let **Attestation** try to
-inherit first.
+```bash
+git merge-tree --write-tree --no-messages HEAD^1 HEAD^2   # exits non-zero if conflicted
+git rev-parse HEAD^{tree}                                 # what the merge actually recorded
+```
+
+A zero exit and two identical OIDs mean a sign-off reachable back along the first-parent
+chain still inherits, and re-running the gate buys nothing. Anything else means it does
+not. One condition the commands cannot check: `HEAD^2` has to be the base branch's
+*current* tip when **Attestation** runs, so a `trunk` that moves on before it does costs
+you the inheritance — merge the new tip rather than reaching for the gate.
+
+**`Cargo.lock` is the usual reason they differ on a Rust branch**, but not automatically.
+Step 3 takes `trunk`'s lockfile and lets cargo re-add the branch's crates; that only
+departs from the automatic result when the branch touched the lockfile itself. A branch
+that changed no manifest restores the same bytes Git would have taken and stays
+inheritable. One that added or bumped a dependency will not — either the lockfile
+conflicted outright, or it merged textually into something cargo then rewrote. The two
+commands above settle it either way.
 
 **Retargeting is not a sign-off event.** When the parent merges, GitHub retargets the
 child's base to `trunk` on its own (timeline event `automatic_base_change_succeeded`) —
@@ -376,6 +396,7 @@ invalidates nor supplies an attestation. The restack is what changes the commit.
       audit sees it.
 - [ ] `restack_stacked_branch.sh audit` clean, and re-run if anything changed after it.
 - [ ] Merge committed and pushed, then `make signoff` re-run on the new pushed HEAD —
-      required whenever the restack resolved a conflict, which for a Rust branch is
-      effectively always (`Cargo.lock` alone). Check
-      [Sign-off after a restack](#sign-off-after-a-restack) before assuming.
+      required whenever the recorded merge tree differs from Git's automatic result, which
+      any conflict resolution or audit correction guarantees. Confirm with the two commands
+      in [Sign-off after a restack](#sign-off-after-a-restack) rather than assuming either
+      way.
