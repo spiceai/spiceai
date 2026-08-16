@@ -427,6 +427,7 @@ pub(crate) async fn do_put_query(
     query: CommandPreparedStatementQuery,
     streaming_flight: Peekable<Streaming<FlightData>>,
 ) -> Result<Response<<Service as FlightService>::DoPutStream>, Status> {
+    let _start = metrics::track_flight_request("do_put", Some("prepared_statement_query")).await;
     tracing::debug!("do_put_query: Binding parameters to prepared statement");
 
     let streaming_flight = streaming_flight
