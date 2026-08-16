@@ -390,6 +390,12 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema, TimeUnit};
     use cayenne::CAYENNE_TYPE_REWRITE_RULES;
 
+    /// `DuckDB`'s normalization of a timezone-aware timestamp to microseconds — the
+    /// engine rewrite these tests exercise. Spelled out rather than imported because
+    /// the `DuckDB` accelerator sits above this crate.
+    static DUCKDB_LIKE_RULES: TypeRewriteRules =
+        &[&arrow_tools::type_rewrite::TimestampTzToMicrosecond];
+
     fn schema(fields: Vec<Field>) -> SchemaRef {
         Arc::new(Schema::new(fields))
     }
@@ -434,10 +440,10 @@ mod tests {
         assert!(changes.is_empty(), "{changes:?}");
     }
 
-    /// Regression test for #13014: a Postgres `timestamptz` is inferred as
-    /// `Timestamp(ns, "UTC")`, Cayenne stores it as `Timestamp(µs, "UTC")` because
-    /// Vortex has no other option, and every refresh then cast ns -> µs and warned
-    /// that the acceleration was stale.
+    /// `DuckDB`'s `TIMESTAMPTZ` is always microsecond-precision, so a Postgres
+    /// `timestamptz` source column - inferred as `Timestamp(ns, "UTC")` - is stored
+    /// and read back as µs. That cast is the engine's own, not the acceleration
+    /// having fallen behind the source.
     #[test]
     fn engine_timestamp_rewrite_is_not_a_narrowing() {
         let input = schema(vec![Field::new(
@@ -451,7 +457,7 @@ mod tests {
             true,
         )]);
 
-        let changes = narrowing_schema_cast_changes(&input, &target, CAYENNE_TYPE_REWRITE_RULES);
+        let changes = narrowing_schema_cast_changes(&input, &target, DUCKDB_LIKE_RULES);
         assert!(changes.dropped.is_empty(), "{:?}", changes.dropped);
         assert!(changes.narrowed.is_empty(), "{:?}", changes.narrowed);
         // Not silent: the cast still happens, so it is reported as the engine's own
@@ -493,7 +499,7 @@ mod tests {
             Field::new("count", DataType::Int32, false),
         ]);
 
-        let changes = narrowing_schema_cast_changes(&input, &target, CAYENNE_TYPE_REWRITE_RULES);
+        let changes = narrowing_schema_cast_changes(&input, &target, DUCKDB_LIKE_RULES);
         assert_eq!(changes.dropped, ["only_in_source".to_string()]);
         assert_eq!(changes.narrowed, ["count: Int64 -> Int32".to_string()]);
         assert_eq!(
@@ -506,7 +512,14 @@ mod tests {
     #[test]
     fn engine_rewrites_apply_inside_nested_types() {
         let nested = |unit: TimeUnit| {
-            DataType::Struct(vec![Field::new("at", DataType::Timestamp(unit, None), true)].into())
+            DataType::Struct(
+                vec![Field::new(
+                    "at",
+                    DataType::Timestamp(unit, Some("UTC".into())),
+                    true,
+                )]
+                .into(),
+            )
         };
         // Nanosecond, not Second: Second -> Microsecond is a lossless widening, so it
         // never reaches the engine-rewrite check and the test would pass vacuously.
@@ -521,7 +534,7 @@ mod tests {
             true,
         )]);
 
-        let changes = narrowing_schema_cast_changes(&input, &target, CAYENNE_TYPE_REWRITE_RULES);
+        let changes = narrowing_schema_cast_changes(&input, &target, DUCKDB_LIKE_RULES);
         assert!(changes.dropped.is_empty(), "{:?}", changes.dropped);
         assert!(changes.narrowed.is_empty(), "{:?}", changes.narrowed);
         assert_eq!(changes.engine_normalized.len(), 1);
@@ -532,9 +545,6 @@ mod tests {
     /// is a real narrowing and must still be reported.
     #[test]
     fn an_engine_rewrite_it_does_not_perform_is_still_a_narrowing() {
-        static DUCKDB_LIKE_RULES: TypeRewriteRules =
-            &[&arrow_tools::type_rewrite::TimestampTzToMicrosecond];
-
         let input = schema(vec![Field::new(
             "naive",
             DataType::Timestamp(TimeUnit::Nanosecond, None),
@@ -552,5 +562,32 @@ mod tests {
             ["naive: Timestamp(ns) -> Timestamp(µs)".to_string()]
         );
         assert!(changes.engine_normalized.is_empty());
+    }
+
+    /// Cayenne stores whatever timestamp unit its source reports, so a µs accelerated
+    /// column under a ns source is a table created before that was true - a genuine
+    /// narrowing the operator can clear by recreating the table, not something the
+    /// engine imposes. Regression test for
+    /// <https://github.com/spiceai/spiceai/issues/13018>.
+    #[test]
+    fn cayenne_does_not_excuse_a_timestamp_narrowing() {
+        let ts = |unit: TimeUnit| DataType::Timestamp(unit, Some("UTC".into()));
+        let input = schema(vec![Field::new("created_at", ts(TimeUnit::Nanosecond), true)]);
+        let target = schema(vec![Field::new(
+            "created_at",
+            ts(TimeUnit::Microsecond),
+            true,
+        )]);
+
+        let changes = narrowing_schema_cast_changes(&input, &target, CAYENNE_TYPE_REWRITE_RULES);
+        assert_eq!(
+            changes.narrowed,
+            [r#"created_at: Timestamp(ns, "UTC") -> Timestamp(µs, "UTC")"#.to_string()]
+        );
+        assert!(
+            changes.engine_normalized.is_empty(),
+            "{:?}",
+            changes.engine_normalized
+        );
     }
 }

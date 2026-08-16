@@ -19,7 +19,7 @@ limitations under the License.
 use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, Schema};
-use arrow_tools::type_rewrite::{Float16ToFloat32, TimestampToMicrosecond, TypeRewriteRules};
+use arrow_tools::type_rewrite::{Float16ToFloat32, TypeRewriteRules};
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion_table_providers::UnsupportedTypeAction;
 
@@ -30,8 +30,7 @@ use datafusion_table_providers::UnsupportedTypeAction;
 /// callers that need only the always-applied part — the acceleration write path, which
 /// must tell an engine-imposed type from a schema that has genuinely drifted — can reuse
 /// it without the unsupported-type handling.
-pub static CAYENNE_TYPE_REWRITE_RULES: TypeRewriteRules =
-    &[&Float16ToFloat32, &TimestampToMicrosecond];
+pub static CAYENNE_TYPE_REWRITE_RULES: TypeRewriteRules = &[&Float16ToFloat32];
 
 fn is_vortex_supported_type(data_type: &DataType) -> bool {
     !matches!(
@@ -249,7 +248,10 @@ fn handle_unsupported_type(
 ///
 /// Always applies:
 /// - `Float16` → `Float32`
-/// - Non-microsecond `Timestamp` → `Timestamp(Microsecond, tz)`
+///
+/// `Timestamp` passes through with its time unit and timezone intact: Vortex
+/// represents second, millisecond, microsecond and nanosecond timestamps, so a
+/// table stores the precision its source reports.
 ///
 /// Truly unsupported types (`Interval`, `Duration`, `FixedSizeBinary`) are
 /// handled according to `unsupported_type_action` at the top level. Nested
@@ -312,19 +314,31 @@ mod tests {
         assert_eq!(out.field(0).data_type(), &DataType::Float32);
     }
 
+    /// Vortex represents all four Arrow timestamp units, so a table stores the
+    /// precision its source reports. Coercing to microseconds instead left a
+    /// Postgres `timestamptz` (inferred as ns) permanently unable to match its
+    /// own accelerated schema — regression test for
+    /// <https://github.com/spiceai/spiceai/issues/13014>.
     #[test]
-    fn non_microsecond_timestamp_converted() {
-        let schema = Schema::new(vec![Field::new(
-            "ts",
-            DataType::Timestamp(TimeUnit::Nanosecond, None),
-            false,
-        )]);
-        let out = transform_schema_for_vortex(&schema, UnsupportedTypeAction::Error)
-            .expect("should succeed");
-        assert_eq!(
-            out.field(0).data_type(),
-            &DataType::Timestamp(TimeUnit::Microsecond, None)
-        );
+    fn timestamp_units_are_preserved() {
+        for unit in [
+            TimeUnit::Second,
+            TimeUnit::Millisecond,
+            TimeUnit::Microsecond,
+            TimeUnit::Nanosecond,
+        ] {
+            for tz in [None, Some("UTC".into()), Some("+05:30".into())] {
+                let data_type = DataType::Timestamp(unit, tz);
+                let schema = Schema::new(vec![Field::new("ts", data_type.clone(), false)]);
+                let out = transform_schema_for_vortex(&schema, UnsupportedTypeAction::Error)
+                    .expect("should succeed");
+                assert_eq!(
+                    out.field(0).data_type(),
+                    &data_type,
+                    "timestamp unit and timezone must pass through unchanged"
+                );
+            }
+        }
     }
 
     #[test]
@@ -358,7 +372,7 @@ mod tests {
     }
 
     #[test]
-    fn field_metadata_preserved_on_timestamp_conversion() {
+    fn field_metadata_preserved_on_timestamp_passthrough() {
         let mut field_metadata = HashMap::new();
         field_metadata.insert("logicalType".to_string(), "TIMESTAMP_NTZ".to_string());
 
@@ -370,7 +384,7 @@ mod tests {
 
         assert_eq!(
             out.field(0).data_type(),
-            &DataType::Timestamp(TimeUnit::Microsecond, None)
+            &DataType::Timestamp(TimeUnit::Nanosecond, None)
         );
         assert_eq!(out.field(0).metadata(), &field_metadata);
     }
@@ -429,7 +443,8 @@ mod tests {
         };
         assert_eq!(
             item.data_type(),
-            &DataType::Timestamp(TimeUnit::Microsecond, None)
+            &DataType::Timestamp(TimeUnit::Nanosecond, None),
+            "a nested timestamp keeps its unit, like a top-level one"
         );
         assert_eq!(item.metadata(), &nested_metadata);
     }

@@ -2652,11 +2652,11 @@ impl RefreshTask {
         }
         let target_schema = self.accelerator.schema();
         // The accelerated table holds the engine's own creation-time rewrite by
-        // construction (Cayenne/Vortex stores every timestamp at microsecond precision),
-        // so the comparison has to be made against what the engine would store from this
-        // input. Without it the classifier reads that permanent rewrite as `Incompatible`
-        // drift on every CDC batch, and `on_schema_change: fail` stops replication for a
-        // schema that never changed.
+        // construction (DuckDB stores every TIMESTAMPTZ at microsecond precision), so the
+        // comparison has to be made against what the engine would store from this input.
+        // Without it the classifier reads that permanent rewrite as `Incompatible` drift
+        // on every CDC batch, and `on_schema_change: fail` stops replication for a schema
+        // that never changed.
         //
         // The match test is rule-aware rather than rebuilding the schema up front: this
         // runs per upsert sub-batch and almost always matches, and rewriting one
@@ -4813,19 +4813,23 @@ mod tests {
         .build()
     }
 
-    /// Regression test for #13014, CDC leg. Cayenne stores every timestamp at
-    /// microsecond precision because Vortex has no other option, so a Postgres
-    /// `timestamptz` CDC stream arrives as `Timestamp(ns, "UTC")` against a
-    /// `Timestamp(us, "UTC")` accelerated table forever. `classify` reads that as
-    /// `Incompatible`, so before the engine's own rewrites were consulted here,
-    /// `on_schema_change: fail` rejected the first batch and stopped replication for a
-    /// schema that never changed.
+    /// Regression test for #13014, CDC leg. `DuckDB` stores every timezone-aware
+    /// timestamp at microsecond precision, so a Postgres `timestamptz` CDC stream
+    /// arrives as `Timestamp(ns, "UTC")` against a `Timestamp(us, "UTC")` accelerated
+    /// table forever. `classify` reads that as `Incompatible`, so before the engine's
+    /// own rewrites were consulted here, `on_schema_change: fail` rejected the first
+    /// batch and stopped replication for a schema that never changed.
     #[tokio::test]
     async fn cdc_schema_evolution_accepts_an_engine_required_timestamp_rewrite() {
         use crate::accelerated::refresh_task::RefreshTaskBuilder;
         use crate::federated::FederatedTable;
         use arrow::datatypes::TimeUnit;
-        use cayenne::CAYENNE_TYPE_REWRITE_RULES;
+
+        /// `DuckDB`'s normalization of a timezone-aware timestamp to microseconds.
+        /// Spelled out rather than imported because the `DuckDB` accelerator sits
+        /// above this crate.
+        static DUCKDB_LIKE_RULES: arrow_tools::type_rewrite::TypeRewriteRules =
+            &[&arrow_tools::type_rewrite::TimestampTzToMicrosecond];
 
         let stored = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int32, false),
@@ -4871,7 +4875,7 @@ mod tests {
             .build()
         };
 
-        let task = build("cdc_engine_rewrite_accepted", CAYENNE_TYPE_REWRITE_RULES);
+        let task = build("cdc_engine_rewrite_accepted", DUCKDB_LIKE_RULES);
         task.maybe_evolve_schema_for_cdc(&incoming).await.expect(
             "an engine-required rewrite is not a schema change and must not fail the write",
         );
