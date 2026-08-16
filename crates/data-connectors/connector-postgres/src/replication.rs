@@ -36,10 +36,10 @@ use data_connector_api::federated::FederatedTableProvider;
 use datafusion::sql::TableReference;
 use futures::StreamExt;
 use opentelemetry::KeyValue;
-use runtime::component::dataset::Dataset;
 use runtime::dataconnector::parameters::ConnectorContext;
 use runtime_api_types::v1::ComponentType;
 use runtime_checkpoint_api::BlobCheckpointStore;
+use runtime_component::dataset::DatasetSpec;
 use runtime_metrics::component::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback};
 use runtime_parameters::{ExposedParamLookup, Parameters};
 use secrecy::SecretString;
@@ -69,7 +69,7 @@ const WATERMARK_TABLE: &str = "spice_sys_postgres_replication";
 /// for one to describe.
 async fn resolve_watermark_store(
     context: Option<&Arc<dyn ConnectorContext>>,
-    dataset: &Dataset,
+    dataset: &DatasetSpec,
 ) -> Option<Arc<dyn BlobCheckpointStore>> {
     context?
         .blob_checkpoint_store(dataset, WATERMARK_TABLE)
@@ -168,7 +168,7 @@ impl AppliedLsnStore for SidecarAppliedLsnStore {
 
 pub fn build_changes_stream(
     params: &Parameters,
-    dataset: &Dataset,
+    dataset: &DatasetSpec,
     context: Option<Arc<dyn ConnectorContext>>,
     federated_table: Arc<dyn FederatedTableProvider>,
     metrics: Arc<ReplicationMetricsCollector>,
