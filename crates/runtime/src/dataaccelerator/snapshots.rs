@@ -501,32 +501,30 @@ mod bootstrap_gate_tests {
         mode_allows_snapshot_bootstrap(source, &source.acceleration)
     }
 
+    /// Every `RefreshMode`, so that adding a variant has to make a deliberate choice
+    /// here rather than inheriting whichever side of the gate it happens to land on.
+    /// A mode bootstraps exactly when it never reads the federated source, because
+    /// then the snapshot is the only remaining copy of the data.
     #[test]
-    fn file_create_does_not_bootstrap_the_snapshot_it_just_discarded() {
-        for refresh_mode in [
-            None,
-            Some(RefreshMode::Full),
-            Some(RefreshMode::Append),
-            Some(RefreshMode::Changes),
-            Some(RefreshMode::Caching),
+    fn file_create_bootstraps_only_when_no_refresh_reads_the_source() {
+        for (refresh_mode, bootstraps) in [
+            (RefreshMode::Full, false),
+            (RefreshMode::Append, false),
+            (RefreshMode::Changes, false),
+            (RefreshMode::Caching, false),
+            (RefreshMode::Snapshot, true),
+            (RefreshMode::Disabled, true),
         ] {
-            assert!(
-                !allows(&source(Some("postgres"), Mode::FileCreate, refresh_mode)),
-                "file_create must not restore the acceleration it deleted ({refresh_mode:?})"
+            assert_eq!(
+                allows(&source(
+                    Some("postgres"),
+                    Mode::FileCreate,
+                    Some(refresh_mode)
+                )),
+                bootstraps,
+                "file_create + {refresh_mode:?}"
             );
         }
-    }
-
-    #[test]
-    fn file_create_still_bootstraps_when_snapshots_are_the_data_source() {
-        assert!(
-            allows(&source(
-                Some("postgres"),
-                Mode::FileCreate,
-                Some(RefreshMode::Snapshot),
-            )),
-            "refresh_mode: snapshot has no source other than the snapshot store to load from"
-        );
     }
 
     /// A `sink:` dataset resolves an unset `refresh_mode` to `disabled`, so no refresh
