@@ -5310,9 +5310,8 @@ mod tests {
             ..Default::default()
         });
 
-        let registry = Arc::new(AcceleratorEngineRegistry::new());
         let err = CayenneAccelerator::new()
-            .init(&dataset, registry)
+            .init(&dataset)
             .await
             .expect_err("init must refuse a data directory that contains the metastore");
 
