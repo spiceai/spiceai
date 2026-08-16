@@ -3247,58 +3247,30 @@ impl DataAccelerator for CayenneAccelerator {
         if let Some(acceleration) = source.acceleration()
             && acceleration.mode == Mode::FileCreate
         {
-            let metadata_dir = Self::resolve_metadata_dir(Some(acceleration));
-
-            let metastore_type = acceleration
-                .params
-                .get("cayenne_metastore")
-                .map_or("sqlite", String::as_str);
-
-            // One catalog handle serves both halves of the wipe: the outgoing
-            // snapshot exports this dataset's metastore slice from it, and the
-            // metadata drop below removes the table from it. `get_or_create_catalog`
-            // is idempotent, so both see the same catalog.
-            let catalog = self
-                .get_or_create_catalog(&metadata_dir, metastore_type)
-                .await;
-
             let path_buf = PathBuf::from(&dir_path);
             if path_buf.exists() {
+                let metadata_dir_for_snapshot =
+                    PathBuf::from(Self::resolve_metadata_dir(Some(acceleration)));
                 let snapshot_layout = runtime_acceleration::snapshot::AccelerationLayout::cayenne(
-                    PathBuf::from(&metadata_dir),
+                    metadata_dir_for_snapshot,
                     path_buf.clone(),
                 );
-                // The outgoing snapshot becomes the store's current snapshot, so it
-                // has to be one a Cayenne bootstrap can consume:
-                // `CayenneSnapshotEngine::finalize_directory_snapshot` requires the
-                // per-dataset metastore slice, and the default engine archives a raw
-                // `cayenne.db` without one. Export the slice while this dataset's
-                // table metadata is still in the catalog — the drop below removes it.
-                let snapshot_engine = match &catalog {
-                    Ok(catalog) => Some(Arc::new(
-                        crate::dataaccelerator::cayenne::snapshot_engine::CayenneSnapshotEngine::new(
-                            Arc::clone(catalog),
-                            source.name().to_string(),
-                            path_buf.clone(),
-                        ),
-                    )
-                        as Arc<dyn runtime_acceleration::snapshot::engine::SnapshotEngine>),
-                    Err(err) => {
-                        tracing::warn!(
-                            "Failed to build CayenneSnapshotEngine for the pre-recreation snapshot \
-                             of {}, falling back to the default engine: {err}",
-                            source.name()
-                        );
-                        None
-                    }
-                };
                 super::snapshots::snapshot_before_recreate(
                     acceleration,
                     source,
                     snapshot_layout,
                     AccelerationEngine::Cayenne,
                     Arc::new(arrow_schema::Schema::empty()),
-                    snapshot_engine,
+                    // The outgoing snapshot becomes the store's current snapshot, so
+                    // it has to be one a Cayenne bootstrap can consume:
+                    // `CayenneSnapshotEngine::finalize_directory_snapshot` requires the
+                    // per-dataset metastore slice, and the default engine archives a
+                    // raw `cayenne.db` without one. This exports the slice while the
+                    // dataset's table metadata is still in the catalog — the drop below
+                    // removes it. If the catalog is unavailable this resolves to `None`
+                    // and `snapshot_before_recreate` skips the snapshot rather than
+                    // publish an archive nothing can restore.
+                    self.snapshot_engine_for_source(source).await,
                 )
                 .await;
 
@@ -3318,7 +3290,18 @@ impl DataAccelerator for CayenneAccelerator {
             }
 
             // Also drop the table from metadata catalog to clean up stale metadata
-            if let Ok(catalog) = catalog {
+            let metadata_dir = Self::resolve_metadata_dir(Some(acceleration));
+
+            let metastore_type = acceleration
+                .params
+                .get("cayenne_metastore")
+                .map_or("sqlite", String::as_str);
+
+            // Get or create catalog and drop the table if it exists
+            if let Ok(catalog) = self
+                .get_or_create_catalog(&metadata_dir, metastore_type)
+                .await
+            {
                 let table_name = source.name().to_string();
                 match catalog.drop_table(&table_name).await {
                     Ok(true) => {

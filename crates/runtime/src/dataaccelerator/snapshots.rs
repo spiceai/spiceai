@@ -50,23 +50,49 @@ use snafu::{ResultExt, Snafu};
 /// but nothing is bootstrapped back in and the next refresh reloads from the
 /// source with the source's current schema.
 ///
-/// That only holds while a refresh actually reads the federated source. Two
-/// resolved refresh modes never do, and for them the snapshot is the only
-/// remaining copy of the data — skipping the bootstrap would discard it for good,
-/// so both keep bootstrapping:
+/// That only holds while something other than the snapshot store can repopulate the
+/// acceleration. Where nothing can, the snapshot is the only remaining copy of the
+/// data and skipping the bootstrap would discard it for good, so these keep
+/// bootstrapping:
 ///
-/// * `snapshot` reads the snapshot store itself; it never queries the source.
-/// * `disabled` — what a `sink:` dataset resolves an unset `refresh_mode` to —
-///   never refreshes at all, because its rows arrive by `INSERT INTO`.
+/// * a push-ingest connector ([`is_push_ingest_connector`]), whose rows Spice cannot
+///   ask anyone to re-send.
+/// * `refresh_mode: snapshot`, which reads the snapshot store itself and never
+///   queries the source.
+/// * a resolved `refresh_mode` of `disabled`, which never refreshes at all.
 fn mode_allows_snapshot_bootstrap(
     source: &dyn AccelerationSource,
     acceleration: &Acceleration,
 ) -> bool {
-    acceleration.mode != Mode::FileCreate
-        || matches!(
-            resolved_refresh_mode(source, acceleration),
-            RefreshMode::Snapshot | RefreshMode::Disabled
-        )
+    if acceleration.mode != Mode::FileCreate {
+        return true;
+    }
+
+    if source
+        .connector_name()
+        .is_some_and(is_push_ingest_connector)
+    {
+        return true;
+    }
+
+    matches!(
+        resolved_refresh_mode(source, acceleration),
+        RefreshMode::Snapshot | RefreshMode::Disabled
+    )
+}
+
+/// Whether a connector's rows are pushed to Spice rather than pulled from a source
+/// Spice can read again.
+///
+/// `sink:` takes rows by `INSERT INTO`, and `cdc:` by
+/// `POST /v1/datasets/{name}/cdc` — both hand Spice a change and move on, the sender
+/// having committed its own offset once Spice acknowledged. Neither can be asked to
+/// replay what the acceleration already held, so a wipe without a bootstrap loses it
+/// permanently. This is what separates `cdc:` from `debezium:`, which resolves to the
+/// same `refresh_mode: changes` but re-reads a Kafka topic that still holds the
+/// history.
+fn is_push_ingest_connector(connector: &str) -> bool {
+    matches!(connector, "sink" | "cdc")
 }
 
 /// Downloads a snapshot if needed for bootstrapping.
@@ -198,6 +224,20 @@ pub(crate) async fn snapshot_before_recreate(
         tracing::debug!(
             dataset = %dataset_name,
             "refresh_mode: snapshot consumes snapshots without publishing them; skipping pre-recreation snapshot"
+        );
+        return;
+    }
+
+    // A Cayenne bootstrap needs the per-dataset metastore slice that only
+    // `CayenneSnapshotEngine` writes, and `create_snapshot` makes whatever it uploads
+    // the store's `current-snapshot-id`. Publishing a default-engine archive (a raw
+    // `cayenne.db`, no slice) would replace a restorable current snapshot with one
+    // nothing can load, which is worse than keeping no backup of this wipe. The
+    // caller still recreates the acceleration either way.
+    if engine == AccelerationEngine::Cayenne && engine_override.is_none() {
+        tracing::warn!(
+            dataset = %dataset_name,
+            "Skipping the pre-recreation snapshot: this dataset's Cayenne metastore catalog is unavailable, and an archive without its metastore slice could not be restored"
         );
         return;
     }
@@ -527,25 +567,25 @@ mod bootstrap_gate_tests {
         }
     }
 
-    /// A `sink:` dataset resolves an unset `refresh_mode` to `disabled`, so no refresh
-    /// ever rebuilds it from a source. Skipping the bootstrap there would discard the
-    /// only remaining copy of the data.
+    /// Whether the connector's rows can be read again at all, which the refresh mode
+    /// alone does not answer: `cdc:` and `debezium:` both resolve to `changes`, but
+    /// only one of them has a source left to replay.
     #[test]
-    fn file_create_still_bootstraps_when_no_refresh_will_rebuild() {
-        assert!(
-            allows(&source(Some("sink"), Mode::FileCreate, None)),
-            "a sink dataset has no source to rebuild from, so the snapshot is its only copy"
-        );
-    }
-
-    /// The `changes` fill-in has to come from the connector too: a `debezium:` stream
-    /// leaves `refresh_mode` unset and still refreshes from the source.
-    #[test]
-    fn file_create_reads_the_connector_fill_in_for_an_unset_refresh_mode() {
-        for connector in ["debezium", "cdc"] {
-            assert!(
-                !allows(&source(Some(connector), Mode::FileCreate, None)),
-                "{connector} resolves to changes, which rebuilds from the source"
+    fn file_create_bootstraps_only_for_connectors_that_cannot_replay() {
+        for (connector, bootstraps) in [
+            // Pushed to Spice by `INSERT INTO` / `POST /v1/datasets/{name}/cdc`. The
+            // sender committed its offset once Spice acknowledged, so the rows the
+            // acceleration held cannot be re-sent.
+            ("sink", true),
+            ("cdc", true),
+            // Pulled by Spice: a Kafka topic Debezium still holds, or a source table.
+            ("debezium", false),
+            ("postgres", false),
+        ] {
+            assert_eq!(
+                allows(&source(Some(connector), Mode::FileCreate, None)),
+                bootstraps,
+                "file_create + {connector}:"
             );
         }
     }
